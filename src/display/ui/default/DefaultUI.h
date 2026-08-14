@@ -76,6 +76,9 @@ class DefaultUI {
     SleepAnimation sleepAnimation;
     lv_obj_t *sleepAnimScreen = nullptr;
     unsigned long lastSleepAnimAttempt = 0;
+    std::atomic<bool> panelStopRequested{false};
+    std::atomic<bool> panelStopped{false};
+    std::atomic<bool> otaEnded{false};
 
     // Animate the dial meters' tick length on screen change (short on profile/new-menu, long elsewhere).
     void animateGaugeTicks(ScreensEnum from, ScreensEnum to);

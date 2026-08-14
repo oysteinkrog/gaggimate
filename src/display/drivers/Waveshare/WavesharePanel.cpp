@@ -942,8 +942,19 @@ void WavesharePanel::writeData(uint8_t data) {
 }
 
 void WavesharePanel::pushColors(uint16_t x, uint16_t y, uint16_t width, uint16_t hight, uint16_t *data) {
-    assert(_panelDrv);
+    if (_panelDrv == nullptr) { // panel stopped for display OTA
+        return;
+    }
     esp_lcd_panel_draw_bitmap(_panelDrv, x, y, width, hight, data);
+}
+
+void WavesharePanel::stopPanel() {
+    setBrightness(0);
+    if (_panelDrv != nullptr) {
+        esp_lcd_panel_handle_t handle = _panelDrv;
+        _panelDrv = nullptr;
+        esp_lcd_panel_del(handle);
+    }
 }
 
 static void TouchDrvDigitalWrite(uint32_t gpio, uint8_t level) {

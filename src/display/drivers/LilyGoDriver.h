@@ -14,6 +14,7 @@ class LilyGoDriver : public Driver {
     bool supportsSDCard() override;
     bool installSDCard() override;
     Display *getDisplay() override { return &panel; }
+    void stopPanel() override { panel.stopPanel(); }
 
     static LilyGoDriver *getInstance() {
         if (instance == nullptr) {

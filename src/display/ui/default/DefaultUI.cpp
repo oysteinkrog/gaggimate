@@ -186,13 +186,22 @@ void DefaultUI::init() {
         rerender = true;
         apActive = event.getInt("AP");
     });
-    pluginManager->on("ota:update:start", [this](Event const &) {
+    pluginManager->on("ota:update:start", [this](Event const &event) {
         rerender = true;
         changeScreen(SCREEN_ID_STANDBY_SCREEN);
+        // A display update flashes ~4 MB while the RGB peripheral streams the
+        // framebuffer from PSRAM; both contend on the S3's shared memory bus
+        // and the download starves and aborts. The device reboots right after
+        // a display OTA anyway, so stop scan-out for the duration. Handled on
+        // the UI task (via flag) so it can't race an in-flight flush.
+        if (event.getString("component") != "controller") {
+            panelStopRequested = true;
+        }
     });
     pluginManager->on("ota:update:end", [this](Event const &) {
         rerender = true;
         changeScreen(SCREEN_ID_STANDBY_SCREEN);
+        otaEnded = true;
     });
     pluginManager->on("ota:update:status", [this](Event const &event) {
         rerender = true;
@@ -230,6 +239,22 @@ void DefaultUI::init() {
 }
 
 void DefaultUI::loop() {
+#ifndef GAGGIMATE_SIM
+    if (panelStopRequested && !panelStopped) {
+        panelStopped = true;
+        stopSleepAnimation();
+        if (panelDriver != nullptr) {
+            panelDriver->stopPanel();
+        }
+    }
+    if (panelStopped && otaEnded) {
+        // Success never reaches here (GitHubOTA restarts the device); a failed
+        // display OTA must reboot to bring the panel back.
+        delay(250);
+        ESP.restart();
+    }
+#endif
+
     const unsigned long now = ::millis();
     const unsigned long diff = now - lastRender;
 
