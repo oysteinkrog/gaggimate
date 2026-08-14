@@ -24,23 +24,26 @@ semver_t from_string(const string &version) {
     if (version.empty()) {
         return {0, 0, 0, nullptr, nullptr};
     }
-    auto numbers = split(version, '.');
-    auto major = atoi(numbers.at(0).c_str());
-    auto minor = atoi(numbers.at(1).c_str());
-    int patch;
+    // Split off the prerelease at the first '-' BEFORE splitting on '.' —
+    // splitting the whole string on '.' first truncated dotted prerelease
+    // identifiers ("1.9.0-sleep.2" parsed as prerelease "sleep", dropping
+    // the ".2"), which made successive prerelease tags compare equal and
+    // blocked OTA updates between them.
+    auto dash = version.find('-');
+    auto core = dash != string::npos ? version.substr(0, dash) : version;
+    auto numbers = split(core, '.');
+    auto major = numbers.size() > 0 ? atoi(numbers.at(0).c_str()) : 0;
+    auto minor = numbers.size() > 1 ? atoi(numbers.at(1).c_str()) : 0;
+    auto patch = numbers.size() > 2 ? atoi(numbers.at(2).c_str()) : 0;
     char *prerelease_ptr = nullptr;
 
-    auto split_at = numbers.at(2).find('-');
-    if (split_at != string::npos) {
-        patch = atoi(numbers.at(2).substr(0, split_at).c_str());
-        auto prerelease = numbers.at(2).substr(split_at + 1);
+    if (dash != string::npos && dash + 1 < version.length()) {
+        auto prerelease = version.substr(dash + 1);
         prerelease_ptr = (char *)malloc(prerelease.length() + 1);
         if (prerelease_ptr != nullptr) {
             prerelease.copy(prerelease_ptr, prerelease.length());
             prerelease_ptr[prerelease.length()] = '\0';
         }
-    } else {
-        patch = atoi(numbers.at(2).c_str());
     }
 
     semver_t _ver = {major, minor, patch, nullptr, prerelease_ptr};
