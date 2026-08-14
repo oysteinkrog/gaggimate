@@ -16,19 +16,32 @@ constexpr uint32_t TARGET_FRAME_US = 21000; // ~47 fps cap, matches overdriven r
 uint16_t rgb565(uint8_t r, uint8_t g, uint8_t b) {
     return static_cast<uint16_t>(((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3));
 }
+
+// Internal SRAM is deliberately scarce in this firmware (WiFi/BLE/TLS all
+// compete for it) — always fall back to PSRAM rather than failing.
+void *allocPreferInternal(size_t size) {
+    void *p = heap_caps_malloc(size, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    if (p == nullptr) {
+        p = ps_malloc(size);
+        if (p != nullptr) {
+            log_w("SleepAnimation: %u B in PSRAM (internal SRAM full)", static_cast<unsigned>(size));
+        }
+    }
+    return p;
+}
 } // namespace
 
 SleepAnimation::~SleepAnimation() { stop(); }
 
 void SleepAnimation::buildLuts() {
     if (sinLut == nullptr) {
-        sinLut = static_cast<int16_t *>(heap_caps_malloc(SIN_N * sizeof(int16_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+        sinLut = static_cast<int16_t *>(allocPreferInternal(SIN_N * sizeof(int16_t)));
         for (int i = 0; sinLut != nullptr && i < SIN_N; i++) {
             sinLut[i] = static_cast<int16_t>(lroundf(sinf(i * (2.0f * static_cast<float>(M_PI) / SIN_N)) * SIN_AMP));
         }
     }
     if (palette == nullptr) {
-        palette = static_cast<uint16_t *>(heap_caps_malloc(256 * sizeof(uint16_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+        palette = static_cast<uint16_t *>(allocPreferInternal(256 * sizeof(uint16_t)));
         if (palette == nullptr) {
             return;
         }
@@ -68,16 +81,17 @@ void SleepAnimation::start(Display *d) {
     buildLuts();
     const int w = display->width();
     if (band == nullptr) {
-        band = static_cast<uint16_t *>(heap_caps_malloc(w * BAND_H * sizeof(uint16_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
-        if (band == nullptr) { // internal SRAM tight — PSRAM works, just slower
-            band = static_cast<uint16_t *>(ps_malloc(w * BAND_H * sizeof(uint16_t)));
-        }
+        band = static_cast<uint16_t *>(allocPreferInternal(w * BAND_H * sizeof(uint16_t)));
     }
     if (colTerm == nullptr) {
-        colTerm = static_cast<int16_t *>(heap_caps_malloc(w * sizeof(int16_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
-        rowTerm = static_cast<int16_t *>(heap_caps_malloc(display->height() * sizeof(int16_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+        colTerm = static_cast<int16_t *>(allocPreferInternal(w * sizeof(int16_t)));
+    }
+    if (rowTerm == nullptr) {
+        rowTerm = static_cast<int16_t *>(allocPreferInternal(display->height() * sizeof(int16_t)));
     }
     if (band == nullptr || sinLut == nullptr || palette == nullptr || colTerm == nullptr || rowTerm == nullptr) {
+        log_e("SleepAnimation: buffer allocation failed (band=%p sin=%p pal=%p col=%p row=%p)", band, sinLut, palette, colTerm,
+              rowTerm);
         return;
     }
     running = true;
@@ -86,11 +100,13 @@ void SleepAnimation::start(Display *d) {
     // Core 1 (same as the UI task, which mostly sleeps while we run), above
     // its priority so frames win; the pacing delay keeps LVGL's touch poll fed.
     if (xTaskCreatePinnedToCore(taskEntry, "SleepAnim", 4096, this, 2, &handle, 1) != pdPASS) {
+        log_e("SleepAnimation: task creation failed");
         running = false;
         stopped = true;
         return;
     }
     taskHandle = handle;
+    log_i("SleepAnimation: started (%dx%d)", w, display->height());
 }
 
 void SleepAnimation::stop() {

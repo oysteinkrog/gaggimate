@@ -273,17 +273,6 @@ void DefaultUI::loop() {
         currentScreen = static_cast<ScreensEnum>(eez_flow_get_current_screen());
         effect_mgr.evaluate_all();
 
-        // OTA/error/autotune arriving mid-animation doesn't change the flow
-        // screen (standby is already current), so hand the panel back to the
-        // EEZ standby screen explicitly to make the status visible.
-        if (sleepAnimation.isActive() &&
-            (controller->isUpdating() || controller->isErrorState() || controller->isAutotuning())) {
-            stopSleepAnimation();
-            if (sleepAnimScreen != nullptr && lv_scr_act() == sleepAnimScreen && objects.standby_screen != nullptr) {
-                lv_scr_load(objects.standby_screen);
-            }
-        }
-
         if (currentScreen == SCREEN_ID_STANDBY_SCREEN) {
             if (standbyEnterTime > 0) {
                 const Settings &settings = controller->getSettings();
@@ -295,8 +284,43 @@ void DefaultUI::loop() {
         }
     }
 
+    maintainSleepAnimation();
+
     ui_tick();
     lv_task_handler();
+}
+
+// Runs every UI-task pass. The EEZ flow loads its screens through LVGL's
+// animation system, so a one-shot start at screen-change time can lose the
+// race against the deferred standby-screen load — instead, continuously
+// assert the desired state while in plain standby and re-assert the
+// animation screen if anything (flow, status changes) replaced it.
+void DefaultUI::maintainSleepAnimation() {
+#ifndef GAGGIMATE_SIM
+    const bool blocked = controller->isUpdating() || controller->isErrorState() || controller->isAutotuning() ||
+                         controller->getSystemInfo().protocolMismatch;
+    const bool wantAnimation = currentScreen == SCREEN_ID_STANDBY_SCREEN && controller->getMode() == MODE_STANDBY && !blocked;
+
+    if (wantAnimation) {
+        if (!sleepAnimation.isActive()) {
+            const unsigned long now = ::millis();
+            if (now - lastSleepAnimAttempt > 2000) {
+                lastSleepAnimAttempt = now;
+                startSleepAnimation();
+            }
+        } else if (sleepAnimScreen != nullptr && lv_scr_act() != sleepAnimScreen) {
+            lv_scr_load(sleepAnimScreen);
+            lv_refr_now(nullptr);
+        }
+    } else if (sleepAnimation.isActive() && blocked) {
+        // OTA/error/autotune status renders on the EEZ standby screen — hand
+        // the panel back so it's visible.
+        stopSleepAnimation();
+        if (sleepAnimScreen != nullptr && lv_scr_act() == sleepAnimScreen && objects.standby_screen != nullptr) {
+            lv_scr_load(objects.standby_screen);
+        }
+    }
+#endif
 }
 
 void DefaultUI::loopProfiles() {
@@ -476,9 +500,6 @@ void DefaultUI::handleScreenChange() {
         }
         eez_flow_set_screen(targetScreen, LV_SCR_LOAD_ANIM_NONE, 0, 0);
         animateGaugeTicks(currentScreen, targetScreen);
-        if (targetScreen == SCREEN_ID_STANDBY_SCREEN) {
-            startSleepAnimation();
-        }
         rerender = true;
     }
 }
