@@ -156,7 +156,15 @@ uint8_t *SleepAnimation::overlayBackBuffer() {
     if (overlayCap == 0) {
         return nullptr;
     }
-    return overlays[(overlayFront.load() + 1) & 1].buf;
+    const int back = (overlayFront.load() + 1) & 1;
+    // With two buffers, the back buffer is the front of two publishes ago; a
+    // frame started just before the last publish may still be blending from
+    // it. Writing into it now would tear the composited widgets — skip and
+    // let the caller retry on the next UI pass (the frame is ~20 ms).
+    if (overlayInUse.load() == back) {
+        return nullptr;
+    }
+    return overlays[back].buf;
 }
 
 void SleepAnimation::publishOverlay(int w, int h) {
@@ -249,7 +257,13 @@ void SleepAnimation::renderFrame(uint32_t frame) {
     }
 
     // One overlay for the whole frame; a publish mid-frame lands next frame.
-    const int ofi = overlayFront.load();
+    // The load/store/load dance closes the race with publishOverlay: after it,
+    // overlayInUse is guaranteed to name the overlay we actually read.
+    int ofi;
+    do {
+        ofi = overlayFront.load();
+        overlayInUse.store(ofi);
+    } while (ofi != overlayFront.load());
     const Overlay *ov = ofi >= 0 ? &overlays[ofi] : nullptr;
     const int ovXoff = ov != nullptr ? (ov->w - w) / 2 : 0;
     const int ovYoff = ov != nullptr ? (ov->h - h) / 2 : 0;

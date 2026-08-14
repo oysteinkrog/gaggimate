@@ -542,6 +542,17 @@ void DefaultUI::startSleepAnimation() {
     // widget snapshots. Making the screen background transparent keeps those
     // snapshots per-pixel alpha (widgets only, no opaque black plate).
     lv_obj_set_style_bg_opa(objects.standby_screen, LV_OPA_TRANSP, LV_PART_MAIN);
+    // The status icons carry a 10 px border in the theme background color (an
+    // EEZ spacing trick, invisible on black) — over the plasma it snapshots as
+    // an opaque plate around each icon. Hide the borders while animating.
+    for (lv_obj_t *icon : {objects.wifi_icon, objects.bluetooth_icon, objects.update_icon}) {
+        if (icon != nullptr) {
+            lv_obj_set_style_border_opa(icon, LV_OPA_TRANSP, LV_PART_MAIN);
+        }
+    }
+    // Widget updates must not race the plasma on the panel: LVGL keeps
+    // rendering to its draw buffer, but flushes are dropped until stop.
+    lvgl_helper_suppress_flush(true);
     refreshSleepOverlay();
 #endif
 }
@@ -549,6 +560,12 @@ void DefaultUI::startSleepAnimation() {
 void DefaultUI::stopSleepAnimation() {
 #ifndef GAGGIMATE_SIM
     sleepAnimation.stop();
+    lvgl_helper_suppress_flush(false);
+    for (lv_obj_t *icon : {objects.wifi_icon, objects.bluetooth_icon, objects.update_icon}) {
+        if (icon != nullptr) {
+            lv_obj_remove_local_style_prop(icon, LV_STYLE_BORDER_OPA, LV_PART_MAIN);
+        }
+    }
     if (objects.standby_screen != nullptr) {
         // Drop the transparent-background override (back to the EEZ style) and
         // repaint the whole screen over the last plasma frame.
@@ -563,12 +580,14 @@ void DefaultUI::stopSleepAnimation() {
 // render task to alpha-blend into every plasma frame.
 void DefaultUI::refreshSleepOverlay() {
 #ifndef GAGGIMATE_SIM
-    lastSleepOverlayRefresh = ::millis();
     lv_obj_t *scr = objects.standby_screen;
+    // nullptr also covers "render task is mid-frame in the back overlay" —
+    // don't stamp the refresh time, so the next UI pass retries immediately.
     uint8_t *buf = sleepAnimation.overlayBackBuffer();
     if (scr == nullptr || buf == nullptr) {
         return;
     }
+    lastSleepOverlayRefresh = ::millis();
     const uint32_t needed = lv_snapshot_buf_size_needed(scr, LV_IMG_CF_TRUE_COLOR_ALPHA);
     if (needed == 0 || needed > sleepAnimation.overlayCapacity()) {
         log_w("Sleep overlay snapshot needs %u B, capacity %u B — skipping", static_cast<unsigned>(needed),

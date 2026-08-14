@@ -43,6 +43,8 @@ class SleepAnimation {
     // the standby widgets. Double-buffered: the UI task renders a snapshot
     // into overlayBackBuffer(), then publishOverlay() computes per-row alpha
     // spans and atomically flips which overlay the render task blends from.
+    // Returns nullptr when the render task is still reading the back overlay
+    // mid-frame (rare, ~20 ms window) — the caller just retries next UI pass.
     uint8_t *overlayBackBuffer();
     uint32_t overlayCapacity() const { return overlayCap; }
     // w/h: the snapshot's actual pixel size (may exceed the panel by the
@@ -79,7 +81,8 @@ class SleepAnimation {
 
     Overlay overlays[2];
     uint32_t overlayCap = 0;
-    std::atomic<int> overlayFront{-1}; // -1 = nothing published yet
+    std::atomic<int> overlayFront{-1};  // -1 = nothing published yet
+    std::atomic<int> overlayInUse{-1};  // overlay the render task reads this frame
 };
 
 #endif // GAGGIMATE_SIM
