@@ -59,11 +59,6 @@ class DefaultUI {
         return is_task_healthy(eTaskGetState(taskHandle)) && is_task_healthy(eTaskGetState(profileTaskHandle));
     }
 
-  public:
-    // Standby animation (procedural, outside the LVGL pipeline). Public so the
-    // animation screen's touch callback can route back through the wake path.
-    void onSleepAnimationTouched();
-
   private:
     void setupPanel();
     void setupState();
@@ -73,9 +68,10 @@ class DefaultUI {
     void startSleepAnimation();
     void stopSleepAnimation();
     void maintainSleepAnimation();
+    void refreshSleepOverlay();
     SleepAnimation sleepAnimation;
-    lv_obj_t *sleepAnimScreen = nullptr;
     unsigned long lastSleepAnimAttempt = 0;
+    unsigned long lastSleepOverlayRefresh = 0;
     std::atomic<bool> panelStopRequested{false};
     std::atomic<bool> panelStopped{false};
     std::atomic<bool> otaEnded{false};

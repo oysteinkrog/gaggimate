@@ -315,29 +315,18 @@ void DefaultUI::loop() {
     lv_task_handler();
 }
 
-// Runs every UI-task pass. The EEZ flow loads its screens through LVGL's
-// animation system, so a one-shot start at screen-change time can lose the
-// race against the deferred standby-screen load — instead, continuously
-// assert the desired state while in plain standby and re-assert the
-// animation screen if anything (flow, status changes) replaced it.
+// Runs every UI-task pass. Starts/stops the plasma background of the standby
+// screen and pumps completed frames into LVGL. The animation only runs during
+// genuine sleep: standby screen, standby mode, controller BLE-connected, and
+// no status overlay (update/error/autotune/protocol mismatch) — those states
+// render on the plain standby screen instead.
 void DefaultUI::maintainSleepAnimation() {
 #ifndef GAGGIMATE_SIM
-    // Boot settling gate: setupPanel() runs a 1 s black->standby fade with
-    // auto_del on the old screen; never swap screens underneath it. (The
-    // sleep3 boot loop turned out to be a pushColors coordinate bug, not
-    // this race — but the gate stays as cheap protection for the fade.)
-    if (::millis() < STARTUP_FADE_MS + 3000) {
-        return;
-    }
-    // Never swap screens while any screen-load animation is pending — let it
-    // finish and retry on a later pass.
-    const lv_disp_t *disp = lv_disp_get_default();
-    if (disp == nullptr || disp->scr_to_load != nullptr) {
-        return;
-    }
     const bool blocked = controller->isUpdating() || controller->isErrorState() || controller->isAutotuning() ||
                          controller->getSystemInfo().protocolMismatch;
-    const bool wantAnimation = currentScreen == SCREEN_ID_STANDBY_SCREEN && controller->getMode() == MODE_STANDBY && !blocked;
+    const bool connected = controller->getClientController() != nullptr && controller->getClientController()->isConnected();
+    const bool wantAnimation =
+        currentScreen == SCREEN_ID_STANDBY_SCREEN && controller->getMode() == MODE_STANDBY && connected && !blocked;
 
     if (wantAnimation) {
         if (!sleepAnimation.isActive()) {
@@ -346,17 +335,13 @@ void DefaultUI::maintainSleepAnimation() {
                 lastSleepAnimAttempt = now;
                 startSleepAnimation();
             }
-        } else if (sleepAnimScreen != nullptr && lv_scr_act() != sleepAnimScreen) {
-            lv_scr_load(sleepAnimScreen);
-            lv_refr_now(nullptr);
+        } else if (::millis() - lastSleepOverlayRefresh > 1000) {
+            // Keep the composited widgets fresh (the clock changes once a
+            // minute; a 1 s cadence keeps status/icon changes snappy too).
+            refreshSleepOverlay();
         }
-    } else if (sleepAnimation.isActive() && blocked) {
-        // OTA/error/autotune status renders on the EEZ standby screen — hand
-        // the panel back so it's visible.
+    } else if (sleepAnimation.isActive()) {
         stopSleepAnimation();
-        if (sleepAnimScreen != nullptr && lv_scr_act() == sleepAnimScreen && objects.standby_screen != nullptr) {
-            lv_scr_load(objects.standby_screen);
-        }
     }
 #endif
 }
@@ -544,52 +529,59 @@ void DefaultUI::handleScreenChange() {
 
 void DefaultUI::startSleepAnimation() {
 #ifndef GAGGIMATE_SIM
-    // Standby doubles as the OTA/error/autotune status screen — only animate
-    // plain sleep.
-    if (controller->isUpdating() || controller->isErrorState() || controller->isAutotuning()) {
-        return;
-    }
     Display *display = panelDriver != nullptr ? panelDriver->getDisplay() : nullptr;
-    if (display == nullptr) {
+    if (display == nullptr || objects.standby_screen == nullptr) {
         return;
     }
-    if (sleepAnimScreen == nullptr) {
-        sleepAnimScreen = lv_obj_create(nullptr);
-        lv_obj_set_style_bg_color(sleepAnimScreen, lv_color_black(), LV_PART_MAIN);
-        lv_obj_set_style_bg_opa(sleepAnimScreen, LV_OPA_COVER, LV_PART_MAIN);
-        lv_obj_add_flag(sleepAnimScreen, LV_OBJ_FLAG_CLICKABLE);
-        lv_obj_add_event_cb(
-            sleepAnimScreen,
-            [](lv_event_t *e) { static_cast<DefaultUI *>(lv_event_get_user_data(e))->onSleepAnimationTouched(); },
-            LV_EVENT_CLICKED, this);
-    }
-    // A bare black screen gives LVGL nothing to redraw, so the animation task
-    // owns the panel until the next screen change; touch stays with LVGL for
-    // tap-to-wake. Flush the base synchronously before frames start.
-    lv_scr_load(sleepAnimScreen);
-    lv_refr_now(nullptr);
     sleepAnimation.start(display);
+    if (!sleepAnimation.isActive()) {
+        return;
+    }
+    // The plasma task owns the panel while the animation runs; LVGL keeps the
+    // standby screen active only for input (tap-to-wake) and for the offscreen
+    // widget snapshots. Making the screen background transparent keeps those
+    // snapshots per-pixel alpha (widgets only, no opaque black plate).
+    lv_obj_set_style_bg_opa(objects.standby_screen, LV_OPA_TRANSP, LV_PART_MAIN);
+    refreshSleepOverlay();
 #endif
 }
 
 void DefaultUI::stopSleepAnimation() {
 #ifndef GAGGIMATE_SIM
     sleepAnimation.stop();
+    if (objects.standby_screen != nullptr) {
+        // Drop the transparent-background override (back to the EEZ style) and
+        // repaint the whole screen over the last plasma frame.
+        lv_obj_remove_local_style_prop(objects.standby_screen, LV_STYLE_BG_OPA, LV_PART_MAIN);
+        lv_obj_invalidate(objects.standby_screen);
+    }
 #endif
 }
 
-void DefaultUI::onSleepAnimationTouched() {
-    // Mirrors action_on_wakeup() — the EEZ standby screen's tap handler.
-    if (controller->isUpdating() || controller->isErrorState() || controller->isAutotuning() ||
-        !controller->getClientController()->isConnected()) {
+// Renders the standby screen's widgets into the animation's back overlay
+// buffer via an offscreen LVGL snapshot (RGB565+A8), then publishes it for the
+// render task to alpha-blend into every plasma frame.
+void DefaultUI::refreshSleepOverlay() {
+#ifndef GAGGIMATE_SIM
+    lastSleepOverlayRefresh = ::millis();
+    lv_obj_t *scr = objects.standby_screen;
+    uint8_t *buf = sleepAnimation.overlayBackBuffer();
+    if (scr == nullptr || buf == nullptr) {
         return;
     }
-    // Stop rendering before any screen change so the animation task can never
-    // push frames concurrently with an LVGL flush.
-    stopSleepAnimation();
-    changeScreen(SCREEN_ID_BREW_SCREEN);
-    controller->deactivate();
-    controller->setMode(MODE_BREW);
+    const uint32_t needed = lv_snapshot_buf_size_needed(scr, LV_IMG_CF_TRUE_COLOR_ALPHA);
+    if (needed == 0 || needed > sleepAnimation.overlayCapacity()) {
+        log_w("Sleep overlay snapshot needs %u B, capacity %u B — skipping", static_cast<unsigned>(needed),
+              static_cast<unsigned>(sleepAnimation.overlayCapacity()));
+        return;
+    }
+    lv_img_dsc_t dsc;
+    if (lv_snapshot_take_to_buf(scr, LV_IMG_CF_TRUE_COLOR_ALPHA, &dsc, buf, needed) != LV_RES_OK) {
+        log_w("Sleep overlay snapshot failed");
+        return;
+    }
+    sleepAnimation.publishOverlay(dsc.header.w, dsc.header.h);
+#endif
 }
 
 // Collect every lv_meter under obj (the dial gauges) so their tick length can be animated together.
