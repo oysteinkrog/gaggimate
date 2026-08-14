@@ -99,7 +99,9 @@ void SleepAnimation::start(Display *d) {
     TaskHandle_t handle = nullptr;
     // Core 1 (same as the UI task, which mostly sleeps while we run), above
     // its priority so frames win; the pacing delay keeps LVGL's touch poll fed.
-    if (xTaskCreatePinnedToCore(taskEntry, "SleepAnim", 4096, this, 2, &handle, 1) != pdPASS) {
+    // 8 KB stack: renderFrame itself is lean, but log_i's float formatting and
+    // the esp_lcd draw path both burn stack; 4 KB was within canary distance.
+    if (xTaskCreatePinnedToCore(taskEntry, "SleepAnim", 8192, this, 2, &handle, 1) != pdPASS) {
         log_e("SleepAnimation: task creation failed");
         running = false;
         stopped = true;

@@ -322,6 +322,19 @@ void DefaultUI::loop() {
 // animation screen if anything (flow, status changes) replaced it.
 void DefaultUI::maintainSleepAnimation() {
 #ifndef GAGGIMATE_SIM
+    // Boot settling gate: setupPanel() runs a 1 s black->standby fade with
+    // auto_del on the old screen. Swapping screens underneath that in-flight
+    // animation corrupts LVGL's screen-load state (prev/act/scr_to_load) —
+    // prime suspect in the v1.9.2-sleep3 boot loop.
+    if (::millis() < STARTUP_FADE_MS + 3000) {
+        return;
+    }
+    // Never swap screens while any screen-load animation is pending — let it
+    // finish and retry on a later pass.
+    const lv_disp_t *disp = lv_disp_get_default();
+    if (disp == nullptr || disp->scr_to_load != nullptr) {
+        return;
+    }
     const bool blocked = controller->isUpdating() || controller->isErrorState() || controller->isAutotuning() ||
                          controller->getSystemInfo().protocolMismatch;
     const bool wantAnimation = currentScreen == SCREEN_ID_STANDBY_SCREEN && controller->getMode() == MODE_STANDBY && !blocked;
