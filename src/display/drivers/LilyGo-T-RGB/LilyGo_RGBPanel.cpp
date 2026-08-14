@@ -12,6 +12,17 @@
 #include <display/drivers/common/RGBPanelInit.h>
 #include <esp_adc_cal.h>
 
+// Panel timing porches, overridable from build flags (see [env:display] in
+// platformio.ini). Defaults are the stock LilyGo values.
+#ifndef GM_LCD_HSYNC_PW
+#define GM_LCD_HSYNC_PW 1
+#define GM_LCD_HSYNC_BP 30
+#define GM_LCD_HSYNC_FP 50
+#define GM_LCD_VSYNC_PW 1
+#define GM_LCD_VSYNC_BP 30
+#define GM_LCD_VSYNC_FP 20
+#endif
+
 static void TouchDrvDigitalWrite(uint32_t gpio, uint8_t level);
 static int TouchDrvDigitalRead(uint32_t gpio);
 static void TouchDrvPinMode(uint32_t gpio, uint8_t mode);
@@ -370,13 +381,15 @@ void LilyGo_RGBPanel::initBUS() {
                 .pclk_hz = RGB_MAX_PIXEL_CLOCK_HZ,
                 .h_res = BOARD_TFT_WIDTH,
                 .v_res = BOARD_TFT_HEIGHT,
-                // The following parameters should refer to LCD spec
-                .hsync_pulse_width = 1,
-                .hsync_back_porch = 30,
-                .hsync_front_porch = 50,
-                .vsync_pulse_width = 1,
-                .vsync_back_porch = 30,
-                .vsync_front_porch = 20,
+                // The following parameters should refer to LCD spec.
+                // Overridable from build flags; stock values give 561x531
+                // total timing (23.5 Hz at 7 MHz pclk).
+                .hsync_pulse_width = GM_LCD_HSYNC_PW,
+                .hsync_back_porch = GM_LCD_HSYNC_BP,
+                .hsync_front_porch = GM_LCD_HSYNC_FP,
+                .vsync_pulse_width = GM_LCD_VSYNC_PW,
+                .vsync_back_porch = GM_LCD_VSYNC_BP,
+                .vsync_front_porch = GM_LCD_VSYNC_FP,
                 .flags =
                     {
                         .pclk_active_neg = 1,

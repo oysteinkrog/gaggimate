@@ -8,7 +8,12 @@
  */
 #pragma once
 
+// Overridable from build flags. 7 MHz is the conservative LilyGo stock value
+// (23.5 Hz refresh); the ST7701S glass itself is a 60 Hz part and octal PSRAM
+// @80 MHz sustains ~22 MHz pclk per Espressif. Upstream LilyGo now ships 8 MHz.
+#ifndef RGB_MAX_PIXEL_CLOCK_HZ
 #define RGB_MAX_PIXEL_CLOCK_HZ (7000000UL)
+#endif
 
 #define BOARD_TFT_WIDTH (480)
 #define BOARD_TFT_HEIGHT (480)

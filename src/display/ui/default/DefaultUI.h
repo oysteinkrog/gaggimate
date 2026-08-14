@@ -7,6 +7,7 @@
 #include <display/core/constants.h>
 #include <display/drivers/Driver.h>
 #include <display/models/profile.h>
+#include <display/ui/default/SleepAnimation.h>
 #include <display/ui/default/eez/screens.h>
 #include <display/ui/default/eez/structs.h>
 #include <mutex>
@@ -58,11 +59,21 @@ class DefaultUI {
         return is_task_healthy(eTaskGetState(taskHandle)) && is_task_healthy(eTaskGetState(profileTaskHandle));
     }
 
+  public:
+    // Standby animation (procedural, outside the LVGL pipeline). Public so the
+    // animation screen's touch callback can route back through the wake path.
+    void onSleepAnimationTouched();
+
   private:
     void setupPanel();
     void setupState();
 
     void handleScreenChange();
+
+    void startSleepAnimation();
+    void stopSleepAnimation();
+    SleepAnimation sleepAnimation;
+    lv_obj_t *sleepAnimScreen = nullptr;
 
     // Animate the dial meters' tick length on screen change (short on profile/new-menu, long elsewhere).
     void animateGaugeTicks(ScreensEnum from, ScreensEnum to);

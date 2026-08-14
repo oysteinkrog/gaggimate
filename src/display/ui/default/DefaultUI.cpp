@@ -273,6 +273,17 @@ void DefaultUI::loop() {
         currentScreen = static_cast<ScreensEnum>(eez_flow_get_current_screen());
         effect_mgr.evaluate_all();
 
+        // OTA/error/autotune arriving mid-animation doesn't change the flow
+        // screen (standby is already current), so hand the panel back to the
+        // EEZ standby screen explicitly to make the status visible.
+        if (sleepAnimation.isActive() &&
+            (controller->isUpdating() || controller->isErrorState() || controller->isAutotuning())) {
+            stopSleepAnimation();
+            if (sleepAnimScreen != nullptr && lv_scr_act() == sleepAnimScreen && objects.standby_screen != nullptr) {
+                lv_scr_load(objects.standby_screen);
+            }
+        }
+
         if (currentScreen == SCREEN_ID_STANDBY_SCREEN) {
             if (standbyEnterTime > 0) {
                 const Settings &settings = controller->getSettings();
@@ -461,11 +472,65 @@ void DefaultUI::handleScreenChange() {
         } else if (currentScreen == SCREEN_ID_STANDBY_SCREEN) {
             const ::Settings &settings = controller->getSettings();
             setBrightness(settings.getMainBrightness());
+            stopSleepAnimation();
         }
         eez_flow_set_screen(targetScreen, LV_SCR_LOAD_ANIM_NONE, 0, 0);
         animateGaugeTicks(currentScreen, targetScreen);
+        if (targetScreen == SCREEN_ID_STANDBY_SCREEN) {
+            startSleepAnimation();
+        }
         rerender = true;
     }
+}
+
+void DefaultUI::startSleepAnimation() {
+#ifndef GAGGIMATE_SIM
+    // Standby doubles as the OTA/error/autotune status screen — only animate
+    // plain sleep.
+    if (controller->isUpdating() || controller->isErrorState() || controller->isAutotuning()) {
+        return;
+    }
+    Display *display = panelDriver != nullptr ? panelDriver->getDisplay() : nullptr;
+    if (display == nullptr) {
+        return;
+    }
+    if (sleepAnimScreen == nullptr) {
+        sleepAnimScreen = lv_obj_create(nullptr);
+        lv_obj_set_style_bg_color(sleepAnimScreen, lv_color_black(), LV_PART_MAIN);
+        lv_obj_set_style_bg_opa(sleepAnimScreen, LV_OPA_COVER, LV_PART_MAIN);
+        lv_obj_add_flag(sleepAnimScreen, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_event_cb(
+            sleepAnimScreen,
+            [](lv_event_t *e) { static_cast<DefaultUI *>(lv_event_get_user_data(e))->onSleepAnimationTouched(); },
+            LV_EVENT_CLICKED, this);
+    }
+    // A bare black screen gives LVGL nothing to redraw, so the animation task
+    // owns the panel until the next screen change; touch stays with LVGL for
+    // tap-to-wake. Flush the base synchronously before frames start.
+    lv_scr_load(sleepAnimScreen);
+    lv_refr_now(nullptr);
+    sleepAnimation.start(display);
+#endif
+}
+
+void DefaultUI::stopSleepAnimation() {
+#ifndef GAGGIMATE_SIM
+    sleepAnimation.stop();
+#endif
+}
+
+void DefaultUI::onSleepAnimationTouched() {
+    // Mirrors action_on_wakeup() — the EEZ standby screen's tap handler.
+    if (controller->isUpdating() || controller->isErrorState() || controller->isAutotuning() ||
+        !controller->getClientController()->isConnected()) {
+        return;
+    }
+    // Stop rendering before any screen change so the animation task can never
+    // push frames concurrently with an LVGL flush.
+    stopSleepAnimation();
+    changeScreen(SCREEN_ID_BREW_SCREEN);
+    controller->deactivate();
+    controller->setMode(MODE_BREW);
 }
 
 // Collect every lv_meter under obj (the dial gauges) so their tick length can be animated together.
