@@ -11,7 +11,7 @@ namespace {
 constexpr int BAND_H = 16;      // rows rendered/pushed per chunk
 constexpr int SIN_N = 1024;     // sine LUT entries
 constexpr int SIN_AMP = 512;    // sine LUT amplitude
-constexpr uint32_t TARGET_FRAME_US = 21000; // ~47 fps cap, matches overdriven refresh
+constexpr uint32_t TARGET_FRAME_US = 21000; // ~47 fps cap
 
 uint16_t rgb565(uint8_t r, uint8_t g, uint8_t b) {
     return static_cast<uint16_t>(((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3));
@@ -63,9 +63,12 @@ void SleepAnimation::buildLuts() {
             const int k0 = static_cast<int>(pos) % nKeys;
             const int k1 = (k0 + 1) % nKeys;
             const float f = pos - floorf(pos);
-            const uint8_t r = static_cast<uint8_t>(keys[k0][0] + (keys[k1][0] - keys[k0][0]) * f);
-            const uint8_t g = static_cast<uint8_t>(keys[k0][1] + (keys[k1][1] - keys[k0][1]) * f);
-            const uint8_t b = static_cast<uint8_t>(keys[k0][2] + (keys[k1][2] - keys[k0][2]) * f);
+            // 70% brightness: the ST7701S's inversion flicker peaks at
+            // mid-luminance grays — keeping the palette in the darker range
+            // suppresses it (and reads better as a sleep mode).
+            const uint8_t r = static_cast<uint8_t>((keys[k0][0] + (keys[k1][0] - keys[k0][0]) * f) * 0.7f);
+            const uint8_t g = static_cast<uint8_t>((keys[k0][1] + (keys[k1][1] - keys[k0][1]) * f) * 0.7f);
+            const uint8_t b = static_cast<uint8_t>((keys[k0][2] + (keys[k1][2] - keys[k0][2]) * f) * 0.7f);
             palette[i] = rgb565(r, g, b);
         }
     }
