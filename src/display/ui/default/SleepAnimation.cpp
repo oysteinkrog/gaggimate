@@ -181,7 +181,11 @@ void SleepAnimation::renderFrame(uint32_t frame) {
                 *out++ = palette[((v >> 4) + cycle) & 255];
             }
         }
-        display->pushColors(0, y0, w, rows, band);
+        // pushColors' width/height params are actually END coordinates — they
+        // pass through unchanged to esp_lcd_panel_draw_bitmap (exclusive end).
+        // Passing dimensions here asserted in rgb_panel_draw_bitmap on the
+        // second band (y_start==y_end) and boot-looped sleep3/sleep4.
+        display->pushColors(0, y0, w, y0 + rows, band);
     }
 }
 

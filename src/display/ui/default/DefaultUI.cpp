@@ -323,9 +323,9 @@ void DefaultUI::loop() {
 void DefaultUI::maintainSleepAnimation() {
 #ifndef GAGGIMATE_SIM
     // Boot settling gate: setupPanel() runs a 1 s black->standby fade with
-    // auto_del on the old screen. Swapping screens underneath that in-flight
-    // animation corrupts LVGL's screen-load state (prev/act/scr_to_load) —
-    // prime suspect in the v1.9.2-sleep3 boot loop.
+    // auto_del on the old screen; never swap screens underneath it. (The
+    // sleep3 boot loop turned out to be a pushColors coordinate bug, not
+    // this race — but the gate stays as cheap protection for the fade.)
     if (::millis() < STARTUP_FADE_MS + 3000) {
         return;
     }
