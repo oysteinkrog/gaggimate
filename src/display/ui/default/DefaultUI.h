@@ -76,6 +76,7 @@ class DefaultUI {
     void refreshSleepOverlay();
     void maintainScaleScreen();
     void buildScaleScreen();
+    void displaceGrindWidgets(bool displaced);
     lv_obj_t *scaleScreen = nullptr;      // overlay covering the grind screen
     lv_obj_t *scaleWeightLabel = nullptr;
     bool scaleScreenRequested = false;
