@@ -104,7 +104,17 @@ void WebUIPlugin::setup(Controller *_controller, PluginManager *_pluginManager) 
     });
     pluginManager->on("controller:ready", [this](Event const &) {
         ota->setControllerVersion(controller->getSystemInfo().version);
-        ota->init(controller->getClientController()->getClient());
+        // getClient() is null until the BLE transport has actually connected.
+        // ControllerOTA::init() calls getService() straight through the pointer
+        // (NimBLEClient.cpp:639), so passing null panics on a null this. The
+        // controller-OTA path needs a live link anyway, so skip it and let the
+        // next controller:ready set it up.
+        NimBLEClient *bleClient = controller->getClientController()->getClient();
+        if (bleClient == nullptr) {
+            ESP_LOGW("WebUIPlugin", "controller:ready with no BLE client; skipping controller OTA init");
+            return;
+        }
+        ota->init(bleClient);
     });
     pluginManager->on("controller:autotune:result", [this](Event const &event) { sendAutotuneResult(); });
     pluginManager->on("controller:autotune:failed", [this](Event const &) { sendAutotuneFailed(); });
