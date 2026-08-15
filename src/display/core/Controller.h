@@ -49,6 +49,12 @@ class Controller {
     bool isUpdating() const;
     bool isAutotuning() const;
     bool isReady() const;
+#ifdef GM_ANIM_BENCH
+    // Bench diagnostics: these two decide whether connect() ever runs, and
+    // nothing outside Controller can otherwise observe them.
+    bool benchInitialized() const { return initialized; }
+    bool benchScreenReady() const { return screenReady; }
+#endif
     bool isVolumetricAvailable() const;
     bool isSDCard() const { return sdcard; }
     virtual float getTargetPressure() const { return targetPressure; }
