@@ -508,7 +508,13 @@ void Controller::setupWifi() {
         if (WiFi.status() == WL_CONNECTED) {
             ESP_LOGI(LOG_TAG, "Connected to %s with IP address %s", settings.getWifiSsid().c_str(),
                      WiFi.localIP().toString().c_str());
-            WiFi.setSleep(false); // see loop(): beacon misses + latency
+            // Modem sleep must stay on: this build enables software WiFi/BT
+            // coexistence, and WIFI_PS_NONE (what setSleep(false) selects)
+            // makes coex_core_enable() abort when the BLE controller is
+            // enabled -- a boot loop, since connect() runs right after this in
+            // loop(). MIN_MODEM wakes for every DTIM beacon, so it keeps the
+            // latency this call was added to fix without starving coex.
+            WiFi.setSleep(WIFI_PS_MIN_MODEM);
             startNtp();
         } else {
             WiFi.disconnect(true, true);
@@ -566,9 +572,11 @@ void Controller::loop() {
             isApConnection = false;
         }
         if (WiFi.status() == WL_CONNECTED) {
-            // Modem power save (Arduino default) causes missed beacons and
-            // multi-second mDNS/web latency; this is a mains-powered device.
-            WiFi.setSleep(false);
+            // Modem sleep stays on for coexistence (see the STA connect path):
+            // WIFI_PS_NONE aborts coex when BLE is enabled, and connect() is
+            // called a few lines below. MIN_MODEM still wakes every DTIM
+            // beacon, which is what the latency fix actually needed.
+            WiFi.setSleep(WIFI_PS_MIN_MODEM);
             startNtp();
         }
         pluginManager->trigger("controller:wifi:connect", "AP", isApConnection ? 1 : 0);
