@@ -636,6 +636,9 @@ void DefaultUI::maintainScaleScreen() {
             buildScaleScreen();
         }
         if (scaleScreen != nullptr) {
+            // Re-asserted every pass: the EEZ tick fights HIDDEN flags on these
+            // widgets, but never touches translate, so displacement sticks.
+            displaceGrindWidgets(true);
             lv_obj_clear_flag(scaleScreen, LV_OBJ_FLAG_HIDDEN);
             lv_obj_move_foreground(scaleScreen);
             const float w = static_cast<float>(activeWeight);
@@ -646,9 +649,31 @@ void DefaultUI::maintainScaleScreen() {
         }
     } else if (scaleScreen != nullptr && !lv_obj_has_flag(scaleScreen, LV_OBJ_FLAG_HIDDEN) &&
                (!scaleScreenRequested || currentScreen != SCREEN_ID_GRIND_SCREEN)) {
+        displaceGrindWidgets(false);
         lv_obj_add_flag(scaleScreen, LV_OBJ_FLAG_HIDDEN);
         if (currentScreen != SCREEN_ID_GRIND_SCREEN) {
             scaleScreenRequested = false;
+        }
+    }
+}
+
+// The grind screen's own widgets can't be hidden while the scale overlay is up:
+// tick_screen_grind_screen re-derives their HIDDEN flags from flow state every
+// tick and would undo it. Translating them off-panel instead is tick-proof and
+// fully reversible (the local style prop is simply removed on exit).
+void DefaultUI::displaceGrindWidgets(bool displaced) {
+    lv_obj_t *const widgets[] = {objects.main_label4, objects.grind_start_button, objects.mode_switch1, objects.target_weight,
+                                 objects.target_time};
+    for (lv_obj_t *obj : widgets) {
+        if (obj == nullptr) {
+            continue;
+        }
+        if (displaced) {
+            if (lv_obj_get_style_translate_y(obj, LV_PART_MAIN) != 600) {
+                lv_obj_set_style_translate_y(obj, 600, LV_PART_MAIN);
+            }
+        } else {
+            lv_obj_remove_local_style_prop(obj, LV_STYLE_TRANSLATE_Y, LV_PART_MAIN);
         }
     }
 }
@@ -658,59 +683,84 @@ void DefaultUI::buildScaleScreen() {
     if (scr == nullptr) {
         return;
     }
-    // Opaque cover over the whole grind screen: hides its widgets and absorbs
-    // their touch targets, so the grind UI stays untouched underneath.
+    const uint32_t themeIdx = eez_flow_get_selected_theme_index();
+    const lv_color_t fg = lv_color_hex(theme_colors[themeIdx][0]);   // text/accent
+    const lv_color_t fill = lv_color_hex(theme_colors[themeIdx][1]); // bg/pill fill
+
+    // Transparent, click-through cover: the dial gauges (and their standby/menu
+    // icons) stay visible and operable underneath, so the screen shares the
+    // visual signature of every other process screen. The grind-only widgets
+    // are translated off-panel (displaceGrindWidgets) and the scale widgets
+    // occupy the same layout slots the grind widgets vacated.
     lv_obj_t *cover = lv_obj_create(scr);
     scaleScreen = cover;
     lv_obj_set_size(cover, LV_PCT(100), LV_PCT(100));
     lv_obj_set_pos(cover, 0, 0);
     lv_obj_set_style_radius(cover, 0, LV_PART_MAIN);
     lv_obj_set_style_border_width(cover, 0, LV_PART_MAIN);
-    lv_obj_set_style_bg_color(cover, lv_color_hex(0x000000), LV_PART_MAIN);
-    lv_obj_set_style_bg_opa(cover, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(cover, LV_OPA_TRANSP, LV_PART_MAIN);
     lv_obj_set_style_pad_all(cover, 0, LV_PART_MAIN);
-    lv_obj_clear_flag(cover, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_clear_flag(cover, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+    // If a flow action ever deletes the grind screen, the overlay dies with it —
+    // null the cached pointers so the next maintain pass rebuilds cleanly.
+    lv_obj_add_event_cb(
+        cover,
+        [](lv_event_t *e) {
+            auto *ui = static_cast<DefaultUI *>(lv_event_get_user_data(e));
+            ui->scaleScreen = nullptr;
+            ui->scaleWeightLabel = nullptr;
+        },
+        LV_EVENT_DELETE, this);
 
+    // Title in the standard slot (grind's "Grind" label position/font).
     lv_obj_t *title = lv_label_create(cover);
     lv_label_set_text(title, "Scale");
-    lv_obj_set_style_text_font(title, &lv_font_montserrat_20, LV_PART_MAIN);
-    lv_obj_set_style_text_color(title, lv_color_hex(0x888888), LV_PART_MAIN);
-    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 64);
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_24, LV_PART_MAIN);
+    lv_obj_set_style_text_color(title, fg, LV_PART_MAIN);
+    lv_obj_align(title, LV_ALIGN_CENTER, 0, -140);
 
     scaleWeightLabel = lv_label_create(cover);
     lv_label_set_text(scaleWeightLabel, "0.0");
     lv_obj_set_style_text_font(scaleWeightLabel, &lv_font_montserrat_48, LV_PART_MAIN);
-    lv_obj_set_style_text_color(scaleWeightLabel, lv_color_hex(0xFFFFFF), LV_PART_MAIN);
-    lv_obj_align(scaleWeightLabel, LV_ALIGN_CENTER, -14, -20);
+    lv_obj_set_style_text_color(scaleWeightLabel, fg, LV_PART_MAIN);
+    lv_obj_align(scaleWeightLabel, LV_ALIGN_CENTER, -14, -15);
     lastShownScaleWeight = -1000.0f;
 
     lv_obj_t *unit = lv_label_create(cover);
     lv_label_set_text(unit, "g");
     lv_obj_set_style_text_font(unit, &lv_font_montserrat_24, LV_PART_MAIN);
-    lv_obj_set_style_text_color(unit, lv_color_hex(0x888888), LV_PART_MAIN);
+    lv_obj_set_style_text_color(unit, fg, LV_PART_MAIN);
     lv_obj_align_to(unit, scaleWeightLabel, LV_ALIGN_OUT_RIGHT_BOTTOM, 8, -6);
 
+    // Tare as a standard pill (mode_switch1 geometry: 160x50, r10, 2px border).
     lv_obj_t *tareBtn = lv_btn_create(cover);
-    lv_obj_set_size(tareBtn, 160, 60);
-    lv_obj_align(tareBtn, LV_ALIGN_CENTER, 0, 90);
-    lv_obj_set_style_radius(tareBtn, 30, LV_PART_MAIN);
-    lv_obj_set_style_bg_color(tareBtn, lv_color_hex(0x2A2A2A), LV_PART_MAIN);
+    lv_obj_set_size(tareBtn, 160, 50);
+    lv_obj_align(tareBtn, LV_ALIGN_CENTER, 0, 70);
+    lv_obj_set_style_radius(tareBtn, 10, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(tareBtn, fill, LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(tareBtn, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_border_color(tareBtn, fg, LV_PART_MAIN);
+    lv_obj_set_style_border_opa(tareBtn, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_border_width(tareBtn, 2, LV_PART_MAIN);
+    lv_obj_set_style_shadow_width(tareBtn, 0, LV_PART_MAIN);
     lv_obj_add_event_cb(
         tareBtn, [](lv_event_t *e) { action_on_volumetric_hold(e); }, LV_EVENT_CLICKED, nullptr);
     lv_obj_t *tareLabel = lv_label_create(tareBtn);
     lv_label_set_text(tareLabel, "Tare");
     lv_obj_set_style_text_font(tareLabel, &lv_font_montserrat_24, LV_PART_MAIN);
+    lv_obj_set_style_text_color(tareLabel, fg, LV_PART_MAIN);
     lv_obj_center(tareLabel);
 
-    // Back to the menu (mirrors action_on_menu_click).
-    lv_obj_t *backBtn = lv_btn_create(cover);
-    lv_obj_set_size(backBtn, 64, 64);
-    lv_obj_align(backBtn, LV_ALIGN_LEFT_MID, 16, 0);
-    lv_obj_set_style_radius(backBtn, 32, LV_PART_MAIN);
-    lv_obj_set_style_bg_opa(backBtn, LV_OPA_TRANSP, LV_PART_MAIN);
-    lv_obj_set_style_shadow_width(backBtn, 0, LV_PART_MAIN);
+    // Exit to the menu: theme-recolored imgbtn in the grind start button's slot.
+    // Up-angle mirrors the swipe-up gesture, which also still works.
+    lv_obj_t *exitBtn = lv_imgbtn_create(cover);
+    lv_obj_set_size(exitBtn, 40, 40);
+    lv_obj_align(exitBtn, LV_ALIGN_CENTER, 0, 130);
+    lv_imgbtn_set_src(exitBtn, LV_IMGBTN_STATE_RELEASED, nullptr, &img_angle_up_40x40, nullptr);
+    lv_obj_set_style_img_recolor(exitBtn, fg, LV_PART_MAIN);
+    lv_obj_set_style_img_recolor_opa(exitBtn, LV_OPA_COVER, LV_PART_MAIN);
     lv_obj_add_event_cb(
-        backBtn,
+        exitBtn,
         [](lv_event_t *e) {
             auto *ui = static_cast<DefaultUI *>(lv_event_get_user_data(e));
             ui->scaleScreenRequested = false;
@@ -718,9 +768,6 @@ void DefaultUI::buildScaleScreen() {
             ui->changeScreen(SCREEN_ID_MENU_SCREEN_NEW);
         },
         LV_EVENT_CLICKED, this);
-    lv_obj_t *backImg = lv_img_create(backBtn);
-    lv_img_set_src(backImg, &img_angle_left_40x40);
-    lv_obj_center(backImg);
 }
 
 // Collect every lv_meter under obj (the dial gauges) so their tick length can be animated together.
