@@ -5,6 +5,12 @@ build/
 # on every optimization and carries no information the source doesn't.
 xtensa-asm/
 
+# Per-function stack-frame sizes from `-fstack-usage`, and the old-revision
+# trees used to diff allocations against a previous tag. Both are derived from
+# committed source and regenerate in seconds; neither belongs in history.
+*-su/
+old-src/
+
 # golden/ IS tracked on purpose: it is the fidelity baseline every optimization
 # is diffed against, and the whole set packs to ~1.3 MB. To rebuild it from the
 # pre-optimization code:
