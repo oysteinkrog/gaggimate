@@ -33,6 +33,8 @@ constexpr int BAND_H = 16; // rows rendered/pushed per chunk
 // Headroom for the snapshot's ext draw size (shadows etc. extend the render
 // area past the object on every side).
 constexpr int OVERLAY_EXT_MARGIN = 16;
+// Granularity of the overlay occupancy bitmap: 1 << 5 = 32 pixels per bit.
+constexpr int OVERLAY_BLOCK_SHIFT = 5;
 
 uint16_t rgb565(uint8_t r, uint8_t g, uint8_t b) {
     return static_cast<uint16_t>(((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3));
@@ -109,6 +111,9 @@ void SleepAnimation::start(Display *d) {
             bandFree[i] = xSemaphoreCreateBinary();
         }
     }
+    if (halfBuf == nullptr) {
+        halfBuf = static_cast<uint16_t *>(allocPreferInternal((w / 2) * (BAND_H / 2) * sizeof(uint16_t)));
+    }
     computeChords(w, h);
     if (overlayCap == 0) {
         overlayCap = static_cast<uint32_t>(w + 2 * OVERLAY_EXT_MARGIN) * (h + 2 * OVERLAY_EXT_MARGIN) * 3;
@@ -119,15 +124,20 @@ void SleepAnimation::start(Display *d) {
             ov.buf = static_cast<uint8_t *>(ps_malloc(overlayCap));
             ov.spanMin = static_cast<int16_t *>(allocPreferInternal(h * sizeof(int16_t)));
             ov.spanMax = static_cast<int16_t *>(allocPreferInternal(h * sizeof(int16_t)));
+            ov.rowBlocks = static_cast<uint32_t *>(allocPreferInternal(h * sizeof(uint32_t)));
         }
     }
     bool overlayOk = true;
     for (auto &ov : overlays) {
-        overlayOk = overlayOk && ov.buf != nullptr && ov.spanMin != nullptr && ov.spanMax != nullptr;
+        overlayOk = overlayOk && ov.buf != nullptr && ov.spanMin != nullptr && ov.spanMax != nullptr &&
+                    ov.rowBlocks != nullptr;
     }
     bool pipelineOk = true;
     for (int i = 0; i < 2; i++) {
         pipelineOk = pipelineOk && bandBuf[i] != nullptr && bandReady[i] != nullptr && bandFree[i] != nullptr;
+    }
+    if (halfBuf == nullptr) {
+        pipelineOk = false;
     }
     if (!pipelineOk || !overlayOk) {
         log_e("SleepAnimation: buffer allocation failed (bandBuf=%p/%p overlayOk=%d)", bandBuf[0], bandBuf[1], overlayOk);
@@ -309,7 +319,7 @@ void SleepAnimation::publishOverlay(int w, int h) {
     }
     const int back = (overlayFront.load() + 1) & 1;
     Overlay &ov = overlays[back];
-    if (ov.buf == nullptr || ov.spanMin == nullptr || ov.spanMax == nullptr) {
+    if (ov.buf == nullptr || ov.spanMin == nullptr || ov.spanMax == nullptr || ov.rowBlocks == nullptr) {
         return;
     }
     ov.w = w;
@@ -324,6 +334,7 @@ void SleepAnimation::publishOverlay(int w, int h) {
     for (int y = 0; y < panelH; y++) {
         int16_t mn = -1;
         int16_t mx = -1;
+        uint32_t blocks = 0;
         const int sy = y + yoff;
         if (sy >= 0 && sy < h) {
             const uint8_t *a = ov.buf + (static_cast<size_t>(sy) * w + xoff) * 3 + 2;
@@ -333,11 +344,13 @@ void SleepAnimation::publishOverlay(int w, int h) {
                         mn = static_cast<int16_t>(x);
                     }
                     mx = static_cast<int16_t>(x);
+                    blocks |= 1u << (x >> OVERLAY_BLOCK_SHIFT);
                 }
             }
         }
         ov.spanMin[y] = mn;
         ov.spanMax[y] = mx;
+        ov.rowBlocks[y] = blocks;
     }
     overlayFront.store(back);
 }
@@ -395,6 +408,8 @@ void SleepAnimation::benchTick() {
             benchDone[i] = BenchResult{};
         }
         accBandUs = accBlendUs = accPushUs = accTotalUs = accWaitUs = accPackUs = 0;
+        accSpanPx = accBlendPx = 0;
+    accSpanPx = accBlendPx = 0;
         accFrames = 0;
         accMaxTotalUs = 0;
         accBandLockedUs = 0;
@@ -431,6 +446,8 @@ void SleepAnimation::benchFinishDwell() {
         r.maxTotalUs = accMaxTotalUs;
         r.waitUs = static_cast<uint32_t>(accWaitUs / accFrames);
         r.packUs = static_cast<uint32_t>(accPackUs / accFrames);
+        r.spanPx = static_cast<uint32_t>(accSpanPx / accFrames);
+        r.blendPx = static_cast<uint32_t>(accBlendPx / accFrames);
         r.achievedFps = elapsedMs > 0 ? static_cast<uint32_t>(accFrames * 100000ULL / elapsedMs) : 0;
         // Both normalised per row so the locked sample (one band per frame)
         // is directly comparable to the unlocked one (all 30 bands).
@@ -446,6 +463,7 @@ void SleepAnimation::benchFinishDwell() {
     }
 
     accBandUs = accBlendUs = accPushUs = accTotalUs = accWaitUs = accPackUs = 0;
+    accSpanPx = accBlendPx = 0;
     accFrames = 0;
     accMaxTotalUs = 0;
     accBandLockedUs = 0;
@@ -493,17 +511,28 @@ void SleepAnimation::renderFrame() {
     const uint32_t packed = animParams.load();
     const uint8_t p[4] = {static_cast<uint8_t>(packed & 0xFF), static_cast<uint8_t>((packed >> 8) & 0xFF),
                           static_cast<uint8_t>((packed >> 16) & 0xFF), static_cast<uint8_t>((packed >> 24) & 0xFF)};
+    // Half-resolution mode: the animation renders a 240x240 image and each
+    // pixel is doubled on the way into the band buffer. Every animation here
+    // is a smooth procedural field -- gradients, glows, warped curtains -- with
+    // no text and no hard one-pixel detail, so the resolution it is computed at
+    // is a quality dial rather than a correctness property. It costs a quarter
+    // of the per-pixel work, which is the only thing on the critical path large
+    // enough to matter for the heavy animations.
+    const bool half = halfRes;
+    const int rw = half ? w / 2 : w;
+    const int rh = half ? h / 2 : h;
     const BgAnimation &anim = bg_animation(id);
-    if (id != initializedAnimId) {
-        if (!anim.init(w, h)) {
+    if (id != initializedAnimId || half != initializedHalf) {
+        if (!anim.init(rw, rh)) {
             log_e("SleepAnimation: init failed for animation %d (%s)", id, anim.id);
             running = false;
             return;
         }
         initializedAnimId = id;
+        initializedHalf = half;
     }
     BENCH_T0(tSetup);
-    anim.frame(tMs, w, h, p);
+    anim.frame(tMs, rw, rh, p);
     BENCH_ACC(accBandUs, tSetup);
 
     // One overlay for the whole frame; a publish mid-frame lands next frame.
@@ -565,7 +594,33 @@ void SleepAnimation::renderFrame() {
         // both populations cover the same pixels.
         const bool lockThisBand = GM_BENCH_LOCK_ONE_BAND && (y0 / BAND_H) == static_cast<int>(benchLockBand);
         BENCH_T0(tBand);
-        if (lockThisBand) {
+        if (half) {
+            // Render rows/2 half-width rows, then expand 2x in both axes.
+            const int hrows = rows >> 1;
+            if (lockThisBand) {
+                vTaskSuspendAll();
+                anim.band(halfBuf, y0 >> 1, hrows, rw, tMs, p);
+                xTaskResumeAll();
+            } else {
+                anim.band(halfBuf, y0 >> 1, hrows, rw, tMs, p);
+            }
+            for (int sr = 0; sr < hrows; sr++) {
+                const uint16_t *__restrict src = halfBuf + static_cast<size_t>(sr) * rw;
+                uint32_t *__restrict d0 = reinterpret_cast<uint32_t *>(band + static_cast<size_t>(sr * 2) * w);
+                // Each source pixel becomes a pair, so one 32-bit store emits
+                // both copies at once.
+                for (int i = 0; i < rw; i++) {
+                    const uint32_t v = src[i];
+                    d0[i] = v | (v << 16);
+                }
+                // The second output row is identical; copy words rather than
+                // re-running the expansion.
+                uint32_t *__restrict d1 = reinterpret_cast<uint32_t *>(band + static_cast<size_t>(sr * 2 + 1) * w);
+                for (int i = 0; i < rw; i++) {
+                    d1[i] = d0[i];
+                }
+            }
+        } else if (lockThisBand) {
             vTaskSuspendAll();
             anim.band(band, y0, rows, w, tMs, p);
             xTaskResumeAll();
@@ -585,19 +640,50 @@ void SleepAnimation::renderFrame() {
             if (ov != nullptr && ov->spanMin[y] >= 0) {
                 // Composite the standby widgets over the plasma (span-limited:
                 // only pixels the snapshot actually covers).
-                const int x0 = ov->spanMin[y];
-                const int x1 = ov->spanMax[y];
+                const int spanLo = ov->spanMin[y];
+                const int spanHi = ov->spanMax[y];
+                // Only 37% of the pixels between spanMin and spanMax are
+                // actually non-transparent -- the widgets are scattered across
+                // the row, and the span is just their bounding extent. Reading
+                // the other 63% cost more than blending them: the overlay is
+                // three unaligned byte loads per pixel out of PSRAM, measured
+                // at 13.2 MB/s and ~59 cycles per span pixel. rowBlocks marks
+                // which 32-pixel blocks contain any alpha at all, built during
+                // the alpha scan that publishOverlay already runs, so the
+                // render task can skip empty stretches without touching them.
+                uint32_t blocks = ov->rowBlocks[y];
+                while (blocks != 0) {
+                    const int b = __builtin_ctz(blocks);
+                    blocks &= blocks - 1;
+                    int x0 = b << OVERLAY_BLOCK_SHIFT;
+                    int x1 = x0 + (1 << OVERLAY_BLOCK_SHIFT) - 1;
+                    if (x0 < spanLo) {
+                        x0 = spanLo;
+                    }
+                    if (x1 > spanHi) {
+                        x1 = spanHi;
+                    }
+                    if (x1 < x0) {
+                        continue;
+                    }
                 const uint8_t *px = ov->buf + (static_cast<size_t>(y + ovYoff) * ov->w + (x0 + ovXoff)) * 3;
                 uint16_t *dst = band + static_cast<size_t>(y - y0) * w + x0;
+#ifdef GM_ANIM_BENCH
+                accSpanPx += static_cast<uint32_t>(x1 - x0 + 1);
+#endif
                 for (int x = x0; x <= x1; x++, px += 3, dst++) {
                     const uint8_t a = px[2];
                     if (a == 0) {
                         continue;
                     }
+#ifdef GM_ANIM_BENCH
+                    accBlendPx++;
+#endif
                     // LV_IMG_CF_TRUE_COLOR_ALPHA @16bpp, LV_COLOR_16_SWAP=0:
                     // little-endian RGB565 followed by an alpha byte.
                     const uint16_t c = static_cast<uint16_t>(px[0] | (px[1] << 8));
                     *dst = (a == 255) ? c : blend565(c, *dst, a);
+                }
                 }
             }
         }

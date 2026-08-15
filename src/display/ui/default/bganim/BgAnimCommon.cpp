@@ -42,6 +42,15 @@ void *alloc(size_t size) {
     // Small tables stay in SRAM, where their random-access latency actually
     // matters. Anything large is a bulk table read in sequential sweeps, which
     // PSRAM (8 MB, cache-line prefetched) serves fine.
+    //
+    // CAVEAT for future tables: this size test is a proxy for access pattern,
+    // and the proxy fails for a large table indexed by a value computed per
+    // pixel. Aurora used to keep (v*v)>>12 in a 16 KB table for exactly that
+    // kind of index; being over the threshold put it in PSRAM and every pixel
+    // paid a bus round trip to avoid one multiply. Deleting the table was
+    // worth -21% on that animation. If a new table is over the limit AND its
+    // index is not monotonic across a row, either shrink it under the limit or
+    // compute the value instead -- do not assume PSRAM will serve it.
     if (size > SRAM_ALLOC_LIMIT) {
         void *big = ps_malloc(size);
         if (big != nullptr) {

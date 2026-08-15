@@ -389,6 +389,13 @@ void WebUIPlugin::setupServer() {
         // is left for the render task's writes -- this is the knob that tests
         // whether the flat push cost is a bandwidth floor. Not persisted: it
         // reverts to the stored setting on the next boot.
+        if (request->hasArg("half")) {
+            SleepAnimation *a = sleep_animation_bench_instance();
+            if (a != nullptr) {
+                a->benchSetHalfRes(request->arg("half").toInt() != 0);
+                a->benchRequestReset();
+            }
+        }
         if (request->hasArg("div")) {
             const int div = request->arg("div").toInt();
             if (div >= 2 && div <= 16) {
@@ -399,6 +406,7 @@ void WebUIPlugin::setupServer() {
                 }
             }
         }
+        SleepAnimation *anim0 = sleep_animation_bench_instance();
         const BenchGateState &g = bench_gate_state();
         JsonObject gate = doc["gate"].to<JsonObject>();
         gate["ui_initialized"] = g.uiInitialized;
@@ -421,6 +429,7 @@ void WebUIPlugin::setupServer() {
         // this. Reporting a derived Hz here would be wrong, so report the
         // divider and let a caller compare relative values across settings.
         gate["pclk_div"] = panelclock::currentDiv();
+        gate["half_res"] = anim0 != nullptr && anim0->benchHalfRes();
         // Where the animations' lookup tables actually landed. alloc() sends
         // anything over SRAM_ALLOC_LIMIT to PSRAM on the assumption that big
         // tables are swept sequentially; a table indexed by a computed value
@@ -454,6 +463,8 @@ void WebUIPlugin::setupServer() {
                 o["max_us"] = res[i].maxTotalUs;
                 o["wait_us"] = res[i].waitUs;
                 o["pack_us"] = res[i].packUs;
+                o["span_px"] = res[i].spanPx;
+                o["blend_px"] = res[i].blendPx;
                 o["fps"] = res[i].achievedFps / 100.0;
                 // Per-row band cost with and without the scheduler suspended.
                 // A gap between them is preemption being charged to the band
