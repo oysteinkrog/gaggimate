@@ -21,6 +21,24 @@ const int16_t *sinLut() {
 }
 
 void *alloc(size_t size) {
+    // Animations allocate their LUTs lazily on first use and never free them,
+    // so switching through the whole fleet in one power cycle accumulates every
+    // table. Requesting all of that from internal SRAM first would be roughly
+    // 280 KB against a 327 KB pool the firmware has already claimed ~110 KB of
+    // — and WiFi/BLE/TLS allocate from the same pool at runtime, so an
+    // animation could starve the network stack.
+    //
+    // Small tables stay in SRAM, where their random-access latency actually
+    // matters. Anything large is a bulk table read in sequential sweeps, which
+    // PSRAM (8 MB, cache-line prefetched) serves fine.
+    if (size > SRAM_ALLOC_LIMIT) {
+        void *big = ps_malloc(size);
+        if (big != nullptr) {
+            return big;
+        }
+        // No PSRAM (or it is exhausted): fall through and try SRAM anyway
+        // rather than failing the animation outright.
+    }
     void *p = heap_caps_malloc(size, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     if (p == nullptr) {
         p = ps_malloc(size);
