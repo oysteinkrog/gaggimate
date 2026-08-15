@@ -228,9 +228,13 @@ void Controller::setupBluetooth() {
     // controller:ready and controller:bluetooth:connect, which is what clears
     // the "waiting for controller" screen and lets standby (and therefore the
     // background animation) come up.
-    ESP_LOGW(LOG_TAG, "GM_FAKE_CONTROLLER: synthesizing a connected controller, BLE stays off");
-    onSystemInfo("FakeBench", "bench", gm_proto::PROTOCOL_VERSION, /*dimming=*/true, /*pressure=*/true,
-                 /*ledControl=*/false, /*tof=*/false, std::vector<uint32_t>{});
+    // Deliberately does NOT call onSystemInfo() here. On real hardware the
+    // SystemInfo frame arrives from a BLE callback well after connect() has
+    // returned and set initialized = true; calling it inline would dispatch
+    // controller:ready and controller:bluetooth:connect (which changes screens
+    // and calls activateStandby) from the middle of connect(), with the
+    // controller only half set up. loop() fires it once, after init.
+    ESP_LOGW(LOG_TAG, "GM_FAKE_CONTROLLER: BLE stays off; handshake is synthesized from loop()");
     return;
 #else
     comms.init("GPBLC");
@@ -607,9 +611,23 @@ void Controller::loop() {
     // telemetry instead: the standby screen and the animation overlay both
     // read these, and a frozen 0 C reading is visually misleading on a bench.
     if (initialized) {
+        static bool fakeHandshakeDone = false;
+        static unsigned long fakeInitAt = 0;
+        const unsigned long fakeNow0 = millis();
+        if (fakeInitAt == 0) {
+            fakeInitAt = fakeNow0;
+        }
+        // Same shape as the real link: the handshake lands a moment after
+        // init, from the loop, not from inside connect().
+        if (!fakeHandshakeDone && fakeNow0 - fakeInitAt >= 500) {
+            fakeHandshakeDone = true;
+            ESP_LOGW(LOG_TAG, "GM_FAKE_CONTROLLER: delivering synthetic SystemInfo");
+            onSystemInfo("FakeBench", "bench", gm_proto::PROTOCOL_VERSION, /*dimming=*/true, /*pressure=*/true,
+                         /*ledControl=*/false, /*tof=*/false, std::vector<uint32_t>{});
+        }
         static unsigned long lastFake = 0;
         const unsigned long fakeNow = millis();
-        if (fakeNow - lastFake >= 250) {
+        if (fakeHandshakeDone && fakeNow - lastFake >= 250) {
             lastFake = fakeNow;
             const float phase = static_cast<float>(fakeNow) / 30000.0f;
             onTempRead(92.0f + 1.5f * sinf(phase));
