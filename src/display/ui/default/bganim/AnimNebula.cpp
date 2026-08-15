@@ -6,6 +6,67 @@
 // bilinear-sampled to kill banding; 2x/4x are nearest. Scroll state lives in
 // persistent Q8.8 accumulators whose overflow is texel-aligned, so the drift
 // never jumps. Design: anim-atmosphere (Fable), 2026-08-15.
+//
+// Palette is stored "padded" (same trick as Ember): paletteExt has PAD clamp
+// entries on each side of the real 256-entry ramp, so the per-pixel index
+// (linear blend of a/b/c plus density offset plus dither) can be used to
+// index paletteExt directly with no branch to clamp into [0,255] — the pad
+// entries already hold the clamped edge color. Range proof: the a/b/c blend
+// itself is a convex combination (wA+wB<=64, wC=64-wA-wB>=0 for all
+// turbulence 0-100) so it stays within a texel or two of [0,255]; density
+// offset is (p[1]-50)*1.1 in [-55,55]; dither is (bayerRow-31)/4 in [-7,8].
+// Empirically swept (see tools/animbench worklog) across full param range x
+// full a/b/c grid: v in [-62,318]. PAD=72 covers that with margin.
+//
+// The dominant-octave blend loop (blendedA, built once per row and reused
+// for the whole 480px row via wraparound) special-cases the last texel
+// instead of masking `(i+1)&255` every iteration — same win as below, lets
+// the compiler treat it as a plain counted loop.
+//
+// Per-pixel dither is precomputed into a row-local int[8] (not int8_t) so
+// the lookup is a plain 32-bit load with no sign-extend.
+//
+// Two register-pressure ideas were tried on the real Xtensa compiler and
+// both measured NEUTRAL-TO-WORSE, so they were reverted rather than kept
+// for looks:
+//   - An 8-wide manual unroll (lambdas, compile-time Bayer column) tanked
+//     register allocation -- wA/wB/densOff and even x0/bIdx/cIdx spilled to
+//     the stack every pixel (622 insns in band(), vs ~208 single-pixel).
+//   - Packing wA/wB/densOff into one uint32_t to free a register: verified
+//     via xtensa-asm that GCC just hoists the unpack above the loop (it's
+//     loop-invariant) and still spills the three unpacked scalars to three
+//     stack slots inside the loop -- same reloads, plus the unpack cost.
+//     Net +5 instructions in band() for zero benefit; reverted.
+// A 2-wide manual unroll with one paired 32-bit store (Aurora/Plasma/Silk/
+// Lava's trick) was also tried and measured a hair faster on host (0.381 ->
+// 0.377ms) -- but xtensa-asm showed it costs the REAL win: the compiler no
+// longer recognizes the unrolled main loop as a simple counted loop, so it
+// loses its hardware zero-overhead LOOP instruction (falls back to an
+// ordinary compare-and-branch every w/2 iterations) while only the small
+// per-row dith/blendedA loops keep theirs. A real per-iteration branch on
+// Xtensa costs more than the store-pairing saves, so this was reverted --
+// host timing said "win", the real compiler's codegen said "regression".
+//
+// b (2x octave) and c (4x octave) are both nearest-sampled with a fixed
+// per-pixel stride (+2, +4 mod 256) -- unlike a's index (x0, stride 1),
+// bIdx/cIdx as a function of pixel step repeat with period 128. They are
+// packed into one uint16 table (bcTable, below) walked by that shared step
+// counter, the same "two same-index uint8 tables -> one uint16 table" trick
+// that won on mandala: it collapses rowB-ptr + rowC-ptr + bIdx + cIdx (4
+// live values) down to one table pointer + one step index (2). This is a
+// HOST REGRESSION (0.382 -> 0.436ms) because x86 was never spilling in the
+// first place -- the 128-iteration per-row precompute is pure added cost
+// there. But on the real compiler it is a clear win, verified in the .S:
+// wA/wB/densOff now stay resident in registers for the entire main pixel
+// loop (previously wA and wB were reloaded from the stack every pixel; grep
+// xtensa-asm/AnimNebula.S's main loop body for "wA"/"wB" -- there are no
+// stack loads for them left), and the main loop KEEPS its hardware
+// zero-overhead LOOP instruction (all four loop bounds in band() -- dith
+// k=8, blendedA i=255, bcTable k=128, main pixel w -- get one; verified via
+// `grep -n loop xtensa-asm/AnimNebula.S`). Golden stays bit-exact. Do not
+// revert this on host-number regression alone; check the .S first.
+//
+// Optimized: opt-nebula, 2026-08-15.
 
 #include "BgAnim.h"
 #include "BgAnimCommon.h"
@@ -13,7 +74,12 @@
 namespace {
 using namespace bganim;
 
-uint16_t *palette = nullptr;
+// Padding either side of the 256-entry palette ramp (see file header proof).
+constexpr int PAD = 72;
+constexpr int PAL_EXT_N = 256 + 2 * PAD;
+
+uint16_t *paletteExt = nullptr; // [PAL_EXT_N]; real ramp lives at paletteExt+PAD
+uint16_t *palette = nullptr;    // = paletteExt + PAD, 256 entries
 const uint8_t *noise = nullptr;
 uint32_t lastThemeGen = 0xFFFFFFFF;
 // Q8.8 scroll accumulators — texel-aligned wraparound (65536 = 256 texels).
@@ -21,13 +87,25 @@ uint16_t sAx = 0, sAy = 0, sBx = 0, sBy = 0, sCx = 0, sCy = 0;
 int g_wA = 32, g_wB = 20, g_wC = 12, g_densOff = 0;
 int g_axI = 0, g_axF = 0, g_ayI = 0, g_ayF = 0, g_bx = 0, g_by = 0, g_cx = 0, g_cy = 0;
 
+// Fills the clamp padding around the freshly-rebuilt 256-entry ramp so
+// paletteExt[PAD + v] is valid for v in [-PAD, 255+PAD] with no branch.
+void extendPalette() {
+    const uint16_t lo = palette[0];
+    const uint16_t hi = palette[255];
+    for (int i = 0; i < PAD; i++) {
+        paletteExt[i] = lo;
+        paletteExt[PAD + 256 + i] = hi;
+    }
+}
+
 bool init(int, int) {
-    if (palette == nullptr) {
-        palette = static_cast<uint16_t *>(alloc(256 * sizeof(uint16_t)));
+    if (paletteExt == nullptr) {
+        paletteExt = static_cast<uint16_t *>(alloc(PAL_EXT_N * sizeof(uint16_t)));
         noise = noiseTex256();
-        if (palette == nullptr || noise == nullptr) {
+        if (paletteExt == nullptr || noise == nullptr) {
             return false;
         }
+        palette = paletteExt + PAD;
     }
     lastThemeGen = 0xFFFFFFFF;
     return true;
@@ -36,6 +114,7 @@ bool init(int, int) {
 void frame(uint32_t, int, int, const uint8_t p[4]) {
     if (themeGen() != lastThemeGen) {
         buildThemeRamp(palette, 256);
+        extendPalette();
         lastThemeGen = themeGen();
     }
     // Per-frame deltas matched to the web preview at ~30fps: px/frame * 256.
@@ -62,47 +141,75 @@ void frame(uint32_t, int, int, const uint8_t p[4]) {
 }
 
 void band(uint16_t *dst, int y0, int rows, int w, uint32_t, const uint8_t *) {
-    const int axF = g_axF, ayF = g_ayF, wA = g_wA, wB = g_wB, densOff = g_densOff;
+    const int axF = g_axF, ayF = g_ayF;
+    const int wA = g_wA, wB = g_wB, densOff = g_densOff;
     static uint8_t blendedA[256];
     for (int r = 0; r < rows; r++) {
         const int y = y0 + r;
         uint16_t *row = dst + static_cast<size_t>(r) * w;
         const uint8_t *bayerRow = &BAYER8[(y & 7) * 8];
-        int8_t dith[8];
+        // int (not int8_t): a plain 32-bit load, no sign-extend per pixel.
+        int dith[8];
         for (int k = 0; k < 8; k++) {
-            dith[k] = static_cast<int8_t>((static_cast<int>(bayerRow[k]) - 31) / 4);
+            dith[k] = (static_cast<int>(bayerRow[k]) - 31) / 4;
         }
         const uint8_t *rowA0 = noise + ((y + g_ayI) & 255) * 256;
         const uint8_t *rowA1 = noise + ((y + g_ayI + 1) & 255) * 256;
         const uint8_t *rowB = noise + ((y * 2 + g_by) & 255) * 256;
         const uint8_t *rowC = noise + ((y * 4 + g_cy) & 255) * 256;
 
-        for (int i = 0; i < 256; i++) {
-            const int i1 = (i + 1) & 255;
-            const int da0 = static_cast<int>(rowA0[i1]) - static_cast<int>(rowA0[i]);
+        // Build the bilinear-blended dominant octave once per row — reused
+        // for the whole row via the x0 wraparound below. i=255's neighbor
+        // (i+1==256) wraps to texel 0; special-cased after the loop instead
+        // of masked every iteration so the loop body is a plain counted
+        // walk over two pointers.
+        for (int i = 0; i < 255; i++) {
+            const int da0 = static_cast<int>(rowA0[i + 1]) - static_cast<int>(rowA0[i]);
             const int va = rowA0[i] + ((da0 * axF) >> 8);
-            const int da1 = static_cast<int>(rowA1[i1]) - static_cast<int>(rowA1[i]);
+            const int da1 = static_cast<int>(rowA1[i + 1]) - static_cast<int>(rowA1[i]);
             const int vb = rowA1[i] + ((da1 * axF) >> 8);
             blendedA[i] = static_cast<uint8_t>(va + (((vb - va) * ayF) >> 8));
         }
+        {
+            const int da0 = static_cast<int>(rowA0[0]) - static_cast<int>(rowA0[255]);
+            const int va = rowA0[255] + ((da0 * axF) >> 8);
+            const int da1 = static_cast<int>(rowA1[0]) - static_cast<int>(rowA1[255]);
+            const int vb = rowA1[255] + ((da1 * axF) >> 8);
+            blendedA[255] = static_cast<uint8_t>(va + (((vb - va) * ayF) >> 8));
+        }
+
+        // b (2x) and c (4x) are both nearest-sampled with a fixed per-pixel
+        // stride (+2, +4 mod 256), so unlike a's index they walk in lockstep
+        // with the pixel counter itself: bIdx/cIdx as a function of pixel
+        // step repeats with period lcm(256/gcd(256,2), 256/gcd(256,4)) = 128.
+        // Pack rowB[bIdx]/rowC[cIdx] into one uint16 table indexed directly
+        // by that step (mod 128), same trick mandala used for two uint8
+        // LUTs sharing an index — this drops rowB/rowC/bIdx/cIdx (4 live
+        // registers) down to one table pointer + one index (2), freeing
+        // room for wA/wB/densOff to stay resident instead of spilling.
+        static uint16_t bcTable[128];
+        {
+            int bI = g_bx & 255;
+            int cI = g_cx & 255;
+            for (int k = 0; k < 128; k++) {
+                bcTable[k] = static_cast<uint16_t>(rowB[bI]) | (static_cast<uint16_t>(rowC[cI]) << 8);
+                bI = (bI + 2) & 255;
+                cI = (cI + 4) & 255;
+            }
+        }
 
         int x0 = g_axI & 255;
-        int bIdx = g_bx & 255;
-        int cIdx = g_cx & 255;
+        int step = 0;
+
         for (int x = 0; x < w; x++) {
             const int a = blendedA[x0];
-            const int b = rowB[bIdx];
-            const int c = rowC[cIdx];
-            int v = c + ((((a - c) * wA) + ((b - c) * wB)) >> 6) + densOff + dith[x & 7];
-            if (v < 0) {
-                v = 0;
-            } else if (v > 255) {
-                v = 255;
-            }
-            row[x] = palette[v];
+            const uint16_t bc = bcTable[step];
+            const int b = bc & 0xFF;
+            const int c = bc >> 8;
+            const int v = c + ((((a - c) * wA) + ((b - c) * wB)) >> 6) + densOff + dith[x & 7];
+            row[x] = paletteExt[PAD + v];
             x0 = (x0 + 1) & 255;
-            bIdx = (bIdx + 2) & 255;
-            cIdx = (cIdx + 4) & 255;
+            step = (step + 1) & 127;
         }
     }
 }
