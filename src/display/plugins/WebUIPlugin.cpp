@@ -367,6 +367,15 @@ void WebUIPlugin::setupServer() {
     server.on("/api/animbench", [](AsyncWebServerRequest *request) {
         AsyncResponseStream *response = request->beginResponseStream("application/json");
         JsonDocument doc;
+        const BenchGateState &g = bench_gate_state();
+        JsonObject gate = doc["gate"].to<JsonObject>();
+        gate["ui_initialized"] = g.uiInitialized;
+        gate["blocked"] = g.blocked;
+        gate["want_animation"] = g.wantAnimation;
+        gate["anim_active"] = g.animActive;
+        gate["mode"] = g.mode;
+        gate["screen"] = g.screen;
+        gate["start_failed"] = g.startFailed;
         SleepAnimation *anim = sleep_animation_bench_instance();
         if (anim == nullptr) {
             doc["running"] = false;
