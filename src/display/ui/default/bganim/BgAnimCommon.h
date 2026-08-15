@@ -1,6 +1,7 @@
 #ifndef BGANIM_COMMON_H
 #define BGANIM_COMMON_H
 
+#include <math.h>
 #include <stdint.h>
 #include <stdlib.h>
 
@@ -97,10 +98,30 @@ void buildPalette(uint16_t *out, const uint8_t (*keys)[3], int nKeys, uint16_t b
 // if the allocation failed.
 const uint8_t *noiseTex256();
 
-// Builds a 256-entry RGB565 ramp by blending two 6-stop gradients (positions
-// 0..1 in stopPos, packed 0xRRGGBB colors) at `blend` (0..256).
-void buildRamp565(uint16_t *out, const float *stopPos, const uint32_t *hexA, const uint32_t *hexB, int nStops,
-                  int blendQ8);
+// ---- active color theme (see BgAnim.h for the theme model) ---------------
+// Written by the UI task on settings change, read by the render task. Writes
+// are double-buffered behind an atomic generation counter; animations poll
+// themeGen() in frame() and rebuild their palettes when it changes.
+void setThemeStops(const uint8_t (*stops)[3], int nStops);
+uint32_t themeGen();
+int themeStopCount();
+const uint8_t (*themeStops())[3];
+
+// RGB888 sample of the active theme gradient, pos 0 (darkest) .. 255.
+void themeRGB(int pos, uint8_t out[3]);
+// 256-entry RGB565 ramp across the active theme, scaled by brightness Q8
+// (0..256). reversed=true puts the brightest stop at index 0.
+void buildThemeRamp(uint16_t *out, uint16_t brightness256, bool reversed = false);
+// Wheel variant: the last stop blends back into stop 0 so palette-cycling
+// animations (plasma) wrap without a seam.
+void buildThemeWheel(uint16_t *out, uint16_t brightness256);
+
+// Universal speed-curve: maps a 0-100 speed param to a multiplier of the
+// animation's tuned base rate — 0.15x at 0, 1x at 50, ~6.7x at 100.
+inline float speedMul(uint8_t sp) {
+    // exp2f((sp-50)/18.2) => 0.15 .. 6.7, exactly 1.0 at 50
+    return exp2f((static_cast<int>(sp) - 50) * (1.0f / 18.2f));
+}
 
 } // namespace bganim
 

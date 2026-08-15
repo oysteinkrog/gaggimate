@@ -12,8 +12,8 @@
 namespace {
 using namespace bganim;
 
-uint16_t *glowLUT = nullptr; // [256 intensity] -> RGB565 glow color (hue-baked)
-int lastHue = -1;
+uint16_t *glowLUT = nullptr; // [256 intensity] -> RGB565 glow color (theme-baked)
+uint32_t lastThemeGen = 0xFFFFFFFF;
 
 // f1 = 0.026, f1b = 0.017 rad/px -> phase steps in Q8 ticks of the 1024-LUT.
 constexpr float TICKS = 1024.0f * 256.0f / 6.2831853f; // rad -> Q8 LUT ticks
@@ -23,27 +23,14 @@ constexpr uint32_t STEP2 = static_cast<uint32_t>(0.017f * TICKS);
 float g_t = 0, g_A1 = 0, g_A2 = 0;
 int32_t g_inten14 = 0; // intensity * 1.4 in Q8
 
-void lerp3(const float a[3], const float b[3], float m, float out[3]) {
-    for (int i = 0; i < 3; i++) {
-        out[i] = a[i] + (b[i] - a[i]) * m;
-    }
-}
-
-void buildGlowLUT(uint8_t hueP) {
-    const float hueShift = hueP / 100.0f;
-    const float green[3] = {10, 140, 90}, teal[3] = {15, 170, 150}, violet[3] = {90, 60, 180}, white[3] = {200, 255, 230};
-    float base[3];
-    if (hueShift < 0.5f) {
-        lerp3(green, teal, hueShift * 2.0f, base);
-    } else {
-        lerp3(teal, violet, (hueShift - 0.5f) * 2.0f * 0.6f, base);
-    }
+// Curtain color rides the theme's mid-to-bright range; the fade ramp keeps
+// low intensities near-black so the additive blend stays subtle.
+void buildGlowLUT() {
     for (int i = 0; i < 256; i++) {
-        const float inten = i / 255.0f;
-        float core[3];
-        lerp3(base, white, fminf(1.0f, inten * 1.3f), core);
-        const float scale = fminf(1.0f, inten * 2.2f);
-        glowLUT[i] = rgb565(clamp8f(core[0] * scale), clamp8f(core[1] * scale), clamp8f(core[2] * scale));
+        uint8_t c[3];
+        themeRGB(40 + ((i * 215) >> 8), c);
+        const float scale = fminf(1.0f, (i / 255.0f) * 2.2f);
+        glowLUT[i] = rgb565(clamp8f(c[0] * scale), clamp8f(c[1] * scale), clamp8f(c[2] * scale));
     }
 }
 
@@ -57,22 +44,20 @@ bool init(int, int) {
     if (glowLUT == nullptr) {
         return false;
     }
-    if (lastHue < 0) {
-        buildGlowLUT(35);
-        lastHue = 35;
-    }
+    buildGlowLUT();
+    lastThemeGen = themeGen();
     return true;
 }
 
 void frame(uint32_t tMs, int, int, const uint8_t p[4]) {
-    if (p[2] != lastHue) {
-        buildGlowLUT(p[2]);
-        lastHue = p[2];
+    if (themeGen() != lastThemeGen) {
+        buildGlowLUT();
+        lastThemeGen = themeGen();
     }
-    g_t = (tMs * 0.001f) * (0.15f + (p[1] / 100.0f) * 0.6f);
-    g_A1 = 0.6f + (p[3] / 100.0f) * 2.4f;
-    g_A2 = 0.4f + (p[3] / 100.0f) * 1.6f;
-    g_inten14 = static_cast<int32_t>((p[0] / 100.0f) * 1.4f * 256.0f);
+    g_t = (tMs * 0.001f) * 0.45f * speedMul(p[0]);
+    g_A1 = 0.6f + (p[2] / 100.0f) * 2.4f;
+    g_A2 = 0.4f + (p[2] / 100.0f) * 1.6f;
+    g_inten14 = static_cast<int32_t>((p[1] / 100.0f) * 1.4f * 256.0f);
 }
 
 inline int16_t sinTick(uint32_t tickQ8) { return sinLut()[(tickQ8 >> 8) & 1023]; }
@@ -87,10 +72,9 @@ void band(uint16_t *dst, int y0, int rows, int w, uint32_t, const uint8_t *) {
         float env = 1.0f - fabsf(yn - 0.32f) / 0.85f;
         env = env < 0 ? 0 : env * env;
         const int32_t envQ12 = static_cast<int32_t>(env * 4096.0f);
-        const uint8_t bgR = static_cast<uint8_t>(2 + yn * 1);
-        const uint8_t bgG = static_cast<uint8_t>(3 + yn * 2);
-        const uint8_t bgB = static_cast<uint8_t>(10 + (1 - yn) * 4);
-        const int bgR5 = bgR >> 3, bgG6 = bgG >> 2, bgB5 = bgB >> 3;
+        uint8_t bg[3];
+        themeRGB(static_cast<int>(yn * 10.0f), bg); // sky sits in the darkest ~4% of the theme
+        const int bgR5 = bg[0] >> 3, bgG6 = bg[1] >> 2, bgB5 = bg[2] >> 3;
 
         // Row phase starts (rad -> Q8 ticks); negatives wrap via uint32.
         uint32_t ph1 = static_cast<uint32_t>(static_cast<int64_t>((warp1 + t * 0.12f) * TICKS));
@@ -138,7 +122,7 @@ extern const BgAnimation bg_anim_aurora;
 const BgAnimation bg_anim_aurora = {
     "aurora",
     "Aurora",
-    {{"intensity", "Intensity", 55}, {"speed", "Speed", 40}, {"hue", "Hue shift", 35}, {"waviness", "Waviness", 50}},
+    {{"speed", "Speed", 50}, {"intensity", "Intensity", 55}, {"waviness", "Waviness", 50}, {nullptr, nullptr, 0}},
     init,
     frame,
     band,

@@ -24,50 +24,8 @@ BlobDef blobDef[NUM_BLOBS];
 BlobState blob[NUM_BLOBS];
 uint16_t *paletteLUT = nullptr;
 float *fieldRow = nullptr; // one row of accumulated field
-int lastHue = -1;
+uint32_t lastThemeGen = 0xFFFFFFFF;
 bool inited = false;
-
-struct Stop {
-    uint8_t t, r, g, b;
-};
-constexpr Stop LAVA_CLASSIC[5] = {{0, 10, 4, 4}, {77, 55, 10, 8}, {140, 150, 35, 10}, {199, 235, 95, 15}, {255, 255, 215, 140}};
-constexpr Stop LAVA_VIOLET[5] = {{0, 8, 4, 12}, {77, 45, 10, 55}, {140, 110, 25, 140}, {199, 200, 70, 220}, {255, 255, 200, 250}};
-constexpr Stop LAVA_TEAL[5] = {{0, 3, 8, 8}, {77, 6, 45, 42}, {140, 10, 110, 95}, {199, 40, 210, 175}, {255, 190, 255, 230}};
-
-void buildLavaPalette(uint8_t hue) {
-    const Stop *A, *B;
-    float f;
-    if (hue <= 50) {
-        A = LAVA_CLASSIC;
-        B = LAVA_VIOLET;
-        f = hue / 50.0f;
-    } else {
-        A = LAVA_VIOLET;
-        B = LAVA_TEAL;
-        f = (hue - 50) / 50.0f;
-    }
-    Stop bl[5];
-    for (int i = 0; i < 5; i++) {
-        bl[i].t = A[i].t;
-        bl[i].r = static_cast<uint8_t>(A[i].r + (B[i].r - A[i].r) * f);
-        bl[i].g = static_cast<uint8_t>(A[i].g + (B[i].g - A[i].g) * f);
-        bl[i].b = static_cast<uint8_t>(A[i].b + (B[i].b - A[i].b) * f);
-    }
-    int seg = 0;
-    for (int idx = 0; idx < 256; idx++) {
-        while (seg < 3 && bl[seg + 1].t < idx) {
-            seg++;
-        }
-        float span = bl[seg + 1].t - bl[seg].t;
-        if (span < 1) {
-            span = 1;
-        }
-        const float fr = (idx - bl[seg].t) / span;
-        paletteLUT[idx] = rgb565(static_cast<uint8_t>(bl[seg].r + (bl[seg + 1].r - bl[seg].r) * fr),
-                                 static_cast<uint8_t>(bl[seg].g + (bl[seg + 1].g - bl[seg].g) * fr),
-                                 static_cast<uint8_t>(bl[seg].b + (bl[seg + 1].b - bl[seg].b) * fr));
-    }
-}
 
 bool init(int w, int h) {
     if (paletteLUT == nullptr) {
@@ -104,8 +62,8 @@ bool init(int w, int h) {
             d.wR = 0.00011f + 0.00003f * i;
             d.phR = ga * 2.7f;
         }
-        buildLavaPalette(0);
-        lastHue = 0;
+        buildThemeRamp(paletteLUT, 256);
+        lastThemeGen = themeGen();
     }
     return true;
 }
@@ -113,13 +71,12 @@ bool init(int w, int h) {
 float g_intensity = 1.0f;
 
 void frame(uint32_t tMs, int, int, const uint8_t p[4]) {
-    const float periodMs = 180000.0f - 1600.0f * p[0];
-    const float omega0 = 6.2831853f / periodMs;
+    const float omega0 = 6.2831853f / 45000.0f * speedMul(p[0]); // 45s base cycle at speed 50
     const float sizeMul = 0.6f + (p[1] / 100.0f);
-    g_intensity = 0.5f + (p[3] / 100.0f) * 1.3f;
-    if (p[2] != lastHue) {
-        buildLavaPalette(p[2]);
-        lastHue = p[2];
+    g_intensity = 0.5f + (p[2] / 100.0f) * 1.3f;
+    if (themeGen() != lastThemeGen) {
+        buildThemeRamp(paletteLUT, 256);
+        lastThemeGen = themeGen();
     }
     const float t = tMs * omega0;
     for (int i = 0; i < NUM_BLOBS; i++) {
@@ -189,7 +146,7 @@ extern const BgAnimation bg_anim_lava;
 const BgAnimation bg_anim_lava = {
     "lava",
     "Lava",
-    {{"speed", "Speed", 35}, {"scale", "Blob size", 50}, {"hue", "Palette", 0}, {"glow", "Glow", 60}},
+    {{"speed", "Speed", 50}, {"scale", "Blob size", 50}, {"glow", "Glow", 60}, {nullptr, nullptr, 0}},
     init,
     frame,
     band,

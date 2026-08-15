@@ -716,6 +716,10 @@ void WebUIPlugin::handleSettings(AsyncWebServerRequest *request) const {
                 settings->setBgAnimId(request->arg("bgAnimId").toInt());
             if (request->hasArg("bgAnimParams"))
                 settings->setBgAnimParams(request->arg("bgAnimParams"));
+            if (request->hasArg("bgAnimTheme"))
+                settings->setBgAnimTheme(request->arg("bgAnimTheme").toInt());
+            if (request->hasArg("bgAnimCustomTheme"))
+                settings->setBgAnimCustomTheme(request->arg("bgAnimCustomTheme"));
             if (request->hasArg("bgAnimId") || request->hasArg("bgAnimParams"))
                 settings->setBgAnimAllScreens(request->hasArg("bgAnimAllScreens"));
             if (request->hasArg("smartGrindIp"))
@@ -869,6 +873,8 @@ void WebUIPlugin::handleSettings(AsyncWebServerRequest *request) const {
     doc["bgAnimId"] = settings.getBgAnimId();
     doc["bgAnimParams"] = settings.getBgAnimParams();
     doc["bgAnimAllScreens"] = settings.isBgAnimAllScreens();
+    doc["bgAnimTheme"] = settings.getBgAnimTheme();
+    doc["bgAnimCustomTheme"] = settings.getBgAnimCustomTheme();
     doc["smartGrindIp"] = settings.getSmartGrindIp();
     doc["smartGrindMode"] = settings.getSmartGrindMode();
     doc["momentaryButtons"] = settings.isMomentaryButtons();

@@ -104,6 +104,8 @@ class Settings {
     int getBgAnimId() const { return bgAnimId.get(); }
     String getBgAnimParams() const { return bgAnimParams.get(); }
     bool isBgAnimAllScreens() const { return bgAnimAllScreens.get(); }
+    int getBgAnimTheme() const { return bgAnimTheme.get(); }
+    String getBgAnimCustomTheme() const { return bgAnimCustomTheme.get(); }
     int getSmartGrindMode() const { return smartGrindMode.get(); }
     String getSmartGrindIp() const { return smartGrindIp.get(); }
     bool isHomeAssistant() const { return homeAssistant.get(); }
@@ -197,6 +199,8 @@ class Settings {
     void setBgAnimId(int bg_anim_id);
     void setBgAnimParams(const String &bg_anim_params);
     void setBgAnimAllScreens(bool bg_anim_all_screens);
+    void setBgAnimTheme(int bg_anim_theme);
+    void setBgAnimCustomTheme(const String &bg_anim_custom_theme);
     void setSmartGrindIp(String smart_grind_ip);
     void setSmartGrindMode(int smart_grind_mode);
     void setHomeAssistant(bool homeAssistant);
@@ -292,6 +296,8 @@ class Settings {
     // each 0-100; missing/short entries fall back to the animation's defaults.
     Property<String> bgAnimParams{registry, "bg_anp", ""};
     Property<bool> bgAnimAllScreens{registry, "bg_all", false};
+    Property<int> bgAnimTheme{registry, "bg_th", 0};
+    Property<String> bgAnimCustomTheme{registry, "bg_ct", ""};
     Property<bool> smartGrindToggle{registry, "sg_t", false}; // legacy, seeds the smartGrindMode default
     Property<int> smartGrindMode{registry, "sg_m", 0};
     Property<String> smartGrindIp{registry, "sg_i", ""};

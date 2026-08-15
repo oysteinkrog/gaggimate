@@ -17,37 +17,14 @@ int16_t *sqrtLUT = nullptr;  // r2 bucket -> radius (bucket 192)
 uint32_t *recipLUT = nullptr; // Q16 65536/(i+1), 0..240
 uint8_t *vigLUT = nullptr;   // radius 0..255 -> falloff Q8
 uint16_t *paletteLUT = nullptr;
-int lastWarmth = -1;
+uint32_t lastThemeGen = 0xFFFFFFFF;
+uint16_t g_outside = 0;
 
-struct Stop {
-    uint8_t t, r, g, b;
-};
-constexpr Stop STOPS[6] = {{0, 0x05, 0x06, 0x0c},  {56, 0x0b, 0x18, 0x2c},  {115, 0x10, 0x2c, 0x44},
-                           {168, 0x1f, 0x54, 0x54}, {209, 0xb0, 0x7a, 0x34}, {255, 0xf3, 0xda, 0xa3}};
-
-void buildPaletteWarmth(uint8_t warmth) {
-    // warmth shifts the sampling index by up to ±15 (±0.06 of the range).
-    const int shift = ((warmth - 50) * 15) / 50;
-    for (int i = 0; i < 256; i++) {
-        int idx = i + shift;
-        if (idx < 0) {
-            idx = 0;
-        } else if (idx > 255) {
-            idx = 255;
-        }
-        int seg = 0;
-        while (seg < 4 && STOPS[seg + 1].t < idx) {
-            seg++;
-        }
-        float span = STOPS[seg + 1].t - STOPS[seg].t;
-        if (span < 1) {
-            span = 1;
-        }
-        const float f = (idx - STOPS[seg].t) / span;
-        paletteLUT[i] = rgb565(static_cast<uint8_t>(STOPS[seg].r + (STOPS[seg + 1].r - STOPS[seg].r) * f),
-                               static_cast<uint8_t>(STOPS[seg].g + (STOPS[seg + 1].g - STOPS[seg].g) * f),
-                               static_cast<uint8_t>(STOPS[seg].b + (STOPS[seg + 1].b - STOPS[seg].b) * f));
-    }
+void buildThemePalette() {
+    buildThemeRamp(paletteLUT, 256);
+    uint8_t c[3];
+    themeRGB(0, c);
+    g_outside = rgb565(c[0], c[1], c[2]);
 }
 
 bool init(int, int) {
@@ -72,8 +49,8 @@ bool init(int, int) {
         for (int i = 0; i < 256; i++) {
             vigLUT[i] = static_cast<uint8_t>(lroundf(255.0f * powf(1.0f - i / 255.0f, 0.55f)));
         }
-        buildPaletteWarmth(50);
-        lastWarmth = 50;
+        buildThemePalette();
+        lastThemeGen = themeGen();
     }
     return true;
 }
@@ -82,13 +59,13 @@ int g_N = 8, g_tOffA = 0, g_tOffB = 0, g_rOffsetScale = 0;
 int g_breatheQ8 = 256;
 
 void frame(uint32_t tMs, int, int, const uint8_t p[4]) {
-    if (p[3] != lastWarmth) {
-        buildPaletteWarmth(p[3]);
-        lastWarmth = p[3];
+    if (themeGen() != lastThemeGen) {
+        buildThemePalette();
+        lastThemeGen = themeGen();
     }
-    g_N = 4 + (p[0] * 8) / 100;
-    const float t = tMs * 0.001f * (0.12f + (p[2] / 100.0f) * 0.55f);
-    const float turb = 0.25f + (p[1] / 100.0f) * 1.1f;
+    g_N = 4 + (p[1] * 8) / 100;
+    const float t = tMs * 0.001f * 0.35f * speedMul(p[0]);
+    const float turb = 0.25f + (p[2] / 100.0f) * 1.1f;
     g_rOffsetScale = static_cast<int>(turb * 18.0f);
     // 40.74 = 256 ticks per 2*pi radians
     g_tOffA = static_cast<int>(t * 1.4f * 40.74f) & 0xFF;
@@ -139,7 +116,7 @@ void band(uint16_t *dst, int y0, int rows, int w, uint32_t, const uint8_t *) {
             const int dx = x - cx;
             const int r2 = dx * dx + dy2;
             if (r2 > maxR2) {
-                row[x] = rgb565(2, 2, 4);
+                row[x] = g_outside;
                 continue;
             }
             const int rbucket = r2 / 192;
@@ -169,7 +146,7 @@ extern const BgAnimation bg_anim_mandala;
 const BgAnimation bg_anim_mandala = {
     "mandala",
     "Mandala",
-    {{"symmetry", "Symmetry", 50}, {"complexity", "Complexity", 45}, {"speed", "Speed", 35}, {"warmth", "Warmth", 50}},
+    {{"speed", "Speed", 50}, {"symmetry", "Symmetry", 50}, {"complexity", "Complexity", 45}, {nullptr, nullptr, 0}},
     init,
     frame,
     band,

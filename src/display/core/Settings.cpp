@@ -157,6 +157,8 @@ void Settings::setScaleMenuButton(bool scale_menu_button) { scaleMenuButton.set(
 void Settings::setBgAnimId(int bg_anim_id) { bgAnimId.set(bg_anim_id); }
 void Settings::setBgAnimParams(const String &bg_anim_params) { bgAnimParams.set(bg_anim_params); }
 void Settings::setBgAnimAllScreens(bool bg_anim_all_screens) { bgAnimAllScreens.set(bg_anim_all_screens); }
+void Settings::setBgAnimTheme(int bg_anim_theme) { bgAnimTheme.set(bg_anim_theme); }
+void Settings::setBgAnimCustomTheme(const String &bg_anim_custom_theme) { bgAnimCustomTheme.set(bg_anim_custom_theme); }
 
 void Settings::setSmartGrindIp(String smart_grind_ip) { smartGrindIp.set(smart_grind_ip); }
 

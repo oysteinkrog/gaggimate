@@ -15,19 +15,11 @@ int16_t *colTerm = nullptr;
 int16_t *rowTerm = nullptr;
 uint16_t *palette = nullptr;
 uint8_t lastP[4] = {255, 255, 255, 255}; // force first palette build
+uint32_t lastThemeGen = 0xFFFFFFFF;
 uint32_t phase1 = 0;
 uint32_t phase2 = 0;
 uint32_t phase3 = 0;
 uint32_t cycle = 0;
-
-// Palette keyframe sets (param 2): espresso, ocean, violet, mono.
-constexpr uint8_t KEYS_ESPRESSO[][3] = {{8, 4, 2},      {54, 22, 8},   {130, 66, 22}, {214, 160, 92},
-                                        {245, 226, 190}, {130, 66, 22}, {40, 16, 6}};
-constexpr uint8_t KEYS_OCEAN[][3] = {{2, 4, 10},   {8, 24, 52},    {18, 64, 110}, {60, 140, 170},
-                                     {170, 220, 230}, {18, 64, 110}, {4, 12, 28}};
-constexpr uint8_t KEYS_VIOLET[][3] = {{6, 2, 10},   {30, 10, 52},   {80, 30, 120}, {160, 90, 200},
-                                      {230, 200, 245}, {80, 30, 120}, {16, 6, 30}};
-constexpr uint8_t KEYS_MONO[][3] = {{4, 4, 5}, {24, 24, 28}, {70, 70, 78}, {140, 140, 150}, {210, 210, 220}, {70, 70, 78}, {12, 12, 14}};
 
 bool init(int w, int h) {
     if (sinLut() == nullptr) {
@@ -46,23 +38,11 @@ bool init(int w, int h) {
 }
 
 void frame(uint32_t tMs, int w, int h, const uint8_t p[4]) {
-    if (memcmp(p, lastP, 4) != 0) {
+    if (memcmp(p, lastP, 4) != 0 || themeGen() != lastThemeGen) {
         memcpy(lastP, p, 4);
-        const uint16_t bright = 64 + static_cast<uint16_t>(p[3]) * 192 / 100; // 25%..100%
-        switch (p[2] * 4 / 101) {
-        case 1:
-            buildPalette(palette, KEYS_OCEAN, 7, bright);
-            break;
-        case 2:
-            buildPalette(palette, KEYS_VIOLET, 7, bright);
-            break;
-        case 3:
-            buildPalette(palette, KEYS_MONO, 7, bright);
-            break;
-        default:
-            buildPalette(palette, KEYS_ESPRESSO, 7, bright);
-            break;
-        }
+        lastThemeGen = themeGen();
+        const uint16_t bright = 64 + static_cast<uint16_t>(p[2]) * 192 / 100; // 25%..100%
+        buildThemeWheel(palette, bright);
     }
     // Speed 0-100 -> 0.25x..3x of the original drift (which advanced ~60
     // sine-index units per second on the fastest term).
@@ -104,7 +84,7 @@ extern const BgAnimation bg_anim_plasma;
 const BgAnimation bg_anim_plasma = {
     "plasma",
     "Plasma",
-    {{"speed", "Speed", 50}, {"scale", "Scale", 50}, {"palette", "Palette", 0}, {"brightness", "Brightness", 70}},
+    {{"speed", "Speed", 50}, {"scale", "Scale", 50}, {"brightness", "Brightness", 70}, {nullptr, nullptr, 0}},
     init,
     frame,
     band,
