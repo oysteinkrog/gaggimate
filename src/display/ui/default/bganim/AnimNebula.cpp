@@ -144,6 +144,10 @@ void band(uint16_t *dst, int y0, int rows, int w, uint32_t, const uint8_t *) {
     const int axF = g_axF, ayF = g_ayF;
     const int wA = g_wA, wB = g_wB, densOff = g_densOff;
     static uint8_t blendedA[256];
+    // Final per-pixel color, memoized over the blend's true period (see
+    // combine loop below) so the w=480-wide pixel loop degenerates to a
+    // sequential table copy instead of re-running the a/b/c blend per pixel.
+    static uint16_t fullColor[256];
     for (int r = 0; r < rows; r++) {
         const int y = y0 + r;
         uint16_t *row = dst + static_cast<size_t>(r) * w;
@@ -198,18 +202,70 @@ void band(uint16_t *dst, int y0, int rows, int w, uint32_t, const uint8_t *) {
             }
         }
 
-        int x0 = g_axI & 255;
-        int step = 0;
+        // Combine step: run the full a/b/c blend (identical math to the old
+        // per-pixel loop) but only far enough to cover its true repeat
+        // period, then memoize it. x0(x) = (g_axI+x)&255 has period 256;
+        // step(x) = x&127 has period 128; 128 | 256 so the combined value
+        // v(x) — and thus the dith term dith[x&7], since 8 | 256 too — is
+        // an exact period-256 function of x. Running this loop for m in
+        // [0,256) reproduces v(x) for every x via v(x) == fullColor[x&255],
+        // bit-for-bit, because x0/step/dith-index at x and at (x mod 256)
+        // are identical by construction (all three periods divide 256).
+        // This turns the expensive blend (loads + 2 muls + shifts) from a
+        // per-real-pixel cost (up to w=480/row) into a fixed 256/row cost,
+        // with the real w-wide loop below reduced to a cache-resident
+        // table copy.
+        {
+            int x0 = g_axI & 255;
+            int step = 0;
+            for (int m = 0; m < 256; m++) {
+                const int a = blendedA[x0];
+                const uint16_t bc = bcTable[step];
+                const int b = bc & 0xFF;
+                const int c = bc >> 8;
+                const int v = c + ((((a - c) * wA) + ((b - c) * wB)) >> 6) + densOff + dith[m & 7];
+                fullColor[m] = paletteExt[PAD + v];
+                x0 = (x0 + 1) & 255;
+                step = (step + 1) & 127;
+            }
+        }
 
-        for (int x = 0; x < w; x++) {
-            const int a = blendedA[x0];
-            const uint16_t bc = bcTable[step];
-            const int b = bc & 0xFF;
-            const int c = bc >> 8;
-            const int v = c + ((((a - c) * wA) + ((b - c) * wB)) >> 6) + densOff + dith[x & 7];
-            row[x] = paletteExt[PAD + v];
-            x0 = (x0 + 1) & 255;
-            step = (step + 1) & 127;
+        // Real per-pixel loop: sequential read from a 256-entry (512B)
+        // table that stays resident in cache across the whole row, plus a
+        // masked wraparound index — no blend math, no palette indirection,
+        // left per pixel. This loop is cheap enough (no compute) that the
+        // pixel-pair packed store (same trick as Aurora/Lava) is a clear
+        // win here even though it lost a previous fidelity/register fight
+        // when tried on the (much heavier) old single-pixel blend loop:
+        // it halves both iteration count and store traffic.
+        {
+            int m = 0;
+            uint16_t *rp = row;
+            // NOTE (verified in xtensa-asm/AnimNebula.S): this loop does NOT
+            // get GCC's Xtensa zero-overhead LOOP instruction, unlike the
+            // four loops above (dith/blendedA/bcTable/combine, all constant
+            // trip counts). A countdown form (tried here, mirroring the lava
+            // fix in OPTIMIZE.md) did not unlock it either -- this appears
+            // to be a real-compiler limit on this function (possibly on
+            // hw-loop count per function, or on runtime-variable trip counts
+            // this late in the body), not a code-shape problem we found a
+            // fix for. It still nets a clear win over the old per-pixel
+            // loop: 2 pixels/iteration halves both the taken-branch count
+            // and the store count, and the body itself is pure loads/store
+            // (no blend math), so the missing hw loop only taxes a cheap
+            // loop. Do not assume this comment is stale if a future pass
+            // finds the actual cause -- it was checked, not guessed.
+            for (int i = w >> 1; i > 0; i--) {
+                const uint16_t p0 = fullColor[m];
+                m = (m + 1) & 255;
+                const uint16_t p1 = fullColor[m];
+                m = (m + 1) & 255;
+                *reinterpret_cast<uint32_t *>(rp) = static_cast<uint32_t>(p0) | (static_cast<uint32_t>(p1) << 16);
+                rp += 2;
+            }
+            if (w & 1) {
+                *rp = fullColor[m];
+            }
         }
     }
 }
