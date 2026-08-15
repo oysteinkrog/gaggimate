@@ -137,6 +137,7 @@ function buildSubmitFormData(formData, autowakeupSchedules, restart) {
     'clock24hFormat',
     'autowakeupEnabled',
     'smartGrindToggle',
+    'bgAnimAllScreens',
   ];
 
   for (const [key, value] of Object.entries(formData)) {
@@ -472,6 +473,7 @@ export function Settings() {
             <GeneralTab
               formData={formData}
               onChange={onChange}
+              setField={setField}
               profiles={profiles}
               currentTheme={currentTheme}
               setCurrentTheme={setCurrentTheme}

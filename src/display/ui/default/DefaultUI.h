@@ -85,6 +85,8 @@ class DefaultUI {
     SleepAnimation sleepAnimation;
     unsigned long lastSleepAnimAttempt = 0;
     unsigned long lastSleepOverlayRefresh = 0;
+    bool bgAnimAllScreens = false;         // settings.isBgAnimAllScreens(), cached per render
+    lv_obj_t *animHostScreen = nullptr;    // screen whose bg was made transparent for the animation
     std::atomic<bool> panelStopRequested{false};
     std::atomic<bool> panelStopped{false};
     std::atomic<bool> otaEnded{false};

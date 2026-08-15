@@ -17,6 +17,7 @@
 
 #include "esp_sntp.h"
 
+#include <display/ui/default/bganim/BgAnim.h>
 #include <display/ui/default/eez/actions.h>
 #include <display/ui/default/eez/images.h>
 #include <display/ui/default/eez/ui.h>
@@ -321,30 +322,42 @@ void DefaultUI::loop() {
     lv_task_handler();
 }
 
-// Runs every UI-task pass. Starts/stops the plasma background of the standby
-// screen and pumps completed frames into LVGL. The animation only runs during
-// genuine sleep: standby screen, standby mode, controller BLE-connected, and
-// no status overlay (update/error/autotune/protocol mismatch) — those states
-// render on the plain standby screen instead.
+// Runs every UI-task pass. Starts/stops the background animation and keeps
+// the composited widget snapshot fresh. Two operating modes:
+//  - default: animation only during genuine sleep — standby screen, standby
+//    mode, controller BLE-connected, and no status overlay (update/error/
+//    autotune/protocol mismatch, which render on the plain standby screen).
+//  - all-screens (settings.bgAnimAllScreens): animation behind every screen
+//    whenever the UI is up and nothing critical is running. OTA/error states
+//    still stop it (the OTA download needs every byte of PSRAM bandwidth).
 void DefaultUI::maintainSleepAnimation() {
 #ifndef GAGGIMATE_SIM
     const bool blocked = controller->isUpdating() || controller->isErrorState() || controller->isAutotuning() ||
                          controller->getSystemInfo().protocolMismatch;
     const bool connected = controller->getClientController() != nullptr && controller->getClientController()->isConnected();
-    const bool wantAnimation =
+    const bool sleepWant =
         currentScreen == SCREEN_ID_STANDBY_SCREEN && controller->getMode() == MODE_STANDBY && connected && !blocked;
+    const bool wantAnimation = bgAnimAllScreens ? (initialized && !blocked) : sleepWant;
 
     if (wantAnimation) {
         if (!sleepAnimation.isActive()) {
             const unsigned long now = ::millis();
+            // lastSleepAnimAttempt is only armed after a FAILED start, so a
+            // stop/start across a screen change restarts on the next pass.
             if (now - lastSleepAnimAttempt > 2000) {
-                lastSleepAnimAttempt = now;
                 startSleepAnimation();
+                if (!sleepAnimation.isActive()) {
+                    lastSleepAnimAttempt = now;
+                }
             }
-        } else if (::millis() - lastSleepOverlayRefresh > 1000) {
-            // Keep the composited widgets fresh (the clock changes once a
-            // minute; a 1 s cadence keeps status/icon changes snappy too).
-            refreshSleepOverlay();
+        } else {
+            // Standby content changes once a minute (clock); active screens
+            // update continuously — refresh the snapshot faster there so
+            // gauges and numbers stay reasonably live behind the animation.
+            const unsigned long interval = currentScreen == SCREEN_ID_STANDBY_SCREEN ? 1000 : 250;
+            if (::millis() - lastSleepOverlayRefresh > interval) {
+                refreshSleepOverlay();
+            }
         }
     } else if (sleepAnimation.isActive()) {
         stopSleepAnimation();
@@ -532,8 +545,11 @@ void DefaultUI::handleScreenChange() {
         } else if (currentScreen == SCREEN_ID_STANDBY_SCREEN) {
             const ::Settings &settings = controller->getSettings();
             setBrightness(settings.getMainBrightness());
-            stopSleepAnimation();
         }
+        // Any screen change while animating: release the old host screen (its
+        // transparent-bg override must not leak) — in all-screens mode the
+        // next maintain pass restarts the animation on the new screen.
+        stopSleepAnimation();
         eez_flow_set_screen(targetScreen, LV_SCR_LOAD_ANIM_NONE, 0, 0);
         animateGaugeTicks(currentScreen, targetScreen);
         rerender = true;
@@ -543,18 +559,20 @@ void DefaultUI::handleScreenChange() {
 void DefaultUI::startSleepAnimation() {
 #ifndef GAGGIMATE_SIM
     Display *display = panelDriver != nullptr ? panelDriver->getDisplay() : nullptr;
-    if (display == nullptr || objects.standby_screen == nullptr) {
+    lv_obj_t *host = lv_scr_act();
+    if (display == nullptr || host == nullptr) {
         return;
     }
     sleepAnimation.start(display);
     if (!sleepAnimation.isActive()) {
         return;
     }
-    // The plasma task owns the panel while the animation runs; LVGL keeps the
-    // standby screen active only for input (tap-to-wake) and for the offscreen
-    // widget snapshots. Making the screen background transparent keeps those
-    // snapshots per-pixel alpha (widgets only, no opaque black plate).
-    lv_obj_set_style_bg_opa(objects.standby_screen, LV_OPA_TRANSP, LV_PART_MAIN);
+    animHostScreen = host;
+    // The render task owns the panel while the animation runs; LVGL keeps the
+    // host screen active only for input and for the offscreen widget
+    // snapshots. Making the screen background transparent keeps those
+    // snapshots per-pixel alpha (widgets only, no opaque color plate).
+    lv_obj_set_style_bg_opa(animHostScreen, LV_OPA_TRANSP, LV_PART_MAIN);
     // The status icons carry a 10 px border in the theme background color (an
     // EEZ spacing trick, invisible on black) — over the plasma it snapshots as
     // an opaque plate around each icon. Hide the borders while animating.
@@ -579,21 +597,22 @@ void DefaultUI::stopSleepAnimation() {
             lv_obj_remove_local_style_prop(icon, LV_STYLE_BORDER_OPA, LV_PART_MAIN);
         }
     }
-    if (objects.standby_screen != nullptr) {
+    if (animHostScreen != nullptr) {
         // Drop the transparent-background override (back to the EEZ style) and
-        // repaint the whole screen over the last plasma frame.
-        lv_obj_remove_local_style_prop(objects.standby_screen, LV_STYLE_BG_OPA, LV_PART_MAIN);
-        lv_obj_invalidate(objects.standby_screen);
+        // repaint the whole screen over the last animation frame.
+        lv_obj_remove_local_style_prop(animHostScreen, LV_STYLE_BG_OPA, LV_PART_MAIN);
+        lv_obj_invalidate(animHostScreen);
+        animHostScreen = nullptr;
     }
 #endif
 }
 
-// Renders the standby screen's widgets into the animation's back overlay
-// buffer via an offscreen LVGL snapshot (RGB565+A8), then publishes it for the
-// render task to alpha-blend into every plasma frame.
+// Renders the host screen's widgets into the animation's back overlay buffer
+// via an offscreen LVGL snapshot (RGB565+A8), then publishes it for the
+// render task to alpha-blend into every animation frame.
 void DefaultUI::refreshSleepOverlay() {
 #ifndef GAGGIMATE_SIM
-    lv_obj_t *scr = objects.standby_screen;
+    lv_obj_t *scr = animHostScreen;
     // nullptr also covers "render task is mid-frame in the back overlay" —
     // don't stamp the refresh time, so the next UI pass retries immediately.
     uint8_t *buf = sleepAnimation.overlayBackBuffer();
@@ -835,6 +854,16 @@ void DefaultUI::updateState() {
     wifiConnected = WiFi.status() == WL_CONNECTED;
     grindAvailable = settings.isSmartGrindActive() || settings.getAltRelayFunction() == ALT_RELAY_GRIND;
     scaleMenuSwap = settings.isScaleMenuButton();
+
+#ifndef GAGGIMATE_SIM
+    // Keep the background animation's selection and params current — cheap
+    // (two atomic stores) and makes web-UI tweaks apply live on the next frame.
+    bgAnimAllScreens = settings.isBgAnimAllScreens();
+    uint8_t animP[4];
+    const int animId = settings.getBgAnimId();
+    bg_parse_params(settings.getBgAnimParams().c_str(), animId, animP);
+    sleepAnimation.configure(static_cast<uint8_t>(animId), animP);
+#endif
 
     uiFlags.brew_adjustments(brewScreenState == BrewScreenState::Settings);
     uiFlags.active(controller->isActive());

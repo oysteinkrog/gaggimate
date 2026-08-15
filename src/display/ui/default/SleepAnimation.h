@@ -13,21 +13,23 @@ class SleepAnimation {
     void start(Display *) {}
     void stop() {}
     bool isActive() const { return false; }
+    void configure(uint8_t, const uint8_t *) {}
     uint8_t *overlayBackBuffer() { return nullptr; }
     uint32_t overlayCapacity() const { return 0; }
     void publishOverlay(int, int) {}
 };
 #else
 
-// Procedural standby animation (classic palette-cycled plasma), rendered by a
-// dedicated task directly to the panel in horizontal bands, bypassing the LVGL
-// draw pipeline (an LVGL full-screen composite moves ~4x the PSRAM traffic and
-// starves the RGB scan-out — visible as horizontal shaking). The standby
-// screen's widgets (clock, status, icons) are alpha-blended into each band
-// from an offscreen LVGL snapshot the UI task refreshes periodically, so the
-// animation appears BEHIND the normal standby content while the standby screen
-// stays the active LVGL screen (tap-to-wake keeps working). No stored assets —
-// everything is generated at runtime, so OTA updates carry the whole feature.
+// Procedural background animation engine: renders the selected registry
+// animation (see bganim/BgAnim.h) with a dedicated task directly to the panel
+// in horizontal bands, bypassing the LVGL draw pipeline (an LVGL full-screen
+// composite moves ~4x the PSRAM traffic and starves the RGB scan-out —
+// visible as horizontal shaking). The host screen's widgets are alpha-blended
+// into each band from an offscreen LVGL snapshot the UI task refreshes
+// periodically, so the animation appears BEHIND the normal content while the
+// host screen stays the active LVGL screen (touch keeps working). No stored
+// assets — everything is generated at runtime, so OTA updates carry the
+// whole feature.
 class SleepAnimation {
   public:
     SleepAnimation() = default;
@@ -38,6 +40,11 @@ class SleepAnimation {
     // Signals the task to exit and blocks briefly until it has stopped.
     void stop();
     bool isActive() const { return running; }
+
+    // Selects which registry animation renders and its 4 params (0-100 each).
+    // Safe to call while running — params apply on the next frame, an id
+    // change triggers the new animation's lazy init on the render task.
+    void configure(uint8_t animId, const uint8_t p[4]);
 
     // Overlay: an LV_IMG_CF_TRUE_COLOR_ALPHA (RGB565 + A8, 3 B/px) snapshot of
     // the standby widgets. Double-buffered: the UI task renders a snapshot
@@ -65,19 +72,20 @@ class SleepAnimation {
 
     static void taskEntry(void *arg);
     void renderLoop();
-    void renderFrame(uint32_t frame);
-    void buildLuts();
+    void renderFrame();
 
     Display *display = nullptr;
     void *taskHandle = nullptr;
     std::atomic<bool> running{false};
     std::atomic<bool> stopped{true};
 
-    uint16_t *band = nullptr;    // one horizontal band of RGB565 pixels
-    int16_t *sinLut = nullptr;   // 1024-entry sine table
-    uint16_t *palette = nullptr; // 256-entry RGB565 palette
-    int16_t *colTerm = nullptr;  // per-column plasma term, rebuilt each frame
-    int16_t *rowTerm = nullptr;  // per-row plasma term, rebuilt each frame
+    uint16_t *band = nullptr; // one horizontal band of RGB565 pixels
+
+    // Animation selection; id and params may tear against each other for one
+    // frame, which is harmless. Packed params: p[i] = (word >> 8*i) & 0xFF.
+    std::atomic<uint8_t> animId{0};
+    std::atomic<uint32_t> animParams{0};
+    int initializedAnimId = -1; // last id whose init() ran on the render task
 
     Overlay overlays[2];
     uint32_t overlayCap = 0;

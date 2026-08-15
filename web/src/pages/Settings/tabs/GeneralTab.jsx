@@ -2,6 +2,11 @@ import { FontAwesomeIcon } from '@fortawesome/react-fontawesome';
 import { faEye } from '@fortawesome/free-solid-svg-icons/faEye';
 import { faEyeSlash } from '@fortawesome/free-solid-svg-icons/faEyeSlash';
 import { timezones } from '../../../config/zones.js';
+import {
+  BG_ANIMATIONS,
+  parseBgAnimParams,
+  setBgAnimParam,
+} from '../../../config/bgAnimations.js';
 import { DASHBOARD_LAYOUTS } from '../../../utils/dashboardManager.js';
 import Section from '../../../components/Card.jsx';
 import {
@@ -35,6 +40,107 @@ function ButtonBehaviorSelect({ id, label, value, onChange, profiles }) {
   );
 }
 
+// Animation picker + parameter sliders for the selected animation only.
+// Params live in formData.bgAnimParams as the same packed string the firmware
+// stores ("p0,p1,p2,p3;..." indexed by animation id) — edited via setField.
+function BackgroundAnimationSettings({ formData, onChange, setField }) {
+  const animIdx = Math.min(
+    BG_ANIMATIONS.length - 1,
+    Math.max(0, parseInt(formData.bgAnimId, 10) || 0),
+  );
+  const anim = BG_ANIMATIONS[animIdx];
+  const values = parseBgAnimParams(formData.bgAnimParams)[animIdx];
+  return (
+    <div className='border-base-content/5 mt-6 border-t pt-6'>
+      <h3 className='text-md text-base-content mb-2 font-semibold'>Background Animation</h3>
+      <div className='grid grid-cols-1 gap-4 md:grid-cols-2'>
+        <SettingsFormField label='Animation' htmlFor='bgAnimId' noMargin>
+          <select
+            id='bgAnimId'
+            name='bgAnimId'
+            className='select select-bordered w-full'
+            value={animIdx}
+            onChange={onChange('bgAnimId')}
+          >
+            {BG_ANIMATIONS.map((a, i) => (
+              <option key={a.id} value={i}>
+                {a.name}
+              </option>
+            ))}
+          </select>
+        </SettingsFormField>
+        {anim.params.map((param, j) =>
+          param.options ? (
+            <SettingsFormField
+              key={`${anim.id}-${param.key}`}
+              label={param.label}
+              htmlFor={`bgAnim-${param.key}`}
+              noMargin
+            >
+              <select
+                id={`bgAnim-${param.key}`}
+                className='select select-bordered w-full'
+                value={Math.min(param.options.length - 1, Math.floor((values[j] * param.options.length) / 101))}
+                onChange={e =>
+                  setField(
+                    'bgAnimParams',
+                    setBgAnimParam(
+                      formData.bgAnimParams,
+                      animIdx,
+                      j,
+                      // Store the option index scaled back onto 0-100.
+                      Math.round((parseInt(e.target.value, 10) * 100) / Math.max(1, param.options.length - 1)),
+                    ),
+                  )
+                }
+              >
+                {param.options.map((label, k) => (
+                  <option key={label} value={k}>
+                    {label}
+                  </option>
+                ))}
+              </select>
+            </SettingsFormField>
+          ) : (
+            <SettingsFormField
+              key={`${anim.id}-${param.key}`}
+              label={`${param.label} (${values[j]})`}
+              htmlFor={`bgAnim-${param.key}`}
+              noMargin
+            >
+              <input
+                id={`bgAnim-${param.key}`}
+                type='range'
+                min='0'
+                max='100'
+                className='range w-full'
+                value={values[j]}
+                onChange={e =>
+                  setField(
+                    'bgAnimParams',
+                    setBgAnimParam(formData.bgAnimParams, animIdx, j, e.target.value),
+                  )
+                }
+              />
+            </SettingsFormField>
+          ),
+        )}
+      </div>
+      {anim.description && (
+        <p className='text-base-content/60 mt-2 text-sm'>{anim.description}</p>
+      )}
+      <div className='mt-4'>
+        <ToggleField
+          label='Show animation behind all screens (not just standby)'
+          htmlFor='bgAnimAllScreens'
+          checked={!!formData.bgAnimAllScreens}
+          onChange={onChange('bgAnimAllScreens')}
+        />
+      </div>
+    </div>
+  );
+}
+
 function PasswordField({ id, label, placeholder, value, onChange, shown, setShown, ...rest }) {
   return (
     <label className='input w-full'>
@@ -62,6 +168,7 @@ function PasswordField({ id, label, placeholder, value, onChange, shown, setShow
 export function GeneralTab({
   formData,
   onChange,
+  setField,
   profiles,
   currentTheme,
   setCurrentTheme,
@@ -300,6 +407,8 @@ export function GeneralTab({
             </InputGroupField>
           </div>
         </div>
+
+        <BackgroundAnimationSettings formData={formData} onChange={onChange} setField={setField} />
       </Section>
 
       {/* Web Settings */}
