@@ -138,3 +138,36 @@ Demo-scene tricks that map well to this chip (encouraged where they fit):
   per pixel.
 - Keep per-pixel state in int registers; Q16.16/Q8.8 with mull (2 cy) beats
   float pipelines that spill.
+
+## When the host bench and the device disagree, the device wins
+
+Several passes have now found changes that are FASTER on the x86 bench and
+SLOWER on the real ESP32-S3. This is structural, not noise: x86 is wide,
+out-of-order, and has many more registers, so it hides exactly the costs that
+dominate the in-order LX7. Known instances, all verified in real assembly:
+
+- **Manual unrolling with more live values** (silk, 4x unroll): host 0.337 ->
+  0.291, device 158 -> 430 instructions. The windowed ABI leaves only ~13-14
+  usable registers; the unroll spilled almost everything and lost the hardware
+  loop. Reverted.
+- **Named locals instead of a pointer array** (aurora): faster on host, device
+  883 -> 949 instructions and one of two hardware loops lost. Reverted.
+- **Packing two uint8 LUTs into one uint16 LUT** (mandala): host ~9% slower,
+  device dropped a base pointer out of a starved register file and halved the
+  per-pixel spills. KEPT — the host number is the misleading one here.
+- **Counted-down loops** (lava): marginally slower on host, but a trip count
+  known at entry is what lets GCC emit the Xtensa zero-overhead LOOP and drop
+  the per-iteration branch. KEPT.
+
+So: use the host bench to find WHERE the time goes and to gate fidelity, and
+use ./xtensa-asm.sh to decide register-pressure and loop-shape questions. If a
+change makes host worse but provably reduces device instructions/spills or
+restores a hardware loop, keep it and say so in your report — and leave a
+comment in the source, because the next pass optimizing blindly against the
+host number will otherwise revert it.
+
+Two techniques worth reusing, both from this class of finding:
+- Pack two same-index uint8 tables into one uint16 table to free a base
+  pointer register.
+- Template-parameterize a compile-time-constant loop stride instead of passing
+  it as a runtime int, so it stops being a spilled live value.
