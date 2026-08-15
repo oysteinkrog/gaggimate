@@ -27,7 +27,7 @@
 // scale) is baked into small (cx+1)-entry tables rebuilt once per frame in
 // frame() — so band() never multiplies/divides by a per-frame param, it
 // just adds two table reads together. The final (v+190)*255/380 rescale
-// (v is bounded -190..190 by construction) is likewise a fixed one-time
+// (v is bounded -191..190 by construction) is likewise a fixed one-time
 // 381-entry LUT built in init(). Net per pixel: a handful of table reads,
 // a couple of adds/shifts, one angle multiply — no float, no divide, no
 // atan2 poly, no per-frame-param multiply.
@@ -75,7 +75,21 @@ int16_t *sinHalf256 = nullptr;  // sin256[i]>>1 precomputed, 256 entries — sav
 int16_t *sqrtLUT = nullptr;     // r2 bucket -> radius (bucket 192); init-time only
 uint32_t *recipLUT = nullptr;   // Q16 65536/(i+1), 0..240; init-time only
 uint8_t *vigByR = nullptr;      // radius 0..cx -> vignette falloff Q8, indexed directly by radius
-uint8_t *rescaleLUT = nullptr;  // (v+190) in 0..380 -> 0..255, replaces the old */380 divide
+// v = sin256[idxA] + sinHalf256[idxB]. sin256 is Q7 with |sin256| <= 127, and
+// sinHalf256[i] = sin256[i] >> 1 — an ARITHMETIC shift, which rounds toward
+// negative infinity, so -127 >> 1 is -64, not -63. The true range of v is
+// therefore [-191, 190], not the symmetric [-190, 190] the original comment
+// claimed, and the unpadded 381-entry table was read one byte off its front
+// (caught by tools/animbench/fuzz under ASan). Rather than re-derive the
+// offset, pad both ends and clamp the padding entries, which keeps every
+// in-range value bit-identical and costs 8 bytes.
+constexpr int RESCALE_SPAN = 381; // v+190 for v in [-190, 190]
+constexpr int RESCALE_PAD = 4;    // covers v = -191 with room on both sides
+constexpr int RESCALE_N = RESCALE_SPAN + 2 * RESCALE_PAD;
+// (v+190) -> 0..255, replaces the old */380 divide. Padded: see RESCALE_PAD.
+// Points RESCALE_PAD entries into its allocation, so a slightly out-of-range v
+// lands on a clamped entry instead of off the front of the block.
+uint8_t *rescaleLUT = nullptr;
 uint16_t *paletteLUT = nullptr;
 uint16_t *polarMap = nullptr;   // quadrant map: (angleOct<<8 | radiusOr0xFF), (cx+1)x(cx+1)
 // idxOffAB/vigBreathe are sized 256, not cx+1: index 0..cx are the
@@ -129,7 +143,8 @@ bool init(int w, int) {
         sqrtLUT = static_cast<int16_t *>(alloc(602 * sizeof(int16_t)));
         recipLUT = static_cast<uint32_t *>(alloc(241 * sizeof(uint32_t)));
         vigByR = static_cast<uint8_t *>(alloc(mapDim));
-        rescaleLUT = static_cast<uint8_t *>(alloc(381));
+        uint8_t *rescaleAlloc = static_cast<uint8_t *>(alloc(RESCALE_N));
+        rescaleLUT = rescaleAlloc != nullptr ? rescaleAlloc + RESCALE_PAD : nullptr;
         paletteLUT = static_cast<uint16_t *>(alloc(256 * sizeof(uint16_t)));
         // polarMap is ~113 KiB ((cx+1)^2 uint16 entries) — a bulk table read
         // in sequential sweeps, not a small randomly-indexed LUT, so it goes
@@ -177,10 +192,16 @@ bool init(int w, int) {
         for (int r = 0; r < mapDim; r++) {
             vigByR[r] = static_cast<uint8_t>(lroundf(255.0f * powf(1.0f - static_cast<float>(r) / g_cx, 0.55f)));
         }
-        // v (sinA + sinB/2) is bounded to roughly -190..190 by construction
-        // (|sinA|<=127, |sinB|<=127 so |sinB>>1|<=63); (v+190) in 0..380.
-        for (int i = 0; i < 381; i++) {
-            rescaleLUT[i] = static_cast<uint8_t>((i * 255) / 380);
+        // Build through the padded base so the leading and trailing pad
+        // entries repeat the clamped end values (see RESCALE_PAD above).
+        for (int j = 0; j < RESCALE_N; j++) {
+            int i = j - RESCALE_PAD;
+            if (i < 0) {
+                i = 0;
+            } else if (i > RESCALE_SPAN - 1) {
+                i = RESCALE_SPAN - 1;
+            }
+            rescaleLUT[j - RESCALE_PAD] = static_cast<uint8_t>((i * 255) / 380);
         }
         const int maxR2 = g_cx * g_cx;
         for (int ay = 0; ay < mapDim; ay++) {
@@ -277,7 +298,7 @@ __attribute__((noinline)) void mandalaRun(uint16_t *dstPtr, const uint16_t *mapP
         const uint16_t offAB = idxOffAB[r]; // low byte = A term, high byte = B term
         const uint8_t idxA = static_cast<uint8_t>(base + (offAB & 0xFF));
         const uint8_t idxB = static_cast<uint8_t>(2 * base + (offAB >> 8));
-        int v = sin256[idxA] + sinHalf256[idxB]; // ~-190..190
+        int v = sin256[idxA] + sinHalf256[idxB]; // -191..190 (see RESCALE_PAD)
         v = rescaleLUT[v + 190];
         v = (v * vigBreathe[r]) >> 8;
         dstPtr[i] = paletteLUT[v];
