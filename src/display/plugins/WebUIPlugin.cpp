@@ -14,6 +14,7 @@
 #include <display/drivers/common/PanelClock.h>
 #include <display/ui/default/SleepAnimation.h>
 #include <display/ui/default/bganim/BgAnim.h>
+#include <display/ui/default/bganim/BgAnimCommon.h>
 #endif
 #include <display/util/PsramStlAllocator.h>
 #include <display/util/PsramWsBuffer.h>
@@ -420,6 +421,14 @@ void WebUIPlugin::setupServer() {
         // this. Reporting a derived Hz here would be wrong, so report the
         // divider and let a caller compare relative values across settings.
         gate["pclk_div"] = panelclock::currentDiv();
+        // Where the animations' lookup tables actually landed. alloc() sends
+        // anything over SRAM_ALLOC_LIMIT to PSRAM on the assumption that big
+        // tables are swept sequentially; a table indexed by a computed value
+        // once per pixel is not, and pays a PSRAM round trip per miss.
+        gate["lut_sram_b"] = static_cast<uint32_t>(bganim::g_allocSram);
+        gate["lut_psram_b"] = static_cast<uint32_t>(bganim::g_allocPsram);
+        gate["sram_limit"] = static_cast<uint32_t>(bganim::SRAM_ALLOC_LIMIT);
+        gate["free_internal_b"] = static_cast<uint32_t>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
         SleepAnimation *anim = sleep_animation_bench_instance();
         if (anim == nullptr) {
             doc["running"] = false;
