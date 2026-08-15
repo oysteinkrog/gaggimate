@@ -31,6 +31,24 @@ void *alloc(size_t size) {
     return p;
 }
 
+const float *cosTableF() {
+    static float *lut = nullptr;
+    if (lut == nullptr) {
+        lut = static_cast<float *>(alloc(256 * sizeof(float)));
+        if (lut != nullptr) {
+            for (int i = 0; i < 256; i++) {
+                lut[i] = cosf(i * (2.0f * static_cast<float>(M_PI) / 256.0f));
+            }
+        }
+    }
+    return lut;
+}
+
+const uint8_t BAYER4[16] = {0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5};
+const uint8_t BAYER8[64] = {0,  32, 8,  40, 2,  34, 10, 42, 48, 16, 56, 24, 50, 18, 58, 26, 12, 44, 4,  36, 14, 46,
+                            6,  38, 60, 28, 52, 20, 62, 30, 54, 22, 3,  35, 11, 43, 1,  33, 9,  41, 51, 19, 59, 27,
+                            49, 17, 57, 25, 15, 47, 7,  39, 13, 45, 5,  37, 63, 31, 55, 23, 61, 29, 53, 21};
+
 void buildPalette(uint16_t *out, const uint8_t (*keys)[3], int nKeys, uint16_t brightness256) {
     for (int i = 0; i < 256; i++) {
         const float pos = i * (static_cast<float>(nKeys) / 256.0f);
