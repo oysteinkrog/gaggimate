@@ -43,6 +43,11 @@ void action_on_water_screen(lv_event_t *e) {
 };
 
 void action_on_grind_screen(lv_event_t *e) {
+    // The menu's grind slot doubles as the Scale screen when configured.
+    if (controller.getSettings().isScaleMenuButton()) {
+        controller.getUI()->openScaleScreen();
+        return;
+    }
     controller.getUI()->changeScreen(SCREEN_ID_GRIND_SCREEN);
     controller.setMode(MODE_GRIND);
     controller.deactivate();

@@ -711,6 +711,7 @@ void WebUIPlugin::handleSettings(AsyncWebServerRequest *request) const {
             if (request->hasArg("steamFillTime"))
                 settings->setSteamFillTime(request->arg("steamFillTime").toInt() * 1000);
             settings->setSmartGrindActive(request->hasArg("smartGrindActive"));
+            settings->setScaleMenuButton(request->hasArg("scaleMenuButton"));
             if (request->hasArg("smartGrindIp"))
                 settings->setSmartGrindIp(request->arg("smartGrindIp"));
             if (request->hasArg("smartGrindMode"))
@@ -858,6 +859,7 @@ void WebUIPlugin::handleSettings(AsyncWebServerRequest *request) const {
     doc["startupFillTime"] = settings.getStartupFillTime() / 1000;
     doc["steamFillTime"] = settings.getSteamFillTime() / 1000;
     doc["smartGrindActive"] = settings.isSmartGrindActive();
+    doc["scaleMenuButton"] = settings.isScaleMenuButton();
     doc["smartGrindIp"] = settings.getSmartGrindIp();
     doc["smartGrindMode"] = settings.getSmartGrindMode();
     doc["momentaryButtons"] = settings.isMomentaryButtons();

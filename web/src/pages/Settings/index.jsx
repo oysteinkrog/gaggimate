@@ -130,6 +130,7 @@ function buildSubmitFormData(formData, autowakeupSchedules, restart) {
     'homekit',
     'boilerFillActive',
     'smartGrindActive',
+    'scaleMenuButton',
     'homeAssistant',
     'momentaryButtons',
     'delayAdjust',

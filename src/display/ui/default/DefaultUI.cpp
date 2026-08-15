@@ -17,7 +17,12 @@
 
 #include "esp_sntp.h"
 
+#include <display/ui/default/eez/actions.h>
+#include <display/ui/default/eez/images.h>
 #include <display/ui/default/eez/ui.h>
+
+// Kitchen-scale glyph for the menu's Scale button (img_scale_80x80.c).
+extern const lv_img_dsc_t img_scale_80x80;
 
 static EffectManager effect_mgr;
 
@@ -310,6 +315,7 @@ void DefaultUI::loop() {
     }
 
     maintainSleepAnimation();
+    maintainScaleScreen();
 
     ui_tick();
     lv_task_handler();
@@ -498,18 +504,25 @@ void DefaultUI::setupState() {
                           &wifiConnected, &apActive);
     effect_mgr.use_effect([this]() { return currentScreen == SCREEN_ID_MENU_SCREEN_NEW; },
                           [this]() {
+                              const bool fourthButton = grindAvailable || scaleMenuSwap;
                               int radius = 135;
-                              int count = grindAvailable ? 4 : 3;
-                              int step = 360 / (grindAvailable ? 4 : 3);
-                              int iconOffset = grindAvailable ? 1 : 0;
+                              int count = fourthButton ? 4 : 3;
+                              int step = 360 / (fourthButton ? 4 : 3);
+                              int iconOffset = fourthButton ? 1 : 0;
                               int rotationOffset = count == 4 ? 45 : 0;
                               positionMenuIcon(objects.btn_brew_1, step * 0 - rotationOffset, radius);
                               positionMenuIcon(objects.btn_steam_1, step * 1 - rotationOffset, radius);
                               positionMenuIcon(objects.btn_water_1, step * 2 - rotationOffset, radius);
                               positionMenuIcon(objects.btn_grind_1, step * 3 - rotationOffset, radius);
                               // positionMenuIcon(objects.btn_settings_1, step * (3 + iconOffset) - rotationOffset, radius);
+                              // Grind slot doubles as the Scale button.
+                              if (objects.btn_grind_1 != nullptr) {
+                                  lv_obj_set_style_bg_img_src(objects.btn_grind_1,
+                                                              scaleMenuSwap ? &img_scale_80x80 : &img_coffee_bean_80x80,
+                                                              LV_PART_MAIN | LV_STATE_DEFAULT);
+                              }
                           },
-                          &grindAvailable);
+                          &grindAvailable, &scaleMenuSwap);
 }
 
 void DefaultUI::handleScreenChange() {
@@ -603,6 +616,113 @@ void DefaultUI::refreshSleepOverlay() {
 #endif
 }
 
+// Entry point for the menu's Scale button (via action_on_grind_screen when the
+// scaleMenuButton setting is on). Mirrors the other menu actions: switch to the
+// host screen, set a non-heating mode, ensure nothing is active.
+void DefaultUI::openScaleScreen() {
+    scaleScreenRequested = true;
+    changeScreen(SCREEN_ID_GRIND_SCREEN);
+    controller->setMode(MODE_GRIND);
+    controller->deactivate();
+}
+
+// Runs every UI pass. The overlay can only be built once the EEZ grind screen
+// object exists (it is created lazily on first load), so creation is deferred
+// here; the same pass also keeps the weight readout current and tears the
+// overlay down when the user leaves the screen by any path.
+void DefaultUI::maintainScaleScreen() {
+    if (scaleScreenRequested && currentScreen == SCREEN_ID_GRIND_SCREEN && objects.grind_screen != nullptr) {
+        if (scaleScreen == nullptr) {
+            buildScaleScreen();
+        }
+        if (scaleScreen != nullptr) {
+            lv_obj_clear_flag(scaleScreen, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_move_foreground(scaleScreen);
+            const float w = static_cast<float>(activeWeight);
+            if (scaleWeightLabel != nullptr && fabsf(w - lastShownScaleWeight) >= 0.05f) {
+                lastShownScaleWeight = w;
+                lv_label_set_text_fmt(scaleWeightLabel, "%.1f", static_cast<double>(w));
+            }
+        }
+    } else if (scaleScreen != nullptr && !lv_obj_has_flag(scaleScreen, LV_OBJ_FLAG_HIDDEN) &&
+               (!scaleScreenRequested || currentScreen != SCREEN_ID_GRIND_SCREEN)) {
+        lv_obj_add_flag(scaleScreen, LV_OBJ_FLAG_HIDDEN);
+        if (currentScreen != SCREEN_ID_GRIND_SCREEN) {
+            scaleScreenRequested = false;
+        }
+    }
+}
+
+void DefaultUI::buildScaleScreen() {
+    lv_obj_t *scr = objects.grind_screen;
+    if (scr == nullptr) {
+        return;
+    }
+    // Opaque cover over the whole grind screen: hides its widgets and absorbs
+    // their touch targets, so the grind UI stays untouched underneath.
+    lv_obj_t *cover = lv_obj_create(scr);
+    scaleScreen = cover;
+    lv_obj_set_size(cover, LV_PCT(100), LV_PCT(100));
+    lv_obj_set_pos(cover, 0, 0);
+    lv_obj_set_style_radius(cover, 0, LV_PART_MAIN);
+    lv_obj_set_style_border_width(cover, 0, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(cover, lv_color_hex(0x000000), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(cover, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(cover, 0, LV_PART_MAIN);
+    lv_obj_clear_flag(cover, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *title = lv_label_create(cover);
+    lv_label_set_text(title, "Scale");
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_20, LV_PART_MAIN);
+    lv_obj_set_style_text_color(title, lv_color_hex(0x888888), LV_PART_MAIN);
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 64);
+
+    scaleWeightLabel = lv_label_create(cover);
+    lv_label_set_text(scaleWeightLabel, "0.0");
+    lv_obj_set_style_text_font(scaleWeightLabel, &lv_font_montserrat_48, LV_PART_MAIN);
+    lv_obj_set_style_text_color(scaleWeightLabel, lv_color_hex(0xFFFFFF), LV_PART_MAIN);
+    lv_obj_align(scaleWeightLabel, LV_ALIGN_CENTER, -14, -20);
+    lastShownScaleWeight = -1000.0f;
+
+    lv_obj_t *unit = lv_label_create(cover);
+    lv_label_set_text(unit, "g");
+    lv_obj_set_style_text_font(unit, &lv_font_montserrat_24, LV_PART_MAIN);
+    lv_obj_set_style_text_color(unit, lv_color_hex(0x888888), LV_PART_MAIN);
+    lv_obj_align_to(unit, scaleWeightLabel, LV_ALIGN_OUT_RIGHT_BOTTOM, 8, -6);
+
+    lv_obj_t *tareBtn = lv_btn_create(cover);
+    lv_obj_set_size(tareBtn, 160, 60);
+    lv_obj_align(tareBtn, LV_ALIGN_CENTER, 0, 90);
+    lv_obj_set_style_radius(tareBtn, 30, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(tareBtn, lv_color_hex(0x2A2A2A), LV_PART_MAIN);
+    lv_obj_add_event_cb(
+        tareBtn, [](lv_event_t *e) { action_on_volumetric_hold(e); }, LV_EVENT_CLICKED, nullptr);
+    lv_obj_t *tareLabel = lv_label_create(tareBtn);
+    lv_label_set_text(tareLabel, "Tare");
+    lv_obj_set_style_text_font(tareLabel, &lv_font_montserrat_24, LV_PART_MAIN);
+    lv_obj_center(tareLabel);
+
+    // Back to the menu (mirrors action_on_menu_click).
+    lv_obj_t *backBtn = lv_btn_create(cover);
+    lv_obj_set_size(backBtn, 64, 64);
+    lv_obj_align(backBtn, LV_ALIGN_LEFT_MID, 16, 0);
+    lv_obj_set_style_radius(backBtn, 32, LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(backBtn, LV_OPA_TRANSP, LV_PART_MAIN);
+    lv_obj_set_style_shadow_width(backBtn, 0, LV_PART_MAIN);
+    lv_obj_add_event_cb(
+        backBtn,
+        [](lv_event_t *e) {
+            auto *ui = static_cast<DefaultUI *>(lv_event_get_user_data(e));
+            ui->scaleScreenRequested = false;
+            ui->controller->deactivate();
+            ui->changeScreen(SCREEN_ID_MENU_SCREEN_NEW);
+        },
+        LV_EVENT_CLICKED, this);
+    lv_obj_t *backImg = lv_img_create(backBtn);
+    lv_img_set_src(backImg, &img_angle_left_40x40);
+    lv_obj_center(backImg);
+}
+
 // Collect every lv_meter under obj (the dial gauges) so their tick length can be animated together.
 void DefaultUI::collectMeters(lv_obj_t *obj) {
     const uint32_t n = lv_obj_get_child_cnt(obj);
@@ -667,6 +787,7 @@ void DefaultUI::updateState() {
     pressureAvailable = controller->getSystemInfo().capabilities.pressure ? 1 : 0;
     wifiConnected = WiFi.status() == WL_CONNECTED;
     grindAvailable = settings.isSmartGrindActive() || settings.getAltRelayFunction() == ALT_RELAY_GRIND;
+    scaleMenuSwap = settings.isScaleMenuButton();
 
     uiFlags.brew_adjustments(brewScreenState == BrewScreenState::Settings);
     uiFlags.active(controller->isActive());
@@ -698,7 +819,9 @@ void DefaultUI::updateSystemStatus() {
     systemStatus.update_available(updateAvailable);
     systemStatus.in_menu(currentScreen == SCREEN_ID_MENU_SCREEN_NEW);
     systemStatus.pressure_available(pressureAvailable);
-    systemStatus.grind_available(grindAvailable);
+    // The Scale menu button reuses the grind slot, so the flow variable that
+    // shows/hides that button must account for both.
+    systemStatus.grind_available(grindAvailable || scaleMenuSwap);
     systemStatus.mode(mode);
     const String ip = apActive ? String("4.4.4.1") : WiFi.localIP().toString();
     if (stringChanged(systemStatus.ip(), ip.c_str()))
