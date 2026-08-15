@@ -73,7 +73,22 @@ void WebUIPlugin::setup(Controller *_controller, PluginManager *_pluginManager) 
         },
         "display-firmware.bin", "display-filesystem.bin", "board-firmware.bin");
     pluginManager->on("controller:wifi:connect", [this](Event const &event) {
-        apMode = event.getInt("AP");
+        const bool nowAp = event.getInt("AP") != 0;
+        // Since the AP-fallback retry landed, this event can fire a SECOND
+        // time with AP=0: the watchdog reconnects STA from AP fallback and
+        // Controller::loop() drops the config AP with WiFi.mode(WIFI_STA).
+        // start() early-returns once serverRunning is set, so without this the
+        // captive-portal DNS server created for AP mode is never torn down and
+        // loop() keeps polling it against an interface that no longer exists.
+        // stop() cannot be used here: it would also close the web server,
+        // which deliberately survives a reconnect (see start()).
+        if (apMode && !nowAp && dnsServer != nullptr) {
+            dnsServer->stop();
+            delete dnsServer;
+            dnsServer = nullptr;
+            ESP_LOGI("WebUIPlugin", "Stopped catchall DNS (STA recovered from AP fallback)");
+        }
+        apMode = nowAp;
         start();
     });
     // Intentionally do NOT stop the server on a WiFi disconnect: the listen

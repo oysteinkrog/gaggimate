@@ -41,6 +41,20 @@ void WifiStaWatchdogPlugin::loop() {
         if (apNow - lastApRetryMs < AP_STA_RETRY_MS)
             return;
         lastApRetryMs = apNow;
+        // Never touch WiFi mode or STA state while someone is actually using
+        // the config portal. Mode transitions and WiFi.begin()/disconnect()
+        // with a station associated to our softAP are a documented crash class
+        // in this Arduino core (dhcps and mode-switch faults), and every call
+        // below runs on core 0 — the same core as the WiFi/LWIP tasks,
+        // AsyncTCP and NimBLE, and the only core whose idle task is subscribed
+        // to the panic-enabled task watchdog. Deferring costs at most one retry
+        // interval of self-healing, and only while someone is connected to the
+        // portal, which is exactly when self-healing matters least.
+        if (WiFi.softAPgetStationNum() > 0) {
+            ESP_LOGI(LOG_TAG, "AP fallback: %u station(s) on the config AP, deferring STA retry",
+                     WiFi.softAPgetStationNum());
+            return;
+        }
         ESP_LOGW(LOG_TAG, "AP fallback active; retrying STA connect to %s", ssid.c_str());
         if (mode == WIFI_MODE_AP) {
             WiFi.mode(WIFI_AP_STA);
