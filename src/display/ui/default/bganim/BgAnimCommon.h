@@ -58,8 +58,20 @@ inline uint8_t clamp8f(float v) { return v < 0 ? 0 : (v > 255 ? 255 : static_cas
 
 // 256-entry float cosine table (built on first use) + radian-indexed helpers.
 // Truncation toward zero keeps negative radians valid via the & 255 wrap.
+//
+// The int64_t step is load-bearing, not decoration. Callers pass angles built
+// from tMs, which reaches 4.3e9 before it wraps, so the scaled argument
+// exceeds INT_MAX after a few days of uptime — and a float-to-int conversion
+// that overflows is undefined, so the & 255 would be masking a value the
+// conversion was never required to produce. int64_t covers every reachable
+// argument by a wide margin (the largest frequency any animation uses keeps
+// the product well under 1e12). Every call site is in frame(), a few hundred
+// times per frame at most, so the wider conversion costs nothing measurable;
+// do NOT copy this into a per-pixel loop.
 const float *cosTableF();
-inline float fastCosRad(float rad) { return cosTableF()[static_cast<int>(rad * (256.0f / 6.2831853f)) & 255]; }
+inline float fastCosRad(float rad) {
+    return cosTableF()[static_cast<int>(static_cast<int64_t>(rad * (256.0f / 6.2831853f)) & 255)];
+}
 inline float fastSinRad(float rad) { return fastCosRad(rad - 1.5707963f); }
 
 // 4x4 ordered dither matrix, values 0..15.

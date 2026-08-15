@@ -139,7 +139,14 @@ void frame(uint32_t tMs, int, int, const uint8_t p[4]) {
     const float spd = speedMul(p[0]);
     // Speed scales virtual time; a param change causes one phase jump, which
     // the slow breathing envelope absorbs invisibly.
-    const uint32_t vt = static_cast<uint32_t>(tMs * spd);
+    // Virtual time is deliberately modular (every use below is a shift-and-mask
+    // into a 1024-entry sine table), but tMs * spd reaches ~2.9e10 at the top
+    // of the speed range before tMs wraps, and converting a float that large
+    // straight to uint32_t is undefined rather than wrapping. Go through double
+    // (float's 24-bit mantissa cannot hold tMs near its wrap anyway) and then
+    // int64_t, where the conversion is defined, and let integer-to-unsigned do
+    // the modular reduction.
+    const uint32_t vt = static_cast<uint32_t>(static_cast<int64_t>(static_cast<double>(tMs) * spd));
     const float pulseGain = p[3] / 100.0f;
     const float s1 = sin1024((vt * STEP1) >> 22) * (1.0f / SIN_AMP);
     const float s2 = sin1024(((vt * STEP2) + PHOFF2) >> 22) * (1.0f / SIN_AMP);
