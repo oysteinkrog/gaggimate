@@ -18,7 +18,12 @@ constexpr int SIN_AMP = 512;
 const int16_t *sinLut();
 inline int16_t sin1024(uint32_t idx) { return sinLut()[idx & (SIN_N - 1)]; }
 
-void *alloc(size_t size); // prefer internal SRAM, fall back to PSRAM
+// Buffers up to this size prefer internal SRAM (latency matters for small,
+// randomly-indexed LUTs); larger ones go to PSRAM first so an animation's
+// bulk tables cannot starve WiFi/BLE, which share the SRAM pool. See alloc().
+constexpr size_t SRAM_ALLOC_LIMIT = 8192;
+
+void *alloc(size_t size); // see SRAM_ALLOC_LIMIT for the placement policy
 
 inline uint16_t rgb565(uint8_t r, uint8_t g, uint8_t b) {
     return static_cast<uint16_t>(((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3));
