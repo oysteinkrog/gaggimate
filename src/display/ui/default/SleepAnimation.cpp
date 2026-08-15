@@ -247,6 +247,25 @@ void SleepAnimation::renderLoop() {
 #ifdef GM_ANIM_BENCH
 void SleepAnimation::benchTick() {
     const unsigned long now = millis();
+    if (benchResetPending.exchange(false)) {
+        // Applied here, on the render task, so no dwell is half-recorded and
+        // the reader never sees a torn benchDone[].
+        for (int i = 0; i < BENCH_MAX_ANIMS; i++) {
+            benchDone[i] = BenchResult{};
+        }
+        accBandUs = accBlendUs = accPushUs = accTotalUs = 0;
+        accFrames = 0;
+        accMaxTotalUs = 0;
+        benchPasses = 0;
+        benchDwellStart = now;
+        uint8_t p[4];
+        bg_parse_params(nullptr, 0, p);
+        animParams.store(static_cast<uint32_t>(p[0]) | (static_cast<uint32_t>(p[1]) << 8) |
+                         (static_cast<uint32_t>(p[2]) << 16) | (static_cast<uint32_t>(p[3]) << 24));
+        animId.store(0);
+        log_i("animbench: results cleared, sweep restarted");
+        return;
+    }
     if (benchDwellStart == 0) {
         benchDwellStart = now;
         return;

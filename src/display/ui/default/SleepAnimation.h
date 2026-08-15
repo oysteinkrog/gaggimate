@@ -86,6 +86,11 @@ class SleepAnimation {
     const BenchResult *benchResults() const { return benchDone; }
     int benchCurrentAnim() const { return animId.load(); }
     uint32_t benchPassCount() const { return benchPasses; }
+    // Discards every recorded dwell and restarts the sweep from the first
+    // animation. Set from the web task after changing something the timings
+    // depend on (the pixel clock), so the next sweep measures the new state
+    // instead of averaging across the change.
+    void benchRequestReset() { benchResetPending.store(true); }
 #endif
 
   private:
@@ -134,6 +139,7 @@ class SleepAnimation {
     unsigned long benchDwellStart = 0;
     uint32_t benchPasses = 0; // completed sweeps of the whole registry
     BenchResult benchDone[BENCH_MAX_ANIMS];
+    std::atomic<bool> benchResetPending{false};
 
     void benchTick();      // called once per frame from renderLoop
     void benchFinishDwell(); // records the current animation and advances

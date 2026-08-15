@@ -11,6 +11,7 @@
 #include <display/plugins/BLEScalePlugin.h>
 #include <display/plugins/ShotHistoryPlugin.h>
 #ifdef GM_ANIM_BENCH
+#include <display/drivers/common/PanelClock.h>
 #include <display/ui/default/SleepAnimation.h>
 #include <display/ui/default/bganim/BgAnim.h>
 #endif
@@ -381,6 +382,22 @@ void WebUIPlugin::setupServer() {
     server.on("/api/animbench", [this](AsyncWebServerRequest *request) {
         AsyncResponseStream *response = request->beginResponseStream("application/json");
         JsonDocument doc;
+        // ?div=n reprograms the RGB pixel clock (pclk = 80 MHz / n) and
+        // restarts the sweep. Scan-out reads the PSRAM framebuffer
+        // continuously, so the divider sets how much of the octal-PSRAM budget
+        // is left for the render task's writes -- this is the knob that tests
+        // whether the flat push cost is a bandwidth floor. Not persisted: it
+        // reverts to the stored setting on the next boot.
+        if (request->hasArg("div")) {
+            const int div = request->arg("div").toInt();
+            if (div >= 2 && div <= 16) {
+                panelclock::setDiv(div);
+                SleepAnimation *a = sleep_animation_bench_instance();
+                if (a != nullptr) {
+                    a->benchRequestReset();
+                }
+            }
+        }
         const BenchGateState &g = bench_gate_state();
         JsonObject gate = doc["gate"].to<JsonObject>();
         gate["ui_initialized"] = g.uiInitialized;
@@ -398,6 +415,11 @@ void WebUIPlugin::setupServer() {
         gate["ctrl_initialized"] = controller->benchInitialized();
         gate["ctrl_screen_ready"] = controller->benchScreenReady();
         gate["uptime_ms"] = millis();
+        // The pixel prescale only, NOT the whole clock path: pclk is the LCD
+        // group clock (PLL160M divided by lcd_clkm_div_*) divided again by
+        // this. Reporting a derived Hz here would be wrong, so report the
+        // divider and let a caller compare relative values across settings.
+        gate["pclk_div"] = panelclock::currentDiv();
         SleepAnimation *anim = sleep_animation_bench_instance();
         if (anim == nullptr) {
             doc["running"] = false;
