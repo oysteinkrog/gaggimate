@@ -235,17 +235,30 @@ bool init(int w, int h) {
         for (int k = 0; k < 16; k++) {
             ditherLUT[k] = (BAYER4[k] / 16.0f - 0.5f) * (255.0f / 160.0f);
         }
-        // Build the merged vignette+dither table (see rowAux comment above):
-        // one array per y&3 phase, each spanning the full panel width. Both
-        // ditherLUT and g_vignK/cx are constant for the process lifetime at
-        // this point, so this is a true one-time cost.
+    }
+
+    // Build the merged vignette+dither table (see rowAux comment above): one
+    // array per y&3 phase, each spanning the full panel width. Both ditherLUT
+    // and g_vignK/cx are constant for the process lifetime at this point, so
+    // each phase is still built at most once.
+    //
+    // This deliberately sits OUTSIDE the lastGlow guard above, and each phase
+    // carries its own null check. Previously the whole thing lived inside that
+    // guard, which set lastGlow before allocating: if any phase failed, init()
+    // returned false but lastGlow stayed set, so the next activation skipped
+    // the block entirely -- retry and check alike -- and the trailing test
+    // only looked at rowAux[0]. A single transient allocation failure on any
+    // of phases 1-3 therefore became a permanent null dereference in band(),
+    // which indexes rowAux[y & 3] with no check of its own.
+    {
         const float cx = w * 0.5f;
-        bool ok = true;
         for (int ph = 0; ph < 4; ph++) {
+            if (rowAux[ph] != nullptr) {
+                continue;
+            }
             rowAux[ph] = static_cast<RowAux *>(alloc(w * sizeof(RowAux)));
             if (rowAux[ph] == nullptr) {
-                ok = false;
-                continue;
+                continue; // retried on the next init()
             }
             for (int x = 0; x < w; x++) {
                 const float dx = x - cx;
@@ -260,12 +273,13 @@ bool init(int w, int h) {
                 rowAux[ph][x].dith = static_cast<int32_t>(lroundf(ditherLUT[ph * 4 + (x & 3)] * 65536.0f));
             }
         }
-        if (!ok) {
+    }
+    // All four phases, unconditionally: band() dereferences whichever phase
+    // the row lands on, so any missing one must fail init().
+    for (int ph = 0; ph < 4; ph++) {
+        if (rowAux[ph] == nullptr) {
             return false;
         }
-    }
-    if (rowAux[0] == nullptr) {
-        return false;
     }
     return true;
 }

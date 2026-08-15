@@ -5,6 +5,14 @@
 void ControllerOTA::init(NimBLEClient *client, const ctr_progress_callback_t &progress_callback) {
     this->client = client;
     progressCallback = progress_callback;
+    // The caller hands us whatever the transport currently has, and that is
+    // null until a client object exists. Dereferencing it here panics the
+    // whole board, so refuse rather than trust: controller OTA needs a live
+    // link anyway and a later call re-runs this with a real client.
+    if (client == nullptr) {
+        ESP_LOGW("ControllerOTA", "init with no BLE client; controller OTA unavailable until the link is up");
+        return;
+    }
     NimBLERemoteService *pRemoteService = client->getService(NimBLEUUID(SERVICE_OTA_BLE_UUID));
     if (pRemoteService == nullptr) {
         ESP_LOGE("ControllerOTA", "OTA BLE service not found");
