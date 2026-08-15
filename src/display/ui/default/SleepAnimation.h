@@ -144,6 +144,21 @@ class SleepAnimation {
 // The running instance, so the web plugin can publish results without the
 // whole UI object graph being reachable from it. Null until start() runs.
 SleepAnimation *sleep_animation_bench_instance();
+
+// Why the animation is or is not running. maintainSleepAnimation() has several
+// gates and none of them are visible from outside the UI, which makes a
+// silently idle bench impossible to diagnose over the network.
+struct BenchGateState {
+    bool uiInitialized = false;
+    bool blocked = false;
+    bool wantAnimation = false;
+    bool animActive = false;
+    int mode = -1;
+    int screen = -1;
+    unsigned long lastStartAttempt = 0;
+    bool startFailed = false;
+};
+const BenchGateState &bench_gate_state();
 #endif
 
 #endif // GAGGIMATE_SIM

@@ -1,6 +1,13 @@
 #include "DefaultUI.h"
 
 #include <WiFi.h>
+#ifdef GM_ANIM_BENCH
+#include <display/ui/default/SleepAnimation.h>
+const BenchGateState &bench_gate_state() {
+    static BenchGateState state;
+    return state;
+}
+#endif
 #include <display/core/Controller.h>
 #include <display/core/process/BrewProcess.h>
 #include <display/core/process/Process.h>
@@ -356,6 +363,18 @@ void DefaultUI::maintainSleepAnimation() {
         currentScreen == SCREEN_ID_STANDBY_SCREEN && controller->getMode() == MODE_STANDBY && connected && !blocked;
     const bool wantAnimation = bgAnimAllScreens ? (initialized && !blocked) : sleepWant;
 
+#ifdef GM_ANIM_BENCH
+    {
+        BenchGateState &g = const_cast<BenchGateState &>(bench_gate_state());
+        g.uiInitialized = initialized;
+        g.blocked = blocked;
+        g.wantAnimation = wantAnimation;
+        g.animActive = sleepAnimation.isActive();
+        g.mode = controller->getMode();
+        g.screen = static_cast<int>(currentScreen);
+    }
+#endif
+
     if (wantAnimation) {
         if (!sleepAnimation.isActive()) {
             const unsigned long now = ::millis();
@@ -365,6 +384,11 @@ void DefaultUI::maintainSleepAnimation() {
                 startSleepAnimation();
                 if (!sleepAnimation.isActive()) {
                     lastSleepAnimAttempt = now;
+#ifdef GM_ANIM_BENCH
+                    BenchGateState &g = const_cast<BenchGateState &>(bench_gate_state());
+                    g.startFailed = true;
+                    g.lastStartAttempt = now;
+#endif
                 }
             }
         } else {
@@ -875,7 +899,13 @@ void DefaultUI::updateState() {
 #ifndef GAGGIMATE_SIM
     // Keep the background animation's selection and params current — cheap
     // (two atomic stores) and makes web-UI tweaks apply live on the next frame.
+#ifdef GM_ANIM_BENCH
+    // The bench exists to render animations, so do not make that conditional
+    // on being parked on the standby screen in standby mode.
+    bgAnimAllScreens = true;
+#else
     bgAnimAllScreens = settings.isBgAnimAllScreens();
+#endif
     uint8_t animP[4];
     const int animId = settings.getBgAnimId();
     bg_parse_params(settings.getBgAnimParams().c_str(), animId, animP);
