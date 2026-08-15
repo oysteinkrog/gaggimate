@@ -304,17 +304,35 @@ void band(uint16_t *dst, int y0, int rows, int w, uint32_t, const uint8_t *) {
                     // interior never contributes.
                     split = true;
                     const float halfInner = sqrtf(inner2 - dy2);
+                    // The two crossings touch when halfInner approaches 0,
+                    // which every mature ring does on the rows where |dy|
+                    // nears innerR: (int)(cx - eps) and (int)(cx + eps)
+                    // truncate to the SAME column, and nothing downstream
+                    // dedupes rings, so that column would accumulate this
+                    // ring's contribution twice. That is both a one-pixel
+                    // brightness artifact and an unmodelled term in the
+                    // clampU8 index bound derived above. Track where the left
+                    // crossing actually ended and start the right one after
+                    // it. -1 means the left crossing seeded nothing (bx0 is
+                    // always >= 0, so it can never collide with the sentinel).
+                    int leftEnd = -1;
                     {
                         const float leftF = g_cx[i] - halfOuter;
                         const float rightF = g_cx[i] - halfInner;
                         const int bx0 = static_cast<int>(leftF > 0.0f ? leftF : 0.0f);
                         const int bx1 = static_cast<int>(rightF < wMinus1 ? rightF : wMinus1);
+                        if (bx1 >= bx0) {
+                            leftEnd = bx1;
+                        }
                         seedBand(i, bx0, bx1);
                     }
                     {
                         const float leftF = g_cx[i] + halfInner;
                         const float rightF = g_cx[i] + halfOuter;
-                        const int bx0 = static_cast<int>(leftF > 0.0f ? leftF : 0.0f);
+                        int bx0 = static_cast<int>(leftF > 0.0f ? leftF : 0.0f);
+                        if (bx0 <= leftEnd) {
+                            bx0 = leftEnd + 1;
+                        }
                         const int bx1 = static_cast<int>(rightF < wMinus1 ? rightF : wMinus1);
                         seedBand(i, bx0, bx1);
                     }

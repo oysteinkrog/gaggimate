@@ -126,6 +126,20 @@ bool init(int, int) {
     return true;
 }
 
+// The DDS phase words are deliberately modular — only the low 32 bits are
+// ever used (band() masks with SIN_N-1 after shifting). But the values being
+// converted leave the range of uint32_t almost immediately: the phase
+// intercept grows without bound with uptime, and sinA*freq / cosA*freq are
+// negative for most of the angle sweep. Converting a double that is negative
+// or >= 2^32 directly to uint32_t is undefined behaviour, not a wrap: the
+// platform may saturate instead. x86 happens to wrap, which is exactly why
+// the host harness matched the reference frames while the real target's
+// behaviour was never actually guaranteed — and why -fsanitize=undefined
+// alone stayed silent here (GCC does not fold float-cast-overflow into it).
+// Reduce into int64_t first, where the conversion is defined, and let the
+// integer-to-unsigned conversion perform the modular wrap the design wants.
+inline uint32_t ddsQ(double v) { return static_cast<uint32_t>(static_cast<int64_t>(fmod(v, 4294967296.0))); }
+
 void frame(uint32_t tMs, int, int, const uint8_t p[4]) {
     if (themeGen() != lastThemeGen) {
         buildThemePalette();
@@ -143,9 +157,9 @@ void frame(uint32_t tMs, int, int, const uint8_t p[4]) {
         const float sinA = fastSinRad(ang);
         const float freq = FREQ_BASE[k] * freqScale; // rad/pixel
         const float phaseRad = PHASE0[k] + t * speedScale * SPEED_MUL[k] * 2.0f;
-        g_rowFreqQ[k] = static_cast<uint32_t>(static_cast<double>(sinA * freq) * PHASE_SCALE);
-        g_phaseQ[k] = static_cast<uint32_t>(static_cast<double>(phaseRad) * PHASE_SCALE);
-        g_stepQ[k] = static_cast<uint32_t>(static_cast<double>(cosA * freq) * PHASE_SCALE);
+        g_rowFreqQ[k] = ddsQ(static_cast<double>(sinA * freq) * PHASE_SCALE);
+        g_phaseQ[k] = ddsQ(static_cast<double>(phaseRad) * PHASE_SCALE);
+        g_stepQ[k] = ddsQ(static_cast<double>(cosA * freq) * PHASE_SCALE);
     }
 
     // Nonlinear shaping LUT: |sum of 3 sin1024 outputs| -> shading index
