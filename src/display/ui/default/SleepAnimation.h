@@ -161,8 +161,9 @@ class SleepAnimation {
     // round, so the corners of the 480x480 rectangle are never visible and
     // pushing them is wasted PSRAM bandwidth. One rectangle per band (the
     // widest row in it), since pushColors takes a rectangle.
-    int16_t bandX0[32] = {};
-    int16_t bandX1[32] = {};
+    static constexpr int MAX_BANDS = 64; // 480 rows / BAND_H, with headroom
+    int16_t bandX0[MAX_BANDS] = {};
+    int16_t bandX1[MAX_BANDS] = {};
     void computeChords(int w, int h);
     static void pushTaskEntry(void *arg);
     void pushLoop();

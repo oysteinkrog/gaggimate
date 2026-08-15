@@ -157,10 +157,22 @@ void band(uint16_t *dst, int y0, int rows, int w, uint32_t, const uint8_t *) {
         for (int k = 0; k < 8; k++) {
             dith[k] = (static_cast<int>(bayerRow[k]) - 31) / 4;
         }
+#ifdef GM_NEBULA_CACHED_NOISE_PROBE
+        // Diagnostic only, visually wrong: pin all four samplers to one noise
+        // row so the working set is 256 bytes and always cache-resident. If
+        // band time collapses, the cost is PSRAM misses on the 64 KB texture
+        // (alloc() puts it there, being far over the 8 KB threshold) and not
+        // the per-row table math. Never build this into anything shipping.
+        const uint8_t *rowA0 = noise;
+        const uint8_t *rowA1 = noise;
+        const uint8_t *rowB = noise;
+        const uint8_t *rowC = noise;
+#else
         const uint8_t *rowA0 = noise + ((y + g_ayI) & 255) * 256;
         const uint8_t *rowA1 = noise + ((y + g_ayI + 1) & 255) * 256;
         const uint8_t *rowB = noise + ((y * 2 + g_by) & 255) * 256;
         const uint8_t *rowC = noise + ((y * 4 + g_cy) & 255) * 256;
+#endif
 
         // Build the bilinear-blended dominant octave once per row — reused
         // for the whole row via the x0 wraparound below. i=255's neighbor

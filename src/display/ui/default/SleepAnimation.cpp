@@ -29,7 +29,13 @@ constexpr unsigned long BENCH_DWELL_MS = 6000;
 #endif
 
 namespace {
-constexpr int BAND_H = 16; // rows rendered/pushed per chunk
+// Rows rendered/pushed per chunk. 8 rather than 16 halves both band buffers
+// (they are the largest internal-SRAM consumers this feature has, and internal
+// SRAM is what the animations' lookup tables compete for). It doubles the
+// number of pushColors calls per frame, which the measurements say is free:
+// push cost is per byte, not per call -- it was flat at ~23 ms across thirteen
+// animations that share nothing but their byte count.
+constexpr int BAND_H = 8;
 // Headroom for the snapshot's ext draw size (shadows etc. extend the render
 // area past the object on every side).
 constexpr int OVERLAY_EXT_MARGIN = 16;
@@ -231,7 +237,7 @@ void SleepAnimation::computeChords(int w, int h) {
     const float cy = (h - 1) * 0.5f;
     const float r = (w < h ? w : h) * 0.5f;
     const int bands = (h + BAND_H - 1) / BAND_H;
-    for (int b = 0; b < bands && b < 32; b++) {
+    for (int b = 0; b < bands && b < MAX_BANDS; b++) {
         const int y0 = b * BAND_H;
         const int y1 = (y0 + BAND_H < h ? y0 + BAND_H : h) - 1;
         // Widest row in the band is the one nearest the vertical centre.
