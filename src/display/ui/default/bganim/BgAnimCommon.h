@@ -44,6 +44,47 @@ inline uint32_t nextRand(uint32_t &s) {
     s ^= s << 5;
     return s;
 }
+inline float nextRandf(uint32_t &s) { return (nextRand(s) >> 8) * (1.0f / 16777216.0f); }
+
+inline float lerpf(float a, float b, float t) { return a + (b - a) * t; }
+
+inline uint8_t clamp8f(float v) { return v < 0 ? 0 : (v > 255 ? 255 : static_cast<uint8_t>(v)); }
+
+// 256-entry float cosine table (built on first use) + radian-indexed helpers.
+// Truncation toward zero keeps negative radians valid via the & 255 wrap.
+const float *cosTableF();
+inline float fastCosRad(float rad) { return cosTableF()[static_cast<int>(rad * (256.0f / 6.2831853f)) & 255]; }
+inline float fastSinRad(float rad) { return fastCosRad(rad - 1.5707963f); }
+
+// 4x4 ordered dither matrix, values 0..15.
+extern const uint8_t BAYER4[16];
+// 8x8 ordered dither matrix, values 0..63.
+extern const uint8_t BAYER8[64];
+
+// Alpha blend fg over bg, alpha Q8 (0..256).
+inline uint16_t blendQ8(uint16_t bg, uint16_t fg, int aQ8) {
+    const int br = (bg >> 11) & 0x1F, bgc = (bg >> 5) & 0x3F, bb = bg & 0x1F;
+    const int fr = (fg >> 11) & 0x1F, fgc = (fg >> 5) & 0x3F, fb = fg & 0x1F;
+    const int r = br + (((fr - br) * aQ8) >> 8);
+    const int g = bgc + (((fgc - bgc) * aQ8) >> 8);
+    const int b = bb + (((fb - bb) * aQ8) >> 8);
+    return static_cast<uint16_t>((r << 11) | (g << 5) | b);
+}
+
+// Saturating additive blend of an 8-bit RGB source scaled by 8-bit alpha
+// (glow sprites: fireflies, steam, star streaks).
+inline uint16_t addScaled565(uint16_t dst, uint8_t r, uint8_t g, uint8_t b, uint8_t a) {
+    int dr = ((dst >> 11) & 0x1F) + ((r * a) >> 11);
+    int dg = ((dst >> 5) & 0x3F) + ((g * a) >> 10);
+    int db = (dst & 0x1F) + ((b * a) >> 11);
+    if (dr > 0x1F)
+        dr = 0x1F;
+    if (dg > 0x3F)
+        dg = 0x3F;
+    if (db > 0x1F)
+        db = 0x1F;
+    return static_cast<uint16_t>((dr << 11) | (dg << 5) | db);
+}
 
 // Builds a 256-entry RGB565 palette by interpolating RGB keyframes around a
 // wheel, scaled by brightness (0-256 = 0-100%).
