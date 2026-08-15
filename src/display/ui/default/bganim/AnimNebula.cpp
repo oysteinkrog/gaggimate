@@ -62,6 +62,8 @@ void frame(uint32_t, int, int, const uint8_t p[4]) {
 }
 
 void band(uint16_t *dst, int y0, int rows, int w, uint32_t, const uint8_t *) {
+    const int axF = g_axF, ayF = g_ayF, wA = g_wA, wB = g_wB, densOff = g_densOff;
+    static uint8_t blendedA[256];
     for (int r = 0; r < rows; r++) {
         const int y = y0 + r;
         uint16_t *row = dst + static_cast<size_t>(r) * w;
@@ -74,22 +76,33 @@ void band(uint16_t *dst, int y0, int rows, int w, uint32_t, const uint8_t *) {
         const uint8_t *rowA1 = noise + ((y + g_ayI + 1) & 255) * 256;
         const uint8_t *rowB = noise + ((y * 2 + g_by) & 255) * 256;
         const uint8_t *rowC = noise + ((y * 4 + g_cy) & 255) * 256;
+
+        for (int i = 0; i < 256; i++) {
+            const int i1 = (i + 1) & 255;
+            const int da0 = static_cast<int>(rowA0[i1]) - static_cast<int>(rowA0[i]);
+            const int va = rowA0[i] + ((da0 * axF) >> 8);
+            const int da1 = static_cast<int>(rowA1[i1]) - static_cast<int>(rowA1[i]);
+            const int vb = rowA1[i] + ((da1 * axF) >> 8);
+            blendedA[i] = static_cast<uint8_t>(va + (((vb - va) * ayF) >> 8));
+        }
+
+        int x0 = g_axI & 255;
+        int bIdx = g_bx & 255;
+        int cIdx = g_cx & 255;
         for (int x = 0; x < w; x++) {
-            // Octave A: bilinear (dominant low-frequency layer, banding-prone).
-            const int x0 = (x + g_axI) & 255;
-            const int x1 = (x0 + 1) & 255;
-            const int va = (rowA0[x0] * (256 - g_axF) + rowA0[x1] * g_axF) >> 8;
-            const int vb = (rowA1[x0] * (256 - g_axF) + rowA1[x1] * g_axF) >> 8;
-            const int a = (va * (256 - g_ayF) + vb * g_ayF) >> 8;
-            const int b = rowB[(x * 2 + g_bx) & 255];
-            const int c = rowC[(x * 4 + g_cx) & 255];
-            int v = ((a * g_wA + b * g_wB + c * g_wC) >> 6) + g_densOff + dith[x & 7];
+            const int a = blendedA[x0];
+            const int b = rowB[bIdx];
+            const int c = rowC[cIdx];
+            int v = c + ((((a - c) * wA) + ((b - c) * wB)) >> 6) + densOff + dith[x & 7];
             if (v < 0) {
                 v = 0;
             } else if (v > 255) {
                 v = 255;
             }
             row[x] = palette[v];
+            x0 = (x0 + 1) & 255;
+            bIdx = (bIdx + 2) & 255;
+            cIdx = (cIdx + 4) & 255;
         }
     }
 }
