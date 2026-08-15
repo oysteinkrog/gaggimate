@@ -384,31 +384,53 @@ export function MachineTab({ formData, onChange, setField }) {
             </div>
 
             <div className='grid grid-cols-1 gap-4 md:grid-cols-2'>
+              {/* Factors can be negative (load cell orientation), but mobile
+                  numeric keypads have no minus key — the ± button covers that. */}
               <SettingsFormField label='Load Cell 1 Scale Factor' htmlFor='scaleFactor1' noMargin>
-                <input
-                  id='scaleFactor1'
-                  name='scaleFactor1'
-                  type='number'
-                  className='input input-bordered w-full'
-                  min='-50000'
-                  max='50000'
-                  step='0.01'
-                  value={formData.scaleFactor1}
-                  onChange={onChange('scaleFactor1')}
-                />
+                <div className='join w-full'>
+                  <input
+                    id='scaleFactor1'
+                    name='scaleFactor1'
+                    type='number'
+                    className='input input-bordered join-item w-full'
+                    min='-50000'
+                    max='50000'
+                    step='0.01'
+                    value={formData.scaleFactor1}
+                    onChange={onChange('scaleFactor1')}
+                  />
+                  <button
+                    type='button'
+                    className='btn btn-outline join-item'
+                    aria-label='Flip sign of load cell 1 scale factor'
+                    onClick={() => setField('scaleFactor1', String(-(parseFloat(formData.scaleFactor1) || 0)))}
+                  >
+                    &plusmn;
+                  </button>
+                </div>
               </SettingsFormField>
               <SettingsFormField label='Load Cell 2 Scale Factor' htmlFor='scaleFactor2' noMargin>
-                <input
-                  id='scaleFactor2'
-                  name='scaleFactor2'
-                  type='number'
-                  className='input input-bordered w-full'
-                  min='-50000'
-                  max='50000'
-                  step='0.01'
-                  value={formData.scaleFactor2}
-                  onChange={onChange('scaleFactor2')}
-                />
+                <div className='join w-full'>
+                  <input
+                    id='scaleFactor2'
+                    name='scaleFactor2'
+                    type='number'
+                    className='input input-bordered join-item w-full'
+                    min='-50000'
+                    max='50000'
+                    step='0.01'
+                    value={formData.scaleFactor2}
+                    onChange={onChange('scaleFactor2')}
+                  />
+                  <button
+                    type='button'
+                    className='btn btn-outline join-item'
+                    aria-label='Flip sign of load cell 2 scale factor'
+                    onClick={() => setField('scaleFactor2', String(-(parseFloat(formData.scaleFactor2) || 0)))}
+                  >
+                    &plusmn;
+                  </button>
+                </div>
               </SettingsFormField>
             </div>
           </div>
