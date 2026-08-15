@@ -221,6 +221,18 @@ static void parseFloatCsv(const String &csv, float *out, size_t count, float def
 }
 
 void Controller::setupBluetooth() {
+#ifdef GM_FAKE_CONTROLLER
+    // Bench build: there is no controller board, so skip BLE entirely and hand
+    // the UI the SystemInfo it would have received over the link. onSystemInfo
+    // is the single funnel for the whole handshake -- it triggers
+    // controller:ready and controller:bluetooth:connect, which is what clears
+    // the "waiting for controller" screen and lets standby (and therefore the
+    // background animation) come up.
+    ESP_LOGW(LOG_TAG, "GM_FAKE_CONTROLLER: synthesizing a connected controller, BLE stays off");
+    onSystemInfo("FakeBench", "bench", gm_proto::PROTOCOL_VERSION, /*dimming=*/true, /*pressure=*/true,
+                 /*ledControl=*/false, /*tof=*/false, std::vector<uint32_t>{});
+    return;
+#else
     comms.init("GPBLC");
     comms.onConnectionChanged([this](bool connected) {
         // Force a full control resend after any (re)connect -- the controller
@@ -365,6 +377,7 @@ void Controller::setupBluetooth() {
         pluginManager->trigger("controller:tof:change", "value", tofDistance);
     });
     pluginManager->trigger("controller:bluetooth:init");
+#endif // GM_FAKE_CONTROLLER
 }
 
 void Controller::onSystemInfo(const char *hardware, const char *version, uint32_t protocolVersion, bool dimming, bool pressure,
@@ -588,6 +601,24 @@ void Controller::loop() {
         connect();
     }
 
+#ifdef GM_FAKE_CONTROLLER
+    // No BLE stack was ever initialized in this build, so the comms pump and
+    // the scan/connect path below must not run. Feed the UI synthetic
+    // telemetry instead: the standby screen and the animation overlay both
+    // read these, and a frozen 0 C reading is visually misleading on a bench.
+    if (initialized) {
+        static unsigned long lastFake = 0;
+        const unsigned long fakeNow = millis();
+        if (fakeNow - lastFake >= 250) {
+            lastFake = fakeNow;
+            const float phase = static_cast<float>(fakeNow) / 30000.0f;
+            onTempRead(92.0f + 1.5f * sinf(phase));
+            pressure = 1.0f + 0.2f * sinf(phase * 2.0f);
+            pluginManager->trigger("boiler:pressure:change", "value", pressure);
+        }
+    }
+    return;
+#else
     if (initialized) {
         comms.loop(); // drive the comms send pump + retransmit
     }
@@ -614,6 +645,7 @@ void Controller::loop() {
     if (comms.isReadyForConnection() && comms.connectToServer()) {
         waitingForController = false;
     }
+#endif // GM_FAKE_CONTROLLER
 }
 
 void Controller::loopLogic() {

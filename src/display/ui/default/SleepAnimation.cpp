@@ -8,6 +8,19 @@
 #include <esp_timer.h>
 #include <math.h>
 
+// Stage timers for the bench build. These compile to nothing in a normal
+// build, so the shipping render path carries no measurement overhead.
+#ifdef GM_ANIM_BENCH
+#define BENCH_T0(v) const int64_t v = esp_timer_get_time()
+#define BENCH_ACC(acc, t0) (acc) += static_cast<uint64_t>(esp_timer_get_time() - (t0))
+// How long to sit on each animation before recording it. Long enough that the
+// mean is not dominated by the first frames, where the lazy LUT init runs.
+constexpr unsigned long BENCH_DWELL_MS = 6000;
+#else
+#define BENCH_T0(v) ((void)0)
+#define BENCH_ACC(acc, t0) ((void)0)
+#endif
+
 namespace {
 constexpr int BAND_H = 16; // rows rendered/pushed per chunk
 // Headroom for the snapshot's ext draw size (shadows etc. extend the render
@@ -44,10 +57,27 @@ void *allocPreferInternal(size_t size) {
 SleepAnimation::~SleepAnimation() { stop(); }
 
 void SleepAnimation::configure(uint8_t id, const uint8_t p[4]) {
+#ifdef GM_ANIM_BENCH
+    // The bench owns the selection: DefaultUI re-applies the stored animation
+    // on every UI pass, which would otherwise yank the sweep back to whatever
+    // is saved in settings after each frame.
+    (void)id;
+    (void)p;
+    return;
+#else
     animId.store(id);
     animParams.store(static_cast<uint32_t>(p[0]) | (static_cast<uint32_t>(p[1]) << 8) | (static_cast<uint32_t>(p[2]) << 16) |
                      (static_cast<uint32_t>(p[3]) << 24));
+#endif
 }
+
+#ifdef GM_ANIM_BENCH
+namespace {
+SleepAnimation *g_benchInstance = nullptr;
+} // namespace
+
+SleepAnimation *sleep_animation_bench_instance() { return g_benchInstance; }
+#endif
 
 void SleepAnimation::start(Display *d) {
     // !stopped: a previous task timed out its stop() and hasn't exited yet —
@@ -55,6 +85,9 @@ void SleepAnimation::start(Display *d) {
     if (running || !stopped || d == nullptr) {
         return;
     }
+#ifdef GM_ANIM_BENCH
+    g_benchInstance = this;
+#endif
     display = d;
     const int w = display->width();
     const int h = display->height();
@@ -182,6 +215,15 @@ void SleepAnimation::renderLoop() {
         const int64_t frameStart = esp_timer_get_time();
         renderFrame();
         fpsFrames++;
+#ifdef GM_ANIM_BENCH
+        const uint32_t frameUs = static_cast<uint32_t>(esp_timer_get_time() - frameStart);
+        accTotalUs += frameUs;
+        accFrames++;
+        if (frameUs > accMaxTotalUs) {
+            accMaxTotalUs = frameUs;
+        }
+        benchTick();
+#endif
 
         const unsigned long now = millis();
         if (now - fpsWindowStart >= 10000) {
@@ -202,6 +244,57 @@ void SleepAnimation::renderLoop() {
     }
 }
 
+#ifdef GM_ANIM_BENCH
+void SleepAnimation::benchTick() {
+    const unsigned long now = millis();
+    if (benchDwellStart == 0) {
+        benchDwellStart = now;
+        return;
+    }
+    if (now - benchDwellStart >= BENCH_DWELL_MS) {
+        benchFinishDwell();
+    }
+}
+
+void SleepAnimation::benchFinishDwell() {
+    const int id = animId.load();
+    const unsigned long elapsedMs = millis() - benchDwellStart;
+    if (id >= 0 && id < BENCH_MAX_ANIMS && accFrames > 0) {
+        BenchResult &r = benchDone[id];
+        r.frames = accFrames;
+        r.bandUs = static_cast<uint32_t>(accBandUs / accFrames);
+        r.blendUs = static_cast<uint32_t>(accBlendUs / accFrames);
+        r.pushUs = static_cast<uint32_t>(accPushUs / accFrames);
+        r.totalUs = static_cast<uint32_t>(accTotalUs / accFrames);
+        r.maxTotalUs = accMaxTotalUs;
+        r.achievedFps = elapsedMs > 0 ? static_cast<uint32_t>(accFrames * 100000ULL / elapsedMs) : 0;
+        r.valid = true; // publish last: readers on other tasks gate on this
+        log_i("animbench: %-10s band=%u us blend=%u us push=%u us total=%u us max=%u us fps=%u.%02u",
+              bg_animation(id).id, r.bandUs, r.blendUs, r.pushUs, r.totalUs, r.maxTotalUs, r.achievedFps / 100,
+              r.achievedFps % 100);
+    }
+
+    accBandUs = accBlendUs = accPushUs = accTotalUs = 0;
+    accFrames = 0;
+    accMaxTotalUs = 0;
+    benchDwellStart = millis();
+
+    const int count = bg_animation_count();
+    const int next = (id + 1) % count;
+    if (next == 0) {
+        benchPasses++;
+        log_i("animbench: completed sweep %u of all %d animations", benchPasses, count);
+    }
+    // Each animation is measured at its own documented defaults, so a run is
+    // reproducible and comparable against the host harness numbers.
+    uint8_t p[4];
+    bg_parse_params(nullptr, next, p);
+    animParams.store(static_cast<uint32_t>(p[0]) | (static_cast<uint32_t>(p[1]) << 8) | (static_cast<uint32_t>(p[2]) << 16) |
+                     (static_cast<uint32_t>(p[3]) << 24));
+    animId.store(static_cast<uint8_t>(next));
+}
+#endif
+
 void SleepAnimation::renderFrame() {
     const int w = display->width();
     const int h = display->height();
@@ -220,7 +313,9 @@ void SleepAnimation::renderFrame() {
         }
         initializedAnimId = id;
     }
+    BENCH_T0(tSetup);
     anim.frame(tMs, w, h, p);
+    BENCH_ACC(accBandUs, tSetup);
 
     // One overlay for the whole frame; a publish mid-frame lands next frame.
     // The load/store/load dance closes the race with publishOverlay: after it,
@@ -236,7 +331,10 @@ void SleepAnimation::renderFrame() {
 
     for (int y0 = 0; y0 < h && running; y0 += BAND_H) {
         const int rows = (y0 + BAND_H <= h) ? BAND_H : (h - y0);
+        BENCH_T0(tBand);
         anim.band(band, y0, rows, w, tMs, p);
+        BENCH_ACC(accBandUs, tBand);
+        BENCH_T0(tBlend);
         for (int y = y0; y < y0 + rows; y++) {
             if (ov != nullptr && ov->spanMin[y] >= 0) {
                 // Composite the standby widgets over the plasma (span-limited:
@@ -257,11 +355,14 @@ void SleepAnimation::renderFrame() {
                 }
             }
         }
+        BENCH_ACC(accBlendUs, tBlend);
         // pushColors' width/height params are actually END coordinates — they
         // pass through unchanged to esp_lcd_panel_draw_bitmap (exclusive end).
         // Passing dimensions here asserted in rgb_panel_draw_bitmap on the
         // second band (y_start==y_end) and boot-looped sleep3/sleep4.
+        BENCH_T0(tPush);
         display->pushColors(0, y0, w, y0 + rows, band);
+        BENCH_ACC(accPushUs, tPush);
     }
 }
 

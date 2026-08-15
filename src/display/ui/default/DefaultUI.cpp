@@ -343,7 +343,15 @@ void DefaultUI::maintainSleepAnimation() {
 #ifndef GAGGIMATE_SIM
     const bool blocked = controller->isUpdating() || controller->isErrorState() || controller->isAutotuning() ||
                          controller->getSystemInfo().protocolMismatch;
+#ifdef GM_FAKE_CONTROLLER
+    // Bench build: no controller board is attached and BLE is never started, so
+    // the real link is permanently down. Only this gate is faked -- the client
+    // still reports honestly everywhere else, so nothing tries to transmit on
+    // an uninitialized BLE stack.
+    const bool connected = true;
+#else
     const bool connected = controller->getClientController() != nullptr && controller->getClientController()->isConnected();
+#endif
     const bool sleepWant =
         currentScreen == SCREEN_ID_STANDBY_SCREEN && controller->getMode() == MODE_STANDBY && connected && !blocked;
     const bool wantAnimation = bgAnimAllScreens ? (initialized && !blocked) : sleepWant;

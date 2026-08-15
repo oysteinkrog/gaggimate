@@ -10,6 +10,10 @@
 #include <display/models/profile.h>
 #include <display/plugins/BLEScalePlugin.h>
 #include <display/plugins/ShotHistoryPlugin.h>
+#ifdef GM_ANIM_BENCH
+#include <display/ui/default/SleepAnimation.h>
+#include <display/ui/default/bganim/BgAnim.h>
+#endif
 #include <display/util/PsramStlAllocator.h>
 #include <display/util/PsramWsBuffer.h>
 #include <display/webassets/web_ui_manifest.h>
@@ -356,6 +360,43 @@ void WebUIPlugin::setupServer() {
         serializeJson(doc, *response);
         request->send(response);
     });
+#ifdef GM_ANIM_BENCH
+    // Bench build only: the render task's own per-stage frame timings. Serial
+    // is not a usable channel on this board (the IDF console goes to UART0,
+    // not the USB CDC), so results come out over HTTP.
+    server.on("/api/animbench", [](AsyncWebServerRequest *request) {
+        AsyncResponseStream *response = request->beginResponseStream("application/json");
+        JsonDocument doc;
+        SleepAnimation *anim = sleep_animation_bench_instance();
+        if (anim == nullptr) {
+            doc["running"] = false;
+            doc["error"] = "animation task not started";
+        } else {
+            doc["running"] = true;
+            doc["passes"] = anim->benchPassCount();
+            doc["current"] = bg_animation(anim->benchCurrentAnim()).id;
+            JsonArray arr = doc["results"].to<JsonArray>();
+            const SleepAnimation::BenchResult *res = anim->benchResults();
+            for (int i = 0; i < bg_animation_count() && i < SleepAnimation::BENCH_MAX_ANIMS; i++) {
+                if (!res[i].valid) {
+                    continue;
+                }
+                JsonObject o = arr.add<JsonObject>();
+                o["id"] = bg_animation(i).id;
+                o["name"] = bg_animation(i).name;
+                o["frames"] = res[i].frames;
+                o["band_us"] = res[i].bandUs;
+                o["blend_us"] = res[i].blendUs;
+                o["push_us"] = res[i].pushUs;
+                o["total_us"] = res[i].totalUs;
+                o["max_us"] = res[i].maxTotalUs;
+                o["fps"] = res[i].achievedFps / 100.0;
+            }
+        }
+        serializeJson(doc, *response);
+        request->send(response);
+    });
+#endif
     server.on("/api/scales/list", [this](AsyncWebServerRequest *request) { handleBLEScaleList(request); });
     server.on("/api/scales/connect", [this](AsyncWebServerRequest *request) { handleBLEScaleConnect(request); });
     server.on("/api/scales/scan", [this](AsyncWebServerRequest *request) { handleBLEScaleScan(request); });
