@@ -27,7 +27,14 @@ struct Blob {
     float seed;
 };
 struct BlobDraw {
-    float x, y, R, invR2;
+    // Fixed-point draw state (all set once per frame in frame(), consumed
+    // per-pixel in band()). xi/yi/Ri are rounded pixel-space ints; scaleQ is
+    // a Q16.16 factor so idx = ((dx*dx+dy2)*scaleQ) >> 16 reproduces
+    // (dist^2 * invR2 * 63) without any float ops in the band inner loop.
+    // Bounded: (dx*dx+dy2) <= 2*Ri*Ri inside the bbox, so the product never
+    // exceeds 2*63*65536 (~8.3M) regardless of R -- always safe in int32.
+    int xi, yi, Ri;
+    int32_t scaleQ;
     uint8_t a8, r, g, b;
     bool visible;
 };
@@ -125,24 +132,29 @@ void frame(uint32_t tMs, int w, int h, const uint8_t p[4]) {
         const Wisp &wp = wisps[b.wisp];
         const float rise = riseSpeed * age;
         const float heightFrac = fminf(1.0f, rise / maxHeight);
-        d.y = wp.y0 - rise;
-        d.R = (10.0f + 26.0f * heightFrac) * (0.85f + 0.3f * fastSinRad(b.seed));
+        const float y = wp.y0 - rise;
+        const float R = (10.0f + 26.0f * heightFrac) * (0.85f + 0.3f * fastSinRad(b.seed));
         const float swayAmp = (5.0f + 22.0f * heightFrac) * swirl;
-        d.x = wp.x0 + swayAmp * fastSinRad(wp.swayFreq1 * tMs + wp.swayPhase1 + b.seed) +
-              swayAmp * 0.35f * fastSinRad(wp.swayFreq2 * tMs + wp.swayPhase2 + b.seed * 1.7f);
+        const float x = wp.x0 + swayAmp * fastSinRad(wp.swayFreq1 * tMs + wp.swayPhase1 + b.seed) +
+                        swayAmp * 0.35f * fastSinRad(wp.swayFreq2 * tMs + wp.swayPhase2 + b.seed * 1.7f);
         float alpha = density * 0.44f * 4.0f * L * (1.0f - L) * (1.0f - heightFrac * 0.3f);
         if (alpha > 0.4f) {
             alpha = 0.4f; // hard cap: steam stays vapor, never opaque
         }
         d.a8 = static_cast<uint8_t>(alpha * 255.0f);
-        d.invR2 = 1.0f / (d.R * d.R);
+        // Round to nearest pixel/Q16.16 once per blob per frame (cheap:
+        // <=55 blobs/frame); the band loop below then stays all-integer.
+        d.xi = static_cast<int>(x >= 0.0f ? x + 0.5f : x - 0.5f);
+        d.yi = static_cast<int>(y >= 0.0f ? y + 0.5f : y - 0.5f);
+        d.Ri = static_cast<int>(R + 0.5f);
+        d.scaleQ = static_cast<int32_t>(63.0f * 65536.0f / (R * R) + 0.5f);
         // Wisps ride the theme's bright end, shifting slightly as they rise.
         uint8_t c[3];
         themeRGB(200 + static_cast<int>(heightFrac * 55.0f), c);
         d.r = c[0];
         d.g = c[1];
         d.b = c[2];
-        d.visible = d.a8 > 0 && d.y > -30.0f;
+        d.visible = d.a8 > 0 && y > -30.0f;
     }
 }
 
@@ -150,26 +162,39 @@ void band(uint16_t *dst, int y0, int rows, int w, uint32_t, const uint8_t *) {
     for (int r = 0; r < rows; r++) {
         const uint16_t c = bgLUT[y0 + r];
         uint16_t *row = dst + static_cast<size_t>(r) * w;
-        for (int x = 0; x < w; x++) {
-            row[x] = c;
+        // Fill two pixels per store: the band buffer is 4-byte aligned and
+        // w is even (480), so pairing halves store traffic vs. one s16i/px.
+        // Odd-width tail (defensive; never hit at w=480) falls back to a
+        // single 16-bit store.
+        const uint32_t c2 = (static_cast<uint32_t>(c) << 16) | c;
+        uint32_t *row32 = reinterpret_cast<uint32_t *>(row);
+        const int pairs = w >> 1;
+        for (int x = 0; x < pairs; x++) {
+            row32[x] = c2;
+        }
+        if (w & 1) {
+            row[w - 1] = c;
         }
     }
     for (int i = 0; i < g_active; i++) {
         const BlobDraw &d = draws[i];
-        if (!d.visible || d.y + d.R < y0 || d.y - d.R >= y0 + rows) {
+        if (!d.visible || d.yi + d.Ri < y0 || d.yi - d.Ri >= y0 + rows) {
             continue;
         }
-        const int yy0 = static_cast<int>(fmaxf(static_cast<float>(y0), d.y - d.R));
-        const int yy1 = static_cast<int>(fminf(static_cast<float>(y0 + rows - 1), d.y + d.R));
-        const int xx0 = static_cast<int>(fmaxf(0.0f, d.x - d.R));
-        const int xx1 = static_cast<int>(fminf(static_cast<float>(w - 1), d.x + d.R));
+        const int yy0 = d.yi - d.Ri > y0 ? d.yi - d.Ri : y0;
+        const int yy1 = d.yi + d.Ri < y0 + rows - 1 ? d.yi + d.Ri : y0 + rows - 1;
+        const int xx0 = d.xi - d.Ri > 0 ? d.xi - d.Ri : 0;
+        const int xx1 = d.xi + d.Ri < w - 1 ? d.xi + d.Ri : w - 1;
         for (int yy = yy0; yy <= yy1; yy++) {
-            const float dy = yy - d.y;
-            const float dy2 = dy * dy;
+            const int dy = yy - d.yi;
+            const int dy2 = dy * dy;
             uint16_t *row = dst + static_cast<size_t>(yy - y0) * w;
             for (int xx = xx0; xx <= xx1; xx++) {
-                const float dx = xx - d.x;
-                const int idx = static_cast<int>((dx * dx + dy2) * d.invR2 * 63.0f);
+                const int dx = xx - d.xi;
+                // All-integer stamp lookup: (dx*dx+dy2) <= 2*Ri*Ri inside
+                // this bbox, so the product with scaleQ (Q16.16) never
+                // overflows int32 -- see BlobDraw comment.
+                const int32_t idx = ((dx * dx + dy2) * d.scaleQ) >> 16;
                 if (idx >= 64) {
                     continue;
                 }

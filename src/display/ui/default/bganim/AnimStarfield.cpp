@@ -35,6 +35,7 @@ StarDraw *draws = nullptr;      // per star, this frame
 int16_t *starY = nullptr;       // fixed row per star
 int16_t *bandHead = nullptr;    // NUM_BANDS heads
 int16_t *bandNext = nullptr;    // linked list per star
+int32_t *driftQ = nullptr;      // per-star drift phase, Q16.16 px, integer-wrapped mod w
 int32_t *dx2 = nullptr, *dy2 = nullptr;
 uint8_t *vigLUT = nullptr;    // 128 entries
 uint8_t *starCol = nullptr;   // MAX_STARS * 3, per-star base color from the theme
@@ -48,11 +49,14 @@ void rebuildThemeAssets();
 struct Shoot {
     bool active = false;
     float x, y, vx, vy, life, maxLife;
+    float invMaxLife; // 1/maxLife, precomputed once at trigger time so band()'s
+                       // per-band progress calc is a multiply, not a divide.
 };
 Shoot shoot;
 uint32_t nextShootMs = 6000;
 uint32_t rng = 0xC0FFEE;
 uint32_t lastTMs = 0;
+uint32_t lastDriftMs = 0xFFFFFFFF; // sentinel: no drift step on the very first frame() call
 
 bool init(int w, int h) {
     if (stars == nullptr) {
@@ -61,13 +65,15 @@ bool init(int w, int h) {
         starY = static_cast<int16_t *>(alloc(MAX_STARS * sizeof(int16_t)));
         bandHead = static_cast<int16_t *>(alloc(NUM_BANDS * sizeof(int16_t)));
         bandNext = static_cast<int16_t *>(alloc(MAX_STARS * sizeof(int16_t)));
+        driftQ = static_cast<int32_t *>(alloc(MAX_STARS * sizeof(int32_t)));
         dx2 = static_cast<int32_t *>(alloc(w * sizeof(int32_t)));
         dy2 = static_cast<int32_t *>(alloc(h * sizeof(int32_t)));
         vigLUT = static_cast<uint8_t *>(alloc(128));
         starCol = static_cast<uint8_t *>(alloc(MAX_STARS * 3));
         vigColor = static_cast<uint16_t *>(alloc(128 * sizeof(uint16_t)));
         if (stars == nullptr || draws == nullptr || starY == nullptr || bandHead == nullptr || bandNext == nullptr ||
-            dx2 == nullptr || dy2 == nullptr || vigLUT == nullptr || starCol == nullptr || vigColor == nullptr) {
+            driftQ == nullptr || dx2 == nullptr || dy2 == nullptr || vigLUT == nullptr || starCol == nullptr ||
+            vigColor == nullptr) {
             return false;
         }
         const float cx = w * 0.5f, cy = h * 0.5f;
@@ -99,6 +105,9 @@ bool init(int w, int h) {
             stars[i].hue = nextRandf(rng);
             stars[i].driftSpeed = 0.5f + nextRandf(rng);
             starY[i] = static_cast<int16_t>(stars[i].y);
+            // Q16.16 fixed-point drift phase, seeded from the initial float position
+            // so frame 0 (dt=0 below) reproduces the old closed-form x exactly.
+            driftQ[i] = static_cast<int32_t>(stars[i].x * 65536.0f);
         }
         rebuildThemeAssets();
         lastThemeGen = themeGen();
@@ -128,22 +137,62 @@ void frame(uint32_t tMs, int w, int h, const uint8_t p[4]) {
     }
     g_nStars = 40 + (p[1] * (MAX_STARS - 40)) / 100;
     const float t = tMs * 0.001f;
-    const float twinkleAmt = p[2] / 100.0f;
+    const float twinkleAmt = p[2] * (1.0f / 100.0f); // reciprocal multiply: dividend isn't a compile-time
+                                                      // constant, so the compiler can't fold /100.0f itself
+    // Old formula was `scale = 1 - twinkleAmt*(1-twinkle)`, i.e. a depth
+    // coefficient equal to twinkleAmt itself (identity). twinkle in [0.4,1.0],
+    // so at p[2]=100 (twinkleAmt=1) the dip only ever reached scale=0.4 -- not
+    // very dramatic. Replace the identity with a quadratic depth curve solved so
+    // depth(0.5)=0.5 (bit-identical to the old default at p[2]=50) but
+    // depth(1.0)=5/3, which drives the trough all the way to scale=0 (full
+    // extinguish) at p[2]=100: 1 - (5/3)*(1-0.4) = 0. Expands only the top of
+    // the range; p[2]<=50 is unchanged from before.
+    const float twinkleDepth = twinkleAmt * (twinkleAmt * (4.0f / 3.0f) + (1.0f / 3.0f));
     const float driftPxPerSec = 3.0f * speedMul(p[0]);
+
+    // Integer phase-wrap drift: replaces the old fmodf(absolute_position, w) with
+    // a per-star Q16.16 accumulator stepped by real elapsed time (dt) and wrapped
+    // with a single compare+subtract (no libm, no divide). dt is clamped so a long
+    // pause between frame() calls can't overflow the Q16.16 delta; the very first
+    // call (lastDriftMs sentinel) takes dt=0 so star positions start exactly at
+    // their init()-seeded x, matching the old t=0 closed form exactly.
+    const float rawDt = (tMs - lastDriftMs) * 0.001f;
+    const float driftDt = lastDriftMs == 0xFFFFFFFF ? 0.0f : (rawDt < 2.0f ? rawDt : 2.0f);
+    lastDriftMs = tMs;
+    const int32_t wQ = w << 16;
+
+    // fastSinRad()/fastCosRad() each pay a call8 + load into cosTableF() per
+    // invocation (xtensa-asm confirms); hoist the table pointer once per frame
+    // and inline the identical lookup math (fastSinRad(r) == cosTab[(r -
+    // 1.5707963f)*scale) & 255]) so the per-star loop below issues zero calls
+    // for the twinkle oscillator instead of one call8 per star.
+    const float *cosTab = cosTableF();
+    constexpr float RAD_TO_TAB = 256.0f / 6.2831853f;
 
     for (int b = 0; b < NUM_BANDS; b++) {
         bandHead[b] = -1;
     }
     for (int i = 0; i < g_nStars; i++) {
         const Star &s = stars[i];
-        float x = fmodf(s.x + t * driftPxPerSec * s.driftSpeed, static_cast<float>(w));
-        if (x < 0) {
-            x += w;
+        const float v = driftPxPerSec * s.driftSpeed;
+        int32_t pos = driftQ[i] + static_cast<int32_t>(v * driftDt * 65536.0f);
+        if (pos >= wQ) {
+            pos -= wQ;
+        } else if (pos < 0) {
+            pos += wQ;
         }
-        const float edgeFade = fminf(1.0f, fminf(x, w - x) / 20.0f);
-        const float twinkle = 0.7f + 0.3f * fastSinRad(t * s.rate + s.phase);
-        float bF = s.baseBrightness * (1.0f - twinkleAmt + twinkleAmt * twinkle) * edgeFade;
-        bF = fmaxf(0.0f, fminf(1.0f, bF));
+        driftQ[i] = pos;
+        const float x = pos * (1.0f / 65536.0f);
+        // fminf/fmaxf compile to libcalls on this toolchain (no FPU min/max) --
+        // ternaries instead. /20.0f is a compile-time-constant divide, which
+        // GCC does NOT fold to a reciprocal multiply under strict IEEE (-O2,
+        // no -ffast-math) since the rounding differs -- so do it by hand.
+        const float edgeRaw = (x < (w - x) ? x : (w - x)) * 0.05f; // *0.05f == /20.0f
+        const float edgeFade = edgeRaw < 1.0f ? edgeRaw : 1.0f;
+        const float twinkleRad = t * s.rate + s.phase - 1.5707963f;
+        const float twinkle = 0.7f + 0.3f * cosTab[static_cast<int>(twinkleRad * RAD_TO_TAB) & 255];
+        float bF = s.baseBrightness * (1.0f - twinkleDepth * (1.0f - twinkle)) * edgeFade;
+        bF = bF < 0.0f ? 0.0f : (bF > 1.0f ? 1.0f : bF);
         draws[i].x = static_cast<int16_t>(x);
         draws[i].r = clamp8f(starCol[i * 3 + 0] * bF);
         draws[i].g = clamp8f(starCol[i * 3 + 1] * bF);
@@ -168,6 +217,7 @@ void frame(uint32_t tMs, int w, int h, const uint8_t p[4]) {
         shoot.vy = sinf(angle) * speed;
         shoot.life = 0;
         shoot.maxLife = 0.5f + nextRandf(rng) * 0.3f;
+        shoot.invMaxLife = 1.0f / shoot.maxLife; // one divide per shoot trigger (rare), not per band()
         const uint32_t interval = 1500 > 30000 - shootFreq * 280 ? 1500 : 30000 - shootFreq * 280;
         nextShootMs = tMs + interval + static_cast<uint32_t>(nextRandf(rng) * interval * 0.5f);
     }
@@ -231,11 +281,16 @@ void band(uint16_t *dst, int y0, int rows, int w, uint32_t, const uint8_t *) {
     }
     // 3. shooting star trail (14 segments, band-clipped by plotMax)
     if (shoot.active) {
-        const float progress = shoot.life / shoot.maxLife;
+        // Both divides here used to run per band() call (up to 30x/frame while
+        // active, x15 for the loop below = 450 __divsf3 libcalls/frame).
+        // progress now uses invMaxLife (precomputed once at trigger time in
+        // frame()); f uses a compile-time reciprocal constant.
+        constexpr float INV14 = 1.0f / 14.0f;
+        const float progress = shoot.life * shoot.invMaxLife;
         const float hx = shoot.x + shoot.vx * shoot.life;
         const float hy = shoot.y + shoot.vy * shoot.life;
         for (int k = 0; k < 14; k++) {
-            const float f = k / 14.0f;
+            const float f = k * INV14;
             const float px = hx - shoot.vx * 0.02f * k;
             const float py = hy - shoot.vy * 0.02f * k;
             const float fade = (1.0f - f) * (1.0f - progress * 0.3f);

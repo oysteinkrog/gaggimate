@@ -167,6 +167,8 @@ void band(uint16_t *dst, int y0, int rows, int w, uint32_t, const uint8_t *) {
         const OrbitDef &o = orbits[sm.orbit];
         const int rr = static_cast<int>(ceilf(sm.radius));
         const int x0i = static_cast<int>(sm.x) - rr, y0i = static_cast<int>(sm.y) - rr;
+        const float r2 = sm.radius * sm.radius; // cached: was recomputed per pixel
+        const float invR = 1.0f / sm.radius;    // cached: one divide per sample, not per pixel
         for (int dy = 0; dy <= rr * 2 + 1; dy++) {
             const int yy = y0i + dy - y0;
             if (yy < 0 || yy >= rows) {
@@ -179,10 +181,20 @@ void band(uint16_t *dst, int y0, int rows, int w, uint32_t, const uint8_t *) {
                 }
                 const float ddx = xx + 0.5f - sm.x, ddy = (y0i + dy) + 0.5f - sm.y;
                 const float d2 = ddx * ddx + ddy * ddy;
-                if (d2 >= sm.radius * sm.radius) {
+                if (d2 >= r2) {
                     continue;
                 }
-                const float cov = 1.0f - sqrtf(d2) / sm.radius;
+                // Alpha-max/beta-min distance approximation (coeffs 0.9604/
+                // 0.3978, max error ~4%) instead of sqrtf(d2): the stamp is a
+                // 2-3px soft glow blob, so a few-percent wobble on the AA
+                // fringe is imperceptible and this is the only per-pixel cost
+                // left in the whole animation.
+                const float adx = ddx < 0 ? -ddx : ddx, ady = ddy < 0 ? -ddy : ddy;
+                const float dist = adx > ady ? (0.9604f * adx + 0.3978f * ady) : (0.9604f * ady + 0.3978f * adx);
+                const float cov = 1.0f - dist * invR;
+                if (cov <= 0.0f) {
+                    continue;
+                }
                 const int aQ8 = static_cast<int>(sm.alpha * cov * cov * 256.0f);
                 if (aQ8 <= 0) {
                     continue;
