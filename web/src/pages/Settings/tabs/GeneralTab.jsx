@@ -222,6 +222,43 @@ function BackgroundAnimationSettings({ formData, onChange, setField }) {
       <div className='mt-4'>
         <ColorThemeSettings formData={formData} onChange={onChange} setField={setField} />
       </div>
+      <div className='mt-4 grid grid-cols-1 gap-4 md:grid-cols-2'>
+        <SettingsFormField
+          label={`Animation frame rate (${parseInt(formData.bgAnimFps, 10) || 30} fps)`}
+          htmlFor='bgAnimFps'
+          noMargin
+        >
+          <input
+            id='bgAnimFps'
+            name='bgAnimFps'
+            type='range'
+            min='5'
+            max='60'
+            className='range w-full'
+            value={parseInt(formData.bgAnimFps, 10) || 30}
+            onChange={onChange('bgAnimFps')}
+          />
+        </SettingsFormField>
+        <SettingsFormField label='Panel refresh rate' htmlFor='panelClockDiv' noMargin>
+          <select
+            id='panelClockDiv'
+            name='panelClockDiv'
+            className='select select-bordered w-full'
+            value={parseInt(formData.panelClockDiv, 10) || 0}
+            onChange={onChange('panelClockDiv')}
+          >
+            <option value={0}>Firmware default</option>
+            <option value={5}>61 Hz — smoothest, flickers if starved</option>
+            <option value={6}>51 Hz — stable, slight gradient shimmer</option>
+            <option value={7}>43 Hz — conservative</option>
+            <option value={8}>38 Hz — most conservative</option>
+          </select>
+        </SettingsFormField>
+      </div>
+      <p className='text-base-content/60 mt-2 text-sm'>
+        If the animation flickers or the image jumps, lower the frame rate or the refresh rate:
+        both compete for the same memory bandwidth. Changes apply live after saving.
+      </p>
       <div className='mt-4'>
         <ToggleField
           label='Show animation behind all screens (not just standby)'

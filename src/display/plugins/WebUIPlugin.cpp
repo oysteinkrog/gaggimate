@@ -718,6 +718,10 @@ void WebUIPlugin::handleSettings(AsyncWebServerRequest *request) const {
                 settings->setBgAnimParams(request->arg("bgAnimParams"));
             if (request->hasArg("bgAnimTheme"))
                 settings->setBgAnimTheme(request->arg("bgAnimTheme").toInt());
+            if (request->hasArg("bgAnimFps"))
+                settings->setBgAnimFps(request->arg("bgAnimFps").toInt());
+            if (request->hasArg("panelClockDiv"))
+                settings->setPanelClockDiv(request->arg("panelClockDiv").toInt());
             if (request->hasArg("bgAnimCustomTheme"))
                 settings->setBgAnimCustomTheme(request->arg("bgAnimCustomTheme"));
             if (request->hasArg("bgAnimId") || request->hasArg("bgAnimParams"))
@@ -874,6 +878,8 @@ void WebUIPlugin::handleSettings(AsyncWebServerRequest *request) const {
     doc["bgAnimParams"] = settings.getBgAnimParams();
     doc["bgAnimAllScreens"] = settings.isBgAnimAllScreens();
     doc["bgAnimTheme"] = settings.getBgAnimTheme();
+    doc["bgAnimFps"] = settings.getBgAnimFps();
+    doc["panelClockDiv"] = settings.getPanelClockDiv();
     doc["bgAnimCustomTheme"] = settings.getBgAnimCustomTheme();
     doc["smartGrindIp"] = settings.getSmartGrindIp();
     doc["smartGrindMode"] = settings.getSmartGrindMode();

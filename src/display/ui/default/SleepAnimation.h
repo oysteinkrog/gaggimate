@@ -14,6 +14,7 @@ class SleepAnimation {
     void stop() {}
     bool isActive() const { return false; }
     void configure(uint8_t, const uint8_t *) {}
+    void setMaxFps(uint8_t) {}
     uint8_t *overlayBackBuffer() { return nullptr; }
     uint32_t overlayCapacity() const { return 0; }
     void publishOverlay(int, int) {}
@@ -45,6 +46,10 @@ class SleepAnimation {
     // Safe to call while running — params apply on the next frame, an id
     // change triggers the new animation's lazy init on the render task.
     void configure(uint8_t animId, const uint8_t p[4]);
+    // Frame-rate cap (clamped 5-60). Lower caps cut the animation's PSRAM
+    // write bandwidth — the tuning lever against scan-out underruns when the
+    // panel refresh (pclk) is raised. Applies on the next frame.
+    void setMaxFps(uint8_t fps) { maxFps.store(fps); }
 
     // Overlay: an LV_IMG_CF_TRUE_COLOR_ALPHA (RGB565 + A8, 3 B/px) snapshot of
     // the standby widgets. Double-buffered: the UI task renders a snapshot
@@ -85,6 +90,7 @@ class SleepAnimation {
     // frame, which is harmless. Packed params: p[i] = (word >> 8*i) & 0xFF.
     std::atomic<uint8_t> animId{0};
     std::atomic<uint32_t> animParams{0};
+    std::atomic<uint8_t> maxFps{30};
     int initializedAnimId = -1; // last id whose init() ran on the render task
 
     Overlay overlays[2];
