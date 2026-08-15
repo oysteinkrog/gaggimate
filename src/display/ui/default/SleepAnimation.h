@@ -88,6 +88,8 @@ class SleepAnimation {
         uint32_t maxTotalUs = 0;
         uint32_t waitUs = 0; // render task blocked waiting for the push task to free a slot
         uint32_t packUs = 0; // compacting each band to the round panel's visible chord
+        uint32_t spanPx = 0;  // overlay pixels read per frame (span-limited)
+        uint32_t blendPx = 0; // of those, how many were not fully transparent
         uint32_t achievedFps = 0; // x100, so 2997 == 29.97 fps
         // Nanoseconds per band row, measured with and without the scheduler
         // suspended on this core. Equal means the band cost is real compute;
@@ -106,6 +108,8 @@ class SleepAnimation {
     // depend on (the pixel clock), so the next sweep measures the new state
     // instead of averaging across the change.
     void benchRequestReset() { benchResetPending.store(true); }
+    void benchSetHalfRes(bool on) { halfRes = on; }
+    bool benchHalfRes() const { return halfRes; }
 #endif
 
   private:
@@ -118,6 +122,9 @@ class SleepAnimation {
         // plain plasma.
         int16_t *spanMin = nullptr;
         int16_t *spanMax = nullptr;
+        // Bit b set => pixels [b*32, b*32+32) in this row contain some alpha.
+        // 32 blocks covers a 1024-wide row, well past this panel.
+        uint32_t *rowBlocks = nullptr;
     };
 
     static void taskEntry(void *arg);
@@ -145,6 +152,7 @@ class SleepAnimation {
     PushJob pushJob[2] = {};
     int renderSlot = 0; // slot the render task fills next; push task tracks its own
     bool cropEnabled = false;   // crop to the panel's circle only while push is the pacing stage
+    std::atomic<bool> halfRes{false}; // render at 240x240 and double on the way out
     uint32_t frameWaitUs = 0;   // this frame's total block on the push task, drives cropEnabled
     void *pushHandle = nullptr;
     std::atomic<bool> pushStopped{true};
@@ -171,6 +179,8 @@ class SleepAnimation {
     std::atomic<uint8_t> maxFps{30};
 #endif
     int initializedAnimId = -1; // last id whose init() ran on the render task
+    bool initializedHalf = false; // resolution that init() ran at; a change re-inits
+    uint16_t *halfBuf = nullptr;  // (w/2)x(BAND_H/2) scratch for half-res rendering
 
     Overlay overlays[2];
     uint32_t overlayCap = 0;
@@ -185,6 +195,8 @@ class SleepAnimation {
     uint64_t accTotalUs = 0;
     uint64_t accWaitUs = 0;
     uint64_t accPackUs = 0;
+    uint64_t accSpanPx = 0;
+    uint64_t accBlendPx = 0;
     uint32_t accFrames = 0;
     uint32_t accMaxTotalUs = 0;
     uint32_t benchLockBand = 0; // which band gets the suspended render, rotates per frame
