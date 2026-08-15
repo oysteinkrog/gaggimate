@@ -381,6 +381,9 @@ void WebUIPlugin::setupServer() {
         gate["ctrl_hardware"] = controller->getSystemInfo().hardware;
         gate["ctrl_proto"] = controller->getSystemInfo().protocolVersion;
         gate["ctrl_mismatch"] = controller->getSystemInfo().protocolMismatch;
+        gate["ctrl_initialized"] = controller->benchInitialized();
+        gate["ctrl_screen_ready"] = controller->benchScreenReady();
+        gate["uptime_ms"] = millis();
         SleepAnimation *anim = sleep_animation_bench_instance();
         if (anim == nullptr) {
             doc["running"] = false;
