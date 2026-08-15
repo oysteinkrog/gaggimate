@@ -106,6 +106,8 @@ class Settings {
     bool isBgAnimAllScreens() const { return bgAnimAllScreens.get(); }
     int getBgAnimTheme() const { return bgAnimTheme.get(); }
     String getBgAnimCustomTheme() const { return bgAnimCustomTheme.get(); }
+    int getBgAnimFps() const { return bgAnimFps.get(); }
+    int getPanelClockDiv() const { return panelClockDiv.get(); }
     int getSmartGrindMode() const { return smartGrindMode.get(); }
     String getSmartGrindIp() const { return smartGrindIp.get(); }
     bool isHomeAssistant() const { return homeAssistant.get(); }
@@ -201,6 +203,8 @@ class Settings {
     void setBgAnimAllScreens(bool bg_anim_all_screens);
     void setBgAnimTheme(int bg_anim_theme);
     void setBgAnimCustomTheme(const String &bg_anim_custom_theme);
+    void setBgAnimFps(int bg_anim_fps);
+    void setPanelClockDiv(int panel_clock_div);
     void setSmartGrindIp(String smart_grind_ip);
     void setSmartGrindMode(int smart_grind_mode);
     void setHomeAssistant(bool homeAssistant);
@@ -298,6 +302,15 @@ class Settings {
     Property<bool> bgAnimAllScreens{registry, "bg_all", false};
     Property<int> bgAnimTheme{registry, "bg_th", 0};
     Property<String> bgAnimCustomTheme{registry, "bg_ct", ""};
+    // Animation task frame-rate cap. Lower values cut the animation's PSRAM
+    // write bandwidth (~460 KB/frame), which is the lever against RGB scan-out
+    // underruns at high panel refresh rates.
+    Property<int> bgAnimFps{registry, "bg_fps", 30};
+    // RGB pixel-clock divider off the 80 MHz LCD group clock; 0 = keep the
+    // build-flag boot value. The IDF 4.4 driver only does integer division,
+    // so real choices are 80/n: 5=16 MHz (~61 Hz), 6=13.3 MHz (~51 Hz),
+    // 7=11.4 MHz (~43 Hz). Applied live from DefaultUI::updateState.
+    Property<int> panelClockDiv{registry, "pclk_div", 0};
     Property<bool> smartGrindToggle{registry, "sg_t", false}; // legacy, seeds the smartGrindMode default
     Property<int> smartGrindMode{registry, "sg_m", 0};
     Property<String> smartGrindIp{registry, "sg_i", ""};

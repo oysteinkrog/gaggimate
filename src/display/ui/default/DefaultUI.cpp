@@ -10,6 +10,9 @@
 #include <display/drivers/LilyGoDriver.h>
 #include <display/drivers/WaveshareDriver.h>
 #include <display/drivers/common/LV_Helper.h>
+#include <display/drivers/common/PanelClock.h>
+
+#include <climits>
 #endif
 #include <display/main.h>
 #include <display/ui/utils/effects.h>
@@ -864,6 +867,15 @@ void DefaultUI::updateState() {
     const int animId = settings.getBgAnimId();
     bg_parse_params(settings.getBgAnimParams().c_str(), animId, animP);
     sleepAnimation.configure(static_cast<uint8_t>(animId), animP);
+    sleepAnimation.setMaxFps(static_cast<uint8_t>(settings.getBgAnimFps()));
+    // Panel refresh rate: live pclk divider (0 = build default). One register
+    // poke, but only touch the peripheral on an actual change.
+    static int lastPclkDiv = INT_MIN;
+    const int pclkDiv = settings.getPanelClockDiv();
+    if (pclkDiv != lastPclkDiv) {
+        lastPclkDiv = pclkDiv;
+        panelclock::setDiv(pclkDiv);
+    }
     // Publish the color theme only on change — setThemeStops bumps a
     // generation counter that makes every animation rebuild its palettes.
     static int lastThemeId = -1;

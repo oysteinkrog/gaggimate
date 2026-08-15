@@ -9,8 +9,7 @@
 #include <math.h>
 
 namespace {
-constexpr int BAND_H = 16;                  // rows rendered/pushed per chunk
-constexpr uint32_t TARGET_FRAME_US = 33000; // ~30 fps cap
+constexpr int BAND_H = 16; // rows rendered/pushed per chunk
 // Headroom for the snapshot's ext draw size (shadows etc. extend the render
 // area past the object on every side).
 constexpr int OVERLAY_EXT_MARGIN = 16;
@@ -191,8 +190,11 @@ void SleepAnimation::renderLoop() {
             fpsWindowStart = now;
         }
 
+        int fps = maxFps.load();
+        fps = fps < 5 ? 5 : (fps > 60 ? 60 : fps);
+        const int64_t targetFrameUs = 1000000 / fps;
         const int64_t elapsed = esp_timer_get_time() - frameStart;
-        const int64_t remaining = TARGET_FRAME_US - elapsed;
+        const int64_t remaining = targetFrameUs - elapsed;
         // Always yield at least one full tick so the UI task keeps polling
         // touch even when a frame overruns its budget.
         TickType_t ticks = pdMS_TO_TICKS(remaining > 1000 ? remaining / 1000 : 1);
