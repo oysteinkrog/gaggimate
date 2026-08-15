@@ -429,6 +429,22 @@ void Controller::onIncompatibleController(const String &infoJson) {
     systemInfo.capabilities.hwScale = doc["cp"]["hs"].as<bool>();
 }
 
+// Idempotent: called from the boot path and from every late STA (re)connect —
+// the AP-fallback recovery path never ran through the boot-success block, so
+// the standby clock stayed at epoch until the next full reboot.
+void Controller::startNtp() {
+    if (ntpStarted) {
+        return;
+    }
+    ntpStarted = true;
+    configTzTime(resolve_timezone(settings.getTimezone()), NTP_SERVER);
+    setenv("TZ", resolve_timezone(settings.getTimezone()), 1);
+    tzset();
+    sntp_set_sync_mode(SNTP_SYNC_MODE_SMOOTH);
+    sntp_setservername(0, NTP_SERVER);
+    sntp_init();
+}
+
 void Controller::setupWifi() {
     // Generate and persist a WPA2 AP password on first start
     if (settings.getWifiApPassword().isEmpty()) {
@@ -492,12 +508,8 @@ void Controller::setupWifi() {
         if (WiFi.status() == WL_CONNECTED) {
             ESP_LOGI(LOG_TAG, "Connected to %s with IP address %s", settings.getWifiSsid().c_str(),
                      WiFi.localIP().toString().c_str());
-            configTzTime(resolve_timezone(settings.getTimezone()), NTP_SERVER);
-            setenv("TZ", resolve_timezone(settings.getTimezone()), 1);
-            tzset();
-            sntp_set_sync_mode(SNTP_SYNC_MODE_SMOOTH);
-            sntp_setservername(0, NTP_SERVER);
-            sntp_init();
+            WiFi.setSleep(false); // see loop(): beacon misses + latency
+            startNtp();
         } else {
             WiFi.disconnect(true, true);
             ESP_LOGI(LOG_TAG, "Timed out while connecting to WiFi");
@@ -546,6 +558,19 @@ void Controller::loop() {
     }
     if (wifiConnectedPending) {
         wifiConnectedPending = false;
+        if (isApConnection && WiFi.status() == WL_CONNECTED) {
+            // STA recovered while in AP fallback (WifiStaWatchdog retries in
+            // AP_STA mode): drop the config AP, we're a normal client again.
+            ESP_LOGI(LOG_TAG, "STA recovered from AP fallback; dropping config AP");
+            WiFi.mode(WIFI_STA);
+            isApConnection = false;
+        }
+        if (WiFi.status() == WL_CONNECTED) {
+            // Modem power save (Arduino default) causes missed beacons and
+            // multi-second mDNS/web latency; this is a mains-powered device.
+            WiFi.setSleep(false);
+            startNtp();
+        }
         pluginManager->trigger("controller:wifi:connect", "AP", isApConnection ? 1 : 0);
     }
 

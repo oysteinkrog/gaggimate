@@ -27,10 +27,31 @@ void WifiStaWatchdogPlugin::loop() {
     if (!armed || updating)
         return;
 
-    // AP-fallback mode is its own world; setupWifi() lifted us here at boot
-    // and there is no STA to recover.  Skip rather than thrash WiFi.begin().
+    // AP-fallback: setupWifi() lands here when the boot-time connect misses
+    // its 10 s window (router still booting, slow AP handshake). Previously a
+    // dead end until a manual reboot — now retry the stored credentials every
+    // AP_STA_RETRY_MS with the config AP kept alive (AP_STA), so the device
+    // self-heals the moment the network is back. Controller::loop() drops the
+    // AP and clears isApConnection when STA_GOT_IP fires.
     const wifi_mode_t mode = WiFi.getMode();
-    if (mode == WIFI_MODE_AP || mode == WIFI_MODE_NULL)
+    if (mode == WIFI_MODE_AP || mode == WIFI_MODE_APSTA) {
+        if (mode == WIFI_MODE_APSTA && WiFi.status() == WL_CONNECTED)
+            return; // recovered; Controller::loop() finishes the switch
+        const unsigned long apNow = millis();
+        if (apNow - lastApRetryMs < AP_STA_RETRY_MS)
+            return;
+        lastApRetryMs = apNow;
+        ESP_LOGW(LOG_TAG, "AP fallback active; retrying STA connect to %s", ssid.c_str());
+        if (mode == WIFI_MODE_AP) {
+            WiFi.mode(WIFI_AP_STA);
+        } else {
+            WiFi.disconnect(false); // reset a stuck attempt, keep the AP up
+            delay(50);
+        }
+        WiFi.begin(ssid.c_str(), pass.c_str());
+        return;
+    }
+    if (mode == WIFI_MODE_NULL)
         return;
 
     const unsigned long now = millis();
