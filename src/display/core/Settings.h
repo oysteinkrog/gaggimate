@@ -101,6 +101,9 @@ class Settings {
     int getSteamFillTime() const { return steamFillTime.get(); }
     bool isSmartGrindActive() const { return smartGrindActive.get(); }
     bool isScaleMenuButton() const { return scaleMenuButton.get(); }
+    int getBgAnimId() const { return bgAnimId.get(); }
+    String getBgAnimParams() const { return bgAnimParams.get(); }
+    bool isBgAnimAllScreens() const { return bgAnimAllScreens.get(); }
     int getSmartGrindMode() const { return smartGrindMode.get(); }
     String getSmartGrindIp() const { return smartGrindIp.get(); }
     bool isHomeAssistant() const { return homeAssistant.get(); }
@@ -191,6 +194,9 @@ class Settings {
     void setSteamFillTime(int steam_fill_time);
     void setSmartGrindActive(bool smart_grind_active);
     void setScaleMenuButton(bool scale_menu_button);
+    void setBgAnimId(int bg_anim_id);
+    void setBgAnimParams(const String &bg_anim_params);
+    void setBgAnimAllScreens(bool bg_anim_all_screens);
     void setSmartGrindIp(String smart_grind_ip);
     void setSmartGrindMode(int smart_grind_mode);
     void setHomeAssistant(bool homeAssistant);
@@ -278,6 +284,14 @@ class Settings {
     Property<bool> smartGrindActive{registry, "sg_a", false};
     // Menu shows a Scale button (live weight + tare) in place of Grind.
     Property<bool> scaleMenuButton{registry, "scl_mb", false};
+    // Background animation: which procedural animation plays behind the UI
+    // (index into BG_ANIMATIONS), its per-animation parameters, and whether it
+    // runs behind every screen or only during standby sleep.
+    Property<int> bgAnimId{registry, "bg_an", 0};
+    // Per-animation params, "p0,p1,p2,p3;p0,p1,p2,p3;..." indexed by anim id,
+    // each 0-100; missing/short entries fall back to the animation's defaults.
+    Property<String> bgAnimParams{registry, "bg_anp", ""};
+    Property<bool> bgAnimAllScreens{registry, "bg_all", false};
     Property<bool> smartGrindToggle{registry, "sg_t", false}; // legacy, seeds the smartGrindMode default
     Property<int> smartGrindMode{registry, "sg_m", 0};
     Property<String> smartGrindIp{registry, "sg_i", ""};

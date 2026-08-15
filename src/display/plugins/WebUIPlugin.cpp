@@ -712,6 +712,12 @@ void WebUIPlugin::handleSettings(AsyncWebServerRequest *request) const {
                 settings->setSteamFillTime(request->arg("steamFillTime").toInt() * 1000);
             settings->setSmartGrindActive(request->hasArg("smartGrindActive"));
             settings->setScaleMenuButton(request->hasArg("scaleMenuButton"));
+            if (request->hasArg("bgAnimId"))
+                settings->setBgAnimId(request->arg("bgAnimId").toInt());
+            if (request->hasArg("bgAnimParams"))
+                settings->setBgAnimParams(request->arg("bgAnimParams"));
+            if (request->hasArg("bgAnimId") || request->hasArg("bgAnimParams"))
+                settings->setBgAnimAllScreens(request->hasArg("bgAnimAllScreens"));
             if (request->hasArg("smartGrindIp"))
                 settings->setSmartGrindIp(request->arg("smartGrindIp"));
             if (request->hasArg("smartGrindMode"))
@@ -860,6 +866,9 @@ void WebUIPlugin::handleSettings(AsyncWebServerRequest *request) const {
     doc["steamFillTime"] = settings.getSteamFillTime() / 1000;
     doc["smartGrindActive"] = settings.isSmartGrindActive();
     doc["scaleMenuButton"] = settings.isScaleMenuButton();
+    doc["bgAnimId"] = settings.getBgAnimId();
+    doc["bgAnimParams"] = settings.getBgAnimParams();
+    doc["bgAnimAllScreens"] = settings.isBgAnimAllScreens();
     doc["smartGrindIp"] = settings.getSmartGrindIp();
     doc["smartGrindMode"] = settings.getSmartGrindMode();
     doc["momentaryButtons"] = settings.isMomentaryButtons();
