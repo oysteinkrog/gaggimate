@@ -118,6 +118,14 @@ void frame(uint32_t tMs, int w, int h, const uint8_t p[4]) {
     const float swirl = 0.5f + (p[2] / 100.0f) * 1.7f;
     const float density = 0.5f + (p[3] / 100.0f) * 0.8f;
     const float maxHeight = h * 0.62f;
+    // Blob radii and sway amplitudes below were written as absolute pixel
+    // counts, which silently assumed the render target is always 480 wide.
+    // It is not: the renderer can compute the animation at half resolution and
+    // double it on the way out, and an absolute radius makes the blobs cover
+    // four times the relative area there -- so the stamping cost stays flat
+    // while everything else quarters. Scaling them to the render width keeps
+    // the picture identical at any resolution and makes the cost scale with it.
+    const float rscale = w * (1.0f / 480.0f);
 
     g_active = wispCount * BLOBS_PER_WISP;
     for (int i = 0; i < g_active; i++) {
@@ -133,8 +141,8 @@ void frame(uint32_t tMs, int w, int h, const uint8_t p[4]) {
         const float rise = riseSpeed * age;
         const float heightFrac = fminf(1.0f, rise / maxHeight);
         const float y = wp.y0 - rise;
-        const float R = (10.0f + 26.0f * heightFrac) * (0.85f + 0.3f * fastSinRad(b.seed));
-        const float swayAmp = (5.0f + 22.0f * heightFrac) * swirl;
+        const float R = (10.0f + 26.0f * heightFrac) * (0.85f + 0.3f * fastSinRad(b.seed)) * rscale;
+        const float swayAmp = (5.0f + 22.0f * heightFrac) * swirl * rscale;
         const float x = wp.x0 + swayAmp * fastSinRad(wp.swayFreq1 * tMs + wp.swayPhase1 + b.seed) +
                         swayAmp * 0.35f * fastSinRad(wp.swayFreq2 * tMs + wp.swayPhase2 + b.seed * 1.7f);
         float alpha = density * 0.44f * 4.0f * L * (1.0f - L) * (1.0f - heightFrac * 0.3f);
