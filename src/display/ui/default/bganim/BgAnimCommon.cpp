@@ -63,6 +63,71 @@ void buildPalette(uint16_t *out, const uint8_t (*keys)[3], int nKeys, uint16_t b
     }
 }
 
+const uint8_t *noiseTex256() {
+    static uint8_t *tex = nullptr;
+    if (tex != nullptr) {
+        return tex;
+    }
+    uint8_t *t = static_cast<uint8_t *>(alloc(256 * 256));
+    if (t == nullptr) {
+        return nullptr;
+    }
+    constexpr int PERIOD = 16;
+    float lattice[PERIOD * PERIOD];
+    uint32_t rng = 1337;
+    for (int i = 0; i < PERIOD * PERIOD; i++) {
+        lattice[i] = nextRandf(rng);
+    }
+    const auto latticeAt = [&](int ix, int iy) { return lattice[(iy & (PERIOD - 1)) * PERIOD + (ix & (PERIOD - 1))]; };
+    const auto smooth = [](float v) { return v * v * v * (v * (v * 6.0f - 15.0f) + 10.0f); };
+    constexpr float CELL = 256.0f / PERIOD;
+    for (int y = 0; y < 256; y++) {
+        const float gy = y / CELL;
+        const int iy0 = static_cast<int>(gy);
+        const float fy = smooth(gy - iy0);
+        for (int x = 0; x < 256; x++) {
+            const float gx = x / CELL;
+            const int ix0 = static_cast<int>(gx);
+            const float fx = smooth(gx - ix0);
+            const float v00 = latticeAt(ix0, iy0), v10 = latticeAt(ix0 + 1, iy0);
+            const float v01 = latticeAt(ix0, iy0 + 1), v11 = latticeAt(ix0 + 1, iy0 + 1);
+            const float a = v00 + (v10 - v00) * fx;
+            const float b = v01 + (v11 - v01) * fx;
+            t[y * 256 + x] = clamp8f((a + (b - a) * fy) * 255.0f);
+        }
+    }
+    tex = t;
+    return tex;
+}
+
+void buildRamp565(uint16_t *out, const float *stopPos, const uint32_t *hexA, const uint32_t *hexB, int nStops,
+                  int blendQ8) {
+    int s = 0;
+    for (int i = 0; i < 256; i++) {
+        const float pos = i / 255.0f;
+        while (s < nStops - 2 && stopPos[s + 1] < pos) {
+            s++;
+        }
+        const float span = stopPos[s + 1] - stopPos[s];
+        float lt = span > 0 ? (pos - stopPos[s]) / span : 0;
+        if (lt < 0) {
+            lt = 0;
+        } else if (lt > 1) {
+            lt = 1;
+        }
+        uint8_t c[3];
+        for (int ch = 0; ch < 3; ch++) {
+            const int sh = 16 - 8 * ch;
+            const float a0 = (hexA[s] >> sh) & 0xFF, a1 = (hexA[s + 1] >> sh) & 0xFF;
+            const float b0 = (hexB[s] >> sh) & 0xFF, b1 = (hexB[s + 1] >> sh) & 0xFF;
+            const float a = a0 + (a1 - a0) * lt;
+            const float b = b0 + (b1 - b0) * lt;
+            c[ch] = clamp8f(a + ((b - a) * blendQ8) * (1.0f / 256.0f));
+        }
+        out[i] = rgb565(c[0], c[1], c[2]);
+    }
+}
+
 } // namespace bganim
 
 #endif // GAGGIMATE_SIM

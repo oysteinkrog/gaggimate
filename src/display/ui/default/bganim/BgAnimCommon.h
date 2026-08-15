@@ -90,6 +90,18 @@ inline uint16_t addScaled565(uint16_t dst, uint8_t r, uint8_t g, uint8_t b, uint
 // wheel, scaled by brightness (0-256 = 0-100%).
 void buildPalette(uint16_t *out, const uint8_t (*keys)[3], int nKeys, uint16_t brightness256);
 
+// Shared 256x256 tileable value-noise texture (64KB, built on first use from
+// a 16x16 lattice with quintic-smoothstep bilinear upsampling; periodic, so
+// sampling with `& 255` never shows a seam). Ember and Nebula both read it at
+// different scroll offsets/scales, so one asset serves both. Returns nullptr
+// if the allocation failed.
+const uint8_t *noiseTex256();
+
+// Builds a 256-entry RGB565 ramp by blending two 6-stop gradients (positions
+// 0..1 in stopPos, packed 0xRRGGBB colors) at `blend` (0..256).
+void buildRamp565(uint16_t *out, const float *stopPos, const uint32_t *hexA, const uint32_t *hexB, int nStops,
+                  int blendQ8);
+
 } // namespace bganim
 
 #endif // BGANIM_COMMON_H
