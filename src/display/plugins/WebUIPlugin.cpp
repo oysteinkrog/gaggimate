@@ -214,8 +214,12 @@ void WebUIPlugin::loop() {
         statusDoc["pw"] = controller->getCurrentPumpPower();
         statusDoc["hp"] = controller->getCurrentHeaterPower();
 
-        if (controller->getClientController()->getClient()->isConnected()) {
-            statusDoc["rssi"] = controller->getClientController()->getClient()->getRssi();
+        // Null until the BLE transport has built a client; this status frame is
+        // broadcast on a timer and can easily precede that (a browser attached
+        // before the controller link comes up, or a build with BLE disabled).
+        NimBLEClient *bleClient = controller->getClientController()->getClient();
+        if (bleClient != nullptr && bleClient->isConnected()) {
+            statusDoc["rssi"] = bleClient->getRssi();
         }
         if (controller->getClientController()->hasLatency()) {
             statusDoc["lat"] = controller->getClientController()->getLatencyMs();
