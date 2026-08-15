@@ -85,8 +85,17 @@ constexpr float FIXED_SCALE = static_cast<float>(1 << FRAC_BITS); // 1,048,576
 // LUT pointer already offset so it can be indexed directly by the signed
 // shifted tt value.
 constexpr int LUT_BITS = 10;
-constexpr int LUT_HALF = 1 << LUT_BITS;   // 1024 buckets covering tt in (0,1]
-constexpr int LUT_MARGIN = 32;            // extra slack past the +-1 analytic bound, for fp rounding
+constexpr int LUT_HALF = 1 << LUT_BITS; // 1024 buckets covering tt in (0,1]
+// Slack past the +-1 analytic bound. The forward-difference accumulator does
+// not track tt exactly: stepQ and step2Q are rounded to whole Q12.20 units, so
+// each carries up to 0.5 LSB of error, and step2Q's error is re-added on every
+// iteration. Over a k-pixel scan the accumulated deviation is bounded by
+//   0.5*k*(k-1)/2 + 0.5*k + 0.5   Q12.20 units,
+// which at the widest possible scan (k = 480, a blob spanning the panel) is
+// ~57.7k units = 0.055 in tt = 57 buckets, on either side. 32 was not enough:
+// it let the shifted index reach lavaLUT[-3] (caught by tools/animbench/fuzz
+// under ASan). 128 covers the worst case with room and costs 768 bytes.
+constexpr int LUT_MARGIN = 128;
 constexpr int LUT_OFFSET = LUT_HALF + LUT_MARGIN;
 constexpr int LUT_SIZE = 2 * LUT_HALF + 2 * LUT_MARGIN;
 constexpr int LUT_SHIFT = FRAC_BITS - LUT_BITS; // 10
