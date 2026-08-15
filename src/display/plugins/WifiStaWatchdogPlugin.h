@@ -19,12 +19,14 @@ class WifiStaWatchdogPlugin : public Plugin {
   private:
     static constexpr unsigned long STA_DOWN_GRACE_MS = 20000;
     static constexpr unsigned long STA_REASSOC_BACKOFF_MS = 30000;
+    static constexpr unsigned long AP_STA_RETRY_MS = 60000;
 
     Controller *controller = nullptr;
     String ssid;
     String pass;
     unsigned long lastConnectedMs = 0;
     unsigned long lastReassocMs = 0;
+    unsigned long lastApRetryMs = 0;
     bool armed = false;
     bool updating = false;
 
