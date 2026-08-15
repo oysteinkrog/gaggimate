@@ -31,9 +31,10 @@ void setDiv(int n) {
         bootDiv = currentDiv();
     }
     if (n == 0) {
+        // Restore the boot value verbatim — it may legitimately be 1
+        // (lcd_clk_equ_sysclk), which the explicit-value clamp below forbids.
         n = bootDiv;
-    }
-    if (n < 2) {
+    } else if (n < 2) {
         n = 2;
     } else if (n > 16) {
         n = 16;

@@ -720,8 +720,15 @@ void WebUIPlugin::handleSettings(AsyncWebServerRequest *request) const {
                 settings->setBgAnimTheme(request->arg("bgAnimTheme").toInt());
             if (request->hasArg("bgAnimFps"))
                 settings->setBgAnimFps(request->arg("bgAnimFps").toInt());
-            if (request->hasArg("panelClockDiv"))
-                settings->setPanelClockDiv(request->arg("panelClockDiv").toInt());
+            if (request->hasArg("panelClockDiv")) {
+                // 0 = firmware default; explicit dividers outside the sane
+                // 4-12 window (6.7-20 MHz pclk) could leave the panel
+                // unreadable, so reject them to default rather than persist.
+                int div = request->arg("panelClockDiv").toInt();
+                if (div != 0 && (div < 4 || div > 12))
+                    div = 0;
+                settings->setPanelClockDiv(div);
+            }
             if (request->hasArg("bgAnimCustomTheme"))
                 settings->setBgAnimCustomTheme(request->arg("bgAnimCustomTheme"));
             if (request->hasArg("bgAnimId") || request->hasArg("bgAnimParams"))
