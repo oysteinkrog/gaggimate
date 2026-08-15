@@ -49,7 +49,14 @@ class SleepAnimation {
     // Frame-rate cap (clamped 5-60). Lower caps cut the animation's PSRAM
     // write bandwidth — the tuning lever against scan-out underruns when the
     // panel refresh (pclk) is raised. Applies on the next frame.
+#ifdef GM_ANIM_BENCH
+    // Inert on the bench, like configure(): DefaultUI re-applies the stored
+    // frame cap on every UI pass, and a throttled frame reports the cap
+    // instead of what the pipeline actually costs.
+    void setMaxFps(uint8_t) {}
+#else
     void setMaxFps(uint8_t fps) { maxFps.store(fps); }
+#endif
 
     // Overlay: an LV_IMG_CF_TRUE_COLOR_ALPHA (RGB565 + A8, 3 B/px) snapshot of
     // the standby widgets. Double-buffered: the UI task renders a snapshot
@@ -79,6 +86,8 @@ class SleepAnimation {
         uint32_t pushUs = 0;  // display->pushColors -- panel/PSRAM write
         uint32_t totalUs = 0; // sum of the above, measured end to end
         uint32_t maxTotalUs = 0;
+        uint32_t waitUs = 0; // render task blocked waiting for the push task to free a slot
+        uint32_t packUs = 0; // compacting each band to the round panel's visible chord
         uint32_t achievedFps = 0; // x100, so 2997 == 29.97 fps
         // Nanoseconds per band row, measured with and without the scheduler
         // suspended on this core. Equal means the band cost is real compute;
@@ -120,13 +129,47 @@ class SleepAnimation {
     std::atomic<bool> running{false};
     std::atomic<bool> stopped{true};
 
-    uint16_t *band = nullptr; // one horizontal band of RGB565 pixels
+    // Two band buffers, so the render task can fill one while the push task
+    // drains the other. band+blend is CPU work touching only internal SRAM;
+    // push is a PSRAM write. They contend for almost nothing, so running them
+    // on separate cores turns frame time from band+blend+push into
+    // max(band+blend, push) plus one band of pipeline latency.
+    uint16_t *bandBuf[2] = {nullptr, nullptr};
+    void *bandReady[2] = {nullptr, nullptr}; // render -> push, slot has data
+    void *bandFree[2] = {nullptr, nullptr};  // push -> render, slot is reusable
+    // The panel rectangle each queued slot covers. pushColors takes end
+    // coordinates, not extents.
+    struct PushJob {
+        int16_t x0, y0, x1, y1;
+    };
+    PushJob pushJob[2] = {};
+    int renderSlot = 0; // slot the render task fills next; push task tracks its own
+    bool cropEnabled = false;   // crop to the panel's circle only while push is the pacing stage
+    uint32_t frameWaitUs = 0;   // this frame's total block on the push task, drives cropEnabled
+    void *pushHandle = nullptr;
+    std::atomic<bool> pushStopped{true};
+
+    // Per-band horizontal extent of the panel's inscribed circle. The panel is
+    // round, so the corners of the 480x480 rectangle are never visible and
+    // pushing them is wasted PSRAM bandwidth. One rectangle per band (the
+    // widest row in it), since pushColors takes a rectangle.
+    int16_t bandX0[32] = {};
+    int16_t bandX1[32] = {};
+    void computeChords(int w, int h);
+    static void pushTaskEntry(void *arg);
+    void pushLoop();
 
     // Animation selection; id and params may tear against each other for one
     // frame, which is harmless. Packed params: p[i] = (word >> 8*i) & 0xFF.
     std::atomic<uint8_t> animId{0};
     std::atomic<uint32_t> animParams{0};
+#ifdef GM_ANIM_BENCH
+    // The bench measures what the pipeline can do, so it must not sit against
+    // the shipping frame cap -- a throttled frame reports the cap, not the cost.
+    std::atomic<uint8_t> maxFps{60};
+#else
     std::atomic<uint8_t> maxFps{30};
+#endif
     int initializedAnimId = -1; // last id whose init() ran on the render task
 
     Overlay overlays[2];
@@ -140,6 +183,8 @@ class SleepAnimation {
     uint64_t accBlendUs = 0;
     uint64_t accPushUs = 0;
     uint64_t accTotalUs = 0;
+    uint64_t accWaitUs = 0;
+    uint64_t accPackUs = 0;
     uint32_t accFrames = 0;
     uint32_t accMaxTotalUs = 0;
     uint32_t benchLockBand = 0; // which band gets the suspended render, rotates per frame
