@@ -63,6 +63,31 @@ class SleepAnimation {
     // object's ext draw size on each side; the blend centers it).
     void publishOverlay(int w, int h);
 
+#ifdef GM_ANIM_BENCH
+    // Bench build only. The render task walks the whole registry, dwelling on
+    // each animation for BENCH_DWELL_MS at its default params, and records
+    // where the frame time actually went. Timings come from the render task
+    // itself, so they are real on-device costs including PSRAM latency and
+    // whatever else shares the core -- not a host estimate.
+    static constexpr int BENCH_MAX_ANIMS = 32;
+    struct BenchResult {
+        bool valid = false;
+        uint32_t frames = 0;
+        // Mean microseconds per frame, split by pipeline stage.
+        uint32_t bandUs = 0;  // anim.frame() + anim.band() -- the animation's own cost
+        uint32_t blendUs = 0; // overlay composite over the rendered bands
+        uint32_t pushUs = 0;  // display->pushColors -- panel/PSRAM write
+        uint32_t totalUs = 0; // sum of the above, measured end to end
+        uint32_t maxTotalUs = 0;
+        uint32_t achievedFps = 0; // x100, so 2997 == 29.97 fps
+    };
+    // Snapshot of every completed dwell. Safe to read from another task: each
+    // entry is only written once, before valid flips true.
+    const BenchResult *benchResults() const { return benchDone; }
+    int benchCurrentAnim() const { return animId.load(); }
+    uint32_t benchPassCount() const { return benchPasses; }
+#endif
+
   private:
     struct Overlay {
         uint8_t *buf = nullptr;
@@ -97,7 +122,29 @@ class SleepAnimation {
     uint32_t overlayCap = 0;
     std::atomic<int> overlayFront{-1};  // -1 = nothing published yet
     std::atomic<int> overlayInUse{-1};  // overlay the render task reads this frame
+
+#ifdef GM_ANIM_BENCH
+    // Accumulators for the dwell in progress; render task only, no locking.
+    uint64_t accBandUs = 0;
+    uint64_t accBlendUs = 0;
+    uint64_t accPushUs = 0;
+    uint64_t accTotalUs = 0;
+    uint32_t accFrames = 0;
+    uint32_t accMaxTotalUs = 0;
+    unsigned long benchDwellStart = 0;
+    uint32_t benchPasses = 0; // completed sweeps of the whole registry
+    BenchResult benchDone[BENCH_MAX_ANIMS];
+
+    void benchTick();      // called once per frame from renderLoop
+    void benchFinishDwell(); // records the current animation and advances
+#endif
 };
+
+#ifdef GM_ANIM_BENCH
+// The running instance, so the web plugin can publish results without the
+// whole UI object graph being reachable from it. Null until start() runs.
+SleepAnimation *sleep_animation_bench_instance();
+#endif
 
 #endif // GAGGIMATE_SIM
 
