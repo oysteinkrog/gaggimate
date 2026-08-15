@@ -100,6 +100,7 @@ class Settings {
     int getStartupFillTime() const { return startupFillTime.get(); }
     int getSteamFillTime() const { return steamFillTime.get(); }
     bool isSmartGrindActive() const { return smartGrindActive.get(); }
+    bool isScaleMenuButton() const { return scaleMenuButton.get(); }
     int getSmartGrindMode() const { return smartGrindMode.get(); }
     String getSmartGrindIp() const { return smartGrindIp.get(); }
     bool isHomeAssistant() const { return homeAssistant.get(); }
@@ -189,6 +190,7 @@ class Settings {
     void setStartupFillTime(int startup_fill_time);
     void setSteamFillTime(int steam_fill_time);
     void setSmartGrindActive(bool smart_grind_active);
+    void setScaleMenuButton(bool scale_menu_button);
     void setSmartGrindIp(String smart_grind_ip);
     void setSmartGrindMode(int smart_grind_mode);
     void setHomeAssistant(bool homeAssistant);
@@ -274,6 +276,8 @@ class Settings {
     Property<int> startupFillTime{registry, "bf_su", 5000};
     Property<int> steamFillTime{registry, "bf_st", 5000};
     Property<bool> smartGrindActive{registry, "sg_a", false};
+    // Menu shows a Scale button (live weight + tare) in place of Grind.
+    Property<bool> scaleMenuButton{registry, "scl_mb", false};
     Property<bool> smartGrindToggle{registry, "sg_t", false}; // legacy, seeds the smartGrindMode default
     Property<int> smartGrindMode{registry, "sg_m", 0};
     Property<String> smartGrindIp{registry, "sg_i", ""};

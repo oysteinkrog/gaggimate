@@ -153,6 +153,7 @@ void Settings::setStartupFillTime(int startup_fill_time) { startupFillTime.set(s
 void Settings::setSteamFillTime(int steam_fill_time) { steamFillTime.set(steam_fill_time); }
 
 void Settings::setSmartGrindActive(bool smart_grind_active) { smartGrindActive.set(smart_grind_active); }
+void Settings::setScaleMenuButton(bool scale_menu_button) { scaleMenuButton.set(scale_menu_button); }
 
 void Settings::setSmartGrindIp(String smart_grind_ip) { smartGrindIp.set(smart_grind_ip); }
 

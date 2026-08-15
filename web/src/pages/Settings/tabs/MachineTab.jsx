@@ -321,6 +321,23 @@ export function MachineTab({ formData, onChange, setField }) {
               <option value='auto'>Auto (best available)</option>
             </select>
           </SettingsFormField>
+
+          <SettingsFormField
+            label='Scale Screen in Menu'
+            htmlFor='scaleMenuButton'
+            helpText='Replace the Grind button on the display menu with a Scale screen showing live weight and a tare button.'
+            noMargin
+          >
+            <input
+              id='scaleMenuButton'
+              name='scaleMenuButton'
+              type='checkbox'
+              className='toggle toggle-primary'
+              checked={!!formData.scaleMenuButton}
+              onChange={onChange('scaleMenuButton')}
+              aria-label='Show Scale screen instead of Grind in the display menu'
+            />
+          </SettingsFormField>
         </div>
 
         {hardwareScaleAvailable.value && (

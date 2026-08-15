@@ -49,6 +49,11 @@ class DefaultUI {
 
     void onVolumetricDelete();
 
+    // Scale mode: opened from the menu's Grind slot when the scaleMenuButton
+    // setting is on. Hosted as an overlay on the grind screen (EEZ flow can't
+    // grow new screens at runtime): live weight readout + tare + back.
+    void openScaleScreen();
+
     void markDirty() { rerender = true; }
     void markProfileDirty() { profileDirty = true; }
     void markProfileClean() { profileDirty = false; }
@@ -69,6 +74,13 @@ class DefaultUI {
     void stopSleepAnimation();
     void maintainSleepAnimation();
     void refreshSleepOverlay();
+    void maintainScaleScreen();
+    void buildScaleScreen();
+    lv_obj_t *scaleScreen = nullptr;      // overlay covering the grind screen
+    lv_obj_t *scaleWeightLabel = nullptr;
+    bool scaleScreenRequested = false;
+    bool scaleMenuSwap = false; // settings.isScaleMenuButton(), cached per render
+    float lastShownScaleWeight = -1000.0f;
     SleepAnimation sleepAnimation;
     unsigned long lastSleepAnimAttempt = 0;
     unsigned long lastSleepOverlayRefresh = 0;
