@@ -6,7 +6,10 @@
 #include <display/ui/default/bganim/BgAnim.h>
 #include <esp_heap_caps.h>
 #include <esp_timer.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
 #include <math.h>
+#include <string.h>  // memmove, for the round-panel band compaction
 
 // Stage timers for the bench build. These compile to nothing in a normal
 // build, so the shipping render path carries no measurement overhead.
@@ -95,9 +98,18 @@ void SleepAnimation::start(Display *d) {
     display = d;
     const int w = display->width();
     const int h = display->height();
-    if (band == nullptr) {
-        band = static_cast<uint16_t *>(allocPreferInternal(w * BAND_H * sizeof(uint16_t)));
+    for (int i = 0; i < 2; i++) {
+        if (bandBuf[i] == nullptr) {
+            bandBuf[i] = static_cast<uint16_t *>(allocPreferInternal(w * BAND_H * sizeof(uint16_t)));
+        }
+        if (bandReady[i] == nullptr) {
+            bandReady[i] = xSemaphoreCreateBinary();
+        }
+        if (bandFree[i] == nullptr) {
+            bandFree[i] = xSemaphoreCreateBinary();
+        }
     }
+    computeChords(w, h);
     if (overlayCap == 0) {
         overlayCap = static_cast<uint32_t>(w + 2 * OVERLAY_EXT_MARGIN) * (h + 2 * OVERLAY_EXT_MARGIN) * 3;
         for (auto &ov : overlays) {
@@ -113,9 +125,26 @@ void SleepAnimation::start(Display *d) {
     for (auto &ov : overlays) {
         overlayOk = overlayOk && ov.buf != nullptr && ov.spanMin != nullptr && ov.spanMax != nullptr;
     }
-    if (band == nullptr || !overlayOk) {
-        log_e("SleepAnimation: buffer allocation failed (band=%p overlayOk=%d)", band, overlayOk);
+    bool pipelineOk = true;
+    for (int i = 0; i < 2; i++) {
+        pipelineOk = pipelineOk && bandBuf[i] != nullptr && bandReady[i] != nullptr && bandFree[i] != nullptr;
+    }
+    if (!pipelineOk || !overlayOk) {
+        log_e("SleepAnimation: buffer allocation failed (bandBuf=%p/%p overlayOk=%d)", bandBuf[0], bandBuf[1], overlayOk);
         return;
+    }
+    // Reset the pipeline: both cursors to slot 0, any signal left over from a
+    // previous run drained, both slots marked free. DefaultUI stops and
+    // restarts the animation on every standby transition, so a stale bandReady
+    // or a cursor left on slot 1 would desynchronise the two tasks and push a
+    // band that was never rendered.
+    renderSlot = 0;
+    for (int i = 0; i < 2; i++) {
+        while (xSemaphoreTake(static_cast<SemaphoreHandle_t>(bandReady[i]), 0) == pdTRUE) {
+        }
+        while (xSemaphoreTake(static_cast<SemaphoreHandle_t>(bandFree[i]), 0) == pdTRUE) {
+        }
+        xSemaphoreGive(static_cast<SemaphoreHandle_t>(bandFree[i]));
     }
     initializedAnimId = -1; // force the animation's init on the render task
     running = true;
@@ -137,7 +166,25 @@ void SleepAnimation::start(Display *d) {
         return;
     }
     taskHandle = handle;
-    log_i("SleepAnimation: started (%dx%d)", w, h);
+
+    // Push task on core 0 at priority 2. It must sit BELOW
+    // Controller::loopLogicTask (core 0, priority 3) so animation work can
+    // never preempt the control path, and above the default-priority-1 tasks
+    // that share core 0 (Arduino loop, WiFi events, AsyncTCP), none of which
+    // are time-critical. Core 1 is left exactly as it was: the render task
+    // stays at priority 1 alongside the UI task, which is deliberate (see the
+    // note above -- priority 2 there starved touch input).
+    TaskHandle_t push = nullptr;
+    pushStopped = false;
+    if (xTaskCreatePinnedToCore(pushTaskEntry, "SleepPush", 4096, this, 2, &push, 0) != pdPASS) {
+        log_e("SleepAnimation: push task creation failed");
+        pushStopped = true;
+        running = false;
+        stopped = true;
+        return;
+    }
+    pushHandle = push;
+    log_i("SleepAnimation: started (%dx%d), push task on core 0", w, h);
 }
 
 void SleepAnimation::stop() {
@@ -148,6 +195,96 @@ void SleepAnimation::stop() {
     const unsigned long deadline = millis() + 500;
     while (!stopped && millis() < deadline) {
         vTaskDelay(pdMS_TO_TICKS(5));
+    }
+    // The push task blocks on bandReady, so it needs a wakeup to observe
+    // !running. Give both slots: whichever it is waiting on releases it.
+    for (int i = 0; i < 2; i++) {
+        if (bandReady[i] != nullptr) {
+            xSemaphoreGive(static_cast<SemaphoreHandle_t>(bandReady[i]));
+        }
+    }
+    const unsigned long pushDeadline = millis() + 500;
+    while (!pushStopped && millis() < pushDeadline) {
+        vTaskDelay(pdMS_TO_TICKS(5));
+    }
+}
+
+// Horizontal extent of the inscribed circle for each band. The panel is round:
+// pixels outside the circle are physically not there, so pushing them spends
+// PSRAM bandwidth -- the scarcest thing in this pipeline -- on invisible
+// output. One rectangle per band, taken from the widest row it contains,
+// because pushColors takes a rectangle and esp_lcd_panel_draw_bitmap has no
+// stride parameter (verified in esp_lcd_panel_ops.h:59) so a sub-window of a
+// full-width buffer would walk off each row's end into the next row's data.
+void SleepAnimation::computeChords(int w, int h) {
+    const float cx = (w - 1) * 0.5f;
+    const float cy = (h - 1) * 0.5f;
+    const float r = (w < h ? w : h) * 0.5f;
+    const int bands = (h + BAND_H - 1) / BAND_H;
+    for (int b = 0; b < bands && b < 32; b++) {
+        const int y0 = b * BAND_H;
+        const int y1 = (y0 + BAND_H < h ? y0 + BAND_H : h) - 1;
+        // Widest row in the band is the one nearest the vertical centre.
+        float dy = 0.0f;
+        if (cy < y0) {
+            dy = y0 - cy;
+        } else if (cy > y1) {
+            dy = cy - y1;
+        }
+        int x0 = 0, x1 = w;
+        const float inside = r * r - dy * dy;
+        if (inside > 0.0f) {
+            const float half = sqrtf(inside);
+            x0 = static_cast<int>(cx - half);
+            x1 = static_cast<int>(cx + half) + 1;
+            if (x0 < 0) {
+                x0 = 0;
+            }
+            if (x1 > w) {
+                x1 = w;
+            }
+        }
+        // Keep the start even and the width even: the animations' paired
+        // 32-bit stores assume 4-byte alignment, and the packing memmove below
+        // is cheaper on aligned words.
+        x0 &= ~1;
+        if ((x1 - x0) & 1) {
+            x1++;
+        }
+        if (x1 > w) {
+            x1 = w;
+        }
+        bandX0[b] = static_cast<int16_t>(x0);
+        bandX1[b] = static_cast<int16_t>(x1);
+    }
+}
+
+void SleepAnimation::pushTaskEntry(void *arg) {
+    auto *self = static_cast<SleepAnimation *>(arg);
+    self->pushLoop();
+    self->pushStopped = true;
+    vTaskDelete(nullptr);
+}
+
+void SleepAnimation::pushLoop() {
+    int slot = 0;
+    while (running) {
+        if (xSemaphoreTake(static_cast<SemaphoreHandle_t>(bandReady[slot]), pdMS_TO_TICKS(200)) != pdTRUE) {
+            continue; // render task idle or stopping; re-check running
+        }
+        if (!running) {
+            break;
+        }
+        const PushJob job = pushJob[slot];
+#ifdef GM_ANIM_BENCH
+        const int64_t t0 = esp_timer_get_time();
+#endif
+        display->pushColors(job.x0, job.y0, job.x1, job.y1, bandBuf[slot]);
+#ifdef GM_ANIM_BENCH
+        accPushUs += static_cast<uint64_t>(esp_timer_get_time() - t0);
+#endif
+        xSemaphoreGive(static_cast<SemaphoreHandle_t>(bandFree[slot]));
+        slot ^= 1;
     }
 }
 
@@ -257,7 +394,7 @@ void SleepAnimation::benchTick() {
         for (int i = 0; i < BENCH_MAX_ANIMS; i++) {
             benchDone[i] = BenchResult{};
         }
-        accBandUs = accBlendUs = accPushUs = accTotalUs = 0;
+        accBandUs = accBlendUs = accPushUs = accTotalUs = accWaitUs = accPackUs = 0;
         accFrames = 0;
         accMaxTotalUs = 0;
         accBandLockedUs = 0;
@@ -292,6 +429,8 @@ void SleepAnimation::benchFinishDwell() {
         r.pushUs = static_cast<uint32_t>(accPushUs / accFrames);
         r.totalUs = static_cast<uint32_t>(accTotalUs / accFrames);
         r.maxTotalUs = accMaxTotalUs;
+        r.waitUs = static_cast<uint32_t>(accWaitUs / accFrames);
+        r.packUs = static_cast<uint32_t>(accPackUs / accFrames);
         r.achievedFps = elapsedMs > 0 ? static_cast<uint32_t>(accFrames * 100000ULL / elapsedMs) : 0;
         // Both normalised per row so the locked sample (one band per frame)
         // is directly comparable to the unlocked one (all 30 bands).
@@ -306,7 +445,7 @@ void SleepAnimation::benchFinishDwell() {
               r.achievedFps % 100);
     }
 
-    accBandUs = accBlendUs = accPushUs = accTotalUs = 0;
+    accBandUs = accBlendUs = accPushUs = accTotalUs = accWaitUs = accPackUs = 0;
     accFrames = 0;
     accMaxTotalUs = 0;
     accBandLockedUs = 0;
@@ -330,6 +469,22 @@ void SleepAnimation::benchFinishDwell() {
 #endif
 
 void SleepAnimation::renderFrame() {
+    // Cropping to the round panel's visible chord trades render-side work
+    // (packing each band to a tight stride) for push-side work (fewer bytes to
+    // PSRAM). Since the push runs on the other core now, that trade only pays
+    // when push is the stage setting the pace -- otherwise it adds ~4.6 ms to
+    // the critical path to save time on a stage that already has slack.
+    //
+    // The render task blocking on bandFree IS the signal that push is the
+    // bottleneck, so last frame's wait decides this frame's crop. Thresholds
+    // are split to damp oscillation around the crossover, where both states
+    // are near-optimal anyway.
+    if (frameWaitUs > 1500) {
+        cropEnabled = true;
+    } else if (frameWaitUs < 400) {
+        cropEnabled = false;
+    }
+    frameWaitUs = 0;
     const int w = display->width();
     const int h = display->height();
     const uint32_t tMs = millis();
@@ -370,6 +525,24 @@ void SleepAnimation::renderFrame() {
 #endif
     for (int y0 = 0; y0 < h && running; y0 += BAND_H) {
         const int rows = (y0 + BAND_H <= h) ? BAND_H : (h - y0);
+        // Wait for the push task to finish with this slot. On the first band
+        // of a frame this is normally already free; mid-frame it is where the
+        // render task blocks if band+blend is faster than push, which is
+        // exactly the intended behaviour -- the pipeline runs at the slower
+        // stage's rate rather than the sum of both.
+        const int64_t tWait = esp_timer_get_time();
+        const bool gotSlot =
+            xSemaphoreTake(static_cast<SemaphoreHandle_t>(bandFree[renderSlot]), pdMS_TO_TICKS(1000)) == pdTRUE;
+        const uint32_t waitUs = static_cast<uint32_t>(esp_timer_get_time() - tWait);
+        frameWaitUs += waitUs;
+#ifdef GM_ANIM_BENCH
+        accWaitUs += waitUs;
+#endif
+        if (!gotSlot) {
+            log_w("SleepAnimation: push task stalled, dropping frame");
+            return;
+        }
+        uint16_t *const band = bandBuf[renderSlot];
         // Bench builds render ONE band per frame with the scheduler suspended
         // on this core. Aurora measures ~82 CPU cycles/pixel for a loop body
         // that looks like it should run in far less, and its max frame is 1.8x
@@ -429,13 +602,59 @@ void SleepAnimation::renderFrame() {
             }
         }
         BENCH_ACC(accBlendUs, tBlend);
+
+        // Compact the band to just the columns the round panel actually shows.
+        // Rows are written full-width by the animations; here each row's
+        // visible span is moved down to a tight [0, cw) stride so pushColors
+        // can take it as a rectangle. The move is always backwards within the
+        // same buffer (dst offset r*cw <= src offset r*w + x0 for every r), so
+        // it is safe in place and needs no second buffer.
+        const int bi = y0 / BAND_H;
+        const int cx0 = cropEnabled ? bandX0[bi] : 0;
+        const int cx1 = cropEnabled ? bandX1[bi] : w;
+        const int cw = cx1 - cx0;
+        BENCH_T0(tPack);
+        if (cw < w) {
+            // Explicit forward word copy, NOT memmove. The regions overlap
+            // (same buffer) so memmove is the only correct libc call, and
+            // newlib's memmove takes a byte-at-a-time path for overlap --
+            // measured at 23 MB/s, which cost 18 ms/frame and cancelled the
+            // entire saving the crop was meant to produce. Forward is provably
+            // safe here because the destination is always below the source
+            // (r*cw <= r*w + cx0 for every r, since cw <= w), and computeChords
+            // forces cx0 and cw even so both pointers stay 4-byte aligned:
+            // two pixels move per store.
+            for (int r = 0; r < rows; r++) {
+                uint32_t *__restrict dst = reinterpret_cast<uint32_t *>(band + static_cast<size_t>(r) * cw);
+                const uint32_t *__restrict src =
+                    reinterpret_cast<const uint32_t *>(band + static_cast<size_t>(r) * w + cx0);
+                const int n = cw >> 1;
+                int i = 0;
+                // 8 pixels per iteration: the copy is load-use bound, so
+                // batching the loads hides their latency behind each other
+                // instead of stalling once per word.
+                for (; i + 4 <= n; i += 4) {
+                    const uint32_t a = src[i], b = src[i + 1], c = src[i + 2], d = src[i + 3];
+                    dst[i] = a;
+                    dst[i + 1] = b;
+                    dst[i + 2] = c;
+                    dst[i + 3] = d;
+                }
+                for (; i < n; i++) {
+                    dst[i] = src[i];
+                }
+            }
+        }
+        BENCH_ACC(accPackUs, tPack);
+
         // pushColors' width/height params are actually END coordinates — they
         // pass through unchanged to esp_lcd_panel_draw_bitmap (exclusive end).
         // Passing dimensions here asserted in rgb_panel_draw_bitmap on the
         // second band (y_start==y_end) and boot-looped sleep3/sleep4.
-        BENCH_T0(tPush);
-        display->pushColors(0, y0, w, y0 + rows, band);
-        BENCH_ACC(accPushUs, tPush);
+        pushJob[renderSlot] = {static_cast<int16_t>(cx0), static_cast<int16_t>(y0), static_cast<int16_t>(cx1),
+                         static_cast<int16_t>(y0 + rows)};
+        xSemaphoreGive(static_cast<SemaphoreHandle_t>(bandReady[renderSlot]));
+        renderSlot ^= 1;
     }
 }
 
