@@ -26,6 +26,8 @@ uint32_t nextDropMs = 0;
 uint32_t rng = 0xC0FFEE;
 float *envLUT = nullptr; // 256: 1-(i/255)^2
 bool inited = false;
+uint32_t lastThemeGen = 0xFFFFFFFF;
+float crestF[3] = {62, 98, 127}, troughF[3] = {7, 12, 15};
 
 int g_n = 0;
 float g_cx[MAX_RIPPLES], g_cy[MAX_RIPPLES], g_r[MAX_RIPPLES], g_amp[MAX_RIPPLES];
@@ -53,9 +55,24 @@ bool init(int, int) {
     return true;
 }
 
+// Water surface sits in the theme's darkest ~10%; ring crests borrow the
+// brightest stop, troughs a dimmed version of it.
+void rebuildThemeAssets() {
+    uint8_t c[3];
+    themeRGB(255, c);
+    for (int ch = 0; ch < 3; ch++) {
+        crestF[ch] = c[ch] * 0.65f;
+        troughF[ch] = crestF[ch] * 0.12f;
+    }
+}
+
 void frame(uint32_t tMs, int w, int h, const uint8_t p[4]) {
     g_tMs = tMs;
-    const float interval = lerpf(14000.0f, 1500.0f, p[0] / 100.0f);
+    if (themeGen() != lastThemeGen) {
+        rebuildThemeAssets();
+        lastThemeGen = themeGen();
+    }
+    const float interval = lerpf(14000.0f, 1500.0f, p[1] / 100.0f);
     if (tMs >= nextDropMs) {
         for (auto &r : ripples) {
             if (!r.active) {
@@ -65,7 +82,7 @@ void frame(uint32_t tMs, int w, int h, const uint8_t p[4]) {
         }
         nextDropMs = tMs + static_cast<uint32_t>(interval * (0.55f + 0.9f * nextRandf(rng)));
     }
-    const float speed = lerpf(38.0f, 150.0f, p[1] / 100.0f);
+    const float speed = lerpf(25.0f, 220.0f, p[0] / 100.0f);
     const float life = lerpf(7.0f, 2.2f, p[2] / 100.0f);
     g_glow = 0.35f + 1.15f * (p[3] / 100.0f);
 
@@ -97,10 +114,16 @@ void band(uint16_t *dst, int y0, int rows, int w, uint32_t, const uint8_t *) {
     for (int yy = 0; yy < rows; yy++) {
         const int y = y0 + yy;
         const float vt = y / 479.0f;
-        const float swell = fastSinRad(g_tMs * 0.00007f + y * 0.014f) * 2.5f;
-        const float baseR = 4 + 5 * vt + swell;
-        const float baseG = 7 + 7 * vt + swell;
-        const float baseB = 14 + 12 * vt + swell * 1.4f;
+        const float swell = fastSinRad(g_tMs * 0.00014f + y * 0.014f) * 2.5f;
+        int basePos = static_cast<int>(vt * 20.0f + swell + 3.0f);
+        if (basePos < 0) {
+            basePos = 0;
+        } else if (basePos > 31) {
+            basePos = 31;
+        }
+        uint8_t baseC[3];
+        themeRGB(basePos, baseC);
+        const float baseR = baseC[0], baseG = baseC[1], baseB = baseC[2];
 
         struct RowRing {
             float cx, r, amp, dy;
@@ -150,13 +173,13 @@ void band(uint16_t *dst, int y0, int rows, int w, uint32_t, const uint8_t *) {
             if (hAcc != 0) {
                 const float g = hAcc * g_glow;
                 if (g > 0) {
-                    cr += g * 95;
-                    cg += g * 150;
-                    cb += g * 195;
+                    cr += g * crestF[0];
+                    cg += g * crestF[1];
+                    cb += g * crestF[2];
                 } else {
-                    cr += g * 9;
-                    cg += g * 13;
-                    cb += g * 22;
+                    cr += g * troughF[0];
+                    cg += g * troughF[1];
+                    cb += g * troughF[2];
                 }
             }
             const float dith = (BAYER4[(y & 3) * 4 + (x & 3)] - 7.5f) * 0.55f;
@@ -171,7 +194,7 @@ extern const BgAnimation bg_anim_ripples;
 const BgAnimation bg_anim_ripples = {
     "ripples",
     "Ripples",
-    {{"rate", "Drop rate", 30}, {"speed", "Ring speed", 40}, {"decay", "Fade", 50}, {"glow", "Glow", 50}},
+    {{"speed", "Ring speed", 50}, {"rate", "Drop rate", 40}, {"decay", "Fade", 50}, {"glow", "Glow", 50}},
     init,
     frame,
     band,

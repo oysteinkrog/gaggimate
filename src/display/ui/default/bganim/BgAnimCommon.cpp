@@ -100,31 +100,87 @@ const uint8_t *noiseTex256() {
     return tex;
 }
 
-void buildRamp565(uint16_t *out, const float *stopPos, const uint32_t *hexA, const uint32_t *hexB, int nStops,
-                  int blendQ8) {
-    int s = 0;
+// ---- active color theme --------------------------------------------------
+
+namespace {
+// Double buffer behind an atomic generation counter: the writer fills the
+// inactive buffer then increments the generation (buffer index = gen & 1).
+// A torn read would need two settings writes inside one frame — harmless.
+uint8_t g_themeBuf[2][8][3] = {
+    {{0x08, 0x04, 0x02}, {0x2a, 0x12, 0x06}, {0x6b, 0x34, 0x13}, {0xb8, 0x70, 0x3a}, {0xe8, 0xb2, 0x68}, {0xf8, 0xe6, 0xc8}},
+    {{0x08, 0x04, 0x02}, {0x2a, 0x12, 0x06}, {0x6b, 0x34, 0x13}, {0xb8, 0x70, 0x3a}, {0xe8, 0xb2, 0x68}, {0xf8, 0xe6, 0xc8}},
+};
+int g_themeCount[2] = {6, 6};
+volatile uint32_t g_themeGen = 0;
+} // namespace
+
+void setThemeStops(const uint8_t (*stops)[3], int nStops) {
+    if (stops == nullptr || nStops < 2) {
+        return;
+    }
+    if (nStops > 8) {
+        nStops = 8;
+    }
+    const uint32_t next = g_themeGen + 1;
+    const int buf = next & 1;
+    for (int i = 0; i < nStops; i++) {
+        for (int c = 0; c < 3; c++) {
+            g_themeBuf[buf][i][c] = stops[i][c];
+        }
+    }
+    g_themeCount[buf] = nStops;
+    g_themeGen = next;
+}
+
+uint32_t themeGen() { return g_themeGen; }
+int themeStopCount() { return g_themeCount[g_themeGen & 1]; }
+const uint8_t (*themeStops())[3] { return g_themeBuf[g_themeGen & 1]; }
+
+void themeRGB(int pos, uint8_t out[3]) {
+    const uint8_t(*st)[3] = themeStops();
+    const int n = themeStopCount();
+    if (pos < 0) {
+        pos = 0;
+    } else if (pos > 255) {
+        pos = 255;
+    }
+    const int scaled = pos * (n - 1);      // 0 .. 255*(n-1)
+    const int seg = scaled >> 8;           // stop index
+    const int f = scaled & 255;            // blend within segment
+    for (int c = 0; c < 3; c++) {
+        out[c] = static_cast<uint8_t>(st[seg][c] + (((st[seg + 1][c] - st[seg][c]) * f) >> 8));
+    }
+}
+
+void buildThemeRamp(uint16_t *out, uint16_t brightness256, bool reversed) {
     for (int i = 0; i < 256; i++) {
-        const float pos = i / 255.0f;
-        while (s < nStops - 2 && stopPos[s + 1] < pos) {
-            s++;
-        }
-        const float span = stopPos[s + 1] - stopPos[s];
-        float lt = span > 0 ? (pos - stopPos[s]) / span : 0;
-        if (lt < 0) {
-            lt = 0;
-        } else if (lt > 1) {
-            lt = 1;
-        }
         uint8_t c[3];
+        themeRGB(reversed ? 255 - i : i, c);
+        const uint32_t r = (c[0] * brightness256) >> 8;
+        const uint32_t g = (c[1] * brightness256) >> 8;
+        const uint32_t b = (c[2] * brightness256) >> 8;
+        out[i] = rgb565(static_cast<uint8_t>(r > 255 ? 255 : r), static_cast<uint8_t>(g > 255 ? 255 : g),
+                        static_cast<uint8_t>(b > 255 ? 255 : b));
+    }
+}
+
+void buildThemeWheel(uint16_t *out, uint16_t brightness256) {
+    const uint8_t(*st)[3] = themeStops();
+    const int n = themeStopCount();
+    for (int i = 0; i < 256; i++) {
+        const int scaled = i * n; // wrap: n segments, last blends into stop 0
+        const int seg = scaled >> 8;
+        const int f = scaled & 255;
+        const int nextSeg = (seg + 1) % n;
+        uint32_t c[3];
         for (int ch = 0; ch < 3; ch++) {
-            const int sh = 16 - 8 * ch;
-            const float a0 = (hexA[s] >> sh) & 0xFF, a1 = (hexA[s + 1] >> sh) & 0xFF;
-            const float b0 = (hexB[s] >> sh) & 0xFF, b1 = (hexB[s + 1] >> sh) & 0xFF;
-            const float a = a0 + (a1 - a0) * lt;
-            const float b = b0 + (b1 - b0) * lt;
-            c[ch] = clamp8f(a + ((b - a) * blendQ8) * (1.0f / 256.0f));
+            const int v = st[seg][ch] + (((st[nextSeg][ch] - st[seg][ch]) * f) >> 8);
+            c[ch] = (static_cast<uint32_t>(v) * brightness256) >> 8;
+            if (c[ch] > 255) {
+                c[ch] = 255;
+            }
         }
-        out[i] = rgb565(c[0], c[1], c[2]);
+        out[i] = rgb565(static_cast<uint8_t>(c[0]), static_cast<uint8_t>(c[1]), static_cast<uint8_t>(c[2]));
     }
 }
 

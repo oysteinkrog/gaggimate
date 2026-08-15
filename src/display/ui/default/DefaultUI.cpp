@@ -18,6 +18,7 @@
 #include "esp_sntp.h"
 
 #include <display/ui/default/bganim/BgAnim.h>
+#include <display/ui/default/bganim/BgAnimCommon.h>
 #include <display/ui/default/eez/actions.h>
 #include <display/ui/default/eez/images.h>
 #include <display/ui/default/eez/ui.h>
@@ -863,6 +864,20 @@ void DefaultUI::updateState() {
     const int animId = settings.getBgAnimId();
     bg_parse_params(settings.getBgAnimParams().c_str(), animId, animP);
     sleepAnimation.configure(static_cast<uint8_t>(animId), animP);
+    // Publish the color theme only on change — setThemeStops bumps a
+    // generation counter that makes every animation rebuild its palettes.
+    static int lastThemeId = -1;
+    static String lastCustom;
+    const int themeId = settings.getBgAnimTheme();
+    const String custom = settings.getBgAnimCustomTheme();
+    if (themeId != lastThemeId || custom != lastCustom) {
+        lastThemeId = themeId;
+        lastCustom = custom;
+        uint8_t stops[BG_THEME_MAX_STOPS][3];
+        int nStops = 0;
+        bg_resolve_theme(themeId, custom.c_str(), stops, nStops);
+        bganim::setThemeStops(stops, nStops);
+    }
 #endif
 
     uiFlags.brew_adjustments(brewScreenState == BrewScreenState::Settings);

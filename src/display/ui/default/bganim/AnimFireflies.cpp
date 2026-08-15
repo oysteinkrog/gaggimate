@@ -35,9 +35,26 @@ Firefly *ff = nullptr;
 FfDraw *draws = nullptr;
 uint8_t *alphaLUT = nullptr; // 64 entries, indexed by normalized d^2
 uint16_t *bgLUT = nullptr;   // per-scanline background
+uint8_t *ffCol = nullptr;    // FF_MAX * 3, per-particle base color from the theme
 int ffCount = 0;
 int builtCount = -1;
 uint32_t rng = 0x9e3779b9;
+uint32_t lastThemeGen = 0xFFFFFFFF;
+int g_h = 480;
+
+// Particles glow in the theme's bright range (per-particle hueMix spreads
+// them); the dusk background sits in the darkest few percent.
+void rebuildThemeAssets() {
+    for (int i = 0; i < FF_MAX; i++) {
+        themeRGB(185 + static_cast<int>(ff[i].hueMix * 70.0f), &ffCol[i * 3]);
+    }
+    for (int y = 0; y < g_h; y++) {
+        const float n = fabsf(y - g_h * 0.5f) / (g_h * 0.5f);
+        uint8_t c[3];
+        themeRGB(static_cast<int>(8.0f - n * 5.0f), c);
+        bgLUT[y] = rgb565(c[0], c[1], c[2]);
+    }
+}
 
 void spawnAll(int count, int w, int h) {
     const float cx = w * 0.5f, cy = h * 0.5f;
@@ -76,30 +93,33 @@ bool init(int w, int h) {
         draws = static_cast<FfDraw *>(alloc(FF_MAX * sizeof(FfDraw)));
         alphaLUT = static_cast<uint8_t *>(alloc(64));
         bgLUT = static_cast<uint16_t *>(alloc(h * sizeof(uint16_t)));
-        if (ff == nullptr || draws == nullptr || alphaLUT == nullptr || bgLUT == nullptr) {
+        ffCol = static_cast<uint8_t *>(alloc(FF_MAX * 3));
+        if (ff == nullptr || draws == nullptr || alphaLUT == nullptr || bgLUT == nullptr || ffCol == nullptr) {
             return false;
         }
+        g_h = h;
         for (int i = 0; i < 64; i++) {
             float a = 1.0f - sqrtf(i / 63.0f);
             a = a < 0 ? 0 : a * a;
             alphaLUT[i] = static_cast<uint8_t>(a * 255.0f);
-        }
-        for (int y = 0; y < h; y++) {
-            const float n = fabsf(y - h * 0.5f) / (h * 0.5f);
-            bgLUT[y] = rgb565(static_cast<uint8_t>(7 + (3 - 7) * n), static_cast<uint8_t>(14 + (6 - 14) * n),
-                              static_cast<uint8_t>(20 + (10 - 20) * n));
         }
     }
     return true;
 }
 
 void frame(uint32_t tMs, int w, int h, const uint8_t p[4]) {
-    const int count = 15 + (p[0] * 25) / 100;
+    const int count = 15 + (p[1] * 25) / 100;
     if (count != builtCount) {
         spawnAll(count, w, h);
+        rebuildThemeAssets();
+        lastThemeGen = themeGen();
+    }
+    if (themeGen() != lastThemeGen) {
+        rebuildThemeAssets();
+        lastThemeGen = themeGen();
     }
     ffCount = count;
-    const float speed = 0.4f + (p[1] / 100.0f) * 1.2f;
+    const float speed = speedMul(p[0]);
     const float glow = 0.7f + (p[2] / 100.0f) * 0.8f;
     const float shimAmt = p[3] / 100.0f;
     const float shimPeriod = 14000.0f - shimAmt * 8000.0f;
@@ -121,12 +141,9 @@ void frame(uint32_t tMs, int w, int h, const uint8_t p[4]) {
             brightness += shimAmt * expf(-(dr * dr) * 61.7f); // sigma 0.09
         }
         d.a8 = brightness >= 1.0f ? 255 : static_cast<uint8_t>(brightness * 255.0f);
-        // Warm core blended toward green glow per particle (hueMix), computed
-        // once per frame instead of per pixel.
-        const float mix = f.hueMix;
-        d.r = clamp8f(255.0f * (1.0f - mix * 0.25f));
-        d.g = clamp8f(230.0f + mix * 0.0f);
-        d.b = clamp8f(130.0f - mix * 40.0f);
+        d.r = ffCol[i * 3 + 0];
+        d.g = ffCol[i * 3 + 1];
+        d.b = ffCol[i * 3 + 2];
     }
 }
 
@@ -173,7 +190,7 @@ extern const BgAnimation bg_anim_fireflies;
 const BgAnimation bg_anim_fireflies = {
     "fireflies",
     "Fireflies",
-    {{"count", "Count", 60}, {"speed", "Speed", 50}, {"glow", "Glow", 55}, {"shimmer", "Shimmer", 40}},
+    {{"speed", "Speed", 50}, {"count", "Count", 60}, {"glow", "Glow", 55}, {"shimmer", "Shimmer", 40}},
     init,
     frame,
     band,

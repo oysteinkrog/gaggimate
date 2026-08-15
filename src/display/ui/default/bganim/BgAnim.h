@@ -45,4 +45,24 @@ const BgAnimation &bg_animation(int id);
 // settings string ("p0,p1,p2,p3;p0,p1,p2,p3;..." indexed by animation id).
 void bg_parse_params(const char *packed, int animId, uint8_t out[4]);
 
+// ---- shared color themes -------------------------------------------------
+// Every animation draws its colors from one global gradient theme: 2-8 RGB
+// stops ordered dark -> bright (stop 0 is the background/darkest tone, the
+// last stop the brightest accent). Built-in themes have 6 stops and are
+// mirrored in web/src/config/bgAnimations.js — keep in sync. The selected
+// theme id and an optional custom stop list are persisted in Settings
+// (bgAnimTheme / bgAnimCustomTheme, custom = comma-separated hex like
+// "080402,2a1206,...", 2-8 stops).
+
+constexpr int BG_THEME_MAX_STOPS = 8;
+
+int bg_theme_count();                       // number of built-in themes
+const char *bg_theme_name(int i);           // clamped like bg_animation
+const uint8_t (*bg_theme_stops(int i))[3];  // 6 RGB stops, dark -> bright
+
+// Resolves themeId + custom string into stops/count. themeId ==
+// bg_theme_count() selects the custom string; invalid/empty custom (or any
+// out-of-range id) falls back to theme 0.
+void bg_resolve_theme(int themeId, const char *custom, uint8_t stops[BG_THEME_MAX_STOPS][3], int &nStops);
+
 #endif // BGANIM_H

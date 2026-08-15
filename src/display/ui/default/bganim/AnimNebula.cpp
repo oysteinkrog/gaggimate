@@ -13,13 +13,9 @@
 namespace {
 using namespace bganim;
 
-constexpr float STOP_POS[6] = {0.00f, 0.35f, 0.60f, 0.80f, 0.93f, 1.00f};
-constexpr uint32_t VIOLET_HEX[6] = {0x05050f, 0x150a28, 0x341840, 0x6b2f5e, 0xb3477d, 0xe6b3d6};
-constexpr uint32_t TEAL_HEX[6] = {0x050a0f, 0x0a1c28, 0x123a44, 0x1f6b6e, 0x3fb3a8, 0xbdeee0};
-
 uint16_t *palette = nullptr;
 const uint8_t *noise = nullptr;
-uint8_t lastHue = 255;
+uint32_t lastThemeGen = 0xFFFFFFFF;
 // Q8.8 scroll accumulators — texel-aligned wraparound (65536 = 256 texels).
 uint16_t sAx = 0, sAy = 0, sBx = 0, sBy = 0, sCx = 0, sCy = 0;
 int g_wA = 32, g_wB = 20, g_wC = 12, g_densOff = 0;
@@ -33,28 +29,28 @@ bool init(int, int) {
             return false;
         }
     }
-    lastHue = 255;
+    lastThemeGen = 0xFFFFFFFF;
     return true;
 }
 
 void frame(uint32_t, int, int, const uint8_t p[4]) {
-    if (p[1] != lastHue) {
-        buildRamp565(palette, STOP_POS, VIOLET_HEX, TEAL_HEX, 6, (p[1] * 256) / 100);
-        lastHue = p[1];
+    if (themeGen() != lastThemeGen) {
+        buildThemeRamp(palette, 256);
+        lastThemeGen = themeGen();
     }
     // Per-frame deltas matched to the web preview at ~30fps: px/frame * 256.
-    const float g = 0.2f + 0.018f * p[2];
+    const float g = 1.2f * speedMul(p[0]);
     sAx += static_cast<uint16_t>(85.0f * g);
     sAy += static_cast<uint16_t>(51.0f * g);
     sBx -= static_cast<uint16_t>(145.0f * g);
     sBy += static_cast<uint16_t>(111.0f * g);
     sCx += static_cast<uint16_t>(222.0f * g);
     sCy -= static_cast<uint16_t>(179.0f * g);
-    const float turb = p[3] / 100.0f;
+    const float turb = p[2] / 100.0f;
     g_wA = static_cast<int>((0.60f - 0.15f * turb) * 64.0f);
     g_wB = static_cast<int>((0.25f + 0.05f * turb) * 64.0f);
     g_wC = 64 - g_wA - g_wB;
-    g_densOff = static_cast<int>((p[0] - 50) * 1.1f);
+    g_densOff = static_cast<int>((p[1] - 50) * 1.1f);
     g_axI = sAx >> 8;
     g_axF = sAx & 0xFF;
     g_ayI = sAy >> 8;
@@ -104,7 +100,7 @@ extern const BgAnimation bg_anim_nebula;
 const BgAnimation bg_anim_nebula = {
     "nebula",
     "Nebula",
-    {{"density", "Density", 50}, {"hue", "Hue", 40}, {"drift", "Drift", 30}, {"turbulence", "Turbulence", 40}},
+    {{"speed", "Drift speed", 50}, {"density", "Density", 50}, {"turbulence", "Turbulence", 40}, {nullptr, nullptr, 0}},
     init,
     frame,
     band,

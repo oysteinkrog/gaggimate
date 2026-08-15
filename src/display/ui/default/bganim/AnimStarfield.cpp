@@ -36,8 +36,14 @@ int16_t *starY = nullptr;       // fixed row per star
 int16_t *bandHead = nullptr;    // NUM_BANDS heads
 int16_t *bandNext = nullptr;    // linked list per star
 int32_t *dx2 = nullptr, *dy2 = nullptr;
-uint8_t *vigLUT = nullptr; // 128 entries
+uint8_t *vigLUT = nullptr;    // 128 entries
+uint8_t *starCol = nullptr;   // MAX_STARS * 3, per-star base color from the theme
+uint16_t *vigColor = nullptr; // 128 RGB565 background entries (theme-tinted)
+uint8_t shootCol[3] = {220, 225, 255};
+uint32_t lastThemeGen = 0xFFFFFFFF;
 int g_nStars = 0;
+
+void rebuildThemeAssets();
 
 struct Shoot {
     bool active = false;
@@ -58,8 +64,10 @@ bool init(int w, int h) {
         dx2 = static_cast<int32_t *>(alloc(w * sizeof(int32_t)));
         dy2 = static_cast<int32_t *>(alloc(h * sizeof(int32_t)));
         vigLUT = static_cast<uint8_t *>(alloc(128));
+        starCol = static_cast<uint8_t *>(alloc(MAX_STARS * 3));
+        vigColor = static_cast<uint16_t *>(alloc(128 * sizeof(uint16_t)));
         if (stars == nullptr || draws == nullptr || starY == nullptr || bandHead == nullptr || bandNext == nullptr ||
-            dx2 == nullptr || dy2 == nullptr || vigLUT == nullptr) {
+            dx2 == nullptr || dy2 == nullptr || vigLUT == nullptr || starCol == nullptr || vigColor == nullptr) {
             return false;
         }
         const float cx = w * 0.5f, cy = h * 0.5f;
@@ -92,16 +100,36 @@ bool init(int w, int h) {
             stars[i].driftSpeed = 0.5f + nextRandf(rng);
             starY[i] = static_cast<int16_t>(stars[i].y);
         }
+        rebuildThemeAssets();
+        lastThemeGen = themeGen();
     }
     return true;
 }
 
+// Stars sample the theme's bright end (per-star hue picks the exact spot);
+// the vignette background sits in the theme's darkest ~14%.
+void rebuildThemeAssets() {
+    for (int i = 0; i < MAX_STARS; i++) {
+        themeRGB(180 + static_cast<int>(stars[i].hue * 75.0f), &starCol[i * 3]);
+    }
+    for (int idx = 0; idx < 128; idx++) {
+        uint8_t c[3];
+        themeRGB((vigLUT[idx] * 36) >> 8, c);
+        vigColor[idx] = rgb565(c[0], c[1], c[2]);
+    }
+    themeRGB(255, shootCol);
+}
+
 void frame(uint32_t tMs, int w, int h, const uint8_t p[4]) {
     (void)h;
-    g_nStars = 40 + (p[0] * (MAX_STARS - 40)) / 100;
+    if (themeGen() != lastThemeGen) {
+        rebuildThemeAssets();
+        lastThemeGen = themeGen();
+    }
+    g_nStars = 40 + (p[1] * (MAX_STARS - 40)) / 100;
     const float t = tMs * 0.001f;
-    const float twinkleAmt = p[1] / 100.0f;
-    const float driftPxPerSec = (p[3] / 100.0f) * 2.0f;
+    const float twinkleAmt = p[2] / 100.0f;
+    const float driftPxPerSec = 3.0f * speedMul(p[0]);
 
     for (int b = 0; b < NUM_BANDS; b++) {
         bandHead[b] = -1;
@@ -117,9 +145,9 @@ void frame(uint32_t tMs, int w, int h, const uint8_t p[4]) {
         float bF = s.baseBrightness * (1.0f - twinkleAmt + twinkleAmt * twinkle) * edgeFade;
         bF = fmaxf(0.0f, fminf(1.0f, bF));
         draws[i].x = static_cast<int16_t>(x);
-        draws[i].r = clamp8f((200.0f + s.hue * 55.0f) * bF);
-        draws[i].g = clamp8f((210.0f + (0.5f - fabsf(s.hue - 0.5f)) * 30.0f) * bF);
-        draws[i].b = clamp8f((255.0f - s.hue * 90.0f) * bF);
+        draws[i].r = clamp8f(starCol[i * 3 + 0] * bF);
+        draws[i].g = clamp8f(starCol[i * 3 + 1] * bF);
+        draws[i].b = clamp8f(starCol[i * 3 + 2] * bF);
         draws[i].sizeClass = s.sizeClass;
         const int bandIdx = starY[i] >> 4;
         bandNext[i] = bandHead[bandIdx];
@@ -129,7 +157,7 @@ void frame(uint32_t tMs, int w, int h, const uint8_t p[4]) {
     // Shooting star lifecycle (dt from the frame delta; robust to pauses).
     const float dt = lastTMs != 0 && tMs > lastTMs ? (tMs - lastTMs) * 0.001f : 0.033f;
     lastTMs = tMs;
-    const uint8_t shootFreq = p[2];
+    const uint8_t shootFreq = p[3];
     if (!shoot.active && shootFreq > 0 && tMs > nextShootMs) {
         const float angle = 3.14159265f * 0.15f + nextRandf(rng) * 3.14159265f * 0.2f;
         const float speed = 260.0f + nextRandf(rng) * 140.0f;
@@ -175,8 +203,7 @@ void band(uint16_t *dst, int y0, int rows, int w, uint32_t, const uint8_t *) {
             if (idx > 127) {
                 idx = 127;
             }
-            const uint8_t shade = vigLUT[idx];
-            row[x] = rgb565(2 + ((shade * 4) >> 8), 3 + ((shade * 6) >> 8), 8 + ((shade * 12) >> 8));
+            row[x] = vigColor[idx];
         }
     }
     // 2. stars bucketed for this band (plus neighbors for the 1px spill)
@@ -212,8 +239,8 @@ void band(uint16_t *dst, int y0, int rows, int w, uint32_t, const uint8_t *) {
             const float px = hx - shoot.vx * 0.02f * k;
             const float py = hy - shoot.vy * 0.02f * k;
             const float fade = (1.0f - f) * (1.0f - progress * 0.3f);
-            plotMax(dst, rows, w, static_cast<int>(px), static_cast<int>(py) - y0, clamp8f(220 * fade), clamp8f(225 * fade),
-                    clamp8f(255 * fade));
+            plotMax(dst, rows, w, static_cast<int>(px), static_cast<int>(py) - y0, clamp8f(shootCol[0] * fade),
+                    clamp8f(shootCol[1] * fade), clamp8f(shootCol[2] * fade));
         }
     }
 }
@@ -224,7 +251,7 @@ extern const BgAnimation bg_anim_starfield;
 const BgAnimation bg_anim_starfield = {
     "starfield",
     "Starfield",
-    {{"density", "Stars", 45}, {"twinkle", "Twinkle", 50}, {"shooting", "Shooting stars", 30}, {"drift", "Drift", 20}},
+    {{"speed", "Drift speed", 50}, {"density", "Stars", 45}, {"twinkle", "Twinkle", 50}, {"shooting", "Shooting stars", 30}},
     init,
     frame,
     band,

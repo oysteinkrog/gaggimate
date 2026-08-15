@@ -41,6 +41,17 @@ int wispCount = 0;
 int builtCount = -1;
 uint32_t rng = 0x1234abcd;
 int g_active = 0;
+uint32_t lastThemeGen = 0xFFFFFFFF;
+int g_h = 480;
+
+void rebuildBg() {
+    for (int y = 0; y < g_h; y++) {
+        const float n = fabsf(y - g_h * 0.5f) / (g_h * 0.5f);
+        uint8_t c[3];
+        themeRGB(static_cast<int>(9.0f - n * 6.0f), c);
+        bgLUT[y] = rgb565(c[0], c[1], c[2]);
+    }
+}
 
 void buildWisps(int count, int w, int h, uint32_t tMs) {
     const float cx = w * 0.5f, cy = h * 0.5f;
@@ -74,27 +85,29 @@ bool init(int, int h) {
         if (alphaLUT == nullptr || bgLUT == nullptr) {
             return false;
         }
+        g_h = h;
         for (int i = 0; i < 64; i++) {
             const float norm = sqrtf(i / 63.0f);
             const float a = powf(fmaxf(0.0f, 1.0f - norm), 1.6f);
             alphaLUT[i] = static_cast<uint8_t>(a * 255.0f);
         }
-        for (int y = 0; y < h; y++) {
-            const float n = fabsf(y - h * 0.5f) / (h * 0.5f);
-            bgLUT[y] = rgb565(static_cast<uint8_t>(16 + (6 - 16) * n), static_cast<uint8_t>(11 + (4 - 11) * n),
-                              static_cast<uint8_t>(8 + (3 - 8) * n));
-        }
+        rebuildBg();
+        lastThemeGen = themeGen();
     }
     return true;
 }
 
 void frame(uint32_t tMs, int w, int h, const uint8_t p[4]) {
-    const int count = 2 + (p[0] * 3) / 100;
+    if (themeGen() != lastThemeGen) {
+        rebuildBg();
+        lastThemeGen = themeGen();
+    }
+    const int count = 2 + (p[1] * 3) / 100;
     if (count != builtCount) {
         buildWisps(count, w, h, tMs);
     }
     wispCount = count;
-    const float riseSpeed = 0.018f + (p[1] / 100.0f) * 0.032f;
+    const float riseSpeed = 0.034f * speedMul(p[0]);
     const float swirl = 0.5f + (p[2] / 100.0f) * 1.7f;
     const float density = 0.5f + (p[3] / 100.0f) * 0.8f;
     const float maxHeight = h * 0.62f;
@@ -123,9 +136,12 @@ void frame(uint32_t tMs, int w, int h, const uint8_t p[4]) {
         }
         d.a8 = static_cast<uint8_t>(alpha * 255.0f);
         d.invR2 = 1.0f / (d.R * d.R);
-        d.r = static_cast<uint8_t>(214 + (206 - 214) * heightFrac);
-        d.g = static_cast<uint8_t>(178 + (210 - 178) * heightFrac);
-        d.b = static_cast<uint8_t>(140 + (216 - 140) * heightFrac);
+        // Wisps ride the theme's bright end, shifting slightly as they rise.
+        uint8_t c[3];
+        themeRGB(200 + static_cast<int>(heightFrac * 55.0f), c);
+        d.r = c[0];
+        d.g = c[1];
+        d.b = c[2];
         d.visible = d.a8 > 0 && d.y > -30.0f;
     }
 }
@@ -173,7 +189,7 @@ extern const BgAnimation bg_anim_steam;
 const BgAnimation bg_anim_steam = {
     "steam",
     "Steam",
-    {{"count", "Wisps", 55}, {"riseSpeed", "Rise speed", 50}, {"swirl", "Swirl", 45}, {"density", "Density", 50}},
+    {{"speed", "Rise speed", 50}, {"count", "Wisps", 55}, {"swirl", "Swirl", 45}, {"density", "Density", 50}},
     init,
     frame,
     band,

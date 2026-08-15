@@ -34,10 +34,9 @@ int orbitCount = 0;
 PathPt *pathBins = nullptr;   // [orbit][band][pt]
 uint8_t *pathBinCount = nullptr; // [orbit][band]
 int lastCountP = -1, lastEccP = -1;
+uint32_t lastThemeGen = 0xFFFFFFFF;
 int g_w = 480;
-
-constexpr uint8_t HUES[6][3] = {{127, 216, 224}, {217, 179, 108}, {217, 140, 160},
-                                {150, 180, 230}, {180, 220, 170}, {230, 200, 150}};
+uint16_t g_bg = 0;
 
 // Per-frame body + trail samples, computed in frame(), drawn per band.
 struct Sample {
@@ -54,7 +53,10 @@ void rebuildGeometry(int countP, int eccP, int w, int h) {
     const float maxR = (w < h ? w : h) * 0.46f;
     const float cx = w * 0.5f, cy = h * 0.5f;
     memset(pathBinCount, 0, MAX_ORBITS * NUM_BANDS);
-    const uint16_t bg = rgb565(3, 4, 8);
+    uint8_t bgC[3];
+    themeRGB(3, bgC);
+    g_bg = rgb565(bgC[0], bgC[1], bgC[2]);
+    const uint16_t bg = g_bg;
     for (int i = 0; i < orbitCount; i++) {
         OrbitDef &o = orbits[i];
         o.a = maxR * (0.30f + i * (0.62f / (orbitCount - 1)));
@@ -64,9 +66,12 @@ void rebuildGeometry(int countP, int eccP, int w, int h) {
         o.sinPhi = sinf(o.phi);
         o.T = 6.0f * powf(1.0f + GOLDEN, static_cast<float>(i));
         o.phase = i * 1.7f;
-        o.colR = HUES[i][0];
-        o.colG = HUES[i][1];
-        o.colB = HUES[i][2];
+        // Bodies sample the theme's upper range, spread so neighbors differ.
+        uint8_t col[3];
+        themeRGB(140 + (i * 115) / (MAX_ORBITS - 1), col);
+        o.colR = col[0];
+        o.colG = col[1];
+        o.colB = col[2];
         o.pathColor565 = blendQ8(bg, rgb565(o.colR, o.colG, o.colB), static_cast<int>(0.11f * 256));
         for (int s = 0; s < 480; s++) {
             const float u = s / 480.0f * 6.2831853f;
@@ -102,12 +107,13 @@ bool init(int w, int h) {
 }
 
 void frame(uint32_t tMs, int w, int h, const uint8_t p[4]) {
-    if (p[0] != lastCountP || p[2] != lastEccP) {
-        rebuildGeometry(p[0], p[2], w, h);
-        lastCountP = p[0];
+    if (p[1] != lastCountP || p[2] != lastEccP || themeGen() != lastThemeGen) {
+        rebuildGeometry(p[1], p[2], w, h);
+        lastCountP = p[1];
         lastEccP = p[2];
+        lastThemeGen = themeGen();
     }
-    const float speedMul = 0.25f + (p[1] / 100.0f) * 1.6f;
+    const float spd = speedMul(p[0]);
     const float trailAmt = p[3] / 100.0f;
     const int K = 6 + static_cast<int>(trailAmt * 10.0f);
     const float t = tMs * 0.001f;
@@ -116,7 +122,7 @@ void frame(uint32_t tMs, int w, int h, const uint8_t p[4]) {
     sampleCount = 0;
     for (int i = 0; i < orbitCount; i++) {
         const OrbitDef &o = orbits[i];
-        const float T = o.T / speedMul;
+        const float T = o.T / spd;
         const float dt = T / 90.0f;
         for (int k = K; k >= 0; k--) {
             const float u = (t - k * dt) / T * 6.2831853f + o.phase;
@@ -134,7 +140,7 @@ void frame(uint32_t tMs, int w, int h, const uint8_t p[4]) {
 }
 
 void band(uint16_t *dst, int y0, int rows, int w, uint32_t, const uint8_t *) {
-    const uint16_t bg = rgb565(3, 4, 8);
+    const uint16_t bg = g_bg;
     const int total = rows * w;
     for (int i = 0; i < total; i++) {
         dst[i] = bg;
@@ -194,7 +200,7 @@ extern const BgAnimation bg_anim_orbits;
 const BgAnimation bg_anim_orbits = {
     "orbits",
     "Orbits",
-    {{"orbitCount", "Orbits", 55}, {"speed", "Speed", 40}, {"eccentricity", "Eccentricity", 55}, {"trail", "Trail", 50}},
+    {{"speed", "Speed", 50}, {"orbitCount", "Orbits", 55}, {"eccentricity", "Eccentricity", 55}, {"trail", "Trail", 50}},
     init,
     frame,
     band,

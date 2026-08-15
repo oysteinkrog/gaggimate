@@ -23,54 +23,10 @@ SilkWave wave[3] = {
 
 uint16_t *paletteLUT = nullptr;
 uint8_t *contrastLUT = nullptr;
-int lastHue = -1, lastGlow = -1;
+uint32_t lastThemeGen = 0xFFFFFFFF;
+int lastGlow = -1;
 float g_invR2 = 1.0f;
 int32_t g_step[3];
-
-struct Stop {
-    uint8_t t, r, g, b;
-};
-constexpr Stop SILK_PEARL[6] = {{0, 5, 7, 10},      {77, 19, 28, 38},    {140, 53, 72, 92},
-                                {191, 143, 151, 168}, {235, 232, 220, 192}, {255, 255, 246, 224}};
-constexpr Stop SILK_CHAMPAGNE[6] = {{0, 8, 6, 4},      {77, 40, 30, 16},    {140, 110, 84, 42},
-                                    {191, 196, 160, 92}, {235, 240, 206, 140}, {255, 255, 235, 190}};
-constexpr Stop SILK_INDIGO[6] = {{0, 6, 4, 12},      {77, 24, 14, 54},    {140, 58, 32, 110},
-                                 {191, 128, 90, 196}, {235, 210, 190, 240}, {255, 245, 232, 255}};
-
-void buildSilkPalette(uint8_t hue) {
-    const Stop *A, *B;
-    float f;
-    if (hue <= 50) {
-        A = SILK_PEARL;
-        B = SILK_CHAMPAGNE;
-        f = hue / 50.0f;
-    } else {
-        A = SILK_CHAMPAGNE;
-        B = SILK_INDIGO;
-        f = (hue - 50) / 50.0f;
-    }
-    Stop bl[6];
-    for (int i = 0; i < 6; i++) {
-        bl[i].t = A[i].t;
-        bl[i].r = static_cast<uint8_t>(A[i].r + (B[i].r - A[i].r) * f);
-        bl[i].g = static_cast<uint8_t>(A[i].g + (B[i].g - A[i].g) * f);
-        bl[i].b = static_cast<uint8_t>(A[i].b + (B[i].b - A[i].b) * f);
-    }
-    int seg = 0;
-    for (int idx = 0; idx < 256; idx++) {
-        while (seg < 4 && bl[seg + 1].t < idx) {
-            seg++;
-        }
-        float span = bl[seg + 1].t - bl[seg].t;
-        if (span < 1) {
-            span = 1;
-        }
-        const float fr = (idx - bl[seg].t) / span;
-        paletteLUT[idx] = rgb565(static_cast<uint8_t>(bl[seg].r + (bl[seg + 1].r - bl[seg].r) * fr),
-                                 static_cast<uint8_t>(bl[seg].g + (bl[seg + 1].g - bl[seg].g) * fr),
-                                 static_cast<uint8_t>(bl[seg].b + (bl[seg + 1].b - bl[seg].b) * fr));
-    }
-}
 
 void buildContrastLUT(uint8_t glow) {
     const float e = 0.6f + 2.0f * (glow / 100.0f);
@@ -94,9 +50,9 @@ bool init(int w, int h) {
     }
     const float R = (w < h ? w : h) * 0.5f;
     g_invR2 = 1.0f / (R * R);
-    if (lastHue < 0) {
-        buildSilkPalette(20);
-        lastHue = 20;
+    if (lastGlow < 0) {
+        buildThemeRamp(paletteLUT, 256);
+        lastThemeGen = themeGen();
         buildContrastLUT(55);
         lastGlow = 55;
     }
@@ -109,16 +65,15 @@ inline int16_t sinFromTurn(uint32_t turn) { return sinLut()[turn >> 22]; }
 constexpr float TURN = 4294967296.0f / 6.2831853f;
 
 void frame(uint32_t tMs, int, int, const uint8_t p[4]) {
-    const float periodDrift = 240000.0f - 2250.0f * p[0];
-    const float omega0 = 6.2831853f / periodDrift;
+    const float omega0 = 6.2831853f / 55000.0f * speedMul(p[0]); // 55s base drift at speed 50
     const float k0 = 0.008f + 0.022f * (p[1] / 100.0f);
-    if (p[2] != lastHue) {
-        buildSilkPalette(p[2]);
-        lastHue = p[2];
+    if (themeGen() != lastThemeGen) {
+        buildThemeRamp(paletteLUT, 256);
+        lastThemeGen = themeGen();
     }
-    if (p[3] != lastGlow) {
-        buildContrastLUT(p[3]);
-        lastGlow = p[3];
+    if (p[2] != lastGlow) {
+        buildContrastLUT(p[2]);
+        lastGlow = p[2];
     }
     for (int i = 0; i < 3; i++) {
         SilkWave &wv = wave[i];
@@ -178,7 +133,7 @@ extern const BgAnimation bg_anim_silk;
 const BgAnimation bg_anim_silk = {
     "silk",
     "Silk",
-    {{"speed", "Speed", 30}, {"scale", "Fringe density", 45}, {"hue", "Palette", 20}, {"glow", "Sheen", 55}},
+    {{"speed", "Speed", 50}, {"scale", "Fringe density", 45}, {"glow", "Sheen", 55}, {nullptr, nullptr, 0}},
     init,
     frame,
     band,

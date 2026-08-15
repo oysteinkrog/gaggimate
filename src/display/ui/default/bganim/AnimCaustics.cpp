@@ -19,44 +19,19 @@ constexpr float PHASE0[K] = {0.0f, 2.1f, 4.6f};
 constexpr float FREQ_BASE[K] = {0.046f, 0.061f, 0.037f};
 constexpr float SPEED_MUL[K] = {1.0f, 0.82f, 1.28f};
 
-struct Stop {
-    float t, r, g, b;
-};
-constexpr Stop BLUE_STOPS[4] = {{0.0f, 2, 4, 10}, {0.55f, 14, 40, 64}, {0.85f, 90, 182, 226}, {1.0f, 206, 236, 250}};
-constexpr Stop TEAL_STOPS[4] = {{0.0f, 2, 5, 9}, {0.55f, 12, 52, 46}, {0.85f, 66, 200, 164}, {1.0f, 216, 252, 236}};
-
-uint8_t *palR = nullptr, *palG = nullptr, *palB = nullptr; // hue-blended, 256 each
-int lastHue = -1;
+uint8_t *palR = nullptr, *palG = nullptr, *palB = nullptr; // theme-baked, 256 each
+uint32_t lastThemeGen = 0xFFFFFFFF;
 
 float g_cosA[K], g_sinA[K], g_freq[K], g_phase[K], g_step[K];
 float g_thresh = 0.5f, g_invSpan = 2.0f;
 
-void gradientAt(const Stop *stops, float t, float out[3]) {
-    int s = 0;
-    while (s < 2 && t > stops[s + 1].t) {
-        s++;
-    }
-    float span = stops[s + 1].t - stops[s].t;
-    if (span < 1e-6f) {
-        span = 1e-6f;
-    }
-    float tt = (t - stops[s].t) / span;
-    tt = tt < 0 ? 0 : (tt > 1 ? 1 : tt);
-    out[0] = stops[s].r + (stops[s + 1].r - stops[s].r) * tt;
-    out[1] = stops[s].g + (stops[s + 1].g - stops[s].g) * tt;
-    out[2] = stops[s].b + (stops[s + 1].b - stops[s].b) * tt;
-}
-
-void buildBlendedPalette(uint8_t hueP) {
-    const float hueT = hueP / 100.0f;
+void buildThemePalette() {
     for (int i = 0; i < 256; i++) {
-        const float t = i / 255.0f;
-        float cb[3], ct[3];
-        gradientAt(BLUE_STOPS, t, cb);
-        gradientAt(TEAL_STOPS, t, ct);
-        palR[i] = static_cast<uint8_t>(cb[0] + (ct[0] - cb[0]) * hueT);
-        palG[i] = static_cast<uint8_t>(cb[1] + (ct[1] - cb[1]) * hueT);
-        palB[i] = static_cast<uint8_t>(cb[2] + (ct[2] - cb[2]) * hueT);
+        uint8_t c[3];
+        themeRGB(i, c);
+        palR[i] = c[0];
+        palG[i] = c[1];
+        palB[i] = c[2];
     }
 }
 
@@ -69,21 +44,19 @@ bool init(int, int) {
     if (palR == nullptr || palG == nullptr || palB == nullptr) {
         return false;
     }
-    if (lastHue < 0) {
-        buildBlendedPalette(50);
-        lastHue = 50;
-    }
+    buildThemePalette();
+    lastThemeGen = themeGen();
     return true;
 }
 
 void frame(uint32_t tMs, int, int, const uint8_t p[4]) {
-    if (p[3] != lastHue) {
-        buildBlendedPalette(p[3]);
-        lastHue = p[3];
+    if (themeGen() != lastThemeGen) {
+        buildThemePalette();
+        lastThemeGen = themeGen();
     }
     const float t = tMs * 0.001f;
     const float freqScale = lerpf(0.55f, 1.9f, p[1] / 100.0f);
-    const float speedScale = lerpf(0.15f, 1.6f, p[0] / 100.0f);
+    const float speedScale = 0.8f * speedMul(p[0]);
     g_thresh = 0.14f + 0.55f * (p[2] / 100.0f);
     g_invSpan = 1.0f / fmaxf(1e-3f, 1.0f - g_thresh);
     for (int k = 0; k < K; k++) {
@@ -126,7 +99,7 @@ extern const BgAnimation bg_anim_caustics;
 const BgAnimation bg_anim_caustics = {
     "caustics",
     "Caustics",
-    {{"speed", "Drift speed", 35}, {"scale", "Cell scale", 45}, {"contrast", "Contrast", 55}, {"hue", "Hue", 50}},
+    {{"speed", "Drift speed", 50}, {"scale", "Cell scale", 45}, {"contrast", "Contrast", 55}, {nullptr, nullptr, 0}},
     init,
     frame,
     band,

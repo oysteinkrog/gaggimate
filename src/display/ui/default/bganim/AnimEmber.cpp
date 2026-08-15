@@ -14,10 +14,6 @@
 namespace {
 using namespace bganim;
 
-constexpr float STOP_POS[6] = {0.00f, 0.12f, 0.30f, 0.55f, 0.80f, 1.00f};
-constexpr uint32_t EMBER_HEX[6] = {0xf4a94a, 0xe2751f, 0xb8420f, 0x6b1a08, 0x2b0a06, 0x0a0604};
-constexpr uint32_t GOLD_HEX[6] = {0xffe0a3, 0xffb454, 0xe07a1a, 0x8a2e0a, 0x331006, 0x0b0704};
-
 // DDS phase steps: full circle = 2^32, periods 11.3s / 17.7s / 6.1s.
 constexpr uint32_t STEP1 = static_cast<uint32_t>(4294967296.0 / 11300.0);
 constexpr uint32_t STEP2 = static_cast<uint32_t>(4294967296.0 / 17700.0);
@@ -26,10 +22,11 @@ constexpr uint32_t PHOFF2 = static_cast<uint32_t>(1.7 / 6.2831853 * 4294967296.0
 constexpr uint32_t PHOFF3 = static_cast<uint32_t>(4.2 / 6.2831853 * 4294967296.0);
 constexpr int RSHIFT = 9; // r^2 -> radiusLUT bucket
 
-uint16_t *palette = nullptr;  // 256 entries, rebuilt on warmth change
+uint16_t *palette = nullptr;  // 256 entries, reversed theme ramp (bright core)
 uint8_t *radiusLUT = nullptr; // r^2>>RSHIFT -> normalized radius byte
 const uint8_t *noise = nullptr;
-uint8_t lastWarmth = 255, lastGlow = 255;
+uint32_t lastThemeGen = 0xFFFFFFFF;
+uint8_t lastGlow = 255;
 int g_cx = 240, g_cy = 260;
 float g_maxR = 353.7f;
 int g_breathe = 0, g_flickerAmp = 0, g_sx = 0, g_sy = 0;
@@ -57,28 +54,32 @@ bool init(int w, int h) {
     const float dx = static_cast<float>(g_cx);
     const float dy = static_cast<float>(g_cy > h - g_cy ? g_cy : h - g_cy);
     g_maxR = sqrtf(dx * dx + dy * dy);
-    lastWarmth = 255;
+    lastThemeGen = 0xFFFFFFFF;
     lastGlow = 255;
     return true;
 }
 
 void frame(uint32_t tMs, int, int, const uint8_t p[4]) {
-    if (p[0] != lastWarmth) {
-        buildRamp565(palette, STOP_POS, EMBER_HEX, GOLD_HEX, 6, (p[0] * 256) / 100);
-        lastWarmth = p[0];
+    if (themeGen() != lastThemeGen) {
+        buildThemeRamp(palette, 256, /*reversed=*/true); // brightest stop at the core
+        lastThemeGen = themeGen();
     }
     if (p[1] != lastGlow) {
         buildRadiusLut(p[1]);
         lastGlow = p[1];
     }
+    const float spd = speedMul(p[0]);
+    // Speed scales virtual time; a param change causes one phase jump, which
+    // the slow breathing envelope absorbs invisibly.
+    const uint32_t vt = static_cast<uint32_t>(tMs * spd);
     const float pulseGain = p[3] / 100.0f;
-    const float s1 = sin1024((tMs * STEP1) >> 22) * (1.0f / SIN_AMP);
-    const float s2 = sin1024(((tMs * STEP2) + PHOFF2) >> 22) * (1.0f / SIN_AMP);
-    const float s3 = sin1024(((tMs * STEP3) + PHOFF3) >> 22) * (1.0f / SIN_AMP);
+    const float s1 = sin1024((vt * STEP1) >> 22) * (1.0f / SIN_AMP);
+    const float s2 = sin1024(((vt * STEP2) + PHOFF2) >> 22) * (1.0f / SIN_AMP);
+    const float s3 = sin1024(((vt * STEP3) + PHOFF3) >> 22) * (1.0f / SIN_AMP);
     g_breathe = static_cast<int>(pulseGain * (0.30f * s1 + 0.15f * s2 + 0.05f * s3) * 70.0f);
     g_flickerAmp = (10 * p[2]) / 100;
-    g_sx = static_cast<int>((tMs * 6u) >> 10) & 255;
-    g_sy = static_cast<int>((tMs * 4u) >> 10) & 255;
+    g_sx = static_cast<int>((vt * 6u) >> 10) & 255;
+    g_sy = static_cast<int>((vt * 4u) >> 10) & 255;
 }
 
 void band(uint16_t *dst, int y0, int rows, int w, uint32_t, const uint8_t *) {
@@ -122,7 +123,7 @@ extern const BgAnimation bg_anim_ember;
 const BgAnimation bg_anim_ember = {
     "ember",
     "Ember",
-    {{"warmth", "Warmth", 55}, {"glow", "Glow size", 45}, {"flicker", "Flicker", 20}, {"pulse", "Pulse", 50}},
+    {{"speed", "Speed", 50}, {"glow", "Glow size", 45}, {"flicker", "Flicker", 20}, {"pulse", "Pulse", 50}},
     init,
     frame,
     band,
