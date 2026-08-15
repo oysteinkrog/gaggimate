@@ -16,9 +16,13 @@
 // How long to sit on each animation before recording it. Long enough that the
 // mean is not dominated by the first frames, where the lazy LUT init runs.
 constexpr unsigned long BENCH_DWELL_MS = 6000;
+#define GM_BENCH_LOCK_ONE_BAND 1
 #else
 #define BENCH_T0(v) ((void)0)
 #define BENCH_ACC(acc, t0) ((void)0)
+// Constant-false, so the suspend branch in renderFrame folds away entirely in
+// shipping builds rather than being compiled and never taken.
+#define GM_BENCH_LOCK_ONE_BAND 0
 #endif
 
 namespace {
@@ -256,6 +260,8 @@ void SleepAnimation::benchTick() {
         accBandUs = accBlendUs = accPushUs = accTotalUs = 0;
         accFrames = 0;
         accMaxTotalUs = 0;
+        accBandLockedUs = 0;
+        accBandLockedRows = accBandRows = 0;
         benchPasses = 0;
         benchDwellStart = now;
         uint8_t p[4];
@@ -287,6 +293,13 @@ void SleepAnimation::benchFinishDwell() {
         r.totalUs = static_cast<uint32_t>(accTotalUs / accFrames);
         r.maxTotalUs = accMaxTotalUs;
         r.achievedFps = elapsedMs > 0 ? static_cast<uint32_t>(accFrames * 100000ULL / elapsedMs) : 0;
+        // Both normalised per row so the locked sample (one band per frame)
+        // is directly comparable to the unlocked one (all 30 bands).
+        const uint64_t unlockedUs = accBandUs > accBandLockedUs ? accBandUs - accBandLockedUs : 0;
+        const uint32_t unlockedRows = accBandRows > accBandLockedRows ? accBandRows - accBandLockedRows : 0;
+        r.bandNsPerRow = unlockedRows > 0 ? static_cast<uint32_t>(unlockedUs * 1000ULL / unlockedRows) : 0;
+        r.bandLockedNsPerRow =
+            accBandLockedRows > 0 ? static_cast<uint32_t>(accBandLockedUs * 1000ULL / accBandLockedRows) : 0;
         r.valid = true; // publish last: readers on other tasks gate on this
         log_i("animbench: %-10s band=%u us blend=%u us push=%u us total=%u us max=%u us fps=%u.%02u",
               bg_animation(id).id, r.bandUs, r.blendUs, r.pushUs, r.totalUs, r.maxTotalUs, r.achievedFps / 100,
@@ -296,6 +309,8 @@ void SleepAnimation::benchFinishDwell() {
     accBandUs = accBlendUs = accPushUs = accTotalUs = 0;
     accFrames = 0;
     accMaxTotalUs = 0;
+    accBandLockedUs = 0;
+    accBandLockedRows = accBandRows = 0;
     benchDwellStart = millis();
 
     const int count = bg_animation_count();
@@ -348,11 +363,50 @@ void SleepAnimation::renderFrame() {
     const int ovXoff = ov != nullptr ? (ov->w - w) / 2 : 0;
     const int ovYoff = ov != nullptr ? (ov->h - h) / 2 : 0;
 
+#ifdef GM_ANIM_BENCH
+    // Advance which band gets the suspended render (see the note by
+    // lockThisBand). h/BAND_H rounded up, so the last short band is included.
+    benchLockBand = (benchLockBand + 1) % static_cast<uint32_t>((h + BAND_H - 1) / BAND_H);
+#endif
     for (int y0 = 0; y0 < h && running; y0 += BAND_H) {
         const int rows = (y0 + BAND_H <= h) ? BAND_H : (h - y0);
+        // Bench builds render ONE band per frame with the scheduler suspended
+        // on this core. Aurora measures ~82 CPU cycles/pixel for a loop body
+        // that looks like it should run in far less, and its max frame is 1.8x
+        // its mean -- both consistent with the render task being preempted
+        // mid-band rather than the loop being slow. The band timer is wall
+        // clock, so preemption lands inside it and is indistinguishable from
+        // compute. Task switches cannot happen inside a suspended section, so
+        // the gap between per-row locked and per-row unlocked cost IS the
+        // preemption share. Interrupts still run, so this bounds the effect
+        // rather than eliminating it. One band only: suspending for a whole
+        // frame would starve LVGL.
+        //
+        // WHICH band rotates every frame. Locking band 0 always confounds
+        // preemption with content: animations whose cost varies down the
+        // screen (steam rises from the bottom, fireflies are sparse, lava
+        // blobs drift) make the top band cheap for reasons that have nothing
+        // to do with the scheduler. The first cut of this measurement locked
+        // band 0 and reported steam at "+191% preemption" purely from that.
+        // Rotating means every band is locked equally often across a dwell, so
+        // both populations cover the same pixels.
+        const bool lockThisBand = GM_BENCH_LOCK_ONE_BAND && (y0 / BAND_H) == static_cast<int>(benchLockBand);
         BENCH_T0(tBand);
-        anim.band(band, y0, rows, w, tMs, p);
+        if (lockThisBand) {
+            vTaskSuspendAll();
+            anim.band(band, y0, rows, w, tMs, p);
+            xTaskResumeAll();
+        } else {
+            anim.band(band, y0, rows, w, tMs, p);
+        }
         BENCH_ACC(accBandUs, tBand);
+#ifdef GM_ANIM_BENCH
+        accBandRows += static_cast<uint32_t>(rows);
+        if (lockThisBand) {
+            accBandLockedUs += static_cast<uint64_t>(esp_timer_get_time() - tBand);
+            accBandLockedRows += static_cast<uint32_t>(rows);
+        }
+#endif
         BENCH_T0(tBlend);
         for (int y = y0; y < y0 + rows; y++) {
             if (ov != nullptr && ov->spanMin[y] >= 0) {

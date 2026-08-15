@@ -444,6 +444,11 @@ void WebUIPlugin::setupServer() {
                 o["total_us"] = res[i].totalUs;
                 o["max_us"] = res[i].maxTotalUs;
                 o["fps"] = res[i].achievedFps / 100.0;
+                // Per-row band cost with and without the scheduler suspended.
+                // A gap between them is preemption being charged to the band
+                // timer; parity means the band really is that expensive.
+                o["band_ns_row"] = res[i].bandNsPerRow;
+                o["band_locked_ns_row"] = res[i].bandLockedNsPerRow;
             }
         }
         serializeJson(doc, *response);

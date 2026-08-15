@@ -248,7 +248,16 @@ void band(uint16_t *dst, int y0, int rows, int w, uint32_t, const uint8_t *) {
         // compare + branch) across 8 pixels instead of paying it every pixel.
         // No clip left at all: rowLUT is padded to cover the analytically
         // bounded pre-clip range, so the index is always valid.
-        auto pixel = [&](int bit) -> uint16_t {
+        // always_inline is load-bearing, not a hint. At -O2 GCC declined to
+        // inline these two and emitted them as real functions, so the
+        // "unrolled, branch-free" loop below actually compiled to four
+        // indirect callx8 per 8 pixels -- a windowed-ABI register rotation
+        // plus caller-saved spills to stack plus a recomputed frame address
+        // to pass the by-reference captures, on every second pixel. That is
+        // where aurora's ~82 cycles/pixel went. Verified by disassembly, not
+        // assumed: before this attribute, band() contained 8 callx8 and the
+        // object exported two lambda operator() symbols.
+        auto pixel = [&](int bit) __attribute__((always_inline)) -> uint16_t {
             const int32_t v = (w1[(ph1 >> 8) & 1023] + w2[(ph2 >> 8) & 1023]) >> 7; // ~±4112
             ph1 += STEP1;
             ph2 += STEP2;
@@ -258,7 +267,7 @@ void band(uint16_t *dst, int y0, int rows, int w, uint32_t, const uint8_t *) {
         // Two pixels' worth of work packed into one 32-bit store (dst is
         // 4-byte aligned and w is even -- see xtensa-asm addendum). Halves
         // the store traffic vs. one s16i per pixel.
-        auto emitPair = [&](int xi, int bit0) {
+        auto emitPair = [&](int xi, int bit0) __attribute__((always_inline)) {
             const uint16_t p0 = pixel(bit0);
             const uint16_t p1 = pixel(bit0 + 1);
             *reinterpret_cast<uint32_t *>(row + xi) = static_cast<uint32_t>(p0) | (static_cast<uint32_t>(p1) << 16);
