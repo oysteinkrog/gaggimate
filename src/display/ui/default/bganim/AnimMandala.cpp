@@ -64,6 +64,7 @@
 // case falls out of the same branch-free arithmetic for free.
 #include "BgAnim.h"
 #include "BgAnimCommon.h"
+#include <esp_heap_caps.h>
 #include <math.h>
 
 namespace {
@@ -130,7 +131,20 @@ bool init(int w, int) {
         vigByR = static_cast<uint8_t *>(alloc(mapDim));
         rescaleLUT = static_cast<uint8_t *>(alloc(381));
         paletteLUT = static_cast<uint16_t *>(alloc(256 * sizeof(uint16_t)));
-        polarMap = static_cast<uint16_t *>(alloc(static_cast<size_t>(mapDim) * mapDim * sizeof(uint16_t)));
+        // polarMap is ~113 KiB ((cx+1)^2 uint16 entries) — a bulk table read
+        // in sequential sweeps, not a small randomly-indexed LUT, so it goes
+        // straight to PSRAM (8 MB, plentiful) rather than through alloc()'s
+        // SRAM-first path. Internal SRAM is the scarce resource WiFi/BLE/TLS
+        // draw from at runtime; a map this size has no business contending
+        // for it. Same convention as SleepAnimation.cpp's overlay snapshot
+        // buffers ("Snapshot pixels only fit in PSRAM (~700 KB each); the
+        // tiny span tables prefer SRAM") — polarMap is the snapshot-sized
+        // table here, and every other LUT on this page is the span-sized one.
+        // heap_caps_malloc(MALLOC_CAP_SPIRAM), not ps_malloc: the latter is an
+        // Arduino-layer helper this translation unit does not pull in, and it
+        // builds on the host shim while failing the real firmware build.
+        polarMap = static_cast<uint16_t *>(
+            heap_caps_malloc(static_cast<size_t>(mapDim) * mapDim * sizeof(uint16_t), MALLOC_CAP_SPIRAM));
         // 256, not mapDim: index 0xFF is the map's outside-disc sentinel and
         // is read unconditionally by band() now (no per-pixel branch).
         idxOffAB = static_cast<uint16_t *>(alloc(256 * sizeof(uint16_t)));
