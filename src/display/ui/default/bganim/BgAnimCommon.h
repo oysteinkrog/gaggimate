@@ -11,12 +11,21 @@
 
 namespace bganim {
 
+// The per-pixel helpers below are called from inner loops that run 230,400
+// times a frame, so they must actually be inlined -- and plain `inline` is a
+// hint GCC was declining. Disassembly of the -O2 objects showed real callx8
+// calls to clamp8f (starfield) and blendQ8 (orbits) from inside band(),
+// paying a windowed-ABI register rotation for three operations' worth of
+// work. always_inline is a directive, not a hint, so it holds.
+#define BGANIM_INLINE inline __attribute__((always_inline))
+
+
 constexpr int SIN_N = 1024; // entries in the shared sine LUT
 constexpr int SIN_AMP = 512;
 
 // Shared 1024-entry sine LUT, amplitude ±512. Built on first use.
 const int16_t *sinLut();
-inline int16_t sin1024(uint32_t idx) { return sinLut()[idx & (SIN_N - 1)]; }
+BGANIM_INLINE int16_t sin1024(uint32_t idx) { return sinLut()[idx & (SIN_N - 1)]; }
 
 // Buffers up to this size prefer internal SRAM (latency matters for small,
 // randomly-indexed LUTs); larger ones go to PSRAM first so an animation's
@@ -25,12 +34,12 @@ constexpr size_t SRAM_ALLOC_LIMIT = 8192;
 
 void *alloc(size_t size); // see SRAM_ALLOC_LIMIT for the placement policy
 
-inline uint16_t rgb565(uint8_t r, uint8_t g, uint8_t b) {
+BGANIM_INLINE uint16_t rgb565(uint8_t r, uint8_t g, uint8_t b) {
     return static_cast<uint16_t>(((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3));
 }
 
 // Saturating additive blend for glow sprites (per-channel clamp).
-inline uint16_t add565(uint16_t a, uint16_t b) {
+BGANIM_INLINE uint16_t add565(uint16_t a, uint16_t b) {
     uint32_t r = ((a >> 11) & 0x1F) + ((b >> 11) & 0x1F);
     uint32_t g = ((a >> 5) & 0x3F) + ((b >> 5) & 0x3F);
     uint32_t bl = (a & 0x1F) + (b & 0x1F);
@@ -44,17 +53,17 @@ inline uint16_t add565(uint16_t a, uint16_t b) {
 }
 
 // Deterministic PRNG (xorshift32) so device and web preview can match.
-inline uint32_t nextRand(uint32_t &s) {
+BGANIM_INLINE uint32_t nextRand(uint32_t &s) {
     s ^= s << 13;
     s ^= s >> 17;
     s ^= s << 5;
     return s;
 }
-inline float nextRandf(uint32_t &s) { return (nextRand(s) >> 8) * (1.0f / 16777216.0f); }
+BGANIM_INLINE float nextRandf(uint32_t &s) { return (nextRand(s) >> 8) * (1.0f / 16777216.0f); }
 
-inline float lerpf(float a, float b, float t) { return a + (b - a) * t; }
+BGANIM_INLINE float lerpf(float a, float b, float t) { return a + (b - a) * t; }
 
-inline uint8_t clamp8f(float v) { return v < 0 ? 0 : (v > 255 ? 255 : static_cast<uint8_t>(v)); }
+BGANIM_INLINE uint8_t clamp8f(float v) { return v < 0 ? 0 : (v > 255 ? 255 : static_cast<uint8_t>(v)); }
 
 // 256-entry float cosine table (built on first use) + radian-indexed helpers.
 // Truncation toward zero keeps negative radians valid via the & 255 wrap.
@@ -69,10 +78,10 @@ inline uint8_t clamp8f(float v) { return v < 0 ? 0 : (v > 255 ? 255 : static_cas
 // times per frame at most, so the wider conversion costs nothing measurable;
 // do NOT copy this into a per-pixel loop.
 const float *cosTableF();
-inline float fastCosRad(float rad) {
+BGANIM_INLINE float fastCosRad(float rad) {
     return cosTableF()[static_cast<int>(static_cast<int64_t>(rad * (256.0f / 6.2831853f)) & 255)];
 }
-inline float fastSinRad(float rad) { return fastCosRad(rad - 1.5707963f); }
+BGANIM_INLINE float fastSinRad(float rad) { return fastCosRad(rad - 1.5707963f); }
 
 // 4x4 ordered dither matrix, values 0..15.
 extern const uint8_t BAYER4[16];
@@ -80,7 +89,7 @@ extern const uint8_t BAYER4[16];
 extern const uint8_t BAYER8[64];
 
 // Alpha blend fg over bg, alpha Q8 (0..256).
-inline uint16_t blendQ8(uint16_t bg, uint16_t fg, int aQ8) {
+BGANIM_INLINE uint16_t blendQ8(uint16_t bg, uint16_t fg, int aQ8) {
     const int br = (bg >> 11) & 0x1F, bgc = (bg >> 5) & 0x3F, bb = bg & 0x1F;
     const int fr = (fg >> 11) & 0x1F, fgc = (fg >> 5) & 0x3F, fb = fg & 0x1F;
     const int r = br + (((fr - br) * aQ8) >> 8);
@@ -91,7 +100,7 @@ inline uint16_t blendQ8(uint16_t bg, uint16_t fg, int aQ8) {
 
 // Saturating additive blend of an 8-bit RGB source scaled by 8-bit alpha
 // (glow sprites: fireflies, steam, star streaks).
-inline uint16_t addScaled565(uint16_t dst, uint8_t r, uint8_t g, uint8_t b, uint8_t a) {
+BGANIM_INLINE uint16_t addScaled565(uint16_t dst, uint8_t r, uint8_t g, uint8_t b, uint8_t a) {
     int dr = ((dst >> 11) & 0x1F) + ((r * a) >> 11);
     int dg = ((dst >> 5) & 0x3F) + ((g * a) >> 10);
     int db = (dst & 0x1F) + ((b * a) >> 11);
@@ -135,7 +144,7 @@ void buildThemeWheel(uint16_t *out, uint16_t brightness256);
 
 // Universal speed-curve: maps a 0-100 speed param to a multiplier of the
 // animation's tuned base rate — 0.15x at 0, 1x at 50, ~6.7x at 100.
-inline float speedMul(uint8_t sp) {
+BGANIM_INLINE float speedMul(uint8_t sp) {
     // exp2f((sp-50)/18.2) => 0.15 .. 6.7, exactly 1.0 at 50
     return exp2f((static_cast<int>(sp) - 50) * (1.0f / 18.2f));
 }

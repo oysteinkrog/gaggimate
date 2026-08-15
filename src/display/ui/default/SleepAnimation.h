@@ -80,6 +80,12 @@ class SleepAnimation {
         uint32_t totalUs = 0; // sum of the above, measured end to end
         uint32_t maxTotalUs = 0;
         uint32_t achievedFps = 0; // x100, so 2997 == 29.97 fps
+        // Nanoseconds per band row, measured with and without the scheduler
+        // suspended on this core. Equal means the band cost is real compute;
+        // unlocked >> locked means the wall-clock band timer is mostly
+        // charging this task for time it spent preempted.
+        uint32_t bandNsPerRow = 0;
+        uint32_t bandLockedNsPerRow = 0;
     };
     // Snapshot of every completed dwell. Safe to read from another task: each
     // entry is only written once, before valid flips true.
@@ -136,6 +142,10 @@ class SleepAnimation {
     uint64_t accTotalUs = 0;
     uint32_t accFrames = 0;
     uint32_t accMaxTotalUs = 0;
+    uint32_t benchLockBand = 0; // which band gets the suspended render, rotates per frame
+    uint64_t accBandLockedUs = 0;
+    uint32_t accBandLockedRows = 0;
+    uint32_t accBandRows = 0;
     unsigned long benchDwellStart = 0;
     uint32_t benchPasses = 0; // completed sweeps of the whole registry
     BenchResult benchDone[BENCH_MAX_ANIMS];
