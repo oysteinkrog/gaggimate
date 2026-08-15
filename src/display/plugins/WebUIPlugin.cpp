@@ -364,7 +364,7 @@ void WebUIPlugin::setupServer() {
     // Bench build only: the render task's own per-stage frame timings. Serial
     // is not a usable channel on this board (the IDF console goes to UART0,
     // not the USB CDC), so results come out over HTTP.
-    server.on("/api/animbench", [](AsyncWebServerRequest *request) {
+    server.on("/api/animbench", [this](AsyncWebServerRequest *request) {
         AsyncResponseStream *response = request->beginResponseStream("application/json");
         JsonDocument doc;
         const BenchGateState &g = bench_gate_state();
@@ -376,6 +376,11 @@ void WebUIPlugin::setupServer() {
         gate["mode"] = g.mode;
         gate["screen"] = g.screen;
         gate["start_failed"] = g.startFailed;
+        // Controller's own view: a populated hardware string is proof the
+        // synthetic handshake reached onSystemInfo().
+        gate["ctrl_hardware"] = controller->getSystemInfo().hardware;
+        gate["ctrl_proto"] = controller->getSystemInfo().protocolVersion;
+        gate["ctrl_mismatch"] = controller->getSystemInfo().protocolMismatch;
         SleepAnimation *anim = sleep_animation_bench_instance();
         if (anim == nullptr) {
             doc["running"] = false;
