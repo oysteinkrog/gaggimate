@@ -30,7 +30,17 @@ BGANIM_INLINE int16_t sin1024(uint32_t idx) { return sinLut()[idx & (SIN_N - 1)]
 // Buffers up to this size prefer internal SRAM (latency matters for small,
 // randomly-indexed LUTs); larger ones go to PSRAM first so an animation's
 // bulk tables cannot starve WiFi/BLE, which share the SRAM pool. See alloc().
-constexpr size_t SRAM_ALLOC_LIMIT = 8192;
+#ifndef GM_BGANIM_SRAM_LIMIT
+#define GM_BGANIM_SRAM_LIMIT 8192
+#endif
+constexpr size_t SRAM_ALLOC_LIMIT = GM_BGANIM_SRAM_LIMIT;
+
+// Bytes alloc() has handed out from each pool since boot, so a bench run can
+// tell whether an animation's tables actually landed where the policy above
+// intends. Not synchronised: written on the render task at init, read over
+// HTTP, and a torn 32-bit read here would only misreport a diagnostic.
+extern size_t g_allocSram;
+extern size_t g_allocPsram;
 
 void *alloc(size_t size); // see SRAM_ALLOC_LIMIT for the placement policy
 

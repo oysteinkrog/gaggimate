@@ -20,6 +20,17 @@ const int16_t *sinLut() {
     return lut;
 }
 
+size_t g_allocSram = 0;
+size_t g_allocPsram = 0;
+
+namespace {
+// Internal SRAM on the S3 is the 0x3FC.. data range; PSRAM maps at 0x3C...
+bool isPsram(const void *p) {
+    const uintptr_t a = reinterpret_cast<uintptr_t>(p);
+    return a >= 0x3C000000u && a < 0x3E000000u;
+}
+} // namespace
+
 void *alloc(size_t size) {
     // Animations allocate their LUTs lazily on first use and never free them,
     // so switching through the whole fleet in one power cycle accumulates every
@@ -34,6 +45,7 @@ void *alloc(size_t size) {
     if (size > SRAM_ALLOC_LIMIT) {
         void *big = ps_malloc(size);
         if (big != nullptr) {
+            g_allocPsram += size;
             return big;
         }
         // No PSRAM (or it is exhausted): fall through and try SRAM anyway
@@ -45,6 +57,9 @@ void *alloc(size_t size) {
         if (p != nullptr) {
             log_w("bganim: %u B in PSRAM (internal SRAM full)", static_cast<unsigned>(size));
         }
+    }
+    if (p != nullptr) {
+        (isPsram(p) ? g_allocPsram : g_allocSram) += size;
     }
     return p;
 }
