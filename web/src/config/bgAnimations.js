@@ -127,6 +127,28 @@ export const BG_ANIMATIONS = [
       { key: 'density', label: 'Density', def: 50 },
     ],
   },
+  {
+    id: 'ember',
+    name: 'Ember',
+    description: 'A warm glow breathing from below, like coals in a hearth.',
+    params: [
+      { key: 'warmth', label: 'Warmth', def: 55 },
+      { key: 'glow', label: 'Glow size', def: 45 },
+      { key: 'flicker', label: 'Flicker', def: 20 },
+      { key: 'pulse', label: 'Pulse', def: 50 },
+    ],
+  },
+  {
+    id: 'nebula',
+    name: 'Nebula',
+    description: 'Deep-space clouds drifting in slow multi-layer turbulence.',
+    params: [
+      { key: 'density', label: 'Density', def: 50 },
+      { key: 'hue', label: 'Hue', def: 40 },
+      { key: 'drift', label: 'Drift', def: 30 },
+      { key: 'turbulence', label: 'Turbulence', def: 40 },
+    ],
+  },
 ];
 
 // Parses the packed setting into a per-animation array of 4-value arrays,

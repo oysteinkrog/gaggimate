@@ -18,11 +18,14 @@ extern const BgAnimation bg_anim_mandala;
 extern const BgAnimation bg_anim_orbits;
 extern const BgAnimation bg_anim_fireflies;
 extern const BgAnimation bg_anim_steam;
+extern const BgAnimation bg_anim_ember;
+extern const BgAnimation bg_anim_nebula;
 
 namespace {
 const BgAnimation *const REGISTRY[] = {
     &bg_anim_plasma,  &bg_anim_lava,    &bg_anim_silk,    &bg_anim_starfield, &bg_anim_aurora, &bg_anim_ripples,
-    &bg_anim_caustics, &bg_anim_mandala, &bg_anim_orbits, &bg_anim_fireflies, &bg_anim_steam,
+    &bg_anim_caustics, &bg_anim_mandala, &bg_anim_orbits, &bg_anim_fireflies, &bg_anim_steam, &bg_anim_ember,
+    &bg_anim_nebula,
 };
 } // namespace
 
