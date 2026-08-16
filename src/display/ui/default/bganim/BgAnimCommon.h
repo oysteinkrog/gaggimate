@@ -85,6 +85,25 @@ extern size_t g_allocPsram;
 
 void *alloc(size_t size); // see SRAM_ALLOC_LIMIT for the placement policy
 
+// Give back one table from alloc(). Takes the size because the budget counters
+// have to be decremented by the same amount they were charged -- otherwise
+// freeing would return the memory but not the right to allocate it again, and
+// the ceiling would still lock the fleet into PSRAM after a few switches.
+// Nulls the caller's pointer so the `if (ptr == nullptr)` init guards see a
+// clean slate. Safe on nullptr.
+void release(void *&p, size_t size);
+
+// Type-safe wrapper. Only ever pass the pointer that OWNS the allocation:
+// several animations keep alias pointers offset into a table they already hold
+// (silk's contrastLUT/paletteExt/palette all point into g_lut, lava's lavaBase
+// is lavaLUT + LUT_OFFSET), and handing one of those to free() is heap
+// corruption. Null the aliases by hand instead.
+template <typename T> inline void releaseTable(T *&p, size_t bytes) {
+    void *tmp = p;
+    release(tmp, bytes);
+    p = static_cast<T *>(tmp);
+}
+
 BGANIM_INLINE uint16_t rgb565(uint8_t r, uint8_t g, uint8_t b) {
     return static_cast<uint16_t>(((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3));
 }

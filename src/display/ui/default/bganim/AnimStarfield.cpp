@@ -57,6 +57,7 @@ uint32_t nextShootMs = 6000;
 uint32_t rng = 0xC0FFEE;
 uint32_t lastTMs = 0;
 uint32_t lastDriftMs = 0xFFFFFFFF; // sentinel: no drift step on the very first frame() call
+int allocW = 0, allocH = 0;        // dimensions dx2/dy2 were sized for
 
 bool init(int w, int h) {
     if (stars == nullptr) {
@@ -66,6 +67,8 @@ bool init(int w, int h) {
         bandHead = static_cast<int16_t *>(alloc(NUM_BANDS * sizeof(int16_t)));
         bandNext = static_cast<int16_t *>(alloc(MAX_STARS * sizeof(int16_t)));
         driftQ = static_cast<int32_t *>(alloc(MAX_STARS * sizeof(int32_t)));
+        allocW = w;
+        allocH = h;
         dx2 = static_cast<int32_t *>(alloc(w * sizeof(int32_t)));
         dy2 = static_cast<int32_t *>(alloc(h * sizeof(int32_t)));
         vigLUT = static_cast<uint8_t *>(alloc(128));
@@ -300,6 +303,24 @@ void band(uint16_t *dst, int y0, int rows, int w, uint32_t, const uint8_t *) {
     }
 }
 
+void release() {
+    releaseTable(stars, static_cast<size_t>(MAX_STARS) * sizeof(Star));
+    releaseTable(draws, static_cast<size_t>(MAX_STARS) * sizeof(StarDraw));
+    releaseTable(starY, static_cast<size_t>(MAX_STARS) * sizeof(int16_t));
+    releaseTable(bandHead, static_cast<size_t>(NUM_BANDS) * sizeof(int16_t));
+    releaseTable(bandNext, static_cast<size_t>(MAX_STARS) * sizeof(int16_t));
+    releaseTable(driftQ, static_cast<size_t>(MAX_STARS) * sizeof(int32_t));
+    releaseTable(dx2, static_cast<size_t>(allocW) * sizeof(int32_t));
+    releaseTable(dy2, static_cast<size_t>(allocH) * sizeof(int32_t));
+    releaseTable(vigLUT, 128);
+    releaseTable(starCol, static_cast<size_t>(MAX_STARS) * 3);
+    releaseTable(vigColor, 128 * sizeof(uint16_t));
+    allocW = allocH = 0;
+    lastThemeGen = 0xFFFFFFFF;
+    lastTMs = 0;
+    lastDriftMs = 0xFFFFFFFF;
+}
+
 } // namespace
 
 extern const BgAnimation bg_anim_starfield;
@@ -310,6 +331,7 @@ const BgAnimation bg_anim_starfield = {
     init,
     frame,
     band,
+    release,
 };
 
 #endif // GAGGIMATE_SIM

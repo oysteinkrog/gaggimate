@@ -46,6 +46,7 @@ uint8_t *alphaLUT = nullptr; // (1-sqrt(i/63))^1.6
 uint16_t *bgLUT = nullptr;
 int wispCount = 0;
 int builtCount = -1;
+int allocH = 0; // height bgLUT was sized for
 uint32_t rng = 0x1234abcd;
 int g_active = 0;
 uint32_t lastThemeGen = 0xFFFFFFFF;
@@ -100,6 +101,7 @@ bool init(int, int h) {
     }
     if (alphaLUT == nullptr) {
         alphaLUT = static_cast<uint8_t *>(alloc(64));
+        allocH = h;
         bgLUT = static_cast<uint16_t *>(alloc(h * sizeof(uint16_t)));
         if (alphaLUT == nullptr || bgLUT == nullptr) {
             return false;
@@ -228,6 +230,16 @@ void band(uint16_t *dst, int y0, int rows, int w, uint32_t, const uint8_t *) {
     }
 }
 
+void release() {
+    releaseTable(blobs, static_cast<size_t>(BLOBS_MAX) * sizeof(Blob));
+    releaseTable(draws, static_cast<size_t>(BLOBS_MAX) * sizeof(BlobDraw));
+    releaseTable(alphaLUT, 64);
+    releaseTable(bgLUT, static_cast<size_t>(allocH) * sizeof(uint16_t));
+    allocH = 0;
+    builtCount = -1;
+    lastThemeGen = 0xFFFFFFFF;
+}
+
 } // namespace
 
 extern const BgAnimation bg_anim_steam;
@@ -238,6 +250,7 @@ const BgAnimation bg_anim_steam = {
     init,
     frame,
     band,
+    release,
 };
 
 #endif // GAGGIMATE_SIM

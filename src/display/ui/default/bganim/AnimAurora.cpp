@@ -287,6 +287,13 @@ void band(uint16_t *dst, int y0, int rows, int w, uint32_t, const uint8_t *) {
     }
 }
 
+void release() {
+    releaseTable(glowLUT, 256 * sizeof(uint16_t));
+    releaseTable(wLut1, static_cast<size_t>(SIN_N) * sizeof(int32_t));
+    releaseTable(wLut2, static_cast<size_t>(SIN_N) * sizeof(int32_t));
+    lastThemeGen = 0xFFFFFFFF;
+}
+
 } // namespace
 
 extern const BgAnimation bg_anim_aurora;
@@ -297,6 +304,7 @@ const BgAnimation bg_anim_aurora = {
     init,
     frame,
     band,
+    release,
 };
 
 #endif // GAGGIMATE_SIM

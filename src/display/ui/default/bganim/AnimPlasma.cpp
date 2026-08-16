@@ -19,6 +19,9 @@ uint16_t *rotPalette = nullptr; // palette pre-rotated by `cycle` each frame,
                                 // instead of an extra per-pixel "+ cycle".
 uint8_t lastP[4] = {255, 255, 255, 255}; // force first palette build
 uint32_t lastThemeGen = 0xFFFFFFFF;
+// Dimensions colTerm/rowTerm were sized for. release() runs after a
+// resolution change too, when w/h no longer describe the allocation.
+int allocW = 0, allocH = 0;
 uint32_t phase1 = 0;
 uint32_t phase2 = 0;
 uint32_t phase3 = 0;
@@ -28,6 +31,8 @@ bool init(int w, int h) {
     if (sinLut() == nullptr) {
         return false;
     }
+    allocW = w;
+    allocH = h;
     if (colTerm == nullptr) {
         colTerm = static_cast<int16_t *>(alloc(w * sizeof(int16_t)));
     }
@@ -107,6 +112,15 @@ void band(uint16_t *dst, int y0, int rows, int w, uint32_t, const uint8_t *) {
     }
 }
 
+void release() {
+    releaseTable(colTerm, static_cast<size_t>(allocW) * sizeof(int16_t));
+    releaseTable(rowTerm, static_cast<size_t>(allocH) * sizeof(int16_t));
+    releaseTable(palette, 256 * sizeof(uint16_t));
+    releaseTable(rotPalette, 256 * sizeof(uint16_t));
+    allocW = allocH = 0;
+    lastThemeGen = 0xFFFFFFFF;
+}
+
 } // namespace
 
 // extern: const namespace-scope objects default to internal linkage.
@@ -118,6 +132,7 @@ const BgAnimation bg_anim_plasma = {
     init,
     frame,
     band,
+    release,
 };
 
 #endif // GAGGIMATE_SIM

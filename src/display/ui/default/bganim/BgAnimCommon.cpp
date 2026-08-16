@@ -97,6 +97,20 @@ void *alloc(size_t size) {
     return p;
 }
 
+void release(void *&p, size_t size) {
+    if (p == nullptr) {
+        return;
+    }
+    // Decrement the pool the pointer actually came from, not the one the
+    // placement policy would have picked: a request over the per-allocation
+    // limit, or one made after the budget was spent, went to PSRAM, and an
+    // internal request can also have fallen back to PSRAM when SRAM was full.
+    size_t &counter = isPsram(p) ? g_allocPsram : g_allocSram;
+    counter = (counter > size) ? counter - size : 0;
+    heap_caps_free(p);
+    p = nullptr;
+}
+
 const float *cosTableF() {
     static float *lut = nullptr;
     if (lut == nullptr) {
