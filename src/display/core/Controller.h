@@ -130,6 +130,23 @@ class Controller {
 
     GaggiMateClient *getClientController() { return &comms; }
 
+    // Whether the UI may treat the controller link as usable. This is the one
+    // place that lies about it: GM_FAKE_CONTROLLER never starts BLE, so the
+    // real link is permanently down, and gating screen changes on it leaves
+    // the display stuck wherever it started. Everything that actually
+    // transmits still reads the honest state via getClientController(), so
+    // nothing here makes the firmware talk to a stack that was never brought
+    // up. Control messages sent anyway are harmless: Endpoint::pump() returns
+    // immediately while the transport is down, and the outbound queue upserts
+    // by message kind rather than appending, so it stays bounded.
+    bool isLinkUp() const {
+#ifdef GM_FAKE_CONTROLLER
+        return true;
+#else
+        return comms.isConnected();
+#endif
+    }
+
   private:
     // Initialization methods
 #ifndef GAGGIMATE_HEADLESS

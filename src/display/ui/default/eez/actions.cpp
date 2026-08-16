@@ -6,8 +6,7 @@
 #include <display/plugins/BLEScalePlugin.h>
 
 void action_on_wakeup(lv_event_t *e) {
-    if (controller.isUpdating() || controller.isErrorState() || controller.isAutotuning() ||
-        !controller.getClientController()->isConnected()) {
+    if (controller.isUpdating() || controller.isErrorState() || controller.isAutotuning() || !controller.isLinkUp()) {
         return;
     }
     controller.getUI()->changeScreen(SCREEN_ID_BREW_SCREEN);
