@@ -203,9 +203,10 @@ class SleepAnimation {
     PushJob pushJob[NUM_SLOTS] = {};
     int renderSlot = 0; // slot the render task fills next; push task tracks its own
     bool cropEnabled = false;   // crop to the panel's circle only while push is the pacing stage
-    // Push every other row, alternating parity each frame. Halves the bytes and
-    // the writeback range at the cost of each row refreshing at half the frame
-    // rate. Off by default until it has been looked at on the panel.
+    // Push every other row pair, alternating parity each frame. Halves the
+    // bytes and the driver's writeback range, at the cost of each row pair
+    // refreshing at half the frame rate. Looked at on the panel at 45-59 fps:
+    // the one-frame stagger between adjacent pairs is not visible.
     std::atomic<bool> interlace{true};
     // Render only the source rows this frame will push. Only legal alongside
     // interlacing at half resolution, where one source row feeds one pushed
@@ -216,7 +217,12 @@ class SleepAnimation {
     // the animation has covered the screen once, the rows an interlaced frame
     // skips still hold the previous screen's pixels.
     uint32_t warmupFrames = 0;
-    std::atomic<bool> halfRes{false}; // render at 240x240 and double on the way out
+    // Render at 240x240 and double on the way out. On this panel 40+ fps and
+    // full resolution are mutually exclusive: full res reaches 40 on only 5 of
+    // the 13 animations (nebula 15.1, mandala 16.6, silk 18.0), half res on all
+    // 13. Note that the bench setter below is compiled out of env:display, so
+    // this initialiser is the shipped configuration, not a starting value.
+    std::atomic<bool> halfRes{true};
     uint32_t frameWaitUs = 0;   // this frame's total block on the push task, drives cropEnabled
     void *pushHandle = nullptr;
     std::atomic<bool> pushStopped{true};
