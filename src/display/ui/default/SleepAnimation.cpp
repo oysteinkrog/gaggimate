@@ -37,10 +37,11 @@ namespace {
 // (60 cross-core semaphore round trips per frame instead of 30) cost ~1.3 ms
 // and dropped plasma 43.0 -> 40.6 fps.
 //
-// 8 rows across three slots is chosen against internal SRAM, which is the
-// binding constraint: 16 rows x 3 slots is 46 KB and would leave under 1 KB
-// free, and internal SRAM is what WiFi/BLE/TLS draw from at runtime. 8 x 3 is
-// 23,040 B, and the handoff cost above is the price of getting there.
+// 8 rows across two slots is chosen against internal SRAM, which is the
+// binding constraint: internal SRAM is what WiFi/BLE/TLS draw from at runtime,
+// and the web server needs a contiguous 2,872 B of it per send round. 8 x 2 is
+// 15,360 B; the handoff cost above is the price of the row count, and the slot
+// count is argued separately at NUM_SLOTS in the header.
 //
 // Note on the fps figure quoted above: it comes from a 16-vs-8 bench, which is
 // where the 30-vs-60 handoff counts come from. The 12-vs-8 step this constant

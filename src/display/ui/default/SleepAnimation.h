@@ -217,14 +217,24 @@ class SleepAnimation {
     // cores turns frame time from band+blend+push into max(band+blend, push)
     // plus one band of pipeline latency.
     //
-    // Three, not two. Throughput is max(render, push) either way -- extra
+    // Two, not three, and this is a memory decision that costs frame rate on
+    // some animations. Throughput is max(render, push) either way -- extra
     // slots buy nothing in steady state -- but band render time is not uniform
     // across a frame (steam's blobs sit at the bottom, fireflies are sparse at
     // the top) while push time per band is flat. With only two slots the render
-    // task blocks the moment it runs ahead, so the frame costs the sum of the
+    // task blocks the moment it runs ahead, so a frame costs the sum of the
     // per-band maxima rather than the max of the two totals. A third slot
-    // absorbs that variance.
-    static constexpr int NUM_SLOTS = 3;
+    // absorbed that variance; animations with flat per-band cost (plasma) lose
+    // nothing, the lumpy ones (steam, fireflies) lose the most.
+    //
+    // What bought the change: each slot is w*BAND_H*2 = 7,680 B of internal
+    // DRAM, and internal DRAM is what ESPAsyncWebServer needs a contiguous
+    // 2,872 B of for every send round. Measured on device, the largest free
+    // internal block fell to 2,804 B under four concurrent HTTP connections --
+    // below that threshold -- and every response stalled silently. Four
+    // connections is an ordinary browser, not a stress test. A third slot is
+    // worth some fps; it is not worth a web UI that stops answering.
+    static constexpr int NUM_SLOTS = 2;
     uint16_t *bandBuf[NUM_SLOTS] = {};
     void *bandReady[NUM_SLOTS] = {}; // render -> push, slot has data
     void *bandFree[NUM_SLOTS] = {};  // push -> render, slot is reusable
