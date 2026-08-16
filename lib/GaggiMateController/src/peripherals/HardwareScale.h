@@ -90,7 +90,7 @@ class HardwareScale {
         portMUX_TYPE _read_mux = portMUX_INITIALIZER_UNLOCKED;
 
         const char *LOG_TAG = "HardwareScale";
-        static void loopTask(void *arg);
+        [[noreturn]] static void loopTask(void *arg);
 
         RawReading readRaw();
         bool waitUntilReady(unsigned long timeoutMs) const;

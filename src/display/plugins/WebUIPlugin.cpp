@@ -399,6 +399,18 @@ void WebUIPlugin::setupServer() {
         // figure: alloc() never frees, so every animation the user visits
         // converts more of that gap into permanently resident internal DRAM.
         // A comfortable int_min means nothing if the gap is larger than it.
+        // Headless builds drop the whole ui/ tree from build_src_filter, so
+        // BgAnimCommon.cpp -- which defines these two counters -- is never
+        // compiled and the references would not link. The keys stay in the
+        // payload either way so the web UI needs no build-specific branch;
+        // zero is the true value when no animation can allocate.
+#ifdef GAGGIMATE_HEADLESS
+        const size_t animSram = 0;
+        const size_t animPsram = 0;
+#else
+        const size_t animSram = bganim::g_allocSram;
+        const size_t animPsram = bganim::g_allocPsram;
+#endif
         char buf[320];
         snprintf(buf, sizeof(buf),
                  "{\"int_free\":%u,\"int_largest\":%u,\"int_min\":%u,\"psram_free\":%u,\"psram_largest\":%u,"
@@ -408,7 +420,7 @@ void WebUIPlugin::setupServer() {
                  static_cast<unsigned>(heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL)),
                  static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_SPIRAM)),
                  static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM)),
-                 static_cast<unsigned>(bganim::g_allocSram), static_cast<unsigned>(bganim::g_allocPsram),
+                 static_cast<unsigned>(animSram), static_cast<unsigned>(animPsram),
                  static_cast<unsigned>(bganim::SRAM_TOTAL_BUDGET));
         request->send(200, "application/json", buf);
     });
