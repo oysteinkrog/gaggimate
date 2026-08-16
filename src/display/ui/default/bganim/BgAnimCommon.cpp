@@ -51,7 +51,31 @@ void *alloc(size_t size) {
     // worth -21% on that animation. If a new table is over the limit AND its
     // index is not monotonic across a row, either shrink it under the limit or
     // compute the value instead -- do not assume PSRAM will serve it.
-    if (size > SRAM_ALLOC_LIMIT) {
+    //
+    // The per-allocation size test above is necessary but NOT sufficient, and
+    // that gap was a real bug: it bounds one table but says nothing about the
+    // sum. Measured on device, walking the bench sweep through the fleet took
+    // the internal-SRAM total to 4,992 -> 8,448 -> 30,984 -> 42,068 -> 50,772
+    // -> 53,396 bytes, monotonically, none of it ever freed. The web UI went
+    // unreachable the moment it crossed 53 KB, and stayed unreachable.
+    //
+    // The failure is silent and does not look like memory pressure. lwIP's
+    // tcp_listen_input() drops an incoming SYN with no RST when tcp_alloc()
+    // returns null, so the symptom is a TCP connect TIMEOUT, while ICMP -- which
+    // allocates nothing -- keeps answering normally and uptime keeps climbing.
+    // For most of a session that reads as "the board hung", which is what it
+    // was misdiagnosed as, repeatedly.
+    //
+    // So the budget is cumulative, checked before the request rather than after.
+    // The first tables to ask still land in SRAM where the latency matters; once
+    // the fleet has taken its share, later tables go to PSRAM instead of eating
+    // the pool the network stack lives in. This is only a ceiling: it does not
+    // reclaim anything, because animations hold their tables in static pointers
+    // and re-initialise only when those are null. Freeing on switch would cap
+    // the peak at max-over-animations instead of sum-over-animations, and is the
+    // right eventual fix; it needs a release entry point on every animation.
+    const bool overBudget = g_allocSram + size > SRAM_TOTAL_BUDGET;
+    if (size > SRAM_ALLOC_LIMIT || overBudget) {
         void *big = ps_malloc(size);
         if (big != nullptr) {
             g_allocPsram += size;
