@@ -131,6 +131,8 @@ class SleepAnimation {
     // an ordinary CPU one, so a fault that appears in 1 is about bypassing the
     // driver and a fault that appears only in 2 is about the transfer.
     void benchSetDmaMode(int m) { dmaMode.store(m); }
+    void benchSetInterlace(bool on) { interlace.store(on); }
+    bool benchInterlace() const { return interlace.load(); }
     int benchDmaMode() const { return dmaMode.load(); }
     bool benchDmaActive() const { return dmaActive; }
     uint32_t benchDmaIssued() const { return dmaIssued.load(); }
@@ -190,10 +192,18 @@ class SleepAnimation {
     // coordinates, not extents.
     struct PushJob {
         int16_t x0, y0, x1, y1;
+        // Which row parity this frame pushes. Only meaningful when interlacing
+        // is on; the push task compares it against each absolute row index.
+        uint8_t parity;
     };
     PushJob pushJob[NUM_SLOTS] = {};
     int renderSlot = 0; // slot the render task fills next; push task tracks its own
     bool cropEnabled = false;   // crop to the panel's circle only while push is the pacing stage
+    // Push every other row, alternating parity each frame. Halves the bytes and
+    // the writeback range at the cost of each row refreshing at half the frame
+    // rate. Off by default until it has been looked at on the panel.
+    std::atomic<bool> interlace{false};
+    uint32_t frameParity = 0;
     std::atomic<bool> halfRes{false}; // render at 240x240 and double on the way out
     uint32_t frameWaitUs = 0;   // this frame's total block on the push task, drives cropEnabled
     void *pushHandle = nullptr;
@@ -216,7 +226,7 @@ class SleepAnimation {
     // at stop() bounds that at the edges of a run but does nothing during one.
     // Enable with /api/animbench?dma=1 to measure; do not ship it on until the
     // coherency problem is actually solved.
-    std::atomic<bool> dmaWanted{true};
+    std::atomic<bool> dmaWanted{false};
     std::atomic<int> dmaMode{2};
     bool dmaActive = false;      // fbDirect resolved AND the engine installed
     uint16_t *fbDirect = nullptr;
