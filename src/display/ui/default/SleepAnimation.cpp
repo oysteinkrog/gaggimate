@@ -60,24 +60,35 @@ uint16_t rgb565(uint8_t r, uint8_t g, uint8_t b) {
 // divisions are not divisions -- GCC strength-reduces each to a multiply-high
 // and a shift, confirmed in the disassembly.
 __attribute__((always_inline)) inline uint16_t blend565(uint16_t fg, uint16_t bg, uint8_t a) {
-    // Red and blue are blended together in one 32-bit lane. Scaling by 256
-    // rather than 255 spreads the two fields far enough apart that neither can
-    // carry into the other: blue lands in bits 8-12 and red in bits 19-23, so
-    // the >> 8 drops them back to 0-4 and 11-15 with no cross-contamination.
-    // Green gets its own lane for the same reason. Four multiplies replace six
-    // multiplies and three reciprocal-multiplies, which matters for more than
-    // the arithmetic -- the old body was 149 bytes, and an Xtensa conditional
-    // branch only reaches +/-128, so the loop could not branch backwards and
-    // ended every iteration with an extra taken jump. Shrinking the body lets
-    // the back-branch reach and stops the register pressure spilling `inv` to
-    // the stack on each blended pixel.
+    // One lane per channel, because the packed red+blue lane this replaces was
+    // wrong. That form multiplied (c & 0xF81F) by an 8-bit alpha and relied on
+    // the two fields staying clear of each other. They do not: blue's product
+    // reaches 31 * 256 = 7936, thirteen bits wide, while red sits only eleven
+    // bits above it, so blue's top two bits land inside red's field and red's
+    // bottom two land inside blue's. Red survives -- the intrusion is worth at
+    // most 3 out of the 256 it is about to be divided by -- but blue comes out
+    // as blue + ((red_product & 3) << 3) mod 32, wrong for 75% of alpha values
+    // and wrapped low nearly every time. Exhaustively: 50% of all
+    // (fg, bg, alpha) triples came out wrong, worst case blue off by 24 of 31.
     //
-    // Alpha stays a full 8 bits: this is UI text and iconography, and dropping
-    // to a 5-bit alpha to save a lane would coarsen every antialiased edge.
+    // On white text over a dark background that is red and green at full
+    // coverage and blue at nothing, i.e. a yellow rim on every antialiased
+    // pixel. The trick is sound with a 5-bit alpha (31 * 32 = 992, ten bits,
+    // clear of red); it did not survive alpha being promoted to eight bits.
+    //
+    // Only edge pixels arrive here at all -- the caller stores fully opaque
+    // pixels directly and skips fully transparent ones -- so this function IS
+    // the antialiasing, and getting it wrong shows up nowhere else.
+    //
+    // Scaling by 256 rather than 255 keeps the divide a shift; each lane now
+    // owns its whole 32-bit word, so the bound that matters is only that a
+    // single field cannot overflow it. Red is the widest at 0xF800 * 256 =
+    // 16,252,928, well inside 32 bits.
     const uint32_t inv = 256u - a;
-    const uint32_t rb = (((fg & 0xF81Fu) * a) + ((bg & 0xF81Fu) * inv)) >> 8;
+    const uint32_t r = (((fg & 0xF800u) * a) + ((bg & 0xF800u) * inv)) >> 8;
     const uint32_t g = (((fg & 0x07E0u) * a) + ((bg & 0x07E0u) * inv)) >> 8;
-    return static_cast<uint16_t>((rb & 0xF81Fu) | (g & 0x07E0u));
+    const uint32_t b = (((fg & 0x001Fu) * a) + ((bg & 0x001Fu) * inv)) >> 8;
+    return static_cast<uint16_t>((r & 0xF800u) | (g & 0x07E0u) | (b & 0x001Fu));
 }
 
 // Internal SRAM is deliberately scarce in this firmware (WiFi/BLE/TLS all
@@ -264,6 +275,13 @@ void SleepAnimation::start(Display *d) {
     log_i("SleepAnimation: started (%dx%d), push task on core 0", w, h);
 }
 
+// Bumped from the completion interrupt, so a plain volatile rather than the
+// std::atomic the other counters use: a fetch_add on this target can land in a
+// libatomic helper that is not in IRAM, and this handler can run with the flash
+// cache disabled. There is one animation instance, and the only readers are the
+// bench endpoint and the drain loop in stop().
+static volatile uint32_t g_sleepAnimDmaDone = 0;
+
 void SleepAnimation::stop() {
     if (!running) {
         return;
@@ -288,7 +306,7 @@ void SleepAnimation::stop() {
         // A transfer may still be reading a band buffer, and the next start()
         // hands those same buffers straight back to the render task.
         const unsigned long drain = millis() + 200;
-        while (dmaIssued.load() != benchDmaCompleted() && millis() < drain) {
+        while (dmaIssued.load() != g_sleepAnimDmaDone && millis() < drain) {
             vTaskDelay(pdMS_TO_TICKS(2));
         }
         if (fbDirect != nullptr && display != nullptr) {
@@ -364,13 +382,6 @@ void SleepAnimation::pushTaskEntry(void *arg) {
     vTaskDelete(nullptr);
 }
 
-// Bumped from the completion interrupt, so a plain volatile rather than the
-// std::atomic the other counters use: a fetch_add on this target can land in a
-// libatomic helper that is not in IRAM, and this handler can run with the flash
-// cache disabled. There is one animation instance, and the only readers are the
-// bench endpoint and the drain loop in stop().
-static volatile uint32_t g_sleepAnimDmaDone = 0;
-
 static bool IRAM_ATTR sleepAnimBandDone(async_memcpy_t, async_memcpy_event_t *, void *arg) {
     g_sleepAnimDmaDone++;
     if (arg == nullptr) {
@@ -385,6 +396,7 @@ static bool IRAM_ATTR sleepAnimBandDone(async_memcpy_t, async_memcpy_event_t *, 
     return woken == pdTRUE;
 }
 
+#ifdef GM_ANIM_BENCH
 uint32_t SleepAnimation::benchDmaCompleted() const { return g_sleepAnimDmaDone; }
 
 bool SleepAnimation::benchBandsInternal() const {
@@ -396,6 +408,7 @@ bool SleepAnimation::benchBandsInternal() const {
     }
     return true;
 }
+#endif // GM_ANIM_BENCH
 
 namespace {
 // esp_intr_alloc binds the handler to whichever core calls it, and there is no
@@ -842,7 +855,11 @@ void SleepAnimation::renderFrame() {
         // band 0 and reported steam at "+191% preemption" purely from that.
         // Rotating means every band is locked equally often across a dwell, so
         // both populations cover the same pixels.
-        const bool lockThisBand = GM_BENCH_LOCK_ONE_BAND && (y0 / BAND_H) == static_cast<int>(benchLockBand);
+#if GM_BENCH_LOCK_ONE_BAND
+        const bool lockThisBand = (y0 / BAND_H) == static_cast<int>(benchLockBand);
+#else
+        constexpr bool lockThisBand = false;
+#endif
         BENCH_T0(tBand);
         if (half) {
             // Render rows/2 half-width rows, then expand 2x in both axes.
