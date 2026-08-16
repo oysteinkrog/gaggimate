@@ -535,7 +535,82 @@ void LilyGo_RGBPanel::pushColors(uint16_t x, uint16_t y, uint16_t width, uint16_
     if (_panelDrv == nullptr) { // panel stopped for display OTA
         return;
     }
+    lockFrameBuffer();
     esp_lcd_panel_draw_bitmap(_panelDrv, x, y, width, hight, data);
+    unlockFrameBuffer();
+}
+
+// Byte offsets into esp_rgb_panel_t, which esp_lcd keeps private to
+// esp_lcd_rgb_panel.c -- there is no accessor for the framebuffer in IDF 4.4.7
+// (esp_lcd_rgb_panel_get_frame_buffer arrives in 5.x). These were recovered by
+// disassembling this exact build's esp_lcd_rgb_panel_draw_bitmap and reading
+// which offsets it loads for the destination pointer and the bounds check.
+//
+// They are therefore valid for ONE toolchain build, which is why every one of
+// them is validated below before the pointer is handed out: a struct layout
+// change from an IDF bump moves these, and the probe must fail closed rather
+// than return a wild pointer into the middle of a live driver object.
+namespace {
+constexpr size_t RGB_PANEL_OFF_BPP = 44;
+constexpr size_t RGB_PANEL_OFF_FB = 72;
+constexpr size_t RGB_PANEL_OFF_HRES = 152;
+constexpr size_t RGB_PANEL_OFF_VRES = 156;
+} // namespace
+
+uint16_t *LilyGo_RGBPanel::directFrameBuffer() {
+    if (_fbResolved) {
+        return _fbDirect;
+    }
+    _fbResolved = true;
+    _fbDirect = nullptr;
+    if (_panelDrv == nullptr) {
+        return nullptr;
+    }
+    const uint8_t *base = reinterpret_cast<const uint8_t *>(_panelDrv);
+    uint16_t *fb = *reinterpret_cast<uint16_t *const *>(base + RGB_PANEL_OFF_FB);
+    const size_t bpp = *reinterpret_cast<const size_t *>(base + RGB_PANEL_OFF_BPP);
+    const uint32_t hres = *reinterpret_cast<const uint32_t *>(base + RGB_PANEL_OFF_HRES);
+    const uint32_t vres = *reinterpret_cast<const uint32_t *>(base + RGB_PANEL_OFF_VRES);
+
+    // Five independent checks. Any one of them failing means the offsets no
+    // longer describe this struct, and three of them (the resolution pair and
+    // the bit depth) would be astronomically unlikely to hold by accident on a
+    // wrong layout -- which is the point: they are the layout's fingerprint,
+    // not just sanity checks on the values.
+    const bool fbInPsram = fb != nullptr && reinterpret_cast<uintptr_t>(fb) >= 0x3C000000u &&
+                           reinterpret_cast<uintptr_t>(fb) < 0x3E000000u;
+    const bool fbAligned = (reinterpret_cast<uintptr_t>(fb) & 63u) == 0;
+    const bool resMatches = hres == width() && vres == height();
+    const bool depthMatches = bpp == 16;
+    if (!fbInPsram || !fbAligned || !resMatches || !depthMatches) {
+        log_w("LilyGo_RGBPanel: framebuffer probe failed (fb=%p psram=%d aligned=%d res=%ux%u want %ux%u bpp=%u)", fb,
+              static_cast<int>(fbInPsram), static_cast<int>(fbAligned), static_cast<unsigned>(hres),
+              static_cast<unsigned>(vres), static_cast<unsigned>(width()), static_cast<unsigned>(height()),
+              static_cast<unsigned>(bpp));
+        return nullptr;
+    }
+    if (_fbMutex == nullptr) {
+        _fbMutex = xSemaphoreCreateMutex();
+        if (_fbMutex == nullptr) {
+            return nullptr; // without the lock a direct writer would race pushColors
+        }
+    }
+    _fbDirect = fb;
+    log_i("LilyGo_RGBPanel: direct framebuffer at %p (%ux%u, %u bpp)", fb, static_cast<unsigned>(hres),
+          static_cast<unsigned>(vres), static_cast<unsigned>(bpp));
+    return _fbDirect;
+}
+
+void LilyGo_RGBPanel::lockFrameBuffer() {
+    if (_fbMutex != nullptr) {
+        xSemaphoreTake(_fbMutex, portMAX_DELAY);
+    }
+}
+
+void LilyGo_RGBPanel::unlockFrameBuffer() {
+    if (_fbMutex != nullptr) {
+        xSemaphoreGive(_fbMutex);
+    }
 }
 
 void LilyGo_RGBPanel::stopPanel() {

@@ -4,6 +4,8 @@
 #include <Arduino.h>
 #include <display/drivers/common/Display.h>
 #include <display/ui/default/bganim/BgAnim.h>
+#include <esp32s3/rom/cache.h> // Cache_WriteBack_Addr / Cache_Invalidate_Addr around the direct push
+#include <esp_async_memcpy.h>
 #include <esp_heap_caps.h>
 #include <esp_timer.h>
 #include <freertos/FreeRTOS.h>
@@ -131,7 +133,15 @@ void SleepAnimation::start(Display *d) {
     const int h = display->height();
     for (int i = 0; i < NUM_SLOTS; i++) {
         if (bandBuf[i] == nullptr) {
-            bandBuf[i] = static_cast<uint16_t *>(allocPreferInternal(w * BAND_H * sizeof(uint16_t)));
+            // 64-byte aligned and DMA-capable, because on the direct path these
+            // are the transfer source and esp_async_memcpy rejects anything
+            // else. The fallback keeps the ordinary push path working if the
+            // aligned allocator cannot find a contiguous block.
+            bandBuf[i] = static_cast<uint16_t *>(
+                heap_caps_aligned_alloc(64, w * BAND_H * sizeof(uint16_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA));
+            if (bandBuf[i] == nullptr) {
+                bandBuf[i] = static_cast<uint16_t *>(allocPreferInternal(w * BAND_H * sizeof(uint16_t)));
+            }
         }
         if (bandReady[i] == nullptr) {
             bandReady[i] = xSemaphoreCreateBinary();
@@ -185,6 +195,21 @@ void SleepAnimation::start(Display *d) {
         while (xSemaphoreTake(static_cast<SemaphoreHandle_t>(bandFree[i]), 0) == pdTRUE) {
         }
         xSemaphoreGive(static_cast<SemaphoreHandle_t>(bandFree[i]));
+    }
+    // Ask the panel for its framebuffer. It may refuse (the probe validates the
+    // driver's struct layout and fails closed), in which case the pipeline runs
+    // exactly as before through the push task. The engine itself is installed
+    // later, on the render task, because esp_intr_alloc binds the completion
+    // handler to whichever core calls it and the render task is the one that
+    // waits on it.
+    dmaActive = false;
+    dmaInstallTried = false;
+    fbDirect = dmaWanted.load() ? display->directFrameBuffer() : nullptr;
+    if (fbDirect != nullptr) {
+        // Whatever LVGL last drew is still sitting in dirty cache lines over
+        // this region. Those must reach PSRAM before DMA starts writing there,
+        // or a later eviction drops a stale line on top of a rendered band.
+        Cache_WriteBack_Addr(reinterpret_cast<uint32_t>(fbDirect), static_cast<uint32_t>(w) * h * 2);
     }
     initializedAnimId = -1; // force the animation's init on the render task
     running = true;
@@ -247,6 +272,26 @@ void SleepAnimation::stop() {
     while (!pushStopped && millis() < pushDeadline) {
         vTaskDelay(pdMS_TO_TICKS(5));
     }
+    if (dmaActive) {
+        // A transfer may still be reading a band buffer, and the next start()
+        // hands those same buffers straight back to the render task.
+        const unsigned long drain = millis() + 200;
+        while (dmaIssued.load() != benchDmaCompleted() && millis() < drain) {
+            vTaskDelay(pdMS_TO_TICKS(2));
+        }
+        if (fbDirect != nullptr && display != nullptr) {
+            // DMA wrote the framebuffer behind the cache, so the CPU's view of
+            // it is stale but not dirty. When LVGL resumes, a partial redraw
+            // writes only its own rectangle, and any 32-byte line it touches is
+            // written back whole -- resurrecting old animation pixels in the
+            // bytes it did not write. Dropping the lines forces a refetch.
+            // Discarding rather than writing back is correct precisely because
+            // nothing has CPU-dirtied this region since start() flushed it.
+            Cache_Invalidate_Addr(reinterpret_cast<uint32_t>(fbDirect),
+                                  static_cast<uint32_t>(display->width()) * display->height() * 2);
+        }
+        dmaActive = false;
+    }
 }
 
 // Horizontal extent of the inscribed circle for each band. The panel is round:
@@ -304,6 +349,51 @@ void SleepAnimation::pushTaskEntry(void *arg) {
     self->pushLoop();
     self->pushStopped = true;
     vTaskDelete(nullptr);
+}
+
+// Bumped from the completion interrupt, so a plain volatile rather than the
+// std::atomic the other counters use: a fetch_add on this target can land in a
+// libatomic helper that is not in IRAM, and this handler can run with the flash
+// cache disabled. There is one animation instance, and the only readers are the
+// bench endpoint and the drain loop in stop().
+static volatile uint32_t g_sleepAnimDmaDone = 0;
+
+static bool IRAM_ATTR sleepAnimBandDone(async_memcpy_t, async_memcpy_event_t *, void *arg) {
+    g_sleepAnimDmaDone++;
+    BaseType_t woken = pdFALSE;
+    // Releases the slot the transfer has finished reading. The render task
+    // waits on this same semaphore before refilling that slot, so the transfer
+    // overlaps the next band's render and the only synchronisation left in the
+    // direct path is one give per band.
+    xSemaphoreGiveFromISR(static_cast<SemaphoreHandle_t>(arg), &woken);
+    return woken == pdTRUE;
+}
+
+uint32_t SleepAnimation::benchDmaCompleted() const { return g_sleepAnimDmaDone; }
+
+bool SleepAnimation::installDmaOnRenderCore() {
+    if (dmaHandle != nullptr) {
+        return true;
+    }
+    if (dmaInstallTried) {
+        return false; // do not retry a failed install once a frame
+    }
+    dmaInstallTried = true;
+    async_memcpy_config_t cfg = ASYNC_MEMCPY_DEFAULT_CONFIG();
+    // The engine splits a transfer into descriptors of its own internal size,
+    // and backlog is how many it can hold. One band is 480 x BAND_H x 2 bytes;
+    // size the pool for every slot being in flight at once, with slack.
+    cfg.backlog = NUM_SLOTS * ((480 * BAND_H * 2) / 4000 + 2);
+    cfg.sram_trans_align = 4;
+    cfg.psram_trans_align = 64;
+    async_memcpy_t h = nullptr;
+    const esp_err_t err = esp_async_memcpy_install(&cfg, &h);
+    if (err != ESP_OK) {
+        log_w("SleepAnimation: async memcpy install failed (%d), using the push task", static_cast<int>(err));
+        return false;
+    }
+    dmaHandle = h;
+    return true;
 }
 
 void SleepAnimation::pushLoop() {
@@ -393,6 +483,12 @@ void SleepAnimation::taskEntry(void *arg) {
 }
 
 void SleepAnimation::renderLoop() {
+    // Installed here, not in start(): esp_intr_alloc binds the completion
+    // handler to the core that calls it, and this is the task that waits on it.
+    if (fbDirect != nullptr && installDmaOnRenderCore()) {
+        dmaActive = true;
+        log_i("SleepAnimation: direct framebuffer push active");
+    }
     uint32_t fpsFrames = 0;
     unsigned long fpsWindowStart = millis();
     while (running) {
@@ -745,9 +841,16 @@ void SleepAnimation::renderFrame() {
         // can take it as a rectangle. The move is always backwards within the
         // same buffer (dst offset r*cw <= src offset r*w + x0 for every r), so
         // it is safe in place and needs no second buffer.
+        // The direct path leaves the band full-width and contiguous so it can
+        // go out as a single transfer. Cropping would buy back the ~21% of
+        // pixels outside the round panel's circle, but each cropped row is a
+        // separate run in the framebuffer and would need its own descriptor to
+        // step the stride. At 48 MB/s those corners cost less than the
+        // descriptors and the extra pack pass would.
+        const bool crop = cropEnabled && !dmaActive;
         const int bi = y0 / BAND_H;
-        const int cx0 = cropEnabled ? bandX0[bi] : 0;
-        const int cx1 = cropEnabled ? bandX1[bi] : w;
+        const int cx0 = crop ? bandX0[bi] : 0;
+        const int cx1 = crop ? bandX1[bi] : w;
         const int cw = cx1 - cx0;
         BENCH_T0(tPack);
         if (cw < w) {
@@ -787,9 +890,37 @@ void SleepAnimation::renderFrame() {
         // pass through unchanged to esp_lcd_panel_draw_bitmap (exclusive end).
         // Passing dimensions here asserted in rgb_panel_draw_bitmap on the
         // second band (y_start==y_end) and boot-looped sleep3/sleep4.
-        pushJob[renderSlot] = {static_cast<int16_t>(cx0), static_cast<int16_t>(y0), static_cast<int16_t>(cx1),
-                         static_cast<int16_t>(y0 + rows)};
-        xSemaphoreGive(static_cast<SemaphoreHandle_t>(bandReady[renderSlot]));
+        if (dmaActive) {
+            // One contiguous run: full-width rows are adjacent in both the band
+            // buffer and the framebuffer. Every operand is 64-byte aligned by
+            // construction -- the panel's framebuffer is (the probe checks it),
+            // the band buffer is allocated aligned, and both the row stride
+            // (480 x 2 = 960 B) and the band size are multiples of 64.
+            //
+            // Nothing is awaited. The transfer reads the slot on its own time
+            // and its completion interrupt gives bandFree[renderSlot], which is
+            // exactly what this loop takes before refilling that slot.
+            BENCH_T0(tPush);
+            const size_t bytes = static_cast<size_t>(w) * rows * 2;
+            dmaIssued++;
+            const esp_err_t err =
+                esp_async_memcpy(static_cast<async_memcpy_t>(dmaHandle), fbDirect + static_cast<size_t>(y0) * w, band,
+                                 bytes, sleepAnimBandDone, bandFree[renderSlot]);
+            if (err != ESP_OK) {
+                // Not expected given the alignment guarantees, but a dropped
+                // band is a visible tear: fall back to the CPU copy and release
+                // the slot here, because no interrupt is coming for it.
+                dmaErrors++;
+                dmaIssued--;
+                display->pushColors(0, y0, w, y0 + rows, band);
+                xSemaphoreGive(static_cast<SemaphoreHandle_t>(bandFree[renderSlot]));
+            }
+            BENCH_ACC(accPushUs, tPush);
+        } else {
+            pushJob[renderSlot] = {static_cast<int16_t>(cx0), static_cast<int16_t>(y0), static_cast<int16_t>(cx1),
+                                   static_cast<int16_t>(y0 + rows)};
+            xSemaphoreGive(static_cast<SemaphoreHandle_t>(bandReady[renderSlot]));
+        }
         renderSlot = (renderSlot + 1) % NUM_SLOTS;
     }
 }
