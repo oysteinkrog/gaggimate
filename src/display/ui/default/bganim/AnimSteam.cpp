@@ -89,6 +89,11 @@ bool init(int, int h) {
     if (blobs == nullptr) {
         blobs = static_cast<Blob *>(alloc(BLOBS_MAX * sizeof(Blob)));
         draws = static_cast<BlobDraw *>(alloc(BLOBS_MAX * sizeof(BlobDraw)));
+        // A fresh allocation holds garbage, not zeros, so no previous build
+        // survives in it. builtCount is a file-scope static that would survive,
+        // and if it happened to match the requested count buildWisps() would be
+        // skipped and frame() would read uninitialised blobs.
+        builtCount = -1;
     }
     if (blobs == nullptr || draws == nullptr) {
         return false;
