@@ -195,7 +195,14 @@ class SleepAnimation {
     // fbDirect is the panel's own framebuffer, or null when the panel will not
     // hand it over -- in which case dmaActive stays false and the pipeline runs
     // the ordinary push task, unchanged.
-    std::atomic<bool> dmaWanted{true};
+    // Off by default: the direct path garbles the panel in practice. Writing
+    // the framebuffer behind the cache is only safe if nothing else writes it
+    // through the cache, and LVGL still does -- its dirty lines get evicted
+    // over DMA-written pixels afterwards. Flushing at start() and invalidating
+    // at stop() bounds that at the edges of a run but does nothing during one.
+    // Enable with /api/animbench?dma=1 to measure; do not ship it on until the
+    // coherency problem is actually solved.
+    std::atomic<bool> dmaWanted{false};
     bool dmaActive = false;      // fbDirect resolved AND the engine installed
     uint16_t *fbDirect = nullptr;
     void *dmaHandle = nullptr;   // async_memcpy_t, installed once from the render task

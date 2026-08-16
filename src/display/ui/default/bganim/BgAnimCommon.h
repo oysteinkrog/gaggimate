@@ -41,10 +41,36 @@ constexpr size_t SRAM_ALLOC_LIMIT = GM_BGANIM_SRAM_LIMIT;
 // the tables are never freed, so switching through the fleet accumulated 53 KB
 // and took the network stack down with it (see the analysis in alloc()).
 //
-// 24 KB is chosen against what the fleet actually asks for: the four heaviest
-// animations are all inside it individually, so whichever one is running keeps
-// its tables in SRAM, and the pool keeps roughly 30 KB of the headroom that
-// WiFi, BLE and TLS allocate from at runtime.
+// 24 KB keeps roughly 45 KB of the pool free for what WiFi, BLE and TLS
+// allocate at runtime, which is the point. What it does NOT do is give the
+// running animation its tables -- there is no budget value that would, and an
+// earlier version of this comment claimed otherwise. The real behaviour, walked
+// through the registry order and confirmed byte-for-byte against a device
+// trace:
+//
+//   plasma    2,944 + sinLut 2,048 shared        -> 4,992,  all SRAM
+//   lava      2,432 + cosTableF 1,024 shared     -> 8,448,  all SRAM
+//   silk      7,176 + 4 x 3,840 rowAux           -> 23,304, last two to PSRAM
+//   starfield 11,084 eligible                    -> 24,548, 6 of 10 to PSRAM
+//   everything after                             -> entirely PSRAM
+//
+// So four animations claim the pool and the remaining nine get none of it,
+// including caustics' 8,192 B rgbLUT and aurora's 8,704 B of sine tables, both
+// individually well under the limit. Which four is decided by position in the
+// registry, not by how hot the tables are. Silk alone asks for 22,536 B, 92% of
+// this ceiling, and does not fully fit even when it runs first from a cold boot.
+//
+// The mechanism that would actually fix this is a release entry point on the
+// BgAnimation ABI, freeing the outgoing animation's tables on a switch, so the
+// peak is max-over-animations (silk's 22.5 KB) instead of sum-over-animations.
+// Six of the thirteen would be mechanical; the rest gate their table CONTENT on
+// separate theme/param sentinels that a naive free-and-null would leave stale,
+// handing back a reallocated buffer that never gets refilled. Mandala is worse
+// than stale content: its fill flag is function-local and unreachable from
+// outside, and its rescaleLUT pointer is offset into the allocation, so freeing
+// the pointer the code holds would corrupt the heap.
+//
+// Until that exists, this ceiling is a safety limit, not a placement policy.
 #ifndef GM_BGANIM_SRAM_BUDGET
 #define GM_BGANIM_SRAM_BUDGET (24 * 1024)
 #endif
