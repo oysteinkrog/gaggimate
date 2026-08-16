@@ -748,6 +748,16 @@ void WebUIPlugin::setupServer() {
                 a->benchRequestReset();
             }
         }
+        // ?ilace=0|1 -- push every other row, alternating each frame. Halves the
+        // push, which is the pipeline's ceiling; costs each row half the refresh
+        // rate. Takes effect on the next band.
+        if (request->hasArg("ilace")) {
+            SleepAnimation *a = sleep_animation_bench_instance();
+            if (a != nullptr) {
+                a->benchSetInterlace(request->arg("ilace").toInt() != 0);
+                a->benchRequestReset();
+            }
+        }
         if (request->hasArg("only")) {
             SleepAnimation *a = sleep_animation_bench_instance();
             if (a != nullptr) {
@@ -813,6 +823,7 @@ void WebUIPlugin::setupServer() {
         gate["dma_wanted"] = anim0 != nullptr && anim0->benchDmaWanted();
         gate["dma_active"] = anim0 != nullptr && anim0->benchDmaActive();
         gate["dma_mode"] = anim0 != nullptr ? anim0->benchDmaMode() : 0;
+        gate["interlace"] = anim0 != nullptr ? anim0->benchInterlace() : false;
         gate["bands_internal"] = anim0 != nullptr && anim0->benchBandsInternal();
         if (anim0 != nullptr) {
             JsonArray ba = gate["band_addr"].to<JsonArray>();

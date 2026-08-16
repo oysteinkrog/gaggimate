@@ -471,7 +471,23 @@ void SleepAnimation::pushLoop() {
 #ifdef GM_ANIM_BENCH
         const int64_t t0 = esp_timer_get_time();
 #endif
-        display->pushColors(job.x0, job.y0, job.x1, job.y1, bandBuf[slot]);
+        if (interlace.load()) {
+            // One call per row rather than one per band. Each row is
+            // (x1 - x0) * 2 bytes and its own contiguous run in the band, and
+            // the framebuffer rows two apart are not adjacent, so there is no
+            // way to express this as a single rectangle. The saving is the
+            // other half of the rows, which keep the previous frame.
+            const int stride = job.x1 - job.x0;
+            for (int y = job.y0; y < job.y1; y++) {
+                if (((y ^ job.parity) & 1) != 0) {
+                    continue;
+                }
+                display->pushColors(job.x0, static_cast<int16_t>(y), job.x1, static_cast<int16_t>(y + 1),
+                                    bandBuf[slot] + static_cast<size_t>(y - job.y0) * stride);
+            }
+        } else {
+            display->pushColors(job.x0, job.y0, job.x1, job.y1, bandBuf[slot]);
+        }
 #ifdef GM_ANIM_BENCH
         accPushUs += static_cast<uint64_t>(esp_timer_get_time() - t0);
 #endif
@@ -560,6 +576,9 @@ void SleepAnimation::renderLoop() {
     while (running) {
         const int64_t frameStart = esp_timer_get_time();
         renderFrame();
+        // Once per frame, not once per band: every band of a frame must push
+        // the same parity or the two halves of the picture drift apart.
+        frameParity++;
         fpsFrames++;
 #ifdef GM_ANIM_BENCH
         const uint32_t frameUs = static_cast<uint32_t>(esp_timer_get_time() - frameStart);
@@ -769,6 +788,11 @@ void SleepAnimation::renderFrame() {
             return;
         }
         uint16_t *const band = bandBuf[renderSlot];
+        // Decided once per band and used twice: the blend skips rows this frame
+        // will not push, and the push job carries the parity. Interlacing only
+        // applies to the two-task push path -- the direct path writes the
+        // framebuffer itself and has no per-row call to skip.
+        const bool interlaceActive = interlace.load() && !(dmaActive && dmaMode.load() != 0);
         // Bench builds render ONE band per frame with the scheduler suspended
         // on this core. Aurora measures ~82 CPU cycles/pixel for a loop body
         // that looks like it should run in far less, and its max frame is 1.8x
@@ -844,7 +868,12 @@ void SleepAnimation::renderFrame() {
         uint32_t spanPxLocal = 0;
         uint32_t blendPxLocal = 0;
 #endif
-        for (int y = y0; y < y0 + rows; y++) {
+        // Rows of the other parity are not pushed this frame, so anything
+        // composited into them is thrown away. Skipping them halves the blend.
+        const int blendStep = interlaceActive ? 2 : 1;
+        const int blendFirst =
+            interlaceActive ? y0 + (((y0 ^ static_cast<int>(frameParity)) & 1) ? 1 : 0) : y0;
+        for (int y = blendFirst; y < y0 + rows; y += blendStep) {
             if (ov != nullptr && ov->spanMin[y] >= 0) {
                 // Composite the standby widgets over the plasma (span-limited:
                 // only pixels the snapshot actually covers).
@@ -1034,7 +1063,7 @@ void SleepAnimation::renderFrame() {
             BENCH_ACC(accPushUs, tPush);
         } else {
             pushJob[renderSlot] = {static_cast<int16_t>(cx0), static_cast<int16_t>(y0), static_cast<int16_t>(cx1),
-                                   static_cast<int16_t>(y0 + rows)};
+                                   static_cast<int16_t>(y0 + rows), static_cast<uint8_t>(frameParity & 1u)};
             xSemaphoreGive(static_cast<SemaphoreHandle_t>(bandReady[renderSlot]));
         }
         renderSlot = (renderSlot + 1) % NUM_SLOTS;
