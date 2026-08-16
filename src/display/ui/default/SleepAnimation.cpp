@@ -495,8 +495,13 @@ void SleepAnimation::benchFinishDwell() {
     benchDwellStart = millis();
 
     const int count = bg_animation_count();
-    const int next = (id + 1) % count;
-    if (next == 0) {
+    // benchOnly pins the sweep to a single animation. A full pass is 13 dwells
+    // of 6 s, so iterating on one animation's inner loop otherwise costs about
+    // 90 s of waiting per measurement, nearly all of it spent measuring the
+    // twelve animations that did not change.
+    const int pin = benchOnly.load();
+    const int next = (pin >= 0 && pin < count) ? pin : (id + 1) % count;
+    if (next == 0 || pin >= 0) {
         benchPasses++;
         log_i("animbench: completed sweep %u of all %d animations", benchPasses, count);
     }
