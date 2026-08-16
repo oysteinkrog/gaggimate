@@ -125,10 +125,24 @@ class SleepAnimation {
     // it: the panel must hand over its framebuffer and the engine must install.
     void benchSetDma(bool on) { dmaWanted.store(on); }
     bool benchDmaWanted() const { return dmaWanted.load(); }
+    // 0 = push task (esp_lcd draw_bitmap), 1 = CPU memcpy straight into the
+    // panel's framebuffer, 2 = GDMA straight into it. Mode 1 exists purely to
+    // bisect: it bypasses draw_bitmap exactly as mode 2 does but keeps the copy
+    // an ordinary CPU one, so a fault that appears in 1 is about bypassing the
+    // driver and a fault that appears only in 2 is about the transfer.
+    void benchSetDmaMode(int m) { dmaMode.store(m); }
+    int benchDmaMode() const { return dmaMode.load(); }
     bool benchDmaActive() const { return dmaActive; }
     uint32_t benchDmaIssued() const { return dmaIssued.load(); }
     uint32_t benchDmaCompleted() const;
     uint32_t benchDmaErrors() const { return dmaErrors.load(); }
+    // Where the band buffers actually landed. They are the DMA source, so one
+    // of them falling back to PSRAM would mean GDMA reads memory the CPU has
+    // only written through the cache.
+    uint32_t benchBandAddr(int i) const {
+        return (i >= 0 && i < NUM_SLOTS) ? reinterpret_cast<uint32_t>(bandBuf[i]) : 0;
+    }
+    bool benchBandsInternal() const;
 #endif
 
   private:
@@ -202,13 +216,21 @@ class SleepAnimation {
     // at stop() bounds that at the edges of a run but does nothing during one.
     // Enable with /api/animbench?dma=1 to measure; do not ship it on until the
     // coherency problem is actually solved.
-    std::atomic<bool> dmaWanted{false};
+    std::atomic<bool> dmaWanted{true};
+    std::atomic<int> dmaMode{2};
     bool dmaActive = false;      // fbDirect resolved AND the engine installed
     uint16_t *fbDirect = nullptr;
+    // dmaMode 4 only: a band-sized PSRAM buffer nothing scans out, so the DMA
+    // traffic can be reproduced exactly while the framebuffer is left alone.
+    uint16_t *dmaScratch = nullptr;
     void *dmaHandle = nullptr;   // async_memcpy_t, installed once from the render task
     bool dmaInstallTried = false;
     std::atomic<uint32_t> dmaIssued{0};
     std::atomic<uint32_t> dmaErrors{0};
+    // Core the async-memcpy completion interrupt is bound to. Deliberately not
+    // the render core: the RGB panel driver's ISR is on core 1 and must not
+    // queue behind ours.
+    static constexpr int DMA_ISR_CORE = 0;
     bool installDmaOnRenderCore();
 
     // Per-band horizontal extent of the panel's inscribed circle. The panel is
