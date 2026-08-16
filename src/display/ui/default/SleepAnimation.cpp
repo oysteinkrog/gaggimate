@@ -803,10 +803,16 @@ void SleepAnimation::renderFrame() {
         //
         // Safe to free here specifically: this runs on the render task, which
         // is the only task that calls init(), frame() or band().
-        if (initializedAnimId >= 0) {
-            const BgAnimation &prev = bg_animation(initializedAnimId);
+        // residentAnimId, not initializedAnimId: start() clears the latter to
+        // force this branch, and gating on it would skip the release on the
+        // first frame after every restart -- leaving init() to no-op against
+        // non-null pointers and, after a resolution change, leaving band() to
+        // walk tables sized for the previous resolution.
+        if (residentAnimId >= 0) {
+            const BgAnimation &prev = bg_animation(residentAnimId);
             if (prev.release != nullptr) {
                 prev.release();
+                residentAnimId = -1;
             }
         }
         if (!anim.init(rw, rh)) {
@@ -816,6 +822,11 @@ void SleepAnimation::renderFrame() {
         }
         initializedAnimId = id;
         initializedHalf = half;
+        // Only animations with a teardown are tracked as resident; the rest
+        // keep their tables and there is nothing to hand back.
+        if (anim.release != nullptr) {
+            residentAnimId = id;
+        }
     }
     BENCH_T0(tSetup);
     anim.frame(tMs, rw, rh, p);

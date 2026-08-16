@@ -332,6 +332,11 @@ class SleepAnimation {
     std::atomic<uint8_t> maxFps{30};
 #endif
     int initializedAnimId = -1; // last id whose init() ran on the render task
+    // Which animation currently holds allocated tables, or -1 for none. Kept
+    // apart from initializedAnimId because start() clears that one to force an
+    // init(), and stopping the render task frees nothing -- so the tables
+    // outlive it and something has to remember whose they are.
+    int residentAnimId = -1;
     bool initializedHalf = false; // resolution that init() ran at; a change re-inits
     uint16_t *halfBuf = nullptr;  // (w/2)x(BAND_H/2) scratch for half-res rendering
 

@@ -31,13 +31,13 @@ bool init(int w, int h) {
     if (sinLut() == nullptr) {
         return false;
     }
-    allocW = w;
-    allocH = h;
     if (colTerm == nullptr) {
         colTerm = static_cast<int16_t *>(alloc(w * sizeof(int16_t)));
+        allocW = w;
     }
     if (rowTerm == nullptr) {
         rowTerm = static_cast<int16_t *>(alloc(h * sizeof(int16_t)));
+        allocH = h;
     }
     if (palette == nullptr) {
         palette = static_cast<uint16_t *>(alloc(256 * sizeof(uint16_t)));
