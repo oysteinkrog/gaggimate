@@ -8,6 +8,8 @@
 #include <ctime>
 #include <display/config.h>
 #include <display/core/constants.h>
+#include <display/core/MemoryMonitor.h>
+#include <display/core/utils.h>
 #include <display/core/process/BrewProcess.h>
 #include <display/core/process/GrindProcess.h>
 #include <display/core/process/PumpProcess.h>
@@ -41,10 +43,18 @@
 #endif
 #endif
 
-const String LOG_TAG = F("Controller");
+static constexpr const char *LOG_TAG = "Controller";
 constexpr uint32_t ADDON_HW_SCALE = 8;
 
 void Controller::setup() {
+    gaggimate::memmon::init();
+    heap_checkpoint_reset();
+    heap_checkpoint("setup/enter");
+
+    // First point at which NVS is up (see Settings::load). Everything below
+    // reads settings, so nothing may be reordered above this.
+    settings.load();
+    heap_checkpoint("setup/after-settings-load");
     mode = MODE_STANDBY;
 
     // Web assets are served from this partition. LittleFS (not SPIFFS): SPIFFS
@@ -56,19 +66,23 @@ void Controller::setup() {
     if (!LittleFS.begin(true, "/littlefs", 16)) {
         Serial.println(F("An Error has occurred while mounting LittleFS"));
     }
+    heap_checkpoint("setup/after-spiffs-mount");
 
 #ifndef GAGGIMATE_HEADLESS
     setupPanel();
+    heap_checkpoint("setup/after-setup-panel");
 #endif
 
     pluginManager = new PluginManager();
 #ifndef GAGGIMATE_HEADLESS
     ui = new DefaultUI(this, driver, pluginManager);
+    heap_checkpoint("setup/after-default-ui-ctor");
     if (driver->supportsSDCard() && driver->installSDCard()) {
         sdcard = true;
         ESP_LOGI(LOG_TAG, "SD Card detected and mounted");
         ESP_LOGI(LOG_TAG, "Used: %lluMB, Capacity: %lluMB", SD_MMC.usedBytes() / 1024 / 1024, SD_MMC.cardSize() / 1024 / 1024);
     }
+    heap_checkpoint("setup/after-sd-probe");
 #endif
     FS *fs = &LittleFS;
     if (sdcard) {
@@ -76,6 +90,7 @@ void Controller::setup() {
     }
     profileManager = new ProfileManager(fs, "/p", settings, pluginManager);
     profileManager->setup();
+    heap_checkpoint("setup/after-profile-manager");
 #ifndef GAGGIMATE_SIM // mDNS/HomeKit are device-only
     if (settings.isHomekit())
         pluginManager->registerPlugin(new HomekitPlugin(settings.getWifiSsid(), settings.getWifiPassword()));
@@ -105,7 +120,9 @@ void Controller::setup() {
 #endif
     pluginManager->registerPlugin(new LedControlPlugin());
     pluginManager->registerPlugin(new AutoWakeupPlugin());
+    heap_checkpoint("setup/after-plugin-register");
     pluginManager->setup(this);
+    heap_checkpoint("setup/after-plugin-setup");
 
     pluginManager->on("profiles:profile:save", [this](Event const &event) {
         String id = event.getString("id");
@@ -118,11 +135,13 @@ void Controller::setup() {
 
 #ifndef GAGGIMATE_HEADLESS
     ui->init();
+    heap_checkpoint("setup/after-ui-init");
 #endif
     this->onScreenReady();
 
     updateLastAction();
     xTaskCreatePinnedToCore(loopLogicTask, "Controller::loopLogic", configMINIMAL_STACK_SIZE * 6, this, 3, &logicTaskHandle, 0);
+    heap_checkpoint("setup/end");
 }
 
 void Controller::onScreenReady() { screenReady = true; }
@@ -136,8 +155,11 @@ void Controller::connect() {
     connectStartTime = millis();
     pluginManager->trigger("controller:startup");
 
+    heap_checkpoint("connect/before-wifi");
     setupWifi();
+    heap_checkpoint("connect/after-wifi");
     setupBluetooth();
+    heap_checkpoint("connect/after-bluetooth");
     pluginManager->on("ota:update:start", [this](Event const &) { this->updating = true; });
     pluginManager->on("ota:update:end", [this](Event const &) { this->updating = false; });
 
@@ -253,7 +275,7 @@ void Controller::setupBluetooth() {
         }
     });
     comms.onSystemInfo([this](const char *hardware, const char *version, uint32_t protocolVersion, bool dimming, bool pressure,
-                              bool ledControl, bool tof, vector<uint32_t> addons) {
+                              bool ledControl, bool tof, std::vector<uint32_t> addons) {
         onSystemInfo(hardware, version, protocolVersion, dimming, pressure, ledControl, tof, addons);
     });
     comms.onIncompatibleController([this](const String &info) { onIncompatibleController(info); });
@@ -385,7 +407,7 @@ void Controller::setupBluetooth() {
 }
 
 void Controller::onSystemInfo(const char *hardware, const char *version, uint32_t protocolVersion, bool dimming, bool pressure,
-                              bool ledControl, bool tof, vector<uint32_t> addons) {
+                              bool ledControl, bool tof, std::vector<uint32_t> addons) {
     const bool mismatch = protocolVersion != gm_proto::PROTOCOL_VERSION;
     systemInfo = SystemInfo{.hardware = String(hardware),
                             .version = String(version),
@@ -458,8 +480,8 @@ void Controller::startNtp() {
     setenv("TZ", resolve_timezone(settings.getTimezone()), 1);
     tzset();
     sntp_set_sync_mode(SNTP_SYNC_MODE_SMOOTH);
-    sntp_setservername(0, NTP_SERVER);
-    sntp_init();
+    esp_sntp_setservername(0, NTP_SERVER);
+    esp_sntp_init();
 }
 
 void Controller::setupWifi() {

@@ -268,7 +268,7 @@ class Controller {
     static const unsigned long HARDWARE_GRACE_PERIOD_MS = 1500;
     static const unsigned long CONTROLLER_WAITING_TIMEOUT_MS = 10000;
 
-    xTaskHandle logicTaskHandle;
+    TaskHandle_t logicTaskHandle;
 
     static void loopLogicTask(void *arg);
 };

@@ -58,7 +58,12 @@ void PreferencesCodec<std::vector<AutoWakeupSchedule>>::write(Preferences &prefs
     prefs.putString(key, serialized);
 }
 
-Settings::Settings() {
+Settings::Settings() = default;
+
+void Settings::load() {
+    if (taskHandle != nullptr) {
+        return; // already loaded; a second call must not spawn a second save task
+    }
     preferences.begin(PREFERENCES_KEY, true);
     for (auto *property : registry) {
         property->load(preferences);

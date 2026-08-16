@@ -1,6 +1,7 @@
 #include "ControllerOTA.h"
 #include <HTTPClient.h>
 #include <LittleFS.h>
+#include <WiFiClient.h>
 
 void ControllerOTA::init(NimBLEClient *client, const ctr_progress_callback_t &progress_callback) {
     this->client = client;

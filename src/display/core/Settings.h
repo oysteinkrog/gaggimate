@@ -7,6 +7,7 @@
 #include <display/core/Property.h>
 #include <display/core/constants.h>
 #include <display/core/utils.h>
+#include <functional>
 #include <vector>
 
 #define PREFERENCES_KEY "controller"
@@ -66,6 +67,15 @@ using SettingsCallback = std::function<void(Settings *)>;
 class Settings {
   public:
     Settings();
+
+    // Read NVS into the property registry and start the async-save task.
+    // Deliberately not the constructor's job: main.cpp defines `Controller
+    // controller;` at file scope, so this object is built during C++ global
+    // initialization, which runs before app_main and therefore before
+    // nvs_flash_init(). Controller::setup() calls this once the runtime is up.
+    // Idempotent -- a second call returns immediately rather than starting a
+    // second save task.
+    void load();
 
     void batchUpdate(const SettingsCallback &callback);
     void save(bool noDelay = false);
@@ -378,7 +388,7 @@ class Settings {
     Property<float> maxPumpPower{registry, "p_mp", 1.0f};
 
     void doSave();
-    xTaskHandle taskHandle;
+    TaskHandle_t taskHandle = nullptr;
     [[noreturn]] static void loopTask(void *arg);
 };
 

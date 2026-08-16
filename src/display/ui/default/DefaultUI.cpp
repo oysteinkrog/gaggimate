@@ -145,31 +145,31 @@ DefaultUI::DefaultUI(Controller *controller, Driver *driver, PluginManager *plug
 void DefaultUI::init() {
     profileManager = controller->getProfileManager();
     auto triggerRender = [this](Event const &) { rerender = true; };
-    pluginManager->on("boiler:currentTemperature:change", [=](Event const &event) {
+    pluginManager->on("boiler:currentTemperature:change", [this](Event const &event) {
         int newTemp = static_cast<int>(event.getFloat("value"));
         if (newTemp != currentTemp) {
             currentTemp = newTemp;
             rerender = true;
         }
     });
-    pluginManager->on("boiler:pressure:change", [=](Event const &event) {
+    pluginManager->on("boiler:pressure:change", [this](Event const &event) {
         float newPressure = event.getFloat("value");
         if (round(newPressure * 10.0f) != round(pressure * 10.0f)) {
             pressure = newPressure;
             rerender = true;
         }
     });
-    pluginManager->on("boiler:targetTemperature:change", [=](Event const &event) {
+    pluginManager->on("boiler:targetTemperature:change", [this](Event const &event) {
         int newTemp = static_cast<int>(event.getFloat("value"));
         if (newTemp != targetTemp) {
             targetTemp = newTemp;
             rerender = true;
         }
     });
-    pluginManager->on("controller:targetVolume:change", [=](Event const &event) { rerender = true; });
-    pluginManager->on("controller:targetDuration:change", [=](Event const &event) { rerender = true; });
-    pluginManager->on("controller:grindDuration:change", [=](Event const &event) { rerender = true; });
-    pluginManager->on("controller:grindVolume:change", [=](Event const &event) { rerender = true; });
+    pluginManager->on("controller:targetVolume:change", [this](Event const &event) { rerender = true; });
+    pluginManager->on("controller:targetDuration:change", [this](Event const &event) { rerender = true; });
+    pluginManager->on("controller:grindDuration:change", [this](Event const &event) { rerender = true; });
+    pluginManager->on("controller:grindVolume:change", [this](Event const &event) { rerender = true; });
     pluginManager->on("controller:process:end", triggerRender);
     pluginManager->on("controller:process:start", triggerRender);
     pluginManager->on("controller:mode:change", [this](Event const &event) {
@@ -269,7 +269,7 @@ void DefaultUI::init() {
     pluginManager->on("profiles:profile:favorite", [this](Event const &event) { reloadProfiles(); });
     pluginManager->on("profiles:profile:unfavorite", [this](Event const &event) { reloadProfiles(); });
     pluginManager->on("profiles:profile:save", [this](Event const &event) { reloadProfiles(); });
-    pluginManager->on("controller:volumetric-measurement:active:change", [=](Event const &event) {
+    pluginManager->on("controller:volumetric-measurement:active:change", [this](Event const &event) {
         double newWeight = event.getFloat("value");
         if (round(newWeight * 10.0) != round(activeWeight * 10.0)) {
             activeWeight = newWeight;
@@ -563,7 +563,7 @@ void DefaultUI::setupState() {
     updateBrewProcess();
 
     effect_mgr.use_effect([this]() { return currentScreen == SCREEN_ID_INFO_SCREEN; },
-                          [=]() {
+                          [this]() {
                               String content = "";
                               if (apActive) {
                                   // WIFI: QR syntax — escape \ ; , : " in the password per the spec.

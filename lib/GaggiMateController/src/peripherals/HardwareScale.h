@@ -85,7 +85,7 @@ class HardwareScale {
         uint8_t _zero_stability_index = 0;
         scale_reading_callback_t _reading_callback;
         scale_configuration_callback_t _configuration_callback;
-        xTaskHandle taskHandle;
+        TaskHandle_t taskHandle;
         SemaphoreHandle_t _operation_mutex;
         portMUX_TYPE _read_mux = portMUX_INITIALIZER_UNLOCKED;
 

@@ -2,7 +2,11 @@
 
 void BleClientTransport::init(const String &deviceName) {
     NimBLEDevice::init(deviceName.c_str());
-    NimBLEDevice::setPower(ESP_PWR_LVL_P9);
+    // +9 dBm — preserves master's setPower(ESP_PWR_LVL_P9), which was +9 dBm
+    // under NimBLE 1.4.x. 2.x setPower takes int8_t dBm, so pass 9 directly
+    // (2.x quantizes 9 -> ESP_PWR_LVL_P9). Do NOT pass the enum: ESP_PWR_LVL_P9
+    // is value 11 on ESP32-S3 and would round up to +12 dBm.
+    NimBLEDevice::setPower(9);
     NimBLEDevice::setMTU(256);
     _client = NimBLEDevice::createClient();
     _scanner = NimBLEDevice::getScan();
@@ -16,14 +20,18 @@ void BleClientTransport::init(const String &deviceName) {
 
 void BleClientTransport::scan() {
     _readyForConnection = false;
-    _scanner->clearDuplicateCache();
-    _scanner->setAdvertisedDeviceCallbacks(this, true);
+    _scanner->clearResults(); // esp-nimble-cpp 2.x has no clearDuplicateCache(); results vector is unused (setMaxResults(0))
+    // 1.x setAdvertisedDeviceCallbacks(cb, wantDuplicates=true) -> 2.x
+    // setScanCallbacks(cb, wantDuplicates). wantDuplicates=true keeps duplicate
+    // adverts flowing (internally setDuplicateFilter(false)) -- same as the explicit
+    // setDuplicateFilter(false) below, preserving the pre-2.x rediscovery behaviour.
+    _scanner->setScanCallbacks(this, true);
     _scanner->setInterval(1000);
     _scanner->setWindow(50);
     _scanner->setMaxResults(0);
     _scanner->setDuplicateFilter(false);
     _scanner->setActiveScan(false);
-    _scanner->start(0, nullptr, false); // 0 = continuous
+    _scanner->start(0, false, false); // 2.x: start(duration=0 continuous, isContinue, restart)
 }
 
 void BleClientTransport::maintain() {
@@ -39,7 +47,7 @@ bool BleClientTransport::connectToServer() {
     if (!_haveServerAddress)
         return false;
 
-    ESP_LOGI(LOG_TAG, "Connecting to advertised device");
+    ESP_LOGI(LOG_TAG, "Connecting to advertised device: %s", _serverAddress.toString().c_str());
     unsigned int tries = 0;
     do {
         if (tries >= MAX_CONNECT_RETRIES) {
@@ -48,7 +56,8 @@ bool BleClientTransport::connectToServer() {
             return false;
         }
         if (!_client->connect(_serverAddress)) {
-            ESP_LOGW(LOG_TAG, "Connect failed, retrying");
+            int error = _client->getLastError();
+            ESP_LOGW(LOG_TAG, "Connect failed: %d, retrying", error);
             delay(500);
         }
         tries++;
@@ -134,22 +143,25 @@ bool BleClientTransport::send(const uint8_t *data, size_t length) {
 
 bool BleClientTransport::isConnected() const { return _client != nullptr && _client->isConnected(); }
 
-void BleClientTransport::onResult(NimBLEAdvertisedDevice *advertisedDevice) {
+void BleClientTransport::onResult(const NimBLEAdvertisedDevice *advertisedDevice) {
     if (!advertisedDevice->haveServiceUUID())
         return;
     if (advertisedDevice->isAdvertisingService(NimBLEUUID(gm_proto::SERVICE_UUID))) {
-        ESP_LOGI(LOG_TAG, "Found controller, ready to connect");
-        _scanner->stop();
-        // Take a value copy of the address now -- the device object is freed as
-        // soon as this callback returns (see _serverAddress note in the header).
+        // Copy everything we need off advertisedDevice BEFORE stopping the scan.
+        // With setMaxResults(0), NimBLEScan::stop() calls clearResults(), which
+        // deletes the very advertisedDevice handed to this callback -- so reading
+        // it after stop() is a use-after-free that returns a garbage peer address
+        // (the connect then fails with BLE_HS_EINVAL).
         _serverAddress = advertisedDevice->getAddress();
         _haveServerAddress = true;
+        ESP_LOGI(LOG_TAG, "Found controller at address %s with name %s, ready to connect",
+                 _serverAddress.toString().c_str(), advertisedDevice->getName().c_str());
+        _scanner->stop();
         _readyForConnection = true;
     }
 }
 
-void BleClientTransport::onDisconnect(NimBLEClient *client) {
-    (void)client;
+void BleClientTransport::onDisconnect(NimBLEClient *, int) {
     ESP_LOGI(LOG_TAG, "Disconnected, will rescan");
     _writeChar = nullptr;
     _notifyChar = nullptr;
@@ -158,7 +170,6 @@ void BleClientTransport::onDisconnect(NimBLEClient *client) {
     scan();
 }
 
-void BleClientTransport::notifyCallback(NimBLERemoteCharacteristic *characteristic, uint8_t *data, size_t length, bool) {
-    (void)characteristic;
+void BleClientTransport::notifyCallback(NimBLERemoteCharacteristic *, uint8_t *data, size_t length, bool) {
     emitData(data, length);
 }

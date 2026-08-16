@@ -28,7 +28,7 @@ class GearpumpAddon {
     const char *LOG_TAG = "GearpumpAddon";
     void ensureSafePowerOnState();
     static void loopTask(void *arg);
-    xTaskHandle taskHandle;
+    TaskHandle_t taskHandle;
 };
 
 #endif // GEARPUMPADDON_H
