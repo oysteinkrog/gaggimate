@@ -800,14 +800,27 @@ void SleepAnimation::renderFrame() {
         // will not push, and the push job carries the parity. Interlacing only
         // applies to the two-task push path -- the direct path writes the
         // framebuffer itself and has no per-row call to skip.
-        const bool interlaceActive = interlace.load() && !(dmaActive && dmaMode.load() != 0);
+        // One decision per band, read by the render, the blend and the push, so
+        // the three cannot disagree about which rows this frame owns. Two things
+        // switch it off beyond the feature flag:
+        //
+        // warmupFrames -- until the animation has covered the screen once, the
+        // rows an interlaced frame skips still hold whatever the previous screen
+        // left in the framebuffer. Gating only the push would send those rows
+        // while the render and blend were still skipping them, which pushes
+        // stale pixels: the opposite of what the warm-up is for.
+        //
+        // An odd row count -- a pair cannot be half a row. The expand loop
+        // truncates at rows >> 1 and the push loop stops at y + 2 <= y1, so the
+        // odd row would be neither written nor sent. 480/12 leaves no partial
+        // band today, so this is a guard rather than a live case.
+        const bool oddBand = (rows & 1) != 0;
+        const bool bandInterlaced = interlace.load() && !(dmaActive && dmaMode.load() != 0) &&
+                                    warmupFrames == 0 && !(half && oddBand);
         const int parityNow = static_cast<int>(frameParity & 1u);
-        // At half resolution a pair is one source row; anywhere else the unit is
-        // a single row. warmupFrames forces whole bands for the first frames
-        // after a start, because until then the rows this frame skips hold
-        // whatever the previous screen left in the framebuffer rather than the
-        // animation's own previous frame.
-        const bool pairMode = interlaceActive && half;
+        // At half resolution the unit is a row pair, one source row expanded;
+        // anywhere else it is a single row.
+        const bool pairMode = bandInterlaced && half;
         const bool renderSkip = pairMode && renderHalf.load();
         // Bench builds render ONE band per frame with the scheduler suspended
         // on this core. Aurora measures ~82 CPU cycles/pixel for a loop body
@@ -908,7 +921,7 @@ void SleepAnimation::renderFrame() {
         // Rows this frame will not push are thrown away, so compositing
         // widgets into them is wasted. Both rows of a pushed pair still need it.
         for (int y = y0; y < y0 + rows; y++) {
-            if (interlaceActive && ((((pairMode ? (y >> 1) : y) ^ parityNow) & 1) != 0)) {
+            if (bandInterlaced && ((((pairMode ? (y >> 1) : y) ^ parityNow) & 1) != 0)) {
                 continue;
             }
             if (ov != nullptr && ov->spanMin[y] >= 0) {
@@ -1099,8 +1112,7 @@ void SleepAnimation::renderFrame() {
             }
             BENCH_ACC(accPushUs, tPush);
         } else {
-            const uint8_t pushMode =
-                !interlaceActive || warmupFrames > 0 ? 0 : (pairMode ? 2 : 1);
+            const uint8_t pushMode = !bandInterlaced ? 0 : (pairMode ? 2 : 1);
             pushJob[renderSlot] = {static_cast<int16_t>(cx0), static_cast<int16_t>(y0), static_cast<int16_t>(cx1),
                                    static_cast<int16_t>(y0 + rows), pushMode,
                                    static_cast<uint8_t>(parityNow)};
