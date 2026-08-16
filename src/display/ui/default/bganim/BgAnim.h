@@ -35,6 +35,14 @@ struct BgAnimation {
     bool (*init)(int w, int h);
     void (*frame)(uint32_t tMs, int w, int h, const uint8_t p[4]);
     void (*band)(uint16_t *dst, int y0, int rows, int w, uint32_t tMs, const uint8_t p[4]);
+    // Optional. Frees everything init() allocated and resets whatever staleness
+    // sentinel gates the rebuild, so the next init() reallocates from scratch.
+    // Called on the render task when the animation is switched away from, or
+    // when the render resolution changes under it -- the latter is why this is
+    // a correctness requirement and not only a memory one, since the tables are
+    // sized from w/h and init() alone will not resize them.
+    // nullptr means "no teardown"; that animation simply keeps its tables.
+    void (*release)();
 };
 
 int bg_animation_count();

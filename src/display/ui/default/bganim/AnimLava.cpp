@@ -126,11 +126,13 @@ int32_t *lavaLUT = nullptr;  // tt-bucket -> field contribution, pre-scaled to p
 int32_t *lavaBase = nullptr; // lavaLUT + LUT_OFFSET, so band() indexes it directly with the signed shifted-tt value
 uint32_t lastThemeGen = 0xFFFFFFFF;
 bool inited = false;
+int allocW = 0; // width fieldRow was sized for
 
 bool init(int w, int h) {
     if (paletteLUT == nullptr) {
         paletteLUT = static_cast<uint16_t *>(alloc(256 * sizeof(uint16_t)));
     }
+    allocW = w;
     if (fieldRow == nullptr) {
         fieldRow = static_cast<int32_t *>(alloc(w * sizeof(int32_t)));
     }
@@ -361,6 +363,17 @@ void band(uint16_t *dst, int y0, int rows, int w, uint32_t, const uint8_t *) {
     }
 }
 
+void release() {
+    releaseTable(paletteLUT, 256 * sizeof(uint16_t));
+    releaseTable(fieldRow, static_cast<size_t>(allocW) * sizeof(int32_t));
+    releaseTable(lavaLUT, static_cast<size_t>(LUT_SIZE) * sizeof(int32_t));
+    // Offset alias into lavaLUT, not an allocation of its own.
+    lavaBase = nullptr;
+    allocW = 0;
+    lastThemeGen = 0xFFFFFFFF;
+    inited = false;
+}
+
 } // namespace
 
 extern const BgAnimation bg_anim_lava;
@@ -371,6 +384,7 @@ const BgAnimation bg_anim_lava = {
     init,
     frame,
     band,
+    release,
 };
 
 #endif // GAGGIMATE_SIM

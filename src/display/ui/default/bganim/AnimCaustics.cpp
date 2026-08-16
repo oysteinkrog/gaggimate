@@ -255,6 +255,12 @@ void band(uint16_t *dst, int y0, int rows, int w, uint32_t, const uint8_t *) {
     }
 }
 
+void release() {
+    releaseTable(rgbLUT, static_cast<size_t>(DITHER_N) * 256 * sizeof(uint16_t));
+    releaseTable(shapeLUT, static_cast<size_t>(SHAPE_N));
+    lastThemeGen = 0xFFFFFFFF;
+}
+
 } // namespace
 
 extern const BgAnimation bg_anim_caustics;
@@ -265,6 +271,7 @@ const BgAnimation bg_anim_caustics = {
     init,
     frame,
     band,
+    release,
 };
 
 #endif // GAGGIMATE_SIM

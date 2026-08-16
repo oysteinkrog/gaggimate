@@ -786,6 +786,29 @@ void SleepAnimation::renderFrame() {
     const int rh = half ? h / 2 : h;
     const BgAnimation &anim = bg_animation(id);
     if (id != initializedAnimId || half != initializedHalf) {
+        // Hand back the outgoing animation's tables before the incoming one
+        // asks for its own. Two reasons, and the second is a correctness one.
+        //
+        // Memory: animations allocate lazily and used to hold their tables for
+        // the rest of the boot, so the fleet's internal-SRAM cost was
+        // sum-over-animations against a fixed ceiling. Releasing here caps it
+        // at max-over-animations and stops registration order from deciding
+        // which animations get SRAM.
+        //
+        // Correctness: per-row and per-column tables are sized from the w/h of
+        // the init() that allocated them, behind an `if (ptr == nullptr)`
+        // guard. This branch already fires on a resolution change, but that
+        // guard made the re-init a no-op, leaving band() to walk a 240-entry
+        // table across 480 columns. Freeing first makes the reallocation real.
+        //
+        // Safe to free here specifically: this runs on the render task, which
+        // is the only task that calls init(), frame() or band().
+        if (initializedAnimId >= 0) {
+            const BgAnimation &prev = bg_animation(initializedAnimId);
+            if (prev.release != nullptr) {
+                prev.release();
+            }
+        }
         if (!anim.init(rw, rh)) {
             log_e("SleepAnimation: init failed for animation %d (%s)", id, anim.id);
             running = false;
