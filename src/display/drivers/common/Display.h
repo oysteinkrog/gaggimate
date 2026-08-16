@@ -25,6 +25,10 @@ class Display {
     // with a cache writeback over the region it touched.
     virtual void lockFrameBuffer() {}
     virtual void unlockFrameBuffer() {}
+    // Tell the panel that someone is writing its framebuffer behind the cache,
+    // so pushColors can stop trusting its own cached view of that memory. See
+    // the implementation for what goes wrong without it.
+    virtual void setDirectWriter(bool) {}
 
   protected:
     uint8_t _rotation;

@@ -153,6 +153,14 @@ void SleepAnimation::start(Display *d) {
     if (halfBuf == nullptr) {
         halfBuf = static_cast<uint16_t *>(allocPreferInternal((w / 2) * (BAND_H / 2) * sizeof(uint16_t)));
     }
+    if (dmaScratch == nullptr) {
+        // Diagnostic destination for dmaMode 4 only. PSRAM, 64-byte aligned,
+        // band-sized, and read by nothing -- so a transfer into it is
+        // indistinguishable from a framebuffer band push except for where the
+        // bytes land.
+        dmaScratch = static_cast<uint16_t *>(
+            heap_caps_aligned_alloc(64, w * BAND_H * sizeof(uint16_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    }
     computeChords(w, h);
     if (overlayCap == 0) {
         overlayCap = static_cast<uint32_t>(w + 2 * OVERLAY_EXT_MARGIN) * (h + 2 * OVERLAY_EXT_MARGIN) * 3;
@@ -291,6 +299,7 @@ void SleepAnimation::stop() {
                                   static_cast<uint32_t>(display->width()) * display->height() * 2);
         }
         dmaActive = false;
+        display->setDirectWriter(false);
     }
 }
 
@@ -360,6 +369,9 @@ static volatile uint32_t g_sleepAnimDmaDone = 0;
 
 static bool IRAM_ATTR sleepAnimBandDone(async_memcpy_t, async_memcpy_event_t *, void *arg) {
     g_sleepAnimDmaDone++;
+    if (arg == nullptr) {
+        return false; // a non-final chunk: nothing to release yet
+    }
     BaseType_t woken = pdFALSE;
     // Releases the slot the transfer has finished reading. The render task
     // waits on this same semaphore before refilling that slot, so the transfer
@@ -370,6 +382,36 @@ static bool IRAM_ATTR sleepAnimBandDone(async_memcpy_t, async_memcpy_event_t *, 
 }
 
 uint32_t SleepAnimation::benchDmaCompleted() const { return g_sleepAnimDmaDone; }
+
+bool SleepAnimation::benchBandsInternal() const {
+    for (int i = 0; i < NUM_SLOTS; i++) {
+        const uintptr_t a = reinterpret_cast<uintptr_t>(bandBuf[i]);
+        if (a == 0 || (a >= 0x3C000000u && a < 0x3E000000u)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+namespace {
+// esp_intr_alloc binds the handler to whichever core calls it, and there is no
+// argument to say otherwise -- so the only way to choose is to call from a task
+// already pinned where the interrupt should land. This one-shot task exists for
+// that and nothing else.
+struct DmaInstallReq {
+    async_memcpy_config_t cfg;
+    async_memcpy_t handle;
+    esp_err_t err;
+    SemaphoreHandle_t done;
+};
+
+void dmaInstallTaskEntry(void *arg) {
+    auto *req = static_cast<DmaInstallReq *>(arg);
+    req->err = esp_async_memcpy_install(&req->cfg, &req->handle);
+    xSemaphoreGive(req->done);
+    vTaskDelete(nullptr);
+}
+} // namespace
 
 bool SleepAnimation::installDmaOnRenderCore() {
     if (dmaHandle != nullptr) {
@@ -383,11 +425,31 @@ bool SleepAnimation::installDmaOnRenderCore() {
     // The engine splits a transfer into descriptors of its own internal size,
     // and backlog is how many it can hold. One band is 480 x BAND_H x 2 bytes;
     // size the pool for every slot being in flight at once, with slack.
-    cfg.backlog = NUM_SLOTS * ((480 * BAND_H * 2) / 4000 + 2);
+    cfg.backlog = 64; // descriptors, ~12 B each; far more than the pipeline can have in flight
     cfg.sram_trans_align = 4;
-    cfg.psram_trans_align = 64;
+    // 64 is what this tree asked for everywhere, and the register field it lands
+    // in documents only 16 and 32 as valid on esp32s3 (gdma_struct.h:212,
+    // "2/3:reserved"). Poking the channel back to 32 at runtime changed nothing
+    // visible, so this is not the cause of the shear -- but there is no reason
+    // to keep programming a reserved value.
+    cfg.psram_trans_align = 32;
     async_memcpy_t h = nullptr;
-    const esp_err_t err = esp_async_memcpy_install(&cfg, &h);
+    esp_err_t err = ESP_FAIL;
+    // The RGB panel is created from setup(), which Arduino runs on core 1, so
+    // the driver's own ISR lives there; the render task is pinned to core 1 too.
+    // Installing from here would put a ~1,300/s completion interrupt on exactly
+    // the core that has to service the panel's. Install from core 0 instead.
+    DmaInstallReq req{cfg, nullptr, ESP_FAIL, xSemaphoreCreateBinary()};
+    if (req.done != nullptr) {
+        TaskHandle_t installer = nullptr;
+        if (xTaskCreatePinnedToCore(dmaInstallTaskEntry, "DmaInstall", 3072, &req, 3, &installer,
+                                    DMA_ISR_CORE) == pdPASS) {
+            xSemaphoreTake(req.done, pdMS_TO_TICKS(2000));
+            err = req.err;
+            h = req.handle;
+        }
+        vSemaphoreDelete(req.done);
+    }
     if (err != ESP_OK) {
         log_w("SleepAnimation: async memcpy install failed (%d), using the push task", static_cast<int>(err));
         return false;
@@ -487,6 +549,10 @@ void SleepAnimation::renderLoop() {
     // handler to the core that calls it, and this is the task that waits on it.
     if (fbDirect != nullptr && installDmaOnRenderCore()) {
         dmaActive = true;
+        // From here the panel's own pushColors must stop trusting its cached
+        // view of the framebuffer, because this task is about to start writing
+        // it behind the cache.
+        display->setDirectWriter(true);
         log_i("SleepAnimation: direct framebuffer push active");
     }
     uint32_t fpsFrames = 0;
@@ -847,7 +913,12 @@ void SleepAnimation::renderFrame() {
         // separate run in the framebuffer and would need its own descriptor to
         // step the stride. At 48 MB/s those corners cost less than the
         // descriptors and the extra pack pass would.
-        const bool crop = cropEnabled && !dmaActive;
+        // dmaMode 0 means "use the ordinary two-task push", so the direct path
+        // can be turned off at runtime without a reboot -- benchSetDma only
+        // takes effect at the next start(), which never happens while a sweep
+        // is running.
+        const bool directPush = dmaActive && dmaMode.load() != 0;
+        const bool crop = cropEnabled && !directPush;
         const int bi = y0 / BAND_H;
         const int cx0 = crop ? bandX0[bi] : 0;
         const int cx1 = crop ? bandX1[bi] : w;
@@ -890,7 +961,7 @@ void SleepAnimation::renderFrame() {
         // pass through unchanged to esp_lcd_panel_draw_bitmap (exclusive end).
         // Passing dimensions here asserted in rgb_panel_draw_bitmap on the
         // second band (y_start==y_end) and boot-looped sleep3/sleep4.
-        if (dmaActive) {
+        if (directPush) {
             // One contiguous run: full-width rows are adjacent in both the band
             // buffer and the framebuffer. Every operand is 64-byte aligned by
             // construction -- the panel's framebuffer is (the probe checks it),
@@ -902,10 +973,55 @@ void SleepAnimation::renderFrame() {
             // exactly what this loop takes before refilling that slot.
             BENCH_T0(tPush);
             const size_t bytes = static_cast<size_t>(w) * rows * 2;
-            dmaIssued++;
-            const esp_err_t err =
-                esp_async_memcpy(static_cast<async_memcpy_t>(dmaHandle), fbDirect + static_cast<size_t>(y0) * w, band,
-                                 bytes, sleepAnimBandDone, bandFree[renderSlot]);
+            uint16_t *const dstRow = fbDirect + static_cast<size_t>(y0) * w;
+            if (dmaMode.load() == 1) {
+                // Bisect mode: same destination, same bytes, ordinary CPU copy,
+                // then the identical writeback esp_lcd does on its way out of
+                // draw_bitmap. Anything still wrong here is about bypassing the
+                // driver, not about GDMA.
+                display->lockFrameBuffer();
+                memcpy(dstRow, band, bytes);
+                Cache_WriteBack_Addr(reinterpret_cast<uint32_t>(dstRow), static_cast<uint32_t>(bytes));
+                display->unlockFrameBuffer();
+                xSemaphoreGive(static_cast<SemaphoreHandle_t>(bandFree[renderSlot]));
+                BENCH_ACC(accPushUs, tPush);
+                renderSlot = (renderSlot + 1) % NUM_SLOTS;
+                continue;
+            }
+            // A DMA descriptor tops out at 4092 bytes, so a whole 12-row band
+            // (11,520) has to be split. The driver's split point is not
+            // necessarily a multiple of psram_trans_align, and a GDMA write to
+            // PSRAM that starts unaligned lands at the wrong offset -- which is
+            // exactly the shear this produced on the panel, while the identical
+            // copy done by the CPU (mode 1) was clean.
+            //
+            // So chunk it here instead, at 4 rows: 3,840 bytes fits one
+            // descriptor, is a multiple of 64, and every chunk's destination
+            // (fb + row * 960) is 64-byte aligned too. Only the final chunk
+            // carries the semaphore, because GDMA retires transfers in
+            // submission order, so its completion means the whole band is done.
+            const int mode = dmaMode.load();
+            // Mode 4 discriminates "GDMA to PSRAM disturbs the panel" from "GDMA
+            // to the framebuffer the panel is scanning disturbs it". Same
+            // transfer sizes, same submission rate, same source buffers -- only
+            // the destination changes, to a scratch band nothing reads. The
+            // screen freezes on whatever the CPU path left there, which makes
+            // any shear that does appear unmistakable.
+            uint16_t *const dmaDst = (mode == 4 && dmaScratch != nullptr) ? dmaScratch : dstRow;
+            const int chunkRows = mode == 3 ? 4 : rows;
+            esp_err_t err = ESP_OK;
+            for (int r0 = 0; r0 < rows && err == ESP_OK; r0 += chunkRows) {
+                const int n = (r0 + chunkRows <= rows) ? chunkRows : (rows - r0);
+                const bool last = (r0 + n >= rows);
+                dmaIssued++;
+                err = esp_async_memcpy(static_cast<async_memcpy_t>(dmaHandle), dmaDst + static_cast<size_t>(r0) * w,
+                                       band + static_cast<size_t>(r0) * w, static_cast<size_t>(n) * w * 2,
+                                       sleepAnimBandDone, last ? bandFree[renderSlot] : nullptr);
+                if (err != ESP_OK) {
+                    dmaIssued--;
+                }
+            }
+            (void)bytes;
             if (err != ESP_OK) {
                 // Not expected given the alignment guarantees, but a dropped
                 // band is a visible tear: fall back to the CPU copy and release

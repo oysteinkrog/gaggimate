@@ -101,6 +101,7 @@ class LilyGo_RGBPanel : public Display {
     uint16_t *directFrameBuffer() override;
     void lockFrameBuffer() override;
     void unlockFrameBuffer() override;
+    void setDirectWriter(bool active) override;
 
   private:
     void writeData(const uint8_t *data, int len);
@@ -135,6 +136,7 @@ class LilyGo_RGBPanel : public Display {
     uint16_t *_fbDirect = nullptr;
     bool _fbResolved = false;
     SemaphoreHandle_t _fbMutex = nullptr;
+    bool _directWriter = false;
 
     ExtensionIOXL9555::ExtensionGPIO cs = ExtensionIOXL9555::IO3;
     ExtensionIOXL9555::ExtensionGPIO mosi = ExtensionIOXL9555::IO4;

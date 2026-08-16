@@ -15,7 +15,10 @@
 #include <display/ui/default/SleepAnimation.h>
 #include <display/ui/default/bganim/BgAnim.h>
 #include <display/ui/default/bganim/BgAnimCommon.h>
+#include <esp32s3/rom/cache.h> // Cache_WriteBack_Addr / Cache_Invalidate_Addr for /api/dmatest
 #include <esp_async_memcpy.h>
+#include <soc/gdma_channel.h> // SOC_GDMA_TRIG_PERIPH_LCD0 for /api/gdma
+#include <soc/gdma_struct.h>  // direct GDMA register access for /api/gdma
 #include <esp_heap_caps.h>
 #endif
 #include <display/util/PsramStlAllocator.h>
@@ -390,6 +393,177 @@ void WebUIPlugin::setupServer() {
     // the CPU cache -- moves the same bytes for half the traffic, which is why
     // esp_async_memcpy is measured alongside. Everything runs with the panel
     // scanning out, so the numbers include the contention push really sees.
+    // Does GDMA actually deliver what it was handed? The animation's direct
+    // framebuffer push renders a sheared image while a byte-identical CPU copy
+    // to the same address renders correctly, which leaves two possibilities:
+    // the transfer is unfaithful, or it is faithful and the artefact is the
+    // panel scanning the region while it is written. Asking the panel cannot
+    // separate those. This can: same source alignment, same size, same engine
+    // config as the animation uses, but into scratch PSRAM nobody is scanning,
+    // then read back and compared.
+    // What is actually programmed into the GDMA channels, read back from the
+    // hardware rather than assumed. Two things worth knowing: which channel the
+    // RGB panel driver took (it never exposes its handle, so the only way to
+    // find it from outside is to scan the peripheral-select registers for
+    // LCD_CAM's trigger ID), and what external-memory block size each channel
+    // is running.
+    //
+    // That second one matters because the esp32s3 register field documents only
+    // 16 and 32 bytes as valid -- gdma_struct.h:212, "0: 16 bytes 1: 32 bytes
+    // 2/3:reserved" -- while the shared LL header still offers a 64B constant
+    // that is legal only on other targets. Both the panel init and the async
+    // memcpy config in this tree ask for 64.
+    //
+    // The poke arguments write the same fields at runtime so their effect can be
+    // measured without a reflash: ?ch=N with bkin/bkout (0=16B, 1=32B, 2=64B)
+    // and priin/priout (0-15).
+    server.on("/api/gdma", [this](AsyncWebServerRequest *request) {
+        AsyncResponseStream *response = request->beginResponseStream("application/json");
+        JsonDocument doc;
+        if (request->hasArg("ch")) {
+            const int ch = request->arg("ch").toInt();
+            if (ch >= 0 && ch < 5) {
+                if (request->hasArg("bkin")) {
+                    GDMA.channel[ch].in.conf1.in_ext_mem_bk_size = request->arg("bkin").toInt() & 0x3;
+                }
+                if (request->hasArg("bkout")) {
+                    GDMA.channel[ch].out.conf1.out_ext_mem_bk_size = request->arg("bkout").toInt() & 0x3;
+                }
+                if (request->hasArg("priin")) {
+                    GDMA.channel[ch].in.pri.rx_pri = request->arg("priin").toInt() & 0xF;
+                }
+                if (request->hasArg("priout")) {
+                    GDMA.channel[ch].out.pri.tx_pri = request->arg("priout").toInt() & 0xF;
+                }
+                doc["poked"] = ch;
+            }
+        }
+        JsonArray chans = doc["channels"].to<JsonArray>();
+        for (int ch = 0; ch < 5; ch++) {
+            JsonObject o = chans.add<JsonObject>();
+            o["ch"] = ch;
+            o["in_sel"] = static_cast<uint32_t>(GDMA.channel[ch].in.peri_sel.sel);
+            o["out_sel"] = static_cast<uint32_t>(GDMA.channel[ch].out.peri_sel.sel);
+            o["mem_trans"] = static_cast<uint32_t>(GDMA.channel[ch].in.conf0.mem_trans_en);
+            o["in_bk"] = static_cast<uint32_t>(GDMA.channel[ch].in.conf1.in_ext_mem_bk_size);
+            o["out_bk"] = static_cast<uint32_t>(GDMA.channel[ch].out.conf1.out_ext_mem_bk_size);
+            o["in_pri"] = static_cast<uint32_t>(GDMA.channel[ch].in.pri.rx_pri);
+            o["out_pri"] = static_cast<uint32_t>(GDMA.channel[ch].out.pri.tx_pri);
+            // The whole "M2M starves the LCD" theory predicts exactly one thing:
+            // the LCD channel's transmit FIFO runs dry. These are the raw
+            // interrupt status bits for that, sticky until cleared, so the
+            // hypothesis stops being an inference. l1 is the per-channel FIFO,
+            // l3 the shared one.
+            o["outfifo_udf"] = static_cast<uint32_t>(GDMA.channel[ch].out.int_raw.outfifo_udf_l1) |
+                               (static_cast<uint32_t>(GDMA.channel[ch].out.int_raw.outfifo_udf_l3) << 1);
+            o["outfifo_ovf"] = static_cast<uint32_t>(GDMA.channel[ch].out.int_raw.outfifo_ovf_l1) |
+                               (static_cast<uint32_t>(GDMA.channel[ch].out.int_raw.outfifo_ovf_l3) << 1);
+            o["infifo_udf"] = static_cast<uint32_t>(GDMA.channel[ch].in.int_raw.infifo_udf_l1) |
+                              (static_cast<uint32_t>(GDMA.channel[ch].in.int_raw.infifo_udf_l3) << 1);
+            o["infifo_ovf"] = static_cast<uint32_t>(GDMA.channel[ch].in.int_raw.infifo_ovf_l1) |
+                              (static_cast<uint32_t>(GDMA.channel[ch].in.int_raw.infifo_ovf_l3) << 1);
+            if (request->hasArg("clr")) {
+                GDMA.channel[ch].out.int_clr.val = 0xFFFFFFFF;
+                GDMA.channel[ch].in.int_clr.val = 0xFFFFFFFF;
+            }
+        }
+        doc["lcd_cam_trig_id"] = static_cast<uint32_t>(SOC_GDMA_TRIG_PERIPH_LCD0);
+        doc["arb_pri_dis"] = static_cast<uint32_t>(GDMA.misc_conf.arb_pri_dis);
+        serializeJson(doc, *response);
+        request->send(response);
+    });
+
+    server.on("/api/dmatest", [this](AsyncWebServerRequest *request) {
+        AsyncResponseStream *response = request->beginResponseStream("application/json");
+        JsonDocument doc;
+        const size_t rows = request->hasArg("rows") ? request->arg("rows").toInt() : 12;
+        const size_t w = 480;
+        const size_t bytes = rows * w * 2;
+        uint16_t *src = static_cast<uint16_t *>(heap_caps_aligned_alloc(64, bytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA));
+        uint16_t *dst = static_cast<uint16_t *>(heap_caps_aligned_alloc(64, bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+        async_memcpy_t h = nullptr;
+        async_memcpy_config_t cfg = ASYNC_MEMCPY_DEFAULT_CONFIG();
+        cfg.backlog = 64;
+        cfg.sram_trans_align = 4;
+        cfg.psram_trans_align = 64;
+        esp_err_t installErr = ESP_OK;
+        if (src != nullptr && dst != nullptr) {
+            installErr = esp_async_memcpy_install(&cfg, &h);
+        }
+        doc["src"] = reinterpret_cast<uint32_t>(src);
+        doc["dst"] = reinterpret_cast<uint32_t>(dst);
+        doc["bytes"] = static_cast<uint32_t>(bytes);
+        doc["install_err"] = static_cast<int>(installErr);
+        if (src == nullptr || dst == nullptr || h == nullptr) {
+            doc["ok"] = false;
+            doc["why"] = "alloc/install failed";
+        } else {
+            // A pattern where every 16-bit word encodes its own index, so a
+            // mismatch reports not just THAT it moved but WHERE it came from --
+            // a constant delta means a displaced transfer, noise means garbage.
+            const size_t words = bytes / 2;
+            for (size_t i = 0; i < words; i++) {
+                src[i] = static_cast<uint16_t>(i * 7 + 1);
+            }
+            memset(dst, 0xA5, bytes);
+            Cache_WriteBack_Addr(reinterpret_cast<uint32_t>(dst), static_cast<uint32_t>(bytes));
+            SemaphoreHandle_t done = xSemaphoreCreateBinary();
+            const int64_t t0 = esp_timer_get_time();
+            const esp_err_t err = esp_async_memcpy(
+                h, dst, src, bytes,
+                [](async_memcpy_t, async_memcpy_event_t *, void *arg) -> bool {
+                    BaseType_t woken = pdFALSE;
+                    xSemaphoreGiveFromISR(static_cast<SemaphoreHandle_t>(arg), &woken);
+                    return woken == pdTRUE;
+                },
+                done);
+            const bool completed = err == ESP_OK && xSemaphoreTake(done, pdMS_TO_TICKS(500)) == pdTRUE;
+            const uint32_t elapsedUs = static_cast<uint32_t>(esp_timer_get_time() - t0);
+            // The CPU's cached view of dst predates the transfer, so it must be
+            // dropped before the comparison or this would verify the cache.
+            Cache_Invalidate_Addr(reinterpret_cast<uint32_t>(dst), static_cast<uint32_t>(bytes));
+            uint32_t mismatches = 0;
+            int32_t firstIdx = -1;
+            uint32_t firstExp = 0, firstGot = 0;
+            int32_t deltaWords = 0;
+            for (size_t i = 0; i < words; i++) {
+                const uint16_t exp = static_cast<uint16_t>(i * 7 + 1);
+                if (dst[i] != exp) {
+                    if (firstIdx < 0) {
+                        firstIdx = static_cast<int32_t>(i);
+                        firstExp = exp;
+                        firstGot = dst[i];
+                        // If the value present is itself a valid pattern word,
+                        // report which index it belongs to: that difference is
+                        // the displacement, in words.
+                        if (firstGot >= 1 && ((firstGot - 1) % 7) == 0) {
+                            deltaWords = static_cast<int32_t>((firstGot - 1) / 7) - firstIdx;
+                        }
+                    }
+                    mismatches++;
+                }
+            }
+            doc["submit_err"] = static_cast<int>(err);
+            doc["completed"] = completed;
+            doc["elapsed_us"] = elapsedUs;
+            doc["mismatches"] = mismatches;
+            doc["words"] = static_cast<uint32_t>(words);
+            doc["first_bad_idx"] = firstIdx;
+            doc["first_expected"] = firstExp;
+            doc["first_got"] = firstGot;
+            doc["displacement_words"] = deltaWords;
+            doc["ok"] = completed && mismatches == 0;
+            vSemaphoreDelete(done);
+        }
+        if (h != nullptr) {
+            esp_async_memcpy_uninstall(h);
+        }
+        heap_caps_free(src);
+        heap_caps_free(dst);
+        serializeJson(doc, *response);
+        request->send(response);
+    });
+
     server.on("/api/membench", [this](AsyncWebServerRequest *request) {
         AsyncResponseStream *response = request->beginResponseStream("application/json");
         JsonDocument doc;
@@ -565,6 +739,15 @@ void WebUIPlugin::setupServer() {
                 a->benchRequestReset();
             }
         }
+        // ?dmamode=0|1|2|3|4 -- see benchSetDmaMode. Bisect control, takes effect
+        // on the next band, no restart needed.
+        if (request->hasArg("dmamode")) {
+            SleepAnimation *a = sleep_animation_bench_instance();
+            if (a != nullptr) {
+                a->benchSetDmaMode(request->arg("dmamode").toInt());
+                a->benchRequestReset();
+            }
+        }
         if (request->hasArg("only")) {
             SleepAnimation *a = sleep_animation_bench_instance();
             if (a != nullptr) {
@@ -629,6 +812,14 @@ void WebUIPlugin::setupServer() {
         // completing.
         gate["dma_wanted"] = anim0 != nullptr && anim0->benchDmaWanted();
         gate["dma_active"] = anim0 != nullptr && anim0->benchDmaActive();
+        gate["dma_mode"] = anim0 != nullptr ? anim0->benchDmaMode() : 0;
+        gate["bands_internal"] = anim0 != nullptr && anim0->benchBandsInternal();
+        if (anim0 != nullptr) {
+            JsonArray ba = gate["band_addr"].to<JsonArray>();
+            for (int i = 0; i < 3; i++) {
+                ba.add(anim0->benchBandAddr(i));
+            }
+        }
         gate["dma_issued"] = anim0 != nullptr ? anim0->benchDmaIssued() : 0;
         gate["dma_done"] = anim0 != nullptr ? anim0->benchDmaCompleted() : 0;
         gate["dma_err"] = anim0 != nullptr ? anim0->benchDmaErrors() : 0;
