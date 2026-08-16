@@ -642,17 +642,19 @@ void SleepAnimation::renderFrame() {
             for (int sr = 0; sr < hrows; sr++) {
                 const uint16_t *__restrict src = halfBuf + static_cast<size_t>(sr) * rw;
                 uint32_t *__restrict d0 = reinterpret_cast<uint32_t *>(band + static_cast<size_t>(sr * 2) * w);
-                // Each source pixel becomes a pair, so one 32-bit store emits
-                // both copies at once.
+                uint32_t *__restrict d1 = reinterpret_cast<uint32_t *>(band + static_cast<size_t>(sr * 2 + 1) * w);
+                // Both output rows in one pass. Each source pixel becomes a
+                // pair, so one 32-bit value covers both copies, and writing it
+                // to each row costs a second store rather than a second pass --
+                // the earlier shape read d0 back to fill d1, which spent a load
+                // per output word purely to re-fetch something already in a
+                // register. This is the whole frame at half resolution: 240
+                // rows x 240 words of avoidable loads.
                 for (int i = 0; i < rw; i++) {
                     const uint32_t v = src[i];
-                    d0[i] = v | (v << 16);
-                }
-                // The second output row is identical; copy words rather than
-                // re-running the expansion.
-                uint32_t *__restrict d1 = reinterpret_cast<uint32_t *>(band + static_cast<size_t>(sr * 2 + 1) * w);
-                for (int i = 0; i < rw; i++) {
-                    d1[i] = d0[i];
+                    const uint32_t pair = v | (v << 16);
+                    d0[i] = pair;
+                    d1[i] = pair;
                 }
             }
         } else if (lockThisBand) {
