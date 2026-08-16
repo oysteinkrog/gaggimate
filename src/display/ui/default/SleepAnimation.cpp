@@ -29,13 +29,13 @@ constexpr unsigned long BENCH_DWELL_MS = 6000;
 #endif
 
 namespace {
-// Rows rendered/pushed per chunk. 8 rather than 16 halves both band buffers
-// (they are the largest internal-SRAM consumers this feature has, and internal
-// SRAM is what the animations' lookup tables compete for). It doubles the
-// number of pushColors calls per frame, which the measurements say is free:
-// push cost is per byte, not per call -- it was flat at ~23 ms across thirteen
-// animations that share nothing but their byte count.
-constexpr int BAND_H = 8;
+// Rows rendered/pushed per chunk. 8 was tried, to halve the band buffers and
+// free internal SRAM for the animations' tables: push cost is per byte rather
+// than per call, so the extra pushColors calls were indeed free. What was not
+// free is the handoff -- 60 cross-core semaphore round trips per frame instead
+// of 30 cost ~1.3 ms, and plasma fell 43.0 -> 40.6 fps. The SRAM was wanted for
+// an overlay alpha cache that turned out not to pay either, so 16 stands.
+constexpr int BAND_H = 16;
 // Headroom for the snapshot's ext draw size (shadows etc. extend the render
 // area past the object on every side).
 constexpr int OVERLAY_EXT_MARGIN = 16;
@@ -47,12 +47,30 @@ uint16_t rgb565(uint8_t r, uint8_t g, uint8_t b) {
 }
 
 // Per-channel RGB565 alpha blend (a: 0..255 foreground opacity).
-uint16_t blend565(uint16_t fg, uint16_t bg, uint8_t a) {
-    const uint32_t inv = 255 - a;
-    const uint32_t r = (((fg >> 11) & 0x1F) * a + ((bg >> 11) & 0x1F) * inv + 127) / 255;
-    const uint32_t g = (((fg >> 5) & 0x3F) * a + ((bg >> 5) & 0x3F) * inv + 127) / 255;
-    const uint32_t b = ((fg & 0x1F) * a + (bg & 0x1F) * inv + 127) / 255;
-    return static_cast<uint16_t>((r << 11) | (g << 5) | b);
+// always_inline rather than plain inline: at -O2 GCC has repeatedly declined to
+// inline same-file helpers in this codebase, and a real call in a per-pixel loop
+// costs a windowed-ABI register rotation on top of the call itself. The /255
+// divisions are not divisions -- GCC strength-reduces each to a multiply-high
+// and a shift, confirmed in the disassembly.
+__attribute__((always_inline)) inline uint16_t blend565(uint16_t fg, uint16_t bg, uint8_t a) {
+    // Red and blue are blended together in one 32-bit lane. Scaling by 256
+    // rather than 255 spreads the two fields far enough apart that neither can
+    // carry into the other: blue lands in bits 8-12 and red in bits 19-23, so
+    // the >> 8 drops them back to 0-4 and 11-15 with no cross-contamination.
+    // Green gets its own lane for the same reason. Four multiplies replace six
+    // multiplies and three reciprocal-multiplies, which matters for more than
+    // the arithmetic -- the old body was 149 bytes, and an Xtensa conditional
+    // branch only reaches +/-128, so the loop could not branch backwards and
+    // ended every iteration with an extra taken jump. Shrinking the body lets
+    // the back-branch reach and stops the register pressure spilling `inv` to
+    // the stack on each blended pixel.
+    //
+    // Alpha stays a full 8 bits: this is UI text and iconography, and dropping
+    // to a 5-bit alpha to save a lane would coarsen every antialiased edge.
+    const uint32_t inv = 256u - a;
+    const uint32_t rb = (((fg & 0xF81Fu) * a) + ((bg & 0xF81Fu) * inv)) >> 8;
+    const uint32_t g = (((fg & 0x07E0u) * a) + ((bg & 0x07E0u) * inv)) >> 8;
+    return static_cast<uint16_t>((rb & 0xF81Fu) | (g & 0x07E0u));
 }
 
 // Internal SRAM is deliberately scarce in this firmware (WiFi/BLE/TLS all
@@ -642,6 +660,15 @@ void SleepAnimation::renderFrame() {
         }
 #endif
         BENCH_T0(tBlend);
+#ifdef GM_ANIM_BENCH
+        // Locals, not the uint64_t members: a member increment in the innermost
+        // per-pixel loop is two loads, an add-with-carry and two stores, and it
+        // pins `this` for the whole loop. Charging that to the blend made the
+        // stage look ~2x its real cost and sent an earlier round of work at a
+        // memory-layout problem the blend did not have.
+        uint32_t spanPxLocal = 0;
+        uint32_t blendPxLocal = 0;
+#endif
         for (int y = y0; y < y0 + rows; y++) {
             if (ov != nullptr && ov->spanMin[y] >= 0) {
                 // Composite the standby widgets over the plasma (span-limited:
@@ -675,7 +702,7 @@ void SleepAnimation::renderFrame() {
                 const uint8_t *px = ov->buf + (static_cast<size_t>(y + ovYoff) * ov->w + (x0 + ovXoff)) * 3;
                 uint16_t *dst = band + static_cast<size_t>(y - y0) * w + x0;
 #ifdef GM_ANIM_BENCH
-                accSpanPx += static_cast<uint32_t>(x1 - x0 + 1);
+                spanPxLocal += static_cast<uint32_t>(x1 - x0 + 1);
 #endif
                 for (int x = x0; x <= x1; x++, px += 3, dst++) {
                     const uint8_t a = px[2];
@@ -683,7 +710,7 @@ void SleepAnimation::renderFrame() {
                         continue;
                     }
 #ifdef GM_ANIM_BENCH
-                    accBlendPx++;
+                    blendPxLocal++;
 #endif
                     // LV_IMG_CF_TRUE_COLOR_ALPHA @16bpp, LV_COLOR_16_SWAP=0:
                     // little-endian RGB565 followed by an alpha byte.
@@ -694,6 +721,10 @@ void SleepAnimation::renderFrame() {
             }
         }
         BENCH_ACC(accBlendUs, tBlend);
+#ifdef GM_ANIM_BENCH
+        accSpanPx += spanPxLocal;
+        accBlendPx += blendPxLocal;
+#endif
 
         // Compact the band to just the columns the round panel actually shows.
         // Rows are written full-width by the animations; here each row's

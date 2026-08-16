@@ -15,6 +15,8 @@
 #include <display/ui/default/SleepAnimation.h>
 #include <display/ui/default/bganim/BgAnim.h>
 #include <display/ui/default/bganim/BgAnimCommon.h>
+#include <esp_async_memcpy.h>
+#include <esp_heap_caps.h>
 #endif
 #include <display/util/PsramStlAllocator.h>
 #include <display/util/PsramWsBuffer.h>
@@ -377,6 +379,160 @@ void WebUIPlugin::setupServer() {
         request->send(response);
     });
 #ifdef GM_ANIM_BENCH
+    // Bench build only: raw memory-path throughput, to attribute the flat ~19 ms
+    // push cost. esp_lcd_panel_draw_bitmap on an fb_in_psram panel is a CPU
+    // memcpy into the PSRAM framebuffer plus a cache writeback, so push should
+    // be bounded by whatever "memcpy SRAM -> PSRAM" measures here. The
+    // interesting comparison is against the read direction: a write that costs
+    // about twice a read is the signature of read-for-ownership, since the
+    // 32-byte write-allocate cache line gets fetched from PSRAM before it is
+    // overwritten. If that holds, a GDMA transfer -- which never passes through
+    // the CPU cache -- moves the same bytes for half the traffic, which is why
+    // esp_async_memcpy is measured alongside. Everything runs with the panel
+    // scanning out, so the numbers include the contention push really sees.
+    server.on("/api/membench", [this](AsyncWebServerRequest *request) {
+        AsyncResponseStream *response = request->beginResponseStream("application/json");
+        JsonDocument doc;
+        // The PSRAM side must be much larger than the 32 KB data cache or the
+        // benchmark measures the cache instead of the bus: a first version used
+        // a 32 KB PSRAM buffer and reported 366 MB/s reads and 517 MB/s memsets,
+        // which is cache bandwidth -- the working set never left L1. PSRAM
+        // buffers are 512 KB and walked linearly so every access misses. The
+        // SRAM side stays small (a real band buffer is 15 KB) and is reused.
+        constexpr size_t SN = 16 * 1024;   // SRAM block, ~= one band buffer
+        constexpr size_t PN = 512 * 1024;  // PSRAM span, 16x the data cache
+        constexpr int REPS = 8;            // full sweeps of PN
+        constexpr int CHUNKS = PN / SN;
+        // 64-byte aligned on both sides: esp_async_memcpy validates the pointers
+        // against the configured trans_align and rejects the submit outright
+        // otherwise (a plain heap_caps_malloc returned a pointer that failed
+        // this and produced ESP_ERR_INVALID_ARG with no other diagnostic).
+        uint8_t *sram = static_cast<uint8_t *>(heap_caps_aligned_alloc(64, SN, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+        uint8_t *psram = static_cast<uint8_t *>(heap_caps_aligned_alloc(64, PN, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+        uint8_t *psram2 = static_cast<uint8_t *>(heap_caps_aligned_alloc(64, PN, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+        if (sram == nullptr || psram == nullptr || psram2 == nullptr) {
+            doc["error"] = "alloc failed";
+            doc["got_sram"] = sram != nullptr;
+            doc["got_psram"] = psram != nullptr && psram2 != nullptr;
+            doc["sram_free"] = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+            doc["sram_largest"] = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
+        } else {
+            memset(sram, 0x5A, SN);
+            memset(psram, 0x5A, PN);
+            memset(psram2, 0x5A, PN);
+            auto mbps = [](uint32_t us) {
+                return us ? static_cast<uint32_t>(static_cast<uint64_t>(PN) * REPS / us) : 0u;
+            };
+
+            // This is the push path: SRAM band buffer -> PSRAM framebuffer.
+            uint32_t t0 = micros();
+            for (int i = 0; i < REPS; i++) {
+                for (int c = 0; c < CHUNKS; c++) {
+                    memcpy(psram + c * SN, sram, SN);
+                }
+            }
+            doc["w_sram_to_psram_mbps"] = mbps(micros() - t0);
+
+            t0 = micros();
+            for (int i = 0; i < REPS; i++) {
+                for (int c = 0; c < CHUNKS; c++) {
+                    memcpy(sram, psram + c * SN, SN);
+                }
+            }
+            doc["r_psram_to_sram_mbps"] = mbps(micros() - t0);
+
+            t0 = micros();
+            for (int i = 0; i < REPS; i++) {
+                memcpy(psram2, psram, PN);
+            }
+            doc["psram_to_psram_mbps"] = mbps(micros() - t0);
+
+            // memset never reads the source, so if the write path really pays a
+            // read-for-ownership on every 32-byte line this lands close to the
+            // SRAM->PSRAM copy rather than well above it.
+            t0 = micros();
+            for (int i = 0; i < REPS; i++) {
+                memset(psram, static_cast<uint8_t>(i), PN);
+            }
+            doc["memset_psram_mbps"] = mbps(micros() - t0);
+
+            // GDMA path. If this clears the CPU memcpy by a wide margin, the
+            // push task should hand its band to the DMA engine rather than copy
+            // it, which also gives the byte movement back to hardware and frees
+            // the core entirely.
+            async_memcpy_config_t cfg = ASYNC_MEMCPY_DEFAULT_CONFIG();
+            cfg.backlog = 8;
+            cfg.psram_trans_align = 64;
+            cfg.sram_trans_align = 4;
+            async_memcpy_t asmcp = nullptr;
+            const esp_err_t inst = esp_async_memcpy_install(&cfg, &asmcp);
+            doc["dma_install_err"] = esp_err_to_name(inst);
+            if (inst == ESP_OK) {
+                static volatile int s_done = 0;
+                esp_err_t sub = ESP_OK;
+                bool ok = true;
+                // Serialised: every transfer is awaited, so this measures the
+                // engine's throughput rather than queue depth.
+                t0 = micros();
+                for (int i = 0; i < REPS && ok; i++) {
+                    for (int c = 0; c < CHUNKS && ok; c++) {
+                        s_done = 0;
+                        sub = esp_async_memcpy(
+                            asmcp, psram + c * SN, sram, SN,
+                            [](async_memcpy_t, async_memcpy_event_t *, void *) -> bool {
+                                s_done = 1;
+                                return false;
+                            },
+                            nullptr);
+                        if (sub != ESP_OK) {
+                            ok = false;
+                            break;
+                        }
+                        uint32_t spin = 0;
+                        while (s_done == 0 && spin < 4000000u) {
+                            spin++;
+                        }
+                        if (s_done == 0) {
+                            ok = false;
+                        }
+                    }
+                }
+                doc["dma_sram_to_psram_mbps"] = ok ? mbps(micros() - t0) : 0;
+                doc["dma_ok"] = ok;
+                doc["dma_submit_err"] = esp_err_to_name(sub);
+                // Reverse direction too. If GDMA declines a PSRAM destination
+                // but accepts a PSRAM source, the push cannot be handed to it
+                // and the write-allocate cost has to be attacked another way.
+                s_done = 0;
+                const esp_err_t rev = esp_async_memcpy(
+                    asmcp, sram, psram, SN,
+                    [](async_memcpy_t, async_memcpy_event_t *, void *) -> bool {
+                        s_done = 1;
+                        return false;
+                    },
+                    nullptr);
+                doc["dma_psram_src_err"] = esp_err_to_name(rev);
+                if (rev == ESP_OK) {
+                    uint32_t spin = 0;
+                    while (s_done == 0 && spin < 4000000u) {
+                        spin++;
+                    }
+                }
+                esp_async_memcpy_uninstall(asmcp);
+            } else {
+                doc["dma_ok"] = false;
+            }
+        }
+        heap_caps_free(sram);
+        heap_caps_free(psram);
+        heap_caps_free(psram2);
+        doc["psram_span"] = PN;
+        doc["reps"] = REPS;
+        doc["sram_block"] = SN;
+        serializeJson(doc, *response);
+        request->send(response);
+    });
+
     // Bench build only: the render task's own per-stage frame timings. Serial
     // is not a usable channel on this board (the IDF console goes to UART0,
     // not the USB CDC), so results come out over HTTP.
