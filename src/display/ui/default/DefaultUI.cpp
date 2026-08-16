@@ -383,8 +383,16 @@ void DefaultUI::maintainSleepAnimation() {
     const bool blocked = controller->isUpdating() || controller->isErrorState() || controller->isAutotuning() ||
                          controller->getSystemInfo().protocolMismatch;
     const bool connected = controller->isLinkUp();
-    const bool sleepWant =
-        currentScreen == SCREEN_ID_STANDBY_SCREEN && controller->getMode() == MODE_STANDBY && connected && !blocked;
+    // getMode() is controller-sourced, so while the link is down its value
+    // carries no information -- only consult it once there is a link that could
+    // have supplied it. Requiring MODE_STANDBY unconditionally is what left the
+    // standby screen blank behind "Waiting for controller...".
+    const bool standbyMode = !connected || controller->getMode() == MODE_STANDBY;
+    // `initialized` is explicit here now. It used to be implied by `connected`:
+    // a live BLE link meant the UI had long since come up. Without that term
+    // this predicate is reachable during startup, and startSleepAnimation needs
+    // a live screen to host the overlay snapshot.
+    const bool sleepWant = initialized && currentScreen == SCREEN_ID_STANDBY_SCREEN && standbyMode && !blocked;
     const bool wantAnimation = bgAnimAllScreens ? (initialized && !blocked) : sleepWant;
 
 #ifdef GM_ANIM_BENCH
