@@ -74,6 +74,9 @@ class DefaultUI {
     void stopSleepAnimation();
     void maintainSleepAnimation();
     void refreshSleepOverlay();
+    // Hide or restore the opaque background plates the generated screens put
+    // behind their content. See the definition for which objects and why.
+    void applyAnimPlates(bool clear);
     // lv_snapshot_take_to_buf with a clip area. Renders only `clip` into `buf`,
     // leaving the rest of the buffer alone, so an overlay refresh costs what
     // actually changed rather than a whole screen.
@@ -98,6 +101,8 @@ class DefaultUI {
     bool overlayValid[2] = {false, false};
     bool bgAnimAllScreens = false;         // settings.isBgAnimAllScreens(), cached per render
     lv_obj_t *animHostScreen = nullptr;    // screen whose bg was made transparent for the animation
+    bool animPlatesCleared = false;
+    lv_opa_t animPlateOpa[4] = {LV_OPA_COVER, LV_OPA_COVER, LV_OPA_COVER, LV_OPA_COVER};
     std::atomic<bool> panelStopRequested{false};
     std::atomic<bool> panelStopped{false};
     std::atomic<bool> otaEnded{false};

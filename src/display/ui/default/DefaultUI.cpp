@@ -407,6 +407,7 @@ void DefaultUI::maintainSleepAnimation() {
             // Standby content changes once a minute (clock); active screens
             // update continuously — refresh the snapshot faster there so
             // gauges and numbers stay reasonably live behind the animation.
+            applyAnimPlates(controller->getSettings().getBgAnimClearPlates() != 0);
             const unsigned long interval = currentScreen == SCREEN_ID_STANDBY_SCREEN ? 1000 : 33;
             if (::millis() - lastSleepOverlayRefresh > interval) {
                 refreshSleepOverlay();
@@ -634,6 +635,7 @@ void DefaultUI::startSleepAnimation() {
             lv_obj_set_style_border_opa(icon, LV_OPA_TRANSP, LV_PART_MAIN);
         }
     }
+    applyAnimPlates(controller->getSettings().getBgAnimClearPlates() != 0);
     // Widget updates must not race the plasma on the panel: LVGL keeps
     // rendering to its draw buffer, but flushes are dropped until stop.
     lvgl_helper_suppress_flush(true);
@@ -644,10 +646,43 @@ void DefaultUI::startSleepAnimation() {
 #endif
 }
 
+// The generated screens put a full-bleed opaque object behind their content:
+// brew, status and profile each a 360x360 circle (radius 180), info a 400x400
+// rounded square. Menu, steam, water and grind have none. startSleepAnimation
+// makes the SCREEN transparent, but not these children, so the animation shows
+// whole on the screens without a plate and with a black disc punched through it
+// on the ones with. Hiding them is what makes every screen look alike.
+//
+// The original opacity is saved and put back rather than dropping the local
+// style property, because the generated code sets that property explicitly and
+// removing it would fall through to the theme default instead of the value the
+// screen was designed with.
+void DefaultUI::applyAnimPlates(bool clear) {
+#ifndef GAGGIMATE_SIM
+    if (clear == animPlatesCleared) {
+        return;
+    }
+    lv_obj_t *const plates[4] = {objects.obj2, objects.obj9, objects.obj15, objects.obj26};
+    for (int i = 0; i < 4; i++) {
+        if (plates[i] == nullptr) {
+            continue;
+        }
+        if (clear) {
+            animPlateOpa[i] = lv_obj_get_style_bg_opa(plates[i], LV_PART_MAIN);
+            lv_obj_set_style_bg_opa(plates[i], LV_OPA_TRANSP, LV_PART_MAIN);
+        } else {
+            lv_obj_set_style_bg_opa(plates[i], animPlateOpa[i], LV_PART_MAIN);
+        }
+    }
+    animPlatesCleared = clear;
+#endif
+}
+
 void DefaultUI::stopSleepAnimation() {
 #ifndef GAGGIMATE_SIM
     sleepAnimation.stop();
     lvgl_helper_suppress_flush(false);
+    applyAnimPlates(false);
     for (lv_obj_t *icon : {objects.wifi_icon, objects.bluetooth_icon, objects.update_icon}) {
         if (icon != nullptr) {
             lv_obj_remove_local_style_prop(icon, LV_STYLE_BORDER_OPA, LV_PART_MAIN);

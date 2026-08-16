@@ -109,6 +109,7 @@ class Settings {
     int getBgAnimFps() const { return bgAnimFps.get(); }
     int getBgAnimHalfRes() const { return bgAnimHalfRes.get(); }
     int getBgAnimInterlace() const { return bgAnimInterlace.get(); }
+    int getBgAnimClearPlates() const { return bgAnimClearPlates.get(); }
     int getPanelClockDiv() const { return panelClockDiv.get(); }
     int getSmartGrindMode() const { return smartGrindMode.get(); }
     String getSmartGrindIp() const { return smartGrindIp.get(); }
@@ -208,6 +209,7 @@ class Settings {
     void setBgAnimFps(int bg_anim_fps);
     void setBgAnimHalfRes(int bg_anim_half_res);
     void setBgAnimInterlace(int bg_anim_interlace);
+    void setBgAnimClearPlates(int bg_anim_clear_plates);
     void setPanelClockDiv(int panel_clock_div);
     void setSmartGrindIp(String smart_grind_ip);
     void setSmartGrindMode(int smart_grind_mode);
@@ -315,6 +317,11 @@ class Settings {
     Property<int> bgAnimHalfRes{registry, "bg_half", 1};
     // 1 = push every other row pair, alternating each frame.
     Property<int> bgAnimInterlace{registry, "bg_ilace", 1};
+    // 1 = hide the opaque background plates on the screens that have one
+    // (brew, status, profile, info) while the animation is running, so the
+    // animation looks the same on every screen instead of only on the ones
+    // that happen not to carry a plate.
+    Property<int> bgAnimClearPlates{registry, "bg_plate", 1};
     // RGB pixel-clock divider off the 80 MHz LCD group clock; 0 = keep the
     // build-flag boot value. The IDF 4.4 driver only does integer division,
     // so real choices are 80/n: 5=16 MHz (~61 Hz), 6=13.3 MHz (~51 Hz),
