@@ -37,11 +37,16 @@ namespace {
 // (60 cross-core semaphore round trips per frame instead of 30) cost ~1.3 ms
 // and dropped plasma 43.0 -> 40.6 fps.
 //
-// 12 rows across three slots is chosen against internal SRAM, which is the
+// 8 rows across three slots is chosen against internal SRAM, which is the
 // binding constraint: 16 rows x 3 slots is 46 KB and would leave under 1 KB
-// free, and internal SRAM is what WiFi/BLE/TLS draw from at runtime. 12 x 3 is
-// 34.5 KB, only 3.8 KB above the old 16 x 2, and leaves ~12 KB. The extra ten
-// handoffs per frame are the price of the third slot.
+// free, and internal SRAM is what WiFi/BLE/TLS draw from at runtime. 8 x 3 is
+// 23,040 B, and the handoff cost above is the price of getting there.
+//
+// Note on the fps figure quoted above: it comes from a 16-vs-8 bench, which is
+// where the 30-vs-60 handoff counts come from. The 12-vs-8 step this constant
+// actually took has never been benched directly; scaling the measured number
+// linearly puts it nearer 0.9 ms than 1.3 ms, so 40.6 fps is a conservative
+// floor rather than a measurement of the current configuration.
 constexpr int BAND_H = 8;
 // Headroom for the snapshot's ext draw size (shadows etc. extend the render
 // area past the object on every side).
@@ -845,7 +850,7 @@ void SleepAnimation::renderFrame() {
         //
         // An odd row count -- a pair cannot be half a row. The expand loop
         // truncates at rows >> 1 and the push loop stops at y + 2 <= y1, so the
-        // odd row would be neither written nor sent. 480/12 leaves no partial
+        // odd row would be neither written nor sent. 480/8 leaves no partial
         // band today, so this is a guard rather than a live case.
         const bool oddBand = (rows & 1) != 0;
         const bool bandInterlaced = interlace.load() && !(dmaActive && dmaMode.load() != 0) &&
