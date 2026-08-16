@@ -120,6 +120,15 @@ class SleepAnimation {
     // measuring what a bounded duty cycle does to the rest of the system.
     void benchSetMaxFps(uint8_t fps) { maxFps.store(fps); }
     uint8_t benchMaxFps() const { return maxFps.load(); }
+    // Direct-to-framebuffer push over GDMA, switchable per frame so both paths
+    // can be measured on one flash. Requesting it is not the same as getting
+    // it: the panel must hand over its framebuffer and the engine must install.
+    void benchSetDma(bool on) { dmaWanted.store(on); }
+    bool benchDmaWanted() const { return dmaWanted.load(); }
+    bool benchDmaActive() const { return dmaActive; }
+    uint32_t benchDmaIssued() const { return dmaIssued.load(); }
+    uint32_t benchDmaCompleted() const;
+    uint32_t benchDmaErrors() const { return dmaErrors.load(); }
 #endif
 
   private:
@@ -175,6 +184,25 @@ class SleepAnimation {
     uint32_t frameWaitUs = 0;   // this frame's total block on the push task, drives cropEnabled
     void *pushHandle = nullptr;
     std::atomic<bool> pushStopped{true};
+
+    // ---- direct-to-framebuffer push ------------------------------------
+    // pushColors copies the band into the PSRAM framebuffer with the CPU, and a
+    // CPU write to PSRAM on this part costs about twice a read: the 32-byte
+    // write-allocate line is fetched before it is overwritten, so a 460 KB
+    // frame moves 920 KB of bus traffic. Measured 24 MB/s that way against
+    // 48 MB/s for the same bytes over GDMA, which never touches the cache.
+    //
+    // fbDirect is the panel's own framebuffer, or null when the panel will not
+    // hand it over -- in which case dmaActive stays false and the pipeline runs
+    // the ordinary push task, unchanged.
+    std::atomic<bool> dmaWanted{true};
+    bool dmaActive = false;      // fbDirect resolved AND the engine installed
+    uint16_t *fbDirect = nullptr;
+    void *dmaHandle = nullptr;   // async_memcpy_t, installed once from the render task
+    bool dmaInstallTried = false;
+    std::atomic<uint32_t> dmaIssued{0};
+    std::atomic<uint32_t> dmaErrors{0};
+    bool installDmaOnRenderCore();
 
     // Per-band horizontal extent of the panel's inscribed circle. The panel is
     // round, so the corners of the 480x480 rectangle are never visible and

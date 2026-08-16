@@ -17,6 +17,8 @@
 
 #include <SD_MMC.h>
 #include <esp_lcd_panel_io.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
 #include <esp_lcd_panel_ops.h>
 #include <esp_lcd_panel_rgb.h>
 #include <esp_lcd_panel_vendor.h>
@@ -96,6 +98,10 @@ class LilyGo_RGBPanel : public Display {
 
     bool supportsDirectMode() { return false; }
 
+    uint16_t *directFrameBuffer() override;
+    void lockFrameBuffer() override;
+    void unlockFrameBuffer() override;
+
   private:
     void writeData(const uint8_t *data, int len);
 
@@ -121,6 +127,14 @@ class LilyGo_RGBPanel : public Display {
     uint64_t _sleepTimeUs;
 
     LilyGo_RGBPanel_TouchType _touchType;
+
+    // Cached result of directFrameBuffer()'s one-time probe into the esp_lcd RGB
+    // panel's private struct, and the mutex that serialises a direct writer
+    // against pushColors. _fbResolved is separate from a null _fbDirect because
+    // a failed probe must not be retried on every frame.
+    uint16_t *_fbDirect = nullptr;
+    bool _fbResolved = false;
+    SemaphoreHandle_t _fbMutex = nullptr;
 
     ExtensionIOXL9555::ExtensionGPIO cs = ExtensionIOXL9555::IO3;
     ExtensionIOXL9555::ExtensionGPIO mosi = ExtensionIOXL9555::IO4;

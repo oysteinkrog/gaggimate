@@ -553,6 +553,18 @@ void WebUIPlugin::setupServer() {
                 a->benchRequestReset();
             }
         }
+        // ?dma=0/1 switches the framebuffer push between the CPU copy through
+        // the push task and GDMA straight into the panel's buffer. Takes effect
+        // at the next start(), because the engine is installed on the render
+        // task; benchRequestReset restarts the sweep so the two are not
+        // averaged together.
+        if (request->hasArg("dma")) {
+            SleepAnimation *a = sleep_animation_bench_instance();
+            if (a != nullptr) {
+                a->benchSetDma(request->arg("dma").toInt() != 0);
+                a->benchRequestReset();
+            }
+        }
         if (request->hasArg("only")) {
             SleepAnimation *a = sleep_animation_bench_instance();
             if (a != nullptr) {
@@ -609,6 +621,17 @@ void WebUIPlugin::setupServer() {
         // once per pixel is not, and pays a PSRAM round trip per miss.
         gate["lut_sram_b"] = static_cast<uint32_t>(bganim::g_allocSram);
         gate["lut_psram_b"] = static_cast<uint32_t>(bganim::g_allocPsram);
+        // Direct-to-framebuffer push. wanted vs active is the difference
+        // between asking and getting: the panel must hand over its framebuffer
+        // and the engine must install. issued minus done is the liveness
+        // check -- the render task cannot outrun the engine by more than
+        // NUM_SLOTS, so a gap parked above that means transfers stopped
+        // completing.
+        gate["dma_wanted"] = anim0 != nullptr && anim0->benchDmaWanted();
+        gate["dma_active"] = anim0 != nullptr && anim0->benchDmaActive();
+        gate["dma_issued"] = anim0 != nullptr ? anim0->benchDmaIssued() : 0;
+        gate["dma_done"] = anim0 != nullptr ? anim0->benchDmaCompleted() : 0;
+        gate["dma_err"] = anim0 != nullptr ? anim0->benchDmaErrors() : 0;
         gate["sram_limit"] = static_cast<uint32_t>(bganim::SRAM_ALLOC_LIMIT);
         gate["sram_budget"] = static_cast<uint32_t>(bganim::SRAM_TOTAL_BUDGET);
         gate["free_internal_b"] = static_cast<uint32_t>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
