@@ -815,6 +815,17 @@ void SleepAnimation::renderFrame() {
                 residentAnimId = -1;
             }
         }
+        // Before init(), not after it succeeds. init() is what allocates, and
+        // it can allocate several tables and then fail on a later one, leaving
+        // the earlier pointers live. Recording residency only on success would
+        // orphan those: the next pass would skip release(), init() would skip
+        // reallocating the surviving buffers because they are non-null, and at
+        // a larger resolution frame() would write past the end of one sized for
+        // the smaller. Marking it resident up front costs nothing when init()
+        // succeeds and makes the failure recoverable.
+        if (anim.release != nullptr) {
+            residentAnimId = id;
+        }
         if (!anim.init(rw, rh)) {
             log_e("SleepAnimation: init failed for animation %d (%s)", id, anim.id);
             running = false;
@@ -822,11 +833,6 @@ void SleepAnimation::renderFrame() {
         }
         initializedAnimId = id;
         initializedHalf = half;
-        // Only animations with a teardown are tracked as resident; the rest
-        // keep their tables and there is nothing to hand back.
-        if (anim.release != nullptr) {
-            residentAnimId = id;
-        }
     }
     BENCH_T0(tSetup);
     anim.frame(tMs, rw, rh, p);
