@@ -1283,6 +1283,8 @@ void WebUIPlugin::handleSettings(AsyncWebServerRequest *request) const {
                 settings->setBgAnimHalfRes(request->arg("bgAnimHalfRes").toInt() != 0 ? 1 : 0);
             if (request->hasArg("bgAnimInterlace"))
                 settings->setBgAnimInterlace(request->arg("bgAnimInterlace").toInt() != 0 ? 1 : 0);
+            if (request->hasArg("bgAnimClearPlates"))
+                settings->setBgAnimClearPlates(request->arg("bgAnimClearPlates").toInt() != 0 ? 1 : 0);
             if (request->hasArg("panelClockDiv")) {
                 // 0 = firmware default; explicit dividers outside the sane
                 // 4-12 window (6.7-20 MHz pclk) could leave the panel
@@ -1451,6 +1453,7 @@ void WebUIPlugin::handleSettings(AsyncWebServerRequest *request) const {
     doc["bgAnimFps"] = settings.getBgAnimFps();
     doc["bgAnimHalfRes"] = settings.getBgAnimHalfRes();
     doc["bgAnimInterlace"] = settings.getBgAnimInterlace();
+    doc["bgAnimClearPlates"] = settings.getBgAnimClearPlates();
     doc["panelClockDiv"] = settings.getPanelClockDiv();
     doc["bgAnimCustomTheme"] = settings.getBgAnimCustomTheme();
     doc["smartGrindIp"] = settings.getSmartGrindIp();
