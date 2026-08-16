@@ -122,7 +122,7 @@ BlobState blob[NUM_BLOBS];
 uint16_t *paletteLUT = nullptr;
 int32_t *fieldRow = nullptr; // one row of accumulated field, already in palette-index units
 int32_t ditherLUT[16];       // precomputed (BAYER4[k]/16 - 0.5) / 128 * 255, indexed by (y&3)*4+(x&3)
-int32_t lavaLUT[LUT_SIZE];   // tt-bucket -> field contribution, pre-scaled to palette-index units, rebuilt in frame()
+int32_t *lavaLUT = nullptr;  // tt-bucket -> field contribution, pre-scaled to palette-index units, rebuilt in frame()
 int32_t *lavaBase = nullptr; // lavaLUT + LUT_OFFSET, so band() indexes it directly with the signed shifted-tt value
 uint32_t lastThemeGen = 0xFFFFFFFF;
 bool inited = false;
@@ -134,9 +134,23 @@ bool init(int w, int h) {
     if (fieldRow == nullptr) {
         fieldRow = static_cast<int32_t *>(alloc(w * sizeof(int32_t)));
     }
-    if (paletteLUT == nullptr || fieldRow == nullptr) {
+    if (lavaLUT == nullptr) {
+        // 9,216 B. As a static array this was the largest single object in
+        // internal DRAM in the whole firmware, and it was resident for every
+        // animation, not just this one -- which is what left AsyncTCP unable to
+        // allocate the few dozen bytes it needs per ACK to keep a large
+        // response moving. alloc() sends anything over 8 KB to PSRAM, and this
+        // table suits that: band() sweeps it monotonically through a forward
+        // difference on ttQ, so the reads are sequential rather than random,
+        // and 9 KB stays largely cache-resident anyway.
+        lavaLUT = static_cast<int32_t *>(alloc(LUT_SIZE * sizeof(int32_t)));
+    }
+    if (paletteLUT == nullptr || fieldRow == nullptr || lavaLUT == nullptr) {
         return false;
     }
+    // Derived here rather than under the !inited guard below: the base pointer
+    // has to follow the allocation, not the one-time table setup.
+    lavaBase = lavaLUT + LUT_OFFSET;
     if (!inited) {
         inited = true;
         for (int k = 0; k < 16; k++) {
@@ -168,7 +182,6 @@ bool init(int w, int h) {
         }
         buildThemeRamp(paletteLUT, 256);
         lastThemeGen = themeGen();
-        lavaBase = lavaLUT + LUT_OFFSET;
     }
     return true;
 }

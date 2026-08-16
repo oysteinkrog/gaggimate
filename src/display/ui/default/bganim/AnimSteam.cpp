@@ -40,8 +40,8 @@ struct BlobDraw {
 };
 
 Wisp wisps[WISPS_MAX];
-Blob blobs[BLOBS_MAX];
-BlobDraw draws[BLOBS_MAX];
+Blob *blobs = nullptr;
+BlobDraw *draws = nullptr;
 uint8_t *alphaLUT = nullptr; // (1-sqrt(i/63))^1.6
 uint16_t *bgLUT = nullptr;
 int wispCount = 0;
@@ -86,6 +86,13 @@ void buildWisps(int count, int w, int h, uint32_t tMs) {
 }
 
 bool init(int, int h) {
+    if (blobs == nullptr) {
+        blobs = static_cast<Blob *>(alloc(BLOBS_MAX * sizeof(Blob)));
+        draws = static_cast<BlobDraw *>(alloc(BLOBS_MAX * sizeof(BlobDraw)));
+    }
+    if (blobs == nullptr || draws == nullptr) {
+        return false;
+    }
     if (alphaLUT == nullptr) {
         alphaLUT = static_cast<uint8_t *>(alloc(64));
         bgLUT = static_cast<uint16_t *>(alloc(h * sizeof(uint16_t)));

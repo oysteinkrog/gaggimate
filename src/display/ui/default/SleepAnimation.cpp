@@ -152,9 +152,15 @@ void SleepAnimation::start(Display *d) {
             // are the transfer source and esp_async_memcpy rejects anything
             // else. The fallback keeps the ordinary push path working if the
             // aligned allocator cannot find a contiguous block.
+#ifdef GM_ANIM_BENCH
+            // Only the bench build can reach the GDMA push path (benchSetDma is
+            // compiled out otherwise), and only that path needs these to be a
+            // legal transfer source.
             bandBuf[i] = static_cast<uint16_t *>(
                 heap_caps_aligned_alloc(64, w * BAND_H * sizeof(uint16_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA));
-            if (bandBuf[i] == nullptr) {
+            if (bandBuf[i] == nullptr)
+#endif
+            {
                 bandBuf[i] = static_cast<uint16_t *>(allocPreferInternal(w * BAND_H * sizeof(uint16_t)));
             }
         }
