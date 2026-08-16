@@ -21,6 +21,8 @@
 #include <soc/gdma_struct.h>  // direct GDMA register access for /api/gdma
 #include <esp_heap_caps.h>
 #endif
+// Not bench-only: /api/debug/heap reports the animation SRAM budget.
+#include <display/ui/default/bganim/BgAnimCommon.h>
 #include <display/util/PsramStlAllocator.h>
 #include <display/util/PsramWsBuffer.h>
 #include <display/webassets/web_ui_manifest.h>
@@ -386,14 +388,22 @@ void WebUIPlugin::setupServer() {
     // endpoint still answers when the heap is too tight for a response stream.
     // Exposes no configuration and no secrets.
     server.on("/api/debug/heap", [](AsyncWebServerRequest *request) {
-        char buf[224];
+        // anim_sram is the committed part of the animation budget and
+        // anim_budget its ceiling. The gap between them is the important
+        // figure: alloc() never frees, so every animation the user visits
+        // converts more of that gap into permanently resident internal DRAM.
+        // A comfortable int_min means nothing if the gap is larger than it.
+        char buf[320];
         snprintf(buf, sizeof(buf),
-                 "{\"int_free\":%u,\"int_largest\":%u,\"int_min\":%u,\"psram_free\":%u,\"psram_largest\":%u}",
+                 "{\"int_free\":%u,\"int_largest\":%u,\"int_min\":%u,\"psram_free\":%u,\"psram_largest\":%u,"
+                 "\"anim_sram\":%u,\"anim_psram\":%u,\"anim_budget\":%u}",
                  static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL)),
                  static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL)),
                  static_cast<unsigned>(heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL)),
                  static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_SPIRAM)),
-                 static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM)));
+                 static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM)),
+                 static_cast<unsigned>(bganim::g_allocSram), static_cast<unsigned>(bganim::g_allocPsram),
+                 static_cast<unsigned>(bganim::SRAM_TOTAL_BUDGET));
         request->send(200, "application/json", buf);
     });
     server.on("/api/status", [this](AsyncWebServerRequest *request) {
