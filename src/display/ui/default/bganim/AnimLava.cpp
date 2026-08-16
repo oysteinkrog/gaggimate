@@ -132,9 +132,9 @@ bool init(int w, int h) {
     if (paletteLUT == nullptr) {
         paletteLUT = static_cast<uint16_t *>(alloc(256 * sizeof(uint16_t)));
     }
-    allocW = w;
     if (fieldRow == nullptr) {
         fieldRow = static_cast<int32_t *>(alloc(w * sizeof(int32_t)));
+        allocW = w;
     }
     if (lavaLUT == nullptr) {
         // 9,216 B. As a static array this was the largest single object in

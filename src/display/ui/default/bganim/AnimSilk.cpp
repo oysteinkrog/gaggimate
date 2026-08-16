@@ -252,13 +252,13 @@ bool init(int w, int h) {
     // of phases 1-3 therefore became a permanent null dereference in band(),
     // which indexes rowAux[y & 3] with no check of its own.
     {
-        allocW = w;
         const float cx = w * 0.5f;
         for (int ph = 0; ph < 4; ph++) {
             if (rowAux[ph] != nullptr) {
                 continue;
             }
             rowAux[ph] = static_cast<RowAux *>(alloc(w * sizeof(RowAux)));
+            allocW = w;
             if (rowAux[ph] == nullptr) {
                 continue; // retried on the next init()
             }
