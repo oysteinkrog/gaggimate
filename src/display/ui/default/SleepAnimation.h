@@ -110,6 +110,16 @@ class SleepAnimation {
     void benchRequestReset() { benchResetPending.store(true); }
     void benchSetHalfRes(bool on) { halfRes = on; }
     bool benchHalfRes() const { return halfRes; }
+    // Pin the sweep to one animation (-1 sweeps the whole registry), so a
+    // change to one inner loop can be measured in one dwell instead of a full
+    // 13-animation pass.
+    void benchSetOnly(int id) { benchOnly.store(id); }
+    int benchGetOnly() const { return benchOnly.load(); }
+    // The sweep normally runs uncapped, because a throttled frame reports the
+    // cap instead of the cost. This puts the cap back deliberately, for
+    // measuring what a bounded duty cycle does to the rest of the system.
+    void benchSetMaxFps(uint8_t fps) { maxFps.store(fps); }
+    uint8_t benchMaxFps() const { return maxFps.load(); }
 #endif
 
   private:
@@ -208,6 +218,7 @@ class SleepAnimation {
     uint32_t benchPasses = 0; // completed sweeps of the whole registry
     BenchResult benchDone[BENCH_MAX_ANIMS];
     std::atomic<bool> benchResetPending{false};
+    std::atomic<int> benchOnly{-1}; // -1 sweeps the registry; otherwise pin to this id
 
     void benchTick();      // called once per frame from renderLoop
     void benchFinishDwell(); // records the current animation and advances

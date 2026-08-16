@@ -545,6 +545,21 @@ void WebUIPlugin::setupServer() {
         // is left for the render task's writes -- this is the knob that tests
         // whether the flat push cost is a bandwidth floor. Not persisted: it
         // reverts to the stored setting on the next boot.
+        if (request->hasArg("fps")) {
+            SleepAnimation *a = sleep_animation_bench_instance();
+            const int f = request->arg("fps").toInt();
+            if (a != nullptr && f >= 5 && f <= 60) {
+                a->benchSetMaxFps(static_cast<uint8_t>(f));
+                a->benchRequestReset();
+            }
+        }
+        if (request->hasArg("only")) {
+            SleepAnimation *a = sleep_animation_bench_instance();
+            if (a != nullptr) {
+                a->benchSetOnly(request->arg("only").toInt());
+                a->benchRequestReset();
+            }
+        }
         if (request->hasArg("half")) {
             SleepAnimation *a = sleep_animation_bench_instance();
             if (a != nullptr) {
@@ -586,6 +601,8 @@ void WebUIPlugin::setupServer() {
         // divider and let a caller compare relative values across settings.
         gate["pclk_div"] = panelclock::currentDiv();
         gate["half_res"] = anim0 != nullptr && anim0->benchHalfRes();
+        gate["only"] = anim0 != nullptr ? anim0->benchGetOnly() : -1;
+        gate["max_fps"] = anim0 != nullptr ? anim0->benchMaxFps() : 0;
         // Where the animations' lookup tables actually landed. alloc() sends
         // anything over SRAM_ALLOC_LIMIT to PSRAM on the assumption that big
         // tables are swept sequentially; a table indexed by a computed value
