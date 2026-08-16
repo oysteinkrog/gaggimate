@@ -758,6 +758,15 @@ void WebUIPlugin::setupServer() {
                 a->benchRequestReset();
             }
         }
+        // ?rhalf=0|1 -- with interlacing on at half resolution, render only the
+        // source rows this frame will push, halving the animation's own cost.
+        if (request->hasArg("rhalf")) {
+            SleepAnimation *a = sleep_animation_bench_instance();
+            if (a != nullptr) {
+                a->benchSetRenderHalf(request->arg("rhalf").toInt() != 0);
+                a->benchRequestReset();
+            }
+        }
         if (request->hasArg("only")) {
             SleepAnimation *a = sleep_animation_bench_instance();
             if (a != nullptr) {
@@ -824,6 +833,7 @@ void WebUIPlugin::setupServer() {
         gate["dma_active"] = anim0 != nullptr && anim0->benchDmaActive();
         gate["dma_mode"] = anim0 != nullptr ? anim0->benchDmaMode() : 0;
         gate["interlace"] = anim0 != nullptr ? anim0->benchInterlace() : false;
+        gate["render_half"] = anim0 != nullptr ? anim0->benchRenderHalf() : false;
         gate["bands_internal"] = anim0 != nullptr && anim0->benchBandsInternal();
         if (anim0 != nullptr) {
             JsonArray ba = gate["band_addr"].to<JsonArray>();

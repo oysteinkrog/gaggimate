@@ -129,6 +129,10 @@ void SleepAnimation::start(Display *d) {
     g_benchInstance = this;
 #endif
     display = d;
+    // Until the animation has covered the screen once, the rows an interlaced
+    // frame skips still hold the previous screen's pixels, so the first frames
+    // go out whole.
+    warmupFrames = 3;
     const int w = display->width();
     const int h = display->height();
     for (int i = 0; i < NUM_SLOTS; i++) {
@@ -471,18 +475,19 @@ void SleepAnimation::pushLoop() {
 #ifdef GM_ANIM_BENCH
         const int64_t t0 = esp_timer_get_time();
 #endif
-        if (interlace.load()) {
-            // One call per row rather than one per band. Each row is
-            // (x1 - x0) * 2 bytes and its own contiguous run in the band, and
-            // the framebuffer rows two apart are not adjacent, so there is no
-            // way to express this as a single rectangle. The saving is the
-            // other half of the rows, which keep the previous frame.
+        if (job.mode != 0) {
+            // esp_lcd takes a rectangle and no stride, so the rows that go out
+            // cannot be one call. Mode 2 sends them two at a time -- at half
+            // resolution a pair is one source row, contiguous in the
+            // framebuffer -- which is half the calls of mode 1 for the same
+            // bytes. The rows left alone keep the previous frame.
+            const int step = job.mode == 2 ? 2 : 1;
             const int stride = job.x1 - job.x0;
-            for (int y = job.y0; y < job.y1; y++) {
-                if (((y ^ job.parity) & 1) != 0) {
+            for (int y = job.y0; y + step <= job.y1; y += step) {
+                if ((((job.mode == 2 ? (y >> 1) : y) ^ job.parity) & 1) != 0) {
                     continue;
                 }
-                display->pushColors(job.x0, static_cast<int16_t>(y), job.x1, static_cast<int16_t>(y + 1),
+                display->pushColors(job.x0, static_cast<int16_t>(y), job.x1, static_cast<int16_t>(y + step),
                                     bandBuf[slot] + static_cast<size_t>(y - job.y0) * stride);
             }
         } else {
@@ -579,6 +584,9 @@ void SleepAnimation::renderLoop() {
         // Once per frame, not once per band: every band of a frame must push
         // the same parity or the two halves of the picture drift apart.
         frameParity++;
+        if (warmupFrames > 0) {
+            warmupFrames--;
+        }
         fpsFrames++;
 #ifdef GM_ANIM_BENCH
         const uint32_t frameUs = static_cast<uint32_t>(esp_timer_get_time() - frameStart);
@@ -793,6 +801,14 @@ void SleepAnimation::renderFrame() {
         // applies to the two-task push path -- the direct path writes the
         // framebuffer itself and has no per-row call to skip.
         const bool interlaceActive = interlace.load() && !(dmaActive && dmaMode.load() != 0);
+        const int parityNow = static_cast<int>(frameParity & 1u);
+        // At half resolution a pair is one source row; anywhere else the unit is
+        // a single row. warmupFrames forces whole bands for the first frames
+        // after a start, because until then the rows this frame skips hold
+        // whatever the previous screen left in the framebuffer rather than the
+        // animation's own previous frame.
+        const bool pairMode = interlaceActive && half;
+        const bool renderSkip = pairMode && renderHalf.load();
         // Bench builds render ONE band per frame with the scheduler suspended
         // on this core. Aurora measures ~82 CPU cycles/pixel for a loop body
         // that looks like it should run in far less, and its max frame is 1.8x
@@ -818,14 +834,35 @@ void SleepAnimation::renderFrame() {
         if (half) {
             // Render rows/2 half-width rows, then expand 2x in both axes.
             const int hrows = rows >> 1;
+            const int srcBase = y0 >> 1;
+            // One band() call per source row instead of one for the whole band,
+            // so the rows this frame will not push are never computed. The
+            // contract takes a row count (BgAnim.h) and the last band of the
+            // screen already passes a short one, so this is within it; what it
+            // relies on is that no animation carries state from one call to the
+            // next, which is true of all thirteen -- each derives its row terms
+            // from the absolute y it is handed.
+            const bool splitRender = renderSkip && hrows > 0;
             if (lockThisBand) {
                 vTaskSuspendAll();
-                anim.band(halfBuf, y0 >> 1, hrows, rw, tMs, p);
-                xTaskResumeAll();
+            }
+            if (splitRender) {
+                for (int sr = 0; sr < hrows; sr++) {
+                    if (((srcBase + sr) & 1) != parityNow) {
+                        continue;
+                    }
+                    anim.band(halfBuf + static_cast<size_t>(sr) * rw, srcBase + sr, 1, rw, tMs, p);
+                }
             } else {
-                anim.band(halfBuf, y0 >> 1, hrows, rw, tMs, p);
+                anim.band(halfBuf, srcBase, hrows, rw, tMs, p);
+            }
+            if (lockThisBand) {
+                xTaskResumeAll();
             }
             for (int sr = 0; sr < hrows; sr++) {
+                if (splitRender && ((srcBase + sr) & 1) != parityNow) {
+                    continue; // its pair is not going out, so do not expand it
+                }
                 const uint16_t *__restrict src = halfBuf + static_cast<size_t>(sr) * rw;
                 uint32_t *__restrict d0 = reinterpret_cast<uint32_t *>(band + static_cast<size_t>(sr * 2) * w);
                 uint32_t *__restrict d1 = reinterpret_cast<uint32_t *>(band + static_cast<size_t>(sr * 2 + 1) * w);
@@ -868,12 +905,12 @@ void SleepAnimation::renderFrame() {
         uint32_t spanPxLocal = 0;
         uint32_t blendPxLocal = 0;
 #endif
-        // Rows of the other parity are not pushed this frame, so anything
-        // composited into them is thrown away. Skipping them halves the blend.
-        const int blendStep = interlaceActive ? 2 : 1;
-        const int blendFirst =
-            interlaceActive ? y0 + (((y0 ^ static_cast<int>(frameParity)) & 1) ? 1 : 0) : y0;
-        for (int y = blendFirst; y < y0 + rows; y += blendStep) {
+        // Rows this frame will not push are thrown away, so compositing
+        // widgets into them is wasted. Both rows of a pushed pair still need it.
+        for (int y = y0; y < y0 + rows; y++) {
+            if (interlaceActive && ((((pairMode ? (y >> 1) : y) ^ parityNow) & 1) != 0)) {
+                continue;
+            }
             if (ov != nullptr && ov->spanMin[y] >= 0) {
                 // Composite the standby widgets over the plasma (span-limited:
                 // only pixels the snapshot actually covers).
@@ -1062,8 +1099,11 @@ void SleepAnimation::renderFrame() {
             }
             BENCH_ACC(accPushUs, tPush);
         } else {
+            const uint8_t pushMode =
+                !interlaceActive || warmupFrames > 0 ? 0 : (pairMode ? 2 : 1);
             pushJob[renderSlot] = {static_cast<int16_t>(cx0), static_cast<int16_t>(y0), static_cast<int16_t>(cx1),
-                                   static_cast<int16_t>(y0 + rows), static_cast<uint8_t>(frameParity & 1u)};
+                                   static_cast<int16_t>(y0 + rows), pushMode,
+                                   static_cast<uint8_t>(parityNow)};
             xSemaphoreGive(static_cast<SemaphoreHandle_t>(bandReady[renderSlot]));
         }
         renderSlot = (renderSlot + 1) % NUM_SLOTS;

@@ -133,6 +133,8 @@ class SleepAnimation {
     void benchSetDmaMode(int m) { dmaMode.store(m); }
     void benchSetInterlace(bool on) { interlace.store(on); }
     bool benchInterlace() const { return interlace.load(); }
+    void benchSetRenderHalf(bool on) { renderHalf.store(on); }
+    bool benchRenderHalf() const { return renderHalf.load(); }
     int benchDmaMode() const { return dmaMode.load(); }
     bool benchDmaActive() const { return dmaActive; }
     uint32_t benchDmaIssued() const { return dmaIssued.load(); }
@@ -192,8 +194,10 @@ class SleepAnimation {
     // coordinates, not extents.
     struct PushJob {
         int16_t x0, y0, x1, y1;
-        // Which row parity this frame pushes. Only meaningful when interlacing
-        // is on; the push task compares it against each absolute row index.
+        // 0 = whole band in one call, 1 = every other absolute row, 2 = every
+        // other row PAIR (half resolution, where a pair is one source row and
+        // must never be split). parity picks which half goes out this frame.
+        uint8_t mode;
         uint8_t parity;
     };
     PushJob pushJob[NUM_SLOTS] = {};
@@ -202,8 +206,16 @@ class SleepAnimation {
     // Push every other row, alternating parity each frame. Halves the bytes and
     // the writeback range at the cost of each row refreshing at half the frame
     // rate. Off by default until it has been looked at on the panel.
-    std::atomic<bool> interlace{false};
+    std::atomic<bool> interlace{true};
+    // Render only the source rows this frame will push. Only legal alongside
+    // interlacing at half resolution, where one source row feeds one pushed
+    // pair, so skipping it costs nothing that is displayed.
+    std::atomic<bool> renderHalf{true};
     uint32_t frameParity = 0;
+    // Frames after a start that push whole bands regardless of parity. Until
+    // the animation has covered the screen once, the rows an interlaced frame
+    // skips still hold the previous screen's pixels.
+    uint32_t warmupFrames = 0;
     std::atomic<bool> halfRes{false}; // render at 240x240 and double on the way out
     uint32_t frameWaitUs = 0;   // this frame's total block on the push task, drives cropEnabled
     void *pushHandle = nullptr;
