@@ -383,12 +383,14 @@ void DefaultUI::maintainSleepAnimation() {
     // have supplied it. Requiring MODE_STANDBY unconditionally is what left the
     // standby screen blank behind "Waiting for controller...".
     const bool standbyMode = !connected || controller->getMode() == MODE_STANDBY;
-    // `initialized` is explicit here now. It used to be implied by `connected`:
-    // a live BLE link meant the UI had long since come up. Without that term
-    // this predicate is reachable during startup, and startSleepAnimation needs
-    // a live screen to host the overlay snapshot.
-    const bool sleepWant = initialized && currentScreen == SCREEN_ID_STANDBY_SCREEN && standbyMode && !blocked;
-    const bool wantAnimation = bgAnimAllScreens ? (initialized && !blocked) : sleepWant;
+    // Not `initialized`, which despite the name only becomes true once a
+    // controller has connected -- testing it here is what kept the standby
+    // screen blank behind "Waiting for controller...". What the animation
+    // actually needs is a built UI and a finished power-up fade, since it
+    // suppresses the LVGL flushes the fade is made of.
+    const bool uiReady = uiBuiltAt != 0 && ::millis() - uiBuiltAt >= STARTUP_FADE_MS;
+    const bool sleepWant = uiReady && currentScreen == SCREEN_ID_STANDBY_SCREEN && standbyMode && !blocked;
+    const bool wantAnimation = bgAnimAllScreens ? (uiReady && !blocked) : sleepWant;
 
 #ifdef GM_ANIM_BENCH
     {
@@ -534,6 +536,7 @@ void DefaultUI::setupPanel() {
     // Set initial brightness based on settings
     const ::Settings &settings = controller->getSettings();
     setBrightness(settings.getMainBrightness());
+    uiBuiltAt = ::millis();
 }
 
 void DefaultUI::setupState() {

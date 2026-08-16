@@ -100,6 +100,11 @@ class DefaultUI {
     lv_area_t overlayDirty[2] = {{1, 1, 0, 0}, {1, 1, 0, 0}};
     bool overlayValid[2] = {false, false};
     bool bgAnimAllScreens = false;         // settings.isBgAnimAllScreens(), cached per render
+    // millis() when setupPanel() finished building the UI, or 0 before that.
+    // The animation needs a live screen to host its overlay snapshot, so it
+    // cannot start earlier. `initialized` cannot serve this purpose: it is set
+    // only when a controller connects, which is a different thing entirely.
+    unsigned long uiBuiltAt = 0;
     lv_obj_t *animHostScreen = nullptr;    // screen whose bg was made transparent for the animation
     bool animPlatesCleared = false;
     lv_opa_t animPlateOpa[6] = {LV_OPA_COVER, LV_OPA_COVER, LV_OPA_COVER,
