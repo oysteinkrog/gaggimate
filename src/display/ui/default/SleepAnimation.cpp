@@ -143,7 +143,7 @@ void SleepAnimation::start(Display *d) {
     // Until the animation has covered the screen once, the rows an interlaced
     // frame skips still hold the previous screen's pixels, so the first frames
     // go out whole.
-    warmupFrames = 3;
+    warmupFrames.store(3);
     const int w = display->width();
     const int h = display->height();
     for (int i = 0; i < NUM_SLOTS; i++) {
@@ -529,7 +529,7 @@ uint8_t *SleepAnimation::overlayBackBuffer() {
     return overlays[back].buf;
 }
 
-void SleepAnimation::publishOverlay(int w, int h) {
+void SleepAnimation::publishOverlay(int w, int h, int rowY0, int rowY1) {
     if (overlayCap == 0 || display == nullptr) {
         return;
     }
@@ -547,7 +547,13 @@ void SleepAnimation::publishOverlay(int w, int h) {
     const int yoff = (h - panelH) / 2;
     // Span scan: one pass over the alpha channel (~230 KB) per refresh, on the
     // UI task. The render task then touches only rows/pixels that matter.
-    for (int y = 0; y < panelH; y++) {
+    if (rowY0 < 0) {
+        rowY0 = 0;
+    }
+    if (rowY1 > panelH) {
+        rowY1 = panelH;
+    }
+    for (int y = rowY0; y < rowY1; y++) {
         int16_t mn = -1;
         int16_t mx = -1;
         uint32_t blocks = 0;
@@ -597,8 +603,9 @@ void SleepAnimation::renderLoop() {
         // Once per frame, not once per band: every band of a frame must push
         // the same parity or the two halves of the picture drift apart.
         frameParity++;
-        if (warmupFrames > 0) {
-            warmupFrames--;
+        const uint32_t warm = warmupFrames.load();
+        if (warm > 0) {
+            warmupFrames.store(warm - 1);
         }
         fpsFrames++;
 #ifdef GM_ANIM_BENCH
@@ -829,7 +836,7 @@ void SleepAnimation::renderFrame() {
         // band today, so this is a guard rather than a live case.
         const bool oddBand = (rows & 1) != 0;
         const bool bandInterlaced = interlace.load() && !(dmaActive && dmaMode.load() != 0) &&
-                                    warmupFrames == 0 && !(half && oddBand);
+                                    warmupFrames.load() == 0 && !(half && oddBand);
         const int parityNow = static_cast<int>(frameParity & 1u);
         // At half resolution the unit is a row pair, one source row expanded;
         // anywhere else it is a single row.

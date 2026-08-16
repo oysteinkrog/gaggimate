@@ -19,7 +19,9 @@ class SleepAnimation {
     void setInterlace(bool) {}
     uint8_t *overlayBackBuffer() { return nullptr; }
     uint32_t overlayCapacity() const { return 0; }
-    void publishOverlay(int, int) {}
+    void publishOverlay(int, int, int, int) {}
+    int overlayBackIndex() const { return 0; }
+    void requestWholeFrames() {}
 };
 #else
 
@@ -91,7 +93,20 @@ class SleepAnimation {
     uint32_t overlayCapacity() const { return overlayCap; }
     // w/h: the snapshot's actual pixel size (may exceed the panel by the
     // object's ext draw size on each side; the blend centers it).
-    void publishOverlay(int w, int h);
+    // rowY0/rowY1 bound the PANEL rows whose alpha changed; only those get
+    // their spans rescanned. Pass the full height after a full snapshot.
+    void publishOverlay(int w, int h, int rowY0, int rowY1);
+    // Which of the two overlay buffers overlayBackBuffer() hands out. The
+    // caller needs it to know how much of that particular buffer is stale,
+    // since the two are written alternately and a partial update is only valid
+    // against what that buffer already holds.
+    int overlayBackIndex() const { return (overlayFront.load() + 1) & 1; }
+    // Push whole bands for the next couple of frames rather than interlacing.
+    // Interlacing splits a change across two frames, which is invisible on the
+    // animation (it moves smoothly and has no hard edges) but very visible on
+    // UI widgets, which change in discrete steps and are full of them. So the
+    // rule is: interlace the animation, never interlace a widget update.
+    void requestWholeFrames() { warmupFrames.store(2); }
 
 #ifdef GM_ANIM_BENCH
     // Bench build only. The render task walks the whole registry, dwelling on
@@ -239,7 +254,7 @@ class SleepAnimation {
     // Frames after a start that push whole bands regardless of parity. Until
     // the animation has covered the screen once, the rows an interlaced frame
     // skips still hold the previous screen's pixels.
-    uint32_t warmupFrames = 0;
+    std::atomic<uint32_t> warmupFrames{0};
     // Render at 240x240 and double on the way out. On this panel 40+ fps and
     // full resolution are mutually exclusive: full res reaches 40 on only 5 of
     // the 13 animations (nebula 15.1, mandala 16.6, silk 18.0), half res on all

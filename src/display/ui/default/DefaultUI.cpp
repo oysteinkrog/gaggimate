@@ -40,6 +40,31 @@ static EffectManager effect_mgr;
 
 static constexpr uint32_t STARTUP_FADE_MS = 1000; // standby fade-in duration on power-up
 
+namespace {
+inline bool areaEmpty(const lv_area_t &a) { return a.x1 > a.x2 || a.y1 > a.y2; }
+inline void areaClear(lv_area_t &a) {
+    a.x1 = 1;
+    a.y1 = 1;
+    a.x2 = 0;
+    a.y2 = 0;
+}
+inline void areaMerge(lv_area_t &dst, const lv_area_t &src) {
+    if (areaEmpty(dst)) {
+        dst = src;
+        return;
+    }
+    if (src.x1 < dst.x1)
+        dst.x1 = src.x1;
+    if (src.y1 < dst.y1)
+        dst.y1 = src.y1;
+    if (src.x2 > dst.x2)
+        dst.x2 = src.x2;
+    if (src.y2 > dst.y2)
+        dst.y2 = src.y2;
+}
+} // namespace
+
+
 static constexpr int32_t GAUGE_TICK_LONG = 25;      // meter tick length on most screens
 static constexpr int32_t GAUGE_TICK_SHORT = 10;     // shortened tick length on profile / new-menu screens
 static constexpr uint32_t GAUGE_TICK_ANIM_MS = 300; // tick length transition duration
@@ -387,7 +412,7 @@ void DefaultUI::maintainSleepAnimation() {
             // Standby content changes once a minute (clock); active screens
             // update continuously — refresh the snapshot faster there so
             // gauges and numbers stay reasonably live behind the animation.
-            const unsigned long interval = currentScreen == SCREEN_ID_STANDBY_SCREEN ? 1000 : 250;
+            const unsigned long interval = currentScreen == SCREEN_ID_STANDBY_SCREEN ? 1000 : 33;
             if (::millis() - lastSleepOverlayRefresh > interval) {
                 refreshSleepOverlay();
             }
@@ -617,6 +642,9 @@ void DefaultUI::startSleepAnimation() {
     // Widget updates must not race the plasma on the panel: LVGL keeps
     // rendering to its draw buffer, but flushes are dropped until stop.
     lvgl_helper_suppress_flush(true);
+    overlayValid[0] = overlayValid[1] = false;
+    areaClear(overlayDirty[0]);
+    areaClear(overlayDirty[1]);
     refreshSleepOverlay();
 #endif
 }
@@ -643,28 +671,149 @@ void DefaultUI::stopSleepAnimation() {
 // Renders the host screen's widgets into the animation's back overlay buffer
 // via an offscreen LVGL snapshot (RGB565+A8), then publishes it for the
 // render task to alpha-blend into every animation frame.
+// Modelled on lv_snapshot_take_to_buf (lvgl/src/extra/others/snapshot), with
+// one difference that is the entire point: buf_area stays the full snapshot
+// rectangle, so the buffer keeps its geometry and stride, while clip_area is
+// narrowed to the region that changed. LVGL then draws only that region, into
+// its correct place in the existing buffer.
+//
+// The upstream function also memsets the whole buffer first. Here only the clip
+// rectangle is cleared, because everything outside it is still valid from an
+// earlier pass. Clearing it at all matters: alpha has to go back to zero where
+// a widget shrank or moved away, or it would leave a trail.
+bool DefaultUI::snapshotAreaToOverlay(lv_obj_t *obj, uint8_t *buf, uint32_t bufSize, const lv_area_t &clip, int *outW,
+                                      int *outH) {
+#ifndef GAGGIMATE_SIM
+    const uint32_t needed = lv_snapshot_buf_size_needed(obj, LV_IMG_CF_TRUE_COLOR_ALPHA);
+    if (needed == 0 || needed > bufSize) {
+        return false;
+    }
+    const lv_coord_t ext = _lv_obj_get_ext_draw_size(obj);
+    lv_area_t snapshotArea;
+    lv_obj_get_coords(obj, &snapshotArea);
+    lv_area_increase(&snapshotArea, ext, ext);
+
+    const int w = lv_obj_get_width(obj) + ext * 2;
+    const int h = lv_obj_get_height(obj) + ext * 2;
+
+    lv_area_t clipped = clip;
+    if (clipped.x1 < snapshotArea.x1)
+        clipped.x1 = snapshotArea.x1;
+    if (clipped.y1 < snapshotArea.y1)
+        clipped.y1 = snapshotArea.y1;
+    if (clipped.x2 > snapshotArea.x2)
+        clipped.x2 = snapshotArea.x2;
+    if (clipped.y2 > snapshotArea.y2)
+        clipped.y2 = snapshotArea.y2;
+    if (areaEmpty(clipped)) {
+        return false;
+    }
+
+    // Reset alpha (and colour) across the region about to be redrawn.
+    const int rowBytes = (clipped.x2 - clipped.x1 + 1) * 3;
+    for (int y = clipped.y1; y <= clipped.y2; y++) {
+        uint8_t *row = buf + (static_cast<size_t>(y - snapshotArea.y1) * w + (clipped.x1 - snapshotArea.x1)) * 3;
+        memset(row, 0, rowBytes);
+    }
+
+    lv_disp_t *objDisp = lv_obj_get_disp(obj);
+    lv_disp_drv_t driver;
+    lv_disp_drv_init(&driver);
+    driver.hor_res = lv_disp_get_hor_res(objDisp);
+    driver.ver_res = lv_disp_get_hor_res(objDisp);
+    lv_disp_drv_use_generic_set_px_cb(&driver, LV_IMG_CF_TRUE_COLOR_ALPHA);
+
+    lv_disp_t fakeDisp;
+    lv_memset_00(&fakeDisp, sizeof(lv_disp_t));
+    fakeDisp.driver = &driver;
+
+    lv_draw_ctx_t *drawCtx = static_cast<lv_draw_ctx_t *>(lv_mem_alloc(objDisp->driver->draw_ctx_size));
+    if (drawCtx == nullptr) {
+        return false;
+    }
+    objDisp->driver->draw_ctx_init(fakeDisp.driver, drawCtx);
+    fakeDisp.driver->draw_ctx = drawCtx;
+    drawCtx->clip_area = &clipped;      // only this is redrawn
+    drawCtx->buf_area = &snapshotArea;  // buffer keeps full geometry and stride
+    drawCtx->buf = static_cast<void *>(buf);
+    driver.draw_ctx = drawCtx;
+
+    lv_disp_t *refrOri = _lv_refr_get_disp_refreshing();
+    _lv_refr_set_disp_refreshing(&fakeDisp);
+    lv_obj_redraw(drawCtx, obj);
+    _lv_refr_set_disp_refreshing(refrOri);
+
+    objDisp->driver->draw_ctx_deinit(fakeDisp.driver, drawCtx);
+    lv_mem_free(drawCtx);
+
+    if (outW != nullptr)
+        *outW = w;
+    if (outH != nullptr)
+        *outH = h;
+    return true;
+#else
+    return false;
+#endif
+}
+
 void DefaultUI::refreshSleepOverlay() {
 #ifndef GAGGIMATE_SIM
     lv_obj_t *scr = animHostScreen;
-    // nullptr also covers "render task is mid-frame in the back overlay" —
-    // don't stamp the refresh time, so the next UI pass retries immediately.
+    if (scr == nullptr) {
+        return;
+    }
+    // Collect what LVGL redrew since the last pass FIRST, and owe it to both
+    // buffers. Doing this before any early return is what makes the retry paths
+    // below safe: a refresh that cannot proceed loses nothing.
+    lv_area_t fresh;
+    if (lvgl_helper_take_dirty(&fresh)) {
+        areaMerge(overlayDirty[0], fresh);
+        areaMerge(overlayDirty[1], fresh);
+    }
+
+    // nullptr means the render task is still reading that buffer; retry next
+    // pass without stamping the refresh time.
     uint8_t *buf = sleepAnimation.overlayBackBuffer();
-    if (scr == nullptr || buf == nullptr) {
+    if (buf == nullptr) {
         return;
     }
+    const int back = sleepAnimation.overlayBackIndex();
+
+    // Nothing moved and this buffer is already complete: the whole refresh
+    // costs one comparison. This is the case that gives touch its time back on
+    // a screen that is merely sitting there.
+    if (overlayValid[back] && areaEmpty(overlayDirty[back])) {
+        return;
+    }
+
+    lv_area_t clip;
+    if (overlayValid[back]) {
+        clip = overlayDirty[back];
+    } else {
+        // First use of this buffer: it holds nothing, so a partial draw would
+        // composite against garbage. Take the whole screen once.
+        lv_obj_get_coords(scr, &clip);
+        const lv_coord_t ext = _lv_obj_get_ext_draw_size(scr);
+        lv_area_increase(&clip, ext, ext);
+    }
+
     lastSleepOverlayRefresh = ::millis();
-    const uint32_t needed = lv_snapshot_buf_size_needed(scr, LV_IMG_CF_TRUE_COLOR_ALPHA);
-    if (needed == 0 || needed > sleepAnimation.overlayCapacity()) {
-        log_w("Sleep overlay snapshot needs %u B, capacity %u B — skipping", static_cast<unsigned>(needed),
-              static_cast<unsigned>(sleepAnimation.overlayCapacity()));
-        return;
-    }
-    lv_img_dsc_t dsc;
-    if (lv_snapshot_take_to_buf(scr, LV_IMG_CF_TRUE_COLOR_ALPHA, &dsc, buf, needed) != LV_RES_OK) {
+    int w = 0, h = 0;
+    if (!snapshotAreaToOverlay(scr, buf, sleepAnimation.overlayCapacity(), clip, &w, &h)) {
         log_w("Sleep overlay snapshot failed");
         return;
     }
-    sleepAnimation.publishOverlay(dsc.header.w, dsc.header.h);
+
+    // Only the rows that changed need their alpha spans recomputed. The clip is
+    // in screen coordinates and the host object is the screen, so screen row
+    // and panel row are the same number.
+    sleepAnimation.publishOverlay(w, h, clip.y1, clip.y2 + 1);
+    overlayValid[back] = true;
+    areaClear(overlayDirty[back]);
+    // A widget just changed. Do not let interlacing split that change across
+    // two frames; on hard-edged UI content the half-updated frame is plainly
+    // visible, where on the animation it is not.
+    sleepAnimation.requestWholeFrames();
 #endif
 }
 

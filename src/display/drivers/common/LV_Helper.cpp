@@ -21,7 +21,33 @@ static lv_color_t *buf1 = NULL;
 
 static volatile bool s_suppressFlush = false;
 
-void lvgl_helper_suppress_flush(bool suppress) { s_suppressFlush = suppress; }
+// Accumulated invalid region while suppressed. x1 > x2 encodes "empty".
+static lv_area_t s_dirty = {1, 1, 0, 0};
+
+static inline void dirtyReset() {
+    s_dirty.x1 = 1;
+    s_dirty.y1 = 1;
+    s_dirty.x2 = 0;
+    s_dirty.y2 = 0;
+}
+
+static inline bool dirtyEmpty() { return s_dirty.x1 > s_dirty.x2 || s_dirty.y1 > s_dirty.y2; }
+
+void lvgl_helper_suppress_flush(bool suppress) {
+    s_suppressFlush = suppress;
+    // Whatever accumulated across a transition describes the other mode's
+    // ownership of the panel and must not be carried over.
+    dirtyReset();
+}
+
+bool lvgl_helper_take_dirty(lv_area_t *out) {
+    if (out == nullptr || dirtyEmpty()) {
+        return false;
+    }
+    *out = s_dirty;
+    dirtyReset();
+    return true;
+}
 
 /* Display flushing */
 static void disp_flush(lv_disp_drv_t *disp_drv, const lv_area_t *area, lv_color_t *color_p) {
@@ -29,6 +55,20 @@ static void disp_flush(lv_disp_drv_t *disp_drv, const lv_area_t *area, lv_color_
         // Sleep animation owns the panel; keep LVGL rendering into the draw
         // buffer (so the content is current when flushing resumes) but don't
         // push — a flushed rect would flicker against the next plasma frame.
+        // Record what was redrawn so the overlay can refresh just that much
+        // instead of re-rendering the whole screen on a timer.
+        if (dirtyEmpty()) {
+            s_dirty = *area;
+        } else {
+            if (area->x1 < s_dirty.x1)
+                s_dirty.x1 = area->x1;
+            if (area->y1 < s_dirty.y1)
+                s_dirty.y1 = area->y1;
+            if (area->x2 > s_dirty.x2)
+                s_dirty.x2 = area->x2;
+            if (area->y2 > s_dirty.y2)
+                s_dirty.y2 = area->y2;
+        }
         lv_disp_flush_ready(disp_drv);
         return;
     }
