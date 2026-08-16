@@ -906,6 +906,8 @@ void DefaultUI::updateState() {
     bg_parse_params(settings.getBgAnimParams().c_str(), animId, animP);
     sleepAnimation.configure(static_cast<uint8_t>(animId), animP);
     sleepAnimation.setMaxFps(static_cast<uint8_t>(settings.getBgAnimFps()));
+    sleepAnimation.setHalfRes(settings.getBgAnimHalfRes() != 0);
+    sleepAnimation.setInterlace(settings.getBgAnimInterlace() != 0);
     // Panel refresh rate: live pclk divider (0 = build default). One register
     // poke, but only touch the peripheral on an actual change.
     static int lastPclkDiv = INT_MIN;
