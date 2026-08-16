@@ -14,7 +14,7 @@
  * client controller, including the low-duty passive scan tuned for Wi-Fi
  * coexistence.
  */
-class BleClientTransport : public Transport, public NimBLEAdvertisedDeviceCallbacks, public NimBLEClientCallbacks {
+class BleClientTransport : public Transport, public NimBLEScanCallbacks, public NimBLEClientCallbacks {
   public:
     BleClientTransport() = default;
 
@@ -48,11 +48,13 @@ class BleClientTransport : public Transport, public NimBLEAdvertisedDeviceCallba
     NimBLEScan *_scanner = nullptr;
     // Copy of the controller's address taken in onResult(). We must NOT keep the
     // NimBLEAdvertisedDevice* itself: with setMaxResults(0) NimBLE deletes that
-    // object the moment onResult() returns (NimBLEScan erase()), so dereferencing
-    // it later in connectToServer() -- which runs on the main loop task -- is a
-    // use-after-free that reads whatever string now occupies the freed heap slot
-    // back as a bogus peer address. NimBLEAddress is a value type, so copying it
-    // while the device is still alive is safe and survives the deletion.
+    // object out from under us -- both when onResult() returns (NimBLEScan erase())
+    // and, crucially, the instant we call _scanner->stop() inside the callback
+    // (stop() -> clearResults() -> delete). So the value copy must be taken BEFORE
+    // stop(); dereferencing the device after that -- or later in connectToServer()
+    // on the loop task -- is a use-after-free that reads whatever now occupies the
+    // freed heap slot back as a bogus peer address. NimBLEAddress is a value type,
+    // so the copy survives the deletion.
     NimBLEAddress _serverAddress{};
     bool _haveServerAddress = false;
     NimBLERemoteCharacteristic *_writeChar = nullptr;  // to server (RX_CHAR_UUID)
@@ -72,8 +74,8 @@ class BleClientTransport : public Transport, public NimBLEAdvertisedDeviceCallba
     static constexpr uint16_t CONN_LATENCY = 0;
     static constexpr uint16_t CONN_TIMEOUT = 400; // 4 s
 
-    void onResult(NimBLEAdvertisedDevice *advertisedDevice) override;
-    void onDisconnect(NimBLEClient *client) override;
+    void onResult(const NimBLEAdvertisedDevice *advertisedDevice) override;
+    void onDisconnect(NimBLEClient *client, int reason) override;
     void notifyCallback(NimBLERemoteCharacteristic *characteristic, uint8_t *data, size_t length, bool isNotify);
 
     static constexpr const char *LOG_TAG = "BleClientTransport";

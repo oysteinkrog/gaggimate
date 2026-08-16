@@ -45,8 +45,12 @@ CONFIG_BT_CTRL_RUN_IN_FLASH_ONLY=y
 # Must explicitly unset template's default=INFO for Kconfig choice to honour WARN.
 # CONFIG_BT_NIMBLE_LOG_LEVEL_INFO is not set
 CONFIG_BT_NIMBLE_LOG_LEVEL_WARNING=y
-# esp-nimble-cpp C++ wrapper log level. 0=DEBUG 1=INFO 2=WARNING 3=ERROR.
-CONFIG_NIMBLE_CPP_LOG_LEVEL=2
+# esp-nimble-cpp C++ wrapper log level. NIMBLE_CPP_LOG_LEVEL is the derived int
+# of a Kconfig choice, not a settable symbol, so assigning it has no effect --
+# the choice keeps its NONE default and the generated header comes out 0.
+# Select the choice option and unset the default it would otherwise take.
+# CONFIG_NIMBLE_CPP_LOG_LEVEL_NONE is not set
+CONFIG_NIMBLE_CPP_LOG_LEVEL_WARNING=y
 
 # --- mbedTLS ---
 # MBEDTLS_EXTERNAL_MEM_ALLOC lives in sdkconfig.gaggimate.defaults (needs PSRAM).

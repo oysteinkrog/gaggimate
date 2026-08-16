@@ -113,7 +113,11 @@ void BLEScalePlugin::setup(Controller *controller, PluginManager *manager) {
 
 void BLEScalePlugin::loop() {
     if (doConnect && scale == nullptr) {
-        establishConnection();
+        const unsigned long now = millis();
+        if (lastConnectAttempt == 0 || now - lastConnectAttempt >= CONNECT_RETRY_INTERVAL_MS) {
+            lastConnectAttempt = now;
+            establishConnection();
+        }
     }
     if (!active) {
         if (scale != nullptr) {

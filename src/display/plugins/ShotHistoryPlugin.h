@@ -103,7 +103,7 @@ class ShotHistoryPlugin : public Plugin {
     // Async rebuild state
     bool rebuildInProgress = false;
 
-    xTaskHandle taskHandle;
+    TaskHandle_t taskHandle;
     void flushBuffer();
     static void loopTask(void *arg);
 };
