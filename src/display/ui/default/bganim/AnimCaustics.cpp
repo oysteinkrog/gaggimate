@@ -85,7 +85,7 @@ uint32_t g_rowFreqQ[K]; // per-row-unit phase step (y * this), DDS units
 uint32_t g_phaseQ[K];   // phase intercept, DDS units
 uint32_t g_stepQ[K];    // per-pixel (x) phase step, DDS units
 int8_t ditherI[DITHER_N]; // (BAYER4[i]-7.5)*0.5, precomputed once at init
-uint8_t shapeLUT[SHAPE_N];
+uint8_t *shapeLUT = nullptr;
 
 void buildThemePalette() {
     uint8_t baseR[256], baseG[256], baseB[256];
@@ -115,7 +115,10 @@ bool init(int, int) {
     if (rgbLUT == nullptr) {
         rgbLUT = static_cast<uint16_t *>(alloc(DITHER_N * 256 * sizeof(uint16_t)));
     }
-    if (rgbLUT == nullptr) {
+    if (shapeLUT == nullptr) {
+        shapeLUT = static_cast<uint8_t *>(alloc(SHAPE_N));
+    }
+    if (rgbLUT == nullptr || shapeLUT == nullptr) {
         return false;
     }
     for (int i = 0; i < DITHER_N; i++) {
