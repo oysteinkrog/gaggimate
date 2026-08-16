@@ -15,6 +15,8 @@ class SleepAnimation {
     bool isActive() const { return false; }
     void configure(uint8_t, const uint8_t *) {}
     void setMaxFps(uint8_t) {}
+    void setHalfRes(bool) {}
+    void setInterlace(bool) {}
     uint8_t *overlayBackBuffer() { return nullptr; }
     uint32_t overlayCapacity() const { return 0; }
     void publishOverlay(int, int) {}
@@ -56,6 +58,27 @@ class SleepAnimation {
     void setMaxFps(uint8_t) {}
 #else
     void setMaxFps(uint8_t fps) { maxFps.store(fps); }
+#endif
+
+    // Render at 240x240 and double on the way out. The panel cannot do full
+    // resolution and 40 fps at once: full res clears 40 on 5 of the 13
+    // animations, half res on all 13. Read once per frame, so a live change
+    // never splits a frame between the two.
+    //
+    // Interlacing pushes every other row pair and alternates each frame,
+    // halving both the bytes and the driver's whole-scanline writeback. Render
+    // halving follows it rather than being separately settable: the rows it
+    // skips are exactly the rows interlacing was already not going to push, so
+    // it changes what the frame COSTS and not what it SHOWS.
+#ifdef GM_ANIM_BENCH
+    void setHalfRes(bool) {}
+    void setInterlace(bool) {}
+#else
+    void setHalfRes(bool on) { halfRes.store(on); }
+    void setInterlace(bool on) {
+        interlace.store(on);
+        renderHalf.store(on);
+    }
 #endif
 
     // Overlay: an LV_IMG_CF_TRUE_COLOR_ALPHA (RGB565 + A8, 3 B/px) snapshot of

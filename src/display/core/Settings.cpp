@@ -159,6 +159,8 @@ void Settings::setBgAnimParams(const String &bg_anim_params) { bgAnimParams.set(
 void Settings::setBgAnimAllScreens(bool bg_anim_all_screens) { bgAnimAllScreens.set(bg_anim_all_screens); }
 void Settings::setBgAnimTheme(int bg_anim_theme) { bgAnimTheme.set(bg_anim_theme); }
 void Settings::setBgAnimFps(int bg_anim_fps) { bgAnimFps.set(bg_anim_fps); }
+void Settings::setBgAnimHalfRes(int bg_anim_half_res) { bgAnimHalfRes.set(bg_anim_half_res); }
+void Settings::setBgAnimInterlace(int bg_anim_interlace) { bgAnimInterlace.set(bg_anim_interlace); }
 void Settings::setPanelClockDiv(int panel_clock_div) { panelClockDiv.set(panel_clock_div); }
 void Settings::setBgAnimCustomTheme(const String &bg_anim_custom_theme) { bgAnimCustomTheme.set(bg_anim_custom_theme); }
 

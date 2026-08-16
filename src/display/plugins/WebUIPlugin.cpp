@@ -1276,6 +1276,13 @@ void WebUIPlugin::handleSettings(AsyncWebServerRequest *request) const {
                 settings->setBgAnimTheme(request->arg("bgAnimTheme").toInt());
             if (request->hasArg("bgAnimFps"))
                 settings->setBgAnimFps(request->arg("bgAnimFps").toInt());
+            // Guarded on hasArg rather than read as a checkbox: a checkbox that
+            // is off is simply not posted, so a partial submit would read as
+            // "full resolution, no interlacing" and drop the panel to ~15 fps.
+            if (request->hasArg("bgAnimHalfRes"))
+                settings->setBgAnimHalfRes(request->arg("bgAnimHalfRes").toInt() != 0 ? 1 : 0);
+            if (request->hasArg("bgAnimInterlace"))
+                settings->setBgAnimInterlace(request->arg("bgAnimInterlace").toInt() != 0 ? 1 : 0);
             if (request->hasArg("panelClockDiv")) {
                 // 0 = firmware default; explicit dividers outside the sane
                 // 4-12 window (6.7-20 MHz pclk) could leave the panel
@@ -1442,6 +1449,8 @@ void WebUIPlugin::handleSettings(AsyncWebServerRequest *request) const {
     doc["bgAnimAllScreens"] = settings.isBgAnimAllScreens();
     doc["bgAnimTheme"] = settings.getBgAnimTheme();
     doc["bgAnimFps"] = settings.getBgAnimFps();
+    doc["bgAnimHalfRes"] = settings.getBgAnimHalfRes();
+    doc["bgAnimInterlace"] = settings.getBgAnimInterlace();
     doc["panelClockDiv"] = settings.getPanelClockDiv();
     doc["bgAnimCustomTheme"] = settings.getBgAnimCustomTheme();
     doc["smartGrindIp"] = settings.getSmartGrindIp();
