@@ -610,7 +610,19 @@ void WebUIPlugin::setupServer() {
         gate["lut_sram_b"] = static_cast<uint32_t>(bganim::g_allocSram);
         gate["lut_psram_b"] = static_cast<uint32_t>(bganim::g_allocPsram);
         gate["sram_limit"] = static_cast<uint32_t>(bganim::SRAM_ALLOC_LIMIT);
+        gate["sram_budget"] = static_cast<uint32_t>(bganim::SRAM_TOTAL_BUDGET);
         gate["free_internal_b"] = static_cast<uint32_t>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+        // Largest contiguous block, not just the total. These diverge under
+        // fragmentation, and the network stack needs whole blocks: lwIP drops
+        // an incoming SYN silently when tcp_alloc() fails, so a fragmented pool
+        // shows up as HTTP connect timeouts with ICMP still answering, which
+        // reads as a wedged board rather than as memory pressure. Watching the
+        // two figures together is what distinguishes exhaustion from
+        // fragmentation.
+        gate["largest_internal_b"] =
+            static_cast<uint32_t>(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+        gate["min_free_internal_b"] =
+            static_cast<uint32_t>(heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL));
         SleepAnimation *anim = sleep_animation_bench_instance();
         if (anim == nullptr) {
             doc["running"] = false;

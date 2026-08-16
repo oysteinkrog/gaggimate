@@ -35,6 +35,21 @@ BGANIM_INLINE int16_t sin1024(uint32_t idx) { return sinLut()[idx & (SIN_N - 1)]
 #endif
 constexpr size_t SRAM_ALLOC_LIMIT = GM_BGANIM_SRAM_LIMIT;
 
+// Ceiling on the TOTAL internal SRAM alloc() will ever hand out, across every
+// animation, for the life of the boot. The per-allocation limit above bounds
+// one table; this bounds the sum, which is what actually ran the pool dry --
+// the tables are never freed, so switching through the fleet accumulated 53 KB
+// and took the network stack down with it (see the analysis in alloc()).
+//
+// 24 KB is chosen against what the fleet actually asks for: the four heaviest
+// animations are all inside it individually, so whichever one is running keeps
+// its tables in SRAM, and the pool keeps roughly 30 KB of the headroom that
+// WiFi, BLE and TLS allocate from at runtime.
+#ifndef GM_BGANIM_SRAM_BUDGET
+#define GM_BGANIM_SRAM_BUDGET (24 * 1024)
+#endif
+constexpr size_t SRAM_TOTAL_BUDGET = GM_BGANIM_SRAM_BUDGET;
+
 // Bytes alloc() has handed out from each pool since boot, so a bench run can
 // tell whether an animation's tables actually landed where the policy above
 // intends. Not synchronised: written on the render task at init, read over
