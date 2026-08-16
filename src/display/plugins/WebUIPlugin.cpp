@@ -372,6 +372,30 @@ void WebUIPlugin::setupServer() {
     server.on("/success.txt", [](AsyncWebServerRequest *request) { request->send(200); }); // firefox captive portal call home
     server.on("/ncsi.txt", [](AsyncWebServerRequest *request) { request->redirect(LOCAL_URL); }); // windows call home
     server.on("/api/settings", [this](AsyncWebServerRequest *request) { handleSettings(request); });
+    // Headroom in the pool that actually runs out. Internal DRAM is the
+    // scarce one: ESPAsyncWebServer stages every response through a
+    // 2,872-byte buffer (ASYNC_RESPONCE_BUFF_SIZE, CONFIG_LWIP_TCP_MSS * 2)
+    // that it allocates and frees per send round, and with
+    // CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL at 4096 that allocation can never
+    // spill to PSRAM. When it fails, write_send_buffs() just breaks: no error,
+    // no RST, the response simply stalls forever.
+    //
+    // int_min is the one to watch -- the low-water mark since boot, which is
+    // what says how close the pool actually came to empty, rather than where it
+    // happens to sit when polled. Built with a fixed stack buffer so the
+    // endpoint still answers when the heap is too tight for a response stream.
+    // Exposes no configuration and no secrets.
+    server.on("/api/debug/heap", [](AsyncWebServerRequest *request) {
+        char buf[224];
+        snprintf(buf, sizeof(buf),
+                 "{\"int_free\":%u,\"int_largest\":%u,\"int_min\":%u,\"psram_free\":%u,\"psram_largest\":%u}",
+                 static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL)),
+                 static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL)),
+                 static_cast<unsigned>(heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL)),
+                 static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_SPIRAM)),
+                 static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM)));
+        request->send(200, "application/json", buf);
+    });
     server.on("/api/status", [this](AsyncWebServerRequest *request) {
         AsyncResponseStream *response = request->beginResponseStream("application/json");
         JsonDocument doc(&psramAllocator);
