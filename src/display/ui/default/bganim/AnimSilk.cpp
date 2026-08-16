@@ -167,7 +167,9 @@ struct RowAux {
 RowAux *rowAux[4] = {nullptr, nullptr, nullptr, nullptr};
 uint32_t lastThemeGen = 0xFFFFFFFF;
 int lastGlow = -1;
-int allocW = 0; // width the rowAux phases were sized for
+int rowAuxW[4] = {0, 0, 0, 0}; // width each rowAux phase was sized for,
+                               // per phase: they are retried independently
+                               // and can differ across init() calls
 float g_invR2 = 1.0f;
 float g_vignK = 0.32f; // 0.32f * g_invR2, folded so band() does one multiply instead of two
 int32_t g_step[3];    // per-pixel x-phase step, Q32 turns/px
@@ -258,7 +260,7 @@ bool init(int w, int h) {
                 continue;
             }
             rowAux[ph] = static_cast<RowAux *>(alloc(w * sizeof(RowAux)));
-            allocW = w;
+            rowAuxW[ph] = w;
             if (rowAux[ph] == nullptr) {
                 continue; // retried on the next init()
             }
@@ -412,11 +414,11 @@ void release() {
     paletteExt = nullptr;
     palette = nullptr;
     for (int ph = 0; ph < 4; ph++) {
-        releaseTable(rowAux[ph], static_cast<size_t>(allocW) * sizeof(RowAux));
+        releaseTable(rowAux[ph], static_cast<size_t>(rowAuxW[ph]) * sizeof(RowAux));
+        rowAuxW[ph] = 0;
     }
     // Borrowed from BgAnimCommon, which owns it and shares it fleet-wide.
     g_sinLut = nullptr;
-    allocW = 0;
     lastThemeGen = 0xFFFFFFFF;
     lastGlow = -1;
 }
