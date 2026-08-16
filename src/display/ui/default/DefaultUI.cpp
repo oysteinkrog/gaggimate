@@ -351,6 +351,14 @@ void DefaultUI::loop() {
         }
     }
 
+    // ui_tick() first: it runs the generated tick_screen_*, which is what derives
+    // widget visibility from flow state. Running it after the maintain calls
+    // meant that on the pass where a screen had just been created, the overlay
+    // snapshot captured HIDDEN flags still at their creation defaults, and the
+    // real values only reached the panel on the following refresh — a widget
+    // visibly settling a frame late, but only the first time a screen was
+    // entered, since after that the flags were already correct.
+    ui_tick();
     // Scale overlay before the animation maintenance: maintainSleepAnimation
     // snapshots the LVGL tree into the panel overlay, so the overlay's
     // show/hide state must be final by then, or the pass that enters the
@@ -359,7 +367,6 @@ void DefaultUI::loop() {
     maintainScaleScreen();
     maintainSleepAnimation();
 
-    ui_tick();
     lv_task_handler();
 }
 
@@ -667,8 +674,13 @@ void DefaultUI::applyAnimPlates(bool clear) {
     if (clear == animPlatesCleared) {
         return;
     }
-    lv_obj_t *const plates[4] = {objects.obj2, objects.obj9, objects.obj15, objects.obj26};
-    for (int i = 0; i < 4; i++) {
+    // The last two are the profile-name labels on the brew and profile screens.
+    // They are not full-bleed panels but they are opaque, and because the text
+    // scrolls (LONG_SCROLL_CIRCULAR) the black bar behind it is in constant
+    // motion against the animation, which makes it the most obvious of the lot.
+    lv_obj_t *const plates[6] = {objects.obj2,   objects.obj9,        objects.obj15,
+                                 objects.obj26,  objects.profile_name, objects.profile_name_1};
+    for (int i = 0; i < 6; i++) {
         if (plates[i] == nullptr) {
             continue;
         }
@@ -797,6 +809,12 @@ void DefaultUI::refreshSleepOverlay() {
     if (scr == nullptr) {
         return;
     }
+    // lv_obj_redraw() below draws objects where the layout says they are, and
+    // it does not run the layout itself — lv_task_handler() does, and that runs
+    // after this. On a freshly created screen the flex containers have not been
+    // laid out yet, so their children still sit at the container origin and the
+    // snapshot catches them stacked. This is a no-op once the layout is valid.
+    lv_obj_update_layout(scr);
     // Collect what LVGL redrew since the last pass FIRST, and owe it to both
     // buffers. Doing this before any early return is what makes the retry paths
     // below safe: a refresh that cannot proceed loses nothing.
@@ -898,8 +916,11 @@ void DefaultUI::maintainScaleScreen() {
 // tick and would undo it. Translating them off-panel instead is tick-proof and
 // fully reversible (the local style prop is simply removed on exit).
 void DefaultUI::displaceGrindWidgets(bool displaced) {
-    lv_obj_t *const widgets[] = {objects.main_label4, objects.grind_start_button, objects.mode_switch1, objects.target_weight,
-                                 objects.target_time};
+    // grind_dials__menu_icon goes with them: the scale overlay draws its own exit
+    // arrow in that slot, and the dials' icon is flow-driven so it cannot simply
+    // be hidden.
+    lv_obj_t *const widgets[] = {objects.main_label4,  objects.grind_start_button, objects.mode_switch1,
+                                 objects.target_weight, objects.target_time,       objects.grind_dials__menu_icon};
     for (lv_obj_t *obj : widgets) {
         if (obj == nullptr) {
             continue;
@@ -987,11 +1008,16 @@ void DefaultUI::buildScaleScreen() {
     lv_obj_set_style_text_color(tareLabel, fg, LV_PART_MAIN);
     lv_obj_center(tareLabel);
 
-    // Exit to the menu: theme-recolored imgbtn in the grind start button's slot.
-    // Up-angle mirrors the swipe-up gesture, which also still works.
+    // Exit to the menu, in the dials widget's menu-icon slot (CENTER + 210) so
+    // it lands where it does on every other screen. The dials' own menu icon is
+    // translated off-panel by displaceGrindWidgets while this screen is up:
+    // both are img_angle_up_40x40 and both leave to the menu, so leaving both
+    // visible drew the arrow twice. This one is kept rather than the dials' one
+    // because it also clears scaleScreenRequested and deactivates the
+    // controller, which the generated handler does not.
     lv_obj_t *exitBtn = lv_imgbtn_create(cover);
     lv_obj_set_size(exitBtn, 40, 40);
-    lv_obj_align(exitBtn, LV_ALIGN_CENTER, 0, 130);
+    lv_obj_align(exitBtn, LV_ALIGN_CENTER, 0, 210);
     lv_imgbtn_set_src(exitBtn, LV_IMGBTN_STATE_RELEASED, nullptr, &img_angle_up_40x40, nullptr);
     lv_obj_set_style_img_recolor(exitBtn, fg, LV_PART_MAIN);
     lv_obj_set_style_img_recolor_opa(exitBtn, LV_OPA_COVER, LV_PART_MAIN);

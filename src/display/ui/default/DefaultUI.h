@@ -102,7 +102,8 @@ class DefaultUI {
     bool bgAnimAllScreens = false;         // settings.isBgAnimAllScreens(), cached per render
     lv_obj_t *animHostScreen = nullptr;    // screen whose bg was made transparent for the animation
     bool animPlatesCleared = false;
-    lv_opa_t animPlateOpa[4] = {LV_OPA_COVER, LV_OPA_COVER, LV_OPA_COVER, LV_OPA_COVER};
+    lv_opa_t animPlateOpa[6] = {LV_OPA_COVER, LV_OPA_COVER, LV_OPA_COVER,
+                                LV_OPA_COVER, LV_OPA_COVER, LV_OPA_COVER};
     std::atomic<bool> panelStopRequested{false};
     std::atomic<bool> panelStopped{false};
     std::atomic<bool> otaEnded{false};
