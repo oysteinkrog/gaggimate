@@ -29,13 +29,18 @@ constexpr unsigned long BENCH_DWELL_MS = 6000;
 #endif
 
 namespace {
-// Rows rendered/pushed per chunk. 8 was tried, to halve the band buffers and
-// free internal SRAM for the animations' tables: push cost is per byte rather
-// than per call, so the extra pushColors calls were indeed free. What was not
-// free is the handoff -- 60 cross-core semaphore round trips per frame instead
-// of 30 cost ~1.3 ms, and plasma fell 43.0 -> 40.6 fps. The SRAM was wanted for
-// an overlay alpha cache that turned out not to pay either, so 16 stands.
-constexpr int BAND_H = 16;
+// Rows rendered/pushed per chunk, and how many of those chunks are in flight.
+// Push cost is per byte rather than per call, so band height does not change
+// what a frame costs to push -- but it does set the handoff count, and 8 rows
+// (60 cross-core semaphore round trips per frame instead of 30) cost ~1.3 ms
+// and dropped plasma 43.0 -> 40.6 fps.
+//
+// 12 rows across three slots is chosen against internal SRAM, which is the
+// binding constraint: 16 rows x 3 slots is 46 KB and would leave under 1 KB
+// free, and internal SRAM is what WiFi/BLE/TLS draw from at runtime. 12 x 3 is
+// 34.5 KB, only 3.8 KB above the old 16 x 2, and leaves ~12 KB. The extra ten
+// handoffs per frame are the price of the third slot.
+constexpr int BAND_H = 12;
 // Headroom for the snapshot's ext draw size (shadows etc. extend the render
 // area past the object on every side).
 constexpr int OVERLAY_EXT_MARGIN = 16;
@@ -124,7 +129,7 @@ void SleepAnimation::start(Display *d) {
     display = d;
     const int w = display->width();
     const int h = display->height();
-    for (int i = 0; i < 2; i++) {
+    for (int i = 0; i < NUM_SLOTS; i++) {
         if (bandBuf[i] == nullptr) {
             bandBuf[i] = static_cast<uint16_t *>(allocPreferInternal(w * BAND_H * sizeof(uint16_t)));
         }
@@ -157,14 +162,15 @@ void SleepAnimation::start(Display *d) {
                     ov.rowBlocks != nullptr;
     }
     bool pipelineOk = true;
-    for (int i = 0; i < 2; i++) {
+    for (int i = 0; i < NUM_SLOTS; i++) {
         pipelineOk = pipelineOk && bandBuf[i] != nullptr && bandReady[i] != nullptr && bandFree[i] != nullptr;
     }
     if (halfBuf == nullptr) {
         pipelineOk = false;
     }
     if (!pipelineOk || !overlayOk) {
-        log_e("SleepAnimation: buffer allocation failed (bandBuf=%p/%p overlayOk=%d)", bandBuf[0], bandBuf[1], overlayOk);
+        log_e("SleepAnimation: buffer allocation failed (bandBuf=%p/%p/%p overlayOk=%d)", bandBuf[0], bandBuf[1],
+              bandBuf[2], overlayOk);
         return;
     }
     // Reset the pipeline: both cursors to slot 0, any signal left over from a
@@ -173,7 +179,7 @@ void SleepAnimation::start(Display *d) {
     // or a cursor left on slot 1 would desynchronise the two tasks and push a
     // band that was never rendered.
     renderSlot = 0;
-    for (int i = 0; i < 2; i++) {
+    for (int i = 0; i < NUM_SLOTS; i++) {
         while (xSemaphoreTake(static_cast<SemaphoreHandle_t>(bandReady[i]), 0) == pdTRUE) {
         }
         while (xSemaphoreTake(static_cast<SemaphoreHandle_t>(bandFree[i]), 0) == pdTRUE) {
@@ -232,7 +238,7 @@ void SleepAnimation::stop() {
     }
     // The push task blocks on bandReady, so it needs a wakeup to observe
     // !running. Give both slots: whichever it is waiting on releases it.
-    for (int i = 0; i < 2; i++) {
+    for (int i = 0; i < NUM_SLOTS; i++) {
         if (bandReady[i] != nullptr) {
             xSemaphoreGive(static_cast<SemaphoreHandle_t>(bandReady[i]));
         }
@@ -318,7 +324,7 @@ void SleepAnimation::pushLoop() {
         accPushUs += static_cast<uint64_t>(esp_timer_get_time() - t0);
 #endif
         xSemaphoreGive(static_cast<SemaphoreHandle_t>(bandFree[slot]));
-        slot ^= 1;
+        slot = (slot + 1) % NUM_SLOTS;
     }
 }
 
@@ -782,7 +788,7 @@ void SleepAnimation::renderFrame() {
         pushJob[renderSlot] = {static_cast<int16_t>(cx0), static_cast<int16_t>(y0), static_cast<int16_t>(cx1),
                          static_cast<int16_t>(y0 + rows)};
         xSemaphoreGive(static_cast<SemaphoreHandle_t>(bandReady[renderSlot]));
-        renderSlot ^= 1;
+        renderSlot = (renderSlot + 1) % NUM_SLOTS;
     }
 }
 

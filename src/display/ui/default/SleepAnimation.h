@@ -146,20 +146,29 @@ class SleepAnimation {
     std::atomic<bool> running{false};
     std::atomic<bool> stopped{true};
 
-    // Two band buffers, so the render task can fill one while the push task
-    // drains the other. band+blend is CPU work touching only internal SRAM;
-    // push is a PSRAM write. They contend for almost nothing, so running them
-    // on separate cores turns frame time from band+blend+push into
-    // max(band+blend, push) plus one band of pipeline latency.
-    uint16_t *bandBuf[2] = {nullptr, nullptr};
-    void *bandReady[2] = {nullptr, nullptr}; // render -> push, slot has data
-    void *bandFree[2] = {nullptr, nullptr};  // push -> render, slot is reusable
+    // Band buffers, so the render task can fill one while the push task drains
+    // another. band+blend is CPU work touching only internal SRAM; push is a
+    // PSRAM write. They contend for almost nothing, so running them on separate
+    // cores turns frame time from band+blend+push into max(band+blend, push)
+    // plus one band of pipeline latency.
+    //
+    // Three, not two. Throughput is max(render, push) either way -- extra
+    // slots buy nothing in steady state -- but band render time is not uniform
+    // across a frame (steam's blobs sit at the bottom, fireflies are sparse at
+    // the top) while push time per band is flat. With only two slots the render
+    // task blocks the moment it runs ahead, so the frame costs the sum of the
+    // per-band maxima rather than the max of the two totals. A third slot
+    // absorbs that variance.
+    static constexpr int NUM_SLOTS = 3;
+    uint16_t *bandBuf[NUM_SLOTS] = {};
+    void *bandReady[NUM_SLOTS] = {}; // render -> push, slot has data
+    void *bandFree[NUM_SLOTS] = {};  // push -> render, slot is reusable
     // The panel rectangle each queued slot covers. pushColors takes end
     // coordinates, not extents.
     struct PushJob {
         int16_t x0, y0, x1, y1;
     };
-    PushJob pushJob[2] = {};
+    PushJob pushJob[NUM_SLOTS] = {};
     int renderSlot = 0; // slot the render task fills next; push task tracks its own
     bool cropEnabled = false;   // crop to the panel's circle only while push is the pacing stage
     std::atomic<bool> halfRes{false}; // render at 240x240 and double on the way out
