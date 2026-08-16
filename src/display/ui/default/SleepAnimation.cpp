@@ -42,7 +42,7 @@ namespace {
 // free, and internal SRAM is what WiFi/BLE/TLS draw from at runtime. 12 x 3 is
 // 34.5 KB, only 3.8 KB above the old 16 x 2, and leaves ~12 KB. The extra ten
 // handoffs per frame are the price of the third slot.
-constexpr int BAND_H = 12;
+constexpr int BAND_H = 8;
 // Headroom for the snapshot's ext draw size (shadows etc. extend the render
 // area past the object on every side).
 constexpr int OVERLAY_EXT_MARGIN = 16;
@@ -174,6 +174,7 @@ void SleepAnimation::start(Display *d) {
     if (halfBuf == nullptr) {
         halfBuf = static_cast<uint16_t *>(allocPreferInternal((w / 2) * (BAND_H / 2) * sizeof(uint16_t)));
     }
+#ifdef GM_ANIM_BENCH
     if (dmaScratch == nullptr) {
         // Diagnostic destination for dmaMode 4 only. PSRAM, 64-byte aligned,
         // band-sized, and read by nothing -- so a transfer into it is
@@ -182,6 +183,7 @@ void SleepAnimation::start(Display *d) {
         dmaScratch = static_cast<uint16_t *>(
             heap_caps_aligned_alloc(64, w * BAND_H * sizeof(uint16_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
     }
+#endif
     computeChords(w, h);
     if (overlayCap == 0) {
         overlayCap = static_cast<uint32_t>(w + 2 * OVERLAY_EXT_MARGIN) * (h + 2 * OVERLAY_EXT_MARGIN) * 3;
@@ -190,9 +192,14 @@ void SleepAnimation::start(Display *d) {
             // tables prefer SRAM. Read a couple times per frame — well within
             // the PSRAM budget that the LVGL composite path blew.
             ov.buf = static_cast<uint8_t *>(ps_malloc(overlayCap));
-            ov.spanMin = static_cast<int16_t *>(allocPreferInternal(h * sizeof(int16_t)));
-            ov.spanMax = static_cast<int16_t *>(allocPreferInternal(h * sizeof(int16_t)));
-            ov.rowBlocks = static_cast<uint32_t *>(allocPreferInternal(h * sizeof(uint32_t)));
+            // PSRAM, not SRAM: these are indexed once per row by the
+            // composite (spanMin[y], spanMax[y], rowBlocks[y]) -- roughly 1,440
+            // reads across a whole frame -- so they are nowhere near a
+            // per-pixel path, and 7,680 B of internal DRAM matters far more to
+            // the network stack than their latency does here.
+            ov.spanMin = static_cast<int16_t *>(ps_malloc(h * sizeof(int16_t)));
+            ov.spanMax = static_cast<int16_t *>(ps_malloc(h * sizeof(int16_t)));
+            ov.rowBlocks = static_cast<uint32_t *>(ps_malloc(h * sizeof(uint32_t)));
         }
     }
     bool overlayOk = true;
