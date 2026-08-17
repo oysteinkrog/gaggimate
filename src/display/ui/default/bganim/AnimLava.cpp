@@ -217,10 +217,27 @@ bool init(int w, int h) {
         lavaLUT = static_cast<int32_t *>(alloc(LUT_SIZE * sizeof(int32_t)));
     }
     if (bgRowAll == nullptr) {
-        // 4 * w * 2 B (3,840 B at w=480) -- under the 8 KB alloc() threshold,
-        // so this lands in internal DRAM alongside paletteLUT/fieldRow, not
-        // PSRAM. New static footprint; see file-top comment for why it's
-        // there and the commit message for the measured device build delta.
+        // 4 * w * 2 B (3,840 B at w=480). Under the 8 KB per-allocation
+        // threshold, so it is not sent to PSRAM on size -- but alloc()'s budget
+        // is CUMULATIVE, and this is the last table lava asks for, which makes
+        // it the one that spills if the budget is short. It lands in internal
+        // DRAM today, and the reason is an invariant held elsewhere: only one
+        // animation's tables are live at a time, because SleepAnimation calls
+        // prev.release() on switch and all 13 animations have a release entry,
+        // and release() refunds g_allocSram from the pool the pointer actually
+        // came from. Live SRAM here is therefore the shared borrowed terms
+        // (sinLut 2,048 B + cosTableF 1,024 B; noiseTex256's 64 KB is over the
+        // limit and in PSRAM) plus lava's own 512 + 1,920 + 3,840, about 9.3 KB
+        // against SRAM_TOTAL_BUDGET's 28,672.
+        //
+        // The margin is thinner than that sounds. Silk asks 22,536 B, so a
+        // silk-then-lava sequence WITHOUT the release in between reaches 24,968
+        // and this request crosses the ceiling by 136 bytes. Adding an animation
+        // that omits release(), or growing any table by ~136 B, therefore
+        // degrades these rows to PSRAM -- read on every row of every band()
+        // call, which is exactly the large-table-with-per-pixel-index pattern
+        // alloc()'s own CAVEAT warns about and that cost aurora 21%. The spill
+        // is silent in the placement path but alloc() now logs the crossing.
         bgRowAll = static_cast<uint16_t *>(alloc(4 * w * sizeof(uint16_t)));
         bgRowAllW = w;
     }

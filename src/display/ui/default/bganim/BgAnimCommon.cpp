@@ -69,13 +69,34 @@ void *alloc(size_t size) {
     // So the budget is cumulative, checked before the request rather than after.
     // The first tables to ask still land in SRAM where the latency matters; once
     // the fleet has taken its share, later tables go to PSRAM instead of eating
-    // the pool the network stack lives in. This is only a ceiling: it does not
-    // reclaim anything, because animations hold their tables in static pointers
-    // and re-initialise only when those are null. Freeing on switch would cap
-    // the peak at max-over-animations instead of sum-over-animations, and is the
-    // right eventual fix; it needs a release entry point on every animation.
+    // the pool the network stack lives in.
+    //
+    // The freeing-on-switch fix this comment used to describe as eventual has
+    // since landed: all 13 animations carry a release entry, SleepAnimation
+    // calls prev.release() when the selection changes, and release() below
+    // refunds the counter for the pool the pointer actually came from. So the
+    // live total is now max-over-animations, not sum-over-animations, and the
+    // 53 KB runaway above cannot recur by simply cycling the fleet. The budget
+    // stays as a backstop, because it still bounds the things release() does
+    // not reclaim -- the shared borrowed terms (sinLut, cosTableF, noiseTex256)
+    // are held by whoever asked first and deliberately never freed -- and
+    // because it is what catches a future animation that forgets its release
+    // entry, which is a silent regression rather than a visible one.
     const bool overBudget = g_allocSram + size > SRAM_TOTAL_BUDGET;
     if (size > SRAM_ALLOC_LIMIT || overBudget) {
+        // Two different situations take this branch and only one is expected.
+        // Over the per-allocation limit is by design: those tables are bulk
+        // sequential sweeps and PSRAM serves them fine, so logging every one
+        // would be noise. Crossing the cumulative budget is NOT expected under
+        // the release invariant above, and it silently relocates a table that
+        // was sized to be latency-sensitive -- which is how a per-row lookup
+        // ends up paying a bus round trip per pixel. Say so, once per crossing,
+        // so it shows up in a device log instead of only as a frame-rate drop.
+        if (overBudget && size <= SRAM_ALLOC_LIMIT) {
+            log_w("bganim: %u B to PSRAM, SRAM budget spent (%u/%u) -- a release() entry is likely missing",
+                  static_cast<unsigned>(size), static_cast<unsigned>(g_allocSram),
+                  static_cast<unsigned>(SRAM_TOTAL_BUDGET));
+        }
         void *big = ps_malloc(size);
         if (big != nullptr) {
             g_allocPsram += size;
