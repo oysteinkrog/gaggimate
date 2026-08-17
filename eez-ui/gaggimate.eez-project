@@ -4198,7 +4198,7 @@
                           "align": "CENTER",
                           "text_align": "CENTER",
                           "text_color": "SemiDark",
-                          "text_opa": 408
+                          "text_opa": 152
                         }
                       }
                     }
@@ -4334,7 +4334,7 @@
                             "DEFAULT": {
                               "align": "CENTER",
                               "bg_color": "SemiDark",
-                              "bg_opa": 408,
+                              "bg_opa": 152,
                               "flex_grow": 10
                             }
                           },
@@ -4433,7 +4433,7 @@
                         "DEFAULT": {
                           "align": "CENTER",
                           "text_color": "SemiDark",
-                          "text_opa": 408,
+                          "text_opa": 152,
                           "text_align": "CENTER",
                           "text_font": "MONTSERRAT_14",
                           "flex_grow": 4
