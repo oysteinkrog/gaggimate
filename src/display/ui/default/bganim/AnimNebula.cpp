@@ -228,6 +228,18 @@ void band(uint16_t *dst, int y0, int rows, int w, uint32_t, const uint8_t *) {
         // -> 0.347, inside the +-4% noise floor. Bit-exactness makes it safe
         // but not free, and nothing available off-device says it pays.
         //
+        // The obvious extension of (2) -- keep the scratch row alive ACROSS
+        // band() calls so the first row of each band reuses the last row of the
+        // previous one -- is not just unprofitable, it is incorrect. The
+        // interlaced half-res path in SleepAnimation.cpp calls band() once per
+        // single source row, with a row count of 1 and a y that skips every
+        // other value (`if (((srcBase + sr) & 1) != parityNow) continue;`
+        // around the `anim.band(halfBuf + sr * rw, srcBase + sr, 1, rw, ...)`
+        // call). So "the previous call's last row" is neither y-1 nor even a
+        // fixed distance from y, and the cached row would be blended against
+        // the wrong noise line. Any reuse has to stay inside one band() call,
+        // where the row sequence is known to be contiguous and ascending.
+        //
         // If nebula needs to go faster, the next measurement to take is on
         // hardware (/api/animbench), not on the host: the host cannot show a
         // PSRAM stall, so it cannot price either of these reorderings. Reduce
