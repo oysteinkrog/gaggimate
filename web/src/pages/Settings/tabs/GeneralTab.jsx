@@ -248,10 +248,10 @@ function BackgroundAnimationSettings({ formData, onChange, setField }) {
             onChange={onChange('panelClockDiv')}
           >
             <option value={0}>Firmware default</option>
-            <option value={5}>61 Hz — smoothest, flickers if starved</option>
-            <option value={6}>51 Hz — stable, slight gradient shimmer</option>
-            <option value={7}>43 Hz — conservative</option>
-            <option value={8}>38 Hz — most conservative</option>
+            <option value={5}>61 Hz, smoothest, flickers if starved</option>
+            <option value={6}>51 Hz, stable, slight gradient shimmer</option>
+            <option value={7}>43 Hz, conservative</option>
+            <option value={8}>38 Hz, most conservative</option>
           </select>
         </SettingsFormField>
         <SettingsFormField label='Animation resolution' htmlFor='bgAnimHalfRes' noMargin>
@@ -294,8 +294,47 @@ function BackgroundAnimationSettings({ formData, onChange, setField }) {
           >
             <option value={1}>Hide, animation fills every screen the same way</option>
             <option value={0}>Keep, solid panel behind the dials on some screens</option>
+            <option value={2}>Custom colour and transparency</option>
           </select>
         </SettingsFormField>
+        {parseInt(formData.bgAnimClearPlates, 10) === 2 && (
+          <>
+            <SettingsFormField label='Panel colour' htmlFor='bgAnimPlateColor' noMargin>
+              <input
+                id='bgAnimPlateColor'
+                name='bgAnimPlateColor'
+                type='color'
+                className='input input-bordered h-12 w-full'
+                value={formData.bgAnimPlateColor || '#000000'}
+                onChange={onChange('bgAnimPlateColor')}
+              />
+            </SettingsFormField>
+            <SettingsFormField
+              label={`Panel opacity (${
+                formData.bgAnimPlateOpacity === undefined
+                  ? 35
+                  : parseInt(formData.bgAnimPlateOpacity, 10)
+              }%)`}
+              htmlFor='bgAnimPlateOpacity'
+              noMargin
+            >
+              <input
+                id='bgAnimPlateOpacity'
+                name='bgAnimPlateOpacity'
+                type='range'
+                min='0'
+                max='100'
+                className='range w-full'
+                value={
+                  formData.bgAnimPlateOpacity === undefined
+                    ? 35
+                    : parseInt(formData.bgAnimPlateOpacity, 10)
+                }
+                onChange={onChange('bgAnimPlateOpacity')}
+              />
+            </SettingsFormField>
+          </>
+        )}
       </div>
       <p className='text-base-content/60 mt-2 text-sm'>
         If the animation flickers or the image jumps, lower the frame rate or the refresh rate:
@@ -308,10 +347,13 @@ function BackgroundAnimationSettings({ formData, onChange, setField }) {
         the rows on each frame, which is not usually noticeable while something is moving.
       </p>
       <p className='text-base-content/60 mt-2 text-sm'>
-        The brew, status and profile screens carry a solid circle behind their dials, and the
-        info screen a solid panel, while the other screens carry none. With the animation
-        running behind every screen that shows up as a black disc on some screens and not
-        others, so by default those panels are hidden while the animation plays.
+        The brew, status and profile screens carry a solid circle behind their dials, the info
+        screen a solid panel, and the brew and grind screens a filled pill behind the scale
+        weight, while the other screens carry none. With the animation running behind every
+        screen those show up as dark shapes on some screens and not others, so by default they
+        are hidden while the animation plays. The pill behind the weight is also the mode
+        switch, so if you want it to still read as a button, pick the custom option and give it
+        a low opacity rather than hiding it outright.
       </p>
       <div className='mt-4'>
         <ToggleField

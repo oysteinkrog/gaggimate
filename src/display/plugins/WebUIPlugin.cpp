@@ -866,6 +866,7 @@ void WebUIPlugin::setupServer() {
         // this. Reporting a derived Hz here would be wrong, so report the
         // divider and let a caller compare relative values across settings.
         gate["pclk_div"] = panelclock::currentDiv();
+        gate["pclk_boot_hz"] = panelclock::bootPclkHz();
         gate["half_res"] = anim0 != nullptr && anim0->benchHalfRes();
         gate["only"] = anim0 != nullptr ? anim0->benchGetOnly() : -1;
         gate["max_fps"] = anim0 != nullptr ? anim0->benchMaxFps() : 0;
@@ -1336,8 +1337,27 @@ void WebUIPlugin::handleSettings(AsyncWebServerRequest *request) const {
                 settings->setBgAnimHalfRes(request->arg("bgAnimHalfRes").toInt() != 0 ? 1 : 0);
             if (request->hasArg("bgAnimInterlace"))
                 settings->setBgAnimInterlace(request->arg("bgAnimInterlace").toInt() != 0 ? 1 : 0);
-            if (request->hasArg("bgAnimClearPlates"))
-                settings->setBgAnimClearPlates(request->arg("bgAnimClearPlates").toInt() != 0 ? 1 : 0);
+            if (request->hasArg("bgAnimClearPlates")) {
+                // 0 keep, 1 hide, 2 custom colour+opacity; anything else is a
+                // stale or hand-made request, so fall back to the default.
+                const int plateMode = request->arg("bgAnimClearPlates").toInt();
+                settings->setBgAnimClearPlates(plateMode >= 0 && plateMode <= 2 ? plateMode : 1);
+            }
+            if (request->hasArg("bgAnimPlateColor")) {
+                // Accepts "#rrggbb" (what <input type=color> submits) as well
+                // as a plain decimal, which is what a scripted client sends.
+                String c = request->arg("bgAnimPlateColor");
+                c.trim();
+                long parsed = 0;
+                if (c.startsWith("#")) {
+                    parsed = strtol(c.c_str() + 1, nullptr, 16);
+                } else {
+                    parsed = strtol(c.c_str(), nullptr, 10);
+                }
+                settings->setBgAnimPlateColor(static_cast<int>(parsed));
+            }
+            if (request->hasArg("bgAnimPlateOpacity"))
+                settings->setBgAnimPlateOpacity(request->arg("bgAnimPlateOpacity").toInt());
             if (request->hasArg("panelClockDiv")) {
                 // 0 = firmware default; explicit dividers outside the sane
                 // 4-12 window (6.7-20 MHz pclk) could leave the panel
@@ -1507,6 +1527,13 @@ void WebUIPlugin::handleSettings(AsyncWebServerRequest *request) const {
     doc["bgAnimHalfRes"] = settings.getBgAnimHalfRes();
     doc["bgAnimInterlace"] = settings.getBgAnimInterlace();
     doc["bgAnimClearPlates"] = settings.getBgAnimClearPlates();
+    {
+        // Emitted as #rrggbb so the form can bind it straight to <input type=color>.
+        char hex[8];
+        snprintf(hex, sizeof(hex), "#%06X", static_cast<unsigned>(settings.getBgAnimPlateColor()) & 0xFFFFFFu);
+        doc["bgAnimPlateColor"] = hex;
+    }
+    doc["bgAnimPlateOpacity"] = settings.getBgAnimPlateOpacity();
     doc["panelClockDiv"] = settings.getPanelClockDiv();
     doc["bgAnimCustomTheme"] = settings.getBgAnimCustomTheme();
     doc["smartGrindIp"] = settings.getSmartGrindIp();
