@@ -1124,6 +1124,19 @@ void DefaultUI::buildScaleScreen() {
             ui->changeScreen(SCREEN_ID_MENU_SCREEN_NEW);
         },
         LV_EVENT_CLICKED, this);
+
+    // The pill above was just built with its designed opaque fill and its plate
+    // capture dropped, so the configured mode has to be re-applied to it. The
+    // maintenance loop does that, but only on its next tick: entering this screen
+    // while the animation is already running would show one frame of the opaque
+    // fill first. Apply it here so the pill is never briefly wrong. Same call the
+    // loop makes, and a no-op when the animation is not running (mode -1 is
+    // re-applied by startSleepAnimation in that case).
+    if (sleepAnimation.isActive()) {
+        const Settings &plateSettings = controller->getSettings();
+        applyAnimPlates(plateSettings.getBgAnimClearPlates(), static_cast<uint32_t>(plateSettings.getBgAnimPlateColor()),
+                        plateSettings.getBgAnimPlateOpacity());
+    }
 }
 
 // Collect every lv_meter under obj (the dial gauges) so their tick length can be animated together.
