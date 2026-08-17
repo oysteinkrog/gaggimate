@@ -31,6 +31,9 @@
 #endif
 #include <display/util/PsramAllocator.h>
 #ifndef GAGGIMATE_HEADLESS
+// Stubbed out on the simulator and on non-S3 targets, so it is safe to include
+// on either side of the split below.
+#include <display/drivers/common/PanelClock.h>
 #ifdef GAGGIMATE_SIM
 #include <SdlDriver.h> // desktop SDL panel stands in for the hardware drivers
 #else
@@ -58,6 +61,10 @@ void Controller::setup() {
     }
 
 #ifndef GAGGIMATE_HEADLESS
+    // Hand the stored panel refresh rate over before the panel exists, so it is
+    // created at the chosen pixel clock instead of being retimed a second later
+    // (and, on ESP-IDF 4.4, instead of never being applied at all).
+    panelclock::setDiv(settings.getPanelClockDiv());
     setupPanel();
 #endif
 

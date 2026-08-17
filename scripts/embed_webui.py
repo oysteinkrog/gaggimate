@@ -77,18 +77,32 @@ def c_escape(text):
     return text.replace("\\", "\\\\").replace('"', '\\"')
 
 
-def write_artifacts(out_dir, entries, blob, blob_path):
+def write_artifacts(out_dir, entries, blob, blob_path, rel_to=None):
     """entries: list of dicts {path, offset, length, content_type, gzip}."""
     os.makedirs(out_dir, exist_ok=True)
 
     with open(os.path.join(out_dir, "web_ui.bin"), "wb") as f:
         f.write(blob)
 
-    # Assembly stub: pull the blob into memory-mapped flash rodata. The absolute
-    # path is fine because this file is regenerated (git-ignored) in whatever
-    # workspace it is compiled in. ``.rodata.embedded`` is matched by the S3
-    # linker's ``.flash.rodata`` (default_rodata_seg / DROM).
-    abs_blob = os.path.abspath(blob_path).replace("\\", "/")
+    # Assembly stub: pull the blob into memory-mapped flash rodata.
+    # ``.rodata.embedded`` is matched by the S3 linker's ``.flash.rodata``
+    # (default_rodata_seg / DROM).
+    #
+    # How the blob is named matters more than it looks. .incbin is resolved by
+    # the assembler against its own working directory, which for both the
+    # PlatformIO and CMake passes is the project root -- not against the
+    # directory holding this .S file. So a path relative to the project root
+    # (--rel-to) works with no include path at all. Neither alternative does: an
+    # absolute path does not survive being written by one toolchain and read by
+    # another, because this repo is generated from WSL (/mnt/c/...) and
+    # assembled by the Windows toolchain (C:\...), and a bare basename needs an
+    # -I that reaches `as` itself, which -I in ASFLAGS does not (gcc hands it to
+    # the preprocessor). Bare basename stays the fallback for callers that pass
+    # no --rel-to; it is then on them to supply the include path.
+    if rel_to:
+        incbin_path = os.path.relpath(blob_path, rel_to).replace("\\", "/")
+    else:
+        incbin_path = os.path.basename(blob_path)
     # SCons hashes this file to decide whether to reassemble, and it cannot see
     # through .incbin to the blob. Without something here that tracks the blob's
     # contents, changing the bundle leaves this file byte-identical, the old
@@ -105,7 +119,7 @@ def write_artifacts(out_dir, entries, blob, blob_path):
     .align 4
     .global gWebUiBlobStart
 gWebUiBlobStart:
-    .incbin "{abs_blob}"
+    .incbin "{incbin_path}"
     .global gWebUiBlobEnd
 gWebUiBlobEnd:
     .align 4
@@ -155,7 +169,7 @@ gWebUiBlobEnd:
         f.write("\n".join(lines))
 
 
-def pack(src_dir, out_dir):
+def pack(src_dir, out_dir, rel_to=None):
     assets = collect_assets(src_dir)
     blob = bytearray()
     entries = []
@@ -176,12 +190,12 @@ def pack(src_dir, out_dir):
     # and the (possibly empty) blob are always well-formed.
     if not blob:
         blob.append(0)
-    write_artifacts(out_dir, entries, bytes(blob), os.path.join(out_dir, "web_ui.bin"))
+    write_artifacts(out_dir, entries, bytes(blob), os.path.join(out_dir, "web_ui.bin"), rel_to)
     return entries
 
 
-def stub(out_dir):
-    write_artifacts(out_dir, [], b"\0", os.path.join(out_dir, "web_ui.bin"))
+def stub(out_dir, rel_to=None):
+    write_artifacts(out_dir, [], b"\0", os.path.join(out_dir, "web_ui.bin"), rel_to)
 
 
 def main(argv):
@@ -189,10 +203,16 @@ def main(argv):
     parser.add_argument("--src", help="Built web bundle (e.g. web/dist), gzipped in place")
     parser.add_argument("--out", required=True, help="Output directory for generated artifacts")
     parser.add_argument("--stub", action="store_true", help="Write an empty placeholder bundle")
+    parser.add_argument(
+        "--rel-to",
+        help="Directory the assembler will run from (the project root). The .incbin path is "
+        "written relative to it; without this the blob is named by basename and the build "
+        "must supply an include path that reaches the assembler.",
+    )
     args = parser.parse_args(argv)
 
     if args.stub or not args.src:
-        stub(args.out)
+        stub(args.out, args.rel_to)
         print("embed_webui: wrote empty stub to %s" % args.out)
         return 0
 
@@ -200,7 +220,7 @@ def main(argv):
         print("embed_webui: source dir %s not found" % args.src, file=sys.stderr)
         return 1
 
-    entries = pack(args.src, args.out)
+    entries = pack(args.src, args.out, args.rel_to)
     total = sum(e["length"] for e in entries)
     print("embed_webui: packed %d assets (%d bytes) into %s" % (len(entries), total, args.out))
     return 0

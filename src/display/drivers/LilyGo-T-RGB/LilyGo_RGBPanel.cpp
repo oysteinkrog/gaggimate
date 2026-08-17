@@ -9,6 +9,7 @@
  */
 #include "LilyGo_RGBPanel.h"
 #include "utilities.h"
+#include <display/drivers/common/PanelClock.h>
 #include <display/drivers/common/RGBPanelInit.h>
 #include <esp32s3/rom/cache.h> // Cache_Invalidate_Addr, for the direct-writer path in pushColors
 #include <esp_adc_cal.h>
@@ -36,6 +37,7 @@ LilyGo_RGBPanel::LilyGo_RGBPanel(/* args */)
 
 LilyGo_RGBPanel::~LilyGo_RGBPanel() {
     if (_panelDrv) {
+        panelclock::detach();
         esp_lcd_panel_del(_panelDrv);
         _panelDrv = nullptr;
     }
@@ -244,6 +246,7 @@ void LilyGo_RGBPanel::sleep() {
     }
 
     if (_panelDrv) {
+        panelclock::detach();
         esp_lcd_panel_disp_off(_panelDrv, true);
         esp_lcd_panel_del(_panelDrv);
     }
@@ -379,7 +382,11 @@ void LilyGo_RGBPanel::initBUS() {
         .clk_src = LCD_CLK_SRC_PLL160M,
         .timings =
             {
-                .pclk_hz = RGB_MAX_PIXEL_CLOCK_HZ,
+                // Build default, unless a refresh-rate setting was seeded from
+                // NVS before setupPanel() — see PanelClock.h. Honouring it here
+                // rather than only live means the setting survives a reboot on
+                // IDF 5 and is the only thing that applies it at all on 4.4.
+                .pclk_hz = panelclock::pclkHzForInit(RGB_MAX_PIXEL_CLOCK_HZ),
                 .h_res = BOARD_TFT_WIDTH,
                 .v_res = BOARD_TFT_HEIGHT,
                 // The following parameters should refer to LCD spec.
@@ -447,6 +454,9 @@ void LilyGo_RGBPanel::initBUS() {
 
     ESP_ERROR_CHECK(esp_lcd_new_rgb_panel(&panel_config, &_panelDrv));
     ESP_ERROR_CHECK(esp_lcd_panel_init(_panelDrv));
+    // Live refresh-rate control needs the driver handle: retiming has to go
+    // through esp_lcd so its cached timings stay truthful (see PanelClock.h).
+    panelclock::attach(_panelDrv, panel_config.timings.pclk_hz);
 }
 
 bool LilyGo_RGBPanel::initTouch() {
@@ -647,6 +657,7 @@ void LilyGo_RGBPanel::stopPanel() {
     if (_panelDrv != nullptr) {
         esp_lcd_panel_handle_t handle = _panelDrv;
         _panelDrv = nullptr;
+        panelclock::detach();
         esp_lcd_panel_del(handle);
     }
 }

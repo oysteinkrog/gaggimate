@@ -110,6 +110,8 @@ class Settings {
     int getBgAnimHalfRes() const { return bgAnimHalfRes.get(); }
     int getBgAnimInterlace() const { return bgAnimInterlace.get(); }
     int getBgAnimClearPlates() const { return bgAnimClearPlates.get(); }
+    int getBgAnimPlateColor() const { return bgAnimPlateColor.get(); }
+    int getBgAnimPlateOpacity() const { return bgAnimPlateOpacity.get(); }
     int getPanelClockDiv() const { return panelClockDiv.get(); }
     int getSmartGrindMode() const { return smartGrindMode.get(); }
     String getSmartGrindIp() const { return smartGrindIp.get(); }
@@ -210,6 +212,8 @@ class Settings {
     void setBgAnimHalfRes(int bg_anim_half_res);
     void setBgAnimInterlace(int bg_anim_interlace);
     void setBgAnimClearPlates(int bg_anim_clear_plates);
+    void setBgAnimPlateColor(int bg_anim_plate_color);
+    void setBgAnimPlateOpacity(int bg_anim_plate_opacity);
     void setPanelClockDiv(int panel_clock_div);
     void setSmartGrindIp(String smart_grind_ip);
     void setSmartGrindMode(int smart_grind_mode);
@@ -317,11 +321,18 @@ class Settings {
     Property<int> bgAnimHalfRes{registry, "bg_half", 1};
     // 1 = push every other row pair, alternating each frame.
     Property<int> bgAnimInterlace{registry, "bg_ilace", 1};
-    // 1 = hide the opaque background plates on the screens that have one
-    // (brew, status, profile, info) while the animation is running, so the
-    // animation looks the same on every screen instead of only on the ones
-    // that happen not to carry a plate.
+    // What to do with the opaque background plates on the screens that carry
+    // one (brew, status, profile, info, and the pill holding the scale weight)
+    // while the animation is running: 0 = leave them as the theme drew them,
+    // 1 = hide them so the animation looks the same on every screen, 2 = repaint
+    // them in bgAnimPlateColor at bgAnimPlateOpacity. Values 0 and 1 predate
+    // the third mode and keep their original meaning.
     Property<int> bgAnimClearPlates{registry, "bg_plate", 1};
+    // Plate fill for mode 2. Colour is 0xRRGGBB; opacity is a percentage, where
+    // 0 is fully transparent (same result as mode 1) and 100 fully opaque (same
+    // as mode 0 but in the chosen colour).
+    Property<int> bgAnimPlateColor{registry, "bg_pcol", 0x000000};
+    Property<int> bgAnimPlateOpacity{registry, "bg_popa", 35};
     // RGB pixel-clock divider off the 80 MHz LCD group clock; 0 = keep the
     // build-flag boot value. The IDF 4.4 driver only does integer division,
     // so real choices are 80/n: 5=16 MHz (~61 Hz), 6=13.3 MHz (~51 Hz),
