@@ -63,12 +63,43 @@
 // loop (previously wA and wB were reloaded from the stack every pixel; grep
 // xtensa-asm/AnimNebula.S's main loop body for "wA"/"wB" -- there are no
 // stack loads for them left), and the main loop KEEPS its hardware
-// zero-overhead LOOP instruction (all four loop bounds in band() -- dith
-// k=8, blendedA i=255, bcTable k=128, main pixel w -- get one; verified via
-// `grep -n loop xtensa-asm/AnimNebula.S`). Golden stays bit-exact. Do not
-// revert this on host-number regression alone; check the .S first.
+// zero-overhead LOOP instruction (at the time, all four loop bounds in
+// band() -- dith k=8, blendedA i=255, bcTable k=128, the shared combine loop
+// -- got one; see the 2026-08-17 note below for how that shared combine loop
+// was later split into two, and why). Golden stays bit-exact. Do not revert
+// this on host-number regression alone; check the .S first.
 //
-// Optimized: opt-nebula, 2026-08-15.
+// The combine step used to write into a separate `fullColor[256]` scratch
+// table, then a masked copy loop (`m = (m+1)&255`) read back through it for
+// every one of w pixels to fill the row -- even the first 256, which the
+// combine loop had just computed in the same order. Since v(x) == v(x mod
+// 256) (see the combine-step comment below), row[0,256) after the combine
+// loop already IS that one period, so `row` doubles as its own memo table:
+// the combine loop writes straight into `row`, and only the entries beyond
+// the first period (w-256 of them, 224 at the 480px panel width) need
+// copying, via a fixed -256 pointer offset instead of a mask. This alone
+// (still sharing one combine loop between the w<=256 and w>256 cases via a
+// runtime bound) was a real host win (0.368 -> 0.305ms) but cost bcTable its
+// hardware zero-overhead LOOP instruction in the real compiler: the new
+// tail-copy loop is a 5th loop candidate in the function, and xtensa-asm
+// showed GCC dropping the ternary-bounded combine loop's sibling (bcTable,
+// 128 iterations) to a plain compare-and-branch to make room, even though
+// nothing in bcTable's own code changed -- a whole-function register/loop
+// budget effect, not a local one. Splitting the combine loop into two
+// separate copies (one bounded by `w` for the w<=256 path, one by the
+// literal 256 for the tail-copy path) removed the shared runtime bound and
+// let all 5 loops in band() keep their hardware LOOP instruction (verified:
+// `grep -n loop xtensa-asm/AnimNebula.S` inside band()'s address range).
+// Only one copy ever executes per call (w decides which branch, and it does
+// not change between calls to the same band() invocation), so the ~30
+// duplicated instructions are flash cost, not runtime cost, while the tail
+// copy's iteration count itself shrank from w/2 to (w-256)/2 (240 -> 112 at
+// w=480). Net measured: 0.368 -> 0.281ms host (24%), bit-exact vs golden at
+// f030/f120/f210, and separately verified that band() called once per row at
+// w=240 (mimicking SleepAnimation's interlaced half-res path) reproduces the
+// same first-240-columns values as the w=480 path, column for column.
+//
+// Optimized: opt-nebula, 2026-08-15 + 2026-08-17.
 
 #include "BgAnim.h"
 #include "BgAnimCommon.h"
@@ -146,10 +177,6 @@ void band(uint16_t *dst, int y0, int rows, int w, uint32_t, const uint8_t *) {
     const int axF = g_axF, ayF = g_ayF;
     const int wA = g_wA, wB = g_wB, densOff = g_densOff;
     static uint8_t blendedA[256];
-    // Final per-pixel color, memoized over the blend's true period (see
-    // combine loop below) so the w=480-wide pixel loop degenerates to a
-    // sequential table copy instead of re-running the a/b/c blend per pixel.
-    static uint16_t fullColor[256];
     for (int r = 0; r < rows; r++) {
         const int y = y0 + r;
         uint16_t *row = dst + static_cast<size_t>(r) * w;
@@ -285,36 +312,42 @@ void band(uint16_t *dst, int y0, int rows, int w, uint32_t, const uint8_t *) {
 
         // Combine step: run the full a/b/c blend (identical math to the old
         // per-pixel loop) but only far enough to cover its true repeat
-        // period, then memoize it. x0(x) = (g_axI+x)&255 has period 256;
+        // period, then reuse it. x0(x) = (g_axI+x)&255 has period 256;
         // step(x) = x&127 has period 128; 128 | 256 so the combined value
         // v(x) — and thus the dith term dith[x&7], since 8 | 256 too — is
-        // an exact period-256 function of x. Running this loop for m in
-        // [0,256) reproduces v(x) for every x via v(x) == fullColor[x&255],
-        // bit-for-bit, because x0/step/dith-index at x and at (x mod 256)
-        // are identical by construction (all three periods divide 256).
-        // This turns the expensive blend (loads + 2 muls + shifts) from a
-        // per-real-pixel cost (up to w=480/row) into a fixed 256/row cost,
-        // with the real w-wide loop below reduced to a cache-resident
-        // table copy.
-        // When the row is no wider than the memo period, the copy loop below
-        // reads fullColor[m] for m in [0, w) and never wraps -- so the memo is
-        // pure overhead and the combine loop can write the row itself. This is
-        // bit-identical, not an approximation: the copy loop's index starts at
-        // 0 and increments, so for w <= 256 it visits exactly the entries this
-        // loop just wrote, in order.
+        // an exact period-256 function of x: v(x) == v(x mod 256) bit-for-
+        // bit, because x0/step/dith-index at x and at (x mod 256) are
+        // identical by construction (all three periods divide 256). This
+        // turns the expensive blend (loads + 2 muls + shifts) from a
+        // per-real-pixel cost (up to w=480/row) into a fixed <=256/row cost.
         //
-        // It matters most where nebula is worst. The per-row table work is a
-        // fixed ~647 iterations regardless of w, so at half resolution (w=240)
-        // the tables cost five times the pixel loop they feed. Going direct
-        // drops the 16 entries the row never reads and the whole w/2-iteration
-        // copy loop.
-        const bool direct = w <= 256;
-        uint16_t *const combineOut = direct ? row : fullColor;
-        const int combineN = direct ? w : 256;
+        // The loop writes straight into `row[0, combineN)` -- there used to
+        // be a separate `fullColor` scratch table plus a masked copy loop
+        // that read back through it for every one of w pixels, even the
+        // first 256 that the combine step had just computed in cache-
+        // adjacent order. Since v(x) == v(x mod 256), row[0,256) already
+        // *is* the one period the rest of the row needs; row IS the memo
+        // table now, so nothing downstream needs to re-touch entries the
+        // combine loop already placed correctly.
+        if (w <= 256) {
+            int x0 = g_axI & 255;
+            int step = 0;
+            for (int m = 0; m < w; m++) {
+                const int a = blendedA[x0];
+                const uint16_t bc = bcTable[step];
+                const int b = bc & 0xFF;
+                const int c = bc >> 8;
+                const int v = c + ((((a - c) * wA) + ((b - c) * wB)) >> 6) + dith2[m & 7];
+                row[m] = palette[v];
+                x0 = (x0 + 1) & 255;
+                step = (step + 1) & 127;
+            }
+            continue;
+        }
         {
             int x0 = g_axI & 255;
             int step = 0;
-            for (int m = 0; m < combineN; m++) {
+            for (int m = 0; m < 256; m++) {
                 const int a = blendedA[x0];
                 const uint16_t bc = bcTable[step];
                 const int b = bc & 0xFF;
@@ -323,50 +356,41 @@ void band(uint16_t *dst, int y0, int rows, int w, uint32_t, const uint8_t *) {
                 // palette == paletteExt + PAD (set once in init()); indexing
                 // through it directly folds the "+ PAD" into the pointer
                 // instead of re-adding it every pixel (one fewer add/pixel).
-                combineOut[m] = palette[v];
+                row[m] = palette[v];
                 x0 = (x0 + 1) & 255;
                 step = (step + 1) & 127;
             }
         }
-        if (direct) {
-            continue;
-        }
 
-        // Real per-pixel loop: sequential read from a 256-entry (512B)
-        // table that stays resident in cache across the whole row, plus a
-        // masked wraparound index — no blend math, no palette indirection,
-        // left per pixel. This loop is cheap enough (no compute) that the
-        // pixel-pair packed store (same trick as Aurora/Lava) is a clear
-        // win here even though it lost a previous fidelity/register fight
-        // when tried on the (much heavier) old single-pixel blend loop:
-        // it halves both iteration count and store traffic.
+        // Tail copy: for m >= 256, row[m] == row[m-256] (the period-256
+        // identity above), so the remaining w-256 pixels (224 of them at
+        // w=480) are a straight, unmasked copy from earlier in the SAME row
+        // -- no wraparound test needed, because m-256 never revisits [256,w)
+        // for any m in [256,w): m-256 < w-256 <= 256 always holds here (w is
+        // the 480px panel width; the general proof for any w is: process m
+        // in increasing order, so by the time m is read back at m'=m+256,
+        // row[m] already holds its final value, either written directly by
+        // the combine loop above or by an earlier iteration of this very
+        // loop). This drops both the periodic `&255` index mask (replaced
+        // by a fixed -256 pointer offset) and the old fullColor indirection,
+        // and it only runs w-256 times instead of w -- at the 480px panel
+        // width that is 224 copies instead of 480, cutting this loop's
+        // share of band() by more than half.
+        // Packed pixel-pair store (same trick as Aurora/Lava): the source
+        // pair (rp-256) and dest pair (rp) are both 4-byte aligned since row
+        // is aligned and both indices are even, so this is one 32-bit load
+        // + one 32-bit store per 2 pixels, not two 16-bit loads.
         {
-            int m = 0;
-            uint16_t *rp = row;
-            // NOTE (verified in xtensa-asm/AnimNebula.S): this loop does NOT
-            // get GCC's Xtensa zero-overhead LOOP instruction, unlike the
-            // four loops above (dith/blendedA/bcTable/combine, all constant
-            // trip counts). A countdown form (tried here, mirroring the lava
-            // fix in OPTIMIZE.md) did not unlock it either -- this appears
-            // to be a real-compiler limit on this function (possibly on
-            // hw-loop count per function, or on runtime-variable trip counts
-            // this late in the body), not a code-shape problem we found a
-            // fix for. It still nets a clear win over the old per-pixel
-            // loop: 2 pixels/iteration halves both the taken-branch count
-            // and the store count, and the body itself is pure loads/store
-            // (no blend math), so the missing hw loop only taxes a cheap
-            // loop. Do not assume this comment is stale if a future pass
-            // finds the actual cause -- it was checked, not guessed.
-            for (int i = w >> 1; i > 0; i--) {
-                const uint16_t p0 = fullColor[m];
-                m = (m + 1) & 255;
-                const uint16_t p1 = fullColor[m];
-                m = (m + 1) & 255;
-                *reinterpret_cast<uint32_t *>(rp) = static_cast<uint32_t>(p0) | (static_cast<uint32_t>(p1) << 16);
+            const int tailN = w - 256;
+            uint16_t *rp = row + 256;
+            int i = tailN;
+            while (i >= 2) {
+                *reinterpret_cast<uint32_t *>(rp) = *reinterpret_cast<const uint32_t *>(rp - 256);
                 rp += 2;
+                i -= 2;
             }
-            if (w & 1) {
-                *rp = fullColor[m];
+            if (i) {
+                *rp = *(rp - 256);
             }
         }
     }
