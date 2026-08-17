@@ -24,7 +24,34 @@ namespace {
 
 constexpr int W = 480;
 constexpr int H = 480;
-constexpr int BAND_H = 16; // matches SleepAnimation.cpp
+// Must match SleepAnimation.cpp's BAND_H. band_ms below times a whole frame's
+// worth of band() calls, so the pixel count is identical at any band height and
+// only the per-call terms change -- but they change by more than the harness
+// noise, and NOT in a consistent direction, so a mismatched height here quietly
+// biases individual animations either way. Measured 8 vs 16 on this host, five
+// runs each, tight enough to separate from the 2-9% run-to-run spread:
+//
+//   aurora   0.204 -> 0.222  (+9%)   fixed per-call cost dominates
+//   caustics 0.130 -> 0.136  (+5%)
+//   nebula   0.288 -> 0.294  (+2%)
+//   lava     0.269 -> 0.250  (-8%)   working-set locality dominates
+//   ember    0.175 -> 0.166  (-5%)
+//
+// The negative rows are the reason this is worth pinning: halving the band also
+// halves the live output window (8 x 480 x 2 = 7.7 KB vs 15.4 KB), and for the
+// animations with a large per-row working set that cache win outweighs paying
+// the per-call overhead twice as often.
+//
+// This drifted once. It was written as 16 when 16 was production, then 7fede9c9
+// ("perf(sleep-anim): BAND_H 16 -> 8") changed the device 5.5 hours later and
+// this constant was not updated, so numbers taken between then and this fix are
+// off by the amounts above. BASELINE.md and the ~x80 calibration predate the
+// drift and are consistent with the 16 they were measured at. Overridable so an
+// old number can still be reproduced: -DGM_BENCH_BAND_H=16.
+#ifndef GM_BENCH_BAND_H
+#define GM_BENCH_BAND_H 8
+#endif
+constexpr int BAND_H = GM_BENCH_BAND_H;
 constexpr uint32_t FRAME_MS = 33;
 const int GOLDEN_FRAMES[] = {30, 120, 210};
 
