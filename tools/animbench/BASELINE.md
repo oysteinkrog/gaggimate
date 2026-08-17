@@ -3,6 +3,13 @@
 Harness: `./build/bench --frames 240` at commit sleep16. Golden PPMs in
 `golden/` were produced by this exact code.
 
+Band height at the time was 16 rows, on both the device and the harness, so
+these numbers are internally consistent and comparable to each other. They are
+NOT directly comparable to anything measured after `7fede9c9` took the device
+to 8 rows: band height shifts individual animations by up to 9%, in either
+direction (see the note on `BAND_H` in `bench.cpp`). To compare against a row
+in this table, build with `-DGM_BENCH_BAND_H=16`.
+
 | id | anim | frame_ms | band_ms | libm/frame | est_dev_ms (libm only) | worst |
 |---|---|---|---|---|---|---|
 | 0 | plasma | 0.002 | 0.122 | 0 | 0 | — |
