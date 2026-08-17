@@ -2,6 +2,14 @@
 # Controller is BLE peripheral-only (display is the central). No WiFi network
 # stacks, no HomeKit, no WebServer — no LWIP tuning or HKDF needed.
 
+# --- Flash size ---
+# Must be pinned: PlatformIO only warns on a board/sdkconfig mismatch, it does
+# not set this from board.json, and Kconfig's 2 MB default would put the tail of
+# partitions/default_8mb.csv outside the flash size recorded in the bootloader
+# image header. See the longer note in sdkconfig.gaggimate.defaults.
+CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y
+CONFIG_ESPTOOLPY_FLASHSIZE="8MB"
+
 # 1 connection: single display consumer.
 CONFIG_BT_NIMBLE_MAX_CONNECTIONS=1
 

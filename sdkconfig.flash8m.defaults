@@ -1,0 +1,17 @@
+# 8 MB flash override, layered AFTER sdkconfig.gaggimate.defaults.
+#
+# The display-class defaults pin 16 MB for the LilyGo T-RGB. display-headless-8m
+# builds the same firmware for a seeed_xiao_esp32s3 (8 MB) with
+# partitions/default_8mb.csv, so it appends this file to bring the size back
+# down. Order matters: SDKCONFIG_DEFAULTS is applied left to right and the last
+# assignment wins, so this must come after sdkconfig.gaggimate.defaults.
+#
+# Why it is pinned at all rather than taken from board.json: see the note in
+# sdkconfig.gaggimate.defaults. PlatformIO only warns about a mismatch.
+#
+# Only the =y entry is given. FLASHSIZE_* is a Kconfig choice, and kconfgen
+# resolves a choice from the last member set to y across the merged defaults --
+# an explicit `CONFIG_ESPTOOLPY_FLASHSIZE_16MB=n` is not needed and would just
+# be a redundant line to keep in sync.
+CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y
+CONFIG_ESPTOOLPY_FLASHSIZE="8MB"

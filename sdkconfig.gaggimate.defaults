@@ -3,8 +3,24 @@
 # reserved for DMA-bound callers. Avoids BLE_INIT malloc storms under the
 # combined pressure of WiFi AP + HomeSpan + BLE GATT links on ESP32-S3.
 
-# Flash mode/freq/size intentionally omitted — boards are heterogeneous
-# (16 MB LilyGo, 8 MB seeed xiao). PlatformIO sets these from board.json.
+# --- Flash size ---
+# PlatformIO does NOT push board.json's flash size into the IDF build. All it
+# does is compare the two after the fact and print a warning:
+# builder/frameworks/espidf.py compares board upload.flash_size against
+# CONFIG_ESPTOOLPY_FLASHSIZE and emits "Warning! Flash memory size mismatch
+# detected." Nothing changes the config. Left unset, Kconfig's own default of
+# 2 MB wins, the IDF-built bootloader records 2 MB in the image header, and IDF
+# clamps usable flash to that -- which puts most of a default_16mb.csv layout
+# (both OTA slots and the LittleFS partition) outside the addressable window.
+#
+# So it has to be pinned here, and this file is the display-class one: the
+# LilyGo T-RGB is 16 MB. The 8 MB display-headless-8m board (seeed xiao) layers
+# sdkconfig.flash8m.defaults after this file to override it, and the controller
+# pins 8 MB in sdkconfig.controller.defaults. scripts/assert_sdkconfig.py checks
+# the merged value against the board's declared size at link time so a new env
+# cannot silently inherit the wrong one.
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+CONFIG_ESPTOOLPY_FLASHSIZE="16MB"
 
 # --- PSRAM (octal 80MHz) — display-class boards only ---
 CONFIG_SPIRAM=y

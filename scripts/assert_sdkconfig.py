@@ -9,8 +9,11 @@
 # only), which made SD-card files with 4-char extensions (".slog"/".json")
 # unreadable and broke shot loading in the web UI ("Bad magic"). This guard
 # fails the build if a required invariant regresses, so the class can't ship
-# again unnoticed. Add new invariants to REQUIRED below as they're discovered.
+# again unnoticed. Add new invariants to REQUIRED below as they're discovered;
+# invariants that need more than the config text (e.g. the board) go in their own
+# _check_* function, called from assert_sdkconfig.
 import os
+import re
 
 Import("env")
 
@@ -40,6 +43,42 @@ REQUIRED = [
 ]
 
 
+def _check_flash_size(text):
+    """Board-aware invariant: merged CONFIG_ESPTOOLPY_FLASHSIZE == board flash size.
+
+    Kept out of REQUIRED because it needs the board, not just the config text.
+    PlatformIO does not derive this config from board.json — espidf.py only
+    compares the two and prints "Warning! Flash memory size mismatch detected",
+    which is easy to miss in a 2000-line build log. Getting it wrong is not
+    cosmetic: the IDF-built bootloader writes the configured size into the image
+    header and IDF clamps usable flash to it, so a 2 MB header on a 16 MB board
+    leaves both OTA slots and the LittleFS partition unaddressable.
+
+    Returns [] when satisfied or not checkable, else [(description, hint)].
+    """
+    board_size = env.BoardConfig().get("upload.flash_size", None)
+    if not board_size:
+        return []
+    m = re.search(r'#define\s+CONFIG_ESPTOOLPY_FLASHSIZE\s+"([^"]+)"', text)
+    if m is None:
+        return [(
+            "CONFIG_ESPTOOLPY_FLASHSIZE present in merged config",
+            "The merged sdkconfig.h has no CONFIG_ESPTOOLPY_FLASHSIZE at all. "
+            "Pin CONFIG_ESPTOOLPY_FLASHSIZE_<n>MB=y in this env's sdkconfig "
+            "defaults.",
+        )]
+    idf_size = m.group(1)
+    if idf_size.lower() == str(board_size).lower():
+        return []
+    return [(
+        f"flash size matches board ({board_size}); merged config says {idf_size}",
+        f"Pin CONFIG_ESPTOOLPY_FLASHSIZE_{board_size.upper().replace('MB', '')}MB=y "
+        f"(and CONFIG_ESPTOOLPY_FLASHSIZE=\"{board_size}\") in the last "
+        f"sdkconfig.*.defaults this env lists in SDKCONFIG_DEFAULTS, delete the "
+        f"cached sdkconfig.<env>, then rebuild.",
+    )]
+
+
 def assert_sdkconfig(*_args, **_kwargs):
     sdkconfig_h = os.path.join(env.subst("$BUILD_DIR"), "config", "sdkconfig.h")
     if not os.path.isfile(sdkconfig_h):
@@ -52,6 +91,7 @@ def assert_sdkconfig(*_args, **_kwargs):
     for desc, predicate, hint in REQUIRED:
         if not predicate(text):
             failures.append((desc, hint))
+    failures.extend(_check_flash_size(text))
 
     if failures:
         print("\n*** sdkconfig guard FAILED — merged config violates required invariants:")
@@ -60,7 +100,7 @@ def assert_sdkconfig(*_args, **_kwargs):
         print(f"  (checked {sdkconfig_h})\n")
         env.Exit(1)
     else:
-        print(f"sdkconfig guard: OK ({len(REQUIRED)} invariant(s) satisfied)")
+        print(f"sdkconfig guard: OK ({len(REQUIRED) + 1} invariant(s) satisfied)")
 
 
 # Run after the firmware ELF is built, so the merged sdkconfig.h exists.
