@@ -90,6 +90,10 @@ constexpr int RESCALE_N = RESCALE_SPAN + 2 * RESCALE_PAD;
 // Points RESCALE_PAD entries into its allocation, so a slightly out-of-range v
 // lands on a clamped entry instead of off the front of the block.
 uint8_t *rescaleLUT = nullptr;
+// The base of rescaleLUT's allocation. rescaleLUT itself points RESCALE_PAD
+// entries into it, so it is not a valid pointer to free; keeping the base is
+// what lets release() hand the block back instead of corrupting the heap.
+uint8_t *rescaleAlloc = nullptr;
 uint16_t *paletteLUT = nullptr;
 uint16_t *polarMap = nullptr;   // quadrant map: (angleOct<<8 | radiusOr0xFF), (cx+1)x(cx+1)
 // idxOffAB/vigBreathe are sized 256, not cx+1: index 0..cx are the
@@ -107,6 +111,12 @@ uint16_t *polarMap = nullptr;   // quadrant map: (angleOct<<8 | radiusOr0xFF), (
 uint16_t *idxOffAB = nullptr;   // radius -> idxOffA(lo) | idxOffB(hi)<<8, [0xFF] unused (any value is safe)
 uint8_t *vigBreathe = nullptr;  // radius -> (vigByR[r] * g_breatheQ8) >> 8, [0xFF] forced to 0
 uint32_t lastThemeGen = 0xFFFFFFFF;
+// Whether the one-time table fills have run. Namespace scope, not a static
+// local in init(): vigByR and polarMap are sized from cx, so a resolution
+// change has to rebuild them, and release() can only reset this flag if it can
+// see it. While it was function-local, init() would reallocate the tables on a
+// resolution change and then skip filling them.
+bool tablesBuilt = false;
 int g_cx = 240; // half panel width; also the map's per-axis extent (assumes cx < 255)
 
 constexpr uint8_t OUTSIDE_R = 0xFF;
@@ -143,7 +153,6 @@ bool init(int w, int) {
     // sin256 non-null, so the next call skipped the whole block -- retry and
     // check alike -- and fell through to `return true` with null tables that
     // frame() and band() dereference without checking.
-    static bool tablesBuilt = false;
     g_cx = w / 2;
     const int mapDim = g_cx + 1;
     if (sin256 == nullptr) {
@@ -162,7 +171,7 @@ bool init(int w, int) {
         vigByR = static_cast<uint8_t *>(alloc(mapDim));
     }
     if (rescaleLUT == nullptr) {
-        uint8_t *rescaleAlloc = static_cast<uint8_t *>(alloc(RESCALE_N));
+        rescaleAlloc = static_cast<uint8_t *>(alloc(RESCALE_N));
         rescaleLUT = rescaleAlloc != nullptr ? rescaleAlloc + RESCALE_PAD : nullptr;
     }
     if (paletteLUT == nullptr) {
@@ -360,6 +369,32 @@ void band(uint16_t *dst, int y0, int rows, int w, uint32_t, const uint8_t *) {
     }
 }
 
+void release() {
+    const int mapDim = g_cx + 1;
+    releaseTable(sin256, 256 * sizeof(int16_t));
+    releaseTable(sinHalf256, 256 * sizeof(int16_t));
+    releaseTable(sqrtLUT, 602 * sizeof(int16_t));
+    releaseTable(recipLUT, 241 * sizeof(uint32_t));
+    releaseTable(vigByR, static_cast<size_t>(mapDim));
+    // The base pointer, not rescaleLUT, which is offset RESCALE_PAD into it.
+    releaseTable(rescaleAlloc, RESCALE_N);
+    rescaleLUT = nullptr;
+    releaseTable(paletteLUT, 256 * sizeof(uint16_t));
+    // Not releaseTable: polarMap comes from heap_caps_malloc(MALLOC_CAP_SPIRAM)
+    // directly rather than through alloc(), so it is not on alloc()'s books and
+    // crediting it back would corrupt the accounting the bench reads.
+    if (polarMap != nullptr) {
+        heap_caps_free(polarMap);
+        polarMap = nullptr;
+    }
+    releaseTable(idxOffAB, 256 * sizeof(uint16_t));
+    releaseTable(vigBreathe, 256);
+    // Both sentinels. tablesBuilt gates the one-time fills, so leaving it set
+    // would hand back reallocated tables that nothing ever writes.
+    tablesBuilt = false;
+    lastThemeGen = 0xFFFFFFFF;
+}
+
 } // namespace
 
 extern const BgAnimation bg_anim_mandala;
@@ -370,6 +405,7 @@ const BgAnimation bg_anim_mandala = {
     init,
     frame,
     band,
+    release,
 };
 
 #endif // GAGGIMATE_SIM
