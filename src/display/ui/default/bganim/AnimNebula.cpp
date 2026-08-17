@@ -99,7 +99,44 @@
 // w=240 (mimicking SleepAnimation's interlaced half-res path) reproduces the
 // same first-240-columns values as the w=480 path, column for column.
 //
-// Optimized: opt-nebula, 2026-08-15 + 2026-08-17.
+// The 0.368/0.281 pair above was measured while tools/animbench/bench.cpp's
+// BAND_H was stale at 16 (the device moved to 8 rows/band at 7fede9c9; the
+// bench constant was not updated until later). Band height is not a uniform
+// scale factor -- it moves different animations different directions by up
+// to 9%, so old figures cannot be rescaled arithmetically. Re-measured at the
+// corrected BAND_H=8: baseline (this file, pre-locality-pass below) 0.291ms,
+// still comfortably under the 0.3125ms 40fps bar.
+//
+// 2026-08-17 (second pass): chased the locality lead GM_NEBULA_CACHED_NOISE_
+// PROBE flags -- at BAND_H=8 it measures band_ms 0.291 -> ~0.242ms (~17%) for
+// pinning all four noise samplers to one resident row, i.e. that fraction of
+// cost is noise-texture addressing/locality on the 64KB asset, not the
+// per-pixel arithmetic. The dominant octave (rowA0/rowA1, bilinear) is the
+// only one of the four with real reuse available: rowA0 at row y+1 is the
+// exact same physical texture row as rowA1 at row y (both are
+// (y+1+ayI)&255), so its x-interpolated form is now cached in a ping-ponged
+// buffer (ixBufs, below) and carried from one row to the next INSIDE a
+// single band() call, cutting the octave's raw noise-row touches from 16 to
+// 9 per 8-row call. This is intra-call only -- reset every call -- so it
+// does not weaken the cross-call invariant one row below discusses.
+// Bit-exact vs golden (all 13 animations), and separately verified via a
+// throwaway harness against band() called as: one call for the whole frame,
+// 4-row bands, 16-row bands, ragged 3-row bands, sequential rows==1 calls,
+// and parity-skipped rows==1 calls (SleepAnimation's interlaced shape) --
+// zero pixel mismatches in every shape. Host result is flat (0.291 ->
+// ~0.288ms, inside the +-4% noise floor): expected and unpriced by
+// construction, since the host bench keeps the whole 64KB texture resident
+// in L2 the whole time, so a redundant re-read there is nearly free in a way
+// a real PSRAM row fetch on the S3 is not. Building bcTable BEFORE this
+// block (rather than after, where it was) was necessary to keep bcTable's
+// own, unrelated loop from losing its hardware zero-overhead LOOP
+// instruction to the same whole-function register/loop-budget effect noted
+// above for the tail-copy split -- verified via xtensa-asm: band() went 269
+// -> 301 insns, 5 -> 7 hardware loops (all seven loop candidates in the
+// function keep the hardware LOOP instruction; none fell back to
+// compare-and-branch), with no new libcalls.
+//
+// Optimized: opt-nebula, 2026-08-15 + 2026-08-17 + 2026-08-17b.
 
 #include "BgAnim.h"
 #include "BgAnimCommon.h"
@@ -177,6 +214,22 @@ void band(uint16_t *dst, int y0, int rows, int w, uint32_t, const uint8_t *) {
     const int axF = g_axF, ayF = g_ayF;
     const int wA = g_wA, wB = g_wB, densOff = g_densOff;
     static uint8_t blendedA[256];
+    // Ping-ponged x-interpolated copies of the dominant octave's raw noise
+    // rows. rowA0(y+1) and rowA1(y) are always the SAME physical texture row
+    // ((y+1+ayI)&255 either way -- see the reuse site below), so the
+    // x-interpolation of "this row's rowA1" can be reused as "next row's
+    // rowA0" instead of re-reading the raw 256-byte row and redoing the
+    // 255-iteration interpolation walk. At BAND_H=8 that cuts the octave's
+    // raw-row touches from 16 to 9 per band() call -- real PSRAM-traffic
+    // reduction, not just a host-cache effect, since noiseTex256() is a 64KB
+    // asset that does not fit the S3's 32KB external-memory cache.
+    // `int`, not `uint8_t`: this stores the exact same intermediate va/vb
+    // values the old fused loop computed and consumed immediately, just
+    // deferred by one iteration -- a narrower type here would risk a
+    // transient out-of-[0,255] value truncating differently than the
+    // original never-stored expression did.
+    static int ixBufs[2][256];
+    int curBuf = 0; // ixBufs[curBuf] is valid as "this row's x-interpolated rowA0"
     for (int r = 0; r < rows; r++) {
         const int y = y0 + r;
         uint16_t *row = dst + static_cast<size_t>(r) * w;
@@ -208,20 +261,13 @@ void band(uint16_t *dst, int y0, int rows, int w, uint32_t, const uint8_t *) {
 
         // Build the bilinear-blended dominant octave once per row — reused
         // for the whole row via the x0 wraparound below. i=255's neighbor
-        // (i+1==256) wraps to texel 0; special-cased after the loop instead
-        // of masked every iteration so the loop body is a plain counted
-        // walk over two pointers. `cur0`/`cur1` carry the previous
-        // iteration's `nxt0`/`nxt1` (rowA0[i]/rowA1[i] were already loaded
-        // as last iteration's "next" neighbor) so each iteration issues one
-        // new load per row instead of two -- 2 loads/iter instead of 4,
-        // verified in xtensa-asm/AnimNebula.S (the loop body dropped from 4
-        // l8ui to 2). This is intra-row state only (cur0/cur1 reset at the
-        // top of every row from rowA0[0]/rowA1[0]), so it does not touch the
-        // "no state carries between band() calls" invariant
-        // SleepAnimation.cpp's interlaced half-res path relies on (see its
-        // comment at the anim.band(halfBuf + ...) split-render call).
+        // (i+1==256) wraps to texel 0; special-cased after each interpolation
+        // pass instead of masked every iteration so the loop body is a plain
+        // counted walk over two pointers (2026-08-17 update: see below for
+        // why there are now two such passes, not one fused pass).
         //
-        // Two separable reformulations were tried here and both reverted.
+        // Two separable reformulations were tried in an earlier pass and both
+        // reverted.
         //
         // (1) y-blend rowA0/rowA1 into a scratch 256-row first, then
         // x-interpolate that single row. Bilinear interpolation commutes
@@ -232,64 +278,42 @@ void band(uint16_t *dst, int y0, int rows, int w, uint32_t, const uint8_t *) {
         // aren't necessarily adjacent in the noise texture across the y-wrap
         // boundary, so GCC derived rowA0's address from rowA1's via an extra
         // sub+add every iteration -- and it drifted off golden (mean
-        // 0.004-0.02, max 9, still "OK" but non-zero vs bit-exact here).
+        // 0.004-0.02, max 9, still "OK" but non-zero vs bit-exact here). Not
+        // revisited: (1) does not expose the identity (2) does, and this
+        // section is about that identity now.
         //
         // (2) x-interpolate FIRST into two ping-ponged scratch rows, then
-        // y-blend. This direction is bit-exact (it is literally the va/vb/
-        // ayF expressions below, in the same order) and it exploits a real
-        // identity: this row's rowA1 is next row's rowA0, for every y
-        // including across the wrap, so the x pass is reusable and runs once
-        // per output row instead of twice. That halves the dominant octave's
-        // PSRAM traffic -- worth chasing, because noiseTex256 is 64 KB and
-        // alloc() therefore places it in PSRAM, behind the S3's 32 KB
-        // external-memory cache, and the GM_NEBULA_CACHED_NOISE_PROBE
-        // diagnostic below measures 12% for perfect locality even on the
-        // host, where the texture fits in L2 entirely.
+        // y-blend, exploiting the real identity: this row's rowA1 is next
+        // row's rowA0, for every y including across the wrap. When first
+        // tried, this was implemented as a single fused pass PLUS a second
+        // full pass every row regardless of reuse (so it paid the extra
+        // pass's cost every row while only sometimes collecting the read
+        // savings the pass existed to enable) -- it stayed bit-exact but
+        // measured band() at 243 -> 273 insns, 4 -> 5 hardware loops, and
+        // 0.357 -> 0.347ms host, inside the +-4% noise floor, with a note to
+        // revisit once cross-row reuse was actually wired up rather than just
+        // structurally possible.
         //
-        // It still lost. Splitting the passes adds a whole extra 256-texel
-        // pass of loads, stores and loop overhead: multiplies per row drop
-        // 765 -> 511, but total inner ops per row rise by roughly a thousand,
-        // against 255 saved PSRAM byte-reads = 8 cache lines. Break-even
-        // needs those lines to cost >100 cycles each. band() went 243 -> 273
-        // insns with 5 hardware loops instead of 4, and the host moved 0.357
-        // -> 0.347, inside the +-4% noise floor. Bit-exactness makes it safe
-        // but not free, and nothing available off-device says it pays.
-        //
-        // The obvious extension of (2) -- keep the scratch row alive ACROSS
-        // band() calls so the first row of each band reuses the last row of the
-        // previous one -- is not just unprofitable, it is incorrect. The
-        // interlaced half-res path in SleepAnimation.cpp calls band() once per
-        // single source row, with a row count of 1 and a y that skips every
-        // other value (`if (((srcBase + sr) & 1) != parityNow) continue;`
-        // around the `anim.band(halfBuf + sr * rw, srcBase + sr, 1, rw, ...)`
-        // call). So "the previous call's last row" is neither y-1 nor even a
-        // fixed distance from y, and the cached row would be blended against
-        // the wrong noise line. Any reuse has to stay inside one band() call,
-        // where the row sequence is known to be contiguous and ascending.
-        //
-        // If nebula needs to go faster, the next measurement to take is on
-        // hardware (/api/animbench), not on the host: the host cannot show a
-        // PSRAM stall, so it cannot price either of these reorderings. Reduce
-        // texture traffic rather than trade compute for it -- e.g. sampling
-        // the 4x octave at half vertical rate, which is not bit-exact and so
-        // needs a visual check, but removes reads instead of adding passes.
-        {
-            int cur0 = rowA0[0];
-            int cur1 = rowA1[0];
-            for (int i = 0; i < 255; i++) {
-                const int nxt0 = rowA0[i + 1];
-                const int va = cur0 + (((nxt0 - cur0) * axF) >> 8);
-                const int nxt1 = rowA1[i + 1];
-                const int vb = cur1 + (((nxt1 - cur1) * axF) >> 8);
-                blendedA[i] = static_cast<uint8_t>(va + (((vb - va) * ayF) >> 8));
-                cur0 = nxt0;
-                cur1 = nxt1;
-            }
-            const int va = cur0 + (((rowA0[0] - cur0) * axF) >> 8);
-            const int vb = cur1 + (((rowA1[0] - cur1) * axF) >> 8);
-            blendedA[255] = static_cast<uint8_t>(va + (((vb - va) * ayF) >> 8));
-        }
-
+        // 2026-08-17: wired up. `ixBufs` below stores va/vb, not rowA0/rowA1
+        // themselves -- the interpolation for what will become "next row's
+        // rowA0" is computed once (into ixNext) and carried via a ping-pong
+        // buffer into the next iteration's ixCur, so a full interpolation
+        // pass is skipped (not merely redirected through a scratch row) for
+        // every row after the first in a multi-row call. At BAND_H=8 that
+        // drops the octave's raw-row touches from 16 to 9 per band() call --
+        // GM_NEBULA_CACHED_NOISE_PROBE (below) attributes roughly 17% of
+        // band_ms to exactly this kind of noise-texture locality, of which
+        // this reuse claims the a-octave's share. This is intra-call state
+        // only: curBuf resets to ixBufs[0] at the top of every band() call
+        // (declared with the call, not with static duration), and r==0 always
+        // takes the "compute ixCur fresh" branch below, so it does not touch
+        // the "no state carries between band() calls" invariant
+        // SleepAnimation.cpp's interlaced half-res path relies on -- a
+        // rows==1 call is all r==0, every call, and never reuses anything.
+        // See the file header for the measured host delta and why it is
+        // expected to matter more on device than the host number shows: the
+        // host bench keeps the whole 64 KB texture in L2, so a redundant
+        // re-read there is cheap in a way a real PSRAM row is not.
         // b (2x) and c (4x) are both nearest-sampled with a fixed per-pixel
         // stride (+2, +4 mod 256), so unlike a's index they walk in lockstep
         // with the pixel counter itself: bIdx/cIdx as a function of pixel
@@ -299,6 +323,21 @@ void band(uint16_t *dst, int y0, int rows, int w, uint32_t, const uint8_t *) {
         // LUTs sharing an index — this drops rowB/rowC/bIdx/cIdx (4 live
         // registers) down to one table pointer + one index (2), freeing
         // room for wA/wB/densOff to stay resident instead of spilling.
+        //
+        // Built BEFORE the ixCur/ixNext/blendedA block below (moved there
+        // 2026-08-17): bcTable and blendedA are independent -- neither reads
+        // the other, both are only consumed together in the w-combine loop
+        // further down -- so this ordering is a pure scheduling choice with
+        // no effect on the result. It matters for codegen: with the a-octave
+        // reuse buffers (ixCur/ixNext) added as two more live loop-carried
+        // pointers, building bcTable AFTER them pushed bcTable's own loop
+        // past GCC's register/loop budget for this function and cost it its
+        // hardware zero-overhead LOOP instruction (verified via xtensa-asm:
+        // fell back to `addi.n; bnez.n`), even though nothing in bcTable's
+        // code changed -- the same whole-function budget effect documented
+        // above for the tail-copy split. Building it first, before ixCur/
+        // ixNext become live, lets bcTable's registers free up before that
+        // pressure exists and restores its hardware loop.
         static uint16_t bcTable[128];
         {
             int bI = g_bx & 255;
@@ -309,6 +348,40 @@ void band(uint16_t *dst, int y0, int rows, int w, uint32_t, const uint8_t *) {
                 cI = (cI + 4) & 255;
             }
         }
+
+        int *ixCur = ixBufs[curBuf];
+        int *ixNext = ixBufs[curBuf ^ 1];
+        if (r == 0) {
+            // First row of the call: no predecessor to reuse from (a rows==1
+            // call always takes only this path), so interpolate rowA0 fresh.
+            // Identical expression to the reuse-eligible rowA1 pass below,
+            // just addressed at rowA0 -- kept as a separate copy rather than
+            // a shared helper so neither loop gains a call in its body.
+            int cur0 = rowA0[0];
+            for (int i = 0; i < 255; i++) {
+                const int nxt0 = rowA0[i + 1];
+                ixCur[i] = cur0 + (((nxt0 - cur0) * axF) >> 8);
+                cur0 = nxt0;
+            }
+            ixCur[255] = cur0 + (((rowA0[0] - cur0) * axF) >> 8);
+        }
+        {
+            int cur1 = rowA1[0];
+            for (int i = 0; i < 255; i++) {
+                const int nxt1 = rowA1[i + 1];
+                ixNext[i] = cur1 + (((nxt1 - cur1) * axF) >> 8);
+                cur1 = nxt1;
+            }
+            ixNext[255] = cur1 + (((rowA1[0] - cur1) * axF) >> 8);
+        }
+        for (int i = 0; i < 256; i++) {
+            const int va = ixCur[i];
+            const int vb = ixNext[i];
+            blendedA[i] = static_cast<uint8_t>(va + (((vb - va) * ayF) >> 8));
+        }
+        // ixNext (this row's interpolated rowA1) is next row's rowA0 -- see
+        // the block comment further up for why that identity holds.
+        curBuf ^= 1;
 
         // Combine step: run the full a/b/c blend (identical math to the old
         // per-pixel loop) but only far enough to cover its true repeat
