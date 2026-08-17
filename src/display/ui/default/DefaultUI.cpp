@@ -754,6 +754,15 @@ void DefaultUI::applyAnimPlates(int mode, uint32_t color, int opaPct) {
     // theme is the authoritative restore: it reassigns every generated object's
     // colours in both states from theme_colors. The per-plate capture above
     // still carries the Tare pill, which the theme function does not reach.
+    //
+    // That leaves the Tare pill relying on its capture having been taken in the
+    // default state, and it is: buildScaleScreen creates it with lv_btn_create
+    // and never sets LV_OBJ_FLAG_CHECKABLE, so it has no checked state to be in,
+    // and LVGL's default theme renders PRESSED through a colour filter rather
+    // than a bg_color override, so a capture taken mid-press still reads the
+    // default colour. If the pill ever becomes checkable, or gains a state-
+    // specific bg_color, capture it explicitly instead of querying the live
+    // state -- the query resolves against whatever state the object is in.
     if (mode == 0 && currentThemeMode >= 0) {
         change_color_theme(static_cast<uint32_t>(currentThemeMode));
     }

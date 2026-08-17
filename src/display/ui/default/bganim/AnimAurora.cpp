@@ -50,8 +50,10 @@ int32_t *wLut2 = nullptr; // [1024] (sin1024(i) * W2) >> 7
 // full signed range so the per-pixel "clip negative to 0, then square>>12"
 // collapses to one branchless offset array read (negative entries are 0).
 // Splitting the >>7 across the two addends (see wLut1/wLut2 above) can only
-// truncate each toward zero at least as much as shifting the sum would, so
-// this bound still holds as an upper bound on the actual per-pixel max.
+// lower each one -- an arithmetic right shift floors toward -inf, it does not
+// truncate toward zero -- so the positive bound still holds. The negative side
+// can undershoot -V_MAX by 1, which does not matter: `vc = v > 0 ? v : 0`
+// clamps before the sqLUT index is formed.
 constexpr int32_t V_MAX = (512 * (W1 + W2)) >> 7;
 
 float g_t = 0, g_A1 = 0, g_A2 = 0;
