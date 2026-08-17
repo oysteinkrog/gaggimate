@@ -160,8 +160,21 @@ void band(uint16_t *dst, int y0, int rows, int w, uint32_t, const uint8_t *) {
         dst[i] = bg;
     }
 
+    // Path points are pre-binned into fixed 16-row spatial bins by
+    // rebuildGeometry, and exactly ONE bin is consulted per call. So band()
+    // requires [y0, y0+rows) to lie inside a single bin: rows must divide 16
+    // with y0 a multiple of rows, or rows == 1 at any y. Both real callers
+    // satisfy that -- SleepAnimation renders 8-row bands, and its interlaced
+    // half-res path renders rows == 1 -- but nothing enforces it, and a caller
+    // that straddles a boundary gets no error, just silently missing path
+    // pixels for every bin but the first (a 40-row band drops two thirds of
+    // them). If a taller band is ever wanted, loop this block over the bins the
+    // range covers rather than widening the bins.
     const int bandIdx = y0 / 16;
-    for (int i = 0; i < orbitCount; i++) {
+    // Guards the pathBinCount/pathBins indexing below, which is otherwise
+    // unbounded in y0. Only the path pass is skipped; the orbit bodies after it
+    // clip themselves and stay correct.
+    for (int i = 0; bandIdx >= 0 && bandIdx < NUM_BANDS && i < orbitCount; i++) {
         const uint8_t n = pathBinCount[i * NUM_BANDS + bandIdx];
         const PathPt *pts = &pathBins[(i * NUM_BANDS + bandIdx) * PTS_PER_BAND];
         for (int j = 0; j < n; j++) {
