@@ -9,13 +9,14 @@
 // as integer x steps by exactly 1 the integer floor(r) changes by at most 1.
 // Ripple centers are rounded to the nearest pixel once per frame (g_icx/
 // g_icy) so the whole per-pixel tracker runs in int32: per ring per row we
-// seed integer r once (one sqrtf, at the crossing's left edge x0), then carry
-// (r, r2=r*r, dist2) forward per pixel with add/shift only — dist2 +=
-// 2*dx+1, and r/r2 rebracketed via `while (dist2 >= r2+2r+1) { r2+=2r+1;
-// r++; }` (and the mirror decrement) — no multiply, no sqrt, amortized O(1).
-// Rounding the ripple center to the nearest pixel and r to an integer (vs.
-// continuous float distance) costs at most ~1px of phase error against a
-// 27px wavelength (~13 degrees) — invisible under the existing dither.
+// seed integer r once (one fastSqrt call, at the crossing's left edge x0),
+// then carry (r, r2=r*r, dist2) forward per pixel with add/shift only —
+// dist2 += 2*dx+1, and r/r2 rebracketed via `while (dist2 >= r2+2r+1) {
+// r2+=2r+1; r++; }` (and the mirror decrement) — no multiply, no libm,
+// amortized O(1). Rounding the ripple center to the nearest pixel and r to
+// an integer (vs. continuous float distance) costs at most ~1px of phase
+// error against a 27px wavelength (~13 degrees) — invisible under the
+// existing dither.
 //
 // Row-window fix (this pass): a ring is a thin annulus (radial thickness
 // 2*HALFW), not a filled disk. The previous version bounded a ring-row's
@@ -61,9 +62,13 @@
 // and clamp8f's branchy `v<0?0:(v>255?255:cast(v))` chain (3 branches per
 // channel, every pixel) is replaced by a single padded uint8 LUT (clampU8),
 // indexed by `(int)v + CLAMP_PAD` — bit-for-bit equivalent to clamp8f (see
-// the derivation in init()) but branch-free. The remaining sqrtf calls
-// (crossing half-widths + integer-tracker seeds) are per-ring-per-row, not
-// per-pixel — cheap regardless of host/device, same cost class as before.
+// the derivation in init()) but branch-free. The crossing half-widths and
+// integer-tracker seeds (per-ring-per-row, not per-pixel) used to call
+// sqrtf; they now call fastSqrt (Quake-style rsqrt-and-multiply, see its
+// definition below) instead — same call site, zero libm calls, since the
+// window math only needs ~1px accuracy (WIN_MARGIN already budgets that)
+// and the tracker seed is corrected exactly by seedBand's rebracket loop
+// regardless of the seed's precision.
 
 #include "BgAnim.h"
 #include "BgAnimCommon.h"
@@ -101,6 +106,32 @@ constexpr int CLAMP_SIZE = 1600; // covers b = (int)v in [-200, 1399]
 // (see file header). Same indexing formula as BgAnimCommon.h.
 inline float cosRadLocal(const float *ct, float rad) { return ct[static_cast<int>(rad * RAD_TO_TABLE) & 255]; }
 inline float sinRadLocal(const float *ct, float rad) { return cosRadLocal(ct, rad - 1.5707963f); }
+
+// Quake-style fast approximate sqrt: rsqrt via the bit-hack magic constant,
+// refined by two Newton iterations, then sqrt(x) = x * rsqrt(x). Device has
+// no HW sqrt (sqrtf compiles to a ~90cy libcall) but DOES have a HW FPU for
+// mul/add/madd (1-2cy each) and no divide is used here at all, so this is
+// ~8 float mul/add ops instead of a libcall -- an order of magnitude
+// cheaper, and fully inlinable (keeps GCC's zero-overhead-loop eligibility
+// for anything this gets hoisted into). Two iterations bring relative error
+// well under 0.01%, negligible next to the ~2px WIN_MARGIN slack the window
+// math already carries, and the seedBand() integer correction loop below
+// exactly fixes up any residual error in its use of this for r0 regardless.
+// Only used for window half-widths and the seed radius -- never per-pixel.
+inline float fastSqrt(float x) {
+    if (x <= 0.0f) {
+        return 0.0f;
+    }
+    const float xhalf = 0.5f * x;
+    int32_t i;
+    __builtin_memcpy(&i, &x, sizeof(i));
+    i = 0x5f3759df - (i >> 1);
+    float y;
+    __builtin_memcpy(&y, &i, sizeof(y));
+    y = y * (1.5f - xhalf * y * y);
+    y = y * (1.5f - xhalf * y * y);
+    return x * y;
+}
 
 struct Ripple {
     float cx, cy;
@@ -265,12 +296,12 @@ void band(uint16_t *dst, int y0, int rows, int w, uint32_t, const uint8_t *) {
             if (bx1 < bx0) {
                 return;
             }
-            // Seed the integer distance at bx0 (one sqrtf per crossing per
-            // row — not per pixel).
+            // Seed the integer distance at bx0 (one fastSqrt per crossing
+            // per row — not per pixel, and libm-free; see fastSqrt above).
             const int idy = y - g_icy[ringIdx];
             const int idx0 = bx0 - g_icx[ringIdx];
             const int dist2 = idx0 * idx0 + idy * idy;
-            int r0 = static_cast<int>(sqrtf(static_cast<float>(dist2)));
+            int r0 = static_cast<int>(fastSqrt(static_cast<float>(dist2)));
             while ((r0 + 1) * (r0 + 1) <= dist2) {
                 r0++;
             }
@@ -288,7 +319,7 @@ void band(uint16_t *dst, int y0, int rows, int w, uint32_t, const uint8_t *) {
             if (dy2 > outer2) {
                 continue;
             }
-            const float halfOuter = sqrtf(outer2 - dy2);
+            const float halfOuter = fastSqrt(outer2 - dy2);
             const float innerR = g_r[i] - HALFW - WIN_MARGIN;
             bool split = false;
             if (innerR > 0.0f) {
@@ -303,7 +334,7 @@ void band(uint16_t *dst, int y0, int rows, int w, uint32_t, const uint8_t *) {
                     // width per ring per row even though the ring's hollow
                     // interior never contributes.
                     split = true;
-                    const float halfInner = sqrtf(inner2 - dy2);
+                    const float halfInner = fastSqrt(inner2 - dy2);
                     // The two crossings touch when halfInner approaches 0,
                     // which every mature ring does on the rows where |dy|
                     // nears innerR: (int)(cx - eps) and (int)(cx + eps)
@@ -446,6 +477,26 @@ void band(uint16_t *dst, int y0, int rows, int w, uint32_t, const uint8_t *) {
     }
 }
 
+void release() {
+    releaseTable(envLUT, 256 * sizeof(float));
+    releaseTable(clampU8, CLAMP_SIZE);
+    // Borrowed: cosTableF() is owned and shared by BgAnimCommon.
+    g_cosTable = nullptr;
+    // Forces frame() to rebuild the crest/trough colors on the next init.
+    // They live in plain statics rather than an allocation, so this is
+    // belt-and-braces rather than load-bearing — but a stale sentinel next to
+    // a freed table set is the bug class this entry point exists to prevent.
+    lastThemeGen = 0xFFFFFFFF;
+    // `inited` is deliberately NOT reset. It gates the ripple SIMULATION
+    // state (active flags and nextDropMs), not any table's content: envLUT and
+    // clampU8 are pure functions of compile-time constants, so init() refills
+    // them identically whatever `inited` says. Resetting it would re-seed
+    // nextDropMs to a boot-relative 600-2600 ms while tMs is already far past
+    // that, firing a drop the instant the animation is selected. Leaving the
+    // simulation intact across a release/init cycle is both correct and the
+    // behaviour that existed before this entry point.
+}
+
 } // namespace
 
 extern const BgAnimation bg_anim_ripples;
@@ -456,6 +507,7 @@ const BgAnimation bg_anim_ripples = {
     init,
     frame,
     band,
+    release,
 };
 
 #endif // GAGGIMATE_SIM

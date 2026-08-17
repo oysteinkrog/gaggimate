@@ -77,8 +77,39 @@
 // with comfortable margin for the rounding choices made when building the
 // Q8/Q16 tables (round-to-nearest, not truncation), so band()'s final
 // lookup is a single unclamped, unbranched paletteExt[PAD+idx] read.
+//
+// Third pass (this one): one exact per-pixel constant-fold-out, plus a
+// coarse-grid interpolation of the wave field.
+//   - rowAux[].dith now has PALETTE_REAL_OFF<<16 baked in at build time, so
+//     band()'s final `idxq >> 16` is already g_lut's absolute palette
+//     index — no per-pixel `addmi PALETTE_REAL_OFF`. The folding is
+//     algebraically exact (arithmetic right shift distributes over adding an
+//     exact multiple of the shift base), not an approximation.
+//   - band() now evaluates the exact 3-LUT-read sine sum only once every
+//     SILK_GRID (8) pixels and linearly interpolates the contrastLUT index
+//     in between via a Q8 fixed-point ramp (one add + one shift per pixel)
+//     — the field is spatially smooth enough at this animation's fringe
+//     densities that the interpolation error is far below what
+//     contrastLUT's 3073-point resolution or the golden-frame comparison
+//     can distinguish. See band()'s comment for the exactness-at-grid-nodes
+//     argument and the overflow bound (checked across the full parameter
+//     range, not just defaults). Vignette and dither stay full-resolution
+//     (read per pixel from ra[x] exactly as before) — only the
+//     slowly-varying interference term is coarsened.
+//
+// Tried and reverted in the same pass: a PRIVATE, pre-biased copy of the
+// shared sine table (each entry +SIN_AMP) so the 3-wave sum would already be
+// the contrastLUT index, saving the `+1536` addmi. Two reasons it lost. The
+// coarse grid above already cut that addmi's frequency by 8x, so it buys
+// almost nothing; and the copy costs 2,048 B of the internal-SRAM budget,
+// taking silk from 22,536 B to 24,584 B against BgAnimCommon.h's 24,576 B
+// ceiling. Eight bytes over is enough to push the FOURTH rowAux table into
+// PSRAM — and ra[x] is read per pixel, so one row in four would then pay
+// PSRAM latency on every pixel. Borrowing the shared table is strictly
+// better here.
 // Design: anim-fluid (Fable), 2026-08-15. Optimized: anim-fluid, 2026-08-15;
-// opt-silk2 (fixed-point tail), 2026-08-15.
+// opt-silk2 (fixed-point tail), 2026-08-15; opt-silk3 (constant folding +
+// coarse-grid interpolation), 2026-08-17.
 
 #include "BgAnim.h"
 #include "BgAnimCommon.h"
@@ -162,7 +193,20 @@ float ditherLUT[16];
 // hardware LOOP instruction. See band()'s comment for the measured effect.
 struct RowAux {
     int32_t dx2;  // Q8: g_vignK*dx*dx * 256, always >= 0
-    int32_t dith; // Q16: dither value * 65536 (see file header for why Q16, not Q8)
+    // Q16: dither value * 65536, PLUS PALETTE_REAL_OFF<<16 baked in (see
+    // file header for why Q16, not Q8, and band()'s comment for why the
+    // offset lives here). Folding the constant palette-array offset into
+    // this per-(phase,x) table (built once, not per pixel) means band()'s
+    // final `idxq >> 16` is already g_lut's absolute index, dropping the
+    // `addmi PALETTE_REAL_OFF` that used to run on every pixel. This is
+    // exact, not approximate: for any integer X and multiple-of-2^16 bias
+    // k*65536, (X + k*65536) >> 16 == (X >> 16) + k under arithmetic right
+    // shift (what C++ does for signed idxq here, same as the pre-existing
+    // reliance on arithmetic shift for negative dith), so this changes
+    // nothing about which palette entry is picked, in any case including
+    // the underflow corner (old idx==-1 -> new idx==PALETTE_REAL_OFF-1,
+    // still inside paletteExt's padding).
+    int32_t dith;
 };
 RowAux *rowAux[4] = {nullptr, nullptr, nullptr, nullptr};
 uint32_t lastThemeGen = 0xFFFFFFFF;
@@ -173,14 +217,41 @@ int rowAuxW[4] = {0, 0, 0, 0}; // width each rowAux phase was sized for,
 float g_invR2 = 1.0f;
 float g_vignK = 0.32f; // 0.32f * g_invR2, folded so band() does one multiply instead of two
 int32_t g_step[3];    // per-pixel x-phase step, Q32 turns/px
+int32_t g_bigStep[3]; // = g_step * SILK_GRID: per-cell x-phase step for the
+                       // coarse-grid interpolation in band() (see there);
+                       // computed once per frame() call alongside g_step,
+                       // not per band()/row/pixel.
 int32_t g_rowStep[3]; // per-row y-phase step, Q32 turns/row
 uint32_t g_wtTurn[3]; // temporal phase at y=0, Q32 turns (already mod 2*pi via wraparound)
+// Coarse-grid interpolation constants for band()'s wave-interference field
+// (see band()'s comment for the full rationale and the overflow/precision
+// bound). SILK_GRID must be a power of two so both the per-cell step (divide
+// by SILK_GRID) and the tail-loop bound (mod SILK_GRID) reduce to shifts —
+// no runtime divide is introduced.
+constexpr int SILK_GRID = 8;       // coarse-grid cell width in pixels
+constexpr int SILK_GRID_SHIFT = 3; // log2(SILK_GRID)
+constexpr int SILK_Q_BITS = 8;     // interpolation fixed-point fractional bits
+// The 3-wave sine sum is in [-1536,1536]; contrastLUT is indexed 0..3072. The
+// bias is added at the GRID NODES (once per SILK_GRID pixels) rather than at
+// every pixel: it cancels out of the ramp's delta, and seeding sQ from the
+// already-biased node means the per-pixel `sQ >> SILK_Q_BITS` yields the
+// contrastLUT index directly. That is where the pre-biased private sine table
+// the header describes would have saved an instruction, and why it isn't
+// needed.
+constexpr int32_t SIN_SUM_BIAS = 3 * SIN_AMP; // 1536
 // sinLut() lives in BgAnimCommon.cpp (a different translation unit — this
 // build has no LTO), so calling it from the pixel loop is a real, un-inlined
 // function call with a lazy-init branch, 3x/pixel = 691200 calls/frame. That
 // call overhead was the actual dominant cost of this animation, not the
 // fmodf (removing fmodf alone barely moved host time). Cache the pointer
 // once at init and index it directly in band() instead.
+//
+// Borrowed, not owned: BgAnimCommon holds the one shared copy and every other
+// animation reads the same unbiased table. Pre-biasing a private copy was
+// tried and reverted — see the file header for why (2 KB over the SRAM
+// ceiling, saving an addmi the coarse grid already made 8x rarer). Entries
+// are in [-512,512] (SIN_AMP), so the sum of three reads is in [-1536,1536]
+// and `s + 1536` covers contrastLUT's [0, CONTRAST_N-1] index domain exactly.
 const int16_t *g_sinLut = nullptr;
 
 // idx spans 0..CONTRAST_N-1 (== s+1536, s being the raw sine sum): this is
@@ -274,7 +345,8 @@ bool init(int w, int h) {
                 // Q16 (not Q8): dith's real magnitude is < 1, so rounding it
                 // to a plain integer here would collapse all 16 dither
                 // levels into 2-3 buckets — see file header.
-                rowAux[ph][x].dith = static_cast<int32_t>(lroundf(ditherLUT[ph * 4 + (x & 3)] * 65536.0f));
+                rowAux[ph][x].dith = static_cast<int32_t>(lroundf(ditherLUT[ph * 4 + (x & 3)] * 65536.0f)) +
+                                     (PALETTE_REAL_OFF << 16);
             }
         }
     }
@@ -313,6 +385,7 @@ void frame(uint32_t tMs, int, int, const uint8_t p[4]) {
         wv.kx = k * fastCosRad(A);
         wv.ky = k * fastSinRad(A);
         g_step[i] = static_cast<int32_t>(wv.kx * TURN);
+        g_bigStep[i] = g_step[i] * SILK_GRID; // see g_bigStep declaration
         g_rowStep[i] = static_cast<int32_t>(wv.ky * TURN);
         // Temporal phase as a 64-bit Q32 product: wRateQ (turns/ms) times
         // tMs (ms) wraps mod 2^32 exactly like mod-one-turn, so the result
@@ -344,7 +417,14 @@ void band(uint16_t *dst, int y0, int rows, int w, uint32_t, const uint8_t *) {
     // stack every iteration and the loop lost its zero-overhead LOOP
     // instruction entirely (confirmed via xtensa-asm.sh: went from a
     // `loop` + ~48 insns/pixel to a plain `bne`-branch loop with ~75
-    // insns/pixel of spill/reload traffic). Kept as a single-pixel loop.
+    // insns/pixel of spill/reload traffic). That was a manual unroll of the
+    // FLAT per-pixel loop (4 copies of a/b/c/LUT-reads live at once, more
+    // registers needed, same total work). The SILK_GRID=8 inner loop added
+    // below is a DIFFERENT kind of change — it does LESS total work per
+    // pixel (one add + one shift, replacing three LUT reads), not the same
+    // work four times over — so it doesn't reintroduce the register
+    // pressure that sank the unroll. Don't conflate the two if revisiting
+    // this loop.
     for (int row = 0; row < rows; row++) {
         const int y = y0 + row;
         const float dy = y - cy;
@@ -361,45 +441,103 @@ void band(uint16_t *dst, int y0, int rows, int w, uint32_t, const uint8_t *) {
         // call needed, keeping band() itself at zero libm calls.
         const int32_t envRowBase_q8 = static_cast<int32_t>((1.0f - g_vignK * dy * dy) * 256.0f + 0.5f);
         uint16_t *out = dst + static_cast<size_t>(row) * w;
-        uint32_t a = base[0], b = base[1], c = base[2];
-        // Pick this row's merged vignette+dither table (see rowAux
-        // comment) — a single per-row pointer select, zero per-pixel cost.
-        // band()'s hot loop then walks ONE incrementing pointer (ra) to
-        // get BOTH per-pixel terms (ra[x].dx2, ra[x].dith) instead of two
-        // separate walking pointers — that's what keeps the loop simple
-        // enough to earn the hardware zero-overhead LOOP instruction
-        // (confirmed via xtensa-asm.sh: two independent per-pixel array
-        // pointers here, on top of the out-pointer, was enough loop-carried
-        // induction traffic to make the compiler fall back to a plain
-        // compare-and-branch, even though raw instruction count was already
-        // below baseline — merging back to two walking pointers total
-        // restores the `loop` instruction).
+        // Pick this row's merged vignette+dither table (see rowAux comment)
+        // — a single per-row pointer select, zero per-pixel cost. band()'s
+        // hot loop then walks ONE incrementing pointer (ra) to get BOTH
+        // per-pixel terms (ra[x].dx2, ra[x].dith) instead of two separate
+        // walking pointers.
         const RowAux *const ra = rowAux[y & 3];
-        for (int x = 0; x < w; x++) {
-            const int32_t s = sinFromTurn(a) + sinFromTurn(b) + sinFromTurn(c); // -1536..1536
+        // --- Coarse-grid interpolation of the wave-interference field ---
+        // `s` (the 3-wave sine sum that indexes contrastLUT) is spatially
+        // SMOOTH at the fringe densities this animation uses (k0 in
+        // [0.008,0.03] turns/px-equivalent, see frame()): its curvature over
+        // a handful of pixels is far below what the eye or the golden-frame
+        // comparison can resolve. So instead of the exact 3-LUT-read/2-add
+        // evaluation at EVERY pixel, evaluate it exactly once per SILK_GRID
+        // pixels ("grid nodes") and fill the pixels in between with a Q8
+        // linear ramp, stepped with one add + one shift per pixel — the
+        // brief's "coarse-grid + integer bilinear upsample" technique. Grid
+        // nodes are exact (no drift accumulates node-to-node, since each
+        // cell's ramp is reseeded from the next exact node, not from the
+        // previous cell's interpolated end). Only vignette/dither stay
+        // full-resolution (ra[x], read per pixel as before) — only the
+        // slowly-varying sine-interference term is coarsened.
+        //
+        // Correctness of the ramp: over SILK_GRID=8 steps of size stepQ,
+        // sQ advances from sCur<<Q_BITS to exactly sCur<<Q_BITS +
+        // GRID*stepQ = sCur<<Q_BITS + (sNext-sCur)<<Q_BITS = sNext<<Q_BITS
+        // (GRID << (Q_BITS-GRID_SHIFT) == 1 << Q_BITS for any power-of-two
+        // GRID) — i.e. the ramp closes EXACTLY on the next node with no
+        // rounding drift, and (being a monotonic linear ramp between two
+        // in-range endpoints) every intermediate sample stays inside
+        // [sCur,sNext] (or [sNext,sCur]), so it can never index contrastLUT
+        // outside [0, CONTRAST_N-1] — verified, not assumed, since sCur/sNext
+        // are provably in [0,3072] at every node (the sine sum is in
+        // [-1536,1536] and SIN_SUM_BIAS is added at the node).
+        //
+        // Overflow bound (checked for the full p[0]/p[1] range, not just
+        // defaults): the biased node value is in [0,3072] always, so
+        // |sNext-sCur| <= 3072 in the most adversarial case; stepQ = delta <<
+        // (Q_BITS-GRID_SHIFT) then maxes out around 3072*32 ~= 98304, and sQ
+        // across a whole cell tops out around 1.6M — both trivially inside
+        // int32 range regardless of speed/scale or how long the device has
+        // been up.
+        //
+        // Width isn't always a multiple of SILK_GRID (466 and 480 are both
+        // supported panel sizes; 466 % 8 == 2), so the trailing <SILK_GRID
+        // pixels at the row's right edge fall back to the exact per-pixel
+        // path below — at most 7 pixels/row, not a per-band()-call cost.
+        uint32_t a = base[0], b = base[1], c = base[2];
+        // Biased once per node, not per pixel (see SIN_SUM_BIAS).
+        int32_t sCur = SIN_SUM_BIAS + sinFromTurn(a) + sinFromTurn(b) + sinFromTurn(c); // exact node @ x=0
+        const int cellsFull = w >> SILK_GRID_SHIFT;
+        int x = 0;
+        for (int cell = 0; cell < cellsFull; cell++) {
+            a += g_bigStep[0];
+            b += g_bigStep[1];
+            c += g_bigStep[2];
+            const int32_t sNext = SIN_SUM_BIAS + sinFromTurn(a) + sinFromTurn(b) + sinFromTurn(c); // exact next node
+            const int32_t stepQ = (sNext - sCur) << (SILK_Q_BITS - SILK_GRID_SHIFT);
+            int32_t sQ = sCur << SILK_Q_BITS;
+            for (int i = 0; i < SILK_GRID; i++) {
+                const int32_t s = sQ >> SILK_Q_BITS;
+                // g_lut[s] (contrast curve) and g_lut[idx] (palette, offset
+                // folded into ra[x].dith — see RowAux comment) are ONE
+                // walking pointer with two precomputed offsets, not two
+                // separate pointers — see the g_lut/contrastLUT/paletteExt
+                // comment above for why that matters.
+                const int32_t nc_q8 = g_lut[s]; // already the biased index, Q8 (nc*256)
+                // env_q8 in [0,256] always (see file header proof); no clamp
+                // needed for any square panel (all current display drivers
+                // are square).
+                const int32_t env_q8 = envRowBase_q8 - ra[x].dx2;
+                // nc_q8 (Q8) * env_q8 (Q8) = Q16 (nc*env*65536); ra[x].dith
+                // is pre-scaled to the same Q16 units AND pre-biased by
+                // PALETTE_REAL_OFF<<16 (see RowAux comment), so one add
+                // combines them and one arithmetic shift recovers g_lut's
+                // ABSOLUTE palette index directly.
+                const int32_t idxq = nc_q8 * env_q8 + ra[x].dith;
+                const int idx = static_cast<int>(idxq >> 16);
+                out[x] = g_lut[idx];
+                sQ += stepQ;
+                x++;
+            }
+            sCur = sNext;
+        }
+        // Exact tail for the row's non-grid-aligned remainder (0..7 pixels):
+        // same per-pixel math band() used everywhere before interpolation
+        // existed. `a,b,c` already sit at the last grid node's phase (== x
+        // here), so this just resumes the ORIGINAL per-pixel g_step.
+        for (; x < w; x++) {
+            const int32_t s = SIN_SUM_BIAS + sinFromTurn(a) + sinFromTurn(b) + sinFromTurn(c);
             a += g_step[0];
             b += g_step[1];
             c += g_step[2];
-            // g_lut[s+1536] (contrast curve) and g_lut[PALETTE_REAL_OFF+idx]
-            // (palette) are ONE walking pointer with two compile-time-
-            // constant offsets, not two separate pointers — see the
-            // g_lut/contrastLUT/paletteExt comment above for why that
-            // matters (frees the AR register the second pointer needed,
-            // which otherwise had to spill/reload every pixel).
-            const int32_t nc_q8 = g_lut[s + 1536]; // direct index, Q8 (nc*256)
-            // env_q8 in [0,256] always (see file header proof); no clamp
-            // needed for any square panel (all current display drivers are
-            // square), which is what turns the old float subtract + compare
-            // + branch + multiply-add + trunc.s chain into one mull + one
-            // shift below.
+            const int32_t nc_q8 = g_lut[s];
             const int32_t env_q8 = envRowBase_q8 - ra[x].dx2;
-            // nc_q8 (Q8) * env_q8 (Q8) = Q16 (nc*env*65536); ra[x].dith is
-            // pre-scaled to the same Q16 units (see file header for why
-            // dither needs the extra fractional bits), so one add combines
-            // them and one arithmetic shift recovers the plain index.
             const int32_t idxq = nc_q8 * env_q8 + ra[x].dith;
             const int idx = static_cast<int>(idxq >> 16);
-            out[x] = g_lut[PALETTE_REAL_OFF + idx];
+            out[x] = g_lut[idx];
         }
         base[0] += static_cast<uint32_t>(g_rowStep[0]);
         base[1] += static_cast<uint32_t>(g_rowStep[1]);

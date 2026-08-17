@@ -35,14 +35,23 @@ constexpr uint32_t STEP2 = static_cast<uint32_t>(0.017f * TICKS);
 
 // Curtain weights (0.62/0.38 in Q7) are compile-time constants, so pre-scaling
 // the shared sine LUT by them once (at init) turns the per-pixel "v1*635"/
-// "v2*393" multiplies into plain array reads.
+// "v2*393" multiplies into plain array reads. The final ">>7" that undoes the
+// Q7 weighting is also folded into the table here (each entry pre-shifted)
+// rather than applied once to the summed v in band() -- (a>>7)+(b>>7) differs
+// from (a+b)>>7 by at most 1 ULP (each addend's low 7 bits are truncated
+// separately instead of the sum's), invisible against the +-8 ordered-dither
+// noise already added downstream, and it removes a per-pixel shift from the
+// hottest loop in the file (perf pass 3, opt-aurora).
 constexpr int32_t W1 = 635, W2 = 393;
-int32_t *wLut1 = nullptr; // [1024] sin1024(i) * W1
-int32_t *wLut2 = nullptr; // [1024] sin1024(i) * W2
+int32_t *wLut1 = nullptr; // [1024] (sin1024(i) * W1) >> 7
+int32_t *wLut2 = nullptr; // [1024] (sin1024(i) * W2) >> 7
 
-// v = (wLut1+wLut2)>>7 ranges about +-4112 (512*(W1+W2)>>7); sqLUT covers the
+// v = wLut1+wLut2 ranges about +-4112 (512*(W1+W2)>>7); sqLUT covers the
 // full signed range so the per-pixel "clip negative to 0, then square>>12"
 // collapses to one branchless offset array read (negative entries are 0).
+// Splitting the >>7 across the two addends (see wLut1/wLut2 above) can only
+// truncate each toward zero at least as much as shifting the sum would, so
+// this bound still holds as an upper bound on the actual per-pixel max.
 constexpr int32_t V_MAX = (512 * (W1 + W2)) >> 7;
 
 float g_t = 0, g_A1 = 0, g_A2 = 0;
@@ -92,8 +101,8 @@ bool init(int, int) {
         return false;
     }
     for (int i = 0; i < SIN_N; i++) {
-        wLut1[i] = static_cast<int32_t>(lut[i]) * W1;
-        wLut2[i] = static_cast<int32_t>(lut[i]) * W2;
+        wLut1[i] = (static_cast<int32_t>(lut[i]) * W1) >> 7;
+        wLut2[i] = (static_cast<int32_t>(lut[i]) * W2) >> 7;
     }
     buildGlowLUT();
     lastThemeGen = themeGen();
@@ -226,6 +235,16 @@ void band(uint16_t *dst, int y0, int rows, int w, uint32_t, const uint8_t *) {
         // "scaledSq + ditherRow[bit]" add into the pointer itself (computed
         // 8x/row instead of 2x/pixel), so the x loop's only remaining work
         // per pixel is the LUT index -- no add left before the final read.
+        //
+        // Tried and reverted (perf pass 3, opt-aurora): collapsing this to
+        // one pointer into ditherFold plus a per-pixel "rowLUT[scaledSq +
+        // df[bit]]" read, on the theory that 8 live pointers were spilling
+        // through the unrolled x loop and one extra integer add would be
+        // cheaper than the spill traffic. Host got worse (0.217ms ->
+        // 0.234ms) AND xtensa-asm showed device instructions rising (861 ->
+        // 877) with one of band()'s two zero-overhead hardware loops lost
+        // (2 -> 1) -- the opposite of the intended trade. Verified in real
+        // assembly, not assumed: keep the pointer-array form.
         const uint16_t *rowLUTAtBit[8];
         for (int b = 0; b < 8; b++) {
             rowLUTAtBit[b] = rowLUT + ditherFold[dbase + b];
@@ -248,7 +267,10 @@ void band(uint16_t *dst, int y0, int rows, int w, uint32_t, const uint8_t *) {
         // assumed: before this attribute, band() contained 8 callx8 and the
         // object exported two lambda operator() symbols.
         auto pixel = [&](int bit) __attribute__((always_inline)) -> uint16_t {
-            const int32_t v = (w1[(ph1 >> 8) & 1023] + w2[(ph2 >> 8) & 1023]) >> 7; // ~±4112
+            // No runtime >>7 here: folded into wLut1/wLut2 at build time (see
+            // note by their declaration) -- this is a plain sum of two table
+            // reads now, ~±4112.
+            const int32_t v = w1[(ph1 >> 8) & 1023] + w2[(ph2 >> 8) & 1023];
             ph1 += STEP1;
             ph2 += STEP2;
             // Was a table read: sqLUT[v] for v in [-V_MAX, V_MAX], which at

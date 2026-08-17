@@ -41,38 +41,56 @@ constexpr size_t SRAM_ALLOC_LIMIT = GM_BGANIM_SRAM_LIMIT;
 // the tables are never freed, so switching through the fleet accumulated 53 KB
 // and took the network stack down with it (see the analysis in alloc()).
 //
-// 24 KB keeps roughly 45 KB of the pool free for what WiFi, BLE and TLS
-// allocate at runtime, which is the point. What it does NOT do is give the
-// running animation its tables -- there is no budget value that would, and an
-// earlier version of this comment claimed otherwise. The real behaviour, walked
-// through the registry order and confirmed byte-for-byte against a device
-// trace:
+// All thirteen animations now declare release() on the BgAnimation ABI, and
+// SleepAnimation frees the outgoing animation's tables before the incoming one
+// allocates. That changes what this number has to cover: the peak is
+// max-over-animations, not sum-over-animations, so the ceiling is a placement
+// policy -- it decides where the running animation's tables live -- rather than
+// the bare safety limit it used to be, when four animations claimed the pool by
+// position in the registry and the remaining nine got none of it.
 //
-//   plasma    2,944 + sinLut 2,048 shared        -> 4,992,  all SRAM
-//   lava      2,432 + cosTableF 1,024 shared     -> 8,448,  all SRAM
-//   silk      7,176 + 4 x 3,840 rowAux           -> 23,304, last two to PSRAM
-//   starfield 11,084 eligible                    -> 24,548, 6 of 10 to PSRAM
-//   everything after                             -> entirely PSRAM
+// The peak has two terms. Some tables are shared fleet-wide, owned by
+// BgAnimCommon, and deliberately outlive any single animation, so they are
+// charged here permanently:
 //
-// So four animations claim the pool and the remaining nine get none of it,
-// including caustics' 8,192 B rgbLUT and aurora's 8,704 B of sine tables, both
-// individually well under the limit. Which four is decided by position in the
-// registry, not by how hot the tables are. Silk alone asks for 22,536 B, 92% of
-// this ceiling, and does not fully fit even when it runs first from a cold boot.
+//   sinLut     2,048  shared by plasma, silk, caustics, aurora, ember, ...
+//   cosTableF  1,024  shared by ripples, starfield, aurora
+//   ---------------
+//              3,072  never released (correctly -- see release() below)
 //
-// The mechanism that would actually fix this is a release entry point on the
-// BgAnimation ABI, freeing the outgoing animation's tables on a switch, so the
-// peak is max-over-animations (silk's 22.5 KB) instead of sum-over-animations.
-// Six of the thirteen would be mechanical; the rest gate their table CONTENT on
-// separate theme/param sentinels that a naive free-and-null would leave stale,
-// handing back a reallocated buffer that never gets refilled. Mandala is worse
-// than stale content: its fill flag is function-local and unreachable from
-// outside, and its rescaleLUT pointer is offset into the allocation, so freeing
-// the pointer the code holds would corrupt the heap.
+// noiseTex256's 65,536 B is shared too but exceeds SRAM_ALLOC_LIMIT, so it goes
+// to PSRAM and is not charged here. The second term is the largest single
+// animation, which is silk:
 //
-// Until that exists, this ceiling is a safety limit, not a placement policy.
+//   g_lut     7,176  LUT_N x 2
+//   rowAux   15,360  4 dither phases x 480 x 8
+//   ---------------
+//            22,536
+//
+// so the peak is 3,072 + 22,536 = 25,608 B. Nothing else comes close: the next
+// largest SRAM-eligible sets are starfield's 11,084, caustics' 9,744 and
+// aurora's 8,704, all of which now fit with room to spare.
+//
+// 28 KB covers the peak with 3,064 B of headroom and still leaves roughly 41 KB
+// of the pool for what WiFi, BLE and TLS allocate at runtime -- about half the
+// 53 KB at which the network stack died (see alloc()). The headroom is not
+// slack: at the previous 24 KB ceiling, measured, silk got 18,696 B in SRAM and
+// its FOURTH rowAux -- exactly 3,840 B -- spilled to PSRAM, and ra[x].dx2 /
+// ra[x].dith are read PER PIXEL, so one row in four paid bus latency on every
+// pixel to save 2 KB of a pool with 45 KB free. A ceiling that spills a
+// per-pixel table is mis-set, not conservative.
+//
+// Adding a release() is not purely mechanical, which is why the rollout took a
+// pass of its own: several animations gate their table CONTENT on separate
+// theme/param sentinels, and a free-and-null that leaves one of those set hands
+// back a reallocated buffer that nothing ever refills. release() has to reset
+// every such sentinel. That is a correctness requirement and not only a memory
+// one, since some tables are sized from w/h and init() alone will not resize
+// them. It also must NOT free a borrowed table: an animation that cached
+// sinLut() or noiseTex256() only drops its pointer, because those belong to the
+// shared term above and other animations still hold them.
 #ifndef GM_BGANIM_SRAM_BUDGET
-#define GM_BGANIM_SRAM_BUDGET (24 * 1024)
+#define GM_BGANIM_SRAM_BUDGET (28 * 1024)
 #endif
 constexpr size_t SRAM_TOTAL_BUDGET = GM_BGANIM_SRAM_BUDGET;
 

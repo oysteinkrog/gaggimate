@@ -209,6 +209,26 @@ void band(uint16_t *dst, int y0, int rows, int w, uint32_t, const uint8_t *) {
     }
 }
 
+void release() {
+    releaseTable(paletteExt, PAL_EXT_N * sizeof(uint16_t));
+    // An alias into paletteExt (paletteExt + PAD), not its own allocation —
+    // handing it to free() would be heap corruption. Just drop it.
+    palette = nullptr;
+    releaseTable(radiusLUT, RLUT_N);
+    releaseTable(flickerLUT, 256);
+    // Borrowed: noiseTex256() is a 64 KB fleet-wide asset owned by
+    // BgAnimCommon and shared with nebula. Dropping the pointer is all this
+    // animation is entitled to do.
+    noise = nullptr;
+    // init() reinstates these unconditionally, but reset them here too so the
+    // freed-and-nulled state is self-consistent: leaving a live sentinel next
+    // to a null table is the failure mode this whole entry point exists to
+    // avoid (see BgAnimCommon.h).
+    lastThemeGen = 0xFFFFFFFF;
+    lastGlow = 255;
+    lastFlickerParam = 255;
+}
+
 } // namespace
 
 extern const BgAnimation bg_anim_ember;
@@ -219,6 +239,7 @@ const BgAnimation bg_anim_ember = {
     init,
     frame,
     band,
+    release,
 };
 
 #endif // GAGGIMATE_SIM
