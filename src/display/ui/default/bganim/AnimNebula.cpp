@@ -194,21 +194,46 @@ void band(uint16_t *dst, int y0, int rows, int w, uint32_t, const uint8_t *) {
         // SleepAnimation.cpp's interlaced half-res path relies on (see its
         // comment at the anim.band(halfBuf + ...) split-render call).
         //
-        // A separable reformulation was also tried: blend rowA0/rowA1 by
-        // ayF first into a scratch 256-row (one pass, no neighbor loads),
-        // then x-interpolate that single row (bilinear interpolation
-        // commutes between x and y order, so this is mathematically the
-        // same result up to >>8 rounding order) -- in theory one 256-texel
-        // pass plus one 255-texel pass instead of one 255-texel pass that
-        // touches two source rows. Measured WORSE on both host (0.373ms vs
-        // 0.364ms here) and xtensa-asm (243 insns here vs 231, because the
-        // y-blend pass couldn't get a plain two-pointer walk -- rowA0 and
-        // rowA1 aren't necessarily adjacent in the noise texture across the
-        // y-wrap boundary, so GCC derived rowA0's address from rowA1's via
-        // an extra sub+add every iteration) and it drifted off golden
-        // (mean 0.004-0.02, max 9, still "OK" but non-zero vs bit-exact
-        // here). Reverted in favor of this rolling-load form, which is both
-        // faster and bit-exact.
+        // Two separable reformulations were tried here and both reverted.
+        //
+        // (1) y-blend rowA0/rowA1 into a scratch 256-row first, then
+        // x-interpolate that single row. Bilinear interpolation commutes
+        // between x and y order, so this is the same result up to >>8
+        // rounding order. Measured WORSE on both host (0.373ms vs 0.364ms
+        // here) and xtensa-asm (243 insns here vs 231), because the y-blend
+        // pass couldn't get a plain two-pointer walk -- rowA0 and rowA1
+        // aren't necessarily adjacent in the noise texture across the y-wrap
+        // boundary, so GCC derived rowA0's address from rowA1's via an extra
+        // sub+add every iteration -- and it drifted off golden (mean
+        // 0.004-0.02, max 9, still "OK" but non-zero vs bit-exact here).
+        //
+        // (2) x-interpolate FIRST into two ping-ponged scratch rows, then
+        // y-blend. This direction is bit-exact (it is literally the va/vb/
+        // ayF expressions below, in the same order) and it exploits a real
+        // identity: this row's rowA1 is next row's rowA0, for every y
+        // including across the wrap, so the x pass is reusable and runs once
+        // per output row instead of twice. That halves the dominant octave's
+        // PSRAM traffic -- worth chasing, because noiseTex256 is 64 KB and
+        // alloc() therefore places it in PSRAM, behind the S3's 32 KB
+        // external-memory cache, and the GM_NEBULA_CACHED_NOISE_PROBE
+        // diagnostic below measures 12% for perfect locality even on the
+        // host, where the texture fits in L2 entirely.
+        //
+        // It still lost. Splitting the passes adds a whole extra 256-texel
+        // pass of loads, stores and loop overhead: multiplies per row drop
+        // 765 -> 511, but total inner ops per row rise by roughly a thousand,
+        // against 255 saved PSRAM byte-reads = 8 cache lines. Break-even
+        // needs those lines to cost >100 cycles each. band() went 243 -> 273
+        // insns with 5 hardware loops instead of 4, and the host moved 0.357
+        // -> 0.347, inside the +-4% noise floor. Bit-exactness makes it safe
+        // but not free, and nothing available off-device says it pays.
+        //
+        // If nebula needs to go faster, the next measurement to take is on
+        // hardware (/api/animbench), not on the host: the host cannot show a
+        // PSRAM stall, so it cannot price either of these reorderings. Reduce
+        // texture traffic rather than trade compute for it -- e.g. sampling
+        // the 4x octave at half vertical rate, which is not bit-exact and so
+        // needs a visual check, but removes reads instead of adding passes.
         {
             int cur0 = rowA0[0];
             int cur1 = rowA1[0];
