@@ -11,7 +11,6 @@
 #include <display/plugins/BLEScalePlugin.h>
 #include <display/plugins/ShotHistoryPlugin.h>
 #ifdef GM_ANIM_BENCH
-#include <display/drivers/common/PanelClock.h>
 #include <display/ui/default/SleepAnimation.h>
 #include <display/ui/default/bganim/BgAnim.h>
 #include <display/ui/default/bganim/BgAnimCommon.h>
@@ -21,7 +20,10 @@
 #include <soc/gdma_struct.h>  // direct GDMA register access for /api/gdma
 #include <esp_heap_caps.h>
 #endif
-// Not bench-only: /api/debug/heap reports the animation SRAM budget.
+// Not bench-only: /api/debug/heap reports the animation SRAM budget, and
+// /api/settings echoes panelclock::hasLiveControl() so the form can tell the
+// user whether a new divider applies now or at the next boot.
+#include <display/drivers/common/PanelClock.h>
 #include <display/ui/default/bganim/BgAnimCommon.h>
 #include <display/util/PsramStlAllocator.h>
 #include <display/util/PsramWsBuffer.h>
