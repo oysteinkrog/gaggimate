@@ -4,3 +4,17 @@ dependencies:
   # that works for ESP32-P4 / esp_hosted-mcu.
   h2zero/esp-nimble-cpp:
     version: "~2.5.0"
+
+  # HomeSpan's HAP crypto (SRP, Ed25519, ChaCha20-Poly1305) includes <sodium.h>.
+  # On the Arduino-only branch that header and archive arrive through the
+  # prebuilt Arduino libs, declared in framework-arduinoespressif32-libs/<mcu>/
+  # pioarduino-build.py. That SConscript is loaded only when espidf is NOT in
+  # PIOFRAMEWORK (platform builder arduino.py gates it on
+  # `"espidf" not in pioframework`), so in this dual-framework build it never
+  # runs. The library pass instead takes its include set from the CMake File API
+  # for the `src` executable target -- the public include dirs of src's
+  # REQUIRES -- so libsodium has to be a real IDF dependency here. Without it
+  # HomeSpan cannot compile, and libsodium.a would not be on the link line
+  # either.
+  espressif/libsodium:
+    version: "~1.0.20"
