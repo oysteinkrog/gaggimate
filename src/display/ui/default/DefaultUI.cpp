@@ -429,7 +429,9 @@ void DefaultUI::maintainSleepAnimation() {
             // Standby content changes once a minute (clock); active screens
             // update continuously — refresh the snapshot faster there so
             // gauges and numbers stay reasonably live behind the animation.
-            applyAnimPlates(controller->getSettings().getBgAnimClearPlates() != 0);
+            const Settings &plateSettings = controller->getSettings();
+            applyAnimPlates(plateSettings.getBgAnimClearPlates(), static_cast<uint32_t>(plateSettings.getBgAnimPlateColor()),
+                            plateSettings.getBgAnimPlateOpacity());
             const unsigned long interval = currentScreen == SCREEN_ID_STANDBY_SCREEN ? 1000 : 33;
             if (::millis() - lastSleepOverlayRefresh > interval) {
                 refreshSleepOverlay();
@@ -658,7 +660,9 @@ void DefaultUI::startSleepAnimation() {
             lv_obj_set_style_border_opa(icon, LV_OPA_TRANSP, LV_PART_MAIN);
         }
     }
-    applyAnimPlates(controller->getSettings().getBgAnimClearPlates() != 0);
+    const Settings &plateSettings = controller->getSettings();
+    applyAnimPlates(plateSettings.getBgAnimClearPlates(), static_cast<uint32_t>(plateSettings.getBgAnimPlateColor()),
+                    plateSettings.getBgAnimPlateOpacity());
     // Widget updates must not race the plasma on the panel: LVGL keeps
     // rendering to its draw buffer, but flushes are dropped until stop.
     lvgl_helper_suppress_flush(true);
@@ -679,30 +683,89 @@ void DefaultUI::startSleepAnimation() {
 // The original opacity is saved and put back rather than dropping the local
 // style property, because the generated code sets that property explicitly and
 // removing it would fall through to the theme default instead of the value the
-// screen was designed with.
-void DefaultUI::applyAnimPlates(bool clear) {
+// screen was designed with. Colours are restored differently — see the note on
+// change_color_theme at the end of the function.
+void DefaultUI::applyAnimPlates(int mode, uint32_t color, int opaPct) {
 #ifndef GAGGIMATE_SIM
-    if (clear == animPlatesCleared) {
+    if (opaPct < 0) {
+        opaPct = 0;
+    } else if (opaPct > 100) {
+        opaPct = 100;
+    }
+    // Colour and opacity only mean anything in mode 2; ignoring them otherwise
+    // keeps mode 0/1 from repainting every time the (unused) colour changes.
+    const uint32_t wantColor = mode == 2 ? color : 0;
+    const int wantOpa = mode == 2 ? opaPct : 0;
+    if (mode == animPlateMode && wantColor == animPlateColor && wantOpa == animPlateOpaPct) {
         return;
     }
-    // The last two are the profile-name labels on the brew and profile screens.
-    // They are not full-bleed panels but they are opaque, and because the text
-    // scrolls (LONG_SCROLL_CIRCULAR) the black bar behind it is in constant
-    // motion against the animation, which makes it the most obvious of the lot.
-    lv_obj_t *const plates[6] = {objects.obj2,   objects.obj9,        objects.obj15,
-                                 objects.obj26,  objects.profile_name, objects.profile_name_1};
-    for (int i = 0; i < 6; i++) {
+
+    // obj2/obj9/obj15/obj26 are the full-bleed panels behind the dials.
+    // profile_name/profile_name_1 are the profile-name labels on the brew and
+    // profile screens: not panels, but opaque, and because the text scrolls
+    // (LONG_SCROLL_CIRCULAR) the bar behind it is in constant motion against
+    // the animation, which makes it the most obvious of the lot.
+    // mode_switch/mode_switch1 are the pills carrying the scale weight readout
+    // on the brew and grind screens. They are buttons as well as backdrops, so
+    // mode 2 is the useful setting for them: it keeps a visible affordance
+    // instead of dissolving the control into the animation.
+    // The last entry is the scale overlay's Tare pill, built at runtime by
+    // buildScaleScreen rather than generated, so it is null whenever that screen
+    // is down. It is the one plate change_color_theme() knows nothing about.
+    lv_obj_t *const plates[ANIM_PLATE_COUNT] = {
+        objects.obj2,         objects.obj9,           objects.obj15,       objects.obj26,      objects.profile_name,
+        objects.profile_name_1, objects.mode_switch, objects.mode_switch1, scaleTareBtn};
+
+    for (int i = 0; i < ANIM_PLATE_COUNT; i++) {
         if (plates[i] == nullptr) {
             continue;
         }
-        if (clear) {
+        if (!animPlateHas[i]) {
             animPlateOpa[i] = lv_obj_get_style_bg_opa(plates[i], LV_PART_MAIN);
-            lv_obj_set_style_bg_opa(plates[i], LV_OPA_TRANSP, LV_PART_MAIN);
-        } else {
+            animPlateBg[i] = lv_obj_get_style_bg_color(plates[i], LV_PART_MAIN);
+            animPlateHas[i] = true;
+        }
+        switch (mode) {
+        case 0:
             lv_obj_set_style_bg_opa(plates[i], animPlateOpa[i], LV_PART_MAIN);
+            lv_obj_set_style_bg_color(plates[i], animPlateBg[i], LV_PART_MAIN);
+            // Mode 2 adds a checked-state colour where most of these objects
+            // never had one; drop it so the state falls back to the default
+            // again. The ones that legitimately do have one (mode_switch1)
+            // get it reinstated by change_color_theme below.
+            lv_obj_remove_local_style_prop(plates[i], LV_STYLE_BG_COLOR, LV_PART_MAIN | LV_STATE_CHECKED);
+            break;
+        case 2:
+            lv_obj_set_style_bg_color(plates[i], lv_color_hex(color), LV_PART_MAIN);
+            lv_obj_set_style_bg_opa(plates[i], static_cast<lv_opa_t>((opaPct * 255 + 50) / 100), LV_PART_MAIN);
+            // mode_switch1 carries a checked-state bg_color of its own, applied
+            // whenever grind_volumetric is set, and a default-state colour does
+            // not win against it. Without this the grind screen's weight pill
+            // ignores the chosen colour (at the chosen opacity) exactly half the
+            // time. Writing both states is also what makes the custom colour
+            // hold on any plate that gains a checked style later.
+            lv_obj_set_style_bg_color(plates[i], lv_color_hex(color), LV_PART_MAIN | LV_STATE_CHECKED);
+            break;
+        default:
+            lv_obj_set_style_bg_opa(plates[i], LV_OPA_TRANSP, LV_PART_MAIN);
+            break;
         }
     }
-    animPlatesCleared = clear;
+
+    // Restoring from a capture is not enough for the generated plates. The
+    // capture reads whichever state the object was in at the time (LVGL resolves
+    // a style query against the live state, it takes no state argument), and
+    // change_color_theme() may have overwritten the colour since. Re-running the
+    // theme is the authoritative restore: it reassigns every generated object's
+    // colours in both states from theme_colors. The per-plate capture above
+    // still carries the Tare pill, which the theme function does not reach.
+    if (mode == 0 && currentThemeMode >= 0) {
+        change_color_theme(static_cast<uint32_t>(currentThemeMode));
+    }
+
+    animPlateMode = mode;
+    animPlateColor = wantColor;
+    animPlateOpaPct = wantOpa;
 #endif
 }
 
@@ -710,7 +773,7 @@ void DefaultUI::stopSleepAnimation() {
 #ifndef GAGGIMATE_SIM
     sleepAnimation.stop();
     lvgl_helper_suppress_flush(false);
-    applyAnimPlates(false);
+    applyAnimPlates(0);
     for (lv_obj_t *icon : {objects.wifi_icon, objects.bluetooth_icon, objects.update_icon}) {
         if (icon != nullptr) {
             lv_obj_remove_local_style_prop(icon, LV_STYLE_BORDER_OPA, LV_PART_MAIN);
@@ -977,6 +1040,9 @@ void DefaultUI::buildScaleScreen() {
             auto *ui = static_cast<DefaultUI *>(lv_event_get_user_data(e));
             ui->scaleScreen = nullptr;
             ui->scaleWeightLabel = nullptr;
+            // Child of the cover, so it dies with it. applyAnimPlates walks this
+            // pointer every pass and would otherwise reach a freed object.
+            ui->scaleTareBtn = nullptr;
         },
         LV_EVENT_DELETE, this);
 
@@ -1001,6 +1067,9 @@ void DefaultUI::buildScaleScreen() {
     lv_obj_align_to(unit, scaleWeightLabel, LV_ALIGN_OUT_RIGHT_BOTTOM, 8, -6);
 
     // Tare as a standard pill (mode_switch1 geometry: 160x50, r10, 2px border).
+    // Opaque, and on screen over the animation, so applyAnimPlates drives its
+    // background like the generated plates. It is registered below, after its
+    // styles are set, so the first capture sees the designed values.
     lv_obj_t *tareBtn = lv_btn_create(cover);
     lv_obj_set_size(tareBtn, 160, 50);
     lv_obj_align(tareBtn, LV_ALIGN_CENTER, 0, 70);
@@ -1011,6 +1080,11 @@ void DefaultUI::buildScaleScreen() {
     lv_obj_set_style_border_opa(tareBtn, LV_OPA_COVER, LV_PART_MAIN);
     lv_obj_set_style_border_width(tareBtn, 2, LV_PART_MAIN);
     lv_obj_set_style_shadow_width(tareBtn, 0, LV_PART_MAIN);
+    // A rebuilt pill is a fresh object with the designed background, so drop the
+    // capture and force the next pass to re-apply the current mode to it.
+    scaleTareBtn = tareBtn;
+    animPlateHas[ANIM_PLATE_COUNT - 1] = false;
+    animPlateMode = -1;
     lv_obj_add_event_cb(
         tareBtn, [](lv_event_t *e) { action_on_volumetric_hold(e); }, LV_EVENT_CLICKED, nullptr);
     lv_obj_t *tareLabel = lv_label_create(tareBtn);
@@ -1398,6 +1472,13 @@ void DefaultUI::applyTheme() {
     if (newThemeMode != currentThemeMode) {
         currentThemeMode = newThemeMode;
         change_color_theme(currentThemeMode);
+        // change_color_theme just reassigned bg_color on every plate, so a
+        // custom-coloured plate (mode 2) has silently reverted to the theme
+        // colour while applyAnimPlates still believes it wrote the custom one.
+        // Clearing the cache makes the next pass re-apply. The captures are
+        // deliberately kept: mode 0 restores the generated plates by re-running
+        // the theme, so a stale captured colour cannot outlive a restore.
+        animPlateMode = -1;
     }
 }
 

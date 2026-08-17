@@ -167,6 +167,12 @@ void Settings::setBgAnimFps(int bg_anim_fps) { bgAnimFps.set(bg_anim_fps); }
 void Settings::setBgAnimHalfRes(int bg_anim_half_res) { bgAnimHalfRes.set(bg_anim_half_res); }
 void Settings::setBgAnimInterlace(int bg_anim_interlace) { bgAnimInterlace.set(bg_anim_interlace); }
 void Settings::setBgAnimClearPlates(int bg_anim_clear_plates) { bgAnimClearPlates.set(bg_anim_clear_plates); }
+
+void Settings::setBgAnimPlateColor(int bg_anim_plate_color) { bgAnimPlateColor.set(bg_anim_plate_color & 0xFFFFFF); }
+
+void Settings::setBgAnimPlateOpacity(int bg_anim_plate_opacity) {
+    bgAnimPlateOpacity.set(bg_anim_plate_opacity < 0 ? 0 : (bg_anim_plate_opacity > 100 ? 100 : bg_anim_plate_opacity));
+}
 void Settings::setPanelClockDiv(int panel_clock_div) { panelClockDiv.set(panel_clock_div); }
 void Settings::setBgAnimCustomTheme(const String &bg_anim_custom_theme) { bgAnimCustomTheme.set(bg_anim_custom_theme); }
 

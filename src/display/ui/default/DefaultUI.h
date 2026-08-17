@@ -74,9 +74,11 @@ class DefaultUI {
     void stopSleepAnimation();
     void maintainSleepAnimation();
     void refreshSleepOverlay();
-    // Hide or restore the opaque background plates the generated screens put
-    // behind their content. See the definition for which objects and why.
-    void applyAnimPlates(bool clear);
+    // Hide, restore or repaint the opaque background plates the generated
+    // screens put behind their content. mode is Settings::getBgAnimClearPlates
+    // (0 keep, 1 hide, 2 custom); color is 0xRRGGBB and opaPct 0-100, both used
+    // only in mode 2. See the definition for which objects and why.
+    void applyAnimPlates(int mode, uint32_t color = 0, int opaPct = 0);
     // lv_snapshot_take_to_buf with a clip area. Renders only `clip` into `buf`,
     // leaving the rest of the buffer alone, so an overlay refresh costs what
     // actually changed rather than a whole screen.
@@ -87,6 +89,7 @@ class DefaultUI {
     void displaceGrindWidgets(bool displaced);
     lv_obj_t *scaleScreen = nullptr;      // overlay covering the grind screen
     lv_obj_t *scaleWeightLabel = nullptr;
+    lv_obj_t *scaleTareBtn = nullptr;     // opaque pill, driven by applyAnimPlates
     bool scaleScreenRequested = false;
     bool scaleMenuSwap = false; // settings.isScaleMenuButton(), cached per render
     float lastShownScaleWeight = -1000.0f;
@@ -106,9 +109,27 @@ class DefaultUI {
     // only when a controller connects, which is a different thing entirely.
     unsigned long uiBuiltAt = 0;
     lv_obj_t *animHostScreen = nullptr;    // screen whose bg was made transparent for the animation
-    bool animPlatesCleared = false;
-    lv_opa_t animPlateOpa[6] = {LV_OPA_COVER, LV_OPA_COVER, LV_OPA_COVER,
-                                LV_OPA_COVER, LV_OPA_COVER, LV_OPA_COVER};
+    // Number of entries in the plate table in applyAnimPlates.
+    static constexpr int ANIM_PLATE_COUNT = 9;
+    // Last applied (mode, color, opacity), so a no-op settings poll costs one
+    // comparison. -1 means nothing has been applied yet, which forces the first
+    // pass through even when the stored mode is 0.
+    //
+    // The cache records what this code last wrote, not what is on screen, so
+    // anything else that writes bg_color on a plate silently invalidates it.
+    // change_color_theme() does exactly that, which is why applyTheme() resets
+    // animPlateMode after a live theme switch.
+    int animPlateMode = -1;
+    uint32_t animPlateColor = 0;
+    int animPlateOpaPct = -1;
+    // Style each plate had before mode 1 or 2 touched it, used to put it back
+    // for mode 0. Captured rather than assumed: these objects do not all start
+    // out fully opaque. Captured per plate, not in one pass, because the scale
+    // screen's Tare pill is built long after the generated screens and would
+    // otherwise be "restored" to a zero-initialised entry.
+    bool animPlateHas[ANIM_PLATE_COUNT] = {};
+    lv_opa_t animPlateOpa[ANIM_PLATE_COUNT] = {};
+    lv_color_t animPlateBg[ANIM_PLATE_COUNT] = {};
     std::atomic<bool> panelStopRequested{false};
     std::atomic<bool> panelStopped{false};
     std::atomic<bool> otaEnded{false};

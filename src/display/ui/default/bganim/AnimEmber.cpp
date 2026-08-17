@@ -72,12 +72,20 @@ int g_cx = 240, g_cy = 260;
 float g_maxR = 353.7f;
 int g_breathe = 0, g_flickerAmp = 0, g_sx = 0, g_sy = 0;
 
+// The ramp is reversed, so index 0 is the brightest stop and the glow's core
+// lands squarely on it — in the middle of the screen, which is where the UI
+// puts its readouts. Starting the ramp part way in keeps the hearth gradient
+// and its falloff but takes the peak off the text. Purely a shift of where the
+// curve begins: clamp8f still bounds the result to [0,255], so the index range
+// the palette padding is sized for (see file header) is unchanged.
+constexpr int CORE_FLOOR = 72;
+
 void buildRadiusLut(uint8_t glow) {
     const float glowGain = 0.55f + 0.014f * glow;
     const float scale = 255.0f / (g_maxR * glowGain);
     for (int i = 0; i < 256; i++) {
         const float r = sqrtf(static_cast<float>(i << RSHIFT));
-        radiusLUT[i] = clamp8f(r * scale);
+        radiusLUT[i] = clamp8f(CORE_FLOOR + r * scale);
     }
     // Pad entries repeat the outermost (fully-clamped) value so an
     // unclamped ridx past 255 (shouldn't happen on the real target, see
