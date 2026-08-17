@@ -49,6 +49,38 @@
 // window computed once in frame() — a safe superset of the true per-row
 // chord; the LUT's zero-padded low side folds the tt<=0 early-out into the
 // table lookup instead of a per-pixel compare.
+//
+// Perf pass, 2026-08-18 (opt-lava): the finalization loop above was still
+// run over all 480 columns of every row, even though 6 blobs of radius
+// ~0.19*min(w,h) rarely cover the whole width — most touched pixels are
+// background, and the finalization formula for a background pixel
+// (fieldRow[x] == 0, always) collapses to a function of (x&3, y&3) alone.
+// That 16-value pattern is now precomputed once per theme change into four
+// full-width rows, one per y&3 (buildBgRows()), and band() memcpy's the
+// right one into the output row before doing anything else. The field
+// accumulation loop is UNCHANGED (still walks every blob's own xlo/xhi
+// window, still the same forward-difference math); band() additionally now
+// records each touched blob's [xlo,xhi] as it accumulates (free — the
+// values are already live locals in that loop), sorts and merges those into
+// the row's true touched-column union (at most NUM_BLOBS==6 intervals, so a
+// plain insertion sort), and re-runs the old finalization arithmetic
+// (moved verbatim into finalizeSpan(), just windowed to [lo,hi] instead of
+// always [0,w)) ONLY over that union, overwriting the memcpy'd background
+// there. A row no blob reaches skips finalization entirely -- one memcpy is
+// the whole cost. Measured host band_ms at BAND_H=8: 0.250 -> ~0.220 (five
+// medians measured directly; team-lead's independent 0.250 predates this
+// pass), a ~12% cut, comfortably outside the quoted 2-9% run-to-run spread,
+// and a genuine arithmetic reduction (not a locality effect), so this one
+// SHOULD show up on host and does. New static footprint: bgRowAll,
+// 4 * w * sizeof(uint16_t) = 3,840 B at w=480, alloc()'d (under the 8 KB
+// PSRAM threshold, so internal DRAM like paletteLUT/fieldRow, not PSRAM —
+// see the growth this cost in the commit message). Golden frames stay
+// bit-exact (background pixels are byte-identical to what full computation
+// produced, by construction: same formula, same inputs, just computed once
+// and copied instead of recomputed per row) and band()'s call-shape
+// invariant is untouched — nothing here is cached across band() calls, only
+// within one call's per-row loop, and the per-row span/merge state is fresh
+// every row and every call.
 
 #include "BgAnim.h"
 #include "BgAnimCommon.h"
@@ -128,6 +160,43 @@ uint32_t lastThemeGen = 0xFFFFFFFF;
 bool inited = false;
 int allocW = 0; // width fieldRow was sized for
 
+// Precomputed "no blob touched this pixel" row, one per y&3 (Bayer4's row
+// period), rebuilt only when paletteLUT changes (theme change). A pixel no
+// blob writes into has fieldRow[x] == 0 for the whole frame, so band()'s
+// finalization formula collapses to a function of (x&3, y&3) alone:
+//   idx = clamp(0 + ditherRow[x&3], 0, 255);  out[x] = paletteLUT[idx];
+// band() used to run that formula (with fieldRow[x] folded in, always 0
+// here) per pixel, every pixel, every row. Four blobs' worth of soft glow
+// rarely covers all 480 columns of every row, so most of that work was
+// computing the same 4-periodic pattern over and over. Precomputing it once
+// per theme and memcpy-ing it into rows that need it (all of a row with no
+// touched blob, everywhere outside the touched span on a partial row) turns
+// that into a sequential copy instead of a per-pixel branch+lookup+store.
+uint16_t *bgRowAll = nullptr; // 4 rows of bgRowAllW pixels each, row py at bgRowAll + py*bgRowAllW
+int bgRowAllW = 0;            // width bgRowAll was sized for (mirrors allocW's fixed-at-first-init contract)
+
+// Rebuilds the four background rows from the current paletteLUT/ditherLUT.
+// Must run after both are populated, and again any time paletteLUT changes
+// (theme change) -- ditherLUT itself never changes after the one-time init
+// below. w is always bgRowAllW: bgRowAll is sized once like fieldRow/allocW,
+// so this never risks writing past the allocation even if a caller's w
+// argument were to differ from the size decided at first init().
+void buildBgRows(int w) {
+    for (int py = 0; py < 4; py++) {
+        uint16_t *row = bgRowAll + static_cast<size_t>(py) * w;
+        const int32_t *ditherRow = &ditherLUT[py * 4];
+        for (int x = 0; x < w; x++) {
+            int idx = ditherRow[x & 3]; // fieldRow[x] == 0 here: min(0, kIndexCap) + dither == dither
+            if (idx < 0) {
+                idx = 0;
+            } else if (idx > 255) {
+                idx = 255;
+            }
+            row[x] = paletteLUT[idx];
+        }
+    }
+}
+
 bool init(int w, int h) {
     if (paletteLUT == nullptr) {
         paletteLUT = static_cast<uint16_t *>(alloc(256 * sizeof(uint16_t)));
@@ -147,7 +216,15 @@ bool init(int w, int h) {
         // and 9 KB stays largely cache-resident anyway.
         lavaLUT = static_cast<int32_t *>(alloc(LUT_SIZE * sizeof(int32_t)));
     }
-    if (paletteLUT == nullptr || fieldRow == nullptr || lavaLUT == nullptr) {
+    if (bgRowAll == nullptr) {
+        // 4 * w * 2 B (3,840 B at w=480) -- under the 8 KB alloc() threshold,
+        // so this lands in internal DRAM alongside paletteLUT/fieldRow, not
+        // PSRAM. New static footprint; see file-top comment for why it's
+        // there and the commit message for the measured device build delta.
+        bgRowAll = static_cast<uint16_t *>(alloc(4 * w * sizeof(uint16_t)));
+        bgRowAllW = w;
+    }
+    if (paletteLUT == nullptr || fieldRow == nullptr || lavaLUT == nullptr || bgRowAll == nullptr) {
         return false;
     }
     // Derived here rather than under the !inited guard below: the base pointer
@@ -184,6 +261,7 @@ bool init(int w, int h) {
         }
         buildThemeRamp(paletteLUT, 256);
         lastThemeGen = themeGen();
+        buildBgRows(bgRowAllW); // needs both ditherLUT (just above) and paletteLUT (just above)
     }
     return true;
 }
@@ -195,6 +273,7 @@ void frame(uint32_t tMs, int w, int, const uint8_t p[4]) {
     if (themeGen() != lastThemeGen) {
         buildThemeRamp(paletteLUT, 256);
         lastThemeGen = themeGen();
+        buildBgRows(bgRowAllW);
     }
 
     // Rebuild the tt -> field-contribution LUT for this frame's intensity.
@@ -253,10 +332,98 @@ void frame(uint32_t tMs, int w, int, const uint8_t p[4]) {
     }
 }
 
+// Finalizes fieldRow[lo..hi] into out[lo..hi], identical arithmetic to the
+// full-width loop this replaces (see the file's history for the pre-span
+// version) — just windowed to a sub-range instead of always [0, w). Pulled
+// out of band() as a named function, not a lambda, so it reads once instead
+// of once per merged span in the disassembly, and so its own loops are not
+// re-examined by GCC's whole-function budget every time band() changes (see
+// the bcTable/tail-copy lesson in AnimNebula.cpp: unrelated loops in a
+// function can lose their hardware LOOP when the function grows unrelated
+// live state around them — keeping this arithmetic in its own function
+// keeps that risk local to this function alone).
+void finalizeSpan(uint16_t *out, int lo, int hi, int yPhase) {
+    const int32_t *ditherRow = &ditherLUT[yPhase * 4];
+    int x = lo;
+    // Scalar prefix up to the next 4-boundary: lo is an arbitrary blob-union
+    // edge, not guaranteed 4-aligned like the whole-row loop's x=0 start, so
+    // the unrolled body below needs an aligned entry point for its d0..d3
+    // literals to line up with x&3 == 0.
+    for (; (x & 3) != 0 && x <= hi; x++) {
+        int idx = (fieldRow[x] < kIndexCap ? fieldRow[x] : kIndexCap) + ditherRow[x & 3];
+        if (idx < 0) {
+            idx = 0;
+        } else if (idx > 255) {
+            idx = 255;
+        }
+        out[x] = paletteLUT[idx];
+    }
+    const int32_t d0 = ditherRow[0];
+    const int32_t d1 = ditherRow[1];
+    const int32_t d2 = ditherRow[2];
+    const int32_t d3 = ditherRow[3];
+    for (; x + 3 <= hi; x += 4) {
+        // min(fieldRow, 255) reproduces the original "clamp field to 1.6f
+        // before scaling" (1.6f*kFieldScale == 255.0f exactly) — see
+        // file-top comment — as a branchless integer MIN. Dither is added
+        // after the cap, exactly like the original float pipeline, so
+        // saturated/overlapping pixels still get jittered instead of
+        // pinning flat.
+        int idx0 = (fieldRow[x] < kIndexCap ? fieldRow[x] : kIndexCap) + d0;
+        int idx1 = (fieldRow[x + 1] < kIndexCap ? fieldRow[x + 1] : kIndexCap) + d1;
+        int idx2 = (fieldRow[x + 2] < kIndexCap ? fieldRow[x + 2] : kIndexCap) + d2;
+        int idx3 = (fieldRow[x + 3] < kIndexCap ? fieldRow[x + 3] : kIndexCap) + d3;
+        if (idx0 < 0) {
+            idx0 = 0;
+        } else if (idx0 > 255) {
+            idx0 = 255;
+        }
+        if (idx1 < 0) {
+            idx1 = 0;
+        } else if (idx1 > 255) {
+            idx1 = 255;
+        }
+        if (idx2 < 0) {
+            idx2 = 0;
+        } else if (idx2 > 255) {
+            idx2 = 255;
+        }
+        if (idx3 < 0) {
+            idx3 = 0;
+        } else if (idx3 > 255) {
+            idx3 = 255;
+        }
+        const uint16_t p0 = paletteLUT[idx0];
+        const uint16_t p1 = paletteLUT[idx1];
+        const uint16_t p2 = paletteLUT[idx2];
+        const uint16_t p3 = paletteLUT[idx3];
+        *reinterpret_cast<uint32_t *>(out + x) = static_cast<uint32_t>(p0) | (static_cast<uint32_t>(p1) << 16);
+        *reinterpret_cast<uint32_t *>(out + x + 2) = static_cast<uint32_t>(p2) | (static_cast<uint32_t>(p3) << 16);
+    }
+    for (; x <= hi; x++) {
+        int idx = (fieldRow[x] < kIndexCap ? fieldRow[x] : kIndexCap) + ditherRow[x & 3];
+        if (idx < 0) {
+            idx = 0;
+        } else if (idx > 255) {
+            idx = 255;
+        }
+        out[x] = paletteLUT[idx];
+    }
+}
+
 void band(uint16_t *dst, int y0, int rows, int w, uint32_t, const uint8_t *) {
     for (int row = 0; row < rows; row++) {
         const int y = y0 + row;
         memset(fieldRow, 0, w * sizeof(int32_t));
+        // Spans of blobs that actually reach this row (dy2 < R2), collected
+        // in the same pass that accumulates the field -- no extra iteration
+        // over blobs. Everywhere outside their union, fieldRow is provably
+        // 0 for the rest of this row (nothing else writes it), so
+        // finalization there is bit-identical to the precomputed background
+        // row and is copied instead of recomputed.
+        int spanLo[NUM_BLOBS];
+        int spanHi[NUM_BLOBS];
+        int nSpans = 0;
         for (int i = 0; i < NUM_BLOBS; i++) {
             const BlobState &b = blob[i];
             const float dy = y - b.by;
@@ -267,6 +434,9 @@ void band(uint16_t *dst, int y0, int rows, int w, uint32_t, const uint8_t *) {
             const float invR2 = b.invR2;
             const int xlo = b.xlo;
             const int xhi = b.xhi;
+            spanLo[nSpans] = xlo;
+            spanHi[nSpans] = xhi;
+            nSpans++;
             const float dx0 = xlo - b.bx;
             // Row-starting value and slope of the tt(x) parabola (one-time
             // float setup per touched row per blob — not per pixel).
@@ -297,69 +467,47 @@ void band(uint16_t *dst, int y0, int rows, int w, uint32_t, const uint8_t *) {
                 stepQ += step2Q;
             }
         }
+
         uint16_t *out = dst + static_cast<size_t>(row) * w;
-        // Dither repeats with period 4 in x (Bayer 4x4), so the four offsets
-        // for this row are loaded once here rather than re-derived (x&3,
-        // array index, load) on every pixel — the 4-wide unroll below lets
-        // each unrolled slot use its offset as a plain local instead of an
-        // indexed load, which is the whole point of hoisting it.
-        const int32_t *ditherRow = &ditherLUT[(y & 3) * 4];
-        const int32_t d0 = ditherRow[0];
-        const int32_t d1 = ditherRow[1];
-        const int32_t d2 = ditherRow[2];
-        const int32_t d3 = ditherRow[3];
-        int x = 0;
-        // 4-wide unroll (w=480 is a multiple of 4, so the scalar tail below
-        // never actually runs for the real display — kept only for
-        // correctness at other widths). Two paired 32-bit stores per
-        // iteration, same trick as before, now over 4 pixels instead of 2.
-        for (; x + 3 < w; x += 4) {
-            // min(fieldRow, 255) reproduces the original "clamp field to
-            // 1.6f before scaling" (1.6f*kFieldScale == 255.0f exactly) —
-            // see file-top comment — as a branchless integer MIN. Dither is
-            // added after the cap, exactly like the original float pipeline,
-            // so saturated/overlapping pixels still get jittered instead of
-            // pinning flat.
-            int idx0 = (fieldRow[x] < kIndexCap ? fieldRow[x] : kIndexCap) + d0;
-            int idx1 = (fieldRow[x + 1] < kIndexCap ? fieldRow[x + 1] : kIndexCap) + d1;
-            int idx2 = (fieldRow[x + 2] < kIndexCap ? fieldRow[x + 2] : kIndexCap) + d2;
-            int idx3 = (fieldRow[x + 3] < kIndexCap ? fieldRow[x + 3] : kIndexCap) + d3;
-            if (idx0 < 0) {
-                idx0 = 0;
-            } else if (idx0 > 255) {
-                idx0 = 255;
-            }
-            if (idx1 < 0) {
-                idx1 = 0;
-            } else if (idx1 > 255) {
-                idx1 = 255;
-            }
-            if (idx2 < 0) {
-                idx2 = 0;
-            } else if (idx2 > 255) {
-                idx2 = 255;
-            }
-            if (idx3 < 0) {
-                idx3 = 0;
-            } else if (idx3 > 255) {
-                idx3 = 255;
-            }
-            const uint16_t p0 = paletteLUT[idx0];
-            const uint16_t p1 = paletteLUT[idx1];
-            const uint16_t p2 = paletteLUT[idx2];
-            const uint16_t p3 = paletteLUT[idx3];
-            *reinterpret_cast<uint32_t *>(out + x) = static_cast<uint32_t>(p0) | (static_cast<uint32_t>(p1) << 16);
-            *reinterpret_cast<uint32_t *>(out + x + 2) = static_cast<uint32_t>(p2) | (static_cast<uint32_t>(p3) << 16);
+        const uint16_t *bg = bgRowAll + static_cast<size_t>(y & 3) * bgRowAllW;
+        memcpy(out, bg, static_cast<size_t>(w) * sizeof(uint16_t));
+        if (nSpans == 0) {
+            continue; // no blob touched this row -- background covers all of it, already copied
         }
-        for (; x < w; x++) {
-            int idx = (fieldRow[x] < kIndexCap ? fieldRow[x] : kIndexCap) + ditherRow[x & 3];
-            if (idx < 0) {
-                idx = 0;
-            } else if (idx > 255) {
-                idx = 255;
+
+        // Sort the (at most NUM_BLOBS==6) collected spans by lo, then sweep
+        // once to merge overlapping/adjacent ones into the true union.
+        // Insertion sort: cheap for this size, done once per row, not once
+        // per pixel.
+        for (int i = 1; i < nSpans; i++) {
+            const int lo = spanLo[i];
+            const int hi = spanHi[i];
+            int j = i - 1;
+            while (j >= 0 && spanLo[j] > lo) {
+                spanLo[j + 1] = spanLo[j];
+                spanHi[j + 1] = spanHi[j];
+                j--;
             }
-            out[x] = paletteLUT[idx];
+            spanLo[j + 1] = lo;
+            spanHi[j + 1] = hi;
         }
+        int mLo = spanLo[0];
+        int mHi = spanHi[0];
+        for (int i = 1; i < nSpans; i++) {
+            if (spanLo[i] <= mHi + 1) {
+                // Overlaps or is adjacent to the run so far: merging is a
+                // pure win (fewer finalizeSpan calls) and never wrong, since
+                // any gap it swallows has fieldRow == 0 there anyway.
+                if (spanHi[i] > mHi) {
+                    mHi = spanHi[i];
+                }
+                continue;
+            }
+            finalizeSpan(out, mLo, mHi, y & 3);
+            mLo = spanLo[i];
+            mHi = spanHi[i];
+        }
+        finalizeSpan(out, mLo, mHi, y & 3);
     }
 }
 
@@ -367,9 +515,11 @@ void release() {
     releaseTable(paletteLUT, 256 * sizeof(uint16_t));
     releaseTable(fieldRow, static_cast<size_t>(allocW) * sizeof(int32_t));
     releaseTable(lavaLUT, static_cast<size_t>(LUT_SIZE) * sizeof(int32_t));
+    releaseTable(bgRowAll, 4 * static_cast<size_t>(bgRowAllW) * sizeof(uint16_t));
     // Offset alias into lavaLUT, not an allocation of its own.
     lavaBase = nullptr;
     allocW = 0;
+    bgRowAllW = 0;
     lastThemeGen = 0xFFFFFFFF;
     inited = false;
 }
