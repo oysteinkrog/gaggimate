@@ -23,7 +23,7 @@ import {
 
 function ButtonBehaviorSelect({ id, label, value, onChange, profiles }) {
   return (
-    <SettingsFormField label={label} htmlFor={id} noMargin >
+    <SettingsFormField label={label} htmlFor={id} noMargin>
       <select
         id={id}
         name={id}
@@ -49,10 +49,7 @@ function ButtonBehaviorSelect({ id, label, value, onChange, profiles }) {
 // Global color theme picker: built-in gradient themes plus a custom editor
 // (2-8 hex stops, dark -> bright). The selected theme colors every animation.
 function ColorThemeSettings({ formData, onChange, setField }) {
-  const themeId = Math.min(
-    BG_THEME_CUSTOM,
-    Math.max(0, parseInt(formData.bgAnimTheme, 10) || 0),
-  );
+  const themeId = Math.min(BG_THEME_CUSTOM, Math.max(0, parseInt(formData.bgAnimTheme, 10) || 0));
   const isCustom = themeId === BG_THEME_CUSTOM;
   const customStops = parseCustomTheme(formData.bgAnimCustomTheme);
   const editStops = customStops.length >= 2 ? customStops : BG_THEMES[0].stops.slice();
@@ -170,7 +167,10 @@ function BackgroundAnimationSettings({ formData, onChange, setField }) {
               <select
                 id={`bgAnim-${param.key}`}
                 className='select select-bordered w-full'
-                value={Math.min(param.options.length - 1, Math.floor((values[j] * param.options.length) / 101))}
+                value={Math.min(
+                  param.options.length - 1,
+                  Math.floor((values[j] * param.options.length) / 101),
+                )}
                 onChange={e =>
                   setField(
                     'bgAnimParams',
@@ -179,7 +179,10 @@ function BackgroundAnimationSettings({ formData, onChange, setField }) {
                       animIdx,
                       j,
                       // Store the option index scaled back onto 0-100.
-                      Math.round((parseInt(e.target.value, 10) * 100) / Math.max(1, param.options.length - 1)),
+                      Math.round(
+                        (parseInt(e.target.value, 10) * 100) /
+                          Math.max(1, param.options.length - 1),
+                      ),
                     ),
                   )
                 }
@@ -216,9 +219,7 @@ function BackgroundAnimationSettings({ formData, onChange, setField }) {
           ),
         )}
       </div>
-      {anim.description && (
-        <p className='text-base-content/60 mt-2 text-sm'>{anim.description}</p>
-      )}
+      {anim.description && <p className='text-base-content/60 mt-2 text-sm'>{anim.description}</p>}
       <div className='mt-4'>
         <ColorThemeSettings formData={formData} onChange={onChange} setField={setField} />
       </div>
@@ -239,7 +240,16 @@ function BackgroundAnimationSettings({ formData, onChange, setField }) {
             onChange={onChange('bgAnimFps')}
           />
         </SettingsFormField>
-        <SettingsFormField label='Panel refresh rate' htmlFor='panelClockDiv' noMargin>
+        <SettingsFormField
+          label='Panel refresh rate'
+          htmlFor='panelClockDiv'
+          noMargin
+          helpText={
+            formData.panelClockLive === false
+              ? 'This build retimes the panel only when it starts up, so restart the display after saving.'
+              : undefined
+          }
+        >
           <select
             id='panelClockDiv'
             name='panelClockDiv'
@@ -276,7 +286,9 @@ function BackgroundAnimationSettings({ formData, onChange, setField }) {
             }
             onChange={onChange('bgAnimInterlace')}
           >
-            <option value={1}>On, refreshes half the rows each frame (roughly doubles the rate)</option>
+            <option value={1}>
+              On, refreshes half the rows each frame (roughly doubles the rate)
+            </option>
             <option value={0}>Off, every row every frame</option>
           </select>
         </SettingsFormField>
@@ -337,23 +349,23 @@ function BackgroundAnimationSettings({ formData, onChange, setField }) {
         )}
       </div>
       <p className='text-base-content/60 mt-2 text-sm'>
-        If the animation flickers or the image jumps, lower the frame rate or the refresh rate:
-        both compete for the same memory bandwidth. Changes apply live after saving.
+        If the animation flickers or the image jumps, lower the frame rate or the refresh rate: both
+        compete for the same memory bandwidth. Changes apply live after saving.
       </p>
       <p className='text-base-content/60 mt-2 text-sm'>
-        Resolution and interlacing trade sharpness for smoothness. Half resolution plus
-        interlacing is what lets every animation run above 40 fps; full resolution is visibly
-        sharper but the heaviest animations drop to around 15 fps. Interlacing refreshes half
-        the rows on each frame, which is not usually noticeable while something is moving.
+        Resolution and interlacing trade sharpness for smoothness. Half resolution plus interlacing
+        is what lets every animation run above 40 fps; full resolution is visibly sharper but the
+        heaviest animations drop to around 15 fps. Interlacing refreshes half the rows on each
+        frame, which is not usually noticeable while something is moving.
       </p>
       <p className='text-base-content/60 mt-2 text-sm'>
         The brew, status and profile screens carry a solid circle behind their dials, the info
-        screen a solid panel, and the brew and grind screens a filled pill behind the scale
-        weight, while the other screens carry none. With the animation running behind every
-        screen those show up as dark shapes on some screens and not others, so by default they
-        are hidden while the animation plays. The pill behind the weight is also the mode
-        switch, so if you want it to still read as a button, pick the custom option and give it
-        a low opacity rather than hiding it outright.
+        screen a solid panel, and the brew and grind screens a filled pill behind the scale weight,
+        while the other screens carry none. With the animation running behind every screen those
+        show up as dark shapes on some screens and not others, so by default they are hidden while
+        the animation plays. The pill behind the weight is also the mode switch, so if you want it
+        to still read as a button, pick the custom option and give it a low opacity rather than
+        hiding it outright.
       </p>
       <div className='mt-4'>
         <ToggleField
@@ -407,7 +419,7 @@ export function GeneralTab({
   return (
     <div className='space-y-4 sm:space-y-6 lg:grid lg:grid-cols-2 lg:gap-4'>
       {/* User Preferences */}
-      <Section title='User Preferences' className='h-full' >
+      <Section title='User Preferences' className='h-full'>
         <div className='grid grid-cols-1 gap-4 md:grid-cols-2'>
           <SettingsFormField label='Startup Mode' htmlFor='startup-mode' noMargin>
             <select
@@ -555,7 +567,7 @@ export function GeneralTab({
       </Section>
 
       {/* Display Settings */}
-      <Section title='Display Settings' className='h-full' >
+      <Section title='Display Settings' className='h-full'>
         <div className='grid grid-cols-1 gap-4 md:grid-cols-2'>
           <SettingsFormField label='Main Brightness (1-16)' htmlFor='mainBrightness' noMargin>
             <input
@@ -638,7 +650,7 @@ export function GeneralTab({
       </Section>
 
       {/* Web Settings */}
-      <Section title='Web Settings' className='h-full' >
+      <Section title='Web Settings' className='h-full'>
         <div className='grid grid-cols-1 gap-4 md:grid-cols-2'>
           <SettingsFormField label='Theme' htmlFor='webui-theme' noMargin>
             <select
@@ -676,7 +688,7 @@ export function GeneralTab({
       </Section>
 
       {/* Network / System Preferences */}
-      <Section title='System & Network' className='h-full' >
+      <Section title='System & Network' className='h-full'>
         <div className='grid grid-cols-1 gap-4 md:grid-cols-2'>
           <SettingsFormField label='Wi-Fi SSID' htmlFor='wifiSsid' noMargin>
             <input

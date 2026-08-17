@@ -1516,6 +1516,11 @@ void WebUIPlugin::handleSettings(AsyncWebServerRequest *request) const {
     }
     doc["bgAnimPlateOpacity"] = settings.getBgAnimPlateOpacity();
     doc["panelClockDiv"] = settings.getPanelClockDiv();
+    // Read-only capability flag, not a setting: on ESP-IDF 4.4 there is no
+    // esp_lcd_rgb_panel_set_pclk, so a new divider is only honoured when the
+    // panel is next created. The form posts the whole document back and the
+    // handler matches on explicit argument names, so echoing this is inert.
+    doc["panelClockLive"] = panelclock::hasLiveControl();
     doc["bgAnimCustomTheme"] = settings.getBgAnimCustomTheme();
     doc["smartGrindIp"] = settings.getSmartGrindIp();
     doc["smartGrindMode"] = settings.getSmartGrindMode();
