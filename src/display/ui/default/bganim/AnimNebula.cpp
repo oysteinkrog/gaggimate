@@ -24,7 +24,9 @@
 // the compiler treat it as a plain counted loop.
 //
 // Per-pixel dither is precomputed into a row-local int[8] (not int8_t) so
-// the lookup is a plain 32-bit load with no sign-extend.
+// the lookup is a plain 32-bit load with no sign-extend; densOff is folded
+// into the same table (dith2 = dith + densOff) so the combine loop's
+// per-pixel "+ densOff" is free.
 //
 // Two register-pressure ideas were tried on the real Xtensa compiler and
 // both measured NEUTRAL-TO-WORSE, so they were reverted rather than kept
@@ -153,9 +155,12 @@ void band(uint16_t *dst, int y0, int rows, int w, uint32_t, const uint8_t *) {
         uint16_t *row = dst + static_cast<size_t>(r) * w;
         const uint8_t *bayerRow = &BAYER8[(y & 7) * 8];
         // int (not int8_t): a plain 32-bit load, no sign-extend per pixel.
-        int dith[8];
+        // densOff is folded in here too (dith2 = dith + densOff) so the
+        // combine loop's per-pixel "+ densOff" becomes free -- one table
+        // build of 8 adds replaces 256 (or, at half-res, up to 256) adds.
+        int dith2[8];
         for (int k = 0; k < 8; k++) {
-            dith[k] = (static_cast<int>(bayerRow[k]) - 31) / 4;
+            dith2[k] = (static_cast<int>(bayerRow[k]) - 31) / 4 + densOff;
         }
 #ifdef GM_NEBULA_CACHED_NOISE_PROBE
         // Diagnostic only, visually wrong: pin all four samplers to one noise
@@ -178,19 +183,46 @@ void band(uint16_t *dst, int y0, int rows, int w, uint32_t, const uint8_t *) {
         // for the whole row via the x0 wraparound below. i=255's neighbor
         // (i+1==256) wraps to texel 0; special-cased after the loop instead
         // of masked every iteration so the loop body is a plain counted
-        // walk over two pointers.
-        for (int i = 0; i < 255; i++) {
-            const int da0 = static_cast<int>(rowA0[i + 1]) - static_cast<int>(rowA0[i]);
-            const int va = rowA0[i] + ((da0 * axF) >> 8);
-            const int da1 = static_cast<int>(rowA1[i + 1]) - static_cast<int>(rowA1[i]);
-            const int vb = rowA1[i] + ((da1 * axF) >> 8);
-            blendedA[i] = static_cast<uint8_t>(va + (((vb - va) * ayF) >> 8));
-        }
+        // walk over two pointers. `cur0`/`cur1` carry the previous
+        // iteration's `nxt0`/`nxt1` (rowA0[i]/rowA1[i] were already loaded
+        // as last iteration's "next" neighbor) so each iteration issues one
+        // new load per row instead of two -- 2 loads/iter instead of 4,
+        // verified in xtensa-asm/AnimNebula.S (the loop body dropped from 4
+        // l8ui to 2). This is intra-row state only (cur0/cur1 reset at the
+        // top of every row from rowA0[0]/rowA1[0]), so it does not touch the
+        // "no state carries between band() calls" invariant
+        // SleepAnimation.cpp's interlaced half-res path relies on (see its
+        // comment at the anim.band(halfBuf + ...) split-render call).
+        //
+        // A separable reformulation was also tried: blend rowA0/rowA1 by
+        // ayF first into a scratch 256-row (one pass, no neighbor loads),
+        // then x-interpolate that single row (bilinear interpolation
+        // commutes between x and y order, so this is mathematically the
+        // same result up to >>8 rounding order) -- in theory one 256-texel
+        // pass plus one 255-texel pass instead of one 255-texel pass that
+        // touches two source rows. Measured WORSE on both host (0.373ms vs
+        // 0.364ms here) and xtensa-asm (243 insns here vs 231, because the
+        // y-blend pass couldn't get a plain two-pointer walk -- rowA0 and
+        // rowA1 aren't necessarily adjacent in the noise texture across the
+        // y-wrap boundary, so GCC derived rowA0's address from rowA1's via
+        // an extra sub+add every iteration) and it drifted off golden
+        // (mean 0.004-0.02, max 9, still "OK" but non-zero vs bit-exact
+        // here). Reverted in favor of this rolling-load form, which is both
+        // faster and bit-exact.
         {
-            const int da0 = static_cast<int>(rowA0[0]) - static_cast<int>(rowA0[255]);
-            const int va = rowA0[255] + ((da0 * axF) >> 8);
-            const int da1 = static_cast<int>(rowA1[0]) - static_cast<int>(rowA1[255]);
-            const int vb = rowA1[255] + ((da1 * axF) >> 8);
+            int cur0 = rowA0[0];
+            int cur1 = rowA1[0];
+            for (int i = 0; i < 255; i++) {
+                const int nxt0 = rowA0[i + 1];
+                const int va = cur0 + (((nxt0 - cur0) * axF) >> 8);
+                const int nxt1 = rowA1[i + 1];
+                const int vb = cur1 + (((nxt1 - cur1) * axF) >> 8);
+                blendedA[i] = static_cast<uint8_t>(va + (((vb - va) * ayF) >> 8));
+                cur0 = nxt0;
+                cur1 = nxt1;
+            }
+            const int va = cur0 + (((rowA0[0] - cur0) * axF) >> 8);
+            const int vb = cur1 + (((rowA1[0] - cur1) * axF) >> 8);
             blendedA[255] = static_cast<uint8_t>(va + (((vb - va) * ayF) >> 8));
         }
 
@@ -250,8 +282,11 @@ void band(uint16_t *dst, int y0, int rows, int w, uint32_t, const uint8_t *) {
                 const uint16_t bc = bcTable[step];
                 const int b = bc & 0xFF;
                 const int c = bc >> 8;
-                const int v = c + ((((a - c) * wA) + ((b - c) * wB)) >> 6) + densOff + dith[m & 7];
-                combineOut[m] = paletteExt[PAD + v];
+                const int v = c + ((((a - c) * wA) + ((b - c) * wB)) >> 6) + dith2[m & 7];
+                // palette == paletteExt + PAD (set once in init()); indexing
+                // through it directly folds the "+ PAD" into the pointer
+                // instead of re-adding it every pixel (one fewer add/pixel).
+                combineOut[m] = palette[v];
                 x0 = (x0 + 1) & 255;
                 step = (step + 1) & 127;
             }
@@ -300,6 +335,19 @@ void band(uint16_t *dst, int y0, int rows, int w, uint32_t, const uint8_t *) {
     }
 }
 
+void release() {
+    releaseTable(paletteExt, PAL_EXT_N * sizeof(uint16_t));
+    // An alias into paletteExt (paletteExt + PAD), not its own allocation.
+    palette = nullptr;
+    // Borrowed: noiseTex256() is a 64 KB fleet-wide asset owned by
+    // BgAnimCommon and shared with ember.
+    noise = nullptr;
+    // The palette's content sentinel. init() resets it too, but a live
+    // sentinel beside a null table is exactly the state this entry point
+    // exists to prevent (see BgAnimCommon.h).
+    lastThemeGen = 0xFFFFFFFF;
+}
+
 } // namespace
 
 extern const BgAnimation bg_anim_nebula;
@@ -310,6 +358,7 @@ const BgAnimation bg_anim_nebula = {
     init,
     frame,
     band,
+    release,
 };
 
 #endif // GAGGIMATE_SIM
