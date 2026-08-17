@@ -35,6 +35,12 @@ PathPt *pathBins = nullptr;   // [orbit][band][pt]
 uint8_t *pathBinCount = nullptr; // [orbit][band]
 int lastCountP = -1, lastEccP = -1;
 uint32_t lastThemeGen = 0xFFFFFFFF;
+// Resolution the path points were baked at. pathBins holds literal pixel
+// coordinates, and unlike the other animations' tables its SIZE is independent
+// of w/h — so a resolution change leaves it allocated, correctly sized, and
+// wrong. Nothing else in this file would notice: init() no-ops on a non-null
+// pathBins and frame() only rebuilds on a param or theme change.
+int geomW = 0, geomH = 0;
 int g_w = 480;
 uint16_t g_bg = 0;
 
@@ -48,6 +54,8 @@ Sample *samples = nullptr;
 int sampleCount = 0;
 
 void rebuildGeometry(int countP, int eccP, int w, int h) {
+    geomW = w;
+    geomH = h;
     orbitCount = 3 + (countP * 3) / 100;
     const float bRatio = 0.95f - (eccP / 100.0f) * 0.4f;
     const float maxR = (w < h ? w : h) * 0.46f;
@@ -113,7 +121,7 @@ bool init(int w, int h) {
 }
 
 void frame(uint32_t tMs, int w, int h, const uint8_t p[4]) {
-    if (p[1] != lastCountP || p[2] != lastEccP || themeGen() != lastThemeGen) {
+    if (p[1] != lastCountP || p[2] != lastEccP || themeGen() != lastThemeGen || w != geomW || h != geomH) {
         rebuildGeometry(p[1], p[2], w, h);
         lastCountP = p[1];
         lastEccP = p[2];
@@ -158,7 +166,12 @@ void band(uint16_t *dst, int y0, int rows, int w, uint32_t, const uint8_t *) {
         const PathPt *pts = &pathBins[(i * NUM_BANDS + bandIdx) * PTS_PER_BAND];
         for (int j = 0; j < n; j++) {
             const int ly = pts[j].y - y0;
-            if (ly >= 0 && ly < rows) {
+            // x is bounds-checked as well as y. rebuildGeometry only clips
+            // against the w it ran at, so an unchecked store here turns any
+            // future staleness into a heap write past the end of the band
+            // buffer rather than a visual artefact. One compare per path
+            // point, a few hundred per band.
+            if (ly >= 0 && ly < rows && pts[j].x >= 0 && pts[j].x < w) {
                 dst[static_cast<size_t>(ly) * w + pts[j].x] = orbits[i].pathColor565;
             }
         }
@@ -212,6 +225,19 @@ void band(uint16_t *dst, int y0, int rows, int w, uint32_t, const uint8_t *) {
     }
 }
 
+void release() {
+    releaseTable(samples, MAX_SAMPLES * sizeof(Sample));
+    releaseTable(pathBins, MAX_ORBITS * NUM_BANDS * PTS_PER_BAND * sizeof(PathPt));
+    releaseTable(pathBinCount, static_cast<size_t>(MAX_ORBITS) * NUM_BANDS);
+    // Every sentinel that gates a rebuild, or init() would hand back
+    // reallocated tables that nothing refills.
+    lastCountP = lastEccP = -1;
+    lastThemeGen = 0xFFFFFFFF;
+    geomW = geomH = 0;
+    orbitCount = 0;
+    sampleCount = 0;
+}
+
 } // namespace
 
 extern const BgAnimation bg_anim_orbits;
@@ -222,6 +248,7 @@ const BgAnimation bg_anim_orbits = {
     init,
     frame,
     band,
+    release,
 };
 
 #endif // GAGGIMATE_SIM
