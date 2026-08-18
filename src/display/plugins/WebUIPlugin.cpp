@@ -1360,6 +1360,15 @@ void WebUIPlugin::handleSettings(AsyncWebServerRequest *request) const {
             }
             if (request->hasArg("bgAnimPlateOpacity"))
                 settings->setBgAnimPlateOpacity(request->arg("bgAnimPlateOpacity").toInt());
+            // Tone controls. All three are percentages and all three clamp in
+            // the setter, so a stale or hand-made request cannot push a value
+            // into the Q8 conversions that drive the render path.
+            if (request->hasArg("bgAnimBrightness"))
+                settings->setBgAnimBrightness(request->arg("bgAnimBrightness").toInt());
+            if (request->hasArg("bgAnimHighlightKnee"))
+                settings->setBgAnimHighlightKnee(request->arg("bgAnimHighlightKnee").toInt());
+            if (request->hasArg("bgAnimScrim"))
+                settings->setBgAnimScrim(request->arg("bgAnimScrim").toInt());
             if (request->hasArg("panelClockDiv")) {
                 // 0 = firmware default; explicit dividers outside the sane
                 // 4-12 window (6.7-20 MHz pclk) could leave the panel
@@ -1536,6 +1545,9 @@ void WebUIPlugin::handleSettings(AsyncWebServerRequest *request) const {
         doc["bgAnimPlateColor"] = hex;
     }
     doc["bgAnimPlateOpacity"] = settings.getBgAnimPlateOpacity();
+    doc["bgAnimBrightness"] = settings.getBgAnimBrightness();
+    doc["bgAnimHighlightKnee"] = settings.getBgAnimHighlightKnee();
+    doc["bgAnimScrim"] = settings.getBgAnimScrim();
     doc["panelClockDiv"] = settings.getPanelClockDiv();
     // Read-only capability flag, not a setting: on ESP-IDF 4.4 there is no
     // esp_lcd_rgb_panel_set_pclk, so a new divider is only honoured when the

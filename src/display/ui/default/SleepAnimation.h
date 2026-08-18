@@ -17,6 +17,7 @@ class SleepAnimation {
     void setMaxFps(uint8_t) {}
     void setHalfRes(bool) {}
     void setInterlace(bool) {}
+    void setScrim(int) {}
     uint8_t *overlayBackBuffer() { return nullptr; }
     uint32_t overlayCapacity() const { return 0; }
     void publishOverlay(int, int, int, int) {}
@@ -82,6 +83,23 @@ class SleepAnimation {
         renderHalf.store(on);
     }
 #endif
+
+    // Text scrim: how far to dim the animation behind and immediately around
+    // overlaid widget pixels, 0-100 percent, where 0 is off and 100 is black.
+    // The one legibility control that does not change the animation anywhere
+    // text is not, which is why it is the one that defaults on. Applies on the
+    // next frame; the halo shape itself is built at overlay-publish time.
+    void setScrim(int pct) {
+        if (pct < 0) {
+            pct = 0;
+        } else if (pct > 100) {
+            pct = 100;
+        }
+        // Stored in Q8 so the per-pixel path multiplies and shifts rather than
+        // dividing by 100. 100 percent maps to 256, which takes a fully covered
+        // cell to black.
+        scrimQ8.store(pct * 256 / 100);
+    }
 
     // Overlay: an LV_IMG_CF_TRUE_COLOR_ALPHA (RGB565 + A8, 3 B/px) snapshot of
     // the standby widgets. Double-buffered: the UI task renders a snapshot
@@ -200,11 +218,38 @@ class SleepAnimation {
         // Bit b set => pixels [b*32, b*32+32) in this row contain some alpha.
         // 32 blocks covers a 1024-wide row, well past this panel.
         uint32_t *rowBlocks = nullptr;
+
+        // Text scrim, at 1/4 resolution (SCRIM_SHIFT): scrimSrc holds each
+        // cell's peak widget alpha, scrim the dilated and smoothed halo the
+        // blend actually reads. Two planes rather than one because the halo has
+        // to be rebuilt from the original coverage every publish -- dilating in
+        // place would grow the halo a little further on every refresh.
+        //
+        // Quarter resolution because the halo carries no fine detail: it is a
+        // soft field whose whole job is to be wider than the glyphs. Full
+        // resolution would cost 460 KB across both overlays for a field that is
+        // blurred anyway.
+        uint8_t *scrimSrc = nullptr;
+        uint8_t *scrim = nullptr;
+        int scrimW = 0;
+        int scrimH = 0;
+        // Span/block tables widened to cover the halo, which reaches past the
+        // glyph bounding span and can put alpha in rows that hold no glyph at
+        // all. Kept separate from spanMin/spanMax/rowBlocks rather than folded
+        // into them: those are recomputed only for the rows LVGL redrew, so
+        // widening them in place would ratchet -- a row's span would keep every
+        // halo it ever had until that row happened to be redrawn. These are
+        // rebuilt whole-panel from the glyph tables each publish, which is
+        // cheap because it never touches the alpha plane.
+        int16_t *blendMin = nullptr;
+        int16_t *blendMax = nullptr;
+        uint32_t *blendBlocks = nullptr;
     };
 
     static void taskEntry(void *arg);
     void renderLoop();
     void renderFrame();
+    void buildScrim(Overlay &ov, int panelW, int panelH);
 
     Display *display = nullptr;
     void *taskHandle = nullptr;
@@ -339,6 +384,14 @@ class SleepAnimation {
     int residentAnimId = -1;
     bool initializedHalf = false; // resolution that init() ran at; a change re-inits
     uint16_t *halfBuf = nullptr;  // (w/2)x(BAND_H/2) scratch for half-res rendering
+
+    // Scrim strength in Q8 (0 = off, 256 = black). Read once per band by the
+    // composite, so a plain relaxed load is all it needs.
+    std::atomic<int> scrimQ8{55 * 256 / 100};
+    // Scratch grid for the separable dilate/blur passes, one shared copy: the
+    // passes run to completion inside publishOverlay on the UI task, so the two
+    // overlays never need it at the same time.
+    uint8_t *scrimTmp = nullptr;
 
     Overlay overlays[2];
     uint32_t overlayCap = 0;

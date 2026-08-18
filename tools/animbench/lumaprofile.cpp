@@ -88,7 +88,22 @@ struct Acc {
 //   shoulder: stops below the knee untouched, above it compressed toward the
 //             knee. Keeps mid-tone colour and only bends the highlights, which
 //             is where the unreadable pixels are.
+//   tone:     the two controls as they actually ship, in integer Q8 through
+//             bganim::setThemeTone(). --scale and --shoulder are the float
+//             proxies the remedies were chosen with and are kept so the choice
+//             stays reproducible; --tone is the one that measures the firmware.
 enum Mode { M_NONE, M_SCALE, M_SHOULDER };
+
+// Mirrors SleepAnimation.cpp's blend565 exactly, one lane per channel with the
+// Q8 divide as a shift, so a --scrim measurement is the number the composite
+// produces and not an approximation of it.
+uint16_t blend565(uint16_t fg, uint16_t bg, int a) {
+    const uint32_t inv = 256u - static_cast<uint32_t>(a);
+    const uint32_t r = (((fg & 0xF800u) * a) + ((bg & 0xF800u) * inv)) >> 8;
+    const uint32_t g = (((fg & 0x07E0u) * a) + ((bg & 0x07E0u) * inv)) >> 8;
+    const uint32_t b = (((fg & 0x001Fu) * a) + ((bg & 0x001Fu) * inv)) >> 8;
+    return static_cast<uint16_t>((r & 0xF800u) | (g & 0x07E0u) | (b & 0x001Fu));
+}
 
 void applyMode(uint8_t stops[BG_THEME_MAX_STOPS][3], int n, Mode m, double k) {
     if (m == M_NONE) { return; }
@@ -112,11 +127,28 @@ int main(int argc, char **argv) {
     int profileAnim = -1;
     Mode mode = M_NONE;
     double k = 1.0;
+    // Percentages, exactly as the settings page sends them. -1 means the
+    // firmware default for that control, which is neutral for both.
+    int tonePct = -1, kneePct = -1, scrimPct = 0;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--csv") == 0) { csv = true; }
         else if (strcmp(argv[i], "--profile") == 0 && i + 1 < argc) { profileAnim = atoi(argv[++i]); }
         else if (strcmp(argv[i], "--scale") == 0 && i + 1 < argc) { mode = M_SCALE; k = atof(argv[++i]); }
         else if (strcmp(argv[i], "--shoulder") == 0 && i + 1 < argc) { mode = M_SHOULDER; k = atof(argv[++i]); }
+        else if (strcmp(argv[i], "--tone") == 0 && i + 2 < argc) { tonePct = atoi(argv[++i]); kneePct = atoi(argv[++i]); }
+        else if (strcmp(argv[i], "--scrim") == 0 && i + 1 < argc) { scrimPct = atoi(argv[++i]); }
+    }
+    // The same Q8 conversions DefaultUI does, so an off-by-one in the mapping
+    // shows up here rather than only on the panel.
+    const int brightQ8 = (tonePct < 0) ? 256 : tonePct * 256 / 100;
+    const int knee255 = (kneePct < 0) ? 255 : kneePct * 255 / 100;
+    // The scrim's dim behind a glyph. Its field is the PEAK widget alpha in the
+    // cell, dilated, and glyph alpha reaches 255, so directly behind text the
+    // dim is the full setting: (255 * scrimQ8) >> 8, one below scrimQ8 itself.
+    const int scrimDim = (scrimPct <= 0) ? 0 : (255 * (scrimPct * 256 / 100)) >> 8;
+    if (tonePct >= 0 || scrimPct > 0) {
+        printf("tone: brightness %d%% (Q8 %d), knee %d%% (%d/255), scrim %d%% (dim %d/256)\n\n", tonePct < 0 ? 100 : tonePct,
+               brightQ8, kneePct < 0 ? 100 : kneePct, knee255, scrimPct, scrimDim);
     }
 
     const double cx = (W - 1) / 2.0, cy = (H - 1) / 2.0;
@@ -149,6 +181,11 @@ int main(int argc, char **argv) {
             bg_resolve_theme(t, nullptr, stops, nStops);
             applyMode(stops, nStops, mode, k);
             bganim::setThemeStops(stops, nStops);
+            // Unconditional, and after the stops, exactly as DefaultUI does it.
+            // The tone is sticky across theme changes by design, so setting it
+            // only when asked would leak the previous theme's tone into the next
+            // one and quietly measure the wrong thing.
+            bganim::setThemeTone(brightQ8, knee255);
 
             Acc core, text, ring;
             for (int f = 0; f < NT; f++) {
@@ -159,7 +196,12 @@ int main(int argc, char **argv) {
                 for (size_t i = 0; i < fb.size(); i++) {
                     const double r = rmap[i];
                     if (r > 1.0) { continue; } // outside the round panel; never visible
-                    const double l = relLuma565(fb[i]);
+                    // The scrim only exists where the overlay puts pixels, so
+                    // applying it to the whole frame would overstate it badly on
+                    // the ring. Restrict it to the text disc, which is where the
+                    // readouts are and so where the halo actually lands.
+                    const uint16_t px = (scrimDim != 0 && r < R_TEXT) ? blend565(0, fb[i], scrimDim) : fb[i];
+                    const double l = relLuma565(px);
                     if (r < R_CORE) { core.add(l); }
                     if (r < R_TEXT) { text.add(l); }
                     if (r >= R_RING_LO) { ring.add(l); }

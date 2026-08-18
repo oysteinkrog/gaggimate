@@ -1244,6 +1244,13 @@ void DefaultUI::updateState() {
         bg_resolve_theme(themeId, custom.c_str(), stops, nStops);
         bganim::setThemeStops(stops, nStops);
     }
+    // Tone is published separately from the stops, and after them: it survives
+    // a theme change (setThemeStops re-applies the stored tone), so a user who
+    // has dimmed the animation does not get full brightness back the moment
+    // they try a different theme. setThemeTone is a no-op when neither value
+    // moved, which keeps this off the generation counter on ordinary ticks.
+    bganim::setThemeTone(settings.getBgAnimBrightness() * 256 / 100, settings.getBgAnimHighlightKnee() * 255 / 100);
+    sleepAnimation.setScrim(settings.getBgAnimScrim());
 #endif
 
     uiFlags.brew_adjustments(brewScreenState == BrewScreenState::Settings);
