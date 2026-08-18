@@ -221,10 +221,38 @@ uint32_t themeGen();
 int themeStopCount();
 const uint8_t (*themeStops())[3];
 
+// Tone controls, applied to the stops before any animation sees them.
+//
+// Overlaid text is unreadable on a bright background, and measurement (see
+// tools/animbench/lumaprofile.cpp) puts that at 7 of the 13 animations on the
+// default theme and 106 of the 234 animation/theme pairs, so it is a property
+// of the theme rather than of any one animation. Every animation's colour
+// reaches it through themeRGB(), directly or via buildThemeRamp/Wheel, and
+// none of them writes an RGB565 literal -- which makes the stops the one place
+// a tone change costs nothing per pixel and covers the whole fleet, custom hex
+// themes included.
+//
+//   brightness256  Q8 scale on every channel. 256 leaves the theme alone.
+//   knee           Highlight shoulder: channels above `knee` are compressed to
+//                  a quarter of their remaining range, so mid-tones keep their
+//                  colour and only highlights bend. 255 disables it.
+//
+// A shoulder is the better shape than scaling everything: at knee 76 (0.30 of
+// full scale) the worst animation/theme pair in the fleet reaches contrast
+// 4.63 with mid-tone colour intact, where the same result from brightness alone
+// needs a scale of about 0.45 and takes the whole image toward grey (0.55, the
+// deepest scale that still looks like the theme, only reaches 3.44).
+void setThemeTone(int brightness256, int knee);
+
 // RGB888 sample of the active theme gradient, pos 0 (darkest) .. 255.
 void themeRGB(int pos, uint8_t out[3]);
 // 256-entry RGB565 ramp across the active theme, scaled by brightness Q8
 // (0..256). reversed=true puts the brightest stop at index 0.
+//
+// This brightness is a per-animation scale on one ramp, and every caller in the
+// tree passes 256. The user-facing brightness control is setThemeTone(), which
+// acts on the stops and so reaches themeRGB() callers too; do not wire a second
+// control to this argument, or the two would multiply.
 void buildThemeRamp(uint16_t *out, uint16_t brightness256, bool reversed = false);
 // Wheel variant: the last stop blends back into stop 0 so palette-cycling
 // animations (plasma) wrap without a seam.

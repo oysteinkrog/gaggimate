@@ -173,6 +173,19 @@ void Settings::setBgAnimPlateColor(int bg_anim_plate_color) { bgAnimPlateColor.s
 void Settings::setBgAnimPlateOpacity(int bg_anim_plate_opacity) {
     bgAnimPlateOpacity.set(bg_anim_plate_opacity < 0 ? 0 : (bg_anim_plate_opacity > 100 ? 100 : bg_anim_plate_opacity));
 }
+// All three are percentages the web UI sends as slider values, so they are
+// clamped rather than trusted: an out-of-range brightness would otherwise reach
+// the Q8 conversion and wrap, and a negative scrim would brighten the text
+// background instead of dimming it.
+void Settings::setBgAnimBrightness(int bg_anim_brightness) {
+    bgAnimBrightness.set(bg_anim_brightness < 0 ? 0 : (bg_anim_brightness > 100 ? 100 : bg_anim_brightness));
+}
+void Settings::setBgAnimHighlightKnee(int bg_anim_highlight_knee) {
+    bgAnimHighlightKnee.set(bg_anim_highlight_knee < 0 ? 0 : (bg_anim_highlight_knee > 100 ? 100 : bg_anim_highlight_knee));
+}
+void Settings::setBgAnimScrim(int bg_anim_scrim) {
+    bgAnimScrim.set(bg_anim_scrim < 0 ? 0 : (bg_anim_scrim > 100 ? 100 : bg_anim_scrim));
+}
 void Settings::setPanelClockDiv(int panel_clock_div) { panelClockDiv.set(panel_clock_div); }
 void Settings::setBgAnimCustomTheme(const String &bg_anim_custom_theme) { bgAnimCustomTheme.set(bg_anim_custom_theme); }
 

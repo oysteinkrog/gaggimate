@@ -347,6 +347,70 @@ function BackgroundAnimationSettings({ formData, onChange, setField }) {
             </SettingsFormField>
           </>
         )}
+        <SettingsFormField
+          label={`Text backdrop (${
+            formData.bgAnimScrim === undefined ? 55 : parseInt(formData.bgAnimScrim, 10)
+          }%)`}
+          htmlFor='bgAnimScrim'
+          noMargin
+        >
+          <input
+            id='bgAnimScrim'
+            name='bgAnimScrim'
+            type='range'
+            min='0'
+            max='100'
+            className='range w-full'
+            value={formData.bgAnimScrim === undefined ? 55 : parseInt(formData.bgAnimScrim, 10)}
+            onChange={onChange('bgAnimScrim')}
+          />
+        </SettingsFormField>
+        <SettingsFormField
+          label={`Animation brightness (${
+            formData.bgAnimBrightness === undefined ? 100 : parseInt(formData.bgAnimBrightness, 10)
+          }%)`}
+          htmlFor='bgAnimBrightness'
+          noMargin
+        >
+          <input
+            id='bgAnimBrightness'
+            name='bgAnimBrightness'
+            type='range'
+            min='10'
+            max='100'
+            className='range w-full'
+            value={
+              formData.bgAnimBrightness === undefined
+                ? 100
+                : parseInt(formData.bgAnimBrightness, 10)
+            }
+            onChange={onChange('bgAnimBrightness')}
+          />
+        </SettingsFormField>
+        <SettingsFormField
+          label={`Highlight rolloff (${
+            formData.bgAnimHighlightKnee === undefined
+              ? 100
+              : parseInt(formData.bgAnimHighlightKnee, 10)
+          }%)`}
+          htmlFor='bgAnimHighlightKnee'
+          noMargin
+        >
+          <input
+            id='bgAnimHighlightKnee'
+            name='bgAnimHighlightKnee'
+            type='range'
+            min='20'
+            max='100'
+            className='range w-full'
+            value={
+              formData.bgAnimHighlightKnee === undefined
+                ? 100
+                : parseInt(formData.bgAnimHighlightKnee, 10)
+            }
+            onChange={onChange('bgAnimHighlightKnee')}
+          />
+        </SettingsFormField>
       </div>
       <p className='text-base-content/60 mt-2 text-sm'>
         If the animation flickers or the image jumps, lower the frame rate or the refresh rate: both
@@ -366,6 +430,19 @@ function BackgroundAnimationSettings({ formData, onChange, setField }) {
         the animation plays. The pill behind the weight is also the mode switch, so if you want it
         to still read as a button, pick the custom option and give it a low opacity rather than
         hiding it outright.
+      </p>
+      <p className='text-base-content/60 mt-2 text-sm'>
+        The last three settings are about reading the screen while an animation plays behind it. The
+        text backdrop dims the animation in a soft halo directly behind the numbers and labels and
+        leaves the rest of the frame alone, which is why it is on by default. 55% is the lightest
+        setting that keeps white text comfortable to read on every animation and every theme,
+        including the brightest; stronger settings work but start to look like a dark plate.
+        Animation brightness and highlight rolloff change how the animation itself looks everywhere.
+        Brightness scales the whole theme down, rolloff compresses only the brightest parts and
+        leaves the mid tones their colour, so rolloff is usually the better one to reach for if a
+        theme looks blown out. Neither is needed for legibility with the backdrop on; they are there
+        for taste. Note that these are separate from screen brightness, which dims the text along
+        with the animation and so does not make anything easier to read.
       </p>
       <div className='mt-4'>
         <ToggleField

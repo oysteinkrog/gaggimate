@@ -122,6 +122,9 @@ class Settings {
     int getBgAnimClearPlates() const { return bgAnimClearPlates.get(); }
     int getBgAnimPlateColor() const { return bgAnimPlateColor.get(); }
     int getBgAnimPlateOpacity() const { return bgAnimPlateOpacity.get(); }
+    int getBgAnimBrightness() const { return bgAnimBrightness.get(); }
+    int getBgAnimHighlightKnee() const { return bgAnimHighlightKnee.get(); }
+    int getBgAnimScrim() const { return bgAnimScrim.get(); }
     int getPanelClockDiv() const { return panelClockDiv.get(); }
     int getSmartGrindMode() const { return smartGrindMode.get(); }
     String getSmartGrindIp() const { return smartGrindIp.get(); }
@@ -224,6 +227,9 @@ class Settings {
     void setBgAnimClearPlates(int bg_anim_clear_plates);
     void setBgAnimPlateColor(int bg_anim_plate_color);
     void setBgAnimPlateOpacity(int bg_anim_plate_opacity);
+    void setBgAnimBrightness(int bg_anim_brightness);
+    void setBgAnimHighlightKnee(int bg_anim_highlight_knee);
+    void setBgAnimScrim(int bg_anim_scrim);
     void setPanelClockDiv(int panel_clock_div);
     void setSmartGrindIp(String smart_grind_ip);
     void setSmartGrindMode(int smart_grind_mode);
@@ -343,6 +349,36 @@ class Settings {
     // as mode 0 but in the chosen colour).
     Property<int> bgAnimPlateColor{registry, "bg_pcol", 0x000000};
     Property<int> bgAnimPlateOpacity{registry, "bg_popa", 35};
+    // Animation content brightness, 0-100 percent of the theme's own levels.
+    // Distinct from mainBrightness/standbyBrightness, which are the LCD
+    // backlight and so dim the text along with the animation, buying no
+    // contrast at all. Default 100 leaves every existing theme as it looks
+    // today; this is a styling control, not the legibility fix.
+    Property<int> bgAnimBrightness{registry, "bg_bri", 100};
+    // Highlight shoulder, 0-100 as a percentage of full scale. Channels above
+    // this level are compressed into a quarter of their remaining range, so
+    // mid-tones keep their colour and only the highlights bend. 100 is off.
+    // Measured: 30 takes the worst animation/theme pair in the fleet from
+    // contrast 1.00 to 4.29.
+    Property<int> bgAnimHighlightKnee{registry, "bg_knee", 100};
+    // Text scrim: how far to dim the animation immediately behind overlaid
+    // widget pixels, 0-100 percent, where 0 is off and 100 is black. Unlike the
+    // two controls above this does not change the animation anywhere text is
+    // not, which is why it is the one that defaults on.
+    //
+    // 55 is the weakest setting that clears the WCAG comfortable bar of 4.5 on
+    // every animation and theme in the fleet: measured (tools/animbench/
+    // lumaprofile.cpp --scrim) it takes the worst pair, lava on Mono, from
+    // contrast 1.00 to 4.81, where 50 reaches only 4.13. Weakest matters because
+    // the scrim is visible as a soft dark halo behind the readouts, so anything
+    // past the bar is a plate nobody asked for -- 75 measures 11.06, far more
+    // dimming than legibility needs.
+    //
+    // Note the percentage is a scale on the gamma-encoded RGB565 value, not on
+    // linear light, so its effect on measured luminance is much stronger than
+    // the number suggests: 55 percent of the encoded value is roughly 25 percent
+    // of the luminance.
+    Property<int> bgAnimScrim{registry, "bg_scrim", 55};
     // RGB pixel-clock divider off the 80 MHz LCD group clock; 0 = keep the
     // build-flag boot value. The IDF 4.4 driver only does integer division,
     // so real choices are 80/n: 5=16 MHz (~61 Hz), 6=13.3 MHz (~51 Hz),

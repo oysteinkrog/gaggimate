@@ -213,6 +213,50 @@ uint8_t g_themeBuf[2][8][3] = {
 };
 int g_themeCount[2] = {6, 6};
 volatile uint32_t g_themeGen = 0;
+
+// The stops as the theme (or the user's hex string) defines them, before tone.
+// Kept separately because brightness and knee have to be re-appliable without
+// the caller re-resolving the theme, and applying them in place would compound:
+// two brightness writes would multiply, and a knee would clamp against the
+// already-kneed values rather than the original ones.
+uint8_t g_rawStops[8][3] = {
+    {0x08, 0x04, 0x02}, {0x2a, 0x12, 0x06}, {0x6b, 0x34, 0x13}, {0xb8, 0x70, 0x3a}, {0xe8, 0xb2, 0x68}, {0xf8, 0xe6, 0xc8},
+};
+int g_rawCount = 6;
+int g_brightness256 = 256; // Q8, 256 = unchanged
+int g_knee = 255;          // 255 = shoulder off
+
+// Applies the tone to g_rawStops and publishes the result. Integer throughout:
+// this runs on a settings write, but the same arithmetic has to be describable
+// to the preview UI, and exact integer steps make the two agree.
+void publishStops() {
+    const uint32_t next = g_themeGen + 1;
+    const int buf = next & 1;
+    const int knee = g_knee;
+    const int bright = g_brightness256;
+    for (int i = 0; i < g_rawCount; i++) {
+        for (int c = 0; c < 3; c++) {
+            int v = g_rawStops[i][c];
+            // Shoulder first, then brightness. The knee is a property of the
+            // theme's shape and is specified against full scale, so it has to
+            // act on the theme's own values; brightness then scales whatever
+            // shape came out. The other order would move the knee wherever
+            // brightness happened to be set.
+            if (v > knee) {
+                v = knee + ((v - knee) >> 2);
+            }
+            v = (v * bright) >> 8;
+            if (v < 0) {
+                v = 0;
+            } else if (v > 255) {
+                v = 255;
+            }
+            g_themeBuf[buf][i][c] = static_cast<uint8_t>(v);
+        }
+    }
+    g_themeCount[buf] = g_rawCount;
+    g_themeGen = next;
+}
 } // namespace
 
 void setThemeStops(const uint8_t (*stops)[3], int nStops) {
@@ -222,15 +266,32 @@ void setThemeStops(const uint8_t (*stops)[3], int nStops) {
     if (nStops > 8) {
         nStops = 8;
     }
-    const uint32_t next = g_themeGen + 1;
-    const int buf = next & 1;
     for (int i = 0; i < nStops; i++) {
         for (int c = 0; c < 3; c++) {
-            g_themeBuf[buf][i][c] = stops[i][c];
+            g_rawStops[i][c] = stops[i][c];
         }
     }
-    g_themeCount[buf] = nStops;
-    g_themeGen = next;
+    g_rawCount = nStops;
+    publishStops();
+}
+
+void setThemeTone(int brightness256, int knee) {
+    if (brightness256 < 0) {
+        brightness256 = 0;
+    } else if (brightness256 > 256) {
+        brightness256 = 256;
+    }
+    if (knee < 0) {
+        knee = 0;
+    } else if (knee > 255) {
+        knee = 255;
+    }
+    if (brightness256 == g_brightness256 && knee == g_knee) {
+        return; // no generation bump, so no palette rebuild across the fleet
+    }
+    g_brightness256 = brightness256;
+    g_knee = knee;
+    publishStops();
 }
 
 uint32_t themeGen() { return g_themeGen; }
