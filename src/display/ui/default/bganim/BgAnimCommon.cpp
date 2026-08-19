@@ -3,6 +3,7 @@
 #include "BgAnimCommon.h"
 #include <Arduino.h>
 #include <esp_heap_caps.h>
+#include <esp_memory_utils.h>
 #include <math.h>
 
 namespace bganim {
@@ -24,11 +25,13 @@ size_t g_allocSram = 0;
 size_t g_allocPsram = 0;
 
 namespace {
-// Internal SRAM on the S3 is the 0x3FC.. data range; PSRAM maps at 0x3C...
-bool isPsram(const void *p) {
-    const uintptr_t a = reinterpret_cast<uintptr_t>(p);
-    return a >= 0x3C000000u && a < 0x3E000000u;
-}
+// esp_ptr_external_ram() tests against the running target's real PSRAM window
+// rather than a hardcoded one. The literal range this used to compare against
+// (0x3C000000..0x3E000000) is the ESP32-S3's, so it silently mis-attributed
+// every allocation on any other target -- and the numbers it feeds are the
+// SRAM/PSRAM budget the bench reports and the alloc() threshold is tuned
+// against, so being wrong there is worse than being merely non-portable.
+bool isPsram(const void *p) { return esp_ptr_external_ram(p); }
 } // namespace
 
 void *alloc(size_t size) {
