@@ -1,3 +1,8 @@
+# No CONFIGURE_DEPENDS on the globs below, deliberately. IDF re-evaluates this
+# file in cmake *script* mode while expanding component requirements, and
+# CONFIGURE_DEPENDS is rejected outright there ("invalid for script and find
+# package modes"). The cost is that adding or deleting a source file needs a
+# manual reconfigure; PlatformIO does one on any platformio.ini change anyway.
 # GAGGIMATE_CONTROLLER_BUILD=1 selects src/controller/**; default is src/display/**.
 if(DEFINED GAGGIMATE_CONTROLLER_BUILD AND GAGGIMATE_CONTROLLER_BUILD)
     FILE(GLOB_RECURSE app_sources

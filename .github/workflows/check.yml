@@ -1,7 +1,14 @@
+# Push/PR gate.
+#
+# Until this branch, nothing that ran on a push actually compiled the firmware:
+# static analysis skipped codegen, the nightly workflow was master-only and the
+# release workflow was tag-only, so a change that broke the build stayed green
+# until someone cut a tag. The `build` and `test` jobs below close that.
 on: [push, pull_request]
 
 jobs:
-  test:
+  analysis:
+    name: Static analysis
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repo
@@ -19,8 +26,77 @@ jobs:
           python-version: '3.11'
       - name: Install PlatformIO Core
         run: pip install --upgrade platformio
+      # src/display/ui is excluded and the step is non-blocking: cppcheck's
+      # findings on the LVGL-facing UI code are mostly noise and were never
+      # triaged. Narrowing the exclusion is worth doing, but not as a gate
+      # that starts red.
       - name: Run static code analysis for display
         continue-on-error: true
         run: platformio check -e display --fail-on-defect=medium -f "-<*>" -f "+<src/display/>" -f "-<src/display/ui>"
       - name: Run static code analysis for controller
         run: platformio check -e controller --fail-on-defect=medium -f "-<*>" -f "+<src/controller/>"
+
+  build:
+    name: Build firmware
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v3
+        with:
+          fetch-tags: true
+          fetch-depth: 0
+          submodules: 'recursive'
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/pip
+            ~/.platformio/.cache
+          key: ${{ runner.os }}-pio
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install PlatformIO Core
+        run: pip install --upgrade platformio
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: 'npm'
+          cache-dependency-path: web/package-lock.json
+      # The same order build.yml uses. The web bundle is built first because
+      # the display image embeds it; without this the pre-build hook silently
+      # substitutes an empty stub and a broken UI build would go unnoticed.
+      - name: Build Web
+        run: ./scripts/build_webui.sh
+      - name: Build controller
+        run: pio run -e controller
+      - name: Build display
+        run: pio run -e display
+      - name: Build display filesystem
+        run: pio run -t buildfs -e display
+      # Headless has its own source selection in src/CMakeLists.txt, so it can
+      # break on a change that leaves the two release targets compiling.
+      - name: Build display-headless
+        run: pio run -e display-headless
+
+  test:
+    name: Unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v3
+        with:
+          submodules: 'recursive'
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/pip
+            ~/.platformio/.cache
+          key: ${{ runner.os }}-pio-native
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install PlatformIO Core
+        run: pip install --upgrade platformio
+      # Host-side SIMC autotune tests. No workflow ran these before.
+      - name: Run autotune unit tests
+        run: pio test -e native_autotune
