@@ -1,0 +1,16 @@
+# 8 MB flash, display-headless-8m only. Single app slot, no dual OTA.
+#
+# The headless display image is ~3.3 MB, so two slots would have to be
+# ~3.4 MB each to fit alongside otadata and a usable spiffs — 93% full
+# on day one, with no room for the image to grow. This env is a
+# development/bring-up target that is flashed over USB and is not
+# published by any release workflow, so it trades OTA for headroom.
+#
+# Consequence: BLE OTA is refused at runtime on this build. See the
+# running-partition guard in lib/ble_ota_dfu/src/ble_ota_dfu.cpp.
+# Name,     Type, SubType, Offset,  Size,    Flags
+nvs,        data, nvs,     0x9000,  0x5000,
+otadata,    data, ota,     0xe000,  0x2000,
+app0,       app,  ota_0,   0x10000, 0x6E0000,
+spiffs,     data, spiffs,  0x6F0000,0x100000,
+coredump,   data, coredump,0x7F0000,0x10000,
