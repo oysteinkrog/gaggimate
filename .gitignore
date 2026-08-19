@@ -17,14 +17,13 @@ src/display/webassets/
 sim_data/
 *.bmp
 
-# pioarduino build artifacts (regenerated each build)
-sdkconfig.display
-sdkconfig.display-headless
-sdkconfig.display-headless-8m
-sdkconfig.controller
-sdkconfig.defaults
+# pioarduino build artifacts (regenerated each build). The generated sdkconfig
+# for every env is ignored by pattern, so adding an env does not leak an
+# untracked file; the hand-written sdkconfig.*.defaults inputs stay tracked.
+sdkconfig
+sdkconfig.*
+!sdkconfig.*.defaults
 managed_components/
-dependencies.lock
 # pioarduino dual-framework hybrid-compile scaffold (auto-generated)
 .dummy/
 

@@ -1,0 +1,4 @@
+# The IDF component manager rewrites dependencies.lock on every build, and on
+# Windows it writes CRLF. Without this the tracked lockfile would show as
+# modified after every local build while its content was unchanged.
+dependencies.lock text eol=lf

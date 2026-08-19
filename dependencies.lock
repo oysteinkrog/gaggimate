@@ -1,0 +1,79 @@
+dependencies:
+  espressif/libsodium:
+    component_hash: d4066b373fc6d4c5196db42aeea7faef4ac7f3080af96c2b74e2476c08b78dc1
+    dependencies:
+    - name: idf
+      require: private
+      version: '>=4.2'
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    version: 1.0.22~1
+  espressif/mdns:
+    component_hash: e81ca7a7f53ea34e78274df054da692c272e1315572876b237b1748e267c013b
+    dependencies:
+    - name: idf
+      require: private
+      version: '>=5.0'
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    version: 1.11.3
+  espressif/network_provisioning:
+    component_hash: ef2e10182fd1861e68b821491916327c25416ca7ae70e5a6e43313dbc71fe993
+    dependencies:
+    - name: idf
+      require: private
+      version: '>=5.1'
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    version: 1.0.2
+  h2zero/esp-nimble-cpp:
+    component_hash: 720050476f7fb47bd0aa08a94642fd09a50536391d60081858702a789405d76f
+    dependencies:
+    - name: espressif/esp_hosted
+      registry_url: https://components.espressif.com
+      require: private
+      rules:
+      - if: target in [esp32p4]
+      version: '*'
+    - name: espressif/esp_wifi_remote
+      registry_url: https://components.espressif.com
+      require: private
+      rules:
+      - if: target in [esp32p4]
+      version: '>=0.5.3'
+    - name: idf
+      require: private
+      rules:
+      - if: target in [esp32p4]
+      version: '>=5.3.0'
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    version: 2.5.0
+  idf:
+    source:
+      type: idf
+    version: 5.5.1
+  joltwallet/littlefs:
+    component_hash: 3af20a3d75c49db9dc2286fd50862c34055c9f578419ad1f2bf7ed3ed01391fe
+    dependencies:
+    - name: idf
+      require: private
+      version: '>=5.0'
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    version: 1.22.3
+direct_dependencies:
+- espressif/libsodium
+- espressif/mdns
+- espressif/network_provisioning
+- h2zero/esp-nimble-cpp
+- idf
+- joltwallet/littlefs
+manifest_hash: 6f157c4ee969a3e3f2c8f116ab9ea0cbd7b1cff96312c7034de3486cd727b69d
+target: esp32s3
+version: 2.0.0
