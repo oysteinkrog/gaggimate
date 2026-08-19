@@ -52,8 +52,11 @@ int hexNibble(char c) {
 // Parses "rrggbb[,rrggbb...]" (optional # prefixes, whitespace tolerated).
 // Returns the number of stops parsed (0 if any entry is malformed).
 int parseCustom(const char *s, uint8_t stops[BG_THEME_MAX_STOPS][3]) {
+    if (s == nullptr) {
+        return 0;
+    }
     int n = 0;
-    while (s != nullptr && *s != '\0') {
+    while (*s != '\0') {
         while (*s == ' ' || *s == ',' || *s == '#') {
             s++;
         }
