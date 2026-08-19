@@ -24,6 +24,7 @@
 // Not bench-only: /api/debug/heap reports the animation SRAM budget, and
 // /api/settings echoes panelclock::hasLiveControl() so the form can tell the
 // user whether a new divider applies now or at the next boot.
+#include <display/core/utils.h>
 #include <display/drivers/common/PanelClock.h>
 #include <display/ui/default/bganim/BgAnimCommon.h>
 #include <display/util/PsramStlAllocator.h>
@@ -1713,7 +1714,6 @@ void WebUIPlugin::updateOTAStatus(const String &version) {
     }
     Settings const &settings = controller->getSettings();
     JsonDocument doc(&psramAllocator);
-    doc["latestVersion"] = ota->getCurrentVersion();
     doc["tp"] = "res:ota-settings";
     doc["displayUpdateAvailable"] = ota->isUpdateAvailable(false);
     doc["controllerUpdateAvailable"] = ota->isUpdateAvailable(true);
@@ -1723,6 +1723,12 @@ void WebUIPlugin::updateOTAStatus(const String &version) {
     doc["latestVersion"] = ota->getCurrentVersion();
     doc["channel"] = settings.getOTAChannel();
     doc["updating"] = updating;
+    // Carried here rather than in a new endpoint because SystemTab's support
+    // bundle already serializes this whole document as `versions`. Without them
+    // a bundle says a dump is attached but not what crashed, and the reset
+    // reason is the first thing you want when the dump turns out to be stale.
+    doc["resetReason"] = boot_reset_reason();
+    doc["coreDumpSize"] = static_cast<uint32_t>(boot_coredump_size());
     // LittleFS usage metrics
     {
         size_t total = LittleFS.totalBytes();

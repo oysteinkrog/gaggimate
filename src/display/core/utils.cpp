@@ -1,6 +1,8 @@
 #include "utils.h"
 #include <array>
+#include <esp_core_dump.h>
 #include <esp_heap_caps.h>
+#include <esp_system.h>
 #include <iomanip>
 #include <memory>
 #include <numeric>
@@ -44,6 +46,52 @@ String implode(const std::vector<String> &strings, String delim) {
     }
     return std::accumulate(std::next(strings.begin()), strings.end(), strings[0],
                            [delim](String a, String b) { return a + delim + b; });
+}
+
+const char *boot_reset_reason() {
+    switch (esp_reset_reason()) {
+    case ESP_RST_POWERON:
+        return "power-on";
+    case ESP_RST_EXT:
+        return "external-pin";
+    case ESP_RST_SW:
+        return "software";
+    case ESP_RST_PANIC:
+        return "panic";
+    case ESP_RST_INT_WDT:
+        return "interrupt-wdt";
+    case ESP_RST_TASK_WDT:
+        return "task-wdt";
+    case ESP_RST_WDT:
+        return "other-wdt";
+    case ESP_RST_DEEPSLEEP:
+        return "deep-sleep-wake";
+    case ESP_RST_BROWNOUT:
+        return "brownout";
+    case ESP_RST_SDIO:
+        return "sdio";
+    case ESP_RST_USB:
+        return "usb";
+    case ESP_RST_JTAG:
+        return "jtag";
+    case ESP_RST_EFUSE:
+        return "efuse-error";
+    case ESP_RST_PWR_GLITCH:
+        return "power-glitch";
+    case ESP_RST_CPU_LOCKUP:
+        return "cpu-lockup";
+    default:
+        return "unknown";
+    }
+}
+
+size_t boot_coredump_size() {
+    size_t addr = 0;
+    size_t size = 0;
+    if (esp_core_dump_image_get(&addr, &size) != ESP_OK) {
+        return 0;
+    }
+    return size;
 }
 
 void measure_heap(const String &label, std::function<void()> callback) {

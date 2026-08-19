@@ -51,6 +51,18 @@ constexpr uint32_t ADDON_HW_SCALE = 8;
 
 void Controller::setup() {
     gaggimate::memmon::init();
+
+    // Said before anything else can fail. If the previous boot ended badly these
+    // are the two facts a support bundle needs, and the dump is only there until
+    // the next crash overwrites it, so a user reporting yesterday's reboot can be
+    // asked for the bundle while it still holds the crash.
+    if (const size_t dumpSize = boot_coredump_size(); dumpSize > 0) {
+        ESP_LOGW(LOG_TAG, "Boot: reset reason %s, core dump present (%u bytes)", boot_reset_reason(),
+                 static_cast<unsigned>(dumpSize));
+    } else {
+        ESP_LOGI(LOG_TAG, "Boot: reset reason %s, no core dump stored", boot_reset_reason());
+    }
+
     heap_checkpoint_reset();
     heap_checkpoint("setup/enter");
 
