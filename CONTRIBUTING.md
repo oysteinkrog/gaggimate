@@ -54,6 +54,11 @@ The rest exist for development and are not published:
 | `native_autotune`     | Host build of the SIMC autotune unit tests. `pio test -e native_autotune`                                                                               |
 | `display-sim`         | Desktop simulator, see below. Requires SDL2                                                                                                             |
 
+`native_autotune` is a host build, so it needs a host `gcc`/`g++` on the PATH of
+whichever PlatformIO runs it. Without one it errors in well under a second with
+`'gcc' is not recognized` (Windows) or `command not found`. That is a missing
+toolchain, not a failing test; the same environment passes in CI.
+
 ### Source selection: read `src/CMakeLists.txt`, not `build_src_filter`
 
 The display and controller build with `framework = arduino, espidf`. Under
@@ -173,6 +178,10 @@ platformio run -e display-sim -t run
 - For web code, use `npm run format` to apply Prettier.
 - Run static analysis with `platformio check -e display` and `platformio check -e controller`.
 - Run the host-side unit tests with `platformio test -e native_autotune`.
+- After touching anything under `src/display/ui/default/bganim/`, run
+  `make -C tools/animbench check`. It re-renders the 39 golden frames and checks
+  that `band()` returns the same row whatever strip height it is asked for, which
+  is what the interlaced half-res sleep path relies on. Plain `g++`, a few seconds.
 - For markdown files, use `npx prettier -w <file>.md`
 
 ## Pull Requests
@@ -181,7 +190,8 @@ platformio run -e display-sim -t run
 - Include screenshots when modifying the UI.
 - Ensure all formatting and checks pass before opening the PR. The push/PR
   workflow compiles `controller`, `display` and `display-headless`, builds the
-  web bundle and runs the unit tests, so a PR that does not build will say so.
+  web bundle, runs the unit tests and checks the animation goldens, so a PR that
+  does not build will say so.
 
 ## Reporting Issues
 
