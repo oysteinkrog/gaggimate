@@ -27,6 +27,19 @@ extern uint8_t randomByte();
 extern String generateShortID(uint8_t length = 10);
 extern std::vector<String> explode(const String &input, char delim);
 extern String implode(const std::vector<String> &strings, String delim);
+
+// Why the previous boot ended, as a short stable slug ("power-on", "panic",
+// "task-wdt", ...). Stable enough to grep a user's log for, and to compare
+// across support bundles.
+extern const char *boot_reset_reason();
+
+// Size in bytes of the core dump currently sitting in the coredump partition,
+// or 0 if there is none. Non-zero means /api/core-dump has something to hand
+// out, which is worth saying out loud at boot: a user who reports "it rebooted
+// yesterday" can then be asked for the support bundle while the dump is still
+// there, rather than after the next crash has overwritten it.
+extern size_t boot_coredump_size();
+
 // Runtime heap observability (60 s sampler, onFailedAlloc, panic hook) lives
 // in src/display/core/MemoryMonitor.* and is always compiled.
 //
