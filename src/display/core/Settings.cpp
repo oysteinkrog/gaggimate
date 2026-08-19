@@ -64,7 +64,14 @@ void Settings::load() {
     if (taskHandle != nullptr) {
         return; // already loaded; a second call must not spawn a second save task
     }
-    preferences.begin(PREFERENCES_KEY, true);
+    // A read-only begin() fails when the namespace does not exist yet, which is
+    // the normal first boot: every property then keeps its compiled-in default
+    // and the first save creates the namespace. Anything else (a full or
+    // corrupted NVS partition) looks identical from here, so log it rather than
+    // let a silent reset to defaults pass for a fresh install.
+    if (!preferences.begin(PREFERENCES_KEY, true)) {
+        ESP_LOGW("Settings", "NVS namespace '%s' not readable; starting from defaults", PREFERENCES_KEY);
+    }
     for (auto *property : registry) {
         property->load(preferences);
     }
@@ -325,7 +332,15 @@ void Settings::doSave() {
         return;
     }
     ESP_LOGI("Settings", "Saving changed settings");
-    preferences.begin(PREFERENCES_KEY, false);
+    // Property::store() clears its dirty flag before writing, so running the loop
+    // against a namespace that failed to open would drop the pending values with
+    // nothing to retry from: every put would fail and no property would ask to be
+    // written again. Bailing out here leaves the flags set, so the next 5 s flush
+    // tries the same values against a hopefully recovered NVS.
+    if (!preferences.begin(PREFERENCES_KEY, false)) {
+        ESP_LOGE("Settings", "Could not open NVS namespace '%s' for writing; keeping changes pending", PREFERENCES_KEY);
+        return;
+    }
     for (auto *property : registry) {
         property->store(preferences);
     }

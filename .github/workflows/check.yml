@@ -26,22 +26,27 @@ jobs:
           python-version: '3.11'
       - name: Install PlatformIO Core
         run: pip install --upgrade platformio
-      # Only the generated EEZ Studio tree is excluded now. A full run over
-      # src/display/ui reports 0 high and 0 medium; of the 1805 low findings,
-      # 1747 are in eez/ (unreadVariable, variableScope, arrayIndexThenCheck in
-      # machine-written code nobody will edit by hand), so excluding that subtree
-      # buys the whole reduction and the rest of the UI is clean.
+      # Only the generated EEZ Studio tree is excluded. A full run over
+      # src/display/ui reports 1 high, 15 medium and 2110 low, and eez/ owns
+      # 1/15/2107 of that: the high and every medium are in eez-flow.cpp, the
+      # vendored flow-engine runtime, and would come straight back the next
+      # time EEZ Studio regenerates it. Everything we actually write is 0/0/3.
       #
-      # Still non-blocking while the -D__extension__= fix in platformio.ini is
-      # confirmed on the runner. What kept this step red had nothing to do with
-      # the code: cppcheck 2.11 cannot parse GCC 14.2's <type_traits>:788, hit a
-      # syntaxError inside PlatformIO's packages directory, and PlatformIO treats
-      # a breaking defect there as a failed run whatever the findings are.
+      # Both steps block now. The display step used to be pinned to
+      # continue-on-error for a reason that had nothing to do with this code:
+      # cppcheck 2.11 could not parse GCC 14.2's libstdc++, so every translation
+      # unit died in a package header and PlatformIO reported the run as failed
+      # whatever the findings were. check_skip_packages in platformio.ini fixes
+      # that; the comment there has the detail.
+      #
+      # --fail-on-defect is an exact severity match, not a threshold: a single
+      # =medium would let a HIGH defect through silently. Both severities have
+      # to be listed. A clean run today is 0 high, 0 medium, 43 low on display
+      # and 0/0/8 on controller, so low stays out of the gate for now.
       - name: Run static code analysis for display
-        continue-on-error: true
-        run: platformio check -e display --fail-on-defect=medium -f "-<*>" -f "+<src/display/>" -f "-<src/display/ui/default/eez>"
+        run: platformio check -e display --fail-on-defect=high --fail-on-defect=medium -f "-<*>" -f "+<src/display/>" -f "-<src/display/ui/default/eez>"
       - name: Run static code analysis for controller
-        run: platformio check -e controller --fail-on-defect=medium -f "-<*>" -f "+<src/controller/>"
+        run: platformio check -e controller --fail-on-defect=high --fail-on-defect=medium -f "-<*>" -f "+<src/controller/>"
 
   build:
     name: Build firmware

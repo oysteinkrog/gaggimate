@@ -294,8 +294,8 @@ void SleepAnimation::start(Display *d) {
         pipelineOk = false;
     }
     if (!pipelineOk || !overlayOk) {
-        log_e("SleepAnimation: buffer allocation failed (bandBuf=%p/%p/%p overlayOk=%d)", bandBuf[0], bandBuf[1],
-              bandBuf[2], overlayOk);
+        log_e("SleepAnimation: buffer allocation failed (bandBuf=%p/%p halfBuf=%p overlayOk=%d)", bandBuf[0], bandBuf[1],
+              halfBuf, overlayOk);
         return;
     }
     // Reset the pipeline: both cursors to slot 0, any signal left over from a
