@@ -136,8 +136,9 @@ constexpr int LUT_SHIFT = FRAC_BITS - LUT_BITS; // 10
 // "clamp to 1.6f before scaling" (1.6f * kFieldScale == 255.0f exactly), now
 // applied post-scale as an integer min() so overlapping hot blob cores
 // still saturate at the same brightness the original design intended —
-// dither can then still jitter the result by +-1, avoiding a flat/banded
-// look at blob overlaps.
+// dither can then still jitter the result below the cap, avoiding a
+// flat/banded look at blob overlaps. Its swing is now one palette step
+// wide rather than +-1 index unit, so a saturated core still dithers.
 constexpr int32_t kIndexCap = 255;
 
 struct BlobDef {
@@ -153,7 +154,7 @@ BlobDef blobDef[NUM_BLOBS];
 BlobState blob[NUM_BLOBS];
 uint16_t *paletteLUT = nullptr;
 int32_t *fieldRow = nullptr; // one row of accumulated field, already in palette-index units
-int32_t ditherLUT[16];       // precomputed (BAYER4[k]/16 - 0.5) / 128 * 255, indexed by (y&3)*4+(x&3)
+int32_t ditherLUT[16];       // ordered dither in palette-index units, indexed by (y&3)*4+(x&3)
 int32_t *lavaLUT = nullptr;  // tt-bucket -> field contribution, pre-scaled to palette-index units, rebuilt in frame()
 int32_t *lavaBase = nullptr; // lavaLUT + LUT_OFFSET, so band() indexes it directly with the signed shifted-tt value
 uint32_t lastThemeGen = 0xFFFFFFFF;
@@ -177,10 +178,23 @@ int bgRowAllW = 0;            // width bgRowAll was sized for (mirrors allocW's 
 
 // Rebuilds the four background rows from the current paletteLUT/ditherLUT.
 // Must run after both are populated, and again any time paletteLUT changes
-// (theme change) -- ditherLUT itself never changes after the one-time init
-// below. w is always bgRowAllW: bgRowAll is sized once like fieldRow/allocW,
+// (theme change) -- which now also means rebuilding ditherLUT first, since
+// its amplitude is derived from the palette's step spacing. w is always bgRowAllW: bgRowAll is sized once like fieldRow/allocW,
 // so this never risks writing past the allocation even if a caller's w
 // argument were to differ from the size decided at first init().
+// Amplitude is half the spacing between the palette's RGB565 steps, so the
+// dither cell spans exactly one step. The old fixed 255/128 was +-1 index unit,
+// enough to break lava's own fixed-point index quantization but not the panel's
+// -- 9.9% of disc pixels sat on a monotone <=1 LSB staircase at brightness 100,
+// 13.5% at 55. Deriving it gives 2.3% and 2.9%.
+void buildDitherLUT() {
+    const float amp = ditherAmp(paletteLUT, 256);
+    for (int k = 0; k < 16; k++) {
+        const float d = (static_cast<float>(BAYER4[k]) - 7.5f) * (amp / 7.5f);
+        ditherLUT[k] = static_cast<int32_t>(d >= 0.0f ? d + 0.5f : d - 0.5f);
+    }
+}
+
 void buildBgRows(int w) {
     for (int py = 0; py < 4; py++) {
         uint16_t *row = bgRowAll + static_cast<size_t>(py) * w;
@@ -249,10 +263,6 @@ bool init(int w, int h) {
     lavaBase = lavaLUT + LUT_OFFSET;
     if (!inited) {
         inited = true;
-        for (int k = 0; k < 16; k++) {
-            const float d = (BAYER4[k] / 16.0f - 0.5f) * (1.0f / 128.0f) * 255.0f;
-            ditherLUT[k] = static_cast<int32_t>(d >= 0.0f ? d + 0.5f : d - 0.5f);
-        }
         for (int i = 0; i < NUM_BLOBS; i++) {
             const float ga = i * 2.39996323f; // golden angle spreads phases
             BlobDef &d = blobDef[i];
@@ -278,7 +288,8 @@ bool init(int w, int h) {
         }
         buildThemeRamp(paletteLUT, 256);
         lastThemeGen = themeGen();
-        buildBgRows(bgRowAllW); // needs both ditherLUT (just above) and paletteLUT (just above)
+        buildDitherLUT();       // amplitude follows the ramp just built
+        buildBgRows(bgRowAllW); // needs both of the above
     }
     return true;
 }
@@ -290,6 +301,7 @@ void frame(uint32_t tMs, int w, int, const uint8_t p[4]) {
     if (themeGen() != lastThemeGen) {
         buildThemeRamp(paletteLUT, 256);
         lastThemeGen = themeGen();
+        buildDitherLUT();
         buildBgRows(bgRowAllW);
     }
 

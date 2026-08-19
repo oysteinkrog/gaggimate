@@ -39,7 +39,28 @@ int32_t *driftQ = nullptr;      // per-star drift phase, Q16.16 px, integer-wrap
 int32_t *dx2 = nullptr, *dy2 = nullptr;
 uint8_t *vigLUT = nullptr;    // 128 entries
 uint8_t *starCol = nullptr;   // MAX_STARS * 3, per-star base color from the theme
-uint16_t *vigColor = nullptr; // 128 RGB565 background entries (theme-tinted)
+// 128 radial steps x 16 Bayer phases of theme-tinted RGB565 background.
+//
+// The vignette has to be dithered in COLOUR space, not index space like the
+// palette animations: it spans theme positions 0..35 only, so consecutive
+// radial steps land on the same RGB565 word and perturbing the index changes
+// nothing. Undithered it was the second-worst bander in the fleet -- 44.0% of
+// disc pixels on a monotone <=1 LSB staircase at brightness 100, and the
+// contour rings are plainly visible as concentric discs on a dark sky.
+//
+// Phase is the MAJOR axis (vigColor[phase * 128 + idx]) so a row resolves its
+// four phases into four base pointers once, and band()'s inner loop is then
+// byte-identical to the undithered version -- one load, one clamp, one indexed
+// load, one store. Indexing the other way (vigColor[idx * 16 + phase]) needs an
+// extra shift and add per pixel and measured +32% on band().
+//
+// The usual objection to phase-major -- consecutive pixels jumping 256 B
+// between blocks -- is a PSRAM problem, and this table is 4 KB, under
+// SRAM_ALLOC_LIMIT, so it is directly addressable with no cache line to miss.
+// If it ever grows past that limit, revisit: in PSRAM this layout is exactly
+// the aurora failure mode described in BgAnimCommon.cpp's alloc().
+constexpr int VIG_PHASES = 16;
+uint16_t *vigColor = nullptr;
 uint8_t shootCol[3] = {220, 225, 255};
 uint32_t lastThemeGen = 0xFFFFFFFF;
 int g_nStars = 0;
@@ -73,7 +94,7 @@ bool init(int w, int h) {
         dy2 = static_cast<int32_t *>(alloc(h * sizeof(int32_t)));
         vigLUT = static_cast<uint8_t *>(alloc(128));
         starCol = static_cast<uint8_t *>(alloc(MAX_STARS * 3));
-        vigColor = static_cast<uint16_t *>(alloc(128 * sizeof(uint16_t)));
+        vigColor = static_cast<uint16_t *>(alloc(128 * VIG_PHASES * sizeof(uint16_t)));
         if (stars == nullptr || draws == nullptr || starY == nullptr || bandHead == nullptr || bandNext == nullptr ||
             driftQ == nullptr || dx2 == nullptr || dy2 == nullptr || vigLUT == nullptr || starCol == nullptr ||
             vigColor == nullptr) {
@@ -124,10 +145,18 @@ void rebuildThemeAssets() {
     for (int i = 0; i < MAX_STARS; i++) {
         themeRGB(180 + static_cast<int>(stars[i].hue * 75.0f), &starCol[i * 3]);
     }
+    // One RGB565 step is 8.226 of 0..255 in red and blue, 4.048 in green. A
+    // 0.75-step peak swing clears the contours (44.0% -> 0.0%) while moving
+    // only ~0.2% of pixels by more than a single LSB, so the ordered pattern
+    // stays below the noise floor of a 0.13 mm pixel pitch.
     for (int idx = 0; idx < 128; idx++) {
         uint8_t c[3];
         themeRGB((vigLUT[idx] * 36) >> 8, c);
-        vigColor[idx] = rgb565(c[0], c[1], c[2]);
+        for (int ph = 0; ph < VIG_PHASES; ph++) {
+            const float d = (static_cast<float>(BAYER4[ph]) - 7.5f) * (0.75f / 7.5f);
+            vigColor[ph * 128 + idx] = rgb565(clamp8f(c[0] + d * 8.226f), clamp8f(c[1] + d * 4.048f),
+                                              clamp8f(c[2] + d * 8.226f));
+        }
     }
     themeRGB(255, shootCol);
 }
@@ -250,13 +279,46 @@ void band(uint16_t *dst, int y0, int rows, int w, uint32_t, const uint8_t *) {
         const int y = y0 + ry;
         const int32_t dyv = dy2[y];
         uint16_t *row = dst + static_cast<size_t>(ry) * w;
-        for (int x = 0; x < w; x++) {
-            const int32_t r2 = dyv + dx2[x];
-            int idx = r2 >> 10; // 480x480: max r2 ~115200 -> 112
+        // One base pointer per x&3 phase for this row, hoisted out of the loop:
+        // inside the unrolled body vp[k] is a register, so the indexed load is
+        // the same instruction the undithered version used.
+        // Four named pointers, not an array: an array indexed by the unroll
+        // counter can spill to the stack and cost a load per pixel, which
+        // measured +15% on band() where these cost nothing.
+        const uint16_t *const vb = vigColor + (y & 3) * 512;
+        const uint16_t *const p0 = vb;
+        const uint16_t *const p1 = vb + 128;
+        const uint16_t *const p2 = vb + 256;
+        const uint16_t *const p3 = vb + 384;
+        int x = 0;
+        for (; x + 3 < w; x += 4) {
+            int i0 = (dyv + dx2[x + 0]) >> 10; // 480x480: max r2 ~115200 -> 112
+            int i1 = (dyv + dx2[x + 1]) >> 10;
+            int i2 = (dyv + dx2[x + 2]) >> 10;
+            int i3 = (dyv + dx2[x + 3]) >> 10;
+            if (i0 > 127) {
+                i0 = 127;
+            }
+            if (i1 > 127) {
+                i1 = 127;
+            }
+            if (i2 > 127) {
+                i2 = 127;
+            }
+            if (i3 > 127) {
+                i3 = 127;
+            }
+            row[x + 0] = p0[i0];
+            row[x + 1] = p1[i1];
+            row[x + 2] = p2[i2];
+            row[x + 3] = p3[i3];
+        }
+        for (; x < w; x++) { // widths not a multiple of 4
+            int idx = (dyv + dx2[x]) >> 10;
             if (idx > 127) {
                 idx = 127;
             }
-            row[x] = vigColor[idx];
+            row[x] = vb[(x & 3) * 128 + idx];
         }
     }
     // 2. stars bucketed for this band (plus neighbors for the 1px spill)
@@ -314,7 +376,7 @@ void release() {
     releaseTable(dy2, static_cast<size_t>(allocH) * sizeof(int32_t));
     releaseTable(vigLUT, 128);
     releaseTable(starCol, static_cast<size_t>(MAX_STARS) * 3);
-    releaseTable(vigColor, 128 * sizeof(uint16_t));
+    releaseTable(vigColor, 128 * VIG_PHASES * sizeof(uint16_t));
     allocW = allocH = 0;
     lastThemeGen = 0xFFFFFFFF;
     lastTMs = 0;
