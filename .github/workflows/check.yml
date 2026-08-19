@@ -32,11 +32,11 @@ jobs:
       # machine-written code nobody will edit by hand), so excluding that subtree
       # buys the whole reduction and the rest of the UI is clean.
       #
-      # Still non-blocking, for a reason unrelated to defects: this step exits 1
-      # on the runner regardless of what it finds, because cppcheck reports
-      # unmatchedSuppression for the .pio tree as information severity and
-      # PlatformIO treats any non-zero tool status as failure. Making it a gate
-      # means fixing that first.
+      # Still non-blocking while the -D__extension__= fix in platformio.ini is
+      # confirmed on the runner. What kept this step red had nothing to do with
+      # the code: cppcheck 2.11 cannot parse GCC 14.2's <type_traits>:788, hit a
+      # syntaxError inside PlatformIO's packages directory, and PlatformIO treats
+      # a breaking defect there as a failed run whatever the findings are.
       - name: Run static code analysis for display
         continue-on-error: true
         run: platformio check -e display --fail-on-defect=medium -f "-<*>" -f "+<src/display/>" -f "-<src/display/ui/default/eez>"
@@ -84,6 +84,14 @@ jobs:
       # break on a change that leaves the two release targets compiling.
       - name: Build display-headless
         run: pio run -e display-headless
+      # No workflow built this one: build.yml ships controller + display, the
+      # nightly adds display-headless, and display-headless-8m was left to
+      # whoever happened to run it locally. It has its own defaults chain
+      # (flash8m.defaults after gaggimate.defaults, which unsets the 16 MB flash
+      # size) and its own partition table, so it is the env most able to break
+      # while the other three stay green.
+      - name: Build display-headless-8m
+        run: pio run -e display-headless-8m
 
   test:
     name: Unit tests
