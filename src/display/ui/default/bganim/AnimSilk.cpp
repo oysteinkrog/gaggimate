@@ -170,10 +170,11 @@ uint16_t *g_lut = nullptr;      // [LUT_N]: contrast curve, then padded palette
 uint16_t *contrastLUT = nullptr; // = g_lut, alias for readability outside band()
 uint16_t *paletteExt = nullptr;  // = g_lut + PALETTE_OFF, alias for readability
 uint16_t *palette = nullptr;     // = g_lut + PALETTE_REAL_OFF, 256 entries
-// Dither LUT folds the BAYER4 "/16, -0.5 center, *255/160 rescale" chain
-// into a single lookup so band() spends one array read instead of two
-// subtracts and two multiplies per pixel. Built as float here (init-time
-// only, once per process) then re-quantized to Q16 into rowAux[].dith.
+// Dither LUT folds the BAYER4 centering and rescale into a single lookup so
+// band() spends one array read instead of two subtracts and two multiplies
+// per pixel. Built as float here, then re-quantized to Q16 into
+// rowAux[].dith. Rebuilt whenever the palette is (theme, brightness, knee),
+// because the amplitude is derived from the palette's step spacing.
 float ditherLUT[16];
 // rowAux[phase][x] merges what used to be two separate per-pixel arrays:
 //   - dx2LUT[x]        = (x - cx)^2 * g_vignK, row-invariant vignette term
@@ -281,6 +282,38 @@ void extendPalette() {
     }
 }
 
+// Amplitude comes from the palette, not a constant: it is half the spacing
+// between the ramp's RGB565 steps, so the dither cell spans exactly one step.
+// The old fixed 255/160 was +-0.8 index units, tuned against silk's own
+// fixed-point index quantization rather than the panel's, which is why the
+// ramp still showed hard contours -- 54.7% of disc pixels sat on a monotone
+// <=1 LSB staircase at brightness 100. Deriving it drops that to 3.4%.
+void buildDitherLUT() {
+    const float amp = ditherAmp(palette, 256);
+    for (int k = 0; k < 16; k++) {
+        ditherLUT[k] = (static_cast<float>(BAYER4[k]) - 7.5f) * (amp / 7.5f);
+    }
+}
+
+// Re-quantize the LUT into whichever rowAux phases exist. Only reached on a
+// theme/tone change, which already rebuilds a 256-entry ramp and the contrast
+// LUT, so 4*w stores on top of that are not worth optimizing.
+void refreshDither() {
+    buildDitherLUT();
+    int32_t q[16];
+    for (int k = 0; k < 16; k++) {
+        q[k] = static_cast<int32_t>(lroundf(ditherLUT[k] * 65536.0f)) + (PALETTE_REAL_OFF << 16);
+    }
+    for (int ph = 0; ph < 4; ph++) {
+        if (rowAux[ph] == nullptr) {
+            continue;
+        }
+        for (int x = 0; x < rowAuxW[ph]; x++) {
+            rowAux[ph][x].dith = q[ph * 4 + (x & 3)];
+        }
+    }
+}
+
 bool init(int w, int h) {
     g_sinLut = sinLut();
     if (g_sinLut == nullptr) {
@@ -306,9 +339,7 @@ bool init(int w, int h) {
         lastThemeGen = themeGen();
         buildContrastLUT(55);
         lastGlow = 55;
-        for (int k = 0; k < 16; k++) {
-            ditherLUT[k] = (BAYER4[k] / 16.0f - 0.5f) * (255.0f / 160.0f);
-        }
+        buildDitherLUT();
     }
 
     // Build the merged vignette+dither table (see rowAux comment above): one
@@ -373,6 +404,7 @@ void frame(uint32_t tMs, int, int, const uint8_t p[4]) {
         buildThemeRamp(palette, 256);
         extendPalette();
         lastThemeGen = themeGen();
+        refreshDither(); // step spacing moved with the new palette
     }
     if (p[2] != lastGlow) {
         buildContrastLUT(p[2]);

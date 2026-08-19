@@ -176,6 +176,24 @@ extern const uint8_t BAYER4[16];
 // 8x8 ordered dither matrix, values 0..63.
 extern const uint8_t BAYER8[64];
 
+// Ordered-dither amplitude for a palette, in palette-index units: half the
+// spacing between the palette's RGB565 steps, which is the swing that turns a
+// hard step into a dither cell.
+//
+// Measured PER CHANNEL, taking the fewest steps of any channel that actually
+// moves. The contour a viewer sees is set by the slowest channel, not by the
+// packed word: the Espresso ramp's word changes at 92 of 256 indices, yet its
+// blue holds flat across ~10 indices at a time, and that flat blue is the
+// stair. Counting changes on the packed word instead reports ~2.8 indices per
+// step, collapses the amplitude to +-0.7, and leaves the banding untouched.
+//
+// A channel flatter than n/64 steps is a constant across this palette and has
+// no staircase to break, so it is skipped rather than dragging the amplitude up.
+// Call it whenever the palette is rebuilt (theme, brightness, knee): the
+// spacing moves with all three, which is why this is derived and not a
+// constant.
+float ditherAmp(const uint16_t *pal, int n);
+
 // Alpha blend fg over bg, alpha Q8 (0..256).
 BGANIM_INLINE uint16_t blendQ8(uint16_t bg, uint16_t fg, int aQ8) {
     const int br = (bg >> 11) & 0x1F, bgc = (bg >> 5) & 0x3F, bb = bg & 0x1F;

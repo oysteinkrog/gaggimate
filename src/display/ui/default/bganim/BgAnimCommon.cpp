@@ -150,6 +150,38 @@ const uint8_t BAYER8[64] = {0,  32, 8,  40, 2,  34, 10, 42, 48, 16, 56, 24, 50, 
                             6,  38, 60, 28, 52, 20, 62, 30, 54, 22, 3,  35, 11, 43, 1,  33, 9,  41, 51, 19, 59, 27,
                             49, 17, 57, 25, 15, 47, 7,  39, 13, 45, 5,  37, 63, 31, 55, 23, 61, 29, 53, 21};
 
+float ditherAmp(const uint16_t *pal, int n) {
+    int cr = 0, cg = 0, cb = 0;
+    for (int i = 1; i < n; i++) {
+        const uint16_t p = pal[i - 1], q = pal[i];
+        if (((q >> 11) & 0x1F) != ((p >> 11) & 0x1F)) {
+            cr++;
+        }
+        if (((q >> 5) & 0x3F) != ((p >> 5) & 0x3F)) {
+            cg++;
+        }
+        if ((q & 0x1F) != (p & 0x1F)) {
+            cb++;
+        }
+    }
+    const int flat = n >> 6; // flatter than this and the channel is a constant
+    int steps = n;
+    if (cr > flat && cr < steps) {
+        steps = cr;
+    }
+    if (cg > flat && cg < steps) {
+        steps = cg;
+    }
+    if (cb > flat && cb < steps) {
+        steps = cb;
+    }
+    if (steps < 1) {
+        steps = 1;
+    }
+    const float a = 0.5f * static_cast<float>(n) / static_cast<float>(steps);
+    return a > 16.0f ? 16.0f : a;
+}
+
 void buildPalette(uint16_t *out, const uint8_t (*keys)[3], int nKeys, uint16_t brightness256) {
     for (int i = 0; i < 256; i++) {
         const float pos = i * (static_cast<float>(nKeys) / 256.0f);
