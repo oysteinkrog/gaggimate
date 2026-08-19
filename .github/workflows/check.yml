@@ -107,3 +107,21 @@ jobs:
       # Host-side SIMC autotune tests. No workflow ran these before.
       - name: Run autotune unit tests
         run: pio test -e native_autotune
+
+  animations:
+    name: Animation goldens
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v3
+        with:
+          submodules: 'recursive'
+      # The background animations carry two host-checkable invariants that
+      # nothing ran automatically: 39 golden frames across the 13 animations,
+      # and band() producing the same row whatever strip height it is called
+      # with -- the property SleepAnimation's interlaced half-res path depends
+      # on, and one that a caching optimization can break while leaving the
+      # golden frames bit-exact. Both are plain g++ and a few seconds; there is
+      # no reason for them to be a thing someone remembers to run.
+      - name: Golden frames and band call-shape invariance
+        run: make -C tools/animbench check

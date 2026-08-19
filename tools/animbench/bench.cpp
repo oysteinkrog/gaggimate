@@ -5,6 +5,7 @@
 //   ./bench --frames 240             frames per animation (default 240)
 //   ./bench --golden DIR             also write reference PPMs (frames 30/120/210)
 //   ./bench --compare DIR            render those frames, diff vs stored PPMs
+//                                    (exits 1 if any frame is off or missing)
 //   ./bench --dump DIR               write PPMs without treating them as golden
 //
 // Timing is host wall-clock (x86), so absolute numbers do NOT transfer to the
@@ -136,6 +137,7 @@ int main(int argc, char **argv) {
     int onlyAnim = -1;
     int frames = 240;
     std::string goldenDir, compareDir, dumpDir;
+    int compareFailures = 0;
     for (int i = 1; i < argc; i++) {
         const std::string a = argv[i];
         if (a == "--anim" && i + 1 < argc) {
@@ -199,8 +201,16 @@ int main(int argc, char **argv) {
                 }
                 if (!compareDir.empty()) {
                     const Diff d = diffPpm(compareDir + name, fb.data());
+                    // The tolerance is deliberately loose: goldens are compared
+                    // across compilers, and float codegen differences move a
+                    // few LSBs. A missing reference counts as a failure too --
+                    // in CI it means a new animation shipped without a golden.
+                    const bool ok = d.mean >= 0 && d.mean <= 3.0 && d.max <= 48;
+                    if (!ok) {
+                        compareFailures++;
+                    }
                     printf("  diff %-9s f%03d: mean %.3f max %d %s\n", anim.id, gf, d.mean, d.max,
-                           d.mean < 0 ? "(NO REFERENCE)" : (d.mean <= 3.0 && d.max <= 48 ? "OK" : "CHECK VISUALLY"));
+                           d.mean < 0 ? "(NO REFERENCE)" : (ok ? "OK" : "CHECK VISUALLY"));
                 }
             }
         }
@@ -237,5 +247,10 @@ int main(int argc, char **argv) {
                (frameMs + bandMs) / frames, static_cast<double>(libmTotal()) / frames, estDevMs,
                top.empty() ? "-" : top.c_str());
     }
-    return 0;
+    // Exit non-zero so --compare can be a CI gate. Without a compare run there
+    // is nothing to fail on, and the benchmark table is the whole output.
+    if (!compareDir.empty()) {
+        printf("\n%s (%d failing)\n", compareFailures == 0 ? "GOLDENS OK" : "GOLDEN MISMATCH", compareFailures);
+    }
+    return compareFailures == 0 ? 0 : 1;
 }
