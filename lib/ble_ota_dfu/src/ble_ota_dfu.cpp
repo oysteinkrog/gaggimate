@@ -1,6 +1,8 @@
 /* Copyright 2022 Vincent Stragier */
 #include "ble_ota_dfu.hpp"
 
+#include <esp_ota_ops.h>
+
 QueueHandle_t start_update_queue;
 QueueHandle_t update_uploading_queue;
 
@@ -76,7 +78,19 @@ void task_install_update(void *parameters) {
     String result = (String) static_cast<char>(0x0F);
 
     // Init update
-    if (Update.begin(update_size)) {
+    //
+    // Arduino's UpdateClass writes to whatever esp_ota_get_next_update_partition()
+    // returns, and IDF returns the *running* partition when the table has only one
+    // OTA slot. Beginning an update there erases the app currently executing, with
+    // nothing to fall back to and no way in to reflash except USB. Refuse instead.
+    // Every table a release ships has two slots, so this only trips on
+    // single-slot development builds (see partitions/headless_8mb.csv).
+    const esp_partition_t *running = esp_ota_get_running_partition();
+    const esp_partition_t *target = esp_ota_get_next_update_partition(nullptr);
+    if (target == nullptr || target == running) {
+        ESP_LOGE(TAG, "Refusing OTA: no spare app slot (running=%s)", running != nullptr ? running->label : "?");
+        result += "Refusing OTA: this build has a single app slot, reflash over USB instead";
+    } else if (Update.begin(update_size)) {
         // Perform the update
         size_t written = Update.writeStream(update_binary);
 
