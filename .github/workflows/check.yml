@@ -79,6 +79,13 @@ jobs:
       # substitutes an empty stub and a broken UI build would go unnoticed.
       - name: Build Web
         run: ./scripts/build_webui.sh
+      # The web tree has carried an eslint config and a lint:check script the
+      # whole time and no workflow ran either, so a JS error only showed up as
+      # a broken page on a device. It runs here because build_webui.sh has
+      # already done npm ci; the tree is clean today at 0 errors and 7
+      # warnings, and only errors fail the step.
+      - name: Lint Web
+        run: npm --prefix web run lint:check
       - name: Build controller
         run: pio run -e controller
       - name: Build display
