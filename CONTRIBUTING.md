@@ -94,6 +94,18 @@ left to right by `SDKCONFIG_DEFAULTS` in each environment's
 carries the shared settings and the reasoning behind each one;
 `scripts/assert_sdkconfig.py` checks a set of invariants after every link.
 
+Two traps come with that layering. The generated `sdkconfig.<env>` is a _saved_
+config whose existing values outrank the defaults files, so editing a defaults
+file on a machine that already has one changes nothing, while CI checks out fresh
+and picks the new value up. If a defaults change looks like a no-op, delete
+`sdkconfig.<env>` and rebuild. Separately, a defaults line is never validated
+against Kconfig: a renamed symbol, or one whose dependencies the rest of the
+config makes unreachable, is dropped without a word and the line stays in the file
+looking authoritative. `assert_sdkconfig.py` fails the link when any line in the
+environment's defaults chain did not reach the merged config, which catches both.
+A value clamped by a Kconfig `range` counts as not applied, so the file has to
+state the number IDF will actually use.
+
 The pioarduino platform is pinned to a specific version in `platformio.ini`, and
 the comment there explains why: later ESP-IDF revisions ship a Bluetooth
 controller blob that crashes NimBLE bring-up on ESP32-S3 rev v0.2. Do not bump
