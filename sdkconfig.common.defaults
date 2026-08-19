@@ -63,7 +63,8 @@ CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=y
 CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_DEFAULT_CMN=y
 CONFIG_MBEDTLS_PSK_MODES=y
 CONFIG_MBEDTLS_KEY_EXCHANGE_PSK=y
-CONFIG_MBEDTLS_KEY_EXCHANGE_DHE_PSK=y
+# No DHE_PSK: that symbol depends on MBEDTLS_DHM_C, which IDF leaves off, so
+# Kconfig never emits it and a line asking for it here is silently dropped.
 CONFIG_MBEDTLS_KEY_EXCHANGE_ECDHE_PSK=y
 CONFIG_MBEDTLS_KEY_EXCHANGE_RSA_PSK=y
 
@@ -124,6 +125,35 @@ CONFIG_LWIP_MAX_SOCKETS=16
 # --- Logging ---
 CONFIG_LOG_DEFAULT_LEVEL_INFO=y
 CONFIG_LOG_MAXIMUM_LEVEL_VERBOSE=y
+
+# --- Core dump ---
+# Every partition table in partitions/ reserves a 64 KB coredump partition, the
+# web UI's "download support data" button fetches /api/core-dump and folds the
+# result into the support bundle, and the Task WDT note above says a WDT trip
+# gives a "clean reboot + coredump". None of that worked: IDF defaults to
+# ESP_COREDUMP_ENABLE_TO_NONE, so esp_core_dump_image_get() always failed, the
+# endpoint always answered 404, and the support bundle a user sends after a
+# crash carried the string "No core dump available" where the crash should be.
+CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH=y
+# ELF is what esp-coredump / idf.py coredump-info expect; the legacy binary
+# format needs the exact firmware ELF to say anything at all.
+CONFIG_ESP_COREDUMP_DATA_FORMAT_ELF=y
+CONFIG_ESP_COREDUMP_CHECKSUM_CRC32=y
+# 0 means the panic handler writes flash from the stack of the task that just
+# crashed, which is the one thing you cannot rely on when the crash is a stack
+# overflow -- the most common way this firmware dies. 1.75 KB of DRAM buys a
+# capture path that does not depend on the wreckage.
+#
+# 1792 is not a free choice. On the display envs task stacks may live in PSRAM
+# (FREERTOS_TASK_CREATE_ALLOW_EXT_MEM=y), which makes IDF force
+# ESP_COREDUMP_USE_STACK_SIZE and narrow this symbol to `range 1792 4096`, so a
+# smaller value written here is silently raised to the floor. The controller has
+# no PSRAM and would take less, but one number for every env is worth 768 bytes
+# of controller DRAM.
+CONFIG_ESP_COREDUMP_STACK_SIZE=1792
+# Task count is well under this; the cap exists so a runaway list cannot walk
+# past the 64 KB partition.
+CONFIG_ESP_COREDUMP_MAX_TASKS_NUM=32
 
 # --- Arduino (as-component) trims ---
 # SELECTIVE_COMPILATION=y + per-lib =n gates out libs that break IDF 5.5+GCC 14

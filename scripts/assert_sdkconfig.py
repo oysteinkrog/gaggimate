@@ -12,6 +12,11 @@
 # again unnoticed. Add new invariants to REQUIRED below as they're discovered;
 # invariants that need more than the config text (e.g. the board) go in their own
 # _check_* function, called from assert_sdkconfig.
+#
+# On top of the named invariants, _check_defaults_applied verifies the weaker
+# but broader property that every line in this env's sdkconfig.*.defaults chain
+# actually reached the merged config -- see that function for why a line can
+# silently do nothing.
 import os
 import re
 
@@ -79,6 +84,84 @@ def _check_flash_size(text):
     )]
 
 
+# Symbols a Kconfig choice group is expected to drop, with the reason. Everything
+# else that fails to reach the merged config is a finding.
+ALLOW_UNAPPLIED = {
+    # display-headless-8m lists flash8m.defaults after gaggimate.defaults, and
+    # picking the 8 MB member of the FLASHSIZE choice unsets the 16 MB one.
+    "CONFIG_ESPTOOLPY_FLASHSIZE_16MB",
+}
+
+
+def _defaults_chain():
+    """The SDKCONFIG_DEFAULTS files this env feeds to IDF, in apply order."""
+    try:
+        extra = env.GetProjectOption("board_build.cmake_extra_args", "")
+    except Exception:
+        return []
+    if isinstance(extra, (list, tuple)):
+        extra = " ".join(extra)
+    m = re.search(r"-DSDKCONFIG_DEFAULTS=([^\s]+)", extra or "")
+    if not m:
+        return []
+    return [p for p in m.group(1).split(";") if p]
+
+
+def _check_defaults_applied(text):
+    """Every `CONFIG_X=...` line in this env's defaults reached the merged config.
+
+    A defaults file is not validated against Kconfig. A symbol that was renamed
+    between IDF releases, or one whose dependencies the rest of the config makes
+    unreachable, is dropped in silence: the build succeeds and the line stays in
+    the file looking authoritative. Worse, `sdkconfig.<env>` is a saved config
+    whose existing values outrank the defaults, so editing a defaults file on a
+    machine that already has one changes nothing at all -- while CI, checking out
+    fresh, gets the new value. That divergence is invisible without this check.
+    Three cases this caught: CONFIG_MBEDTLS_KEY_EXCHANGE_DHE_PSK was never
+    reachable (it needs MBEDTLS_DHM_C, which IDF leaves off); the coredump block
+    was inert for a whole build cycle behind a stale sdkconfig.<env>; and
+    ESP_COREDUMP_STACK_SIZE=1024 was quietly raised to 1792 by a Kconfig range
+    that narrows once task stacks may live in PSRAM. A clamped value counts as
+    not applied, so the defaults file has to state what IDF will really use.
+
+    Returns [] when satisfied, else [(description, hint)].
+    """
+    defines = dict(re.findall(r"^#define\s+(CONFIG_[A-Za-z0-9_]+)\s+(.*)$", text, re.M))
+
+    wanted = {}
+    for path in _defaults_chain():
+        if not os.path.isfile(path):
+            continue
+        with open(path, encoding="utf-8") as handle:
+            for lineno, line in enumerate(handle, 1):
+                m = re.match(r"^(CONFIG_[A-Za-z0-9_]+)=(.*)$", line.strip())
+                if m:
+                    wanted[m.group(1)] = (m.group(2), path, lineno)
+
+    failures = []
+    for symbol, (value, path, lineno) in sorted(wanted.items()):
+        if symbol in ALLOW_UNAPPLIED:
+            continue
+        got = defines.get(symbol)
+        if value == "n":
+            # Kconfig omits a disabled bool entirely; a #define means it is on.
+            ok = got is None
+        elif value == "y":
+            ok = got == "1"
+        else:
+            ok = got is not None and got.strip() == value.strip()
+        if not ok:
+            shown = "absent" if got is None else got.strip()
+            failures.append((
+                f"{symbol}={value} reached the merged config (it is {shown})",
+                f"{path}:{lineno} asks for this and the build did not take it. "
+                f"Either the symbol no longer exists / is unreachable in this IDF "
+                f"and the line should go, or a stale sdkconfig.<env> is winning -- "
+                f"delete it and rebuild.",
+            ))
+    return failures
+
+
 def assert_sdkconfig(*_args, **_kwargs):
     sdkconfig_h = os.path.join(env.subst("$BUILD_DIR"), "config", "sdkconfig.h")
     if not os.path.isfile(sdkconfig_h):
@@ -92,6 +175,7 @@ def assert_sdkconfig(*_args, **_kwargs):
         if not predicate(text):
             failures.append((desc, hint))
     failures.extend(_check_flash_size(text))
+    failures.extend(_check_defaults_applied(text))
 
     if failures:
         print("\n*** sdkconfig guard FAILED — merged config violates required invariants:")
@@ -100,7 +184,8 @@ def assert_sdkconfig(*_args, **_kwargs):
         print(f"  (checked {sdkconfig_h})\n")
         env.Exit(1)
     else:
-        print(f"sdkconfig guard: OK ({len(REQUIRED) + 1} invariant(s) satisfied)")
+        print(f"sdkconfig guard: OK ({len(REQUIRED) + 1} invariant(s) satisfied, "
+              f"every defaults line applied)")
 
 
 # Run after the firmware ELF is built, so the merged sdkconfig.h exists.
