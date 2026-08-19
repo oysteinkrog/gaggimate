@@ -26,13 +26,20 @@ jobs:
           python-version: '3.11'
       - name: Install PlatformIO Core
         run: pip install --upgrade platformio
-      # src/display/ui is excluded and the step is non-blocking: cppcheck's
-      # findings on the LVGL-facing UI code are mostly noise and were never
-      # triaged. Narrowing the exclusion is worth doing, but not as a gate
-      # that starts red.
+      # Only the generated EEZ Studio tree is excluded now. A full run over
+      # src/display/ui reports 0 high and 0 medium; of the 1805 low findings,
+      # 1747 are in eez/ (unreadVariable, variableScope, arrayIndexThenCheck in
+      # machine-written code nobody will edit by hand), so excluding that subtree
+      # buys the whole reduction and the rest of the UI is clean.
+      #
+      # Still non-blocking, for a reason unrelated to defects: this step exits 1
+      # on the runner regardless of what it finds, because cppcheck reports
+      # unmatchedSuppression for the .pio tree as information severity and
+      # PlatformIO treats any non-zero tool status as failure. Making it a gate
+      # means fixing that first.
       - name: Run static code analysis for display
         continue-on-error: true
-        run: platformio check -e display --fail-on-defect=medium -f "-<*>" -f "+<src/display/>" -f "-<src/display/ui>"
+        run: platformio check -e display --fail-on-defect=medium -f "-<*>" -f "+<src/display/>" -f "-<src/display/ui/default/eez>"
       - name: Run static code analysis for controller
         run: platformio check -e controller --fail-on-defect=medium -f "-<*>" -f "+<src/controller/>"
 
