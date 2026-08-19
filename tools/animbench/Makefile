@@ -7,7 +7,7 @@ ANIM_DIR := ../../src/display/ui/default/bganim
 SRCS := bench.cpp mathcount.cpp $(wildcard $(ANIM_DIR)/*.cpp)
 CXXFLAGS := -O2 -g -std=gnu++17 -Ishim -I. -include mathcount.h -Wall -Wno-unused-function
 
-$(BIN): $(SRCS) mathcount.h shim/Arduino.h shim/esp_heap_caps.h
+$(BIN): $(SRCS) mathcount.h shim/Arduino.h shim/esp_heap_caps.h shim/esp_memory_utils.h
 	@mkdir -p $(dir $(BIN))
 	g++ $(CXXFLAGS) $(SRCS) -o $(BIN) -lm
 
