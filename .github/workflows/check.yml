@@ -120,6 +120,10 @@ jobs:
       - name: Checkout repo
         uses: actions/checkout@v3
         with:
+          # auto_firmware_version.py runs git describe, so the tags have to be
+          # here or the simulator reports an empty version string.
+          fetch-tags: true
+          fetch-depth: 0
           submodules: 'recursive'
       - uses: actions/cache@v4
         with:
