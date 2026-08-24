@@ -12,6 +12,12 @@ constexpr uint8_t PHASE_DISPLAY_FW = 1;
 constexpr uint8_t PHASE_DISPLAY_FS = 2;
 constexpr uint8_t PHASE_CONTROLLER_FW = 3;
 constexpr uint8_t PHASE_FINISHED = 4;
+// A failed update used to return from update() without any further callback, so
+// the UI kept showing the phase it had last been told about, with a spinner and
+// no way back. The web UI treats any non-zero phase as "in progress", so an
+// explicit terminal error phase is the only way to say the run is over and it
+// did not work.
+constexpr uint8_t PHASE_ERROR = 5;
 
 using phase_callback_t = std::function<void(uint8_t phase)>;
 using progress_callback_t = std::function<void(uint8_t phase, int progress)>;

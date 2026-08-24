@@ -6,6 +6,7 @@
 #include <HTTPUpdate.h>
 #include <Update.h>
 #include <WiFiClientSecure.h>
+#include <esp_ota_ops.h>
 
 GitHubOTA::GitHubOTA(const String &display_version, const String &controller_version, const String &release_url,
                      const phase_callback_t &phase_callback, const progress_callback_t &progress_callback,
@@ -97,8 +98,16 @@ void GitHubOTA::update(bool controller, bool display) {
         // controller .bin hits GitHub with no trusted roots and the TLS handshake
         // fails (the constructor no longer attaches it once for the client).
         attach_ca_bundle(_wifi_client);
-        _controller_ota.update(_wifi_client, _latest_url + _controller_firmware_name);
-        ESP_LOGI(TAG, "Controller update successful. Restarting...\n");
+        // This used to ignore the result and log "Controller update successful"
+        // unconditionally, then fall through to reboot the display -- so a
+        // controller that never received the image reported a clean update.
+        if (!_controller_ota.update(_wifi_client, _latest_url + _controller_firmware_name)) {
+            ESP_LOGE(TAG, "Controller update failed; not touching the display image.");
+            this->phase = PHASE_ERROR;
+            this->_phase_callback(PHASE_ERROR);
+            return;
+        }
+        ESP_LOGI(TAG, "Controller update successful.");
         updateExecuted = true;
     }
 
@@ -109,7 +118,9 @@ void GitHubOTA::update(bool controller, bool display) {
         auto result = update_firmware(_latest_url + _firmware_name);
 
         if (result != HTTP_UPDATE_OK) {
-            ESP_LOGI(TAG, "Update failed: %s\n", Updater.getLastErrorString().c_str());
+            ESP_LOGE(TAG, "Update failed: %s\n", Updater.getLastErrorString().c_str());
+            this->phase = PHASE_ERROR;
+            this->_phase_callback(PHASE_ERROR);
             return;
         }
 
@@ -137,6 +148,21 @@ void GitHubOTA::setReleaseUrl(const String &release_url) { this->_release_url = 
 HTTPUpdateResult GitHubOTA::update_firmware(const String &url) {
     const char *TAG = "update_firmware";
     ESP_LOGI(TAG, "Download URL: %s\n", url.c_str());
+
+    // Same guard the BLE DFU path already has: HTTPUpdate writes to whatever
+    // esp_ota_get_next_update_partition() hands back, and IDF hands back the
+    // *running* partition when the table holds only one OTA slot. Beginning an
+    // update there erases the app that is executing, leaving nothing to roll
+    // back to and no route in except USB. partitions/headless_8mb.csv is
+    // single-slot and its build still shows the update button, so this is
+    // reachable today, not hypothetical.
+    const esp_partition_t *running = esp_ota_get_running_partition();
+    const esp_partition_t *target = esp_ota_get_next_update_partition(nullptr);
+    if (target == nullptr || target == running) {
+        ESP_LOGE(TAG, "Refusing OTA: this build has a single app slot (running=%s); reflash over USB instead",
+                 running != nullptr ? running->label : "?");
+        return HTTP_UPDATE_FAILED;
+    }
 
     attach_ca_bundle(_wifi_client);
     auto result = Updater.update(_wifi_client, url);

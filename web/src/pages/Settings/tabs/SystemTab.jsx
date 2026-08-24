@@ -30,6 +30,13 @@ const getRssiStatusClass = rssi => {
   return 'status-success';
 };
 
+// Phase numbers come from PHASE_* in lib/OTA/src/GitHubOTA.h: 1 display fw,
+// 2 display fs, 3 controller fw, 4 finished, 5 failed. Anything non-zero
+// replaces the whole tab, so 4 and 5 are the only phases that give the user a
+// way back out and the only ones that stop the spinner.
+const OTA_PHASE_FINISHED = 4;
+const OTA_PHASE_ERROR = 5;
+
 function OtaProgressView({ phase, progress }) {
   const getOtaPhaseText = p => {
     switch (p) {
@@ -39,17 +46,33 @@ function OtaProgressView({ phase, progress }) {
         return 'Updating Display filesystem';
       case 3:
         return 'Updating controller firmware';
+      case OTA_PHASE_ERROR:
+        return 'Update failed';
       default:
         return 'Finished';
     }
   };
 
+  const failed = phase === OTA_PHASE_ERROR;
+  const done = failed || phase === OTA_PHASE_FINISHED;
+
   return (
     <div className='flex flex-col items-center gap-4 py-12'>
-      <Spinner size={8} />
-      <span className='text-base-content text-xl font-medium'>{getOtaPhaseText(phase)}</span>
-      <span className='text-base-content text-lg font-medium'>{phase === 4 ? 100 : progress}%</span>
-      {phase === 4 && (
+      {!done && <Spinner size={8} />}
+      <span className={`text-xl font-medium ${failed ? 'text-error' : 'text-base-content'}`}>
+        {getOtaPhaseText(phase)}
+      </span>
+      {failed ? (
+        <span className='text-base-content/70 max-w-md text-center text-sm'>
+          The machine was left on its current firmware. Check the display log for the reason, then
+          try again.
+        </span>
+      ) : (
+        <span className='text-base-content text-lg font-medium'>
+          {phase === OTA_PHASE_FINISHED ? 100 : progress}%
+        </span>
+      )}
+      {done && (
         <a href='/' className='btn btn-primary'>
           Back
         </a>
@@ -317,7 +340,7 @@ export function SystemTab() {
             <label htmlFor='channel' className='mb-2 block text-sm font-medium'>
               Update Channel
             </label>
-            <div className='flex items-center gap-2 w-full'>
+            <div className='flex w-full items-center gap-2'>
               <select id='channel' name='channel' className='select select-bordered grow'>
                 <option value='latest' selected={formData.channel === 'latest'}>
                   Stable
@@ -345,7 +368,7 @@ export function SystemTab() {
             </span>
             <span className='text-base-content flex items-center gap-2 font-semibold'>
               {rssi}dB (Roundtrip: {lat} ms)
-              <span className={`indicator-item status ${getRssiStatusClass(rssi)}`}/>
+              <span className={`indicator-item status ${getRssiStatusClass(rssi)}`} />
             </span>
           </div>
 
