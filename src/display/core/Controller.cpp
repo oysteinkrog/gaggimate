@@ -23,7 +23,7 @@
 #include <display/plugins/ShotHistoryPlugin.h>
 #include <display/plugins/SmartGrindPlugin.h>
 #include <display/plugins/WebUIPlugin.h>
-#ifndef GAGGIMATE_SIM // network/BLE plugins are device-only
+#ifndef GAGGIMATE_NO_RADIO // network/BLE plugins are device-only
 #include <display/plugins/BLEScalePlugin.h>
 #include <display/plugins/HomekitPlugin.h>
 #include <display/plugins/ImprovPlugin.h>
@@ -39,6 +39,8 @@
 #include <display/drivers/common/PanelClock.h>
 #ifdef GAGGIMATE_SIM
 #include <SdlDriver.h> // desktop SDL panel stands in for the hardware drivers
+#elif defined(GAGGIMATE_QEMU)
+#include <display/drivers/Qemu/QemuDriver.h> // synthetic RGB panel provided by QEMU
 #else
 #include <Preferences.h>
 #include <display/drivers/AmoledDisplayDriver.h>
@@ -111,7 +113,7 @@ void Controller::setup() {
     profileManager = new ProfileManager(fs, "/p", settings, pluginManager);
     profileManager->setup();
     heap_checkpoint("setup/after-profile-manager");
-#ifndef GAGGIMATE_SIM // mDNS/HomeKit are device-only
+#ifndef GAGGIMATE_NO_RADIO // mDNS/HomeKit are device-only
     if (settings.isHomekit())
         pluginManager->registerPlugin(new HomekitPlugin(settings.getWifiSsid(), settings.getWifiPassword()));
     else
@@ -123,19 +125,19 @@ void Controller::setup() {
     if (settings.isSmartGrindActive()) {
         pluginManager->registerPlugin(new SmartGrindPlugin());
     }
-#ifndef GAGGIMATE_SIM // MQTT/HomeAssistant is device-only
+#ifndef GAGGIMATE_NO_RADIO // MQTT/HomeAssistant is device-only
     if (settings.isHomeAssistant()) {
         pluginManager->registerPlugin(new MQTTPlugin());
     }
 #endif
     pluginManager->registerPlugin(new WebUIPlugin());
-#ifndef GAGGIMATE_SIM // WiFi watchdogs and BLE scales are device-only
+#ifndef GAGGIMATE_NO_RADIO // WiFi watchdogs and BLE scales are device-only
     pluginManager->registerPlugin(new NetworkWatchdogPlugin());
     pluginManager->registerPlugin(new WifiStaWatchdogPlugin());
     pluginManager->registerPlugin(new ImprovPlugin());
 #endif
     pluginManager->registerPlugin(&ShotHistory);
-#ifndef GAGGIMATE_SIM
+#ifndef GAGGIMATE_NO_RADIO
     pluginManager->registerPlugin(&BLEScales);
 #endif
     pluginManager->registerPlugin(new LedControlPlugin());
@@ -176,7 +178,9 @@ void Controller::connect() {
     pluginManager->trigger("controller:startup");
 
     heap_checkpoint("connect/before-wifi");
+#ifndef GAGGIMATE_NO_RADIO
     setupWifi();
+#endif
     heap_checkpoint("connect/after-wifi");
     setupBluetooth();
     heap_checkpoint("connect/after-bluetooth");
@@ -194,6 +198,13 @@ enum PanelModel : uint8_t { PANEL_UNKNOWN = 0, PANEL_LILYGO = 1, PANEL_AMOLED = 
 void Controller::setupPanel() {
 #ifdef GAGGIMATE_SIM
     driver = SdlDriver::getInstance(); // desktop SDL panel
+    driver->init();
+#elif defined(GAGGIMATE_QEMU)
+    // Selected outright, not probed. Every hardware detection step (LilyGo's
+    // strap pin, the Amoled I2C scan, Waveshare's SPI bring-up) reads
+    // peripherals QEMU does not emulate, so the chain would fall through to
+    // Waveshare and hang in its bus init.
+    driver = QemuDriver::getInstance();
     driver->init();
 #else
     // The panel can't change after flashing, so cache the detection result in NVS
