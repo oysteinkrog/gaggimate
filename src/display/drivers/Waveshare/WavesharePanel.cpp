@@ -832,7 +832,7 @@ void WavesharePanel::initBUS() {
                     },
             },
         .data_width = 16, // RGB565 in parallel mode, thus 16bit in width
-        .psram_trans_align = 64,
+        .dma_burst_size = 64, // union alias of the deprecated psram_trans_align under IDF 5.5
         .hsync_gpio_num = WS_BOARD_TFT_HSYNC,
         .vsync_gpio_num = WS_BOARD_TFT_VSYNC,
         .de_gpio_num = WS_BOARD_TFT_DE,

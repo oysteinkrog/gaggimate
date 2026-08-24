@@ -11,7 +11,9 @@
 #include "utilities.h"
 #include <display/drivers/common/PanelClock.h>
 #include <display/drivers/common/RGBPanelInit.h>
-#include <esp32s3/rom/cache.h> // Cache_Invalidate_Addr, for the direct-writer path in pushColors
+#include <esp_cache.h>                    // esp_cache_msync, for the direct-writer path in pushColors
+#include <esp_memory_utils.h>              // esp_ptr_external_ram
+#include <esp_private/esp_cache_private.h> // esp_cache_get_alignment
 
 // Panel timing porches, overridable from build flags (see [env:display] in
 // platformio.ini). Defaults are the stock LilyGo values.
@@ -394,7 +396,7 @@ void LilyGo_RGBPanel::initBUS() {
                     },
             },
         .data_width = 16, // RGB565 in parallel mode, thus 16bit in width
-        .psram_trans_align = 64,
+        .dma_burst_size = 64, // union alias of the deprecated psram_trans_align under IDF 5.5
         .hsync_gpio_num = BOARD_TFT_HSYNC,
         .vsync_gpio_num = BOARD_TFT_VSYNC,
         .de_gpio_num = BOARD_TFT_DE,
@@ -562,31 +564,14 @@ void LilyGo_RGBPanel::pushColors(uint16_t x, uint16_t y, uint16_t width, uint16_
         // The span is line-aligned by construction -- 480 px x 2 B = 960 B per
         // line, a multiple of the 32-byte cache line.
         const uint32_t stride = static_cast<uint32_t>(this->width()) * 2;
-        Cache_Invalidate_Addr(reinterpret_cast<uint32_t>(_fbDirect) + y * stride,
-                              static_cast<uint32_t>(hight - y) * stride);
+        esp_cache_msync(reinterpret_cast<uint8_t *>(_fbDirect) + static_cast<size_t>(y) * stride,
+                        static_cast<size_t>(hight - y) * stride, ESP_CACHE_MSYNC_FLAG_DIR_M2C);
     }
     esp_lcd_panel_draw_bitmap(_panelDrv, x, y, width, hight, data);
     unlockFrameBuffer();
 }
 
 void LilyGo_RGBPanel::setDirectWriter(bool active) { _directWriter = active; }
-
-// Byte offsets into esp_rgb_panel_t, which esp_lcd keeps private to
-// esp_lcd_rgb_panel.c -- there is no accessor for the framebuffer in IDF 4.4.7
-// (esp_lcd_rgb_panel_get_frame_buffer arrives in 5.x). These were recovered by
-// disassembling this exact build's esp_lcd_rgb_panel_draw_bitmap and reading
-// which offsets it loads for the destination pointer and the bounds check.
-//
-// They are therefore valid for ONE toolchain build, which is why every one of
-// them is validated below before the pointer is handed out: a struct layout
-// change from an IDF bump moves these, and the probe must fail closed rather
-// than return a wild pointer into the middle of a live driver object.
-namespace {
-constexpr size_t RGB_PANEL_OFF_BPP = 44;
-constexpr size_t RGB_PANEL_OFF_FB = 72;
-constexpr size_t RGB_PANEL_OFF_HRES = 152;
-constexpr size_t RGB_PANEL_OFF_VRES = 156;
-} // namespace
 
 uint16_t *LilyGo_RGBPanel::directFrameBuffer() {
     if (_fbResolved) {
@@ -597,52 +582,82 @@ uint16_t *LilyGo_RGBPanel::directFrameBuffer() {
     if (_panelDrv == nullptr) {
         return nullptr;
     }
-    const uint8_t *base = reinterpret_cast<const uint8_t *>(_panelDrv);
-    uint16_t *fb = *reinterpret_cast<uint16_t *const *>(base + RGB_PANEL_OFF_FB);
-    const size_t bpp = *reinterpret_cast<const size_t *>(base + RGB_PANEL_OFF_BPP);
-    const uint32_t hres = *reinterpret_cast<const uint32_t *>(base + RGB_PANEL_OFF_HRES);
-    const uint32_t vres = *reinterpret_cast<const uint32_t *>(base + RGB_PANEL_OFF_VRES);
-
-    // Five independent checks. Any one of them failing means the offsets no
-    // longer describe this struct, and three of them (the resolution pair and
-    // the bit depth) would be astronomically unlikely to hold by accident on a
-    // wrong layout -- which is the point: they are the layout's fingerprint,
-    // not just sanity checks on the values.
-    const bool fbInPsram = fb != nullptr && reinterpret_cast<uintptr_t>(fb) >= 0x3C000000u &&
-                           reinterpret_cast<uintptr_t>(fb) < 0x3E000000u;
-    const bool fbAligned = (reinterpret_cast<uintptr_t>(fb) & 63u) == 0;
-    const bool resMatches = hres == width() && vres == height();
-    const bool depthMatches = bpp == 16;
-    if (!fbInPsram || !fbAligned || !resMatches || !depthMatches) {
-        log_w("LilyGo_RGBPanel: framebuffer probe failed (fb=%p psram=%d aligned=%d res=%ux%u want %ux%u bpp=%u)", fb,
-              static_cast<int>(fbInPsram), static_cast<int>(fbAligned), static_cast<unsigned>(hres),
-              static_cast<unsigned>(vres), static_cast<unsigned>(width()), static_cast<unsigned>(height()),
-              static_cast<unsigned>(bpp));
+    // esp_lcd's public accessor. This used to index the driver's private
+    // esp_rgb_panel_t at byte offsets recovered by disassembling an IDF 4.4.7
+    // build, guarded by a fingerprint of the neighbouring fields so a layout
+    // change would fail closed rather than hand out a pointer into the middle
+    // of a live driver object. It did fail closed, silently: IDF 5.5.1 moved
+    // the framebuffer array from offset 72 to 108, so every resolve returned
+    // null and the direct push path was unreachable on this branch. There is
+    // no layout dependency left to break.
+    void *fb0 = nullptr;
+    const esp_err_t err = esp_lcd_rgb_panel_get_frame_buffer(_panelDrv, 1, &fb0);
+    if (err != ESP_OK) {
+        log_w("LilyGo_RGBPanel: no direct framebuffer (%s)", esp_err_to_name(err));
         return nullptr;
     }
-    if (_fbMutex == nullptr) {
-        _fbMutex = xSemaphoreCreateMutex();
-        if (_fbMutex == nullptr) {
-            return nullptr; // without the lock a direct writer would race pushColors
+    uint16_t *const fb = static_cast<uint16_t *>(fb0);
+
+    // Preconditions the direct push path actually relies on, not a layout
+    // check: a framebuffer outside PSRAM means the panel was built with
+    // fb_in_psram off and none of the cache reasoning below applies, and one
+    // that is not cache-line aligned makes every esp_cache_msync over a band
+    // fail its own alignment check.
+    //
+    // Asked for rather than hardcoded. An earlier version of this required 64
+    // bytes, which held under IDF 4.4 because psram_trans_align was a real
+    // alignment request; under 5.5 that field is the DMA burst size and the
+    // driver aligns the framebuffer to the data cache line instead -- 32 bytes
+    // on this part -- so a fixed 64 rejected a framebuffer that was perfectly
+    // usable.
+    size_t cacheAlign = 0;
+    if (esp_cache_get_alignment(MALLOC_CAP_SPIRAM, &cacheAlign) != ESP_OK || cacheAlign == 0) {
+        cacheAlign = 64; // unknown: fall back to the stricter requirement
+    }
+    const bool inPsram = fb != nullptr && esp_ptr_external_ram(fb);
+    const bool aligned = (reinterpret_cast<uintptr_t>(fb) & (cacheAlign - 1)) == 0;
+    // Every band lands at fb + row * stride, so the stride has to preserve
+    // whatever alignment the base has. 480 px x 2 B = 960 B, which is a
+    // multiple of 32 but not of 64 -- worth asserting rather than assuming.
+    const bool strideOk = ((static_cast<size_t>(width()) * 2) % cacheAlign) == 0;
+    if (!inPsram || !aligned || !strideOk) {
+        log_w("LilyGo_RGBPanel: framebuffer %p unusable for direct writes (psram=%d aligned=%d stride=%d, need %u B)",
+              fb, static_cast<int>(inPsram), static_cast<int>(aligned), static_cast<int>(strideOk),
+              static_cast<unsigned>(cacheAlign));
+        return nullptr;
+    }
+    if (_fbGate == nullptr) {
+        // A binary semaphore rather than a mutex: the direct writer holds this
+        // across an asynchronous GDMA transfer and releases it from the
+        // completion interrupt, and xSemaphoreGiveFromISR cannot act on a
+        // mutex. The priority inheritance a mutex would add buys nothing here
+        // -- the only two contenders, the LVGL task and the animation render
+        // task, run at the same priority on the same core.
+        _fbGate = xSemaphoreCreateBinary();
+        if (_fbGate == nullptr) {
+            return nullptr; // without the gate a direct writer would race pushColors
         }
+        xSemaphoreGive(_fbGate); // created empty; start it unheld
     }
     _fbDirect = fb;
-    log_i("LilyGo_RGBPanel: direct framebuffer at %p (%ux%u, %u bpp)", fb, static_cast<unsigned>(hres),
-          static_cast<unsigned>(vres), static_cast<unsigned>(bpp));
+    log_i("LilyGo_RGBPanel: direct framebuffer at %p (%ux%u)", fb, static_cast<unsigned>(width()),
+          static_cast<unsigned>(height()));
     return _fbDirect;
 }
 
 void LilyGo_RGBPanel::lockFrameBuffer() {
-    if (_fbMutex != nullptr) {
-        xSemaphoreTake(_fbMutex, portMAX_DELAY);
+    if (_fbGate != nullptr) {
+        xSemaphoreTake(_fbGate, portMAX_DELAY);
     }
 }
 
 void LilyGo_RGBPanel::unlockFrameBuffer() {
-    if (_fbMutex != nullptr) {
-        xSemaphoreGive(_fbMutex);
+    if (_fbGate != nullptr) {
+        xSemaphoreGive(_fbGate);
     }
 }
+
+void *LilyGo_RGBPanel::frameBufferGate() { return _fbGate; }
 
 void LilyGo_RGBPanel::stopPanel() {
     setBrightness(0);

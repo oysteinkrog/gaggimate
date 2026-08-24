@@ -25,6 +25,12 @@ class Display {
     // with a cache writeback over the region it touched.
     virtual void lockFrameBuffer() {}
     virtual void unlockFrameBuffer() {}
+    // The gate lockFrameBuffer() takes, as a raw FreeRTOS handle, or nullptr on
+    // a panel that has none. Handed out raw rather than wrapped in an
+    // unlockFrameBufferFromISR() because the only caller is a DMA completion
+    // interrupt that may run with the flash cache disabled: a virtual call
+    // would land in flash, while xSemaphoreGiveFromISR is in IRAM.
+    virtual void *frameBufferGate() { return nullptr; }
     // Tell the panel that someone is writing its framebuffer behind the cache,
     // so pushColors can stop trusting its own cached view of that memory. See
     // the implementation for what goes wrong without it.

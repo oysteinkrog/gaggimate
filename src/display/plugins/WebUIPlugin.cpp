@@ -15,7 +15,7 @@
 #include <display/ui/default/SleepAnimation.h>
 #include <display/ui/default/bganim/BgAnim.h>
 #include <display/ui/default/bganim/BgAnimCommon.h>
-#include <esp32s3/rom/cache.h> // Cache_WriteBack_Addr / Cache_Invalidate_Addr for /api/dmatest
+#include <esp_cache.h> // esp_cache_msync, for /api/dmatest
 #include <esp_async_memcpy.h>
 #include <esp_heap_caps.h>
 #include <soc/gdma_channel.h> // SOC_GDMA_TRIG_PERIPH_LCD0 for /api/gdma
@@ -538,8 +538,10 @@ void WebUIPlugin::setupServer() {
         async_memcpy_t h = nullptr;
         async_memcpy_config_t cfg = ASYNC_MEMCPY_DEFAULT_CONFIG();
         cfg.backlog = 64;
-        cfg.sram_trans_align = 4;
-        cfg.psram_trans_align = 64;
+        // Burst size, not an alignment: psram_trans_align is a deprecated union
+        // alias of dma_burst_size under IDF 5.5. 32 matches the data cache line
+        // and the octal PSRAM burst.
+        cfg.dma_burst_size = 32;
         esp_err_t installErr = ESP_OK;
         if (src != nullptr && dst != nullptr) {
             installErr = esp_async_memcpy_install(&cfg, &h);
@@ -560,7 +562,7 @@ void WebUIPlugin::setupServer() {
                 src[i] = static_cast<uint16_t>(i * 7 + 1);
             }
             memset(dst, 0xA5, bytes);
-            Cache_WriteBack_Addr(reinterpret_cast<uint32_t>(dst), static_cast<uint32_t>(bytes));
+            esp_cache_msync(dst, bytes, ESP_CACHE_MSYNC_FLAG_DIR_C2M);
             SemaphoreHandle_t done = xSemaphoreCreateBinary();
             const int64_t t0 = esp_timer_get_time();
             const esp_err_t err = esp_async_memcpy(
@@ -575,7 +577,7 @@ void WebUIPlugin::setupServer() {
             const uint32_t elapsedUs = static_cast<uint32_t>(esp_timer_get_time() - t0);
             // The CPU's cached view of dst predates the transfer, so it must be
             // dropped before the comparison or this would verify the cache.
-            Cache_Invalidate_Addr(reinterpret_cast<uint32_t>(dst), static_cast<uint32_t>(bytes));
+            esp_cache_msync(dst, bytes, ESP_CACHE_MSYNC_FLAG_DIR_M2C);
             uint32_t mismatches = 0;
             int32_t firstIdx = -1;
             uint32_t firstExp = 0, firstGot = 0;
@@ -688,8 +690,7 @@ void WebUIPlugin::setupServer() {
             // the core entirely.
             async_memcpy_config_t cfg = ASYNC_MEMCPY_DEFAULT_CONFIG();
             cfg.backlog = 8;
-            cfg.psram_trans_align = 64;
-            cfg.sram_trans_align = 4;
+            cfg.dma_burst_size = 32;
             async_memcpy_t asmcp = nullptr;
             const esp_err_t inst = esp_async_memcpy_install(&cfg, &asmcp);
             doc["dma_install_err"] = esp_err_to_name(inst);
@@ -791,8 +792,8 @@ void WebUIPlugin::setupServer() {
                 a->benchRequestReset();
             }
         }
-        // ?dmamode=0|1|2|3|4 -- see benchSetDmaMode. Bisect control, takes effect
-        // on the next band, no restart needed.
+        // ?dmamode=0|1|2|3 -- see benchSetDmaMode. Takes effect on the next band,
+        // no restart needed.
         if (request->hasArg("dmamode")) {
             SleepAnimation *a = sleep_animation_bench_instance();
             if (a != nullptr) {
