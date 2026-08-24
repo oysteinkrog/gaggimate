@@ -165,7 +165,11 @@ uint16_t BLEOverTheAirDeviceFirmwareUpdate::write_binary(fs::FS *file_system, co
     if (!file_open) {
         ESP_LOGI(TAG, "Opening binary file %s\r\n", path);
         file = file_system->open(path, FILE_WRITE);
-        file_open = true;
+        // Only latch the flag on a file we actually got. Setting it
+        // unconditionally meant a failed open was never retried: every later
+        // call skipped the open, fell through to the !file check and returned 0
+        // for the rest of the transfer.
+        file_open = static_cast<bool>(file);
     }
 
     if (!file) {
@@ -173,13 +177,24 @@ uint16_t BLEOverTheAirDeviceFirmwareUpdate::write_binary(fs::FS *file_system, co
         return 0;
     }
 
+    size_t written = 0;
     if (data != nullptr) {
         ESP_LOGI(TAG, "Write binary file %s\r\n", path);
-        file.write(data, length);
+        written = file.write(data, length);
+        if (written != length) {
+            // The caller adds this return value to received_file_size, and that
+            // running total is the only thing gating the install: reporting the
+            // requested length after a short write let received_file_size reach
+            // expected_file_size over a truncated update.bin, which was then
+            // flashed as a complete image. Returning what landed keeps the total
+            // short, so the install never starts and the display's OTA signal
+            // timeout reports the failure.
+            ESP_LOGE(TAG, "Short write to %s: %u of %u bytes", path, written, length);
+        }
     }
 
     if (keep_open) {
-        return length;
+        return static_cast<uint16_t>(written);
     } else {
         file.close();
         file_open = false;
@@ -194,8 +209,9 @@ void BLEOverTheAirDeviceFirmwareUpdate::onWrite(BLECharacteristic *pCharacterist
     // pData = pCharacteristic->getData();
     uint8_t *pData = (uint8_t *)value.data();
 
-    // Check that data have been received
-    if (pData != NULL) {
+    // Check that data have been received. A zero-length write is legal on the
+    // wire and the switch below dereferences pData[0] unconditionally.
+    if (pData != NULL && len > 0) {
 // #define DEBUG_BLE_OTA_DFU_RX
 #ifdef DEBUG_BLE_OTA_DFU_RX
         ESP_LOGD(TAG, "Write callback for characteristic %s of data length %d", pCharacteristic->getUUID().toString().c_str(),
@@ -229,17 +245,51 @@ void BLEOverTheAirDeviceFirmwareUpdate::onWrite(BLECharacteristic *pCharacterist
 
             // Write parts to RAM
         case 0xFB: {
+            // Everything addressing `updater` here comes off the wire: pData[1]
+            // is the sub-packet index and MTU was set by the peer in 0xFF, so
+            // the destination offset was entirely peer-controlled against a
+            // fixed 20000-byte buffer. A packet claiming index 255 with the
+            // MTU the display actually uses already lands 10 KB past the end,
+            // and `len - 2` underflows to 65535 on a 1-byte packet. Both wrote
+            // straight over whatever follows the buffer in the object.
+            if (len < 3) {
+                ESP_LOGW(TAG, "Ignoring undersized part packet (%u bytes)", len);
+                break;
+            }
+            if (MTU == 0) {
+                // No valid 0xFF preceded this, so every sub-packet would stack
+                // at offset 0 and assemble a garbage image that then gets flashed.
+                ESP_LOGW(TAG, "Ignoring part packet before a valid MTU was negotiated");
+                break;
+            }
+            const uint16_t payload = len - 2;
+            const uint32_t offset = static_cast<uint32_t>(pData[1]) * MTU;
+            if (offset > UPDATER_SIZE || payload > UPDATER_SIZE - offset) {
+                ESP_LOGW(TAG, "Ignoring part packet outside the buffer: offset %u + %u > %u", offset, payload, UPDATER_SIZE);
+                break;
+            }
             // pData[1] is the position of the next part
-            for (uint16_t index = 0; index < len - 2; index++) {
-                updater[!selected_updater][(pData[1] * MTU) + index] = pData[index + 2];
+            for (uint16_t index = 0; index < payload; index++) {
+                updater[!selected_updater][offset + index] = pData[index + 2];
             }
         } break;
 
             // Write updater content to the flash
         case 0xFC: {
+            if (len < 5) {
+                ESP_LOGW(TAG, "Ignoring undersized flush packet (%u bytes)", len);
+                break;
+            }
             OTA_DFU_BLE->setUpdating(true);
             selected_updater = !selected_updater;
             write_len[selected_updater] = (pData[1] * 256) + pData[2];
+            // write_binary() reads this many bytes out of `updater`, so a peer
+            // asking for more than the buffer holds used to flush up to 45 KB of
+            // adjacent memory into update.bin.
+            if (write_len[selected_updater] > UPDATER_SIZE) {
+                ESP_LOGW(TAG, "Clamping part length %u to the %u-byte buffer", write_len[selected_updater], UPDATER_SIZE);
+                write_len[selected_updater] = UPDATER_SIZE;
+            }
             current_progression = (pData[3] * 256) + pData[4];
 
             received_file_size += write_binary(&FLASH, "/update.bin", updater[selected_updater], write_len[selected_updater]);
@@ -302,6 +352,10 @@ void BLEOverTheAirDeviceFirmwareUpdate::onWrite(BLECharacteristic *pCharacterist
 
             // Keep track of the received file and of the expected file sizes
         case 0xFE:
+            if (len < 5) {
+                ESP_LOGW(TAG, "Ignoring undersized size packet (%u bytes)", len);
+                break;
+            }
             received_file_size = 0;
             expected_file_size = (pData[1] * 16777216) + (pData[2] * 65536) + (pData[3] * 256) + pData[4];
 
@@ -310,9 +364,20 @@ void BLEOverTheAirDeviceFirmwareUpdate::onWrite(BLECharacteristic *pCharacterist
 
             // Switch to update mode
         case 0xFF:
+            if (len < 5) {
+                ESP_LOGW(TAG, "Ignoring undersized mode packet (%u bytes)", len);
+                break;
+            }
             OTA_DFU_BLE->setUpdating(true);
             parts = (pData[1] * 256) + pData[2];
             MTU = (pData[3] * 256) + pData[4];
+            // A single sub-packet has to fit in the buffer for any offset to be
+            // meaningful. Rejected here as well as bounds-checked in 0xFB so a
+            // nonsense MTU says so once instead of once per dropped packet.
+            if (MTU == 0 || MTU > UPDATER_SIZE) {
+                ESP_LOGW(TAG, "Refusing MTU %u: outside 1..%u", MTU, UPDATER_SIZE);
+                MTU = 0;
+            }
             break;
 
         default:
