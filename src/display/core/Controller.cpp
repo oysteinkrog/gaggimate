@@ -2,6 +2,7 @@
 #include "ArduinoJson.h"
 #include "esp_coexist.h"
 #include "esp_sntp.h"
+#include "esp_timer.h"
 #include <LittleFS.h>
 #include <SD_MMC.h>
 #include <cmath>
@@ -1531,8 +1532,57 @@ void Controller::handleProfileUpdate() {
 void Controller::loopLogicTask(void *arg) {
     TickType_t lastWake = xTaskGetTickCount();
     auto *controller = static_cast<Controller *>(arg);
+
+    // Iteration-time telemetry for the logic loop.
+    //
+    // This task is the machine's control loop: it drives the active process,
+    // the standby timeout, and -- via loopControl() -- the keepalive ping the
+    // controller board's 20 s safety timeout is fed by. xTaskDelayUntil holds
+    // it to a fixed period, so an iteration that outruns its period does not
+    // stretch the schedule, it just eats the slack and starts the next one
+    // late. Nothing measured that.
+    //
+    // It is needed to decide the task-watchdog question. Subscribing this task
+    // to the Task WDT turns a freeze into an automatic reboot instead of a
+    // machine that is thermally safe (the controller cuts heater, pump and
+    // both valves when the ping stops) but dead until power-cycled. The
+    // timeout has to sit above the worst *legitimate* iteration, or the cure
+    // is a reboot in the middle of a shot. That number was unknown; now it is
+    // measured. worst is since boot, window_worst resets each report.
+    constexpr int64_t kReportIntervalUs = 60LL * 1000 * 1000;
+    int64_t worstUs = 0;
+    int64_t windowWorstUs = 0;
+    uint32_t overruns = 0;
+    uint32_t iterations = 0;
+    int64_t nextReportUs = esp_timer_get_time() + kReportIntervalUs;
+
     while (true) {
+        const int64_t startUs = esp_timer_get_time();
         controller->loopLogic();
-        xTaskDelayUntil(&lastWake, pdMS_TO_TICKS(controller->getMode() == MODE_STANDBY ? 1000 : PROGRESS_INTERVAL));
+        const int64_t elapsedUs = esp_timer_get_time() - startUs;
+
+        // One getMode() read, used for both the overrun threshold and the
+        // delay below, so the two can never disagree about which period this
+        // iteration was scheduled against.
+        const bool standby = controller->getMode() == MODE_STANDBY;
+        const int64_t periodMs = standby ? 1000 : PROGRESS_INTERVAL;
+
+        ++iterations;
+        if (elapsedUs > worstUs)
+            worstUs = elapsedUs;
+        if (elapsedUs > windowWorstUs)
+            windowWorstUs = elapsedUs;
+        if (elapsedUs > periodMs * 1000)
+            ++overruns;
+
+        if (startUs >= nextReportUs) {
+            ESP_LOGI("LogicLoop", "iters=%u worst=%.1fms window_worst=%.1fms overruns=%u period=%dms",
+                     static_cast<unsigned>(iterations), worstUs / 1000.0, windowWorstUs / 1000.0, static_cast<unsigned>(overruns),
+                     static_cast<int>(periodMs));
+            windowWorstUs = 0;
+            nextReportUs = startUs + kReportIntervalUs;
+        }
+
+        xTaskDelayUntil(&lastWake, pdMS_TO_TICKS(periodMs));
     }
 }
