@@ -33,6 +33,15 @@ else()
     endif()
 endif()
 
+# Shared QEMU workarounds, needed by both node builds: the display and the
+# controller both link esp_adc and both construct floating-point statics before
+# the scheduler starts. src/qemu/ is outside the two globs above on purpose, so
+# a hardware build cannot pick it up by accident.
+if(DEFINED GAGGIMATE_QEMU_BUILD AND GAGGIMATE_QEMU_BUILD)
+    FILE(GLOB_RECURSE qemu_sources ${CMAKE_SOURCE_DIR}/src/qemu/*.cpp)
+    list(APPEND app_sources ${qemu_sources})
+endif()
+
 idf_component_register(SRCS ${app_sources}
     INCLUDE_DIRS ${CMAKE_SOURCE_DIR}/src
     REQUIRES esp-nimble-cpp
@@ -42,11 +51,11 @@ target_compile_options(${COMPONENT_LIB} PRIVATE
     $<$<COMPILE_LANGUAGE:CXX>:-std=gnu++20>
 )
 
-# QEMU build (-DGAGGIMATE_QEMU_BUILD=1). esp_adc's constructor-time self
-# calibration spins forever on a SENS register QEMU does not implement, so the
-# call is interposed by __wrap_adc_hal_self_calibration in
-# src/display/drivers/Qemu/QemuShims.cpp. INTERFACE, not PRIVATE: --wrap has to
-# reach the final executable link, not just this component's archive.
+# esp_adc's constructor-time self calibration spins forever on a SENS register
+# QEMU does not implement, so the call is interposed by
+# __wrap_adc_hal_self_calibration in src/qemu/QemuShims.cpp. INTERFACE, not
+# PRIVATE: --wrap has to reach the final executable link, not just this
+# component's archive.
 if(DEFINED GAGGIMATE_QEMU_BUILD AND GAGGIMATE_QEMU_BUILD)
     target_link_libraries(${COMPONENT_LIB} INTERFACE "-Wl,--wrap=adc_hal_self_calibration")
 endif()
