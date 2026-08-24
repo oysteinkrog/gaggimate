@@ -38,6 +38,7 @@ class QemuPanel : public Display {
     void pushColors(uint16_t x, uint16_t y, uint16_t x_end, uint16_t y_end, uint16_t *data) override;
     uint16_t width() override { return PANEL_WIDTH; }
     uint16_t height() override { return PANEL_HEIGHT; }
+    // Touch comes from the host over the console UART; see QemuTouch.h.
     uint8_t getPoint(int16_t *x, int16_t *y, uint8_t get_point) override;
 
     // LVGL keeps its own draw buffer in PSRAM and we copy out of it. Direct mode
