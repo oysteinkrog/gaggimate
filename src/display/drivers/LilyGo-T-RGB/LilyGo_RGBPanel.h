@@ -101,6 +101,7 @@ class LilyGo_RGBPanel : public Display {
     uint16_t *directFrameBuffer() override;
     void lockFrameBuffer() override;
     void unlockFrameBuffer() override;
+    void *frameBufferGate() override;
     void setDirectWriter(bool active) override;
 
   private:
@@ -129,13 +130,13 @@ class LilyGo_RGBPanel : public Display {
 
     LilyGo_RGBPanel_TouchType _touchType;
 
-    // Cached result of directFrameBuffer()'s one-time probe into the esp_lcd RGB
-    // panel's private struct, and the mutex that serialises a direct writer
-    // against pushColors. _fbResolved is separate from a null _fbDirect because
-    // a failed probe must not be retried on every frame.
+    // Cached result of directFrameBuffer()'s one-time resolve, and the gate that
+    // serialises a direct writer against pushColors. _fbResolved is separate
+    // from a null _fbDirect because a failed resolve must not be retried on
+    // every frame.
     uint16_t *_fbDirect = nullptr;
     bool _fbResolved = false;
-    SemaphoreHandle_t _fbMutex = nullptr;
+    SemaphoreHandle_t _fbGate = nullptr;
     bool _directWriter = false;
 
     ExtensionIOXL9555::ExtensionGPIO cs = ExtensionIOXL9555::IO3;

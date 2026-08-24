@@ -38,6 +38,15 @@ class SleepAnimation {
 // whole feature.
 class SleepAnimation {
   public:
+    // What the GDMA completion interrupt is handed on the last chunk of a band.
+    // Two handles rather than one because the last band of a frame also
+    // releases the framebuffer gate, and the interrupt cannot look either of
+    // them up: it may run with the flash cache disabled.
+    struct BandDone {
+        void *slot = nullptr; // SemaphoreHandle_t, the band buffer this transfer read
+        void *gate = nullptr; // SemaphoreHandle_t or null, the framebuffer gate
+    };
+
     SleepAnimation() = default;
     ~SleepAnimation();
 
@@ -281,6 +290,7 @@ class SleepAnimation {
     // worth some fps; it is not worth a web UI that stops answering.
     static constexpr int NUM_SLOTS = 2;
     uint16_t *bandBuf[NUM_SLOTS] = {};
+    BandDone bandDone[NUM_SLOTS] = {};
     void *bandReady[NUM_SLOTS] = {}; // render -> push, slot has data
     void *bandFree[NUM_SLOTS] = {};  // push -> render, slot is reusable
     // The panel rectangle each queued slot covers. pushColors takes end
@@ -338,14 +348,25 @@ class SleepAnimation {
     // Enable with /api/animbench?dma=1 to measure; do not ship it on until the
     // coherency problem is actually solved.
     std::atomic<bool> dmaWanted{false};
+    // 0 = ordinary two-task CPU push, 1 = direct CPU memcpy under the gate
+    // (diagnostic), 2 = one esp_async_memcpy per band, 3 = the same split into
+    // 4-row chunks.
+    //
+    // 2 is the default: measured on the panel, 3 costs 9 ms more render-task
+    // time per frame (25.6 fps against 33.2) for no visible benefit. IDF 5.5's
+    // esp_async_memcpy rebuilds both of its GDMA link lists from the heap on
+    // every single call -- four frees and four aligned allocations -- so its
+    // cost is dominated by submissions, not by bytes, and splitting a band into
+    // three triples it.
     std::atomic<int> dmaMode{2};
-    bool dmaActive = false;      // fbDirect resolved AND the engine installed
+    bool dmaActive = false; // fbDirect resolved AND the engine installed
     uint16_t *fbDirect = nullptr;
-    // dmaMode 4 only: a band-sized PSRAM buffer nothing scans out, so the DMA
-    // traffic can be reproduced exactly while the framebuffer is left alone.
-    uint16_t *dmaScratch = nullptr;
     void *dmaHandle = nullptr;   // async_memcpy_t, installed once from the render task
     bool dmaInstallTried = false;
+    bool gateWarned = false;    // one warning per run, not one per frame
+    bool frameGateHeld = false; // the framebuffer gate is taken for this frame's transfers
+    bool beginDirectPath();
+    void endDirectPath();
     std::atomic<uint32_t> dmaIssued{0};
     std::atomic<uint32_t> dmaErrors{0};
     // Core the async-memcpy completion interrupt is bound to. Deliberately not
