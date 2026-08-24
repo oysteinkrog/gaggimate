@@ -20,7 +20,25 @@ class Display {
     // one: 24 MB/s measured, against 48 for the same bytes over GDMA, which
     // never passes through the cache. A caller that can drive its own DMA wants
     // the destination address, not a copy routine.
-    virtual uint16_t *directFrameBuffer() { return nullptr; }
+    //
+    // `index` selects which of frameBufferCount() buffers to write. Index 0 is
+    // whatever the panel scans by default; a panel with two lets the caller
+    // write the one that is NOT being scanned and then flip, which is the only
+    // way to make tearing structurally impossible rather than merely unlikely.
+    virtual uint16_t *directFrameBuffer(int index = 0) { return nullptr; }
+    // How many framebuffers directFrameBuffer() can hand out. 0 means the panel
+    // has none the caller may write; 1 means writes race the scan-out.
+    virtual int frameBufferCount() { return 0; }
+    // Make `index` the buffer the panel scans from. The switch happens when the
+    // scan-out DMA reaches the end of the current buffer, so it lands on a
+    // frame boundary and never mid-picture.
+    //
+    // dirtyY0/dirtyY1 bound the rows the CPU wrote *through the cache* and that
+    // therefore still need a writeback. A DMA writer has already put its bytes
+    // in memory and passes an empty range, which is not an optimisation but the
+    // truth: there is nothing dirty to write back, and asking for 480 rows of
+    // it every frame would be pure cost.
+    virtual void presentFrameBuffer(int index, int dirtyY0, int dirtyY1) {}
     // Serialise a direct writer against this panel's own pushColors, which ends
     // with a cache writeback over the region it touched.
     virtual void lockFrameBuffer() {}

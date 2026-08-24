@@ -323,7 +323,9 @@ void SleepAnimation::start(Display *d) {
     // it. All start() does is clear the latches so a new run re-resolves.
     dmaActive = false;
     dmaInstallTried = false;
-    fbDirect = nullptr;
+    fbDirect[0] = fbDirect[1] = nullptr;
+    fbCount = 0;
+    fbBack = 0;
     gateWarned = false;
     frameGateHeld = false;
     g_sleepAnimFbGate = nullptr;
@@ -403,11 +405,23 @@ bool SleepAnimation::beginDirectPath() {
     if (display == nullptr) {
         return false;
     }
-    if (fbDirect == nullptr) {
-        fbDirect = display->directFrameBuffer(); // the panel caches its own answer
-        if (fbDirect == nullptr) {
+    if (fbCount == 0) {
+        // The panel caches its own answer, so this resolve happens once.
+        const int have = display->frameBufferCount();
+        for (int i = 0; i < have && i < FB_MAX; i++) {
+            fbDirect[i] = display->directFrameBuffer(i);
+            if (fbDirect[i] == nullptr) {
+                break;
+            }
+            fbCount = i + 1;
+        }
+        if (fbCount == 0) {
             return false;
         }
+        // Compose into the buffer that is not on screen. With only one there is
+        // nothing to flip to and the path degrades to writing the live buffer,
+        // which is what it did before -- fast, and it tears.
+        fbBack = fbCount > 1 ? 1 : 0;
     }
     // Without the gate the direct path cannot be made coherent against
     // pushColors, so refuse it rather than run a known race.
@@ -425,8 +439,10 @@ bool SleepAnimation::beginDirectPath() {
     // Whatever LVGL last drew is still sitting in dirty cache lines over this
     // region. Those must reach PSRAM before DMA starts writing there, or a
     // later eviction drops a stale line on top of a rendered band.
-    esp_cache_msync(fbDirect, static_cast<size_t>(display->width()) * display->height() * 2,
-                    ESP_CACHE_MSYNC_FLAG_DIR_C2M);
+    const size_t fbBytes = static_cast<size_t>(display->width()) * display->height() * 2;
+    for (int i = 0; i < fbCount; i++) {
+        esp_cache_msync(fbDirect[i], fbBytes, ESP_CACHE_MSYNC_FLAG_DIR_C2M);
+    }
     g_sleepAnimFbGate = gate;
     frameGateHeld = false;
     // From here the panel's own pushColors must stop trusting its cached view
@@ -452,7 +468,7 @@ void SleepAnimation::endDirectPath() {
     }
     dmaActive = false;
     if (display != nullptr) {
-        if (fbDirect != nullptr) {
+        for (int i = 0; i < fbCount; i++) {
             // DMA wrote the framebuffer behind the cache, so the CPU's view of
             // it is stale but not dirty. When LVGL resumes, a partial redraw
             // writes only its own rectangle, and any 32-byte line it touches is
@@ -461,7 +477,7 @@ void SleepAnimation::endDirectPath() {
             // Discarding rather than writing back is correct precisely because
             // nothing has CPU-dirtied this region since beginDirectPath
             // flushed it.
-            esp_cache_msync(fbDirect, static_cast<size_t>(display->width()) * display->height() * 2,
+            esp_cache_msync(fbDirect[i], static_cast<size_t>(display->width()) * display->height() * 2,
                             ESP_CACHE_MSYNC_FLAG_DIR_M2C);
         }
         display->setDirectWriter(false);
@@ -575,6 +591,61 @@ static bool sleepAnimBandRetire(void *arg) {
 
 #ifdef GM_ANIM_BENCH
 uint32_t SleepAnimation::benchDmaCompleted() const { return g_sleepAnimDmaDone; }
+
+size_t SleepAnimation::benchCopyFrameBuffer(uint8_t *out, size_t cap, int *outW, int *outH) {
+    if (out == nullptr || display == nullptr) {
+        return 0;
+    }
+    // The buffer currently on screen, which with double buffering is the one
+    // the render task is NOT composing into. Dumping the back buffer would show
+    // a half-written frame and invite exactly the wrong conclusion.
+    uint16_t *const fb = (dmaActive && fbCount > 1) ? fbDirect[fbBack ^ 1] : display->directFrameBuffer(0);
+    if (fb == nullptr) {
+        return 0;
+    }
+    const int w = display->width();
+    const int h = display->height();
+    const size_t bytes = static_cast<size_t>(w) * h * 2;
+    if (bytes > cap) {
+        return 0;
+    }
+    display->lockFrameBuffer();
+    // The DMA path writes this buffer without going through the cache, so a
+    // plain read can return whatever the CPU happens to still hold.
+    esp_cache_msync(fb, bytes, ESP_CACHE_MSYNC_FLAG_DIR_M2C);
+    memcpy(out, fb, bytes);
+    display->unlockFrameBuffer();
+    if (outW != nullptr) {
+        *outW = w;
+    }
+    if (outH != nullptr) {
+        *outH = h;
+    }
+    return bytes;
+}
+
+size_t SleepAnimation::benchCopyOverlay(uint8_t *out, size_t cap, int *outW, int *outH) {
+    const int front = overlayFront.load();
+    if (out == nullptr || front < 0) {
+        return 0;
+    }
+    const Overlay &ov = overlays[front & 1];
+    if (ov.buf == nullptr || ov.w <= 0 || ov.h <= 0) {
+        return 0;
+    }
+    const size_t bytes = static_cast<size_t>(ov.w) * ov.h * 3;
+    if (bytes > cap) {
+        return 0;
+    }
+    memcpy(out, ov.buf, bytes);
+    if (outW != nullptr) {
+        *outW = ov.w;
+    }
+    if (outH != nullptr) {
+        *outH = ov.h;
+    }
+    return bytes;
+}
 
 bool SleepAnimation::benchBandsInternal() const {
     for (int i = 0; i < NUM_SLOTS; i++) {
@@ -912,6 +983,33 @@ void SleepAnimation::taskEntry(void *arg) {
     vTaskDelete(nullptr);
 }
 
+// Show the frame that renderFrame just composed, and start composing into the
+// other buffer.
+//
+// This is what makes the pipeline tear-free rather than merely fast. The panel
+// scans its framebuffer continuously at ~61 Hz and the render task writes at
+// ~40, so with a single buffer the write front crosses the scan line several
+// times a frame and the picture on screen is a seam of two generations. Writing
+// a buffer nobody is reading removes the race instead of narrowing it.
+//
+// The gate is taken and immediately released rather than held: taking it is how
+// this task learns the frame's last transfer has landed, because the completion
+// interrupt is what gives it back. Presenting before that would flip to a
+// buffer whose bottom bands are still in flight.
+void SleepAnimation::presentFrame() {
+    if (!dmaActive || fbCount < 2 || display == nullptr) {
+        return;
+    }
+    display->lockFrameBuffer();
+    // Empty dirty range: everything in this buffer arrived over DMA, straight
+    // into PSRAM, so there is nothing in the cache to write back. The exception
+    // is the mode 1 diagnostic, which copies with the CPU and syncs each band
+    // itself on the way past -- so that one has nothing outstanding either.
+    display->presentFrameBuffer(fbBack, 0, 0);
+    display->unlockFrameBuffer();
+    fbBack ^= 1;
+}
+
 void SleepAnimation::renderLoop() {
     uint32_t fpsFrames = 0;
     unsigned long fpsWindowStart = millis();
@@ -926,6 +1024,7 @@ void SleepAnimation::renderLoop() {
         }
         const int64_t frameStart = esp_timer_get_time();
         renderFrame();
+        presentFrame();
         // Once per frame, not once per band: every band of a frame must push
         // the same parity or the two halves of the picture drift apart.
         frameParity++;
@@ -1482,7 +1581,7 @@ void SleepAnimation::renderFrame() {
             // render of band N+1 overlaps the transfer of band N.
             BENCH_T0(tPush);
             const size_t bytes = static_cast<size_t>(w) * rows * 2;
-            uint16_t *const dstRow = fbDirect + static_cast<size_t>(y0) * w;
+            uint16_t *const dstRow = fbDirect[fbBack] + static_cast<size_t>(y0) * w;
             if (dmaMode.load() == 1) {
                 // Diagnostic mode: same destination, same bytes, ordinary CPU
                 // copy, then the identical writeback esp_lcd does on its way

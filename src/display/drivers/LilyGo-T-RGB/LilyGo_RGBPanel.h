@@ -98,13 +98,21 @@ class LilyGo_RGBPanel : public Display {
 
     bool supportsDirectMode() { return false; }
 
-    uint16_t *directFrameBuffer() override;
+    uint16_t *directFrameBuffer(int index = 0) override;
+    int frameBufferCount() override;
+    void presentFrameBuffer(int index, int dirtyY0, int dirtyY1) override;
     void lockFrameBuffer() override;
     void unlockFrameBuffer() override;
     void *frameBufferGate() override;
     void setDirectWriter(bool active) override;
 
   private:
+    // Two, so a frame can be composed off-screen and shown whole. Named rather
+    // than spelled 2 in four places because it also sizes the panel config.
+    static constexpr int FB_COUNT = 2;
+
+    void resolveFrameBuffers();
+
     void writeData(const uint8_t *data, int len);
 
     void writeCommand(const uint8_t cmd);
@@ -130,13 +138,21 @@ class LilyGo_RGBPanel : public Display {
 
     LilyGo_RGBPanel_TouchType _touchType;
 
-    // Cached result of directFrameBuffer()'s one-time resolve, and the gate that
-    // serialises a direct writer against pushColors. _fbResolved is separate
-    // from a null _fbDirect because a failed resolve must not be retried on
-    // every frame.
-    uint16_t *_fbDirect = nullptr;
+    // Cached result of directFrameBuffer()'s one-time resolve, and the gate
+    // that serialises a direct writer against pushColors. _fbResolved is
+    // separate from a null entry because a failed resolve must not be retried
+    // on every frame.
+    //
+    // Both of the panel's framebuffers. The animation writes whichever one
+    // the scan-out is not reading and flips at the end of the frame, so no
+    // pixel is ever written while it is being displayed.
+    uint16_t *_fbDirect[FB_COUNT] = {};
     bool _fbResolved = false;
     SemaphoreHandle_t _fbGate = nullptr;
+    int _fbCount = 0;
+    // Which buffer the panel is scanning. pushColors invalidates against
+    // this one, because that is where esp_lcd's copy path will land.
+    int _fbCurrent = 0;
     bool _directWriter = false;
 
     ExtensionIOXL9555::ExtensionGPIO cs = ExtensionIOXL9555::IO3;
