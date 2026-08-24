@@ -58,7 +58,7 @@ struct AutoWakeupSchedule {
 // Serialized as "time1|days1;time2|days2" where days is a 7-bit string (e.g. "1111100" for weekdays)
 template <> struct PreferencesCodec<std::vector<AutoWakeupSchedule>> {
     static std::vector<AutoWakeupSchedule> read(Preferences &prefs, const char *key, const std::vector<AutoWakeupSchedule> &def);
-    static void write(Preferences &prefs, const char *key, const std::vector<AutoWakeupSchedule> &value);
+    static bool write(Preferences &prefs, const char *key, const std::vector<AutoWakeupSchedule> &value);
 };
 
 class Settings;
