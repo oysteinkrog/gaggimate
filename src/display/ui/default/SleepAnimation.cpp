@@ -185,6 +185,8 @@ static volatile uint32_t g_sleepAnimDmaDone = 0;
 // there would be a jump into flash.
 static SemaphoreHandle_t g_sleepAnimFbGate = nullptr;
 
+static bool IRAM_ATTR sleepAnimBandRetire(void *arg);
+
 void SleepAnimation::start(Display *d) {
     // !stopped: a previous task timed out its stop() and hasn't exited yet —
     // refuse to start rather than run two renderers against the same buffers.
@@ -395,6 +397,7 @@ void SleepAnimation::stop() {
 // already failed costs a handful of loads and logs nothing.
 bool SleepAnimation::beginDirectPath() {
     if (dmaActive) {
+        engineReadyForMode(); // the mode may have changed under a running path
         return true;
     }
     if (display == nullptr) {
@@ -416,7 +419,7 @@ bool SleepAnimation::beginDirectPath() {
         }
         return false;
     }
-    if (!installDmaOnRenderCore()) {
+    if (!engineReadyForMode()) {
         return false;
     }
     // Whatever LVGL last drew is still sitting in dirty cache lines over this
@@ -539,6 +542,17 @@ static bool IRAM_ATTR sleepAnimBandDone(async_memcpy_t, async_memcpy_event_t *, 
     if (arg == nullptr) {
         return false; // a non-final chunk: nothing to release yet
     }
+    return sleepAnimBandRetire(arg);
+}
+
+// The same retirement, for the native engine, which gives every transfer an arg
+// because it submits one per band rather than one per chunk.
+static bool IRAM_ATTR sleepAnimNativeDone(void *arg) {
+    g_sleepAnimDmaDone = g_sleepAnimDmaDone + 1;
+    return arg != nullptr && sleepAnimBandRetire(arg);
+}
+
+static bool sleepAnimBandRetire(void *arg) {
     const auto *done = static_cast<const SleepAnimation::BandDone *>(arg);
     BaseType_t woken = pdFALSE;
     // Releases the slot the transfer has finished reading. The render task
@@ -591,7 +605,59 @@ void dmaInstallTaskEntry(void *arg) {
     xSemaphoreGive(req->done);
     vTaskDelete(nullptr);
 }
+
+struct NativeInstallReq {
+    BandDma *dma;
+    size_t maxBytes;
+    size_t burst;
+    esp_err_t err;
+    SemaphoreHandle_t done;
+};
+
+void nativeInstallTaskEntry(void *arg) {
+    auto *req = static_cast<NativeInstallReq *>(arg);
+    req->err = req->dma->install(req->maxBytes, req->burst, sleepAnimNativeDone);
+    xSemaphoreGive(req->done);
+    vTaskDelete(nullptr);
+}
 } // namespace
+
+bool SleepAnimation::installNativeOnIsrCore() {
+    if (bandDma.ready()) {
+        return true;
+    }
+    if (nativeInstallTried) {
+        return false;
+    }
+    nativeInstallTried = true;
+    // 32-byte burst: it matches both the data cache line and the octal PSRAM
+    // burst, and the esp32s3 register field documents 16 and 32 as the valid
+    // encodings for this channel.
+    NativeInstallReq req{&bandDma, static_cast<size_t>(BAND_H) * 480 * 2, 32, ESP_FAIL, xSemaphoreCreateBinary()};
+    if (req.done != nullptr) {
+        TaskHandle_t installer = nullptr;
+        // Same reason as the async engine: esp_intr_alloc binds the handler to
+        // the calling core, and the render task shares core 1 with the panel's
+        // own scan-out interrupt.
+        if (xTaskCreatePinnedToCore(nativeInstallTaskEntry, "BandDmaIns", 4096, &req, 3, &installer, DMA_ISR_CORE) ==
+            pdPASS) {
+            xSemaphoreTake(req.done, pdMS_TO_TICKS(2000));
+        }
+        vSemaphoreDelete(req.done);
+    }
+    if (!bandDma.ready()) {
+        log_w("SleepAnimation: native GDMA install failed (%s), falling back", esp_err_to_name(req.err));
+        return false;
+    }
+    return true;
+}
+
+// Whichever engine the current mode needs, installed on first use. The mode is
+// a live setting, so this is re-checked every frame; both installs latch, so
+// the steady-state cost is a load and a branch.
+bool SleepAnimation::engineReadyForMode() {
+    return dmaMode.load() == 4 ? installNativeOnIsrCore() : installDmaOnRenderCore();
+}
 
 bool SleepAnimation::installDmaOnRenderCore() {
     if (dmaHandle != nullptr) {
@@ -1468,17 +1534,28 @@ void SleepAnimation::renderFrame() {
             // Only the final chunk carries the release arg, because GDMA
             // retires transfers in submission order, so its completion means
             // the whole band has landed.
-            const int chunkRows = dmaMode.load() == 3 ? 4 : rows;
+            const int mode = dmaMode.load();
             esp_err_t err = ESP_OK;
-            for (int r0 = 0; r0 < rows && err == ESP_OK; r0 += chunkRows) {
-                const int n = (r0 + chunkRows <= rows) ? chunkRows : (rows - r0);
-                const bool last = (r0 + n >= rows);
+            if (mode == 4 && bandDma.ready()) {
+                // One submission for the whole band, into descriptors that were
+                // built at install and are only re-pointed here.
                 dmaIssued++;
-                err = esp_async_memcpy(static_cast<async_memcpy_t>(dmaHandle), dstRow + static_cast<size_t>(r0) * w,
-                                       band + static_cast<size_t>(r0) * w, static_cast<size_t>(n) * w * 2,
-                                       sleepAnimBandDone, last ? &done : nullptr);
+                err = bandDma.submit(renderSlot, dstRow, band, bytes, &done);
                 if (err != ESP_OK) {
                     dmaIssued--;
+                }
+            } else {
+                const int chunkRows = mode == 3 ? 4 : rows;
+                for (int r0 = 0; r0 < rows && err == ESP_OK; r0 += chunkRows) {
+                    const int n = (r0 + chunkRows <= rows) ? chunkRows : (rows - r0);
+                    const bool last = (r0 + n >= rows);
+                    dmaIssued++;
+                    err = esp_async_memcpy(static_cast<async_memcpy_t>(dmaHandle), dstRow + static_cast<size_t>(r0) * w,
+                                           band + static_cast<size_t>(r0) * w, static_cast<size_t>(n) * w * 2,
+                                           sleepAnimBandDone, last ? &done : nullptr);
+                    if (err != ESP_OK) {
+                        dmaIssued--;
+                    }
                 }
             }
             (void)bytes;
