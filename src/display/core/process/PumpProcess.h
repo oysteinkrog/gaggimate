@@ -17,7 +17,7 @@ class PumpProcess : public Process {
 
     float getPumpValue() override { return isActive() ? 100.f : 0.f; };
 
-    void progress() override {
+    void progress() override{
         // Stateless implementation
     };
 
@@ -30,7 +30,7 @@ class PumpProcess : public Process {
 
     int getType() override { return MODE_WATER; }
 
-    void updateVolume(double volume) override {};
+    void updateVolume(double volume) override{};
 };
 
 #endif // PUMPPROCESS_H

@@ -150,22 +150,10 @@ class Settings {
     int getThemeMode() const { return themeMode.get(); }
     int getHistoryIndex() const { return historyIndex.get(); }
 
-    [[deprecated]]
-    int getSunriseR() const {
-        return sunriseR;
-    }
-    [[deprecated]]
-    int getSunriseG() const {
-        return sunriseG;
-    }
-    [[deprecated]]
-    int getSunriseB() const {
-        return sunriseB;
-    }
-    [[deprecated]]
-    int getSunriseW() const {
-        return sunriseW;
-    }
+    [[deprecated]] int getSunriseR() const { return sunriseR; }
+    [[deprecated]] int getSunriseG() const { return sunriseG; }
+    [[deprecated]] int getSunriseB() const { return sunriseB; }
+    [[deprecated]] int getSunriseW() const { return sunriseW; }
     String getSunriseIdle() const { return sunriseIdle.get(); }
     String getSunriseActive() const { return sunriseActive.get(); }
     String getSunriseFinished() const { return sunriseFinished.get(); }
@@ -256,14 +244,10 @@ class Settings {
     void setSteamPumpCutoff(float steam_pump_cutoff);
     void setThemeMode(int theme_mode);
     void setHistoryIndex(int history_index);
-    [[deprecated]]
-    void setSunriseR(int sunrise_r);
-    [[deprecated]]
-    void setSunriseG(int sunrise_g);
-    [[deprecated]]
-    void setSunriseB(int sunrise_b);
-    [[deprecated]]
-    void setSunriseW(int sunrise_w);
+    [[deprecated]] void setSunriseR(int sunrise_r);
+    [[deprecated]] void setSunriseG(int sunrise_g);
+    [[deprecated]] void setSunriseB(int sunrise_b);
+    [[deprecated]] void setSunriseW(int sunrise_w);
     void setSunriseIdle(String hexColor);
     void setSunriseActive(String hexColor);
     void setSunriseFinished(String hexColor);

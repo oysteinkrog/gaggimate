@@ -7,14 +7,14 @@
 #include <cmath>
 #include <ctime>
 #include <display/config.h>
-#include <display/core/constants.h>
 #include <display/core/MemoryMonitor.h>
-#include <display/core/utils.h>
+#include <display/core/constants.h>
 #include <display/core/process/BrewProcess.h>
 #include <display/core/process/GrindProcess.h>
 #include <display/core/process/PumpProcess.h>
 #include <display/core/process/SteamProcess.h>
 #include <display/core/static_profiles.h>
+#include <display/core/utils.h>
 #include <display/core/zones.h>
 #include <display/plugins/AutoWakeupPlugin.h>
 #include <display/plugins/BoilerFillPlugin.h>
@@ -1293,7 +1293,8 @@ void Controller::onVolumetricMeasurement(double measurement, VolumetricMeasureme
 #endif
 
     if (source == VolumetricMeasurementSource::FLOW_ESTIMATION) {
-        pluginManager->trigger(F("controller:volumetric-measurement:estimation:change"), "value", static_cast<float>(measurement));
+        pluginManager->trigger(F("controller:volumetric-measurement:estimation:change"), "value",
+                               static_cast<float>(measurement));
     } else if (source == VolumetricMeasurementSource::HARDWARE) {
         pluginManager->trigger(F("controller:volumetric-measurement:hardware:change"), "value", static_cast<float>(measurement));
     } else {
@@ -1362,8 +1363,7 @@ VolumetricMeasurementSource Controller::getActiveScaleSource() const {
 }
 
 VolumetricMeasurementSource Controller::getGrindScaleSource() const {
-    return isBluetoothScaleHealthy() ? VolumetricMeasurementSource::BLUETOOTH
-                                     : VolumetricMeasurementSource::INACTIVE;
+    return isBluetoothScaleHealthy() ? VolumetricMeasurementSource::BLUETOOTH : VolumetricMeasurementSource::INACTIVE;
 }
 
 bool Controller::isScaleSourceHealthy(VolumetricMeasurementSource source) const {

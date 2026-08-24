@@ -260,10 +260,8 @@ void GaggiMateController::loop() {
     // Keep zero tracking and idle display quantization out of the measurement
     // path whenever the brew valve or pump can be adding liquid to the cup.
     if (hardwareScale != nullptr) {
-        const float pumpPower =
-            pump != nullptr && pump->getPumpPowerPtr() != nullptr ? *pump->getPumpPowerPtr() : 0.0f;
-        const bool scaleActivity =
-            (valve != nullptr && valve->getState()) || pumpPower > 0.01f;
+        const float pumpPower = pump != nullptr && pump->getPumpPowerPtr() != nullptr ? *pump->getPumpPowerPtr() : 0.0f;
+        const bool scaleActivity = (valve != nullptr && valve->getState()) || pumpPower > 0.01f;
         hardwareScale->setBrewingActive(scaleActivity);
     }
 

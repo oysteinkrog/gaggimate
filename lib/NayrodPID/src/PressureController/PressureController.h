@@ -19,8 +19,8 @@ class PressureController {
                        float *controllerOutput, int *valveStatus);
     void initSetpointFilter(float val = 0.0f);
 
-    void setFlowLimit(float lim) { /* Flow limit not currently implemented */ };
-    void setPressureLimit(float lim) { /* Pressure limit not currently implemented */ };
+    void setFlowLimit(float lim){/* Flow limit not currently implemented */};
+    void setPressureLimit(float lim){/* Pressure limit not currently implemented */};
 
     void update(ControlMode mode);
     void tare();

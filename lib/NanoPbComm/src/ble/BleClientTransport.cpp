@@ -154,8 +154,8 @@ void BleClientTransport::onResult(const NimBLEAdvertisedDevice *advertisedDevice
         // (the connect then fails with BLE_HS_EINVAL).
         _serverAddress = advertisedDevice->getAddress();
         _haveServerAddress = true;
-        ESP_LOGI(LOG_TAG, "Found controller at address %s with name %s, ready to connect",
-                 _serverAddress.toString().c_str(), advertisedDevice->getName().c_str());
+        ESP_LOGI(LOG_TAG, "Found controller at address %s with name %s, ready to connect", _serverAddress.toString().c_str(),
+                 advertisedDevice->getName().c_str());
         _scanner->stop();
         _readyForConnection = true;
     }

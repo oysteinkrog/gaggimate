@@ -7,7 +7,7 @@ struct Event;
 class mDNSPlugin : public Plugin {
   public:
     void setup(Controller *controller, PluginManager *pluginManager) override;
-    void loop() override {};
+    void loop() override{};
 
   private:
     void start(Event const &event);

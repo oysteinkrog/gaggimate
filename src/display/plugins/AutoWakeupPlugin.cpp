@@ -58,8 +58,8 @@ void AutoWakeupPlugin::checkAutoWakeup() {
     // Check if current time and day matches any of the schedules
     for (const AutoWakeupSchedule &schedule : settings->getAutoWakeupSchedules()) {
         if (schedule.time == currentTime && schedule.isDayEnabled(currentDayOfWeek)) {
-            ESP_LOGI(LOG_TAG, "Auto-wakeup schedule matched (time: %s, day: %d), switching to brew mode",
-                     schedule.time.c_str(), currentDayOfWeek);
+            ESP_LOGI(LOG_TAG, "Auto-wakeup schedule matched (time: %s, day: %d), switching to brew mode", schedule.time.c_str(),
+                     currentDayOfWeek);
 
             controller->setMode(MODE_BREW);
 

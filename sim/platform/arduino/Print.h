@@ -94,7 +94,8 @@ class Print {
     size_t println(struct tm *timeinfo, const char *format = NULL);
     size_t println(void);
 
-    virtual void flush() { /* Empty implementation for backward compatibility */ }
+    virtual void flush() { /* Empty implementation for backward compatibility */
+    }
 };
 
 #endif

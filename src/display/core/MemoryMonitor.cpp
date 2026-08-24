@@ -59,9 +59,9 @@ void init() {
 
     g_monitor.onSample([](const MemorySnapshot &snap) {
         for (const auto &r : snap.regions) {
-            ESP_LOGI(TAG, "heartbeat %s free=%u min=%u largest=%u frag=%.2f slope=%.1fB/s t_warn=%us",
-                     regionName(r.region), (unsigned)r.freeBytes, (unsigned)r.minimumFreeBytes,
-                     (unsigned)r.largestFreeBlock, r.fragmentation, r.freeBytesSlope, (unsigned)r.secondsToWarn);
+            ESP_LOGI(TAG, "heartbeat %s free=%u min=%u largest=%u frag=%.2f slope=%.1fB/s t_warn=%us", regionName(r.region),
+                     (unsigned)r.freeBytes, (unsigned)r.minimumFreeBytes, (unsigned)r.largestFreeBlock, r.fragmentation,
+                     r.freeBytesSlope, (unsigned)r.secondsToWarn);
         }
     });
 
@@ -87,8 +87,8 @@ void init() {
 
     g_monitor.installPanicHook([](const MemorySnapshot &snap) {
         for (const auto &r : snap.regions) {
-            ESP_LOGE(TAG, "PANIC %s free=%u min=%u largest=%u frag=%.2f", regionName(r.region),
-                     (unsigned)r.freeBytes, (unsigned)r.minimumFreeBytes, (unsigned)r.largestFreeBlock, r.fragmentation);
+            ESP_LOGE(TAG, "PANIC %s free=%u min=%u largest=%u frag=%.2f", regionName(r.region), (unsigned)r.freeBytes,
+                     (unsigned)r.minimumFreeBytes, (unsigned)r.largestFreeBlock, r.fragmentation);
         }
     });
 
