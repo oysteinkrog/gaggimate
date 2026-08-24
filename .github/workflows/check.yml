@@ -135,6 +135,25 @@ jobs:
       # the runner, and the value here is the compile, not the window.
       - name: Build display-sim
         run: pio run -e display-sim
+      # Boot smoke test. SDL's dummy video driver gives the panel somewhere to
+      # push pixels without a display, so the whole startup path runs for real:
+      # LVGL init, the mock BLE link, the web server. A crash in setup() exits
+      # before the timeout fires, which is why the success condition is "timeout
+      # had to kill it" (124) plus the line the web server prints once it is up.
+      - name: Boot the simulator
+        env:
+          SDL_VIDEODRIVER: dummy
+        run: |
+          set +e
+          timeout 20 .pio/build/display-sim/program > sim-boot.log 2>&1
+          rc=$?
+          set -e
+          cat sim-boot.log
+          if [[ $rc -ne 124 ]]; then
+            echo "::error::simulator exited early (rc=$rc) instead of running until the timeout"
+            exit 1
+          fi
+          grep -q "Started webserver" sim-boot.log
 
   format:
     name: Formatting
