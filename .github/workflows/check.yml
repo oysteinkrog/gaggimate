@@ -112,6 +112,15 @@ jobs:
       # while the other three stay green.
       - name: Build display-headless-8m
         run: pio run -e display-headless-8m
+      # display-bench and display-demo are the last two envs no workflow
+      # touches. Both extend env:display and only add defines, and bench's set
+      # is a strict superset of demo's (GM_FAKE_CONTROLLER plus GM_ANIM_BENCH,
+      # every guard on either is a plain #ifdef), so this one build compiles
+      # both. It is worth having: GM_ANIM_BENCH alone gates roughly 500 lines
+      # across WebUIPlugin, SleepAnimation and DefaultUI that nothing else
+      # compiles, which is exactly how display-sim rotted.
+      - name: Build display-bench
+        run: pio run -e display-bench
 
   simulator:
     name: Build simulator
