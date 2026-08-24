@@ -186,7 +186,18 @@ bool ProfileManager::saveProfile(Profile &profile) {
 
     ESP_LOGI("ProfileManager", "Saving profile %s", profile.id.c_str());
 
-    File file = _fs->open(profilePath(profile.id), "w");
+    // Serialized to a temporary file and moved into place only once the whole
+    // document is on disk. Opening the real path with "w" truncates it up front,
+    // so a filesystem that fills up mid-serialize left a half-written JSON file
+    // where a valid profile had been: the old profile was destroyed and the new
+    // one would not parse on the next load. serializeJson()'s return was only
+    // compared against 0, so a short write reported success and the UI said the
+    // profile had saved.
+    const String target = profilePath(profile.id);
+    // listProfiles() only picks up names ending in .json, so a leftover .tmp
+    // from a power cut is inert rather than a profile that fails to parse.
+    const String tmpPath = target + ".tmp";
+    File file = _fs->open(tmpPath, "w");
     if (!file)
         return false;
 
@@ -194,8 +205,31 @@ bool ProfileManager::saveProfile(Profile &profile) {
     JsonObject obj = doc.to<JsonObject>();
     writeProfile(obj, profile);
 
-    bool ok = serializeJson(doc, file) > 0;
+    const size_t expected = measureJson(doc);
+    const size_t written = serializeJson(doc, file);
     file.close();
+    if (written != expected) {
+        ESP_LOGE("ProfileManager", "Wrote %u of %u bytes for profile %s; keeping the previous version", written, expected,
+                 profile.id.c_str());
+        _fs->remove(tmpPath);
+        return false;
+    }
+    // FAT (SD_MMC) refuses to rename onto a name that already exists, so the
+    // target has to go first. If power is lost between the two, the complete
+    // document is still sitting in the .tmp file, which is recoverable; a
+    // truncated target is not.
+    if (_fs->exists(target)) {
+        _fs->remove(target);
+    }
+    if (!_fs->rename(tmpPath, target)) {
+        ESP_LOGE("ProfileManager", "Could not move profile %s into place", profile.id.c_str());
+        _fs->remove(tmpPath);
+        return false;
+    }
+
+    // Everything below reloads state and announces the save. It used to run even
+    // when the write had failed, so a failed save still fired
+    // profiles:profile:save and added the profile to the favourites list.
     if (profile.id == selectedProfile.id) {
         selectedProfile = Profile{};
         loadSelectedProfile(selectedProfile);
@@ -205,7 +239,7 @@ bool ProfileManager::saveProfile(Profile &profile) {
     if (isNew) {
         addFavoritedProfile(profile.id);
     }
-    return ok;
+    return true;
 }
 
 bool ProfileManager::deleteProfile(const String &uuid) {
