@@ -44,7 +44,7 @@ PreferencesCodec<std::vector<AutoWakeupSchedule>>::read(Preferences &prefs, cons
     return schedules.empty() ? def : schedules;
 }
 
-void PreferencesCodec<std::vector<AutoWakeupSchedule>>::write(Preferences &prefs, const char *key,
+bool PreferencesCodec<std::vector<AutoWakeupSchedule>>::write(Preferences &prefs, const char *key,
                                                               const std::vector<AutoWakeupSchedule> &value) {
     String serialized = "";
     for (size_t i = 0; i < value.size(); i++) {
@@ -55,7 +55,7 @@ void PreferencesCodec<std::vector<AutoWakeupSchedule>>::write(Preferences &prefs
             serialized += value[i].days[j] ? "1" : "0";
         }
     }
-    prefs.putString(key, serialized);
+    return nvsPutString(prefs, key, serialized);
 }
 
 Settings::Settings() = default;
@@ -332,19 +332,33 @@ void Settings::doSave() {
         return;
     }
     ESP_LOGI("Settings", "Saving changed settings");
-    // Property::store() clears its dirty flag before writing, so running the loop
-    // against a namespace that failed to open would drop the pending values with
-    // nothing to retry from: every put would fail and no property would ask to be
-    // written again. Bailing out here leaves the flags set, so the next 5 s flush
-    // tries the same values against a hopefully recovered NVS.
+    // Running the loop against a namespace that failed to open would fail every
+    // single put and log a line naming all of them. The flags survive either way
+    // now that store() re-arms on failure, so bail out and let the next 5 s flush
+    // try the same values against a hopefully recovered NVS.
     if (!preferences.begin(PREFERENCES_KEY, false)) {
         ESP_LOGE("Settings", "Could not open NVS namespace '%s' for writing; keeping changes pending", PREFERENCES_KEY);
         return;
     }
+    // A per-key failure does not abort the flush: the other properties can still
+    // be written, and the ones that failed stay dirty for the next pass. Counted
+    // and logged once rather than per property, so a full NVS partition does not
+    // bury the rest of the log at one line per setting every 5 s.
+    size_t failed = 0;
+    const char *firstFailed = nullptr;
     for (auto *property : registry) {
-        property->store(preferences);
+        if (!property->store(preferences)) {
+            if (failed == 0) {
+                firstFailed = property->name();
+            }
+            failed++;
+        }
     }
     preferences.end();
+    if (failed > 0) {
+        ESP_LOGE("Settings", "%u setting(s) could not be written to NVS (first: %s); retrying in 5 s", failed,
+                 firstFailed != nullptr ? firstFailed : "?");
+    }
 }
 
 [[noreturn]] void Settings::loopTask(void *arg) {

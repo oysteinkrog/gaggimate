@@ -7,32 +7,45 @@
 #include <display/core/utils.h>
 #include <vector>
 
+// Preferences::putString returns strlen(value), so a successful write of an
+// empty string is indistinguishable from a failure by the return value alone.
+// Empty is a legitimate value here -- a cleared list serializes to "" -- so
+// treat 0 as success when there was nothing to write, rather than retrying and
+// logging forever on a save that actually worked. The cost is that a genuinely
+// failed empty write still passes unnoticed, which is what every write did
+// before; the API gives us no way to tell those two apart.
+inline bool nvsPutString(Preferences &prefs, const char *key, const String &value) {
+    return prefs.putString(key, value) != 0 || value.isEmpty();
+}
+
 // Type-specific NVS access used by Property<T>; add a specialization to support a new type.
+// write() returns false when the value did not reach NVS, so the property stays
+// dirty and the next flush retries it.
 template <typename T> struct PreferencesCodec;
 
 template <> struct PreferencesCodec<int> {
     static int read(Preferences &prefs, const char *key, const int &def) { return prefs.getInt(key, def); }
-    static void write(Preferences &prefs, const char *key, const int &value) { prefs.putInt(key, value); }
+    static bool write(Preferences &prefs, const char *key, const int &value) { return prefs.putInt(key, value) != 0; }
 };
 
 template <> struct PreferencesCodec<bool> {
     static bool read(Preferences &prefs, const char *key, const bool &def) { return prefs.getBool(key, def); }
-    static void write(Preferences &prefs, const char *key, const bool &value) { prefs.putBool(key, value); }
+    static bool write(Preferences &prefs, const char *key, const bool &value) { return prefs.putBool(key, value) != 0; }
 };
 
 template <> struct PreferencesCodec<float> {
     static float read(Preferences &prefs, const char *key, const float &def) { return prefs.getFloat(key, def); }
-    static void write(Preferences &prefs, const char *key, const float &value) { prefs.putFloat(key, value); }
+    static bool write(Preferences &prefs, const char *key, const float &value) { return prefs.putFloat(key, value) != 0; }
 };
 
 template <> struct PreferencesCodec<double> {
     static double read(Preferences &prefs, const char *key, const double &def) { return prefs.getDouble(key, def); }
-    static void write(Preferences &prefs, const char *key, const double &value) { prefs.putDouble(key, value); }
+    static bool write(Preferences &prefs, const char *key, const double &value) { return prefs.putDouble(key, value) != 0; }
 };
 
 template <> struct PreferencesCodec<String> {
     static String read(Preferences &prefs, const char *key, const String &def) { return prefs.getString(key, def); }
-    static void write(Preferences &prefs, const char *key, const String &value) { prefs.putString(key, value); }
+    static bool write(Preferences &prefs, const char *key, const String &value) { return nvsPutString(prefs, key, value); }
 };
 
 template <> struct PreferencesCodec<std::vector<String>> {
@@ -41,8 +54,8 @@ template <> struct PreferencesCodec<std::vector<String>> {
             return def;
         return explode(prefs.getString(key, ""), ',');
     }
-    static void write(Preferences &prefs, const char *key, const std::vector<String> &value) {
-        prefs.putString(key, implode(value, ","));
+    static bool write(Preferences &prefs, const char *key, const std::vector<String> &value) {
+        return nvsPutString(prefs, key, implode(value, ","));
     }
 };
 
@@ -50,7 +63,10 @@ class PropertyBase {
   public:
     virtual ~PropertyBase() = default;
     virtual void load(Preferences &prefs) = 0;
-    virtual void store(Preferences &prefs) = 0;
+    // False when this property had a pending value that did not make it into NVS.
+    virtual bool store(Preferences &prefs) = 0;
+    // The NVS key, so a failed save can name what was lost.
+    [[nodiscard]] virtual const char *name() const = 0;
     virtual bool isDirty() const = 0;
 };
 
@@ -81,13 +97,25 @@ template <typename T> class Property : public PropertyBase {
 
     void load(Preferences &prefs) override { value = PreferencesCodec<T>::read(prefs, key, value); }
 
-    void store(Preferences &prefs) override {
+    bool store(Preferences &prefs) override {
         if (!dirty)
-            return;
+            return true;
         // Clear before writing so a concurrent set() is not lost, only deferred to the next flush.
         dirty = false;
-        PreferencesCodec<T>::write(prefs, key, value);
+        if (PreferencesCodec<T>::write(prefs, key, value)) {
+            return true;
+        }
+        // The namespace opened, so doSave() did not bail, but this individual key
+        // still failed -- a full NVS partition rejects new keys one at a time.
+        // Without restoring the flag the value is gone for good: nothing marks it
+        // dirty again, so it silently reverts on the next boot and the setting
+        // "does not stick" with no trace in the log. Re-arming means the next
+        // flush tries again, and doSave() reports that it had to.
+        dirty = true;
+        return false;
     }
+
+    [[nodiscard]] const char *name() const override { return key; }
 
   private:
     const char *key;
