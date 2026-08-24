@@ -188,11 +188,9 @@ class PCA9634 {
     //
     //  OBSOLETE future
     //
-    [[deprecated("Use setLedDriverModeAll(mode) instead")]]
-    uint8_t setLedDriverMode(uint8_t mode);
+    [[deprecated("Use setLedDriverModeAll(mode) instead")]] uint8_t setLedDriverMode(uint8_t mode);
 
-    [[deprecated("use setMode1(value) or setMode2(value) instead")]]
-    uint8_t writeMode(uint8_t reg, uint8_t value);
+    [[deprecated("use setMode1(value) or setMode2(value) instead")]] uint8_t writeMode(uint8_t reg, uint8_t value);
     uint8_t readMode(uint8_t reg);
 
   private:

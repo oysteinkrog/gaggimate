@@ -21,7 +21,7 @@ class SteamProcess : public Process {
 
     float getPumpValue() override { return isActive() ? pumpValue : 0.f; };
 
-    void progress() override {
+    void progress() override{
         // Stateless implmentation
     };
 
@@ -34,7 +34,7 @@ class SteamProcess : public Process {
 
     int getType() override { return MODE_STEAM; }
 
-    void updateVolume(double volume) override {};
+    void updateVolume(double volume) override{};
 };
 
 #endif // STEAMPROCESS_H

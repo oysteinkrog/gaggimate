@@ -48,7 +48,7 @@ struct PhaseTransition {
     uint8_t phaseNumber;      // Phase number (0-based)
     uint8_t transitionReason; // Why the previous phase ended (PhaseExitReason / PHASE_EXIT_REASON_*; 0 = unknown/legacy)
     char phaseName[25];       // Phase name (24 chars + null terminator)
-}; // 29 bytes per transition
+};                            // 29 bytes per transition
 #pragma pack(pop)
 
 // Phase exit reason codes stored in PhaseTransition.transitionReason.

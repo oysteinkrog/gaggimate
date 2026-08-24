@@ -30,8 +30,8 @@ typedef struct hw_timer_s hw_timer_t;
 #define RAD_TO_DEG 57.295779513082320876798154814105
 
 #define constrain(amt, low, high) ((amt) < (low) ? (low) : ((amt) > (high) ? (high) : (amt)))
-#define radians(deg) ((deg) * DEG_TO_RAD)
-#define degrees(rad) ((rad) * RAD_TO_DEG)
+#define radians(deg) ((deg)*DEG_TO_RAD)
+#define degrees(rad) ((rad)*RAD_TO_DEG)
 #define sq(x) ((x) * (x))
 #define _min(a, b) ((a) < (b) ? (a) : (b))
 #define _max(a, b) ((a) > (b) ? (a) : (b))
@@ -40,7 +40,7 @@ typedef struct hw_timer_s hw_timer_t;
 #define bitSet(value, b) ((value) |= (1UL << (b)))
 #define bitClear(value, b) ((value) &= ~(1UL << (b)))
 #define bitWrite(value, b, bv) ((bv) ? bitSet(value, b) : bitClear(value, b))
-#define lowByte(w) ((uint8_t)((w) & 0xff))
+#define lowByte(w) ((uint8_t)((w)&0xff))
 #define highByte(w) ((uint8_t)((w) >> 8))
 #define interrupts()
 #define noInterrupts()

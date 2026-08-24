@@ -71,11 +71,11 @@ class GaggiMateClient {
     gm::Payload buildPressureScale(float scale);
     gm::Payload buildTare();
     gm::Payload buildScaleFactors(float scaleFactor1, float scaleFactor2) {
-      gm::Payload p = gaggimate_Payload_init_zero;
-      p.which_content = gaggimate_Payload_scale_factors_tag;
-      p.content.scale_factors.scale_factor1 = scaleFactor1;
-      p.content.scale_factors.scale_factor2 = scaleFactor2;
-      return p;
+        gm::Payload p = gaggimate_Payload_init_zero;
+        p.which_content = gaggimate_Payload_scale_factors_tag;
+        p.content.scale_factors.scale_factor1 = scaleFactor1;
+        p.content.scale_factors.scale_factor2 = scaleFactor2;
+        return p;
     }
     // Pack channel/brightness pairs into one LedControl payload; entries beyond
     // the schema's per-message cap (LedControl.channels max_count) are dropped.
@@ -91,7 +91,9 @@ class GaggiMateClient {
                           float maxPower, float slipA, float slipB, float slipC, float slipD);
     void sendAutotune(uint32_t testTime, uint32_t samples, uint32_t heaterWattage);
     void sendPressureScale(float scale);
-    void sendScaleFactors(float scaleFactor1, float scaleFactor2) { _endpoint.send(buildScaleFactors(scaleFactor1, scaleFactor2)); }
+    void sendScaleFactors(float scaleFactor1, float scaleFactor2) {
+        _endpoint.send(buildScaleFactors(scaleFactor1, scaleFactor2));
+    }
     void tare();
     // Drive several LED channels in one message (avoids per-channel sends that
     // the outbound queue would coalesce down to a single channel).

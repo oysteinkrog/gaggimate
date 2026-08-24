@@ -162,14 +162,14 @@ void heap_checkpoint(const char *label) {
 
     if (!s_lastCheckpoint.valid) {
         ESP_LOGI("HeapProfile", "[%s] int: free=%u largest=%u frag=%.0f%% | psram: free=%u largest=%u frag=%.0f%%", label,
-                 (unsigned)now.intFree, (unsigned)now.intLargest, intFrag, (unsigned)now.psramFree,
-                 (unsigned)now.psramLargest, psramFrag);
+                 (unsigned)now.intFree, (unsigned)now.intLargest, intFrag, (unsigned)now.psramFree, (unsigned)now.psramLargest,
+                 psramFrag);
     } else {
         const int dInt = (int)now.intFree - (int)s_lastCheckpoint.intFree;
         const int dPsram = (int)now.psramFree - (int)s_lastCheckpoint.psramFree;
         ESP_LOGI("HeapProfile",
-                 "[%s] int: free=%u (Δ%+dB) largest=%u frag=%.0f%% | psram: free=%u (Δ%+dB) largest=%u frag=%.0f%%",
-                 label, (unsigned)now.intFree, dInt, (unsigned)now.intLargest, intFrag, (unsigned)now.psramFree, dPsram,
+                 "[%s] int: free=%u (Δ%+dB) largest=%u frag=%.0f%% | psram: free=%u (Δ%+dB) largest=%u frag=%.0f%%", label,
+                 (unsigned)now.intFree, dInt, (unsigned)now.intLargest, intFrag, (unsigned)now.psramFree, dPsram,
                  (unsigned)now.psramLargest, psramFrag);
     }
     s_lastCheckpoint = now;

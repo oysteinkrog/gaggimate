@@ -51,8 +51,7 @@ void WifiStaWatchdogPlugin::loop() {
         // interval of self-healing, and only while someone is connected to the
         // portal, which is exactly when self-healing matters least.
         if (WiFi.softAPgetStationNum() > 0) {
-            ESP_LOGI(LOG_TAG, "AP fallback: %u station(s) on the config AP, deferring STA retry",
-                     WiFi.softAPgetStationNum());
+            ESP_LOGI(LOG_TAG, "AP fallback: %u station(s) on the config AP, deferring STA retry", WiFi.softAPgetStationNum());
             return;
         }
         ESP_LOGW(LOG_TAG, "AP fallback active; retrying STA connect to %s", ssid.c_str());

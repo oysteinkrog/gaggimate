@@ -17,9 +17,9 @@
 #include <display/ui/default/bganim/BgAnimCommon.h>
 #include <esp32s3/rom/cache.h> // Cache_WriteBack_Addr / Cache_Invalidate_Addr for /api/dmatest
 #include <esp_async_memcpy.h>
+#include <esp_heap_caps.h>
 #include <soc/gdma_channel.h> // SOC_GDMA_TRIG_PERIPH_LCD0 for /api/gdma
 #include <soc/gdma_struct.h>  // direct GDMA register access for /api/gdma
-#include <esp_heap_caps.h>
 #endif
 // Not bench-only: /api/debug/heap reports the animation SRAM budget, and
 // /api/settings echoes panelclock::hasLiveControl() so the form can tell the
@@ -247,7 +247,7 @@ void WebUIPlugin::loop() {
         // Add Bluetooth scale weight information
         statusDoc["bw"] = this->currentWeight;
         statusDoc["cw"] = this->currentWeight;
-        statusDoc["bc"] = bleConnected;                                    // bluetooth scale connected status
+        statusDoc["bc"] = bleConnected; // bluetooth scale connected status
         // Scale battery — only surfaced when the driver reports one and the
         // value isn't the UNKNOWN sentinel (255). UI omits the battery pill
         // entirely when `sbat` is absent, so disconnected/unknown scales don't
@@ -397,16 +397,16 @@ void WebUIPlugin::setupServer() {
     // endpoint still answers when the heap is too tight for a response stream.
     // Exposes no configuration and no secrets.
     server.on("/api/debug/heap", [](AsyncWebServerRequest *request) {
-        // anim_sram is the committed part of the animation budget and
-        // anim_budget its ceiling. The gap between them is the important
-        // figure: alloc() never frees, so every animation the user visits
-        // converts more of that gap into permanently resident internal DRAM.
-        // A comfortable int_min means nothing if the gap is larger than it.
-        // Headless builds drop the whole ui/ tree from build_src_filter, so
-        // BgAnimCommon.cpp -- which defines these two counters -- is never
-        // compiled and the references would not link. The keys stay in the
-        // payload either way so the web UI needs no build-specific branch;
-        // zero is the true value when no animation can allocate.
+    // anim_sram is the committed part of the animation budget and
+    // anim_budget its ceiling. The gap between them is the important
+    // figure: alloc() never frees, so every animation the user visits
+    // converts more of that gap into permanently resident internal DRAM.
+    // A comfortable int_min means nothing if the gap is larger than it.
+    // Headless builds drop the whole ui/ tree from build_src_filter, so
+    // BgAnimCommon.cpp -- which defines these two counters -- is never
+    // compiled and the references would not link. The keys stay in the
+    // payload either way so the web UI needs no build-specific branch;
+    // zero is the true value when no animation can allocate.
 #ifdef GAGGIMATE_HEADLESS
         const size_t animSram = 0;
         const size_t animPsram = 0;
@@ -422,9 +422,8 @@ void WebUIPlugin::setupServer() {
                  static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL)),
                  static_cast<unsigned>(heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL)),
                  static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_SPIRAM)),
-                 static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM)),
-                 static_cast<unsigned>(animSram), static_cast<unsigned>(animPsram),
-                 static_cast<unsigned>(bganim::SRAM_TOTAL_BUDGET));
+                 static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM)), static_cast<unsigned>(animSram),
+                 static_cast<unsigned>(animPsram), static_cast<unsigned>(bganim::SRAM_TOTAL_BUDGET));
         request->send(200, "application/json", buf);
     });
     server.on("/api/status", [this](AsyncWebServerRequest *request) {
@@ -628,9 +627,9 @@ void WebUIPlugin::setupServer() {
         // which is cache bandwidth -- the working set never left L1. PSRAM
         // buffers are 512 KB and walked linearly so every access misses. The
         // SRAM side stays small (a real band buffer is 15 KB) and is reused.
-        constexpr size_t SN = 16 * 1024;   // SRAM block, ~= one band buffer
-        constexpr size_t PN = 512 * 1024;  // PSRAM span, 16x the data cache
-        constexpr int REPS = 8;            // full sweeps of PN
+        constexpr size_t SN = 16 * 1024;  // SRAM block, ~= one band buffer
+        constexpr size_t PN = 512 * 1024; // PSRAM span, 16x the data cache
+        constexpr int REPS = 8;           // full sweeps of PN
         constexpr int CHUNKS = PN / SN;
         // 64-byte aligned on both sides: esp_async_memcpy validates the pointers
         // against the configured trans_align and rejects the submit outright
@@ -649,9 +648,7 @@ void WebUIPlugin::setupServer() {
             memset(sram, 0x5A, SN);
             memset(psram, 0x5A, PN);
             memset(psram2, 0x5A, PN);
-            auto mbps = [](uint32_t us) {
-                return us ? static_cast<uint32_t>(static_cast<uint64_t>(PN) * REPS / us) : 0u;
-            };
+            auto mbps = [](uint32_t us) { return us ? static_cast<uint32_t>(static_cast<uint64_t>(PN) * REPS / us) : 0u; };
 
             // This is the push path: SRAM band buffer -> PSRAM framebuffer.
             uint32_t t0 = micros();
@@ -910,10 +907,8 @@ void WebUIPlugin::setupServer() {
         // reads as a wedged board rather than as memory pressure. Watching the
         // two figures together is what distinguishes exhaustion from
         // fragmentation.
-        gate["largest_internal_b"] =
-            static_cast<uint32_t>(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
-        gate["min_free_internal_b"] =
-            static_cast<uint32_t>(heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL));
+        gate["largest_internal_b"] = static_cast<uint32_t>(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+        gate["min_free_internal_b"] = static_cast<uint32_t>(heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL));
         SleepAnimation *anim = sleep_animation_bench_instance();
         if (anim == nullptr) {
             doc["running"] = false;
@@ -1757,8 +1752,8 @@ void WebUIPlugin::updateOTAStatus(const String &version) {
             }
         }
         const size_t total = heap_caps_get_total_size(MALLOC_CAP_DEFAULT | MALLOC_CAP_INTERNAL);
-        doc["heapFree"] = static_cast<uint32_t>(ri ? ri->freeBytes
-                                                   : heap_caps_get_free_size(MALLOC_CAP_DEFAULT | MALLOC_CAP_INTERNAL));
+        doc["heapFree"] =
+            static_cast<uint32_t>(ri ? ri->freeBytes : heap_caps_get_free_size(MALLOC_CAP_DEFAULT | MALLOC_CAP_INTERNAL));
         doc["heapLargest"] = static_cast<uint32_t>(
             ri ? ri->largestFreeBlock : heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT | MALLOC_CAP_INTERNAL));
         doc["heapTotal"] = static_cast<uint32_t>(total);
