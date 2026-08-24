@@ -131,8 +131,12 @@ void ShotHistoryPlugin::record() {
                 // Brew delay (ms) the shot ran with; round and clamp into the uint16_t field
                 double delayMs = currentBrewDelay > 0.0 ? currentBrewDelay + 0.5 : 0.0;
                 header.brewDelayMs = delayMs > 65535.0 ? 65535 : static_cast<uint16_t>(delayMs);
+                logWriteFailed = false;
                 // Write header placeholder
-                currentFile.write(reinterpret_cast<const uint8_t *>(&header), sizeof(header));
+                if (currentFile.write(reinterpret_cast<const uint8_t *>(&header), sizeof(header)) != sizeof(header)) {
+                    ESP_LOGE("ShotHistoryPlugin", "Could not write the shot log header for %s", currentId.c_str());
+                    logWriteFailed = true;
+                }
             }
         }
         // Bluetooth weight flow (vf): derive from the same non-negative weight we
@@ -250,12 +254,25 @@ void ShotHistoryPlugin::record() {
         header.finalExitReason = finalExitReason; // why the shot ended (last phase exit or manual abort)
         float finalWeight = currentBluetoothWeight;
         header.finalWeight = finalWeight > 0.0f ? encodeUnsigned(finalWeight, WEIGHT_SCALE, WEIGHT_MAX_VALUE) : 0;
-        currentFile.seek(0, SeekSet);
-        currentFile.write(reinterpret_cast<const uint8_t *>(&header), sizeof(header));
+        if (!currentFile.seek(0, SeekSet) ||
+            currentFile.write(reinterpret_cast<const uint8_t *>(&header), sizeof(header)) != sizeof(header)) {
+            ESP_LOGE("ShotHistoryPlugin", "Could not finalize the shot log header for %s", currentId.c_str());
+            logWriteFailed = true;
+        }
         currentFile.close();
         isFileOpen = false;
         unsigned long duration = header.durationMs;
-        if (duration <= 7500) { // Exclude failed shots and flushes
+        // A log that did not fully land is discarded rather than published. The
+        // header carries sampleCount from the in-memory counter, not from what
+        // reached flash, so a truncated file would be indexed as a complete shot
+        // and every reader would walk off the end of it.
+        if (logWriteFailed) {
+            ESP_LOGE("ShotHistoryPlugin", "Discarding shot log %s: it was not written completely", currentId.c_str());
+            fs->remove("/h/" + currentId + ".slog");
+            if (indexEntryCreated) {
+                markIndexDeleted(currentId.toInt());
+            }
+        } else if (duration <= 7500) { // Exclude failed shots and flushes
             fs->remove("/h/" + currentId + ".slog");
 
             // If we created an early index entry, mark it as deleted
@@ -555,7 +572,7 @@ void ShotHistoryPlugin::handleRequest(JsonDocument &request, JsonDocument &respo
         auto id = request["id"].as<String>();
         JsonDocument notes; // explicit document: variant->const JsonDocument& is ambiguous on clang
         notes.set(request["notes"]);
-        saveNotes(id, notes);
+        const bool notesSaved = saveNotes(id, notes);
 
         // Update rating and volume in index
         uint8_t rating = notes["rating"].as<uint8_t>();
@@ -572,7 +589,14 @@ void ShotHistoryPlugin::handleRequest(JsonDocument &request, JsonDocument &respo
         // Always use updateIndexMetadata - it handles both rating and optional volume
         updateIndexMetadata(id.toInt(), rating, volume);
 
-        response["msg"] = "Ok";
+        if (notesSaved) {
+            response["msg"] = "Ok";
+        } else {
+            // Same key the profile handlers use for a failed write. Reporting "Ok"
+            // here told the user their notes were saved when the file was left
+            // untouched.
+            response["error"] = F("Notes save failed");
+        }
     } else if (type == "req:history:rebuild") {
         // Rebuild is now handled asynchronously by WebUIPlugin
         // This path shouldn't be reached, but handle it just in case
@@ -580,14 +604,37 @@ void ShotHistoryPlugin::handleRequest(JsonDocument &request, JsonDocument &respo
     }
 }
 
-void ShotHistoryPlugin::saveNotes(const String &id, const JsonDocument &notes) {
-    File file = fs->open("/h/" + id + ".json", FILE_WRITE);
-    if (file) {
-        String notesStr;
-        serializeJson(notes, notesStr);
-        file.print(notesStr);
-        file.close();
+bool ShotHistoryPlugin::saveNotes(const String &id, const JsonDocument &notes) {
+    const String target = "/h/" + id + ".json";
+    // Same shape as ProfileManager::saveProfile: FILE_WRITE truncates the
+    // existing notes before anything replaces them, so a short write used to
+    // destroy the notes that were there and report nothing. Write beside it and
+    // move it in only once the whole document is down.
+    const String tmpPath = target + ".tmp";
+    File file = fs->open(tmpPath, FILE_WRITE);
+    if (!file) {
+        ESP_LOGE("ShotHistoryPlugin", "Could not open notes file for shot %s", id.c_str());
+        return false;
     }
+    String notesStr;
+    serializeJson(notes, notesStr);
+    const size_t written = file.print(notesStr);
+    file.close();
+    if (written != notesStr.length()) {
+        ESP_LOGE("ShotHistoryPlugin", "Wrote %u of %u bytes of notes for shot %s; keeping the previous version", written,
+                 notesStr.length(), id.c_str());
+        fs->remove(tmpPath);
+        return false;
+    }
+    if (fs->exists(target)) {
+        fs->remove(target);
+    }
+    if (!fs->rename(tmpPath, target)) {
+        ESP_LOGE("ShotHistoryPlugin", "Could not move the new notes for shot %s into place", id.c_str());
+        fs->remove(tmpPath);
+        return false;
+    }
+    return true;
 }
 
 void ShotHistoryPlugin::loadNotes(const String &id, JsonDocument &notes) {
@@ -610,7 +657,13 @@ void ShotHistoryPlugin::loopTask(void *arg) {
 
 void ShotHistoryPlugin::flushBuffer() {
     if (isFileOpen && ioBufferPos > 0) {
-        currentFile.write(ioBuffer, ioBufferPos);
+        // Logged once per shot: this runs every 4 KB of samples, so a full
+        // filesystem would otherwise repeat the same line for the rest of the
+        // recording.
+        if (currentFile.write(ioBuffer, ioBufferPos) != ioBufferPos && !logWriteFailed) {
+            ESP_LOGE("ShotHistoryPlugin", "Short write flushing shot log %s; the recording will be discarded", currentId.c_str());
+            logWriteFailed = true;
+        }
         ioBufferPos = 0;
     }
 }
@@ -647,8 +700,16 @@ bool ShotHistoryPlugin::ensureIndexExists() {
     header.entryCount = 0;
     header.nextId = controller->getSettings().getHistoryIndex();
 
-    indexFile.write(reinterpret_cast<const uint8_t *>(&header), sizeof(header));
+    const bool headerWritten = writeIndexHeader(indexFile, header);
     indexFile.close();
+    if (!headerWritten) {
+        // A file with no valid magic fails validation on the next call and gets
+        // recreated, so leaving it behind would make every append attempt run
+        // through a create that reports success and an open that then fails to
+        // read the header. Remove it and say so.
+        fs->remove("/h/index.bin");
+        return false;
+    }
 
     ESP_LOGI("ShotHistoryPlugin", "Created new index file");
     return true;
@@ -693,11 +754,20 @@ bool ShotHistoryPlugin::appendToIndex(const ShotIndexEntry &entry) {
         return false;
     }
 
-    // Update header
+    // Update header. The entry bytes are already on disk at this point, so a
+    // failure here leaves entryCount one short of what the file holds: the shot
+    // just recorded is invisible to every reader, and the next append seeks to
+    // SeekEnd and writes past the orphan, so the count stays permanently out of
+    // step with the offsets. nextId does not advance either, so the following
+    // shot reuses this one's id. Returning true here reported all of that as a
+    // successful append.
     header.entryCount++;
     header.nextId = entry.id + 1;
-    indexFile.seek(0, SeekSet);
-    indexFile.write(reinterpret_cast<const uint8_t *>(&header), sizeof(header));
+    if (!writeIndexHeader(indexFile, header)) {
+        ESP_LOGE("ShotHistoryPlugin", "Wrote index entry for shot %u but could not update the header", entry.id);
+        indexFile.close();
+        return false;
+    }
 
     indexFile.close();
     ESP_LOGD("ShotHistoryPlugin", "Appended shot %u to index", entry.id);
@@ -1054,6 +1124,18 @@ bool ShotHistoryPlugin::readIndexHeader(File &indexFile, ShotIndexHeader &header
     }
     if (header.magic != SHOT_INDEX_MAGIC) {
         ESP_LOGE("ShotHistoryPlugin", "Invalid index magic: 0x%08X", header.magic);
+        return false;
+    }
+    return true;
+}
+
+bool ShotHistoryPlugin::writeIndexHeader(File &indexFile, const ShotIndexHeader &header) {
+    if (!indexFile.seek(0, SeekSet)) {
+        ESP_LOGE("ShotHistoryPlugin", "Failed to seek to index header");
+        return false;
+    }
+    if (indexFile.write(reinterpret_cast<const uint8_t *>(&header), sizeof(header)) != sizeof(header)) {
+        ESP_LOGE("ShotHistoryPlugin", "Failed to write index header");
         return false;
     }
     return true;

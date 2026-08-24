@@ -130,11 +130,16 @@ class NotesService {
 
     if (source === 'gaggimate') {
       if (!this.apiService) throw new Error('ApiService not available');
-      await this.apiService.request({
+      // request() resolves with the response whether or not the device managed
+      // to write the file, so an unchecked call reports every save as a success.
+      const response = await this.apiService.request({
         tp: 'req:history:notes:save',
         id: shotId,
         notes: notesWithId,
       });
+      if (response?.error) {
+        throw new Error(response.error);
+      }
       return;
     }
 
