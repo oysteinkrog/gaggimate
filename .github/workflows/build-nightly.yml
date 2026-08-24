@@ -12,6 +12,16 @@ on:
 permissions:
   contents: write
 name: Build Nightly
+
+# Every run of this workflow deletes and recreates the same `nightly` tag and
+# republishes the same release. Two runs in flight interleave those steps, and
+# the device reads the tag and the assets separately, so it can end up flashing
+# a binary that is not what the tag points at. Queued rather than cancelled:
+# a cancelled run can have deleted the tag without republishing, which leaves
+# the OTA channel returning 404 until the next one finishes.
+concurrency:
+  group: nightly-${{ github.ref }}
+  cancel-in-progress: false
 jobs:
   build:
     runs-on: ubuntu-latest
