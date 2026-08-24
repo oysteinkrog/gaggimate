@@ -172,6 +172,11 @@ jobs:
       # it atomically; the fallback POST covers the case where the tag does not
       # exist yet. Deliberately not delete-then-recreate: that leaves a window
       # where the OTA channel 404s.
+      #
+      # This step 403'd once ("Resource not accessible by integration", on both
+      # the PATCH and the POST) and then succeeded unchanged on the next commit,
+      # so treat a 403 here as transient rather than as a permissions problem to
+      # go re-engineer. Nothing about the job's token changed in between.
       - name: Move the nightly tag
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -198,7 +203,7 @@ jobs:
           allowUpdates: true
           removeArtifacts: true
           artifacts: 'release/*'
-          body: 'Latest nightly release, use the nightly channel in the UI to download this firmware.'
+          body: 'Latest nightly release, use the nightly channel in the UI to download this firmware. Built from ${{ github.sha }}.'
           token: ${{ secrets.GITHUB_TOKEN }}
       - name: Deploy to GitHub Pages subdirectory
         uses: peaceiris/actions-gh-pages@4f9cc6602d3f66b9c108549d475ec49e8ef4d45e
