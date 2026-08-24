@@ -208,6 +208,24 @@ class SleepAnimation {
     uint32_t benchDmaIssued() const { return dmaIssued.load(); }
     uint32_t benchDmaCompleted() const;
     uint32_t benchDmaErrors() const { return dmaErrors.load(); }
+    int benchFrameBufferCount() const { return fbCount; }
+
+    // Pixel-exact captures, so a claim about corruption can be checked against
+    // bytes instead of against a photograph of a lit panel. A webcam in a dark
+    // room integrates several panel frames and cannot separate a moving widget
+    // from a stale one; these can.
+    //
+    // benchCopyFrameBuffer takes the frame gate, so what comes out is one
+    // coherent frame rather than a tear, and invalidates the range first
+    // because the DMA path writes it behind the cache.
+    // Returns the byte count written, or 0 if the panel has no direct buffer
+    // or the caller's buffer is too small.
+    size_t benchCopyFrameBuffer(uint8_t *out, size_t cap, int *outW, int *outH);
+    // The overlay the render task is currently blending from, alpha plane and
+    // all (LV_IMG_CF_TRUE_COLOR_ALPHA, 3 B/px). Unsynchronised: the UI task
+    // only ever writes the OTHER buffer, so the worst case is catching a flip
+    // mid-copy, which shows up as a seam and is itself informative.
+    size_t benchCopyOverlay(uint8_t *out, size_t cap, int *outW, int *outH);
     // Where the band buffers actually landed. They are the DMA source, so one
     // of them falling back to PSRAM would mean GDMA reads memory the CPU has
     // only written through the cache.
@@ -369,7 +387,15 @@ class SleepAnimation {
     // bytes. Mode 4 keeps the descriptors and only re-points them.
     std::atomic<int> dmaMode{4};
     bool dmaActive = false; // fbDirect resolved AND the engine installed
-    uint16_t *fbDirect = nullptr;
+    // The panel's framebuffers. With two, the frame is composed in the one the
+    // scan-out is not reading and shown by flipping at the end of the frame, so
+    // no pixel is ever written while it is on screen -- the difference between
+    // tearing being unlikely and tearing being impossible. With one, fbBack
+    // stays 0 and the writes race the beam exactly as before.
+    static constexpr int FB_MAX = 2;
+    uint16_t *fbDirect[FB_MAX] = {};
+    int fbCount = 0;
+    int fbBack = 0; // the buffer this frame is being composed into
     void *dmaHandle = nullptr; // async_memcpy_t, installed once from the render task
     bool dmaInstallTried = false;
 #ifndef GAGGIMATE_SIM
@@ -384,6 +410,7 @@ class SleepAnimation {
     bool gateWarned = false;    // one warning per run, not one per frame
     bool frameGateHeld = false; // the framebuffer gate is taken for this frame's transfers
     bool beginDirectPath();
+    void presentFrame();
     void endDirectPath();
     std::atomic<uint32_t> dmaIssued{0};
     std::atomic<uint32_t> dmaErrors{0};

@@ -527,6 +527,42 @@ void WebUIPlugin::setupServer() {
         request->send(response);
     });
 
+    // Raw capture of what is actually on the panel, so a corruption claim can
+    // be settled with bytes. ?src=fb (default) returns the RGB565 framebuffer,
+    // ?src=ov the live overlay as RGB565+A8. Both are little-endian and
+    // row-major; the geometry comes back in the headers because the overlay is
+    // larger than the panel by the host object's ext draw size.
+    server.on("/api/fbdump", [](AsyncWebServerRequest *request) {
+        SleepAnimation *a = sleep_animation_bench_instance();
+        if (a == nullptr) {
+            request->send(503, "text/plain", "animation not running");
+            return;
+        }
+        const bool wantOverlay = request->hasArg("src") && request->arg("src") == "ov";
+        // 480x480 at 3 B/px covers both shapes with the ext draw margin.
+        const size_t cap = 512u * 512u * 3u;
+        uint8_t *buf = static_cast<uint8_t *>(heap_caps_malloc(cap, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+        if (buf == nullptr) {
+            request->send(507, "text/plain", "no psram for capture");
+            return;
+        }
+        int w = 0, h = 0;
+        const size_t bytes = wantOverlay ? a->benchCopyOverlay(buf, cap, &w, &h) : a->benchCopyFrameBuffer(buf, cap, &w, &h);
+        if (bytes == 0) {
+            free(buf);
+            request->send(503, "text/plain", "capture unavailable");
+            return;
+        }
+        // The response reads from this pointer lazily as it streams, so the
+        // scratch has to outlive send() and is freed on disconnect instead.
+        AsyncWebServerResponse *response = request->beginResponse(200, "application/octet-stream", buf, bytes);
+        response->addHeader("X-Width", String(w));
+        response->addHeader("X-Height", String(h));
+        response->addHeader("X-Bpp", wantOverlay ? "3" : "2");
+        request->onDisconnect([buf]() { free(buf); });
+        request->send(response);
+    });
+
     server.on("/api/dmatest", [this](AsyncWebServerRequest *request) {
         AsyncResponseStream *response = request->beginResponseStream("application/json");
         JsonDocument doc;
@@ -886,6 +922,10 @@ void WebUIPlugin::setupServer() {
         gate["dma_wanted"] = anim0 != nullptr && anim0->benchDmaWanted();
         gate["dma_active"] = anim0 != nullptr && anim0->benchDmaActive();
         gate["dma_mode"] = anim0 != nullptr ? anim0->benchDmaMode() : 0;
+        // 2 means the frame is composed off-screen and flipped at a frame
+        // boundary, which is what makes the picture tear-free; 1 means the
+        // writes race the scan-out.
+        gate["fb_count"] = anim0 != nullptr ? anim0->benchFrameBufferCount() : 0;
         gate["interlace"] = anim0 != nullptr ? anim0->benchInterlace() : false;
         gate["render_half"] = anim0 != nullptr ? anim0->benchRenderHalf() : false;
         gate["bands_internal"] = anim0 != nullptr && anim0->benchBandsInternal();
