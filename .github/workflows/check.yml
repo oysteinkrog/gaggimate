@@ -105,6 +105,34 @@ jobs:
       - name: Build display-headless-8m
         run: pio run -e display-headless-8m
 
+  format:
+    name: Formatting
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v3
+      # .clang-format and scripts/format.sh have both been in the tree since
+      # before this branch, CONTRIBUTING points at them, and nothing ever
+      # checked them: 27 of the 207 in-scope files had drifted, one of them
+      # indented two spaces in a four-space project.
+      #
+      # The version is pinned. clang-format output is not stable across major
+      # versions, so taking whatever the runner happens to ship would fail this
+      # gate on a runner-image bump with no source change. 14 is the version
+      # the tree is formatted with.
+      #
+      # Note for anyone chasing a failure here: clang-format 14 is not
+      # idempotent on HardwareScale.cpp. It miscounts the display width of the
+      # U+26A0 emoji in an ESP_LOGW string, so the first -i pass breaks the line
+      # one way and the second corrects it. Run scripts/format.sh twice if a
+      # single run leaves --check unhappy.
+      - name: Install clang-format
+        run: sudo apt-get update && sudo apt-get install -y clang-format-14
+      - name: Check formatting
+        env:
+          CLANG_FORMAT: clang-format-14
+        run: ./scripts/format.sh --check
+
   test:
     name: Unit tests
     runs-on: ubuntu-latest

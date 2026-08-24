@@ -261,10 +261,11 @@ void HardwareScale::loop() {
 
     while (!_scale_factors_ready) {
         if (millis() - startWait > SCALE_FACTOR_TIMEOUT_MS) {
-            ESP_LOGW(LOG_TAG,
-                     "⚠️ Timeout waiting for scale factors after %lu ms, proceeding with defaults (readings will be inaccurate "
-                     "until calibrated)",
-                     SCALE_FACTOR_TIMEOUT_MS);
+            ESP_LOGW(
+                LOG_TAG,
+                "⚠️ Timeout waiting for scale factors after %lu ms, proceeding with defaults (readings will be inaccurate "
+                "until calibrated)",
+                SCALE_FACTOR_TIMEOUT_MS);
             _scale_factors_ready = true; // Allow operation with default factors
             break;
         }
