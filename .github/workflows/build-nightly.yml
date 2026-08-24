@@ -166,17 +166,40 @@ jobs:
         with:
           name: gaggimate-firmware
           path: release
-      - name: Update Nightly Release
-        uses: andelf/nightly-release@c5ed4bdb7c1da04a4fa1e40bc5e67306f682563b
+      # The device resolves .../releases/tag/nightly and then pulls version.txt
+      # and the .bin assets from that release, so the tag has to end up on the
+      # commit these binaries were built from. A single PATCH on the ref moves
+      # it atomically; the fallback POST covers the case where the tag does not
+      # exist yet. Deliberately not delete-then-recreate: that leaves a window
+      # where the OTA channel 404s.
+      - name: Move the nightly tag
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+        run: |
+          gh api -X PATCH "repos/$REPO/git/refs/tags/nightly" -f sha="$SHA" -F force=true ||
+            gh api -X POST "repos/$REPO/git/refs" -f ref=refs/tags/nightly -f sha="$SHA"
+      # Was andelf/nightly-release, which failed here with "Resource not
+      # accessible by integration" even though this job's token is logged as
+      # holding Contents: write. ncipollo/release-action is what build.yml has
+      # been publishing tagged releases with on this repo all along, at this
+      # same pinned SHA, so switching to it removes a variable instead of
+      # adding one. removeArtifacts clears the previous nightly's binaries,
+      # which would otherwise accumulate under the same tag.
+      - name: Update Nightly Release
+        uses: ncipollo/release-action@bcfe5470707e8832e12347755757cec0eb3c22af
         with:
-          tag_name: nightly
-          name: 'Nightly Release $$'
+          tag: nightly
+          commit: ${{ github.sha }}
+          name: 'Nightly Release'
           prerelease: true
+          makeLatest: false
+          allowUpdates: true
+          removeArtifacts: true
+          artifacts: 'release/*'
           body: 'Latest nightly release, use the nightly channel in the UI to download this firmware.'
-          files: |
-            release/*
+          token: ${{ secrets.GITHUB_TOKEN }}
       - name: Deploy to GitHub Pages subdirectory
         uses: peaceiris/actions-gh-pages@4f9cc6602d3f66b9c108549d475ec49e8ef4d45e
         with:
