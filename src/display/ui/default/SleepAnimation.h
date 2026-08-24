@@ -3,6 +3,9 @@
 
 #include <atomic>
 #include <stdint.h>
+#ifndef GAGGIMATE_SIM
+#include <display/drivers/common/BandDma.h>
+#endif
 
 class Display;
 
@@ -334,35 +337,50 @@ class SleepAnimation {
     // pushColors copies the band into the PSRAM framebuffer with the CPU, and a
     // CPU write to PSRAM on this part costs about twice a read: the 32-byte
     // write-allocate line is fetched before it is overwritten, so a 460 KB
-    // frame moves 920 KB of bus traffic. Measured 24 MB/s that way against
-    // 48 MB/s for the same bytes over GDMA, which never touches the cache.
+    // frame moves 920 KB of bus traffic. The direct path hands the same bytes
+    // to a DMA engine instead, which never passes through the cache.
     //
     // fbDirect is the panel's own framebuffer, or null when the panel will not
     // hand it over -- in which case dmaActive stays false and the pipeline runs
-    // the ordinary push task, unchanged.
-    // Off by default: the direct path garbles the panel in practice. Writing
-    // the framebuffer behind the cache is only safe if nothing else writes it
-    // through the cache, and LVGL still does -- its dirty lines get evicted
-    // over DMA-written pixels afterwards. Flushing at start() and invalidating
-    // at stop() bounds that at the edges of a run but does nothing during one.
-    // Enable with /api/animbench?dma=1 to measure; do not ship it on until the
-    // coherency problem is actually solved.
-    std::atomic<bool> dmaWanted{false};
+    // the ordinary push task, unchanged. Only the LilyGo RGB panel offers one.
+    //
+    // On by default since the coherency work: the panel hands out a gate that
+    // the direct writer holds for as long as a frame has transfers in flight,
+    // so esp_lcd's whole-scanline cache writeback can no longer land on top of
+    // one, and the cache is flushed into PSRAM on the way in and dropped on the
+    // way out. Measured on the panel against the CPU push: 41.5 fps at full row
+    // count against 58 fps interlaced at half, with the render task's share of
+    // the push falling from 9.7 ms per frame to 0.6, and no transfer errors in
+    // 72k transfers. /api/animbench?dma=0 turns it off at runtime.
+    std::atomic<bool> dmaWanted{true};
     // 0 = ordinary two-task CPU push, 1 = direct CPU memcpy under the gate
     // (diagnostic), 2 = one esp_async_memcpy per band, 3 = the same split into
-    // 4-row chunks.
+    // 4-row chunks, 4 = the native preallocated GDMA engine (see BandDma.h).
     //
-    // 2 is the default: measured on the panel, 3 costs 9 ms more render-task
-    // time per frame (25.6 fps against 33.2) for no visible benefit. IDF 5.5's
-    // esp_async_memcpy rebuilds both of its GDMA link lists from the heap on
-    // every single call -- four frees and four aligned allocations -- so its
-    // cost is dominated by submissions, not by bytes, and splitting a band into
-    // three triples it.
-    std::atomic<int> dmaMode{2};
+    // 4 is the default. Measured on the panel, per frame:
+    //
+    //   mode 3  push 18.8 ms  25.6 fps    esp_async_memcpy, 3 chunks per band
+    //   mode 2  push  9.7 ms  33.2 fps    esp_async_memcpy, 1 call per band
+    //   mode 4  push  0.6 ms  41.5 fps    native engine, 1 submit per band
+    //
+    // The spread between 2 and 3 is what gives the API away: IDF 5.5's
+    // esp_async_memcpy deletes and rebuilds both of its GDMA link lists from
+    // the heap on every single call, so its cost tracks submissions rather than
+    // bytes. Mode 4 keeps the descriptors and only re-points them.
+    std::atomic<int> dmaMode{4};
     bool dmaActive = false; // fbDirect resolved AND the engine installed
     uint16_t *fbDirect = nullptr;
-    void *dmaHandle = nullptr;   // async_memcpy_t, installed once from the render task
+    void *dmaHandle = nullptr; // async_memcpy_t, installed once from the render task
     bool dmaInstallTried = false;
+#ifndef GAGGIMATE_SIM
+    // The native engine used by mode 4. Kept beside the esp_async_memcpy handle
+    // rather than replacing it so the two can be compared on the same run; only
+    // the engine a mode actually asks for is ever installed.
+    BandDma bandDma;
+#endif
+    bool nativeInstallTried = false;
+    bool installNativeOnIsrCore();
+    bool engineReadyForMode();
     bool gateWarned = false;    // one warning per run, not one per frame
     bool frameGateHeld = false; // the framebuffer gate is taken for this frame's transfers
     bool beginDirectPath();

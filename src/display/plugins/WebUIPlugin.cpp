@@ -792,7 +792,7 @@ void WebUIPlugin::setupServer() {
                 a->benchRequestReset();
             }
         }
-        // ?dmamode=0|1|2|3 -- see benchSetDmaMode. Takes effect on the next band,
+        // ?dmamode=0|1|2|3|4 -- see benchSetDmaMode. Takes effect on the next band,
         // no restart needed.
         if (request->hasArg("dmamode")) {
             SleepAnimation *a = sleep_animation_bench_instance();
