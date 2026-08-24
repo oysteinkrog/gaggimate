@@ -1,7 +1,13 @@
+# The device fetches OTA straight from GitHub releases: WebUIPlugin's
+# RELEASE_URL + "tag/nightly", then version.txt and the .bin assets from the
+# matching download URL. So a branch that never runs this workflow has a
+# nightly channel that 404s on the machine. This fork develops on idf5, so
+# idf5 publishes nightlies too.
 on:
   push:
     branches:
       - "master"
+      - "idf5"
 
 permissions:
   contents: write
@@ -38,9 +44,32 @@ jobs:
           mkdir -p upload/display
           mkdir -p upload/headless
           mkdir -p upload/controller
-          git tag -d nightly
-          git tag -d db
+          # Both are moving tags that would otherwise win `git describe` and
+          # make the version string self-referential. `|| true` because a fork
+          # that has never published one of them does not have the tag to
+          # delete, and a bare `git tag -d` failure would kill the whole job.
+          git tag -d nightly || true
+          git tag -d db || true
           git describe --tags --dirty > out/version.txt
+      # The update server is upstream's own distribution channel and its
+      # credentials are repository secrets. A fork does not have them, and the
+      # composite action ends in `curl --fail-with-body` against an empty host,
+      # so every upload step failed the job -- which meant `release-nightly`
+      # (needs: build) never ran and no GitHub release was published either.
+      # That is the actual reason the nightly channel 404s here. Detect once
+      # and skip the uploads; the GitHub release is what the firmware reads.
+      - name: Detect update server credentials
+        id: update_server
+        env:
+          UPDATE_SERVER_HOST: ${{ secrets.UPDATE_SERVER_HOST }}
+          UPDATE_SERVER_API_KEY: ${{ secrets.UPDATE_SERVER_API_KEY }}
+        run: |
+          if [[ -n "${UPDATE_SERVER_HOST}" && -n "${UPDATE_SERVER_API_KEY}" ]]; then
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::No update-server credentials; skipping those uploads. The GitHub nightly release is still published and is what devices fetch."
+          fi
       - name: Build Web
         run: ./scripts/build_webui.sh
       - name: Build controller
@@ -54,6 +83,7 @@ jobs:
           cp .pio/build/controller/partitions.bin upload/controller/partitions.bin
           cp .pio/build/controller/bootloader.bin upload/controller/bootloader.bin
       - uses: ./.github/actions/upload-firmware
+        if: steps.update_server.outputs.configured == 'true'
         env:
           UPDATE_SERVER_HOST: ${{ secrets.UPDATE_SERVER_HOST }}
           UPDATE_SERVER_API_KEY: ${{ secrets.UPDATE_SERVER_API_KEY }}
@@ -79,6 +109,7 @@ jobs:
           cp .pio/build/display/partitions.bin upload/display/partitions.bin
           cp .pio/build/display/bootloader.bin upload/display/bootloader.bin
       - uses: ./.github/actions/upload-firmware
+        if: steps.update_server.outputs.configured == 'true'
         env:
           UPDATE_SERVER_HOST: ${{ secrets.UPDATE_SERVER_HOST }}
           UPDATE_SERVER_API_KEY: ${{ secrets.UPDATE_SERVER_API_KEY }}
@@ -98,6 +129,7 @@ jobs:
           cp .pio/build/display-headless/partitions.bin upload/headless/partitions.bin
           cp .pio/build/display-headless/bootloader.bin upload/headless/bootloader.bin
       - uses: ./.github/actions/upload-firmware
+        if: steps.update_server.outputs.configured == 'true'
         env:
           UPDATE_SERVER_HOST: ${{ secrets.UPDATE_SERVER_HOST }}
           UPDATE_SERVER_API_KEY: ${{ secrets.UPDATE_SERVER_API_KEY }}
