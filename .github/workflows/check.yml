@@ -6,6 +6,14 @@
 # until someone cut a tag. The `build` and `test` jobs below close that.
 on: [push, pull_request]
 
+name: Checks
+
+# Nothing here publishes anything, so a superseded push has no reason to keep
+# five jobs on the runners.
+concurrency:
+  group: checks-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   analysis:
     name: Static analysis
