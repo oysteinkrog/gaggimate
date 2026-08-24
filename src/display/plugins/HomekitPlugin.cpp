@@ -1,3 +1,12 @@
+// Guarded as a whole file, not just at its registration site in Controller.cpp.
+// ESP-IDF links the app component with --whole-archive, so this object file ends
+// up in the image even with nothing referencing it, and that is enough to pull
+// HomeSpan in. HomeSpan overrides Arduino's weak `extern "C" void init()` hook
+// and calls WiFi.mode(WIFI_STA) from it, so merely linking the library brings the
+// radio up before setup() runs -- which under QEMU means phy_init spinning on
+// hardware that is not emulated.
+#ifndef GAGGIMATE_NO_RADIO
+
 #include "HomekitPlugin.h"
 // HomeSpan 2.x defines `class Controller` at global scope — rename it via the
 // preprocessor so it doesn't collide with our own Controller (used everywhere).
@@ -166,3 +175,5 @@ void HomekitPlugin::loop() {
     impl->controller->setTargetTemp(impl->accessory->getTargetTemperature());
     impl->actionRequired = false;
 }
+
+#endif // GAGGIMATE_NO_RADIO

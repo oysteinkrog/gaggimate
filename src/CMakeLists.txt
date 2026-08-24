@@ -41,3 +41,12 @@ idf_component_register(SRCS ${app_sources}
 target_compile_options(${COMPONENT_LIB} PRIVATE
     $<$<COMPILE_LANGUAGE:CXX>:-std=gnu++20>
 )
+
+# QEMU build (-DGAGGIMATE_QEMU_BUILD=1). esp_adc's constructor-time self
+# calibration spins forever on a SENS register QEMU does not implement, so the
+# call is interposed by __wrap_adc_hal_self_calibration in
+# src/display/drivers/Qemu/QemuShims.cpp. INTERFACE, not PRIVATE: --wrap has to
+# reach the final executable link, not just this component's archive.
+if(DEFINED GAGGIMATE_QEMU_BUILD AND GAGGIMATE_QEMU_BUILD)
+    target_link_libraries(${COMPONENT_LIB} INTERFACE "-Wl,--wrap=adc_hal_self_calibration")
+endif()
