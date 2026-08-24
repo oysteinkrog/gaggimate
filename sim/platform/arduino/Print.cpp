@@ -26,6 +26,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+// va_start/va_copy/va_end in printf() below. The Arduino core headers pull this
+// in transitively on device, so its absence only ever showed up on a host build.
+#include <stdarg.h>
 
 #include "Print.h"
 extern "C" {

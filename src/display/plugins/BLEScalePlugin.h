@@ -3,6 +3,10 @@
 #include "../core/Plugin.h"
 #include "remote_scales.h"
 #include "remote_scales_plugin_registry.h"
+// std::unique_ptr<RemoteScales> member below. The NimBLE headers reached by
+// remote_scales.h pull this in transitively on device, so the missing include
+// only ever surfaced as a simulator build failure.
+#include <memory>
 
 void on_ble_measurement(float value);
 

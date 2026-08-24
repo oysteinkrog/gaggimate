@@ -6,6 +6,9 @@
 typedef uint32_t TickType_t;
 typedef int BaseType_t;
 typedef unsigned int UBaseType_t;
+// Byte-granular on the Xtensa port, which is what stack sizes here are counted
+// in. Only used for sizeof() in default stack-size expressions.
+typedef uint8_t StackType_t;
 
 #define pdFALSE 0
 #define pdTRUE 1

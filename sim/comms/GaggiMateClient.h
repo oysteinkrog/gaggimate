@@ -87,6 +87,9 @@ class GaggiMateClient {
                           float maxPower, float slipA, float slipB, float slipC, float slipD);
     void sendAutotune(uint32_t testTime, uint32_t samples, uint32_t heaterWattage);
     void sendPressureScale(float scale);
+    // Load-cell calibration factors. The mock scale is synthetic, so there is
+    // nothing on the host for these to calibrate.
+    void sendScaleFactors(float scaleFactor1, float scaleFactor2);
     void tare();
     void sendLedControl(const LedChannelCommand *channels, size_t count);
 

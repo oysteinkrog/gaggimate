@@ -108,5 +108,6 @@ void GaggiMateClient::sendAutotune(uint32_t, uint32_t, uint32_t) {
     _autotuneDueMs = millis() + 1500;
 }
 void GaggiMateClient::sendPressureScale(float) {}
+void GaggiMateClient::sendScaleFactors(float, float) {}
 void GaggiMateClient::tare() { _mock.tareScale(); }
 void GaggiMateClient::sendLedControl(const LedChannelCommand *, size_t) {}
