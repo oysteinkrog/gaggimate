@@ -11,6 +11,10 @@
 #   scripts/qemu-run.sh --log /tmp/boot.log   # tee the serial output
 #   scripts/qemu-run.sh --monitor-port 0      # no monitor socket
 #   scripts/qemu-run.sh --keep-image          # boot the existing image again
+#   scripts/qemu-run.sh --console-port 55556  # console on TCP, for qemu-touch.py
+#   scripts/qemu-run.sh --console-port 55556 --console-wait   # ... and hold the
+#                                             # reset until the client attaches,
+#                                             # so the boot log is not lost
 #   scripts/qemu-run.sh -- -d guest_errors    # anything after -- goes to QEMU
 #
 # This drives the Windows build of QEMU from WSL. The Linux build aborts on WSL1
@@ -40,6 +44,15 @@ MONITOR_PORT=55555
 # settings, profiles and shot history reset on every run. Keeping the image is
 # how you test anything that has to survive a reboot.
 KEEP_IMAGE=0
+# Putting the console on a socket instead of this terminal lets one process own
+# both directions of it, which is what mouse-as-touch injection needs: QEMU has
+# no input device for the ESP32-S3, so touch records ride in on the console UART
+# (scripts/qemu-touch.py, src/display/drivers/Qemu/QemuTouch.cpp).
+CONSOLE_PORT=0
+# QEMU discards console output written before a client attaches, which loses the
+# whole bootloader and early-init log. wait=on holds the machine at reset until
+# the bridge connects.
+CONSOLE_WAIT=0
 GDB=0
 HALT=0
 LOG=
@@ -79,6 +92,14 @@ while [[ $# -gt 0 ]]; do
         ;;
     --keep-image) # reuse the previous image, warts and stored state included
         KEEP_IMAGE=1
+        shift
+        ;;
+    --console-port) # 0 keeps the console on this terminal
+        CONSOLE_PORT="$2"
+        shift 2
+        ;;
+    --console-wait) # only meaningful with --console-port
+        CONSOLE_WAIT=1
         shift
         ;;
     --monitor-port) # 0 disables the monitor entirely
@@ -167,14 +188,25 @@ if ((MONITOR_PORT)); then
     args+=(-monitor "tcp:127.0.0.1:$MONITOR_PORT,server=on,wait=off")
 fi
 
+if ((CONSOLE_PORT)); then
+    # server=on so the bridge can come and go without restarting the emulator.
+    # wait=off boots immediately at the cost of the early log; see --console-wait.
+    if ((CONSOLE_WAIT)); then
+        serial=(-serial "tcp:127.0.0.1:$CONSOLE_PORT,server=on,wait=on")
+    else
+        serial=(-serial "tcp:127.0.0.1:$CONSOLE_PORT,server=on,wait=off")
+    fi
+else
+    serial=(-serial stdio)
+fi
+
 if [[ "$DISPLAY_MODE" == none ]]; then
     # -nographic would also steal the monitor onto stdio; keep it on TCP and
     # only multiplex the serial port here.
-    args+=(-display none -serial stdio)
+    args+=(-display none "${serial[@]}")
 else
     # esp_rgb, the synthetic framebuffer at 0x20000000, renders into this window.
-    # Serial goes to stdout so the boot log is still readable next to it.
-    args+=(-display sdl -serial stdio)
+    args+=(-display sdl "${serial[@]}")
 fi
 ((GDB)) && args+=(-s)
 ((HALT)) && args+=(-S)
@@ -183,6 +215,12 @@ args+=("${QEMU_EXTRA[@]+"${QEMU_EXTRA[@]}"}")
 echo "==> $QEMU_BIN ${args[*]}"
 if ((MONITOR_PORT)); then
     echo "    monitor: scripts/qemu-screenshot.sh out.png"
+fi
+if ((CONSOLE_PORT)); then
+    echo "    console: scripts/qemu-touch.py --port $CONSOLE_PORT"
+    if ((CONSOLE_WAIT)); then
+        echo "    (held at reset until that connects)"
+    fi
 fi
 if ((GDB)); then
     echo "    gdb: xtensa-esp32s3-elf-gdb.exe -ex 'target remote :1234' $(wslpath -w "$BUILD_DIR/firmware.elf")"

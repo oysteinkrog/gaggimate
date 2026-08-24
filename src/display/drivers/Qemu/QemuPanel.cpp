@@ -2,6 +2,8 @@
 
 #include "QemuPanel.h"
 
+#include "QemuTouch.h"
+
 #include <esp_log.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
@@ -54,6 +56,8 @@ bool QemuPanel::begin() {
         ESP_LOGE(LOG_TAG, "Failed to start scan-out task");
         return false;
     }
+
+    qemutouch::begin();
 
     started = true;
     return true;
@@ -119,12 +123,12 @@ void QemuPanel::scanoutTask(void *arg) {
 }
 
 uint8_t QemuPanel::getPoint(int16_t *x, int16_t *y, uint8_t get_point) {
-    (void)x;
-    (void)y;
-    (void)get_point;
-    // No touch controller is emulated. Injecting synthetic touches needs a host
-    // side channel, which is a separate piece of work.
-    return 0;
+    if (get_point == 0) {
+        return 0;
+    }
+    // Single point only: the host bridge is a mouse, and nothing in the UI uses
+    // a second finger.
+    return qemutouch::read(x, y) ? 1 : 0;
 }
 
 #endif // GAGGIMATE_QEMU
