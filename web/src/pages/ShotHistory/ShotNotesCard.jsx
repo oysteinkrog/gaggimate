@@ -125,11 +125,17 @@ export default function ShotNotesCard({ shot, onNotesUpdate, onNotesLoaded }) {
   const saveNotes = async () => {
     setLoading(true);
     try {
-      await apiService.request({
+      // request() resolves even when the device could not write the file, so
+      // without this the editor closes and the card shows the new notes as
+      // saved while the stored ones are unchanged.
+      const response = await apiService.request({
         tp: 'req:history:notes:save',
         id: shot.id,
         notes: notes,
       });
+      if (response?.error) {
+        throw new Error(response.error);
+      }
       setIsEditing(false);
       if (onNotesUpdate) {
         onNotesUpdate(notes);

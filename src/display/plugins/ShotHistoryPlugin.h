@@ -39,12 +39,16 @@ class ShotHistoryPlugin : public Plugin {
   private:
     // Index helper functions
     bool readIndexHeader(File &indexFile, ShotIndexHeader &header);
+    // Writes the header at offset 0. False on a short write, which leaves the
+    // on-disk entryCount disagreeing with the entries that follow it.
+    bool writeIndexHeader(File &indexFile, const ShotIndexHeader &header);
     int findEntryPosition(File &indexFile, const ShotIndexHeader &header, uint32_t shotId);
     bool readEntryAtPosition(File &indexFile, size_t position, ShotIndexEntry &entry);
     bool writeEntryAtPosition(File &indexFile, size_t position, const ShotIndexEntry &entry);
     bool createEarlyIndexEntry();
 
-    void saveNotes(const String &id, const JsonDocument &notes);
+    // False when the notes did not reach flash; the previous notes are left intact.
+    bool saveNotes(const String &id, const JsonDocument &notes);
     void loadNotes(const String &id, JsonDocument &notes);
     void startRecording();
 
@@ -73,7 +77,12 @@ class ShotHistoryPlugin : public Plugin {
 
     bool recording = false;
     bool extendedRecording = false;
-    bool indexEntryCreated = false;     // Track if early index entry was created
+    bool indexEntryCreated = false; // Track if early index entry was created
+    // Set when any write to the current .slog came up short (a full filesystem
+    // is the realistic cause). The header records sampleCount independently of
+    // what actually landed, so a truncated log would otherwise be published as
+    // a complete shot and read past its own end.
+    bool logWriteFailed = false;
     bool shotStartedVolumetric = false; // Track initial volumetric mode
     double currentBrewDelay = 0.0;      // Brew delay (ms) the active shot was started with
     unsigned long shotStart = 0;
