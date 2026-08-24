@@ -105,6 +105,37 @@ jobs:
       - name: Build display-headless-8m
         run: pio run -e display-headless-8m
 
+  simulator:
+    name: Build simulator
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v3
+        with:
+          submodules: 'recursive'
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/pip
+            ~/.platformio/.cache
+          key: ${{ runner.os }}-pio-native
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install PlatformIO Core
+        run: pip install --upgrade platformio
+      - name: Install SDL2
+        run: sudo apt-get update && sudo apt-get install -y libsdl2-dev
+      # display-sim compiles the real display sources against the host shims in
+      # sim/, so it is the only target that catches a missing include or a use
+      # of something the shims do not provide. Nothing ever built it in CI and
+      # it had rotted through: seven separate breakages, from a header the host
+      # cannot compile at all to production calls added since the shims were
+      # last touched. It only links, it is never run -- there is no display on
+      # the runner, and the value here is the compile, not the window.
+      - name: Build display-sim
+        run: pio run -e display-sim
+
   format:
     name: Formatting
     runs-on: ubuntu-latest

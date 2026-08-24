@@ -3,4 +3,6 @@
 
 #include <stdint.h>
 
-int64_t esp_timer_get_time(void); // microseconds since start (impl in arduino_shim.cpp)
+// arduino_shim.cpp defines this inside its extern "C" block, matching the real
+// esp_timer.h, so the declaration has to carry C linkage too.
+extern "C" int64_t esp_timer_get_time(void); // microseconds since start

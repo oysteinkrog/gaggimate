@@ -11,3 +11,13 @@ static inline void sntp_setservername(int idx, const char *server) {
     (void)idx;
     (void)server;
 }
+
+// IDF 5 renamed the lwIP-era entry points with an esp_ prefix and Controller.cpp
+// calls the new names. The old ones stay because other shim consumers use them.
+static inline void esp_sntp_init(void) {}
+static inline void esp_sntp_stop(void) {}
+static inline void esp_sntp_setoperatingmode(int mode) { (void)mode; }
+static inline void esp_sntp_setservername(int idx, const char *server) {
+    (void)idx;
+    (void)server;
+}

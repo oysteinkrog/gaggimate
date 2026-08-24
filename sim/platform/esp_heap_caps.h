@@ -39,3 +39,9 @@ static inline size_t heap_caps_get_largest_free_block(uint32_t caps) {
     (void)caps;
     return 2u * 1024u * 1024u;
 }
+// Low-water mark since boot. Nothing tracks it on the host, so report the same
+// fixed figure as the current free size: "never dipped".
+static inline size_t heap_caps_get_minimum_free_size(uint32_t caps) {
+    (void)caps;
+    return 4u * 1024u * 1024u;
+}
