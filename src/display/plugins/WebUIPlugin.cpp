@@ -754,6 +754,14 @@ void WebUIPlugin::setupServer() {
                 a->benchRequestReset();
             }
         }
+        // ?pattern=0|1 -- deterministic framebuffer contents, see benchSetPattern.
+        if (request->hasArg("pattern")) {
+            SleepAnimation *a = sleep_animation_bench_instance();
+            if (a != nullptr) {
+                a->benchSetPattern(request->arg("pattern").toInt() != 0);
+                a->benchRequestReset();
+            }
+        }
         // ?probe=0..3 -- blend-stage decomposition, see benchSetBlendProbe.
         if (request->hasArg("probe")) {
             SleepAnimation *a = sleep_animation_bench_instance();
