@@ -1766,8 +1766,50 @@ void SleepAnimation::renderFrame() {
         //        partly blend, and a test whose contrast has been washed out
         //        reports no tear because it can no longer see one. Mode 2
         //        holds the edge still so the same measurement has to find it.
+        //   4 -- a static fiducial for horizontal scanout displacement, which
+        //        modes 1-3 cannot see at all: they fill whole rows with one
+        //        colour, so every pixel in a row is identical and shifting the
+        //        row sideways changes nothing a camera could record. The RGB
+        //        peripheral clocks HSYNC and VSYNC off its own counters
+        //        regardless of whether the DMA kept up, so a PSRAM underrun
+        //        desynchronises the pixel stream against the sync signals and
+        //        the picture shifts horizontally without the framebuffer ever
+        //        being wrong. /api/fbdump is therefore blind to it by
+        //        construction and only the panel's own output can show it.
+        //
+        //        Three vertical bars at deliberately unequal spacing, plus one
+        //        horizontal bar. Unequal spacing is the point: a periodic
+        //        grating shifted by a whole period is indistinguishable from
+        //        one not shifted at all, so a regular pattern can report clean
+        //        while displaced. The scene is static, which removes the other
+        //        confound -- with nothing moving, any displacement a photograph
+        //        records belongs to the panel and not to the animation.
+        //
+        //        Reading the result: a bar that is ragged or stepped means the
+        //        displacement varies line to line, while several clean copies
+        //        of the same bar mean the scanout phase was stable within a
+        //        frame but moved between frames during the exposure. The
+        //        horizontal bar catches the vertical component, since a shift
+        //        large enough to wrap carries pixels onto the next line.
         const int flashMode = flashOn.load();
-        if (flashMode != 0) {
+        if (flashMode == 4) {
+            // Dark grey rather than black: the camera's auto-exposure hunts on
+            // a near-black field and returns unusable frames (measured at
+            // roughly one in seven), and a bar blooming out of pure black is
+            // harder to locate than one on a ground the sensor can meter.
+            const int bw = w >= 400 ? 6 : 4;
+            const int bx0 = w / 8, bx1 = (w * 2) / 5, bx2 = (w * 5) / 6;
+            const int by = h / 4, bh = bw;
+            for (int r = 0; r < rows; r++) {
+                const int py = y0 + r;
+                uint16_t *const prow = band + static_cast<size_t>(r) * w;
+                const bool hbar = py >= by && py < by + bh;
+                for (int x = 0; x < w; x++) {
+                    const bool vbar = (x >= bx0 && x < bx0 + bw) || (x >= bx1 && x < bx1 + bw) || (x >= bx2 && x < bx2 + bw);
+                    prow[x] = (hbar || vbar) ? 0xFFFF : 0x2124;
+                }
+            }
+        } else if (flashMode != 0) {
             const uint32_t phase = flashMode == 3 ? (frameParity >> 5) : frameParity;
             const uint16_t alt = (phase & 1u) != 0 ? 0xF800 : 0x001F;
             for (int r = 0; r < rows; r++) {
