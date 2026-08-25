@@ -43,11 +43,6 @@ static bool s_fbActive = false;  // ...and LVGL holds them right now
 static lv_color_t *s_scratch = nullptr;
 static uint32_t s_scratchPx = 0;
 
-// Rows dirtied through the cache across the current frame's flushes, merged so
-// presentFrameBuffer can be told the truth once instead of per area.
-static lv_coord_t s_flushY0 = LV_COORD_MAX;
-static lv_coord_t s_flushY1 = 0;
-
 static volatile bool s_suppressFlush = false;
 
 // Accumulated invalid region while suppressed. x1 > x2 encodes "empty".
@@ -92,8 +87,6 @@ void lvgl_helper_suppress_flush(bool suppress) {
         lv_disp_draw_buf_init(&draw_buf, s_fb[0], s_fb[1], static_cast<uint32_t>(disp_drv.hor_res) * disp_drv.ver_res);
         disp_drv.direct_mode = 1;
     }
-    s_flushY0 = LV_COORD_MAX;
-    s_flushY1 = 0;
     // Resets inv_areas and invalidates the active screen, which is exactly what
     // taking the framebuffers back needs: both of them hold plasma, and the
     // full repaint this schedules is what LVGL then feeds to refr_sync_areas so
@@ -135,26 +128,21 @@ static void disp_flush(lv_disp_drv_t *disp_drv, const lv_area_t *area, lv_color_
     }
     if (s_fbActive) {
         // Nothing to push: LVGL rendered into the framebuffer itself. What is
-        // left is to make it the one the panel scans, and that is worth doing
-        // once per frame rather than once per area, so the flip waits for the
-        // last part. Until then the panel keeps showing the other buffer, which
-        // is a whole and finished picture.
-        if (area->y1 < s_flushY0) {
-            s_flushY0 = area->y1;
-        }
-        if (area->y2 + 1 > s_flushY1) {
-            s_flushY1 = area->y2 + 1;
-        }
+        // left is to make it the one the panel scans, and only once the frame
+        // is finished. LVGL calls this once per unjoined invalid area, and the
+        // buffer is not whole until the last of them; flipping early would put
+        // a half-drawn frame on the panel. Until the flip the panel keeps
+        // showing the other buffer, which is a finished picture.
         if (lv_disp_flush_is_last(disp_drv)) {
             const int index = (color_p == s_fb[1]) ? 1 : 0;
-            // The dirty range is the rows LVGL wrote through the cache, which
-            // is what esp_lcd would have to write back. In bounce-buffer mode
-            // it writes nothing back at all -- the refill memcpy reads the
-            // framebuffer through the same cache -- but the range is still the
-            // honest answer for a panel configured without bounce buffers.
-            static_cast<Display *>(disp_drv->user_data)->presentFrameBuffer(index, s_flushY0, s_flushY1);
-            s_flushY0 = LV_COORD_MAX;
-            s_flushY1 = 0;
+            // Whole screen, not `area`. In direct mode LVGL sets buf_area to
+            // the full display before every flush and narrows only clip_area,
+            // so `area` says nothing about what was redrawn and cannot be used
+            // to bound a writeback. Which costs nothing here: the range only
+            // feeds esp_lcd's cache writeback, and in bounce-buffer mode it
+            // does not write back at all, because the refill memcpy reads the
+            // framebuffer through the same cache the CPU just wrote it with.
+            static_cast<Display *>(disp_drv->user_data)->presentFrameBuffer(index, 0, disp_drv->ver_res);
         }
         lv_disp_flush_ready(disp_drv);
         return;

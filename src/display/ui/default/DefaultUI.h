@@ -72,6 +72,13 @@ class DefaultUI {
 
     void startSleepAnimation();
     void stopSleepAnimation();
+    // Move the animation's host screen without interrupting it. The only
+    // per-screen state the animation holds is the host's transparent
+    // background: the plate table and the status icons it also rewrites are
+    // fixed global objects that span every screen, so a screen change costs
+    // one style property, not a restart.
+    void adoptAnimHost(lv_obj_t *host);
+    void releaseAnimHost();
     void maintainSleepAnimation();
     void refreshSleepOverlay();
     // Hide, restore or repaint the opaque background plates the generated
