@@ -554,6 +554,23 @@ void WebUIPlugin::setupServer() {
         request->send(response);
     });
 
+    // Exhaustive check of the PIE scrim kernel against the scalar one, on the
+    // device, over the whole 65,536 x 33 input space. ~135 ms, blocking.
+    server.on("/api/pietest", HTTP_GET, [this](AsyncWebServerRequest *request) {
+        SleepAnimation *a = sleep_animation_bench_instance();
+        if (a == nullptr) {
+            request->send(503, "text/plain", "no animation instance");
+            return;
+        }
+        uint32_t firstBad = 0;
+        const uint32_t bad = a->benchPieSelfTest(&firstBad);
+        char out[192];
+        snprintf(out, sizeof(out),
+                 "{\"pairs\":%u,\"mismatches\":%u,\"first_colour\":%u,\"first_factor\":%u,\"result\":\"%s\"}",
+                 33u * 65536u, bad, firstBad & 0xFFFFu, firstBad >> 16, bad == 0 ? "PASS" : "FAIL");
+        request->send(200, "application/json", out);
+    });
+
     server.on("/api/membench", [this](AsyncWebServerRequest *request) {
         AsyncResponseStream *response = request->beginResponseStream("application/json");
         JsonDocument doc;
@@ -754,6 +771,14 @@ void WebUIPlugin::setupServer() {
                 a->benchRequestReset();
             }
         }
+        // ?pie=0|1 -- vector or scalar scrim, see benchSetPie.
+        if (request->hasArg("pie")) {
+            SleepAnimation *a = sleep_animation_bench_instance();
+            if (a != nullptr) {
+                a->benchSetPie(request->arg("pie").toInt() != 0);
+                a->benchRequestReset();
+            }
+        }
         // ?pattern=0|1 -- deterministic framebuffer contents, see benchSetPattern.
         if (request->hasArg("pattern")) {
             SleepAnimation *a = sleep_animation_bench_instance();
@@ -836,6 +861,7 @@ void WebUIPlugin::setupServer() {
         gate["dma_wanted"] = anim0 != nullptr && anim0->benchDmaWanted();
         gate["dma_active"] = anim0 != nullptr && anim0->benchDmaActive();
         gate["direct_push"] = anim0 != nullptr && anim0->benchDirectPush();
+        gate["pie_scrim"] = anim0 != nullptr && anim0->benchPie();
         // 2 means the frame is composed off-screen and flipped at a frame
         // boundary, which is what makes the picture tear-free; 1 means the
         // writes race the scan-out.
