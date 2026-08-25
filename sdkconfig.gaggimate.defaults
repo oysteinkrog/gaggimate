@@ -22,7 +22,19 @@
 CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
 CONFIG_ESPTOOLPY_FLASHSIZE="16MB"
 
-# --- PSRAM (octal 80MHz) — display-class boards only ---
+# --- PSRAM (octal 80MHz) - display-class boards only ---
+#
+# 80 MHz and not 120 MHz, deliberately. Octal PSRAM at 120 MHz would raise the
+# documented pixel-clock ceiling for a PSRAM framebuffer from roughly 22 MHz to
+# roughly 30 MHz, which would put 20 MHz and a 76 Hz refresh within reach. IDF
+# gates it behind IDF_EXPERIMENTAL_FEATURES and states the failure mode: once
+# the chip has powered on at some temperature, a swing of about 20 degrees C in
+# either direction makes accesses to PSRAM crash randomly.
+# SPIRAM_TIMING_TUNING_POINT_VIA_TEMPERATURE_SENSOR exists to re-tune from the
+# on-chip sensor and would mitigate it, but this firmware runs an espresso
+# machine with a boiler in the same enclosure, so a 20 degree swing is the
+# normal duty cycle rather than an edge case, and the failure is a random crash
+# rather than a visual glitch. 61 Hz with no artifacts is the better trade.
 CONFIG_SPIRAM=y
 CONFIG_SPIRAM_MODE_OCT=y
 CONFIG_SPIRAM_SPEED_80M=y
