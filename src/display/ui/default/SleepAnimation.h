@@ -156,8 +156,8 @@ class SleepAnimation {
         uint32_t maxTotalUs = 0;
         uint32_t waitUs = 0; // render task blocked waiting for the push task to free a slot
         uint32_t packUs = 0; // compacting each band to the round panel's visible chord
-        uint32_t spanPx = 0;  // overlay pixels read per frame (span-limited)
-        uint32_t blendPx = 0; // of those, how many were not fully transparent
+        uint32_t spanPx = 0;  // overlay pixels the composite walked, per frame
+        uint32_t scrimPx = 0; // panel pixels the scrim pass dimmed, per frame
         uint32_t achievedFps = 0; // x100, so 2997 == 29.97 fps
         // Nanoseconds per band row, measured with and without the scheduler
         // suspended on this core. Equal means the band cost is real compute;
@@ -182,6 +182,13 @@ class SleepAnimation {
     // change to one inner loop can be measured in one dwell instead of a full
     // 13-animation pass.
     void benchSetOnly(int id) { benchOnly.store(id); }
+    // Blend-stage decomposition, by removing work from the composite:
+    //   1 -- scrim pass and the run walk only, no glyph pixels touched
+    //   2 -- plus the coverage load, so the PSRAM read shows on its own
+    //   3 -- plus the band read-modify-write, so the SRAM traffic does too
+    // Which separates the cost of deciding what to touch from the cost of
+    // touching it, and that from what waits on memory.
+    void benchSetBlendProbe(int level) { blendProbe.store(level); }
     int benchGetOnly() const { return benchOnly.load(); }
     // The sweep normally runs uncapped, because a throttled frame reports the
     // cap instead of the cost. This puts the cap back deliberately, for
@@ -236,18 +243,30 @@ class SleepAnimation {
 #endif
 
   private:
+  public:
     struct Overlay {
         uint8_t *buf = nullptr;
         int w = 0;
         int h = 0;
-        // Per PANEL row: first/last column with alpha > 0, or min = -1 for an
-        // empty row. Lets the blend skip the ~85% of rows/pixels that are
-        // plain plasma.
-        int16_t *spanMin = nullptr;
-        int16_t *spanMax = nullptr;
-        // Bit b set => pixels [b*32, b*32+32) in this row contain some alpha.
-        // 32 blocks covers a 1024-wide row, well past this panel.
-        uint32_t *rowBlocks = nullptr;
+        // What each pass has to touch, as exact per-row runs of consecutive
+        // pixels rather than a bounding span or a block mask.
+        //
+        // The block mask this replaces marked 8-pixel groups, and the widgets
+        // are scattered: of the 14,200 pixels a frame it sent the composite
+        // through, only 5,300 had any coverage at all. The rest paid a load and
+        // a test to learn they were transparent. Runs come out of the same scan
+        // for nothing -- the scan already walks every pixel and already knows
+        // where coverage starts and stops -- and they made the separate alpha
+        // plane pointless too, since with no wasted pixels the coverage byte is
+        // cheapest read from the snapshot alongside the colour it belongs to.
+        //
+        // Packed [x0 | x1 << 16), half-open, ascending, non-overlapping, so the
+        // walk is one aligned load per run. RUNS_PER_ROW bounds each list; see
+        // emitRun in the .cpp for what happens at the bound.
+        // Glyph runs, per PANEL row. runN[y] == 0 means the row is plain
+        // animation and the composite skips it entirely.
+        uint32_t *runs = nullptr;
+        uint8_t *runN = nullptr;
 
         // Text scrim, at 1/4 resolution (SCRIM_SHIFT): scrimSrc holds each
         // cell's peak widget alpha, scrim the dilated and smoothed halo the
@@ -263,17 +282,14 @@ class SleepAnimation {
         uint8_t *scrim = nullptr;
         int scrimW = 0;
         int scrimH = 0;
-        // Span/block tables widened to cover the halo, which reaches past the
-        // glyph bounding span and can put alpha in rows that hold no glyph at
-        // all. Kept separate from spanMin/spanMax/rowBlocks rather than folded
-        // into them: those are recomputed only for the rows LVGL redrew, so
-        // widening them in place would ratchet -- a row's span would keep every
-        // halo it ever had until that row happened to be redrawn. These are
-        // rebuilt whole-panel from the glyph tables each publish, which is
-        // cheap because it never touches the alpha plane.
-        int16_t *blendMin = nullptr;
-        int16_t *blendMax = nullptr;
-        uint32_t *blendBlocks = nullptr;
+        // Halo runs, in scrim CELLS and per CELL row -- a quarter as many rows
+        // and a quarter as many columns as the glyph runs, because that is the
+        // resolution the field itself has. Read straight off the blurred grid
+        // after it is built, so they cover exactly the cells that dim anything;
+        // deriving them from the glyph runs instead would mean guessing how far
+        // the dilate reached.
+        uint32_t *haloRuns = nullptr;
+        uint8_t *haloN = nullptr;
     };
 
     static void taskEntry(void *arg);
@@ -454,6 +470,7 @@ class SleepAnimation {
     // Scrim strength in Q8 (0 = off, 256 = black). Read once per band by the
     // composite, so a plain relaxed load is all it needs.
     std::atomic<int> scrimQ8{55 * 256 / 100};
+    std::atomic<int> blendProbe{0};
     // Scratch grid for the separable dilate/blur passes, one shared copy: the
     // passes run to completion inside publishOverlay on the UI task, so the two
     // overlays never need it at the same time.
@@ -473,7 +490,9 @@ class SleepAnimation {
     uint64_t accWaitUs = 0;
     uint64_t accPackUs = 0;
     uint64_t accSpanPx = 0;
-    uint64_t accBlendPx = 0;
+    uint64_t accScrimPx = 0;
+    // Keeps the probe kernels' loads from being optimised away. Never read.
+    volatile uint64_t benchProbeSink = 0;
     uint32_t accFrames = 0;
     uint32_t accMaxTotalUs = 0;
     uint32_t benchLockBand = 0; // which band gets the suspended render, rotates per frame

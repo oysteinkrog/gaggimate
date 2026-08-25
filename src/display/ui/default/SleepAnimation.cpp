@@ -52,15 +52,30 @@ constexpr int BAND_H = 8;
 // Headroom for the snapshot's ext draw size (shadows etc. extend the render
 // area past the object on every side).
 constexpr int OVERLAY_EXT_MARGIN = 16;
-// Granularity of the overlay occupancy bitmap: 1 << 5 = 32 pixels per bit.
-constexpr int OVERLAY_BLOCK_SHIFT = 5;
+// How many runs a single row's list can hold before emitRun starts merging.
+// 24 is well past what the standby widgets produce; a row through the clock and
+// both icons emits about eight.
+constexpr int RUNS_PER_ROW = 24;
+// Runs closer together than this are emitted as one. A run record costs a load,
+// two extracts and a loop setup, which is more than the handful of transparent
+// pixels the blend will skip, and antialiased text puts one- and two-pixel gaps
+// everywhere.
+constexpr int RUN_GAP_MERGE = 4;
+// The same idea for the halo runs, but in cells, so a merged gap is four times
+// as wide in pixels. One cell, because a merged gap here is not a few skipped
+// pixels: every cell in it gets read, scaled and written back.
+constexpr int HALO_GAP_MERGE_CELLS = 1;
+// The scrim factor is stored as 32nds of full brightness, so 32 means "leave
+// this cell alone". Two smoothing passes leave a wide skirt of cells whose dim
+// rounds away to nothing, and those are dropped from the runs entirely.
+constexpr int SCRIM_INV_NONE = 32;
+
 // Scrim grid resolution: 1 << 2 = one cell per 4x4 panel pixels.
 constexpr int SCRIM_SHIFT = 2;
 // How far the halo reaches past the outermost widget pixel, in cells: two
 // 3-wide max passes carry coverage two cells out, and the 3-tap smoothing pass
 // carries a fraction of it one further. 3 cells is 12 pixels.
 constexpr int SCRIM_REACH_CELLS = 3;
-
 // One separable 3-tap pass over a byte grid, either a max (dilate) or a
 // 1-2-1 average (smooth), with the edges clamped rather than wrapped.
 //
@@ -131,6 +146,169 @@ __attribute__((always_inline)) inline uint16_t blend565(uint16_t fg, uint16_t bg
     const uint32_t b = (((fg & 0x001Fu) * a) + ((bg & 0x001Fu) * inv)) >> 8;
     return static_cast<uint16_t>((r & 0xF800u) | (g & 0x07E0u) | (b & 0x001Fu));
 }
+
+// Scale an RGB565 toward black. inv is 0..32, i.e. 32 keeps the pixel and 0
+// blacks it out.
+//
+// Two multiplies rather than blend565's six, because red and blue share one
+// lane. That packing is what the comment above blend565 warns is broken -- and
+// it is, for an 8-bit alpha. With five bits it is exact: blue's product tops
+// out at 31 * 32 = 992, ten bits, while red's starts at bit 11, so the two
+// never touch. The scrim is a blurred halo, so the step from 256 levels to 32
+// is not visible in it; the antialiasing on the glyph edges, where it would be,
+// still goes through blend565.
+__attribute__((always_inline)) inline uint16_t scale565(uint16_t c, uint32_t inv) {
+    // The two products are left where the multiply puts them and the masks do
+    // the shifting, so one shift serves both lanes instead of one each.
+    // (c & 0xF81F) * inv leaves blue in bits 0..9 and red in bits 11..20 -- inv
+    // is five bits, so they cannot reach each other -- and 0x1F03E0 picks the
+    // top five of each. Green, five bits further up, comes out under 0xFC00.
+    const uint32_t rb = (c & 0xF81Fu) * inv;
+    const uint32_t g = (c & 0x07E0u) * inv;
+    return static_cast<uint16_t>(((rb & 0x1F03E0u) | (g & 0xFC00u)) >> 5);
+}
+
+// Two neighbouring pixels at once. The band is 4-byte aligned and a scrim cell
+// starts on an even pixel, so the pair is one aligned load and one aligned
+// store where four half-word accesses stood before.
+__attribute__((always_inline)) inline uint32_t scale565x2(uint32_t w, uint32_t inv) {
+    return scale565(static_cast<uint16_t>(w), inv) | (static_cast<uint32_t>(scale565(w >> 16, inv)) << 16);
+}
+
+// Append [x0, x1) to a row's run list, merging rather than growing it where
+// merging is the cheaper answer.
+//
+// Two merges, for two different reasons. A gap narrower than gapMerge is
+// swallowed because a run record costs a load, two extracts and a loop setup,
+// which is more than the few skipped pixels; antialiased text is full of one-
+// and two-pixel gaps. A full list is merged
+// into its last entry because the alternative is dropping coverage, and
+// swallowing the gap is only slower, never wrong -- the kernels test each
+// pixel's own coverage byte.
+static inline int emitRun(uint32_t *runs, int n, int x0, int x1, int gapMerge) {
+    if (n > 0) {
+        const uint32_t last = runs[n - 1];
+        const int lastEnd = static_cast<int>(last >> 16);
+        if (x0 - lastEnd <= gapMerge || n >= RUNS_PER_ROW) {
+            runs[n - 1] = (last & 0xFFFFu) | (static_cast<uint32_t>(x1) << 16);
+            return n;
+        }
+    }
+    runs[n] = static_cast<uint32_t>(x0) | (static_cast<uint32_t>(x1) << 16);
+    return n + 1;
+}
+
+// Composite one row of overlay pixels over the band.
+//
+// Standalone rather than inlined into renderFrame, and that is load-bearing.
+// Inlined, the loop ran out of registers: the disassembly reloaded the span
+// end, the alpha pointer and the scrim row from the stack on every single
+// pixel and closed with a taken branch instead of Xtensa's zero-overhead loop,
+// which is how a body of five instructions came to cost sixty cycles.
+//
+// A row at a time rather than a run, for the opposite reason. Entered once per
+// run it was called ~3,100 times a frame, and on the windowed ABI each of those
+// entry/retw pairs can trip a register-window overflow, which is a real
+// exception. Taking the whole row's run list instead costs one call per row
+// with content, about 150 a frame.
+//
+// Colour and coverage both come from the snapshot, four bytes apart in the
+// same cache line, because the runs are exact: every pixel this walks is one
+// the caller already knows has coverage, so there is nothing to be gained by
+// reading the coverage from somewhere denser first.
+__attribute__((noinline)) static void blendRow(uint16_t *__restrict dst, const uint8_t *__restrict colour,
+                                               const uint32_t *__restrict runs, int nRuns) {
+    for (int i = 0; i < nRuns; i++) {
+        const uint32_t r = runs[i];
+        int x = static_cast<int>(r & 0xFFFFu);
+        const int xEnd = static_cast<int>(r >> 16);
+        const uint8_t *px = colour + static_cast<size_t>(x) * 3;
+        for (; x < xEnd; x++, px += 3) {
+            // LV_IMG_CF_TRUE_COLOR_ALPHA @16bpp, LV_COLOR_16_SWAP=0:
+            // little-endian RGB565 followed by a coverage byte.
+            const uint32_t a = px[2];
+            if (a == 0) {
+                continue; // only the few pixels a gap merge swallowed
+            }
+            const uint16_t c = static_cast<uint16_t>(px[0] | (px[1] << 8));
+            // Opaque is most of a glyph's interior and needs no arithmetic at
+            // all; only the antialiased rim reaches blend565.
+            dst[x] = a == 255 ? c : blend565(c, dst[x], static_cast<uint8_t>(a));
+        }
+    }
+}
+
+// Dim the band toward black wherever the text scrim reaches, so the glyphs
+// about to go down on top of it stay legible over a bright animation.
+//
+// A pass of its own, ahead of the blend, and that is what makes it cheap. Done
+// inside the blend it had to load the coverage byte for every pixel in the
+// halo just to decide whether to also composite, and the halo is four times
+// the area of the glyphs: 19,000 of the 24,600 pixels the composite walked
+// paid a load whose answer was always zero. Split out, this pass reads nothing
+// but the 1/4-resolution grid -- 120 bytes a row -- and writes the band, which
+// is internal SRAM.
+//
+// Dimming a pixel the blend is about to overwrite is wasted, but only for the
+// ~3,000 fully opaque pixels a frame, and detecting them is what cost the load
+// in the first place.
+//
+// The dim is keyed on the cell rather than on a pixel's own coverage on
+// purpose: the pixels that decide legibility are the transparent ones between
+// strokes and inside glyph counters, which the blend never touches at all.
+__attribute__((noinline)) static void scrimRow(uint16_t *__restrict dst, const uint8_t *__restrict invRow,
+                                               const uint32_t *__restrict runs, int nRuns, int w) {
+    for (int i = 0; i < nRuns; i++) {
+        const uint32_t r = runs[i];
+        const int c0 = static_cast<int>(r & 0xFFFFu);
+        int c1 = static_cast<int>(r >> 16);
+        if ((c1 << SCRIM_SHIFT) > w) {
+            c1 = w >> SCRIM_SHIFT;
+        }
+        for (int c = c0; c < c1; c++) {
+            // Already the 1/32 factor, not the coverage it came from: the
+            // strength multiply, the clamp and the rounding are the same for
+            // every frame the overlay lives through, so buildScrim does them
+            // once per publish instead of 24,000 times per frame.
+            const uint32_t inv = invRow[c];
+            if (inv == SCRIM_INV_NONE) {
+                continue; // a cell a gap merge swallowed
+            }
+            // Spelled out rather than looped: at a four-iteration trip count
+            // the compiler kept the counter and the branch, which is two of
+            // every thirteen instructions the loop issued.
+            static_assert(SCRIM_SHIFT == 2, "the cell body below is four pixels wide");
+            uint32_t *const q = reinterpret_cast<uint32_t *>(dst + (c << SCRIM_SHIFT));
+            q[0] = scale565x2(q[0], inv);
+            q[1] = scale565x2(q[1], inv);
+        }
+    }
+}
+
+#ifdef GM_ANIM_BENCH
+// Bench only: the blend walk with its work removed, so the pixel loop can be
+// split into what it computes and what it waits on.
+//   2 -- read the coverage byte and nothing else (the PSRAM load on its own)
+//   3 -- coverage plus the band read-modify-write (adds the SRAM traffic)
+// Returns the accumulator so the loads cannot be optimised away.
+__attribute__((noinline)) static uint32_t blendRowProbe(uint16_t *__restrict dst, const uint8_t *__restrict colour,
+                                                        const uint32_t *__restrict runs, int nRuns, int level) {
+    uint32_t acc = 0;
+    for (int i = 0; i < nRuns; i++) {
+        const uint32_t r = runs[i];
+        int x = static_cast<int>(r & 0xFFFFu);
+        const int xEnd = static_cast<int>(r >> 16);
+        const uint8_t *px = colour + static_cast<size_t>(x) * 3;
+        for (; x < xEnd; x++, px += 3) {
+            acc += px[2];
+            if (level >= 3) {
+                dst[x] = scale565(dst[x], 24);
+            }
+        }
+    }
+    return acc;
+}
+#endif
 
 // Internal SRAM is deliberately scarce in this firmware (WiFi/BLE/TLS all
 // compete for it) — always fall back to PSRAM rather than failing.
@@ -239,20 +417,26 @@ void SleepAnimation::start(Display *d) {
             // tables prefer SRAM. Read a couple times per frame — well within
             // the PSRAM budget that the LVGL composite path blew.
             ov.buf = static_cast<uint8_t *>(ps_malloc(overlayCap));
-            // PSRAM, not SRAM: these are indexed once per row by the
-            // composite (spanMin[y], spanMax[y], rowBlocks[y]) -- roughly 1,440
-            // reads across a whole frame -- so they are nowhere near a
-            // per-pixel path, and 7,680 B of internal DRAM matters far more to
-            // the network stack than their latency does here.
-            ov.spanMin = static_cast<int16_t *>(ps_malloc(h * sizeof(int16_t)));
-            ov.spanMax = static_cast<int16_t *>(ps_malloc(h * sizeof(int16_t)));
-            ov.rowBlocks = static_cast<uint32_t *>(ps_malloc(h * sizeof(uint32_t)));
-            ov.blendMin = static_cast<int16_t *>(ps_malloc(h * sizeof(int16_t)));
-            ov.blendMax = static_cast<int16_t *>(ps_malloc(h * sizeof(int16_t)));
-            ov.blendBlocks = static_cast<uint32_t *>(ps_malloc(h * sizeof(uint32_t)));
+            // PSRAM, not SRAM: the run lists are read once per row by the
+            // composite, roughly 480 loads across a whole frame, so they are
+            // nowhere near a per-pixel path and 46 KB of internal DRAM matters
+            // far more to the network stack than their latency does here.
+            ov.runs = static_cast<uint32_t *>(ps_malloc(static_cast<size_t>(h) * RUNS_PER_ROW * 4));
+            ov.runN = static_cast<uint8_t *>(ps_malloc(h));
+            if (ov.runN != nullptr) {
+                // A publish only rewrites the rows LVGL redrew, so every other
+                // row has to start out meaning "nothing here".
+                memset(ov.runN, 0, h);
+            }
             ov.scrimW = (w + (1 << SCRIM_SHIFT) - 1) >> SCRIM_SHIFT;
             ov.scrimH = (h + (1 << SCRIM_SHIFT) - 1) >> SCRIM_SHIFT;
             const size_t cells = static_cast<size_t>(ov.scrimW) * ov.scrimH;
+            ov.haloRuns =
+                static_cast<uint32_t *>(ps_malloc(static_cast<size_t>(ov.scrimH) * RUNS_PER_ROW * 4));
+            ov.haloN = static_cast<uint8_t *>(ps_malloc(ov.scrimH));
+            if (ov.haloN != nullptr) {
+                memset(ov.haloN, 0, ov.scrimH);
+            }
             ov.scrimSrc = static_cast<uint8_t *>(ps_malloc(cells));
             ov.scrim = static_cast<uint8_t *>(ps_malloc(cells));
             // Zeroed because a publish only rewrites the cell rows LVGL
@@ -270,8 +454,7 @@ void SleepAnimation::start(Display *d) {
             // requirement: losing it costs legibility on bright themes and
             // nothing else, so it degrades on its own rather than joining
             // overlayOk and taking the animation down with it.
-            if (ov.scrimSrc == nullptr || ov.blendMin == nullptr || ov.blendMax == nullptr ||
-                ov.blendBlocks == nullptr) {
+            if (ov.scrimSrc == nullptr || ov.haloRuns == nullptr || ov.haloN == nullptr) {
                 free(ov.scrim);
                 ov.scrim = nullptr;
             }
@@ -289,8 +472,7 @@ void SleepAnimation::start(Display *d) {
     }
     bool overlayOk = true;
     for (auto &ov : overlays) {
-        overlayOk = overlayOk && ov.buf != nullptr && ov.spanMin != nullptr && ov.spanMax != nullptr &&
-                    ov.rowBlocks != nullptr;
+        overlayOk = overlayOk && ov.buf != nullptr && ov.runs != nullptr && ov.runN != nullptr;
     }
     bool pipelineOk = true;
     for (int i = 0; i < NUM_SLOTS; i++) {
@@ -835,7 +1017,7 @@ void SleepAnimation::publishOverlay(int w, int h, int rowY0, int rowY1) {
     }
     const int back = (overlayFront.load() + 1) & 1;
     Overlay &ov = overlays[back];
-    if (ov.buf == nullptr || ov.spanMin == nullptr || ov.spanMax == nullptr || ov.rowBlocks == nullptr) {
+    if (ov.buf == nullptr || ov.runs == nullptr || ov.runN == nullptr) {
         return;
     }
     ov.w = w;
@@ -872,20 +1054,18 @@ void SleepAnimation::publishOverlay(int w, int h, int rowY0, int rowY1) {
         memset(ov.scrimSrc + static_cast<size_t>(cellY0) * sw, 0, static_cast<size_t>(cellY1 - cellY0) * sw);
     }
     for (int y = rowY0; y < rowY1; y++) {
-        int16_t mn = -1;
-        int16_t mx = -1;
-        uint32_t blocks = 0;
+        uint32_t *const rowRuns = ov.runs + static_cast<size_t>(y) * RUNS_PER_ROW;
+        int nRuns = 0;
         const int sy = y + yoff;
         if (sy >= 0 && sy < h) {
             const uint8_t *a = ov.buf + (static_cast<size_t>(sy) * w + xoff) * 3 + 2;
             uint8_t *cell = doScrim ? ov.scrimSrc + static_cast<size_t>(y >> SCRIM_SHIFT) * sw : nullptr;
+            int runStart = -1;
             for (int x = 0; x < panelW; x++, a += 3) {
                 if (*a != 0) {
-                    if (mn < 0) {
-                        mn = static_cast<int16_t>(x);
+                    if (runStart < 0) {
+                        runStart = x;
                     }
-                    mx = static_cast<int16_t>(x);
-                    blocks |= 1u << (x >> OVERLAY_BLOCK_SHIFT);
                     if (cell != nullptr) {
                         // Peak, not average: the halo is meant to cover the gaps
                         // between strokes and inside glyph counters, and those
@@ -895,12 +1075,19 @@ void SleepAnimation::publishOverlay(int w, int h, int rowY0, int rowY1) {
                             c = *a;
                         }
                     }
+                    continue;
                 }
+                if (runStart < 0) {
+                    continue;
+                }
+                nRuns = emitRun(rowRuns, nRuns, runStart, x, RUN_GAP_MERGE);
+                runStart = -1;
+            }
+            if (runStart >= 0) {
+                nRuns = emitRun(rowRuns, nRuns, runStart, panelW, RUN_GAP_MERGE);
             }
         }
-        ov.spanMin[y] = mn;
-        ov.spanMax[y] = mx;
-        ov.rowBlocks[y] = blocks;
+        ov.runN[y] = static_cast<uint8_t>(nRuns);
     }
     if (doScrim) {
         buildScrim(ov, panelW, panelH);
@@ -930,50 +1117,45 @@ void SleepAnimation::buildScrim(Overlay &ov, int panelW, int panelH) {
     scrimTap3(ov.scrim, scrimTmp, sh, sw, sw, 1, false);
     scrimTap3(scrimTmp, ov.scrim, sw, sh, 1, sw, false);
 
-    // The widened tables. Derived from the glyph tables and the known reach
-    // rather than by scanning the halo: a row's halo comes from glyph pixels
-    // within SCRIM_REACH_CELLS rows of it, so the union of those rows' spans
-    // grown by the reach is guaranteed to contain it. Block bits grow by a whole
-    // 32-pixel block on each side, which is coarser than the reach needs but
-    // costs only a few extra transparent pixels in the composite.
-    const int reach = SCRIM_REACH_CELLS << SCRIM_SHIFT;
-    for (int y = 0; y < panelH; y++) {
-        int lo = y - reach;
-        int hi = y + reach;
-        if (lo < 0) {
-            lo = 0;
+    // The halo runs the composite walks, read straight off the grid that was
+    // just built. Whole-grid, like the passes above: the dilate spreads
+    // coverage three cells in every direction, so which cells are non-zero in
+    // one row depends on glyphs several rows away, and a partial rebuild would
+    // get the seam wrong wherever its margin was stale. It is 120x120.
+    const int q8 = scrimQ8.load();
+    for (int cy = 0; cy < ov.scrimH; cy++) {
+        uint8_t *const row = ov.scrim + static_cast<size_t>(cy) * sw;
+        for (int cx = 0; cx < sw; cx++) {
+            int dim = (row[cx] * q8) >> 8;
+            if (dim > 255) {
+                dim = 255;
+            }
+            // Round to the nearest 1/32 so a full-strength scrim still reaches 0.
+            row[cx] = static_cast<uint8_t>(SCRIM_INV_NONE - ((dim + 4) >> 3));
         }
-        if (hi > panelH - 1) {
-            hi = panelH - 1;
-        }
-        int mn = -1;
-        int mx = -1;
-        uint32_t blocks = 0;
-        for (int r = lo; r <= hi; r++) {
-            if (ov.spanMin[r] < 0) {
+        uint32_t *const runs = ov.haloRuns + static_cast<size_t>(cy) * RUNS_PER_ROW;
+        int n = 0;
+        int start = -1;
+        for (int cx = 0; cx < sw; cx++) {
+            if (row[cx] != SCRIM_INV_NONE) {
+                if (start < 0) {
+                    start = cx;
+                }
                 continue;
             }
-            int a = ov.spanMin[r] - reach;
-            int b = ov.spanMax[r] + reach;
-            if (a < 0) {
-                a = 0;
+            if (start < 0) {
+                continue;
             }
-            if (b > panelW - 1) {
-                b = panelW - 1;
-            }
-            if (mn < 0 || a < mn) {
-                mn = a;
-            }
-            if (b > mx) {
-                mx = b;
-            }
-            const uint32_t g = ov.rowBlocks[r];
-            blocks |= g | (g << 1) | (g >> 1);
+            n = emitRun(runs, n, start, cx, HALO_GAP_MERGE_CELLS);
+            start = -1;
         }
-        ov.blendMin[y] = static_cast<int16_t>(mn);
-        ov.blendMax[y] = static_cast<int16_t>(mx);
-        ov.blendBlocks[y] = blocks;
+        if (start >= 0) {
+            n = emitRun(runs, n, start, sw, HALO_GAP_MERGE_CELLS);
+        }
+        ov.haloN[cy] = static_cast<uint8_t>(n);
     }
+    (void)panelW;
+    (void)panelH;
 }
 
 void SleepAnimation::taskEntry(void *arg) {
@@ -1072,8 +1254,8 @@ void SleepAnimation::benchTick() {
             benchDone[i] = BenchResult{};
         }
         accBandUs = accBlendUs = accPushUs = accTotalUs = accWaitUs = accPackUs = 0;
-        accSpanPx = accBlendPx = 0;
-    accSpanPx = accBlendPx = 0;
+        accSpanPx = accScrimPx = 0;
+    accSpanPx = accScrimPx = 0;
         accFrames = 0;
         accMaxTotalUs = 0;
         accBandLockedUs = 0;
@@ -1111,7 +1293,7 @@ void SleepAnimation::benchFinishDwell() {
         r.waitUs = static_cast<uint32_t>(accWaitUs / accFrames);
         r.packUs = static_cast<uint32_t>(accPackUs / accFrames);
         r.spanPx = static_cast<uint32_t>(accSpanPx / accFrames);
-        r.blendPx = static_cast<uint32_t>(accBlendPx / accFrames);
+        r.scrimPx = static_cast<uint32_t>(accScrimPx / accFrames);
         r.achievedFps = elapsedMs > 0 ? static_cast<uint32_t>(accFrames * 100000ULL / elapsedMs) : 0;
         // Both normalised per row so the locked sample (one band per frame)
         // is directly comparable to the unlocked one (all 30 bands).
@@ -1127,7 +1309,7 @@ void SleepAnimation::benchFinishDwell() {
     }
 
     accBandUs = accBlendUs = accPushUs = accTotalUs = accWaitUs = accPackUs = 0;
-    accSpanPx = accBlendPx = 0;
+    accSpanPx = accScrimPx = 0;
     accFrames = 0;
     accMaxTotalUs = 0;
     accBandLockedUs = 0;
@@ -1405,108 +1587,69 @@ void SleepAnimation::renderFrame() {
         // stage look ~2x its real cost and sent an earlier round of work at a
         // memory-layout problem the blend did not have.
         uint32_t spanPxLocal = 0;
-        uint32_t blendPxLocal = 0;
+        uint32_t probeAcc = 0;
+        uint32_t scrimPxLocal = 0;
 #endif
         // Text scrim strength, Q8. Zero whenever the user has it off or the
-        // grids could not be allocated, and that zero is what makes the scrim
-        // free when unused -- the row loop then walks the narrow glyph spans and
-        // the inner loop's scrim branch is never taken.
+        // grids could not be allocated, and that zero is what makes it free
+        // when unused: pass one is skipped outright rather than run with a
+        // no-op factor.
         const int scrim = (ov != nullptr && ov->scrim != nullptr) ? scrimQ8.load() : 0;
-        // Which span tables drive the walk. The halo reaches 12 pixels past the
-        // glyphs and into rows that hold no glyph at all, so with the scrim on
-        // the widened tables have to be the ones iterated or the halo would be
-        // clipped at the glyph bounding span and at 32-pixel block edges.
-        const int16_t *rowMin = (ov == nullptr) ? nullptr : (scrim != 0 ? ov->blendMin : ov->spanMin);
-        const int16_t *rowMax = (ov == nullptr) ? nullptr : (scrim != 0 ? ov->blendMax : ov->spanMax);
-        const uint32_t *rowBlk = (ov == nullptr) ? nullptr : (scrim != 0 ? ov->blendBlocks : ov->rowBlocks);
+#ifdef GM_ANIM_BENCH
+        const int probe = blendProbe.load();
+#endif
         // Rows this frame will not push are thrown away, so compositing
         // widgets into them is wasted. Both rows of a pushed pair still need it.
-        for (int y = y0; y < y0 + rows; y++) {
+        for (int y = y0; y < y0 + rows && ov != nullptr; y++) {
             if (bandInterlaced && ((((pairMode ? (y >> 1) : y) ^ parityNow) & 1) != 0)) {
                 continue;
             }
-            if (ov != nullptr && rowMin[y] >= 0) {
-                // Composite the standby widgets over the plasma (span-limited:
-                // only pixels the snapshot actually covers).
-                const int spanLo = rowMin[y];
-                const int spanHi = rowMax[y];
-                // One row of the scrim grid, or nullptr when the scrim is off.
-                // Hoisted out of the inner loop: the row's cell index does not
-                // change across it, and the branch on this pointer is the whole
-                // per-pixel cost of the feature when it is disabled.
-                const uint8_t *scRow =
-                    scrim != 0 ? ov->scrim + static_cast<size_t>(y >> SCRIM_SHIFT) * ov->scrimW : nullptr;
-                // Only 37% of the pixels between spanMin and spanMax are
-                // actually non-transparent -- the widgets are scattered across
-                // the row, and the span is just their bounding extent. Reading
-                // the other 63% cost more than blending them: the overlay is
-                // three unaligned byte loads per pixel out of PSRAM, measured
-                // at 13.2 MB/s and ~59 cycles per span pixel. rowBlocks marks
-                // which 32-pixel blocks contain any alpha at all, built during
-                // the alpha scan that publishOverlay already runs, so the
-                // render task can skip empty stretches without touching them.
-                uint32_t blocks = rowBlk[y];
-                while (blocks != 0) {
-                    const int b = __builtin_ctz(blocks);
-                    blocks &= blocks - 1;
-                    int x0 = b << OVERLAY_BLOCK_SHIFT;
-                    int x1 = x0 + (1 << OVERLAY_BLOCK_SHIFT) - 1;
-                    if (x0 < spanLo) {
-                        x0 = spanLo;
-                    }
-                    if (x1 > spanHi) {
-                        x1 = spanHi;
-                    }
-                    if (x1 < x0) {
-                        continue;
-                    }
-                const uint8_t *px = ov->buf + (static_cast<size_t>(y + ovYoff) * ov->w + (x0 + ovXoff)) * 3;
-                uint16_t *dst = band + static_cast<size_t>(y - y0) * w + x0;
+            uint16_t *const drow = band + static_cast<size_t>(y - y0) * w;
+            // Pass one: dim the halo. Its own runs, at cell resolution, because
+            // the halo reaches 12 pixels past the glyphs and into rows that
+            // hold no glyph at all.
+            if (scrim != 0) {
+                const int cy = y >> SCRIM_SHIFT;
+                const int nHalo = ov->haloN[cy];
+                if (nHalo != 0) {
+                    scrimRow(drow, ov->scrim + static_cast<size_t>(cy) * ov->scrimW,
+                             ov->haloRuns + static_cast<size_t>(cy) * RUNS_PER_ROW, nHalo, w);
 #ifdef GM_ANIM_BENCH
-                spanPxLocal += static_cast<uint32_t>(x1 - x0 + 1);
-#endif
-                for (int x = x0; x <= x1; x++, px += 3, dst++) {
-                    const uint8_t a = px[2];
-                    // LV_IMG_CF_TRUE_COLOR_ALPHA @16bpp, LV_COLOR_16_SWAP=0:
-                    // little-endian RGB565 followed by an alpha byte.
-                    if (a == 255) {
-                        // Opaque: the glyph covers the background outright, so
-                        // scrimming it first would be work the next store
-                        // throws away. Taken by most of a glyph's interior.
-                        *dst = static_cast<uint16_t>(px[0] | (px[1] << 8));
-#ifdef GM_ANIM_BENCH
-                        blendPxLocal++;
-#endif
-                        continue;
+                    for (int i = 0; i < nHalo; i++) {
+                        const uint32_t r = ov->haloRuns[static_cast<size_t>(cy) * RUNS_PER_ROW + i];
+                        scrimPxLocal += ((r >> 16) - (r & 0xFFFFu)) << SCRIM_SHIFT;
                     }
-                    if (scRow != nullptr) {
-                        // Dim toward black before the glyph goes down. This is
-                        // the point of the whole mechanism: the pixels that
-                        // decide legibility are the transparent ones between
-                        // strokes and inside glyph counters, which the blend
-                        // below skips entirely, so keying the dim on the pixel's
-                        // own alpha would leave exactly the wrong pixels bright.
-                        const int dim = (scRow[x >> SCRIM_SHIFT] * scrim) >> 8;
-                        if (dim > 0) {
-                            *dst = blend565(0, *dst, static_cast<uint8_t>(dim > 255 ? 255 : dim));
-                        }
-                    }
-                    if (a == 0) {
-                        continue;
-                    }
-#ifdef GM_ANIM_BENCH
-                    blendPxLocal++;
 #endif
-                    const uint16_t c = static_cast<uint16_t>(px[0] | (px[1] << 8));
-                    *dst = blend565(c, *dst, a);
-                }
                 }
             }
+            // Pass two: composite the widgets, over the glyph runs only.
+            const int nRuns = ov->runN[y];
+            if (nRuns == 0) {
+                continue;
+            }
+            const uint32_t *const runs = ov->runs + static_cast<size_t>(y) * RUNS_PER_ROW;
+#ifdef GM_ANIM_BENCH
+            for (int i = 0; i < nRuns; i++) {
+                spanPxLocal += (runs[i] >> 16) - (runs[i] & 0xFFFFu);
+            }
+            if (probe == 1) {
+                continue; // row and run walk only, no pixels touched
+            }
+#endif
+            const uint8_t *const crow = ov->buf + (static_cast<size_t>(y + ovYoff) * ov->w + ovXoff) * 3;
+#ifdef GM_ANIM_BENCH
+            if (probe >= 2) {
+                probeAcc += blendRowProbe(drow, crow, runs, nRuns, probe);
+                continue;
+            }
+#endif
+            blendRow(drow, crow, runs, nRuns);
         }
         BENCH_ACC(accBlendUs, tBlend);
 #ifdef GM_ANIM_BENCH
         accSpanPx += spanPxLocal;
-        accBlendPx += blendPxLocal;
+        accScrimPx += scrimPxLocal;
+        benchProbeSink += probeAcc;
 #endif
 
         // Compact the band to just the columns the round panel actually shows.
