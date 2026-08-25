@@ -145,12 +145,24 @@ class Controller {
     // immediately while the transport is down, and the outbound queue upserts
     // by message kind rather than appending, so it stays bounded.
     bool isLinkUp() const {
-#ifdef GM_FAKE_CONTROLLER
+#if defined(GM_SYNTH_HANDSHAKE)
+        // Not an unconditional true. The bench rig exists to match production's
+        // ORDER as well as its load: the animation must not allocate until the
+        // radios have taken their share, because in production it waits on a
+        // real BLE connection and therefore starts with ~16 KB of internal DRAM
+        // free rather than ~89 KB. Returning true from boot made the rig lie in
+        // exactly the direction that hides the bug it was built to expose.
+        return synthLinkUp;
+#elif defined(GM_FAKE_CONTROLLER)
         return true;
 #else
         return comms.isConnected();
 #endif
     }
+
+#ifdef GM_SYNTH_HANDSHAKE
+    bool synthLinkUp = false;
+#endif
 
   private:
     // Initialization methods

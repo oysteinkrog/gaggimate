@@ -3,6 +3,10 @@
 #include "BgAnimCommon.h"
 #include <Arduino.h>
 #include <esp_heap_caps.h>
+#include <esp_wifi.h>
+#if defined(CONFIG_BT_ENABLED)
+#include <esp_bt.h>
+#endif
 #include <esp_memory_utils.h>
 #include <math.h>
 
@@ -34,7 +38,40 @@ namespace {
 bool isPsram(const void *p) { return esp_ptr_external_ram(p); }
 } // namespace
 
+namespace {
+// Whether WiFi and BLE have already taken their internal DRAM.
+//
+// This gate matters more than the reserve below it. With bgAnimAllScreens the
+// animation starts as soon as the UI is built, which is BEFORE Controller
+// ::connect() brings up either radio -- measured on this board, it allocates
+// with 89 KB of internal DRAM free, and WiFi (47.2 KB) plus BLE (40.7 KB) then
+// take 88 KB of it. A free-space check at that moment is not conservative, it
+// is simply looking at the wrong number: everything it sees is already spoken
+// for. So until both radios have claimed, nothing here may take internal DRAM
+// at all, whatever the reserve says.
+//
+// A build where a radio never starts must not wait forever for it, so the ones
+// that skip a radio are compiled out of the test rather than polled.
+bool radiosSettled() {
+#ifndef GAGGIMATE_NO_RADIO
+    wifi_mode_t mode;
+    if (esp_wifi_get_mode(&mode) != ESP_OK) {
+        return false; // ESP_ERR_WIFI_NOT_INIT: esp_wifi_init has not run yet
+    }
+#endif
+#if defined(CONFIG_BT_ENABLED) && !defined(GM_FAKE_CONTROLLER)
+    if (esp_bt_controller_get_status() != ESP_BT_CONTROLLER_STATUS_ENABLED) {
+        return false;
+    }
+#endif
+    return true;
+}
+} // namespace
+
 bool internalHasRoomFor(size_t size) {
+    if (!radiosSettled()) {
+        return false;
+    }
     const size_t freeInternal = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
     return freeInternal >= size + INTERNAL_RESERVE;
 }
