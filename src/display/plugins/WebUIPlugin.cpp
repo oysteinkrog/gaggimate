@@ -771,6 +771,14 @@ void WebUIPlugin::setupServer() {
                 a->benchRequestReset();
             }
         }
+        // ?flash=0|1 -- alternating solid frames, see benchSetFlash.
+        if (request->hasArg("flash")) {
+            SleepAnimation *a = sleep_animation_bench_instance();
+            if (a != nullptr) {
+                a->benchSetFlash(request->arg("flash").toInt());
+                a->benchRequestReset();
+            }
+        }
         // ?pie=0|1 -- vector or scalar scrim, see benchSetPie.
         if (request->hasArg("pie")) {
             SleepAnimation *a = sleep_animation_bench_instance();
@@ -862,6 +870,7 @@ void WebUIPlugin::setupServer() {
         gate["dma_active"] = anim0 != nullptr && anim0->benchDmaActive();
         gate["direct_push"] = anim0 != nullptr && anim0->benchDirectPush();
         gate["pie_scrim"] = anim0 != nullptr && anim0->benchPie();
+        gate["flash"] = anim0 != nullptr ? anim0->benchFlash() : 0;
         // 2 means the frame is composed off-screen and flipped at a frame
         // boundary, which is what makes the picture tear-free; 1 means the
         // writes race the scan-out.
