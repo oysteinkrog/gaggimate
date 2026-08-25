@@ -81,7 +81,10 @@
 #define LV_DISP_DEF_REFR_PERIOD 10      /*[ms]*/
 
 /*Input device read period in milliseconds*/
-#define LV_INDEV_DEF_READ_PERIOD 30     /*[ms]*/
+/*10, not the stock 30: this is the floor on how quickly a touch can be noticed,
+ *and 30 ms of it sat on top of the UI task's own period. A read is one short I2C
+ *transaction, so sampling three times as often is cheap next to what it buys.*/
+#define LV_INDEV_DEF_READ_PERIOD 10     /*[ms]*/
 
 /*Use a custom tick source that tells the elapsed time in milliseconds.
  *It removes the need to manually update the tick with `lv_tick_inc()`)*/

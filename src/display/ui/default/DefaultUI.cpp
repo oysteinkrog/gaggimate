@@ -637,8 +637,14 @@ void DefaultUI::startSleepAnimation() {
     if (display == nullptr || host == nullptr) {
         return;
     }
+    // Before start(), not after: LVGL renders into the panel's framebuffers, and
+    // start() spawns a task that begins writing them. Suppressing first is what
+    // moves LVGL onto its scratch buffer, so the two never hold the same memory
+    // at once. Put back if the animation declines to run.
+    lvgl_helper_suppress_flush(true);
     sleepAnimation.start(display);
     if (!sleepAnimation.isActive()) {
+        lvgl_helper_suppress_flush(false);
         return;
     }
     animHostScreen = host;
@@ -658,9 +664,6 @@ void DefaultUI::startSleepAnimation() {
     const Settings &plateSettings = controller->getSettings();
     applyAnimPlates(plateSettings.getBgAnimClearPlates(), static_cast<uint32_t>(plateSettings.getBgAnimPlateColor()),
                     plateSettings.getBgAnimPlateOpacity());
-    // Widget updates must not race the plasma on the panel: LVGL keeps
-    // rendering to its draw buffer, but flushes are dropped until stop.
-    lvgl_helper_suppress_flush(true);
     overlayValid[0] = overlayValid[1] = false;
     areaClear(overlayDirty[0]);
     areaClear(overlayDirty[1]);
@@ -1515,9 +1518,29 @@ void DefaultUI::applyTheme() {
 
 void DefaultUI::loopTask(void *arg) {
     auto *ui = static_cast<DefaultUI *>(arg);
+    // The UI work and LVGL do not want the same cadence, and running them at
+    // one rate charged the responsive half the price of the expensive half.
+    // lv_task_handler() is where the touch controller is polled, so how often
+    // it is called IS the input sampling rate -- LVGL cannot read the panel
+    // more often than it is asked to run. At one call per 25 ms pass a tap
+    // could sit unnoticed for most of a frame, on top of the indev timer's own
+    // period, and the result was a screen that answered late. ui_tick() and the
+    // widget updates, meanwhile, are worth doing only a few times a second.
+    //
+    // A refresh still only happens when something was invalidated, so the
+    // faster handler costs nothing on a screen that is merely sitting there.
+    constexpr unsigned long HANDLER_PERIOD_MS = 5;
+    constexpr unsigned long UI_PERIOD_MS = 25;
+    unsigned long lastUi = 0;
     while (true) {
-        ui->loop();
-        vTaskDelay(25 / portTICK_PERIOD_MS);
+        const unsigned long now = ::millis();
+        if (now - lastUi >= UI_PERIOD_MS) {
+            lastUi = now;
+            ui->loop();
+        } else {
+            lv_task_handler();
+        }
+        vTaskDelay(HANDLER_PERIOD_MS / portTICK_PERIOD_MS);
     }
 }
 
