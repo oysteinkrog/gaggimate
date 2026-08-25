@@ -441,6 +441,14 @@ void WebUIPlugin::setupServer() {
                  "{\"int_free\":%u,\"int_largest\":%u,\"int_min\":%u,\"psram_free\":%u,\"psram_largest\":%u,"
                  "\"anim_sram\":%u,\"anim_psram\":%u,\"anim_budget\":%u,"
                  "\"sc_frames\":%u,\"sc_refills\":%u,\"sc_slips\":%u}",
+                 // heap_caps_get_largest_free_block walks every block in the heap,
+                 // which costs about 1.3 ms across both regions and starves the
+                 // RGB panel's bounce refill for the duration -- one displaced
+                 // frame per call. That is an acceptable price for a debug
+                 // endpoint somebody asked for, and an unacceptable one for
+                 // anything polled on a timer, so do not fold these into a
+                 // status poll. The free and min-free figures beside them are
+                 // O(1) counters and cost nothing.
                  static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL)),
                  static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL)),
                  static_cast<unsigned>(heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL)),
@@ -477,6 +485,21 @@ void WebUIPlugin::setupServer() {
         }
         response->print("]}");
         request->send(response);
+    });
+    // Times a full heap walk over each region, which is what a memory sample
+    // costs. Deliberately its own endpoint: calling it perturbs the display, so
+    // it must not be folded into a status poll something scrapes on a timer.
+    server.on("/api/debug/heapwalk", [](AsyncWebServerRequest *request) {
+        multi_heap_info_t info{};
+        const int64_t a = esp_timer_get_time();
+        heap_caps_get_info(&info, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+        const int64_t b = esp_timer_get_time();
+        heap_caps_get_info(&info, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        const int64_t c = esp_timer_get_time();
+        char buf[128];
+        snprintf(buf, sizeof(buf), "{\"internal_us\":%u,\"psram_us\":%u,\"deadline_us\":162}", static_cast<unsigned>(b - a),
+                 static_cast<unsigned>(c - b));
+        request->send(200, "application/json", buf);
     });
     server.on("/api/status", [this](AsyncWebServerRequest *request) {
         AsyncResponseStream *response = request->beginResponseStream("application/json");

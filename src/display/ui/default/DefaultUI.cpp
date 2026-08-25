@@ -434,10 +434,6 @@ void DefaultUI::maintainSleepAnimation() {
                             plateSettings.getBgAnimPlateOpacity());
             const unsigned long interval = currentScreen == SCREEN_ID_STANDBY_SCREEN ? 1000 : 33;
             if (::millis() - lastSleepOverlayRefresh > interval) {
-                // Marked for the scan-out slip log: this snapshot renders LVGL
-                // widgets into a PSRAM buffer, and on the standby screen it is the
-                // only thing that happens at roughly the rate slips are seen.
-                panelclock::scanoutMark(panelclock::SCANOUT_ACT_OVERLAY);
                 refreshSleepOverlay();
             }
         }
@@ -943,6 +939,13 @@ void DefaultUI::refreshSleepOverlay() {
         log_w("Sleep overlay snapshot failed");
         return;
     }
+    // Marked here rather than at the call site, and after the snapshot rather
+    // than before it, so the slip log measures the thing that actually costs
+    // something. Every early return above is a pass that touched no memory --
+    // most of them, since on standby the widgets only change when the clock
+    // does -- and marking those would spread the timestamp over passes that
+    // cannot have caused anything.
+    panelclock::scanoutMark(panelclock::SCANOUT_ACT_OVERLAY);
 
     // Only the rows that changed need their alpha spans recomputed. The clip is
     // in screen coordinates and the host object is the screen, so screen row

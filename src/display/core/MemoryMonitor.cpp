@@ -40,7 +40,20 @@ void init() {
     cfg.psram = {500 * 1024, 200 * 1024};
     cfg.thresholdHysteresisBytes = 4 * 1024;
     cfg.enableSamplerTask = true;
-    cfg.enableFragmentation = true;
+    // No block walk on the sampler's path. heap_caps_get_info() has to traverse
+    // every block to find the largest free one, and both heaps' headers are read
+    // over the same MSPI controller the RGB panel streams pixels through. Timed
+    // on this board: 209-341 us for the internal heap and 1030-1253 us for the
+    // PSRAM heap. The panel's bounce buffer needs refilling every 162 us, so one
+    // sample starved the scan-out for about eight deadlines and put a visibly
+    // displaced band on screen -- once per sample, exactly at the interval.
+    //
+    // Free bytes and min-ever-free are counters the heap already keeps, so the
+    // leak detection this exists for is unaffected. Only fragmentation is lost,
+    // and that is available on demand from /api/debug/heap, where the cost is
+    // paid by whoever asked for it rather than by every user once a minute.
+    cfg.enableHeapWalk = false;
+    cfg.enableFragmentation = false;
     cfg.enableMinEverFree = true;
     cfg.enablePerTaskStacks = false;
     cfg.enableFailedAllocEvents = true;
