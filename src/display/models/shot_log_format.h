@@ -17,7 +17,7 @@
 // Older files may have fewer fields - use fieldsMask to determine layout.
 
 static constexpr uint32_t SHOT_LOG_MAGIC = 0x544F4853; // 'S''H''O''T' little-endian 0x54 0x4F 0x48 0x53
-static constexpr uint8_t SHOT_LOG_VERSION = 5;
+static constexpr uint8_t SHOT_LOG_VERSION = 6;
 static constexpr uint16_t SHOT_LOG_HEADER_SIZE = 512;
 static constexpr uint16_t SHOT_LOG_SAMPLE_INTERVAL_MS = 250; // nominal recording interval
 static constexpr uint32_t SHOT_LOG_FIELDS_MASK_ALL = 0x1FFF; // 13 fields present (removed phase number)
@@ -111,8 +111,8 @@ struct ShotLogSample {
     int16_t fl;  // current pump flow * 100 (allows small negatives)
     int16_t tf;  // target flow * 100
     int16_t pf;  // puck flow * 100
-    int16_t vf;  // bluetooth flow * 100
-    uint16_t v;  // bluetooth weight * 10
+    int16_t vf;  // active scale weight flow * 100
+    uint16_t v;  // active scale weight * 10
     uint16_t ev; // estimated weight * 10
     uint16_t pr; // puck resistance * 100
     uint16_t si; // system info bit-packed
@@ -127,6 +127,10 @@ static constexpr uint16_t SYSTEM_INFO_CURRENTLY_VOLUMETRIC = 0x0002;      // Cur
 static constexpr uint16_t SYSTEM_INFO_BLUETOOTH_SCALE_CONNECTED = 0x0004; // Bluetooth scale connected
 static constexpr uint16_t SYSTEM_INFO_VOLUMETRIC_AVAILABLE = 0x0008;      // Volumetric available
 static constexpr uint16_t SYSTEM_INFO_EXTENDED_RECORDING = 0x0010;        // Extended recording active
+static constexpr uint16_t SYSTEM_INFO_PROCESS_IS_BREW = 0x0020;           // Process is MODE_BREW
+static constexpr uint16_t SYSTEM_INFO_TARGET_IS_VOLUMETRIC = 0x0040;      // Target is volumetric
+static constexpr uint16_t SYSTEM_INFO_PHASE_HAS_VOLUMETRIC = 0x0080;      // Phase has volumetric target
+static constexpr uint16_t SYSTEM_INFO_ACTIVE_SCALE_CONNECTED = 0x0100;    // Active hardware/Bluetooth scale is healthy
 
 // Binary shot index format
 // File: /h/index.bin

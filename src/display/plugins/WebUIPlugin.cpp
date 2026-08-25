@@ -200,6 +200,17 @@ void WebUIPlugin::loop() {
         }
         lastUpdateCheck = now;
     }
+    if (now > lastHardwareScaleDiagnostic + HARDWARE_SCALE_DIAGNOSTIC_PERIOD && !ws.getClients().empty() &&
+        controller->getSystemInfo().capabilities.hwScale) {
+        lastHardwareScaleDiagnostic = now;
+        hardwareScaleDiagnosticDoc.clear();
+        hardwareScaleDiagnosticDoc["tp"] = "evt:hardware-scale";
+        hardwareScaleDiagnosticDoc["c1"] = controller->getHardwareScaleCell1Weight();
+        hardwareScaleDiagnosticDoc["c2"] = controller->getHardwareScaleCell2Weight();
+        hardwareScaleDiagnosticDoc["c1v"] = controller->isHardwareScaleCell1Valid();
+        hardwareScaleDiagnosticDoc["c2v"] = controller->isHardwareScaleCell2Valid();
+        broadcastJson(hardwareScaleDiagnosticDoc);
+    }
     if (now > lastStatus + STATUS_PERIOD && !ws.getClients().empty()) {
         lastStatus = now;
         statusDoc.clear();
@@ -592,8 +603,7 @@ void WebUIPlugin::setupServer() {
         uint32_t firstBad = 0;
         const uint32_t bad = a->benchPieSelfTest(&firstBad);
         char out[192];
-        snprintf(out, sizeof(out),
-                 "{\"pairs\":%u,\"mismatches\":%u,\"first_colour\":%u,\"first_factor\":%u,\"result\":\"%s\"}",
+        snprintf(out, sizeof(out), "{\"pairs\":%u,\"mismatches\":%u,\"first_colour\":%u,\"first_factor\":%u,\"result\":\"%s\"}",
                  33u * 65536u, bad, firstBad & 0xFFFFu, firstBad >> 16, bad == 0 ? "PASS" : "FAIL");
         request->send(200, "application/json", out);
     });
@@ -1313,6 +1323,19 @@ void WebUIPlugin::handleSettings(AsyncWebServerRequest *request) const {
                 }
                 settings->setScaleFactors(sf1, sf2);
             }
+            if (request->hasArg("hardwareScaleSampleRateSps") || request->hasArg("hardwareScaleIdleAlpha") ||
+                request->hasArg("hardwareScaleActiveAlpha")) {
+                const uint16_t sampleRate = request->hasArg("hardwareScaleSampleRateSps")
+                                                ? static_cast<uint16_t>(request->arg("hardwareScaleSampleRateSps").toInt())
+                                                : settings->getHardwareScaleSampleRateSps();
+                const float idleAlpha = request->hasArg("hardwareScaleIdleAlpha")
+                                            ? request->arg("hardwareScaleIdleAlpha").toFloat()
+                                            : settings->getHardwareScaleIdleAlpha();
+                const float activeAlpha = request->hasArg("hardwareScaleActiveAlpha")
+                                              ? request->arg("hardwareScaleActiveAlpha").toFloat()
+                                              : settings->getHardwareScaleActiveAlpha();
+                settings->setHardwareScaleConfiguration(sampleRate, idleAlpha, activeAlpha);
+            }
             if (request->hasArg("preferredScaleSource"))
                 settings->setPreferredScaleSource(request->arg("preferredScaleSource"));
             if (request->hasArg("pid"))
@@ -1537,6 +1560,9 @@ void WebUIPlugin::handleSettings(AsyncWebServerRequest *request) const {
     doc["pressureScaling"] = String(settings.getPressureScaling());
     doc["scaleFactor1"] = settings.getScaleFactor1();
     doc["scaleFactor2"] = settings.getScaleFactor2();
+    doc["hardwareScaleSampleRateSps"] = settings.getHardwareScaleSampleRateSps();
+    doc["hardwareScaleIdleAlpha"] = settings.getHardwareScaleIdleAlpha();
+    doc["hardwareScaleActiveAlpha"] = settings.getHardwareScaleActiveAlpha();
     doc["preferredScaleSource"] = settings.getPreferredScaleSource();
     doc["boilerFillActive"] = settings.isBoilerFillActive();
     doc["startupFillTime"] = settings.getStartupFillTime() / 1000;

@@ -6,6 +6,7 @@
 #include "Settings.h"
 #include "SystemInfo.h"
 #include <WiFi.h>
+#include <atomic>
 #include <display/core/ProfileManager.h>
 #include <display/core/process/Process.h>
 #include <mutex>
@@ -106,14 +107,18 @@ class Controller {
     void onProfileSave() const;
     void onProfileSaveAsNew();
     void onVolumetricMeasurement(double measurement, VolumetricMeasurementSource source);
-    void setVolumetricOverride(bool override) { volumetricOverride = override; }
     VolumetricMeasurementSource getActiveScaleSource() const;
+    VolumetricMeasurementSource getEffectiveScaleSource() const;
     VolumetricMeasurementSource getGrindScaleSource() const;
     VolumetricMeasurementSource getPreferredScaleSource() const;
     bool isScaleSourceHealthy(VolumetricMeasurementSource source) const;
     String getActiveScaleSourceName() const;
     bool isBluetoothScaleHealthy() const;
     bool isHardwareScaleHealthy() const;
+    float getHardwareScaleCell1Weight() const { return hardwareScaleCell1Weight.load(); }
+    float getHardwareScaleCell2Weight() const { return hardwareScaleCell2Weight.load(); }
+    bool isHardwareScaleCell1Valid() const { return hardwareScaleCell1Valid.load(); }
+    bool isHardwareScaleCell2Valid() const { return hardwareScaleCell2Valid.load(); }
     void onFlush();
     int getWaterLevel() const {
         float reversedLevel = static_cast<float>(settings.getEmptyTankDistance()) -
@@ -254,7 +259,6 @@ class Controller {
     unsigned long lastConfigResend = 0;
     static const unsigned long CONFIG_RESEND_WINDOW_MS = 8000;
     static const unsigned long CONFIG_RESEND_INTERVAL_MS = 1000;
-    bool volumetricOverride = false;
     bool processCompleted = false;
     bool steamReady = false;
     bool sdcard = false;
@@ -262,8 +266,24 @@ class Controller {
 
     // Bluetooth scale connection monitoring
     VolumetricMeasurementSource currentVolumetricSource = VolumetricMeasurementSource::INACTIVE;
-    unsigned long lastBluetoothMeasurement = 0;
-    unsigned long lastHardwareMeasurement = 0;
+    std::atomic<unsigned long> lastBluetoothMeasurement{0};
+    std::atomic<unsigned long> lastHardwareMeasurement{0};
+#ifdef NIGHTLY_BUILD
+    // The virtual scale runs in parallel with a physical scale. If the selected
+    // physical source stops reporting, preserve continuity by applying the
+    // estimator's change since the last good physical measurement.
+    double latestFlowEstimation = 0.0;
+    double estimatorAtLastPhysicalMeasurement = 0.0;
+    double lastPhysicalMeasurement = 0.0;
+    double flowEstimationOffset = 0.0;
+    bool flowEstimationValid = false;
+    bool physicalMeasurementValid = false;
+    bool physicalEstimatorBaselineValid = false;
+#endif
+    std::atomic<float> hardwareScaleCell1Weight{0.0f};
+    std::atomic<float> hardwareScaleCell2Weight{0.0f};
+    std::atomic<bool> hardwareScaleCell1Valid{false};
+    std::atomic<bool> hardwareScaleCell2Valid{false};
     static const unsigned long BLUETOOTH_GRACE_PERIOD_MS = 1500; // 1.5 second grace period
     static const unsigned long HARDWARE_GRACE_PERIOD_MS = 1500;
     static const unsigned long CONTROLLER_WAITING_TIMEOUT_MS = 10000;
