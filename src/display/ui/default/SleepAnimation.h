@@ -194,8 +194,8 @@ class SleepAnimation {
     // byte comparison instead of by looking at it.
     void benchSetFlash(int on) { flashOn.store(on); }
     int benchFlash() const { return flashOn.load(); }
-    void benchSetPattern(bool on) { patternOn.store(on); }
-    bool benchPattern() const { return patternOn.load(); }
+    void benchSetPattern(int on) { patternOn.store(on); }
+    int benchPattern() const { return patternOn.load(); }
     // Dim the scrim on the PIE vector unit rather than a pixel at a time, and
     // check that kernel against the scalar one over its whole input space.
     void benchSetPie(bool on) { pieOn.store(on); }
@@ -495,7 +495,7 @@ class SleepAnimation {
     // Default on; the scalar path stays as the reference /api/pietest checks
     // against, and as the kernel for a run's unaligned edge cells.
     std::atomic<bool> pieOn{true};
-    std::atomic<bool> patternOn{false};
+    std::atomic<int> patternOn{0};
     // Alternate the whole screen between two colours per frame, so tearing
     // shows up as a spatial edge a long-exposure photo cannot fabricate.
     std::atomic<int> flashOn{0};
