@@ -421,6 +421,9 @@ void DefaultUI::maintainSleepAnimation() {
                 }
             }
         } else {
+            // A screen change released the old host without stopping the
+            // animation; give it the new one. Idempotent on every other pass.
+            adoptAnimHost(lv_scr_act());
             // Standby content changes once a minute (clock); active screens
             // update continuously — refresh the snapshot faster there so
             // gauges and numbers stay reasonably live behind the animation.
@@ -620,10 +623,27 @@ void DefaultUI::handleScreenChange() {
             const ::Settings &settings = controller->getSettings();
             setBrightness(settings.getMainBrightness());
         }
-        // Any screen change while animating: release the old host screen (its
-        // transparent-bg override must not leak) — in all-screens mode the
-        // next maintain pass restarts the animation on the new screen.
-        stopSleepAnimation();
+        // Any screen change while animating has to release the old host screen,
+        // or its transparent-bg override leaks onto a screen that is no longer
+        // being drawn over plasma.
+        //
+        // Releasing is all it takes though. This used to stop the animation
+        // outright and let the next maintain pass start it again, which meant
+        // every navigation tore the background down and built it back up: the
+        // render task exited, the framebuffers changed hands twice, and the
+        // plasma visibly restarted. In all-screens mode that is the common
+        // case, not the rare one, and it read as jank. Nothing about the
+        // animation is per-screen except this one style property; the plate
+        // table and the status icons it also rewrites are fixed global objects
+        // that span every screen. So when the animation is going to keep
+        // running anyway, hand it the new host instead of restarting it.
+        // maintainSleepAnimation does the adopting, which runs later in this
+        // same pass, after ui_tick has actually swapped the screen.
+        if (bgAnimAllScreens && sleepAnimation.isActive()) {
+            releaseAnimHost();
+        } else {
+            stopSleepAnimation();
+        }
         eez_flow_set_screen(targetScreen, LV_SCR_LOAD_ANIM_NONE, 0, 0);
         animateGaugeTicks(currentScreen, targetScreen);
         rerender = true;
@@ -647,12 +667,6 @@ void DefaultUI::startSleepAnimation() {
         lvgl_helper_suppress_flush(false);
         return;
     }
-    animHostScreen = host;
-    // The render task owns the panel while the animation runs; LVGL keeps the
-    // host screen active only for input and for the offscreen widget
-    // snapshots. Making the screen background transparent keeps those
-    // snapshots per-pixel alpha (widgets only, no opaque color plate).
-    lv_obj_set_style_bg_opa(animHostScreen, LV_OPA_TRANSP, LV_PART_MAIN);
     // The status icons carry a 10 px border in the theme background color (an
     // EEZ spacing trick, invisible on black) — over the plasma it snapshots as
     // an opaque plate around each icon. Hide the borders while animating.
@@ -664,10 +678,9 @@ void DefaultUI::startSleepAnimation() {
     const Settings &plateSettings = controller->getSettings();
     applyAnimPlates(plateSettings.getBgAnimClearPlates(), static_cast<uint32_t>(plateSettings.getBgAnimPlateColor()),
                     plateSettings.getBgAnimPlateOpacity());
-    overlayValid[0] = overlayValid[1] = false;
-    areaClear(overlayDirty[0]);
-    areaClear(overlayDirty[1]);
-    refreshSleepOverlay();
+    // Last, because it ends by snapshotting the widgets, and the two rewrites
+    // above are part of what that snapshot has to capture.
+    adoptAnimHost(host);
 #endif
 }
 
@@ -776,6 +789,36 @@ void DefaultUI::applyAnimPlates(int mode, uint32_t color, int opaPct) {
 #endif
 }
 
+void DefaultUI::releaseAnimHost() {
+#ifndef GAGGIMATE_SIM
+    if (animHostScreen != nullptr) {
+        // Drop the transparent-background override, back to the EEZ style.
+        lv_obj_remove_local_style_prop(animHostScreen, LV_STYLE_BG_OPA, LV_PART_MAIN);
+        animHostScreen = nullptr;
+    }
+#endif
+}
+
+void DefaultUI::adoptAnimHost(lv_obj_t *host) {
+#ifndef GAGGIMATE_SIM
+    if (host == nullptr || host == animHostScreen) {
+        return;
+    }
+    releaseAnimHost();
+    animHostScreen = host;
+    // The render task owns the panel while the animation runs; LVGL keeps the
+    // host screen active only for input and for the offscreen widget
+    // snapshots. Making the screen background transparent keeps those
+    // snapshots per-pixel alpha (widgets only, no opaque color plate).
+    lv_obj_set_style_bg_opa(animHostScreen, LV_OPA_TRANSP, LV_PART_MAIN);
+    // Both overlay buffers describe the screen that just went away.
+    overlayValid[0] = overlayValid[1] = false;
+    areaClear(overlayDirty[0]);
+    areaClear(overlayDirty[1]);
+    refreshSleepOverlay();
+#endif
+}
+
 void DefaultUI::stopSleepAnimation() {
 #ifndef GAGGIMATE_SIM
     sleepAnimation.stop();
@@ -786,12 +829,11 @@ void DefaultUI::stopSleepAnimation() {
             lv_obj_remove_local_style_prop(icon, LV_STYLE_BORDER_OPA, LV_PART_MAIN);
         }
     }
-    if (animHostScreen != nullptr) {
-        // Drop the transparent-background override (back to the EEZ style) and
-        // repaint the whole screen over the last animation frame.
-        lv_obj_remove_local_style_prop(animHostScreen, LV_STYLE_BG_OPA, LV_PART_MAIN);
-        lv_obj_invalidate(animHostScreen);
-        animHostScreen = nullptr;
+    lv_obj_t *const host = animHostScreen;
+    releaseAnimHost();
+    if (host != nullptr) {
+        // Repaint the whole screen over the last animation frame.
+        lv_obj_invalidate(host);
     }
 #endif
 }
