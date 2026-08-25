@@ -50,9 +50,17 @@ void NetworkWatchdogPlugin::logStats(const char *reason) {
     const unsigned freeInt = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
     const unsigned minInt = heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL);
     const unsigned largestInt = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
+    // DMA-capable internal is reported separately because it is the pool that
+    // actually fails first, and the plain internal figure hides that. WiFi's
+    // frame buffers ask for MALLOC_CAP_INTERNAL|DMA|8BIT (caps 0x80c); measured
+    // on this board, 178-to-333 byte requests were failing while the internal
+    // total still read 8 KB free, because none of that 8 KB was DMA-capable.
+    // Watching the wrong number is how that went undiagnosed.
+    const unsigned freeDma = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
+    const unsigned minDma = heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
     const unsigned long sinceOk = millis() - _lastAlive;
-    ESP_LOGI(LOG_TAG, "[%s] internal heap: free=%u min=%u largest=%u | egress ok %lus ago (stage %u)", reason, freeInt, minInt,
-             largestInt, sinceOk / 1000, _stage);
+    ESP_LOGI(LOG_TAG, "[%s] internal heap: free=%u min=%u largest=%u | dma: free=%u min=%u | egress ok %lus ago (stage %u)",
+             reason, freeInt, minInt, largestInt, freeDma, minDma, sinceOk / 1000, _stage);
 }
 
 bool NetworkWatchdogPlugin::rebootAllowed(unsigned long now) const {

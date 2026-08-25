@@ -172,3 +172,15 @@ CONFIG_LCD_RGB_RESTART_IN_VSYNC=n
 # device reboots." Arduino-prebuilt has it on; IDF default is n. Without
 # it, every paired BLE peer (scale, HomeKit phone) re-pairs on every boot.
 CONFIG_BT_NIMBLE_NVS_PERSIST=y
+
+# --- BLE controller sizing ---
+# The controller keeps per-activity and per-connection state in internal DRAM,
+# and esp_bt_controller_enable() costs 44.3 KB of it on this board -- measured,
+# and second only to WiFi. BLE_MAX_ACT covers connections plus scanning and
+# advertising slots; this display talks to one controller board and at most one
+# scale, so 6 activities and 4 host connections were sized for a device that
+# does not exist. The duplicate-scan cache is 100 entries of continuously
+# scanned advertisers, which is generous for a fixed-function appliance.
+CONFIG_BT_CTRL_BLE_MAX_ACT=3
+CONFIG_BT_NIMBLE_MAX_CONNECTIONS=3
+CONFIG_BT_CTRL_SCAN_DUPL_CACHE_SIZE=20

@@ -5,13 +5,15 @@
 #include <display/drivers/common/Display.h>
 #include <display/drivers/common/PanelClock.h>
 #include <display/ui/default/bganim/BgAnim.h>
+#include <display/ui/default/bganim/BgAnimCommon.h>
 #include <esp_cache.h> // esp_cache_msync, around the direct push
 #include <esp_heap_caps.h>
+#include <esp_memory_utils.h>
 #include <esp_timer.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
 #include <math.h>
-#include <string.h>  // memmove, for the round-panel band compaction
+#include <string.h> // memmove, for the round-panel band compaction
 
 // Stage timers for the bench build. These compile to nothing in a normal
 // build, so the shipping render path carries no measurement overhead.
@@ -228,8 +230,8 @@ __attribute__((noinline)) static void scale565Oct(uint16_t *__restrict dst, cons
     uint16_t *wr = dst;
     const uint16_t *masks = kPieMasks;
     int n = nOct;
-    asm volatile("ee.vld.128.ip q3, %[m], 16\n"  // q3 = 0xF81F x8
-                 "ee.vld.128.ip q4, %[m], 16\n"  // q4 = 0x07E0 x8
+    asm volatile("ee.vld.128.ip q3, %[m], 16\n" // q3 = 0xF81F x8
+                 "ee.vld.128.ip q4, %[m], 16\n" // q4 = 0x07E0 x8
                  "ssai 5\n"
                  "1:\n"
                  "ee.vld.128.ip q0, %[rd], 16\n" // eight pixels
@@ -238,7 +240,7 @@ __attribute__((noinline)) static void scale565Oct(uint16_t *__restrict dst, cons
                  "ee.andq q2, q0, q4\n"          // green
                  "ee.vmul.u16 q1, q1, q5\n"      // 32-bit product, >>5, low 16
                  "ee.vmul.u16 q2, q2, q5\n"
-                 "ee.andq q1, q1, q3\n"          // drop red's division remainder
+                 "ee.andq q1, q1, q3\n" // drop red's division remainder
                  "ee.andq q2, q2, q4\n"
                  "ee.orq q1, q1, q2\n"
                  "ee.vst.128.ip q1, %[wr], 16\n"
@@ -394,8 +396,8 @@ __attribute__((noinline)) static void scrimRow(uint16_t *__restrict dst, const u
 // rather than skipped, because a lane cannot branch. That factor is an exact
 // identity -- 32/32 -- so the group writes those pixels back unchanged.
 __attribute__((noinline)) static void scrimRowPie(uint16_t *__restrict dst, const uint8_t *__restrict invRow,
-                                                  const uint16_t *__restrict invPx, const uint32_t *__restrict runs,
-                                                  int nRuns, int w) {
+                                                  const uint16_t *__restrict invPx, const uint32_t *__restrict runs, int nRuns,
+                                                  int w) {
     for (int i = 0; i < nRuns; i++) {
         const uint32_t r = runs[i];
         int c0 = static_cast<int>(r & 0xFFFFu);
@@ -508,14 +510,27 @@ __attribute__((always_inline)) inline uint16_t benchPatternPx(int x, int y) {
 
 // Internal SRAM is deliberately scarce in this firmware (WiFi/BLE/TLS all
 // compete for it) — always fall back to PSRAM rather than failing.
+//
+// "Rather than failing" was too late a fallback, and this function was the
+// worst offender for it: the band slots alone are 15,360 B and there was no
+// budget on them at all, so they took internal DRAM until internal DRAM was
+// gone. Falling back only once heap_caps_malloc returns null hands the
+// animation everything and leaves the radios to fail instead -- which is what
+// happened, with WiFi unable to allocate 180 bytes for a probe request and the
+// display never associating. So the reserve is checked first, and the null
+// check below stays as the last resort it was meant to be.
 void *allocPreferInternal(size_t size) {
-    void *p = heap_caps_malloc(size, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    const size_t freeBefore = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
+    void *p = nullptr;
+    if (bganim::internalHasRoomFor(size)) {
+        p = heap_caps_malloc(size, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    }
     if (p == nullptr) {
         p = ps_malloc(size);
-        if (p != nullptr) {
-            log_w("SleepAnimation: %u B in PSRAM (internal SRAM full)", static_cast<unsigned>(size));
-        }
     }
+    log_i("SleepAnimation: %u B -> %s (internal free was %u, reserve %u)", static_cast<unsigned>(size),
+          p == nullptr ? "FAILED" : (esp_ptr_external_ram(p) ? "PSRAM" : "internal"), static_cast<unsigned>(freeBefore),
+          static_cast<unsigned>(bganim::INTERNAL_RESERVE));
     return p;
 }
 } // namespace
@@ -614,8 +629,8 @@ void SleepAnimation::start(Display *d) {
         // SRAM and 16-byte aligned, both required: the 128-bit loads force the
         // low four address bits to zero, and the point of expanding here rather
         // than reading the cell grid twice is to keep this off PSRAM.
-        scrimInvPx = static_cast<uint16_t *>(
-            heap_caps_aligned_alloc(16, static_cast<size_t>(w) * sizeof(uint16_t), MALLOC_CAP_INTERNAL));
+        scrimInvPx =
+            static_cast<uint16_t *>(heap_caps_aligned_alloc(16, static_cast<size_t>(w) * sizeof(uint16_t), MALLOC_CAP_INTERNAL));
     }
     computeChords(w, h);
     if (overlayCap == 0) {
@@ -639,8 +654,7 @@ void SleepAnimation::start(Display *d) {
             ov.scrimW = (w + (1 << SCRIM_SHIFT) - 1) >> SCRIM_SHIFT;
             ov.scrimH = (h + (1 << SCRIM_SHIFT) - 1) >> SCRIM_SHIFT;
             const size_t cells = static_cast<size_t>(ov.scrimW) * ov.scrimH;
-            ov.haloRuns =
-                static_cast<uint32_t *>(ps_malloc(static_cast<size_t>(ov.scrimH) * RUNS_PER_ROW * 4));
+            ov.haloRuns = static_cast<uint32_t *>(ps_malloc(static_cast<size_t>(ov.scrimH) * RUNS_PER_ROW * 4));
             ov.haloN = static_cast<uint8_t *>(ps_malloc(ov.scrimH));
             if (ov.haloN != nullptr) {
                 memset(ov.haloN, 0, ov.scrimH);
@@ -668,8 +682,7 @@ void SleepAnimation::start(Display *d) {
             }
         }
         if (scrimTmp == nullptr) {
-            scrimTmp = static_cast<uint8_t *>(
-                ps_malloc(static_cast<size_t>(overlays[0].scrimW) * overlays[0].scrimH));
+            scrimTmp = static_cast<uint8_t *>(ps_malloc(static_cast<size_t>(overlays[0].scrimW) * overlays[0].scrimH));
         }
         if (scrimTmp == nullptr) {
             for (auto &ov : overlays) {
@@ -690,8 +703,8 @@ void SleepAnimation::start(Display *d) {
         pipelineOk = false;
     }
     if (!pipelineOk || !overlayOk) {
-        log_e("SleepAnimation: buffer allocation failed (bandBuf=%p/%p halfBuf=%p overlayOk=%d)", bandBuf[0], bandBuf[1],
-              halfBuf, overlayOk);
+        log_e("SleepAnimation: buffer allocation failed (bandBuf=%p/%p halfBuf=%p overlayOk=%d)", bandBuf[0], bandBuf[1], halfBuf,
+              overlayOk);
         return;
     }
     // Reset the pipeline: both cursors to slot 0, any signal left over from a
@@ -940,7 +953,6 @@ void SleepAnimation::pushTaskEntry(void *arg) {
     vTaskDelete(nullptr);
 }
 
-
 // The same retirement, for the native engine, which gives every transfer an arg
 // because it submits one per band rather than one per chunk.
 static bool IRAM_ATTR sleepAnimNativeDone(void *arg) {
@@ -1076,8 +1088,7 @@ bool SleepAnimation::installNativeOnIsrCore() {
         // Same reason as the async engine: esp_intr_alloc binds the handler to
         // the calling core, and the render task shares core 1 with the panel's
         // own scan-out interrupt.
-        if (xTaskCreatePinnedToCore(nativeInstallTaskEntry, "BandDmaIns", 4096, &req, 3, &installer, DMA_ISR_CORE) ==
-            pdPASS) {
+        if (xTaskCreatePinnedToCore(nativeInstallTaskEntry, "BandDmaIns", 4096, &req, 3, &installer, DMA_ISR_CORE) == pdPASS) {
             xSemaphoreTake(req.done, pdMS_TO_TICKS(2000));
         }
         vSemaphoreDelete(req.done);
@@ -1092,7 +1103,6 @@ bool SleepAnimation::installNativeOnIsrCore() {
 // Installed on first use, and latched, so the steady-state cost of asking is a
 // load and a branch.
 bool SleepAnimation::engineReadyForMode() { return installNativeOnIsrCore(); }
-
 
 void SleepAnimation::pushLoop() {
     int slot = 0;
@@ -1482,7 +1492,7 @@ void SleepAnimation::benchTick() {
         }
         accBandUs = accBlendUs = accPushUs = accTotalUs = accWaitUs = accPackUs = 0;
         accSpanPx = accScrimPx = 0;
-    accSpanPx = accScrimPx = 0;
+        accSpanPx = accScrimPx = 0;
         accFrames = 0;
         accMaxTotalUs = 0;
         accBandLockedUs = 0;
@@ -1491,8 +1501,8 @@ void SleepAnimation::benchTick() {
         benchDwellStart = now;
         uint8_t p[4];
         bg_parse_params(nullptr, 0, p);
-        animParams.store(static_cast<uint32_t>(p[0]) | (static_cast<uint32_t>(p[1]) << 8) |
-                         (static_cast<uint32_t>(p[2]) << 16) | (static_cast<uint32_t>(p[3]) << 24));
+        animParams.store(static_cast<uint32_t>(p[0]) | (static_cast<uint32_t>(p[1]) << 8) | (static_cast<uint32_t>(p[2]) << 16) |
+                         (static_cast<uint32_t>(p[3]) << 24));
         animId.store(0);
         log_i("animbench: results cleared, sweep restarted");
         return;
@@ -1527,12 +1537,10 @@ void SleepAnimation::benchFinishDwell() {
         const uint64_t unlockedUs = accBandUs > accBandLockedUs ? accBandUs - accBandLockedUs : 0;
         const uint32_t unlockedRows = accBandRows > accBandLockedRows ? accBandRows - accBandLockedRows : 0;
         r.bandNsPerRow = unlockedRows > 0 ? static_cast<uint32_t>(unlockedUs * 1000ULL / unlockedRows) : 0;
-        r.bandLockedNsPerRow =
-            accBandLockedRows > 0 ? static_cast<uint32_t>(accBandLockedUs * 1000ULL / accBandLockedRows) : 0;
+        r.bandLockedNsPerRow = accBandLockedRows > 0 ? static_cast<uint32_t>(accBandLockedUs * 1000ULL / accBandLockedRows) : 0;
         r.valid = true; // publish last: readers on other tasks gate on this
-        log_i("animbench: %-10s band=%u us blend=%u us push=%u us total=%u us max=%u us fps=%u.%02u",
-              bg_animation(id).id, r.bandUs, r.blendUs, r.pushUs, r.totalUs, r.maxTotalUs, r.achievedFps / 100,
-              r.achievedFps % 100);
+        log_i("animbench: %-10s band=%u us blend=%u us push=%u us total=%u us max=%u us fps=%u.%02u", bg_animation(id).id,
+              r.bandUs, r.blendUs, r.pushUs, r.totalUs, r.maxTotalUs, r.achievedFps / 100, r.achievedFps % 100);
     }
 
     accBandUs = accBlendUs = accPushUs = accTotalUs = accWaitUs = accPackUs = 0;
@@ -1678,8 +1686,7 @@ void SleepAnimation::renderFrame() {
         // exactly the intended behaviour -- the pipeline runs at the slower
         // stage's rate rather than the sum of both.
         const int64_t tWait = esp_timer_get_time();
-        const bool gotSlot =
-            xSemaphoreTake(static_cast<SemaphoreHandle_t>(bandFree[renderSlot]), pdMS_TO_TICKS(1000)) == pdTRUE;
+        const bool gotSlot = xSemaphoreTake(static_cast<SemaphoreHandle_t>(bandFree[renderSlot]), pdMS_TO_TICKS(1000)) == pdTRUE;
         const uint32_t waitUs = static_cast<uint32_t>(esp_timer_get_time() - tWait);
         frameWaitUs += waitUs;
 #ifdef GM_ANIM_BENCH
@@ -1719,8 +1726,8 @@ void SleepAnimation::renderFrame() {
         // odd row would be neither written nor sent. 480/8 leaves no partial
         // band today, so this is a guard rather than a live case.
         const bool oddBand = (rows & 1) != 0;
-        const bool bandInterlaced = interlace.load() && !(dmaActive && directPushOn.load()) &&
-                                    warmupFrames.load() == 0 && !(half && oddBand);
+        const bool bandInterlaced =
+            interlace.load() && !(dmaActive && directPushOn.load()) && warmupFrames.load() == 0 && !(half && oddBand);
         const int parityNow = static_cast<int>(frameParity & 1u);
         // At half resolution the unit is a row pair, one source row expanded;
         // anywhere else it is a single row.
@@ -2049,8 +2056,7 @@ void SleepAnimation::renderFrame() {
             // two pixels move per store.
             for (int r = 0; r < rows; r++) {
                 uint32_t *__restrict dst = reinterpret_cast<uint32_t *>(band + static_cast<size_t>(r) * cw);
-                const uint32_t *__restrict src =
-                    reinterpret_cast<const uint32_t *>(band + static_cast<size_t>(r) * w + cx0);
+                const uint32_t *__restrict src = reinterpret_cast<const uint32_t *>(band + static_cast<size_t>(r) * w + cx0);
                 const int n = cw >> 1;
                 int i = 0;
                 // 8 pixels per iteration: the copy is load-use bound, so
@@ -2163,8 +2169,11 @@ void SleepAnimation::renderFrame() {
             panelclock::scanoutMark(panelclock::SCANOUT_ACT_BANDPUSH);
         } else {
             const uint8_t pushMode = !bandInterlaced ? 0 : (pairMode ? 2 : 1);
-            pushJob[renderSlot] = {static_cast<int16_t>(cx0), static_cast<int16_t>(y0), static_cast<int16_t>(cx1),
-                                   static_cast<int16_t>(y0 + rows), pushMode,
+            pushJob[renderSlot] = {static_cast<int16_t>(cx0),
+                                   static_cast<int16_t>(y0),
+                                   static_cast<int16_t>(cx1),
+                                   static_cast<int16_t>(y0 + rows),
+                                   pushMode,
                                    static_cast<uint8_t>(parityNow)};
             xSemaphoreGive(static_cast<SemaphoreHandle_t>(bandReady[renderSlot]));
         }
