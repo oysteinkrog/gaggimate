@@ -89,7 +89,16 @@ class SleepAnimation {
     void setHalfRes(bool) {}
     void setInterlace(bool) {}
 #else
-    void setHalfRes(bool on) { halfRes.store(on); }
+    // A ceiling, not an instruction. Half resolution has a real quality cost
+    // (see autoResolution), so which animations actually pay it is measured
+    // rather than assumed; this only says whether they are allowed to.
+    void setHalfRes(bool on) {
+        halfResAllowed.store(on);
+        if (!on) {
+            halfRes.store(false);
+        }
+        autoResReset.store(true);
+    }
     void setInterlace(bool on) {
         interlace.store(on);
         renderHalf.store(on);
@@ -307,6 +316,9 @@ class SleepAnimation {
     static void taskEntry(void *arg);
     void renderLoop();
     void renderFrame();
+    // Chooses the render resolution for the running animation by measuring it.
+    // See the definition for why this is a probe rather than a setting.
+    void autoResolution(int id, int fps, int64_t frameUs, int64_t budgetUs);
     void buildScrim(Overlay &ov, int panelW, int panelH);
 
     Display *display = nullptr;
@@ -375,6 +387,17 @@ class SleepAnimation {
     // 13. Note that the bench setter below is compiled out of env:display, so
     // this initialiser is the shipped configuration, not a starting value.
     std::atomic<bool> halfRes{true};
+    // Whether halfRes is allowed to be true at all: the user setting. The
+    // effective value above is chosen per animation by autoResolution().
+    std::atomic<bool> halfResAllowed{true};
+    // Set when something the decision depended on changed under it.
+    std::atomic<bool> autoResReset{true};
+    int autoResAnim = -1;      // animation the current decision belongs to
+    uint8_t autoResFps = 0;    // and the fps target it was taken against
+    uint8_t autoResSeen = 0;   // frames discarded before the window opened
+    uint8_t autoResFrames = 0; // frames accumulated into autoResUs
+    uint64_t autoResUs = 0;
+    bool autoResSettled = false;
     uint32_t frameWaitUs = 0;   // this frame's total block on the push task, drives cropEnabled
     void *pushHandle = nullptr;
     std::atomic<bool> pushStopped{true};
