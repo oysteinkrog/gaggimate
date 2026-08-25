@@ -11,7 +11,7 @@
 #include "utilities.h"
 #include <display/drivers/common/PanelClock.h>
 #include <display/drivers/common/RGBPanelInit.h>
-#include <esp_cache.h>                    // esp_cache_msync, for the direct-writer path in pushColors
+#include <esp_cache.h>                     // esp_cache_msync, for the direct-writer path in pushColors
 #include <esp_memory_utils.h>              // esp_ptr_external_ram
 #include <esp_private/esp_cache_private.h> // esp_cache_get_alignment
 
@@ -584,24 +584,26 @@ void LilyGo_RGBPanel::pushColors(uint16_t x, uint16_t y, uint16_t width, uint16_
     }
     lockFrameBuffer();
     if (_directWriter && _fbDirect[_fbCurrent] != nullptr && hight > y) {
-        // esp_lcd's rgb_panel_draw_bitmap ends with a Cache_WriteBack_Addr over
-        // whole SCANLINES -- disassembled from this build: it computes
-        // (y_end - y_start) * bytes_per_line from fb + y_start * bytes_per_line
-        // and writes that whole span back, not the rectangle it was asked to
-        // draw. So a repaint of a small clock area flushes every cache line
-        // across the full width of those rows.
+        // Drop this framebuffer region from the data cache before letting
+        // esp_lcd copy into it.
         //
-        // With something else writing the same framebuffer over DMA, those
-        // lines hold a stale view, and the writeback smears it across
-        // full-width bands on top of the DMA's pixels. That is a persistent
-        // visible garble, not a transient one, because the stale data wins.
+        // With bounce buffers configured, esp_lcd does no cache maintenance of
+        // its own -- both branches of rgb_panel_draw_bitmap gate their
+        // esp_cache_msync on !bb_size, and the bounce refill reads the
+        // framebuffer through the CPU cache, so ordinary writes are coherent
+        // without a flush. What that leaves is the other direction: something
+        // else writes this same framebuffer over DMA, which does not pass
+        // through the cache, so any line still held dirty here from an earlier
+        // repaint holds a stale view of pixels DMA has since replaced. When
+        // that line is eventually evicted it lands on top of the DMA's content
+        // and smears it across a full-width band. The garble is persistent
+        // rather than transient, because the stale data is what wins.
         //
-        // Dropping the lines first makes the copy below read-allocate from
-        // PSRAM, which is where the DMA's pixels actually are, so the driver's
-        // writeback carries fresh content plus whatever LVGL just drew.
-        // Discarding is safe rather than lossy: the only writer that dirties
-        // this region is this function, and the driver already wrote those
-        // lines back on the way out last time.
+        // Invalidating first makes the copy below read-allocate from PSRAM,
+        // which is where the DMA's pixels actually are, so the region ends up
+        // holding fresh content plus whatever LVGL just drew and no stale line
+        // survives to evict later. Discarding is safe rather than lossy: the
+        // only CPU writer that dirties this region is this function.
         //
         // The span is line-aligned by construction -- 480 px x 2 B = 960 B per
         // line, a multiple of the 32-byte cache line.
@@ -614,6 +616,58 @@ void LilyGo_RGBPanel::pushColors(uint16_t x, uint16_t y, uint16_t width, uint16_
 }
 
 void LilyGo_RGBPanel::setDirectWriter(bool active) { _directWriter = active; }
+
+namespace {
+// 0xFF is the ST7701S's bank select: the last byte picks which command set the
+// following writes land in. The init table uses 0x10 for BK0, 0x11 for BK1 and
+// 0x00 to leave, and everything here follows it exactly rather than inventing
+// a sequence -- a write to the wrong bank hits an unrelated register.
+//
+// Every buffer here carries one byte more than the length passed to
+// writeData(), and that trailing zero is load-bearing rather than padding.
+// writeData's loop is `do { ... } while (len--)`, which sends len+1 bytes: the
+// init table only looks correct because its rows are fixed 16-byte arrays, so
+// the extra byte is an in-bounds zero. Every register the panel is configured
+// with is therefore already followed by a 0x00, and the part is happy with it.
+// Matching that exactly is the point -- sending one byte fewer would be a
+// different sequence from the one known to work, and sizing these to the
+// nominal length instead would read off the end of a local.
+constexpr uint8_t BANK_BK0[6] = {0x77, 0x01, 0x00, 0x00, 0x10, 0x00};
+constexpr uint8_t BANK_BK1[6] = {0x77, 0x01, 0x00, 0x00, 0x11, 0x00};
+constexpr uint8_t BANK_USER[6] = {0x77, 0x01, 0x00, 0x00, 0x00, 0x00};
+constexpr int BANK_LEN = 5;
+} // namespace
+
+void LilyGo_RGBPanel::setVcom(uint8_t vcoms) {
+    if (!_has_init) {
+        return;
+    }
+    const uint8_t data[2] = {vcoms, 0x00};
+    writeCommand(0xFF);
+    writeData(BANK_BK1, BANK_LEN);
+    writeCommand(0xB1);
+    writeData(data, 1);
+    // Back to the user bank, which is where the table leaves the part and so
+    // where anything else touching it will expect to find it.
+    writeCommand(0xFF);
+    writeData(BANK_USER, BANK_LEN);
+}
+
+void LilyGo_RGBPanel::setInversion(uint8_t invset0) {
+    if (!_has_init) {
+        return;
+    }
+    // INVSET is two bytes and only the first selects the inversion mode; the
+    // second is the shipped 0x0A, rewritten with it so the register is never
+    // left half-updated.
+    const uint8_t data[3] = {invset0, 0x0A, 0x00};
+    writeCommand(0xFF);
+    writeData(BANK_BK0, BANK_LEN);
+    writeCommand(0xC2);
+    writeData(data, 2);
+    writeCommand(0xFF);
+    writeData(BANK_USER, BANK_LEN);
+}
 
 uint16_t *LilyGo_RGBPanel::directFrameBuffer(int index) {
     if (!_fbResolved) {
@@ -683,8 +737,8 @@ void LilyGo_RGBPanel::resolveFrameBuffers() {
             // does not: a caller flipping between 0 and 1 needs them both, and
             // one usable buffer is still worth having for a direct writer that
             // accepts the tearing.
-            log_w("LilyGo_RGBPanel: framebuffer %d at %p unusable for direct writes (psram=%d aligned=%d, need %u B)", i,
-                  fb, static_cast<int>(inPsram), static_cast<int>(aligned), static_cast<unsigned>(cacheAlign));
+            log_w("LilyGo_RGBPanel: framebuffer %d at %p unusable for direct writes (psram=%d aligned=%d, need %u B)", i, fb,
+                  static_cast<int>(inPsram), static_cast<int>(aligned), static_cast<unsigned>(cacheAlign));
             break;
         }
         _fbDirect[i] = fb;

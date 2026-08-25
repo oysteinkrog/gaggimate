@@ -27,6 +27,7 @@ extern uint32_t nebula_lerp_self_test(uint32_t *firstBad);
 // /api/settings echoes panelclock::hasLiveControl() so the form can tell the
 // user whether a new divider applies now or at the next boot.
 #include <display/core/utils.h>
+#include <display/drivers/LilyGoDriver.h>
 #include <display/drivers/common/PanelClock.h>
 #include <display/ui/default/bganim/BgAnimCommon.h>
 #include <display/util/PsramStlAllocator.h>
@@ -499,6 +500,34 @@ void WebUIPlugin::setupServer() {
         char buf[128];
         snprintf(buf, sizeof(buf), "{\"internal_us\":%u,\"psram_us\":%u,\"deadline_us\":162}", static_cast<unsigned>(b - a),
                  static_cast<unsigned>(c - b));
+        request->send(200, "application/json", buf);
+    });
+    // Live ST7701S inversion-mode tuning: /api/debug/panelreg?inv=49
+    //
+    // INVSET's first byte (BK0 0xC2) selects the inversion mode; the panel
+    // ships with 0x31, 49 decimal. It is not persisted, so a reboot puts the
+    // init table's value back and a bad sweep cannot leave the panel wrong.
+    //
+    // VCOM used to be swept here too and is now the panelVcom setting instead,
+    // which is both persisted and applied live. Do not add it back: the setting
+    // is only re-applied when its value changes, so a poke from here would sit
+    // on top of it invisibly and the slider would appear to do nothing on the
+    // way back to the value it already held.
+    server.on("/api/debug/panelreg", [](AsyncWebServerRequest *request) {
+        LilyGoDriver *drv = LilyGoDriver::peekInstance();
+        if (drv == nullptr) {
+            request->send(404, "application/json", "{\"error\":\"not a LilyGo panel\"}");
+            return;
+        }
+        int inv = -1;
+        if (request->hasArg("inv")) {
+            inv = request->arg("inv").toInt();
+            if (inv >= 0 && inv <= 255) {
+                drv->setPanelInversion(static_cast<uint8_t>(inv));
+            }
+        }
+        char buf[96];
+        snprintf(buf, sizeof(buf), "{\"inv\":%d,\"shipped_inv\":49}", inv);
         request->send(200, "application/json", buf);
     });
     server.on("/api/status", [this](AsyncWebServerRequest *request) {
@@ -1466,6 +1495,13 @@ void WebUIPlugin::handleSettings(AsyncWebServerRequest *request) const {
                     div = 0;
                 settings->setPanelClockDiv(div);
             }
+            if (request->hasArg("panelVcom")) {
+                // Clamped in the setter to 0-127. The register is 8-bit, but
+                // the top half is far past any VCOM this glass wants, and a
+                // wildly wrong VCOM is visible as a washed-out or flickering
+                // panel rather than as anything that fails safely.
+                settings->setPanelVcom(request->arg("panelVcom").toInt());
+            }
             if (request->hasArg("bgAnimCustomTheme"))
                 settings->setBgAnimCustomTheme(request->arg("bgAnimCustomTheme"));
             if (request->hasArg("bgAnimId") || request->hasArg("bgAnimParams"))
@@ -1640,6 +1676,7 @@ void WebUIPlugin::handleSettings(AsyncWebServerRequest *request) const {
     doc["bgAnimHighlightKnee"] = settings.getBgAnimHighlightKnee();
     doc["bgAnimScrim"] = settings.getBgAnimScrim();
     doc["panelClockDiv"] = settings.getPanelClockDiv();
+    doc["panelVcom"] = settings.getPanelVcom();
     // Read-only capability flag, not a setting: on ESP-IDF 4.4 there is no
     // esp_lcd_rgb_panel_set_pclk, so a new divider is only honoured when the
     // panel is next created. The form posts the whole document back and the

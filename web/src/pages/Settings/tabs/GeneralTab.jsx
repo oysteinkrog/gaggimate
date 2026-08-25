@@ -264,6 +264,26 @@ function BackgroundAnimationSettings({ formData, onChange, setField }) {
             <option value={8}>38 Hz, most conservative</option>
           </select>
         </SettingsFormField>
+        <SettingsFormField
+          label={`Panel VCOM (${formData.panelVcom === undefined ? 45 : parseInt(formData.panelVcom, 10)}, ${(
+            0.1 +
+            (formData.panelVcom === undefined ? 45 : parseInt(formData.panelVcom, 10)) * 0.0125
+          ).toFixed(2)} V)`}
+          htmlFor='panelVcom'
+          noMargin
+          helpText='Trim this only if you see a faint shimmer on large flat areas. Move it a few steps at a time and stop where the shimmer is weakest. The right value differs per panel and drifts while the display warms up, so judge it on a cold screen. 45 is what the panel ships with.'
+        >
+          <input
+            id='panelVcom'
+            name='panelVcom'
+            type='range'
+            min='20'
+            max='100'
+            className='range w-full'
+            value={formData.panelVcom === undefined ? 45 : parseInt(formData.panelVcom, 10)}
+            onChange={onChange('panelVcom')}
+          />
+        </SettingsFormField>
         <SettingsFormField label='Animation resolution' htmlFor='bgAnimHalfRes' noMargin>
           <select
             id='bgAnimHalfRes'

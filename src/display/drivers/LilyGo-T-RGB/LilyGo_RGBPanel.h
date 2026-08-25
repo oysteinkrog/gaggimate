@@ -17,11 +17,11 @@
 
 #include <SD_MMC.h>
 #include <esp_lcd_panel_io.h>
-#include <freertos/FreeRTOS.h>
-#include <freertos/semphr.h>
 #include <esp_lcd_panel_ops.h>
 #include <esp_lcd_panel_rgb.h>
 #include <esp_lcd_panel_vendor.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
 
 #include <display/drivers/common/Display.h>
 #include <display/drivers/common/ext.h>
@@ -105,6 +105,26 @@ class LilyGo_RGBPanel : public Display {
     void unlockFrameBuffer() override;
     void *frameBufferGate() override;
     void setDirectWriter(bool active) override;
+
+    // The two ST7701S registers that set where inversion flicker nulls out:
+    // VCOMS (BK1 0xB1) and INVSET's first byte (BK0 0xC2).
+    //
+    // Both are writable at runtime rather than only at init, because the fault
+    // they address only shows up under conditions a build-and-flash loop cannot
+    // hold still. VCOM's null moves with the temperature of the glass, so a
+    // cold panel sits off it and shimmers on large mid-tone areas until it
+    // warms; finding the value that is right cold means adjusting it while it
+    // IS cold, which is a few seconds of sweeping, not a few minutes of
+    // reflashing and waiting for the panel to cool down again.
+    //
+    // setVcom backs the panelVcom setting and is applied from DefaultUI on
+    // every change. setInversion is not persisted and reverts to the init table
+    // on the next boot.
+    //
+    // The control interface is the 9-bit SPI extender, entirely separate from
+    // the RGB data path, so both are safe to write while scan-out is running.
+    void setVcom(uint8_t vcoms);
+    void setInversion(uint8_t invset0);
 
   private:
     // Two, so a frame can be composed off-screen and shown whole. Named rather
