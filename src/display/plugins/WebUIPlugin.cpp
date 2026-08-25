@@ -856,6 +856,14 @@ void WebUIPlugin::setupServer() {
                 a->benchRequestReset();
             }
         }
+        // ?probe=0..3 -- blend-stage decomposition, see benchSetBlendProbe.
+        if (request->hasArg("probe")) {
+            SleepAnimation *a = sleep_animation_bench_instance();
+            if (a != nullptr) {
+                a->benchSetBlendProbe(request->arg("probe").toInt());
+                a->benchRequestReset();
+            }
+        }
         if (request->hasArg("only")) {
             SleepAnimation *a = sleep_animation_bench_instance();
             if (a != nullptr) {
@@ -976,7 +984,7 @@ void WebUIPlugin::setupServer() {
                 o["wait_us"] = res[i].waitUs;
                 o["pack_us"] = res[i].packUs;
                 o["span_px"] = res[i].spanPx;
-                o["blend_px"] = res[i].blendPx;
+                o["scrim_px"] = res[i].scrimPx;
                 o["fps"] = res[i].achievedFps / 100.0;
                 // Per-row band cost with and without the scheduler suspended.
                 // A gap between them is preemption being charged to the band
