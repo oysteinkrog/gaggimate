@@ -55,6 +55,26 @@ CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=16384
 # cache tops out at a 32-byte line.
 CONFIG_ESP32S3_DATA_CACHE_LINE_64B=y
 
+# Not enabling CONFIG_SPIRAM_XIP_FROM_PSRAM (and so not
+# SPIRAM_FETCH_INSTRUCTIONS / SPIRAM_RODATA), even though Espressif's LCD FAQ
+# lists them among the prerequisites for RGB bounce-buffer mode. Their argument
+# is sound on both counts: flash and PSRAM share the MSPI controller and octal
+# PSRAM is four times the bandwidth of quad SDR flash, so an instruction miss
+# served from PSRAM occupies the controller for a quarter as long; and a flash
+# write disables the cache, which suspends the bounce-buffer refill ISR
+# (esp_lcd_panel_rgb.c warns its memcpy would crash, not merely glitch, if it
+# ran then), so every NVS save is a run of stale bounce buffers on screen.
+#
+# It does not survive contact with this firmware's size. Measured: copying .text
+# and .rodata into PSRAM at startup took 4.3 MB of the 4.5 MB free, leaving
+# 255 kB. Internal DRAM gained 19.5 kB, since code that needed IRAM placement no
+# longer does, but the background animations could not allocate their working
+# buffers at all and the screen came up as bare text on black. The embedded web
+# UI blob and the LVGL fonts are most of that 4.3 MB.
+#
+# So the brief corruption during an NVS write stands as a known defect. It is
+# bounded by the write and it is what upstream ships.
+
 # Route NimBLE host + mbedTLS allocations to PSRAM (reclaims ~40 KB internal).
 CONFIG_BT_NIMBLE_MEM_ALLOC_MODE_INTERNAL=n
 CONFIG_BT_NIMBLE_MEM_ALLOC_MODE_EXTERNAL=y
