@@ -1330,6 +1330,90 @@ void SleepAnimation::presentFrame() {
     fbBack ^= 1;
 }
 
+// Pick the render resolution for the running animation, once, by measuring it.
+//
+// Half resolution costs a quarter of the per-pixel work and shows it. The field
+// is computed at 240x240 and every pixel doubled on the way out, so a 4x4
+// ordered dither cell reaches the panel as an 8x8 block of four identical
+// pixels. At that size the dither stops dissolving the palette steps it exists
+// to hide and becomes a texture in its own right, which is what it looks like:
+// a visible weave over what should read as a smooth field.
+//
+// That price used to be paid by all thirteen animations, because the setting
+// was a single global dial and a dial has to be set for the worst of the
+// fleet. They are nothing like each other -- plasma's band work is a fifth of
+// caustics' -- so the cheap ones were giving up quality to buy headroom they
+// did not need.
+//
+// So treat the setting as a ceiling and measure instead. Start every animation
+// at full resolution, watch a few frames, and drop to half only if it actually
+// misses its budget. The number used is the frame time the pacing code below
+// already computes, which is the honest one: it counts the push and any wait on
+// it, not just the band loop.
+//
+// The decision is settled per animation and per fps target and then left alone.
+// A later frame that happens to also composite a fresh widget snapshot cannot
+// flip it, so nothing oscillates, and each resolution change costs an init() --
+// worth paying once when the animation changes, not repeatedly.
+void SleepAnimation::autoResolution(int id, int fps, int64_t frameUs, int64_t budgetUs) {
+    // Frames to discard before the window opens. The first frames after a
+    // resolution change are not representative: init() ran on one of them, and
+    // the warmup pass renders every row rather than the interlaced half.
+    constexpr uint8_t SKIP_FRAMES = 3;
+    constexpr uint8_t WINDOW_FRAMES = 6;
+
+    if (!halfResAllowed.load()) {
+        // Forbidden outright, so there is nothing to decide.
+        if (halfRes.load()) {
+            halfRes.store(false);
+        }
+        autoResAnim = -1;
+        return;
+    }
+    if (autoResReset.exchange(false)) {
+        autoResAnim = -1;
+    }
+    if (id != autoResAnim || fps != autoResFps) {
+        autoResAnim = id;
+        autoResFps = static_cast<uint8_t>(fps);
+        autoResSeen = 0;
+        autoResFrames = 0;
+        autoResUs = 0;
+        autoResSettled = false;
+        halfRes.store(false); // probe at the resolution we would rather keep
+        return;
+    }
+    if (autoResSettled) {
+        return;
+    }
+    if (autoResSeen < SKIP_FRAMES) {
+        autoResSeen++;
+        return;
+    }
+    // A frame this far over is not going to be rescued by averaging, and full
+    // resolution on the heavy animations is slow enough that sitting out the
+    // whole window is itself the visible problem.
+    if (frameUs > budgetUs * 2) {
+        halfRes.store(true);
+        autoResSettled = true;
+        return;
+    }
+    autoResUs += static_cast<uint64_t>(frameUs);
+    if (++autoResFrames < WINDOW_FRAMES) {
+        return;
+    }
+    const int64_t mean = static_cast<int64_t>(autoResUs / autoResFrames);
+    // Four fifths of the budget rather than all of it. The window is short
+    // enough to miss the frames that also composite a widget snapshot, and a
+    // decision held this long should carry margin.
+    if (mean * 5 > budgetUs * 4) {
+        halfRes.store(true);
+    }
+    autoResSettled = true;
+    log_i("SleepAnimation: anim %d at %s resolution (%lld us mean, %lld us budget)", id, halfRes.load() ? "half" : "full",
+          static_cast<long long>(mean), static_cast<long long>(budgetUs));
+}
+
 void SleepAnimation::renderLoop() {
     uint32_t fpsFrames = 0;
     unsigned long fpsWindowStart = millis();
@@ -1374,6 +1458,11 @@ void SleepAnimation::renderLoop() {
         fps = fps < 5 ? 5 : (fps > 60 ? 60 : fps);
         const int64_t targetFrameUs = 1000000 / fps;
         const int64_t elapsed = esp_timer_get_time() - frameStart;
+#ifndef GM_ANIM_BENCH
+        // Bench builds drive the resolution explicitly, and a probe moving it
+        // underneath a sweep would average two configurations into one number.
+        autoResolution(animId.load(), fps, elapsed, targetFrameUs);
+#endif
         const int64_t remaining = targetFrameUs - elapsed;
         // Always yield at least one full tick so the UI task keeps polling
         // touch even when a frame overruns its budget.

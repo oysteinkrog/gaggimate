@@ -12,16 +12,26 @@ namespace {
 using namespace bganim;
 
 int16_t *colTerm = nullptr;
-// colTerm plus the ordered dither, in four copies -- one per y&3 Bayer phase.
-// The dither has to vary with both x&3 and y&3, and rowTerm[y] is a single
+// colTerm plus the ordered dither, in eight copies -- one per y&7 Bayer phase.
+// The dither has to vary with both x&7 and y&7, and rowTerm[y] is a single
 // scalar per row, so there is nowhere else to hide it: folding it here keeps
 // band()'s inner loop byte-identical to the undithered version, at the cost of
-// 4*w int16 stores per frame in frame() (1920 at w=480, against 230k pixels).
+// 8*w int16 stores per frame in frame() (3840 at w=480, against 230k pixels).
+//
+// Eight and not four, i.e. BAYER8 rather than BAYER4, because the amplitude
+// this needs is large -- plasma was the worst bander in the fleet without it --
+// and a 4x4 matrix has only 16 levels to spread that amplitude over. Each step
+// is then a sixteenth of the swing and the pattern reads as a weave. The 8x8
+// matrix carries the same swing in 64 steps, so the individual step is four
+// times smaller and the period twice as long, which is the whole difference
+// between dither that dissolves a contour and dither you can see. It costs one
+// more row of int16 per phase and nothing per pixel: band() indexes y&7 where
+// it indexed y&3.
 int16_t *colTermPh = nullptr;
 int16_t *rowTerm = nullptr;
 // Dither offsets in PRE-SHIFT units, where one palette index is 16, so a
 // sub-index amplitude survives the >>4 in band(). Rebuilt with the wheel.
-int16_t dithOff[16] = {0};
+int16_t dithOff[64] = {0};
 uint16_t *palette = nullptr;    // base palette (theme-cycled build)
 uint16_t *rotPalette = nullptr; // palette pre-rotated by `cycle` each frame,
                                 // so band() can index with a plain & 255
@@ -48,7 +58,7 @@ bool init(int w, int h) {
         // Sized from allocW, not w, so it always matches what colTerm can hold
         // and what release() frees: if a retried init() sees colTerm already
         // allocated at an earlier width, allocW is that earlier width.
-        colTermPh = static_cast<int16_t *>(alloc(4 * allocW * sizeof(int16_t)));
+        colTermPh = static_cast<int16_t *>(alloc(8 * allocW * sizeof(int16_t)));
     }
     if (rowTerm == nullptr) {
         rowTerm = static_cast<int16_t *>(alloc(h * sizeof(int16_t)));
@@ -77,8 +87,8 @@ void frame(uint32_t tMs, int w, int h, const uint8_t p[4]) {
         // would get over-dithered into visible texture at full amplitude. At
         // 0.75 the contour share is 12.6%/9.4% with the pattern still hidden.
         const float amp = ditherAmp(palette, 256) * 0.75f;
-        for (int k = 0; k < 16; k++) {
-            const float d = (static_cast<float>(BAYER4[k]) - 7.5f) * (amp * 16.0f / 7.5f);
+        for (int k = 0; k < 64; k++) {
+            const float d = (static_cast<float>(BAYER8[k]) - 31.5f) * (amp * 16.0f / 31.5f);
             dithOff[k] = static_cast<int16_t>(lroundf(d));
         }
     }
@@ -107,14 +117,14 @@ void frame(uint32_t tMs, int w, int h, const uint8_t p[4]) {
     for (int y = 0; y < h; y++) {
         rowTerm[y] = sl[(y * f4 + phase2) & (SIN_N - 1)] + sl[(y * f3 + phase3) & (SIN_N - 1)];
     }
-    // Expand into the four y-phase copies. colTerm's own range is +-1024 (two
+    // Expand into the eight y-phase copies. colTerm's own range is +-1024 (two
     // sine terms of amplitude 512) and the dither adds at most +-256, so int16
     // still has headroom.
-    for (int ph = 0; ph < 4; ph++) {
+    for (int ph = 0; ph < 8; ph++) {
         int16_t *dstPh = colTermPh + static_cast<size_t>(ph) * w;
-        const int16_t *off = &dithOff[ph * 4];
+        const int16_t *off = &dithOff[ph * 8];
         for (int x = 0; x < w; x++) {
-            dstPh[x] = static_cast<int16_t>(colTerm[x] + off[x & 3]);
+            dstPh[x] = static_cast<int16_t>(colTerm[x] + off[x & 7]);
         }
     }
 
@@ -134,7 +144,7 @@ void band(uint16_t *dst, int y0, int rows, int w, uint32_t, const uint8_t *) {
         const int rt = rowTerm[y];
         // The dither is already in this row's phase copy, so the loop below is
         // unchanged from the undithered version -- zero per-pixel cost.
-        const int16_t *ct = colTermPh + static_cast<size_t>(y & 3) * w;
+        const int16_t *ct = colTermPh + static_cast<size_t>(y & 7) * w;
         int x = 0;
         // Emit pixels in pairs via a single uint32 store where possible —
         // halves the number of store instructions in the hot loop (device
@@ -154,7 +164,7 @@ void band(uint16_t *dst, int y0, int rows, int w, uint32_t, const uint8_t *) {
 
 void release() {
     releaseTable(colTerm, static_cast<size_t>(allocW) * sizeof(int16_t));
-    releaseTable(colTermPh, static_cast<size_t>(4 * allocW) * sizeof(int16_t));
+    releaseTable(colTermPh, static_cast<size_t>(8 * allocW) * sizeof(int16_t));
     releaseTable(rowTerm, static_cast<size_t>(allocH) * sizeof(int16_t));
     releaseTable(palette, 256 * sizeof(uint16_t));
     releaseTable(rotPalette, 256 * sizeof(uint16_t));
