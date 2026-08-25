@@ -224,6 +224,26 @@ void frame(uint32_t, int, int, const uint8_t p[4]) {
     g_cy = sCy >> 8;
 }
 
+// The same arithmetic, for the host bench and as the reference the device
+// self-test compares against.
+static inline uint8_t lerpScalar(int a, int b, int f) {
+    return static_cast<uint8_t>(a + (((b - a) * f) >> 8));
+}
+
+// A whole row of the x-interpolation, scalar. This is what the host bench
+// builds, and what the device falls back to when the texture row is not
+// 16-byte aligned -- see lerpShiftRowPie for why alignment is a precondition
+// there rather than a preference.
+static void lerpShiftRowScalar(uint8_t *__restrict out, const uint8_t *__restrict a, int f) {
+    int cur = a[0];
+    for (int i = 0; i < 255; i++) {
+        const int nxt = a[i + 1];
+        out[i] = static_cast<uint8_t>(cur + (((nxt - cur) * f) >> 8));
+        cur = nxt;
+    }
+    out[255] = static_cast<uint8_t>(cur + (((a[0] - cur) * f) >> 8));
+}
+
 #if defined(__XTENSA__)
 // out[i] = a[i] + (((b[i] - a[i]) * f) >> 8), sixteen bytes per group, on the
 // ESP32-S3's PIE vector unit.
@@ -305,10 +325,17 @@ __attribute__((noinline)) static void lerpRowPie(uint8_t *__restrict out, const 
 // derives the shifted vector in-register. That is one extra load and one
 // EE.SRC.Q per group instead of a separate 256-byte shifted copy of the row.
 //
-// n16 is 15, not 16, deliberately: iteration k reads block k+1 and writes
-// block k, so fifteen groups touch bytes 0..255 exactly and never read past
-// the row. The last sixteen entries, including the wrap where a[256] means
-// a[0], are the caller's scalar tail.
+// Iteration k reads aligned block k+1 and writes block k, so n16 groups touch
+// bytes 0..16*n16+15. At n16=16 that is one block past the row, which is why
+// noiseTex256 carries sixteen bytes of slack: for rows 0..254 the extra block
+// is simply the next row, and for row 255 it is that padding. Only the wrap at
+// index 255 is then wrong, since the interpolation wants a[0] there rather
+// than a[256], and the caller fixes that one entry.
+//
+// The row must be 16-byte aligned. EE.LD.128.USAR.IP forces the low four
+// address bits of its access to zero while capturing them into SAR_BYTE, so an
+// unaligned base would still compute the right values but would read behind
+// the row on the setup load. band() checks and falls back to scalar.
 __attribute__((noinline)) static void lerpShiftRowPie(uint8_t *__restrict out, const uint8_t *__restrict a,
                                                       const uint16_t *__restrict fv, int n16) {
     const uint8_t *pa = a + 1; // sets SAR_BYTE = 1 in the setup load
@@ -340,12 +367,6 @@ __attribute__((noinline)) static void lerpShiftRowPie(uint8_t *__restrict out, c
                  : [pa] "+r"(pa), [po] "+r"(po), [f] "+r"(pf), [n] "+r"(n)
                  :
                  : "memory");
-}
-
-// The same arithmetic, for the host bench and as the reference the device
-// self-test compares against.
-static inline uint8_t lerpScalar(int a, int b, int f) {
-    return static_cast<uint8_t>(a + (((b - a) * f) >> 8));
 }
 
 // Every input the kernel can see: 256 values of a, by 256 of b, by 256 of f.
@@ -381,14 +402,13 @@ uint32_t nebulaLerpSelfTest(uint32_t *firstBad) {
     return bad;
 }
 
-// The whole x-interpolation as band() actually calls it: the vector kernel
-// over the first fifteen groups plus the scalar tail that finishes the row and
-// closes the wrap, against the original single scalar loop, over real noise
-// texture rows.
+// The whole x-interpolation as band() actually calls it: the vector kernel over
+// all sixteen groups plus the single scalar fixup that closes the wrap, against
+// the original single scalar loop, over real noise texture rows.
 //
 // The two tests above check the kernels on synthetic input. This checks the
-// composition, which is where the parts that are not the kernel live: the
-// group count, the tail's start index, and the wrap entry at 255. Those are
+// composition, which is where the parts that are not the kernel live: the group
+// count and the wrap entry at 255. Those are
 // exactly the mistakes that would show up as a seam or a band in one place on
 // the panel rather than as garbage everywhere, and a photograph of a moving
 // animation cannot tell that apart from its own motion smear.
@@ -408,10 +428,7 @@ uint32_t nebulaRowSelfTest(uint32_t *firstBad) {
                 fv[k] = static_cast<uint16_t>(f);
             }
             // exactly what band() does
-            lerpShiftRowPie(got, a, fv, 15);
-            for (int i = 240; i < 255; i++) {
-                got[i] = lerpScalar(a[i], a[i + 1], f);
-            }
+            lerpShiftRowPie(got, a, fv, 16);
             got[255] = lerpScalar(a[255], a[0], f);
             // exactly what band() used to do
             int cur = a[0];
@@ -442,12 +459,14 @@ uint32_t nebulaRowSelfTest(uint32_t *firstBad) {
 // the alternating and reversed patterns then exercise the sign of the
 // difference, which a ramp cannot, across every factor.
 uint32_t nebulaShiftSelfTest(uint32_t *firstBad) {
-    alignas(16) uint8_t in[256];
+    // Sixteen bytes of slack, matching noiseTex256, so the last group has a
+    // real block to read and every one of the 256 outputs is well defined.
+    alignas(16) uint8_t in[256 + 16];
     alignas(16) uint8_t out[256];
     alignas(16) uint16_t fv[8];
     uint32_t bad = 0;
     for (int pat = 0; pat < 4; pat++) {
-        for (int i = 0; i < 256; i++) {
+        for (int i = 0; i < 256 + 16; i++) {
             switch (pat) {
             case 0: in[i] = static_cast<uint8_t>(i); break;               // ramp
             case 1: in[i] = static_cast<uint8_t>(255 - i); break;         // reversed
@@ -462,8 +481,8 @@ uint32_t nebulaShiftSelfTest(uint32_t *firstBad) {
             for (int i = 0; i < 256; i++) {
                 out[i] = 0xAA; // so a group the kernel skips cannot pass by luck
             }
-            lerpShiftRowPie(out, in, fv, 15);
-            for (int i = 0; i < 240; i++) {
+            lerpShiftRowPie(out, in, fv, 16);
+            for (int i = 0; i < 256; i++) {
                 if (out[i] != lerpScalar(in[i], in[i + 1], f)) {
                     if (bad == 0 && firstBad != nullptr) {
                         *firstBad = static_cast<uint32_t>(i) | (static_cast<uint32_t>(f) << 8) |
@@ -480,6 +499,15 @@ uint32_t nebulaShiftSelfTest(uint32_t *firstBad) {
 #endif
 
 void band(uint16_t *dst, int y0, int rows, int w, uint32_t, const uint8_t *) {
+#if defined(__XTENSA__)
+    // Every row of the texture sits at a 256-byte offset from its base, so one
+    // test on the base settles it for all of them. The vector path needs it
+    // because EE.LD.128.USAR.IP forces the low four address bits of its access
+    // to zero, so an unaligned base would make the first load of row 0 reach
+    // behind the allocation. noiseTex256 asks for 16 and this checks rather
+    // than assumes, since its fallback allocator does not promise it.
+    const bool rowAligned = (reinterpret_cast<uintptr_t>(noise) & 15) == 0;
+#endif
     const int axF = g_axF, ayF = g_ayF;
     const int wA = g_wA, wB = g_wB, densOff = g_densOff;
     alignas(16) static uint8_t blendedA[256];
@@ -615,6 +643,14 @@ void band(uint16_t *dst, int y0, int rows, int w, uint32_t, const uint8_t *) {
         // ixNext become live, lets bcTable's registers free up before that
         // pressure exists and restores its hardware loop.
         static uint16_t bcTable[128];
+#ifdef GM_NEBULA_BCTABLE_PROBE
+        // Diagnostic only, visually wrong: leave bcTable holding whatever the
+        // previous row left in it. 128 iterations per row, two noise-texture
+        // reads each, to feed a 240-pixel loop. Never build this into
+        // anything shipping.
+        (void)rowB;
+        (void)rowC;
+#else
         {
             int bI = g_bx & 255;
             int cI = g_cx & 255;
@@ -624,6 +660,7 @@ void band(uint16_t *dst, int y0, int rows, int w, uint32_t, const uint8_t *) {
                 cI = (cI + 4) & 255;
             }
         }
+#endif
 
         uint8_t *ixCur = ixBufs[curBuf];
         uint8_t *ixNext = ixBufs[curBuf ^ 1];
@@ -634,25 +671,21 @@ void band(uint16_t *dst, int y0, int rows, int w, uint32_t, const uint8_t *) {
             // just addressed at rowA0 -- kept as a separate copy rather than
             // a shared helper so neither loop gains a call in its body.
 #if defined(__XTENSA__)
-            {
+            if (rowAligned) {
                 alignas(16) uint16_t fv[8];
                 for (int k = 0; k < 8; k++) {
                     fv[k] = static_cast<uint16_t>(axF);
                 }
-                lerpShiftRowPie(ixCur, rowA0, fv, 15);
-                for (int i = 240; i < 255; i++) {
-                    ixCur[i] = lerpScalar(rowA0[i], rowA0[i + 1], axF);
-                }
+                lerpShiftRowPie(ixCur, rowA0, fv, 16);
+                // Only the wrap needs fixing: the kernel's last group read
+                // a[256], which is the next row, where the interpolation wants
+                // a[0]. Everything below 255 the vector path already has right.
                 ixCur[255] = lerpScalar(rowA0[255], rowA0[0], axF);
+            } else {
+                lerpShiftRowScalar(ixCur, rowA0, axF);
             }
 #else
-            int cur0 = rowA0[0];
-            for (int i = 0; i < 255; i++) {
-                const int nxt0 = rowA0[i + 1];
-                ixCur[i] = static_cast<uint8_t>(cur0 + (((nxt0 - cur0) * axF) >> 8));
-                cur0 = nxt0;
-            }
-            ixCur[255] = static_cast<uint8_t>(cur0 + (((rowA0[0] - cur0) * axF) >> 8));
+            lerpShiftRowScalar(ixCur, rowA0, axF);
 #endif
         }
 #ifdef GM_NEBULA_TABLE_PROBE
@@ -669,25 +702,21 @@ void band(uint16_t *dst, int y0, int rows, int w, uint32_t, const uint8_t *) {
 #else
         {
 #if defined(__XTENSA__)
-            {
+            if (rowAligned) {
                 alignas(16) uint16_t fv[8];
                 for (int k = 0; k < 8; k++) {
                     fv[k] = static_cast<uint16_t>(axF);
                 }
-                lerpShiftRowPie(ixNext, rowA1, fv, 15);
-                for (int i = 240; i < 255; i++) {
-                    ixNext[i] = lerpScalar(rowA1[i], rowA1[i + 1], axF);
-                }
+                lerpShiftRowPie(ixNext, rowA1, fv, 16);
+                // Only the wrap needs fixing: the kernel's last group read
+                // a[256], which is the next row, where the interpolation wants
+                // a[0]. Everything below 255 the vector path already has right.
                 ixNext[255] = lerpScalar(rowA1[255], rowA1[0], axF);
+            } else {
+                lerpShiftRowScalar(ixNext, rowA1, axF);
             }
 #else
-            int cur1 = rowA1[0];
-            for (int i = 0; i < 255; i++) {
-                const int nxt1 = rowA1[i + 1];
-                ixNext[i] = static_cast<uint8_t>(cur1 + (((nxt1 - cur1) * axF) >> 8));
-                cur1 = nxt1;
-            }
-            ixNext[255] = static_cast<uint8_t>(cur1 + (((rowA1[0] - cur1) * axF) >> 8));
+            lerpShiftRowScalar(ixNext, rowA1, axF);
 #endif
         }
 #if defined(__XTENSA__)
@@ -737,7 +766,18 @@ void band(uint16_t *dst, int y0, int rows, int w, uint32_t, const uint8_t *) {
                 const uint16_t bc = bcTable[step];
                 const int b = bc & 0xFF;
                 const int c = bc >> 8;
+#ifdef GM_NEBULA_ARITH_PROBE
+                // Diagnostic only, visually wrong: keep all three loads and
+                // the palette gather, drop the two multiplies, the shift and
+                // the dither. This splits the combine loop's cost into
+                // "arithmetic" and "loads plus gather", which decides whether
+                // a PIE rewrite of the blend is worth anything -- the palette
+                // lookup is a real gather and cannot vectorise, so if the
+                // gather dominates there is nothing here to win.
+                const int v = a ^ b ^ c;
+#else
                 const int v = c + ((((a - c) * wA) + ((b - c) * wB)) >> 6) + dith2[m & 7];
+#endif
                 row[m] = palette[v];
                 x0 = (x0 + 1) & 255;
                 step = (step + 1) & 127;
