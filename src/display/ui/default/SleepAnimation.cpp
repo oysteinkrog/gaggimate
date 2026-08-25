@@ -1779,8 +1779,16 @@ void SleepAnimation::renderFrame() {
                 }
             }
         }
-        const bool patternMode = patternOn.load() || flashMode != 0;
-        if (patternOn.load()) {
+        // pattern 1 replaces the animation and skips the composite, so the
+        // host can predict every pixel. pattern 2 keeps the composite, which
+        // the host cannot predict -- but it makes the background static, and a
+        // static scene is what lets the vector scrim be compared against the
+        // scalar one end to end: same scene, two kernels, the dumps must match
+        // byte for byte. The exhaustive kernel test covers the arithmetic;
+        // this covers the plumbing around it.
+        const int patternLevel = patternOn.load();
+        const bool patternMode = patternLevel == 1 || flashMode != 0;
+        if (patternLevel != 0) {
             for (int r = 0; r < rows; r++) {
                 uint16_t *const prow = band + static_cast<size_t>(r) * w;
                 const int py = y0 + r;

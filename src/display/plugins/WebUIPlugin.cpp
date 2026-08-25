@@ -791,7 +791,7 @@ void WebUIPlugin::setupServer() {
         if (request->hasArg("pattern")) {
             SleepAnimation *a = sleep_animation_bench_instance();
             if (a != nullptr) {
-                a->benchSetPattern(request->arg("pattern").toInt() != 0);
+                a->benchSetPattern(request->arg("pattern").toInt());
                 a->benchRequestReset();
             }
         }
