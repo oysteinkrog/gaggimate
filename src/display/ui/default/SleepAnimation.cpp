@@ -174,6 +174,97 @@ __attribute__((always_inline)) inline uint32_t scale565x2(uint32_t w, uint32_t i
     return scale565(static_cast<uint16_t>(w), inv) | (static_cast<uint32_t>(scale565(w >> 16, inv)) << 16);
 }
 
+// The same arithmetic as scale565, eight pixels per instruction group, on the
+// ESP32-S3's PIE vector unit.
+//
+// PIE is coprocessor CP3 ("cop_ai", 208-byte save area, XCHAL_CP_MASK 0x09).
+// Two consequences, both load-bearing:
+//
+//   - It is legal in thread context only. xtensa_vectors.S faults a
+//     coprocessor instruction issued from an interrupt or from kernel code,
+//     deliberately, to keep interrupt entry from having to save 208 bytes of
+//     vector state. This runs on the SleepAnim task, so that holds -- but it
+//     means this kernel must never be called from an ISR or a callback that
+//     might run in one.
+//   - The q registers are saved lazily per task by the generic mechanism
+//     (xtensa_context.S guards the CP3 save and restore on XCHAL_CP3_SA_SIZE),
+//     and SAR is part of the ordinary context frame (XT_STK_SAR), so the ssai
+//     hoisted out of the loop below survives both an interrupt and a task
+//     switch. Nothing else in this firmware issues an EE.* instruction; esp-dsp
+//     is a declared dependency but no routine from it is called, and in any
+//     case each of its kernels loads the q registers it needs on entry.
+//
+// EE.VMUL.U16 multiplies eight 16-bit lanes into eight 32-bit products, shifts
+// each right by SAR, and keeps the low 16 bits of the result (TRM v1.8 §1.8.128,
+// page 204). That full-width product is what makes scale565's packed red+blue
+// lane survive here: (c & 0xF81F) * inv overflows 16 bits for red, but the
+// product is 32 bits wide before the shift truncates it.
+//
+// The truncation does move where the channels land, though. At SAR=5 the lane
+// holds red*inv*64 + floor(blue*inv/32) rather than the 32-bit kernel's
+// bits 5..9 and 16..20, so the top five bits are red, the bottom five are blue,
+// and the remainder of red's division sits in bits 6..10 between them -- which
+// is exactly what the second AND against 0xF81F discards. Green is the same
+// story one mask over. Verified exhaustively against scale565 over all 65,536
+// colours by all 33 factors, and again on hardware; see /api/pietest.
+//
+// Twelve instructions for eight pixels, loop control included, against the
+// thirteen the scalar kernel issues for one -- both counted off the emitted
+// code, not the source. Both masks stay resident in q3 and q4 and SAR is set
+// once above the label, so the loop body is two loads, four ANDs, two
+// multiplies, an OR and a store.
+alignas(16) static const DRAM_ATTR uint16_t kPieMasks[16] = {
+    0xF81F, 0xF81F, 0xF81F, 0xF81F, 0xF81F, 0xF81F, 0xF81F, 0xF81F, // red and blue
+    0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, // green
+};
+
+// nOct eight-pixel groups. dst and inv must both be 16-byte aligned:
+// EE.VLD.128 and EE.VST.128 force the low four address bits to zero rather
+// than trapping, so a misaligned pointer here corrupts the neighbouring
+// pixels silently instead of failing.
+__attribute__((noinline)) static void scale565Oct(uint16_t *__restrict dst, const uint16_t *__restrict inv, int nOct) {
+    const uint16_t *rd = dst;
+    uint16_t *wr = dst;
+    const uint16_t *masks = kPieMasks;
+    int n = nOct;
+    asm volatile("ee.vld.128.ip q3, %[m], 16\n"  // q3 = 0xF81F x8
+                 "ee.vld.128.ip q4, %[m], 16\n"  // q4 = 0x07E0 x8
+                 "ssai 5\n"
+                 "1:\n"
+                 "ee.vld.128.ip q0, %[rd], 16\n" // eight pixels
+                 "ee.vld.128.ip q5, %[iv], 16\n" // eight factors, one per pixel
+                 "ee.andq q1, q0, q3\n"          // red and blue, packed
+                 "ee.andq q2, q0, q4\n"          // green
+                 "ee.vmul.u16 q1, q1, q5\n"      // 32-bit product, >>5, low 16
+                 "ee.vmul.u16 q2, q2, q5\n"
+                 "ee.andq q1, q1, q3\n"          // drop red's division remainder
+                 "ee.andq q2, q2, q4\n"
+                 "ee.orq q1, q1, q2\n"
+                 "ee.vst.128.ip q1, %[wr], 16\n"
+                 "addi %[n], %[n], -1\n"
+                 "bnez %[n], 1b\n"
+                 : [rd] "+r"(rd), [wr] "+r"(wr), [iv] "+r"(inv), [m] "+r"(masks), [n] "+r"(n)
+                 :
+                 : "memory");
+}
+
+// One cell's factor, replicated to the four pixels the cell covers.
+//
+// The vector kernel needs a factor per pixel, the scrim grid stores one per
+// cell, and one cell row serves the SCRIM_SHIFT panel rows below it -- so the
+// expansion is done once per cell row and read back SCRIM_SHIFT times.
+// Expanding the whole row rather than only the cells in runs keeps this
+// branchless; it is 120 cells either way at the widths this panel uses.
+static void expandScrimInv(uint16_t *__restrict out, const uint8_t *__restrict invRow, int cells) {
+    for (int c = 0; c < cells; c++) {
+        const uint16_t v = invRow[c];
+        const uint32_t pair = static_cast<uint32_t>(v) | (static_cast<uint32_t>(v) << 16);
+        uint32_t *const q = reinterpret_cast<uint32_t *>(out + (c << SCRIM_SHIFT));
+        q[0] = pair;
+        q[1] = pair;
+    }
+}
+
 // Append [x0, x1) to a row's run list, merging rather than growing it where
 // merging is the cheaper answer.
 //
@@ -248,6 +339,18 @@ __attribute__((noinline)) static void blendRow(uint16_t *__restrict dst, const u
 // but the 1/4-resolution grid -- 120 bytes a row -- and writes the band, which
 // is internal SRAM.
 //
+// One cell: four pixels at one factor.
+//
+// Spelled out rather than looped: at a four-iteration trip count the compiler
+// kept the counter and the branch, which is two of every thirteen instructions
+// the loop issued.
+__attribute__((always_inline)) inline void scrimCell(uint16_t *__restrict dst, uint32_t inv, int c) {
+    static_assert(SCRIM_SHIFT == 2, "the cell body is four pixels wide");
+    uint32_t *const q = reinterpret_cast<uint32_t *>(dst + (c << SCRIM_SHIFT));
+    q[0] = scale565x2(q[0], inv);
+    q[1] = scale565x2(q[1], inv);
+}
+
 // Dimming a pixel the blend is about to overwrite is wasted, but only for the
 // ~3,000 fully opaque pixels a frame, and detecting them is what cost the load
 // in the first place.
@@ -273,18 +376,88 @@ __attribute__((noinline)) static void scrimRow(uint16_t *__restrict dst, const u
             if (inv == SCRIM_INV_NONE) {
                 continue; // a cell a gap merge swallowed
             }
-            // Spelled out rather than looped: at a four-iteration trip count
-            // the compiler kept the counter and the branch, which is two of
-            // every thirteen instructions the loop issued.
-            static_assert(SCRIM_SHIFT == 2, "the cell body below is four pixels wide");
-            uint32_t *const q = reinterpret_cast<uint32_t *>(dst + (c << SCRIM_SHIFT));
-            q[0] = scale565x2(q[0], inv);
-            q[1] = scale565x2(q[1], inv);
+            scrimCell(dst, inv, c);
+        }
+    }
+}
+
+// scrimRow over the vector kernel.
+//
+// A group is eight pixels, which is two cells, and the 128-bit accesses need
+// the group 16-byte aligned -- so a run that starts on an odd cell has one
+// scalar cell ahead of the aligned body, and a run that ends on one has a
+// scalar cell after it. Every panel row is 16-byte aligned to begin with:
+// bandBuf is allocated on a 64-byte boundary and the row stride is 960 bytes.
+//
+// Cells the halo's gap merge swallowed are dimmed by SCRIM_INV_NONE here
+// rather than skipped, because a lane cannot branch. That factor is an exact
+// identity -- 32/32 -- so the group writes those pixels back unchanged.
+__attribute__((noinline)) static void scrimRowPie(uint16_t *__restrict dst, const uint8_t *__restrict invRow,
+                                                  const uint16_t *__restrict invPx, const uint32_t *__restrict runs,
+                                                  int nRuns, int w) {
+    for (int i = 0; i < nRuns; i++) {
+        const uint32_t r = runs[i];
+        int c0 = static_cast<int>(r & 0xFFFFu);
+        int c1 = static_cast<int>(r >> 16);
+        if ((c1 << SCRIM_SHIFT) > w) {
+            c1 = w >> SCRIM_SHIFT;
+        }
+        if ((c0 & 1) != 0 && c0 < c1) {
+            scrimCell(dst, invRow[c0], c0);
+            c0++;
+        }
+        const int nOct = (c1 - c0) >> 1;
+        if (nOct > 0) {
+            scale565Oct(dst + (c0 << SCRIM_SHIFT), invPx + (c0 << SCRIM_SHIFT), nOct);
+            c0 += nOct << 1;
+        }
+        for (int c = c0; c < c1; c++) {
+            scrimCell(dst, invRow[c], c);
         }
     }
 }
 
 #ifdef GM_ANIM_BENCH
+// Bench only: every input the vector kernel can ever see, checked against the
+// scalar one on the silicon that will run it.
+//
+// The host can only confirm the algebra. What it cannot confirm is that this
+// core's EE.VMUL.U16 really keeps a 32-bit product before the shift, that the
+// assembler encoded what was meant, or that the 128-bit accesses land where
+// they were pointed -- and all three fail silently, as wrong colours rather
+// than as a fault. 65,536 colours by 33 factors is the whole input space, so a
+// pass here is exhaustive rather than a sample.
+//
+// ~135 ms of solid compute, so it blocks whichever task calls it. Diagnostic
+// only, never on a frame path.
+static uint32_t pieSelfTest(uint32_t *firstBad) {
+    alignas(16) uint16_t px[8];
+    alignas(16) uint16_t iv[8];
+    uint32_t bad = 0;
+    for (uint32_t inv = 0; inv <= SCRIM_INV_NONE; inv++) {
+        for (int i = 0; i < 8; i++) {
+            iv[i] = static_cast<uint16_t>(inv);
+        }
+        for (uint32_t c = 0; c < 65536; c += 8) {
+            for (int i = 0; i < 8; i++) {
+                px[i] = static_cast<uint16_t>(c + i);
+            }
+            scale565Oct(px, iv, 1);
+            for (int i = 0; i < 8; i++) {
+                const uint16_t want = scale565(static_cast<uint16_t>(c + i), inv);
+                if (px[i] != want) {
+                    if (bad == 0 && firstBad != nullptr) {
+                        // colour, factor, what came back, what was wanted
+                        *firstBad = (c + i) | (inv << 16);
+                    }
+                    bad++;
+                }
+            }
+        }
+    }
+    return bad;
+}
+
 // Bench only: the blend walk with its work removed, so the pixel loop can be
 // split into what it computes and what it waits on.
 //   2 -- read the coverage byte and nothing else (the PSRAM load on its own)
@@ -345,6 +518,10 @@ void *allocPreferInternal(size_t size) {
     return p;
 }
 } // namespace
+
+#ifdef GM_ANIM_BENCH
+uint32_t SleepAnimation::benchPieSelfTest(uint32_t *firstBad) { return pieSelfTest(firstBad); }
+#endif
 
 SleepAnimation::~SleepAnimation() { stop(); }
 
@@ -430,6 +607,14 @@ void SleepAnimation::start(Display *d) {
     }
     if (halfBuf == nullptr) {
         halfBuf = static_cast<uint16_t *>(allocPreferInternal((w / 2) * (BAND_H / 2) * sizeof(uint16_t)));
+    }
+    if (scrimInvPx == nullptr) {
+        // One panel row of per-pixel dim factors for the vector scrim. Internal
+        // SRAM and 16-byte aligned, both required: the 128-bit loads force the
+        // low four address bits to zero, and the point of expanding here rather
+        // than reading the cell grid twice is to keep this off PSRAM.
+        scrimInvPx = static_cast<uint16_t *>(
+            heap_caps_aligned_alloc(16, static_cast<size_t>(w) * sizeof(uint16_t), MALLOC_CAP_INTERNAL));
     }
     computeChords(w, h);
     if (overlayCap == 0) {
@@ -1415,6 +1600,16 @@ void SleepAnimation::renderFrame() {
             return;
         }
         uint16_t *const band = bandBuf[renderSlot];
+        // Reset per band, not per frame: a band may be rendered against a
+        // different overlay than the one the last band saw.
+        int expandedCy = -1;
+        // EE.VLD.128/EE.VST.128 mask the low four address bits off rather
+        // than trapping, so an unaligned row would corrupt its neighbours
+        // silently. bandBuf's own allocation asks for 64 bytes and the 960-byte
+        // row stride keeps every row aligned, but it has a fallback allocator
+        // that promises nothing -- so this is checked rather than assumed.
+        const bool pieScrim = pieOn.load() && scrimInvPx != nullptr &&
+                              ((reinterpret_cast<uintptr_t>(band) | (static_cast<uintptr_t>(w) * 2)) & 0xF) == 0;
         // Decided once per band and used twice: the blend skips rows this frame
         // will not push, and the push job carries the parity. Interlacing only
         // applies to the two-task push path -- the direct path writes the
@@ -1546,6 +1741,10 @@ void SleepAnimation::renderFrame() {
                 }
             }
         }
+#else
+        // The composite reads this below; without the bench build there is no
+        // pattern to substitute, so it folds away.
+        constexpr bool patternMode = false;
 #endif
         BENCH_T0(tBlend);
 #ifdef GM_ANIM_BENCH
@@ -1580,8 +1779,19 @@ void SleepAnimation::renderFrame() {
                 const int cy = y >> SCRIM_SHIFT;
                 const int nHalo = ov->haloN[cy];
                 if (nHalo != 0) {
-                    scrimRow(drow, ov->scrim + static_cast<size_t>(cy) * ov->scrimW,
-                             ov->haloRuns + static_cast<size_t>(cy) * RUNS_PER_ROW, nHalo, w);
+                    const uint8_t *const invRow = ov->scrim + static_cast<size_t>(cy) * ov->scrimW;
+                    const uint32_t *const halo = ov->haloRuns + static_cast<size_t>(cy) * RUNS_PER_ROW;
+                    if (pieScrim) {
+                        // SCRIM_SHIFT panel rows share a cell row, so the
+                        // expansion is amortised over all of them.
+                        if (cy != expandedCy) {
+                            expandScrimInv(scrimInvPx, invRow, ov->scrimW);
+                            expandedCy = cy;
+                        }
+                        scrimRowPie(drow, invRow, scrimInvPx, halo, nHalo, w);
+                    } else {
+                        scrimRow(drow, invRow, halo, nHalo, w);
+                    }
 #ifdef GM_ANIM_BENCH
                     for (int i = 0; i < nHalo; i++) {
                         const uint32_t r = ov->haloRuns[static_cast<size_t>(cy) * RUNS_PER_ROW + i];

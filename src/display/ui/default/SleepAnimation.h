@@ -188,12 +188,17 @@ class SleepAnimation {
     //   3 -- plus the band read-modify-write, so the SRAM traffic does too
     // Which separates the cost of deciding what to touch from the cost of
     // touching it, and that from what waits on memory.
+    void benchSetBlendProbe(int level) { blendProbe.store(level); }
     // Replace the animation and the composite with a deterministic pattern the
     // host can recompute, so the render-to-framebuffer path can be checked by
     // byte comparison instead of by looking at it.
     void benchSetPattern(bool on) { patternOn.store(on); }
     bool benchPattern() const { return patternOn.load(); }
-    void benchSetBlendProbe(int level) { blendProbe.store(level); }
+    // Dim the scrim on the PIE vector unit rather than a pixel at a time, and
+    // check that kernel against the scalar one over its whole input space.
+    void benchSetPie(bool on) { pieOn.store(on); }
+    bool benchPie() const { return pieOn.load(); }
+    uint32_t benchPieSelfTest(uint32_t *firstBad);
     int benchGetOnly() const { return benchOnly.load(); }
     // The sweep normally runs uncapped, because a throttled frame reports the
     // cap instead of the cost. This puts the cap back deliberately, for
@@ -476,12 +481,18 @@ class SleepAnimation {
     // outlive it and something has to remember whose they are.
     int residentAnimId = -1;
     bool initializedHalf = false; // resolution that init() ran at; a change re-inits
-    uint16_t *halfBuf = nullptr;  // (w/2)x(BAND_H/2) scratch for half-res rendering
+    uint16_t *halfBuf = nullptr;     // (w/2)x(BAND_H/2) scratch for half-res rendering
+    // One panel row of per-pixel scrim factors, internal SRAM, 16-byte aligned.
+    uint16_t *scrimInvPx = nullptr;
 
     // Scrim strength in Q8 (0 = off, 256 = black). Read once per band by the
     // composite, so a plain relaxed load is all it needs.
     std::atomic<int> scrimQ8{55 * 256 / 100};
     std::atomic<int> blendProbe{0};
+    // Dim the scrim on the PIE vector unit rather than a pixel at a time.
+    // Default on; the scalar path stays as the reference /api/pietest checks
+    // against, and as the kernel for a run's unaligned edge cells.
+    std::atomic<bool> pieOn{true};
     std::atomic<bool> patternOn{false};
     // Scratch grid for the separable dilate/blur passes, one shared copy: the
     // passes run to completion inside publishOverlay on the UI task, so the two
