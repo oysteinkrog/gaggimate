@@ -359,21 +359,29 @@ class Settings {
     // Text scrim: how far to dim the animation immediately behind overlaid
     // widget pixels, 0-100 percent, where 0 is off and 100 is black. Unlike the
     // two controls above this does not change the animation anywhere text is
-    // not, which is why it is the one that defaults on.
+    // not.
     //
-    // 55 is the weakest setting that clears the WCAG comfortable bar of 4.5 on
-    // every animation and theme in the fleet: measured (tools/animbench/
-    // lumaprofile.cpp --scrim) it takes the worst pair, lava on Mono, from
-    // contrast 1.00 to 4.81, where 50 reaches only 4.13. Weakest matters because
-    // the scrim is visible as a soft dark halo behind the readouts, so anything
-    // past the bar is a plate nobody asked for -- 75 measures 11.06, far more
-    // dimming than legibility needs.
+    // Off by default, which is a deliberate reversal. It used to ship at 55,
+    // the weakest setting that clears the WCAG comfortable bar of 4.5 on every
+    // animation and theme in the fleet: measured (tools/animbench/
+    // lumaprofile.cpp --scrim) that takes the worst pair, lava on Mono, from
+    // contrast 1.00 to 4.81, where 50 reaches only 4.13. The measurement still
+    // stands and is the reason the control exists. What it does not capture is
+    // that the scrim reads as a soft dark halo around every readout, and on a
+    // dark theme over a dark animation -- which is what most of the fleet
+    // actually looks like -- that halo is more noticeable than the contrast it
+    // buys is missed. Shipping it on meant everyone paid for the worst pair.
+    //
+    // So it is opt-in. Anyone running a bright animation under a light theme,
+    // lava on Mono being the measured worst case, wants this back around 55;
+    // below that it stops clearing the bar and above it becomes a plate nobody
+    // asked for, since 75 measures 11.06.
     //
     // Note the percentage is a scale on the gamma-encoded RGB565 value, not on
     // linear light, so its effect on measured luminance is much stronger than
     // the number suggests: 55 percent of the encoded value is roughly 25 percent
     // of the luminance.
-    Property<int> bgAnimScrim{registry, "bg_scrim", 55};
+    Property<int> bgAnimScrim{registry, "bg_scrim", 0};
     // RGB pixel-clock divider off the 80 MHz LCD group clock; 0 = keep the
     // build-flag boot value. The IDF 4.4 driver only does integer division,
     // so real choices are 80/n: 5=16 MHz (~61 Hz), 6=13.3 MHz (~51 Hz),
