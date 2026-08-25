@@ -159,9 +159,7 @@ void BLEScalePlugin::update() {
             if (reconnectionTries > RECONNECTION_TRIES) {
                 ESP_LOGW("BLEScalePlugin", "Max reconnection attempts reached, disconnecting");
                 disconnect();
-                if (scanner != nullptr) {
-                    scanner->initializeAsyncScan();
-                }
+                scan();
             }
         } else {
             // Poll slow-changing metadata (battery, unit). Flow rate is
@@ -202,6 +200,21 @@ void BLEScalePlugin::scan() const {
     }
     if (scanner == nullptr) {
         ESP_LOGE("BLEScalePlugin", "Scanner not initialized, cannot start scan");
+        return;
+    }
+    // The host stack may never have been brought up. Controller::connect()
+    // skips comms.init(), and therefore NimBLEDevice::init(), on the builds that
+    // synthesize the controller handshake instead of talking to a real board.
+    // The scan path does not survive that: initializeAsyncScan() goes straight
+    // to NimBLEDevice::getScan(), whose constructor initialises a callout
+    // against host structures that do not exist yet, and the load faults on a
+    // null pointer. It reached users as "touching the screen reboots it",
+    // because leaving standby raises controller:mode:change, which lands here.
+    //
+    // Guarding at this end rather than at that one event covers every caller,
+    // including the web UI's scan button.
+    if (!NimBLEDevice::isInitialized()) {
+        ESP_LOGW("BLEScalePlugin", "BLE host not initialized, skipping scale scan");
         return;
     }
     scanner->initializeAsyncScan();
@@ -317,9 +330,7 @@ void BLEScalePlugin::establishConnection() {
             if (!connectResult) {
                 ESP_LOGW("BLEScalePlugin", "Failed to connect to scale, retrying scan");
                 disconnect();
-                if (scanner != nullptr) {
-                    scanner->initializeAsyncScan();
-                }
+                scan();
             }
             break;
         }
@@ -327,9 +338,7 @@ void BLEScalePlugin::establishConnection() {
 
     if (!deviceFound) {
         ESP_LOGW("BLEScalePlugin", "Device %s not found in discovered scales", uuid.c_str());
-        if (scanner != nullptr) {
-            scanner->initializeAsyncScan();
-        }
+        scan();
     }
 }
 
