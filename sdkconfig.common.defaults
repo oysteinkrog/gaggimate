@@ -24,7 +24,9 @@ CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ=240
 # --- Compiler optimization ---
 # Optimize for size (-Os), matching arduino-esp32. IDF's default is -Og (debug),
 # which is slower across the board. SIZE (not PERF/-O2) keeps flash/IRAM in
-# budget while restoring baseline performance.
+# budget while restoring baseline performance. PERF was measured on the display
+# board and is a 2.2% frame-rate regression there; see the note in
+# sdkconfig.gaggimate.defaults.
 CONFIG_COMPILER_OPTIMIZATION_SIZE=y
 
 # PSRAM config lives in sdkconfig.gaggimate.defaults — only the display-class

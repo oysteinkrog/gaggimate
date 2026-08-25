@@ -55,6 +55,24 @@ CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=16384
 # cache tops out at a 32-byte line.
 CONFIG_ESP32S3_DATA_CACHE_LINE_64B=y
 
+# Not raising the optimization level to PERF (-O2) either, though Espressif
+# lists that alongside the cache-line setting as a bounce-buffer prerequisite.
+# Measured both ways on this board at 16 MHz:
+#
+#   -O2 costs 2.2% mean frame rate across all thirteen background animations,
+#   slower on ten of the thirteen, worst on nebula (-6.9%) and starfield
+#   (-6.3%). Image size actually fell by 32 kB, so this is not icache pressure
+#   from bigger code; there is simply nothing left for the compiler to find. The
+#   hot loops here are hand-written Xtensa PIE assembly and the rest of the
+#   frame is memory-bound.
+#
+#   It also buys no scan-out headroom, which was the reason to try it. At a
+#   divider of 4 (20 MHz, 76 Hz) the panel still shows band-local tearing in
+#   roughly a quarter of captured frames, the same as under -Os. 16 MHz remains
+#   the ceiling.
+#
+# So the whole-project -Os from sdkconfig.common.defaults stands.
+
 # Not enabling CONFIG_SPIRAM_XIP_FROM_PSRAM (and so not
 # SPIRAM_FETCH_INSTRUCTIONS / SPIRAM_RODATA), even though Espressif's LCD FAQ
 # lists them among the prerequisites for RGB bounce-buffer mode. Their argument
