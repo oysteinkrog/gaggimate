@@ -434,6 +434,10 @@ void DefaultUI::maintainSleepAnimation() {
                             plateSettings.getBgAnimPlateOpacity());
             const unsigned long interval = currentScreen == SCREEN_ID_STANDBY_SCREEN ? 1000 : 33;
             if (::millis() - lastSleepOverlayRefresh > interval) {
+                // Marked for the scan-out slip log: this snapshot renders LVGL
+                // widgets into a PSRAM buffer, and on the standby screen it is the
+                // only thing that happens at roughly the rate slips are seen.
+                panelclock::scanoutMark(panelclock::SCANOUT_ACT_OVERLAY);
                 refreshSleepOverlay();
             }
         }

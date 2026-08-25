@@ -1,4 +1,5 @@
 #include "Settings.h"
+#include <display/drivers/common/PanelClock.h>
 
 #include <algorithm>
 #include <cmath>
@@ -342,6 +343,11 @@ void Settings::doSave() {
     if (!dirty) {
         return;
     }
+    // Marked for the scan-out slip log. A flash write disables the cache, and
+    // the RGB panel ISR is not IRAM-safe, so the bounce refill cannot run at
+    // all for the duration -- this is the one suspect that should produce a
+    // tight burst of slips rather than isolated ones.
+    panelclock::scanoutMark(panelclock::SCANOUT_ACT_FLASH);
     ESP_LOGI("Settings", "Saving changed settings");
     // Running the loop against a namespace that failed to open would fail every
     // single put and log a line naming all of them. The flags survive either way
