@@ -425,9 +425,17 @@ void LilyGo_RGBPanel::initBUS() {
         //
         // Sized in whole scanlines so the copy stays a single contiguous run,
         // and it must divide the framebuffer exactly (the driver rejects it
-        // otherwise). Five lines is a compromise against internal RAM, which is
-        // the scarce resource here: two buffers cost 2 * 480 * 5 * 2 = 9600
-        // bytes out of a runtime low-water mark near 21 kB.
+        // otherwise). Internal RAM is the scarce resource here -- two buffers of
+        // ten lines cost 2 * 480 * 10 * 2 = 19200 bytes -- but the slack a
+        // bounce buffer buys is one buffer period, so it scales with the size,
+        // and ten lines also halves the EOF interrupt rate to 48 per frame.
+        //
+        // The other half of the fix is CONFIG_ESP32S3_DATA_CACHE_LINE_64B. The
+        // refill reads the framebuffer front to back, which is exactly the
+        // pattern a long cache line serves best; at 32 bytes a 9600-byte refill
+        // is 300 separate PSRAM transactions, at 64 it is 150. Measured on this
+        // panel, that one setting is the difference between a visible vertical
+        // shake at 16 MHz and thirty consecutive clean frames.
         .bounce_buffer_size_px = GM_LCD_BOUNCE_LINES * BOARD_TFT_WIDTH,
         .dma_burst_size = 64, // union alias of the deprecated psram_trans_align under IDF 5.5
         .hsync_gpio_num = BOARD_TFT_HSYNC,
