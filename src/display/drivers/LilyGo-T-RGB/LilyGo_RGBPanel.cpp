@@ -403,6 +403,32 @@ void LilyGo_RGBPanel::initBUS() {
         // boundary. With one buffer there is nothing to synchronise against and
         // every write races the beam.
         .num_fbs = FB_COUNT,
+        // Bounce buffers. Without them the scan-out DMA reads every pixel
+        // straight out of PSRAM in real time, so anything else touching PSRAM
+        // -- the render task's writes, WiFi, a cache miss on the shared SPI0
+        // controller -- can starve it. The RGB peripheral does not stall when
+        // that happens: it keeps generating HSYNC/VSYNC off its own counters
+        // and clocks out whatever is in the FIFO, so the pixel stream slips
+        // against the sync signals. On screen that is a line displaced
+        // sideways, wrapping around the edge, and because RGB565's green field
+        // straddles the byte boundary a one-byte slip also recolours white to
+        // green. Measured directly: at 13.3 MHz pclk the panel is unreadable
+        // with the renderer at 60 fps and mostly clean at 5 fps, and dropping
+        // to 6.7 MHz cleans it up at 60 fps. Both are the same bandwidth
+        // cliff.
+        //
+        // With bounce buffers the DMA reads internal SRAM, which cannot be
+        // starved, and an EOF interrupt refills it from the framebuffer. PSRAM
+        // traffic is unchanged; what changes is that it no longer has to be
+        // punctual. The refill may run late by most of a bounce period before
+        // anything shows.
+        //
+        // Sized in whole scanlines so the copy stays a single contiguous run,
+        // and it must divide the framebuffer exactly (the driver rejects it
+        // otherwise). Five lines is a compromise against internal RAM, which is
+        // the scarce resource here: two buffers cost 2 * 480 * 5 * 2 = 9600
+        // bytes out of a runtime low-water mark near 21 kB.
+        .bounce_buffer_size_px = GM_LCD_BOUNCE_LINES * BOARD_TFT_WIDTH,
         .dma_burst_size = 64, // union alias of the deprecated psram_trans_align under IDF 5.5
         .hsync_gpio_num = BOARD_TFT_HSYNC,
         .vsync_gpio_num = BOARD_TFT_VSYNC,

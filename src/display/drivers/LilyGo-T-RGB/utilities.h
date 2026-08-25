@@ -9,10 +9,27 @@
 #pragma once
 
 // Overridable from build flags. 7 MHz is the conservative LilyGo stock value
-// (23.5 Hz refresh); the ST7701S glass itself is a 60 Hz part and octal PSRAM
-// @80 MHz sustains ~22 MHz pclk per Espressif. Upstream LilyGo now ships 8 MHz.
+// (23.5 Hz refresh); the ST7701S glass itself is a 60 Hz part. Upstream LilyGo
+// now ships 8 MHz.
+//
+// Espressif's ~22 MHz figure for octal PSRAM @80 MHz is a quiet-bus number and
+// does not survive contact with a busy renderer. Measured on this board with
+// the scan-out DMA reading PSRAM directly: 13.3 MHz is unreadable while the
+// render task writes at 60 fps, and the same clock is mostly clean at 5 fps.
+// The ceiling is set by how much PSRAM traffic competes with scan-out, not by
+// the pclk alone -- see GM_LCD_BOUNCE_LINES.
 #ifndef RGB_MAX_PIXEL_CLOCK_HZ
 #define RGB_MAX_PIXEL_CLOCK_HZ (7000000UL)
+#endif
+
+// Scanlines per bounce buffer, or 0 to scan straight out of PSRAM. Two buffers
+// of this size are allocated from internal DRAM, so the cost is
+// 2 * lines * 480 * 2 bytes. Must divide the 480-line framebuffer exactly.
+#ifndef GM_LCD_BOUNCE_LINES
+#define GM_LCD_BOUNCE_LINES (0)
+#endif
+#if GM_LCD_BOUNCE_LINES && (480 % GM_LCD_BOUNCE_LINES)
+#error "GM_LCD_BOUNCE_LINES must divide the 480-line framebuffer exactly"
 #endif
 
 #define BOARD_TFT_WIDTH (480)
