@@ -216,7 +216,9 @@ const uint8_t *noiseTex256() {
     // Sixteen bytes of slack past the last row, so AnimNebula's vector walk can
     // read the aligned block one past a row without a special case for row 255.
     // Every row then costs one scalar fixup (the wrap at index 255) instead of
-    // sixteen, which is the difference between clearing 40 fps and not.
+    // sixteen. This is a simplification, not a speedup: measured against the
+    // special-cased version the band time was 17930 us either way (17921 with
+    // the slack), which is inside the run-to-run noise on this board.
     uint8_t *t = static_cast<uint8_t *>(heap_caps_aligned_alloc(16, 256 * 256 + 16, MALLOC_CAP_SPIRAM));
     if (t == nullptr) {
         t = static_cast<uint8_t *>(alloc(256 * 256));
