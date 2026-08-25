@@ -37,6 +37,7 @@ extern uint32_t nebula_lerp_self_test(uint32_t *firstBad);
 #include <esp_err.h>
 #include <esp_heap_caps.h>
 #include <esp_partition.h>
+#include <esp_timer.h>
 #include <mbedtls/platform.h>
 #include <string>
 #include <unordered_map>
@@ -448,6 +449,34 @@ void WebUIPlugin::setupServer() {
                  static_cast<unsigned>(animPsram), static_cast<unsigned>(bganim::SRAM_TOTAL_BUDGET),
                  static_cast<unsigned>(scFrames), static_cast<unsigned>(scRefills), static_cast<unsigned>(scSlips));
         request->send(200, "application/json", buf);
+    });
+    // Which slips happened, and how long before each one the suspects last ran.
+    // The rate alone does not identify the cause: several things can overrun the
+    // refill's 162 us budget, and they are told apart by timing signature rather
+    // than by magnitude. A once-per-second overlay snapshot leaves a small
+    // overlay_us on most slips; a flash write leaves a tight burst of slips
+    // sharing one flash_us, because the cache is off and the LCD interrupt
+    // masked for the write's whole duration; radio coexistence leaves every
+    // source stale and the slips scattered. Exposes no configuration and no
+    // secrets.
+    server.on("/api/debug/scanout", [](AsyncWebServerRequest *request) {
+        uint32_t frames = 0, refills = 0, slips = 0;
+        panelclock::scanoutStats(&frames, &refills, &slips);
+        panelclock::ScanoutSlip slipLog[24];
+        const size_t n = panelclock::scanoutSlipLog(slipLog, 24);
+        AsyncResponseStream *response = request->beginResponseStream("application/json");
+        response->printf("{\"frames\":%u,\"refills\":%u,\"slips\":%u,\"now_us\":%u,\"log\":[", static_cast<unsigned>(frames),
+                         static_cast<unsigned>(refills), static_cast<unsigned>(slips),
+                         static_cast<unsigned>(esp_timer_get_time()));
+        for (size_t i = 0; i < n; i++) {
+            response->printf("%s{\"frame\":%u,\"t_us\":%u,\"overlay_us\":%u,\"flash_us\":%u,\"band_us\":%u}", i ? "," : "",
+                             static_cast<unsigned>(slipLog[i].frame), static_cast<unsigned>(slipLog[i].tUs),
+                             static_cast<unsigned>(slipLog[i].sinceUs[panelclock::SCANOUT_ACT_OVERLAY]),
+                             static_cast<unsigned>(slipLog[i].sinceUs[panelclock::SCANOUT_ACT_FLASH]),
+                             static_cast<unsigned>(slipLog[i].sinceUs[panelclock::SCANOUT_ACT_BANDPUSH]));
+        }
+        response->print("]}");
+        request->send(response);
     });
     server.on("/api/status", [this](AsyncWebServerRequest *request) {
         AsyncResponseStream *response = request->beginResponseStream("application/json");

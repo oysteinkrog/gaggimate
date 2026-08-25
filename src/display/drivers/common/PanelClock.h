@@ -28,6 +28,7 @@
 // which of the two behaviours is in effect so the UI can say whether a restart
 // is needed.
 
+#include <stddef.h>
 #include <stdint.h>
 
 namespace panelclock {
@@ -87,6 +88,36 @@ bool hasLiveControl();
 //
 // Any argument may be null. All three are zero before attach().
 void scanoutStats(uint32_t *frames, uint32_t *refills, uint32_t *slips);
+
+// Correlation log for those slips.
+//
+// Knowing the rate is not enough to fix it: several plausible causes all steal
+// more than the refill's 162 us budget, and they are told apart by WHEN they
+// do it, not by how much. A once-per-second overlay snapshot leaves slips
+// clustered near a 1 s cadence; a flash write leaves a tight burst, because the
+// cache is off for the whole write and the ISR is masked throughout; radio
+// coexistence arbitration leaves them scattered. So each slip records how long
+// it had been since each suspect last ran, and one dump separates them.
+//
+// Sources call mark() as they run. The cost is one timestamp store.
+enum ScanoutActivity {
+    SCANOUT_ACT_OVERLAY = 0,  // LVGL widget snapshot into the overlay buffer
+    SCANOUT_ACT_FLASH = 1,    // NVS / LittleFS write, which masks the LCD ISR
+    SCANOUT_ACT_BANDPUSH = 2, // animation band pushed into the framebuffer
+    SCANOUT_ACT_COUNT = 3,
+};
+
+void scanoutMark(int which);
+
+struct ScanoutSlip {
+    uint32_t frame;                         // frame counter when it happened
+    uint32_t tUs;                           // esp_timer microseconds, low 32 bits
+    uint32_t sinceUs[SCANOUT_ACT_COUNT];    // since each source last marked
+};
+
+// Copies out up to `max` of the most recent slips, oldest first, and returns
+// how many were written.
+size_t scanoutSlipLog(ScanoutSlip *out, size_t max);
 
 } // namespace panelclock
 

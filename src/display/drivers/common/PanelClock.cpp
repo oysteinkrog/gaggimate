@@ -9,6 +9,7 @@
 #if defined(CONFIG_IDF_TARGET_ESP32S3) && !defined(GAGGIMATE_SIM)
 
 #include <esp_lcd_panel_rgb.h>
+#include <esp_timer.h>
 #include <esp_log.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
@@ -45,6 +46,16 @@ volatile uint32_t g_refills = 0; // on_frame_buf_complete, one per refill pass
 volatile uint32_t g_slips = 0;   // ratcheted count of underrun frames
 volatile uint32_t g_maxDrift = 0;
 
+// Last time each activity ran, in esp_timer microseconds truncated to 32 bits.
+// Truncation wraps every ~71 minutes; only differences are ever taken, and
+// unsigned subtraction gives the right answer across a wrap.
+volatile uint32_t g_actUs[SCANOUT_ACT_COUNT] = {0};
+
+// Ring of recent slips. Written only from the VSYNC ISR, read from a task.
+constexpr size_t SLIP_LOG_N = 24;
+ScanoutSlip g_slipLog[SLIP_LOG_N] = {};
+volatile uint32_t g_slipWrite = 0;
+
 // IRAM because these run from the panel's interrupts, which the driver keeps
 // alive across a flash operation when its own ISR is IRAM-safe. Two increments
 // each; the cost to the frame budget is nil, and putting them in flash would
@@ -68,6 +79,16 @@ IRAM_ATTR bool onVsync(esp_lcd_panel_handle_t, const esp_lcd_rgb_panel_event_dat
         // completed refill pass, which is a phase offset and not a fault.
         if (g_frames > 4) {
             g_slips++;
+            const uint32_t now = static_cast<uint32_t>(esp_timer_get_time());
+            ScanoutSlip &e = g_slipLog[g_slipWrite % SLIP_LOG_N];
+            e.frame = g_frames;
+            e.tUs = now;
+            for (int i = 0; i < SCANOUT_ACT_COUNT; i++) {
+                // Zero means the source has never run, which would otherwise
+                // read as "ran at time zero" and look like a very stale hit.
+                e.sinceUs[i] = (g_actUs[i] == 0) ? UINT32_MAX : (now - g_actUs[i]);
+            }
+            g_slipWrite++;
         }
     }
     return false;
@@ -193,6 +214,31 @@ uint32_t bootPclkHz() {
 
 bool hasLiveControl() { return PANELCLOCK_HAS_SET_PCLK != 0; }
 
+void scanoutMark(int which) {
+    if (which >= 0 && which < SCANOUT_ACT_COUNT) {
+        // esp_timer_get_time is IRAM-safe, so this stays callable from the
+        // paths that run with the cache disabled -- which are exactly the ones
+        // most worth correlating against.
+        g_actUs[which] = static_cast<uint32_t>(esp_timer_get_time());
+    }
+}
+
+size_t scanoutSlipLog(ScanoutSlip *out, size_t max) {
+    if (out == nullptr || max == 0) {
+        return 0;
+    }
+    const uint32_t w = g_slipWrite;
+    const size_t have = (w < SLIP_LOG_N) ? w : SLIP_LOG_N;
+    const size_t n = (have < max) ? have : max;
+    // Oldest first. A slip landing mid-copy can tear one entry; this is a
+    // diagnostic read over seconds, not a synchronisation primitive, and a
+    // critical section here would sit in the VSYNC ISR's path.
+    for (size_t i = 0; i < n; i++) {
+        out[i] = g_slipLog[(w - n + i) % SLIP_LOG_N];
+    }
+    return n;
+}
+
 void scanoutStats(uint32_t *frames, uint32_t *refills, uint32_t *slips) {
     // Deliberately not taking the lock: these are ISR-written counters, and the
     // mutex here guards the panel handle against deletion, which is unrelated.
@@ -234,6 +280,8 @@ int currentDiv() { return 0; }
 uint32_t bootPclkHz() { return 0; }
 bool hasLiveControl() { return false; }
 void setDiv(int) {}
+void scanoutMark(int) {}
+size_t scanoutSlipLog(ScanoutSlip *, size_t) { return 0; }
 void scanoutStats(uint32_t *frames, uint32_t *refills, uint32_t *slips) {
     if (frames != nullptr) {
         *frames = 0;
