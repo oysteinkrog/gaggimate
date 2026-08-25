@@ -27,7 +27,9 @@ extern uint32_t nebula_lerp_self_test(uint32_t *firstBad);
 // /api/settings echoes panelclock::hasLiveControl() so the form can tell the
 // user whether a new divider applies now or at the next boot.
 #include <display/core/utils.h>
+#ifndef GAGGIMATE_HEADLESS
 #include <display/drivers/LilyGoDriver.h>
+#endif
 #include <display/drivers/common/PanelClock.h>
 #include <display/ui/default/bganim/BgAnimCommon.h>
 #include <display/util/PsramStlAllocator.h>
@@ -502,6 +504,7 @@ void WebUIPlugin::setupServer() {
                  static_cast<unsigned>(c - b));
         request->send(200, "application/json", buf);
     });
+#ifndef GAGGIMATE_HEADLESS
     // Live ST7701S inversion-mode tuning: /api/debug/panelreg?inv=49
     //
     // INVSET's first byte (BK0 0xC2) selects the inversion mode; the panel
@@ -530,6 +533,7 @@ void WebUIPlugin::setupServer() {
         snprintf(buf, sizeof(buf), "{\"inv\":%d,\"shipped_inv\":49}", inv);
         request->send(200, "application/json", buf);
     });
+#endif // GAGGIMATE_HEADLESS
     server.on("/api/status", [this](AsyncWebServerRequest *request) {
         AsyncResponseStream *response = request->beginResponseStream("application/json");
         JsonDocument doc(&psramAllocator);
