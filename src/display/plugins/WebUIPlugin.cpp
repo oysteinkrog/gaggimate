@@ -1,4 +1,7 @@
 #include "WebUIPlugin.h"
+
+// Defined in AnimNebula.cpp; see nebulaLerpSelfTest there.
+extern uint32_t nebula_lerp_self_test(uint32_t *firstBad);
 #include <DNSServer.h>
 #include <LittleFS.h>
 #include <SD_MMC.h>
@@ -556,6 +559,20 @@ void WebUIPlugin::setupServer() {
 
     // Exhaustive check of the PIE scrim kernel against the scalar one, on the
     // device, over the whole 65,536 x 33 input space. ~135 ms, blocking.
+    // Exhaustive check of nebula's vector lerp against its scalar form, over
+    // all 256 x 256 x 256 inputs, on the device. ~1 s, blocking.
+    server.on("/api/nebtest", HTTP_GET, [this](AsyncWebServerRequest *request) {
+        uint32_t firstBad = 0;
+        const uint32_t bad = nebula_lerp_self_test(&firstBad);
+        char out[192];
+        snprintf(out, sizeof(out),
+                 "{\"triples\":%u,\"mismatches\":%u,\"first_a\":%u,\"first_b\":%u,"
+                 "\"first_f\":%u,\"result\":\"%s\"}",
+                 256u * 256u * 256u, bad, firstBad & 0xFFu, (firstBad >> 8) & 0xFFu, (firstBad >> 16) & 0xFFu,
+                 bad == 0 ? "PASS" : "FAIL");
+        request->send(200, "application/json", out);
+    });
+
     server.on("/api/pietest", HTTP_GET, [this](AsyncWebServerRequest *request) {
         SleepAnimation *a = sleep_animation_bench_instance();
         if (a == nullptr) {

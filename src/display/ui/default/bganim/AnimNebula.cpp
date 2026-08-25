@@ -224,10 +224,265 @@ void frame(uint32_t, int, int, const uint8_t p[4]) {
     g_cy = sCy >> 8;
 }
 
+#if defined(__XTENSA__)
+// out[i] = a[i] + (((b[i] - a[i]) * f) >> 8), sixteen bytes per group, on the
+// ESP32-S3's PIE vector unit.
+//
+// Why this loop and not the pixel loop: the two dominant-octave tables run 255
+// and 256 iterations per row to feed a pixel loop of w, and at the half
+// resolution this panel renders at, w is 240. Removing them outright measured
+// 33.6 -> 44.8 fps on the device, so they, not the per-pixel arithmetic the
+// earlier passes went at and not noise locality, are where the time goes.
+//
+// The unit multiplies 16-bit lanes and the data is bytes, so a group widens
+// then narrows:
+//   EE.VZIP.8 qs0, qs1 interleaves the two registers' bytes and writes BOTH
+//   of them. Zipped against a zeroed register that is a zero-extending widen:
+//   the low eight bytes become eight 16-bit lanes in qs0 and the high eight
+//   become eight more in qs1. One instruction for both halves, which is why
+//   the zero is re-made per zip rather than kept in a register.
+//   EE.VUNZIP.8 is the inverse, taking every other byte of the pair, and on
+//   little-endian 16-bit lanes those are the low bytes -- the same truncation
+//   the scalar store did.
+//
+// EE.VMUL.S16 shifts the full 32-bit product ARITHMETICALLY by SAR before
+// keeping the low 16 bits, and the arithmetic part is load-bearing because
+// b - a is signed. EE.VSUBS/EE.VADDS.S16 saturate, which never fires here: a
+// lerp between two bytes cannot leave 0..255 for any factor in 0..255.
+//
+// PIE is coprocessor CP3, legal in thread context only; this runs on the
+// render task. SAR is in the ordinary context frame, so the ssai is hoisted
+// out of the loop and survives an interrupt.
+//
+// Sixteen instructions per sixteen outputs against roughly seven per output
+// scalar. Checked against the scalar form over every (a, b, f) triple on the
+// device, because the widen and narrow orderings and the sign of that shift
+// all fail as wrong pixels rather than as a fault.
+__attribute__((noinline)) static void lerpRowPie(uint8_t *__restrict out, const uint8_t *__restrict a,
+                                                 const uint8_t *__restrict b, const uint16_t *__restrict fv, int n16) {
+    const uint8_t *pa = a;
+    const uint8_t *pb = b;
+    uint8_t *po = out;
+    const uint16_t *pf = fv;
+    int n = n16;
+    asm volatile("ee.vld.128.ip q7, %[f], 0\n" // eight copies of f, resident
+                 "ssai 8\n"
+                 "1:\n"
+                 "ee.vld.128.ip q0, %[pa], 16\n"
+                 "ee.vld.128.ip q1, %[pb], 16\n"
+                 "ee.zero.q q2\n"
+                 "ee.vzip.8 q0, q2\n" // q0 = a lanes 0-7, q2 = a lanes 8-15
+                 "ee.zero.q q3\n"
+                 "ee.vzip.8 q1, q3\n" // q1 = b lanes 0-7, q3 = b lanes 8-15
+                 "ee.vsubs.s16 q4, q1, q0\n"
+                 "ee.vsubs.s16 q5, q3, q2\n"
+                 "ee.vmul.s16 q4, q4, q7\n" // ((b-a)*f) >> 8, arithmetic
+                 "ee.vmul.s16 q5, q5, q7\n"
+                 "ee.vadds.s16 q0, q0, q4\n"
+                 "ee.vadds.s16 q2, q2, q5\n"
+                 "ee.vunzip.8 q0, q2\n" // sixteen lanes back to sixteen bytes
+                 "ee.vst.128.ip q0, %[po], 16\n"
+                 "addi %[n], %[n], -1\n"
+                 "bnez %[n], 1b\n"
+                 : [pa] "+r"(pa), [pb] "+r"(pb), [po] "+r"(po), [f] "+r"(pf), [n] "+r"(n)
+                 :
+                 : "memory");
+}
+
+// out[i] = a[i] + (((a[i+1] - a[i]) * f) >> 8), the x-interpolation, sixteen
+// bytes per group.
+//
+// Same lerp as lerpRowPie, but the second operand is the first shifted by one
+// byte, and a 128-bit load cannot start at an odd address: EE.VLD.128 forces
+// the low four address bits to zero. The hardware's answer is SAR_BYTE.
+// EE.LD.128.USAR.IP loads the block containing an unaligned address and saves
+// that address's low four bits into SAR_BYTE, and EE.SRC.Q then shifts the
+// 32-byte concatenation of two consecutive aligned blocks right by SAR_BYTE
+// bytes, which is the unaligned window. Pointing the setup load at a+1 makes
+// SAR_BYTE 1 for the whole loop.
+//
+// So each iteration keeps the previous aligned block, loads the next, and
+// derives the shifted vector in-register. That is one extra load and one
+// EE.SRC.Q per group instead of a separate 256-byte shifted copy of the row.
+//
+// n16 is 15, not 16, deliberately: iteration k reads block k+1 and writes
+// block k, so fifteen groups touch bytes 0..255 exactly and never read past
+// the row. The last sixteen entries, including the wrap where a[256] means
+// a[0], are the caller's scalar tail.
+__attribute__((noinline)) static void lerpShiftRowPie(uint8_t *__restrict out, const uint8_t *__restrict a,
+                                                      const uint16_t *__restrict fv, int n16) {
+    const uint8_t *pa = a + 1; // sets SAR_BYTE = 1 in the setup load
+    uint8_t *po = out;
+    const uint16_t *pf = fv;
+    int n = n16;
+    asm volatile("ee.vld.128.ip q7, %[f], 0\n"
+                 "ee.ld.128.usar.ip q6, %[pa], 16\n" // block 0, SAR_BYTE = 1
+                 "ssai 8\n"
+                 "1:\n"
+                 "ee.vld.128.ip q1, %[pa], 16\n" // next aligned block
+                 "ee.src.q q2, q6, q1\n"         // a[i+1 .. i+16]
+                 "ee.orq q3, q1, q1\n"           // stash it for the next pass
+                 "ee.zero.q q4\n"
+                 "ee.vzip.8 q6, q4\n" // a lanes
+                 "ee.zero.q q5\n"
+                 "ee.vzip.8 q2, q5\n" // shifted lanes
+                 "ee.vsubs.s16 q0, q2, q6\n"
+                 "ee.vsubs.s16 q1, q5, q4\n"
+                 "ee.vmul.s16 q0, q0, q7\n"
+                 "ee.vmul.s16 q1, q1, q7\n"
+                 "ee.vadds.s16 q6, q6, q0\n"
+                 "ee.vadds.s16 q4, q4, q1\n"
+                 "ee.vunzip.8 q6, q4\n"
+                 "ee.vst.128.ip q6, %[po], 16\n"
+                 "ee.orq q6, q3, q3\n" // next iteration's unshifted block
+                 "addi %[n], %[n], -1\n"
+                 "bnez %[n], 1b\n"
+                 : [pa] "+r"(pa), [po] "+r"(po), [f] "+r"(pf), [n] "+r"(n)
+                 :
+                 : "memory");
+}
+
+// The same arithmetic, for the host bench and as the reference the device
+// self-test compares against.
+static inline uint8_t lerpScalar(int a, int b, int f) {
+    return static_cast<uint8_t>(a + (((b - a) * f) >> 8));
+}
+
+// Every input the kernel can see: 256 values of a, by 256 of b, by 256 of f.
+// Returns the mismatch count and, on the first one, packs a, b and f into
+// *firstBad. Diagnostic only, and it blocks for about a second.
+uint32_t nebulaLerpSelfTest(uint32_t *firstBad) {
+    alignas(16) uint8_t va[16], vb[16], vo[16];
+    alignas(16) uint16_t fv[8];
+    uint32_t bad = 0;
+    for (int f = 0; f < 256; f++) {
+        for (int k = 0; k < 8; k++) {
+            fv[k] = static_cast<uint16_t>(f);
+        }
+        for (int a = 0; a < 256; a++) {
+            for (int b = 0; b < 256; b += 16) {
+                for (int k = 0; k < 16; k++) {
+                    va[k] = static_cast<uint8_t>(a);
+                    vb[k] = static_cast<uint8_t>(b + k);
+                }
+                lerpRowPie(vo, va, vb, fv, 1);
+                for (int k = 0; k < 16; k++) {
+                    if (vo[k] != lerpScalar(a, b + k, f)) {
+                        if (bad == 0 && firstBad != nullptr) {
+                            *firstBad = static_cast<uint32_t>(a) | (static_cast<uint32_t>(b + k) << 8) |
+                                        (static_cast<uint32_t>(f) << 16);
+                        }
+                        bad++;
+                    }
+                }
+            }
+        }
+    }
+    return bad;
+}
+
+// The whole x-interpolation as band() actually calls it: the vector kernel
+// over the first fifteen groups plus the scalar tail that finishes the row and
+// closes the wrap, against the original single scalar loop, over real noise
+// texture rows.
+//
+// The two tests above check the kernels on synthetic input. This checks the
+// composition, which is where the parts that are not the kernel live: the
+// group count, the tail's start index, and the wrap entry at 255. Those are
+// exactly the mistakes that would show up as a seam or a band in one place on
+// the panel rather than as garbage everywhere, and a photograph of a moving
+// animation cannot tell that apart from its own motion smear.
+uint32_t nebulaRowSelfTest(uint32_t *firstBad) {
+    const uint8_t *tex = noiseTex256();
+    if (tex == nullptr) {
+        return 0;
+    }
+    alignas(16) uint8_t got[256];
+    uint8_t want[256];
+    alignas(16) uint16_t fv[8];
+    uint32_t bad = 0;
+    for (int row = 0; row < 256; row += 7) { // 37 rows, spread over the texture
+        const uint8_t *a = tex + static_cast<size_t>(row) * 256;
+        for (int f = 0; f < 256; f += 5) { // 52 factors
+            for (int k = 0; k < 8; k++) {
+                fv[k] = static_cast<uint16_t>(f);
+            }
+            // exactly what band() does
+            lerpShiftRowPie(got, a, fv, 15);
+            for (int i = 240; i < 255; i++) {
+                got[i] = lerpScalar(a[i], a[i + 1], f);
+            }
+            got[255] = lerpScalar(a[255], a[0], f);
+            // exactly what band() used to do
+            int cur = a[0];
+            for (int i = 0; i < 255; i++) {
+                const int nxt = a[i + 1];
+                want[i] = static_cast<uint8_t>(cur + (((nxt - cur) * f) >> 8));
+                cur = nxt;
+            }
+            want[255] = static_cast<uint8_t>(cur + (((a[0] - cur) * f) >> 8));
+            for (int i = 0; i < 256; i++) {
+                if (got[i] != want[i]) {
+                    if (bad == 0 && firstBad != nullptr) {
+                        *firstBad = static_cast<uint32_t>(i) | (static_cast<uint32_t>(f) << 8) |
+                                    (static_cast<uint32_t>(row) << 16);
+                    }
+                    bad++;
+                }
+            }
+        }
+    }
+    return bad;
+}
+
+// The shifted variant. Its arithmetic is the kernel above, already checked
+// over every triple, so what is left to establish is that EE.SRC.Q really
+// hands back a[i+1] and not some other window. A permutation is settled by
+// one input whose elements are all distinct, so a ramp proves the addressing;
+// the alternating and reversed patterns then exercise the sign of the
+// difference, which a ramp cannot, across every factor.
+uint32_t nebulaShiftSelfTest(uint32_t *firstBad) {
+    alignas(16) uint8_t in[256];
+    alignas(16) uint8_t out[256];
+    alignas(16) uint16_t fv[8];
+    uint32_t bad = 0;
+    for (int pat = 0; pat < 4; pat++) {
+        for (int i = 0; i < 256; i++) {
+            switch (pat) {
+            case 0: in[i] = static_cast<uint8_t>(i); break;               // ramp
+            case 1: in[i] = static_cast<uint8_t>(255 - i); break;         // reversed
+            case 2: in[i] = (i & 1) != 0 ? 255 : 0; break;               // full swing
+            default: in[i] = static_cast<uint8_t>((i * 97 + 13) & 0xFF); // scattered
+            }
+        }
+        for (int f = 0; f < 256; f++) {
+            for (int k = 0; k < 8; k++) {
+                fv[k] = static_cast<uint16_t>(f);
+            }
+            for (int i = 0; i < 256; i++) {
+                out[i] = 0xAA; // so a group the kernel skips cannot pass by luck
+            }
+            lerpShiftRowPie(out, in, fv, 15);
+            for (int i = 0; i < 240; i++) {
+                if (out[i] != lerpScalar(in[i], in[i + 1], f)) {
+                    if (bad == 0 && firstBad != nullptr) {
+                        *firstBad = static_cast<uint32_t>(i) | (static_cast<uint32_t>(f) << 8) |
+                                    (static_cast<uint32_t>(pat) << 16);
+                    }
+                    bad++;
+                }
+            }
+        }
+    }
+    return bad;
+}
+
+#endif
+
 void band(uint16_t *dst, int y0, int rows, int w, uint32_t, const uint8_t *) {
     const int axF = g_axF, ayF = g_ayF;
     const int wA = g_wA, wB = g_wB, densOff = g_densOff;
-    static uint8_t blendedA[256];
+    alignas(16) static uint8_t blendedA[256];
     // Ping-ponged x-interpolated copies of the dominant octave's raw noise
     // rows. rowA0(y+1) and rowA1(y) are always the SAME physical texture row
     // ((y+1+ayI)&255 either way -- see the reuse site below), so the
@@ -242,7 +497,14 @@ void band(uint16_t *dst, int y0, int rows, int w, uint32_t, const uint8_t *) {
     // deferred by one iteration -- a narrower type here would risk a
     // transient out-of-[0,255] value truncating differently than the
     // original never-stored expression did.
-    static int ixBufs[2][256];
+    // Bytes, not ints. The x-interpolated octave is a lerp between two
+    // texels, so it cannot leave 0..255 for any factor in 0..255: with
+    // nxt >= cur the result lands in [cur, nxt], and with nxt < cur the
+    // factor's own bound keeps it above nxt. Storing it 32 bits wide spent
+    // 2 KB to hold values that fit in 512 B, and it put the data at the one
+    // width the vector unit's 16-bit lanes cannot consume directly. Aligned
+    // because the vector kernel below loads 128 bits at a time.
+    alignas(16) static uint8_t ixBufs[2][256];
     int curBuf = 0; // ixBufs[curBuf] is valid as "this row's x-interpolated rowA0"
     for (int r = 0; r < rows; r++) {
         const int y = y0 + r;
@@ -363,21 +625,35 @@ void band(uint16_t *dst, int y0, int rows, int w, uint32_t, const uint8_t *) {
             }
         }
 
-        int *ixCur = ixBufs[curBuf];
-        int *ixNext = ixBufs[curBuf ^ 1];
+        uint8_t *ixCur = ixBufs[curBuf];
+        uint8_t *ixNext = ixBufs[curBuf ^ 1];
         if (r == 0) {
             // First row of the call: no predecessor to reuse from (a rows==1
             // call always takes only this path), so interpolate rowA0 fresh.
             // Identical expression to the reuse-eligible rowA1 pass below,
             // just addressed at rowA0 -- kept as a separate copy rather than
             // a shared helper so neither loop gains a call in its body.
+#if defined(__XTENSA__)
+            {
+                alignas(16) uint16_t fv[8];
+                for (int k = 0; k < 8; k++) {
+                    fv[k] = static_cast<uint16_t>(axF);
+                }
+                lerpShiftRowPie(ixCur, rowA0, fv, 15);
+                for (int i = 240; i < 255; i++) {
+                    ixCur[i] = lerpScalar(rowA0[i], rowA0[i + 1], axF);
+                }
+                ixCur[255] = lerpScalar(rowA0[255], rowA0[0], axF);
+            }
+#else
             int cur0 = rowA0[0];
             for (int i = 0; i < 255; i++) {
                 const int nxt0 = rowA0[i + 1];
-                ixCur[i] = cur0 + (((nxt0 - cur0) * axF) >> 8);
+                ixCur[i] = static_cast<uint8_t>(cur0 + (((nxt0 - cur0) * axF) >> 8));
                 cur0 = nxt0;
             }
-            ixCur[255] = cur0 + (((rowA0[0] - cur0) * axF) >> 8);
+            ixCur[255] = static_cast<uint8_t>(cur0 + (((rowA0[0] - cur0) * axF) >> 8));
+#endif
         }
 #ifdef GM_NEBULA_TABLE_PROBE
         // Diagnostic only, visually wrong: skip both dominant-octave tables
@@ -392,19 +668,43 @@ void band(uint16_t *dst, int y0, int rows, int w, uint32_t, const uint8_t *) {
         (void)ayF;
 #else
         {
+#if defined(__XTENSA__)
+            {
+                alignas(16) uint16_t fv[8];
+                for (int k = 0; k < 8; k++) {
+                    fv[k] = static_cast<uint16_t>(axF);
+                }
+                lerpShiftRowPie(ixNext, rowA1, fv, 15);
+                for (int i = 240; i < 255; i++) {
+                    ixNext[i] = lerpScalar(rowA1[i], rowA1[i + 1], axF);
+                }
+                ixNext[255] = lerpScalar(rowA1[255], rowA1[0], axF);
+            }
+#else
             int cur1 = rowA1[0];
             for (int i = 0; i < 255; i++) {
                 const int nxt1 = rowA1[i + 1];
-                ixNext[i] = cur1 + (((nxt1 - cur1) * axF) >> 8);
+                ixNext[i] = static_cast<uint8_t>(cur1 + (((nxt1 - cur1) * axF) >> 8));
                 cur1 = nxt1;
             }
-            ixNext[255] = cur1 + (((rowA1[0] - cur1) * axF) >> 8);
+            ixNext[255] = static_cast<uint8_t>(cur1 + (((rowA1[0] - cur1) * axF) >> 8));
+#endif
         }
+#if defined(__XTENSA__)
+        {
+            alignas(16) uint16_t fv[8];
+            for (int k = 0; k < 8; k++) {
+                fv[k] = static_cast<uint16_t>(ayF);
+            }
+            lerpRowPie(blendedA, ixCur, ixNext, fv, 256 / 16);
+        }
+#else
         for (int i = 0; i < 256; i++) {
             const int va = ixCur[i];
             const int vb = ixNext[i];
             blendedA[i] = static_cast<uint8_t>(va + (((vb - va) * ayF) >> 8));
         }
+#endif
 #endif
         // ixNext (this row's interpolated rowA1) is next row's rowA0 -- see
         // the block comment further up for why that identity holds.
@@ -510,6 +810,22 @@ void release() {
 }
 
 } // namespace
+
+#if defined(__XTENSA__) && defined(GM_ANIM_BENCH)
+// Exposed so the bench endpoint can run the vector kernel's exhaustive check
+// without the animation registry having to know about it.
+uint32_t nebula_lerp_self_test(uint32_t *firstBad) {
+    uint32_t bad = nebulaLerpSelfTest(firstBad);
+    if (bad != 0) {
+        return bad;
+    }
+    bad = nebulaShiftSelfTest(firstBad);
+    if (bad != 0) {
+        return bad;
+    }
+    return nebulaRowSelfTest(firstBad);
+}
+#endif
 
 extern const BgAnimation bg_anim_nebula;
 const BgAnimation bg_anim_nebula = {
