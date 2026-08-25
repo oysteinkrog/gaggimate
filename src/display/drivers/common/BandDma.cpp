@@ -27,6 +27,20 @@ esp_err_t BandDma::install(size_t maxTransferBytes, size_t burstBytes, DoneFn on
     // TX and RX have to be the two halves of one GDMA pair, so the TX is
     // allocated first with its sibling reserved and the RX is then pinned to
     // it. This mirrors esp_async_memcpy_install_gdma_template.
+    //
+    // isr_cache_safe is deliberately left off. Setting it would put the
+    // driver's interrupt in IRAM, but the handler below finishes by starting
+    // the next queued band, and both gdma_start and gdma_link_get_head_addr
+    // live in flash -- so an IRAM interrupt would call into unmapped memory
+    // during a flash write, which is worse than what it fixes. What it fixes
+    // is also smaller than it looks: spi_flash's cache_utils calls
+    // esp_intr_noniram_disable before it turns the cache off, so a non-IRAM
+    // interrupt is masked rather than fired, and the cost of a flash write
+    // landing mid-frame is a deferred completion, not a crash. The render task
+    // blocks on that band's slot for as long as the write takes and the frame
+    // stutters. Making this genuinely cache-safe means caching the head
+    // addresses here and poking the start register directly, which is worth
+    // doing only if a stutter during a settings save ever matters.
     gdma_channel_alloc_config_t txCfg = {};
     txCfg.direction = GDMA_CHANNEL_DIRECTION_TX;
     txCfg.flags.reserve_sibling = 1;
@@ -162,10 +176,22 @@ esp_err_t BandDma::submit(int slot, void *dst, const void *src, size_t bytes, vo
 
     // The whole transfer is one mounted buffer per direction; the link list
     // splits it across as many descriptors as the item cap needs, sets the
-    // owner bit on each, and marks the last TX item EOF+final. The RX items
-    // carry no flags, exactly as esp_async_memcpy mounts them: the RX EOF is
-    // raised when the TX's EOF data has been received, so the RX list never
-    // needs a terminator of its own.
+    // owner bit on each, and marks the last item of each direction final.
+    //
+    // Only TX carries mark_eof. The RX EOF interrupt is raised when the data
+    // the TX tagged has been received, not by anything on the RX descriptors
+    // themselves, which is why esp_async_memcpy mounts its RX side with no
+    // flags at all.
+    //
+    // It does not set mark_final either, and this does. Without it the last RX
+    // item's next pointer wraps to the head of its own list, so nothing in the
+    // descriptor chain stops the receiver from walking back to the start; what
+    // stops it is that TX has finished sending and no more bytes arrive. That
+    // is almost certainly why the reference gets away with it, but it rests on
+    // RX advancing only when it has data rather than eagerly following the
+    // chain, and that is an inference about the hardware rather than something
+    // the driver states. A null terminator costs nothing and does not need the
+    // inference to hold.
     gdma_buffer_mount_config_t txMount = {};
     txMount.buffer = const_cast<void *>(src);
     txMount.length = bytes;
@@ -178,6 +204,7 @@ esp_err_t BandDma::submit(int slot, void *dst, const void *src, size_t bytes, vo
     gdma_buffer_mount_config_t rxMount = {};
     rxMount.buffer = dst;
     rxMount.length = bytes;
+    rxMount.flags.mark_final = 1;
     if ((err = gdma_link_mount_buffers(_rxLink[slot], 0, &rxMount, 1, nullptr)) != ESP_OK) {
         return err;
     }
