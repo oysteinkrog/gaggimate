@@ -1107,14 +1107,15 @@ void SleepAnimation::taskEntry(void *arg) {
 // interrupt is what gives it back. Presenting before that would flip to a
 // buffer whose bottom bands are still in flight.
 void SleepAnimation::presentFrame() {
-    if (!dmaActive || fbCount < 2 || display == nullptr) {
+    // directPushOn as well as dmaActive: with the direct path switched off the
+    // bands go through pushColors, which writes whichever buffer esp_lcd counts
+    // as current, so flipping underneath it would show a buffer nothing wrote.
+    if (!dmaActive || !directPushOn.load() || fbCount < 2 || display == nullptr) {
         return;
     }
     display->lockFrameBuffer();
     // Empty dirty range: everything in this buffer arrived over DMA, straight
-    // into PSRAM, so there is nothing in the cache to write back. The exception
-    // is the mode 1 diagnostic, which copies with the CPU and syncs each band
-    // itself on the way past -- so that one has nothing outstanding either.
+    // into PSRAM, so there is nothing in the cache to write back.
     display->presentFrameBuffer(fbBack, 0, 0);
     display->unlockFrameBuffer();
     fbBack ^= 1;

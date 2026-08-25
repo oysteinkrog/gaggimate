@@ -446,6 +446,114 @@ void WebUIPlugin::setupServer() {
     // the CPU cache -- moves the same bytes for half the traffic, which is why
     // esp_async_memcpy is measured alongside. Everything runs with the panel
     // scanning out, so the numbers include the contention push really sees.
+    // What is actually programmed into the GDMA channels, read back from the
+    // hardware rather than assumed. Two things worth knowing: which channel the
+    // RGB panel driver took (it never exposes its handle, so the only way to
+    // find it from outside is to scan the peripheral-select registers for
+    // LCD_CAM's trigger ID), and what external-memory block size each channel
+    // is running.
+    //
+    // That second one matters because the esp32s3 register field documents only
+    // 16 and 32 bytes as valid -- gdma_struct.h:212, "0: 16 bytes 1: 32 bytes
+    // 2/3:reserved" -- while the shared LL header still offers a 64B constant
+    // that is legal only on other targets. Both the panel init and the async
+    // memcpy config in this tree ask for 64.
+    //
+    // The poke arguments write the same fields at runtime so their effect can be
+    // measured without a reflash: ?ch=N with bkin/bkout (0=16B, 1=32B, 2=64B)
+    // and priin/priout (0-15).
+    server.on("/api/gdma", [this](AsyncWebServerRequest *request) {
+        AsyncResponseStream *response = request->beginResponseStream("application/json");
+        JsonDocument doc;
+        if (request->hasArg("ch")) {
+            const int ch = request->arg("ch").toInt();
+            if (ch >= 0 && ch < 5) {
+                if (request->hasArg("bkin")) {
+                    GDMA.channel[ch].in.conf1.in_ext_mem_bk_size = request->arg("bkin").toInt() & 0x3;
+                }
+                if (request->hasArg("bkout")) {
+                    GDMA.channel[ch].out.conf1.out_ext_mem_bk_size = request->arg("bkout").toInt() & 0x3;
+                }
+                if (request->hasArg("priin")) {
+                    GDMA.channel[ch].in.pri.rx_pri = request->arg("priin").toInt() & 0xF;
+                }
+                if (request->hasArg("priout")) {
+                    GDMA.channel[ch].out.pri.tx_pri = request->arg("priout").toInt() & 0xF;
+                }
+                doc["poked"] = ch;
+            }
+        }
+        JsonArray chans = doc["channels"].to<JsonArray>();
+        for (int ch = 0; ch < 5; ch++) {
+            JsonObject o = chans.add<JsonObject>();
+            o["ch"] = ch;
+            o["in_sel"] = static_cast<uint32_t>(GDMA.channel[ch].in.peri_sel.sel);
+            o["out_sel"] = static_cast<uint32_t>(GDMA.channel[ch].out.peri_sel.sel);
+            o["mem_trans"] = static_cast<uint32_t>(GDMA.channel[ch].in.conf0.mem_trans_en);
+            o["in_bk"] = static_cast<uint32_t>(GDMA.channel[ch].in.conf1.in_ext_mem_bk_size);
+            o["out_bk"] = static_cast<uint32_t>(GDMA.channel[ch].out.conf1.out_ext_mem_bk_size);
+            o["in_pri"] = static_cast<uint32_t>(GDMA.channel[ch].in.pri.rx_pri);
+            o["out_pri"] = static_cast<uint32_t>(GDMA.channel[ch].out.pri.tx_pri);
+            // The whole "M2M starves the LCD" theory predicts exactly one thing:
+            // the LCD channel's transmit FIFO runs dry. These are the raw
+            // interrupt status bits for that, sticky until cleared, so the
+            // hypothesis stops being an inference. l1 is the per-channel FIFO,
+            // l3 the shared one.
+            o["outfifo_udf"] = static_cast<uint32_t>(GDMA.channel[ch].out.int_raw.outfifo_udf_l1) |
+                               (static_cast<uint32_t>(GDMA.channel[ch].out.int_raw.outfifo_udf_l3) << 1);
+            o["outfifo_ovf"] = static_cast<uint32_t>(GDMA.channel[ch].out.int_raw.outfifo_ovf_l1) |
+                               (static_cast<uint32_t>(GDMA.channel[ch].out.int_raw.outfifo_ovf_l3) << 1);
+            o["infifo_udf"] = static_cast<uint32_t>(GDMA.channel[ch].in.int_raw.infifo_udf_l1) |
+                              (static_cast<uint32_t>(GDMA.channel[ch].in.int_raw.infifo_udf_l3) << 1);
+            o["infifo_ovf"] = static_cast<uint32_t>(GDMA.channel[ch].in.int_raw.infifo_ovf_l1) |
+                              (static_cast<uint32_t>(GDMA.channel[ch].in.int_raw.infifo_ovf_l3) << 1);
+            if (request->hasArg("clr")) {
+                GDMA.channel[ch].out.int_clr.val = 0xFFFFFFFF;
+                GDMA.channel[ch].in.int_clr.val = 0xFFFFFFFF;
+            }
+        }
+        doc["lcd_cam_trig_id"] = static_cast<uint32_t>(SOC_GDMA_TRIG_PERIPH_LCD0);
+        doc["arb_pri_dis"] = static_cast<uint32_t>(GDMA.misc_conf.arb_pri_dis);
+        serializeJson(doc, *response);
+        request->send(response);
+    });
+
+    // Raw capture of what is actually on the panel, so a corruption claim can
+    // be settled with bytes. ?src=fb (default) returns the RGB565 framebuffer,
+    // ?src=ov the live overlay as RGB565+A8. Both are little-endian and
+    // row-major; the geometry comes back in the headers because the overlay is
+    // larger than the panel by the host object's ext draw size.
+    server.on("/api/fbdump", [](AsyncWebServerRequest *request) {
+        SleepAnimation *a = sleep_animation_bench_instance();
+        if (a == nullptr) {
+            request->send(503, "text/plain", "animation not running");
+            return;
+        }
+        const bool wantOverlay = request->hasArg("src") && request->arg("src") == "ov";
+        // 480x480 at 3 B/px covers both shapes with the ext draw margin.
+        const size_t cap = 512u * 512u * 3u;
+        uint8_t *buf = static_cast<uint8_t *>(heap_caps_malloc(cap, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+        if (buf == nullptr) {
+            request->send(507, "text/plain", "no psram for capture");
+            return;
+        }
+        int w = 0, h = 0;
+        const size_t bytes = wantOverlay ? a->benchCopyOverlay(buf, cap, &w, &h) : a->benchCopyFrameBuffer(buf, cap, &w, &h);
+        if (bytes == 0) {
+            free(buf);
+            request->send(503, "text/plain", "capture unavailable");
+            return;
+        }
+        // The response reads from this pointer lazily as it streams, so the
+        // scratch has to outlive send() and is freed on disconnect instead.
+        AsyncWebServerResponse *response = request->beginResponse(200, "application/octet-stream", buf, bytes);
+        response->addHeader("X-Width", String(w));
+        response->addHeader("X-Height", String(h));
+        response->addHeader("X-Bpp", wantOverlay ? "3" : "2");
+        request->onDisconnect([buf]() { free(buf); });
+        request->send(response);
+    });
+
     server.on("/api/membench", [this](AsyncWebServerRequest *request) {
         AsyncResponseStream *response = request->beginResponseStream("application/json");
         JsonDocument doc;
