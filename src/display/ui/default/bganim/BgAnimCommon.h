@@ -19,7 +19,6 @@ namespace bganim {
 // work. always_inline is a directive, not a hint, so it holds.
 #define BGANIM_INLINE inline __attribute__((always_inline))
 
-
 constexpr int SIN_N = 1024; // entries in the shared sine LUT
 constexpr int SIN_AMP = 512;
 
@@ -93,6 +92,36 @@ constexpr size_t SRAM_ALLOC_LIMIT = GM_BGANIM_SRAM_LIMIT;
 #define GM_BGANIM_SRAM_BUDGET (28 * 1024)
 #endif
 constexpr size_t SRAM_TOTAL_BUDGET = GM_BGANIM_SRAM_BUDGET;
+
+// Internal DRAM the animation must leave alone, whatever its own budget says.
+//
+// SRAM_TOTAL_BUDGET above bounds what the animation takes. That is only half
+// the question, and the half that does not matter: what the radios need is not
+// a bound on the animation's appetite but a floor under what is left. A fixed
+// budget is a bound on the wrong side of the subtraction, and it was tuned on
+// a build with GM_FAKE_CONTROLLER set, where BLE never starts and roughly 30 KB
+// more internal DRAM is free than production ever has.
+//
+// The result on real hardware was total starvation rather than degradation:
+// internal free sat at 1.4 KB, and WiFi could not allocate the 180 bytes a
+// probe request needs, so the display never associated at all. The failing
+// allocation is small, so this is not fragmentation -- the pool was simply
+// gone. The display garbled at the same time and for the same reason.
+//
+// So placement is gated on the free pool as it actually is at the moment of
+// the request, not on a number chosen at build time. Reserve generously: the
+// radios allocate in bursts long after the animation has taken its share, and
+// there is nothing to reclaim it from once the animation holds it.
+#ifndef GM_INTERNAL_RESERVE
+#define GM_INTERNAL_RESERVE (48 * 1024)
+#endif
+constexpr size_t INTERNAL_RESERVE = GM_INTERNAL_RESERVE;
+
+// Whether `size` can come out of internal DRAM without cutting into that
+// reserve. Checked against the DMA-capable internal pool specifically, because
+// that is the one WiFi's frame buffers come from (caps 0x80c) and it is a
+// subset of internal DRAM rather than all of it.
+bool internalHasRoomFor(size_t size);
 
 // Bytes alloc() has handed out from each pool since boot, so a bench run can
 // tell whether an animation's tables actually landed where the policy above

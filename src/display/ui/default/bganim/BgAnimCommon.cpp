@@ -34,6 +34,11 @@ namespace {
 bool isPsram(const void *p) { return esp_ptr_external_ram(p); }
 } // namespace
 
+bool internalHasRoomFor(size_t size) {
+    const size_t freeInternal = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
+    return freeInternal >= size + INTERNAL_RESERVE;
+}
+
 void *alloc(size_t size) {
     // Animations allocate their LUTs lazily on first use and never free them,
     // so switching through the whole fleet in one power cycle accumulates every
@@ -85,7 +90,12 @@ void *alloc(size_t size) {
     // are held by whoever asked first and deliberately never freed -- and
     // because it is what catches a future animation that forgets its release
     // entry, which is a silent regression rather than a visible one.
-    const bool overBudget = g_allocSram + size > SRAM_TOTAL_BUDGET;
+    //
+    // The cumulative budget stays as the backstop it was built to be, but it is
+    // no longer what decides placement on its own: internalHasRoomFor() vetoes
+    // any request that would take the free pool below the radios' reserve. See
+    // INTERNAL_RESERVE for why a build-time budget alone was not enough.
+    const bool overBudget = g_allocSram + size > SRAM_TOTAL_BUDGET || !internalHasRoomFor(size);
     if (size > SRAM_ALLOC_LIMIT || overBudget) {
         // Two different situations take this branch and only one is expected.
         // Over the per-allocation limit is by design: those tables are bulk
@@ -97,9 +107,11 @@ void *alloc(size_t size) {
         // so it shows up in a device log instead of only as a frame-rate drop.
         if (overBudget && size <= SRAM_ALLOC_LIMIT) {
             log_w("bganim: %u B to PSRAM, SRAM budget spent (%u/%u) -- a release() entry is likely missing",
-                  static_cast<unsigned>(size), static_cast<unsigned>(g_allocSram),
-                  static_cast<unsigned>(SRAM_TOTAL_BUDGET));
+                  static_cast<unsigned>(size), static_cast<unsigned>(g_allocSram), static_cast<unsigned>(SRAM_TOTAL_BUDGET));
         }
+        log_w("bganim: %u B -> PSRAM (internal free %u, sram budget %u/%u)", static_cast<unsigned>(size),
+              static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA | MALLOC_CAP_8BIT)),
+              static_cast<unsigned>(g_allocSram), static_cast<unsigned>(SRAM_TOTAL_BUDGET));
         void *big = ps_malloc(size);
         if (big != nullptr) {
             g_allocPsram += size;
@@ -362,9 +374,9 @@ void themeRGB(int pos, uint8_t out[3]) {
     } else if (pos > 255) {
         pos = 255;
     }
-    const int scaled = pos * (n - 1);      // 0 .. 255*(n-1)
-    const int seg = scaled >> 8;           // stop index
-    const int f = scaled & 255;            // blend within segment
+    const int scaled = pos * (n - 1); // 0 .. 255*(n-1)
+    const int seg = scaled >> 8;      // stop index
+    const int f = scaled & 255;       // blend within segment
     for (int c = 0; c < 3; c++) {
         out[c] = static_cast<uint8_t>(st[seg][c] + (((st[seg + 1][c] - st[seg][c]) * f) >> 8));
     }
