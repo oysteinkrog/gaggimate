@@ -108,8 +108,9 @@ class SleepAnimation {
     // Text scrim: how far to dim the animation behind and immediately around
     // overlaid widget pixels, 0-100 percent, where 0 is off and 100 is black.
     // The one legibility control that does not change the animation anywhere
-    // text is not, which is why it is the one that defaults on. Applies on the
-    // next frame; the halo shape itself is built at overlay-publish time.
+    // text is not, but it ships off: see bgAnimScrim in Settings.h for why the
+    // halo costs more than it buys on most of the fleet. Applies on the next
+    // frame; the halo shape itself is built at overlay-publish time.
     void setScrim(int pct) {
         if (pct < 0) {
             pct = 0;
@@ -512,7 +513,7 @@ class SleepAnimation {
 
     // Scrim strength in Q8 (0 = off, 256 = black). Read once per band by the
     // composite, so a plain relaxed load is all it needs.
-    std::atomic<int> scrimQ8{55 * 256 / 100};
+    std::atomic<int> scrimQ8{0}; // off until setScrim says otherwise; see bgAnimScrim
     std::atomic<int> blendProbe{0};
     // Dim the scrim on the PIE vector unit rather than a pixel at a time.
     // Default on; the scalar path stays as the reference /api/pietest checks

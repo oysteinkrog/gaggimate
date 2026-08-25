@@ -349,7 +349,7 @@ function BackgroundAnimationSettings({ formData, onChange, setField }) {
         )}
         <SettingsFormField
           label={`Text backdrop (${
-            formData.bgAnimScrim === undefined ? 55 : parseInt(formData.bgAnimScrim, 10)
+            formData.bgAnimScrim === undefined ? 0 : parseInt(formData.bgAnimScrim, 10)
           }%)`}
           htmlFor='bgAnimScrim'
           noMargin
@@ -361,7 +361,7 @@ function BackgroundAnimationSettings({ formData, onChange, setField }) {
             min='0'
             max='100'
             className='range w-full'
-            value={formData.bgAnimScrim === undefined ? 55 : parseInt(formData.bgAnimScrim, 10)}
+            value={formData.bgAnimScrim === undefined ? 0 : parseInt(formData.bgAnimScrim, 10)}
             onChange={onChange('bgAnimScrim')}
           />
         </SettingsFormField>
