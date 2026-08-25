@@ -4,7 +4,6 @@
 #include <Arduino.h>
 #include <display/drivers/common/Display.h>
 #include <display/ui/default/bganim/BgAnim.h>
-#include <esp_async_memcpy.h>
 #include <esp_cache.h> // esp_cache_msync, around the direct push
 #include <esp_heap_caps.h>
 #include <esp_timer.h>
@@ -384,9 +383,9 @@ void SleepAnimation::start(Display *d) {
     for (int i = 0; i < NUM_SLOTS; i++) {
         if (bandBuf[i] == nullptr) {
             // 64-byte aligned and DMA-capable, because on the direct path these
-            // are the transfer source and esp_async_memcpy rejects anything
-            // else. The fallback keeps the ordinary push path working if the
-            // aligned allocator cannot find a contiguous block.
+            // are the transfer source. The fallback keeps the ordinary push
+            // path working if the aligned allocator cannot find a contiguous
+            // block.
 #ifdef GM_ANIM_BENCH
             // Only the bench build can reach the GDMA push path (benchSetDma is
             // compiled out otherwise), and only that path needs these to be a
@@ -632,7 +631,7 @@ bool SleepAnimation::beginDirectPath() {
     // cache.
     display->setDirectWriter(true);
     dmaActive = true;
-    log_i("SleepAnimation: direct framebuffer push active (mode %d)", dmaMode.load());
+    log_i("SleepAnimation: direct framebuffer push active");
     return true;
 }
 
@@ -732,16 +731,6 @@ void SleepAnimation::pushTaskEntry(void *arg) {
     vTaskDelete(nullptr);
 }
 
-static bool IRAM_ATTR sleepAnimBandDone(async_memcpy_t, async_memcpy_event_t *, void *arg) {
-    // Spelled out rather than ++: C++20 deprecates increment on a volatile
-    // lvalue, and this counter has to stay volatile rather than atomic (see
-    // its declaration) because a libatomic helper would not be in IRAM.
-    g_sleepAnimDmaDone = g_sleepAnimDmaDone + 1;
-    if (arg == nullptr) {
-        return false; // a non-final chunk: nothing to release yet
-    }
-    return sleepAnimBandRetire(arg);
-}
 
 // The same retirement, for the native engine, which gives every transfer an arg
 // because it submits one per band rather than one per chunk.
@@ -845,20 +834,6 @@ namespace {
 // argument to say otherwise -- so the only way to choose is to call from a task
 // already pinned where the interrupt should land. This one-shot task exists for
 // that and nothing else.
-struct DmaInstallReq {
-    async_memcpy_config_t cfg;
-    async_memcpy_t handle;
-    esp_err_t err;
-    SemaphoreHandle_t done;
-};
-
-void dmaInstallTaskEntry(void *arg) {
-    auto *req = static_cast<DmaInstallReq *>(arg);
-    req->err = esp_async_memcpy_install(&req->cfg, &req->handle);
-    xSemaphoreGive(req->done);
-    vTaskDelete(nullptr);
-}
-
 struct NativeInstallReq {
     BandDma *dma;
     size_t maxBytes;
@@ -905,57 +880,10 @@ bool SleepAnimation::installNativeOnIsrCore() {
     return true;
 }
 
-// Whichever engine the current mode needs, installed on first use. The mode is
-// a live setting, so this is re-checked every frame; both installs latch, so
-// the steady-state cost is a load and a branch.
-bool SleepAnimation::engineReadyForMode() {
-    return dmaMode.load() == 4 ? installNativeOnIsrCore() : installDmaOnRenderCore();
-}
+// Installed on first use, and latched, so the steady-state cost of asking is a
+// load and a branch.
+bool SleepAnimation::engineReadyForMode() { return installNativeOnIsrCore(); }
 
-bool SleepAnimation::installDmaOnRenderCore() {
-    if (dmaHandle != nullptr) {
-        return true;
-    }
-    if (dmaInstallTried) {
-        return false; // do not retry a failed install once a frame
-    }
-    dmaInstallTried = true;
-    async_memcpy_config_t cfg = ASYNC_MEMCPY_DEFAULT_CONFIG();
-    // The engine splits a transfer into descriptors of its own internal size,
-    // and backlog is how many it can hold. One band is 480 x BAND_H x 2 bytes;
-    // size the pool for every slot being in flight at once, with slack.
-    cfg.backlog = 64; // descriptors, ~12 B each; far more than the pipeline can have in flight
-    // Burst size, not an alignment. Under IDF 5.5 psram_trans_align is a
-    // deprecated union alias of dma_burst_size, so the old
-    // `cfg.psram_trans_align = 32` was already setting the burst and only its
-    // comment said otherwise. 32 bytes matches both the data cache line and
-    // the octal PSRAM burst; the esp32s3 register field documents 16 and 32 as
-    // the valid encodings.
-    cfg.dma_burst_size = 32;
-    async_memcpy_t h = nullptr;
-    esp_err_t err = ESP_FAIL;
-    // The RGB panel is created from setup(), which Arduino runs on core 1, so
-    // the driver's own ISR lives there; the render task is pinned to core 1 too.
-    // Installing from here would put a ~1,300/s completion interrupt on exactly
-    // the core that has to service the panel's. Install from core 0 instead.
-    DmaInstallReq req{cfg, nullptr, ESP_FAIL, xSemaphoreCreateBinary()};
-    if (req.done != nullptr) {
-        TaskHandle_t installer = nullptr;
-        if (xTaskCreatePinnedToCore(dmaInstallTaskEntry, "DmaInstall", 3072, &req, 3, &installer,
-                                    DMA_ISR_CORE) == pdPASS) {
-            xSemaphoreTake(req.done, pdMS_TO_TICKS(2000));
-            err = req.err;
-            h = req.handle;
-        }
-        vSemaphoreDelete(req.done);
-    }
-    if (err != ESP_OK) {
-        log_w("SleepAnimation: async memcpy install failed (%d), using the push task", static_cast<int>(err));
-        return false;
-    }
-    dmaHandle = h;
-    return true;
-}
 
 void SleepAnimation::pushLoop() {
     int slot = 0;
@@ -1482,7 +1410,7 @@ void SleepAnimation::renderFrame() {
         // odd row would be neither written nor sent. 480/8 leaves no partial
         // band today, so this is a guard rather than a live case.
         const bool oddBand = (rows & 1) != 0;
-        const bool bandInterlaced = interlace.load() && !(dmaActive && dmaMode.load() != 0) &&
+        const bool bandInterlaced = interlace.load() && !(dmaActive && directPushOn.load()) &&
                                     warmupFrames.load() == 0 && !(half && oddBand);
         const int parityNow = static_cast<int>(frameParity & 1u);
         // At half resolution the unit is a row pair, one source row expanded;
@@ -1664,11 +1592,7 @@ void SleepAnimation::renderFrame() {
         // separate run in the framebuffer and would need its own descriptor to
         // step the stride. At 48 MB/s those corners cost less than the
         // descriptors and the extra pack pass would.
-        // dmaMode 0 means "use the ordinary two-task push", so the direct path
-        // can be turned off at runtime without a reboot -- benchSetDma only
-        // takes effect at the next start(), which never happens while a sweep
-        // is running.
-        const bool directPush = dmaActive && dmaMode.load() != 0;
+        const bool directPush = dmaActive && directPushOn.load();
         const bool crop = cropEnabled && !directPush;
         const int bi = y0 / BAND_H;
         const int cx0 = crop ? bandX0[bi] : 0;
@@ -1725,21 +1649,6 @@ void SleepAnimation::renderFrame() {
             BENCH_T0(tPush);
             const size_t bytes = static_cast<size_t>(w) * rows * 2;
             uint16_t *const dstRow = fbDirect[fbBack] + static_cast<size_t>(y0) * w;
-            if (dmaMode.load() == 1) {
-                // Diagnostic mode: same destination, same bytes, ordinary CPU
-                // copy, then the identical writeback esp_lcd does on its way
-                // out of draw_bitmap. It isolates "bypassing the driver" from
-                // "GDMA" -- anything still wrong in mode 1 is not about the
-                // transfer engine.
-                display->lockFrameBuffer();
-                memcpy(dstRow, band, bytes);
-                esp_cache_msync(dstRow, bytes, ESP_CACHE_MSYNC_FLAG_DIR_C2M);
-                display->unlockFrameBuffer();
-                xSemaphoreGive(static_cast<SemaphoreHandle_t>(bandFree[renderSlot]));
-                BENCH_ACC(accPushUs, tPush);
-                renderSlot = (renderSlot + 1) % NUM_SLOTS;
-                continue;
-            }
             // Shut pushColors out for as long as this FRAME has transfers in
             // flight. esp_lcd_panel_draw_bitmap ends with a cache writeback
             // over whole SCANLINES, so letting another writer in mid-transfer
@@ -1764,41 +1673,24 @@ void SleepAnimation::renderFrame() {
                 frameGateHeld = false; // the completion interrupt owns the release now
             }
 
-            // A DMA descriptor tops out at 4092 bytes, so a whole 12-row band
-            // (11,520) has to be split, and the driver's split point is not a
-            // multiple of the burst size. Chunk it here instead, at 4 rows:
-            // 3,840 bytes fits one descriptor and is a whole number of rows, so
-            // every chunk's destination (fb + row * 960) keeps the framebuffer
-            // base's alignment, which the panel checked against the data cache
-            // line before handing the pointer over. Mode 2 leaves the split to
-            // the driver, which is the comparison.
+            // One submission for the whole band, into descriptors that were
+            // built at install and are only re-pointed here.
             //
-            // Only the final chunk carries the release arg, because GDMA
-            // retires transfers in submission order, so its completion means
-            // the whole band has landed.
-            const int mode = dmaMode.load();
+            // A DMA descriptor tops out at 4092 bytes, so a whole 12-row band
+            // (11,520) has to be split. BandDma splits it at install time, at
+            // four rows: 3,840 bytes fits one descriptor and is a whole number
+            // of rows, so every chunk's destination (fb + row * 960) keeps the
+            // framebuffer base's alignment, which the panel checked against the
+            // data cache line before handing the pointer over.
             esp_err_t err = ESP_OK;
-            if (mode == 4 && bandDma.ready()) {
-                // One submission for the whole band, into descriptors that were
-                // built at install and are only re-pointed here.
+            if (bandDma.ready()) {
                 dmaIssued++;
                 err = bandDma.submit(renderSlot, dstRow, band, bytes, &done);
                 if (err != ESP_OK) {
                     dmaIssued--;
                 }
             } else {
-                const int chunkRows = mode == 3 ? 4 : rows;
-                for (int r0 = 0; r0 < rows && err == ESP_OK; r0 += chunkRows) {
-                    const int n = (r0 + chunkRows <= rows) ? chunkRows : (rows - r0);
-                    const bool last = (r0 + n >= rows);
-                    dmaIssued++;
-                    err = esp_async_memcpy(static_cast<async_memcpy_t>(dmaHandle), dstRow + static_cast<size_t>(r0) * w,
-                                           band + static_cast<size_t>(r0) * w, static_cast<size_t>(n) * w * 2,
-                                           sleepAnimBandDone, last ? &done : nullptr);
-                    if (err != ESP_OK) {
-                        dmaIssued--;
-                    }
-                }
+                err = ESP_ERR_INVALID_STATE;
             }
             (void)bytes;
             if (err != ESP_OK) {
@@ -1809,10 +1701,9 @@ void SleepAnimation::renderFrame() {
                 // the same gate.
                 dmaErrors++;
                 dmaIssued--;
-                // Earlier chunks of this same band may still be in flight,
-                // reading `band` and writing the framebuffer. Let them retire
-                // before the CPU fallback touches either, or the fallback
-                // races the transfer it is replacing.
+                // Earlier bands may still be in flight, reading their slot
+                // and writing the framebuffer. Let them retire before the CPU
+                // fallback touches either, or the fallback races a transfer.
                 const unsigned long chunkDrain = millis() + 50;
                 while (dmaIssued.load() != g_sleepAnimDmaDone && millis() < chunkDrain) {
                     taskYIELD();

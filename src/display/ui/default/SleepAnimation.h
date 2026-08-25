@@ -205,12 +205,12 @@ class SleepAnimation {
     // bisect: it bypasses draw_bitmap exactly as mode 2 does but keeps the copy
     // an ordinary CPU one, so a fault that appears in 1 is about bypassing the
     // driver and a fault that appears only in 2 is about the transfer.
-    void benchSetDmaMode(int m) { dmaMode.store(m); }
+    void benchSetDirectPush(bool on) { directPushOn.store(on); }
     void benchSetInterlace(bool on) { interlace.store(on); }
     bool benchInterlace() const { return interlace.load(); }
     void benchSetRenderHalf(bool on) { renderHalf.store(on); }
     bool benchRenderHalf() const { return renderHalf.load(); }
-    int benchDmaMode() const { return dmaMode.load(); }
+    bool benchDirectPush() const { return directPushOn.load(); }
     bool benchDmaActive() const { return dmaActive; }
     uint32_t benchDmaIssued() const { return dmaIssued.load(); }
     uint32_t benchDmaCompleted() const;
@@ -387,21 +387,29 @@ class SleepAnimation {
     // the push falling from 9.7 ms per frame to 0.6, and no transfer errors in
     // 72k transfers. /api/animbench?dma=0 turns it off at runtime.
     std::atomic<bool> dmaWanted{true};
-    // 0 = ordinary two-task CPU push, 1 = direct CPU memcpy under the gate
-    // (diagnostic), 2 = one esp_async_memcpy per band, 3 = the same split into
-    // 4-row chunks, 4 = the native preallocated GDMA engine (see BandDma.h).
+    // Whether bands go straight into the panel's framebuffer over GDMA, or
+    // through the ordinary two-task CPU push. Live, unlike dmaWanted, which
+    // only takes effect at the next start() -- and start() never happens while
+    // a bench sweep is running, so this is the switch a measurement can use.
     //
-    // 4 is the default. Measured on the panel, per frame:
+    // Three other routes lived here and are gone: a CPU memcpy under the same
+    // gate, and esp_async_memcpy at one call per band and at four-row chunks.
+    // They existed to find out whether a sheared picture came from the
+    // transfer engine or from the panel scanning a region while it was
+    // written. It was neither -- the shear was the camera's exposure
+    // integrating ten panel frames -- and the framebuffer now flips at a frame
+    // boundary, so there is nothing left for them to bisect. Their numbers,
+    // measured on the panel, per frame:
     //
-    //   mode 3  push 18.8 ms  25.6 fps    esp_async_memcpy, 3 chunks per band
-    //   mode 2  push  9.7 ms  33.2 fps    esp_async_memcpy, 1 call per band
-    //   mode 4  push  0.6 ms  41.5 fps    native engine, 1 submit per band
+    //   4-row chunks   push 18.8 ms  25.6 fps
+    //   one per band   push  9.7 ms  33.2 fps
+    //   native engine  push  0.6 ms  41.5 fps
     //
-    // The spread between 2 and 3 is what gives the API away: IDF 5.5's
+    // The spread between the first two is what gives that API away: IDF 5.5's
     // esp_async_memcpy deletes and rebuilds both of its GDMA link lists from
-    // the heap on every single call, so its cost tracks submissions rather than
-    // bytes. Mode 4 keeps the descriptors and only re-points them.
-    std::atomic<int> dmaMode{4};
+    // the heap on every call, so its cost tracks submissions rather than bytes.
+    // The native engine keeps its descriptors and only re-points them.
+    std::atomic<bool> directPushOn{true};
     bool dmaActive = false; // fbDirect resolved AND the engine installed
     // The panel's framebuffers. With two, the frame is composed in the one the
     // scan-out is not reading and shown by flipping at the end of the frame, so
@@ -412,10 +420,9 @@ class SleepAnimation {
     uint16_t *fbDirect[FB_MAX] = {};
     int fbCount = 0;
     int fbBack = 0; // the buffer this frame is being composed into
-    void *dmaHandle = nullptr; // async_memcpy_t, installed once from the render task
     bool dmaInstallTried = false;
 #ifndef GAGGIMATE_SIM
-    // The native engine used by mode 4. Kept beside the esp_async_memcpy handle
+    // The native engine. Kept beside the panel's framebuffer pointers
     // rather than replacing it so the two can be compared on the same run; only
     // the engine a mode actually asks for is ever installed.
     BandDma bandDma;
@@ -434,7 +441,6 @@ class SleepAnimation {
     // the render core: the RGB panel driver's ISR is on core 1 and must not
     // queue behind ours.
     static constexpr int DMA_ISR_CORE = 0;
-    bool installDmaOnRenderCore();
 
     // Per-band horizontal extent of the panel's inscribed circle. The panel is
     // round, so the corners of the 480x480 rectangle are never visible and
