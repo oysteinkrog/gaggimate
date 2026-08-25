@@ -425,10 +425,11 @@ void LilyGo_RGBPanel::initBUS() {
         //
         // Sized in whole scanlines so the copy stays a single contiguous run,
         // and it must divide the framebuffer exactly (the driver rejects it
-        // otherwise). Internal RAM is the scarce resource here -- two buffers of
-        // ten lines cost 2 * 480 * 10 * 2 = 19200 bytes -- but the slack a
-        // bounce buffer buys is one buffer period, so it scales with the size,
-        // and ten lines also halves the EOF interrupt rate to 48 per frame.
+        // otherwise). Internal RAM is the scarce resource here: two buffers cost
+        // 2 * 480 * lines * 2 bytes. Ten lines was tried and is no cleaner than
+        // five on the camera, while its extra 9600 bytes drove the internal-DRAM
+        // low-water mark from 29.5 kB down to 2.6 kB under an animation sweep,
+        // which is close enough to the floor to start failing allocations.
         //
         // The other half of the fix is CONFIG_ESP32S3_DATA_CACHE_LINE_64B. The
         // refill reads the framebuffer front to back, which is exactly the
