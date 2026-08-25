@@ -416,16 +416,26 @@ void WebUIPlugin::setupServer() {
         const size_t animSram = bganim::g_allocSram;
         const size_t animPsram = bganim::g_allocPsram;
 #endif
-        char buf[320];
+        // Scan-out health, from the panel's own interrupts. `slips` is the one
+        // to watch: it counts frames whose bounce-buffer refill lost its race
+        // against everything else on the shared MSPI bus, which is exactly what
+        // shows on the panel as a displaced band. A run of minutes at a
+        // constant value is the only real evidence the display is clean, since
+        // the fault is far too rare to catch by looking at it.
+        uint32_t scFrames = 0, scRefills = 0, scSlips = 0;
+        panelclock::scanoutStats(&scFrames, &scRefills, &scSlips);
+        char buf[420];
         snprintf(buf, sizeof(buf),
                  "{\"int_free\":%u,\"int_largest\":%u,\"int_min\":%u,\"psram_free\":%u,\"psram_largest\":%u,"
-                 "\"anim_sram\":%u,\"anim_psram\":%u,\"anim_budget\":%u}",
+                 "\"anim_sram\":%u,\"anim_psram\":%u,\"anim_budget\":%u,"
+                 "\"sc_frames\":%u,\"sc_refills\":%u,\"sc_slips\":%u}",
                  static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL)),
                  static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL)),
                  static_cast<unsigned>(heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL)),
                  static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_SPIRAM)),
                  static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM)), static_cast<unsigned>(animSram),
-                 static_cast<unsigned>(animPsram), static_cast<unsigned>(bganim::SRAM_TOTAL_BUDGET));
+                 static_cast<unsigned>(animPsram), static_cast<unsigned>(bganim::SRAM_TOTAL_BUDGET),
+                 static_cast<unsigned>(scFrames), static_cast<unsigned>(scRefills), static_cast<unsigned>(scSlips));
         request->send(200, "application/json", buf);
     });
     server.on("/api/status", [this](AsyncWebServerRequest *request) {

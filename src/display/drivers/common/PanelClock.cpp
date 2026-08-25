@@ -36,6 +36,43 @@ uint32_t g_bootPclkHz = 0;
 int g_bootDiv = 0;
 int g_curDiv = 0;
 
+// Scan-out underrun counters. Written only from the panel's ISRs and read from
+// tasks, so plain volatile is enough: each is a single naturally aligned 32-bit
+// store on this core, and a reader that catches a stale value is off by one
+// frame on a number whose whole purpose is to be watched over seconds.
+volatile uint32_t g_frames = 0;  // on_vsync, one per displayed frame
+volatile uint32_t g_refills = 0; // on_frame_buf_complete, one per refill pass
+volatile uint32_t g_slips = 0;   // ratcheted count of underrun frames
+volatile uint32_t g_maxDrift = 0;
+
+// IRAM because these run from the panel's interrupts, which the driver keeps
+// alive across a flash operation when its own ISR is IRAM-safe. Two increments
+// each; the cost to the frame budget is nil, and putting them in flash would
+// turn a diagnostic into a way to crash during an NVS write.
+IRAM_ATTR bool onRefillDone(esp_lcd_panel_handle_t, const esp_lcd_rgb_panel_event_data_t *, void *) {
+    g_refills++;
+    return false;
+}
+
+IRAM_ATTR bool onVsync(esp_lcd_panel_handle_t, const esp_lcd_rgb_panel_event_data_t *, void *) {
+    g_frames++;
+    // Ratchet rather than report the raw difference. The two callbacks fire at
+    // different points in the frame, so their difference sits at 0 or 1 even
+    // when the scan-out is perfect; only a refill pass that never completed
+    // pushes it permanently higher, and each new high-water mark is one
+    // underrun frame.
+    const uint32_t drift = g_frames - g_refills;
+    if (drift > g_maxDrift) {
+        g_maxDrift = drift;
+        // The first frames after init legitimately run ahead of the first
+        // completed refill pass, which is a phase offset and not a fault.
+        if (g_frames > 4) {
+            g_slips++;
+        }
+    }
+    return false;
+}
+
 // setDiv() runs on the async web-server task (WebUIPlugin) and the LVGL task,
 // while attach()/detach() run on the display task around panel creation and
 // deletion. Without serialisation, setDiv() can pass its null check on one core
@@ -109,6 +146,18 @@ void attach(void *panelHandle, uint32_t bootPclkHz) {
     g_panel = static_cast<esp_lcd_panel_handle_t>(panelHandle);
     g_bootPclkHz = bootPclkHz;
     g_bootDiv = divForHz(bootPclkHz);
+    // Counters restart with the panel: after a display OTA tears it down and
+    // rebuilds it, a total carried over from the previous instance would be
+    // attributed to the new timing.
+    g_frames = g_refills = g_slips = g_maxDrift = 0;
+    // Field-by-field rather than a designated initialiser: on_frame_buf_complete
+    // shares an anonymous union with a deprecated alias, and naming a union
+    // member in a braced list makes the initialiser order-dependent in a way
+    // g++ rejects outright.
+    esp_lcd_rgb_panel_event_callbacks_t cbs = {};
+    cbs.on_vsync = onVsync;
+    cbs.on_frame_buf_complete = onRefillDone;
+    esp_lcd_rgb_panel_register_event_callbacks(g_panel, &cbs, nullptr);
     // A divider chosen before the panel existed (or before it was torn down for
     // a display OTA) is still the user's choice — re-apply it rather than
     // silently reverting to the boot rate.
@@ -144,6 +193,20 @@ uint32_t bootPclkHz() {
 
 bool hasLiveControl() { return PANELCLOCK_HAS_SET_PCLK != 0; }
 
+void scanoutStats(uint32_t *frames, uint32_t *refills, uint32_t *slips) {
+    // Deliberately not taking the lock: these are ISR-written counters, and the
+    // mutex here guards the panel handle against deletion, which is unrelated.
+    if (frames != nullptr) {
+        *frames = g_frames;
+    }
+    if (refills != nullptr) {
+        *refills = g_refills;
+    }
+    if (slips != nullptr) {
+        *slips = g_slips;
+    }
+}
+
 void setDiv(int n) {
     Guard g(lock());
     if (n == 0) {
@@ -171,6 +234,17 @@ int currentDiv() { return 0; }
 uint32_t bootPclkHz() { return 0; }
 bool hasLiveControl() { return false; }
 void setDiv(int) {}
+void scanoutStats(uint32_t *frames, uint32_t *refills, uint32_t *slips) {
+    if (frames != nullptr) {
+        *frames = 0;
+    }
+    if (refills != nullptr) {
+        *refills = 0;
+    }
+    if (slips != nullptr) {
+        *slips = 0;
+    }
+}
 } // namespace panelclock
 
 #endif
