@@ -188,6 +188,11 @@ class SleepAnimation {
     //   3 -- plus the band read-modify-write, so the SRAM traffic does too
     // Which separates the cost of deciding what to touch from the cost of
     // touching it, and that from what waits on memory.
+    // Replace the animation and the composite with a deterministic pattern the
+    // host can recompute, so the render-to-framebuffer path can be checked by
+    // byte comparison instead of by looking at it.
+    void benchSetPattern(bool on) { patternOn.store(on); }
+    bool benchPattern() const { return patternOn.load(); }
     void benchSetBlendProbe(int level) { blendProbe.store(level); }
     int benchGetOnly() const { return benchOnly.load(); }
     // The sweep normally runs uncapped, because a throttled frame reports the
@@ -477,6 +482,7 @@ class SleepAnimation {
     // composite, so a plain relaxed load is all it needs.
     std::atomic<int> scrimQ8{55 * 256 / 100};
     std::atomic<int> blendProbe{0};
+    std::atomic<bool> patternOn{false};
     // Scratch grid for the separable dilate/blur passes, one shared copy: the
     // passes run to completion inside publishOverlay on the UI task, so the two
     // overlays never need it at the same time.

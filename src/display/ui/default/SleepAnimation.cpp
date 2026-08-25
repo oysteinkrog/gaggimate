@@ -309,6 +309,29 @@ __attribute__((noinline)) static uint32_t blendRowProbe(uint16_t *__restrict dst
 }
 #endif
 
+#ifdef GM_ANIM_BENCH
+// Bench only: a deterministic value for every panel pixel, so a host can
+// compute the entire framebuffer independently and compare it byte for byte.
+//
+// The point is to take visual judgement out of the loop. A photograph of this
+// panel cannot settle whether the pipeline corrupts anything -- a webcam in a
+// dark room auto-exposes to tens of milliseconds and integrates ten panel
+// frames, which fabricates shear and duplication that are not on the screen.
+// This is the same path the animations use, up to and including the GDMA
+// transfer into the framebuffer, with the content replaced by something the
+// far end already knows the answer to. Any misplaced band, dropped descriptor,
+// wrong destination offset or flipped bit shows up as an exact mismatch count
+// and coordinate rather than an opinion about a JPEG.
+//
+// Multiplied by primes and folded so neighbouring pixels and neighbouring rows
+// differ in the high bits: an offset error has to change the value, which a
+// smooth ramp would let slide for small displacements.
+__attribute__((always_inline)) inline uint16_t benchPatternPx(int x, int y) {
+    const uint32_t v = static_cast<uint32_t>(x) * 2654435761u + static_cast<uint32_t>(y) * 40503u;
+    return static_cast<uint16_t>((v >> 11) ^ (v >> 27));
+}
+#endif
+
 // Internal SRAM is deliberately scarce in this firmware (WiFi/BLE/TLS all
 // compete for it) — always fall back to PSRAM rather than failing.
 void *allocPreferInternal(size_t size) {
@@ -1508,6 +1531,22 @@ void SleepAnimation::renderFrame() {
             accBandLockedRows += static_cast<uint32_t>(rows);
         }
 #endif
+#ifdef GM_ANIM_BENCH
+        // Overwrite whatever the animation produced, after any half-resolution
+        // expansion, so what lands in the framebuffer is exactly the pattern
+        // regardless of how the band was generated. The composite is skipped
+        // too: the widgets are the one thing the host cannot predict.
+        const bool patternMode = patternOn.load();
+        if (patternMode) {
+            for (int r = 0; r < rows; r++) {
+                uint16_t *const prow = band + static_cast<size_t>(r) * w;
+                const int py = y0 + r;
+                for (int x = 0; x < w; x++) {
+                    prow[x] = benchPatternPx(x, py);
+                }
+            }
+        }
+#endif
         BENCH_T0(tBlend);
 #ifdef GM_ANIM_BENCH
         // Locals, not the uint64_t members: a member increment in the innermost
@@ -1529,7 +1568,7 @@ void SleepAnimation::renderFrame() {
 #endif
         // Rows this frame will not push are thrown away, so compositing
         // widgets into them is wasted. Both rows of a pushed pair still need it.
-        for (int y = y0; y < y0 + rows && ov != nullptr; y++) {
+        for (int y = y0; y < y0 + rows && ov != nullptr && !patternMode; y++) {
             if (bandInterlaced && ((((pairMode ? (y >> 1) : y) ^ parityNow) & 1) != 0)) {
                 continue;
             }
