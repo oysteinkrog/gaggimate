@@ -379,6 +379,18 @@ void band(uint16_t *dst, int y0, int rows, int w, uint32_t, const uint8_t *) {
             }
             ixCur[255] = cur0 + (((rowA0[0] - cur0) * axF) >> 8);
         }
+#ifdef GM_NEBULA_TABLE_PROBE
+        // Diagnostic only, visually wrong: skip both dominant-octave tables
+        // and let the combine step read whatever they last held. 255 + 256
+        // iterations per row build them to serve w output pixels, and at the
+        // half resolution this panel renders at, w is 240 -- so the two
+        // tables cost more iterations than the pixel loop they feed. This
+        // prices removing them outright, which is the ceiling for any
+        // restructuring that sizes them to the output width instead of to the
+        // noise texture's 256 period. Never build this into anything
+        // shipping.
+        (void)ayF;
+#else
         {
             int cur1 = rowA1[0];
             for (int i = 0; i < 255; i++) {
@@ -393,6 +405,7 @@ void band(uint16_t *dst, int y0, int rows, int w, uint32_t, const uint8_t *) {
             const int vb = ixNext[i];
             blendedA[i] = static_cast<uint8_t>(va + (((vb - va) * ayF) >> 8));
         }
+#endif
         // ixNext (this row's interpolated rowA1) is next row's rowA0 -- see
         // the block comment further up for why that identity holds.
         curBuf ^= 1;
