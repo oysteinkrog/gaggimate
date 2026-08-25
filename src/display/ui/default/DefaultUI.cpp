@@ -64,7 +64,6 @@ inline void areaMerge(lv_area_t &dst, const lv_area_t &src) {
 }
 } // namespace
 
-
 static constexpr int32_t GAUGE_TICK_LONG = 25;      // meter tick length on most screens
 static constexpr int32_t GAUGE_TICK_SHORT = 10;     // shortened tick length on profile / new-menu screens
 static constexpr uint32_t GAUGE_TICK_ANIM_MS = 300; // tick length transition duration
@@ -723,9 +722,9 @@ void DefaultUI::applyAnimPlates(int mode, uint32_t color, int opaPct) {
     // The last entry is the scale overlay's Tare pill, built at runtime by
     // buildScaleScreen rather than generated, so it is null whenever that screen
     // is down. It is the one plate change_color_theme() knows nothing about.
-    lv_obj_t *const plates[ANIM_PLATE_COUNT] = {
-        objects.obj2,         objects.obj9,           objects.obj15,       objects.obj26,      objects.profile_name,
-        objects.profile_name_1, objects.mode_switch, objects.mode_switch1, scaleTareBtn};
+    lv_obj_t *const plates[ANIM_PLATE_COUNT] = {objects.obj2,        objects.obj9,         objects.obj15,
+                                                objects.obj26,       objects.profile_name, objects.profile_name_1,
+                                                objects.mode_switch, objects.mode_switch1, scaleTareBtn};
 
     for (int i = 0; i < ANIM_PLATE_COUNT; i++) {
         if (plates[i] == nullptr) {
@@ -903,8 +902,8 @@ bool DefaultUI::snapshotAreaToOverlay(lv_obj_t *obj, uint8_t *buf, uint32_t bufS
     }
     objDisp->driver->draw_ctx_init(fakeDisp.driver, drawCtx);
     fakeDisp.driver->draw_ctx = drawCtx;
-    drawCtx->clip_area = &clipped;      // only this is redrawn
-    drawCtx->buf_area = &snapshotArea;  // buffer keeps full geometry and stride
+    drawCtx->clip_area = &clipped;     // only this is redrawn
+    drawCtx->buf_area = &snapshotArea; // buffer keeps full geometry and stride
     drawCtx->buf = static_cast<void *>(buf);
     driver.draw_ctx = drawCtx;
 
@@ -1049,8 +1048,8 @@ void DefaultUI::displaceGrindWidgets(bool displaced) {
     // grind_dials__menu_icon goes with them: the scale overlay draws its own exit
     // arrow in that slot, and the dials' icon is flow-driven so it cannot simply
     // be hidden.
-    lv_obj_t *const widgets[] = {objects.main_label4,  objects.grind_start_button, objects.mode_switch1,
-                                 objects.target_weight, objects.target_time,       objects.grind_dials__menu_icon};
+    lv_obj_t *const widgets[] = {objects.main_label4,   objects.grind_start_button, objects.mode_switch1,
+                                 objects.target_weight, objects.target_time,        objects.grind_dials__menu_icon};
     for (lv_obj_t *obj : widgets) {
         if (obj == nullptr) {
             continue;
@@ -1276,6 +1275,17 @@ void DefaultUI::updateState() {
     if (pclkDiv != lastPclkDiv) {
         lastPclkDiv = pclkDiv;
         panelclock::setDiv(pclkDiv);
+    }
+    // Panel VCOM, same shape: a register write over the panel's SPI control
+    // interface, which is separate from the RGB data path, so it is safe to do
+    // while scan-out is running. Panels that have no such register ignore it.
+    static int lastVcom = INT_MIN;
+    const int vcom = settings.getPanelVcom();
+    if (vcom != lastVcom) {
+        lastVcom = vcom;
+        if (panelDriver != nullptr) {
+            panelDriver->setPanelVcom(vcom);
+        }
     }
     // Publish the color theme only on change — setThemeStops bumps a
     // generation counter that makes every animation rebuild its palettes.

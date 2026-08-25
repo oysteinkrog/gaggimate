@@ -133,6 +133,7 @@ class Settings {
     int getBgAnimHighlightKnee() const { return bgAnimHighlightKnee.get(); }
     int getBgAnimScrim() const { return bgAnimScrim.get(); }
     int getPanelClockDiv() const { return panelClockDiv.get(); }
+    int getPanelVcom() const { return panelVcom.get(); }
     int getSmartGrindMode() const { return smartGrindMode.get(); }
     String getSmartGrindIp() const { return smartGrindIp.get(); }
     bool isHomeAssistant() const { return homeAssistant.get(); }
@@ -227,6 +228,7 @@ class Settings {
     void setBgAnimHighlightKnee(int bg_anim_highlight_knee);
     void setBgAnimScrim(int bg_anim_scrim);
     void setPanelClockDiv(int panel_clock_div);
+    void setPanelVcom(int panel_vcom);
     void setSmartGrindIp(String smart_grind_ip);
     void setSmartGrindMode(int smart_grind_mode);
     void setHomeAssistant(bool homeAssistant);
@@ -387,6 +389,22 @@ class Settings {
     // so real choices are 80/n: 5=16 MHz (~61 Hz), 6=13.3 MHz (~51 Hz),
     // 7=11.4 MHz (~43 Hz). Applied live from DefaultUI::updateState.
     Property<int> panelClockDiv{registry, "pclk_div", 0};
+    // ST7701S VCOMS (BK1 0xB1) as the raw register value: VCOM = 0.1 + n*0.0125 V,
+    // so 45 = 0.66 V, which is what the LilyGo panel ships with, and 72 = 1.0 V.
+    //
+    // VCOM sets the common-electrode voltage the pixel voltages swing around.
+    // When it is off centre the two halves of the inversion cycle do not cancel,
+    // and the residual shows up as a low-level flicker or shimmer on large flat
+    // mid-tones. Where the null sits depends on the individual panel and on the
+    // temperature of the glass, which is why a display can shimmer for the first
+    // minutes after a cold start and then settle: the null moves as it warms.
+    //
+    // That is a per-unit, per-moment quantity, so it is a setting rather than a
+    // number compiled into the init table. Applied live from DefaultUI so it can
+    // be swept while looking at the panel. Anything outside 0-127 is rejected in
+    // the web handler; the register itself is 8-bit but the upper half is well
+    // past any sane VCOM for this glass.
+    Property<int> panelVcom{registry, "pnl_vcom", 45};
     Property<bool> smartGrindToggle{registry, "sg_t", false}; // legacy, seeds the smartGrindMode default
     Property<int> smartGrindMode{registry, "sg_m", 0};
     Property<String> smartGrindIp{registry, "sg_i", ""};

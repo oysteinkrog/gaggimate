@@ -74,10 +74,21 @@ DRAM_ATTR static const lcd_init_cmd_t st7701_2_8_inches[] = {
     {0xb1, {0x0B, 0x11, 0x97, 0x0C, 0x12, 0x06, 0x06, 0x08, 0x08, 0x22, 0x03, 0x51, 0x11, 0x66, 0x2B, 0x0F}, 0x10},
     {0xFF, {0x77, 0x01, 0x00, 0x00, 0x11}, 0x05},
     {0xb0, {0x5d}, 0x01},
-    // VCOMS 0x48 = 1.0 V (LilyGo shipped 0x2D = 0.66 V). Raising VCOM toward
-    // the values other ST7701S configs use measurably reduced inversion
-    // flicker on gradients (VCOM = 0.1 + n*0.0125 V).
-    {0xb1, {0x48}, 0x01},
+    // VCOMS, left at LilyGo's shipped 0x2D (0.66 V; VCOM = 0.1 + n*0.0125 V).
+    //
+    // This used to be raised to 0x48 here, because doing so measurably reduced
+    // inversion flicker on gradients. It was measured before INVSET below was
+    // corrected, though, and that is what actually fixed the flicker; the VCOM
+    // change was the smaller half of a pair and kept out of momentum.
+    //
+    // Compiling in a value is the wrong shape for this register regardless.
+    // The point of VCOM is to null the inversion flicker, and where that null
+    // sits moves with the temperature of the glass and varies unit to unit --
+    // which is exactly why a panel shows flicker for the first minutes after a
+    // cold power-on and then settles. So it is a setting now (panelVcom),
+    // defaulting to whatever the panel shipped with rather than to a number
+    // this project picked on one unit on one day.
+    {0xb1, {0x2D}, 0x01},
     {0xb2, {0x81}, 0x01},
     {0xb3, {0x80}, 0x01},
     {0xb5, {0x4E}, 0x01},

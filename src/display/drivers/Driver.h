@@ -20,6 +20,11 @@ class Driver {
     // RGB scan-out from PSRAM and sustained flash writes contend on the S3's
     // shared memory bus and the OTA download starves and aborts.
     virtual void stopPanel() {}
+    // Panel VCOM, as the controller's own register value, or ignored by panels
+    // that do not expose one. Tunable because the value that nulls inversion
+    // flicker moves with the glass's temperature and with the individual unit,
+    // so there is no single right answer to compile in.
+    virtual void setPanelVcom(int) {}
 };
 
 #endif // DRIVER_H

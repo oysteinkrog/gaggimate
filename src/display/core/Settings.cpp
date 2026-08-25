@@ -206,6 +206,7 @@ void Settings::setBgAnimScrim(int bg_anim_scrim) {
     bgAnimScrim.set(bg_anim_scrim < 0 ? 0 : (bg_anim_scrim > 100 ? 100 : bg_anim_scrim));
 }
 void Settings::setPanelClockDiv(int panel_clock_div) { panelClockDiv.set(panel_clock_div); }
+void Settings::setPanelVcom(int panel_vcom) { panelVcom.set(panel_vcom < 0 ? 0 : (panel_vcom > 127 ? 127 : panel_vcom)); }
 void Settings::setBgAnimCustomTheme(const String &bg_anim_custom_theme) { bgAnimCustomTheme.set(bg_anim_custom_theme); }
 
 void Settings::setSmartGrindIp(String smart_grind_ip) { smartGrindIp.set(smart_grind_ip); }
