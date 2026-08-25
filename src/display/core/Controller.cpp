@@ -674,6 +674,31 @@ void Controller::loop() {
         connect();
     }
 
+#ifdef GM_SYNTH_HANDSHAKE
+    // Bench rig for the one configuration that was never testable: BLE running
+    // AND the UI past its handshake, so the background animation actually
+    // starts. GM_FAKE_CONTROLLER gets the animation but skips BLE entirely,
+    // which is how 44 KB of internal DRAM went unaccounted for through a whole
+    // round of display tuning. This flag keeps the real BLE bring-up and the
+    // real comms pump below, and only synthesizes the SystemInfo the UI waits
+    // on, so memory and radio load match production with no controller board.
+    if (initialized) {
+        static bool synthDone = false;
+        static unsigned long synthAt = 0;
+        const unsigned long synthNow = millis();
+        if (synthAt == 0) {
+            synthAt = synthNow;
+        }
+        if (!synthDone && synthNow - synthAt >= 500) {
+            synthDone = true;
+            synthLinkUp = true;
+            ESP_LOGW(LOG_TAG, "GM_SYNTH_HANDSHAKE: delivering synthetic SystemInfo (BLE stays up)");
+            onSystemInfo("SynthBench", "bench", gm_proto::PROTOCOL_VERSION, /*dimming=*/true, /*pressure=*/true,
+                         /*ledControl=*/false, /*tof=*/false, std::vector<uint32_t>{});
+        }
+    }
+#endif
+
 #ifdef GM_FAKE_CONTROLLER
     // No BLE stack was ever initialized in this build, so the comms pump and
     // the scan/connect path below must not run. Feed the UI synthetic
