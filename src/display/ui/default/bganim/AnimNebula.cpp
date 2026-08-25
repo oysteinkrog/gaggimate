@@ -136,6 +136,20 @@
 // function keep the hardware LOOP instruction; none fell back to
 // compare-and-branch), with no new libcalls.
 //
+// 2026-08-25: measured GM_NEBULA_CACHED_NOISE_PROBE on the device rather than
+// on the host, and it closes the locality lead rather than opening it. Pinning
+// all four samplers to one resident row takes band_us 22773 -> 19131 (-16%)
+// and the animation 33.9 -> 38.3 fps. That is the ceiling, not an estimate of
+// a fix: the probe's working set is 256 bytes, while any version that still
+// draws the right picture has to reach ~25 texture rows per 8-row band. So
+// perfect noise locality does not get this animation to 40 fps, and the
+// remaining 19.1 ms is the per-pixel arithmetic the passes above already went
+// at. Do not spend another pass on caching the noise texture.
+//
+// Nebula is the only one of the thirteen below 40 fps; the other twelve run
+// 49.6 to 59.3. The composite stage is no longer the constraint for any of
+// them (3.8 ms, flat, since the scrim moved to the PIE vector unit).
+//
 // Optimized: opt-nebula, 2026-08-15 + 2026-08-17 + 2026-08-17b.
 
 #include "BgAnim.h"
