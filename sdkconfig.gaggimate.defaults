@@ -38,6 +38,23 @@ CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y
 CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=4096
 CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=16384
 
+# --- MSPI cache geometry ---
+#
+# Flash and PSRAM share one controller and one cache on the ESP32-S3, and the
+# LCD scan-out has to win a race against everything else on that bus every
+# frame. The cache line size sets how many bytes each miss fetches, so it is
+# the direct lever on how many separate PSRAM transactions the same byte count
+# costs. The framebuffer is streamed, not randomly poked: the render task
+# writes it front to back and the bounce-buffer refill reads it front to back,
+# which is the access pattern a long line serves best. At 32 bytes a 9600-byte
+# bounce refill is 300 transactions; at 64 it is 150, each one amortising the
+# octal-PSRAM command and latency overhead over twice as much payload.
+#
+# This costs no RAM: the cache is already allocated, only its line granularity
+# changes. There is no matching knob for instructions -- the S3's instruction
+# cache tops out at a 32-byte line.
+CONFIG_ESP32S3_DATA_CACHE_LINE_64B=y
+
 # Route NimBLE host + mbedTLS allocations to PSRAM (reclaims ~40 KB internal).
 CONFIG_BT_NIMBLE_MEM_ALLOC_MODE_INTERNAL=n
 CONFIG_BT_NIMBLE_MEM_ALLOC_MODE_EXTERNAL=y
@@ -77,16 +94,28 @@ CONFIG_LIBC_NEWLIB_NANO_FORMAT=n
 CONFIG_COMPILER_CXX_EXCEPTIONS=y
 
 # --- RGB LCD: restart GDMA at every VBlank ---
-# Arduino's precompiled libs set this implicitly; the dual-framework build
-# would otherwise inherit the IDF default (n) and lose the protection.
-# Without it, a single PSRAM-bus contention event (WiFi/BT alloc, TLS
-# handshake, big WS payload) can desync LCD_CAM's pixel pointer from the
-# panel's HSYNC and PERMANENTLY shift the image until reboot — IDF docs
-# call this out as "permanently shifted image". Resetting the GDMA channel
-# at VSYNC_END (the start of VBlank) restarts the DMA stream from the
-# framebuffer head every frame, so any desync clears on the next refresh.
-# See components/esp_lcd/rgb/esp_lcd_panel_rgb.c — lcd_rgb_panel_try_restart_transmission().
-CONFIG_LCD_RGB_RESTART_IN_VSYNC=y
+# Off, which is also the IDF default. It was on as a workaround for the
+# scan-out desync that GM_LCD_BOUNCE_LINES now fixes at the source, and in
+# bounce mode it does active harm.
+#
+# Read lcd_rgb_panel_try_restart_transmission() in
+# components/esp_lcd/rgb/esp_lcd_panel_rgb.c. With this set, do_restart is
+# true unconditionally, so the LCD FIFO and the GDMA channel are reset on
+# every VSYNC. Without bounce buffers that restarts the stream from the
+# framebuffer head, which is where the old comment here got its claim. With
+# bounce buffers it restarts from bounce_buffer[0], filled from whatever
+# bounce_pos_px the refill ISR had reached, and that pointer is only forced
+# back to 0 when it exceeds two buffers. So each frame begins scanning at a
+# near-arbitrary multiple of the bounce buffer and the picture jumps
+# vertically in 5-line steps, frame after frame. Observed on hardware as a
+# pronounced vertical shake.
+#
+# It also compiles out the genuine underrun detector, which lives only in
+# the #else branch: bb_eof_count < expect_eof_count at VSYNC means the
+# refill ISR fell behind during the frame, and that is what should trigger a
+# restart. Off, we get recovery when it is actually needed and a DMA stream
+# that otherwise stays locked to the frame.
+CONFIG_LCD_RGB_RESTART_IN_VSYNC=n
 
 # --- NimBLE bond persistence ---
 # IDF Kconfig help: "Enable this flag to make bonding persistent across
