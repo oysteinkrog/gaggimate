@@ -66,6 +66,28 @@ uint32_t bootPclkHz();
 // True when setDiv takes effect without a restart.
 bool hasLiveControl();
 
+// Scan-out underrun counters, the direct measure of the fault that shows up on
+// the panel as a band of displaced pixels.
+//
+// The RGB peripheral generates HSYNC and VSYNC from its own counters and does
+// not stall when its FIFO runs dry, so losing the race to refill a bounce
+// buffer does not stop the scan -- it slides the pixel stream against the sync
+// signals, which is what tears the picture. The driver detects this in its
+// VSYNC ISR and restarts the transfer, so the damage is bounded to a frame or
+// two, but nothing counts how often it happens.
+//
+// These two callbacks bracket it exactly. on_vsync fires once per displayed
+// frame. on_frame_buf_complete fires once per full pass of the bounce refill
+// over the framebuffer. In steady state they run 1:1; a frame whose refill fell
+// behind never completes its pass, so the counts diverge by one and stay
+// diverged. `slips` ratchets on each such divergence, which makes it a count of
+// underrun frames since boot rather than an instantaneous phase difference --
+// the two callbacks fire at slightly different points in the frame, so their
+// raw difference oscillates by one even when nothing is wrong.
+//
+// Any argument may be null. All three are zero before attach().
+void scanoutStats(uint32_t *frames, uint32_t *refills, uint32_t *slips);
+
 } // namespace panelclock
 
 #endif // PANELCLOCK_H
