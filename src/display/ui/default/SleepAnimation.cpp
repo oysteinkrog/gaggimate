@@ -3,6 +3,7 @@
 #include "SleepAnimation.h"
 #include <Arduino.h>
 #include <display/drivers/common/Display.h>
+#include <display/drivers/common/PanelClock.h>
 #include <display/ui/default/bganim/BgAnim.h>
 #include <esp_cache.h> // esp_cache_msync, around the direct push
 #include <esp_heap_caps.h>
@@ -2066,6 +2067,11 @@ void SleepAnimation::renderFrame() {
                 xSemaphoreGive(static_cast<SemaphoreHandle_t>(bandFree[renderSlot]));
             }
             BENCH_ACC(accPushUs, tPush);
+            // Marked for the scan-out slip log. This runs many times a frame, so
+            // a slip will almost always show a small band_us whether or not the
+            // push caused it -- the column is here to show when a push was
+            // unusually late, not to implicate the push by proximity.
+            panelclock::scanoutMark(panelclock::SCANOUT_ACT_BANDPUSH);
         } else {
             const uint8_t pushMode = !bandInterlaced ? 0 : (pairMode ? 2 : 1);
             pushJob[renderSlot] = {static_cast<int16_t>(cx0), static_cast<int16_t>(y0), static_cast<int16_t>(cx1),
