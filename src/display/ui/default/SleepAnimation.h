@@ -192,6 +192,8 @@ class SleepAnimation {
     // Replace the animation and the composite with a deterministic pattern the
     // host can recompute, so the render-to-framebuffer path can be checked by
     // byte comparison instead of by looking at it.
+    void benchSetFlash(int on) { flashOn.store(on); }
+    int benchFlash() const { return flashOn.load(); }
     void benchSetPattern(bool on) { patternOn.store(on); }
     bool benchPattern() const { return patternOn.load(); }
     // Dim the scrim on the PIE vector unit rather than a pixel at a time, and
@@ -494,6 +496,9 @@ class SleepAnimation {
     // against, and as the kernel for a run's unaligned edge cells.
     std::atomic<bool> pieOn{true};
     std::atomic<bool> patternOn{false};
+    // Alternate the whole screen between two colours per frame, so tearing
+    // shows up as a spatial edge a long-exposure photo cannot fabricate.
+    std::atomic<int> flashOn{0};
     // Scratch grid for the separable dilate/blur passes, one shared copy: the
     // passes run to completion inside publishOverlay on the UI task, so the two
     // overlays never need it at the same time.

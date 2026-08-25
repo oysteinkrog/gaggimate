@@ -1731,8 +1731,56 @@ void SleepAnimation::renderFrame() {
         // expansion, so what lands in the framebuffer is exactly the pattern
         // regardless of how the band was generated. The composite is skipped
         // too: the widgets are the one thing the host cannot predict.
-        const bool patternMode = patternOn.load();
-        if (patternMode) {
+        // A tearing test a bad camera can still answer.
+        //
+        // The reason the webcam kept reporting corruption that was not in
+        // memory is that a dark room drives its exposure to tens of
+        // milliseconds, so one photo integrates ten panel frames. Integration
+        // blends, though -- it cannot invent an edge. So drive the whole
+        // screen to one of two maximally distinct colours on alternating
+        // frames and the signature becomes spatial instead of temporal: a
+        // correct flip can only ever photograph as uniform red, uniform blue,
+        // or a uniform mix of the two, at any exposure. A horizontal boundary
+        // between the two colours means part of the panel was scanning one
+        // frame while part scanned the next, which is exactly tearing, and no
+        // exposure time can fake it.
+        //
+        // frameParity advances once per frame, so every band of a frame picks
+        // the same colour. The fill covers all rows of the band whatever the
+        // interlace is doing, or the untouched rows would themselves read as
+        // a tear.
+        //   1 -- alternate per frame, the actual test
+        //   3 -- alternate every 32 frames instead of every frame. Mode 1 came
+        //        back uniformly red in every photo, which has two possible
+        //        causes: the flip never reaches the panel and one buffer is
+        //        stuck on screen, or the render rate and the panel's 61 Hz
+        //        scan are close enough to a harmonic that the shutter keeps
+        //        landing on the same parity. Half a second per colour is far
+        //        longer than any exposure and beats any harmonic, so if the
+        //        panel still never goes blue, the flip is the problem. Both
+        //        the pattern test and mode 1 render identical content every
+        //        frame, so neither can see a stuck flip on its own.
+        //   2 -- a fixed red-over-blue split at mid-screen, which is what a
+        //        tear looks like, as the negative control. Without it a clean
+        //        result proves nothing: at these exposures the two colours
+        //        partly blend, and a test whose contrast has been washed out
+        //        reports no tear because it can no longer see one. Mode 2
+        //        holds the edge still so the same measurement has to find it.
+        const int flashMode = flashOn.load();
+        if (flashMode != 0) {
+            const uint32_t phase = flashMode == 3 ? (frameParity >> 5) : frameParity;
+            const uint16_t alt = (phase & 1u) != 0 ? 0xF800 : 0x001F;
+            for (int r = 0; r < rows; r++) {
+                const uint16_t c = flashMode == 2 ? ((y0 + r) < (h / 2) ? 0xF800 : 0x001F) : alt;
+                const uint32_t pair = static_cast<uint32_t>(c) | (static_cast<uint32_t>(c) << 16);
+                uint32_t *const prow = reinterpret_cast<uint32_t *>(band + static_cast<size_t>(r) * w);
+                for (int x = 0; x < w / 2; x++) {
+                    prow[x] = pair;
+                }
+            }
+        }
+        const bool patternMode = patternOn.load() || flashMode != 0;
+        if (patternOn.load()) {
             for (int r = 0; r < rows; r++) {
                 uint16_t *const prow = band + static_cast<size_t>(r) * w;
                 const int py = y0 + r;
