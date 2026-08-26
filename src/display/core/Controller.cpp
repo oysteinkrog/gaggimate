@@ -692,6 +692,19 @@ void Controller::loop() {
         if (!synthDone && synthNow - synthAt >= 500) {
             synthDone = true;
             synthLinkUp = true;
+#ifdef GM_DMA_BALLAST
+            // Model the DMA-capable internal DRAM a live controller connection
+            // claims and this rig cannot: BLE here is enabled and scanning but
+            // never connects, so its measurements are optimistic by however
+            // much a real link costs. Rather than reason about that number,
+            // hold it hostage and see whether the board still behaves.
+            if (void *ballast = heap_caps_malloc(GM_DMA_BALLAST, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA | MALLOC_CAP_8BIT)) {
+                memset(ballast, 0, GM_DMA_BALLAST); // fault it in, never freed
+                ESP_LOGW(LOG_TAG, "GM_DMA_BALLAST: holding %d B of DMA-capable internal", (int)GM_DMA_BALLAST);
+            } else {
+                ESP_LOGE(LOG_TAG, "GM_DMA_BALLAST: could not reserve %d B -- margin is already gone", (int)GM_DMA_BALLAST);
+            }
+#endif
             ESP_LOGW(LOG_TAG, "GM_SYNTH_HANDSHAKE: delivering synthetic SystemInfo (BLE stays up)");
             onSystemInfo("SynthBench", "bench", gm_proto::PROTOCOL_VERSION, /*dimming=*/true, /*pressure=*/true,
                          /*ledControl=*/false, /*tof=*/false, std::vector<uint32_t>{});
