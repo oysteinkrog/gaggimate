@@ -3,6 +3,7 @@
 #include "../core/Event.h"
 #include "../core/constants.h" // MODE_STANDBY
 #include <WiFi.h>
+#include <cerrno>
 #include <esp_heap_caps.h>
 #include <esp_log.h>
 
@@ -18,6 +19,7 @@ void NetworkWatchdogPlugin::setup(Controller *c, PluginManager *pluginManager) {
         _lastProbe = now;
         _lastStats = now;
         _stage = 0;
+        _busyGrace = 0;
         ESP_LOGI(LOG_TAG, "Watchdog started (wifi connected)");
     });
     pluginManager->on("controller:wifi:disconnect", [this](Event const &) {
@@ -34,16 +36,39 @@ bool NetworkWatchdogPlugin::networkShouldBeUp() const {
     return WiFi.status() == WL_CONNECTED;
 }
 
-bool NetworkWatchdogPlugin::probeEgress() {
+NetworkWatchdogPlugin::Probe NetworkWatchdogPlugin::probeEgress() {
     const wifi_mode_t mode = WiFi.getMode();
     const bool ap = (mode == WIFI_MODE_AP || mode == WIFI_MODE_APSTA);
     IPAddress target = ap ? WiFi.softAPIP() : WiFi.gatewayIP();
     if (static_cast<uint32_t>(target) == 0)
-        return true;
+        return Probe::Alive;
     if (_probe.beginPacket(target, PROBE_PORT) != 1)
-        return false;
+        return Probe::Dead;
     _probe.write(static_cast<uint8_t>(0));
-    return _probe.endPacket() == 1;
+    errno = 0;
+    if (_probe.endPacket() == 1)
+        return Probe::Alive;
+    // A failed send is not evidence of a wedged stack when the reason is that
+    // there was no buffer to send from. WiFi's TX path draws 1630-byte cache
+    // buffers out of the same DMA-capable internal DRAM the LCD bounce buffers
+    // live in, and a browser pulling the whole UI in two tabs empties it for
+    // seconds at a time; lwIP surfaces that as ERR_MEM, which arrives here as
+    // ENOMEM. Treating it as a dead link is how a slow page load used to
+    // become a WiFi reconnect that dropped every websocket and every request
+    // in flight, turning a stall into an outage. Sends that fail this way mean
+    // the stack is alive and busy, which is the opposite of the fault this
+    // watchdog exists to catch.
+    switch (errno) {
+    case ENOMEM:
+    case ENOBUFS:
+    case EAGAIN:
+#if EWOULDBLOCK != EAGAIN
+    case EWOULDBLOCK:
+#endif
+        return Probe::Busy;
+    default:
+        return Probe::Dead;
+    }
 }
 
 void NetworkWatchdogPlugin::logStats(const char *reason) {
@@ -59,8 +84,10 @@ void NetworkWatchdogPlugin::logStats(const char *reason) {
     const unsigned freeDma = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
     const unsigned minDma = heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
     const unsigned long sinceOk = millis() - _lastAlive;
-    ESP_LOGI(LOG_TAG, "[%s] internal heap: free=%u min=%u largest=%u | dma: free=%u min=%u | egress ok %lus ago (stage %u)",
-             reason, freeInt, minInt, largestInt, freeDma, minDma, sinceOk / 1000, _stage);
+    ESP_LOGI(LOG_TAG,
+             "[%s] internal heap: free=%u min=%u largest=%u | dma: free=%u min=%u | egress ok %lus ago (stage %u, busy "
+             "grace %lus)",
+             reason, freeInt, minInt, largestInt, freeDma, minDma, sinceOk / 1000, _stage, _busyGrace / 1000);
 }
 
 bool NetworkWatchdogPlugin::rebootAllowed(unsigned long now) const {
@@ -114,6 +141,7 @@ void NetworkWatchdogPlugin::loop() {
     if (!_socketReady || !networkShouldBeUp()) {
         _lastAlive = now;
         _stage = 0;
+        _busyGrace = 0;
         _rebootHeld = false;
         return;
     }
@@ -125,16 +153,32 @@ void NetworkWatchdogPlugin::loop() {
 
     if (now - _lastProbe >= PROBE_PERIOD) {
         _lastProbe = now;
-        if (probeEgress()) {
+        switch (probeEgress()) {
+        case Probe::Alive:
             if (_stage != 0)
                 ESP_LOGW(LOG_TAG, "Network egress recovered");
             _lastAlive = now;
             _stage = 0;
+            _busyGrace = 0;
             _rebootHeld = false;
+            break;
+        case Probe::Busy:
+            // Out of TX buffers, so this probe proved nothing either way. Hold
+            // the recovery timer off for as long as the probe took, up to a
+            // ceiling, rather than counting the interval as evidence of death.
+            if (_busyGrace < BUSY_GRACE_MAX) {
+                _busyGrace += PROBE_PERIOD;
+                if (_busyGrace > BUSY_GRACE_MAX)
+                    _busyGrace = BUSY_GRACE_MAX;
+            }
+            break;
+        case Probe::Dead:
+            break;
         }
     }
 
-    const unsigned long deadFor = now - _lastAlive;
+    const unsigned long since = now - _lastAlive;
+    const unsigned long deadFor = since > _busyGrace ? since - _busyGrace : 0;
     if (deadFor >= DEAD_AFTER)
         recover(now, deadFor);
 }
