@@ -240,6 +240,31 @@ CONFIG_LWIP_TCP_SND_BUF_DEFAULT=2880
 # min 1,587. Under the two-tab load the websocket could not connect at all and
 # status polls started failing. Confirmed reject; keep lwIP in PSRAM.
 
+# --- WiFi TX block-ack window: 6 -> 3 measured, rejected ---
+# An A-MPDU session holds up to TX_BA_WIN MPDUs in flight awaiting
+# block-ack, and each one is parked in a ~1630-byte cache TX buffer out of
+# the same DMA-capable pool the bounce buffers live in. Six of them is
+# roughly 9.8 kB against about 18 kB free, so halving the window looked like
+# a direct cut to peak demand at no real cost, this device being nowhere
+# near the link rate.
+#
+# It is a regression. Three tabs repeating a cold load of every asset for a
+# fixed 120 s window:
+#
+#   TX_BA_WIN   1630 B alloc failures   requests ok/failed   rounds
+#           3                     586             207 / 27       13
+#           6                    1059             270 /  0       15
+#
+# Note which way the two columns point. The smaller window logs half as many
+# failed allocations and serves a worse page, because the driver treats a
+# failed cache TX buffer as backpressure and retries: the failure count
+# measures how hard the TX path is pushing, not how much harm is done.
+# A window of three simply keeps less in flight, so it finishes fewer rounds
+# and gives AsyncTCP time to hit its ack timeout. Do not use the alloc
+# failure count on its own to judge a WiFi change; pair it with request
+# outcomes, which is what inverted this one.
+CONFIG_ESP_WIFI_TX_BA_WIN=6
+
 # --- Beacon receive path in IRAM: measured, no effect on scan-out ---
 # ESP_WIFI_SLP_IRAM_OPT looks like it should matter here and does not.
 # esp_wifi's Kconfig gives it one default, "default y if SOC_WIFI_HE_SUPPORT",
