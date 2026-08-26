@@ -42,12 +42,26 @@ CONFIG_SPIRAM_TYPE_AUTO=y
 CONFIG_SPIRAM_BOOT_INIT=y
 CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY=y
 CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y
-# Threshold below which allocations are forced into internal DRAM. arduino-esp32
-# baseline is 4096; we had dropped it to 512, which pushed mid-size (512-4096 B)
-# allocations to PSRAM and left internal DRAM shattered into tiny blocks —
-# startup fragmentation (1 - largest_free/total_free) ballooned 15% -> 64%,
-# starving contiguous internal allocs AsyncTCP needs to serve. Restore 4096.
-CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=4096
+# Threshold below which allocations are forced into internal DRAM. The
+# arduino-esp32 baseline is 4096, and 512 was tried and reverted: it pushed
+# mid-size allocations to PSRAM and left internal DRAM shattered into tiny
+# blocks, taking startup fragmentation from 15% to 64% and starving the
+# contiguous 2,872 B block AsyncTCP needs for every send round.
+#
+# 1024 is a different point on that curve and was measured, not assumed. Under
+# the display-blestress rig with WiFi and BLE up, the animation running, and
+# 8 KB of DMA-capable DRAM held hostage to stand in for a live controller link:
+#
+#                        DMA free   DMA min   largest block   failed allocs
+#   4096 (baseline)         2,531       779           7,668               0
+#   1024                    8,347     6,303           7,668               0
+#
+# The largest free block does not move, so the fragmentation that killed 512
+# does not reproduce here. What the 5.8 KB buys is the bounce buffers going
+# from ten scanlines to twelve, which is worth roughly half the remaining
+# scan-out slips. Re-measure both columns before touching this again: the
+# largest-block figure is the one that decides whether the web UI answers.
+CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=1024
 CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=16384
 
 # --- MSPI cache geometry ---
