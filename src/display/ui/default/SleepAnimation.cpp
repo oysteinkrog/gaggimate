@@ -523,7 +523,16 @@ void *allocPreferInternal(size_t size) {
     const size_t freeBefore = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
     void *p = nullptr;
     if (bganim::internalHasRoomFor(size)) {
-        p = heap_caps_malloc(size, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+        // MALLOC_CAP_DMA is not optional here even though it looks like a
+        // tightening. bandBuf is handed to bandDma.submit() as the GDMA source
+        // on the direct push path, which is the shipping default, so a buffer
+        // the DMA engine cannot address is not a slow path, it is wrong data.
+        // Most internal SRAM on this chip is DMA-capable, which is why asking
+        // for plain INTERNAL has worked so far, but nothing stopped the
+        // allocator from returning the non-DMA sliver once the rest filled up.
+        // The gate just above already measures free space with MALLOC_CAP_DMA,
+        // so this only makes the request agree with the question being asked.
+        p = heap_caps_malloc(size, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
     }
     if (p == nullptr) {
         p = ps_malloc(size);
