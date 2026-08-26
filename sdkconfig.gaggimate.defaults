@@ -187,6 +187,21 @@ CONFIG_LCD_RGB_RESTART_IN_VSYNC=n
 # it, every paired BLE peer (scale, HomeKit phone) re-pairs on every boot.
 CONFIG_BT_NIMBLE_NVS_PERSIST=y
 
+# --- BLE controller code placement ---
+# sdkconfig.common.defaults sets CONFIG_BT_CTRL_RUN_IN_FLASH_ONLY=y. Leave it
+# there. Moving the controller to IRAM is tempting, because flash and PSRAM
+# share one MSPI controller on the ESP32-S3 and every controller instruction
+# fetch that misses icache competes with the LCD bounce refill. It is not
+# affordable: the IRAM grows .dram0.dummy and takes ~12 kB straight out of the
+# DMA-capable heap. Measured with the linktest rig holding a live BLE link:
+#   flash controller, 12 bounce lines: dma free 12351 / min 6528, 0 failed
+#   IRAM  controller, 12 bounce lines: dma free   552 / min  180, 273 failed
+#   IRAM  controller,  8 bounce lines: dma free  8136 / min 7476, 1 failed
+# The last row looks survivable and is not. In both IRAM builds WiFi lands in
+# the failure this whole fix exists to prevent: ICMP still replies while every
+# TCP connect is dropped, because lwIP cannot allocate a PCB. Dropping to 8
+# bounce lines to pay for it also costs more tearing than it buys.
+
 # --- BLE controller sizing ---
 # The controller keeps per-activity and per-connection state in internal DRAM,
 # and esp_bt_controller_enable() costs 44.3 KB of it on this board -- measured,
@@ -198,3 +213,15 @@ CONFIG_BT_NIMBLE_NVS_PERSIST=y
 CONFIG_BT_CTRL_BLE_MAX_ACT=3
 CONFIG_BT_NIMBLE_MAX_CONNECTIONS=3
 CONFIG_BT_CTRL_SCAN_DUPL_CACHE_SIZE=20
+
+# --- Instruction cache geometry: nothing to win here ---
+# The BLE controller executes from flash, so its icache misses are MSPI
+# transactions competing with the bounce refill's PSRAM reads. Two obvious
+# responses both fail on the ESP32-S3:
+#   - Wider lines. The dcache runs 64-byte lines, but esp_system's
+#     Kconfig.cache offers the icache only 16 or 32 bytes, and 16 only at the
+#     16 kB size. 32 is already the maximum and already set.
+#   - A bigger icache. 16 kB -> 32 kB comes straight out of SRAM, and there is
+#     roughly 15 kB of internal free at steady state. Paying for it by halving
+#     the dcache is worse than the disease: the dcache is what the refill
+#     reads the framebuffer through.
