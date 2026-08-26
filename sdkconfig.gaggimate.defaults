@@ -189,6 +189,35 @@ CONFIG_LWIP_TCP_SND_BUF_DEFAULT=2880
 # opposite of what the rest of this file is doing. The build guard caught the
 # attempt: none of the three symbols reached the merged config.
 
+# --- WiFi static TX buffer pool ---
+# TX is forced 100% static here: ESP_WIFI_DYNAMIC_TX_BUFFER depends on
+# !(SPIRAM_TRY_ALLOCATE_WIFI_LWIP && !SPIRAM_IGNORE_NOTFOUND), and this build
+# needs the first and cannot have the second. So the driver reserves
+# STATIC_TX_BUFFER_NUM buffers of ~1.6 kB at esp_wifi_init and holds them for
+# the process lifetime, traffic or no traffic: 16 of them is ~26 kB of the
+# DMA-capable pool, permanently.
+# This is structurally unlike the RX pool below. RX runs static AND dynamic
+# concurrently, so shrinking static just moves the load onto the dynamic pool
+# out of the same heap, which is why that experiment went backwards. TX has no
+# concurrent fallback; what it does have is CACHE_TX_BUFFER_NUM (32), an
+# overflow queue that engages once the static pool is exhausted. Shrinking the
+# static reservation therefore converts permanently-parked memory into elastic
+# on-demand memory the driver already knows how to use.
+# Measured: 16 -> 10 went backwards on both counts. Steady-state dma free fell
+# 12,335 -> 10,575, and the two-tab browser load got worse rather than better,
+# failing on index.html itself where 16 at least served it. Whatever the static
+# pool costs, releasing part of it does not land in the pool the TX path draws
+# from. Left at the default, like RX below.
+#CONFIG_ESP_WIFI_STATIC_TX_BUFFER_NUM=10
+#
+# Turning SPIRAM_TRY_ALLOCATE_WIFI_LWIP off was the other way at this: it makes
+# ESP_WIFI_DYNAMIC_TX_BUFFER selectable and default, which would retire the
+# 1630-byte cache TX buffer class outright instead of competing for it. It also
+# moves WiFi's and lwIP's own structures into internal DRAM, and that bill is
+# far larger than the one it settles: steady-state dma free 12,335 -> 3,027,
+# min 1,587. Under the two-tab load the websocket could not connect at all and
+# status polls started failing. Confirmed reject; keep lwIP in PSRAM.
+
 # --- WiFi RX buffer depth: measured, and it goes the wrong way ---
 # Arduino defaults to 16 static and 32 dynamic RX buffers, and the static ones
 # look like an easy ~13 kB of DMA-capable internal DRAM to reclaim. Halving
