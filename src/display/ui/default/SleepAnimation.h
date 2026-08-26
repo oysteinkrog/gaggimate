@@ -164,10 +164,10 @@ class SleepAnimation {
         uint32_t pushUs = 0;  // display->pushColors -- panel/PSRAM write
         uint32_t totalUs = 0; // sum of the above, measured end to end
         uint32_t maxTotalUs = 0;
-        uint32_t waitUs = 0; // render task blocked waiting for the push task to free a slot
-        uint32_t packUs = 0; // compacting each band to the round panel's visible chord
-        uint32_t spanPx = 0;  // overlay pixels the composite walked, per frame
-        uint32_t scrimPx = 0; // panel pixels the scrim pass dimmed, per frame
+        uint32_t waitUs = 0;      // render task blocked waiting for the push task to free a slot
+        uint32_t packUs = 0;      // compacting each band to the round panel's visible chord
+        uint32_t spanPx = 0;      // overlay pixels the composite walked, per frame
+        uint32_t scrimPx = 0;     // panel pixels the scrim pass dimmed, per frame
         uint32_t achievedFps = 0; // x100, so 2997 == 29.97 fps
         // Nanoseconds per band row, measured with and without the scheduler
         // suspended on this core. Equal means the band cost is real compute;
@@ -258,9 +258,7 @@ class SleepAnimation {
     // Where the band buffers actually landed. They are the DMA source, so one
     // of them falling back to PSRAM would mean GDMA reads memory the CPU has
     // only written through the cache.
-    uint32_t benchBandAddr(int i) const {
-        return (i >= 0 && i < NUM_SLOTS) ? reinterpret_cast<uint32_t>(bandBuf[i]) : 0;
-    }
+    uint32_t benchBandAddr(int i) const { return (i >= 0 && i < NUM_SLOTS) ? reinterpret_cast<uint32_t>(bandBuf[i]) : 0; }
     bool benchBandsInternal() const;
 #endif
 
@@ -366,8 +364,8 @@ class SleepAnimation {
         uint8_t parity;
     };
     PushJob pushJob[NUM_SLOTS] = {};
-    int renderSlot = 0; // slot the render task fills next; push task tracks its own
-    bool cropEnabled = false;   // crop to the panel's circle only while push is the pacing stage
+    int renderSlot = 0;       // slot the render task fills next; push task tracks its own
+    bool cropEnabled = false; // crop to the panel's circle only while push is the pacing stage
     // Push every other row pair, alternating parity each frame. Halves the
     // bytes and the driver's writeback range, at the cost of each row pair
     // refreshing at half the frame rate. Looked at on the panel at 45-59 fps:
@@ -399,7 +397,7 @@ class SleepAnimation {
     uint8_t autoResFrames = 0; // frames accumulated into autoResUs
     uint64_t autoResUs = 0;
     bool autoResSettled = false;
-    uint32_t frameWaitUs = 0;   // this frame's total block on the push task, drives cropEnabled
+    uint32_t frameWaitUs = 0; // this frame's total block on the push task, drives cropEnabled
     void *pushHandle = nullptr;
     std::atomic<bool> pushStopped{true};
 
@@ -445,7 +443,38 @@ class SleepAnimation {
     // esp_async_memcpy deletes and rebuilds both of its GDMA link lists from
     // the heap on every call, so its cost tracks submissions rather than bytes.
     // The native engine keeps its descriptors and only re-points them.
-    std::atomic<bool> directPushOn{true};
+    // Off, because on this board the animation is not the only writer of the
+    // framebuffer pair and the direct path assumes it is.
+    //
+    // LV_Helper hands LVGL both panel framebuffers and runs it in direct_mode,
+    // so LVGL alternates between them itself and draws only invalidated areas
+    // into whichever one it believes is current. The direct path renders bands
+    // into fbDirect[fbBack] and then flips the panel in presentFrame(). Neither
+    // owner knows about the other's flip, so the two disagree about which
+    // buffer is back, and LVGL's widget pixels land in a buffer the animation
+    // is about to overwrite or has already flipped away from.
+    //
+    // What that looks like on the panel: every glyph drawn twice about 24 rows
+    // apart, the second copy partial, with the animation behind it broken into
+    // displaced horizontal bands. Confirmed by dumping both framebuffers over
+    // /api/debug/fb -- the duplicate is in the pixels, not the scan-out -- and
+    // by this switch alone making it clean, on the same build, in the buffer
+    // dump and on the panel.
+    //
+    // presentFrame() already states half of this hazard: flipping underneath
+    // pushColors would show a buffer nothing wrote. The same argument applies
+    // to LVGL and was missed.
+    //
+    // It costs nothing here. The animation is capped at 15 fps and holds 15.1
+    // through the ordinary push, so the direct path was buying headroom above
+    // a ceiling the shipping build never reaches. Re-enabling it needs the
+    // framebuffer pair to have exactly one owner: either LVGL renders into its
+    // own buffer and the animation owns the panel's, or the flip is taken away
+    // from presentFrame() and driven by whoever LVGL thinks is current. Until
+    // one of those is true this must stay off, and the scan-out slip counter
+    // will not catch it if it goes wrong -- it read 0.032%, a healthy display,
+    // through the whole fault.
+    std::atomic<bool> directPushOn{false};
     bool dmaActive = false; // fbDirect resolved AND the engine installed
     // The panel's framebuffers. With two, the frame is composed in the one the
     // scan-out is not reading and shown by flipping at the end of the frame, so
@@ -507,7 +536,7 @@ class SleepAnimation {
     // outlive it and something has to remember whose they are.
     int residentAnimId = -1;
     bool initializedHalf = false; // resolution that init() ran at; a change re-inits
-    uint16_t *halfBuf = nullptr;     // (w/2)x(BAND_H/2) scratch for half-res rendering
+    uint16_t *halfBuf = nullptr;  // (w/2)x(BAND_H/2) scratch for half-res rendering
     // One panel row of per-pixel scrim factors, internal SRAM, 16-byte aligned.
     uint16_t *scrimInvPx = nullptr;
 
@@ -530,8 +559,8 @@ class SleepAnimation {
 
     Overlay overlays[2];
     uint32_t overlayCap = 0;
-    std::atomic<int> overlayFront{-1};  // -1 = nothing published yet
-    std::atomic<int> overlayInUse{-1};  // overlay the render task reads this frame
+    std::atomic<int> overlayFront{-1}; // -1 = nothing published yet
+    std::atomic<int> overlayInUse{-1}; // overlay the render task reads this frame
 
 #ifdef GM_ANIM_BENCH
     // Accumulators for the dwell in progress; render task only, no locking.
@@ -557,7 +586,7 @@ class SleepAnimation {
     std::atomic<bool> benchResetPending{false};
     std::atomic<int> benchOnly{-1}; // -1 sweeps the registry; otherwise pin to this id
 
-    void benchTick();      // called once per frame from renderLoop
+    void benchTick();        // called once per frame from renderLoop
     void benchFinishDwell(); // records the current animation and advances
 #endif
 };
