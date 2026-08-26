@@ -533,6 +533,72 @@ void WebUIPlugin::setupServer() {
         snprintf(buf, sizeof(buf), "{\"inv\":%d,\"shipped_inv\":49}", inv);
         request->send(200, "application/json", buf);
     });
+
+    // /api/debug/fb?n=0|1[&step=2] streams one panel framebuffer as raw
+    // RGB565, little-endian, row-major, step**2 decimated.
+    //
+    // This exists because the scan-out slip counter answers a different
+    // question than "is the picture right". It counts bounce-buffer refills
+    // that missed their deadline, and it reported 0.032% while every element
+    // on the panel was visibly drawn twice, 25 px apart. A photograph proves
+    // something is wrong but cannot say whether the duplicate is in the pixels
+    // or only in the scan-out, and those two have opposite fixes. Reading the
+    // buffers settles it: if the ghost is here, the compositor put it here.
+    //
+    // Both buffers are dumpable separately on purpose. With two framebuffers
+    // alternating at 43 fps, content sitting at different offsets in each one
+    // shows up on camera as a stable double image, which is exactly the
+    // symptom, so comparing 0 against 1 is the first thing worth doing.
+    server.on("/api/debug/fb", [](AsyncWebServerRequest *request) {
+        LilyGoDriver *drv = LilyGoDriver::peekInstance();
+        Display *disp = drv != nullptr ? drv->getDisplay() : nullptr;
+        if (disp == nullptr) {
+            request->send(404, "application/json", "{\"error\":\"not a LilyGo panel\"}");
+            return;
+        }
+        const int idx = request->hasArg("n") ? request->arg("n").toInt() : 0;
+        if (idx < 0 || idx >= disp->frameBufferCount()) {
+            request->send(400, "application/json", "{\"error\":\"bad buffer index\"}");
+            return;
+        }
+        const uint16_t *fb = disp->directFrameBuffer(idx);
+        if (fb == nullptr) {
+            request->send(404, "application/json", "{\"error\":\"no direct framebuffer\"}");
+            return;
+        }
+        int step = request->hasArg("step") ? request->arg("step").toInt() : 1;
+        if (step < 1 || step > 8)
+            step = 1;
+        const int w = disp->width();
+        const int h = disp->height();
+        const int ow = w / step;
+        const int oh = h / step;
+        // Chunked, because a full 480x480 buffer is 460,800 bytes and this
+        // board has no business allocating that to answer a debug request. The
+        // callback is handed a row budget and fills whole output rows only, so
+        // it never has to carry a partial pixel across chunks.
+        auto *state = new int(0);
+        AsyncWebServerResponse *response = request->beginChunkedResponse(
+            "application/octet-stream", [fb, w, step, ow, oh, state](uint8_t *out, size_t maxLen, size_t) -> size_t {
+                const size_t rowBytes = static_cast<size_t>(ow) * 2;
+                size_t written = 0;
+                while (*state < oh && written + rowBytes <= maxLen) {
+                    const uint16_t *src = fb + static_cast<size_t>(*state) * step * w;
+                    uint16_t *dst = reinterpret_cast<uint16_t *>(out + written);
+                    for (int x = 0; x < ow; x++)
+                        dst[x] = src[x * step];
+                    written += rowBytes;
+                    (*state)++;
+                }
+                if (written == 0)
+                    delete state;
+                return written;
+            });
+        char disposition[64];
+        snprintf(disposition, sizeof(disposition), "%dx%d", ow, oh);
+        response->addHeader("X-FB-Size", disposition);
+        request->send(response);
+    });
 #endif // GAGGIMATE_HEADLESS
     server.on("/api/status", [this](AsyncWebServerRequest *request) {
         AsyncResponseStream *response = request->beginResponseStream("application/json");
