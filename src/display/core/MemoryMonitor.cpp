@@ -1,6 +1,9 @@
 #include "MemoryMonitor.h"
 #include <atomic>
 #include <esp_log.h>
+#ifdef GM_SCANOUT_SERIAL
+#include <display/drivers/common/PanelClock.h>
+#endif
 
 namespace {
 
@@ -76,6 +79,15 @@ void init() {
                      (unsigned)r.freeBytes, (unsigned)r.minimumFreeBytes, (unsigned)r.largestFreeBlock, r.fragmentation,
                      r.freeBytesSlope, (unsigned)r.secondsToWarn);
         }
+#ifdef GM_SCANOUT_SERIAL
+        // Bench only: the scan-out counters are otherwise reachable only over
+        // HTTP, which is useless for the one experiment that needs them, namely
+        // running with the radio off.
+        uint32_t frames = 0, refills = 0, slips = 0;
+        panelclock::scanoutStats(&frames, &refills, &slips);
+        ESP_LOGW(TAG, "GM_SCANOUT_SERIAL frames=%u refills=%u slips=%u", static_cast<unsigned>(frames),
+                 static_cast<unsigned>(refills), static_cast<unsigned>(slips));
+#endif
     });
 
     g_monitor.onThreshold([](const ThresholdEvent &evt) {
