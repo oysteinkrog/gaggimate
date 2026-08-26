@@ -218,6 +218,21 @@ CONFIG_LWIP_TCP_SND_BUF_DEFAULT=2880
 # min 1,587. Under the two-tab load the websocket could not connect at all and
 # status polls started failing. Confirmed reject; keep lwIP in PSRAM.
 
+# --- Beacon receive path in IRAM: measured, no effect on scan-out ---
+# ESP_WIFI_SLP_IRAM_OPT looks like it should matter here and does not.
+# esp_wifi's Kconfig gives it one default, "default y if SOC_WIFI_HE_SUPPORT",
+# and the ESP32-S3 has no HE support (the symbol is absent from
+# esp32s3/soc_caps.h), so it silently defaults to n on this chip. Its help text
+# names what therefore stays in flash: "Wi-Fi library TBTT process and receive
+# beacon functions". TBTT is the DTIM wake, the station runs WIFI_PS_MIN_MODEM,
+# and so it executes from flash roughly every 100 ms while associated, on the
+# MSPI controller the LCD bounce refill reads the framebuffer through. A clean
+# periodic jitter source, on paper.
+# Measured at 8 bounce lines over a 720 s idle window: 7 slips / 31,284 frames,
+# against 6.7 expected from the rate without it. No effect. It also costs
+# ~2.3 kB of the DMA-capable pool (dma free 18,299 -> 15,979), which is enough
+# to put the two-tab browser load back into timing out. Rejected on both counts.
+
 # --- WiFi RX buffer depth: measured, and it goes the wrong way ---
 # Arduino defaults to 16 static and 32 dynamic RX buffers, and the static ones
 # look like an easy ~13 kB of DMA-capable internal DRAM to reclaim. Halving
