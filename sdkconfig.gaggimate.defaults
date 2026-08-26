@@ -166,6 +166,10 @@ CONFIG_LWIP_CHECK_THREAD_SAFETY=y
 # asset is 61 kB.
 CONFIG_LWIP_TCP_WND_DEFAULT=2880
 CONFIG_LWIP_TCP_SND_BUF_DEFAULT=2880
+# 2880 is the floor, not a choice. lwIP requires the send buffer to hold at
+# least two maximum segments, so 1440 (one segment) is rejected and the value
+# silently falls all the way back to the 5760 default. The build guard catches
+# it; do not "optimise" this downwards.
 
 # --- Admission control does not help: measured ---
 # Capping active PCBs at 10 with TCP_MSL cut to 5 s, on the theory that fewer
