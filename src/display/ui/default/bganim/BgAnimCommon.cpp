@@ -132,21 +132,56 @@ void *alloc(size_t size) {
     // no longer what decides placement on its own: internalHasRoomFor() vetoes
     // any request that would take the free pool below the radios' reserve. See
     // INTERNAL_RESERVE for why a build-time budget alone was not enough.
-    const bool overBudget = g_allocSram + size > SRAM_TOTAL_BUDGET || !internalHasRoomFor(size);
-    if (size > SRAM_ALLOC_LIMIT || overBudget) {
-        // Two different situations take this branch and only one is expected.
+    // Three independent reasons send a table to PSRAM, and they used to be
+    // collapsed into one flag with one message. That message named the
+    // cumulative budget and a missing release() entry, so a run where the
+    // budget was untouched still reported "SRAM budget spent (0/28672) -- a
+    // release() entry is likely missing" on every allocation. It sent a real
+    // investigation looking for a leak that does not exist. Keep them apart.
+    const bool overSizeLimit = size > SRAM_ALLOC_LIMIT;
+    const bool overBudget = g_allocSram + size > SRAM_TOTAL_BUDGET;
+    const bool poolTooTight = !internalHasRoomFor(size);
+    if (overSizeLimit || overBudget || poolTooTight) {
         // Over the per-allocation limit is by design: those tables are bulk
         // sequential sweeps and PSRAM serves them fine, so logging every one
-        // would be noise. Crossing the cumulative budget is NOT expected under
-        // the release invariant above, and it silently relocates a table that
-        // was sized to be latency-sensitive -- which is how a per-row lookup
-        // ends up paying a bus round trip per pixel. Say so, once per crossing,
-        // so it shows up in a device log instead of only as a frame-rate drop.
-        if (overBudget && size <= SRAM_ALLOC_LIMIT) {
-            log_w("bganim: %u B to PSRAM, SRAM budget spent (%u/%u) -- a release() entry is likely missing",
-                  static_cast<unsigned>(size), static_cast<unsigned>(g_allocSram), static_cast<unsigned>(SRAM_TOTAL_BUDGET));
+        // would be noise.
+        if (!overSizeLimit) {
+            if (overBudget) {
+                // NOT expected under the release invariant above, and it
+                // silently relocates a table that was sized to be
+                // latency-sensitive -- which is how a per-row lookup ends up
+                // paying a bus round trip per pixel. Warn every time: it is
+                // rare, and it really does mean an animation forgot to release.
+                log_w("bganim: %u B to PSRAM, SRAM budget spent (%u/%u) -- a release() entry is likely missing",
+                      static_cast<unsigned>(size), static_cast<unsigned>(g_allocSram), static_cast<unsigned>(SRAM_TOTAL_BUDGET));
+            } else {
+                // The pool was too tight, which on this board is not an
+                // anomaly but the permanent state. internalHasRoomFor() only
+                // runs once both radios have claimed, and wants
+                // size + INTERNAL_RESERVE (48 KB) free of DMA-capable internal
+                // DRAM; measured on this panel that pool peaks at 18.6 KB with
+                // WiFi and BLE up. So the SRAM placement path is unreachable
+                // here by construction, every table lives in PSRAM, and
+                // anim_sram reads 0 for the life of the process.
+                //
+                // That is the correct outcome -- the 48 KB reserve is what
+                // stopped the animation eating the pool the network stack
+                // needs, back when cycling the fleet took internal SRAM to
+                // 53 KB and left the web UI permanently unreachable -- but it
+                // does mean SRAM_TOTAL_BUDGET and the size-based placement
+                // policy currently decide nothing. Anyone re-tuning either
+                // should know that before measuring.
+                //
+                // Once per boot, because it is the steady state and not news.
+                static bool reported = false;
+                if (!reported) {
+                    reported = true;
+                    log_i("bganim: internal DRAM below the %u B radio reserve, all tables go to PSRAM",
+                          static_cast<unsigned>(INTERNAL_RESERVE));
+                }
+            }
         }
-        log_w("bganim: %u B -> PSRAM (internal free %u, sram budget %u/%u)", static_cast<unsigned>(size),
+        log_d("bganim: %u B -> PSRAM (internal free %u, sram budget %u/%u)", static_cast<unsigned>(size),
               static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA | MALLOC_CAP_8BIT)),
               static_cast<unsigned>(g_allocSram), static_cast<unsigned>(SRAM_TOTAL_BUDGET));
         void *big = ps_malloc(size);
