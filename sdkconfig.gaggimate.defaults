@@ -139,6 +139,64 @@ CONFIG_MBEDTLS_HKDF_C=y
 CONFIG_LWIP_TCPIP_CORE_LOCKING=y
 CONFIG_LWIP_CHECK_THREAD_SAFETY=y
 
+# Two segments in flight per connection, not four. This is a memory setting
+# wearing a throughput costume.
+#
+# SPIRAM_TRY_ALLOCATE_WIFI_LWIP puts lwIP's pbufs in PSRAM, and the WiFi MAC
+# cannot DMA out of PSRAM, so every outgoing segment is first copied into an
+# internal DMA-capable "cache TX" buffer of about 1630 bytes. Those come out of
+# the same ~12 kB DMA-capable pool the radios and the LCD bounce buffers live
+# in. At the 5760-byte default each connection can have four segments in
+# flight, so two connections are enough to claim the whole pool.
+#
+# Measured on the shipping build, browser-shaped load over the real 105 kB of
+# web UI assets (61 kB JS, 29 kB CSS, 12.9 kB PNG):
+#   1 connection:   28/28 requests ok
+#   4 connections:  61/84 ok, 23 timed out
+#   8 connections:  71/168 ok
+#   16 connections: 27/224 ok
+# with 547 failed allocations, 522 of them the 1630-byte cache TX buffer, and
+# DMA-capable free driven from 12.3 kB down to a 247-byte low-water mark. The
+# collateral damage reached past the web server: UDP sends returned ENOMEM, DNS
+# lookups failed, and the STA reported ESP_ERR_WIFI_STATE. A browser opens six
+# parallel connections, which is exactly the failing case.
+#
+# 2880 costs nothing that matters here. On a LAN at a few ms RTT it still
+# permits roughly half a megabyte per second per connection, and the largest
+# asset is 61 kB.
+CONFIG_LWIP_TCP_WND_DEFAULT=2880
+CONFIG_LWIP_TCP_SND_BUF_DEFAULT=2880
+
+# --- Admission control does not help: measured ---
+# Capping active PCBs at 10 with TCP_MSL cut to 5 s, on the theory that fewer
+# connections each getting enough memory beats a dozen starving together, made
+# no difference: the two-tab cold load still timed out on every asset, and the
+# websockets stopped receiving as well. The shortage is DMA-capable bytes, and
+# WiFi TX demand scales with in-flight data rather than with connection count,
+# so bounding the connection count does not bound the demand. Left at defaults.
+
+# --- WiFi TX buffers: dynamic is not reachable from here ---
+# WiFi holds 16 static TX buffers of about 1.6 kB each, ~25.6 kB of DMA-capable
+# internal DRAM, whatever the traffic looks like, and when that pool is
+# exhausted it falls back to malloc'ing 1630-byte cache TX buffers. Those are
+# the allocations that fail here under load. Dynamic TX buffers would size
+# themselves to the actual frame and free the fixed pool, but esp_wifi's
+# Kconfig gates them behind
+#   !(SPIRAM_TRY_ALLOCATE_WIFI_LWIP && !SPIRAM_IGNORE_NOTFOUND)
+# and SPIRAM_IGNORE_NOTFOUND in turn depends on !SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY,
+# which this build relies on to keep BSS out of internal DRAM. Enabling it also
+# makes WiFi and lwIP behave as if there were no PSRAM at all, which is the
+# opposite of what the rest of this file is doing. The build guard caught the
+# attempt: none of the three symbols reached the merged config.
+
+# --- WiFi RX buffer depth: measured, and it goes the wrong way ---
+# Arduino defaults to 16 static and 32 dynamic RX buffers, and the static ones
+# look like an easy ~13 kB of DMA-capable internal DRAM to reclaim. Halving
+# both (8/16) instead COST memory: steady-state dma free fell 12,335 -> 10,567
+# and internal free 20,111 -> 18,343. Shrinking the static pool just pushes the
+# driver into allocating dynamic RX buffers from the same heap, which is worse
+# than the fixed pool it replaced. Left at the Arduino defaults deliberately.
+
 # --- IPv6 ---
 CONFIG_LWIP_IPV6_AUTOCONFIG=y
 CONFIG_LWIP_IPV6_NUM_ADDRESSES=6
