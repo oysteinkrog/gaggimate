@@ -62,6 +62,24 @@ CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y
 # scan-out slips. Re-measure both columns before touching this again: the
 # largest-block figure is the one that decides whether the web UI answers.
 CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=1024
+# RESERVE_INTERNAL was raised to 32768 and measured worse, so 16384 stays.
+# esp_psram_extram_reserve_dma_pool carves the reserve out of the largest
+# free block and re-registers it with caps {0, DMA|INTERNAL, 8BIT|32BIT}.
+# Priority zero being empty is the point: a plain malloc never reaches it,
+# so on paper a bigger reserve should fence more DMA-capable DRAM away from
+# the sub-1024-byte allocations that ALWAYSINTERNAL forces internal. It does
+# the opposite. Measured idle just after boot, the larger reserve cost
+# 2,396 B of total free internal (27,287 to 24,891) and 3,072 B of the
+# largest free block (16,372 to 13,300), because the pool is carved out of
+# the largest block and each chunk carries its own heap bookkeeping. The
+# two-tab cold load went from 13 passes / 1 failure to 4 passes / 3
+# failures over seven runs.
+#
+# Which of the two figures caused that is not established: both moved
+# together. The failing allocation is WiFi's 1630-byte cache TX buffer and
+# minimum free DMA under load bottomed at 651 B, which is plain exhaustion
+# rather than a contiguity problem, so the 2.4 KB of lost total is the
+# likelier culprit. Either way this pool has no headroom to give away.
 CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=16384
 
 # --- MSPI cache geometry ---
