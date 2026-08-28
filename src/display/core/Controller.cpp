@@ -6,9 +6,27 @@
 // production ever will.
 #define GM_SYNTH_TELEMETRY_MS 250
 #endif
+#ifdef GM_SYNTH_HANDSHAKE
+// Counters from the patched esp_lcd driver (scripts/patch_esp_lcd_rgb.py),
+// for the GM_SCANOUT serial line below. The histograms are 24 buckets of
+// 32 us: busy is how long the bounce refill spent copying, gap how long it
+// waited between calls, so a masked-interrupt stall piles into gap's tail
+// while bus contention piles into busy's.
+extern "C" {
+extern volatile uint32_t gm_rgb_resync_count;
+extern volatile uint32_t gm_rgb_busy_hist[];
+extern volatile uint32_t gm_rgb_gap_hist[];
+extern volatile uint32_t gm_rgb_busy_max;
+extern volatile uint32_t gm_rgb_gap_max;
+extern volatile uint32_t gm_rgb_catchup_count;
+extern volatile uint32_t gm_rgb_catchup_bufs;
+extern volatile uint32_t gm_rgb_catchup_max;
+}
+#endif
 #include "ArduinoJson.h"
 #include "esp_coexist.h"
 #include "esp_sntp.h"
+#include "esp_intr_alloc.h"
 #include "esp_timer.h"
 #include <LittleFS.h>
 #include <SD_MMC.h>
@@ -780,6 +798,72 @@ void Controller::loop() {
                     synthBrewing = wantBrew;
                     pluginManager->trigger(wantBrew ? "controller:brew:start" : "controller:brew:end");
                     ESP_LOGW(LOG_TAG, "GM_SYNTH_HANDSHAKE: synthetic brew %s", wantBrew ? "start" : "end");
+                }
+
+                // Scan-out counters on the serial log, because HTTP is the
+                // wrong transport for reading them on this rig: the ballast
+                // pins the heap where the WPA2 handshake's allocations fail,
+                // so the network drops for minutes at a stretch exactly when
+                // the rig is doing its job. /api/debug/scanout stays the
+                // full-detail view; this line is the rate data a soak needs,
+                // reachable over the wire that never goes away.
+                {
+                    static unsigned long lastScanoutLog = 0;
+                    if (telNow - lastScanoutLog >= 10000UL) {
+                        lastScanoutLog = telNow;
+                        // One-shot map of which core every ISR lives on: the
+                        // LCD EOF interrupt only tolerates ~672 us of latency,
+                        // so any radio ISR sharing its core is a suspect.
+                        static bool intrDumped = false;
+                        if (!intrDumped) {
+                            intrDumped = true;
+                            esp_intr_dump(NULL);
+                        }
+                        uint32_t frames = 0, refills = 0, slips = 0;
+                        panelclock::scanoutStats(&frames, &refills, &slips);
+                        // Tail sums: >=384 us covers anything that could eat a
+                        // bounce deadline, >=736 us the full-pool blackouts that
+                        // show up as shortfall-8 resyncs.
+                        uint32_t busyHi = 0, gapHi = 0;
+                        for (int i = 12; i < 24; i++) {
+                            busyHi += gm_rgb_busy_hist[i];
+                            gapHi += gm_rgb_gap_hist[i];
+                        }
+                        ESP_LOGI(LOG_TAG,
+                                 "GM_SCANOUT: t_us=%llu frames=%u slips=%u resyncs=%u phy_defer=%u "
+                                 "busy_max=%u gap_max=%u busy_hi=%u gap_hi=%u busy_top=%u gap_top=%u "
+                                 "catchups=%u catchup_bufs=%u catchup_max=%u",
+                                 static_cast<unsigned long long>(esp_timer_get_time()), frames, slips,
+                                 static_cast<unsigned>(gm_rgb_resync_count),
+                                 panelclock::phyTrackDeferred(), static_cast<unsigned>(gm_rgb_busy_max),
+                                 static_cast<unsigned>(gm_rgb_gap_max), static_cast<unsigned>(busyHi),
+                                 static_cast<unsigned>(gapHi), static_cast<unsigned>(gm_rgb_busy_hist[23]),
+                                 static_cast<unsigned>(gm_rgb_gap_hist[23]),
+                                 static_cast<unsigned>(gm_rgb_catchup_count),
+                                 static_cast<unsigned>(gm_rgb_catchup_bufs),
+                                 static_cast<unsigned>(gm_rgb_catchup_max));
+                        // The slip log carries per-event phase against each
+                        // instrumented activity; print entries not yet shown so
+                        // attribution works when HTTP cannot.
+                        static uint32_t lastSlipTUs = 0;
+                        panelclock::ScanoutSlip slipBuf[8];
+                        const size_t slipN = panelclock::scanoutSlipLog(slipBuf, 8);
+                        for (size_t i = 0; i < slipN; i++) {
+                            if (static_cast<int32_t>(slipBuf[i].tUs - lastSlipTUs) <= 0) {
+                                continue;
+                            }
+                            lastSlipTUs = slipBuf[i].tUs;
+                            ESP_LOGI(LOG_TAG,
+                                     "GM_SLIP: t_us=%u short=%u overlay_us=%u flash_us=%u band_us=%u "
+                                     "present_us=%u phy_us=%u",
+                                     slipBuf[i].tUs, slipBuf[i].marginUs,
+                                     slipBuf[i].sinceUs[panelclock::SCANOUT_ACT_OVERLAY],
+                                     slipBuf[i].sinceUs[panelclock::SCANOUT_ACT_FLASH],
+                                     slipBuf[i].sinceUs[panelclock::SCANOUT_ACT_BANDPUSH],
+                                     slipBuf[i].sinceUs[panelclock::SCANOUT_ACT_PRESENT],
+                                     slipBuf[i].sinceUs[panelclock::SCANOUT_ACT_PHY]);
+                        }
+                    }
                 }
             }
         }
