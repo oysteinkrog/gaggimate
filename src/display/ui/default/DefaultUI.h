@@ -109,6 +109,25 @@ class DefaultUI {
     // is only valid against what that specific buffer already holds.
     lv_area_t overlayDirty[2] = {{1, 1, 0, 0}, {1, 1, 0, 0}};
     bool overlayValid[2] = {false, false};
+    // The snapshot geometry each overlay buffer was built with.
+    //
+    // The snapshot is sized width+ext*2 by height+ext*2, where ext is the
+    // screen's extended draw size, and the animation composites it centred, at
+    // an offset of exactly ext. LVGL recomputes ext as widgets with shadows or
+    // outlines come and go, so it is not a constant. The buffer is indexed
+    // relative to coords.y1-ext, which means a change to ext moves the whole
+    // buffer's coordinate system -- every pixel already in it is now read a
+    // few rows off.
+    //
+    // The dirty rectangles track which pixels changed, not that the frame they
+    // are expressed in changed, so a partial publish after an ext change
+    // leaves the untouched remainder displaced. On the panel that is the
+    // profile name drawn a second time about 25 rows below itself, faint and
+    // clipped, while every widget that happened to be re-published looks
+    // perfect. It survives with the scan-out slip counter reading zero,
+    // because nothing about the scan-out is wrong.
+    int overlayW[2] = {-1, -1};
+    int overlayH[2] = {-1, -1};
     bool bgAnimAllScreens = false;         // settings.isBgAnimAllScreens(), cached per render
     // millis() when setupPanel() finished building the UI, or 0 before that.
     // The animation needs a live screen to host its overlay snapshot, so it

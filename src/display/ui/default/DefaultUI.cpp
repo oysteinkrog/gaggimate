@@ -966,6 +966,24 @@ void DefaultUI::refreshSleepOverlay() {
         return;
     }
 
+    // If the snapshot geometry has moved since this buffer was last written,
+    // its contents are no longer where they claim to be: the buffer is indexed
+    // from coords.y1-ext and composited at an offset of ext, so a change to
+    // the screen's extended draw size displaces everything already in it. A
+    // dirty rectangle cannot express that, so redraw the buffer whole.
+    {
+        lv_area_t geom;
+        lv_obj_get_coords(scr, &geom);
+        const lv_coord_t extNow = _lv_obj_get_ext_draw_size(scr);
+        const int wNow = lv_area_get_width(&geom) + extNow * 2;
+        const int hNow = lv_area_get_height(&geom) + extNow * 2;
+        if (overlayValid[back] && (overlayW[back] != wNow || overlayH[back] != hNow)) {
+            log_i("sleep overlay: snapshot geometry %dx%d -> %dx%d, redrawing buffer %d whole", overlayW[back],
+                  overlayH[back], wNow, hNow, back);
+            overlayValid[back] = false;
+        }
+    }
+
     lv_area_t clip;
     if (overlayValid[back]) {
         clip = overlayDirty[back];
@@ -996,6 +1014,8 @@ void DefaultUI::refreshSleepOverlay() {
     // and panel row are the same number.
     sleepAnimation.publishOverlay(w, h, clip.y1, clip.y2 + 1);
     overlayValid[back] = true;
+    overlayW[back] = w;
+    overlayH[back] = h;
     areaClear(overlayDirty[back]);
     // A widget just changed. Do not let interlacing split that change across
     // two frames; on hard-edged UI content the half-updated frame is plainly
