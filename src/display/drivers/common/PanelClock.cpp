@@ -13,6 +13,7 @@
 #include <esp_log.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
+#include <freertos/task.h>
 
 // esp_lcd_rgb_panel_set_pclk arrived in ESP-IDF 5.0. On 4.4 there is no
 // supported way to retime a running RGB panel, so the setting is applied at the
@@ -109,7 +110,62 @@ extern "C" IRAM_ATTR void gm_rgb_restart_hook(uint32_t shortfall) {
     panelclock::logEvent(static_cast<uint32_t>(esp_timer_get_time()), shortfall);
 }
 
+// The RF PHY tracks its PLL against temperature drift once a second, and the
+// tracking call's flash fetches occupy the MSPI bus for a ~0.5-1 ms burst:
+// long enough to overrun the bounce pool's ~670 us of slack and displace one
+// band, once a second, phase-locked (that was the flat 0.7/s resync train the
+// slip log dated to x.26-x.33 of every second). The patched timer callback
+// (scripts/patch_phy_track_defer.py) offers each tick here first; we park it
+// until the next VSYNC and run it at the top of vertical blanking, where the
+// scan-out consumes nothing for ~1.3 ms and the pool then still holds its
+// full slack. Cadence stays one second, quantized to a 23 ms frame, which
+// thermal drift cannot see.
+//
+// The heartbeat check makes the takeover self-disarming: if the panel is not
+// scanning (standby teardown, pre-init, OTA rebuild), defer() sees a stale
+// heartbeat, declines the tick, and the PHY timer runs it inline exactly as
+// stock. PLL tracking is never starved by a stopped display.
+namespace {
+TaskHandle_t g_phyTrackTask = nullptr;
+volatile bool g_phyTrackPending = false;
+volatile uint32_t g_phyTrackHeartbeatUs = 0;
+volatile uint32_t g_phyTrackDeferred = 0; // ticks run in the blanking window
+constexpr uint32_t PHY_TRACK_HEARTBEAT_STALE_US = 100000;
+
+extern "C" void gm_phy_track_pll_run(void);
+
+void phyTrackTask(void *) {
+    for (;;) {
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        // Marked so the slip log can convict or acquit these ticks: a slip
+        // with a tiny phy_us is a deferred run that still overran the
+        // blanking window; a huge one rules this path out.
+        panelclock::scanoutMark(panelclock::SCANOUT_ACT_PHY);
+        gm_phy_track_pll_run();
+        g_phyTrackDeferred = g_phyTrackDeferred + 1;
+    }
+}
+} // namespace
+
+extern "C" bool gm_phy_track_defer(void) {
+    // Runs on the esp_timer task, once a second. Volatile reads only; the
+    // pending flag is consumed in the VSYNC ISR.
+    const uint32_t now = static_cast<uint32_t>(esp_timer_get_time());
+    if (g_phyTrackTask == nullptr || now - g_phyTrackHeartbeatUs > PHY_TRACK_HEARTBEAT_STALE_US) {
+        // A tick deferred just before the panel stopped has no VSYNC left to
+        // release it. Drop it here rather than let it replay out of cadence
+        // when the panel comes back; the inline run below covers this period.
+        g_phyTrackPending = false;
+        return false;
+    }
+    g_phyTrackPending = true;
+    return true;
+}
+
 namespace panelclock {
+
+uint32_t phyTrackDeferred() { return g_phyTrackDeferred; }
+
 namespace {
 
 IRAM_ATTR bool onVsync(esp_lcd_panel_handle_t, const esp_lcd_rgb_panel_event_data_t *, void *) {
@@ -167,6 +223,18 @@ IRAM_ATTR bool onVsync(esp_lcd_panel_handle_t, const esp_lcd_rgb_panel_event_dat
         // marginUs 0 marks a total refill failure: no pass completed at all, so
         // there is no headroom to report.
         logEvent(nowUs, 0);
+    }
+    // PHY PLL-track deferral (see gm_phy_track_defer above): mark the panel
+    // alive, and if a tick is parked, release the runner now. VSYNC_END puts
+    // the beam at the start of the vertical back porch: ~450 us of no
+    // consumption, then a freshly topped pool's ~670 us of slack, which is
+    // the roomiest window this frame will ever offer a ~0.5 ms bus hold.
+    g_phyTrackHeartbeatUs = nowUs;
+    if (g_phyTrackPending && g_phyTrackTask != nullptr) {
+        g_phyTrackPending = false;
+        BaseType_t hpw = pdFALSE;
+        vTaskNotifyGiveFromISR(g_phyTrackTask, &hpw);
+        return hpw == pdTRUE;
     }
     return false;
 }
@@ -264,6 +332,13 @@ void attach(void *panelHandle, uint32_t bootPclkHz) {
     cbs.on_vsync = onVsync;
     cbs.on_frame_buf_complete = onRefillDone;
     esp_lcd_rgb_panel_register_event_callbacks(g_panel, &cbs, nullptr);
+    // The PHY-track runner outlives panel rebuilds (a stopped panel just
+    // stops feeding it); create it once. Core 0, where the esp_timer task
+    // would have run the tick anyway; priority above the radio housekeeping
+    // it replaces so the VSYNC release is not sat on.
+    if (g_phyTrackTask == nullptr) {
+        xTaskCreatePinnedToCore(phyTrackTask, "gm_phy_trk", 3072, nullptr, 19, &g_phyTrackTask, 0);
+    }
     // A divider chosen before the panel existed (or before it was torn down for
     // a display OTA) is still the user's choice — re-apply it rather than
     // silently reverting to the boot rate.
@@ -400,6 +475,7 @@ void setDiv(int n) {
 
 namespace panelclock {
 void attach(void *, uint32_t) {}
+uint32_t phyTrackDeferred() { return 0; }
 void detach() {}
 uint32_t pclkHzForInit(uint32_t defaultHz) { return defaultHz; }
 int currentDiv() { return 0; }

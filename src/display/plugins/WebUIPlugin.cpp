@@ -586,7 +586,7 @@ void WebUIPlugin::setupServer() {
         // it up against the beam instead of restarting the DMA, so it now costs one
         // band of stale pixels rather than a whole shifted frame. dma_restarts should
         // stay at zero: only an explicit panel restart reaches it.
-        response->printf("],\"resyncs\":%u,\"resync_bufs\":%u,\"resync_max\":%u,\"over_count\":%u,\"over_bufs\":%u,"
+        response->printf("],\"resyncs\":%u,\"resync_bufs\":%u,\"resync_max\":%u,\"over_count\":%u,\"over_bufs\":%u,\"phy_defer\":%u,"
                          "\"flash_skips\":%u,"
                          "\"dma_restarts\":%u,\"dma_catchups\":%u,\"dma_catchup_bufs\":%u,"
                          "\"dma_catchup_max\":%u,\"eof_expect\":%u,\"eof_min\":%u,\"eof_max\":%u,\"log\":[",
@@ -594,6 +594,7 @@ void WebUIPlugin::setupServer() {
                          static_cast<unsigned>(gm_rgb_resync_bufs),
                          static_cast<unsigned>(gm_rgb_resync_max),
                          static_cast<unsigned>(gm_rgb_over_count), static_cast<unsigned>(gm_rgb_over_bufs),
+                         static_cast<unsigned>(panelclock::phyTrackDeferred()),
                          static_cast<unsigned>(gm_rgb_flash_skip_bufs),
                          static_cast<unsigned>(gm_rgb_restart_count),
                          static_cast<unsigned>(gm_rgb_catchup_count),
@@ -605,13 +606,14 @@ void WebUIPlugin::setupServer() {
         for (size_t i = 0; i < n; i++) {
             response->printf(
                 "%s{\"frame\":%u,\"t_us\":%u,\"margin_us\":%u,\"overlay_us\":%u,\"flash_us\":%u,\"band_us\":%u,"
-                "\"present_us\":%u}",
+                "\"present_us\":%u,\"phy_us\":%u}",
                 i ? "," : "", static_cast<unsigned>(slipLog[i].frame), static_cast<unsigned>(slipLog[i].tUs),
                 static_cast<unsigned>(slipLog[i].marginUs),
                 static_cast<unsigned>(slipLog[i].sinceUs[panelclock::SCANOUT_ACT_OVERLAY]),
                 static_cast<unsigned>(slipLog[i].sinceUs[panelclock::SCANOUT_ACT_FLASH]),
                 static_cast<unsigned>(slipLog[i].sinceUs[panelclock::SCANOUT_ACT_BANDPUSH]),
-                static_cast<unsigned>(slipLog[i].sinceUs[panelclock::SCANOUT_ACT_PRESENT]));
+                static_cast<unsigned>(slipLog[i].sinceUs[panelclock::SCANOUT_ACT_PRESENT]),
+                static_cast<unsigned>(slipLog[i].sinceUs[panelclock::SCANOUT_ACT_PHY]));
         }
         // busy_hist is how long the refill handler spent copying, gap_hist how long it
         // waited between calls, both in 32 us buckets. They separate the two faults that
