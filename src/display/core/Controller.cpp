@@ -763,8 +763,10 @@ void Controller::loop() {
                 // as able to mask the LCD bounce refill outright rather than
                 // merely narrow its margin: flushBuffer()'s 4 KB LittleFS write
                 // disables the flash cache, and the refill copies out of a PSRAM
-                // framebuffer sitting behind that same cache. That is also why
-                // CONFIG_LCD_RGB_ISR_IRAM_SAFE cannot be turned on.
+                // framebuffer sitting behind that same cache. That constraint is
+                // why CONFIG_LCD_RGB_ISR_IRAM_SAFE needs the cache_utils flag
+                // patch (scripts/patch_flash_cache_flag.py) before it can be on:
+                // the refill must skip, not copy, in that window.
                 //
                 // 30 s recording then 15 s idle, which is roughly a shot and the
                 // rest after it. At 250 ms samples into a 4096 B buffer a flush

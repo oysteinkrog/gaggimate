@@ -374,3 +374,19 @@ CONFIG_BT_CTRL_SCAN_DUPL_CACHE_SIZE=20
 #     roughly 15 kB of internal free at steady state. Paying for it by halving
 #     the dcache is worse than the disease: the dcache is what the refill
 #     reads the framebuffer through.
+
+# --- LCD interrupts survive flash operations ---
+# Without this, neither the panel's VSYNC interrupt nor the GDMA EOF interrupt
+# carries ESP_INTR_FLAG_IRAM, so a flash operation on either core masks both
+# outright (esp_intr_noniram_disable) and the panel scans stale bounce buffers
+# for the whole write. A shot recording flushes 4 KB to LittleFS every ~42 s,
+# which made every brew a run of stale frames. With the flag on, the refill
+# keeps running through the write; the memcpy it must not do in that window
+# (the PSRAM framebuffer sits behind the disabled cache) is skipped via the
+# gm_flash_cache_down flag from scripts/patch_flash_cache_flag.py, costing a
+# few uncopied scanlines instead of a fault. Both cores keep IRAM interrupts
+# live during flash ops on this chip: cache_utils.c stalls the other core
+# cooperatively (spi_flash_op_block_func masks only non-IRAM interrupts).
+# Costs ~16 small HAL/driver functions of IRAM (esp_lcd/linker.lf plus the
+# GDMA_ISR_HANDLER_IN_IRAM and ESP_PERIPH_CTRL_FUNC_IN_IRAM selects).
+CONFIG_LCD_RGB_ISR_IRAM_SAFE=y
