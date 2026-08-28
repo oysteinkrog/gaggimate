@@ -16,6 +16,39 @@
 #include <scales/varia.h>
 #include <scales/weighmybru.h>
 
+// Scan cadence, read by the vendored scanner each time an async scan starts
+// (scripts/patch_ble_scan_duty.py wires that up). Two cadences exist because
+// every scan window TRANSITION stalls the display: the BT controller runs from
+// flash, flash and PSRAM share the MSPI controller, and opening or closing the
+// receiver costs the RGB panel's PSRAM bounce refill its deadline. The cost is
+// per transition, not per millisecond the receiver is open; that was measured,
+// not reasoned (the table is in scripts/patch_ble_scan_duty.py).
+//
+// There is only one cadence: 80 ms window every 2000 ms. A transition every
+// 2 s, discovery within a few windows, tolerable to the panel and to WiFi
+// coexistence. What varies is WHEN a scan runs at all. scan() holds one
+// continuously for SCAN_BOOST_MS after power-on, mode change, an explicit
+// scan from the web UI, or a lost connection: every moment a user is actually
+// waiting for a scale to appear. After a boosted minute finds nothing, the
+// scale is off or absent, and update() drops to SCAN_BURST_LEN_MS of this
+// same cadence every SCAN_BURST_PERIOD_MS: ~7 window transitions per period
+// instead of 45, a 6x cut in how often the receiver disturbs the panel, for
+// a worst-case discovery latency of period plus burst. Scanning stops
+// entirely once a scale connects, and in standby; a paired, present scale
+// costs nothing at all.
+//
+// A high-duty burst (window == interval, receiver held open) was tried first
+// and measured WORSE than scanning all day: 0.79/s panel resyncs against
+// 0.5/s. With the receiver held open, WiFi coexistence preempts BLE in tens-
+// of-milliseconds timeslices, and every preemption is a radio transition
+// with the same MSPI cost as a window boundary -- one per ~50 ms for the
+// whole burst. Short windows at a long interval are the shape coexistence
+// can schedule around; that is not a tunable, it is the mechanism.
+extern "C" {
+uint16_t gm_ble_scan_interval_ms = 2000;
+uint16_t gm_ble_scan_window_ms = 80;
+}
+
 void on_ble_measurement(float value) {
     if (&BLEScales != nullptr) {
         BLEScales.onMeasurement(value);
@@ -177,6 +210,34 @@ void BLEScalePlugin::update() {
             }
         }
     }
+
+    // Scan phase scheduler: while nothing is connected or connecting, run the
+    // boost phase out and then keep discovery alive as short high-duty bursts
+    // (the cadence rationale sits above the gm_ble_scan_* definitions). All
+    // comparisons are wrap-safe deltas; this runs on update()'s 1 s tick, so
+    // every deadline lands within a second of its nominal time.
+    if (scale == nullptr && !doConnect && scanner != nullptr && NimBLEDevice::isInitialized()) {
+        const unsigned long now = millis();
+        if (static_cast<long>(now - scanBoostUntil) < 0) {
+            // Boost phase: scan() already started the pairing-cadence scan.
+        } else if (scanner->isScanRunning()) {
+            if (scanBurstStopAt == 0) {
+                // The boost expired with its scan still running: stop it and
+                // schedule the first burst a period out. The boost minute
+                // itself was continuous discovery, so there is nothing to
+                // gain from a burst right away.
+                scanner->stopAsyncScan();
+                scanNextBurstAt = now + SCAN_BURST_PERIOD_MS;
+            } else if (static_cast<long>(now - scanBurstStopAt) >= 0) {
+                scanner->stopAsyncScan();
+                scanBurstStopAt = 0;
+            }
+        } else if (static_cast<long>(now - scanNextBurstAt) >= 0) {
+            scanner->initializeAsyncScan();
+            scanBurstStopAt = now + SCAN_BURST_LEN_MS;
+            scanNextBurstAt = now + SCAN_BURST_PERIOD_MS;
+        }
+    }
 }
 
 void BLEScalePlugin::connect(const std::string &uuid) {
@@ -217,6 +278,14 @@ void BLEScalePlugin::scan() const {
         ESP_LOGW("BLEScalePlugin", "BLE host not initialized, skipping scale scan");
         return;
     }
+    // Every caller of scan() is a moment someone may be waiting for a scale:
+    // leaving standby, the controller link coming up, the web UI's scan
+    // button, a lost connection. Enter the boost phase; update() drops to
+    // bursts if a minute of this finds nothing. A burst already in flight
+    // just keeps running (initializeAsyncScan() is a no-op then, and it is
+    // the same cadence); the boost extension alone is what matters.
+    scanBoostUntil = millis() + SCAN_BOOST_MS;
+    scanBurstStopAt = 0;
     scanner->initializeAsyncScan();
 }
 

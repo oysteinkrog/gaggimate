@@ -1,4 +1,5 @@
-"""Lower the BLE scale scanner's duty cycle, so scanning stops disturbing scan-out.
+"""Hand the BLE scale scanner's cadence to the firmware, so scanning stops
+disturbing scan-out.
 
 The fault
 ---------
@@ -21,11 +22,8 @@ The cost is per window, not per millisecond of window. Halving the window at a
 fixed interval, 40 ms to 20 ms, changed nothing: 0.82/s against 0.92/s at 43.4 Hz,
 inside the noise. Doubling the interval at a fixed duty cycle halved the rate
 every time. So what disturbs the refill is opening and closing the receiver, not
-holding it open, and the parameter worth spending is the interval.
-
-That is why the window is 80 ms rather than 40. Both are the same 4% duty cycle,
-but 80/2000 has half the window transitions of 40/1000, and it measures better at
-every pixel clock. Late frames per second, animation running, 120 s windows:
+holding it open, and the parameter worth spending is the interval. Late frames
+per second, animation running, 120 s windows:
 
     Hz     stock 100/500   40/1000   80/2000
     60.8       5.77          2.85      1.91
@@ -33,40 +31,48 @@ every pixel clock. Late frames per second, animation running, 120 s windows:
     43.4       2.37          0.82      0.57
     38.0       0.73          0.04      0.12
 
-The trade
+The patch
 ---------
-An 80 ms window every 2000 ms is a 4% duty cycle instead of 20%, so discovering a
-scale takes longer. Scales advertise every few hundred milliseconds, and this
-window still overlaps one within a few seconds, which is the right side of the
-trade for a machine whose display is on the whole time and whose scale is paired
-once. Scanning only runs while no scale is connected, so a paired machine never
-pays either cost.
+The library sets its interval and window as literals inside
+RemoteScalesScanner::initializeAsyncScan(), which runs every time an async scan
+starts. This patch replaces the literals with two globals the firmware owns,
+gm_ble_scan_interval_ms and gm_ble_scan_window_ms, defined in
+src/display/plugins/BLEScalePlugin.cpp. That is where the scan policy lives:
+which cadence runs when, and the measurements above that justify it. The
+library keeps deciding WHEN to scan; the firmware decides HOW.
 
-Why a patch rather than a fork: it is two numbers in a library we do not
+Why a patch rather than a fork: it is a few lines in a library we do not
 otherwise touch. The patch is idempotent and anchored on exact upstream text, so
 a library bump fails the build loudly rather than silently reverting.
 """
 
 import os
 
-# Milliseconds. esp-nimble-cpp 2.x takes both of these in milliseconds and
-# converts to the radio's 0.625 ms units internally.
-SCAN_INTERVAL_MS = 2000
-SCAN_WINDOW_MS = 80
-
 MARKER = "GM_BLE_SCAN_DUTY_PATCH"
 
 HUNKS = [
     (
+        '#include "remote_scales.h"\n'
+        '#include "remote_scales_plugin_registry.h"\n',
+        '#include "remote_scales.h"\n'
+        '#include "remote_scales_plugin_registry.h"\n'
+        "\n"
+        "// %s: the scan cadence is a firmware policy decision, not a library\n"
+        "// constant. The globals live in src/display/plugins/BLEScalePlugin.cpp\n"
+        "// together with the policy and the measurements behind it; they are read\n"
+        "// below each time an async scan starts. See scripts/patch_ble_scan_duty.py.\n"
+        'extern "C" {\n'
+        "extern uint16_t gm_ble_scan_interval_ms;\n"
+        "extern uint16_t gm_ble_scan_window_ms;\n"
+        "}\n" % MARKER,
+    ),
+    (
         "  NimBLEDevice::getScan()->setInterval(500);\n"
         "  NimBLEDevice::getScan()->setWindow(100);\n",
-        "  // %s: %d ms window every %d ms, not 100/500. A 20%% duty cycle on the\n"
-        "  // BLE receiver starves the RGB panel's bounce refill over the shared MSPI\n"
-        "  // bus, because the BT controller runs from flash and PSRAM is behind the\n"
-        "  // same controller. See scripts/patch_ble_scan_duty.py.\n"
-        "  NimBLEDevice::getScan()->setInterval(%d);\n"
-        "  NimBLEDevice::getScan()->setWindow(%d);\n"
-        % (MARKER, SCAN_WINDOW_MS, SCAN_INTERVAL_MS, SCAN_INTERVAL_MS, SCAN_WINDOW_MS),
+        "  // %s: cadence owned by the firmware; see the declaration at the top of\n"
+        "  // this file. esp-nimble-cpp 2.x takes both values in milliseconds.\n"
+        "  NimBLEDevice::getScan()->setInterval(gm_ble_scan_interval_ms);\n"
+        "  NimBLEDevice::getScan()->setWindow(gm_ble_scan_window_ms);\n" % MARKER,
     ),
 ]
 
