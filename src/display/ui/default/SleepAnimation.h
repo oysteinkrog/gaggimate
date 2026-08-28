@@ -88,12 +88,26 @@ class SleepAnimation {
 #ifdef GM_ANIM_BENCH
     void setHalfRes(bool) {}
     void setInterlace(bool) {}
+    void setHalfForce(int8_t) {}
+    int8_t halfForced() const { return -1; }
+    void setDebugPattern(int) {}
+    int debugPatternOn() const { return 0; }
 #else
     // A ceiling, not an instruction. Half resolution has a real quality cost
     // (see autoResolution), so which animations actually pay it is measured
     // rather than assumed; this only says whether they are allowed to.
+    // Idempotent on purpose. DefaultUI::updateState() re-applies the stored
+    // settings wholesale, so this is called with the SAME value repeatedly.
+    // Resetting the probe unconditionally meant autoResReset was raised again
+    // before autoResolution could ever settle, which pinned every animation at
+    // full resolution permanently: measured 8.5 fps against a 15 fps target
+    // with a 105,000 us frame against a 66,667 us budget, and no drop to half
+    // ever taken because the decision was restarted every pass. Only an actual
+    // change to the ceiling should cost a re-probe.
     void setHalfRes(bool on) {
-        halfResAllowed.store(on);
+        if (halfResAllowed.exchange(on) == on) {
+            return;
+        }
         if (!on) {
             halfRes.store(false);
         }
@@ -103,7 +117,57 @@ class SleepAnimation {
         interlace.store(on);
         renderHalf.store(on);
     }
+    void setHalfForce(int8_t v) {
+        halfForce.store(v);
+        autoResReset.store(true);
+    }
+    int8_t halfForced() const { return halfForce.load(); }
+    void setDebugPattern(int v) { debugPattern.store(v); }
+    int debugPatternOn() const { return debugPattern.load(); }
 #endif
+    // Read-only instrument accessors, outside the bench split on purpose: the
+    // counters they expose exist in every build, and putting them on one side
+    // of it once already broke display-bench while display and the load rig
+    // both compiled.
+    //
+    // Where the DMA source slots actually landed. Reported rather than assumed:
+    // the allocation falls back to PSRAM when internal DRAM is short, and which
+    // one it picked decides whether a cache writeback is needed at all.
+    const void *bandBufAddr(int i) const { return bandBuf[i]; }
+    uint32_t msyncFailCount() const { return msyncFails.load(); }
+    uint32_t msyncOkCount() const { return msyncOks.load(); }
+    uint32_t fbCheckedCount() const { return fbChecked.load(); }
+    uint32_t fbMismatchCount() const { return fbMismatch.load(); }
+    int32_t fbLastBandIndex() const { return fbLastBand.load(); }
+    int32_t fbLastSourceIndex() const { return fbLastSource.load(); }
+    int32_t fbLastDeltaBands() const { return fbLastDelta.load(); }
+    uint32_t lastInvalidateUs() const { return lastInvalUs.load(); }
+    // Caps the animation's frame rate independently of the stored setting, to
+    // measure how much of the scan-out's lost refill headroom the animation's
+    // own PSRAM traffic accounts for. 0 restores the normal cap.
+    void setFpsOverride(uint8_t fps) { fpsOverride.store(fps); }
+    // Replaces the rendered image with a scan-out test pattern a camera can
+    // decode from a single photograph, which is the only way to judge the panel
+    // with nobody in front of it. See the comment at the write site.
+    void setTestPattern(bool on) { testPattern.store(on); }
+    bool testPatternOn() const { return testPattern.load(); }
+    uint8_t fpsOverrideValue() const { return fpsOverride.load(); }
+    // Tearing: live writes over frames actually checked. The denominator is
+    // exposed so a zero cannot be read as clean when the check never ran.
+    uint32_t liveWriteCount() const { return liveWrites.load(); }
+    uint32_t liveWriteCheckedCount() const { return liveWriteClean.load() + liveWrites.load(); }
+    uint32_t flipTimeoutCount() const { return flipTimeouts.load(); }
+    uint32_t lastFrameUsValue() const { return lastFrameUs.load(); }
+    uint32_t lastWorkUsValue() const { return lastWorkUs.load(); }
+    uint32_t lastWaitUsValue() const { return lastWaitUs.load(); }
+    uint32_t lastBandUsValue() const { return lastBandUs.load(); }
+    uint32_t lastExpandUsValue() const { return lastExpandUs.load(); }
+    uint32_t lastFillUsValue() const { return lastFillUs.load(); }
+    uint32_t lastCopyUsValue() const { return lastCopyUs.load(); }
+    const void *halfBufAddr() const { return halfBuf; }
+    uint32_t lastBlendUsValue() const { return lastBlendUs.load(); }
+    uint32_t lastMsyncUsValue() const { return lastMsyncUs.load(); }
+    uint32_t lastPushUsValue() const { return lastPushUs.load(); }
 
     // Text scrim: how far to dim the animation behind and immediately around
     // overlaid widget pixels, 0-100 percent, where 0 is off and 100 is black.
@@ -147,6 +211,25 @@ class SleepAnimation {
     // UI widgets, which change in discrete steps and are full of them. So the
     // rule is: interlace the animation, never interlace a widget update.
     void requestWholeFrames() { warmupFrames.store(2); }
+
+    // Framebuffer-ownership controls, deliberately not behind GM_ANIM_BENCH.
+    // Each setting produces a different visible defect and neither is visible
+    // to the scan-out slip counter, so the only way to tell them apart is a
+    // person watching the panel while the setting changes. Behind a build flag
+    // that comparison costs a reflash each way.
+    void setDirectPush(bool on) { directPushWanted.store(on); }
+    bool directPush() const { return directPushWanted.load(); }
+    void setDmaWanted(bool on) { dmaWanted.store(on); }
+    // Reports the resolution actually in effect. setHalfRes() already exists
+    // above and owns the allow/reset logic; this is only so the debug endpoint
+    // can show which way the auto-resolution logic landed.
+    bool halfResOn() const { return halfRes.load(); }
+    // Band-DMA submit failures. Not a curiosity: on failure the band falls back
+    // to pushColors, which writes fbs[cur_fb_index] -- the buffer the panel is
+    // scanning -- while its neighbours went to fbDirect[fbBack]. A frame split
+    // across both buffers shows as content composited twice.
+    uint32_t dmaErrorCount() const { return dmaErrors.load(); }
+    bool dmaPathWanted() const { return dmaWanted.load(); }
 
 #ifdef GM_ANIM_BENCH
     // Bench build only. The render task walks the whole registry, dwelling on
@@ -227,7 +310,7 @@ class SleepAnimation {
     // bisect: it bypasses draw_bitmap exactly as mode 2 does but keeps the copy
     // an ordinary CPU one, so a fault that appears in 1 is about bypassing the
     // driver and a fault that appears only in 2 is about the transfer.
-    void benchSetDirectPush(bool on) { directPushOn.store(on); }
+    void benchSetDirectPush(bool on) { directPushWanted.store(on); }
     void benchSetInterlace(bool on) { interlace.store(on); }
     bool benchInterlace() const { return interlace.load(); }
     void benchSetRenderHalf(bool on) { renderHalf.store(on); }
@@ -389,6 +472,16 @@ class SleepAnimation {
     // Whether halfRes is allowed to be true at all: the user setting. The
     // effective value above is chosen per animation by autoResolution().
     std::atomic<bool> halfResAllowed{true};
+    // Debug override for autoResolution: -1 auto, 0 pin full, 1 pin half.
+    // setHalfRes() is a ceiling, not an instruction, so it cannot be used to
+    // hold a resolution for a measurement: autoResolution weighs frame time
+    // against the budget and on a light screen keeps full res however loudly
+    // half was allowed. A before/after that cannot pin the variable it is
+    // comparing is not a comparison, and one was already read the wrong way
+    // round because of this.
+    std::atomic<int8_t> halfForce{-1};
+    // Row-encoded test pattern; see the renderFrame() site for what it settles.
+    std::atomic<int> debugPattern{0};
     // Set when something the decision depended on changed under it.
     std::atomic<bool> autoResReset{true};
     int autoResAnim = -1;      // animation the current decision belongs to
@@ -396,6 +489,11 @@ class SleepAnimation {
     uint8_t autoResSeen = 0;   // frames discarded before the window opened
     uint8_t autoResFrames = 0; // frames accumulated into autoResUs
     uint64_t autoResUs = 0;
+    // Long-run watch kept AFTER the decision has settled, so a verdict reached
+    // on an unrepresentative six-frame window does not stand for the rest of
+    // the animation. See the re-probe branch in autoResolution().
+    uint64_t autoResPostUs = 0;
+    uint32_t autoResPostFrames = 0;
     bool autoResSettled = false;
     uint32_t frameWaitUs = 0; // this frame's total block on the push task, drives cropEnabled
     void *pushHandle = nullptr;
@@ -465,16 +563,50 @@ class SleepAnimation {
     // pushColors would show a buffer nothing wrote. The same argument applies
     // to LVGL and was missed.
     //
-    // It costs nothing here. The animation is capped at 15 fps and holds 15.1
-    // through the ordinary push, so the direct path was buying headroom above
-    // a ceiling the shipping build never reaches. Re-enabling it needs the
-    // framebuffer pair to have exactly one owner: either LVGL renders into its
-    // own buffer and the animation owns the panel's, or the flip is taken away
-    // from presentFrame() and driven by whoever LVGL thinks is current. Until
-    // one of those is true this must stay off, and the scan-out slip counter
-    // will not catch it if it goes wrong -- it read 0.032%, a healthy display,
-    // through the whole fault.
+    // The dual-ownership reading above was wrong, and the real cause is now
+    // known. lvgl_helper_suppress_flush() already moves LVGL off the pair
+    // before start(), correctly ordered, and the doubling survived it. What
+    // actually produced it: bandBuf[] is the GDMA transfer SOURCE and it lands
+    // in cached PSRAM, so the CPU rendered each band into the data cache while
+    // the engine read PSRAM underneath and got the slot's previous occupant.
+    // With NUM_SLOTS 2 that is the band from two bands earlier, which a
+    // row-encoded framebuffer dump measured as a clean -16 row offset across
+    // the panel. The writeback meant to prevent it was refused every call for
+    // being 36 and 40 bytes off a 64 byte cache line, and only said so on a
+    // serial port nobody was reading. Aligning the allocation fixed it.
+    //
+    // The remaining reason this stayed off was that no instrument could see a
+    // tear: framebuffer content is identical whether or not it was written
+    // while being scanned, so the dump calls a torn frame perfect, and the
+    // slip counter read 0.032% -- a healthy display -- through the whole
+    // fault. presentFrame() now grounds that: on_frame_buf_complete confirms
+    // which buffer the panel is reading, and any frame rendered into it is
+    // counted (tear_live over tear_checked on /api/debug/anim).
+    //
+    // Measured after both fixes, under WiFi load and repeated brew cycling:
+    // 0 tearing frames in 8,570 checked with 0 unconfirmed flips, and 0
+    // misplaced rows in 26,400. The path this switch enables is also the only
+    // one that CAN reach zero -- the ordinary push hands esp_lcd a pointer
+    // outside the framebuffers, and vendor rgb_panel_draw_bitmap then copies
+    // it straight into the buffer being scanned, every band of every frame.
     std::atomic<bool> directPushOn{false};
+    // What the next frame should switch to. Never read inside a frame.
+    //
+    // directPushOn is read per band in renderFrame() and again in
+    // presentFrame(), and the two paths balance the framebuffer gate
+    // differently: the direct path queues DMA whose completion interrupt gives
+    // the gate back, the ordinary path does not. Change it between those two
+    // reads and the gate is left unbalanced -- the render task then blocks on
+    // it forever, which also blocks LVGL's pushColors, and the panel freezes
+    // holding whatever half-composed frame was on it. Observed exactly that,
+    // live, from the debug endpoint: scan-out kept running at 45 fps and the
+    // controller task kept updating temperature while the picture stood still.
+    //
+    // So the setting is latched once per frame at the top of renderLoop(), the
+    // same place and for the same reason as frameParity.
+    // Default on: see directPushOn above for why this is now the path that
+    // reaches zero tearing rather than the one that caused the doubling.
+    std::atomic<bool> directPushWanted{true};
     bool dmaActive = false; // fbDirect resolved AND the engine installed
     // The panel's framebuffers. With two, the frame is composed in the one the
     // scan-out is not reading and shown by flipping at the end of the frame, so
@@ -485,6 +617,20 @@ class SleepAnimation {
     uint16_t *fbDirect[FB_MAX] = {};
     int fbCount = 0;
     int fbBack = 0; // the buffer this frame is being composed into
+    // Render one extra frame into the other buffer before the first flip.
+    //
+    // beginDirectPath() has to pick a starting fbBack and there is no way to
+    // ask esp_lcd which buffer it is scanning -- cur_fb_index is private to
+    // esp_lcd_panel_rgb.c and no getter is exported. So it guesses 1, assuming
+    // LVGL left buffer 0 on screen, and LVGL's direct-mode parity is whatever
+    // it happened to land on since boot. Guess wrong and the animation's first
+    // full band sweep goes straight into the live buffer.
+    //
+    // Priming sidesteps the guess instead of trying to win it: fill BOTH
+    // buffers before presenting, and whichever one is really on screen already
+    // holds a correct frame. Costs one extra render at animation start.
+    bool primePending = false;
+    size_t fbBytes = 0;   // one framebuffer, for the per-frame cache invalidate
     bool dmaInstallTried = false;
 #ifndef GAGGIMATE_SIM
     // The native engine. Kept beside the panel's framebuffer pointers
@@ -498,10 +644,84 @@ class SleepAnimation {
     bool gateWarned = false;    // one warning per run, not one per frame
     bool frameGateHeld = false; // the framebuffer gate is taken for this frame's transfers
     bool beginDirectPath();
+    void verifyBandPlacement();
     void presentFrame();
     void endDirectPath();
     std::atomic<uint32_t> dmaIssued{0};
     std::atomic<uint32_t> dmaErrors{0};
+    // Cache writeback outcomes for the GDMA source band. Both directions are
+    // counted so "it is working" is a positive reading rather than the absence
+    // of a complaint.
+    std::atomic<uint32_t> msyncFails{0};
+    std::atomic<uint32_t> msyncOks{0};
+
+    // Framebuffer placement verifier.
+    //
+    // Every instrument this file carried was blind to the fault the panel
+    // actually shows: a block of lines displaying content that belongs to a
+    // different Y. tear_live compares the scan-out buffer against the render
+    // target and cannot see it; the scan-out slip counters live in the panel
+    // driver and cannot see it either, because the framebuffer is already
+    // wrong by the time it is scanned. Both read clean while the picture was
+    // visibly displacing, and every "clean" conclusion drawn from them was
+    // worthless.
+    //
+    // So check the thing itself. Each band's rendered content gets a signature
+    // taken from the middle of its first row -- the middle, because column 0 is
+    // outside the round panel's circle and is the same black on every band,
+    // which would make the signature collide everywhere. presentFrame() then
+    // recomputes the signature from the framebuffer it is about to present, at
+    // the row that band was rendered for, and compares. A mismatch is a band
+    // that did not land where it belonged.
+    //
+    // On a mismatch the other bands' signatures are searched for the content
+    // that DID land there, which turns "something is wrong" into the exact
+    // displacement in bands -- the number that separates a stale slot (a fixed
+    // offset of NUM_SLOTS) from anything else.
+    uint16_t fbCheckCursor = 0;
+    std::atomic<uint32_t> fbChecked{0};
+    std::atomic<uint32_t> fbMismatch{0};
+    std::atomic<int32_t> fbLastBand{-1};    // band index that held wrong content
+    std::atomic<int32_t> fbLastSource{-1};  // band whose content was there instead
+    std::atomic<int32_t> fbLastDelta{0};    // source - band, in bands
+    std::atomic<uint32_t> lastInvalUs{0};   // cost of the pre-flip cache invalidate
+    // Tearing instrument. scanFb is which framebuffer the panel was last
+    // CONFIRMED to be scanning, set only after on_frame_buf_complete has fired
+    // for a flip, and -1 when that confirmation timed out. liveWrites counts
+    // frames rendered into that buffer, which is the only way this path can
+    // tear; liveWriteClean counts the frames that were checked and were fine,
+    // so a zero is distinguishable from a check that never ran.
+    std::atomic<int> scanFb{-1};
+    std::atomic<uint32_t> liveWrites{0};
+    std::atomic<uint32_t> liveWriteClean{0};
+    std::atomic<uint32_t> flipTimeouts{0};
+    // How long the last presentFrame() spent waiting for the scan-out to leave
+    // the buffer the next frame overwrites. Render-task only, so a plain
+    // member. Subtracted from the frame time before autoResolution judges it.
+    uint32_t lastFlipWaitUs = 0;
+    // Per-frame stage costs, render-task only so plain members. Published at
+    // the end of each frame into the atomics below.
+    uint32_t profBandUs = 0;   // the animation's own per-pixel field work, plus the half-res expansion
+    uint32_t profExpandUs = 0; // just the 2x2 expansion inside profBandUs, zero at full resolution
+    uint32_t profFillUs = 0;   // the x2 fill of the even output row, inside profExpandUs
+    uint32_t profCopyUs = 0;   // duplicating that row into the odd one, inside profExpandUs
+    uint32_t profBlendUs = 0; // compositing the widget overlay into the band
+    uint32_t profMsyncUs = 0; // cache writeback of the GDMA source band
+    uint32_t profPushUs = 0;  // handing the band to the DMA engine
+    // Frame time split, for working out what actually caps the frame rate:
+    // total wall clock, the part that was work, and the part that was waiting
+    // for the panel. Reported rather than reasoned about, because the first
+    // guess at this (autoResolution being the cap) was wrong.
+    std::atomic<uint32_t> lastFrameUs{0};
+    std::atomic<uint32_t> lastWorkUs{0};
+    std::atomic<uint32_t> lastWaitUs{0};
+    std::atomic<uint32_t> lastBandUs{0};
+    std::atomic<uint32_t> lastExpandUs{0};
+    std::atomic<uint32_t> lastFillUs{0};
+    std::atomic<uint32_t> lastCopyUs{0};
+    std::atomic<uint32_t> lastBlendUs{0};
+    std::atomic<uint32_t> lastMsyncUs{0};
+    std::atomic<uint32_t> lastPushUs{0};
     // Core the async-memcpy completion interrupt is bound to. Deliberately not
     // the render core: the RGB panel driver's ISR is on core 1 and must not
     // queue behind ours.
@@ -511,9 +731,10 @@ class SleepAnimation {
     // round, so the corners of the 480x480 rectangle are never visible and
     // pushing them is wasted PSRAM bandwidth. One rectangle per band (the
     // widest row in it), since pushColors takes a rectangle.
-    static constexpr int MAX_BANDS = 64; // 480 rows / BAND_H, with headroom
+    static constexpr int MAX_BANDS = 256; // 480 rows / BAND_H, with headroom
     int16_t bandX0[MAX_BANDS] = {};
     int16_t bandX1[MAX_BANDS] = {};
+    uint32_t bandSig[MAX_BANDS] = {}; // see the framebuffer placement verifier above
     void computeChords(int w, int h);
     static void pushTaskEntry(void *arg);
     void pushLoop();
@@ -526,9 +747,15 @@ class SleepAnimation {
     // The bench measures what the pipeline can do, so it must not sit against
     // the shipping frame cap -- a throttled frame reports the cap, not the cost.
     std::atomic<uint8_t> maxFps{60};
+    // Diagnostic frame cap, 0 for off. Separate from maxFps because DefaultUI
+    // re-applies the stored cap on every UI pass and would stomp a value
+    // written from the debug endpoint within a frame or two.
+    std::atomic<uint8_t> fpsOverride{0};
 #else
     std::atomic<uint8_t> maxFps{30};
+    std::atomic<uint8_t> fpsOverride{0};
 #endif
+    std::atomic<bool> testPattern{false};
     int initializedAnimId = -1; // last id whose init() ran on the render task
     // Which animation currently holds allocated tables, or -1 for none. Kept
     // apart from initializedAnimId because start() clears that one to force an
@@ -591,10 +818,11 @@ class SleepAnimation {
 #endif
 };
 
-#ifdef GM_ANIM_BENCH
 // The running instance, so the web plugin can publish results without the
 // whole UI object graph being reachable from it. Null until start() runs.
 SleepAnimation *sleep_animation_bench_instance();
+
+#ifdef GM_ANIM_BENCH
 
 // Why the animation is or is not running. maintainSleepAnimation() has several
 // gates and none of them are visible from outside the UI, which makes a

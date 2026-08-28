@@ -25,7 +25,12 @@
 constexpr unsigned long BENCH_DWELL_MS = 6000;
 #define GM_BENCH_LOCK_ONE_BAND 1
 #else
-#define BENCH_T0(v) ((void)0)
+// The timestamp itself is taken in every build now: the per-stage profile
+// exposed on /api/debug/anim needs these marks, and the fault being chased only
+// reproduces on the load rig, which is not a bench build. Marked unused because
+// not every mark has a consumer outside the bench. BENCH_ACC stays compiled out
+// so the bench's own accumulators do not exist here.
+#define BENCH_T0(v) const int64_t v __attribute__((unused)) = esp_timer_get_time()
 #define BENCH_ACC(acc, t0) ((void)0)
 // Constant-false, so the suspend branch in renderFrame folds away entirely in
 // shipping builds rather than being compiled and never taken.
@@ -50,7 +55,14 @@ namespace {
 // actually took has never been benched directly; scaling the measured number
 // linearly puts it nearer 0.9 ms than 1.3 ms, so 40.6 fps is a conservative
 // floor rather than a measurement of the current configuration.
-constexpr int BAND_H = 8;
+constexpr int BAND_H = 2;
+
+// Longest the render task will wait for the scan-out to leave the buffer it is
+// about to overwrite, in milliseconds. One panel frame is ~23 ms at the shipped
+// pixel clock; this is a backstop for a panel that has stopped refilling at all,
+// not a tuning knob. Timing out draws a torn frame, which is strictly better
+// than blocking the render task forever.
+constexpr int FLIP_WAIT_MAX_MS = 60;
 // Headroom for the snapshot's ext draw size (shadows etc. extend the render
 // area past the object on every side).
 constexpr int OVERLAY_EXT_MARGIN = 16;
@@ -565,13 +577,17 @@ void SleepAnimation::configure(uint8_t id, const uint8_t p[4]) {
 #endif
 }
 
-#ifdef GM_ANIM_BENCH
+// Not bench-gated. The two framebuffer-ownership settings this exposes each
+// produce a distinct, visible defect, and telling them apart takes a person
+// looking at the panel while the setting changes underneath them. Gating that
+// behind a build flag means every comparison costs a reflash, which is how a
+// wrong default shipped: the direct path was switched off on the strength of a
+// counter that cannot see either defect.
 namespace {
 SleepAnimation *g_benchInstance = nullptr;
 } // namespace
 
 SleepAnimation *sleep_animation_bench_instance() { return g_benchInstance; }
-#endif
 
 // Both of these are reached from the GDMA completion interrupt, which is
 // IRAM_ATTR and can run with the flash cache disabled, so neither may hide
@@ -595,9 +611,7 @@ void SleepAnimation::start(Display *d) {
     if (running || !stopped || d == nullptr) {
         return;
     }
-#ifdef GM_ANIM_BENCH
     g_benchInstance = this;
-#endif
     display = d;
     // Until the animation has covered the screen once, the rows an interlaced
     // frame skips still hold the previous screen's pixels, so the first frames
@@ -607,20 +621,66 @@ void SleepAnimation::start(Display *d) {
     const int h = display->height();
     for (int i = 0; i < NUM_SLOTS; i++) {
         if (bandBuf[i] == nullptr) {
-            // 64-byte aligned and DMA-capable, because on the direct path these
-            // are the transfer source. The fallback keeps the ordinary push
-            // path working if the aligned allocator cannot find a contiguous
-            // block.
-#ifdef GM_ANIM_BENCH
-            // Only the bench build can reach the GDMA push path (benchSetDma is
-            // compiled out otherwise), and only that path needs these to be a
-            // legal transfer source.
-            bandBuf[i] = static_cast<uint16_t *>(
-                heap_caps_aligned_alloc(64, w * BAND_H * sizeof(uint16_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA));
-            if (bandBuf[i] == nullptr)
-#endif
-            {
-                bandBuf[i] = static_cast<uint16_t *>(allocPreferInternal(w * BAND_H * sizeof(uint16_t)));
+            // 64-byte aligned wherever it lands, because on the direct path
+            // these are the GDMA transfer source and a PSRAM source has to be
+            // written back out of the data cache before the engine reads it.
+            //
+            // esp_cache_msync refuses any address that is not a multiple of the
+            // 64 B cache line unless ESP_CACHE_MSYNC_FLAG_UNALIGNED is passed,
+            // and it refuses by returning before the writeback runs. The old
+            // PSRAM fallback went through allocPreferInternal to a bare
+            // ps_malloc, which returned 0x...964 and 0x...7e8, i.e. 36 and 40
+            // mod 64. So every writeback silently did nothing and logged an
+            // error instead, at 82 lines/second, which stalled the render task
+            // enough on the UART that the dirty lines got evicted by ordinary
+            // cache pressure before the DMA read them. That looked like a fix.
+            //
+            // Aligning the allocation makes the strict call succeed on its own
+            // terms. Deliberately NOT ESP_CACHE_MSYNC_FLAG_UNALIGNED: that
+            // rounds the writeback out to the enclosing lines and would push
+            // whatever heap allocation shares the first and last line out with
+            // it.
+            //
+            // Internal DMA-capable first, PSRAM second, and the internal
+            // attempt goes through internalHasRoomFor's veto rather than
+            // straight to the allocator.
+            //
+            // Internal SRAM is the better home: GDMA reads it directly, so
+            // there is no cache writeback and no coherency step to get wrong.
+            // It is also unaffordable. Asking the raw allocator without the
+            // veto succeeded, put both slots in SRAM, rendered the panel
+            // perfectly -- and took WiFi down completely, repeating
+            // 4WAY_HANDSHAKE_TIMEOUT with the STA down for 170 s, because the
+            // WPA handshake allocates from the same pool these 15,360 B came
+            // out of. That is the same failure the bounce-buffer depth
+            // experiment hit at 12 lines, from the same budget.
+            //
+            // So the veto stays, and the realistic placement is aligned PSRAM
+            // with a working writeback.
+            //
+            // EXPERIMENT (BAND_H=4): the veto above is INTERNAL_RESERVE, 48 KB,
+            // and it was sized when a slot was 7,680 B. At BAND_H=4 a slot is
+            // 3,840 B and both slots together are 7,680 B -- exactly half of
+            // the 15,360 B that took WiFi down. halfBuf already proved a small
+            // internal allocation is survivable, so the band buffers get their
+            // own reserve on the same principle, and this has to be validated
+            // against a real WPA association before it can ship.
+            const size_t bandBytes = static_cast<size_t>(w) * BAND_H * sizeof(uint16_t);
+            constexpr size_t BANDBUF_RESERVE = 32 * 1024;
+            if (heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA | MALLOC_CAP_8BIT) >=
+                bandBytes + BANDBUF_RESERVE) {
+                bandBuf[i] = static_cast<uint16_t *>(
+                    heap_caps_aligned_alloc(64, bandBytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA));
+            }
+            if (bandBuf[i] == nullptr && bganim::internalHasRoomFor(bandBytes)) {
+                bandBuf[i] = static_cast<uint16_t *>(
+                    heap_caps_aligned_alloc(64, bandBytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA));
+            }
+            if (bandBuf[i] == nullptr) {
+                bandBuf[i] = static_cast<uint16_t *>(heap_caps_aligned_alloc(64, bandBytes, MALLOC_CAP_SPIRAM));
+            }
+            if (bandBuf[i] == nullptr) {
+                bandBuf[i] = static_cast<uint16_t *>(allocPreferInternal(bandBytes));
             }
         }
         if (bandReady[i] == nullptr) {
@@ -631,7 +691,33 @@ void SleepAnimation::start(Display *d) {
         }
     }
     if (halfBuf == nullptr) {
-        halfBuf = static_cast<uint16_t *>(allocPreferInternal((w / 2) * (BAND_H / 2) * sizeof(uint16_t)));
+        // 1,920 B, and where it lands dominates the half-resolution path.
+        //
+        // The 2x2 expansion reads this buffer once per output pixel pair while
+        // streaming writes into band[] in PSRAM. Moving it here is worth a
+        // measured 5.4 ms/frame: the half-resolution anim.band() render went
+        // from 15,830 us to 10,405 us against a 46,546 us full-resolution
+        // render, i.e. from 0.34 of full to 0.22, which is what the quarter
+        // pixel count predicts. It does NOT speed up the expansion itself --
+        // that is bounded by PSRAM write bandwidth to band[] (~15 MB/s) and no
+        // arrangement of the loop moves it.
+        //
+        // allocPreferInternal weighs it against INTERNAL_RESERVE
+        // (48 KB), which is sized for the multi-kilobyte band buffers and sends
+        // this 1,920 B allocation to PSRAM for want of headroom it does not
+        // need. 15,360 B of band buffers in internal SRAM provably kills the
+        // WPA handshake; 1,920 B is eight times smaller, so it gets its own
+        // reserve rather than the band buffers'.
+        constexpr size_t HALFBUF_RESERVE = 32 * 1024;
+        const size_t halfBytes = static_cast<size_t>(w / 2) * (BAND_H / 2) * sizeof(uint16_t);
+        if (heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA | MALLOC_CAP_8BIT) >= halfBytes + HALFBUF_RESERVE) {
+            halfBuf = static_cast<uint16_t *>(heap_caps_malloc(halfBytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+        }
+        if (halfBuf == nullptr) {
+            halfBuf = static_cast<uint16_t *>(allocPreferInternal(halfBytes));
+        }
+        log_i("SleepAnimation: halfBuf %u B at %p (%s)", static_cast<unsigned>(halfBytes), halfBuf,
+              halfBuf == nullptr ? "FAILED" : (esp_ptr_external_ram(halfBuf) ? "PSRAM" : "internal"));
     }
     if (scrimInvPx == nullptr) {
         // One panel row of per-pixel dim factors for the vector scrim. Internal
@@ -834,6 +920,7 @@ bool SleepAnimation::beginDirectPath() {
         // nothing to flip to and the path degrades to writing the live buffer,
         // which is what it did before -- fast, and it tears.
         fbBack = fbCount > 1 ? 1 : 0;
+        primePending = fbCount > 1;
     }
     // Without the gate the direct path cannot be made coherent against
     // pushColors, so refuse it rather than run a known race.
@@ -851,7 +938,7 @@ bool SleepAnimation::beginDirectPath() {
     // Whatever LVGL last drew is still sitting in dirty cache lines over this
     // region. Those must reach PSRAM before DMA starts writing there, or a
     // later eviction drops a stale line on top of a rendered band.
-    const size_t fbBytes = static_cast<size_t>(display->width()) * display->height() * 2;
+    fbBytes = static_cast<size_t>(display->width()) * display->height() * 2;
     for (int i = 0; i < fbCount; i++) {
         esp_cache_msync(fbDirect[i], fbBytes, ESP_CACHE_MSYNC_FLAG_DIR_C2M);
     }
@@ -1334,19 +1421,179 @@ void SleepAnimation::taskEntry(void *arg) {
 // this task learns the frame's last transfer has landed, because the completion
 // interrupt is what gives it back. Presenting before that would flip to a
 // buffer whose bottom bands are still in flight.
+// Signature of a band's content, taken from the middle of its first row.
+//
+// The middle and not the start: column 0 sits outside the round panel's circle
+// on every band and holds the same black, so a signature taken there would be
+// identical for every band and the comparison would pass no matter where the
+// content landed. 32 pixels is one 64-byte cache line, which is also the
+// smallest read the framebuffer can serve.
+static inline uint32_t bandSignature(const uint16_t *row, int w) {
+    const uint16_t *p = row + (w / 2);
+    uint32_t h = 2166136261u;
+    for (int i = 0; i < 32; i++) {
+        h = (h ^ p[i]) * 16777619u;
+    }
+    return h;
+}
+
+// Checks that the bands of the frame about to be presented actually landed at
+// the rows they were rendered for. See SleepAnimation.h for why this exists.
+//
+// Runs after the M2C invalidate, so these reads see what the panel will scan
+// rather than a cached copy of what the CPU last wrote. A rotating window
+// rather than the whole frame: each band costs one cold PSRAM cache line, and
+// at 43 frames a second a window of 12 still covers all 240 bands about twice
+// a second, which is far denser than the fault has ever been observed.
+void SleepAnimation::verifyBandPlacement() {
+    if (display == nullptr || fbDirect[fbBack] == nullptr) {
+        return;
+    }
+    const int w = display->width();
+    const int h = display->height();
+    const int nBands = h / BAND_H;
+    if (nBands <= 0 || nBands > MAX_BANDS || w < 64) {
+        return;
+    }
+    constexpr int WINDOW = 12;
+    for (int k = 0; k < WINDOW; k++) {
+        const int bi = (fbCheckCursor + k) % nBands;
+        const uint16_t *fbRow = fbDirect[fbBack] + static_cast<size_t>(bi) * BAND_H * w;
+        const uint32_t got = bandSignature(fbRow, w);
+        fbChecked.fetch_add(1);
+        if (got == bandSig[bi]) {
+            continue;
+        }
+        fbMismatch.fetch_add(1);
+        // Find which band's content is sitting here instead. A stale DMA slot
+        // gives a fixed offset of NUM_SLOTS; anything else points elsewhere.
+        int src = -1;
+        for (int j = 0; j < nBands; j++) {
+            if (j != bi && bandSig[j] == got) {
+                src = j;
+                break;
+            }
+        }
+        fbLastBand.store(bi);
+        fbLastSource.store(src);
+        fbLastDelta.store(src < 0 ? 0 : (src - bi));
+    }
+    fbCheckCursor = static_cast<uint16_t>((fbCheckCursor + WINDOW) % nBands);
+}
+
 void SleepAnimation::presentFrame() {
     // directPushOn as well as dmaActive: with the direct path switched off the
     // bands go through pushColors, which writes whichever buffer esp_lcd counts
     // as current, so flipping underneath it would show a buffer nothing wrote.
     if (!dmaActive || !directPushOn.load() || fbCount < 2 || display == nullptr) {
+        // No flip, so no wait to discount. Clearing it matters: renderLoop
+        // subtracts this from the frame time before judging resolution, and a
+        // value left over from the last direct-path frame would credit work
+        // that did not happen on this one.
+        lastFlipWaitUs = 0;
         return;
     }
     display->lockFrameBuffer();
+    // Drop this buffer from the data cache now that the frame's transfers have
+    // landed, so the scan-out reads what DMA actually wrote.
+    //
+    // The bands went in over GDMA, which does not pass through the cache. The
+    // bounce refill reads the framebuffer with an ordinary CPU memcpy, which
+    // does (lcd_rgb_panel_fill_bounce_buffer in esp_lcd_panel_rgb.c). So every
+    // line still cached over this region from an earlier CPU write -- LVGL
+    // before the handoff, or pushColors -- keeps being served to the panel in
+    // place of the pixels DMA replaced. That is persistent, not transient,
+    // because the stale copy wins every time it is read, and it is exactly the
+    // hazard LilyGo_RGBPanel::pushColors already documents in the other
+    // direction.
+    //
+    // beginDirectPath() writes back once at install, which gets LVGL's dirty
+    // lines out to PSRAM, but nothing invalidated afterwards: those lines stay
+    // resident and clean, and clean-but-stale is what the refill then reads.
+    // Measured as the whole frame composited twice at an offset, in the
+    // framebuffer's own pixels, on ~85% of frames, with zero scan-out slips.
+    //
+    // Safe to discard rather than write back: while the direct path is active
+    // this task is the only writer, and it writes behind the cache.
+    if (fbBytes != 0) {
+        // Marked for the correlation log. This invalidates 460,800 bytes, or
+        // 7,200 cache lines, in one uninterrupted call once per animation
+        // frame, and it is the same work in every render configuration -- which
+        // is why half versus full resolution and DMA versus pushColors all
+        // measured the same lag rate. If refill lag clusters right after this
+        // mark, this is the stall.
+        panelclock::scanoutMark(panelclock::SCANOUT_ACT_PRESENT);
+        const int64_t tInval = esp_timer_get_time();
+        esp_cache_msync(fbDirect[fbBack], fbBytes, ESP_CACHE_MSYNC_FLAG_DIR_M2C);
+        lastInvalUs.store(static_cast<uint32_t>(esp_timer_get_time() - tInval));
+    }
+    verifyBandPlacement();
     // Empty dirty range: everything in this buffer arrived over DMA, straight
     // into PSRAM, so there is nothing in the cache to write back.
+    const int presented = fbBack;
     display->presentFrameBuffer(fbBack, 0, 0);
     display->unlockFrameBuffer();
     fbBack ^= 1;
+
+    // Wait for the scan-out to actually leave the buffer we are about to start
+    // overwriting. presentFrameBuffer() does NOT flip it: esp_lcd's
+    // rgb_panel_draw_bitmap only assigns cur_fb_index when the draw pointer is
+    // inside a framebuffer, and the bounce refill keeps reading the OLD buffer
+    // through bb_fb_index until bounce_pos_px wraps a whole frame
+    // (esp_lcd_panel_rgb.c, the bb_fb_index = cur_fb_index assignment in
+    // lcd_rgb_panel_fill_bounce_buffer). Only at that wrap does
+    // on_frame_buf_complete fire.
+    //
+    // The frame gate above proves our own last GDMA band landed. It says
+    // nothing about the beam. Without this wait the render task returns and
+    // immediately begins writing the buffer the panel is still scanning, every
+    // frame -- which is why the direct path garbled 100% of frames while the
+    // ordinary path, which merely races occasionally, garbled 35%.
+    //
+    // on_frame_buf_complete is exactly that wrap and PanelClock already counts
+    // it as `refills`, so this waits for one increment rather than registering
+    // a second callback (esp_lcd takes one callback struct, and PanelClock owns
+    // it). Polling with a 1 ms sleep: the wait is at most one panel frame
+    // (~23 ms) and the render task runs at 12 fps, so the granularity costs
+    // nothing and no ISR-side signalling has to be added.
+    //
+    // Bounded, because a panel that has stopped refilling must not wedge the
+    // render task -- that failure mode has already cost one frozen display.
+    //
+    // The wait is also the instrument for tearing, which is why `presented` is
+    // carried down here. A tear on this path can only happen by writing the
+    // buffer the panel is reading, and nothing in the framebuffer's own pixels
+    // records that: a torn frame holds exactly the bytes the compositor meant
+    // to write, so the row-encoded dump calls it perfect. Only the timing is
+    // wrong, and the timing is what this wait observes.
+    //
+    // on_frame_buf_complete fires when the driver has taken cur_fb_index into
+    // bb_fb_index, so once it has fired, "the panel is scanning `presented`" is
+    // an observation rather than a belief. That matters because the alternative
+    // -- mirroring the driver's flip logic in our own accounting -- would only
+    // ever prove we agree with ourselves, and would read a clean zero while
+    // writing live every frame if beginDirectPath's starting guess were wrong.
+    // Grounding it here retires that guess after the first present.
+    uint32_t f0 = 0, r0 = 0, s0 = 0;
+    panelclock::scanoutStats(&f0, &r0, &s0);
+    const int64_t waitStart = esp_timer_get_time();
+    for (int waited = 0; waited < FLIP_WAIT_MAX_MS; waited++) {
+        uint32_t f = 0, r = 0, sl = 0;
+        panelclock::scanoutStats(&f, &r, &sl);
+        if (r != r0) {
+            scanFb.store(presented);
+            lastFlipWaitUs = static_cast<uint32_t>(esp_timer_get_time() - waitStart);
+            return;
+        }
+        vTaskDelay(pdMS_TO_TICKS(1));
+    }
+    lastFlipWaitUs = static_cast<uint32_t>(esp_timer_get_time() - waitStart);
+    // Timed out, so the flip was never confirmed and which buffer is being
+    // scanned is genuinely unknown. Say so rather than carrying a stale belief
+    // forward: -1 makes the live-write check abstain instead of reporting a
+    // reassuring zero it cannot justify.
+    flipTimeouts++;
+    scanFb.store(-1);
 }
 
 // Pick the render resolution for the running animation, once, by measuring it.
@@ -1381,6 +1628,15 @@ void SleepAnimation::autoResolution(int id, int fps, int64_t frameUs, int64_t bu
     constexpr uint8_t SKIP_FRAMES = 3;
     constexpr uint8_t WINDOW_FRAMES = 6;
 
+    const int8_t forced = halfForce.load();
+    if (forced >= 0) {
+        // Pinned by the debug override: hold it and stop measuring, so a
+        // capture runs at the resolution it says it does.
+        halfRes.store(forced != 0);
+        autoResAnim = id;
+        autoResSettled = true;
+        return;
+    }
     if (!halfResAllowed.load()) {
         // Forbidden outright, so there is nothing to decide.
         if (halfRes.load()) {
@@ -1403,6 +1659,35 @@ void SleepAnimation::autoResolution(int id, int fps, int64_t frameUs, int64_t bu
         return;
     }
     if (autoResSettled) {
+        // Settled is not permanent. The probe window is six frames, which is
+        // short enough to land entirely inside a cheap stretch and then hold
+        // that verdict for the rest of the animation: measured at full
+        // resolution holding while the sustained work mean was ~78,000 us
+        // against a 66,667 us budget, i.e. 8.6 fps on a 15 fps target, because
+        // the window happened to catch the cheap frames.
+        //
+        // So keep watching, and re-probe only when the long-run mean disagrees
+        // with the standing decision by a clear margin. Cheap to do (one add
+        // and a compare per frame) and it cannot oscillate on noise: the
+        // window is 300 frames, roughly half a minute, and the thresholds are
+        // deliberately apart -- full res must be over budget, half res must be
+        // comfortably under a third of it before paying an init() to go back.
+        constexpr uint32_t RECHECK_FRAMES = 300;
+        autoResPostUs += static_cast<uint64_t>(frameUs);
+        if (++autoResPostFrames < RECHECK_FRAMES) {
+            return;
+        }
+        const int64_t mean = static_cast<int64_t>(autoResPostUs / autoResPostFrames);
+        autoResPostUs = 0;
+        autoResPostFrames = 0;
+        const bool half = halfRes.load();
+        const bool wrongAtFull = !half && mean > budgetUs;
+        const bool wrongAtHalf = half && mean * 3 < budgetUs;
+        if (wrongAtFull || wrongAtHalf) {
+            log_i("SleepAnimation: re-probing resolution, %lld us mean against %lld us budget at %s",
+                  static_cast<long long>(mean), static_cast<long long>(budgetUs), half ? "half" : "full");
+            autoResAnim = -1; // forces a fresh probe on the next call
+        }
         return;
     }
     if (autoResSeen < SKIP_FRAMES) {
@@ -1445,8 +1730,38 @@ void SleepAnimation::renderLoop() {
         } else {
             endDirectPath();
         }
+        // Latch the framebuffer-ownership setting for the whole frame. It is
+        // read per band by renderFrame() and again by presentFrame(), and
+        // those two paths balance the framebuffer gate differently, so a
+        // change landing between them deadlocks the render task. Safe here:
+        // the previous presentFrame() took the gate, which is how it learned
+        // the last transfer had landed, so nothing is in flight right now.
+        directPushOn.store(directPushWanted.load());
+        // Tearing check, taken before a single byte of this frame is written.
+        // If the buffer we are about to render into is the one the panel was
+        // last confirmed to be scanning, this frame tears by construction. A
+        // scanFb of -1 means the last flip was never confirmed, so abstain.
+        if (directPushOn.load() && fbCount > 1) {
+            const int sf = scanFb.load();
+            if (sf >= 0) {
+                if (sf == fbBack) {
+                    liveWrites++;
+                } else {
+                    liveWriteClean++;
+                }
+            }
+        }
         const int64_t frameStart = esp_timer_get_time();
         renderFrame();
+        // First frame of the direct path: fill the other buffer too, so the
+        // one the panel is really scanning holds a good frame whichever it is.
+        // See primePending -- esp_lcd exports no way to read cur_fb_index, so
+        // beginDirectPath() can only guess which buffer it started on.
+        if (primePending && dmaActive && directPushOn.load() && fbCount > 1) {
+            primePending = false;
+            fbBack ^= 1;
+            renderFrame();
+        }
         presentFrame();
         // Once per frame, not once per band: every band of a frame must push
         // the same parity or the two halves of the picture drift apart.
@@ -1473,14 +1788,41 @@ void SleepAnimation::renderLoop() {
             fpsWindowStart = now;
         }
 
-        int fps = maxFps.load();
-        fps = fps < 5 ? 5 : (fps > 60 ? 60 : fps);
+        int fps = fpsOverride.load();
+        if (fps == 0) {
+            fps = maxFps.load();
+        }
+        fps = fps < 1 ? 1 : (fps > 60 ? 60 : fps);
         const int64_t targetFrameUs = 1000000 / fps;
         const int64_t elapsed = esp_timer_get_time() - frameStart;
 #ifndef GM_ANIM_BENCH
         // Bench builds drive the resolution explicitly, and a probe moving it
         // underneath a sweep would average two configurations into one number.
-        autoResolution(animId.load(), fps, elapsed, targetFrameUs);
+        //
+        // autoResolution is asked how long the frame's WORK took, not how long
+        // the frame took. presentFrame() ends by waiting for the scan-out to
+        // leave the buffer the next frame will overwrite, which is up to one
+        // panel frame (~23 ms) of vTaskDelay and is idle, not compute. Charging
+        // it to the budget makes a frame that comfortably fits look like an
+        // overrun, and the animation then drops to half resolution to pay back
+        // time it never spent. Half resolution has a real quality cost, so this
+        // has to be judged on the work.
+        //
+        // The pacing sleep below deliberately still uses the full wall clock:
+        // the wait is real elapsed time whatever its cause, and double-counting
+        // it there would run the loop fast.
+        const int64_t workUs = elapsed - static_cast<int64_t>(lastFlipWaitUs);
+        autoResolution(animId.load(), fps, workUs > 0 ? workUs : elapsed, targetFrameUs);
+        lastWorkUs.store(static_cast<uint32_t>(workUs > 0 ? workUs : elapsed));
+        lastFrameUs.store(static_cast<uint32_t>(elapsed));
+        lastWaitUs.store(lastFlipWaitUs);
+        lastBandUs.store(profBandUs);
+        lastExpandUs.store(profExpandUs);
+        lastFillUs.store(profFillUs);
+        lastCopyUs.store(profCopyUs);
+        lastBlendUs.store(profBlendUs);
+        lastMsyncUs.store(profMsyncUs);
+        lastPushUs.store(profPushUs);
 #endif
         const int64_t remaining = targetFrameUs - elapsed;
         // Always yield at least one full tick so the UI task keeps polling
@@ -1582,6 +1924,19 @@ void SleepAnimation::benchFinishDwell() {
 #endif
 
 void SleepAnimation::renderFrame() {
+    // Per-frame cost breakdown, always on. Half resolution turned out to save
+    // only ~13 ms of a ~102 ms frame, which means the per-pixel field work is
+    // a minority of the cost and the rest was unaccounted for. Guessing at it
+    // twice already produced wrong answers, so measure the four stages
+    // directly. esp_timer_get_time is a few hundred ns and this adds ~480
+    // calls per frame, well under a millisecond.
+    profBandUs = 0;
+    profExpandUs = 0;
+    profFillUs = 0;
+    profCopyUs = 0;
+    profBlendUs = 0;
+    profMsyncUs = 0;
+    profPushUs = 0;
     // Cropping to the round panel's visible chord trades render-side work
     // (packing each band to a tight stride) for push-side work (fewer bytes to
     // PSRAM). Since the push runs on the other core now, that trade only pays
@@ -1703,6 +2058,33 @@ void SleepAnimation::renderFrame() {
 #endif
         if (!gotSlot) {
             log_w("SleepAnimation: push task stalled, dropping frame");
+            // Hand the framebuffer gate back before bailing, or the render task
+            // wedges permanently.
+            //
+            // On the direct path the gate is taken by the FIRST band of a frame
+            // and released by the completion interrupt of the LAST one, which
+            // is the only band that carries a release in its BandDone. Leaving
+            // here skips every remaining band, so no band is ever the last one,
+            // so no interrupt is coming: frameGateHeld stays true and the gate
+            // stays taken forever. presentFrame() runs unconditionally after
+            // renderFrame() returns and takes the same gate with
+            // portMAX_DELAY, so the render task blocks with nothing left that
+            // could wake it. Only a reset recovers, and the display simply
+            // freezes on its last frame while the web server keeps answering,
+            // which is why this never showed up as anything but a hang.
+            //
+            // Drain first, for the same reason the DMA submit failure below
+            // does: earlier bands of this frame may still be reading their
+            // slots and writing the framebuffer, and presentFrame() is about to
+            // invalidate that buffer's cache and flip it.
+            if (frameGateHeld) {
+                const unsigned long bailDrain = millis() + 50;
+                while (dmaIssued.load() != g_sleepAnimDmaDone && millis() < bailDrain) {
+                    taskYIELD();
+                }
+                display->unlockFrameBuffer();
+                frameGateHeld = false;
+            }
             return;
         }
         uint16_t *const band = bandBuf[renderSlot];
@@ -1796,27 +2178,48 @@ void SleepAnimation::renderFrame() {
             if (lockThisBand) {
                 xTaskResumeAll();
             }
+            const int64_t tExpand = esp_timer_get_time();
             for (int sr = 0; sr < hrows; sr++) {
                 if (splitRender && ((srcBase + sr) & 1) != parityNow) {
                     continue; // its pair is not going out, so do not expand it
                 }
                 const uint16_t *__restrict src = halfBuf + static_cast<size_t>(sr) * rw;
-                uint32_t *__restrict d0 = reinterpret_cast<uint32_t *>(band + static_cast<size_t>(sr * 2) * w);
-                uint32_t *__restrict d1 = reinterpret_cast<uint32_t *>(band + static_cast<size_t>(sr * 2 + 1) * w);
-                // Both output rows in one pass. Each source pixel becomes a
-                // pair, so one 32-bit value covers both copies, and writing it
-                // to each row costs a second store rather than a second pass --
-                // the earlier shape read d0 back to fill d1, which spent a load
-                // per output word purely to re-fetch something already in a
-                // register. This is the whole frame at half resolution: 240
-                // rows x 240 words of avoidable loads.
+                uint16_t *const row0 = band + static_cast<size_t>(sr * 2) * w;
+                uint16_t *const row1 = row0 + w;
+                uint32_t *__restrict d0 = reinterpret_cast<uint32_t *>(row0);
+                // One output row per pass, then duplicate it, rather than
+                // writing both rows inside the same loop.
+                //
+                // The two-rows-in-one-pass shape that used to be here was
+                // chosen to avoid re-loading d0 to fill d1, counting the loads
+                // it saved. It cost far more than it saved: row0 and row1 are
+                // `w` pixels (960 B) apart, so alternating stores between them
+                // touch two different cache lines every iteration, and band[]
+                // lives in PSRAM, so each newly touched line is a write-allocate
+                // fill -- a 64 B read from PSRAM of data the loop is about to
+                // overwrite completely. Measured on device at half resolution:
+                // the expansion cost 31.2 ms per frame against the 15.8 ms of
+                // animation render it existed to enable, i.e. it consumed twice
+                // the work it saved and left half resolution worth only 14%.
+                //
+                // Filling one row sequentially keeps a single write stream, and
+                // the memcpy then reads a row that is still cache-resident and
+                // writes the next one linearly.
+                uint32_t *__restrict d1 = reinterpret_cast<uint32_t *>(row1);
+                const int64_t tFill = esp_timer_get_time();
                 for (int i = 0; i < rw; i++) {
                     const uint32_t v = src[i];
-                    const uint32_t pair = v | (v << 16);
-                    d0[i] = pair;
-                    d1[i] = pair;
+                    d0[i] = v | (v << 16);
                 }
+                const int64_t tCopy = esp_timer_get_time();
+                for (int i = 0; i < rw; i++) {
+                    const uint32_t v = src[i];
+                    d1[i] = v | (v << 16);
+                }
+                profFillUs += static_cast<uint32_t>(tCopy - tFill);
+                profCopyUs += static_cast<uint32_t>(esp_timer_get_time() - tCopy);
             }
+            profExpandUs += static_cast<uint32_t>(esp_timer_get_time() - tExpand);
         } else if (lockThisBand) {
             vTaskSuspendAll();
             anim.band(band, y0, rows, w, tMs, p);
@@ -1825,6 +2228,7 @@ void SleepAnimation::renderFrame() {
             anim.band(band, y0, rows, w, tMs, p);
         }
         BENCH_ACC(accBandUs, tBand);
+        profBandUs += static_cast<uint32_t>(esp_timer_get_time() - tBand);
 #ifdef GM_ANIM_BENCH
         accBandRows += static_cast<uint32_t>(rows);
         if (lockThisBand) {
@@ -1946,9 +2350,29 @@ void SleepAnimation::renderFrame() {
             }
         }
 #else
-        // The composite reads this below; without the bench build there is no
-        // pattern to substitute, so it folds away.
-        constexpr bool patternMode = false;
+        // Row-encoded test pattern, debug builds included, because the bench
+        // pattern above is compiled out of the load rig and the load rig is
+        // the only build that reproduces the fault.
+        //
+        // Every pixel of source row py carries py * 137, so a framebuffer dump
+        // says which row each row's bytes actually CAME FROM. That separates
+        // the two candidates for the direct path's doubling that no black-box
+        // test has been able to tell apart: if row py holds some other row's
+        // value the band-to-framebuffer address path is placing bands wrong,
+        // and if every row holds its own value the address path is correct and
+        // the duplicate is coming from the overlay composite or from a second
+        // writer. The composite is skipped while this is on so every pixel is
+        // predictable from its row alone.
+        const bool patternMode = debugPattern.load() != 0;
+        if (patternMode) {
+            for (int r = 0; r < rows; r++) {
+                uint16_t *const prow = band + static_cast<size_t>(r) * w;
+                const uint16_t v = static_cast<uint16_t>((y0 + r) * 137u);
+                for (int x = 0; x < w; x++) {
+                    prow[x] = v;
+                }
+            }
+        }
 #endif
         BENCH_T0(tBlend);
 #ifdef GM_ANIM_BENCH
@@ -2028,6 +2452,7 @@ void SleepAnimation::renderFrame() {
             blendRow(drow, crow, runs, nRuns);
         }
         BENCH_ACC(accBlendUs, tBlend);
+        profBlendUs += static_cast<uint32_t>(esp_timer_get_time() - tBlend);
 #ifdef GM_ANIM_BENCH
         accSpanPx += spanPxLocal;
         accScrimPx += scrimPxLocal;
@@ -2046,6 +2471,54 @@ void SleepAnimation::renderFrame() {
         // separate run in the framebuffer and would need its own descriptor to
         // step the stride. At 48 MB/s those corners cost less than the
         // descriptors and the extra pack pass would.
+        // Scan-out test pattern. Replaces the rendered band with a code a camera
+        // can decode from one photograph, which is the only way to judge the panel
+        // when nobody is standing in front of it.
+        //
+        // Each eight-row group is filled flat with one of two grey levels, chosen by
+        // a de Bruijn sequence of order 6. Every run of six groups in such a sequence
+        // occurs exactly once, so six groups read off a photograph name the panel
+        // rows they were rendered for. Where a group ends up is then not merely
+        // visible but measurable, in scanlines, against where it should be.
+        //
+        // Eight rows rather than four: at 720p the panel is under 400 camera pixels
+        // tall, and a four-row group came out at 3.3 of them, which the lens blurs
+        // into its neighbours. Eight rows doubles that, at the cost of resolving a
+        // displacement no finer than eight scanlines.
+        //
+        // Two levels rather than a ramp, because a camera pointed at a lit panel sets
+        // its own exposure and a ramp's upper steps clip together. Mid-greys rather
+        // than black and white so neither end clips.
+        //
+        // The first and last groups are forced bright with dark neighbours. That is
+        // the geometry check and it needs no decoding at all: if the top and bottom
+        // edges of the disc are bright, every panel row is reaching the glass.
+        //
+        // Written after the overlay blend on purpose: the widgets would otherwise sit
+        // on top of the code and corrupt it for reasons unrelated to scan-out.
+        if (testPattern.load()) {
+            static const uint32_t kDeBruijn6[2] = {0x49C51840u, 0xFDBABCB3u};
+            const int lastGroup = (h - 1) >> 3;
+            for (int r = 0; r < rows; r++) {
+                const int gi = (y0 + r) >> 3;
+                uint32_t bit;
+                if (gi == 0 || gi == lastGroup) {
+                    bit = 1;
+                } else if (gi == 1 || gi == lastGroup - 1) {
+                    bit = 0;
+                } else {
+                    const uint32_t g = static_cast<uint32_t>(gi) & 63u;
+                    bit = (kDeBruijn6[g >> 5] >> (g & 31u)) & 1u;
+                }
+                const uint32_t v = bit ? 200u : 70u;
+                const uint16_t px = static_cast<uint16_t>(((v >> 3) << 11) | ((v >> 2) << 5) | (v >> 3));
+                uint16_t *const drow = band + static_cast<size_t>(r) * w;
+                for (int x = 0; x < w; x++) {
+                    drow[x] = px;
+                }
+            }
+        }
+
         const bool directPush = dmaActive && directPushOn.load();
         const bool crop = cropEnabled && !directPush;
         const int bi = y0 / BAND_H;
@@ -2102,6 +2575,33 @@ void SleepAnimation::renderFrame() {
             BENCH_T0(tPush);
             const size_t bytes = static_cast<size_t>(w) * rows * 2;
             uint16_t *const dstRow = fbDirect[fbBack] + static_cast<size_t>(y0) * w;
+            // Flush this band out of the data cache before GDMA reads it.
+            //
+            // The 64-byte-aligned internal-DMA allocation for bandBuf is inside
+            // #ifdef GM_ANIM_BENCH, so every non-bench build falls straight
+            // through to allocPreferInternal, whose gate needs 7,680 B against a
+            // largest free internal block of 7,668 B. It fails, and the slots
+            // land in PSRAM, which is cached. The CPU renders each band into
+            // that cache; GDMA reads PSRAM underneath it and gets whatever was
+            // last written back, which is the slot's previous occupant. With
+            // NUM_SLOTS 2 that occupant is the band from two bands ago, and a
+            // row-encoded pattern dump measured exactly that: framebuffer row
+            // 32 holding row 16's pixels, a clean -16 offset across the panel.
+            //
+            // Only meaningful for a cached region, so internal SRAM skips it.
+            if (esp_ptr_external_ram(band)) {
+                // Counted, not ignored. This call failed on every band for a
+                // whole measurement round and the only evidence was an error
+                // line on a serial port nobody was reading, which made a fix
+                // that never ran look like it had worked.
+                const int64_t tMsync = esp_timer_get_time();
+                if (esp_cache_msync(band, bytes, ESP_CACHE_MSYNC_FLAG_DIR_C2M) != ESP_OK) {
+                    msyncFails++;
+                } else {
+                    msyncOks++;
+                }
+                profMsyncUs += static_cast<uint32_t>(esp_timer_get_time() - tMsync);
+            }
             // Shut pushColors out for as long as this FRAME has transfers in
             // flight. esp_lcd_panel_draw_bitmap ends with a cache writeback
             // over whole SCANLINES, so letting another writer in mid-transfer
@@ -2135,6 +2635,12 @@ void SleepAnimation::renderFrame() {
             // of rows, so every chunk's destination (fb + row * 960) keeps the
             // framebuffer base's alignment, which the panel checked against the
             // data cache line before handing the pointer over.
+            // Taken here, from the same pointer and after the same msync that
+            // the transfer reads, so a mismatch later can only mean the content
+            // did not reach the framebuffer row it was rendered for.
+            if (bi >= 0 && bi < MAX_BANDS) {
+                bandSig[bi] = bandSignature(band, w);
+            }
             esp_err_t err = ESP_OK;
             if (bandDma.ready()) {
                 dmaIssued++;
@@ -2171,6 +2677,7 @@ void SleepAnimation::renderFrame() {
                 xSemaphoreGive(static_cast<SemaphoreHandle_t>(bandFree[renderSlot]));
             }
             BENCH_ACC(accPushUs, tPush);
+            profPushUs += static_cast<uint32_t>(esp_timer_get_time() - tPush);
             // Marked for the scan-out slip log. This runs many times a frame, so
             // a slip will almost always show a small band_us whether or not the
             // push caused it -- the column is here to show when a push was
