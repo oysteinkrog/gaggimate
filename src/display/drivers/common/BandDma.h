@@ -66,6 +66,27 @@ class BandDma {
     size_t externalAlignment() const { return _extAlign; }
     size_t internalAlignment() const { return _intAlign; }
 
+    // Per-transfer duration, hardware start to RX EOF, queue wait excluded.
+    //
+    // This exists to answer one question about the scan-out fault: when the
+    // BLE scanner's window transition occupies the MSPI bus for ~900 us, does
+    // a GDMA engine's PSRAM access queue behind it the way the refill ISR's
+    // CPU memcpy does, or does it ride through? These transfers run ~440
+    // times a second while the animation renders, so the bus events at
+    // ~0.5/s cannot miss them for long. A clean band is ~70-150 us; if the
+    // over-512 counter climbs at the same rate the refill's resyncs do, a
+    // DMA-driven refill would inherit the stall rather than dodge it, and
+    // the idea is dead. If it stays at zero, the stall is specific to CPU
+    // cache traffic and moving the refill onto GDMA is the road to zero.
+    //
+    // Measured, 180 s at 43.4 Hz with BLE scanning at 80 ms/2000 ms: over-512
+    // 7.05/s against resyncs 0.49/s, max transfer 2135 us. GDMA queues behind
+    // the same MSPI stall the CPU does, only with a fatter tail. The idea is
+    // dead; the counters stay because they are the cheapest live view of bus
+    // contention this firmware has.
+    void xferStats(uint32_t *count, uint32_t *sumUs, uint32_t *maxUs, uint32_t *over256, uint32_t *over512) const;
+    void xferStatsReset();
+
   private:
     struct Pending {
         int slot;
@@ -94,6 +115,18 @@ class BandDma {
     volatile uint8_t _tail = 0; // next free
     volatile bool _running = false;
     Pending _current = {};
+
+    // Transfer-duration stats. Written from startSlot (task or ISR) and the
+    // EOF ISR, read from the web task; 32-bit aligned loads and stores are
+    // atomic on this core, and the readers only ever see a value one event
+    // stale, which a rate measurement does not care about. The sum is in
+    // microseconds and wraps after ~71 minutes; the reader takes deltas.
+    volatile int64_t _xferStartUs = 0;
+    volatile uint32_t _xferCount = 0;
+    volatile uint32_t _xferSumUs = 0;
+    volatile uint32_t _xferMaxUs = 0;
+    volatile uint32_t _xferOver256 = 0;
+    volatile uint32_t _xferOver512 = 0;
 };
 
 #endif // GAGGIMATE_SIM
