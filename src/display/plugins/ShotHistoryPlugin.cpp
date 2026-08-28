@@ -8,6 +8,7 @@
 #include <display/core/process/BrewProcess.h>
 #include <display/core/utils.h>
 #include <display/models/shot_log_format.h>
+#include <display/drivers/common/PanelClock.h>
 #include <display/util/PsramAllocator.h>
 
 namespace {
@@ -690,6 +691,15 @@ void ShotHistoryPlugin::loopTask(void *arg) {
 
 void ShotHistoryPlugin::flushBuffer() {
     if (isFileOpen && ioBufferPos > 0) {
+        // A 4 KB LittleFS write disables the flash cache while it runs, and the
+        // LCD bounce refill copies out of a PSRAM framebuffer, which is behind
+        // that same cache. So this masks the refill for as long as it takes,
+        // and a shot recording is the only thing on the display that writes
+        // flash at a steady rate. Mark it, or the slip attribution log blames
+        // whatever happened to run nearby: it carried exactly one FLASH marker
+        // (a settings save) and therefore reported "flash: never" through a
+        // whole investigation of slips on a live machine.
+        panelclock::scanoutMark(panelclock::SCANOUT_ACT_FLASH);
         // Logged once per shot: this runs every 4 KB of samples, so a full
         // filesystem would otherwise repeat the same line for the rest of the
         // recording.

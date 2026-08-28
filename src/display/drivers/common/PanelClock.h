@@ -67,27 +67,74 @@ uint32_t bootPclkHz();
 // True when setDiv takes effect without a restart.
 bool hasLiveControl();
 
-// Scan-out underrun counters, the direct measure of the fault that shows up on
-// the panel as a band of displaced pixels.
+// Scan-out counters.
 //
 // The RGB peripheral generates HSYNC and VSYNC from its own counters and does
 // not stall when its FIFO runs dry, so losing the race to refill a bounce
-// buffer does not stop the scan -- it slides the pixel stream against the sync
-// signals, which is what tears the picture. The driver detects this in its
-// VSYNC ISR and restarts the transfer, so the damage is bounded to a frame or
-// two, but nothing counts how often it happens.
+// buffer does not stop the scan. esp_lcd notices at the next VSYNC and restarts
+// the transfer, and because that restart resets the FIFO and the DMA but not
+// the peripheral's line and pixel counters, the stream resumes from the top of
+// the buffer while the beam is already partway down the frame. Everything below
+// that point is displaced downward by however far the beam had travelled: whole
+// blocks of lines, no colour corruption. The driver's own author documents it
+// at esp_lcd_panel_rgb.c:1093 as "the display will shift".
 //
-// These two callbacks bracket it exactly. on_vsync fires once per displayed
-// frame. on_frame_buf_complete fires once per full pass of the bounce refill
-// over the framebuffer. In steady state they run 1:1; a frame whose refill fell
-// behind never completes its pass, so the counts diverge by one and stay
-// diverged. `slips` ratchets on each such divergence, which makes it a count of
-// underrun frames since boot rather than an instantaneous phase difference --
-// the two callbacks fire at slightly different points in the frame, so their
-// raw difference oscillates by one even when nothing is wrong.
+// `slips` counts frames that completed NO refill pass. Read it as a count of
+// total refill failures, not as the underrun rate, because the restart trigger
+// is far weaker than that: esp_lcd restarts whenever bb_eof_count <
+// expect_eof_count at VSYNC, so ONE late bounce buffer out of sixty is enough.
+// Such a frame still finishes its pass and still fires on_frame_buf_complete,
+// so a completion counter cannot see it. Measured against a panel visibly
+// shifting several times a second, `slips` read 91 in 33 minutes.
 //
 // Any argument may be null. All three are zero before attach().
 void scanoutStats(uint32_t *frames, uint32_t *refills, uint32_t *slips);
+
+// Refill headroom, which is the measurement `slips` cannot make.
+//
+// There is no public per-EOF callback to replicate esp_lcd's own condition with
+// -- on_bounce_empty exists but the driver only calls it when it owns no frame
+// buffer of its own (esp_lcd_panel_rgb.c:880). So headroom is timed instead of
+// counted. on_frame_buf_complete fires when the refill has copied the frame's
+// last bounce buffer, at which point the DMA still has two bounce buffers plus
+// the vertical front porch left to transmit; the gap from there to VSYNC is
+// how much slack the refill had. A healthy frame reports a few hundred
+// microseconds. As contention grows the margin collapses toward zero, and an
+// underrun is the moment it crosses -- so the bucket histogram shows the fault
+// approaching, at a resolution a binary counter never had.
+//
+// The histogram is the raw margin distribution: 32 buckets of 128 us, the last
+// one holding everything at or above 3968 us. Deliberately absolute and
+// deliberately not normalised on-device.
+//
+// Two earlier shapes were both wrong. Fixed edges in microseconds chosen at one
+// pixel clock say nothing at another, because the healthy margin is two bounce
+// buffers plus the front porch and so scales with the clock. Normalising
+// against the running maximum then failed for a subtler reason: margin grows
+// when the VSYNC ISR is late just as it shrinks when the refill is late, so the
+// maximum is an outlier statistic that ratchets up and eventually marks every
+// healthy frame as lagging. It drifted 1257 -> 1845 us mid-measurement and
+// turned a 20 percent reading into 89 percent.
+//
+// The distribution answers it without a baseline having to be chosen in
+// advance: healthy frames pile up in one mode, and lagging frames fall in
+// discrete steps of one bounce-buffer time below it, because the refill can
+// only ever be a whole number of bounce buffers behind. Read the mode, count
+// the tail below it. `slips` counts only total refill failure and will read
+// near zero throughout.
+//
+// Any argument may be null.
+enum { SCANOUT_MARGIN_BUCKETS = 32, SCANOUT_MARGIN_BUCKET_US = 128 };
+void scanoutMargin(uint32_t *lastUs, uint32_t *minUs, uint32_t *maxUs, uint32_t *buckets);
+
+// Zeroes every scan-out counter, including the margin calibration.
+//
+// Comparing two configurations means comparing rates, and counters that have
+// been accumulating since boot bury a change in whatever came before it.
+// setDiv() calls this on its own: the healthy margin scales with the pixel
+// clock, so a maximum established at one clock is the wrong yardstick at the
+// next, and at a faster clock it would mark every frame as lagging.
+void scanoutReset();
 
 // Correlation log for those slips.
 //
@@ -104,7 +151,8 @@ enum ScanoutActivity {
     SCANOUT_ACT_OVERLAY = 0,  // LVGL widget snapshot into the overlay buffer
     SCANOUT_ACT_FLASH = 1,    // NVS / LittleFS write, which masks the LCD ISR
     SCANOUT_ACT_BANDPUSH = 2, // animation band pushed into the framebuffer
-    SCANOUT_ACT_COUNT = 3,
+    SCANOUT_ACT_PRESENT = 3,  // whole-framebuffer cache invalidate before a flip
+    SCANOUT_ACT_COUNT = 4,
 };
 
 void scanoutMark(int which);
@@ -112,8 +160,20 @@ void scanoutMark(int which);
 struct ScanoutSlip {
     uint32_t frame;                         // frame counter when it happened
     uint32_t tUs;                           // esp_timer microseconds, low 32 bits
+    uint32_t marginUs;                      // refill headroom, 0 for a total failure
     uint32_t sinceUs[SCANOUT_ACT_COUNT];    // since each source last marked
 };
+
+// Also log a correlation entry for every frame whose refill headroom fell below
+// `us`, not just for total refill failures. 0 disables it.
+//
+// The log was keyed on `slips` alone, and slips are rare -- single digits over
+// runs where the panel displaced thousands of times -- so it almost never had a
+// sample of the event actually being chased. Lagging frames are common enough
+// (10 to 14 percent at 13.3 MHz) that a few seconds of logging says which
+// source was running when the refill fell behind. Pick the threshold from the
+// margin histogram: one bucket below its healthy mode.
+void setLagThresholdUs(uint32_t us);
 
 // Copies out up to `max` of the most recent slips, oldest first, and returns
 // how many were written.

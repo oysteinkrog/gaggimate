@@ -4,6 +4,9 @@
 extern uint32_t nebula_lerp_self_test(uint32_t *firstBad);
 #include <DNSServer.h>
 #include <LittleFS.h>
+#include <esp_cache.h>        // esp_cache_msync, so /api/debug/fb reads past the cache
+#include <esp_timer.h>        // esp_timer_dump, for /api/debug/timers
+#include <esp_memory_utils.h> // esp_ptr_external_ram, for the band-buffer placement report
 #include <SD_MMC.h>
 #include <algorithm>
 #include <display/core/Controller.h>
@@ -383,6 +386,30 @@ void WebUIPlugin::serveWebAsset(AsyncWebServerRequest *request) {
     request->send(response);
 }
 
+// Counters exported by the patched esp_lcd RGB driver (scripts/patch_esp_lcd_rgb.py).
+// restart is the one that matters: the driver restarts the transfer when it has
+// lost count of the DMA EOFs, and every restart is one visible block of
+// vertically displaced lines. catchup counts the coalesced EOFs the patch
+// recovered from, which are the restarts that no longer happen.
+extern "C" {
+extern volatile uint32_t gm_rgb_restart_count;
+extern volatile uint32_t gm_rgb_catchup_count;
+extern volatile uint32_t gm_rgb_catchup_bufs;
+extern volatile uint32_t gm_rgb_catchup_max;
+extern volatile uint32_t gm_rgb_resync_count;
+extern volatile uint32_t gm_rgb_resync_bufs;
+extern volatile uint32_t gm_rgb_resync_max;
+extern volatile uint32_t gm_rgb_over_count;
+extern volatile uint32_t gm_rgb_eof_expect;
+
+extern volatile uint32_t gm_rgb_eof_min;
+extern volatile uint32_t gm_rgb_eof_max;
+extern volatile uint32_t gm_rgb_busy_hist[];
+extern volatile uint32_t gm_rgb_gap_hist[];
+extern volatile uint32_t gm_rgb_busy_max;
+extern volatile uint32_t gm_rgb_gap_max;
+}
+
 void WebUIPlugin::setupServer() {
     server.on("/connecttest.txt", [](AsyncWebServerRequest *request) {
         request->redirect("http://logout.net");
@@ -413,6 +440,30 @@ void WebUIPlugin::setupServer() {
     // happens to sit when polled. Built with a fixed stack buffer so the
     // endpoint still answers when the heap is too tight for a response stream.
     // Exposes no configuration and no secrets.
+    // Every armed esp_timer, with its period. Added to name the source of a
+    // periodic event that stalls the panel refill for most of a millisecond.
+    // What is known about it: the period is wall clock rather than frame
+    // locked, holding at 454 to 478 ms across pixel clocks while the same
+    // period measured in frames tracks refresh exactly (27.7 frames at 60.8 Hz,
+    // 23.9 at 50.7, 20.8 at 43.4); it survives sustained WiFi traffic, so it is
+    // not a modem-sleep wake being deferred; and it is indifferent to the
+    // animation's frame rate, so it is not the renderer. Nothing this firmware
+    // schedules runs at roughly 2.1 Hz, which leaves the timers IDF and the
+    // radio stacks arm for themselves.
+    //
+    // Without CONFIG_ESP_TIMER_PROFILING the dump carries no names, only the
+    // handle address and the period, which is enough to identify a period and
+    // then chase the address through the map file. It lists armed timers only.
+    //
+    // The dump goes to the serial console because esp_timer_dump takes a FILE*
+    // and there is no in-memory stream here; the HTTP response only confirms it
+    // ran. Exposes no configuration and no secrets.
+    server.on("/api/debug/timers", [](AsyncWebServerRequest *request) {
+        esp_timer_dump(stdout);
+        fflush(stdout);
+        request->send(200, "application/json", "{\"dumped\":true}");
+    });
+
     server.on("/api/debug/heap", [](AsyncWebServerRequest *request) {
     // anim_sram is the committed part of the animation budget and
     // anim_budget its ceiling. The gap between them is the important
@@ -471,20 +522,104 @@ void WebUIPlugin::setupServer() {
     // source stale and the slips scattered. Exposes no configuration and no
     // secrets.
     server.on("/api/debug/scanout", [](AsyncWebServerRequest *request) {
+        // reset=1 zeroes the counters so two configurations can be compared as
+        // rates rather than as totals accumulated since boot.
+        if (request->hasArg("reset")) {
+            panelclock::scanoutReset();
+            gm_rgb_restart_count = 0;
+            gm_rgb_catchup_count = 0;
+            gm_rgb_catchup_bufs = 0;
+            gm_rgb_catchup_max = 0;
+            gm_rgb_resync_count = 0;
+            gm_rgb_resync_bufs = 0;
+            gm_rgb_resync_max = 0;
+            gm_rgb_over_count = 0;
+            gm_rgb_eof_min = 0xFFFFFFFFu;
+            gm_rgb_eof_max = 0;
+            gm_rgb_busy_max = 0;
+            gm_rgb_gap_max = 0;
+            for (int i = 0; i < 24; i++) {
+                gm_rgb_busy_hist[i] = 0;
+                gm_rgb_gap_hist[i] = 0;
+            }
+        }
+        // lagthresh=N also logs a correlation entry for every frame whose
+        // refill headroom fell below N us. Set it one histogram bucket below
+        // the healthy mode; 0 turns it off.
+        if (request->hasArg("lagthresh")) {
+            panelclock::setLagThresholdUs(
+                static_cast<uint32_t>(request->arg("lagthresh").toInt()));
+        }
         uint32_t frames = 0, refills = 0, slips = 0;
         panelclock::scanoutStats(&frames, &refills, &slips);
+        uint32_t marginLast = 0, marginMin = 0, marginMax = 0;
+        uint32_t marginBucket[panelclock::SCANOUT_MARGIN_BUCKETS] = {0};
+        panelclock::scanoutMargin(&marginLast, &marginMin, &marginMax, marginBucket);
         panelclock::ScanoutSlip slipLog[24];
         const size_t n = panelclock::scanoutSlipLog(slipLog, 24);
         AsyncResponseStream *response = request->beginResponseStream("application/json");
-        response->printf("{\"frames\":%u,\"refills\":%u,\"slips\":%u,\"now_us\":%u,\"log\":[", static_cast<unsigned>(frames),
+        response->printf("{\"frames\":%u,\"refills\":%u,\"slips\":%u,\"now_us\":%u,", static_cast<unsigned>(frames),
                          static_cast<unsigned>(refills), static_cast<unsigned>(slips),
                          static_cast<unsigned>(esp_timer_get_time()));
+        // margin_us is the headroom the refill had on the last frame and
+        // margin_min_us / margin_max_us the extremes since the last reset.
+        // margin_hist is the raw distribution in 128 us buckets: healthy frames
+        // form one mode and lagging ones fall in steps of a bounce-buffer time
+        // below it, each step being BOUNCE_LINES lines of visible vertical
+        // displacement. Read the histogram, not slips -- esp_lcd restarts the
+        // transfer on a single late bounce buffer and such a frame never
+        // registers as a slip.
+        response->printf("\"margin_us\":%u,\"margin_min_us\":%u,\"margin_max_us\":%u,\"margin_bucket_us\":%u,"
+                         "\"margin_hist\":[",
+                         static_cast<unsigned>(marginLast), static_cast<unsigned>(marginMin),
+                         static_cast<unsigned>(marginMax),
+                         static_cast<unsigned>(panelclock::SCANOUT_MARGIN_BUCKET_US));
+        for (size_t i = 0; i < panelclock::SCANOUT_MARGIN_BUCKETS; i++) {
+            response->printf("%s%u", i ? "," : "", static_cast<unsigned>(marginBucket[i]));
+        }
+        // resyncs is the event that used to displace the picture: a frame that
+        // counted fewer bounce buffers than a frame holds. The patched driver squares
+        // it up against the beam instead of restarting the DMA, so it now costs one
+        // band of stale pixels rather than a whole shifted frame. dma_restarts should
+        // stay at zero: only an explicit panel restart reaches it.
+        response->printf("],\"resyncs\":%u,\"resync_bufs\":%u,\"resync_max\":%u,\"over_count\":%u,"
+                         "\"dma_restarts\":%u,\"dma_catchups\":%u,\"dma_catchup_bufs\":%u,"
+                         "\"dma_catchup_max\":%u,\"eof_expect\":%u,\"eof_min\":%u,\"eof_max\":%u,\"log\":[",
+                         static_cast<unsigned>(gm_rgb_resync_count),
+                         static_cast<unsigned>(gm_rgb_resync_bufs),
+                         static_cast<unsigned>(gm_rgb_resync_max),
+                         static_cast<unsigned>(gm_rgb_over_count),
+                         static_cast<unsigned>(gm_rgb_restart_count),
+                         static_cast<unsigned>(gm_rgb_catchup_count),
+                         static_cast<unsigned>(gm_rgb_catchup_bufs),
+                         static_cast<unsigned>(gm_rgb_catchup_max),
+                         static_cast<unsigned>(gm_rgb_eof_expect),
+                         static_cast<unsigned>(gm_rgb_eof_min),
+                         static_cast<unsigned>(gm_rgb_eof_max));
         for (size_t i = 0; i < n; i++) {
-            response->printf("%s{\"frame\":%u,\"t_us\":%u,\"overlay_us\":%u,\"flash_us\":%u,\"band_us\":%u}", i ? "," : "",
-                             static_cast<unsigned>(slipLog[i].frame), static_cast<unsigned>(slipLog[i].tUs),
-                             static_cast<unsigned>(slipLog[i].sinceUs[panelclock::SCANOUT_ACT_OVERLAY]),
-                             static_cast<unsigned>(slipLog[i].sinceUs[panelclock::SCANOUT_ACT_FLASH]),
-                             static_cast<unsigned>(slipLog[i].sinceUs[panelclock::SCANOUT_ACT_BANDPUSH]));
+            response->printf(
+                "%s{\"frame\":%u,\"t_us\":%u,\"margin_us\":%u,\"overlay_us\":%u,\"flash_us\":%u,\"band_us\":%u,"
+                "\"present_us\":%u}",
+                i ? "," : "", static_cast<unsigned>(slipLog[i].frame), static_cast<unsigned>(slipLog[i].tUs),
+                static_cast<unsigned>(slipLog[i].marginUs),
+                static_cast<unsigned>(slipLog[i].sinceUs[panelclock::SCANOUT_ACT_OVERLAY]),
+                static_cast<unsigned>(slipLog[i].sinceUs[panelclock::SCANOUT_ACT_FLASH]),
+                static_cast<unsigned>(slipLog[i].sinceUs[panelclock::SCANOUT_ACT_BANDPUSH]),
+                static_cast<unsigned>(slipLog[i].sinceUs[panelclock::SCANOUT_ACT_PRESENT]));
+        }
+        // busy_hist is how long the refill handler spent copying, gap_hist how long it
+        // waited between calls, both in 32 us buckets. They separate the two faults that
+        // look identical from the frame counters: a refill that is slow because PSRAM is
+        // contended piles up in busy_hist, one that is late because its interrupt was
+        // masked piles up in gap_hist while busy_hist stays flat.
+        response->printf("],\"hist_bucket_us\":32,\"busy_max_us\":%u,\"gap_max_us\":%u,\"busy_hist\":[",
+                         static_cast<unsigned>(gm_rgb_busy_max), static_cast<unsigned>(gm_rgb_gap_max));
+        for (int i = 0; i < 24; i++) {
+            response->printf("%s%u", i ? "," : "", static_cast<unsigned>(gm_rgb_busy_hist[i]));
+        }
+        response->print("],\"gap_hist\":[");
+        for (int i = 0; i < 24; i++) {
+            response->printf("%s%u", i ? "," : "", static_cast<unsigned>(gm_rgb_gap_hist[i]));
         }
         response->print("]}");
         request->send(response);
@@ -534,6 +669,158 @@ void WebUIPlugin::setupServer() {
         request->send(200, "application/json", buf);
     });
 
+    // /api/debug/anim[?direct=0|1][&dma=0|1] reads and live-sets who owns the
+    // panel's framebuffer pair while the background animation is running.
+    //
+    // Both settings produce a visible defect and neither moves the scan-out
+    // slip counter, which is why this needs to be switchable with someone
+    // watching the panel:
+    //
+    //   direct=1  the animation renders into the buffer the panel is NOT
+    //             scanning and flips at the frame boundary. Correct by
+    //             construction, provided the animation really is the pair's
+    //             only writer.
+    //   direct=0  the bands go out through pushColors, which is
+    //             esp_lcd_panel_draw_bitmap into _fbDirect[_fbCurrent] -- the
+    //             buffer being scanned right now. Every band write races the
+    //             beam. The scan-out never starves, so slips stay near zero
+    //             while the picture tears.
+    //
+    // Live and not persisted; the next boot goes back to the compiled default.
+    server.on("/api/debug/anim", [](AsyncWebServerRequest *request) {
+        SleepAnimation *a = sleep_animation_bench_instance();
+        if (a == nullptr) {
+            request->send(409, "application/json", "{\"error\":\"animation not running\"}");
+            return;
+        }
+        if (request->hasArg("direct")) {
+            a->setDirectPush(request->arg("direct").toInt() != 0);
+        }
+        if (request->hasArg("dma")) {
+            a->setDmaWanted(request->arg("dma").toInt() != 0);
+        }
+        if (request->hasArg("half")) {
+            a->setHalfRes(request->arg("half").toInt() != 0);
+        }
+        if (request->hasArg("ilace")) {
+            a->setInterlace(request->arg("ilace").toInt() != 0);
+        }
+        // forcehalf pins the resolution: -1 auto, 0 full, 1 half. half= only
+        // raises or drops the ceiling and autoResolution still gets the vote,
+        // which is not enough to hold one variable still across a capture.
+        if (request->hasArg("pattern")) {
+            a->setDebugPattern(request->arg("pattern").toInt());
+        }
+        // capfps=N pins the animation's frame rate regardless of the stored
+        // setting; 0 releases it. This is how much of the scan-out's refill
+        // headroom the animation's PSRAM traffic is costing, as a curve.
+        if (request->hasArg("capfps")) {
+            const int f = request->arg("capfps").toInt();
+            if (f >= 0 && f <= 60) {
+                a->setFpsOverride(static_cast<uint8_t>(f));
+            }
+        }
+        // testpattern=1 replaces the image with a decodable scan-out ramp. It is
+        // the only way to judge the panel from a photograph rather than by eye.
+        if (request->hasArg("testpattern")) {
+            a->setTestPattern(request->arg("testpattern").toInt() != 0);
+        }
+        if (request->hasArg("forcehalf")) {
+            a->setHalfForce(static_cast<int8_t>(request->arg("forcehalf").toInt()));
+        }
+        AsyncResponseStream *response = request->beginResponseStream("application/json");
+        JsonDocument doc;
+        doc["direct"] = a->directPush();
+        doc["dma"] = a->dmaPathWanted();
+        doc["half"] = a->halfResOn();
+        doc["forcehalf"] = a->halfForced();
+        doc["pattern"] = a->debugPatternOn();
+        doc["msync_fail"] = a->msyncFailCount();
+        doc["msync_ok"] = a->msyncOkCount();
+        // tear_live over tear_checked is the tearing rate on the direct path.
+        // tear_checked is reported alongside so a zero cannot be confused with
+        // a check that never ran.
+        doc["tear_live"] = a->liveWriteCount();
+        doc["tear_checked"] = a->liveWriteCheckedCount();
+        doc["flip_timeouts"] = a->flipTimeoutCount();
+        doc["frame_us"] = a->lastFrameUsValue();
+        doc["work_us"] = a->lastWorkUsValue();
+        doc["wait_us"] = a->lastWaitUsValue();
+        doc["band_us"] = a->lastBandUsValue();
+        doc["expand_us"] = a->lastExpandUsValue();
+        doc["fill_us"] = a->lastFillUsValue();
+        doc["copy_us"] = a->lastCopyUsValue();
+        doc["half_psram"] = esp_ptr_external_ram(const_cast<void *>(a->halfBufAddr()));
+        doc["blend_us"] = a->lastBlendUsValue();
+        doc["msync_us"] = a->lastMsyncUsValue();
+        doc["push_us"] = a->lastPushUsValue();
+        for (int i = 0; i < 2; i++) {
+            const void *bp = a->bandBufAddr(i);
+            doc["band_psram"][i] = bp != nullptr && esp_ptr_external_ram(bp);
+            doc["band_align"][i] = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(bp) & 63u);
+        }
+        doc["dma_errors"] = a->dmaErrorCount();
+        // fb_mismatch over fb_checked is the rate at which a band's content
+        // failed to reach the framebuffer row it was rendered for, which is the
+        // fault the panel shows as a block of lines displaced vertically. This
+        // is the only counter here that can see it: tear_live compares the
+        // scan-out buffer against the render target, and the panel driver's
+        // slip counters only see the scan, by which point the framebuffer is
+        // already wrong. fb_delta is the displacement of the last mismatch in
+        // bands, or 0 when no other band held the content either.
+        doc["fb_checked"] = a->fbCheckedCount();
+        doc["fb_mismatch"] = a->fbMismatchCount();
+        doc["fb_band"] = a->fbLastBandIndex();
+        doc["fb_source"] = a->fbLastSourceIndex();
+        doc["fb_delta"] = a->fbLastDeltaBands();
+        doc["inval_us"] = a->lastInvalidateUs();
+        doc["capfps"] = a->fpsOverrideValue();
+        doc["testpattern"] = a->testPatternOn();
+        uint32_t frames = 0, refills = 0, slips = 0;
+        panelclock::scanoutStats(&frames, &refills, &slips);
+        doc["frames"] = frames;
+        doc["refills"] = refills;
+        doc["slips"] = slips;
+        serializeJson(doc, *response);
+        request->send(response);
+    });
+
+    // /api/debug/pclk[?div=n] reads and live-sets the RGB pixel
+    // clock divider (pclk = 80 MHz / n) and reports the scan-out counters.
+    //
+    // The divider is the one lever on the bounce-refill deadline that costs no
+    // memory. Deadline is lines * htotal / pclk, so a slower clock buys slack
+    // per refill, where more bounce lines buy it out of the same DMA-capable
+    // internal DRAM that WiFi's TX buffers come from. That tradeoff has already
+    // been got wrong once in both directions, so it needs sweeping against real
+    // load rather than reasoning about.
+    //
+    // Live and deliberately not persisted: this reverts to the stored setting
+    // on the next boot, so a sweep that ends badly cannot leave the panel
+    // wrong. The persisted control is the panelClockDiv setting.
+    //
+    // The counters are cumulative and there is no reset: a sweep takes the
+    // difference between two reads of this endpoint, which keeps the reset
+    // logic out of the ISR-side counters entirely.
+    server.on("/api/debug/pclk", [](AsyncWebServerRequest *request) {
+        if (request->hasArg("div")) {
+            const int div = request->arg("div").toInt();
+            if (div < 2 || div > 16) {
+                request->send(400, "application/json", "{\"error\":\"div out of range 2..16\"}");
+                return;
+            }
+            panelclock::setDiv(div);
+        }
+        uint32_t frames = 0, refills = 0, slips = 0;
+        panelclock::scanoutStats(&frames, &refills, &slips);
+        char buf[192];
+        snprintf(buf, sizeof(buf), "{\"div\":%d,\"live\":%s,\"hz\":%u,\"frames\":%u,\"refills\":%u,\"slips\":%u}",
+                 panelclock::currentDiv(), panelclock::hasLiveControl() ? "true" : "false",
+                 static_cast<unsigned>(80000000UL / (panelclock::currentDiv() > 0 ? panelclock::currentDiv() : 1)),
+                 static_cast<unsigned>(frames), static_cast<unsigned>(refills), static_cast<unsigned>(slips));
+        request->send(200, "application/json", buf);
+    });
+
     // /api/debug/fb?n=0|1[&step=2] streams one panel framebuffer as raw
     // RGB565, little-endian, row-major, step**2 decimated.
     //
@@ -565,6 +852,24 @@ void WebUIPlugin::setupServer() {
         if (fb == nullptr) {
             request->send(404, "application/json", "{\"error\":\"no direct framebuffer\"}");
             return;
+        }
+        // Read past the data cache, or this endpoint reports what the CPU last
+        // happened to hold rather than what is in the framebuffer. On the
+        // direct path the bands arrive over GDMA straight into PSRAM, which
+        // does not go through the cache, so any line still resident from an
+        // earlier CPU write wins the read and the dump quietly shows old
+        // pixels. That is the same hazard the animation's own present path
+        // documents, in the same direction, and this instrument is used to
+        // decide whether the display is correct, so it must not have it.
+        //
+        // Writeback first, then invalidate. A bare invalidate would be right
+        // while the animation owns the pair (DMA is the only writer) and would
+        // silently discard LVGL's dirty lines when it does not, which is a
+        // corrupted panel rather than a bad measurement.
+        if (const size_t fbBytes = static_cast<size_t>(disp->width()) * disp->height() * 2) {
+            void *base = const_cast<uint16_t *>(fb);
+            esp_cache_msync(base, fbBytes, ESP_CACHE_MSYNC_FLAG_DIR_C2M);
+            esp_cache_msync(base, fbBytes, ESP_CACHE_MSYNC_FLAG_DIR_M2C);
         }
         int step = request->hasArg("step") ? request->arg("step").toInt() : 1;
         if (step < 1 || step > 8)
