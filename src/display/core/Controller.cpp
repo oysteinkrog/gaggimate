@@ -1,4 +1,11 @@
 #include "Controller.h"
+
+#if defined(GM_SYNTH_HANDSHAKE) && !defined(GM_SYNTH_TELEMETRY_MS)
+// Telemetry period for the load rig, milliseconds. The real controller pushes
+// temperature about four times a second; lower this to push the UI harder than
+// production ever will.
+#define GM_SYNTH_TELEMETRY_MS 250
+#endif
 #include "ArduinoJson.h"
 #include "esp_coexist.h"
 #include "esp_sntp.h"
@@ -708,6 +715,71 @@ void Controller::loop() {
             ESP_LOGW(LOG_TAG, "GM_SYNTH_HANDSHAKE: delivering synthetic SystemInfo (BLE stays up)");
             onSystemInfo("SynthBench", "bench", gm_proto::PROTOCOL_VERSION, /*dimming=*/true, /*pressure=*/true,
                          /*ledControl=*/false, /*tof=*/false, std::vector<uint32_t>{});
+            // Force the brew screen rather than inheriting the saved startup
+            // mode. A machine coming up to temperature sits on the gauge, and
+            // the gauge is the widget that repaints; standby is the animation,
+            // which is a different load and already well measured.
+            setMode(MODE_BREW);
+        }
+
+        // Telemetry churn. The scan-out fault only shows up on a real machine,
+        // and the thing a real machine does that a quiet bench does not is
+        // redraw. LVGL runs in direct_mode here, so every widget repaint is a
+        // write straight into the framebuffer the LCD is scanning out of, and
+        // both sit behind the same MSPI controller. A settled reading moves the
+        // gauge by a pixel; a boiler coming up to temperature sweeps the whole
+        // arc, frame after frame, which is the load that was never on the bench.
+        //
+        // So this ramps rather than wobbles: 20 to 95 C and back over 48 s, with
+        // pressure tracking it. Deliberately not the +-1.5 C sine that
+        // GM_FAKE_CONTROLLER feeds, which is visually alive but repaints almost
+        // nothing.
+        if (synthDone) {
+            static unsigned long lastSynthTel = 0;
+            const unsigned long telNow = millis();
+            if (telNow - lastSynthTel >= GM_SYNTH_TELEMETRY_MS) {
+                lastSynthTel = telNow;
+                // Hold the brew screen. Setting it once at handshake is not
+                // enough: the standby timeout moves the rig off it after a
+                // while, and a capture taken hours later is then of a
+                // different screen with a different widget load. Two runs
+                // meant as a before/after were compared across that change
+                // before it was noticed.
+                if (getMode() != MODE_BREW) {
+                    setMode(MODE_BREW);
+                }
+                const float cycle = fmodf(static_cast<float>(telNow) / 1000.0f, 48.0f);
+                const float ramp = cycle < 24.0f ? cycle / 24.0f : (48.0f - cycle) / 24.0f;
+                onTempRead(20.0f + 75.0f * ramp);
+                pressure = 1.0f + 8.0f * ramp;
+                pluginManager->trigger("boiler:pressure:change", "value", pressure);
+
+                // Brew cycling, so the rig actually writes flash.
+                //
+                // ShotHistoryPlugin::record() only stores samples while
+                // recording, and recording only starts on controller:brew:start,
+                // which the synthetic handshake never fired. So every rig run so
+                // far has been missing the one stall the display code documents
+                // as able to mask the LCD bounce refill outright rather than
+                // merely narrow its margin: flushBuffer()'s 4 KB LittleFS write
+                // disables the flash cache, and the refill copies out of a PSRAM
+                // framebuffer sitting behind that same cache. That is also why
+                // CONFIG_LCD_RGB_ISR_IRAM_SAFE cannot be turned on.
+                //
+                // 30 s recording then 15 s idle, which is roughly a shot and the
+                // rest after it. At 250 ms samples into a 4096 B buffer a flush
+                // lands every ~42.5 s of recording, so the writes are at the
+                // production cadence rather than an amplified one: the point is
+                // to reproduce the fault, not to manufacture a worse one.
+                static bool synthBrewing = false;
+                const unsigned long phase = (telNow / 1000UL) % 45UL;
+                const bool wantBrew = phase < 30UL;
+                if (wantBrew != synthBrewing) {
+                    synthBrewing = wantBrew;
+                    pluginManager->trigger(wantBrew ? "controller:brew:start" : "controller:brew:end");
+                    ESP_LOGW(LOG_TAG, "GM_SYNTH_HANDSHAKE: synthetic brew %s", wantBrew ? "start" : "end");
+                }
+            }
         }
     }
 #endif
@@ -761,7 +833,16 @@ void Controller::loop() {
 
     // If BLE scanning has been running for a while without finding the controller,
     // notify the UI so it can update the startup label accordingly.
-    if (!waitingForController && initialized && !comms.isConnected() &&
+    //
+    // isLinkUp() rather than comms.isConnected(): identical in production,
+    // where one is defined as the other, but it is the one thing the bench
+    // rigs are allowed to lie about. Without it GM_SYNTH_HANDSHAKE delivers a
+    // synthetic SystemInfo, the UI leaves the waiting screen, and then this
+    // timeout fires a few seconds later and drags it straight back -- which is
+    // exactly what happened: the rig ran with the panel parked on "Waiting for
+    // controller", a screen that repaints almost nothing, while the telemetry
+    // it was built to churn had nowhere to draw.
+    if (!waitingForController && initialized && !isLinkUp() &&
         (now - connectStartTime) > CONTROLLER_WAITING_TIMEOUT_MS) {
         waitingForController = true;
         pluginManager->trigger("controller:bluetooth:waiting");
