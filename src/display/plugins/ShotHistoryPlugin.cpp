@@ -693,9 +693,12 @@ void ShotHistoryPlugin::flushBuffer() {
     if (isFileOpen && ioBufferPos > 0) {
         // A 4 KB LittleFS write disables the flash cache while it runs, and the
         // LCD bounce refill copies out of a PSRAM framebuffer, which is behind
-        // that same cache. So this masks the refill for as long as it takes,
-        // and a shot recording is the only thing on the display that writes
-        // flash at a steady rate. Mark it, or the slip attribution log blames
+        // that same cache. CONFIG_LCD_RGB_ISR_IRAM_SAFE keeps the refill ISR
+        // alive through that window and it skips the copy instead of stalling
+        // (gm_rgb_flash_skip_bufs counts those), so the panel holds sync and
+        // briefly repeats stale scanlines rather than desyncing. A shot
+        // recording is still the only thing on the display that writes flash
+        // at a steady rate. Mark it, or the slip attribution log blames
         // whatever happened to run nearby: it carried exactly one FLASH marker
         // (a settings save) and therefore reported "flash: never" through a
         // whole investigation of slips on a live machine.

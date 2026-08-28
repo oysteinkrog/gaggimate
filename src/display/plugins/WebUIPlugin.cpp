@@ -400,6 +400,7 @@ extern volatile uint32_t gm_rgb_resync_count;
 extern volatile uint32_t gm_rgb_resync_bufs;
 extern volatile uint32_t gm_rgb_resync_max;
 extern volatile uint32_t gm_rgb_over_count;
+extern volatile uint32_t gm_rgb_flash_skip_bufs;
 extern volatile uint32_t gm_rgb_eof_expect;
 
 extern volatile uint32_t gm_rgb_eof_min;
@@ -534,6 +535,7 @@ void WebUIPlugin::setupServer() {
             gm_rgb_resync_bufs = 0;
             gm_rgb_resync_max = 0;
             gm_rgb_over_count = 0;
+            gm_rgb_flash_skip_bufs = 0;
             gm_rgb_eof_min = 0xFFFFFFFFu;
             gm_rgb_eof_max = 0;
             gm_rgb_busy_max = 0;
@@ -583,12 +585,14 @@ void WebUIPlugin::setupServer() {
         // band of stale pixels rather than a whole shifted frame. dma_restarts should
         // stay at zero: only an explicit panel restart reaches it.
         response->printf("],\"resyncs\":%u,\"resync_bufs\":%u,\"resync_max\":%u,\"over_count\":%u,"
+                         "\"flash_skips\":%u,"
                          "\"dma_restarts\":%u,\"dma_catchups\":%u,\"dma_catchup_bufs\":%u,"
                          "\"dma_catchup_max\":%u,\"eof_expect\":%u,\"eof_min\":%u,\"eof_max\":%u,\"log\":[",
                          static_cast<unsigned>(gm_rgb_resync_count),
                          static_cast<unsigned>(gm_rgb_resync_bufs),
                          static_cast<unsigned>(gm_rgb_resync_max),
                          static_cast<unsigned>(gm_rgb_over_count),
+                         static_cast<unsigned>(gm_rgb_flash_skip_bufs),
                          static_cast<unsigned>(gm_rgb_restart_count),
                          static_cast<unsigned>(gm_rgb_catchup_count),
                          static_cast<unsigned>(gm_rgb_catchup_bufs),
@@ -666,6 +670,51 @@ void WebUIPlugin::setupServer() {
         }
         char buf[96];
         snprintf(buf, sizeof(buf), "{\"inv\":%d,\"shipped_inv\":49}", inv);
+        request->send(200, "application/json", buf);
+    });
+
+    // /api/debug/flashchurn[?kb=64] writes that many kilobytes to a scratch
+    // file on the internal-flash LittleFS partition in 4 KB flushed chunks,
+    // then deletes it. Every flush programs flash with the cache disabled,
+    // which is the same stall a production machine's shot recording produces
+    // every ~42 s -- but a bench with an SD card logs shots to the card, so
+    // its brews never take the flash cache down and the path goes untested.
+    // Pair it with /api/debug/scanout: flash_skips climbing during the churn
+    // while resyncs hold still is the LCD refill riding out the cache-down
+    // window instead of being masked by it.
+    server.on("/api/debug/flashchurn", [](AsyncWebServerRequest *request) {
+        int kb = 64;
+        if (request->hasArg("kb")) {
+            kb = request->arg("kb").toInt();
+        }
+        kb = std::min(std::max(kb, 4), 512);
+        // Static because this runs on the async_tcp task, whose stack is not
+        // sized for a 4 KB buffer. The endpoint is a bench tool; one caller
+        // at a time is its contract.
+        static uint8_t chunk[4096];
+        for (size_t i = 0; i < sizeof(chunk); i++) {
+            chunk[i] = static_cast<uint8_t>(i * 31 + kb);
+        }
+        const char *path = "/gm_flashchurn.tmp";
+        const int64_t t0 = esp_timer_get_time();
+        File f = LittleFS.open(path, FILE_WRITE);
+        if (!f) {
+            request->send(500, "application/json", "{\"error\":\"littlefs open failed\"}");
+            return;
+        }
+        size_t written = 0;
+        for (int i = 0; i < kb / 4; i++) {
+            // Same marker the shot recorder sets, so the slip attribution log
+            // blames these windows on flash rather than on a bystander.
+            panelclock::scanoutMark(panelclock::SCANOUT_ACT_FLASH);
+            written += f.write(chunk, sizeof(chunk));
+            f.flush();
+        }
+        f.close();
+        LittleFS.remove(path);
+        const int dtMs = static_cast<int>((esp_timer_get_time() - t0) / 1000);
+        char buf[96];
+        snprintf(buf, sizeof(buf), "{\"written\":%u,\"ms\":%d}", static_cast<unsigned>(written), dtMs);
         request->send(200, "application/json", buf);
     });
 
