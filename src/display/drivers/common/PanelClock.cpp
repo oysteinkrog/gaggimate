@@ -43,8 +43,21 @@ int g_curDiv = 0;
 // frame on a number whose whole purpose is to be watched over seconds.
 volatile uint32_t g_frames = 0;  // on_vsync, one per displayed frame
 volatile uint32_t g_refills = 0; // on_frame_buf_complete, one per refill pass
-volatile uint32_t g_slips = 0;   // ratcheted count of underrun frames
+volatile uint32_t g_slips = 0;   // count of frames that completed no refill pass
+volatile uint32_t g_refillsAtVsync = 0; // g_refills as of the previous VSYNC
 volatile uint32_t g_maxDrift = 0;
+
+// Refill headroom in microseconds: how long before VSYNC the refill pass
+// finished copying the frame's last bounce buffer. See PanelClock.h for why
+// this is timed rather than counted -- in short, esp_lcd restarts the transfer
+// on a single late bounce buffer, and such a frame still completes its pass, so
+// g_slips is blind to exactly the events that displace the picture.
+volatile uint32_t g_fbcUs = 0; // esp_timer at the last on_frame_buf_complete
+volatile uint32_t g_marginLastUs = 0;
+volatile uint32_t g_marginMinUs = UINT32_MAX;
+volatile uint32_t g_marginMaxUs = 0;
+volatile uint32_t g_marginBucket[SCANOUT_MARGIN_BUCKETS] = {0};
+volatile uint32_t g_lagThreshUs = 0;
 
 // Last time each activity ran, in esp_timer microseconds truncated to 32 bits.
 // Truncation wraps every ~71 minutes; only differences are ever taken, and
@@ -62,34 +75,98 @@ volatile uint32_t g_slipWrite = 0;
 // turn a diagnostic into a way to crash during an NVS write.
 IRAM_ATTR bool onRefillDone(esp_lcd_panel_handle_t, const esp_lcd_rgb_panel_event_data_t *, void *) {
     g_refills++;
+    g_fbcUs = static_cast<uint32_t>(esp_timer_get_time());
     return false;
 }
 
+IRAM_ATTR void logEvent(uint32_t nowUs, uint32_t marginUs) {
+    ScanoutSlip &e = g_slipLog[g_slipWrite % SLIP_LOG_N];
+    e.frame = g_frames;
+    e.tUs = nowUs;
+    e.marginUs = marginUs;
+    for (int i = 0; i < SCANOUT_ACT_COUNT; i++) {
+        // Zero means the source has never run, which would otherwise read as
+        // "ran at time zero" and look like a very stale hit.
+        e.sinceUs[i] = (g_actUs[i] == 0) ? UINT32_MAX : (nowUs - g_actUs[i]);
+    }
+    g_slipWrite++;
+}
+
+} // namespace
+} // namespace panelclock
+
+// Called by the patched esp_lcd RGB driver every time it decides to restart the
+// transmission (scripts/patch_esp_lcd_rgb.py). A restart is the moment the panel
+// visibly shifts, so this is the event the correlation log exists for: logging
+// on refill headroom instead was a proxy, and a proxy that fires on frames the
+// driver went on to handle cleanly.
+//
+// `shortfall` is how many DMA end-of-frame interrupts the frame came up short,
+// which converts to displaced scan-out time at one bounce buffer each. It is
+// carried in the entry's marginUs field rather than a new one, because the two
+// are never both meaningful: an entry logged here has no headroom reading.
+extern "C" IRAM_ATTR void gm_rgb_restart_hook(uint32_t shortfall) {
+    panelclock::logEvent(static_cast<uint32_t>(esp_timer_get_time()), shortfall);
+}
+
+namespace panelclock {
+namespace {
+
 IRAM_ATTR bool onVsync(esp_lcd_panel_handle_t, const esp_lcd_rgb_panel_event_data_t *, void *) {
     g_frames++;
-    // Ratchet rather than report the raw difference. The two callbacks fire at
-    // different points in the frame, so their difference sits at 0 or 1 even
-    // when the scan-out is perfect; only a refill pass that never completed
-    // pushes it permanently higher, and each new high-water mark is one
-    // underrun frame.
+    // Count frames that completed no refill pass, not new high-water marks of
+    // drift.
+    //
+    // This used to ratchet on g_maxDrift, which meant each drift level could
+    // only ever be counted ONCE: miss a refill, recover, miss again, and the
+    // second miss found drift == g_maxDrift and was not counted. The counter
+    // saturated after the first few events and then read flat forever. It
+    // reported 3 underruns in 160 s on a panel that a human watching it saw
+    // displacing several times a second, and every "clean" measurement taken
+    // against it was worthless.
+    //
+    // In steady state exactly one refill pass completes per displayed frame, so
+    // a frame that completes none is an underrun, and it counts every time it
+    // happens. g_maxDrift is kept because the correlation log is keyed on it
+    // and a growing drift is still worth seeing.
     const uint32_t drift = g_frames - g_refills;
     if (drift > g_maxDrift) {
         g_maxDrift = drift;
-        // The first frames after init legitimately run ahead of the first
-        // completed refill pass, which is a phase offset and not a fault.
-        if (g_frames > 4) {
-            g_slips++;
-            const uint32_t now = static_cast<uint32_t>(esp_timer_get_time());
-            ScanoutSlip &e = g_slipLog[g_slipWrite % SLIP_LOG_N];
-            e.frame = g_frames;
-            e.tUs = now;
-            for (int i = 0; i < SCANOUT_ACT_COUNT; i++) {
-                // Zero means the source has never run, which would otherwise
-                // read as "ran at time zero" and look like a very stale hit.
-                e.sinceUs[i] = (g_actUs[i] == 0) ? UINT32_MAX : (now - g_actUs[i]);
-            }
-            g_slipWrite++;
+    }
+    const uint32_t refillsNow = g_refills;
+    const uint32_t refillsThisFrame = refillsNow - g_refillsAtVsync;
+    g_refillsAtVsync = refillsNow;
+    const uint32_t nowUs = static_cast<uint32_t>(esp_timer_get_time());
+    // Only meaningful when this frame's pass actually completed. On a frame
+    // that completed none, g_fbcUs is left over from an earlier frame and the
+    // difference would read as an enormous margin, which is the opposite of
+    // the truth; g_slips is the counter for that case.
+    if (g_frames > 4 && refillsThisFrame >= 1) {
+        const uint32_t margin = nowUs - g_fbcUs;
+        g_marginLastUs = margin;
+        if (margin < g_marginMinUs) {
+            g_marginMinUs = margin;
         }
+        if (margin > g_marginMaxUs) {
+            g_marginMaxUs = margin;
+        }
+        // 128 us buckets so the index is a shift, which keeps this ISR cheap.
+        size_t b = margin >> 7;
+        if (b >= SCANOUT_MARGIN_BUCKETS) {
+            b = SCANOUT_MARGIN_BUCKETS - 1;
+        }
+        g_marginBucket[b]++;
+        if (g_lagThreshUs != 0 && margin < g_lagThreshUs) {
+            logEvent(nowUs, margin);
+        }
+    }
+    // The first frames after init legitimately run ahead of the first completed
+    // refill pass, which is a phase offset and not a fault.
+    if (g_frames > 4 && refillsThisFrame == 0) {
+        g_slips++;
+        // marginUs 0 marks a total refill failure: no pass completed at all, so
+        // there is no headroom to report.
+        logEvent(nowUs, 0);
     }
     return false;
 }
@@ -171,6 +248,14 @@ void attach(void *panelHandle, uint32_t bootPclkHz) {
     // rebuilds it, a total carried over from the previous instance would be
     // attributed to the new timing.
     g_frames = g_refills = g_slips = g_maxDrift = 0;
+    g_refillsAtVsync = 0;
+    g_fbcUs = 0;
+    g_marginLastUs = 0;
+    g_marginMinUs = UINT32_MAX;
+    g_marginMaxUs = 0;
+    for (size_t i = 0; i < SCANOUT_MARGIN_BUCKETS; i++) {
+        g_marginBucket[i] = 0;
+    }
     // Field-by-field rather than a designated initialiser: on_frame_buf_complete
     // shares an anonymous union with a deprecated alias, and naming a union
     // member in a braced list makes the initialiser order-dependent in a way
@@ -253,6 +338,46 @@ void scanoutStats(uint32_t *frames, uint32_t *refills, uint32_t *slips) {
     }
 }
 
+void scanoutMargin(uint32_t *lastUs, uint32_t *minUs, uint32_t *maxUs, uint32_t *buckets) {
+    if (lastUs != nullptr) {
+        *lastUs = g_marginLastUs;
+    }
+    if (maxUs != nullptr) {
+        *maxUs = g_marginMaxUs;
+    }
+    if (minUs != nullptr) {
+        // Before the first measured frame this is the sentinel, which would
+        // print as 4294967295 and read as an absurdly healthy panel.
+        *minUs = (g_marginMinUs == UINT32_MAX) ? 0 : g_marginMinUs;
+    }
+    if (buckets != nullptr) {
+        for (size_t i = 0; i < SCANOUT_MARGIN_BUCKETS; i++) {
+            buckets[i] = g_marginBucket[i];
+        }
+    }
+}
+
+void setLagThresholdUs(uint32_t us) { g_lagThreshUs = us; }
+
+void scanoutReset() {
+    // Order matters a little: clear the derived counters before the phase
+    // reference, so the VSYNC ISR cannot land between them and log a slip
+    // against a frame count that has already been zeroed.
+    g_slips = 0;
+    g_maxDrift = 0;
+    g_marginLastUs = 0;
+    g_marginMinUs = UINT32_MAX;
+    g_marginMaxUs = 0;
+    for (size_t i = 0; i < SCANOUT_MARGIN_BUCKETS; i++) {
+        g_marginBucket[i] = 0;
+    }
+    g_slipWrite = 0;
+    g_frames = 0;
+    g_refills = 0;
+    g_refillsAtVsync = 0;
+    g_fbcUs = 0;
+}
+
 void setDiv(int n) {
     Guard g(lock());
     if (n == 0) {
@@ -266,6 +391,7 @@ void setDiv(int n) {
         return;
     }
     applyLocked(n);
+    scanoutReset();
 }
 
 } // namespace panelclock
@@ -282,6 +408,24 @@ bool hasLiveControl() { return false; }
 void setDiv(int) {}
 void scanoutMark(int) {}
 size_t scanoutSlipLog(ScanoutSlip *, size_t) { return 0; }
+void scanoutReset() {}
+void setLagThresholdUs(uint32_t) {}
+void scanoutMargin(uint32_t *lastUs, uint32_t *minUs, uint32_t *maxUs, uint32_t *buckets) {
+    if (lastUs != nullptr) {
+        *lastUs = 0;
+    }
+    if (minUs != nullptr) {
+        *minUs = 0;
+    }
+    if (maxUs != nullptr) {
+        *maxUs = 0;
+    }
+    if (buckets != nullptr) {
+        for (size_t i = 0; i < SCANOUT_MARGIN_BUCKETS; i++) {
+            buckets[i] = 0;
+        }
+    }
+}
 void scanoutStats(uint32_t *frames, uint32_t *refills, uint32_t *slips) {
     if (frames != nullptr) {
         *frames = 0;
