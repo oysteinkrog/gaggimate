@@ -400,6 +400,7 @@ extern volatile uint32_t gm_rgb_resync_count;
 extern volatile uint32_t gm_rgb_resync_bufs;
 extern volatile uint32_t gm_rgb_resync_max;
 extern volatile uint32_t gm_rgb_over_count;
+extern volatile uint32_t gm_rgb_over_bufs;
 extern volatile uint32_t gm_rgb_flash_skip_bufs;
 extern volatile uint32_t gm_rgb_eof_expect;
 
@@ -535,6 +536,7 @@ void WebUIPlugin::setupServer() {
             gm_rgb_resync_bufs = 0;
             gm_rgb_resync_max = 0;
             gm_rgb_over_count = 0;
+            gm_rgb_over_bufs = 0;
             gm_rgb_flash_skip_bufs = 0;
             gm_rgb_eof_min = 0xFFFFFFFFu;
             gm_rgb_eof_max = 0;
@@ -584,14 +586,14 @@ void WebUIPlugin::setupServer() {
         // it up against the beam instead of restarting the DMA, so it now costs one
         // band of stale pixels rather than a whole shifted frame. dma_restarts should
         // stay at zero: only an explicit panel restart reaches it.
-        response->printf("],\"resyncs\":%u,\"resync_bufs\":%u,\"resync_max\":%u,\"over_count\":%u,"
+        response->printf("],\"resyncs\":%u,\"resync_bufs\":%u,\"resync_max\":%u,\"over_count\":%u,\"over_bufs\":%u,"
                          "\"flash_skips\":%u,"
                          "\"dma_restarts\":%u,\"dma_catchups\":%u,\"dma_catchup_bufs\":%u,"
                          "\"dma_catchup_max\":%u,\"eof_expect\":%u,\"eof_min\":%u,\"eof_max\":%u,\"log\":[",
                          static_cast<unsigned>(gm_rgb_resync_count),
                          static_cast<unsigned>(gm_rgb_resync_bufs),
                          static_cast<unsigned>(gm_rgb_resync_max),
-                         static_cast<unsigned>(gm_rgb_over_count),
+                         static_cast<unsigned>(gm_rgb_over_count), static_cast<unsigned>(gm_rgb_over_bufs),
                          static_cast<unsigned>(gm_rgb_flash_skip_bufs),
                          static_cast<unsigned>(gm_rgb_restart_count),
                          static_cast<unsigned>(gm_rgb_catchup_count),
