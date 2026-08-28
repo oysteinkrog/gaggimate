@@ -80,6 +80,17 @@ class BLEScalePlugin : public Plugin {
     unsigned int reconnectionTries = 0;
     static constexpr unsigned long CONNECT_RETRY_INTERVAL_MS = 2000;
 
+    // Discovery scan phases; the policy and the measurements behind these
+    // numbers live above the gm_ble_scan_* definitions in BLEScalePlugin.cpp.
+    // scan() enters the boost phase; update() runs bursts after it expires.
+    // Mutable because scan() is const and every phase entry goes through it.
+    static constexpr unsigned long SCAN_BOOST_MS = 60000;
+    static constexpr unsigned long SCAN_BURST_LEN_MS = 15000;
+    static constexpr unsigned long SCAN_BURST_PERIOD_MS = 90000;
+    mutable unsigned long scanBoostUntil = 0;
+    mutable unsigned long scanBurstStopAt = 0;
+    mutable unsigned long scanNextBurstAt = 0;
+
     // Cached scale-metadata values used to avoid firing an event for each
     // unchanged poll tick. Reset when the scale disconnects.
     uint8_t lastBatteryLevel = REMOTE_SCALES_BATTERY_UNKNOWN;
