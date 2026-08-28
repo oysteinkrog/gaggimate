@@ -275,7 +275,36 @@ void Controller::setupPanel() {
             ESP.restart();
         }
     }
-    driver->init();
+    // Panel init runs in a task pinned to core 1, because the interrupts it
+    // allocates land on the core that allocates them and must not share a
+    // core with the radio. esp_intr_dump on this firmware showed LCD_CAM and
+    // DMA_OUT_CH0 (the bounce-refill EOF, priority 1) on core 0 next to RWBLE
+    // (the BLE link-layer ISR, priority 3): every scan window preempted the
+    // refill for longer than the bounce pool's ~670 us of slack, and the
+    // panel painted a 16-line stale band a few times a minute. Core 1 has no
+    // radio ISRs, so pinning the allocation there removes the whole class.
+    // A task rather than trusting the caller's core: this ran on core 0
+    // even though setup() is documented to run on ARDUINO_RUNNING_CORE=1,
+    // so the core is forced explicitly instead of assumed.
+    {
+        struct PanelInitCtx {
+            Driver *drv;
+            TaskHandle_t waiter;
+        } ctx = {driver, xTaskGetCurrentTaskHandle()};
+        auto initFn = [](void *arg) {
+            auto *c = static_cast<PanelInitCtx *>(arg);
+            ESP_LOGI("Controller", "panel init on core %d", xPortGetCoreID());
+            c->drv->init();
+            xTaskNotifyGive(c->waiter);
+            vTaskDelete(nullptr);
+        };
+        TaskHandle_t initTask = nullptr;
+        if (xTaskCreatePinnedToCore(initFn, "panel_init", 8192, &ctx, 5, &initTask, 1) == pdPASS) {
+            ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        } else {
+            driver->init(); // out of memory for the helper task; init in place
+        }
+    }
     panelPrefs.putUChar("driver", model);
     panelPrefs.end();
 #endif
