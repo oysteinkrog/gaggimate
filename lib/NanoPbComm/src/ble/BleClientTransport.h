@@ -78,6 +78,17 @@ class BleClientTransport : public Transport, public NimBLEScanCallbacks, public 
     void onDisconnect(NimBLEClient *client, int reason) override;
     void notifyCallback(NimBLERemoteCharacteristic *characteristic, uint8_t *data, size_t length, bool isNotify);
 
+    // Scan duty policy (see scan()/maintain() in the .cpp). Boost gives fast
+    // discovery when a controller is expected imminently; after SCAN_BOOST_MS
+    // without one, maintain() widens the interval so the radio stops paying a
+    // coex window transition every second for a peer that is not there.
+    static constexpr uint16_t SCAN_WINDOW_MS = 50;
+    static constexpr uint16_t SCAN_BOOST_INTERVAL_MS = 1000;
+    static constexpr uint16_t SCAN_BACKOFF_INTERVAL_MS = 5000;
+    static constexpr uint32_t SCAN_BOOST_MS = 45000;
+    unsigned long _scanStartedMs = 0;
+    bool _scanBackedOff = false;
+
     static constexpr const char *LOG_TAG = "BleClientTransport";
     static constexpr size_t MAX_CONNECT_RETRIES = 3;
 };
