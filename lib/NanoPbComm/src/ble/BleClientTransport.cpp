@@ -26,8 +26,18 @@ void BleClientTransport::scan() {
     // adverts flowing (internally setDuplicateFilter(false)) -- same as the explicit
     // setDuplicateFilter(false) below, preserving the pre-2.x rediscovery behaviour.
     _scanner->setScanCallbacks(this, true);
-    _scanner->setInterval(1000);
-    _scanner->setWindow(50);
+    // Every scan window open/close forces a Wi-Fi/BLE coex switch, and on the
+    // RGB-panel display each switch can stall the MSPI bus long enough to
+    // starve the panel's bounce-buffer refill (~0.55 displaced bands per
+    // second measured at a 1000 ms interval, 0.19/s at 5000 ms). Boost at
+    // 1000 ms only while discovery is likely imminent -- scan() entry means
+    // boot or a fresh disconnect -- then maintain() backs off to 5000 ms.
+    // Passive scan with a 50 ms window catches typical 100-200 ms adverts
+    // within a few windows, so backed-off discovery still lands in seconds.
+    _scanStartedMs = millis();
+    _scanBackedOff = false;
+    _scanner->setInterval(SCAN_BOOST_INTERVAL_MS);
+    _scanner->setWindow(SCAN_WINDOW_MS);
     _scanner->setMaxResults(0);
     _scanner->setDuplicateFilter(false);
     _scanner->setActiveScan(false);
@@ -38,8 +48,30 @@ void BleClientTransport::maintain() {
     if (_client == nullptr || _scanner == nullptr)
         return; // init() failed to create the client/scanner
     if (!_readyForConnection && !_client->isConnected() && !_scanner->isScanning()) {
+        // Restart in place, keeping the current interval. Scans stall every
+        // minute or two when coexistence aborts them; a stall says nothing
+        // about whether a controller is near, and going through scan() here
+        // re-entered boost each time, which held the radio at the boost duty
+        // (and its display cost) nearly continuously on a bench with no
+        // controller. Parameters survive in the scanner object, so start()
+        // alone resumes; fall back to a full scan() only if it refuses.
         ESP_LOGI(LOG_TAG, "Scan stalled, restarting");
-        scan();
+        if (!_scanner->start(0, false, false)) {
+            scan();
+        }
+        return;
+    }
+    // Back off a long-running fruitless scan (rationale at scan()). Inline
+    // stop/start rather than scan(), which would reset the boost clock; the
+    // early return above keeps the stall-restart path from seeing the brief
+    // not-scanning gap this creates.
+    if (!_scanBackedOff && _scanner->isScanning() && millis() - _scanStartedMs >= SCAN_BOOST_MS) {
+        _scanBackedOff = true;
+        _scanner->stop();
+        _scanner->setInterval(SCAN_BACKOFF_INTERVAL_MS);
+        _scanner->start(0, false, false);
+        ESP_LOGI(LOG_TAG, "No controller in %us, scan backing off to %u ms interval",
+                 (unsigned)(SCAN_BOOST_MS / 1000), (unsigned)SCAN_BACKOFF_INTERVAL_MS);
     }
 }
 
