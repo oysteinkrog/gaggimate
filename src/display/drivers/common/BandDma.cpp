@@ -2,6 +2,7 @@
 
 #include "BandDma.h"
 #include <esp32-hal-log.h>
+#include <esp_timer.h>
 
 namespace {
 // gdma_link.c caps one descriptor at GDMA_MAX_BUFFER_SIZE_PER_LINK_ITEM (4095)
@@ -233,10 +234,38 @@ esp_err_t BandDma::submit(int slot, void *dst, const void *src, size_t bytes, vo
 }
 
 void BandDma::startSlot(int slot) {
+    _xferStartUs = esp_timer_get_time();
     // RX first: the receiver has to be armed before the sender pushes, or the
     // first bytes have nowhere to land.
     gdma_start(_rxChan, gdma_link_get_head_addr(_rxLink[slot]));
     gdma_start(_txChan, gdma_link_get_head_addr(_txLink[slot]));
+}
+
+void BandDma::xferStats(uint32_t *count, uint32_t *sumUs, uint32_t *maxUs, uint32_t *over256,
+                        uint32_t *over512) const {
+    if (count != nullptr) {
+        *count = _xferCount;
+    }
+    if (sumUs != nullptr) {
+        *sumUs = _xferSumUs;
+    }
+    if (maxUs != nullptr) {
+        *maxUs = _xferMaxUs;
+    }
+    if (over256 != nullptr) {
+        *over256 = _xferOver256;
+    }
+    if (over512 != nullptr) {
+        *over512 = _xferOver512;
+    }
+}
+
+void BandDma::xferStatsReset() {
+    _xferCount = 0;
+    _xferSumUs = 0;
+    _xferMaxUs = 0;
+    _xferOver256 = 0;
+    _xferOver512 = 0;
 }
 
 bool IRAM_ATTR BandDma::rxEofTrampoline(gdma_channel_handle_t, gdma_event_data_t *, void *user) {
@@ -244,6 +273,21 @@ bool IRAM_ATTR BandDma::rxEofTrampoline(gdma_channel_handle_t, gdma_event_data_t
 }
 
 bool IRAM_ATTR BandDma::onRxEof() {
+    // Duration of the transfer that just finished, taken before anything can
+    // overwrite the start stamp (starting the next slot below does).
+    const uint32_t dt = static_cast<uint32_t>(esp_timer_get_time() - _xferStartUs);
+    _xferCount = _xferCount + 1;
+    _xferSumUs = _xferSumUs + dt;
+    if (dt > _xferMaxUs) {
+        _xferMaxUs = dt;
+    }
+    if (dt > 256) {
+        _xferOver256 = _xferOver256 + 1;
+        if (dt > 512) {
+            _xferOver512 = _xferOver512 + 1;
+        }
+    }
+
     void *const arg = _current.arg;
 
     int nextSlot = -1;

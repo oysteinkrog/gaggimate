@@ -230,6 +230,12 @@ class SleepAnimation {
     // across both buffers shows as content composited twice.
     uint32_t dmaErrorCount() const { return dmaErrors.load(); }
     bool dmaPathWanted() const { return dmaWanted.load(); }
+    // Band-DMA transfer durations, hardware start to EOF. The discriminating
+    // measurement for the scan-out residual: BandDma.h explains what the
+    // over-512 rate decides.
+    void dmaXferStats(uint32_t *count, uint32_t *sumUs, uint32_t *maxUs, uint32_t *over256, uint32_t *over512) const {
+        bandDma.xferStats(count, sumUs, maxUs, over256, over512);
+    }
 
 #ifdef GM_ANIM_BENCH
     // Bench build only. The render task walks the whole registry, dwelling on

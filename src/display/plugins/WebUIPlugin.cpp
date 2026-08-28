@@ -760,6 +760,19 @@ void WebUIPlugin::setupServer() {
             doc["band_align"][i] = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(bp) & 63u);
         }
         doc["dma_errors"] = a->dmaErrorCount();
+        {
+            // Band-DMA transfer durations. bdma_over512 climbing at the
+            // refill's resync rate means a GDMA PSRAM access queues behind
+            // the same bus stall the CPU memcpy does; staying at zero means
+            // it dodges it. BandDma.h carries the full argument.
+            uint32_t n = 0, sum = 0, mx = 0, o256 = 0, o512 = 0;
+            a->dmaXferStats(&n, &sum, &mx, &o256, &o512);
+            doc["bdma_n"] = n;
+            doc["bdma_mean_us"] = n != 0 ? sum / n : 0;
+            doc["bdma_max_us"] = mx;
+            doc["bdma_over256"] = o256;
+            doc["bdma_over512"] = o512;
+        }
         // fb_mismatch over fb_checked is the rate at which a band's content
         // failed to reach the framebuffer row it was rendered for, which is the
         // fault the panel shows as a block of lines displaced vertically. This
