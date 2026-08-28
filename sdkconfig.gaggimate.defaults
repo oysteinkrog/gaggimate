@@ -390,3 +390,21 @@ CONFIG_BT_CTRL_SCAN_DUPL_CACHE_SIZE=20
 # Costs ~16 small HAL/driver functions of IRAM (esp_lcd/linker.lf plus the
 # GDMA_ISR_HANDLER_IN_IRAM and ESP_PERIPH_CTRL_FUNC_IN_IRAM selects).
 CONFIG_LCD_RGB_ISR_IRAM_SAFE=y
+
+# --- RF PLL temperature tracking at 5 s instead of 1 s ---
+# Every PLL-track tick is followed ~100-180 ms later by radio-side work that
+# stalls the scan-out refill for ~770 us, just over the bounce pool's 672 us
+# of slack, displacing a band of the picture. The tick body itself already
+# runs in the vertical blanking window (scripts/patch_phy_track_defer.py +
+# PanelClock.cpp), but that follow-on work fires on the radio's own schedule
+# and cannot be deferred from here, so the remaining lever is the tick rate.
+# Slips in /api/debug/scanout's log sat phase-locked 5-8 frames after each
+# tick (phy_us 115/138/161/184 ms at 23.04 ms per frame) with flash and
+# overlay acquitted, so the rate should scale down with the period.
+# Tracking exists to re-trim the RF PLL against temperature drift. The board
+# sits beside a boiler, so drift is real but slow: thermal time constants are
+# minutes, and a 5 s trim loop tracks that as well as a 1 s one. Espressif
+# exposes exactly this knob for the purpose; the experimental
+# ESP_PHY_DISABLE_PLL_TRACK was rejected because losing tracking entirely
+# next to a heat source is the one environment where it must keep working.
+CONFIG_ESP_PHY_PLL_TRACK_PERIOD_MS=5000
