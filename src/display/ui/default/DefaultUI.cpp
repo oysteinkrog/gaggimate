@@ -367,6 +367,9 @@ void DefaultUI::loop() {
     // visibly settling a frame late, but only the first time a screen was
     // entered, since after that the flags were already correct.
     ui_tick();
+    // After ui_tick so a screen eez_flow_set_screen created this pass exists
+    // before the walk runs.
+    applyPressedFeedback();
     // Scale overlay before the animation maintenance: maintainSleepAnimation
     // snapshots the LVGL tree into the panel overlay, so the overlay's
     // show/hide state must be final by then, or the pass that enters the
@@ -671,8 +674,62 @@ void DefaultUI::handleScreenChange() {
         }
         eez_flow_set_screen(targetScreen, LV_SCR_LOAD_ANIM_NONE, 0, 0);
         animateGaugeTicks(currentScreen, targetScreen);
+        // The flow engine may delete and later recreate the screen this
+        // leaves; a recreated screen can land on the old lv_obj address, so
+        // an address compare alone would skip restyling it.
+        pressedStyledRoot = nullptr;
         rerender = true;
     }
+}
+
+// See the declaration for why this exists and why it darkens colors instead
+// of changing background opacity. Local per-object props (not one shared
+// style) because the pressed look derives from each widget's OWN rest
+// colors — a flat black-60 recolor read as "almost too much" dimming on
+// theme-tinted icons and lost their hue entirely. Setting a local prop
+// twice just overwrites it, so the walk is idempotent, and the rest colors
+// are re-read on every walk, which is what makes the theme-change rewalk
+// (applyTheme clears the root) pick up new hues.
+static void applyPressedRecurse(lv_obj_t *obj) {
+    const bool isImgBtn = lv_obj_check_type(obj, &lv_imgbtn_class);
+    if (isImgBtn || (lv_obj_check_type(obj, &lv_img_class) && lv_obj_has_flag(obj, LV_OBJ_FLAG_CLICKABLE))) {
+        // Resolved for the unpressed state this walk runs in. Icons the theme
+        // fully recolors (opa 255, most of them) dim to a darker shade of
+        // their own theme color; raw bitmaps pull 40% toward black.
+        const lv_color_t rest = lv_obj_get_style_img_recolor(obj, LV_PART_MAIN);
+        const lv_opa_t restOpa = lv_obj_get_style_img_recolor_opa(obj, LV_PART_MAIN);
+        lv_color_t pressed = lv_color_black();
+        lv_opa_t pressedOpa = LV_OPA_40;
+        if (restOpa > LV_OPA_50) {
+            pressed = lv_color_darken(rest, LV_OPA_40);
+            pressedOpa = restOpa;
+        }
+        lv_obj_set_style_img_recolor(obj, pressed, LV_PART_MAIN | LV_STATE_PRESSED);
+        lv_obj_set_style_img_recolor_opa(obj, pressedOpa, LV_PART_MAIN | LV_STATE_PRESSED);
+    } else if (lv_obj_check_type(obj, &lv_btn_class)) {
+        // The generated buttons set their bg locally in the DEFAULT state,
+        // which outranks the theme's pressed styles — so give them a local
+        // pressed bg too. Buttons without a visible bg are left alone rather
+        // than given one: adding opacity on press would change the snapshot's
+        // alpha coverage and re-trigger the scrim rebuild.
+        if (lv_obj_get_style_bg_opa(obj, LV_PART_MAIN) >= LV_OPA_20) {
+            const lv_color_t bg = lv_obj_get_style_bg_color(obj, LV_PART_MAIN);
+            lv_obj_set_style_bg_color(obj, lv_color_darken(bg, LV_OPA_40), LV_PART_MAIN | LV_STATE_PRESSED);
+        }
+    }
+    const uint32_t n = lv_obj_get_child_cnt(obj);
+    for (uint32_t i = 0; i < n; i++) {
+        applyPressedRecurse(lv_obj_get_child(obj, i));
+    }
+}
+
+void DefaultUI::applyPressedFeedback() {
+    lv_obj_t *scr = lv_scr_act();
+    if (scr == nullptr || scr == pressedStyledRoot) {
+        return;
+    }
+    applyPressedRecurse(scr);
+    pressedStyledRoot = scr;
 }
 
 void DefaultUI::startSleepAnimation() {
@@ -1687,6 +1744,8 @@ void DefaultUI::applyTheme() {
     if (newThemeMode != currentThemeMode) {
         currentThemeMode = newThemeMode;
         change_color_theme(currentThemeMode);
+        // Rest colors just changed under the pressed-feedback props; rewalk.
+        pressedStyledRoot = nullptr;
         // change_color_theme just reassigned bg_color on every plate, so a
         // custom-coloured plate (mode 2) has silently reverted to the theme
         // colour while applyAnimPlates still believes it wrote the custom one.
