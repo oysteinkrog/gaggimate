@@ -1,0 +1,8 @@
+# Golden reference dumps are raw binary (run tables, cell grids, packed
+# RGB565 framebuffers) with no reliable early NUL byte, so git's own binary
+# heuristic does not always classify them as binary. Without this, the repo's
+# pre-commit hook's trailing-whitespace fixup (`git diff-index --check` +
+# `sed -i 's/[[:space:]]*$//'`) silently strips bytes that happen to look like
+# trailing whitespace right before a 0x0A byte or at EOF, corrupting the file
+# on every commit. Force binary explicitly so nothing ever text-processes these.
+golden/*.bin binary
