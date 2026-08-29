@@ -18,6 +18,7 @@ const BenchGateState &bench_gate_state() {
 #include <display/drivers/WaveshareDriver.h>
 #include <display/drivers/common/LV_Helper.h>
 #include <display/drivers/common/PanelClock.h>
+#include <display/gm_lv_mem.h>
 
 #include <climits>
 #ifdef GM_TOUCH_PROBE
@@ -1732,6 +1733,18 @@ void DefaultUI::loopTask(void *arg) {
                 g_ovlAreaSum = g_ovlAreaMax = 0;
                 g_snapClearSum = g_snapDrawSum = 0;
                 g_statPubScanUs = g_statPubScrimUs = 0;
+                {
+                    // Sizing data for a possible internal-RAM LVGL arena:
+                    // the live set the tree walk chases vs. the internal
+                    // heap headroom that would have to absorb it.
+                    GmLvMemStats m = gm_lv_mem_stats();
+                    ESP_LOGI("TouchProbe",
+                             "GM_LVMEM: live=%lu hwm=%lu n=%lu allocs=%lu | int_free=%u int_lgst=%u",
+                             (unsigned long)m.liveBytes, (unsigned long)m.hwmBytes, (unsigned long)m.liveCount,
+                             (unsigned long)m.allocCalls,
+                             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+                             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+                }
             }
         }
 #endif
