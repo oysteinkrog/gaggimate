@@ -18,14 +18,44 @@ void beginLvglHelper(Display &board, bool debug = false);
 // widget updates can't race the plasma frames on screen.
 void lvgl_helper_suppress_flush(bool suppress);
 
-// Union of the areas LVGL re-rendered while flushing was suppressed, in screen
-// coordinates. Returns false and leaves *out untouched when nothing has been
-// redrawn since the last call; taking the value clears the accumulator.
+// The areas LVGL re-rendered while flushing was suppressed, in screen
+// coordinates, as a list of disjoint rectangles rather than one bounding box.
+// The box turned two small widgets at opposite screen corners into a
+// full-screen union, and the overlay refresh paid full-screen snapshot and
+// span-scan costs for every temperature tick. Returns the count written to
+// out (0 when nothing was redrawn); taking the values clears the accumulator.
 //
 // The suppressed flush is the exact hook for this: LVGL calls it once per
 // redrawn area, so what it is handed IS the invalidated region, already merged
 // and clipped by LVGL's own refresh logic. Both this and the caller run on the
 // UI task (lv_timer_handler), so the accumulator needs no locking.
-bool lvgl_helper_take_dirty(lv_area_t *out);
+#define GM_DIRTY_RECT_CAP 8
+int lvgl_helper_take_dirty_rects(lv_area_t *out, int maxN);
+// Merge one rectangle into a fixed-capacity list: unions with anything it
+// overlaps or touches (folding transitively), appends while there is room,
+// and otherwise folds into the entry whose bounding box grows least. Exported
+// for the overlay's per-buffer debt lists, which need the same policy.
+void lvgl_helper_rect_add(lv_area_t *list, int *n, int cap, const lv_area_t &r);
+
+#ifdef GM_TOUCH_PROBE
+#include <atomic>
+// Touch-to-pixel latency probe (bench builds). touchpad_read stamps the edge;
+// whichever path carries the resulting redraw to the panel closes the interval
+// and clears the stamp: disp_flush's direct present, or the animation's
+// renderLoop when the overlay path owns the panel. These two are UI-task-only.
+extern volatile int64_t g_probeEdgeUs;
+extern volatile bool g_probeEdgeIsPress;
+// Handoff from the overlay publish to the render task. The publish only makes
+// the snapshot AVAILABLE; the composite samples it at the start of the next
+// frame, so the publish copies the edge stamp here and the render task closes
+// the interval at the present of the first frame that sampled it. UI task
+// (core 1) writes, render task (core 0) reads-and-clears: atomic because a
+// 64-bit access is two instructions on Xtensa and a cross-core torn read
+// would fabricate a latency number. A stamp lost to the check-then-clear
+// window still just drops one probe line, nothing more.
+extern std::atomic<int64_t> g_probePublishUs;
+extern std::atomic<bool> g_probePublishIsPress;
+#endif
+
 String lvgl_helper_get_fs_filename(String filename);
 const char *lvgl_helper_get_fs_filename(const char *filename);

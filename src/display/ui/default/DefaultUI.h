@@ -81,6 +81,11 @@ class DefaultUI {
     void releaseAnimHost();
     void maintainSleepAnimation();
     void refreshSleepOverlay();
+    // The 5 ms handler pass in loopTask calls this so widget redraws reach the
+    // overlay snapshot on the input cadence instead of waiting for the next
+    // 25 ms ui->loop() pass. Costs a bool check when the animation is off and
+    // one comparison when it is on but nothing was drawn.
+    void pumpSleepOverlay();
     // Hide, restore or repaint the opaque background plates the generated
     // screens put behind their content. mode is Settings::getBgAnimClearPlates
     // (0 keep, 1 hide, 2 custom); color is 0xRRGGBB and opaPct 0-100, both used
@@ -103,11 +108,18 @@ class DefaultUI {
     SleepAnimation sleepAnimation;
     unsigned long lastSleepAnimAttempt = 0;
     unsigned long lastSleepOverlayRefresh = 0;
-    // Dirty region still owed to each of the two overlay buffers, in screen
+    // Dirty regions still owed to each of the two overlay buffers, in screen
     // coordinates, and whether that buffer has ever held a full render. They
     // are written alternately, so each carries its own debt: a partial update
     // is only valid against what that specific buffer already holds.
-    lv_area_t overlayDirty[2] = {{1, 1, 0, 0}, {1, 1, 0, 0}};
+    //
+    // A list per buffer, not one rectangle: a single bounding box unioned the
+    // temperature readout and the status bar into the whole screen, and every
+    // refresh then re-rendered and re-scanned all 480x480 pixels. That was
+    // most of the 650 ms UI pass the touch probe measured.
+    static constexpr int OVERLAY_DIRTY_RECTS = 8;
+    lv_area_t overlayDirty[2][OVERLAY_DIRTY_RECTS];
+    int overlayDirtyN[2] = {0, 0};
     bool overlayValid[2] = {false, false};
     // The snapshot geometry each overlay buffer was built with.
     //

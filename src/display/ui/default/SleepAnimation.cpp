@@ -15,6 +15,15 @@
 #include <math.h>
 #include <string.h> // memmove, for the round-panel band compaction
 
+#ifdef GM_TOUCH_PROBE
+#include "esp_log.h"
+#include <display/drivers/common/LV_Helper.h>
+// Edge stamp of a publish this frame's composite sampled; renderLoop logs it
+// once the frame is presented. Render-task-private, so no volatile needed.
+static int64_t s_probeFrameEdgeUs = 0;
+static bool s_probeFramePress = false;
+#endif
+
 // Stage timers for the bench build. These compile to nothing in a normal
 // build, so the shipping render path carries no measurement overhead.
 #ifdef GM_ANIM_BENCH
@@ -854,7 +863,7 @@ void SleepAnimation::start(Display *d) {
     // that share core 0 (Arduino loop, WiFi events, AsyncTCP), none of which
     // are time-critical. Core 1 is left exactly as it was: the render task
     // stays at priority 1 alongside the UI task, which is deliberate (see the
-    // note above -- priority 2 there starved touch input).
+    // note above — priority 2 there starved touch input).
     TaskHandle_t push = nullptr;
     pushStopped = false;
     if (xTaskCreatePinnedToCore(pushTaskEntry, "SleepPush", 4096, this, 2, &push, 0) != pdPASS) {
@@ -1255,7 +1264,12 @@ uint8_t *SleepAnimation::overlayBackBuffer() {
 }
 
 void SleepAnimation::publishOverlay(int w, int h, int rowY0, int rowY1) {
-    if (overlayCap == 0 || display == nullptr) {
+    const int r[1][2] = {{rowY0, rowY1}};
+    publishOverlayRanges(w, h, r, 1);
+}
+
+void SleepAnimation::publishOverlayRanges(int w, int h, const int (*ranges)[2], int n) {
+    if (overlayCap == 0 || display == nullptr || n <= 0) {
         return;
     }
     const int back = (overlayFront.load() + 1) & 1;
@@ -1270,69 +1284,130 @@ void SleepAnimation::publishOverlay(int w, int h, int rowY0, int rowY1) {
     // The snapshot extends past the panel by ext draw size on every side.
     const int xoff = (w - panelW) / 2;
     const int yoff = (h - panelH) / 2;
-    // Span scan: one pass over the alpha channel (~230 KB) per refresh, on the
-    // UI task. The render task then touches only rows/pixels that matter.
-    if (rowY0 < 0) {
-        rowY0 = 0;
-    }
-    if (rowY1 > panelH) {
-        rowY1 = panelH;
-    }
     const bool doScrim = ov.scrim != nullptr && scrimTmp != nullptr;
     const int sw = ov.scrimW;
-    if (doScrim) {
-        // Widen the range to whole scrim cells. A cell's value is the peak alpha
-        // of the 4 rows it covers, so it can only be rebuilt from all 4 of them
-        // -- clearing a cell row and then refilling it from a partial range
-        // would drop the coverage the other rows contributed. The extra rows
-        // cost one more pass over alpha the buffer already holds, and their span
-        // tables come out identical to what was there.
-        rowY0 &= ~((1 << SCRIM_SHIFT) - 1);
-        rowY1 = (rowY1 + (1 << SCRIM_SHIFT) - 1) & ~((1 << SCRIM_SHIFT) - 1);
-        if (rowY1 > panelH) {
-            rowY1 = panelH;
+
+    // Clamp each range to the panel and, when the scrim is on, widen it to
+    // whole scrim cells. A cell's value is the peak alpha of the 4 rows it
+    // covers, so it can only be rebuilt from all 4 of them -- clearing a cell
+    // row and then refilling it from a partial range would drop the coverage
+    // the other rows contributed. The extra rows cost one more pass over alpha
+    // the buffer already holds, and their span tables come out identical.
+    constexpr int MAX_RANGES = 8;
+    int rr[MAX_RANGES][2];
+    int m = 0;
+    for (int i = 0; i < n; i++) {
+        int y0 = ranges[i][0];
+        int y1 = ranges[i][1];
+        if (y0 < 0) {
+            y0 = 0;
         }
-        const int cellY0 = rowY0 >> SCRIM_SHIFT;
-        const int cellY1 = ((rowY1 + (1 << SCRIM_SHIFT) - 1) >> SCRIM_SHIFT);
-        memset(ov.scrimSrc + static_cast<size_t>(cellY0) * sw, 0, static_cast<size_t>(cellY1 - cellY0) * sw);
+        if (y1 > panelH) {
+            y1 = panelH;
+        }
+        if (doScrim) {
+            y0 &= ~((1 << SCRIM_SHIFT) - 1);
+            y1 = (y1 + (1 << SCRIM_SHIFT) - 1) & ~((1 << SCRIM_SHIFT) - 1);
+            if (y1 > panelH) {
+                y1 = panelH;
+            }
+        }
+        if (y1 <= y0) {
+            continue;
+        }
+        if (m < MAX_RANGES) {
+            rr[m][0] = y0;
+            rr[m][1] = y1;
+            m++;
+        } else {
+            // Never drop a range: stale spans would persist until the next
+            // publish that happens to cover those rows. Fold into the last
+            // entry; the sort+merge below keeps the result well-formed.
+            if (y0 < rr[MAX_RANGES - 1][0]) {
+                rr[MAX_RANGES - 1][0] = y0;
+            }
+            if (y1 > rr[MAX_RANGES - 1][1]) {
+                rr[MAX_RANGES - 1][1] = y1;
+            }
+        }
     }
-    for (int y = rowY0; y < rowY1; y++) {
-        uint32_t *const rowRuns = ov.runs + static_cast<size_t>(y) * RUNS_PER_ROW;
-        int nRuns = 0;
-        const int sy = y + yoff;
-        if (sy >= 0 && sy < h) {
-            const uint8_t *a = ov.buf + (static_cast<size_t>(sy) * w + xoff) * 3 + 2;
-            uint8_t *cell = doScrim ? ov.scrimSrc + static_cast<size_t>(y >> SCRIM_SHIFT) * sw : nullptr;
-            int runStart = -1;
-            for (int x = 0; x < panelW; x++, a += 3) {
-                if (*a != 0) {
-                    if (runStart < 0) {
-                        runStart = x;
-                    }
-                    if (cell != nullptr) {
-                        // Peak, not average: the halo is meant to cover the gaps
-                        // between strokes and inside glyph counters, and those
-                        // are exactly where an average would fade it out.
-                        uint8_t &c = cell[x >> SCRIM_SHIFT];
-                        if (*a > c) {
-                            c = *a;
+    // Sort and merge. After the cell widening two ranges can share a cell row,
+    // and processing them separately would memset coverage the other had just
+    // contributed.
+    for (int i = 1; i < m; i++) {
+        const int a0 = rr[i][0], a1 = rr[i][1];
+        int j = i - 1;
+        while (j >= 0 && rr[j][0] > a0) {
+            rr[j + 1][0] = rr[j][0];
+            rr[j + 1][1] = rr[j][1];
+            j--;
+        }
+        rr[j + 1][0] = a0;
+        rr[j + 1][1] = a1;
+    }
+    int k = 0;
+    for (int i = 1; i < m; i++) {
+        if (rr[i][0] <= rr[k][1]) {
+            if (rr[i][1] > rr[k][1]) {
+                rr[k][1] = rr[i][1];
+            }
+        } else {
+            k++;
+            rr[k][0] = rr[i][0];
+            rr[k][1] = rr[i][1];
+        }
+    }
+    m = (m > 0) ? k + 1 : 0;
+
+    // Span scan per range, on the UI task. The render task then touches only
+    // rows/pixels that matter. Scanning only the changed ranges rather than
+    // their bounding row span is the point of taking a list.
+    for (int g = 0; g < m; g++) {
+        const int rowY0 = rr[g][0];
+        const int rowY1 = rr[g][1];
+        if (doScrim) {
+            const int cellY0 = rowY0 >> SCRIM_SHIFT;
+            const int cellY1 = ((rowY1 + (1 << SCRIM_SHIFT) - 1) >> SCRIM_SHIFT);
+            memset(ov.scrimSrc + static_cast<size_t>(cellY0) * sw, 0, static_cast<size_t>(cellY1 - cellY0) * sw);
+        }
+        for (int y = rowY0; y < rowY1; y++) {
+            uint32_t *const rowRuns = ov.runs + static_cast<size_t>(y) * RUNS_PER_ROW;
+            int nRuns = 0;
+            const int sy = y + yoff;
+            if (sy >= 0 && sy < h) {
+                const uint8_t *a = ov.buf + (static_cast<size_t>(sy) * w + xoff) * 3 + 2;
+                uint8_t *cell = doScrim ? ov.scrimSrc + static_cast<size_t>(y >> SCRIM_SHIFT) * sw : nullptr;
+                int runStart = -1;
+                for (int x = 0; x < panelW; x++, a += 3) {
+                    if (*a != 0) {
+                        if (runStart < 0) {
+                            runStart = x;
                         }
+                        if (cell != nullptr) {
+                            // Peak, not average: the halo is meant to cover the gaps
+                            // between strokes and inside glyph counters, and those
+                            // are exactly where an average would fade it out.
+                            uint8_t &c = cell[x >> SCRIM_SHIFT];
+                            if (*a > c) {
+                                c = *a;
+                            }
+                        }
+                        continue;
                     }
-                    continue;
+                    if (runStart < 0) {
+                        continue;
+                    }
+                    nRuns = emitRun(rowRuns, nRuns, runStart, x, RUN_GAP_MERGE);
+                    runStart = -1;
                 }
-                if (runStart < 0) {
-                    continue;
+                if (runStart >= 0) {
+                    nRuns = emitRun(rowRuns, nRuns, runStart, panelW, RUN_GAP_MERGE);
                 }
-                nRuns = emitRun(rowRuns, nRuns, runStart, x, RUN_GAP_MERGE);
-                runStart = -1;
             }
-            if (runStart >= 0) {
-                nRuns = emitRun(rowRuns, nRuns, runStart, panelW, RUN_GAP_MERGE);
-            }
+            ov.runN[y] = static_cast<uint8_t>(nRuns);
         }
-        ov.runN[y] = static_cast<uint8_t>(nRuns);
     }
-    if (doScrim) {
+    if (doScrim && m > 0) {
         buildScrim(ov, panelW, panelH);
     }
     overlayFront.store(back);
@@ -1763,6 +1838,13 @@ void SleepAnimation::renderLoop() {
             renderFrame();
         }
         presentFrame();
+#ifdef GM_TOUCH_PROBE
+        if (s_probeFrameEdgeUs != 0) {
+            ESP_LOGI("TouchProbe", "GM_TOUCHLAT: %s->anim_frame %lld us", s_probeFramePress ? "press" : "release",
+                     (long long)(esp_timer_get_time() - s_probeFrameEdgeUs));
+            s_probeFrameEdgeUs = 0;
+        }
+#endif
         // Once per frame, not once per band: every band of a frame must push
         // the same parity or the two halves of the picture drift apart.
         frameParity++;
@@ -2033,6 +2115,15 @@ void SleepAnimation::renderFrame() {
         ofi = overlayFront.load();
         overlayInUse.store(ofi);
     } while (ofi != overlayFront.load());
+#ifdef GM_TOUCH_PROBE
+    // This sample is the moment a publish becomes part of a frame; a stamp
+    // still pending here means this frame is the first to carry the response.
+    if (g_probePublishUs != 0 && ofi >= 0) {
+        s_probeFrameEdgeUs = g_probePublishUs;
+        s_probeFramePress = g_probePublishIsPress;
+        g_probePublishUs = 0;
+    }
+#endif
     const Overlay *ov = ofi >= 0 ? &overlays[ofi] : nullptr;
     const int ovXoff = ov != nullptr ? (ov->w - w) / 2 : 0;
     const int ovYoff = ov != nullptr ? (ov->h - h) / 2 : 0;

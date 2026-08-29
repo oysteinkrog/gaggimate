@@ -20,6 +20,22 @@ const BenchGateState &bench_gate_state() {
 #include <display/drivers/common/PanelClock.h>
 
 #include <climits>
+#ifdef GM_TOUCH_PROBE
+#include "esp_log.h"
+#include "esp_timer.h"
+// Where does a UI pass spend its time? The touch probe showed the LVGL task
+// pass effectively running every ~650 ms instead of every 5, which starves
+// input and widget updates alike. All on the UI task, so no locking.
+namespace {
+uint32_t g_uiPassN = 0;
+int64_t g_uiPassSum = 0, g_uiPassMax = 0;
+uint32_t g_ovlN = 0;
+int64_t g_ovlSnapSum = 0, g_ovlSnapMax = 0;
+int64_t g_ovlPubSum = 0, g_ovlPubMax = 0;
+int64_t g_ovlAreaSum = 0, g_ovlAreaMax = 0;
+int64_t g_uiStatLastLog = 0;
+} // namespace
+#endif
 #endif
 #include <display/main.h>
 #include <display/ui/utils/effects.h>
@@ -42,26 +58,6 @@ static constexpr uint32_t STARTUP_FADE_MS = 1000; // standby fade-in duration on
 
 namespace {
 inline bool areaEmpty(const lv_area_t &a) { return a.x1 > a.x2 || a.y1 > a.y2; }
-inline void areaClear(lv_area_t &a) {
-    a.x1 = 1;
-    a.y1 = 1;
-    a.x2 = 0;
-    a.y2 = 0;
-}
-inline void areaMerge(lv_area_t &dst, const lv_area_t &src) {
-    if (areaEmpty(dst)) {
-        dst = src;
-        return;
-    }
-    if (src.x1 < dst.x1)
-        dst.x1 = src.x1;
-    if (src.y1 < dst.y1)
-        dst.y1 = src.y1;
-    if (src.x2 > dst.x2)
-        dst.x2 = src.x2;
-    if (src.y2 > dst.y2)
-        dst.y2 = src.y2;
-}
 } // namespace
 
 static constexpr int32_t GAUGE_TICK_LONG = 25;      // meter tick length on most screens
@@ -434,13 +430,25 @@ void DefaultUI::maintainSleepAnimation() {
             const Settings &plateSettings = controller->getSettings();
             applyAnimPlates(plateSettings.getBgAnimClearPlates(), static_cast<uint32_t>(plateSettings.getBgAnimPlateColor()),
                             plateSettings.getBgAnimPlateOpacity());
-            const unsigned long interval = currentScreen == SCREEN_ID_STANDBY_SCREEN ? 1000 : 33;
-            if (::millis() - lastSleepOverlayRefresh > interval) {
-                refreshSleepOverlay();
-            }
+            // No refresh throttle. refreshSleepOverlay's own early-out makes a
+            // pass with no fresh LVGL output cost one comparison, so the only
+            // thing an interval here rate-limited was the response to actual
+            // changes -- and the standby screen's old 1000 ms interval held a
+            // tap's visual feedback for up to a second, which is most of what
+            // "the UI feels slow under the animation" was. The snapshot rate
+            // stays bounded by the rate at which LVGL actually redraws.
+            refreshSleepOverlay();
         }
     } else if (sleepAnimation.isActive()) {
         stopSleepAnimation();
+    }
+#endif
+}
+
+void DefaultUI::pumpSleepOverlay() {
+#ifndef GAGGIMATE_SIM
+    if (sleepAnimation.isActive()) {
+        refreshSleepOverlay();
     }
 #endif
 }
@@ -817,8 +825,7 @@ void DefaultUI::adoptAnimHost(lv_obj_t *host) {
     lv_obj_set_style_bg_opa(animHostScreen, LV_OPA_TRANSP, LV_PART_MAIN);
     // Both overlay buffers describe the screen that just went away.
     overlayValid[0] = overlayValid[1] = false;
-    areaClear(overlayDirty[0]);
-    areaClear(overlayDirty[1]);
+    overlayDirtyN[0] = overlayDirtyN[1] = 0;
     refreshSleepOverlay();
 #endif
 }
@@ -932,6 +939,9 @@ bool DefaultUI::snapshotAreaToOverlay(lv_obj_t *obj, uint8_t *buf, uint32_t bufS
 
 void DefaultUI::refreshSleepOverlay() {
 #ifndef GAGGIMATE_SIM
+    // The debt lists, LVGL's accumulator and publishOverlayRanges' local range
+    // buffer all size to the same cap; a mismatch silently drops debt.
+    static_assert(OVERLAY_DIRTY_RECTS == GM_DIRTY_RECT_CAP, "rect caps must match");
     lv_obj_t *scr = animHostScreen;
     if (scr == nullptr) {
         return;
@@ -945,10 +955,11 @@ void DefaultUI::refreshSleepOverlay() {
     // Collect what LVGL redrew since the last pass FIRST, and owe it to both
     // buffers. Doing this before any early return is what makes the retry paths
     // below safe: a refresh that cannot proceed loses nothing.
-    lv_area_t fresh;
-    if (lvgl_helper_take_dirty(&fresh)) {
-        areaMerge(overlayDirty[0], fresh);
-        areaMerge(overlayDirty[1], fresh);
+    lv_area_t fresh[OVERLAY_DIRTY_RECTS];
+    const int freshN = lvgl_helper_take_dirty_rects(fresh, OVERLAY_DIRTY_RECTS);
+    for (int i = 0; i < freshN; i++) {
+        lvgl_helper_rect_add(overlayDirty[0], &overlayDirtyN[0], OVERLAY_DIRTY_RECTS, fresh[i]);
+        lvgl_helper_rect_add(overlayDirty[1], &overlayDirtyN[1], OVERLAY_DIRTY_RECTS, fresh[i]);
     }
 
     // nullptr means the render task is still reading that buffer; retry next
@@ -962,7 +973,7 @@ void DefaultUI::refreshSleepOverlay() {
     // Nothing moved and this buffer is already complete: the whole refresh
     // costs one comparison. This is the case that gives touch its time back on
     // a screen that is merely sitting there.
-    if (overlayValid[back] && areaEmpty(overlayDirty[back])) {
+    if (overlayValid[back] && overlayDirtyN[back] == 0) {
         return;
     }
 
@@ -984,23 +995,45 @@ void DefaultUI::refreshSleepOverlay() {
         }
     }
 
-    lv_area_t clip;
+    // One snapshot per owed rectangle rather than one of their bounding box:
+    // the snapshot render is the expensive stage, and its cost has to scale
+    // with what actually changed, not with how far apart the changes sit.
+    lv_area_t clips[OVERLAY_DIRTY_RECTS];
+    int clipN = 0;
     if (overlayValid[back]) {
-        clip = overlayDirty[back];
+        clipN = overlayDirtyN[back];
+        for (int i = 0; i < clipN; i++) {
+            clips[i] = overlayDirty[back][i];
+        }
     } else {
         // First use of this buffer: it holds nothing, so a partial draw would
         // composite against garbage. Take the whole screen once.
-        lv_obj_get_coords(scr, &clip);
+        lv_obj_get_coords(scr, &clips[0]);
         const lv_coord_t ext = _lv_obj_get_ext_draw_size(scr);
-        lv_area_increase(&clip, ext, ext);
+        lv_area_increase(&clips[0], ext, ext);
+        clipN = 1;
     }
 
     lastSleepOverlayRefresh = ::millis();
     int w = 0, h = 0;
-    if (!snapshotAreaToOverlay(scr, buf, sleepAnimation.overlayCapacity(), clip, &w, &h)) {
-        log_w("Sleep overlay snapshot failed");
-        return;
+#ifdef GM_TOUCH_PROBE
+    const int64_t probeSnap0 = esp_timer_get_time();
+    int64_t probeArea = 0;
+#endif
+    for (int i = 0; i < clipN; i++) {
+        if (!snapshotAreaToOverlay(scr, buf, sleepAnimation.overlayCapacity(), clips[i], &w, &h)) {
+            // Leave the debt list intact; the next pass retries every rect.
+            // Rects already snapshotted this pass just render identically then.
+            log_w("Sleep overlay snapshot failed");
+            return;
+        }
+#ifdef GM_TOUCH_PROBE
+        probeArea += static_cast<int64_t>(lv_area_get_width(&clips[i])) * lv_area_get_height(&clips[i]);
+#endif
     }
+#ifdef GM_TOUCH_PROBE
+    const int64_t probeSnap1 = esp_timer_get_time();
+#endif
     // Marked here rather than at the call site, and after the snapshot rather
     // than before it, so the slip log measures the thing that actually costs
     // something. Every early return above is a pass that touched no memory --
@@ -1009,14 +1042,45 @@ void DefaultUI::refreshSleepOverlay() {
     // cannot have caused anything.
     panelclock::scanoutMark(panelclock::SCANOUT_ACT_OVERLAY);
 
-    // Only the rows that changed need their alpha spans recomputed. The clip is
-    // in screen coordinates and the host object is the screen, so screen row
-    // and panel row are the same number.
-    sleepAnimation.publishOverlay(w, h, clip.y1, clip.y2 + 1);
+    // Only the rows that changed need their alpha spans recomputed. The clips
+    // are in screen coordinates and the host object is the screen, so screen
+    // row and panel row are the same number.
+    int ranges[OVERLAY_DIRTY_RECTS][2];
+    for (int i = 0; i < clipN; i++) {
+        ranges[i][0] = clips[i].y1;
+        ranges[i][1] = clips[i].y2 + 1;
+    }
+    sleepAnimation.publishOverlayRanges(w, h, ranges, clipN);
+#ifdef GM_TOUCH_PROBE
+    {
+        const int64_t snapUs = probeSnap1 - probeSnap0;
+        const int64_t pubUs = esp_timer_get_time() - probeSnap1;
+        g_ovlN++;
+        g_ovlSnapSum += snapUs;
+        g_ovlPubSum += pubUs;
+        if (snapUs > g_ovlSnapMax)
+            g_ovlSnapMax = snapUs;
+        if (pubUs > g_ovlPubMax)
+            g_ovlPubMax = pubUs;
+        g_ovlAreaSum += probeArea;
+        if (probeArea > g_ovlAreaMax)
+            g_ovlAreaMax = probeArea;
+    }
+    if (g_probeEdgeUs != 0) {
+        const int64_t edge = g_probeEdgeUs;
+        g_probeEdgeUs = 0;
+        ESP_LOGI("TouchProbe", "GM_TOUCHLAT: %s->overlay_publish %lld us", g_probeEdgeIsPress ? "press" : "release",
+                 (long long)(esp_timer_get_time() - edge));
+        // Hand the interval to the render task: the pixels reach the panel at
+        // the present of the first frame whose composite samples this publish.
+        g_probePublishIsPress = g_probeEdgeIsPress;
+        g_probePublishUs = edge;
+    }
+#endif
     overlayValid[back] = true;
     overlayW[back] = w;
     overlayH[back] = h;
-    areaClear(overlayDirty[back]);
+    overlayDirtyN[back] = 0;
     // A widget just changed. Do not let interlacing split that change across
     // two frames; on hard-edged UI content the half-updated frame is plainly
     // visible, where on the animation it is not.
@@ -1611,12 +1675,46 @@ void DefaultUI::loopTask(void *arg) {
     unsigned long lastUi = 0;
     while (true) {
         const unsigned long now = ::millis();
+#ifdef GM_TOUCH_PROBE
+        const int64_t probePass0 = esp_timer_get_time();
+#endif
         if (now - lastUi >= UI_PERIOD_MS) {
             lastUi = now;
             ui->loop();
         } else {
             lv_task_handler();
+            // While the animation owns the panel, LVGL output only reaches the
+            // screen through the overlay snapshot, and waiting for the next
+            // ui->loop() pass added up to UI_PERIOD_MS to every touch response.
+            // Publishing from here puts the snapshot on the same 5 ms cadence
+            // as input; the refresh early-outs to one comparison when the
+            // handler above drew nothing.
+            ui->pumpSleepOverlay();
         }
+#ifdef GM_TOUCH_PROBE
+        {
+            const int64_t passUs = esp_timer_get_time() - probePass0;
+            g_uiPassN++;
+            g_uiPassSum += passUs;
+            if (passUs > g_uiPassMax)
+                g_uiPassMax = passUs;
+            if (esp_timer_get_time() - g_uiStatLastLog >= 5000000 && g_uiPassN > 0) {
+                g_uiStatLastLog = esp_timer_get_time();
+                ESP_LOGI("TouchProbe",
+                         "GM_UISTAT: passes=%lu avg=%lld max=%lld us | refreshes=%lu snap avg=%lld max=%lld pub "
+                         "avg=%lld max=%lld area avg=%lld max=%lld px",
+                         (unsigned long)g_uiPassN, (long long)(g_uiPassSum / g_uiPassN), (long long)g_uiPassMax,
+                         (unsigned long)g_ovlN, (long long)(g_ovlN ? g_ovlSnapSum / g_ovlN : 0), (long long)g_ovlSnapMax,
+                         (long long)(g_ovlN ? g_ovlPubSum / g_ovlN : 0), (long long)g_ovlPubMax,
+                         (long long)(g_ovlN ? g_ovlAreaSum / g_ovlN : 0), (long long)g_ovlAreaMax);
+                g_uiPassN = 0;
+                g_uiPassSum = g_uiPassMax = 0;
+                g_ovlN = 0;
+                g_ovlSnapSum = g_ovlSnapMax = g_ovlPubSum = g_ovlPubMax = 0;
+                g_ovlAreaSum = g_ovlAreaMax = 0;
+            }
+        }
+#endif
         vTaskDelay(HANDLER_PERIOD_MS / portTICK_PERIOD_MS);
     }
 }
