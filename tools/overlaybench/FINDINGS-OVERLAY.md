@@ -302,3 +302,29 @@ rebuild is 33-38ms and span scan 8-9ms):
   before committing, not assumed. If a future kernel's golden file looks
   corrupted after a commit, check that file first; see BASELINE-OVERLAY.md's
   golden/correctness note for the full history of why this exists.
+
+## Device verdicts (appended by the team lead after rig integration)
+
+Every candidate above that could be measured on the rig has been, each in
+its own flash cycle with per-counter attribution (GM_UISTAT scan=/scrim=,
+logs 30-35 in data/rig-logs/):
+
+- **scanRow_spec**: neutral (scan= ~9.0 -> ~9.1 ms). Landed anyway
+  (38416c94) as strictly fewer instructions.
+- **buildScrim_transposed34**: real win, ~33-36 -> ~30.5 ms (38416c94).
+- **transposed_all follow-up** (pass-6 bracket): the bigger half, ~30.5 ->
+  ~23.5 ms with tighter variance (8a2734fb). Together: the scrim rebuild
+  lost ~10-12 ms and the publish dropped from ~42-44 to ~33 ms.
+- **scanRow_block16**: neutral (scan= ~9.5 -> ~9.2 ms, within noise).
+  Reverted (kept in a stash). With spec and block16 both flat, the span
+  scan reads as memory-system-bound (~14 MB/s effective over the scanned
+  rows), not branch-bound: the pure-ALU x77 calibration match was a
+  coincidence of magnitudes, not evidence the loop shape mattered. The PIE
+  probe variant would read the same cache lines and is not worth a cycle.
+- **Descriptor cache** (the QEMU lane's candidate #2, integrated alongside
+  this work): 71% hit rate but 4% net SLOWER draw in a within-run A/B;
+  reverted. Full write-up in data/qemu-snapshot-profile.md.
+
+Still open from this file: the composite-blend PIE general path (needs the
+declined vector arithmetic written and validated) and expandRow_pie_asm
+(the 16-byte-store PSRAM write hypothesis, render-task side).
