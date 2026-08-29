@@ -24,6 +24,7 @@ class SleepAnimation {
     uint8_t *overlayBackBuffer() { return nullptr; }
     uint32_t overlayCapacity() const { return 0; }
     void publishOverlay(int, int, int, int) {}
+    void publishOverlayRanges(int, int, const int (*)[2], int) {}
     int overlayBackIndex() const { return 0; }
     void requestWholeFrames() {}
 };
@@ -200,6 +201,11 @@ class SleepAnimation {
     // rowY0/rowY1 bound the PANEL rows whose alpha changed; only those get
     // their spans rescanned. Pass the full height after a full snapshot.
     void publishOverlay(int w, int h, int rowY0, int rowY1);
+    // Same, for several disjoint row ranges in one publish (one flip). Each
+    // ranges[i] is {rowY0, rowY1}. Rescanning rows between two changed widgets
+    // is what made every publish cost a near-full-screen span scan when the
+    // dirty regions sat at opposite ends of the screen.
+    void publishOverlayRanges(int w, int h, const int (*ranges)[2], int n);
     // Which of the two overlay buffers overlayBackBuffer() hands out. The
     // caller needs it to know how much of that particular buffer is stale,
     // since the two are written alternately and a partial update is only valid
