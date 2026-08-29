@@ -31,6 +31,60 @@ using ScanRowFn = int (*)(const uint8_t *__restrict rowAlpha3, int panelW, uint3
 int scanRow_ref(const uint8_t *__restrict rowAlpha3, int panelW, uint32_t *__restrict rowRuns,
                 uint8_t *__restrict cellRow);
 
+// scanRow_ref with the `cellRow != nullptr` test hoisted out of the per-pixel
+// loop. In the real caller (publishOverlayRanges) doScrim is a per-publish
+// constant -- every row of one publish passes either a live cellRow or null,
+// never a mix -- so the null check scanRow_ref repeats for every covered
+// pixel is loop-invariant. This dispatches once per call (a single branch)
+// to a template instantiated for both cases, so the compiled loop body for
+// each case never mentions the other. No other behavioural change.
+int scanRow_spec(const uint8_t *__restrict rowAlpha3, int panelW, uint32_t *__restrict rowRuns,
+                  uint8_t *__restrict cellRow);
+
+// scanRow_spec plus a whole-block emptiness fast path. Real content is
+// sparse (see the file header comment and BASELINE-OVERLAY.md); most
+// BLOCK-pixel spans have zero coverage. Each block is probed with a
+// branch-free OR-accumulate over its alpha bytes (a fixed-trip-count loop,
+// a hardware-loop candidate where the branchy per-pixel body is not); a
+// zero result skips the block outright (closing any run left open from a
+// prior block, exactly where the per-pixel scan would have closed it -- see
+// the correctness note above scanRowBlockT's definition in span_scan.cpp).
+// A nonzero result falls back to exactly scanRow_spec's per-pixel body for
+// that block only. Every emitRun_ref call this produces, for any input, is
+// identical in order and arguments to what scanRow_ref would have made --
+// see the block-skip correctness note in span_scan.cpp.
+int scanRow_block16(const uint8_t *__restrict rowAlpha3, int panelW, uint32_t *__restrict rowRuns,
+                     uint8_t *__restrict cellRow);
+int scanRow_block32(const uint8_t *__restrict rowAlpha3, int panelW, uint32_t *__restrict rowRuns,
+                     uint8_t *__restrict cellRow);
+
+// Pure-C model of a PIE (ESP32-S3 vector unit) block-emptiness probe: 16
+// pixels (48 bytes, exactly three 128-bit lanes) at a time, masked so only
+// the alpha lane of each pixel survives, OR-reduced across the three lanes,
+// then reduced to one word -- see the block comment above scanRowPieModelT
+// in span_scan.cpp for the lane layout. Bit-identical output to
+// scanRow_block16 (both are "is this block ever nonzero", just computed two
+// different ways); registered separately because THIS is the function whose
+// arithmetic scanRow_pie_asm's inline asm must match, so it is the
+// bit-exactness gate for that PIE variant, not merely another block-skip
+// implementation.
+int scanRow_pie_model(const uint8_t *__restrict rowAlpha3, int panelW, uint32_t *__restrict rowRuns,
+                       uint8_t *__restrict cellRow);
+
+#if defined(__XTENSA__)
+// Real ESP32-S3 PIE (EE.* vector) implementation of the same probe
+// scanRow_pie_model describes, guarded because EE.* is Xtensa-only inline
+// asm and cannot build for the host. Falls back to the plain block-skip
+// scalar path (scanRow_block16's core) whenever the fast lane requires
+// something it does not handle -- see the guard conditions in
+// span_scan.cpp -- so it is always at least as correct as scanRow_block16,
+// never less. piePending in its kScanRowVariants entry: this harness cannot
+// execute Xtensa asm, so it has only ever been checked by inspection; it
+// needs a real-device or QEMU run before it ships.
+int scanRow_pie_asm(const uint8_t *__restrict rowAlpha3, int panelW, uint32_t *__restrict rowRuns,
+                     uint8_t *__restrict cellRow);
+#endif
+
 struct ScanRowVariant {
     const char *name;
     ScanRowFn fn;
