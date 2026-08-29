@@ -71,7 +71,10 @@ class BLEScalePlugin : public Plugin {
 
     void establishConnection();
 
-    bool active = false;
+    // mutable because scan() is const and must be able to arm discovery: it
+    // is the one entry point the web UI's scan button shares with the
+    // saved-scale auto paths, and loop() kills any scan while this is false.
+    mutable bool active = false;
     bool doConnect = false;
     std::string uuid;
 

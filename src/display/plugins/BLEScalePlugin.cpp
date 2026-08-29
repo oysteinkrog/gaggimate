@@ -115,8 +115,18 @@ void BLEScalePlugin::setup(Controller *controller, PluginManager *manager) {
         return;
     }
 
+    // Both auto-scan paths below only fire when a scale is actually saved.
+    // Auto-scan exists to RECONNECT a known scale; with none saved it was
+    // pure cost with no possible payoff, and the cost is not small: every
+    // wake-from-standby and every mode change re-armed a 60 s scan boost,
+    // whose RX buffers eat ~3 KB of internal heap and enough DMA that the
+    // web server times out serving the frontend and mDNS UDP sends fail
+    // with ENOMEM for minutes at a time ("web UI stops working whenever I
+    // touch the machine"). Discovery for pairing still works: the web UI's
+    // scan endpoint calls scan() directly, unguarded.
     manager->on("controller:bluetooth:connect", [this](Event const &) {
-        if (this->controller != nullptr && this->controller->getMode() != MODE_STANDBY) {
+        if (this->controller != nullptr && this->controller->getMode() != MODE_STANDBY &&
+            this->controller->getSettings().getSavedScale() != "") {
             ESP_LOGI("BLEScalePlugin", "Resuming scanning");
             scan();
             active = true;
@@ -135,9 +145,11 @@ void BLEScalePlugin::setup(Controller *controller, PluginManager *manager) {
     manager->on("controller:grind:start", [this](Event const &) { onProcessStart(); });
     manager->on("controller:mode:change", [this](Event const &event) {
         if (event.getInt("value") != MODE_STANDBY) {
-            ESP_LOGI("BLEScalePlugin", "Resuming scanning");
-            scan();
-            active = true;
+            if (this->controller != nullptr && this->controller->getSettings().getSavedScale() != "") {
+                ESP_LOGI("BLEScalePlugin", "Resuming scanning");
+                scan();
+                active = true;
+            }
         } else {
             active = false;
         }
@@ -286,6 +298,14 @@ void BLEScalePlugin::scan() const {
     // the same cadence); the boost extension alone is what matters.
     scanBoostUntil = millis() + SCAN_BOOST_MS;
     scanBurstStopAt = 0;
+    // Arm discovery here rather than relying on the callers: the auto paths
+    // only reach this with a saved scale (see begin()), but the web UI's
+    // scan button must also survive loop()'s !active scan-kill when no scale
+    // was ever saved — that is the first-pairing case. Standby keeps its old
+    // semantics (the scan is stopped on the next loop pass).
+    if (controller != nullptr && controller->getMode() != MODE_STANDBY) {
+        active = true;
+    }
     scanner->initializeAsyncScan();
 }
 
