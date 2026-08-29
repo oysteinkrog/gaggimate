@@ -123,6 +123,17 @@ CONFIG_LWIP_TCPIP_TASK_STACK_SIZE=4096
 # Hard cap on simultaneous sockets. Arduino: 16. IDF default: 10. AsyncWebServer
 # (HTTP+WS) + HomeKit + MQTT + mDNS + OTA can hit 10 under load.
 CONFIG_LWIP_MAX_SOCKETS=16
+# TIME_WAIT lifetime is 2*MSL. At the IDF default (60000 -> 120 s) the web UI
+# is self-strangling: ESPAsyncWebServer hardcodes Connection: close, so one
+# page load opens ~15 TCP connections whose corpses then sit in TIME_WAIT for
+# two minutes, drawn from the same 16-pcb pool as live connections. A browser's
+# next parallel asset burst finds no pcbs (SYNs silently dropped -- measured:
+# 8/8 parallel fetches 0 bytes while sequential ones fly), mDNS UDP sends
+# ENOMEM, and after 60 s without a successful send the network watchdog
+# declares egress dead and cycles WiFi mid-page-load. 5000 (10 s TIME_WAIT) is
+# plenty on a LAN where clients use fresh ephemeral ports; corpses clear
+# before the user can retry, and the whole cascade never starts.
+CONFIG_LWIP_TCP_MSL=5000
 
 # --- Logging ---
 CONFIG_LOG_DEFAULT_LEVEL_INFO=y
