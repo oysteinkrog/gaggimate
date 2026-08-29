@@ -49,7 +49,10 @@ class QemuPanel : public Display {
     bool supportsDirectMode() override { return false; }
     // Still exposed, because the standby animation writes the panel directly
     // rather than through LVGL.
-    uint16_t *directFrameBuffer() override { return framebuffer(); }
+    uint16_t *directFrameBuffer(int index = 0) override {
+        (void)index;
+        return framebuffer();
+    }
 
     static uint16_t *framebuffer();
 
