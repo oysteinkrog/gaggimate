@@ -26,7 +26,41 @@ for production, `-e display-loadtest` for the bench rig).
   The Windows and WSL PlatformIO installs share `~/.platformio`; a
   Windows-side build can clobber the patched sources, and the patch scripts
   re-apply on the next WSL build — if a display fault appears out of nowhere,
-  check the patches applied in the build log first.
+  check the patches applied in the build log first. One patch targets the
+  LVGL libdep rather than the framework: `scripts/patch_lvgl_meter_inv.py`
+  (per-env, into `.pio/libdeps/<env>/lvgl`) gives lv_meter scale-lines
+  indicators sector invalidation. If dial updates ever get slow again, check
+  it applied for that env.
+
+## UI-pipeline invariants (violate these and touch latency regresses)
+
+The background animation owns the panel on active screens; LVGL redraws are
+snapshotted into an RGB565+A8 overlay the render task composites. Getting a
+telemetry-driven screen from a 650 ms LVGL pass (1.5 Hz widget updates,
+~750 ms touch) down to ~110 ms per visual refresh (~7 Hz, animation at
+15 fps) took four load-bearing arrangements:
+
+- **The UI task has core 1 to itself; the animation render task lives on
+  core 0** at priority 1, under SleepPush (2) and Controller::loopLogic (3).
+  When render shared core 1 with the UI task at equal priority they
+  round-robined and each ran at half speed exactly when both were busy.
+  Only compute moved: the panel's interrupts stay on core 1 (setupPanel).
+- **While flushes are suppressed, LVGL must not render at all.**
+  `lvgl_helper_suppress_flush` parks the refresh timer (period, not pause —
+  `_lv_inv_area` un-pauses on every invalidation) and
+  `lvgl_helper_take_dirty_rects` harvests `disp->inv_areas` directly. The
+  render-and-discard pass it replaces cost more than the snapshot render
+  that actually feeds the overlay.
+- **Dirty tracking is a rect list, not one bounding box** (GM_DIRTY_RECT_CAP
+  everywhere; the caps are static_assert-linked). A union box between two
+  far-apart widgets is a full-screen snapshot.
+- **Meter updates must stay sector-sized**: the vendored patch above plus the
+  clip precheck in `action_on_meter_draw` (eez/actions.cpp), which skips
+  ticks outside `draw_ctx->clip_area` before paying rounded-cap mask setup.
+
+Measure with `-e display-loadtest` (`GM_TOUCH_PROBE`): `GM_UISTAT` lines give
+pass/snapshot/publish times and snapshot area per 5 s window; `GM_TOUCHLAT`
+lines stamp press→overlay_publish→anim_frame per tap.
 
 ## Measuring the display rig
 
