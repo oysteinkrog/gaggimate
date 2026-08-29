@@ -33,6 +33,8 @@ uint32_t g_ovlN = 0;
 int64_t g_ovlSnapSum = 0, g_ovlSnapMax = 0;
 int64_t g_ovlPubSum = 0, g_ovlPubMax = 0;
 int64_t g_ovlAreaSum = 0, g_ovlAreaMax = 0;
+// Snapshot sub-stages: alpha-clear memset vs the lv_obj_redraw itself.
+int64_t g_snapClearSum = 0, g_snapDrawSum = 0;
 int64_t g_uiStatLastLog = 0;
 } // namespace
 #endif
@@ -891,11 +893,17 @@ bool DefaultUI::snapshotAreaToOverlay(lv_obj_t *obj, uint8_t *buf, uint32_t bufS
     }
 
     // Reset alpha (and colour) across the region about to be redrawn.
+#ifdef GM_TOUCH_PROBE
+    const int64_t clear0 = esp_timer_get_time();
+#endif
     const int rowBytes = (clipped.x2 - clipped.x1 + 1) * 3;
     for (int y = clipped.y1; y <= clipped.y2; y++) {
         uint8_t *row = buf + (static_cast<size_t>(y - snapshotArea.y1) * w + (clipped.x1 - snapshotArea.x1)) * 3;
         memset(row, 0, rowBytes);
     }
+#ifdef GM_TOUCH_PROBE
+    g_snapClearSum += esp_timer_get_time() - clear0;
+#endif
 
     lv_disp_t *objDisp = lv_obj_get_disp(obj);
     lv_disp_drv_t driver;
@@ -921,7 +929,13 @@ bool DefaultUI::snapshotAreaToOverlay(lv_obj_t *obj, uint8_t *buf, uint32_t bufS
 
     lv_disp_t *refrOri = _lv_refr_get_disp_refreshing();
     _lv_refr_set_disp_refreshing(&fakeDisp);
+#ifdef GM_TOUCH_PROBE
+    const int64_t draw0 = esp_timer_get_time();
+#endif
     lv_obj_redraw(drawCtx, obj);
+#ifdef GM_TOUCH_PROBE
+    g_snapDrawSum += esp_timer_get_time() - draw0;
+#endif
     _lv_refr_set_disp_refreshing(refrOri);
 
     objDisp->driver->draw_ctx_deinit(fakeDisp.driver, drawCtx);
@@ -1702,16 +1716,22 @@ void DefaultUI::loopTask(void *arg) {
                 g_uiStatLastLog = esp_timer_get_time();
                 ESP_LOGI("TouchProbe",
                          "GM_UISTAT: passes=%lu avg=%lld max=%lld us | refreshes=%lu snap avg=%lld max=%lld pub "
-                         "avg=%lld max=%lld area avg=%lld max=%lld px",
+                         "avg=%lld max=%lld area avg=%lld max=%lld px | clear=%lld draw=%lld scan=%lld scrim=%lld",
                          (unsigned long)g_uiPassN, (long long)(g_uiPassSum / g_uiPassN), (long long)g_uiPassMax,
                          (unsigned long)g_ovlN, (long long)(g_ovlN ? g_ovlSnapSum / g_ovlN : 0), (long long)g_ovlSnapMax,
                          (long long)(g_ovlN ? g_ovlPubSum / g_ovlN : 0), (long long)g_ovlPubMax,
-                         (long long)(g_ovlN ? g_ovlAreaSum / g_ovlN : 0), (long long)g_ovlAreaMax);
+                         (long long)(g_ovlN ? g_ovlAreaSum / g_ovlN : 0), (long long)g_ovlAreaMax,
+                         (long long)(g_ovlN ? g_snapClearSum / g_ovlN : 0),
+                         (long long)(g_ovlN ? g_snapDrawSum / g_ovlN : 0),
+                         (long long)(g_ovlN ? g_statPubScanUs / g_ovlN : 0),
+                         (long long)(g_ovlN ? g_statPubScrimUs / g_ovlN : 0));
                 g_uiPassN = 0;
                 g_uiPassSum = g_uiPassMax = 0;
                 g_ovlN = 0;
                 g_ovlSnapSum = g_ovlSnapMax = g_ovlPubSum = g_ovlPubMax = 0;
                 g_ovlAreaSum = g_ovlAreaMax = 0;
+                g_snapClearSum = g_snapDrawSum = 0;
+                g_statPubScanUs = g_statPubScrimUs = 0;
             }
         }
 #endif

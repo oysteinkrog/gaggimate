@@ -232,6 +232,8 @@ volatile int64_t g_probeEdgeUs = 0;
 volatile bool g_probeEdgeIsPress = false;
 std::atomic<int64_t> g_probePublishUs{0};
 std::atomic<bool> g_probePublishIsPress{false};
+volatile int64_t g_statPubScanUs = 0;
+volatile int64_t g_statPubScrimUs = 0;
 #endif
 
 /* Display flushing */

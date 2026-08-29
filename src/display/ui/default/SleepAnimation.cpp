@@ -1367,6 +1367,9 @@ void SleepAnimation::publishOverlayRanges(int w, int h, const int (*ranges)[2], 
     // Span scan per range, on the UI task. The render task then touches only
     // rows/pixels that matter. Scanning only the changed ranges rather than
     // their bounding row span is the point of taking a list.
+#ifdef GM_TOUCH_PROBE
+    const int64_t scan0 = esp_timer_get_time();
+#endif
     for (int g = 0; g < m; g++) {
         const int rowY0 = rr[g][0];
         const int rowY1 = rr[g][1];
@@ -1412,9 +1415,16 @@ void SleepAnimation::publishOverlayRanges(int w, int h, const int (*ranges)[2], 
             ov.runN[y] = static_cast<uint8_t>(nRuns);
         }
     }
+#ifdef GM_TOUCH_PROBE
+    const int64_t scrim0 = esp_timer_get_time();
+    g_statPubScanUs += scrim0 - scan0;
+#endif
     if (doScrim && m > 0) {
         buildScrim(ov, panelW, panelH);
     }
+#ifdef GM_TOUCH_PROBE
+    g_statPubScrimUs += esp_timer_get_time() - scrim0;
+#endif
     overlayFront.store(back);
 }
 
