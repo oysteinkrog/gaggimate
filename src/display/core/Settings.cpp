@@ -192,6 +192,12 @@ void Settings::setBgAnimPlateColor(int bg_anim_plate_color) { bgAnimPlateColor.s
 void Settings::setBgAnimPlateOpacity(int bg_anim_plate_opacity) {
     bgAnimPlateOpacity.set(bg_anim_plate_opacity < 0 ? 0 : (bg_anim_plate_opacity > 100 ? 100 : bg_anim_plate_opacity));
 }
+
+void Settings::setElementTintEnabled(bool element_tint_enabled) { elementTintEnabled.set(element_tint_enabled); }
+
+void Settings::setElementTintColor(int element_tint_color) { elementTintColor.set(element_tint_color & 0xFFFFFF); }
+
+void Settings::setTouchDimColor(int touch_dim_color) { touchDimColor.set(touch_dim_color & 0xFFFFFF); }
 // All three are percentages the web UI sends as slider values, so they are
 // clamped rather than trusted: an out-of-range brightness would otherwise reach
 // the Q8 conversion and wrap, and a negative scrim would brighten the text

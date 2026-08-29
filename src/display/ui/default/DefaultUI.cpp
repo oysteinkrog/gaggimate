@@ -690,18 +690,19 @@ void DefaultUI::handleScreenChange() {
 // twice just overwrites it, so the walk is idempotent, and the rest colors
 // are re-read on every walk, which is what makes the theme-change rewalk
 // (applyTheme clears the root) pick up new hues.
-static void applyPressedRecurse(lv_obj_t *obj) {
+static void applyPressedRecurse(lv_obj_t *obj, lv_color_t dim) {
     const bool isImgBtn = lv_obj_check_type(obj, &lv_imgbtn_class);
     if (isImgBtn || (lv_obj_check_type(obj, &lv_img_class) && lv_obj_has_flag(obj, LV_OBJ_FLAG_CLICKABLE))) {
         // Resolved for the unpressed state this walk runs in. Icons the theme
-        // fully recolors (opa 255, most of them) dim to a darker shade of
-        // their own theme color; raw bitmaps pull 40% toward black.
+        // fully recolors (opa 255, most of them) shift 40% toward the
+        // configured dim color from their own rest color; raw bitmaps get
+        // the dim color at 40% directly.
         const lv_color_t rest = lv_obj_get_style_img_recolor(obj, LV_PART_MAIN);
         const lv_opa_t restOpa = lv_obj_get_style_img_recolor_opa(obj, LV_PART_MAIN);
-        lv_color_t pressed = lv_color_black();
+        lv_color_t pressed = dim;
         lv_opa_t pressedOpa = LV_OPA_40;
         if (restOpa > LV_OPA_50) {
-            pressed = lv_color_darken(rest, LV_OPA_40);
+            pressed = lv_color_mix(dim, rest, LV_OPA_40);
             pressedOpa = restOpa;
         }
         lv_obj_set_style_img_recolor(obj, pressed, LV_PART_MAIN | LV_STATE_PRESSED);
@@ -714,21 +715,23 @@ static void applyPressedRecurse(lv_obj_t *obj) {
         // alpha coverage and re-trigger the scrim rebuild.
         if (lv_obj_get_style_bg_opa(obj, LV_PART_MAIN) >= LV_OPA_20) {
             const lv_color_t bg = lv_obj_get_style_bg_color(obj, LV_PART_MAIN);
-            lv_obj_set_style_bg_color(obj, lv_color_darken(bg, LV_OPA_40), LV_PART_MAIN | LV_STATE_PRESSED);
+            lv_obj_set_style_bg_color(obj, lv_color_mix(dim, bg, LV_OPA_40), LV_PART_MAIN | LV_STATE_PRESSED);
         }
     }
     const uint32_t n = lv_obj_get_child_cnt(obj);
     for (uint32_t i = 0; i < n; i++) {
-        applyPressedRecurse(lv_obj_get_child(obj, i));
+        applyPressedRecurse(lv_obj_get_child(obj, i), dim);
     }
 }
 
 void DefaultUI::applyPressedFeedback() {
     lv_obj_t *scr = lv_scr_act();
-    if (scr == nullptr || scr == pressedStyledRoot) {
+    const int dim = controller->getSettings().getTouchDimColor();
+    if (scr == nullptr || (scr == pressedStyledRoot && dim == appliedDimColor)) {
         return;
     }
-    applyPressedRecurse(scr);
+    appliedDimColor = dim;
+    applyPressedRecurse(scr, lv_color_hex(static_cast<uint32_t>(dim)));
     pressedStyledRoot = scr;
 }
 
@@ -1741,8 +1744,35 @@ void DefaultUI::applyTheme() {
     }
 #endif
 
-    if (newThemeMode != currentThemeMode) {
+    // The element-tint override participates in the change key: enabling,
+    // disabling, or recoloring it must re-run change_color_theme just like a
+    // mode change. 0x1000000 is out of the 24-bit color range, so "disabled"
+    // can never collide with a chosen color.
+    const int tintKey = settings.getElementTintEnabled() ? settings.getElementTintColor() : 0x1000000;
+    if (newThemeMode != currentThemeMode || tintKey != appliedTintKey) {
         currentThemeMode = newThemeMode;
+        appliedTintKey = tintKey;
+        // The generated screens read their accent (icons, accent text) from
+        // theme_colors slot 0, both at create time and inside
+        // change_color_theme's live re-apply — so patching that one slot IS
+        // the custom-tint mechanism, and it survives EEZ regen because only
+        // runtime memory is written. Pristine values are captured before the
+        // first override so disabling the tint restores the theme's own
+        // accent.
+        static bool accentCaptured = false;
+        static uint32_t themeAccent[sizeof(theme_colors) / sizeof(theme_colors[0])];
+        constexpr int themeCount = sizeof(theme_colors) / sizeof(theme_colors[0]);
+        if (!accentCaptured) {
+            accentCaptured = true;
+            for (int i = 0; i < themeCount; i++) {
+                themeAccent[i] = theme_colors[i][0];
+            }
+        }
+        if (currentThemeMode >= 0 && currentThemeMode < themeCount) {
+            theme_colors[currentThemeMode][0] = settings.getElementTintEnabled()
+                                                    ? static_cast<uint32_t>(settings.getElementTintColor())
+                                                    : themeAccent[currentThemeMode];
+        }
         change_color_theme(currentThemeMode);
         // Rest colors just changed under the pressed-feedback props; rewalk.
         pressedStyledRoot = nullptr;

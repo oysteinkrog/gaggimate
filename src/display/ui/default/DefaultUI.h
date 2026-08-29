@@ -225,6 +225,10 @@ class DefaultUI {
     // root so recreated screens and re-themed rest colors get rewalked.
     void applyPressedFeedback();
     lv_obj_t *pressedStyledRoot = nullptr;
+    // Last-applied web-configurable colors, sentinel-initialized so the first
+    // pass applies. appliedTintKey packs enabled+color (see applyTheme).
+    int appliedDimColor = -1;
+    int appliedTintKey = -1;
 
     // Animate the dial meters' tick length on screen change (short on profile/new-menu, long elsewhere).
     void animateGaugeTicks(ScreensEnum from, ScreensEnum to);

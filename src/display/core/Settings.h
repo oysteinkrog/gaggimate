@@ -129,6 +129,9 @@ class Settings {
     int getBgAnimClearPlates() const { return bgAnimClearPlates.get(); }
     int getBgAnimPlateColor() const { return bgAnimPlateColor.get(); }
     int getBgAnimPlateOpacity() const { return bgAnimPlateOpacity.get(); }
+    bool getElementTintEnabled() const { return elementTintEnabled.get(); }
+    int getElementTintColor() const { return elementTintColor.get(); }
+    int getTouchDimColor() const { return touchDimColor.get(); }
     int getBgAnimBrightness() const { return bgAnimBrightness.get(); }
     int getBgAnimHighlightKnee() const { return bgAnimHighlightKnee.get(); }
     int getBgAnimScrim() const { return bgAnimScrim.get(); }
@@ -224,6 +227,9 @@ class Settings {
     void setBgAnimClearPlates(int bg_anim_clear_plates);
     void setBgAnimPlateColor(int bg_anim_plate_color);
     void setBgAnimPlateOpacity(int bg_anim_plate_opacity);
+    void setElementTintEnabled(bool element_tint_enabled);
+    void setElementTintColor(int element_tint_color);
+    void setTouchDimColor(int touch_dim_color);
     void setBgAnimBrightness(int bg_anim_brightness);
     void setBgAnimHighlightKnee(int bg_anim_highlight_knee);
     void setBgAnimScrim(int bg_anim_scrim);
@@ -346,6 +352,18 @@ class Settings {
     // as mode 0 but in the chosen colour).
     Property<int> bgAnimPlateColor{registry, "bg_pcol", 0x000000};
     Property<int> bgAnimPlateOpacity{registry, "bg_popa", 35};
+    // Custom accent for the on-screen elements: when enabled, elementTintColor
+    // replaces theme_colors slot 0 (the icon/text accent the generated screens
+    // read 130 times) before change_color_theme re-applies it, so every
+    // element retints live and newly created screens pick it up at create
+    // time. Enabled/colour kept separate so toggling the override off does
+    // not forget the chosen colour.
+    Property<bool> elementTintEnabled{registry, "el_tint_on", false};
+    Property<int> elementTintColor{registry, "el_tint", 0xFFFFFF};
+    // Colour the pressed-state feedback pulls tapped elements toward
+    // (DefaultUI::applyPressedFeedback). Black reads as dimming; a bright
+    // colour reads as a highlight flash.
+    Property<int> touchDimColor{registry, "tdim_col", 0x000000};
     // Animation content brightness, 0-100 percent of the theme's own levels.
     // Distinct from mainBrightness/standbyBrightness, which are the LCD
     // backlight and so dim the text along with the animation, buying no
