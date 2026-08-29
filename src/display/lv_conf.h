@@ -60,10 +60,25 @@
     #endif
 
 #else       /*LV_MEM_CUSTOM*/
-    #define LV_MEM_CUSTOM_INCLUDE <esp32-hal-psram.h>//<stdlib.h>   /*Header for the dynamic memory function*/
-    #define LV_MEM_CUSTOM_ALLOC   ps_malloc
-    #define LV_MEM_CUSTOM_FREE    free
-    #define LV_MEM_CUSTOM_REALLOC ps_realloc
+    /*LVGL's heap goes through src/display/gm_lv_mem.cpp: ps_malloc behavior
+     *plus live-set accounting, so the rig can size a potential internal-RAM
+     *arena for the objects/styles the redraw tree walk pointer-chases.
+     *Prototypes live here (not in a separate header) because this file is
+     *the only one every LVGL translation unit is guaranteed to include.*/
+    #include <stddef.h>
+    #ifdef __cplusplus
+    extern "C" {
+    #endif
+    void *gm_lv_malloc(size_t size);
+    void gm_lv_free(void *ptr);
+    void *gm_lv_realloc(void *ptr, size_t size);
+    #ifdef __cplusplus
+    }
+    #endif
+    #define LV_MEM_CUSTOM_INCLUDE <stddef.h>   /*Header for the dynamic memory function*/
+    #define LV_MEM_CUSTOM_ALLOC   gm_lv_malloc
+    #define LV_MEM_CUSTOM_FREE    gm_lv_free
+    #define LV_MEM_CUSTOM_REALLOC gm_lv_realloc
 #endif     /*LV_MEM_CUSTOM*/
 
 /*Number of the intermediate memory buffer used during rendering and other internal processing mechanisms.
