@@ -29,7 +29,13 @@ void lvgl_helper_suppress_flush(bool suppress);
 // redrawn area, so what it is handed IS the invalidated region, already merged
 // and clipped by LVGL's own refresh logic. Both this and the caller run on the
 // UI task (lv_timer_handler), so the accumulator needs no locking.
-#define GM_DIRTY_RECT_CAP 8
+//
+// Cap of 4, not 8: every rect costs a full lv_obj_redraw tree walk, and with
+// LVGL's heap in PSRAM (LV_MEM_CUSTOM_ALLOC) that walk is a random PSRAM
+// pointer chase that dominates the snapshot. On the bench rig, 4 cut the
+// draw stage from ~59 ms to ~51 ms per refresh with no growth in redrawn
+// area (the least-growth merge keeps clips tight) and publish unchanged.
+#define GM_DIRTY_RECT_CAP 4
 int lvgl_helper_take_dirty_rects(lv_area_t *out, int maxN);
 // Merge one rectangle into a fixed-capacity list: unions with anything it
 // overlaps or touches (folding transitively), appends while there is room,
