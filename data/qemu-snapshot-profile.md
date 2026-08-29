@@ -224,3 +224,300 @@ or the vendored-LVGL sandbox changes.
 - `.pio/libdeps/display-qemu/lvgl/src/hal/lv_hal_disp.c`,
   `.../draw/sw/lv_draw_sw_blend.c`, `.../core/lv_refr.c` -- all the
   instrumentation and the candidate #1 prototype described above.
+
+# Candidate #2: attributing and attacking the `lv_obj_redraw` tree-walk
+
+Same env, same sandbox rules. Picks up from "Recommended next step" above:
+sub-attribute the ~69-77%-of-draw tree-walk into style resolution, event
+dispatch, descriptor init, and geometry/clip math, measure rect-count
+sensitivity (`GM_DIRTY_RECT_CAP` 8/4/2/1), and prototype the best structural
+fix. Counters added: `lv_event_send` (depth-guarded top-level total, plus a
+total-including-nested count), `lv_obj_get_style_prop` (same pattern),
+`lv_obj_init_draw_{rect,label,img,line,arc}_dsc` (rename-and-wrap, all five),
+`_lv_area_intersect` (count-only, paired with a microbench for a ns/call
+estimate). All gated on a shared `gm_in_snapshot_refresh()` check
+(`lv_refr.c`) so nothing here ever counts LVGL's normal on-screen refresh of
+the real panel, only `DefaultUI`'s offscreen snapshot pass.
+
+## A merge conflict, fixed before any of this could run
+
+Between Phase 1 and this pass, `scripts/patch_lvgl_setpx_fast.py` landed
+(candidate #1's fast path, made official) and tried to patch files this
+profiling run had already hand-modified. It applied a working-but-shadowed
+patch to `lv_hal_disp.c` (would have collided with this run's own
+`gm_disp_uses_generic_true_color_alpha`) and hard-failed on
+`lv_draw_sw_blend.c` ("anchor found 0 times"), aborting the build -- and, on
+that first invocation, wrote `.gm-orig` backups that captured this run's
+modified content as the assumed-pristine baseline, not real pristine LVGL.
+Fixed by restoring both files from the genuinely-pristine `.bak` saved in
+Phase 1, letting the official patch reapply cleanly (confirmed via a clean
+build log, no anchor errors), then re-layering this run's own
+instrumentation back on top -- careful this time not to redefine
+`gm_disp_uses_generic_true_color_alpha` (now owned by the official patch)
+and to time the official `gm_fill_set_px_rgb565a8`/`gm_map_set_px_rgb565a8`
+functions by name instead of this run's old candidate #1 prototype names.
+No further action needed; noted here only so the next person who edits
+these files in parallel with a `patch_*.py` script knows the failure mode.
+
+## PIE re-verification: Phase 1's "confirmed twice" had a live alignment bug
+
+Re-running the exact Phase 1 poison-then-check test after the file restore
+above, `GM_PIETEST` came back **FAIL** on the first boot of this pass --
+contradicting Phase 1's "PASS, two independent boots." The test's poison
+buffers (`uint8_t src[16]; uint8_t dst[16];`) were plain stack arrays with no
+alignment attribute, and `ee.vst.128.ip` requires a 16-byte-aligned address;
+Phase 1's two PASS results were apparently stack-alignment luck, not a
+verified property of the instruction. Adding
+`__attribute__((aligned(16)))` to both buffers made the test deterministic:
+**PASS on every subsequent boot in this pass** (5 independent QEMU boots,
+covering the cap=8/4/2/1 sweep below plus the initial re-verification boot).
+The verdict itself is unchanged and now stronger -- `ee.zero.q`/
+`ee.vst.128.ip` do execute with correct semantics in this QEMU -- but Phase
+1's methodology for reaching it was unsound. Anyone writing a similar
+poison-then-check test for other PIE opcodes should align the buffer
+explicitly rather than rely on the toolchain's default stack layout.
+
+## Sub-attribution of the walk
+
+Eight samples (two per boot, four independent rebuild+boot cycles -- see the
+rect-cap sweep below, which held the workload fixed and only varied
+`GM_DIRTY_RECT_CAP`) all touched the *exact same content*: 6,920 pixels
+through the fast path, 24 top-level event-dispatch calls (40 including
+nested), 134 style-prop lookups, 7 draw-descriptor inits, 144
+`_lv_area_intersect` calls. That fixed fingerprint, replayed identically
+across four rebuilds, is what makes averaging across them a fair way to
+smooth QEMU's run-to-run timing noise (see below) without averaging across
+different scenes.
+
+| Sub-stage | Mean time (8 samples) | Range | % of walk (event+style+dscinit+area) |
+|---|---|---|---|
+| Event dispatch (`lv_event_send`, top-level, depth-guarded) | 3671us | 3323-4351us | **78.7%** |
+| Style resolution (`lv_obj_get_style_prop`, top-level) | 525us | 409-639us | 11.3% |
+| Draw-descriptor init (`lv_obj_init_draw_*_dsc`, all 5) | 453us | 335-583us | 9.7% |
+| Geometry/clip math (`_lv_area_intersect`, count x ns/call) | 12us | 12-13us | 0.3% |
+| **Walk total (sum of the above)** | **4661us** | | **100%** |
+| Pixel-blend (candidate #1 fast path, for comparison) | 363us | 290-462us | -- |
+| **Walk share of walk+blend** | | | **92.8%** (blend: 7.2%) |
+
+This tightens Phase 1's coarser split (draw = 69-77% walk / 23-31% blend,
+derived by subtracting leaf totals from a sibling wall-clock probe) into a
+walk share that's directly leaf-timed rather than derived by subtraction --
+92.8% walk / 7.2% blend for the components this pass could measure
+directly. The two methods aren't computing quite the same thing (Phase 1's
+"draw" bucket included some untimed residual this pass's leaf timers don't
+cover either), so treat 92.8% as a tighter lower bound on the walk's true
+share, not a contradiction of the 69-77% figure.
+
+The naive recursive `lv_obj_redraw` wrap (`gm_redraw_us`, kept from Phase 1
+for magnitude sanity only -- see "a measurement bug worth naming" -- never
+used for a real split) averaged 7405us across the same 8 samples, 1.59x the
+4661us clean walk total. That ratio is a direct, now-quantified measure of
+how much the `refr_obj`/`lv_obj_redraw` mutual recursion inflates a naive
+wrap: real, but nowhere near the naive 2x someone might assume from "it
+recurses into itself once."
+
+### Why event dispatch dominates: it isn't wasted dispatch overhead
+
+`lv_event_send` at 78.7% of the walk sounds like an obvious target for
+"skip dispatch when nobody's listening" -- but in LVGL 8's architecture,
+sending `LV_EVENT_DRAW_MAIN`/`_BEGIN`/`_END` **is** the mechanism by which a
+widget's own class draws itself: `lv_label_event`, `lv_img_event`, and
+friends respond to those events by calling `lv_draw_label`/`lv_draw_img`/
+etc. from inside the class's own event callback. The `gm_event_us` timer
+here wraps the *entire* `lv_event_send` call, so it necessarily includes
+whatever the callback does -- for this scene's 7 touched objects, that
+includes the three meters' `action_on_meter_draw` custom tick-drawing
+handler (`src/display/ui/default/eez/actions.cpp:106`), which does real
+per-tick geometry and line/dot drawing work inside a `DRAW_PART`-style
+callback. Reading `lv_event_send` and `lv_refr.c`'s `lv_obj_redraw` directly
+rather than guessing from the timer name: there is no "dispatch with no
+hooks" waste to cut here for the base widget types, because dispatch *is*
+draw for them.
+
+### Candidate ideas already implemented in the code as read
+
+Two of the four mitigation ideas turn out to already be in place, found by
+reading rather than assuming:
+
+- **"Skip DRAW event dispatch for objects with no registered draw hooks"**
+  -- not applicable as stated (see above): for standard widgets the
+  dispatch *performs* the draw. There's no separable "hook" to skip without
+  skipping the drawing itself.
+- **"Early-out for objects whose clipped area is empty before style
+  resolution happens"** -- already implemented, at two levels:
+  - `lv_obj_redraw` itself (`lv_refr.c:160-169` in this pass's instrumented
+    sandbox copy -- stock LVGL 8.4 logic, unmodified by this project, just
+    shifted a few lines down by this pass's own timer wrap) computes
+    `_lv_area_intersect` against the clip *before* sending any `DRAW_MAIN*`
+    event, and gates all three draw events (and the post-draw events)
+    behind `should_draw = com_clip_res || LV_OBJ_FLAG_OVERFLOW_VISIBLE`. An
+    object entirely outside the clip never reaches style resolution or
+    descriptor init for its own draw.
+  - `action_on_meter_draw` (`actions.cpp:151-181`) does its own per-tick
+    early-out *before* touching color/style, with an explicit comment
+    calling this out: "Geometry before colour, so ticks outside the clip
+    can be rejected early." This is finer-grained than the object-level
+    check above (per-tick, not per-object) and is why only 6,920 of a
+    500x500-meter's ~250,000px face actually reach a `set_px_cb` call in
+    this scene.
+
+  The children-pruning path (`lv_refr.c:187-196`, same file) has one gap: for a
+  container with `LV_OBJ_FLAG_OVERFLOW_VISIBLE` set, `clip_coords_for_children`
+  is assigned the unclipped parent clip directly, with no bounding check at
+  all -- every child still gets its own (cheap, ~88ns) `_lv_area_intersect`
+  check when its own turn comes, so this doesn't look like a real gap, just
+  a deferred one; not chased further, no `OVERFLOW_VISIBLE` container was
+  observed in this scene's touched-object set.
+
+  Net: neither idea has a QEMU prototype in this pass, because both are
+  already shipped in the code being profiled.
+
+## Rect-count sensitivity: `GM_DIRTY_RECT_CAP` 8 / 4 / 2 / 1
+
+Swept all four requested values (current production value is 4, landed
+mid-session at `197f97c9`/`5d71fa99` -- see below). Each value: edit
+`GM_DIRTY_RECT_CAP` in `LV_Helper.h` and `OVERLAY_DIRTY_RECTS` in
+`DefaultUI.h` together (the `static_assert` at `DefaultUI.cpp:953` requires
+them equal), full rebuild, fresh QEMU boot, same scripted tap sequence.
+
+**Result: identical sub-attribution at every cap value tested**, both
+occurrences of the 6,920px sample, every boot -- fastpath_calls=6920,
+event_top=24/event_total=40, style_top=134, dscinit_calls=7, area_calls=144,
+matching to the call for cap=8, 4, 2, and 1. Timings varied by the same
+~15-25% run-to-run noise seen elsewhere in this pass (see caveats), but the
+*content* touched by the redraw never changed.
+
+Root cause, not a bug: `GM_FAKE_CONTROLLER` sends one synthetic `SystemInfo`
+at boot and never updates it again (see Phase 1's caveats). With only one
+value source ticking, this environment never produces more than one
+disjoint dirty region per refresh -- so the union/fold algorithm that
+`GM_DIRTY_RECT_CAP` bounds never has more regions than headroom, at any cap
+from 1 to 8. **This is a real limitation of this bench for this specific
+question, not a finding that the cap doesn't matter.** The already-landed
+production decision (cap=4, `197f97c9`, reasoning recorded in `5d71fa99`)
+must have come from richer traffic than this env can generate -- the rig,
+or `display-loadtest`'s `GM_SYNTH_HANDSHAKE` continuous telemetry ramp,
+either of which can move more than one widget in the same tick. If a QEMU-side
+validation of the cap curve is wanted later, `GM_FAKE_CONTROLLER` would need
+a mode that updates 2+ independent widgets concurrently -- this pass did
+not attempt that, since it would mean changing `Controller.cpp`'s synth
+path, outside the vendored-LVGL sandbox this task was scoped to.
+
+## What landed elsewhere mid-session: candidate #3 is already shipped
+
+Partway through this pass, `idf5` picked up commits `fcb29ace`/`c3ddbde1`
+("invalidate a sector, not the screen, when a meter value moves" /
+"document the pitch-clamp assumption") -- a `scripts/patch_lvgl_meter_inv.py`
+patch to the vendored `lv_meter.c`, replacing the stock `else: lv_obj_invalidate(obj)`
+catch-all (full-meter invalidation) with a narrow tick-sector box for
+`LV_METER_INDICATOR_TYPE_SCALE_LINES` value changes. This is a different
+mechanism than "hoist the per-rect walk cost" (the team lead's framing),
+but the same effect on the metric that matters: it shrinks *how much area
+gets invalidated in the first place* when a meter's tick colors update,
+rather than caching/skipping the walk after the fact. Checked against this
+scene's actual indicator types (`screens.c:5913-5979`): every meter here
+uses `lv_meter_add_needle_img` (already routed through a narrower
+`inv_line` path in stock LVGL, not the full-invalidate catch-all) plus
+`lv_meter_add_scale_lines` (the one that *was* hitting the catch-all before
+this patch, now fixed). No `lv_meter_add_arc` indicators are used by this
+UI, so "background arc" in the original framing maps to the tick-ring
+(scale-lines), not a separate arc indicator.
+
+This pass's sub-attribution independently corroborates the fix was aimed
+at the right thing without having been informed by it: event dispatch
+(78.7% of the walk, tied to the meters' custom tick-draw handler and
+LVGL's own needle-image draw) is the dominant cost here, and shrinking the
+invalidated area is exactly what reduces how much of that dispatch work
+happens per value change. No further prototype attempted for this
+candidate; it's shipped.
+
+## Candidate #1's idea (per-refresh style/descriptor cache): sized, not prototyped
+
+Style resolution + descriptor init together are 21.0% of the walk in this
+scene (11.3% + 9.7%). A perfect per-refresh cache -- reusing an unchanged
+object's resolved style/descriptor across the (now capped at 4, and per the
+finding above, typically just 1 in this env's actual traffic) per-refresh
+rect passes -- would save at most that 21%, and the rect-cap sweep above
+shows this env's synthetic traffic essentially never exercises more than
+one rect pass per refresh, so a cross-rect cache would have close to zero
+real hit rate to measure here. Beyond the sizing, this pass did not
+prototype it: a cache has to be invalidated correctly on every real style
+change (`lv_obj_set_style_*`, state transitions, theme changes) and scoped
+correctly to "this refresh" without leaking into the next one -- getting
+that wrong produces *visually wrong* output (stale colors/sizes), a worse
+failure mode than the performance regression it would be trying to fix, and
+verifying that correctness needs either a scene with real per-object style
+churn (which this env, per the same `GM_FAKE_CONTROLLER` limitation above,
+doesn't generate) or reading through every style-mutation call site by hand.
+Neither was done in the time available for this pass. Documenting the size
+of the opportunity (up to ~21% of walk time, contingent on real cross-rect
+reuse existing on the rig, which this bench can't confirm) rather than
+shipping an unverified cache.
+
+## QEMU-vs-device caveats (addendum to Phase 1's list)
+
+- **PSRAM pointer-chase, again, more sharply.** `lv_conf.h`'s
+  `LV_MEM_CUSTOM_ALLOC = ps_malloc` means every `lv_obj_t`, style list, and
+  `_lv_ll_get_head`/`_get_next` linked-list hop this walk performs (scale
+  list, indicator list, child list, event-descriptor list) is a real PSRAM
+  access on device. This pass's 92.8%/7.2% walk/blend split is flat-memory;
+  the device split is almost certainly more walk-dominant than that, not
+  less, since the walk is the pointer-chase-heavy side and the blend is the
+  sequential-buffer-write side.
+- **Run-to-run noise, quantified this time**: identical-workload samples
+  (same call counts, different boots or different points in the same boot)
+  varied 15-25% in absolute time (e.g. fastpath_us: 290-462us for the same
+  6,920-pixel push). Percentage splits stayed stable to within ~1
+  percentage point across all 8 samples, which is why this section reports
+  percentages from an 8-sample mean rather than trusting any single sample.
+  Plausible cause not chased down: QEMU's TCG dynamic translation compiles
+  a code path on first execution and runs from the cached translation
+  after, so a "cold" first occurrence of a given call pattern in a boot
+  measured consistently slower than a "warm" second occurrence of the same
+  pattern later in the same boot.
+- The rect-cap sweep's negative result (above) is itself a caveat: this
+  bench cannot validate `GM_DIRTY_RECT_CAP` choices, full stop, until
+  `GM_FAKE_CONTROLLER` can move more than one widget per tick.
+
+## Files touched (uncommitted, kept for reference; this pass)
+
+- `.pio/libdeps/display-qemu/lvgl/src/hal/lv_hal_disp.c` -- re-layered
+  Phase 1's counters/PXBENCH/PIETEST (now with the alignment fix) on top of
+  the official `scripts/patch_lvgl_setpx_fast.py` patch, plus `gm_redraw_us`
+  and the Phase 2 counter externs/log line. `.bak` (pristine) and
+  `.gm-orig` (official-patch-only, this pass's recovery snapshot) both kept.
+- `.pio/libdeps/display-qemu/lvgl/src/draw/sw/lv_draw_sw_blend.c` -- timing
+  wraps around `fill_set_px`/`map_set_px` (generic path) and the official
+  `gm_fill_set_px_rgb565a8`/`gm_map_set_px_rgb565a8` (fast path). Same `.bak`
+  / `.gm-orig` pair kept.
+- `.pio/libdeps/display-qemu/lvgl/src/core/lv_refr.c` -- `gm_in_snapshot_refresh()`
+  gate (shared by every counter below) plus the existing `gm_redraw_us`
+  wrap from Phase 1.
+- `.pio/libdeps/display-qemu/lvgl/src/core/lv_event.c` -- depth-guarded
+  `lv_event_send` timing (`gm_event_us`/`gm_event_toplevel_calls`/
+  `gm_event_calls_total`).
+- `.pio/libdeps/display-qemu/lvgl/src/core/lv_obj_style.c` -- depth-guarded
+  `lv_obj_get_style_prop` timing (`gm_style_us`/`gm_style_toplevel_calls`/
+  `gm_style_calls_total`).
+- `.pio/libdeps/display-qemu/lvgl/src/core/lv_obj_draw.c` -- all five
+  `lv_obj_init_draw_*_dsc` renamed to `gm_orig_*` plus thin timed wrappers
+  (`gm_dscinit_us`/`gm_dscinit_calls`).
+- `.pio/libdeps/display-qemu/lvgl/src/misc/lv_area.c` -- `_lv_area_intersect`
+  call count only (`gm_area_intersect_calls`), paired with the `GM_PXBENCH2`
+  microbench in `lv_hal_disp.c` for a ns/call estimate.
+- `src/display/drivers/common/LV_Helper.h` and
+  `src/display/ui/default/DefaultUI.h` -- `GM_DIRTY_RECT_CAP` /
+  `OVERLAY_DIRTY_RECTS` swept to 8, 2, and 1 in turn for the sweep above,
+  then **restored to the committed value (4)** before finishing; `git
+  status`/`git diff` on both files is clean.
+
+Combined instrumentation diff (this pass's additions only, against the
+`.bak` pristine files, all seven vendored-LVGL files above):
+`/tmp/claude-1000/-mnt-c-work-gaggimate/07be1453-f4b0-4be8-9c5f-5664583e9577/scratchpad/candidate2-subattribution-instrumentation.diff`.
+No new production-integration diff is proposed here: the two structural
+mitigations this pass's own data points at most strongly (shrink meter
+invalidation, reduce the rect cap) were both already shipped mid-session by
+a different route (`fcb29ace`/`c3ddbde1`, `197f97c9`/`5d71fa99`) before this
+pass's measurements were in hand to inform them; the one remaining idea
+(style/descriptor cache) is sized above but not prototyped, for the
+correctness reasons given.
