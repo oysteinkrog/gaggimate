@@ -15,7 +15,45 @@
 class Controller;
 
 constexpr int RERENDER_INTERVAL_IDLE = 2500;
-constexpr int RERENDER_INTERVAL_ACTIVE = 100;
+// Freshness floor: force a pass at least this often during an active
+// process even if no change event fired. Was 100, which against the old
+// ~650 ms pipeline merely throttled; raising it alone measured marginal
+// (logs 36 vs 37) because the real saturator is the event side, bounded by
+// RERENDER_MIN_INTERVAL below.
+constexpr int RERENDER_INTERVAL_ACTIVE = 300;
+// Rate ceiling for telemetry passes: a rerender pass may not START within
+// this many ms of the previous pass start unless a touch edge arrived
+// within GM_TOUCH_GRACE_US. Every telemetry change event sets rerender,
+// the loadtest feed changes continuously, and a full pass costs ~90-110
+// ms, so unspaced passes ran back to back (~7 Hz, 60-100% UI-task duty)
+// and a touch edge waited a median 122 ms just to be READ (GM_EDGEWAIT,
+// log 37): the indev poll runs on the same task the passes monopolize.
+// Measured alone this spacer was null on tap latency (log 38 == log 36
+// medians) because the snapshot refresh keeps running off invalidations
+// that never ride the rerender flag — OVERLAY_MIN_REFRESH_US below is the
+// gate on the expensive unit; this one only spaces the updateState/eez
+// side. 4 Hz numeric readouts are indistinguishable from 7 Hz by eye.
+constexpr int RERENDER_MIN_INTERVAL = 250;
+// Rate ceiling for overlay refresh STARTS (the snapshot+publish unit in
+// refreshSleepOverlay), in esp_timer time. Spacing rerender passes alone
+// measured null on tap latency (log 38 == log 36 medians): invalidations
+// keep arriving outside the gated pass, and each ~100 ms refresh re-armed
+// the next one back to back, so the UI task stayed ~96% busy and a touch
+// edge still waited a median ~110 ms to be read. This gates the expensive
+// unit itself; the debt lists make a held refresh lossless (coalesced, not
+// dropped). A touch edge since the last refresh start bypasses the gate,
+// which is what separates this from the unconditional 1000 ms throttle
+// that was removed for holding tap feedback a second (see maintain call
+// site). Full-buffer fills (screen change, geometry move) also bypass.
+constexpr int64_t OVERLAY_MIN_REFRESH_US = 250000;
+// How long after a touch edge the gates above stay open. An edge-vs-stamp
+// comparison is not enough: a release's CLICK handler only sets flags, the
+// flags are applied in the NEXT loop() pass, and by then an edge-triggered
+// refresh has already re-stamped the gate — the click's visible result
+// would wait out a full gate period. Inside this window every refresh and
+// rerender pass runs ungated, so an interaction's knock-on invalidations
+// (pressed visuals, applied flags, screen change) all flow immediately.
+constexpr int64_t GM_TOUCH_GRACE_US = 400000;
 
 constexpr int TEMP_HISTORY_INTERVAL = 250;
 constexpr int TEMP_HISTORY_LENGTH = 20 * 1000 / TEMP_HISTORY_INTERVAL;
@@ -221,6 +259,13 @@ class DefaultUI {
 
     bool rerender = false;
     unsigned long lastRender = 0;
+    // Same stamp in esp_timer time, compared against g_touchEdgeAtUs for the
+    // telemetry-pass spacer's touch bypass (millis and esp_timer drift, so
+    // the comparison stays within one clock).
+    int64_t lastRenderUs = 0;
+    // Last overlay refresh START in esp_timer time, for OVERLAY_MIN_REFRESH_US
+    // and its g_touchEdgeAtUs comparison (same clock as the edge stamp).
+    int64_t lastOverlayRefreshUs = 0;
 
     int mode = MODE_STANDBY;
     bool pressureAvailable = false;
