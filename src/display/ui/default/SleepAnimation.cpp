@@ -15,9 +15,13 @@
 #include <math.h>
 #include <string.h> // memmove, for the round-panel band compaction
 
+// Production-path: g_touchEdgeAtUs + GM_TOUCH_GRACE_US, for the overlay
+// publish's early render wake (the probe externs it also carries stay
+// GM_TOUCH_PROBE-gated inside the header).
+#include <display/drivers/common/LV_Helper.h>
+
 #ifdef GM_TOUCH_PROBE
 #include "esp_log.h"
-#include <display/drivers/common/LV_Helper.h>
 // Edge stamp of a publish this frame's composite sampled; renderLoop logs it
 // once the frame is presented. Render-task-private, so no volatile needed.
 static int64_t s_probeFrameEdgeUs = 0;
@@ -842,6 +846,9 @@ void SleepAnimation::start(Display *d) {
     initializedAnimId = -1; // force the animation's init on the render task
     running = true;
     stopped = false;
+    if (overlayWakeSem == nullptr) {
+        overlayWakeSem = xSemaphoreCreateBinary();
+    }
     TaskHandle_t handle = nullptr;
     // Core 0, priority 1: below the push task (2), Controller::loopLogic (3)
     // and every radio task, so the render compute only ever gets core 0's
@@ -1466,6 +1473,15 @@ void SleepAnimation::publishOverlayRanges(int w, int h, const int (*ranges)[2], 
     g_statPubScrimUs += esp_timer_get_time() - scrim0;
 #endif
     overlayFront.store(back);
+    // Interaction publishes wake the render task's pacing sleep so the tap's
+    // visuals reach glass ~a frame render after publish, not a frame render
+    // plus the residual frame period. Telemetry publishes deliberately do
+    // not: each early wake is a full extra frame of core-0 compute, and at
+    // the gated 4 Hz telemetry cadence that would be a steady ~20% load bump
+    // for updates nobody is watching that closely.
+    if (overlayWakeSem != nullptr && esp_timer_get_time() - g_touchEdgeAtUs < GM_TOUCH_GRACE_US) {
+        xSemaphoreGive(static_cast<SemaphoreHandle_t>(overlayWakeSem));
+    }
 }
 
 // Turns the per-cell coverage in ov.scrimSrc into the halo the composite reads,
@@ -2020,7 +2036,16 @@ void SleepAnimation::renderLoop() {
         // Always yield at least one full tick so the UI task keeps polling
         // touch even when a frame overruns its budget.
         TickType_t ticks = pdMS_TO_TICKS(remaining > 1000 ? remaining / 1000 : 1);
-        vTaskDelay(ticks > 0 ? ticks : 1);
+        // Paced sleep a touch-driven overlay publish can cut short (see
+        // overlayWakeSem): same blocking behavior as the vTaskDelay it
+        // replaces, but the frame carrying a tap's visuals starts as soon as
+        // the snapshot is published instead of waiting out the period. A
+        // stale pending give costs one early frame, nothing more.
+        if (overlayWakeSem != nullptr) {
+            xSemaphoreTake(static_cast<SemaphoreHandle_t>(overlayWakeSem), ticks > 0 ? ticks : 1);
+        } else {
+            vTaskDelay(ticks > 0 ? ticks : 1);
+        }
     }
 }
 

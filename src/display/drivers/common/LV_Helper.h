@@ -50,6 +50,14 @@ void lvgl_helper_rect_add(lv_area_t *list, int *n, int cap, const lv_area_t &r);
 // probe-gated). DefaultUI::loop compares it against the last telemetry pass
 // start so an interaction bypasses the pass spacing.
 extern volatile int64_t g_touchEdgeAtUs;
+// How long after a touch edge the interaction fast paths stay open: the
+// telemetry-pass and overlay-refresh gates in DefaultUI stand aside, and the
+// overlay publish wakes the render task early. A window rather than an
+// edge-vs-stamp compare because a release's CLICK handler only sets flags
+// that are applied one pass later — by then an edge-triggered refresh has
+// already re-stamped the gates, and the click's visible result would wait
+// out a full gate period.
+constexpr int64_t GM_TOUCH_GRACE_US = 400000;
 
 #ifdef GM_TOUCH_PROBE
 #include <atomic>

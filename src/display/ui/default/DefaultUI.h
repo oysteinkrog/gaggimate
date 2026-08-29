@@ -46,14 +46,10 @@ constexpr int RERENDER_MIN_INTERVAL = 250;
 // that was removed for holding tap feedback a second (see maintain call
 // site). Full-buffer fills (screen change, geometry move) also bypass.
 constexpr int64_t OVERLAY_MIN_REFRESH_US = 250000;
-// How long after a touch edge the gates above stay open. An edge-vs-stamp
-// comparison is not enough: a release's CLICK handler only sets flags, the
-// flags are applied in the NEXT loop() pass, and by then an edge-triggered
-// refresh has already re-stamped the gate — the click's visible result
-// would wait out a full gate period. Inside this window every refresh and
-// rerender pass runs ungated, so an interaction's knock-on invalidations
-// (pressed visuals, applied flags, screen change) all flow immediately.
-constexpr int64_t GM_TOUCH_GRACE_US = 400000;
+// The touch grace window that holds both gates above open after an edge
+// (GM_TOUCH_GRACE_US) lives in LV_Helper.h beside the edge stamp it reads:
+// the overlay publish in SleepAnimation uses the same window to wake the
+// render task early.
 
 constexpr int TEMP_HISTORY_INTERVAL = 250;
 constexpr int TEMP_HISTORY_LENGTH = 20 * 1000 / TEMP_HISTORY_INTERVAL;
@@ -209,6 +205,26 @@ class DefaultUI {
     std::atomic<bool> panelStopRequested{false};
     std::atomic<bool> panelStopped{false};
     std::atomic<bool> otaEnded{false};
+
+    // Phone-style pressed feedback for the generated tappable widgets. The
+    // EEZ screens register only LV_IMGBTN_STATE_RELEASED images, lv_imgbtn is
+    // not lv_btn_class, and the buttons' local default-state backgrounds
+    // outrank the theme's pressed styles — so a press changed no pixels at
+    // all, even though lv_imgbtn's refr_img already invalidates on every
+    // PRESSED/RELEASED (the overlay pipeline was paying the redraw on every
+    // tap for zero visual return). The walk sets per-object LOCAL
+    // LV_STATE_PRESSED color props derived from each widget's own resolved
+    // rest colors (hue-preserving darken), covering imgbtns, clickable
+    // lv_imgs, and buttons with a visible background. Color-only props on
+    // purpose: they alter RGB, never alpha, so the snapshot's alpha plane
+    // stays byte-identical and publishOverlayRanges' scrim memcmp skips the
+    // ~23 ms whole-grid scrim rebuild on the press/release refreshes.
+    // Applied by walk over the active screen, not by editing generated
+    // screens.c (EEZ regen would drop it). Re-applied when the active screen
+    // object changes; handleScreenChange and a theme-mode change clear the
+    // root so recreated screens and re-themed rest colors get rewalked.
+    void applyPressedFeedback();
+    lv_obj_t *pressedStyledRoot = nullptr;
 
     // Animate the dial meters' tick length on screen change (short on profile/new-menu, long elsewhere).
     void animateGaugeTicks(ScreensEnum from, ScreensEnum to);
