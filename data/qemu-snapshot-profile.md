@@ -651,3 +651,21 @@ working tree per the sandbox rules -- `git status`/`git diff` on it is not
 clean at the time of this commit (that one line is the only content); the
 team lead already has the diff and can drop it or fold it into the real
 patch script.
+
+## Candidate #2 epilogue: device A/B says no (added by the team lead)
+
+The descriptor cache went onto the rig as a vendored patch
+(rename-and-wrap, canonical-input bypass, PSRAM-resident 48-slot table,
+generation bumped in _lv_disp_refr_timer and refreshSleepOverlay). Measured
+hit rate: 71% -- above the 46-56% multi-rect projection. Measured effect,
+within-run A/B (log 33, alternating 60 s bypass phases, 31-32 windows per
+arm, same boot): draw/area 3.87 us/kpx with the cache vs 3.71 us/kpx
+without. The cache makes the draw ~4% SLOWER. The saved style cascade and
+the added slot-table scan + ~150 B payload copy are both PSRAM traffic, and
+the second costs more than the first at this scene's descriptor mix.
+
+Reverted (patch script retired to the session scratchpad, vendored files
+restored, hooks removed). What survives: the attribution method, the 71%
+hit-rate datum (the reuse is real, a cheaper memo could still win), and the
+projection-vs-device lesson -- QEMU's instruction-count shares do not rank
+PSRAM-bound work.
