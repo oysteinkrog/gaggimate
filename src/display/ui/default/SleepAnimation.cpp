@@ -840,16 +840,20 @@ void SleepAnimation::start(Display *d) {
     running = true;
     stopped = false;
     TaskHandle_t handle = nullptr;
-    // Core 1, SAME priority as the UI task: FreeRTOS round-robins equal
-    // priorities every tick, so LVGL's touch poll stays responsive even when
-    // a frame overruns its budget. At priority 2 the animation preempted the
-    // UI task and left it ~1 ms per 33 ms frame — standby taps took seconds
-    // to register. In standby the UI task is nearly idle, so the animation
-    // still gets almost the whole core; on active screens (all-screens mode)
-    // it gracefully drops frames instead of starving input.
+    // Core 0, priority 1: below the push task (2), Controller::loopLogic (3)
+    // and every radio task, so the render compute only ever gets core 0's
+    // leftovers and cannot delay control or coex. Off core 1 entirely because
+    // that is the UI task's core: at equal priority the two round-robined and
+    // each ran at half speed exactly when both were busy. On active screens
+    // (all-screens mode) that halved the widget refresh rate AND held the
+    // animation at ~13 fps of its 30 fps target at the same time. (An earlier
+    // same-core arrangement at priority 2 was worse still: it starved touch
+    // outright, standby taps took seconds.) Only the task's compute moves; the
+    // panel's LCD_CAM/DMA interrupts stay pinned to core 1 by setupPanel,
+    // which is the invariant that keeps scan-out clean.
     // 8 KB stack: renderFrame itself is lean, but log_i's float formatting and
     // the esp_lcd draw path both burn stack; 4 KB was within canary distance.
-    if (xTaskCreatePinnedToCore(taskEntry, "SleepAnim", 8192, this, 1, &handle, 1) != pdPASS) {
+    if (xTaskCreatePinnedToCore(taskEntry, "SleepAnim", 8192, this, 1, &handle, 0) != pdPASS) {
         log_e("SleepAnimation: task creation failed");
         running = false;
         stopped = true;
@@ -861,9 +865,10 @@ void SleepAnimation::start(Display *d) {
     // Controller::loopLogicTask (core 0, priority 3) so animation work can
     // never preempt the control path, and above the default-priority-1 tasks
     // that share core 0 (Arduino loop, WiFi events, AsyncTCP), none of which
-    // are time-critical. Core 1 is left exactly as it was: the render task
-    // stays at priority 1 alongside the UI task, which is deliberate (see the
-    // note above — priority 2 there starved touch input).
+    // are time-critical. It also sits above the render task (priority 1,
+    // same core): when both stages contend, draining a finished band to the
+    // framebuffer beats computing the next one, or the band slots back up
+    // and the pipeline stalls at the slower stage anyway.
     TaskHandle_t push = nullptr;
     pushStopped = false;
     if (xTaskCreatePinnedToCore(pushTaskEntry, "SleepPush", 4096, this, 2, &push, 0) != pdPASS) {
