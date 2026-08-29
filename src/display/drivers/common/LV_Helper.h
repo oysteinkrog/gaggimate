@@ -35,6 +35,9 @@ void lvgl_helper_suppress_flush(bool suppress);
 // pointer chase that dominates the snapshot. On the bench rig, 4 cut the
 // draw stage from ~59 ms to ~51 ms per refresh with no growth in redrawn
 // area (the least-growth merge keeps clips tight) and publish unchanged.
+// 2 is past the floor: typical refreshes carry 3-4 disjoint widget regions,
+// so the merge starts unioning across the screen (area avg ~15k -> ~103k px,
+// snap ~55 -> ~90 ms measured). Do not go below 4.
 #define GM_DIRTY_RECT_CAP 4
 int lvgl_helper_take_dirty_rects(lv_area_t *out, int maxN);
 // Merge one rectangle into a fixed-capacity list: unions with anything it
