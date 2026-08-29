@@ -521,3 +521,133 @@ a different route (`fcb29ace`/`c3ddbde1`, `197f97c9`/`5d71fa99`) before this
 pass's measurements were in hand to inform them; the one remaining idea
 (style/descriptor cache) is sized above but not prototyped, for the
 correctness reasons given.
+
+## Addendum: rig updates folded in, and the per-refresh descriptor cache prototype
+
+Two updates arrived from the team lead after the section above was written,
+folded in here rather than rewritten above (git history has the original):
+candidate #1 is confirmed shipped as `scripts/patch_lvgl_setpx_fast.py`
+(`2b477bfb`) -- no integration diff needed from this pass, consistent with
+what this report already said. The rect-count question is closed on-device:
+cap=2 measured on the rig at ~103k px/refresh redrawn (from ~15k at cap=4)
+and ~90ms snapshot time (from ~55ms) -- cap=4 is the floor. This matches
+this pass's own QEMU finding that the fold algorithm has no headroom to
+usefully exercise below cap=4 in the traffic this bench can generate, and
+explains *why* on the rig specifically: real refreshes carry 3-4 disjoint
+widget regions, so a cap of 2 forces the least-growth merge to union across
+much of the screen. **Drop the rect-count question entirely, per the team
+lead -- nothing further attempted on it here.**
+
+### Prototype: a per-refresh cache for `lv_obj_init_draw_*_dsc`
+
+Candidate #1 from the team lead's mitigation list (the per-refresh
+style/descriptor cache), sized earlier in this section at up to ~21% of
+the walk (style 11.3% + descriptor init 9.7%, and descriptor
+init calls into style resolution internally so the two overlap -- a full
+cache hit saves both). Implemented as a generation-scoped cache: one slot
+per distinct `(object pointer, part, descriptor kind)` seen during a
+refresh, stamped with a counter (`gm_refresh_generation`) that increments
+once per call to `refreshSleepOverlay()`. Confirmed by reading that
+function directly: its per-rect loop (`for (int i = 0; i < clipN; i++)`,
+`DefaultUI.cpp`) calls `snapshotAreaToOverlay()` back-to-back with no
+`lv_timer_handler()` or style-transition tick in between, so a descriptor
+resolved on rect 0 cannot have gone stale by rect 1..clipN-1 of the *same*
+call -- and a generation mismatch on the *next* call makes every entry an
+automatic miss, so nothing needs explicit invalidation when real style state
+changes on the next refresh.
+
+**A collision, caught before it produced a wrong number.** Partway through
+prototyping this, another concurrent edit to `DefaultUI.cpp` (a `GM_LVMEM`
+heap-stats addition, not authored by this pass) silently overwrote this
+pass's one-line `gm_refresh_generation++` hook -- the file changed out from
+under a local, uncommitted edit in the shared checkout. The first symptom
+was a follow-up measurement (an artificial 4x-repeat harness meant to proxy
+the rig's multi-rect-per-refresh traffic in QEMU) producing an impossible
+result: 100% cache hits on the *second* `refreshSleepOverlay()` call,
+which only makes sense if the generation counter had frozen at 0 -- i.e.
+exactly what happens when the increment silently stops running. Caught by
+checking `git diff` on the file before trusting the number, not by the
+number looking suspicious on its own; the number alone would have read as
+"great, the cache works even better than expected." Flagged to the team
+lead, re-applied the one-line hook on top of the current file, verified it
+survived the next build, and **did not re-attempt the 4x-repeat harness**
+given a second collision was one more concurrent write away -- see below
+for how that gap is closed analytically instead. The hook also had a real
+bug of its own, independent of the collision: as first written it was
+unconditional, and since `DefaultUI.cpp` is shared by every env, an
+unconditional `extern volatile uint32_t gm_refresh_generation;` would
+link-fail `display` and `display-loadtest` the moment the cache patch
+script ships to `display-qemu` only, since no other env's vendored LVGL
+would define that symbol. Someone (likely the team lead, reacting to the
+collision flag) caught this too and wrapped it in `#ifdef GM_FAKE_CONTROLLER`
+before this pass got back to it -- adopted as-is, it's correct, and it's
+reflected in the production diff below.
+
+**QEMU-measured effect** (4 samples, 2 independent boots, both showing the
+generation-scoping working correctly -- consistently `dsc_cache_hits=1,
+dsc_cache_misses=6` per refresh, never drifting to full-hit or full-miss):
+
+| | baseline (no cache) | with cache | delta |
+|---|---|---|---|
+| descriptor-init substage | 453us | 425us | -6.2% |
+| style-resolution substage | 525us | 426us | -18.9% |
+| combined (style+dscinit) | 978us | 851us | **-13.0%** |
+| style calls (`style_top`) | 134 | 129 | -3.7% (call count) |
+
+The style-time drop (18.9%) is disproportionate to the style-*call-count*
+drop (3.7%) -- the one cached object's internal style resolution costs
+above the group's per-call average, or this is noise within this pass's
+established ~15-25% run-to-run QEMU variance; four samples isn't enough to
+tell those apart, so treat the 18.9% figure as directional, not precise.
+
+**This measured number is deliberately not the number that matters.** The
+hit rate here (1 of 7 descriptor calls, ~14%) is *incidental* -- one object
+happened to get queried twice within a single dirty-rect pass -- not the
+cross-rect reuse this cache is actually for, because `GM_FAKE_CONTROLLER`'s
+scene structurally never produces more than one dirty rect per refresh (the
+same limitation as the rect-count sweep above). The cache cannot show its
+real effect in this bench.
+
+**Analytical projection for the rig's actual regime** (3-4 disjoint widget
+regions per refresh, cap=4, per the team lead): if `k` of a refresh's
+touched objects overlap all `R` rects (the three ~500x500 meters are the
+obvious candidates -- plausible but *not verified*, this pass did not
+instrument which specific objects those 7 dscinit calls belong to) and the
+rest are single-rect-only, the cache turns `k*R` redundant resolutions into
+`k`, saving `k*(R-1)` of `k*R + (7-k)` total calls for this scene's 7-object
+mix. For `k=3`: `R=4` saves 9 of 16 (56%), `R=3` saves 6 of 13 (46%). This
+is a **projection, not a measurement** -- it assumes which objects overlap
+multiple rects, which this bench cannot confirm. **Validate on the rig**
+against `gm_dscinit_cache_hits`/`gm_dscinit_cache_misses` (wire the same
+pair into whichever build gets this patch) before trusting either number;
+if the real hit rate comes back well under the projection, the objects
+doing the overlapping aren't what this projection assumed.
+
+**Memory cost**: 48 slots x 72 bytes = 3,456 bytes static, measured via a
+boot-time `sizeof` log (`GM_DSCCACHE_SIZE`) rather than computed by hand
+(the payload union includes `lv_draw_rect_dsc_t`'s gradient descriptor
+member, not a trivial size to eyeball correctly). Slot count (48) is a
+guess sized above the 7-30 distinct objects this pass's samples touched per
+rect-pass, times up to 4 rects/refresh; recount against the real screens'
+worst case before shipping.
+
+**Correctness caveat, stated plainly**: safe only if `refreshSleepOverlay()`
+never runs concurrently across two threads/cores (no locking added) and its
+per-rect loop never yields to a timer/style-transition tick between
+iterations -- both true in the code as read here, but the loop this cache
+depends on is the *exact* function that already got edited out from under
+this pass once during this session; re-verify against whatever it looks
+like when this actually ships, and pixel-diff a real screen before trusting
+it, same discipline as candidate #1's fast path.
+
+Production diff: `candidate2-dsccache-production.diff` (scratchpad, same
+directory as `candidate1-fastpath-production.diff`). Full instrumented
+sandbox diff (this pass's counters/timers plus the cache):
+`candidate2-subattribution-instrumentation.diff`. The one `src/` line this
+prototype needed (`DefaultUI.cpp`'s `gm_refresh_generation++`, now correctly
+`#ifdef GM_FAKE_CONTROLLER`-guarded) is isolated in
+`defaultui-gm-refresh-generation-hook.diff`, left **uncommitted** in the
+working tree per the sandbox rules -- `git status`/`git diff` on it is not
+clean at the time of this commit (that one line is the only content); the
+team lead already has the diff and can drop it or fold it into the real
+patch script.
