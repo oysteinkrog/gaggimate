@@ -1276,6 +1276,44 @@ void SleepAnimation::publishOverlay(int w, int h, int rowY0, int rowY1) {
     publishOverlayRanges(w, h, r, 1);
 }
 
+// Span scan of one panel row. HAS_CELL is a template parameter rather than
+// the runtime null test this loop used to carry: the pointer is fixed for
+// the whole publish, and re-testing it per covered pixel (~5,000 times a
+// publish) was measurable against a loop this small
+// (tools/overlaybench scanRow_spec, codegen-verified hoist).
+template <bool HAS_CELL>
+static int scanOverlayRow(const uint8_t *__restrict a, int panelW, uint32_t *__restrict rowRuns,
+                          uint8_t *__restrict cell) {
+    int nRuns = 0;
+    int runStart = -1;
+    for (int x = 0; x < panelW; x++, a += 3) {
+        if (*a != 0) {
+            if (runStart < 0) {
+                runStart = x;
+            }
+            if (HAS_CELL) {
+                // Peak, not average: the halo is meant to cover the gaps
+                // between strokes and inside glyph counters, and those
+                // are exactly where an average would fade it out.
+                uint8_t &c = cell[x >> SCRIM_SHIFT];
+                if (*a > c) {
+                    c = *a;
+                }
+            }
+            continue;
+        }
+        if (runStart < 0) {
+            continue;
+        }
+        nRuns = emitRun(rowRuns, nRuns, runStart, x, RUN_GAP_MERGE);
+        runStart = -1;
+    }
+    if (runStart >= 0) {
+        nRuns = emitRun(rowRuns, nRuns, runStart, panelW, RUN_GAP_MERGE);
+    }
+    return nRuns;
+}
+
 void SleepAnimation::publishOverlayRanges(int w, int h, const int (*ranges)[2], int n) {
     if (overlayCap == 0 || display == nullptr || n <= 0) {
         return;
@@ -1396,32 +1434,8 @@ void SleepAnimation::publishOverlayRanges(int w, int h, const int (*ranges)[2], 
             if (sy >= 0 && sy < h) {
                 const uint8_t *a = ov.buf + (static_cast<size_t>(sy) * w + xoff) * 3 + 2;
                 uint8_t *cell = doScrim ? ov.scrimSrc + static_cast<size_t>(y >> SCRIM_SHIFT) * sw : nullptr;
-                int runStart = -1;
-                for (int x = 0; x < panelW; x++, a += 3) {
-                    if (*a != 0) {
-                        if (runStart < 0) {
-                            runStart = x;
-                        }
-                        if (cell != nullptr) {
-                            // Peak, not average: the halo is meant to cover the gaps
-                            // between strokes and inside glyph counters, and those
-                            // are exactly where an average would fade it out.
-                            uint8_t &c = cell[x >> SCRIM_SHIFT];
-                            if (*a > c) {
-                                c = *a;
-                            }
-                        }
-                        continue;
-                    }
-                    if (runStart < 0) {
-                        continue;
-                    }
-                    nRuns = emitRun(rowRuns, nRuns, runStart, x, RUN_GAP_MERGE);
-                    runStart = -1;
-                }
-                if (runStart >= 0) {
-                    nRuns = emitRun(rowRuns, nRuns, runStart, panelW, RUN_GAP_MERGE);
-                }
+                nRuns = cell != nullptr ? scanOverlayRow<true>(a, panelW, rowRuns, cell)
+                                        : scanOverlayRow<false>(a, panelW, rowRuns, nullptr);
             }
             ov.runN[y] = static_cast<uint8_t>(nRuns);
         }
@@ -1462,6 +1476,39 @@ void SleepAnimation::publishOverlayRanges(int w, int h, const int (*ranges)[2], 
 // rows plus a margin and would still get the seam wrong wherever the margin
 // itself was stale. The grid is 120x120, and six passes over it cost far less
 // than the single pass over the 230 KB alpha plane that just ran.
+// Cache-blocked transpose of an n x n byte grid, src and dst distinct. The
+// 16x16 on-stack tile is the point: it keeps both the grid read and the grid
+// write sequential, so the only strided access left is inside a 256-byte
+// stack array instead of a 14.4 KB PSRAM buffer. A naive element-at-a-time
+// transpose would just move the 120-byte stride from the vertical tap onto
+// the transpose's write side. always_inline because GCC has declined to
+// inline same-file helpers in this file at -O2 before (see scale565x2).
+__attribute__((always_inline)) static inline void transposeSquare(const uint8_t *__restrict src, uint8_t *__restrict dst,
+                                                                  int n) {
+    constexpr int kBlock = 16;
+    uint8_t tile[kBlock][kBlock];
+    for (int by = 0; by < n; by += kBlock) {
+        const int yEnd = (by + kBlock < n) ? by + kBlock : n;
+        const int bh = yEnd - by;
+        for (int bx = 0; bx < n; bx += kBlock) {
+            const int xEnd = (bx + kBlock < n) ? bx + kBlock : n;
+            const int bw = xEnd - bx;
+            for (int y = 0; y < bh; y++) {
+                const uint8_t *srow = src + static_cast<size_t>(by + y) * n + bx;
+                for (int x = 0; x < bw; x++) {
+                    tile[y][x] = srow[x];
+                }
+            }
+            for (int x = 0; x < bw; x++) {
+                uint8_t *drow = dst + static_cast<size_t>(bx + x) * n + by;
+                for (int y = 0; y < bh; y++) {
+                    drow[y] = tile[y][x];
+                }
+            }
+        }
+    }
+}
+
 void SleepAnimation::buildScrim(Overlay &ov, int panelW, int panelH) {
     const int sw = ov.scrimW;
     const int sh = ov.scrimH;
@@ -1469,8 +1516,21 @@ void SleepAnimation::buildScrim(Overlay &ov, int panelW, int panelH) {
     // in every direction and diagonals get the same reach as the axes.
     scrimTap3(ov.scrimSrc, scrimTmp, sh, sw, sw, 1, true);
     scrimTap3(scrimTmp, ov.scrim, sh, sw, sw, 1, true);
-    scrimTap3(ov.scrim, scrimTmp, sw, sh, 1, sw, true);
-    scrimTap3(scrimTmp, ov.scrim, sw, sh, 1, sw, true);
+    if (sw == sh) {
+        // The two vertical passes used to walk the grid at a 120-byte PSRAM
+        // stride (lineStep=1, step=sw). Bracketing them in a transpose makes
+        // both taps sequential; the mapping is proven bit-exact in
+        // tools/overlaybench/kernels/scrim_build.cpp (buildScrim_transposed34).
+        // No extra buffers: at each step the source of the previous call is
+        // dead, so the pair ping-pongs scrimTmp and ov.scrim.
+        transposeSquare(ov.scrim, scrimTmp, sw);
+        scrimTap3(scrimTmp, ov.scrim, sw, sh, sw, 1, true);
+        scrimTap3(ov.scrim, scrimTmp, sw, sh, sw, 1, true);
+        transposeSquare(scrimTmp, ov.scrim, sw);
+    } else {
+        scrimTap3(ov.scrim, scrimTmp, sw, sh, 1, sw, true);
+        scrimTap3(scrimTmp, ov.scrim, sw, sh, 1, sw, true);
+    }
     // Smooth, so the scrim's own edge is a gradient rather than a visible
     // rectangle sitting on the animation.
     scrimTap3(ov.scrim, scrimTmp, sh, sw, sw, 1, false);
