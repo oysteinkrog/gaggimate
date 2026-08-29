@@ -55,6 +55,11 @@ extern volatile bool g_probeEdgeIsPress;
 // window still just drops one probe line, nothing more.
 extern std::atomic<int64_t> g_probePublishUs;
 extern std::atomic<bool> g_probePublishIsPress;
+// Publish sub-stage accumulators for GM_UISTAT: span scan vs scrim rebuild.
+// Written in publishOverlayRanges and read+reset by the UISTAT logger, all on
+// the UI task; volatile only to keep the accumulation visible across TUs.
+extern volatile int64_t g_statPubScanUs;
+extern volatile int64_t g_statPubScrimUs;
 #endif
 
 String lvgl_helper_get_fs_filename(String filename);
