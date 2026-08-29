@@ -233,6 +233,8 @@ volatile bool g_probeEdgeIsPress = false;
 std::atomic<int64_t> g_probePublishUs{0};
 std::atomic<bool> g_probePublishIsPress{false};
 volatile int64_t g_statPubScanUs = 0;
+volatile int64_t g_statPassStartUs = 0;
+volatile int64_t g_statPassEndUs = 0;
 volatile int64_t g_statPubScrimUs = 0;
 #endif
 
@@ -300,16 +302,38 @@ static void disp_flush(lv_disp_drv_t *disp_drv, const lv_area_t *area, lv_color_
     lv_disp_flush_ready(disp_drv);
 }
 
+volatile int64_t g_touchEdgeAtUs = 0;
+
 /*Read the touchpad*/
 static void touchpad_read(lv_indev_drv_t *indev_driver, lv_indev_data_t *data) {
     static int16_t x, y;
     uint8_t touched = static_cast<Display *>(indev_driver->user_data)->getPoint(&x, &y, 1);
+    {
+        // Production-path edge stamp (not probe-gated): DefaultUI::loop uses
+        // it to let an interaction bypass the telemetry-pass spacing, so a
+        // tap's effect applies on the very next pass instead of waiting out
+        // the spacer.
+        static bool edgeWasTouched = false;
+        if (touched != edgeWasTouched) {
+            edgeWasTouched = touched;
+            g_touchEdgeAtUs = esp_timer_get_time();
+        }
+    }
 #ifdef GM_TOUCH_PROBE
     static bool wasTouched = false;
     if (touched != wasTouched) {
         wasTouched = touched;
         g_probeEdgeUs = esp_timer_get_time();
         g_probeEdgeIsPress = touched;
+        {
+            // See g_statPassStartUs in LV_Helper.h: separates "edge waited in
+            // the touch controller behind a saturated UI task" from "edge was
+            // read promptly and the pipeline itself was slow".
+            const int64_t start = g_statPassStartUs;
+            ESP_LOGI("TouchProbe", "GM_EDGEWAIT: press=%d in_pass_us=%lld since_prev_pass_end_us=%lld",
+                     (int)touched, (long long)(start != 0 ? g_probeEdgeUs - start : -1),
+                     (long long)(g_statPassEndUs != 0 ? g_probeEdgeUs - g_statPassEndUs : -1));
+        }
         // Force a small redraw on every edge so the interval always measures
         // the render pipeline. Without this a tap that hits nothing reactive
         // produces no redraw, and the probe closes on the next unrelated

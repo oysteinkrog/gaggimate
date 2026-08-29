@@ -307,9 +307,19 @@ void DefaultUI::loop() {
         rerender = true;
     }
 
-    if (rerender) {
+    // Telemetry-pass spacing (see RERENDER_MIN_INTERVAL): rerender stays
+    // pending while held, so no change is ever dropped, only coalesced into
+    // the next spaced pass. Within GM_TOUCH_GRACE_US of a touch edge the
+    // spacer is bypassed so interaction effects — including CLICK flags that
+    // only get applied on the pass AFTER the edge — run immediately.
+    // ui_tick() and the maintain calls below still run on a held pass.
+    const bool spacerHold =
+        rerender && diff < RERENDER_MIN_INTERVAL && esp_timer_get_time() - g_touchEdgeAtUs >= GM_TOUCH_GRACE_US;
+
+    if (rerender && !spacerHold) {
         rerender = false;
         lastRender = now;
+        lastRenderUs = esp_timer_get_time();
         applyTheme();
         if (controller->isErrorState()) {
             changeScreen(SCREEN_ID_STANDBY_SCREEN);
@@ -992,6 +1002,20 @@ void DefaultUI::refreshSleepOverlay() {
         return;
     }
 
+    // Telemetry refresh spacing (see OVERLAY_MIN_REFRESH_US). Only partial
+    // refreshes of an already-filled buffer are gated: a buffer that needs a
+    // whole fill (screen change, geometry move) paints immediately, and for
+    // GM_TOUCH_GRACE_US after any touch edge everything goes straight
+    // through so a tap's visual effects never wait behind the gate. The debt
+    // merged above survives the return, so a held refresh coalesces instead
+    // of dropping.
+    if (overlayValid[back]) {
+        const int64_t nowUs = esp_timer_get_time();
+        if (nowUs - g_touchEdgeAtUs >= GM_TOUCH_GRACE_US && nowUs - lastOverlayRefreshUs < OVERLAY_MIN_REFRESH_US) {
+            return;
+        }
+    }
+
     // If the snapshot geometry has moved since this buffer was last written,
     // its contents are no longer where they claim to be: the buffer is indexed
     // from coords.y1-ext and composited at an offset of ext, so a change to
@@ -1030,6 +1054,7 @@ void DefaultUI::refreshSleepOverlay() {
     }
 
     lastSleepOverlayRefresh = ::millis();
+    lastOverlayRefreshUs = esp_timer_get_time();
     int w = 0, h = 0;
 #ifdef GM_TOUCH_PROBE
     const int64_t probeSnap0 = esp_timer_get_time();
@@ -1692,6 +1717,7 @@ void DefaultUI::loopTask(void *arg) {
         const unsigned long now = ::millis();
 #ifdef GM_TOUCH_PROBE
         const int64_t probePass0 = esp_timer_get_time();
+        g_statPassStartUs = probePass0;
 #endif
         if (now - lastUi >= UI_PERIOD_MS) {
             lastUi = now;
@@ -1708,7 +1734,10 @@ void DefaultUI::loopTask(void *arg) {
         }
 #ifdef GM_TOUCH_PROBE
         {
-            const int64_t passUs = esp_timer_get_time() - probePass0;
+            const int64_t passEnd = esp_timer_get_time();
+            g_statPassEndUs = passEnd;
+            g_statPassStartUs = 0;
+            const int64_t passUs = passEnd - probePass0;
             g_uiPassN++;
             g_uiPassSum += passUs;
             if (passUs > g_uiPassMax)

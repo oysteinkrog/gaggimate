@@ -46,6 +46,11 @@ int lvgl_helper_take_dirty_rects(lv_area_t *out, int maxN);
 // for the overlay's per-buffer debt lists, which need the same policy.
 void lvgl_helper_rect_add(lv_area_t *list, int *n, int cap, const lv_area_t &r);
 
+// Stamped by touchpad_read on every press/release edge (production path, not
+// probe-gated). DefaultUI::loop compares it against the last telemetry pass
+// start so an interaction bypasses the pass spacing.
+extern volatile int64_t g_touchEdgeAtUs;
+
 #ifdef GM_TOUCH_PROBE
 #include <atomic>
 // Touch-to-pixel latency probe (bench builds). touchpad_read stamps the edge;
@@ -69,6 +74,13 @@ extern std::atomic<bool> g_probePublishIsPress;
 // the UI task; volatile only to keep the accumulation visible across TUs.
 extern volatile int64_t g_statPubScanUs;
 extern volatile int64_t g_statPubScrimUs;
+// Saturation probe: when a touch edge is read, how deep into an in-flight UI
+// pass it landed and how long since the previous pass ended. The indev read
+// itself runs on the UI task, so an edge that spent its wait inside the touch
+// controller shows up here as a tiny in-pass offset right after a long pass:
+// the wait happened BEFORE the edge could even be read. Same-task access.
+extern volatile int64_t g_statPassStartUs; // current pass start (0 = idle)
+extern volatile int64_t g_statPassEndUs;   // previous pass end
 #endif
 
 String lvgl_helper_get_fs_filename(String filename);
