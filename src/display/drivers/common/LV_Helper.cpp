@@ -48,6 +48,8 @@ static lv_color_t *s_scratch = nullptr;
 static uint32_t s_scratchPx = 0;
 
 static volatile bool s_suppressFlush = false;
+// Refresh-timer period before suppression parked it; 0 = not parked.
+static uint32_t s_refrPeriodSaved = 0;
 
 // Accumulated invalid regions while suppressed, as a small list rather than
 // one bounding box. The box was the display's 650 ms UI pass in disguise: a
@@ -162,11 +164,48 @@ void lvgl_helper_suppress_flush(bool suppress) {
     // full repaint this schedules is what LVGL then feeds to refr_sync_areas so
     // the second buffer is brought up to date before it is ever presented.
     lv_disp_drv_update(disp, &disp_drv);
+
+    // While suppressed, LVGL's refresh would render every invalid area through
+    // the scratch buffer only for disp_flush to drop the pixels and keep the
+    // rectangle -- the overlay snapshot then renders the same content again.
+    // Park the refresh timer instead and let take_dirty_rects harvest the
+    // pending areas straight from disp->inv_areas. A plain lv_timer_pause does
+    // not survive: _lv_inv_area resumes the timer on every invalidation, but
+    // resuming a timer whose period is an hour still never fires it.
+    lv_timer_t *refr = _lv_disp_get_refr_timer(disp);
+    if (refr != nullptr) {
+        if (suppress) {
+            if (s_refrPeriodSaved == 0) {
+                s_refrPeriodSaved = refr->period;
+            }
+            lv_timer_set_period(refr, 3600000);
+        } else if (s_refrPeriodSaved != 0) {
+            lv_timer_set_period(refr, s_refrPeriodSaved);
+            s_refrPeriodSaved = 0;
+            lv_timer_resume(refr);
+        }
+    }
 }
 
 int lvgl_helper_take_dirty_rects(lv_area_t *out, int maxN) {
     if (out == nullptr || maxN <= 0) {
         return 0;
+    }
+    // With the refresh timer parked (see lvgl_helper_suppress_flush), the
+    // widgets' invalidations sit unconsumed in disp->inv_areas. Fold them into
+    // the accumulator here; disp_flush still feeds it too, so anything that
+    // does render while suppressed (lv_refr_now) is not counted twice --
+    // rect_add unions overlaps away. _lv_inv_area caps inv_p at
+    // LV_INV_BUF_SIZE by collapsing an overflow to the full screen.
+    if (s_suppressFlush) {
+        lv_disp_t *disp = lv_disp_get_default();
+        if (disp != nullptr && disp->inv_p > 0) {
+            uint16_t p = disp->inv_p < LV_INV_BUF_SIZE ? disp->inv_p : LV_INV_BUF_SIZE;
+            for (uint16_t i = 0; i < p; i++) {
+                lvgl_helper_rect_add(s_dirtyRects, &s_dirtyN, GM_DIRTY_RECT_CAP, disp->inv_areas[i]);
+            }
+            disp->inv_p = 0;
+        }
     }
     int n = s_dirtyN < maxN ? s_dirtyN : maxN;
     for (int i = 0; i < n; i++) {
