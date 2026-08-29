@@ -1918,6 +1918,23 @@ void WebUIPlugin::handleSettings(AsyncWebServerRequest *request) const {
             }
             if (request->hasArg("bgAnimPlateOpacity"))
                 settings->setBgAnimPlateOpacity(request->arg("bgAnimPlateOpacity").toInt());
+            // Checkbox: the form omits it entirely when unchecked (see
+            // buildSubmitFormData's checkboxKeys), so presence IS the value.
+            settings->setElementTintEnabled(request->hasArg("elementTintEnabled"));
+            if (request->hasArg("elementTintColor")) {
+                // Same accepted forms as bgAnimPlateColor: "#rrggbb" from
+                // <input type=color>, plain decimal from scripted clients.
+                String c = request->arg("elementTintColor");
+                c.trim();
+                settings->setElementTintColor(
+                    static_cast<int>(c.startsWith("#") ? strtol(c.c_str() + 1, nullptr, 16) : strtol(c.c_str(), nullptr, 10)));
+            }
+            if (request->hasArg("touchDimColor")) {
+                String c = request->arg("touchDimColor");
+                c.trim();
+                settings->setTouchDimColor(
+                    static_cast<int>(c.startsWith("#") ? strtol(c.c_str() + 1, nullptr, 16) : strtol(c.c_str(), nullptr, 10)));
+            }
             // Tone controls. All three are percentages and all three clamp in
             // the setter, so a stale or hand-made request cannot push a value
             // into the Q8 conversions that drive the render path.
@@ -2113,6 +2130,14 @@ void WebUIPlugin::handleSettings(AsyncWebServerRequest *request) const {
         doc["bgAnimPlateColor"] = hex;
     }
     doc["bgAnimPlateOpacity"] = settings.getBgAnimPlateOpacity();
+    doc["elementTintEnabled"] = settings.getElementTintEnabled();
+    {
+        char hex[8];
+        snprintf(hex, sizeof(hex), "#%06X", static_cast<unsigned>(settings.getElementTintColor()) & 0xFFFFFFu);
+        doc["elementTintColor"] = hex;
+        snprintf(hex, sizeof(hex), "#%06X", static_cast<unsigned>(settings.getTouchDimColor()) & 0xFFFFFFu);
+        doc["touchDimColor"] = hex;
+    }
     doc["bgAnimBrightness"] = settings.getBgAnimBrightness();
     doc["bgAnimHighlightKnee"] = settings.getBgAnimHighlightKnee();
     doc["bgAnimScrim"] = settings.getBgAnimScrim();

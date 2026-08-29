@@ -153,6 +153,7 @@ function buildSubmitFormData(formData, autowakeupSchedules, restart) {
     'autowakeupEnabled',
     'smartGrindToggle',
     'bgAnimAllScreens',
+    'elementTintEnabled',
   ];
 
   for (const [key, value] of Object.entries(formData)) {

@@ -472,6 +472,44 @@ function BackgroundAnimationSettings({ formData, onChange, setField }) {
           onChange={onChange('bgAnimAllScreens')}
         />
       </div>
+      <div className='mt-4'>
+        <ToggleField
+          label='Custom element tint (icons and accent colour on the display)'
+          htmlFor='elementTintEnabled'
+          checked={!!formData.elementTintEnabled}
+          onChange={onChange('elementTintEnabled')}
+        />
+      </div>
+      {!!formData.elementTintEnabled && (
+        <div className='mt-4'>
+          <SettingsFormField label='Element tint colour' htmlFor='elementTintColor' noMargin>
+            <input
+              id='elementTintColor'
+              name='elementTintColor'
+              type='color'
+              className='input input-bordered h-12 w-full'
+              value={formData.elementTintColor || '#FFFFFF'}
+              onChange={onChange('elementTintColor')}
+            />
+          </SettingsFormField>
+        </div>
+      )}
+      <div className='mt-4'>
+        <SettingsFormField
+          label='Touch feedback colour (pressed elements shift toward this)'
+          htmlFor='touchDimColor'
+          noMargin
+        >
+          <input
+            id='touchDimColor'
+            name='touchDimColor'
+            type='color'
+            className='input input-bordered h-12 w-full'
+            value={formData.touchDimColor || '#000000'}
+            onChange={onChange('touchDimColor')}
+          />
+        </SettingsFormField>
+      </div>
     </div>
   );
 }
