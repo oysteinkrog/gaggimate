@@ -32,6 +32,28 @@ using BuildScrimFn = void (*)(const uint8_t *__restrict src, uint8_t *__restrict
 void buildScrim_ref(const uint8_t *__restrict src, uint8_t *__restrict tmp, uint8_t *__restrict out, int sw, int sh,
                     int q8, uint32_t *__restrict haloRuns, uint8_t *__restrict haloN);
 
+// buildScrim_ref with the two "vertical" dilate passes (3 and 4 -- the only
+// ADJACENT pair of same-shape passes in the fixed H,H,V,V,H,V order)
+// rewritten as: transpose once, run both as sequential "horizontal-shaped"
+// calls to scrimTap3_ref on the transposed grid (same 3-tap window, same
+// clamp bound, just walking transposed coordinates -- a mathematical no-op,
+// not a reordering of the iterative dependency), transpose back once. Pass 6
+// (the third vertical pass, isolated between two horizontal passes) is left
+// exactly as buildScrim_ref computes it -- see the worker's report for why
+// bracketing an isolated single pass with its own transpose-in/transpose-out
+// is not expected to pay for itself. Bit-exact by construction; see
+// scrim_build.cpp for the parameter-mapping proof.
+void buildScrim_transposed34(const uint8_t *__restrict src, uint8_t *__restrict tmp, uint8_t *__restrict out, int sw,
+                             int sh, int q8, uint32_t *__restrict haloRuns, uint8_t *__restrict haloN);
+
+// buildScrim_transposed34 taken further: transposes around pass 6 as well
+// (a second, separate transpose bracket), so all six passes run sequential
+// rather than strided. Costs 4 transposes total instead of 2. Registered
+// mainly as a comparison point for whether the extra two transposes are
+// worth eliminating the one remaining strided pass -- see the report.
+void buildScrim_transposed_all(const uint8_t *__restrict src, uint8_t *__restrict tmp, uint8_t *__restrict out, int sw,
+                               int sh, int q8, uint32_t *__restrict haloRuns, uint8_t *__restrict haloN);
+
 struct BuildScrimVariant {
     const char *name;
     BuildScrimFn fn;
