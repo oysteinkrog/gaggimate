@@ -117,7 +117,7 @@ class DefaultUI {
     // temperature readout and the status bar into the whole screen, and every
     // refresh then re-rendered and re-scanned all 480x480 pixels. That was
     // most of the 650 ms UI pass the touch probe measured.
-    static constexpr int OVERLAY_DIRTY_RECTS = 8;
+    static constexpr int OVERLAY_DIRTY_RECTS = 4;
     lv_area_t overlayDirty[2][OVERLAY_DIRTY_RECTS];
     int overlayDirtyN[2] = {0, 0};
     bool overlayValid[2] = {false, false};
