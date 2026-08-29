@@ -149,6 +149,37 @@ void action_on_meter_draw(lv_event_t *e) {
     constexpr float DEG2RAD = 3.14159265358979323846f / 180.0f;
 
     for (uint16_t i = 0; i < cnt; i++) {
+        const float angle = ((float)i * scale->angle_range / (cnt - 1) + scale->rotation) * DEG2RAD;
+        const float ux = cosf(angle);
+        const float uy = sinf(angle);
+
+        // Geometry before colour, so ticks outside the clip can be rejected
+        // early. Partial invalidation keeps a value update down to a thin
+        // sector of the ring; lv_draw_line/_rect do clip, but only after each
+        // call has built its rounded-cap masks, and paying that for the ~95%
+        // of ticks a sector excludes is what kept redraws meter-sized. The
+        // 2px margin covers anti-aliasing bleed past the rounded coords.
+        lv_point_t inner{}, outer{};
+        lv_coord_t dx = 0, dy = 0;
+        lv_area_t tickBox;
+        if (pill) {
+            // Round (not truncate) the coords so every tick lands evenly on the pixel grid.
+            inner = {(lv_coord_t)lroundf(cx + ux * (r_in + cap)), (lv_coord_t)lroundf(cy + uy * (r_in + cap))};
+            outer = {(lv_coord_t)lroundf(cx + ux * (r_out - cap)), (lv_coord_t)lroundf(cy + uy * (r_out - cap))};
+            tickBox.x1 = (lv_coord_t)(LV_MIN(inner.x, outer.x) - cap - 2);
+            tickBox.y1 = (lv_coord_t)(LV_MIN(inner.y, outer.y) - cap - 2);
+            tickBox.x2 = (lv_coord_t)(LV_MAX(inner.x, outer.x) + cap + 2);
+            tickBox.y2 = (lv_coord_t)(LV_MAX(inner.y, outer.y) + cap + 2);
+        } else {
+            dx = (lv_coord_t)lroundf(cx + ux * cr);
+            dy = (lv_coord_t)lroundf(cy + uy * cr);
+            tickBox = {(lv_coord_t)(dx - ri - 2), (lv_coord_t)(dy - ri - 2), (lv_coord_t)(dx + ri + 2),
+                       (lv_coord_t)(dy + ri + 2)};
+        }
+        if (!_lv_area_is_on(&tickBox, draw_ctx->clip_area)) {
+            continue;
+        }
+
         const int32_t value = lv_map(i, 0, cnt - 1, scale->min, scale->max);
 
         // SCALE_LINES indicators light up the ticks within their [start,end] range (the current level).
@@ -169,19 +200,10 @@ void action_on_meter_draw(lv_event_t *e) {
             }
         }
 
-        const float angle = ((float)i * scale->angle_range / (cnt - 1) + scale->rotation) * DEG2RAD;
-        const float ux = cosf(angle);
-        const float uy = sinf(angle);
-
         if (pill) {
-            // Round (not truncate) the coords so every tick lands evenly on the pixel grid.
-            lv_point_t inner = {(lv_coord_t)lroundf(cx + ux * (r_in + cap)), (lv_coord_t)lroundf(cy + uy * (r_in + cap))};
-            lv_point_t outer = {(lv_coord_t)lroundf(cx + ux * (r_out - cap)), (lv_coord_t)lroundf(cy + uy * (r_out - cap))};
             line_dsc.color = color;
             lv_draw_line(draw_ctx, &line_dsc, &inner, &outer);
         } else {
-            const lv_coord_t dx = (lv_coord_t)lroundf(cx + ux * cr);
-            const lv_coord_t dy = (lv_coord_t)lroundf(cy + uy * cr);
             dot_dsc.bg_color = color;
             lv_area_t area = {(lv_coord_t)(dx - ri), (lv_coord_t)(dy - ri), (lv_coord_t)(dx + ri), (lv_coord_t)(dy + ri)};
             lv_draw_rect(draw_ctx, &dot_dsc, &area);
