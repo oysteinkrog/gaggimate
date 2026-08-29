@@ -18,6 +18,16 @@ export default defineConfig({
         entryFileNames: 'assets/[hash].js',
         chunkFileNames: 'assets/[hash].js',
         assetFileNames: 'assets/[hash][extname]',
+        // The firmware's HTTP server (ESPAsyncWebServer over AsyncTCP) sends
+        // Connection: close on every response and listens with a backlog of 5
+        // on a 16-pcb lwIP pool, so each asset costs a fresh TCP connection
+        // and a burst of parallel fetches drops SYNs. Route-level code
+        // splitting made every navigation such a burst (55 lazy chunks), and
+        // a dropped SYN on a dynamic import is fatal: the import rejects,
+        // preact-iso has no retry, and the page body stays blank until a full
+        // reload. Inlining dynamic imports ships one JS bundle fetched once
+        // over one connection; navigation then costs zero network requests.
+        inlineDynamicImports: true,
       },
     },
   },
