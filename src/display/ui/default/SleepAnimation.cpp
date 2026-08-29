@@ -1534,7 +1534,16 @@ void SleepAnimation::buildScrim(Overlay &ov, int panelW, int panelH) {
     // Smooth, so the scrim's own edge is a gradient rather than a visible
     // rectangle sitting on the animation.
     scrimTap3(ov.scrim, scrimTmp, sh, sw, sw, 1, false);
-    scrimTap3(scrimTmp, ov.scrim, sw, sh, 1, sw, false);
+    if (sw == sh) {
+        // Same bracket for the last vertical pass. A worse trade than the
+        // dilate pair on paper (one strided pass removed for two transposes
+        // instead of two for two), measured separately on the rig.
+        transposeSquare(scrimTmp, ov.scrim, sw);
+        scrimTap3(ov.scrim, scrimTmp, sw, sh, sw, 1, false);
+        transposeSquare(scrimTmp, ov.scrim, sw);
+    } else {
+        scrimTap3(scrimTmp, ov.scrim, sw, sh, 1, sw, false);
+    }
 
     // The halo runs the composite walks, read straight off the grid that was
     // just built. Whole-grid, like the passes above: the dilate spreads
