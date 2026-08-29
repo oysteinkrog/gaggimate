@@ -93,7 +93,15 @@
 #define DIAG_IGNORE(w)
 #endif
 #ifndef EXTRAM_DATA
-#define EXTRAM_DATA
+// g_queue (flow/queue.cpp section below) is a 300-entry circular buffer
+// touched by tick() on every eez_flow_tick() call, but only the entries
+// between head and tail -- not the whole array -- and nothing in this file
+// reaches LittleFS/NVS/profile I/O, so there is no same-task
+// flash-cache-disabled path to worry about. It is BSS (no initializer), so
+// EXT_RAM_BSS_ATTR (CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY=y places
+// ".ext_ram.bss" in PSRAM) applies directly.
+#include <esp_attr.h>
+#define EXTRAM_DATA EXT_RAM_BSS_ATTR
 #endif
 #ifdef __cplusplus
 

@@ -301,6 +301,11 @@ class Controller {
     static const unsigned long CONTROLLER_WAITING_TIMEOUT_MS = 10000;
 
     TaskHandle_t logicTaskHandle;
+    // TCB for loopLogicTask. Stays internal even though the stack moves to
+    // PSRAM: xTaskCreateStaticPinnedToCore asserts esp_ptr_internal() on the
+    // TCB buffer unconditionally (xPortCheckValidTCBMem), unlike the stack
+    // check, which CONFIG_FREERTOS_TASK_CREATE_ALLOW_EXT_MEM relaxes.
+    StaticTask_t logicTaskBuffer;
 
     static void loopLogicTask(void *arg);
 };

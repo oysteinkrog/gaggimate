@@ -28,6 +28,7 @@ extern volatile uint32_t gm_rgb_catchup_max;
 #include "esp_sntp.h"
 #include "esp_intr_alloc.h"
 #include "esp_timer.h"
+#include <esp_heap_caps.h>
 #include <LittleFS.h>
 #include <SD_MMC.h>
 #include <cmath>
@@ -192,7 +193,30 @@ void Controller::setup() {
     this->onScreenReady();
 
     updateLastAction();
-    xTaskCreatePinnedToCore(loopLogicTask, "Controller::loopLogic", configMINIMAL_STACK_SIZE * 6, this, 3, &logicTaskHandle, 0);
+    // Stack in PSRAM (CONFIG_FREERTOS_TASK_CREATE_ALLOW_EXT_MEM=y). loopLogic
+    // never runs with the flash cache disabled: Settings setters only mark a
+    // property dirty (Settings::loop, a separate task with an internal
+    // stack, does the actual NVS write), and the three events this task can
+    // dispatch -- controller:brew:end, controller:grind:end,
+    // controller:process:end -- resolve to handlers that touch no
+    // filesystem (ShotHistoryPlugin::endRecording only clears flags and
+    // fires an in-memory stats event; BLEScalePlugin/MQTTPlugin/
+    // SmartGrindPlugin/DefaultUI's handlers are BLE, MQTT, HTTP and a render
+    // flag). comms sends from this task are also just enqueued --
+    // Controller::loop pumps comms.loop() on a different task -- so no BLE
+    // transport code runs on this stack either. The TCB stays internal:
+    // xTaskCreateStaticPinnedToCore asserts esp_ptr_internal() on it even
+    // with the ALLOW_EXT_MEM flag set.
+    static constexpr uint32_t LOGIC_TASK_STACK_BYTES = configMINIMAL_STACK_SIZE * 6;
+    auto *logicTaskStack = static_cast<StackType_t *>(heap_caps_malloc(LOGIC_TASK_STACK_BYTES, MALLOC_CAP_SPIRAM));
+    if (logicTaskStack != nullptr) {
+        logicTaskHandle = xTaskCreateStaticPinnedToCore(loopLogicTask, "Controller::loopLogic", LOGIC_TASK_STACK_BYTES, this,
+                                                         3, logicTaskStack, &logicTaskBuffer, 0);
+    } else {
+        // PSRAM exhausted: fall back to an internal-heap stack rather than
+        // leaving the machine without a control task.
+        xTaskCreatePinnedToCore(loopLogicTask, "Controller::loopLogic", LOGIC_TASK_STACK_BYTES, this, 3, &logicTaskHandle, 0);
+    }
     heap_checkpoint("setup/end");
 }
 
