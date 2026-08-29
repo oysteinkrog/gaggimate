@@ -404,6 +404,10 @@ class SleepAnimation {
         // deriving them from the glyph runs instead would mean guessing how far
         // the dilate reached.
         uint32_t *haloRuns = nullptr;
+        // scrimQ8 value the current scrim/haloRuns were built with; -1 means
+        // never built. Lets publishes skip the rebuild when the coverage
+        // grid did not change (see publishOverlayRanges).
+        int scrimBuiltQ8 = -1;
         uint8_t *haloN = nullptr;
     };
 
@@ -795,6 +799,10 @@ class SleepAnimation {
     // passes run to completion inside publishOverlay on the UI task, so the two
     // overlays never need it at the same time.
     uint8_t *scrimTmp = nullptr;
+    // Pre-scan copy of the scanned scrimSrc rows, compared after the scan so
+    // an unchanged coverage grid skips the whole buildScrim. nullptr degrades
+    // to always rebuilding.
+    uint8_t *scrimCmp = nullptr;
 
     Overlay overlays[2];
     uint32_t overlayCap = 0;

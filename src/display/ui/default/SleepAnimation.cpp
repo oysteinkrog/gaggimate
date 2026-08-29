@@ -788,6 +788,9 @@ void SleepAnimation::start(Display *d) {
         if (scrimTmp == nullptr) {
             scrimTmp = static_cast<uint8_t *>(ps_malloc(static_cast<size_t>(overlays[0].scrimW) * overlays[0].scrimH));
         }
+        if (scrimCmp == nullptr) {
+            scrimCmp = static_cast<uint8_t *>(ps_malloc(static_cast<size_t>(overlays[0].scrimW) * overlays[0].scrimH));
+        }
         if (scrimTmp == nullptr) {
             for (auto &ov : overlays) {
                 free(ov.scrim);
@@ -1376,6 +1379,14 @@ void SleepAnimation::publishOverlayRanges(int w, int h, const int (*ranges)[2], 
         if (doScrim) {
             const int cellY0 = rowY0 >> SCRIM_SHIFT;
             const int cellY1 = ((rowY1 + (1 << SCRIM_SHIFT) - 1) >> SCRIM_SHIFT);
+            // Keep the outgoing rows so the post-scan compare can tell whether
+            // coverage actually moved. A recolor (meter ticks, mostly) rewrites
+            // colour but leaves alpha coverage identical, and the scrim only
+            // depends on coverage.
+            if (scrimCmp != nullptr) {
+                memcpy(scrimCmp + static_cast<size_t>(cellY0) * sw, ov.scrimSrc + static_cast<size_t>(cellY0) * sw,
+                       static_cast<size_t>(cellY1 - cellY0) * sw);
+            }
             memset(ov.scrimSrc + static_cast<size_t>(cellY0) * sw, 0, static_cast<size_t>(cellY1 - cellY0) * sw);
         }
         for (int y = rowY0; y < rowY1; y++) {
@@ -1420,7 +1431,22 @@ void SleepAnimation::publishOverlayRanges(int w, int h, const int (*ranges)[2], 
     g_statPubScanUs += scrim0 - scan0;
 #endif
     if (doScrim && m > 0) {
-        buildScrim(ov, panelW, panelH);
+        // The rebuild is seven whole-grid passes over PSRAM (~34 ms measured),
+        // and most publishes are recolors that leave the coverage grid
+        // byte-identical. Rebuild only when a scanned cell actually changed,
+        // or when the dim strength moved under an unchanged grid.
+        bool scrimChanged = scrimCmp == nullptr || ov.scrimBuiltQ8 != scrimQ8.load();
+        for (int g = 0; !scrimChanged && g < m; g++) {
+            const int cellY0 = rr[g][0] >> SCRIM_SHIFT;
+            const int cellY1 = ((rr[g][1] + (1 << SCRIM_SHIFT) - 1) >> SCRIM_SHIFT);
+            scrimChanged = memcmp(scrimCmp + static_cast<size_t>(cellY0) * sw,
+                                  ov.scrimSrc + static_cast<size_t>(cellY0) * sw,
+                                  static_cast<size_t>(cellY1 - cellY0) * sw) != 0;
+        }
+        if (scrimChanged) {
+            buildScrim(ov, panelW, panelH);
+            ov.scrimBuiltQ8 = scrimQ8.load();
+        }
     }
 #ifdef GM_TOUCH_PROBE
     g_statPubScrimUs += esp_timer_get_time() - scrim0;
