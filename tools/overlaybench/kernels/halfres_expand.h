@@ -28,6 +28,39 @@ using ExpandRowFn = void (*)(const uint16_t *__restrict src, uint16_t *__restric
                              int rw);
 void expandRow_ref(const uint16_t *__restrict src, uint16_t *__restrict row0, uint16_t *__restrict row1, int rw);
 
+// Sanity-check variant: packs two adjacent 32-bit `v | (v<<16)` words (four
+// source pixels) into one 64-bit store via memcpy (portable, no
+// alignment/aliasing UB), to validate the pairing arithmetic before trying a
+// genuinely wider hardware store. Same values, same order as expandRow_ref;
+// only the store grouping differs. See halfres_expand.cpp for why this is
+// not expected to help on the real device (Xtensa has no native 64-bit
+// integer store).
+void expandRow_wide64(const uint16_t *__restrict src, uint16_t *__restrict row0, uint16_t *__restrict row1, int rw);
+
+// Pure-C model of expandRow_pie_asm's approach below: four source pixels
+// computed independently (same `v | (v<<16)` as expandRow_ref), then
+// flushed as a group of four -- the same grouping the real asm flushes with
+// one EE.VST.128.IP. Bit-identical to expandRow_ref for any input; this is
+// the bit-exactness gate the real asm variant is checked against in spirit
+// (registered separately per the span_scan pie_model convention), not
+// merely another expandRow_ref reimplementation.
+void expandRow_pie_model(const uint16_t *__restrict src, uint16_t *__restrict row0, uint16_t *__restrict row1,
+                          int rw);
+
+#if defined(__XTENSA__)
+// Real ESP32-S3 PIE implementation of the "wider store" hypothesis this
+// kernel exists to test (see BASELINE-OVERLAY.md and the comment above
+// expandRow_pie_asm in halfres_expand.cpp for the full derivation and the
+// confirmed-real instructions it relies on). Xtensa-only inline asm: cannot
+// build, and has never been run, on this x86 host -- see piePending on this
+// variant's kExpandRowVariants entry. Falls back to plain scalar (identical
+// to expandRow_ref) for any row whose pointer is not 16-byte aligned, so
+// this is never less correct than expandRow_ref, only faster on the
+// aligned common case (real band[] rows always are -- see the comment in
+// halfres_expand.cpp).
+void expandRow_pie_asm(const uint16_t *__restrict src, uint16_t *__restrict row0, uint16_t *__restrict row1, int rw);
+#endif
+
 struct ExpandRowVariant {
     const char *name;
     ExpandRowFn fn;
