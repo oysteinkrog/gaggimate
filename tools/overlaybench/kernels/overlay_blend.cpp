@@ -2,9 +2,14 @@
 
 namespace ovb {
 
-// Byte-identical to blendRow in SleepAnimation.cpp.
-void blendRow_ref(uint16_t *__restrict dst, const uint8_t *__restrict colour, const uint32_t *__restrict runs,
-                  int nRuns) {
+// Byte-identical to blendRow in SleepAnimation.cpp. noinline is load-bearing,
+// not a style choice: the source comment on blendRow explains that inlined
+// into its caller, the loop ran out of registers on Xtensa's windowed ABI and
+// a five-instruction body cost sixty cycles. Dropping this attribute would
+// make the asm dump (and any register-pressure conclusions drawn from it)
+// unfaithful to what the firmware actually ships.
+__attribute__((noinline)) void blendRow_ref(uint16_t *__restrict dst, const uint8_t *__restrict colour,
+                                            const uint32_t *__restrict runs, int nRuns) {
     for (int i = 0; i < nRuns; i++) {
         const uint32_t r = runs[i];
         int x = static_cast<int>(r & 0xFFFFu);
@@ -30,9 +35,10 @@ __attribute__((always_inline)) static inline void scrimCell_ref(uint16_t *__rest
     q[1] = scale565x2_ref(q[1], inv);
 }
 
-// Byte-identical to scrimRow in SleepAnimation.cpp.
-void scrimRow_ref(uint16_t *__restrict dst, const uint8_t *__restrict invRow, const uint32_t *__restrict haloRuns,
-                  int nHalo, int w) {
+// Byte-identical to scrimRow in SleepAnimation.cpp. noinline for the same
+// register-pressure reason as blendRow_ref above.
+__attribute__((noinline)) void scrimRow_ref(uint16_t *__restrict dst, const uint8_t *__restrict invRow,
+                                            const uint32_t *__restrict haloRuns, int nHalo, int w) {
     for (int i = 0; i < nHalo; i++) {
         const uint32_t r = haloRuns[i];
         const int c0 = static_cast<int>(r & 0xFFFFu);
@@ -53,8 +59,15 @@ void scrimRow_ref(uint16_t *__restrict dst, const uint8_t *__restrict invRow, co
 // The two-pass row body from renderFrame, scrim gated the same way (nHalo
 // checked before touching invRow/haloRuns at all -- matching the firmware,
 // where a whole-row-transparent cell row costs nothing beyond the branch).
-void blendStage_ref(uint16_t *__restrict dst, const uint8_t *__restrict invRow, const uint32_t *__restrict haloRuns,
-                    int nHalo, const uint8_t *__restrict colour, const uint32_t *__restrict runs, int nRuns, int w) {
+// noinline: renderFrame is a large function that would not inline these
+// calls either; keeping the same shape here avoids the single-TU asm dump
+// (kernels compiled alone, unlike the real multi-thousand-line
+// SleepAnimation.cpp) reaching a different inlining decision than the
+// firmware does.
+__attribute__((noinline)) void blendStage_ref(uint16_t *__restrict dst, const uint8_t *__restrict invRow,
+                                              const uint32_t *__restrict haloRuns, int nHalo,
+                                              const uint8_t *__restrict colour, const uint32_t *__restrict runs,
+                                              int nRuns, int w) {
     if (nHalo != 0) {
         scrimRow_ref(dst, invRow, haloRuns, nHalo, w);
     }
