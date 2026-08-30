@@ -466,6 +466,53 @@ void WebUIPlugin::setupServer() {
         request->send(200, "application/json", "{\"dumped\":true}");
     });
 
+#if CONFIG_FREERTOS_USE_TRACE_FACILITY && CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS
+    // /api/debug/tasks: every task with its accumulated runtime counter, so
+    // two samples diffed over a wall-clock interval say exactly which tasks
+    // own each core's time. Exists because the animation render task measures
+    // ~11x more wall time than its bands' compute, and the split between
+    // "preempted by which task" and "stalled on what bus" cannot be read from
+    // stage timers alone: those are wall clock, and preemption lands inside
+    // them. Runtime counters use esp_timer (us) per the sdkconfig, so
+    // d(rt)/d(now_us) is that task's share of ONE core over the interval; the
+    // IDLE0/IDLE1 rows give each core's headroom directly. ISR time is charged
+    // to whichever task it interrupts, so a task's share here is an upper
+    // bound on its own compute. Loadtest-only: the config flags are off in the
+    // production sdkconfigs and this block compiles away with them.
+    server.on("/api/debug/tasks", [](AsyncWebServerRequest *request) {
+        // A few spare rows: tasks can be born between the count and the
+        // snapshot, and a short array makes uxTaskGetSystemState return 0.
+        const UBaseType_t cap = uxTaskGetNumberOfTasks() + 4;
+        TaskStatus_t *st = static_cast<TaskStatus_t *>(
+            heap_caps_malloc(sizeof(TaskStatus_t) * cap, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+        if (st == nullptr) {
+            request->send(500, "application/json", "{\"error\":\"alloc\"}");
+            return;
+        }
+        configRUN_TIME_COUNTER_TYPE total = 0;
+        const UBaseType_t got = uxTaskGetSystemState(st, cap, &total);
+        JsonDocument doc;
+        doc["now_us"] = esp_timer_get_time();
+        doc["total_rt"] = total;
+        JsonArray arr = doc["tasks"].to<JsonArray>();
+        for (UBaseType_t i = 0; i < got; i++) {
+            JsonObject o = arr.add<JsonObject>();
+            o["n"] = st[i].pcTaskName;
+            o["p"] = static_cast<int>(st[i].uxCurrentPriority);
+#if CONFIG_FREERTOS_VTASKLIST_INCLUDE_COREID
+            o["c"] = st[i].xCoreID == tskNO_AFFINITY ? -1 : static_cast<int>(st[i].xCoreID);
+#endif
+            o["rt"] = st[i].ulRunTimeCounter;
+            o["hwm"] = st[i].usStackHighWaterMark;
+            o["s"] = static_cast<int>(st[i].eCurrentState);
+        }
+        free(st);
+        AsyncResponseStream *response = request->beginResponseStream("application/json");
+        serializeJson(doc, *response);
+        request->send(response);
+    });
+#endif
+
     server.on("/api/debug/heap", [](AsyncWebServerRequest *request) {
     // anim_sram is the committed part of the animation budget and
     // anim_budget its ceiling. The gap between them is the important
@@ -778,6 +825,14 @@ void WebUIPlugin::setupServer() {
         if (request->hasArg("testpattern")) {
             a->setTestPattern(request->arg("testpattern").toInt() != 0);
         }
+        // rprio=N re-prioritises the render task live (clamped to [1,4], see
+        // SleepAnimation::setRenderPrio). The band bracket is pure compute, so
+        // fps against rprio is a direct read of how much of the render task's
+        // wall time is core-0 preemption. Measurement knob, not a shipping
+        // arrangement: 3+ delays the control loop.
+        if (request->hasArg("rprio")) {
+            a->setRenderPrio(request->arg("rprio").toInt());
+        }
         if (request->hasArg("forcehalf")) {
             a->setHalfForce(static_cast<int8_t>(request->arg("forcehalf").toInt()));
         }
@@ -785,6 +840,7 @@ void WebUIPlugin::setupServer() {
         JsonDocument doc;
         doc["direct"] = a->directPush();
         doc["dma"] = a->dmaPathWanted();
+        doc["rprio"] = a->renderPrioValue();
         doc["half"] = a->halfResOn();
         doc["forcehalf"] = a->halfForced();
         doc["pattern"] = a->debugPatternOn();

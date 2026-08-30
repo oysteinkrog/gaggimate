@@ -892,6 +892,25 @@ void SleepAnimation::start(Display *d) {
     log_i("SleepAnimation: started (%dx%d), push task on core 0", w, h);
 }
 
+void SleepAnimation::setRenderPrio(int prio) {
+    TaskHandle_t h = static_cast<TaskHandle_t>(taskHandle);
+    if (h == nullptr) {
+        return;
+    }
+    if (prio < 1) {
+        prio = 1;
+    }
+    if (prio > 4) {
+        prio = 4;
+    }
+    vTaskPrioritySet(h, static_cast<UBaseType_t>(prio));
+}
+
+int SleepAnimation::renderPrioValue() const {
+    TaskHandle_t h = static_cast<TaskHandle_t>(taskHandle);
+    return h != nullptr ? static_cast<int>(uxTaskPriorityGet(h)) : -1;
+}
+
 void SleepAnimation::stop() {
     if (!running) {
         return;

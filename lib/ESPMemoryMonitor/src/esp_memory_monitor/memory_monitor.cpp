@@ -443,7 +443,10 @@ MemoryMonitorVector<ESPMemoryMonitor::InternalTaskStackUsage> ESPMemoryMonitor::
 
     MemoryMonitorVector<TaskStatus_t> statuses{MemoryMonitorAllocator<TaskStatus_t>(_usePSRAMBuffers)};
     statuses.resize(taskCount);
-    uint32_t totalRuntime = 0;
+    // The kernel's counter width follows CONFIG_FREERTOS_RUN_TIME_COUNTER_TYPE
+    // (u32 or u64), so a hardcoded uint32_t fails to compile on builds that
+    // pick the 64-bit counter.
+    configRUN_TIME_COUNTER_TYPE totalRuntime = 0;
     const UBaseType_t written = uxTaskGetSystemState(statuses.data(), statuses.size(), &totalRuntime);
     statuses.resize(written);
 

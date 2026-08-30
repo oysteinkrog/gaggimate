@@ -147,6 +147,18 @@ class SleepAnimation {
     // measure how much of the scan-out's lost refill headroom the animation's
     // own PSRAM traffic accounts for. 0 restores the normal cap.
     void setFpsOverride(uint8_t fps) { fpsOverride.store(fps); }
+    // Live re-prioritisation of the render task, to measure how much of its
+    // wall time is preemption by higher-priority core-0 work: the band bracket
+    // is pure compute into SRAM, so any wall time a priority bump removes was
+    // never the animation's. Debug-only, not persisted, clamped to [1,4]:
+    // above 4 sits inside the radio stack's priority range and a starved
+    // WiFi/BLE task wedges the link rather than just skewing the measurement.
+    // 3 and 4 do delay Controller::loopLogic - acceptable for a bench
+    // measurement, never for a shipped default. Defined in the .cpp because
+    // the handle is opaque here (this header compiles in the simulator,
+    // without FreeRTOS).
+    void setRenderPrio(int prio);
+    int renderPrioValue() const;
     // Replaces the rendered image with a scan-out test pattern a camera can
     // decode from a single photograph, which is the only way to judge the panel
     // with nobody in front of it. See the comment at the write site.
