@@ -769,6 +769,23 @@ void WebUIPlugin::setupServer() {
         request->send(200, "application/json", buf);
     });
 
+#ifdef GM_TOUCH_PROBE
+    // Synthetic core-1 PSRAM load: the falsification test for the planned
+    // core-1 render helper. The helper idea puts kernel work on core 1 at
+    // priority 0 (under the UI task), where a task cannot delay the panel's
+    // core-1 ISRs but CAN slow the bounce refill's copy through MSPI/dcache
+    // contention -- the one risk code review cannot settle. This task
+    // reproduces that bus pressure without any of the helper's machinery:
+    // it streams 4 KB memcpys through two 64 KB PSRAM buffers (working set
+    // 4x the 32 KB dcache, so the traffic stays real) whenever core 1 is
+    // otherwise idle. Toggle it within one boot per the rig rules and watch
+    // GM_SCANOUT slips/busy_max and GM_TOUCHLAT: if this alone moves them,
+    // the helper is dead before it is written.
+    static volatile bool s_c1LoadRun = false;
+    static volatile uint32_t s_c1LoadIters = 0;
+    static TaskHandle_t s_c1LoadTask = nullptr;
+#endif
+
     // /api/debug/anim[?direct=0|1][&dma=0|1] reads and live-sets who owns the
     // panel's framebuffer pair while the background animation is running.
     //
@@ -833,6 +850,39 @@ void WebUIPlugin::setupServer() {
         if (request->hasArg("rprio")) {
             a->setRenderPrio(request->arg("rprio").toInt());
         }
+#ifdef GM_TOUCH_PROBE
+        // c1load=0|1 starts/stops the synthetic core-1 PSRAM load declared
+        // above. Off is asynchronous (the task frees its buffers and deletes
+        // itself), so a fast off->on can see the old task still winding down
+        // and skip the create; toggle off, snapshot until c1load reads false,
+        // then toggle on. Bench knob, volatile across reboot like the rest.
+        if (request->hasArg("c1load")) {
+            const bool want = request->arg("c1load").toInt() != 0;
+            if (want && s_c1LoadTask == nullptr) {
+                s_c1LoadRun = true;
+                s_c1LoadIters = 0;
+                xTaskCreatePinnedToCore(
+                    [](void *) {
+                        constexpr size_t kBuf = 64 * 1024;
+                        uint8_t *src = static_cast<uint8_t *>(heap_caps_malloc(kBuf, MALLOC_CAP_SPIRAM));
+                        uint8_t *dst = static_cast<uint8_t *>(heap_caps_malloc(kBuf, MALLOC_CAP_SPIRAM));
+                        size_t off = 0;
+                        while (s_c1LoadRun && src != nullptr && dst != nullptr) {
+                            memcpy(dst + off, src + off, 4096);
+                            off = (off + 4096) % kBuf;
+                            s_c1LoadIters = s_c1LoadIters + 1;
+                        }
+                        free(src);
+                        free(dst);
+                        s_c1LoadTask = nullptr;
+                        vTaskDelete(nullptr);
+                    },
+                    "c1load", 3072, nullptr, 0, &s_c1LoadTask, 1);
+            } else if (!want) {
+                s_c1LoadRun = false;
+            }
+        }
+#endif
         if (request->hasArg("forcehalf")) {
             a->setHalfForce(static_cast<int8_t>(request->arg("forcehalf").toInt()));
         }
@@ -903,6 +953,10 @@ void WebUIPlugin::setupServer() {
         doc["frames"] = frames;
         doc["refills"] = refills;
         doc["slips"] = slips;
+#ifdef GM_TOUCH_PROBE
+        doc["c1load"] = s_c1LoadTask != nullptr;
+        doc["c1load_iters"] = s_c1LoadIters;
+#endif
         serializeJson(doc, *response);
         request->send(response);
     });
