@@ -35,6 +35,9 @@ extern volatile uint32_t gm_rgb_catchup_max;
 #include <ctime>
 #include <display/config.h>
 #include <display/core/MemoryMonitor.h>
+#ifdef GM_SYNTH_HANDSHAKE
+#include <display/drivers/common/LV_Helper.h> // g_touchEdgeAtUs: the synth brew hold defers to manual touches
+#endif
 #include <display/core/constants.h>
 #include <display/core/process/BrewProcess.h>
 #include <display/core/process/GrindProcess.h>
@@ -816,7 +819,15 @@ void Controller::loop() {
                 // different screen with a different widget load. Two runs
                 // meant as a before/after were compared across that change
                 // before it was noticed.
-                if (getMode() != MODE_BREW) {
+                // ...but not while someone is poking the panel: forcing BREW
+                // within a telemetry tick of a touch rips a manually opened
+                // screen (scale mode, the menu) away mid-test, which made the
+                // rig untestable by hand. 60 s without touches means the rig
+                // is soaking again and the hold resumes; the boot-time cost
+                // (g_touchEdgeAtUs starts at 0, so the hold first engages at
+                // ~60 s uptime) sits inside the >=90 s churn window rig
+                // analysis already discards.
+                if (getMode() != MODE_BREW && esp_timer_get_time() - g_touchEdgeAtUs >= 60LL * 1000 * 1000) {
                     setMode(MODE_BREW);
                 }
                 const float cycle = fmodf(static_cast<float>(telNow) / 1000.0f, 48.0f);
