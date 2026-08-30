@@ -68,6 +68,15 @@ namespace {
 // actually took has never been benched directly; scaling the measured number
 // linearly puts it nearer 0.9 ms than 1.3 ms, so 40.6 fps is a conservative
 // floor rather than a measurement of the current configuration.
+// BAND_H=4 was tried on-device 2026-08-30 and reverted the same day, on two
+// measurements. bdma_mean scaled exactly with the transfer (91 us at 1,920 B,
+// 179 us at 3,840 B): the band DMA is bandwidth-bound at ~21.5 MB/s, so a
+// bigger band buys no per-transfer overhead back. And the doubled internal
+// slots (2 x 3,840 B, +3,840 B over BAND_H=2) tipped the DMA-capable pool
+// with BLE up: NetWatchdog showed dma free 1.5-5 KB with min=256 B and the
+// web server started timing out, which is the same WiFi-pool cliff the
+// bounce-depth and 15,360 B experiments hit. The ~6.5 ms/frame of per-band
+// loop overhead at 240 bands/frame is real but not worth that pool.
 constexpr int BAND_H = 2;
 
 // Longest the render task will wait for the scan-out to leave the buffer it is
