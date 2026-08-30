@@ -66,6 +66,11 @@ bool radiosSettled() {
 #endif
     return true;
 }
+
+// Raised by alloc() when a qualifying table was refused internal DRAM only
+// because the radios had not settled yet. Render-task written and read; a
+// stale read costs one frame of delay, nothing else.
+bool g_replaceWanted = false;
 } // namespace
 
 bool internalHasRoomFor(size_t size) {
@@ -75,6 +80,10 @@ bool internalHasRoomFor(size_t size) {
     const size_t freeInternal = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
     return freeInternal >= size + INTERNAL_RESERVE;
 }
+
+bool replaceWanted() { return g_replaceWanted && radiosSettled(); }
+
+void clearReplaceWanted() { g_replaceWanted = false; }
 
 void *alloc(size_t size) {
     // Animations allocate their LUTs lazily on first use and never free them,
@@ -178,6 +187,13 @@ void *alloc(size_t size) {
                     reported = true;
                     log_i("bganim: internal DRAM below the %u B radio reserve, all tables go to PSRAM",
                           static_cast<unsigned>(INTERNAL_RESERVE));
+                }
+                // Pre-settle refusals are provisional: the pool the check saw
+                // is not the pool the animation will live with. Flag it so the
+                // render task can re-run placement once the radios have
+                // claimed (see replaceWanted() in the header).
+                if (!radiosSettled()) {
+                    g_replaceWanted = true;
                 }
             }
         }

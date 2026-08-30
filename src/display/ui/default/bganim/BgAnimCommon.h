@@ -123,6 +123,19 @@ constexpr size_t INTERNAL_RESERVE = GM_INTERNAL_RESERVE;
 // subset of internal DRAM rather than all of it.
 bool internalHasRoomFor(size_t size);
 
+// The boot animation initialises when the UI is built, BEFORE either radio
+// has claimed its share, and internalHasRoomFor() rightly refuses internal
+// DRAM until they have -- so the boot animation's tables always land in
+// PSRAM, no matter what the reserve would later allow. alloc() raises this
+// flag when a table that qualified by size and budget was sent to PSRAM only
+// because the radios had not settled yet; it reads true only once they have,
+// so acting on it (release + re-init of the active animation, on the render
+// task) re-runs placement against the pool as it actually is. One-shot:
+// clear it before the re-init -- a table refused after settling does not
+// re-raise it, so this cannot loop.
+bool replaceWanted();
+void clearReplaceWanted();
+
 // Bytes alloc() has handed out from each pool since boot, so a bench run can
 // tell whether an animation's tables actually landed where the policy above
 // intends. Not synchronised: written on the render task at init, read over
