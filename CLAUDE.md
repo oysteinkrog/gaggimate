@@ -111,3 +111,12 @@ Debugging methodology that this codebase has already paid for:
   period stay regardless (less coex churn for free).
 - `tools/animbench/OPTIMIZE.md`: do NOT modify golden/, BASELINE.md, or bench
   sources.
+- The DMA footprint of a live BLE controller link is unmeasured; the rig's
+  GM_DMA_BALLAST (now 2048 on display-loadtest) is a declared hostage guess,
+  not a stand-in. Log 38 (ballast-8192 era) showed the WiFi TX cache-buffer
+  pool (1630 B allocs, caps 0x80c) hitting FAILED ALLOC three times in 92 min
+  with zero browser/WS clients, each ending in a watchdog WiFi reconnect, so
+  the squeeze is firmware-internal, not client-load-driven. Production ships
+  no ballast and has ~2x the rig's DMA headroom, but before certifying it:
+  measure a real controller connection's DMA-capable cost and re-run the
+  two-tab soak at that number.
