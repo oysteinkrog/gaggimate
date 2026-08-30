@@ -240,7 +240,30 @@ GM_ANIM_IRAM void band(uint16_t *dst, int y0, int rows, int w, uint32_t, const u
             for (int x = 0; x < w; x++) {
                 combRow[x] = static_cast<int16_t>(perCol[x & 7] + flickerLUT[noiseRow[(x + g_sx) & 255]]);
             }
-            for (int x = 0; x < w; x++) {
+            // 2x unrolled, paired into one 32-bit store (dst is 4-byte
+            // aligned and w is even -- see xtensa-asm addendum, and matches
+            // the existing convention in AnimAurora.cpp's emitPair). Two
+            // independent pixel computations sit between each loop branch
+            // instead of one, giving the in-order core two non-dependent
+            // load chains to interleave while a radiusLUT/palette load from
+            // one pixel is still in flight for the other -- the unroll's
+            // actual payoff is hiding load latency, not the halved store
+            // count. Xtensa is little-endian, so the first pixel of the pair
+            // is the low halfword.
+            int x = 0;
+            for (; x + 1 < w; x += 2) {
+                const int ridx0 = r2 >> RSHIFT;
+                const uint16_t c0 = palOff[radiusLUT[ridx0] + combRow[x]];
+                r2 += ddx;
+                ddx += 2;
+                const int ridx1 = r2 >> RSHIFT;
+                const uint16_t c1 = palOff[radiusLUT[ridx1] + combRow[x + 1]];
+                r2 += ddx;
+                ddx += 2;
+                *reinterpret_cast<uint32_t *>(row + x) =
+                    static_cast<uint32_t>(c0) | (static_cast<uint32_t>(c1) << 16);
+            }
+            if (x < w) { // odd leftover (w is 480 on the real target; kept for contract generality)
                 const int ridx = r2 >> RSHIFT;
                 row[x] = palOff[radiusLUT[ridx] + combRow[x]];
                 r2 += ddx;
