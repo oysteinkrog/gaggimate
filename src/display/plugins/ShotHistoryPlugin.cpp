@@ -525,28 +525,42 @@ void ShotHistoryPlugin::cleanupHistory() {
         return; // Enough space, nothing to do
     }
 
-    // Collect and sort .slog files to find the oldest
+    // Collect .slog files and their sizes in one directory walk. openNextFile()
+    // already stats each entry to open it, so File::size() below is free; that
+    // lets the removal loop track freed space by arithmetic instead of calling
+    // getFreeSpace() again per file. getFreeSpace() (LittleFS/SD usedBytes())
+    // walks every allocated block, so re-querying it per removed file used to
+    // turn an N-shot cleanup into N full filesystem scans.
     File directory = fs->open("/h");
-    std::vector<String> slogFiles;
-    String filename = directory.getNextFileName();
-    while (filename != "") {
-        if (filename.endsWith(".slog")) {
-            slogFiles.push_back(filename);
+    std::vector<std::pair<String, size_t>> slogFiles;
+    if (directory) {
+        File file = directory.openNextFile();
+        while (file) {
+            String fname = String(file.name());
+            if (fname.endsWith(".slog")) {
+                slogFiles.emplace_back(fname, file.size());
+            }
+            file.close();
+            file = directory.openNextFile();
         }
-        filename = directory.getNextFileName();
+        directory.close();
     }
-    directory.close();
 
     if (slogFiles.empty()) {
         return;
     }
 
-    sort(slogFiles.begin(), slogFiles.end(), [](const String &a, const String &b) { return a < b; });
+    sort(slogFiles.begin(), slogFiles.end(),
+         [](const std::pair<String, size_t> &a, const std::pair<String, size_t> &b) { return a.first < b.first; });
 
-    // Remove oldest files one at a time until we have enough free space
+    // Remove oldest files until the running estimate clears the threshold.
+    // freeSpace is exact for the first comparison and an estimate thereafter
+    // (it does not account for LittleFS block/wear-leveling overhead), so this
+    // can stop a shot or two early or late versus a live re-query; it cannot
+    // misreport or corrupt a shot.
     size_t removed = 0;
-    for (size_t i = 0; i < slogFiles.size() && getFreeSpace() <= MIN_FREE_SPACE_BYTES; i++) {
-        String fname = slogFiles[i];
+    for (size_t i = 0; i < slogFiles.size() && freeSpace <= MIN_FREE_SPACE_BYTES; i++) {
+        String fname = "/h/" + slogFiles[i].first;
         int start = fname.lastIndexOf('/') + 1;
         int end = fname.lastIndexOf('.');
         if (end > start) {
@@ -558,11 +572,12 @@ void ShotHistoryPlugin::cleanupHistory() {
         fs->remove(fname);
         String notesPath = fname.substring(0, fname.lastIndexOf('.')) + ".json";
         fs->remove(notesPath);
+        freeSpace += slogFiles[i].second;
         removed++;
     }
 
     if (removed > 0) {
-        ESP_LOGI("ShotHistoryPlugin", "Cleaned up %u old shots (free space: %u bytes)", removed, getFreeSpace());
+        ESP_LOGI("ShotHistoryPlugin", "Cleaned up %u old shots (estimated free space: %u bytes)", removed, freeSpace);
     }
 }
 
@@ -1188,18 +1203,32 @@ bool ShotHistoryPlugin::writeIndexHeader(File &indexFile, const ShotIndexHeader 
 }
 
 int ShotHistoryPlugin::findEntryPosition(File &indexFile, const ShotIndexHeader &header, uint32_t shotId) {
-    for (uint32_t i = 0; i < header.entryCount; i++) {
-        size_t entryPos = sizeof(ShotIndexHeader) + i * sizeof(ShotIndexEntry);
-        indexFile.seek(entryPos, SeekSet);
+    // Entries are appended in strictly increasing shot-ID order and never reordered:
+    // nextId/Settings::historyIndex only ever advances (see appendToIndex, startRecording),
+    // upserts rewrite an existing slot in place rather than moving it, and rebuildIndex()
+    // replays .slog files sorted by the same numeric ID embedded in their filename.
+    // readRecentEntries() already depends on this same ordering to walk newest-first.
+    // That makes the index a sorted array by construction, so a binary search finds any
+    // shot in O(log entryCount) instead of scanning every historical entry on every call.
+    int32_t lo = 0;
+    int32_t hi = static_cast<int32_t>(header.entryCount) - 1;
+    while (lo <= hi) {
+        int32_t mid = lo + (hi - lo) / 2;
+        size_t entryPos = sizeof(ShotIndexHeader) + static_cast<size_t>(mid) * sizeof(ShotIndexEntry);
 
         ShotIndexEntry entry{};
         if (!readEntryAtPosition(indexFile, entryPos, entry)) {
-            ESP_LOGW("ShotHistoryPlugin", "Failed to read entry at position %u", i);
-            break;
+            ESP_LOGW("ShotHistoryPlugin", "Failed to read entry at position %d", mid);
+            return -1;
         }
 
         if (entry.id == shotId) {
-            return entryPos;
+            return static_cast<int>(entryPos);
+        }
+        if (entry.id < shotId) {
+            lo = mid + 1;
+        } else {
+            hi = mid - 1;
         }
     }
     return -1;
