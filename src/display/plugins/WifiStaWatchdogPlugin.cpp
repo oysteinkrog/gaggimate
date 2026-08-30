@@ -1,6 +1,7 @@
 #include "WifiStaWatchdogPlugin.h"
 #include "../core/Controller.h"
 #include "../core/Settings.h"
+#include "../core/constants.h" // MODE_STANDBY
 #include <WiFi.h>
 #include <esp_log.h>
 #include <esp_wifi.h>
@@ -68,18 +69,73 @@ void WifiStaWatchdogPlugin::loop() {
         return;
 
     const unsigned long now = millis();
+    if (controller != nullptr && controller->getMode() == MODE_STANDBY) {
+        if (standbySinceMs == 0)
+            standbySinceMs = now;
+    } else {
+        standbySinceMs = 0;
+    }
     if (WiFi.status() == WL_CONNECTED) {
         lastConnectedMs = now;
+        lastDriverRestartMs = 0;
+        rebootHeld = false;
         return;
     }
 
-    if (now - lastConnectedMs < STA_DOWN_GRACE_MS)
+    const unsigned long downFor = now - lastConnectedMs;
+    if (downFor < STA_DOWN_GRACE_MS)
         return;
+
+    if (downFor >= REBOOT_AFTER_DOWN_MS) {
+        if (rebootAllowed(now)) {
+            ESP_LOGE(LOG_TAG, "STA down %lus; reassoc and driver restarts didn't take and machine idle -> rebooting",
+                     downFor / 1000);
+            delay(50);
+            ESP.restart();
+        }
+        if (!rebootHeld) {
+            rebootHeld = true;
+            ESP_LOGW(LOG_TAG, "STA down %lus but deferring reboot (needs uptime > 15min and standby > 5min)", downFor / 1000);
+        }
+        // Fall through: keep trying the cheaper rungs while the reboot is held.
+    }
+
+    if (downFor >= DRIVER_RESTART_AFTER_MS &&
+        (lastDriverRestartMs == 0 || now - lastDriverRestartMs >= DRIVER_RESTART_AFTER_MS)) {
+        restartDriver();
+        lastDriverRestartMs = now;
+        lastReassocMs = now;
+        return;
+    }
+
     if (lastReassocMs != 0 && now - lastReassocMs < STA_REASSOC_BACKOFF_MS)
         return;
 
     forceReassoc();
     lastReassocMs = now;
+}
+
+bool WifiStaWatchdogPlugin::rebootAllowed(unsigned long now) const {
+    if (now < MIN_UPTIME_FOR_REBOOT)
+        return false;
+    if (standbySinceMs == 0)
+        return false;
+    if (now - standbySinceMs < MIN_STANDBY_FOR_REBOOT)
+        return false;
+    return true;
+}
+
+void WifiStaWatchdogPlugin::restartDriver() {
+    // Reassoc keeps the driver's RF/coex state; the wedge lives in it (see
+    // header). WIFI_OFF stops and deinits the driver, WIFI_STA brings it back
+    // from scratch. Same crash-class caution as the AP branch above does not
+    // apply: this rung runs only in plain STA mode with the link down, so no
+    // softAP station can be mid-conversation with us.
+    ESP_LOGW(LOG_TAG, "STA down %lums; reassoc isn't taking -> full WiFi driver restart", millis() - lastConnectedMs);
+    WiFi.mode(WIFI_OFF);
+    delay(200);
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(ssid.c_str(), pass.c_str());
 }
 
 void WifiStaWatchdogPlugin::forceReassoc() {
