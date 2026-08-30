@@ -34,11 +34,45 @@
 // The "is flicker on" test is hoisted out of the pixel loop entirely — band()
 // picks one of two loop bodies (with/without noise term) once, not per pixel.
 //
-// Design: anim-atmosphere (Fable), 2026-08-15. Optimized: opt-ember, 2026-08-15.
+// combRow[x] = perCol[x&7] + flickerLUT[noiseRow[(x+g_sx)&255]], the two
+// non-radius terms of rn, is precomputed once per row in a short sequential
+// pass before the radius loop runs (doFlicker branch only). Integer addition
+// is associative/commutative exactly, so summing these two terms first and
+// adding radiusLUT[ridx] second gives the identical rn the three-term sum
+// always did — this is a reassociation, not a behavior change. It matters
+// because the un-reassociated per-pixel loop chained FOUR dependent loads
+// (radiusLUT, perCol, noiseRow, then flickerLUT keyed off the noiseRow byte)
+// into one scalar dependency chain feeding the palette lookup; the precompute
+// pass turns that into loads with no cross-iteration dependency (only the
+// loop counter carries), and the radius loop is left with just two
+// independent loads (radiusLUT[ridx], combRow[x]) on the critical path.
+// combRow is int16_t and read with a sign-extending load so the per-pixel
+// path needs no separate sign-extend op — see the range proof above (rn's
+// non-radius terms land in about [-51,+50], comfortably inside int16_t).
+// palOff = paletteExt + PAD folds the "+PAD" constant into the base pointer
+// once per row instead of adding it to rn on every pixel.
+//
+// Design: anim-atmosphere (Fable), 2026-08-15. Optimized: opt-ember,
+// 2026-08-15; row-precomputed flicker/dither term, 2026-08-30.
 
 #include "BgAnim.h"
 #include "BgAnimCommon.h"
 #include <math.h>
+
+// Band-kernel code pinned to IRAM on device. The ESP32-S3's single icache
+// (16 KB here) is shared by both cores, and LVGL's code footprint churns it
+// from core 1 on every telemetry repaint; a flash refill for this loop then
+// queues on the MSPI behind the scan-out refill's PSRAM stream. With the
+// kernel's tables in SRAM (post-settle re-placement in bganim::alloc) and its
+// output band buffer in SRAM, instruction fetch is the band bracket's last
+// external dependency; pinning removes it. Host and sim builds compile the
+// attribute away.
+#if defined(ESP_PLATFORM)
+#include <esp_attr.h>
+#define GM_ANIM_IRAM IRAM_ATTR
+#else
+#define GM_ANIM_IRAM
+#endif
 
 namespace {
 using namespace bganim;
@@ -65,6 +99,8 @@ uint16_t *palette = nullptr;    // = paletteExt + PAD, 256 entries, reversed the
 uint8_t *radiusLUT = nullptr;   // [RLUT_N]; r^2>>RSHIFT -> normalized radius byte
 int8_t *flickerLUT = nullptr;   // noise byte -> signed flicker contribution
 const uint8_t *noise = nullptr;
+int16_t *combRow = nullptr; // [allocW]; perCol+flicker combined, rebuilt per row (see file header)
+int allocW = 0;             // width combRow was sized for; release() needs it back
 uint32_t lastThemeGen = 0xFFFFFFFF;
 uint8_t lastGlow = 255;
 uint8_t lastFlickerParam = 255;
@@ -118,7 +154,10 @@ bool init(int w, int h) {
         radiusLUT = static_cast<uint8_t *>(alloc(RLUT_N));
         flickerLUT = static_cast<int8_t *>(alloc(256));
         noise = noiseTex256();
-        if (paletteExt == nullptr || radiusLUT == nullptr || flickerLUT == nullptr || noise == nullptr) {
+        combRow = static_cast<int16_t *>(alloc(static_cast<size_t>(w) * sizeof(int16_t)));
+        allocW = w;
+        if (paletteExt == nullptr || radiusLUT == nullptr || flickerLUT == nullptr || noise == nullptr ||
+            combRow == nullptr) {
             return false;
         }
         palette = paletteExt + PAD;
@@ -169,7 +208,7 @@ void frame(uint32_t tMs, int, int, const uint8_t p[4]) {
     g_sy = static_cast<int>((vt * 4u) >> 10) & 255;
 }
 
-void band(uint16_t *dst, int y0, int rows, int w, uint32_t, const uint8_t *) {
+GM_ANIM_IRAM void band(uint16_t *dst, int y0, int rows, int w, uint32_t, const uint8_t *) {
     const bool doFlicker = g_flickerAmp != 0;
     for (int r = 0; r < rows; r++) {
         const int y = y0 + r;
@@ -188,20 +227,29 @@ void band(uint16_t *dst, int y0, int rows, int w, uint32_t, const uint8_t *) {
         int r2 = dx * dx + dy2;
         int ddx = 2 * dx + 1; // r2 delta for this step; += 2 per pixel thereafter
 
+        // PAD folded into the base pointer once per row instead of into rn on
+        // every pixel (see file header) -- valid because PAD is compile-time
+        // constant and paletteExt[PAD + rn] == (paletteExt + PAD)[rn] exactly.
+        const uint16_t *palOff = paletteExt + PAD;
+
         if (doFlicker) {
             const uint8_t *noiseRow = noise + ((y + g_sy) & 255) * 256;
+            // Precompute the two non-radius terms of rn once per row (see file
+            // header): no cross-iteration dependency here, unlike the radius
+            // loop below, so this pass is just independent loads+adds+stores.
+            for (int x = 0; x < w; x++) {
+                combRow[x] = static_cast<int16_t>(perCol[x & 7] + flickerLUT[noiseRow[(x + g_sx) & 255]]);
+            }
             for (int x = 0; x < w; x++) {
                 const int ridx = r2 >> RSHIFT;
-                const int rn = radiusLUT[ridx] + perCol[x & 7] + flickerLUT[noiseRow[(x + g_sx) & 255]];
-                row[x] = paletteExt[PAD + rn];
+                row[x] = palOff[radiusLUT[ridx] + combRow[x]];
                 r2 += ddx;
                 ddx += 2;
             }
         } else {
             for (int x = 0; x < w; x++) {
                 const int ridx = r2 >> RSHIFT;
-                const int rn = radiusLUT[ridx] + perCol[x & 7];
-                row[x] = paletteExt[PAD + rn];
+                row[x] = palOff[radiusLUT[ridx] + perCol[x & 7]];
                 r2 += ddx;
                 ddx += 2;
             }
@@ -216,6 +264,7 @@ void release() {
     palette = nullptr;
     releaseTable(radiusLUT, RLUT_N);
     releaseTable(flickerLUT, 256);
+    releaseTable(combRow, static_cast<size_t>(allocW) * sizeof(int16_t));
     // Borrowed: noiseTex256() is a 64 KB fleet-wide asset owned by
     // BgAnimCommon and shared with nebula. Dropping the pointer is all this
     // animation is entitled to do.

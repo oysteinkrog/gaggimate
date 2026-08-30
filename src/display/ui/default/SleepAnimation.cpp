@@ -334,8 +334,12 @@ static inline int emitRun(uint32_t *runs, int n, int x0, int x1, int gapMerge) {
 // same cache line, because the runs are exact: every pixel this walks is one
 // the caller already knows has coverage, so there is nothing to be gained by
 // reading the coverage from somewhere denser first.
-__attribute__((noinline)) static void blendRow(uint16_t *__restrict dst, const uint8_t *__restrict colour,
-                                               const uint32_t *__restrict runs, int nRuns) {
+// IRAM: same reasoning as the band kernels (see AnimEmber.cpp) — the shared
+// icache is churned by LVGL on core 1, and a flash refill for this inner loop
+// queues on the MSPI behind the scan-out's PSRAM stream. The overlay bytes it
+// reads are PSRAM either way; the instruction stream doesn't have to be.
+__attribute__((noinline)) static void IRAM_ATTR blendRow(uint16_t *__restrict dst, const uint8_t *__restrict colour,
+                                                         const uint32_t *__restrict runs, int nRuns) {
     for (int i = 0; i < nRuns; i++) {
         const uint32_t r = runs[i];
         int x = static_cast<int>(r & 0xFFFFu);
