@@ -45,3 +45,9 @@ logs/
 # Editor / agent workspaces
 .serena/
 .claude/
+
+# Off-device kernel-bench build artifacts (generated .elf/.o + qemu traces)
+tools/qemubench/build/
+tools/animbench/kernels-blend/build/
+tools/animbench/kernels-scrimfix/build/
+**/__pycache__/

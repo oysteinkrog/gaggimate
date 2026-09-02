@@ -1,0 +1,305 @@
+PROPOSED patch, NOT applied to src/. This is the deliverable's integration
+illustration: a unified diff against src/display/ui/default/SleepAnimation.cpp
+at HEAD (branch idf5) showing exactly what adding the PIE-vectorized
+blendRow composite would look like, plus this rationale. Apply with
+`git apply` (or `patch -p1`) from the repo root if and when someone with
+device/QEMU access decides to try it -- it has NOT been applied, built,
+flashed, or run anywhere as part of this work. See
+tools/animbench/kernels-blend/ for the correctness proofs this patch's
+content is drawn from (blendGroup8General's asm block is verified
+byte-for-byte identical, mnemonic-for-mnemonic, to the standalone
+blend_group8.S file that was assembled and instruction-counted with the
+real toolchain -- see prove_asm_match.py -- and the same block was proven
+to compile+assemble cleanly as part of blend_pie_kernel.cpp via
+build_and_report.sh, and separately confirmed to compile+assemble cleanly
+in exactly this patch's textual form via a standalone syntax check before
+this file was written).
+
+Rationale
+---------
+blendRow (the per-row alpha-composite pass, SleepAnimation.cpp:350-370) is
+measured at ~7.9ms/frame median on device, ~25% of the core-0 render
+budget, running unconditionally scalar. This patch adds a second code path,
+blendRowPie, that processes 8-pixel-aligned groups within each run: an
+all-opaque group (every lane a==255) copies via one EE.VLD.128/EE.VST.128
+pair (no arithmetic, matching the existing precedent in
+tools/overlaybench/kernels/overlay_blend.cpp's blendRow_pie_asm); a group
+with no opaque lanes runs the new blendGroup8General vector arithmetic
+(the piece that file's own header comment explicitly declined to write,
+judging the hand-scheduled SAR-juggling sequence "too likely to ship a
+silently-wrong result... without a way to execute it" -- this patch is
+that missing piece, now proven three ways: host bit-exactness for both the
+per-pixel formula (23.2M cases) and the whole group-dispatch function
+(50,000 randomized rows), plus a semantic-trace interpreter executing the
+literal instruction sequence (1.6M lane-checks) -- see the report this
+patch accompanies for exactly what each proof does and does not establish);
+a mixed group (some lanes opaque, some not) falls back to the same scalar
+body blendRow already uses, since no group-level vector shortcut is safe
+across a mix (the a==255 counterexample in the comment above
+kBlendGroupConsts is why). Pixels before/after the first/last 8-pixel-
+aligned boundary within a run (a run's own start/end need not be aligned)
+use that same scalar fallback too.
+
+What this patch does NOT do: change blendRow itself (left in place,
+unused after the call-site swap, so it stays available as an immediate
+revert -- just swap the call site back); change scrimRow/scrimRowPie/
+scale565Oct or anything else in the file; touch the two-pass ordering,
+the scrim-skip gating, or any other part of renderFrame's band loop
+besides the one blendRow(...) call.
+
+UPDATE (2026-08-31, after this patch was first written): blendGroup8General
+has now executed under Espressif's qemu-system-xtensa fork, not just been
+proven on the host. tools/qemubench/tests/blend_row/main.c transcribes this
+exact instruction sequence (mnemonics, operand registers, ssai immediates,
+load/store order all unchanged from blendGroup8General above -- see that
+file's own header for why it's a transcription, not a regeneration) and
+runs it against the "general_all_nonopaque" case from
+tools/animbench/kernels-blend/blend_qemu_vectors.h -- eight lanes, every
+channel's arithmetic exercised, several boundary alphas in one group.
+`./tools/qemubench/build.sh tests/blend_row && ./tools/qemubench/run.sh
+build/tests/blend_row.elf` (bare-metal, no pio, no physical device --
+tools/qemubench/build.sh's own header explains why it's exempt from this
+effort's offline-only constraint): RESULT: PASS, all 8 lanes bit-exact
+against the host-proven expected output. This is real ssai/SAR-threading
+and EE.VADDS.S16 execution, on the specific ISA implementation this
+project already trusts for other PIE code (scale565Oct, GM_PIETEST) --
+not a claim about physical silicon, since this is an emulator, and not a
+claim about the full 23.2M-case host sweep (only this one representative
+group ran under QEMU; the exhaustive coverage is host-side only). The two
+risks named below are accordingly downgraded from "unchecked" to "checked
+once, on a representative case, under emulation" -- worth a broader QEMU
+sweep or a real-device run before this ships unconditionally, but no
+longer a completely open question.
+
+Open risks before this should ship (see the report's honest-assessment
+section for the full list, and the UPDATE above): the semantic-trace
+interpreter models the documented instruction semantics, and the QEMU run
+above confirms that model against this specific fork's actual
+implementation for one representative case -- neither is a claim about
+real silicon, which could still differ (a hardware erratum QEMU's model
+doesn't reproduce). The saturating-add bound (EE.VADDS.S16 clamps at
++-32767; every sum this design produces tops out at 16128, so saturation
+is argued never to trigger, and the QEMU case above exercises alphas at
+1/2/127/128/253/254 without hitting it) and the SAR-threading across nine
+`ssai` calls per group (now QEMU-confirmed correct for this one case) are
+the two things worth broadening coverage on before a real-device run.
+
+--- a/src/display/ui/default/SleepAnimation.cpp
++++ b/src/display/ui/default/SleepAnimation.cpp
+@@ -369,6 +369,207 @@
+     }
+ }
+
++// PIE (vector) composite for blendRow, eight pixels per group. Design and
++// correctness proofs live in tools/animbench/kernels-blend/ (not shipped
++// in this tree): blend_model.h's header comment has the full per-channel
++// derivation (raw-magnitude reformulation of blend565's arithmetic),
++// prove_layer1.cpp/prove_layer2.cpp prove the design bit-exact against
++// blend565/blendRow above on the host (23.2M and 50,000 randomized cases
++// respectively, both zero failures), and prove_interp.cpp semantically
++// traces this exact EE.* instruction sequence (parsed live from
++// blend_group8.S, so it cannot drift from what was actually assembled)
++// against 1.6M randomized lanes, also zero failures. See that directory's
++// report for what those proofs do and do not establish -- in particular,
++// NONE of this has been run on a device or in QEMU; see the open risks
++// noted there before enabling this path.
++//
++// a==255 (fully opaque) is NOT safe for this vector formula: worked
++// counterexample (fg raw R=31, bg raw R=1, a=255) gives raw output R=30,
++// not fg's 31 -- the weighted-average formula is one 256th short of an
++// exact copy at full alpha, which is exactly why the scalar blendRow above
++// special-cases a==255 as a direct copy. Any 8-pixel group containing an
++// a==255 lane MUST take the copy path instead of this one; the dispatcher
++// below enforces that at group granularity (EE.* has no per-lane branch).
++alignas(16) static const DRAM_ATTR uint16_t kBlendGroupConsts[48] = {
++    // ones (0x0001 x8): EE.VMUL.U16 only ever shifts right, so multiplying
++    // by 1 at SAR=<bit position> is how a channel's raw magnitude is
++    // extracted from its bit-positioned value, and multiplying by 1 at
++    // SAR=8 is the final "divide by 256" -- one constant vector serves
++    // every right-shift this kernel needs.
++    1, 1, 1, 1, 1, 1, 1, 1,
++    0xF800, 0xF800, 0xF800, 0xF800, 0xF800, 0xF800, 0xF800, 0xF800, // maskR
++    2048, 2048, 2048, 2048, 2048, 2048, 2048, 2048,                 // constR2048: raw R (0..31) << 11, as a multiply
++    0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, // maskG
++    32, 32, 32, 32, 32, 32, 32, 32,                                 // constG32: raw G (0..63) << 5, as a multiply
++    0x001F, 0x001F, 0x001F, 0x001F, 0x001F, 0x001F, 0x001F, 0x001F, // maskB (already raw; blue needs no repositioning)
++};
++
++// One 8-pixel group of blend565, vectorised, for the case where NO lane in
++// the group has a==255 (the caller guarantees this). Safe for a==0 lanes:
++// the raw-magnitude formula is an exact identity there (reproduces bg
++// unchanged), proven both on host and via the semantic-trace interpreter
++// (see the file header comment above).
++//
++// dst8, colStage8, aStage8, invStage8 must all be 16-byte aligned, same
++// EE.VLD.128/EE.VST.128 caveat as scale565Oct above (misalignment
++// corrupts neighbouring memory silently rather than trapping).
++//
++// Register budget forced per-channel-serial processing (R, then G, then
++// B) rather than batching all three channels' work by shared SAR value:
++// q0 (fg), q1 (bg), q2 (a), q3 (inv), q7 (ones) are pinned for the whole
++// group (five of the eight q-registers), leaving only q4/q5/q6 free, with
++// q6 doubling as the running OR-accumulator so no channel's result needs a
++// spill to memory. This costs more `ssai` mode changes (9) than a
++// SAR-batched schedule would, but needs zero register spills -- see the
++// PIE-composite report in tools/animbench/kernels-blend/ for the batched
++// alternative that was considered and not used, and for the SAR-threading
++// risk this design still carries into a real device/QEMU validation pass.
++__attribute__((noinline)) static void blendGroup8General(uint16_t *__restrict dst8,
++                                                          const uint16_t *__restrict colStage8,
++                                                          const uint16_t *__restrict aStage8,
++                                                          const uint16_t *__restrict invStage8) {
++    const uint16_t *rd = dst8;
++    uint16_t *wr = dst8;
++    const uint16_t *col = colStage8;
++    const uint16_t *av = aStage8;
++    const uint16_t *iv = invStage8;
++    const uint16_t *ct = kBlendGroupConsts;
++    asm volatile("ee.vld.128.ip q7, %[ct], 16\n"
++                 "ee.vld.128.ip q0, %[col], 16\n"
++                 "ee.vld.128.ip q1, %[rd], 16\n"
++                 "ee.vld.128.ip q2, %[av], 16\n"
++                 "ee.vld.128.ip q3, %[iv], 16\n"
++                 "ee.vld.128.ip q4, %[ct], 16\n"
++                 "ee.andq q5, q0, q4\n"
++                 "ee.andq q4, q1, q4\n"
++                 "ssai 11\n"
++                 "ee.vmul.u16 q5, q5, q7\n"
++                 "ee.vmul.u16 q4, q4, q7\n"
++                 "ssai 0\n"
++                 "ee.vmul.u16 q5, q5, q2\n"
++                 "ee.vmul.u16 q4, q4, q3\n"
++                 "ee.vadds.s16 q5, q5, q4\n"
++                 "ssai 8\n"
++                 "ee.vmul.u16 q5, q5, q7\n"
++                 "ee.vld.128.ip q4, %[ct], 16\n"
++                 "ssai 0\n"
++                 "ee.vmul.u16 q6, q5, q4\n"
++                 "ee.vld.128.ip q4, %[ct], 16\n"
++                 "ee.andq q5, q0, q4\n"
++                 "ee.andq q4, q1, q4\n"
++                 "ssai 5\n"
++                 "ee.vmul.u16 q5, q5, q7\n"
++                 "ee.vmul.u16 q4, q4, q7\n"
++                 "ssai 0\n"
++                 "ee.vmul.u16 q5, q5, q2\n"
++                 "ee.vmul.u16 q4, q4, q3\n"
++                 "ee.vadds.s16 q5, q5, q4\n"
++                 "ssai 8\n"
++                 "ee.vmul.u16 q5, q5, q7\n"
++                 "ee.vld.128.ip q4, %[ct], 16\n"
++                 "ssai 0\n"
++                 "ee.vmul.u16 q5, q5, q4\n"
++                 "ee.orq q6, q6, q5\n"
++                 "ee.vld.128.ip q4, %[ct], 16\n"
++                 "ee.andq q5, q0, q4\n"
++                 "ee.andq q4, q1, q4\n"
++                 "ee.vmul.u16 q5, q5, q2\n"
++                 "ee.vmul.u16 q4, q4, q3\n"
++                 "ee.vadds.s16 q5, q5, q4\n"
++                 "ssai 8\n"
++                 "ee.vmul.u16 q5, q5, q7\n"
++                 "ee.orq q6, q6, q5\n"
++                 "ee.vst.128.ip q6, %[wr], 16\n"
++                 : [col] "+r"(col), [rd] "+r"(rd), [wr] "+r"(wr), [av] "+r"(av), [iv] "+r"(iv), [ct] "+r"(ct)
++                 :
++                 : "memory");
++}
++
++// Shared per-pixel scalar body -- byte-identical to blendRow's own inner
++// loop above, factored out so blendRowPie's prologue/epilogue/mixed-group
++// fallback all use exactly this code instead of a parallel reimplementation
++// of it (same reasoning as scanRow_pie_asm's scalar fallback elsewhere in
++// this codebase's PIE work).
++__attribute__((always_inline)) inline void blendPixelScalar(uint16_t *__restrict dst, const uint8_t *__restrict px,
++                                                              int x) {
++    const uint32_t a = px[2];
++    if (a == 0) {
++        return;
++    }
++    const uint16_t c = static_cast<uint16_t>(px[0] | (px[1] << 8));
++    dst[x] = a == 255 ? c : blend565(c, dst[x], static_cast<uint8_t>(a));
++}
++
++// blendRow, restructured around 8-pixel-aligned groups (see
++// tools/animbench/kernels-blend/ for the design and proofs). NOT YET
++// DEVICE-VALIDATED -- see the file header comment on blendGroup8General
++// and the PIE-composite report before switching the call site below from
++// blendRow to this function.
++__attribute__((noinline)) static void IRAM_ATTR blendRowPie(uint16_t *__restrict dst, const uint8_t *__restrict colour,
++                                                            const uint32_t *__restrict runs, int nRuns) {
++    for (int i = 0; i < nRuns; i++) {
++        const uint32_t r = runs[i];
++        int x = static_cast<int>(r & 0xFFFFu);
++        const int xEnd = static_cast<int>(r >> 16);
++
++        int xAlignedStart = (x + 7) & ~7;
++        if (xAlignedStart > xEnd) {
++            xAlignedStart = xEnd;
++        }
++        const int xAlignedEnd = xAlignedStart + ((xEnd - xAlignedStart) & ~7);
++
++        {
++            const uint8_t *px = colour + static_cast<size_t>(x) * 3;
++            for (; x < xAlignedStart; x++, px += 3) {
++                blendPixelScalar(dst, px, x);
++            }
++        }
++        for (; x < xAlignedEnd; x += 8) {
++            alignas(16) uint16_t colStage[8];
++            alignas(16) uint16_t aStage[8];
++            alignas(16) uint16_t invStage[8];
++            bool allOpaque = true;
++            bool anyOpaque = false;
++            {
++                const uint8_t *gp = colour + static_cast<size_t>(x) * 3;
++                for (int k = 0; k < 8; k++, gp += 3) {
++                    colStage[k] = static_cast<uint16_t>(gp[0] | (gp[1] << 8));
++                    const uint8_t a = gp[2];
++                    aStage[k] = a;
++                    invStage[k] = static_cast<uint16_t>(256u - a);
++                    if (a == 255) {
++                        anyOpaque = true;
++                    } else {
++                        allOpaque = false;
++                    }
++                }
++            }
++            if (allOpaque) {
++                const uint16_t *src = colStage;
++                uint16_t *wr = dst + x;
++                asm volatile("ee.vld.128.ip q0, %[src], 16\n"
++                             "ee.vst.128.ip q0, %[wr], 16\n"
++                             : [src] "+r"(src), [wr] "+r"(wr)
++                             :
++                             : "memory");
++            } else if (!anyOpaque) {
++                blendGroup8General(dst + x, colStage, aStage, invStage);
++            } else {
++                const uint8_t *px = colour + static_cast<size_t>(x) * 3;
++                for (int k = 0; k < 8; k++, px += 3) {
++                    blendPixelScalar(dst, px, x + k);
++                }
++            }
++        }
++        {
++            const uint8_t *px = colour + static_cast<size_t>(x) * 3;
++            for (; x < xEnd; x++, px += 3) {
++                blendPixelScalar(dst, px, x);
++            }
++        }
++    }
++}
++
+ // Dim the band toward black wherever the text scrim reaches, so the glyphs
+ // about to go down on top of it stay legible over a bright animation.
+ //
+@@ -3052,7 +3253,7 @@
+                 continue;
+             }
+ #endif
+-            blendRow(drow, crow, runs, nRuns);
++            blendRowPie(drow, crow, runs, nRuns); // was: blendRow(drow, crow, runs, nRuns);
+         }
+         BENCH_ACC(accBlendUs, tBlend);
+         profBlendUs += static_cast<uint32_t>(esp_timer_get_time() - tBlend);

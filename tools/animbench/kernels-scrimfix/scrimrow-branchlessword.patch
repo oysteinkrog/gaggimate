@@ -1,0 +1,130 @@
+Proposed change: replace scrimRow's body (SleepAnimation.cpp, currently
+~lines 402-423) with the scrimRow_branchlessWord shape derived and proven
+in this directory (tools/animbench/kernels-scrimfix/scrimrow.cpp). This is
+a diff, not an applied edit -- src/ is untouched by this task; apply with
+`git apply` from the repo root if/when someone decides to ship it.
+
+Rationale
+---------
+scrimRow gets ZERO Xtensa hardware zero-overhead LOOP instructions from GCC
+despite being call-free (everything it calls -- scrimCell, scale565x2,
+scale565 -- is always_inline): 94 instructions, 0 loops, confirmed via this
+directory's own asm.sh against the real toolchain
+(toolchain-xtensa-esp-elf, GCC 14.2.0, the same compiler
+.pio/build/*/compile_commands.json confirms the firmware actually ships
+with) at the real firmware's flags (-O2 -std=gnu++20 -mlongcalls
+-fno-exceptions -fno-rtti -ffunction-sections -fdata-sections
+-fno-jump-tables, cross-checked against platformio.ini's
+[display_common]/[env:display] sections directly, since this checkout's
+.pio/build/ has no display-env compile_commands.json to read from --
+see this directory's asm.sh header for the full cross-check).
+
+The obvious suspect is the per-cell `if (inv == SCRIM_INV_NONE) continue;`:
+GCC's Xtensa backend only emits a zero-overhead LOOP for a fixed trip count
+with no early exit, and this `continue` is data-dependent (keyed on
+invRow[c], not on c). Removing JUST that branch -- calling scrimCell
+unconditionally, safe because scale565's own doc comment establishes 32 is
+an exact identity factor ("inv is 0..32, i.e. 32 keeps the pixel and 0
+blacks it out") -- does NOT fix it: still 0 loops, and at 97 instructions
+it is worse than the original 94 (confirmed here as scrimRow_branchlessCell
+in scrimrow.cpp/scrimrow.S, independently, not assumed). Comparing the two
+loop bodies directly finds the real blocker: scrimCell computes a cell's
+TWO words in parallel (`q[0] = scale565x2(q[0], inv); q[1] =
+scale565x2(q[1], inv);`), and that register pressure -- not the branch --
+is what starves GCC's Xtensa doloop pass of the address register it needs
+for the loop-count mechanism.
+
+scrimRow_branchlessWord fixes the actual blocker: iterate one 32-bit WORD
+(two pixels) per loop trip instead of one CELL (two words / four pixels),
+keeping the same branchless SCRIM_INV_NONE substitution. This halves the
+live temporaries per trip while doubling the trip count. The loop-counter
+SHAPE also matters, confirmed the hard way: a first attempt walking an
+absolute word index over the row (mathematically identical, verified
+bit-exact, but NOT kept as the shipped shape) still got 0 loops at 61
+instructions; rewriting to count up from zero with the pointer pre-offset
+by the run's start (`uint32_t *const qBase = reinterpret_cast<uint32_t*>(dst
++ (c0 << SCRIM_SHIFT)); const int nWords = (c1 - c0) * 2; for (int wi = 0;
+wi < nWords; wi++) ...`) is what actually recovers it: 64 instructions, 1
+zero-overhead LOOP. This independently reproduces the exact figure a second
+worker (tools/overlaybench/kernels/overlay_blend.cpp, working in parallel
+on a related composite-pass optimization) reported for their own,
+separately-derived equivalent function -- a real independent confirmation,
+not an assumed match; the two derivations converged on the same loop shape
+without sharing code.
+
+Bit-exactness: proven over 20,416 randomized and directed test cases
+(tools/animbench/kernels-scrimfix/prove_scrimfix.cpp) -- random invRow/runs/
+dst content, nHalo==0, runs ending on an odd cell boundary, w not a multiple
+of 4 or 8, all-SCRIM_INV_NONE rows, all-zero rows. All pass byte-for-byte
+against the unmodified scrimRow.
+
+Net effect at the call site (SleepAnimation.cpp ~3015-3024): none needed.
+scrimRow is called unconditionally there when pieScrim is false
+(`scrimRow(drow, invRow, halo, nHalo, w);`) -- this patch only changes
+scrimRow's own body, so the call site's text is untouched and every caller
+picks up the fix automatically.
+
+Not addressed by this patch: the composite/blend pass (blendRow) is a
+separate optimization target (see the FINDINGS-OVERLAY.md/kernels-blend
+work happening in parallel) and is untouched here.
+
+--- a/src/display/ui/default/SleepAnimation.cpp
++++ b/src/display/ui/default/SleepAnimation.cpp
+@@ -399,6 +399,26 @@
+ // The dim is keyed on the cell rather than on a pixel's own coverage on
+ // purpose: the pixels that decide legibility are the transparent ones between
+ // strokes and inside glyph counters, which the blend never touches at all.
++//
++// One 32-bit WORD (two pixels) per loop trip, not one cell (four pixels,
++// scrimCell's own unit) -- and counted up from zero, not walked over an
++// absolute word index -- is what actually gets this loop a hardware
++// zero-overhead LOOP. The per-cell `if (inv == SCRIM_INV_NONE) continue;`
++// this replaced looked like the obvious blocker (GCC's Xtensa backend needs
++// a fixed trip count for LOOP, and a data-dependent `continue` breaks that),
++// but removing just the branch does not fix it: 0 loops, 97 instructions,
++// worse than this function's original 94, because scrimCell's two words
++// computed back-to-back are what starve the loop-count register, not the
++// branch. Restructuring to one word per trip, counted from zero so the trip
++// count is its own SSA value at loop entry rather than a difference GCC has
++// to re-derive from a loop-carried index, recovers it: 64 instructions, 1
++// zero-overhead LOOP. Both the branch removal alone and this word-restructure
++// are bit-exact substitutions -- see the identity argument below and
++// tools/animbench/kernels-scrimfix/scrimrow.cpp for the full derivation
++// (including the rejected absolute-index shape, which is bit-exact and
++// halves the per-trip body the same way but still doesn't recover the
++// loop), the randomized bit-exactness proof, and the real-toolchain asm
++// evidence for all three shapes (tools/animbench/kernels-scrimfix/asm.sh).
+ __attribute__((noinline)) static void scrimRow(uint16_t *__restrict dst, const uint8_t *__restrict invRow,
+                                                const uint32_t *__restrict runs, int nRuns, int w) {
+     for (int i = 0; i < nRuns; i++) {
+@@ -408,16 +428,20 @@
+         if ((c1 << SCRIM_SHIFT) > w) {
+             c1 = w >> SCRIM_SHIFT;
+         }
+-        for (int c = c0; c < c1; c++) {
+-            // Already the 1/32 factor, not the coverage it came from: the
+-            // strength multiply, the clamp and the rounding are the same for
+-            // every frame the overlay lives through, so buildScrim does them
+-            // once per publish instead of 24,000 times per frame.
+-            const uint32_t inv = invRow[c];
+-            if (inv == SCRIM_INV_NONE) {
+-                continue; // a cell a gap merge swallowed
+-            }
+-            scrimCell(dst, inv, c);
++        // scrimCell maps cell c to words 2c and 2c+1 of the row (dst is
++        // 4-byte aligned to start and a scrim cell starts on an even pixel,
++        // see the comment on scale565x2 above), so this cast agrees with
++        // scrimCell's own reinterpret_cast<uint32_t*>(dst + (c<<2)) on where
++        // a cell's two words live.
++        uint32_t *const qBase = reinterpret_cast<uint32_t *>(dst + (c0 << SCRIM_SHIFT));
++        const int nWords = (c1 - c0) * 2;
++        for (int wi = 0; wi < nWords; wi++) {
++            // No skip on SCRIM_INV_NONE: scale565(c, 32) == c exactly (see
++            // scale565's own doc comment above -- "32 keeps the pixel"), so
++            // scaling a cell a gap merge already left at full strength is a
++            // wasted multiply, not a wrong pixel.
++            const uint32_t inv = invRow[c0 + (wi >> 1)];
++            qBase[wi] = scale565x2(qBase[wi], inv);
+         }
+     }
+ }

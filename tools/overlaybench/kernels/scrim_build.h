@@ -54,6 +54,29 @@ void buildScrim_transposed34(const uint8_t *__restrict src, uint8_t *__restrict 
 void buildScrim_transposed_all(const uint8_t *__restrict src, uint8_t *__restrict tmp, uint8_t *__restrict out, int sw,
                                int sh, int q8, uint32_t *__restrict haloRuns, uint8_t *__restrict haloN);
 
+// Regional rebuild. Contract: `out`/`haloRuns`/`haloN` hold the completed
+// state of a previous build whose source differed from `src` ONLY in cell
+// rows [r0, r1] (same q8); on return they equal what buildScrim_ref(src, ...)
+// would produce, byte for byte (halo runs compared over each row's used
+// prefix; entries past haloN[y] are scratch in the reference too).
+//
+// Why the margins are what they are: of the six passes only the vertical
+// ones move information across rows, and each moves it one row (3-tap). Two
+// vertical dilates plus one vertical smooth = final row y depends on source
+// rows [y-3, y+3], so changed source rows [r0, r1] can only alter final rows
+// [r0-3, r1+3]; those are the rows rewritten. Recomputing them through
+// band-local passes whose taps clamp at the band edge is exact as long as
+// the clamped rows lie at least 3 rows away from any rewritten row, hence
+// the input band [r0-6, r1+6]. Where the band edge IS the grid edge, the
+// band-local clamp coincides with the reference clamp and the margin
+// requirement vanishes. Intermediates ping-pong through `tmp` and `tmp2`
+// (both whole-grid scratch) so `out` rows outside the rewrite window are
+// never touched. Proven bit-exact against buildScrim_ref over randomized
+// grids, bands, and edge cases by tools/overlaybench/scrim_regional_prove.cpp.
+void buildScrim_regional(const uint8_t *__restrict src, uint8_t *__restrict tmp, uint8_t *__restrict tmp2,
+                         uint8_t *__restrict out, int sw, int sh, int q8, uint32_t *__restrict haloRuns,
+                         uint8_t *__restrict haloN, int r0, int r1);
+
 struct BuildScrimVariant {
     const char *name;
     BuildScrimFn fn;

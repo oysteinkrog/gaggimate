@@ -283,6 +283,72 @@ void buildScrim_transposed_all(const uint8_t *__restrict src, uint8_t *__restric
     emitHaloFromOut(out, sw, sh, q8, haloRuns, haloN);
 }
 
+void buildScrim_regional(const uint8_t *__restrict src, uint8_t *__restrict tmp, uint8_t *__restrict tmp2,
+                         uint8_t *__restrict out, int sw, int sh, int q8, uint32_t *__restrict haloRuns,
+                         uint8_t *__restrict haloN, int r0, int r1) {
+    if (r0 < 0) {
+        r0 = 0;
+    }
+    if (r1 >= sh) {
+        r1 = sh - 1;
+    }
+    if (r1 < r0) {
+        return;
+    }
+    // Rows whose final value can differ (vertical reach 3, see the header).
+    const int w0 = r0 - 3 < 0 ? 0 : r0 - 3;
+    const int w1 = r1 + 3 >= sh ? sh - 1 : r1 + 3;
+    // Input band: 3 more rows so band-edge clamping stays out of [w0, w1].
+    const int b0 = r0 - 6 < 0 ? 0 : r0 - 6;
+    const int b1 = r1 + 6 >= sh ? sh - 1 : r1 + 6;
+    const int bl = b1 - b0 + 1;
+    const size_t off = static_cast<size_t>(b0) * sw;
+
+    // The six passes, band-local. Horizontal passes are exact per row; the
+    // vertical passes clamp at the band edges, which is either the grid edge
+    // (reference behaviour) or at least 3 rows away from [w0, w1].
+    scrimTap3_ref(src + off, tmp + off, bl, sw, sw, 1, true);
+    scrimTap3_ref(tmp + off, tmp2 + off, bl, sw, sw, 1, true);
+    scrimTap3_ref(tmp2 + off, tmp + off, sw, bl, 1, sw, true);
+    scrimTap3_ref(tmp + off, tmp2 + off, sw, bl, 1, sw, true);
+    scrimTap3_ref(tmp2 + off, tmp + off, bl, sw, sw, 1, false);
+    scrimTap3_ref(tmp + off, tmp2 + off, sw, bl, 1, sw, false);
+
+    // Quantize + emit halo runs, rewrite window only. Byte-for-byte the loop
+    // in buildScrim_ref, reading the band result and writing `out` in place.
+    for (int cy = w0; cy <= w1; cy++) {
+        const uint8_t *const brow = tmp2 + static_cast<size_t>(cy) * sw;
+        uint8_t *const row = out + static_cast<size_t>(cy) * sw;
+        for (int cx = 0; cx < sw; cx++) {
+            int dim = (brow[cx] * q8) >> 8;
+            if (dim > 255) {
+                dim = 255;
+            }
+            row[cx] = static_cast<uint8_t>(SCRIM_INV_NONE - ((dim + 4) >> 3));
+        }
+        uint32_t *const runs = haloRuns + static_cast<size_t>(cy) * RUNS_PER_ROW;
+        int n = 0;
+        int start = -1;
+        for (int cx = 0; cx < sw; cx++) {
+            if (row[cx] != SCRIM_INV_NONE) {
+                if (start < 0) {
+                    start = cx;
+                }
+                continue;
+            }
+            if (start < 0) {
+                continue;
+            }
+            n = emitRun_ref(runs, n, start, cx, HALO_GAP_MERGE_CELLS);
+            start = -1;
+        }
+        if (start >= 0) {
+            n = emitRun_ref(runs, n, start, sw, HALO_GAP_MERGE_CELLS);
+        }
+        haloN[cy] = static_cast<uint8_t>(n);
+    }
+}
+
 const BuildScrimVariant kBuildScrimVariants[] = {
     {"ref_scalar", &buildScrim_ref, true, false},
     {"transposed34", &buildScrim_transposed34, true, false},
