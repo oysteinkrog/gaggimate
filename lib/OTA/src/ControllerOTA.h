@@ -30,6 +30,15 @@ class ControllerOTA {
     // fine" is not good enough here.
     bool update(WiFiClientSecure &wifi_client, const String &release_url);
 
+    // After update() returns true the controller keeps running: it flashes the
+    // received image asynchronously and then notifies its Update result as a
+    // 0x0F-prefixed ASCII string ("OTA Done: Failed!", "Error #: N", ...). This
+    // blocks up to timeoutMs for that notification (logged by onReceive) so a
+    // failed install is visible on serial instead of being hidden behind the
+    // display's own reboot dropping the BLE link. Returns true if a result
+    // arrived. Purely a diagnostic settle window -- never load-bearing.
+    bool waitForInstallResult(uint32_t timeoutMs);
+
   private:
     bool downloadFile(WiFiClientSecure &wifi_client, const String &release_url);
     bool runUpdate(Stream &in, uint32_t size);
@@ -51,6 +60,10 @@ class ControllerOTA {
 
     bool interrupted = false;
     uint8_t lastSignal = 0x00;
+    // Set by onReceive when the controller's async installer reports its result
+    // (0x0F prefix). volatile because it is written from the NimBLE callback and
+    // polled from the update task.
+    volatile bool installResultReceived = false;
     uint32_t currentPart = 0;
     uint32_t fileParts = 0;
 };

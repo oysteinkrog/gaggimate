@@ -1,4 +1,5 @@
 #include "ControllerOTA.h"
+#include "common.h"
 #include <HTTPClient.h>
 #include <LittleFS.h>
 #include <WiFiClient.h>
@@ -44,6 +45,10 @@ bool ControllerOTA::update(WiFiClientSecure &wifi_client, const String &release_
         return false;
     }
 
+    // Clear any result left over from a previous attempt so waitForInstallResult
+    // can only observe this run's notification.
+    installResultReceived = false;
+
     if (LittleFS.exists(UPDATE_FILE)) {
         ESP_LOGI("ControllerOTA", "Removing previous update file");
         LittleFS.remove(UPDATE_FILE);
@@ -81,6 +86,13 @@ bool ControllerOTA::update(WiFiClientSecure &wifi_client, const String &release_
 }
 
 bool ControllerOTA::downloadFile(WiFiClientSecure &wifi_client, const String &release_url) {
+    // The CA bundle attachment does not survive a prior HTTPClient begin/end
+    // cycle on this same client (the caller resolves the redirect first, which
+    // runs its own requests), so re-attach immediately before this begin() or
+    // the handshake fails with -30336 "No CA Chain is set". release_url is
+    // already the terminal single-host asset URL, so redirect-following is off:
+    // if it ever redirects we want a loud failure, not a silently untrusted leg.
+    attach_ca_bundle(wifi_client);
     HTTPClient http;
     if (!http.begin(wifi_client, release_url)) {
         ESP_LOGE("ControllerOTA", "Failed to start http client");
@@ -90,7 +102,7 @@ bool ControllerOTA::downloadFile(WiFiClientSecure &wifi_client, const String &re
     http.useHTTP10(true);
     http.setTimeout(60000);
     http.setConnectTimeout(10000);
-    http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+    http.setFollowRedirects(HTTPC_DISABLE_FOLLOW_REDIRECTS);
     http.setUserAgent("ESP32-http-Update");
     http.addHeader("Cache-Control", "no-cache");
     int code = http.GET();
@@ -376,8 +388,38 @@ void ControllerOTA::onReceive(NimBLERemoteCharacteristic *pRemoteCharacteristic,
     case 0xF2:
         ESP_LOGI("ControllerOTA", "Controller installing firmware");
         break;
+    case 0x0F:
+        // The controller's async installer reports its Arduino Update result as
+        // a 0x0F-prefixed ASCII string: "Written: x/y [z %]", "OTA Done:
+        // Success!/Failed!", "Error #: N", or "Not enough space...". This used
+        // to fall into the unlogged default case, hiding a failed install
+        // behind the display's "update successful". Log it verbatim; it is the
+        // only window we get into what the controller's flash actually did.
+        ESP_LOGI("ControllerOTA", "Controller install result: %.*s", static_cast<int>(length - 1),
+                 reinterpret_cast<const char *>(pData + 1));
+        installResultReceived = true;
+        break;
     default:
-        ESP_LOGI("ControllerOTA", "Unhandled message");
+        ESP_LOGI("ControllerOTA", "Unhandled message (0x%02x, %u bytes)", lastSignal, static_cast<unsigned>(length));
         break;
     }
+}
+
+bool ControllerOTA::waitForInstallResult(uint32_t timeoutMs) {
+    const uint32_t start = millis();
+    while (millis() - start < timeoutMs) {
+        if (installResultReceived) {
+            return true;
+        }
+        // The controller reboots itself a few seconds after flashing, which
+        // drops the link. If that happens before a result notification lands we
+        // are not going to get one, so stop waiting.
+        if (client == nullptr || !client->isConnected()) {
+            ESP_LOGW("ControllerOTA", "Controller link dropped before an install result arrived");
+            return false;
+        }
+        delay(100);
+    }
+    ESP_LOGW("ControllerOTA", "No install result from controller within %u ms", timeoutMs);
+    return false;
 }

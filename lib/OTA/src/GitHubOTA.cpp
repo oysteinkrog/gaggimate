@@ -98,16 +98,37 @@ void GitHubOTA::update(bool controller, bool display) {
         // controller .bin hits GitHub with no trusted roots and the TLS handshake
         // fails (the constructor no longer attaches it once for the client).
         attach_ca_bundle(_wifi_client);
+        // Resolve the github.com -> release-assets.githubusercontent.com hop up
+        // front: downloadFile() follows redirects with HTTPClient, which drops
+        // the CA bundle across hosts (-30336). Handing it the terminal
+        // single-host URL keeps the one GET it makes on a trusted leg.
+        const String controller_url = resolve_redirect_chain(_wifi_client, _latest_url + _controller_firmware_name);
+        if (controller_url.length() == 0) {
+            ESP_LOGE(TAG, "Could not resolve controller firmware URL; aborting update.");
+            this->phase = PHASE_ERROR;
+            this->_phase_callback(PHASE_ERROR);
+            return;
+        }
         // This used to ignore the result and log "Controller update successful"
         // unconditionally, then fall through to reboot the display -- so a
         // controller that never received the image reported a clean update.
-        if (!_controller_ota.update(_wifi_client, _latest_url + _controller_firmware_name)) {
+        if (!_controller_ota.update(_wifi_client, controller_url)) {
             ESP_LOGE(TAG, "Controller update failed; not touching the display image.");
             this->phase = PHASE_ERROR;
             this->_phase_callback(PHASE_ERROR);
             return;
         }
-        ESP_LOGI(TAG, "Controller update successful.");
+        ESP_LOGI(TAG, "Controller received the image; waiting for its install result.");
+        // update() returns as soon as the controller acks receipt (0xF2), but
+        // the controller flashes the image asynchronously afterwards and only
+        // then notifies whether Update.end() actually succeeded. The display
+        // used to reboot ~1 s later (updateExecuted -> restart below), tearing
+        // down BLE before that result could arrive, so a failed install looked
+        // identical to a good one. Hold a bounded window for the result to land
+        // and be logged. This is diagnostic only: a timeout does not change the
+        // outcome, and the display still reboots to reconnect either way.
+        _controller_ota.waitForInstallResult(25000);
+        ESP_LOGI(TAG, "Controller update sequence finished.");
         updateExecuted = true;
     }
 
@@ -165,7 +186,17 @@ HTTPUpdateResult GitHubOTA::update_firmware(const String &url) {
     }
 
     attach_ca_bundle(_wifi_client);
-    auto result = Updater.update(_wifi_client, url);
+    // Updater follows redirects with FORCE_FOLLOW, which drops the CA bundle
+    // across the github.com -> release-assets.githubusercontent.com hop
+    // (-30336). Resolve to the terminal single-host URL so the update runs on a
+    // trusted leg with no redirect to follow.
+    const String resolved = resolve_redirect_chain(_wifi_client, url);
+    if (resolved.length() == 0) {
+        ESP_LOGE(TAG, "Could not resolve firmware URL: %s", url.c_str());
+        return HTTP_UPDATE_FAILED;
+    }
+    attach_ca_bundle(_wifi_client);
+    auto result = Updater.update(_wifi_client, resolved);
 
     print_update_result(Updater, result, TAG);
     return result;

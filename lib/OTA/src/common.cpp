@@ -61,15 +61,62 @@ String get_redirect_location(WiFiClientSecure &wifi_client, String &initial_url)
     return redirect_url;
 }
 
+String resolve_redirect_chain(WiFiClientSecure &wifi_client, String url, int maxHops) {
+    const char *TAG = "resolve_redirect_chain";
+    for (int hop = 0; hop < maxHops; hop++) {
+        // Re-attach before every leg: HTTPClient's own redirect follow does
+        // not, which is the whole bug this exists to route around.
+        attach_ca_bundle(wifi_client);
+        HTTPClient https;
+        https.setFollowRedirects(HTTPC_DISABLE_FOLLOW_REDIRECTS);
+        if (!https.begin(wifi_client, url)) {
+            ESP_LOGE(TAG, "[HTTPS] Unable to connect: %s", url.c_str());
+            return "";
+        }
+        // GET, not HEAD: the signed release-assets URL is issued for a GET
+        // ("sp=r") and can refuse HEAD. GET returns after status + headers;
+        // the body is never read here, so probing the terminal asset costs a
+        // header exchange, not its megabytes.
+        const int code = https.GET();
+        if (code == HTTP_CODE_OK) {
+            https.end();
+            return url;
+        }
+        if (code == HTTP_CODE_MOVED_PERMANENTLY || code == HTTP_CODE_FOUND ||
+            code == HTTP_CODE_TEMPORARY_REDIRECT || code == HTTP_CODE_PERMANENT_REDIRECT) {
+            const String loc = https.getLocation();
+            https.end();
+            if (loc.length() == 0) {
+                ESP_LOGE(TAG, "redirect (%d) with empty Location", code);
+                return "";
+            }
+            url = loc;
+            continue;
+        }
+        ESP_LOGE(TAG, "[HTTPS] unexpected code %d for %s", code, url.c_str());
+        https.end();
+        return "";
+    }
+    ESP_LOGE(TAG, "too many redirects");
+    return "";
+}
+
 String get_updated_version_via_txt_file(WiFiClientSecure &wifi_client, String &_release_url) {
     const char *TAG = "get_updated_version_via_txt_file";
+    const String start = _release_url + "version.txt";
+    ESP_LOGI(TAG, "url: %s", start.c_str());
+    // Resolve the github.com -> release-assets.githubusercontent.com hop by
+    // hand so the final GET is a single-host request the CA bundle survives.
+    const String resolved = resolve_redirect_chain(wifi_client, start);
+    if (resolved.length() == 0) {
+        ESP_LOGE(TAG, "[HTTPS] could not resolve version.txt URL");
+        return "";
+    }
+
     attach_ca_bundle(wifi_client);
     HTTPClient https;
-    https.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
-
-    String url = _release_url + "version.txt";
-    ESP_LOGI(TAG, "url: %s\n", url.c_str());
-    if (!https.begin(wifi_client, url)) {
+    https.setFollowRedirects(HTTPC_DISABLE_FOLLOW_REDIRECTS);
+    if (!https.begin(wifi_client, resolved)) {
         ESP_LOGE(TAG, "[HTTPS] Unable to connect\n");
         return "";
     }
