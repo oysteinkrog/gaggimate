@@ -50,6 +50,12 @@ export function GeneralTabSkeleton() {
   );
 }
 
+// The Display tab has the same two-card shape as General (a field grid with a
+// bordered sub-block, then a second card), so it shares that skeleton geometry.
+export function DisplayTabSkeleton() {
+  return <GeneralTabSkeleton />;
+}
+
 export function MachineTabSkeleton() {
   return (
     <div className='space-y-4 sm:space-y-6'>

@@ -28,6 +28,7 @@ import lazy from 'preact-iso/lazy';
 import { StickyFormFooter } from './StickyFormFooter.jsx';
 import {
   GeneralTabSkeleton,
+  DisplayTabSkeleton,
   MachineTabSkeleton,
   PluginsTabSkeleton,
   BluetoothTabSkeleton,
@@ -35,6 +36,7 @@ import {
 } from '../../components/skeletons/SettingsSkeletons.jsx';
 import { GeneralTab } from './tabs/GeneralTab.jsx';
 
+const LazyDisplayTab = lazy(() => import('./tabs/DisplayTab.jsx').then(m => m.DisplayTab));
 const LazyMachineTab = lazy(() => import('./tabs/MachineTab.jsx').then(m => m.MachineTab));
 const LazyCalibrationTab = lazy(() =>
   import('./tabs/CalibrationTab.jsx').then(m => m.CalibrationTab),
@@ -43,6 +45,7 @@ const LazyPluginsTab = lazy(() => import('./tabs/PluginsTab.jsx').then(m => m.Pl
 const LazyBluetoothTab = lazy(() => import('./tabs/BluetoothTab.jsx').then(m => m.BluetoothTab));
 const LazySystemTab = lazy(() => import('./tabs/SystemTab.jsx').then(m => m.SystemTab));
 
+const loadDisplayTab = () => import('./tabs/DisplayTab.jsx');
 const loadMachineTab = () => import('./tabs/MachineTab.jsx');
 const loadCalibrationTab = () => import('./tabs/CalibrationTab.jsx');
 const loadPluginsTab = () => import('./tabs/PluginsTab.jsx');
@@ -51,6 +54,7 @@ const loadSystemTab = () => import('./tabs/SystemTab.jsx');
 
 // Icons
 import { faSliders } from '@fortawesome/free-solid-svg-icons/faSliders';
+import { faDisplay } from '@fortawesome/free-solid-svg-icons/faDisplay';
 import { faTemperatureHalf } from '@fortawesome/free-solid-svg-icons/faTemperatureHalf';
 import { faCrosshairs } from '@fortawesome/free-solid-svg-icons/faCrosshairs';
 import { faPuzzlePiece } from '@fortawesome/free-solid-svg-icons/faPuzzlePiece';
@@ -203,7 +207,7 @@ export function Settings() {
   const apiService = useContext(ApiServiceContext);
   const { params } = useRoute();
   const tab = params.tab || 'general';
-  const isFormTab = ['general', 'machine', 'plugins'].includes(tab);
+  const isFormTab = ['general', 'display', 'machine', 'plugins'].includes(tab);
 
   const [profiles, setProfiles] = useState([]);
   const [submitting, setSubmitting] = useState(false);
@@ -406,6 +410,7 @@ export function Settings() {
 
   const settingsTabs = [
     { id: 'general', label: 'General', icon: faSliders },
+    { id: 'display', label: 'Display', icon: faDisplay, preload: loadDisplayTab },
     { id: 'machine', label: 'Machine', icon: faTemperatureHalf, preload: loadMachineTab },
     { id: 'calibration', label: 'Calibration', icon: faCrosshairs, preload: loadCalibrationTab },
     { id: 'plugins', label: 'Plugins', icon: faPuzzlePiece, preload: loadPluginsTab },
@@ -499,6 +504,12 @@ export function Settings() {
               showApPassword={showApPassword}
               setShowApPassword={setShowApPassword}
             />
+          ))}
+        {tab === 'display' &&
+          (isLoading ? (
+            <DisplayTabSkeleton />
+          ) : (
+            <LazyDisplayTab formData={formData} onChange={onChange} setField={setField} />
           ))}
         {tab === 'machine' &&
           (isLoading ? (
