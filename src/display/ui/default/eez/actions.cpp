@@ -103,7 +103,30 @@ void action_on_profile_save_as_new(lv_event_t *e) {
 };
 
 // Repaint all of a dial meter's ticks as rounded pills/dots
+#ifdef GM_TOUCH_PROBE
+#include <esp_timer.h>
+// Attribution for GM_UISTAT's draw= bucket (the whole lv_obj_redraw walk of a
+// snapshot pass): how much of it is this handler, and how well the per-tick
+// clip precheck is holding. Printed and reset by the UISTAT logger in
+// DefaultUI.cpp on its 5 s cadence.
+int64_t g_meterDrawUs = 0;
+uint32_t g_meterDrawCalls = 0, g_meterTicksDrawn = 0, g_meterTicksClipped = 0;
+#endif
+
+static void gm_meter_draw_inner(lv_event_t *e);
+
 void action_on_meter_draw(lv_event_t *e) {
+#ifdef GM_TOUCH_PROBE
+    const int64_t t0 = esp_timer_get_time();
+    gm_meter_draw_inner(e);
+    g_meterDrawUs += esp_timer_get_time() - t0;
+    g_meterDrawCalls++;
+#else
+    gm_meter_draw_inner(e);
+#endif
+};
+
+static void gm_meter_draw_inner(lv_event_t *e) {
     lv_obj_t *obj = lv_event_get_target(e);
     if (!lv_obj_check_type(obj, &lv_meter_class)) {
         return;
@@ -177,8 +200,14 @@ void action_on_meter_draw(lv_event_t *e) {
                        (lv_coord_t)(dy + ri + 2)};
         }
         if (!_lv_area_is_on(&tickBox, draw_ctx->clip_area)) {
+#ifdef GM_TOUCH_PROBE
+            g_meterTicksClipped++;
+#endif
             continue;
         }
+#ifdef GM_TOUCH_PROBE
+        g_meterTicksDrawn++;
+#endif
 
         const int32_t value = lv_map(i, 0, cnt - 1, scale->min, scale->max);
 
@@ -271,6 +300,15 @@ static void suppressMeterTicks(lv_obj_t *obj) {
                 scale->tick_major_nth = scale->tick_cnt;
                 scale->tick_cnt = 0;
             }
+            // The default theme dresses every meter in the card style: a grey
+            // border ring under a full-circle radius mask. The screens zero
+            // bg_opa but not the border, so each meter redraw still paid the
+            // circle-mask border pass (measured 2-21 ms per lv_draw_rect call,
+            // ~22 ms of a ~68 ms walk per refresh) for a ring that lies in the
+            // round panel's invisible corner region: the 500 px dial overhangs
+            // the 480 px display everywhere the ring would show.
+            lv_obj_set_style_border_width(child, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
+            lv_obj_set_style_outline_width(child, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
         }
         suppressMeterTicks(child);
     }

@@ -38,6 +38,14 @@ class BandDma {
     // outstanding, so four is slack rather than a limit.
     static constexpr int SLOTS = 4;
 
+    // Largest row-group count submitRows() below will mount in one call.
+    // install()'s own link-list sizing (maxTransferBytes / 2048 + 2) already
+    // has enough spare items to cover BAND_H/2 single-row groups up to
+    // BAND_H=64 -- the arithmetic is in install()'s comment -- so this is a
+    // ceiling submitRows() enforces on its caller, not a size this class has
+    // to grow its own lists for.
+    static constexpr int MAX_ROW_GROUPS = 8;
+
     BandDma() = default;
     ~BandDma();
     BandDma(const BandDma &) = delete;
@@ -60,6 +68,32 @@ class BandDma {
     //
     // Returns ESP_OK once the transfer is queued. It does NOT wait.
     esp_err_t submit(int slot, void *dst, const void *src, size_t bytes, void *arg);
+
+    // Queues a STRIPED transfer: `n` disjoint row-groups within one band,
+    // each `groupBytes` long, read from `srcBase + rowOffsets[i]` and written
+    // to `dstBase + rowOffsets[i]` -- the same offset on both sides, because
+    // the caller's SRAM band buffer and the destination framebuffer band
+    // region share one row layout, only the base pointer differs.
+    //
+    // This exists for interlaced pushes, where only some rows of the band
+    // hold this frame's content and the rest is a stale slot from NUM_SLOTS-1
+    // bands back. submit() above mounts one contiguous run, so it would DMA
+    // that stale content over destination rows the LAST frame correctly
+    // wrote. Mounting `n` separate buffers instead means the gaps between
+    // them never get a descriptor at all -- gdma_link_mount_buffers puts each
+    // buffer in the config array on its own list item(s) rather than
+    // coalescing them (see its own doc comment) -- so the skipped rows are
+    // never read from srcBase and never written to dstBase, not merely
+    // "skipped" by a policy this engine has to remember to apply.
+    //
+    // Same semantics as submit() otherwise: queues and returns without
+    // waiting, `slot` must be free, `arg` reaches the completion callback
+    // untouched. Fails with ESP_ERR_INVALID_SIZE if n is 0, exceeds
+    // MAX_ROW_GROUPS, or the total would exceed the size install() sized the
+    // descriptor lists for -- the caller already has a CPU-push fallback for
+    // submit() failures and this reuses it rather than asserting.
+    esp_err_t submitRows(int slot, void *dstBase, const void *srcBase, const uint32_t *rowOffsets, int n,
+                         size_t groupBytes, void *arg);
 
     // Destination alignment this channel requires, valid after install(). The
     // caller needs it to decide whether its buffers can be used at all.
@@ -96,6 +130,10 @@ class BandDma {
     static bool rxEofTrampoline(gdma_channel_handle_t chan, gdma_event_data_t *ev, void *user);
     bool onRxEof();
     void startSlot(int slot); // must not be called while another transfer runs
+    // Shared tail of submit()/submitRows(): both have already mounted their
+    // buffers onto _txLink[slot]/_rxLink[slot] by the time they call this: it
+    // only owns the pending-ring bookkeeping and kicking the engine if idle.
+    esp_err_t queueSlot(int slot, void *arg);
 
     gdma_channel_handle_t _txChan = nullptr;
     gdma_channel_handle_t _rxChan = nullptr;

@@ -294,6 +294,10 @@ class DefaultUI {
     float currentTemp = 0.0f;
     float targetTemp = 0.0f;
     double activeWeight = 0.0;
+    // Scale screen reads the hardware cells directly, not the mode-gated active
+    // stream: getActiveScaleSource() goes BLUETOOTH-only in grind mode and would
+    // freeze this readout. hardware:change fires on every valid HW measurement.
+    double scaleHardwareWeight = 0.0;
     BrewScreenState brewScreenState = BrewScreenState::Brew;
 
     // EEZ Structs

@@ -38,6 +38,35 @@ int64_t g_ovlAreaSum = 0, g_ovlAreaMax = 0;
 int64_t g_snapClearSum = 0, g_snapDrawSum = 0;
 int64_t g_uiStatLastLog = 0;
 } // namespace
+// Defined in eez/actions.cpp: the meter tick-draw handler's share of the
+// draw= bucket, plus its clip-precheck hit rate. Outside the anonymous
+// namespace, or the extern picks up internal linkage and never resolves.
+extern int64_t g_meterDrawUs;
+extern uint32_t g_meterDrawCalls, g_meterTicksDrawn, g_meterTicksClipped;
+// Defined in the patched LVGL libdep (scripts/patch_lvgl_walkstat.py): the
+// walk's event-dispatch / style-lookup / image-blit shares. gm_ws_active is
+// raised around the snapshot lv_obj_redraw below so these partition exactly
+// the draw= bucket. C symbols, hence the linkage block.
+extern "C" {
+extern bool gm_ws_active;
+extern uint32_t gm_ws_ev_calls;
+extern int64_t gm_ws_ev_us;
+extern uint32_t gm_ws_style_calls;
+extern int64_t gm_ws_style_us;
+extern uint32_t gm_ws_img_calls;
+extern int64_t gm_ws_img_us;
+extern uint32_t gm_ws_rect_calls;
+extern int64_t gm_ws_rect_us;
+extern uint32_t gm_ws_rectr_calls;
+extern int64_t gm_ws_rectr_us;
+extern int64_t gm_ws_rect_max_us;
+extern uint32_t gm_ws_label_calls;
+extern int64_t gm_ws_label_us;
+extern uint32_t gm_ws_line_calls;
+extern int64_t gm_ws_line_us;
+extern uint32_t gm_ws_arc_calls;
+extern int64_t gm_ws_arc_us;
+}
 #endif
 #endif
 #include <display/main.h>
@@ -274,6 +303,12 @@ void DefaultUI::init() {
             rerender = true;
         }
     });
+    // Scale screen feed. The hardware cells report through this event on every
+    // valid measurement regardless of controller mode, so the readout stays live
+    // even while the overlay forces MODE_GRIND (which routes active:change to the
+    // Bluetooth-only grind source and would otherwise freeze it).
+    pluginManager->on("controller:volumetric-measurement:hardware:change",
+                      [this](Event const &event) { scaleHardwareWeight = event.getFloat("value"); });
     xTaskCreatePinnedToCore(profileLoopTask, "DefaultUI::loopProfiles", configMINIMAL_STACK_SIZE * 4, this, 1, &profileTaskHandle,
                             0);
 }
@@ -1002,9 +1037,11 @@ bool DefaultUI::snapshotAreaToOverlay(lv_obj_t *obj, uint8_t *buf, uint32_t bufS
     _lv_refr_set_disp_refreshing(&fakeDisp);
 #ifdef GM_TOUCH_PROBE
     const int64_t draw0 = esp_timer_get_time();
+    gm_ws_active = true;
 #endif
     lv_obj_redraw(drawCtx, obj);
 #ifdef GM_TOUCH_PROBE
+    gm_ws_active = false;
     g_snapDrawSum += esp_timer_get_time() - draw0;
 #endif
     _lv_refr_set_disp_refreshing(refrOri);
@@ -1183,8 +1220,15 @@ void DefaultUI::refreshSleepOverlay() {
     overlayDirtyN[back] = 0;
     // A widget just changed. Do not let interlacing split that change across
     // two frames; on hard-edged UI content the half-updated frame is plainly
-    // visible, where on the animation it is not.
-    sleepAnimation.requestWholeFrames();
+    // visible, where on the animation it is not. Regional, not global: only
+    // the bands `ranges` actually covers need this, and ranges is the exact
+    // list publishOverlayRanges() just used a few lines up, in the same
+    // panel-row space -- not a fresh read of anything, so there is nothing
+    // to race against that publish. A first-fill or geometry-change pass
+    // above set clips[0] (and so ranges[0]) to the whole screen, which
+    // covers every band the same way the old global call did; only a
+    // partial telemetry update actually narrows this to a handful of bands.
+    sleepAnimation.requestBandWarmup(ranges, clipN);
 #endif
 }
 
@@ -1213,7 +1257,7 @@ void DefaultUI::maintainScaleScreen() {
             displaceGrindWidgets(true);
             lv_obj_clear_flag(scaleScreen, LV_OBJ_FLAG_HIDDEN);
             lv_obj_move_foreground(scaleScreen);
-            const float w = static_cast<float>(activeWeight);
+            const float w = static_cast<float>(scaleHardwareWeight);
             if (scaleWeightLabel != nullptr && fabsf(w - lastShownScaleWeight) >= 0.05f) {
                 lastShownScaleWeight = w;
                 lv_label_set_text_fmt(scaleWeightLabel, "%.1f", static_cast<double>(w));
@@ -1835,7 +1879,9 @@ void DefaultUI::loopTask(void *arg) {
                 g_uiStatLastLog = esp_timer_get_time();
                 ESP_LOGI("TouchProbe",
                          "GM_UISTAT: passes=%lu avg=%lld max=%lld us | refreshes=%lu snap avg=%lld max=%lld pub "
-                         "avg=%lld max=%lld area avg=%lld max=%lld px | clear=%lld draw=%lld scan=%lld scrim=%lld",
+                         "avg=%lld max=%lld area avg=%lld max=%lld px | clear=%lld draw=%lld scan=%lld scrim=%lld"
+                         " | meter=%lld mcalls=%lu ticks=%lu clip=%lu | ev=%lld/%lu sty=%lld/%lu img=%lld/%lu"
+                         " rect=%lld/%lu rectr=%lld/%lu rmax=%lld lbl=%lld/%lu ln=%lld/%lu arc=%lld/%lu",
                          (unsigned long)g_uiPassN, (long long)(g_uiPassSum / g_uiPassN), (long long)g_uiPassMax,
                          (unsigned long)g_ovlN, (long long)(g_ovlN ? g_ovlSnapSum / g_ovlN : 0), (long long)g_ovlSnapMax,
                          (long long)(g_ovlN ? g_ovlPubSum / g_ovlN : 0), (long long)g_ovlPubMax,
@@ -1843,7 +1889,18 @@ void DefaultUI::loopTask(void *arg) {
                          (long long)(g_ovlN ? g_snapClearSum / g_ovlN : 0),
                          (long long)(g_ovlN ? g_snapDrawSum / g_ovlN : 0),
                          (long long)(g_ovlN ? g_statPubScanUs / g_ovlN : 0),
-                         (long long)(g_ovlN ? g_statPubScrimUs / g_ovlN : 0));
+                         (long long)(g_ovlN ? g_statPubScrimUs / g_ovlN : 0),
+                         (long long)(g_ovlN ? g_meterDrawUs / g_ovlN : 0), (unsigned long)g_meterDrawCalls,
+                         (unsigned long)g_meterTicksDrawn, (unsigned long)g_meterTicksClipped,
+                         (long long)(g_ovlN ? gm_ws_ev_us / g_ovlN : 0), (unsigned long)gm_ws_ev_calls,
+                         (long long)(g_ovlN ? gm_ws_style_us / g_ovlN : 0), (unsigned long)gm_ws_style_calls,
+                         (long long)(g_ovlN ? gm_ws_img_us / g_ovlN : 0), (unsigned long)gm_ws_img_calls,
+                         (long long)(g_ovlN ? gm_ws_rect_us / g_ovlN : 0), (unsigned long)gm_ws_rect_calls,
+                         (long long)(g_ovlN ? gm_ws_rectr_us / g_ovlN : 0), (unsigned long)gm_ws_rectr_calls,
+                         (long long)gm_ws_rect_max_us,
+                         (long long)(g_ovlN ? gm_ws_label_us / g_ovlN : 0), (unsigned long)gm_ws_label_calls,
+                         (long long)(g_ovlN ? gm_ws_line_us / g_ovlN : 0), (unsigned long)gm_ws_line_calls,
+                         (long long)(g_ovlN ? gm_ws_arc_us / g_ovlN : 0), (unsigned long)gm_ws_arc_calls);
                 g_uiPassN = 0;
                 g_uiPassSum = g_uiPassMax = 0;
                 g_ovlN = 0;
@@ -1851,6 +1908,14 @@ void DefaultUI::loopTask(void *arg) {
                 g_ovlAreaSum = g_ovlAreaMax = 0;
                 g_snapClearSum = g_snapDrawSum = 0;
                 g_statPubScanUs = g_statPubScrimUs = 0;
+                g_meterDrawUs = 0;
+                g_meterDrawCalls = g_meterTicksDrawn = g_meterTicksClipped = 0;
+                gm_ws_ev_us = gm_ws_style_us = gm_ws_img_us = 0;
+                gm_ws_ev_calls = gm_ws_style_calls = gm_ws_img_calls = 0;
+                gm_ws_rect_us = gm_ws_label_us = gm_ws_line_us = gm_ws_arc_us = 0;
+                gm_ws_rect_calls = gm_ws_label_calls = gm_ws_line_calls = gm_ws_arc_calls = 0;
+                gm_ws_rectr_us = gm_ws_rect_max_us = 0;
+                gm_ws_rectr_calls = 0;
                 {
                     // Sizing data for a possible internal-RAM LVGL arena:
                     // the live set the tree walk chases vs. the internal

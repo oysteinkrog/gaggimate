@@ -347,6 +347,23 @@ static inline int emitRun(uint32_t *runs, int n, int x0, int x1, int gapMerge) {
 // icache is churned by LVGL on core 1, and a flash refill for this inner loop
 // queues on the MSPI behind the scan-out's PSRAM stream. The overlay bytes it
 // reads are PSRAM either way; the instruction stream doesn't have to be.
+#ifdef GM_TOUCH_PROBE
+// GM_RUNSTAT: geometric census of the composite's run widths, for the PIE
+// group-blend go/no-go (tools/animbench/kernels-blend). The vector kernel only
+// fires on 8-aligned groups of 8 pixels inside one run, so the decision needs
+// the run-width distribution and the 8-aligned coverage from real content;
+// the 24.6k-px figure in older comments predates the scrim/glyph split and
+// pairs with a different run structure. Written and read on the render task
+// only (census in the composite, log+reset in the 10 s fps window).
+static uint32_t gmRunWidthBuckets[7]; // 1-3, 4-7, 8-11, 12-15, 16-23, 24-31, 32+
+static uint32_t gmRunCount, gmRunPx, gmRunG8Px;
+// Aligned-group composition, classified exactly the way the candidate PIE
+// dispatch would: opq = all eight coverage bytes 255 (vector copy path),
+// blnd = all eight below 255 (vector arithmetic path, a==0 included), mix =
+// anything else (scalar fallback, the case that pays for the failed gather).
+static uint32_t gmGrpOpq, gmGrpBlnd, gmGrpMix;
+#endif
+
 __attribute__((noinline)) static void IRAM_ATTR blendRow(uint16_t *__restrict dst, const uint8_t *__restrict colour,
                                                          const uint32_t *__restrict runs, int nRuns) {
     for (int i = 0; i < nRuns; i++) {
@@ -365,6 +382,207 @@ __attribute__((noinline)) static void IRAM_ATTR blendRow(uint16_t *__restrict ds
             // Opaque is most of a glyph's interior and needs no arithmetic at
             // all; only the antialiased rim reaches blend565.
             dst[x] = a == 255 ? c : blend565(c, dst[x], static_cast<uint8_t>(a));
+        }
+    }
+}
+
+// PIE (vector) composite for blendRow, eight pixels per group. Design and
+// correctness proofs live in tools/animbench/kernels-blend/ (not shipped
+// in this tree): blend_model.h's header comment has the full per-channel
+// derivation (raw-magnitude reformulation of blend565's arithmetic),
+// prove_layer1.cpp/prove_layer2.cpp prove the design bit-exact against
+// blend565/blendRow above on the host (23.2M and 50,000 randomized cases
+// respectively, both zero failures), and prove_interp.cpp semantically
+// traces this exact EE.* instruction sequence (parsed live from
+// blend_group8.S, so it cannot drift from what was actually assembled)
+// against 1.6M randomized lanes, also zero failures. See that directory's
+// report for what those proofs do and do not establish -- in particular,
+// NONE of this has been run on a device or in QEMU; see the open risks
+// noted there before enabling this path.
+//
+// a==255 (fully opaque) is NOT safe for this vector formula: worked
+// counterexample (fg raw R=31, bg raw R=1, a=255) gives raw output R=30,
+// not fg's 31 -- the weighted-average formula is one 256th short of an
+// exact copy at full alpha, which is exactly why the scalar blendRow above
+// special-cases a==255 as a direct copy. Any 8-pixel group containing an
+// a==255 lane MUST take the copy path instead of this one; the dispatcher
+// below enforces that at group granularity (EE.* has no per-lane branch).
+alignas(16) static const DRAM_ATTR uint16_t kBlendGroupConsts[48] = {
+    // ones (0x0001 x8): EE.VMUL.U16 only ever shifts right, so multiplying
+    // by 1 at SAR=<bit position> is how a channel's raw magnitude is
+    // extracted from its bit-positioned value, and multiplying by 1 at
+    // SAR=8 is the final "divide by 256" -- one constant vector serves
+    // every right-shift this kernel needs.
+    1, 1, 1, 1, 1, 1, 1, 1,
+    0xF800, 0xF800, 0xF800, 0xF800, 0xF800, 0xF800, 0xF800, 0xF800, // maskR
+    2048, 2048, 2048, 2048, 2048, 2048, 2048, 2048,                 // constR2048: raw R (0..31) << 11, as a multiply
+    0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, // maskG
+    32, 32, 32, 32, 32, 32, 32, 32,                                 // constG32: raw G (0..63) << 5, as a multiply
+    0x001F, 0x001F, 0x001F, 0x001F, 0x001F, 0x001F, 0x001F, 0x001F, // maskB (already raw; blue needs no repositioning)
+};
+
+// One 8-pixel group of blend565, vectorised, for the case where NO lane in
+// the group has a==255 (the caller guarantees this). Safe for a==0 lanes:
+// the raw-magnitude formula is an exact identity there (reproduces bg
+// unchanged), proven both on host and via the semantic-trace interpreter
+// (see the file header comment above).
+//
+// dst8, colStage8, aStage8, invStage8 must all be 16-byte aligned, same
+// EE.VLD.128/EE.VST.128 caveat as scale565Oct above (misalignment
+// corrupts neighbouring memory silently rather than trapping).
+//
+// Register budget forced per-channel-serial processing (R, then G, then
+// B) rather than batching all three channels' work by shared SAR value:
+// q0 (fg), q1 (bg), q2 (a), q3 (inv), q7 (ones) are pinned for the whole
+// group (five of the eight q-registers), leaving only q4/q5/q6 free, with
+// q6 doubling as the running OR-accumulator so no channel's result needs a
+// spill to memory. This costs more `ssai` mode changes (9) than a
+// SAR-batched schedule would, but needs zero register spills -- see the
+// PIE-composite report in tools/animbench/kernels-blend/ for the batched
+// alternative that was considered and not used, and for the SAR-threading
+// risk this design still carries into a real device/QEMU validation pass.
+__attribute__((noinline)) static void blendGroup8General(uint16_t *__restrict dst8,
+                                                          const uint16_t *__restrict colStage8,
+                                                          const uint16_t *__restrict aStage8,
+                                                          const uint16_t *__restrict invStage8) {
+    const uint16_t *rd = dst8;
+    uint16_t *wr = dst8;
+    const uint16_t *col = colStage8;
+    const uint16_t *av = aStage8;
+    const uint16_t *iv = invStage8;
+    const uint16_t *ct = kBlendGroupConsts;
+    asm volatile("ee.vld.128.ip q7, %[ct], 16\n"
+                 "ee.vld.128.ip q0, %[col], 16\n"
+                 "ee.vld.128.ip q1, %[rd], 16\n"
+                 "ee.vld.128.ip q2, %[av], 16\n"
+                 "ee.vld.128.ip q3, %[iv], 16\n"
+                 "ee.vld.128.ip q4, %[ct], 16\n"
+                 "ee.andq q5, q0, q4\n"
+                 "ee.andq q4, q1, q4\n"
+                 "ssai 11\n"
+                 "ee.vmul.u16 q5, q5, q7\n"
+                 "ee.vmul.u16 q4, q4, q7\n"
+                 "ssai 0\n"
+                 "ee.vmul.u16 q5, q5, q2\n"
+                 "ee.vmul.u16 q4, q4, q3\n"
+                 "ee.vadds.s16 q5, q5, q4\n"
+                 "ssai 8\n"
+                 "ee.vmul.u16 q5, q5, q7\n"
+                 "ee.vld.128.ip q4, %[ct], 16\n"
+                 "ssai 0\n"
+                 "ee.vmul.u16 q6, q5, q4\n"
+                 "ee.vld.128.ip q4, %[ct], 16\n"
+                 "ee.andq q5, q0, q4\n"
+                 "ee.andq q4, q1, q4\n"
+                 "ssai 5\n"
+                 "ee.vmul.u16 q5, q5, q7\n"
+                 "ee.vmul.u16 q4, q4, q7\n"
+                 "ssai 0\n"
+                 "ee.vmul.u16 q5, q5, q2\n"
+                 "ee.vmul.u16 q4, q4, q3\n"
+                 "ee.vadds.s16 q5, q5, q4\n"
+                 "ssai 8\n"
+                 "ee.vmul.u16 q5, q5, q7\n"
+                 "ee.vld.128.ip q4, %[ct], 16\n"
+                 "ssai 0\n"
+                 "ee.vmul.u16 q5, q5, q4\n"
+                 "ee.orq q6, q6, q5\n"
+                 "ee.vld.128.ip q4, %[ct], 16\n"
+                 "ee.andq q5, q0, q4\n"
+                 "ee.andq q4, q1, q4\n"
+                 "ee.vmul.u16 q5, q5, q2\n"
+                 "ee.vmul.u16 q4, q4, q3\n"
+                 "ee.vadds.s16 q5, q5, q4\n"
+                 "ssai 8\n"
+                 "ee.vmul.u16 q5, q5, q7\n"
+                 "ee.orq q6, q6, q5\n"
+                 "ee.vst.128.ip q6, %[wr], 16\n"
+                 : [col] "+r"(col), [rd] "+r"(rd), [wr] "+r"(wr), [av] "+r"(av), [iv] "+r"(iv), [ct] "+r"(ct)
+                 :
+                 : "memory");
+}
+
+// Shared per-pixel scalar body -- byte-identical to blendRow's own inner
+// loop above, factored out so blendRowPie's prologue/epilogue/mixed-group
+// fallback all use exactly this code instead of a parallel reimplementation
+// of it (same reasoning as scanRow_pie_asm's scalar fallback elsewhere in
+// this codebase's PIE work).
+__attribute__((always_inline)) inline void blendPixelScalar(uint16_t *__restrict dst, const uint8_t *__restrict px,
+                                                              int x) {
+    const uint32_t a = px[2];
+    if (a == 0) {
+        return;
+    }
+    const uint16_t c = static_cast<uint16_t>(px[0] | (px[1] << 8));
+    dst[x] = a == 255 ? c : blend565(c, dst[x], static_cast<uint8_t>(a));
+}
+
+// blendRow, restructured around 8-pixel-aligned groups (see
+// tools/animbench/kernels-blend/ for the design and proofs). NOT YET
+// DEVICE-VALIDATED -- see the file header comment on blendGroup8General
+// and the PIE-composite report before switching the call site below from
+// blendRow to this function.
+__attribute__((noinline)) static void IRAM_ATTR blendRowPie(uint16_t *__restrict dst, const uint8_t *__restrict colour,
+                                                            const uint32_t *__restrict runs, int nRuns) {
+    for (int i = 0; i < nRuns; i++) {
+        const uint32_t r = runs[i];
+        int x = static_cast<int>(r & 0xFFFFu);
+        const int xEnd = static_cast<int>(r >> 16);
+
+        int xAlignedStart = (x + 7) & ~7;
+        if (xAlignedStart > xEnd) {
+            xAlignedStart = xEnd;
+        }
+        const int xAlignedEnd = xAlignedStart + ((xEnd - xAlignedStart) & ~7);
+
+        {
+            const uint8_t *px = colour + static_cast<size_t>(x) * 3;
+            for (; x < xAlignedStart; x++, px += 3) {
+                blendPixelScalar(dst, px, x);
+            }
+        }
+        for (; x < xAlignedEnd; x += 8) {
+            alignas(16) uint16_t colStage[8];
+            alignas(16) uint16_t aStage[8];
+            alignas(16) uint16_t invStage[8];
+            bool allOpaque = true;
+            bool anyOpaque = false;
+            {
+                const uint8_t *gp = colour + static_cast<size_t>(x) * 3;
+                for (int k = 0; k < 8; k++, gp += 3) {
+                    colStage[k] = static_cast<uint16_t>(gp[0] | (gp[1] << 8));
+                    const uint8_t a = gp[2];
+                    aStage[k] = a;
+                    invStage[k] = static_cast<uint16_t>(256u - a);
+                    if (a == 255) {
+                        anyOpaque = true;
+                    } else {
+                        allOpaque = false;
+                    }
+                }
+            }
+            if (allOpaque) {
+                const uint16_t *src = colStage;
+                uint16_t *wr = dst + x;
+                asm volatile("ee.vld.128.ip q0, %[src], 16\n"
+                             "ee.vst.128.ip q0, %[wr], 16\n"
+                             : [src] "+r"(src), [wr] "+r"(wr)
+                             :
+                             : "memory");
+            } else if (!anyOpaque) {
+                blendGroup8General(dst + x, colStage, aStage, invStage);
+            } else {
+                const uint8_t *px = colour + static_cast<size_t>(x) * 3;
+                for (int k = 0; k < 8; k++, px += 3) {
+                    blendPixelScalar(dst, px, x + k);
+                }
+            }
+        }
+        {
+            const uint8_t *px = colour + static_cast<size_t>(x) * 3;
+            for (; x < xEnd; x++, px += 3) {
+                blendPixelScalar(dst, px, x);
+            }
         }
     }
 }
@@ -399,6 +617,26 @@ __attribute__((always_inline)) inline void scrimCell(uint16_t *__restrict dst, u
 // The dim is keyed on the cell rather than on a pixel's own coverage on
 // purpose: the pixels that decide legibility are the transparent ones between
 // strokes and inside glyph counters, which the blend never touches at all.
+//
+// One 32-bit WORD (two pixels) per loop trip, not one cell (four pixels,
+// scrimCell's own unit) -- and counted up from zero, not walked over an
+// absolute word index -- is what actually gets this loop a hardware
+// zero-overhead LOOP. The per-cell `if (inv == SCRIM_INV_NONE) continue;`
+// this replaced looked like the obvious blocker (GCC's Xtensa backend needs
+// a fixed trip count for LOOP, and a data-dependent `continue` breaks that),
+// but removing just the branch does not fix it: 0 loops, 97 instructions,
+// worse than this function's original 94, because scrimCell's two words
+// computed back-to-back are what starve the loop-count register, not the
+// branch. Restructuring to one word per trip, counted from zero so the trip
+// count is its own SSA value at loop entry rather than a difference GCC has
+// to re-derive from a loop-carried index, recovers it: 64 instructions, 1
+// zero-overhead LOOP. Both the branch removal alone and this word-restructure
+// are bit-exact substitutions -- see the identity argument below and
+// tools/animbench/kernels-scrimfix/scrimrow.cpp for the full derivation
+// (including the rejected absolute-index shape, which is bit-exact and
+// halves the per-trip body the same way but still doesn't recover the
+// loop), the randomized bit-exactness proof, and the real-toolchain asm
+// evidence for all three shapes (tools/animbench/kernels-scrimfix/asm.sh).
 __attribute__((noinline)) static void scrimRow(uint16_t *__restrict dst, const uint8_t *__restrict invRow,
                                                const uint32_t *__restrict runs, int nRuns, int w) {
     for (int i = 0; i < nRuns; i++) {
@@ -408,16 +646,20 @@ __attribute__((noinline)) static void scrimRow(uint16_t *__restrict dst, const u
         if ((c1 << SCRIM_SHIFT) > w) {
             c1 = w >> SCRIM_SHIFT;
         }
-        for (int c = c0; c < c1; c++) {
-            // Already the 1/32 factor, not the coverage it came from: the
-            // strength multiply, the clamp and the rounding are the same for
-            // every frame the overlay lives through, so buildScrim does them
-            // once per publish instead of 24,000 times per frame.
-            const uint32_t inv = invRow[c];
-            if (inv == SCRIM_INV_NONE) {
-                continue; // a cell a gap merge swallowed
-            }
-            scrimCell(dst, inv, c);
+        // scrimCell maps cell c to words 2c and 2c+1 of the row (dst is
+        // 4-byte aligned to start and a scrim cell starts on an even pixel,
+        // see the comment on scale565x2 above), so this cast agrees with
+        // scrimCell's own reinterpret_cast<uint32_t*>(dst + (c<<2)) on where
+        // a cell's two words live.
+        uint32_t *const qBase = reinterpret_cast<uint32_t *>(dst + (c0 << SCRIM_SHIFT));
+        const int nWords = (c1 - c0) * 2;
+        for (int wi = 0; wi < nWords; wi++) {
+            // No skip on SCRIM_INV_NONE: scale565(c, 32) == c exactly (see
+            // scale565's own doc comment above -- "32 keeps the pixel"), so
+            // scaling a cell a gap merge already left at full strength is a
+            // wasted multiply, not a wrong pixel.
+            const uint32_t inv = invRow[c0 + (wi >> 1)];
+            qBase[wi] = scale565x2(qBase[wi], inv);
         }
     }
 }
@@ -804,6 +1046,13 @@ void SleepAnimation::start(Display *d) {
         }
         if (scrimTmp == nullptr) {
             scrimTmp = static_cast<uint8_t *>(ps_malloc(static_cast<size_t>(overlays[0].scrimW) * overlays[0].scrimH));
+        }
+        if (scrimTmp2 == nullptr) {
+            // Second scratch for the regional rebuild's ping-pong: its band
+            // passes must not run through ov.scrim, whose rows outside the
+            // rewrite window have to survive. Optional: when this allocation
+            // fails, every rebuild simply takes the whole-grid path.
+            scrimTmp2 = static_cast<uint8_t *>(ps_malloc(static_cast<size_t>(overlays[0].scrimW) * overlays[0].scrimH));
         }
         if (scrimCmp == nullptr) {
             scrimCmp = static_cast<uint8_t *>(ps_malloc(static_cast<size_t>(overlays[0].scrimW) * overlays[0].scrimH));
@@ -1484,21 +1733,33 @@ void SleepAnimation::publishOverlayRanges(int w, int h, const int (*ranges)[2], 
     g_statPubScanUs += scrim0 - scan0;
 #endif
     if (doScrim && m > 0) {
-        // The rebuild is seven whole-grid passes over PSRAM (~34 ms measured),
-        // and most publishes are recolors that leave the coverage grid
-        // byte-identical. Rebuild only when a scanned cell actually changed,
-        // or when the dim strength moved under an unchanged grid.
-        bool scrimChanged = scrimCmp == nullptr || ov.scrimBuiltQ8 != scrimQ8.load();
-        for (int g = 0; !scrimChanged && g < m; g++) {
-            const int cellY0 = rr[g][0] >> SCRIM_SHIFT;
-            const int cellY1 = ((rr[g][1] + (1 << SCRIM_SHIFT) - 1) >> SCRIM_SHIFT);
-            scrimChanged = memcmp(scrimCmp + static_cast<size_t>(cellY0) * sw,
-                                  ov.scrimSrc + static_cast<size_t>(cellY0) * sw,
-                                  static_cast<size_t>(cellY1 - cellY0) * sw) != 0;
-        }
-        if (scrimChanged) {
+        // The full rebuild is seven whole-grid passes over PSRAM (~34 ms
+        // measured), and most publishes are recolors that leave the coverage
+        // grid byte-identical. Rebuild nothing when no scanned cell changed;
+        // rebuild only the reachable rows when some did (a telemetry text
+        // update touches a handful of cell rows out of 120); fall back to the
+        // whole grid when the dim strength moved (every row's quantization
+        // changes) or the scratch the regional path needs is missing.
+        const bool fullNeeded = scrimCmp == nullptr || scrimTmp2 == nullptr || ov.scrimBuiltQ8 != scrimQ8.load();
+        if (fullNeeded) {
             buildScrim(ov, panelW, panelH);
             ov.scrimBuiltQ8 = scrimQ8.load();
+        } else {
+            // One regional rebuild per changed range rather than one over
+            // their union: the ranges are typically small and far apart (top
+            // telemetry text vs mid-screen timer), and a union band spanning
+            // them costs most of a full rebuild. Sequential per-range calls
+            // are exact: each rewrites precisely the rows its own band can
+            // reach, computed from the current source, and rows outside every
+            // rewrite window have no changed source row within reach.
+            for (int g = 0; g < m; g++) {
+                const int cellY0 = rr[g][0] >> SCRIM_SHIFT;
+                const int cellY1 = ((rr[g][1] + (1 << SCRIM_SHIFT) - 1) >> SCRIM_SHIFT);
+                if (memcmp(scrimCmp + static_cast<size_t>(cellY0) * sw, ov.scrimSrc + static_cast<size_t>(cellY0) * sw,
+                           static_cast<size_t>(cellY1 - cellY0) * sw) != 0) {
+                    buildScrimRegional(ov, cellY0, cellY1 - 1);
+                }
+            }
         }
     }
 #ifdef GM_TOUCH_PROBE
@@ -1513,6 +1774,48 @@ void SleepAnimation::publishOverlayRanges(int w, int h, const int (*ranges)[2], 
     // for updates nobody is watching that closely.
     if (overlayWakeSem != nullptr && esp_timer_get_time() - g_touchEdgeAtUs < GM_TOUCH_GRACE_US) {
         xSemaphoreGive(static_cast<SemaphoreHandle_t>(overlayWakeSem));
+    }
+}
+
+// See the comment on the declaration for the rationale. ranges[] here is the
+// exact same list the caller just handed to publishOverlayRanges() above (in
+// the same panel-row space, not the snapshot's padded w/h) -- called from the
+// UI task strictly after that publish's overlayFront.store(back) already
+// ran, so there is nothing of the overlay's own double-buffer state left to
+// read here at all, and nothing to synchronize against: bandWarmup[] is its
+// own array, touched only by this method (UI task) and the per-band decision
+// point in renderFrame() below (render task), the same two-writer shape
+// warmupFrames itself already has.
+void SleepAnimation::requestBandWarmup(const int (*ranges)[2], int n) {
+    if (display == nullptr) {
+        return;
+    }
+    const int panelH = display->height();
+    const int nBands = panelH / BAND_H;
+    if (nBands <= 0 || nBands > MAX_BANDS) {
+        return;
+    }
+    for (int i = 0; i < n; i++) {
+        int y0 = ranges[i][0];
+        int y1 = ranges[i][1];
+        if (y0 < 0) {
+            y0 = 0;
+        }
+        if (y1 > panelH) {
+            y1 = panelH;
+        }
+        if (y1 <= y0) {
+            continue;
+        }
+        const int b0 = y0 / BAND_H;
+        const int b1 = (y1 - 1) / BAND_H; // inclusive: y1 is exclusive of the last covered row
+        for (int bi = b0; bi <= b1 && bi < nBands; bi++) {
+            // Not a max-with-existing: a fresh publish means this band's
+            // pixels just changed again, so its own 2-frame window starts
+            // over from here regardless of how far the last one had counted
+            // down. Only ever grows the window, never shrinks it early.
+            bandWarmup[bi].store(2);
+        }
     }
 }
 
@@ -1634,6 +1937,82 @@ void SleepAnimation::buildScrim(Overlay &ov, int panelW, int panelH) {
     (void)panelH;
 }
 
+// The regional counterpart: rebuild only what a source change in cell rows
+// [cellY0, cellY1] can reach. Of buildScrim's six passes only the vertical
+// ones move information across rows, one row per 3-tap pass; two vertical
+// dilates plus one vertical smooth mean a final row depends on source rows at
+// most 3 away, so only rows [cellY0-3, cellY1+3] are rewritten. They are
+// recomputed through band-local passes over input rows [cellY0-6, cellY1+6]:
+// the vertical taps clamp at the band edge, which is either the grid edge
+// (where the full build clamps identically) or at least 3 rows from any
+// rewritten row, outside its influence. Intermediates ping-pong through
+// scrimTmp and scrimTmp2 so ov.scrim rows outside the rewrite window are
+// never touched; they still hold the previous build, which is byte-identical
+// there by the reach argument. No transpose bracket here: the band is a
+// handful of rows, so the strided vertical taps the full build pays 120 rows
+// for stay cheap. Bit-exactness against the full build is proven over
+// randomized grids, bands, and the edge cases in
+// tools/overlaybench/scrim_regional_prove.cpp (mirrors this code 1:1).
+void SleepAnimation::buildScrimRegional(Overlay &ov, int cellY0, int cellY1) {
+    const int sw = ov.scrimW;
+    const int sh = ov.scrimH;
+    if (cellY0 < 0) {
+        cellY0 = 0;
+    }
+    if (cellY1 >= sh) {
+        cellY1 = sh - 1;
+    }
+    if (cellY1 < cellY0) {
+        return;
+    }
+    const int w0 = cellY0 - 3 < 0 ? 0 : cellY0 - 3;
+    const int w1 = cellY1 + 3 >= sh ? sh - 1 : cellY1 + 3;
+    const int b0 = cellY0 - 6 < 0 ? 0 : cellY0 - 6;
+    const int b1 = cellY1 + 6 >= sh ? sh - 1 : cellY1 + 6;
+    const int bl = b1 - b0 + 1;
+    const size_t off = static_cast<size_t>(b0) * sw;
+
+    scrimTap3(ov.scrimSrc + off, scrimTmp + off, bl, sw, sw, 1, true);
+    scrimTap3(scrimTmp + off, scrimTmp2 + off, bl, sw, sw, 1, true);
+    scrimTap3(scrimTmp2 + off, scrimTmp + off, sw, bl, 1, sw, true);
+    scrimTap3(scrimTmp + off, scrimTmp2 + off, sw, bl, 1, sw, true);
+    scrimTap3(scrimTmp2 + off, scrimTmp + off, bl, sw, sw, 1, false);
+    scrimTap3(scrimTmp + off, scrimTmp2 + off, sw, bl, 1, sw, false);
+
+    const int q8 = scrimQ8.load();
+    for (int cy = w0; cy <= w1; cy++) {
+        const uint8_t *const brow = scrimTmp2 + static_cast<size_t>(cy) * sw;
+        uint8_t *const row = ov.scrim + static_cast<size_t>(cy) * sw;
+        for (int cx = 0; cx < sw; cx++) {
+            int dim = (brow[cx] * q8) >> 8;
+            if (dim > 255) {
+                dim = 255;
+            }
+            row[cx] = static_cast<uint8_t>(SCRIM_INV_NONE - ((dim + 4) >> 3));
+        }
+        uint32_t *const runs = ov.haloRuns + static_cast<size_t>(cy) * RUNS_PER_ROW;
+        int n = 0;
+        int start = -1;
+        for (int cx = 0; cx < sw; cx++) {
+            if (row[cx] != SCRIM_INV_NONE) {
+                if (start < 0) {
+                    start = cx;
+                }
+                continue;
+            }
+            if (start < 0) {
+                continue;
+            }
+            n = emitRun(runs, n, start, cx, HALO_GAP_MERGE_CELLS);
+            start = -1;
+        }
+        if (start >= 0) {
+            n = emitRun(runs, n, start, sw, HALO_GAP_MERGE_CELLS);
+        }
+        ov.haloN[cy] = static_cast<uint8_t>(n);
+    }
+}
+
 void SleepAnimation::taskEntry(void *arg) {
     auto *self = static_cast<SleepAnimation *>(arg);
     self->renderLoop();
@@ -1723,6 +2102,64 @@ void SleepAnimation::presentFrame() {
         // subtracts this from the frame time before judging resolution, and a
         // value left over from the last direct-path frame would credit work
         // that did not happen on this one.
+        lastFlipWaitUs = 0;
+        return;
+    }
+    // Interlacing never flips at all: renderLoop already converged fbBack
+    // onto scanFb before this frame's bands were rendered (see
+    // directInterlacedFrame's declaration), so the rows renderFrame() just
+    // wrote over GDMA landed directly in the buffer the panel is already
+    // scanning. There is nothing to present -- presentFrameBuffer() swaps
+    // which buffer esp_lcd calls current, and it already is this one.
+    //
+    // This is deliberate, not a gap: the entire value of interlacing is that
+    // each pass is visible the moment it lands, at the PASS rate, not at half
+    // of it. A flip-then-alternate scheme was tried instead (accumulate both
+    // phases into an off-screen buffer, flip only every second pass) and
+    // rejected for exactly this reason -- see this feature's design notes
+    // for the arithmetic, but the short version is that a flip's cost and a
+    // flip's row count are both fixed by the panel regardless of how many
+    // render passes fed it, so gating visibility behind a flip throws away
+    // interlacing's entire benefit and converges to "render at half rate,
+    // more expensively." Writing the live buffer is what the CPU-push path's
+    // OWN interlacing has always done (LilyGo_RGBPanel::pushColors targets
+    // _fbDirect[_fbCurrent], the buffer esp_lcd itself calls current, every
+    // band of every frame, interlaced or not); this only narrows that
+    // exposure to the rows an interlaced pass actually touches, using a
+    // GDMA transfer measured at 70-150 us a band rather than a CPU copy
+    // through esp_lcd_panel_draw_bitmap. See the tearing counters below and
+    // in the header for what that exposure costs and how to watch it.
+    //
+    // directInterlacedFrame was latched at the top of this frame's pass in
+    // renderLoop from the same terms bandInterlaced folds into per band, so
+    // the two cannot disagree about whether this frame was interlacing.
+    if (directInterlacedFrame) {
+        // Not flipping, so no flip-confirmation WAIT to run (the panel is
+        // never told a new buffer is current, because it already is). But
+        // the tear check below needs its own, narrower proof first: this
+        // frame's LAST band's GDMA completion still lands asynchronously,
+        // exactly as it does on the non-interlaced path below, and
+        // renderFrame()'s own per-band msync only proves the CACHE will
+        // fetch fresh bytes on the next read, not that the transfer
+        // producing those bytes has actually finished -- its own comment
+        // says so explicitly (see the "else if (bandInterlaced)" block
+        // after each submitRows()). Re-taking the frame gate here is the
+        // same idiom the non-interlaced path below uses for the same
+        // reason: renderFrame() takes it once on this frame's first band
+        // and only the LAST band's completion interrupt gives it back, so
+        // blocking to re-take it proves that interrupt has already run
+        // before a single byte is read for the check. Released again right
+        // after -- unlike below, nothing here needs the gate held past this
+        // point, and renderFrame()'s next frame needs to be able to take it.
+        display->lockFrameBuffer();
+        display->unlockFrameBuffer();
+        // fbDirect[fbBack] is the buffer this frame's rows just landed in
+        // (fbBack was converged onto scanFb above for exactly this frame),
+        // and bandSig[bi] tracks it correctly across both phases of an
+        // interlaced pair (see row0Owned in renderFrame()), so a mismatch
+        // here means what it always has: displaced content, not an artifact
+        // of this feature's own row-skipping or of checking too early.
+        verifyBandPlacement();
         lastFlipWaitUs = 0;
         return;
     }
@@ -1970,14 +2407,55 @@ void SleepAnimation::renderLoop() {
         // the previous presentFrame() took the gate, which is how it learned
         // the last transfer had landed, so nothing is in flight right now.
         directPushOn.store(directPushWanted.load());
+        // Latched alongside directPushOn and for the same reason: renderFrame()
+        // and presentFrame() both need to agree on whether this frame is an
+        // interlaced direct-DMA pass, and each reads this exactly once rather
+        // than re-deriving it from the underlying atomics at a slightly
+        // different moment. See the member's declaration in the header for
+        // what this buys and what it costs.
+        directInterlacedFrame = dmaActive && directPushOn.load() && interlace.load() && warmupFrames.load() == 0;
+        // fbBack reconciliation for the mode this frame is about to run in.
+        // Interlacing writes into whichever buffer is ALREADY on screen (see
+        // directInterlacedFrame's declaration for why), so entering or
+        // continuing an interlaced run converges fbBack onto scanFb; leaving
+        // one un-converges it, because the ordinary flip machinery below
+        // (presentFrame()) is about to render a full frame and needs fbBack
+        // to be the buffer NOT on screen, same as it always has been.
+        //
+        // Done here rather than inside renderFrame()/presentFrame() because
+        // it has to happen exactly once, before renderFrame() picks up
+        // fbBack for this frame's bands, and after presentFrame()'s own flip
+        // confirmation from the PREVIOUS frame -- the same ordering
+        // constraint directPushOn.store() above already has to respect.
+        if (dmaActive && directPushOn.load() && fbCount > 1) {
+            if (directInterlacedFrame) {
+                const int sf = scanFb.load();
+                if (sf >= 0) {
+                    fbBack = sf;
+                }
+            } else if (wasDirectInterlacedFrame) {
+                fbBack ^= 1;
+            }
+        }
+        wasDirectInterlacedFrame = directInterlacedFrame;
         // Tearing check, taken before a single byte of this frame is written.
         // If the buffer we are about to render into is the one the panel was
         // last confirmed to be scanning, this frame tears by construction. A
         // scanFb of -1 means the last flip was never confirmed, so abstain.
+        //
+        // An interlaced frame ALWAYS trips this (fbBack was just converged
+        // onto sf above, deliberately) -- that is the whole mechanism, not a
+        // bug, so it is counted separately below rather than into liveWrites,
+        // which exists to catch this happening BY ACCIDENT on a frame that
+        // was never supposed to touch the live buffer at all. Folding the
+        // deliberate case into that counter would make an accidental one
+        // invisible in the noise the moment interlacing is turned on.
         if (directPushOn.load() && fbCount > 1) {
             const int sf = scanFb.load();
             if (sf >= 0) {
-                if (sf == fbBack) {
+                if (directInterlacedFrame) {
+                    interlacedLiveWrites++;
+                } else if (sf == fbBack) {
                     liveWrites++;
                 } else {
                     liveWriteClean++;
@@ -2024,6 +2502,21 @@ void SleepAnimation::renderLoop() {
         const unsigned long now = millis();
         if (now - fpsWindowStart >= 10000) {
             log_i("SleepAnimation: %.1f fps", fpsFrames * 1000.0f / (now - fpsWindowStart));
+#ifdef GM_TOUCH_PROBE
+            if (gmRunCount > 0) {
+                ESP_LOGI("TouchProbe",
+                         "GM_RUNSTAT runs=%lu px=%lu g8px=%lu w1_3=%lu w4_7=%lu w8_11=%lu w12_15=%lu w16_23=%lu "
+                         "w24_31=%lu w32p=%lu grp_o=%lu grp_b=%lu grp_m=%lu",
+                         gmRunCount, gmRunPx, gmRunG8Px, gmRunWidthBuckets[0], gmRunWidthBuckets[1],
+                         gmRunWidthBuckets[2], gmRunWidthBuckets[3], gmRunWidthBuckets[4], gmRunWidthBuckets[5],
+                         gmRunWidthBuckets[6], gmGrpOpq, gmGrpBlnd, gmGrpMix);
+                gmRunCount = gmRunPx = gmRunG8Px = 0;
+                gmGrpOpq = gmGrpBlnd = gmGrpMix = 0;
+                for (int i = 0; i < 7; i++) {
+                    gmRunWidthBuckets[i] = 0;
+                }
+            }
+#endif
             fpsFrames = 0;
             fpsWindowStart = now;
         }
@@ -2368,15 +2861,31 @@ void SleepAnimation::renderFrame() {
         // silently. bandBuf's own allocation asks for 64 bytes and the 960-byte
         // row stride keeps every row aligned, but it has a fallback allocator
         // that promises nothing -- so this is checked rather than assumed.
+        // Composite path selector, hoisted like pieScrim below: one atomic
+        // load per band, so the ?bpie A/B knob can flip it between frames
+        // without a per-row cost.
+        const bool pieBlend = bpieOn.load();
         const bool pieScrim = pieOn.load() && scrimInvPx != nullptr &&
                               ((reinterpret_cast<uintptr_t>(band) | (static_cast<uintptr_t>(w) * 2)) & 0xF) == 0;
-        // Decided once per band and used twice: the blend skips rows this frame
-        // will not push, and the push job carries the parity. Interlacing only
-        // applies to the two-task push path -- the direct path writes the
-        // framebuffer itself and has no per-row call to skip.
+        // Decided once per band and used three times: the render below skips
+        // computing rows this frame will not push, the blend skips
+        // compositing into them, and the push -- on BOTH paths now -- skips
+        // writing them. This used to be vetoed outright on the direct path
+        // (dmaActive && directPushOn), because skipping a row there is not as
+        // simple as not calling pushColors on it: the direct path's fbBack is
+        // double-buffered and flips every frame, so if a flip-every-frame
+        // frame also skipped rows, the skipped rows would show whatever the
+        // OTHER buffer held two flips ago, not one -- the picture combing
+        // against itself. Fixing that turned out to be a flip-scheduling
+        // problem, not a row-skipping one: the direct path now skips the
+        // flip entirely while interlacing, writing the buffer already on
+        // screen instead (see directInterlacedFrame in the header for the
+        // full argument and what it costs), so this predicate no longer
+        // needs to know or care which push path is reading it.
+        //
         // One decision per band, read by the render, the blend and the push, so
-        // the three cannot disagree about which rows this frame owns. Two things
-        // switch it off beyond the feature flag:
+        // the three cannot disagree about which rows this frame owns. Three
+        // things switch it off beyond the feature flag:
         //
         // warmupFrames -- until the animation has covered the screen once, the
         // rows an interlaced frame skips still hold whatever the previous screen
@@ -2387,15 +2896,76 @@ void SleepAnimation::renderFrame() {
         // An odd row count -- a pair cannot be half a row. The expand loop
         // truncates at rows >> 1 and the push loop stops at y + 2 <= y1, so the
         // odd row would be neither written nor sent. 480/8 leaves no partial
-        // band today, so this is a guard rather than a live case.
+        // band today, so this is a guard rather than a live case. Moot now
+        // that half also vetoes outright (below), since this only ever fired
+        // when half was true, but kept as documentation of why pairMode's
+        // row-pair rounding is safe on the rare geometry where the two might
+        // someday be decoupled again.
+        //
+        // half -- rig soak measured push_us at ~5,982,000 (fps 0.2, a 6 second
+        // frame) with forcehalf=1 and interlace both active; forcehalf=-1
+        // recovered instantly (fps 26.6). The row-group table below and
+        // submitRows() itself both check out against this feature's own
+        // sizing math (BandDma.h's MAX_ROW_GROUPS/install() comment): at this
+        // BAND_H the worst case is one small row-group per band regardless of
+        // which unit size half selects, so the wedge is not a mounted-buffer
+        // overrun this code can see and refuse cleanly. Diagnosing a GDMA
+        // completion-side stall blind, with no rig to reflash or measure
+        // against, is not a fix I can stand behind -- so this vetoes the
+        // untested combination outright instead, per the explicit fallback:
+        // half-res already keeps its own 4x byte saving from halving both
+        // axes, interlacing's saving is smaller on top of that, and a frame
+        // that silently drops to 0.2 fps cannot ship for the sake of it.
+        // Revisit if the geometry theory above is ever actually confirmed on
+        // the rig; halfInterlaceVeto below counts how often this fires, so a
+        // soak with forcehalf left on can distinguish "never got the chance
+        // to wedge" from "opted out every time".
         const bool oddBand = (rows & 1) != 0;
-        const bool bandInterlaced =
-            interlace.load() && !(dmaActive && directPushOn.load()) && warmupFrames.load() == 0 && !(half && oddBand);
+        // Regional counterpart to warmupFrames: requestBandWarmup() (see its
+        // own comment) counts this band down from 2 whenever a widget change
+        // inside it was just published, so this ONE band skips interlacing
+        // for its own 2-frame window while every other band interlaces as
+        // normal. bandIdx is looked up fresh here rather than sharing the
+        // later `bi` further down this same loop body -- same value, kept
+        // separate because the two are used for unrelated things many lines
+        // apart and merging them would just make both harder to follow.
+        const int bandIdx = y0 / BAND_H;
+        const uint8_t bandWarm = (bandIdx >= 0 && bandIdx < MAX_BANDS) ? bandWarmup[bandIdx].load() : 0;
+        // What this band would do on the global/half-res rules alone, before
+        // the regional gate below has a say -- named so the forced-full
+        // counter can ask "did the regional mechanism actually change the
+        // outcome" instead of just "is bandWarm nonzero", since a nonzero
+        // countdown on a band that would never have interlaced anyway (half
+        // res, or the global warmup already covering it) forces nothing.
+        const bool wouldInterlace = interlace.load() && warmupFrames.load() == 0 && !(half && oddBand) && !half;
+        const bool bandInterlaced = wouldInterlace && bandWarm == 0;
+        if (half && interlace.load() && warmupFrames.load() == 0) {
+            halfInterlaceVeto++;
+        }
+        if (bandWarm != 0) {
+            if (wouldInterlace) {
+                bandsForcedFull++;
+            }
+            // Once per frame, not once per read: this band is visited exactly
+            // once per renderFrame() call, same reasoning as warmupFrames'
+            // own once-per-frame decrement below.
+            bandWarmup[bandIdx].store(bandWarm - 1);
+        }
         const int parityNow = static_cast<int>(frameParity & 1u);
         // At half resolution the unit is a row pair, one source row expanded;
         // anywhere else it is a single row.
         const bool pairMode = bandInterlaced && half;
-        const bool renderSkip = pairMode && renderHalf.load();
+        // Render only the rows this frame will push. Used to require pairMode
+        // (half resolution) because that was the only path that could ever
+        // reach here with bandInterlaced true and half false was impossible
+        // to arrange -- the direct path's veto above made bandInterlaced
+        // imply pairMode's own half check would have been redundant either
+        // way. With that veto gone, bandInterlaced can be true at full
+        // resolution too, and the same reasoning applies unchanged: a row
+        // this frame will not push is a row this frame will not show, so
+        // computing it is wasted work. See the full-resolution render branch
+        // below for where this now also fires.
+        const bool renderSkip = bandInterlaced && renderHalf.load();
         // Bench builds render ONE band per frame with the scheduler suspended
         // on this core. Aurora measures ~82 CPU cycles/pixel for a loop body
         // that looks like it should run in far less, and its max frame is 1.8x
@@ -2492,12 +3062,34 @@ void SleepAnimation::renderFrame() {
                 profCopyUs += static_cast<uint32_t>(esp_timer_get_time() - tCopy);
             }
             profExpandUs += static_cast<uint32_t>(esp_timer_get_time() - tExpand);
-        } else if (lockThisBand) {
-            vTaskSuspendAll();
-            anim.band(band, y0, rows, w, tMs, p);
-            xTaskResumeAll();
         } else {
-            anim.band(band, y0, rows, w, tMs, p);
+            // Row-level interlace at full resolution: the same trade
+            // splitRender makes above for half resolution (skip anim.band()
+            // for a row this frame will not push), at single-row granularity
+            // since there is no 2x expansion here to make pairs necessary --
+            // pairMode is false whenever half is, so this only ever fires at
+            // unit size 1. The per-row call is within BgAnim.h's contract:
+            // splitRender's comment above already established that every
+            // animation derives its row terms from the absolute y it is
+            // handed, which is exactly what makes a stride-2 walk over
+            // y0..y0+rows as legal as the contiguous call it replaces.
+            const bool splitRenderFull = renderSkip && !pairMode;
+            if (lockThisBand) {
+                vTaskSuspendAll();
+            }
+            if (splitRenderFull) {
+                for (int r = 0; r < rows; r++) {
+                    if ((((y0 + r) ^ parityNow) & 1) != 0) {
+                        continue;
+                    }
+                    anim.band(band + static_cast<size_t>(r) * w, y0 + r, 1, w, tMs, p);
+                }
+            } else {
+                anim.band(band, y0, rows, w, tMs, p);
+            }
+            if (lockThisBand) {
+                xTaskResumeAll();
+            }
         }
         BENCH_ACC(accBandUs, tBand);
         profBandUs += static_cast<uint32_t>(esp_timer_get_time() - tBand);
@@ -2706,6 +3298,42 @@ void SleepAnimation::renderFrame() {
                 continue;
             }
             const uint32_t *const runs = ov->runs + static_cast<size_t>(y) * RUNS_PER_ROW;
+#ifdef GM_TOUCH_PROBE
+            const uint8_t *const gmArow = ov->buf + (static_cast<size_t>(y + ovYoff) * ov->w + ovXoff) * 3;
+            for (int i = 0; i < nRuns; i++) {
+                const uint32_t r = runs[i];
+                const int x0 = static_cast<int>(r & 0xFFFFu);
+                const int x1 = static_cast<int>(r >> 16);
+                const int wRun = x1 - x0;
+                if (wRun <= 0) {
+                    continue;
+                }
+                const int b = wRun < 4 ? 0 : wRun < 8 ? 1 : wRun < 12 ? 2 : wRun < 16 ? 3 : wRun < 24 ? 4 : wRun < 32 ? 5 : 6;
+                gmRunWidthBuckets[b]++;
+                gmRunCount++;
+                gmRunPx += static_cast<uint32_t>(wRun);
+                // Pixels covered by whole 8-aligned 8-pixel groups: the only
+                // pixels the PIE group kernel could take off the scalar path.
+                const int ga = (x0 + 7) & ~7;
+                if (x1 - ga >= 8) {
+                    gmRunG8Px += static_cast<uint32_t>(((x1 - ga) >> 3) << 3);
+                }
+                for (int gx = ga; gx + 8 <= x1; gx += 8) {
+                    int nOpq = 0;
+                    const uint8_t *ap = gmArow + static_cast<size_t>(gx) * 3 + 2;
+                    for (int k = 0; k < 8; k++, ap += 3) {
+                        nOpq += (*ap == 255);
+                    }
+                    if (nOpq == 8) {
+                        gmGrpOpq++;
+                    } else if (nOpq == 0) {
+                        gmGrpBlnd++;
+                    } else {
+                        gmGrpMix++;
+                    }
+                }
+            }
+#endif
 #ifdef GM_ANIM_BENCH
             for (int i = 0; i < nRuns; i++) {
                 spanPxLocal += (runs[i] >> 16) - (runs[i] & 0xFFFFu);
@@ -2721,7 +3349,11 @@ void SleepAnimation::renderFrame() {
                 continue;
             }
 #endif
-            blendRow(drow, crow, runs, nRuns);
+            if (pieBlend) {
+                blendRowPie(drow, crow, runs, nRuns);
+            } else {
+                blendRow(drow, crow, runs, nRuns);
+            }
         }
         BENCH_ACC(accBlendUs, tBlend);
         profBlendUs += static_cast<uint32_t>(esp_timer_get_time() - tBlend);
@@ -2847,6 +3479,34 @@ void SleepAnimation::renderFrame() {
             BENCH_T0(tPush);
             const size_t bytes = static_cast<size_t>(w) * rows * 2;
             uint16_t *const dstRow = fbDirect[fbBack] + static_cast<size_t>(y0) * w;
+
+            // Row-group table for an interlaced band: which rows within
+            // [0, rows) this frame actually owns, as {row, byteOffset}. Built
+            // once and shared by the msync below, the DMA submission and the
+            // bandSig update, so the three cannot disagree about which bytes
+            // are real this frame -- the same absolute-row parity test the
+            // blend loop above already applies row by row
+            // ((pairMode ? y>>1 : y) ^ parityNow). A non-interlaced band
+            // (bandInterlaced false: warmup, ilace off, or an odd band at
+            // half res) never populates this and takes the plain contiguous
+            // path a few lines down, unchanged from before this feature.
+            int rowGroupRow[BandDma::MAX_ROW_GROUPS];
+            uint32_t rowGroupOffsets[BandDma::MAX_ROW_GROUPS];
+            int nRowGroups = 0;
+            size_t rowGroupBytes = 0;
+            if (bandInterlaced) {
+                const int unit = pairMode ? 2 : 1;
+                rowGroupBytes = static_cast<size_t>(w) * unit * 2;
+                for (int r = 0; r < rows && nRowGroups < BandDma::MAX_ROW_GROUPS; r += unit) {
+                    const int y = y0 + r;
+                    if ((((pairMode ? (y >> 1) : y) ^ parityNow) & 1) != 0) {
+                        continue;
+                    }
+                    rowGroupRow[nRowGroups] = r;
+                    rowGroupOffsets[nRowGroups] = static_cast<uint32_t>(r) * w * 2;
+                    nRowGroups++;
+                }
+            }
             // Flush this band out of the data cache before GDMA reads it.
             //
             // The 64-byte-aligned internal-DMA allocation for bandBuf is inside
@@ -2861,13 +3521,32 @@ void SleepAnimation::renderFrame() {
             // 32 holding row 16's pixels, a clean -16 offset across the panel.
             //
             // Only meaningful for a cached region, so internal SRAM skips it.
+            // Interlaced bands flush only the row groups above rather than the
+            // whole `bytes` span: the skipped rows hold stale SRAM content
+            // GDMA will never read (the table above sees to that), and
+            // writing THEM back too would spend PSRAM bandwidth on bytes that
+            // never leave this chip -- exactly the traffic interlacing exists
+            // to cut, so doing it anyway here would give half of the saving
+            // back for nothing.
             if (esp_ptr_external_ram(band)) {
                 // Counted, not ignored. This call failed on every band for a
                 // whole measurement round and the only evidence was an error
                 // line on a serial port nobody was reading, which made a fix
                 // that never ran look like it had worked.
                 const int64_t tMsync = esp_timer_get_time();
-                if (esp_cache_msync(band, bytes, ESP_CACHE_MSYNC_FLAG_DIR_C2M) != ESP_OK) {
+                esp_err_t msyncErr = ESP_OK;
+                if (bandInterlaced) {
+                    for (int i = 0; i < nRowGroups; i++) {
+                        msyncErr = esp_cache_msync(band + static_cast<size_t>(rowGroupRow[i]) * w, rowGroupBytes,
+                                                   ESP_CACHE_MSYNC_FLAG_DIR_C2M);
+                        if (msyncErr != ESP_OK) {
+                            break;
+                        }
+                    }
+                } else {
+                    msyncErr = esp_cache_msync(band, bytes, ESP_CACHE_MSYNC_FLAG_DIR_C2M);
+                }
+                if (msyncErr != ESP_OK) {
                     msyncFails++;
                 } else {
                     msyncOks++;
@@ -2898,25 +3577,82 @@ void SleepAnimation::renderFrame() {
                 frameGateHeld = false; // the completion interrupt owns the release now
             }
 
-            // One submission for the whole band, into descriptors that were
-            // built at install and are only re-pointed here.
-            //
-            // A DMA descriptor tops out at 4092 bytes, so a whole 12-row band
-            // (11,520) has to be split. BandDma splits it at install time, at
-            // four rows: 3,840 bytes fits one descriptor and is a whole number
-            // of rows, so every chunk's destination (fb + row * 960) keeps the
-            // framebuffer base's alignment, which the panel checked against the
-            // data cache line before handing the pointer over.
-            // Taken here, from the same pointer and after the same msync that
-            // the transfer reads, so a mismatch later can only mean the content
-            // did not reach the framebuffer row it was rendered for.
-            if (bi >= 0 && bi < MAX_BANDS) {
+            // Signature bookkeeping. bandSignature() always samples row 0 of
+            // the band. On a frame that owns row 0 -- every non-interlaced
+            // frame, or the phase of an interlaced pair whose parity matches
+            // y0's -- this frame's content is what will sit there once the
+            // pair closes, so record it as usual. On the OTHER phase, row 0
+            // is untouched: fbBack still holds whatever the owning phase last
+            // wrote there, while band[]'s own row 0 is stale SRAM from
+            // NUM_SLOTS-1 bands back. Recording THAT would make
+            // verifyBandPlacement() flag every such band as displaced for a
+            // reason that has nothing to do with placement -- so it is left
+            // alone here, and the still-accurate signature from the owning
+            // phase keeps standing until that phase runs again.
+            const bool row0Owned = !bandInterlaced || ((((pairMode ? (y0 >> 1) : y0) ^ parityNow) & 1) == 0);
+            if (row0Owned && bi >= 0 && bi < MAX_BANDS) {
                 bandSig[bi] = bandSignature(band, w);
             }
+
+            // Non-interlaced: one submission for the whole band, into
+            // descriptors that were built at install and are only re-pointed
+            // here, same as before this feature -- a DMA descriptor tops out
+            // at 4092 bytes, so a whole band wider than that is split at
+            // install time, at row boundaries, so every chunk's destination
+            // (fb + row * 960) keeps the framebuffer base's alignment, which
+            // the panel checked against the data cache line before handing
+            // the pointer over.
+            //
+            // Interlaced: submitRows() mounts each owned row group at its OWN
+            // offset on both sides instead of one contiguous run, so the rows
+            // the table above left out are never read from band[] and never
+            // written to dstRow -- not copied over, not touched at all. That
+            // is what makes this cheaper than copy-forward (see the
+            // option-comparison this feature's change introduced): nothing is
+            // written INTO the skipped rows here, this transfer simply has no
+            // descriptor that points at them.
             esp_err_t err = ESP_OK;
-            if (bandDma.ready()) {
+            // bandInterlaced with nRowGroups==0 means this band's row-pair
+            // belongs to the OTHER phase this frame -- not a failure. At
+            // full resolution the loop above always finds one row of each
+            // parity (y0 and y0+1, always opposite), so nRowGroups is never
+            // zero there; at half resolution (pairMode, unit=2) BAND_H's
+            // current tuning gives only ONE candidate per band, and on
+            // roughly half of all frames it is the wrong parity. The
+            // previous shape of this code (nRowGroups > 0 ? submitRows(...)
+            // : ESP_ERR_INVALID_SIZE, on the belief that "unit divides rows"
+            // made an empty table impossible) treated that as a failure and
+            // fell into the CPU-fallback branch below, which pushes the
+            // WHOLE band -- including the row this frame never rendered,
+            // still holding stale content from NUM_SLOTS-1 bands back --
+            // over the OTHER phase's live pixels, on ~half of all 240 bands,
+            // every single frame. Confirmed root cause of both the
+            // half+interlace six-second wedge (each occurrence pays the
+            // fallback's 50 ms drain wait; 120 bands x 50 ms alone accounts
+            // for very close to the observed ~6 s) and the corruption the
+            // rig capture photographed (dma_errors climbed into the
+            // thousands at half+interlace, zero at full-res+interlace, while
+            // dma_row_fallbacks stayed 0 the whole time -- it only counts
+            // submitRows() failures, and this was never one). Nothing to
+            // submit means nothing else will release this band's slot, or
+            // (on the last band) the frame gate -- released here by hand,
+            // the same as the completion interrupt would have.
+            const bool nothingOwnedThisBand = bandInterlaced && nRowGroups == 0;
+            if (nothingOwnedThisBand) {
+                interlaceBandSkips++;
+                xSemaphoreGive(static_cast<SemaphoreHandle_t>(bandFree[renderSlot]));
+                if (lastBandOfFrame) {
+                    display->unlockFrameBuffer();
+                    frameGateHeld = false;
+                }
+            } else if (bandDma.ready()) {
                 dmaIssued++;
-                err = bandDma.submit(renderSlot, dstRow, band, bytes, &done);
+                if (bandInterlaced) {
+                    err = bandDma.submitRows(renderSlot, dstRow, band, rowGroupOffsets, nRowGroups, rowGroupBytes,
+                                             &done);
+                } else {
+                    err = bandDma.submit(renderSlot, dstRow, band, bytes, &done);
+                }
                 if (err != ESP_OK) {
                     dmaIssued--;
                 }
@@ -2924,12 +3660,17 @@ void SleepAnimation::renderFrame() {
                 err = ESP_ERR_INVALID_STATE;
             }
             (void)bytes;
-            if (err != ESP_OK) {
+            if (!nothingOwnedThisBand && err != ESP_OK) {
                 // A dropped band is a visible tear, so fall back to the CPU
-                // copy. The gate has to be released by hand first: the failed
-                // submission is the one that would have carried the release
-                // arg, so no interrupt is coming for it, and pushColors takes
-                // the same gate.
+                // copy -- of only the owned row groups when interlaced, for
+                // the same reason submitRows() above stops at those rows:
+                // pushColors of the WHOLE band here would overwrite the OTHER
+                // phase's content in the rows this frame does not own, inside
+                // the very buffer that content is waiting to be shown from.
+                // The gate has to be released by hand first either way: the
+                // failed submission is the one that would have carried the
+                // release arg, so no interrupt is coming for it, and
+                // pushColors takes the same gate.
                 dmaErrors++;
                 dmaIssued--;
                 // Earlier bands may still be in flight, reading their slot
@@ -2945,8 +3686,46 @@ void SleepAnimation::renderFrame() {
                 // below wants it.
                 display->unlockFrameBuffer();
                 frameGateHeld = false;
-                display->pushColors(0, y0, w, y0 + rows, band);
+                if (bandInterlaced && nRowGroups > 0) {
+                    dmaRowFallbacks++;
+                    const int unit = pairMode ? 2 : 1;
+                    for (int i = 0; i < nRowGroups; i++) {
+                        const int16_t ry0 = static_cast<int16_t>(y0 + rowGroupRow[i]);
+                        display->pushColors(0, ry0, w, static_cast<int16_t>(ry0 + unit),
+                                            band + static_cast<size_t>(rowGroupRow[i]) * w);
+                    }
+                } else {
+                    display->pushColors(0, y0, w, y0 + rows, band);
+                }
                 xSemaphoreGive(static_cast<SemaphoreHandle_t>(bandFree[renderSlot]));
+            } else if (!nothingOwnedThisBand && bandInterlaced) {
+                // Make these bytes visible to the bounce refill's
+                // cache-mediated reads. A non-interlaced frame gets this for
+                // free, once, for the whole buffer, from presentFrame()'s
+                // pre-flip invalidate -- but an interlaced frame never flips
+                // (renderLoop converged fbBack onto the live buffer already;
+                // see directInterlacedFrame in the header), so presentFrame()
+                // returns immediately and nothing else will ever invalidate
+                // this region. Done here instead, scoped to just the row
+                // groups this band actually wrote -- the same "touch only
+                // what changed" reasoning as the msync on the SOURCE side
+                // above, and why this halves rather than repeats the
+                // once-per-frame whole-buffer cost that comment describes.
+                //
+                // Ordering against the transfer itself does not need to be
+                // exact: dropping a cache line early does not corrupt
+                // anything, it just means the NEXT read of that address
+                // range -- CPU or bounce refill -- takes a fresh fetch from
+                // PSRAM rather than serving a stale cached copy. If that read
+                // happens to land before this band's GDMA transfer has
+                // actually finished, it can see a partly-written line; that
+                // is the beam-racing exposure this feature accepts (see
+                // presentFrame()), not a new failure mode this invalidate
+                // introduces.
+                for (int i = 0; i < nRowGroups; i++) {
+                    esp_cache_msync(dstRow + static_cast<size_t>(rowGroupRow[i]) * w, rowGroupBytes,
+                                    ESP_CACHE_MSYNC_FLAG_DIR_M2C);
+                }
             }
             BENCH_ACC(accPushUs, tPush);
             profPushUs += static_cast<uint32_t>(esp_timer_get_time() - tPush);

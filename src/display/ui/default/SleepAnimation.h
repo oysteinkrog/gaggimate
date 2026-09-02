@@ -27,6 +27,7 @@ class SleepAnimation {
     void publishOverlayRanges(int, int, const int (*)[2], int) {}
     int overlayBackIndex() const { return 0; }
     void requestWholeFrames() {}
+    void requestBandWarmup(const int (*)[2], int) {}
 };
 #else
 
@@ -91,6 +92,8 @@ class SleepAnimation {
     void setInterlace(bool) {}
     void setHalfForce(int8_t) {}
     int8_t halfForced() const { return -1; }
+    void setInterlaceForce(int8_t) {}
+    int8_t interlaceForced() const { return -1; }
     void setDebugPattern(int) {}
     int debugPatternOn() const { return 0; }
 #else
@@ -114,7 +117,17 @@ class SleepAnimation {
         }
         autoResReset.store(true);
     }
+    // Same idempotent-caller shape as setHalfRes(): DefaultUI::updateState()
+    // re-applies the persisted setting on every pass regardless of whether it
+    // changed, which is exactly what a debug-endpoint override needs to
+    // survive. Pinned by setInterlaceForce() below, this becomes a no-op --
+    // otherwise the very next UI pass after a ilace=0/interlace=0 debug
+    // request silently puts the persisted value straight back, which reads
+    // as a dead knob.
     void setInterlace(bool on) {
+        if (interlaceForce.load() >= 0) {
+            return;
+        }
         interlace.store(on);
         renderHalf.store(on);
     }
@@ -123,6 +136,23 @@ class SleepAnimation {
         autoResReset.store(true);
     }
     int8_t halfForced() const { return halfForce.load(); }
+    // Debug override for setInterlace(), mirroring halfForce/setHalfForce
+    // above: -1 leaves the settings-driven value in control, 0/1 pins
+    // interlace (and renderHalf, kept in lockstep the same way setInterlace()
+    // does) and holds it there against DefaultUI's periodic re-apply. Applies
+    // immediately on pin so the caller does not have to wait for the next UI
+    // pass to see the change take effect; releasing the pin (v < 0) leaves
+    // the last-applied value in place until the next settings-driven
+    // setInterlace() call restores control, same as halfForce does for
+    // resolution.
+    void setInterlaceForce(int8_t v) {
+        interlaceForce.store(v);
+        if (v >= 0) {
+            interlace.store(v != 0);
+            renderHalf.store(v != 0);
+        }
+    }
+    int8_t interlaceForced() const { return interlaceForce.load(); }
     void setDebugPattern(int v) { debugPattern.store(v); }
     int debugPatternOn() const { return debugPattern.load(); }
 #endif
@@ -167,8 +197,20 @@ class SleepAnimation {
     uint8_t fpsOverrideValue() const { return fpsOverride.load(); }
     // Tearing: live writes over frames actually checked. The denominator is
     // exposed so a zero cannot be read as clean when the check never ran.
+    // Scoped to non-interlaced frames only -- see interlacedLiveWriteCount()
+    // below for the frames this deliberately excludes and why a nonzero
+    // liveWriteCount() stays a bug report even while interlacing runs.
     uint32_t liveWriteCount() const { return liveWrites.load(); }
     uint32_t liveWriteCheckedCount() const { return liveWriteClean.load() + liveWrites.load(); }
+    // Frames where renderFrame() deliberately wrote the buffer the panel was
+    // scanning, because interlacing converged fbBack onto it on purpose (see
+    // directInterlacedFrame in the private section). This climbs continuously
+    // while interlacing is active -- that is the mechanism working as
+    // designed, not a fault -- which is exactly why it is a separate counter
+    // from liveWriteCount() rather than folded into it: an interlaced run's
+    // volume here would swamp the one real accidental live-write this file
+    // has ever shipped with, so mixing them would have hidden it.
+    uint32_t interlacedLiveWriteCount() const { return interlacedLiveWrites.load(); }
     uint32_t flipTimeoutCount() const { return flipTimeouts.load(); }
     uint32_t lastFrameUsValue() const { return lastFrameUs.load(); }
     uint32_t lastWorkUsValue() const { return lastWorkUs.load(); }
@@ -229,6 +271,20 @@ class SleepAnimation {
     // UI widgets, which change in discrete steps and are full of them. So the
     // rule is: interlace the animation, never interlace a widget update.
     void requestWholeFrames() { warmupFrames.store(2); }
+    // Same rule as requestWholeFrames() above, but scoped to just the bands
+    // the published ranges cover, for the same 2-frame window: a widget
+    // change must not straddle interlace phases across ITS OWN pixels, but
+    // pixels the change never touched carry no such constraint, and forcing
+    // every OTHER band full too (240 of them for a telemetry number update
+    // touching 2-12) was interlacing's whole saving given straight back.
+    // ranges[i] is {rowY0, rowY1}, same shape and same units as
+    // publishOverlayRanges() above -- call this with the exact list just
+    // handed to that publish, not a separate read of stored dirty rects, so
+    // it can never see a rect the render task has not been told about yet
+    // either. A range spanning the whole screen (first buffer fill,
+    // geometry change, host screen swap) covers every band, so this
+    // subsumes the whole-frame cases without any special-casing of its own.
+    void requestBandWarmup(const int (*ranges)[2], int n);
 
     // Framebuffer-ownership controls, deliberately not behind GM_ANIM_BENCH.
     // Each setting produces a different visible defect and neither is visible
@@ -242,11 +298,46 @@ class SleepAnimation {
     // above and owns the allow/reset logic; this is only so the debug endpoint
     // can show which way the auto-resolution logic landed.
     bool halfResOn() const { return halfRes.load(); }
+    // Reports whether interlacing is currently on. setInterlace() above owns
+    // the write side (and keeps renderHalf in lockstep); this is only so the
+    // debug endpoint can report back which way the knob is actually set,
+    // rather than which way a request just asked for it to be -- the two can
+    // differ if the request never arrived, or arrived before boot finished
+    // applying its own default.
+    bool interlaceEnabled() const { return interlace.load(); }
     // Band-DMA submit failures. Not a curiosity: on failure the band falls back
     // to pushColors, which writes fbs[cur_fb_index] -- the buffer the panel is
     // scanning -- while its neighbours went to fbDirect[fbBack]. A frame split
     // across both buffers shows as content composited twice.
     uint32_t dmaErrorCount() const { return dmaErrors.load(); }
+    // submitRows() failures specifically -- a subset of the above. Falls back
+    // to pushColors on only the rows this frame owned rather than the whole
+    // band, so it does not carry the same double-composite risk the plain
+    // dmaErrorCount() comment describes; watched separately because a rising
+    // count here says the row-group mount is failing (capacity, alignment)
+    // even while whole-band submits keep succeeding, which dmaErrorCount()
+    // alone cannot distinguish.
+    uint32_t dmaRowFallbackCount() const { return dmaRowFallbacks.load(); }
+    // How many bands ran with interlace requested but half resolution
+    // vetoing it -- see bandInterlaced's declaration. A soak that expects
+    // half+interlace to actually interlace and instead sees fps recover to
+    // the non-interlaced number should check this counter before suspecting
+    // the knob is dead again: it may simply be opting out, as designed.
+    uint32_t halfInterlaceVetoCount() const { return halfInterlaceVeto.load(); }
+    // See interlaceBandSkips's own comment: legitimate "other phase's turn"
+    // no-ops, not failures. Should track roughly half of h/BAND_H per frame
+    // whenever half+interlace is forced back on for testing, and stay at
+    // zero at full resolution.
+    uint32_t interlaceBandSkipCount() const { return interlaceBandSkips.load(); }
+    // Bands the REGIONAL warmup (requestBandWarmup(), bandWarmup[] below)
+    // forced full this run, cumulative since boot -- distinct from the
+    // bands warmupFrames forces full on init/geometry/host-screen changes,
+    // which this does not count (see requestBandWarmup's own comment for
+    // why those already arrive as a full-screen range and so are already
+    // counted band-by-band the same way, just because every band matches).
+    // Expect near zero on a static screen and a small number (2-12 for one
+    // changed telemetry field, not all 240) right after a widget update.
+    uint32_t bandsForcedFullCount() const { return bandsForcedFull.load(); }
     bool dmaPathWanted() const { return dmaWanted.load(); }
     // Band-DMA transfer durations, hardware start to EOF. The discriminating
     // measurement for the scan-out residual: BandDma.h explains what the
@@ -317,6 +408,8 @@ class SleepAnimation {
     // check that kernel against the scalar one over its whole input space.
     void benchSetPie(bool on) { pieOn.store(on); }
     bool benchPie() const { return pieOn.load(); }
+    void benchSetBpie(bool on) { bpieOn.store(on); }
+    bool benchBpie() const { return bpieOn.load(); }
     uint32_t benchPieSelfTest(uint32_t *firstBad);
     int benchGetOnly() const { return benchOnly.load(); }
     // The sweep normally runs uncapped, because a throttled frame reports the
@@ -430,6 +523,12 @@ class SleepAnimation {
     // See the definition for why this is a probe rather than a setting.
     void autoResolution(int id, int fps, int64_t frameUs, int64_t budgetUs);
     void buildScrim(Overlay &ov, int panelW, int panelH);
+    // Rebuild only the scrim rows a source change in cell rows
+    // [cellY0, cellY1] (inclusive) can reach. Requires ov to hold a completed
+    // build of the otherwise-identical previous source at the same strength.
+    // Proven bit-exact against the full build in
+    // tools/overlaybench/scrim_regional_prove.cpp.
+    void buildScrimRegional(Overlay &ov, int cellY0, int cellY1);
 
     Display *display = nullptr;
     void *taskHandle = nullptr;
@@ -485,15 +584,37 @@ class SleepAnimation {
     PushJob pushJob[NUM_SLOTS] = {};
     int renderSlot = 0;       // slot the render task fills next; push task tracks its own
     bool cropEnabled = false; // crop to the panel's circle only while push is the pacing stage
-    // Push every other row pair, alternating parity each frame. Halves the
-    // bytes and the driver's writeback range, at the cost of each row pair
-    // refreshing at half the frame rate. Looked at on the panel at 45-59 fps:
-    // the one-frame stagger between adjacent pairs is not visible.
-    std::atomic<bool> interlace{true};
-    // Render only the source rows this frame will push. Only legal alongside
-    // interlacing at half resolution, where one source row feeds one pushed
-    // pair, so skipping it costs nothing that is displayed.
-    std::atomic<bool> renderHalf{true};
+    // Push every other row (or, at half resolution, row pair), alternating
+    // parity each frame. Halves the bytes and, on the CPU push path, the
+    // driver's writeback range; on the direct-DMA path it halves both the
+    // transfer and the render, at the cost of each row (or pair) refreshing
+    // at half the frame rate. Looked at on the panel at 45-59 fps: the
+    // one-frame stagger between adjacent rows is not visible. One flag feeds
+    // both push paths -- see bandInterlaced in renderFrame() and
+    // directInterlacedFrame below for what the direct path does with it and
+    // what that costs, without a second copy of this setting.
+    //
+    // Defaults false. Before the direct-DMA path grew its own interlaced
+    // branch, a default of true here was harmless in the shipping
+    // configuration: bandInterlaced's old veto (!(dmaActive &&
+    // directPushOn.load())) forced it off whenever the direct path was
+    // active, which is the normal case, so this flag only ever did anything
+    // on the CPU-push fallback. That veto is gone now, so a true default
+    // would make every boot skip flips and write the live framebuffer from
+    // first frame on the shipping path -- exactly the untested-by-default
+    // behaviour the interlace lane's own knob (ilace=1 / interlace=1 on
+    // /api/debug/anim, see WebUIPlugin.cpp) exists to opt into deliberately.
+    std::atomic<bool> interlace{false};
+    // Render only the rows this frame will push. At half resolution one
+    // source row feeds one pushed pair; at full resolution (direct-DMA path
+    // only -- see bandInterlaced) it is one row for one row. Either way,
+    // skipping it costs nothing that is displayed.
+    //
+    // Defaults false alongside interlace above, for the same reason: this
+    // flag is meaningless while interlace is off (bandInterlaced already
+    // requires interlace.load()), so it only needs to track interlace's
+    // safe-default change, not add a second one of its own.
+    std::atomic<bool> renderHalf{false};
     uint32_t frameParity = 0;
     // Frames after a start that push whole bands regardless of parity. Until
     // the animation has covered the screen once, the rows an interlaced frame
@@ -516,6 +637,12 @@ class SleepAnimation {
     // comparing is not a comparison, and one was already read the wrong way
     // round because of this.
     std::atomic<int8_t> halfForce{-1};
+    // Debug override for setInterlace(): -1 auto (settings control it), 0/1
+    // pin interlace off/on. See setInterlaceForce() for why this exists --
+    // without it, DefaultUI::updateState()'s unconditional periodic
+    // setInterlace(settings...) call stomps a debug-endpoint request within
+    // one UI pass.
+    std::atomic<int8_t> interlaceForce{-1};
     // Row-encoded test pattern; see the renderFrame() site for what it settles.
     std::atomic<int> debugPattern{0};
     // Set when something the decision depended on changed under it.
@@ -644,6 +771,60 @@ class SleepAnimation {
     // reaches zero tearing rather than the one that caused the doubling.
     std::atomic<bool> directPushWanted{true};
     bool dmaActive = false; // fbDirect resolved AND the engine installed
+    // Whether THIS frame is an interlaced pass on the direct-DMA path.
+    // Latched once per frame in renderLoop(), same place and for the same
+    // reason as directPushOn just above: renderFrame() decides per band
+    // whether to skip a row from these same terms (bandInterlaced), and
+    // presentFrame() decides from this member whether to flip at all, and a
+    // change landing between the two calls would let them disagree about
+    // whether this frame wrote half of fbBack or all of it, or about which
+    // buffer fbBack even was.
+    //
+    // The double-buffered flip this path normally uses is what interlacing
+    // has to give up, not what it rides on top of. The first design tried
+    // here kept flipping: accumulate one phase into the off-screen buffer,
+    // then the other, then flip once every two passes, so fbBack is always
+    // complete and never touched live. It preserves zero tearing perfectly
+    // and buys NOTHING -- a flip's row count and a flip's byte count are
+    // fixed by the panel regardless of how many render passes fed it, so the
+    // total bytes moved and the total render-task CPU per second of VISIBLE
+    // update are identical to just running the ordinary non-interlaced path
+    // at half the frame rate, with none of this feature's extra bookkeeping.
+    // Interlacing's actual value -- letting a fixed bandwidth budget buy
+    // twice the update FREQUENCY, each update touching half the rows, which
+    // is what the CPU-push path's own long-shipped interlacing already does
+    // and calls invisible at 45-59 fps -- only exists if each pass is
+    // visible the moment it lands, not deferred behind a flip.
+    //
+    // So: no flip, ever, while this is true. renderLoop() converges fbBack
+    // onto scanFb (the buffer the panel is CONFIRMED to be scanning) for as
+    // long as directInterlacedFrame holds, and renderFrame()'s row-group GDMA
+    // writes land directly in it -- visible as soon as the transfer completes
+    // and this frame's own cache invalidate runs (see the interlaced branch
+    // in renderFrame()'s directPush block). presentFrame() then has nothing
+    // to do and returns immediately.
+    //
+    // What this costs: the rows an interlaced pass touches are written while
+    // the panel may be scanning them, exactly the exposure
+    // LilyGo_RGBPanel::pushColors has always had for EVERY row of EVERY
+    // frame via a CPU copy through esp_lcd_panel_draw_bitmap. This narrows
+    // that same exposure to only the rows a pass actually writes, over a
+    // GDMA transfer measured at 70-150 us a band (BandDma's own xferStats),
+    // rather than widening it. interlacedLiveWrites below counts it
+    // separately from liveWrites, which stays reserved for catching this
+    // happening somewhere it was NOT supposed to.
+    //
+    // When this goes false (warmupFrames just got set, or ilace was turned
+    // off), renderLoop's wasDirectInterlacedFrame check un-converges fbBack
+    // back to the off-screen buffer, because the ordinary flip machinery
+    // below is about to render a full frame into it and flip as it always
+    // has -- fbBack has to mean "not on screen" again for that to be correct.
+    bool directInterlacedFrame = false;
+    // Previous frame's directInterlacedFrame, so renderLoop can tell when
+    // interlacing just STOPPED (this false, that true) and un-converge fbBack
+    // back off-screen for the ordinary flip path -- see directInterlacedFrame
+    // above for why that reconciliation exists at all.
+    bool wasDirectInterlacedFrame = false;
     // The panel's framebuffers. With two, the frame is composed in the one the
     // scan-out is not reading and shown by flipping at the end of the frame, so
     // no pixel is ever written while it is on screen -- the difference between
@@ -685,6 +866,35 @@ class SleepAnimation {
     void endDirectPath();
     std::atomic<uint32_t> dmaIssued{0};
     std::atomic<uint32_t> dmaErrors{0};
+    // submitRows() failures, counted separately from dmaErrors above (which
+    // still counts them too) because a rise here specifically implicates the
+    // row-group mount -- capacity or alignment -- rather than the plain
+    // whole-band submit(), and the two failing at different rates is itself
+    // the diagnostic.
+    std::atomic<uint32_t> dmaRowFallbacks{0};
+    // Bands where interlace was on but half resolution vetoed it outright --
+    // see the comment at bandInterlaced's declaration for why. Counts bands,
+    // not frames, so it also reads back the shape of the veto: at BAND_H's
+    // current tuning a frame is h/BAND_H bands, so a soak run entirely at
+    // half+interlace should see this climb by exactly that many per frame,
+    // not some smaller number that would mean the veto was only catching
+    // part of the screen.
+    std::atomic<uint32_t> halfInterlaceVeto{0};
+    // Bands where an interlaced pass legitimately had nothing to push --
+    // this band's row-pair belonged to the OTHER phase this frame, not a
+    // failure. See the nothingOwnedThisBand comment at the submit call site
+    // for why this used to be misrouted through dmaErrors/the CPU-fallback
+    // path instead: fixed now, but this counter is what proves it, and
+    // what dma_row_fallbacks could not (it only ever counted a genuine
+    // submitRows() failure, which this never was). At half resolution
+    // (pairMode) expect this to climb by roughly half of h/BAND_H per
+    // frame; at full resolution it should never move at all, since the
+    // two-candidate-per-band loop there always finds one of each parity.
+    std::atomic<uint32_t> interlaceBandSkips{0};
+    // See bandsForcedFullCount()'s own comment. Incremented at the same
+    // per-band decision point as halfInterlaceVeto/interlaceBandSkips above,
+    // once per band per frame, never inside a per-pixel loop.
+    std::atomic<uint32_t> bandsForcedFull{0};
     // Cache writeback outcomes for the GDMA source band. Both directions are
     // counted so "it is working" is a positive reading rather than the absence
     // of a complaint.
@@ -730,6 +940,13 @@ class SleepAnimation {
     std::atomic<int> scanFb{-1};
     std::atomic<uint32_t> liveWrites{0};
     std::atomic<uint32_t> liveWriteClean{0};
+    // Same trigger as liveWrites (fbBack == scanFb) but for frames where
+    // directInterlacedFrame made that true on purpose. Excluded from
+    // liveWrites/liveWriteClean entirely -- not merely tallied alongside them
+    // -- so that pair keeps meaning exactly what it always has: a nonzero
+    // liveWriteCount() is a bug, full stop, whether or not interlacing is
+    // running at the same time.
+    std::atomic<uint32_t> interlacedLiveWrites{0};
     std::atomic<uint32_t> flipTimeouts{0};
     // How long the last presentFrame() spent waiting for the scan-out to leave
     // the buffer the next frame overwrites. Render-task only, so a plain
@@ -771,6 +988,18 @@ class SleepAnimation {
     int16_t bandX0[MAX_BANDS] = {};
     int16_t bandX1[MAX_BANDS] = {};
     uint32_t bandSig[MAX_BANDS] = {}; // see the framebuffer placement verifier above
+    // Per-band regional-warmup countdown: frames remaining to force this one
+    // band non-interlaced. Written by requestBandWarmup() from the UI task
+    // right after an overlay publish; read and decremented once per frame by
+    // the render task at the same per-band decision point as warmupFrames
+    // (see requestWholeFrames()'s comment for why interlacing must not run
+    // across a band a widget update just touched). Atomic for the same
+    // cross-core reason warmupFrames itself is: the UI task runs on core 1,
+    // the render task on core 0. Array-of-atomics zero-init via `= {}` is
+    // confirmed to actually zero every element (checked against this
+    // toolchain's libstdc++ across every -std flag this project builds
+    // with), unlike relying on each element's bare default constructor.
+    std::atomic<uint8_t> bandWarmup[MAX_BANDS] = {};
     void computeChords(int w, int h);
     static void pushTaskEntry(void *arg);
     void pushLoop();
@@ -811,6 +1040,9 @@ class SleepAnimation {
     // Default on; the scalar path stays as the reference /api/pietest checks
     // against, and as the kernel for a run's unaligned edge cells.
     std::atomic<bool> pieOn{true};
+    // Same shape for the composite pass: vector blendRowPie vs the scalar
+    // blendRow it replaced. Default on; ?bpie=0 is the within-boot A/B.
+    std::atomic<bool> bpieOn{true};
     std::atomic<int> patternOn{0};
     // Alternate the whole screen between two colours per frame, so tearing
     // shows up as a spatial edge a long-exposure photo cannot fabricate.
@@ -819,6 +1051,8 @@ class SleepAnimation {
     // passes run to completion inside publishOverlay on the UI task, so the two
     // overlays never need it at the same time.
     uint8_t *scrimTmp = nullptr;
+    // Second whole-grid scratch, used only by buildScrimRegional (see there).
+    uint8_t *scrimTmp2 = nullptr;
     // Pre-scan copy of the scanned scrimSrc rows, compared after the scan so
     // an unchanged coverage grid skips the whole buildScrim. nullptr degrades
     // to always rebuilding.

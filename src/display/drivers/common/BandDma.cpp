@@ -104,6 +104,16 @@ esp_err_t BandDma::install(size_t maxTransferBytes, size_t burstBytes, DoneFn on
     // the burst size and the cache line, so the value is only knowable after it.
     gdma_get_alignment_constraints(_rxChan, &_intAlign, &_extAlign);
 
+    // Sized for the plain contiguous submit() (one buffer, split at the item
+    // cap) but it also has to cover submitRows()'s worst case: MAX_ROW_GROUPS
+    // single-row groups, each small enough to need only one item apiece. That
+    // worst case is maxTransferBytes's own row count / 2 (interlacing owns
+    // half the rows), and items/rowcount both scale with maxTransferBytes, so
+    // the margin is a fixed ratio rather than a one-off fit: solving
+    // rows/2 <= items for BAND_H*960 = maxTransferBytes gives headroom up to
+    // BAND_H=64 before this formula would need to grow. Checked here rather
+    // than assumed because submitRows() enforces MAX_ROW_GROUPS as a hard cap
+    // and returns an error instead of overrunning the list either way.
     const size_t items = maxTransferBytes / GDMA_ITEM_BYTES_WORST_CASE + 2;
     for (int i = 0; i < SLOTS; i++) {
         gdma_link_list_config_t linkCfg = {};
@@ -210,6 +220,47 @@ esp_err_t BandDma::submit(int slot, void *dst, const void *src, size_t bytes, vo
         return err;
     }
 
+    return queueSlot(slot, arg);
+}
+
+esp_err_t BandDma::submitRows(int slot, void *dstBase, const void *srcBase, const uint32_t *rowOffsets, int n,
+                              size_t groupBytes, void *arg) {
+    if (_rxChan == nullptr || slot < 0 || slot >= SLOTS) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (n <= 0 || n > MAX_ROW_GROUPS || groupBytes == 0 || static_cast<size_t>(n) * groupBytes > _maxBytes) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    // Each row group is its own entry in the mount array rather than one
+    // contiguous buffer, which is what keeps the rows between them off this
+    // transfer entirely -- see this method's doc comment in the header.
+    // mark_eof/mark_final only on the LAST entry: the same rule submit()
+    // follows for its one entry, just applied at the end of a longer array.
+    gdma_buffer_mount_config_t txMount[MAX_ROW_GROUPS] = {};
+    gdma_buffer_mount_config_t rxMount[MAX_ROW_GROUPS] = {};
+    for (int i = 0; i < n; i++) {
+        txMount[i].buffer = const_cast<uint8_t *>(static_cast<const uint8_t *>(srcBase)) + rowOffsets[i];
+        txMount[i].length = groupBytes;
+        rxMount[i].buffer = static_cast<uint8_t *>(dstBase) + rowOffsets[i];
+        rxMount[i].length = groupBytes;
+    }
+    txMount[n - 1].flags.mark_eof = 1;
+    txMount[n - 1].flags.mark_final = 1;
+    rxMount[n - 1].flags.mark_final = 1;
+
+    esp_err_t err = gdma_link_mount_buffers(_txLink[slot], 0, txMount, static_cast<size_t>(n), nullptr);
+    if (err != ESP_OK) {
+        return err;
+    }
+    if ((err = gdma_link_mount_buffers(_rxLink[slot], 0, rxMount, static_cast<size_t>(n), nullptr)) != ESP_OK) {
+        return err;
+    }
+
+    return queueSlot(slot, arg);
+}
+
+esp_err_t BandDma::queueSlot(int slot, void *arg) {
     bool startNow = false;
     portENTER_CRITICAL(&_mux);
     const uint8_t next = static_cast<uint8_t>((_tail + 1) % SLOTS);

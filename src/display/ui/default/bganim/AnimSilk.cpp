@@ -107,13 +107,79 @@
 // PSRAM — and ra[x] is read per pixel, so one row in four would then pay
 // PSRAM latency on every pixel. Borrowing the shared table is strictly
 // better here.
+// Fourth pass: per-cell PRODUCT ramp. The third pass still paid, per pixel,
+// a contrast-LUT gather, two rowAux loads (dx2, dith), a subtract and a
+// 32x32 mull. This pass moves ALL of that to the grid nodes: each cell
+// computes the full Q16 product P = nc_q8 * env_q8 at its two endpoints and
+// linearly ramps P across the cell with the same exact-closure trick the
+// s-ramp already used (seed Pcur<<3, step Pnext-Pcur, 8 steps land exactly
+// on Pnext<<3). The 4-periodic Bayer dither (the only remaining per-pixel
+// table term) becomes four per-row register constants pre-shifted into the
+// ramp's Q19, so the pixel body collapses to add + shift + palette gather +
+// store + ramp add — no loads except the palette read, no multiply.
+//   - Exact at every node column: ((P + d)<<3)>>19 == (P + d)>>16 for the
+//     in-range values here, so pixel 0 of every cell is bit-identical to
+//     the third-pass (slow-path) value — fast and slow cells never seam.
+//   - The contrast curve is now applied at nodes only and CHORDED between
+//     them, where the third pass applied it at full resolution along the
+//     interpolated s. Cells where that chord would visibly deviate fall
+//     back to the exact per-pixel path, gated by a direct curvature probe:
+//     one extra contrast gather at the cell's s-midpoint, and if
+//     |2*lut(mid) - lut(a) - lut(b)| > SILK_BOW_TOL the cell goes exact.
+//     Probing in OUTPUT space is what makes this safe across the whole
+//     glow range — the curve's exponent spans [0.6, 2.6], so it has both a
+//     steep convex bright end (glow high) and an infinite-second-derivative
+//     concave dark end (glow low, near s=0); an input-space |ds| threshold
+//     can't see the second kind, a chord probe catches both.
+//   - The vignette's contribution to the endpoint products comes from
+//     g_dx2Node (the dx2 column term at node columns only, incl. x==w which
+//     rowAux can't supply), quantized identically to rowAux[].dx2.
+//     Linearizing env across a cell adds at most vignK*4096 =~ 0.024 of a
+//     Q8 env unit of interior error (env is quadratic in x; max lerp error
+//     over h=8 is f''*h^2/8 = 2*vignK*256*64/8) — three orders of magnitude
+//     under one palette step.
+//   - Ranges/overflow: interior P is a convex combination of two node
+//     products, both in [0, 255<<16], so idx stays in [-1, 255] exactly as
+//     proven above (dither unchanged). PQ = P<<3 <= 255<<19 < 2^27.
+//     dq = dith<<3 <= (3328*65536 + 45696)*8 < 1.75e9, PQ + dq < 1.88e9 <
+//     2^31 — no int32 overflow anywhere in the fast path.
+//   - band() is now also IRAM-pinned (GM_ANIM_IRAM), AnimEmber.cpp's
+//     precedent: the S3 has one 16 KB flash icache shared by both cores,
+//     LVGL churns it from core 1, and refills queue on the MSPI bus behind
+//     the panel's PSRAM scan-out stream.
+//
 // Design: anim-fluid (Fable), 2026-08-15. Optimized: anim-fluid, 2026-08-15;
 // opt-silk2 (fixed-point tail), 2026-08-15; opt-silk3 (constant folding +
-// coarse-grid interpolation), 2026-08-17.
+// coarse-grid interpolation), 2026-08-17; opt-silk4 (per-cell product ramp +
+// IRAM pin), 2026-08-31.
 
 #include "BgAnim.h"
 #include "BgAnimCommon.h"
 #include <math.h>
+
+// Same pattern as AnimEmber.cpp: keep band() out of flash so LVGL's icache
+// churn on the other core can't stall it behind MSPI refills (see file
+// header). No-op on the host bench.
+#if defined(ESP_PLATFORM)
+#include <esp_attr.h>
+#define GM_ANIM_IRAM IRAM_ATTR
+#else
+#define GM_ANIM_IRAM
+#endif
+
+#ifdef GM_SILK_HOST_DIFF
+// Test hooks for the host differ (tools/animbench silk_diff builds this file
+// with -DGM_SILK_HOST_DIFF; neither the firmware, the bench timing build,
+// nor xtensa-asm.sh define it, so none of them carry the per-cell check or
+// the counters below). g_silkForceExact forces every grid cell down the
+// exact per-pixel path, which is bit-identical to the pre-pass-4 algorithm;
+// the differ renders with and without it to bound the fast path's error
+// across the full parameter space, not just the goldens' default params.
+// External linkage on purpose.
+bool g_silkForceExact = false;
+unsigned long long g_silkFastCells = 0;
+unsigned long long g_silkSlowCells = 0;
+#endif
 
 namespace {
 using namespace bganim;
@@ -215,6 +281,14 @@ int lastGlow = -1;
 int rowAuxW[4] = {0, 0, 0, 0}; // width each rowAux phase was sized for,
                                // per phase: they are retried independently
                                // and can differ across init() calls
+// Vignette column term (same value and quantization as rowAux[].dx2) at the
+// GRID-NODE columns only: x = 0, SILK_GRID, ..., cellsFull*SILK_GRID — note
+// the last entry can be x == w, one past what rowAux holds, because it is
+// the ramp target of the final full cell. (w>>SILK_GRID_SHIFT)+1 int32
+// entries, ~244 B at w=480. Matching rowAux's quantization exactly is what
+// makes the fast path's node pixels bit-identical to the slow path's.
+int32_t *g_dx2Node = nullptr;
+int g_dx2NodeN = 0;
 float g_invR2 = 1.0f;
 float g_vignK = 0.32f; // 0.32f * g_invR2, folded so band() does one multiply instead of two
 int32_t g_step[3];    // per-pixel x-phase step, Q32 turns/px
@@ -240,6 +314,12 @@ constexpr int SILK_Q_BITS = 8;     // interpolation fixed-point fractional bits
 // the header describes would have saved an instruction, and why it isn't
 // needed.
 constexpr int32_t SIN_SUM_BIAS = 3 * SIN_AMP; // 1536
+// Fast-path gate for the fourth pass's per-cell product ramp (see band()):
+// |2*lut(mid) - lut(a) - lut(b)| in Q8 contrast-output units == twice the
+// chord's deviation from the curve at the cell midpoint. 512 caps the
+// interior error at ~1 palette index (one index == 256 Q8 units, and env
+// <= 1 only shrinks it) before a cell falls back to the exact path.
+constexpr int32_t SILK_BOW_TOL = 512;
 // sinLut() lives in BgAnimCommon.cpp (a different translation unit — this
 // build has no LTO), so calling it from the pixel loop is a real, un-inlined
 // function call with a lazy-init branch, 3x/pixel = 691200 calls/frame. That
@@ -388,6 +468,24 @@ bool init(int w, int h) {
             return false;
         }
     }
+    // Node-column vignette table for the fourth pass's product ramp (see
+    // declaration). Null-checked like rowAux so a transient allocation
+    // failure is retried on the next init() rather than latched.
+    if (g_dx2Node == nullptr) {
+        const float cx = w * 0.5f;
+        const int n = (w >> SILK_GRID_SHIFT) + 1;
+        g_dx2Node = static_cast<int32_t *>(alloc(static_cast<size_t>(n) * sizeof(int32_t)));
+        if (g_dx2Node == nullptr) {
+            return false;
+        }
+        g_dx2NodeN = n;
+        for (int j = 0; j < n; j++) {
+            const float dx = j * SILK_GRID - cx;
+            // Identical rounding to rowAux[].dx2 above — required for the
+            // node-column bit-exactness argument in the file header.
+            g_dx2Node[j] = static_cast<int32_t>(lroundf(g_vignK * dx * dx * 256.0f));
+        }
+    }
     return true;
 }
 
@@ -430,7 +528,7 @@ void frame(uint32_t tMs, int, int, const uint8_t p[4]) {
     }
 }
 
-void band(uint16_t *dst, int y0, int rows, int w, uint32_t, const uint8_t *) {
+GM_ANIM_IRAM void band(uint16_t *dst, int y0, int rows, int w, uint32_t, const uint8_t *) {
     const float cy = w * 0.5f;
     // Seed each wave's row-phase at y0, then step by g_rowStep per row
     // (plain uint32 add — wraps mod 2*pi for free, replacing the old
@@ -522,6 +620,21 @@ void band(uint16_t *dst, int y0, int rows, int w, uint32_t, const uint8_t *) {
         uint32_t a = base[0], b = base[1], c = base[2];
         // Biased once per node, not per pixel (see SIN_SUM_BIAS).
         int32_t sCur = SIN_SUM_BIAS + sinFromTurn(a) + sinFromTurn(b) + sinFromTurn(c); // exact node @ x=0
+        int32_t ncCur = g_lut[sCur];                            // Q8 contrast at the node
+        int32_t Pcur = ncCur * (envRowBase_q8 - g_dx2Node[0]);  // Q16 nc*env product at the node
+        // --- Fourth pass: per-cell PRODUCT ramp (see file header) ---
+        // The Bayer dither has period 4 in x and every cell starts at
+        // x % 8 == 0, so within ANY cell the dither values cycle phases
+        // 0,1,2,3,0,1,2,3 from the cell start. ra[0..3].dith is exactly
+        // those four values (dith depends only on y&3 — already selected by
+        // ra — and x&3), pre-biased by PALETTE_REAL_OFF<<16. Shift them
+        // into the ramp's Q19 once per ROW and they live in registers for
+        // the whole row: the fast path reads no per-pixel tables at all
+        // except the palette itself.
+        const int32_t dq0 = ra[0].dith << SILK_GRID_SHIFT;
+        const int32_t dq1 = ra[1].dith << SILK_GRID_SHIFT;
+        const int32_t dq2 = ra[2].dith << SILK_GRID_SHIFT;
+        const int32_t dq3 = ra[3].dith << SILK_GRID_SHIFT;
         const int cellsFull = w >> SILK_GRID_SHIFT;
         int x = 0;
         for (int cell = 0; cell < cellsFull; cell++) {
@@ -529,32 +642,94 @@ void band(uint16_t *dst, int y0, int rows, int w, uint32_t, const uint8_t *) {
             b += g_bigStep[1];
             c += g_bigStep[2];
             const int32_t sNext = SIN_SUM_BIAS + sinFromTurn(a) + sinFromTurn(b) + sinFromTurn(c); // exact next node
-            const int32_t stepQ = (sNext - sCur) << (SILK_Q_BITS - SILK_GRID_SHIFT);
-            int32_t sQ = sCur << SILK_Q_BITS;
-            for (int i = 0; i < SILK_GRID; i++) {
-                const int32_t s = sQ >> SILK_Q_BITS;
-                // g_lut[s] (contrast curve) and g_lut[idx] (palette, offset
-                // folded into ra[x].dith — see RowAux comment) are ONE
-                // walking pointer with two precomputed offsets, not two
-                // separate pointers — see the g_lut/contrastLUT/paletteExt
-                // comment above for why that matters.
-                const int32_t nc_q8 = g_lut[s]; // already the biased index, Q8 (nc*256)
-                // env_q8 in [0,256] always (see file header proof); no clamp
-                // needed for any square panel (all current display drivers
-                // are square).
-                const int32_t env_q8 = envRowBase_q8 - ra[x].dx2;
-                // nc_q8 (Q8) * env_q8 (Q8) = Q16 (nc*env*65536); ra[x].dith
-                // is pre-scaled to the same Q16 units AND pre-biased by
-                // PALETTE_REAL_OFF<<16 (see RowAux comment), so one add
-                // combines them and one arithmetic shift recovers g_lut's
-                // ABSOLUTE palette index directly.
-                const int32_t idxq = nc_q8 * env_q8 + ra[x].dith;
-                const int idx = static_cast<int>(idxq >> 16);
-                out[x] = g_lut[idx];
-                sQ += stepQ;
-                x++;
+            const int32_t ncNext = g_lut[sNext];
+            const int32_t Pnext = ncNext * (envRowBase_q8 - g_dx2Node[cell + 1]);
+            // Curvature probe: one extra contrast gather at the cell's
+            // s-midpoint. bow == twice the chord-vs-curve deviation there,
+            // in Q8 output units. Probing OUTPUT space (not |ds|) is what
+            // keeps this valid at both exponent extremes of the contrast
+            // curve — see the file-header discussion of glow 0 vs 100.
+            const int32_t ncMid = g_lut[(sCur + sNext) >> 1];
+            int32_t bow = 2 * ncMid - (ncCur + ncNext);
+            bow = bow < 0 ? -bow : bow;
+#ifdef GM_SILK_HOST_DIFF
+            if (g_silkForceExact) {
+                bow = SILK_BOW_TOL + 1; // force the exact path (differ hook)
+            }
+#endif
+            if (bow <= SILK_BOW_TOL) {
+#ifdef GM_SILK_HOST_DIFF
+                g_silkFastCells++;
+#endif
+                // FAST cell: ramp the Q16 product P from Pcur to Pnext in
+                // Q19 (<< SILK_GRID_SHIFT). Exact closure, same argument as
+                // the old s-ramp: 8 steps of (Pnext-Pcur) from Pcur<<3 land
+                // on Pnext<<3 exactly. Pixel 0 telescopes to the slow
+                // path's node value bit-for-bit: ((P + d) << 3) >> 19 ==
+                // (P + d) >> 16 (the <<3 is exact — see the header overflow
+                // bound — and arithmetic shifts compose), so fast and slow
+                // cells never seam.
+                //
+                // This IS an 8x unroll, but not the one band()'s NOTE above
+                // warns about: that flat unroll replicated the whole 3-LUT
+                // pixel body (~20+ simultaneous live values, spilled, lost
+                // the hardware LOOP). This body keeps ~10 values live (PQ,
+                // dP, dq0-3, out, g_lut, temps) — inside the ~13-14 AR
+                // budget. Verified via xtensa-asm.sh; re-verify if touched.
+                int32_t PQ = Pcur << SILK_GRID_SHIFT;
+                const int32_t dP = Pnext - Pcur;
+                uint16_t *const o = out + x;
+                o[0] = g_lut[(PQ + dq0) >> (16 + SILK_GRID_SHIFT)];
+                PQ += dP;
+                o[1] = g_lut[(PQ + dq1) >> (16 + SILK_GRID_SHIFT)];
+                PQ += dP;
+                o[2] = g_lut[(PQ + dq2) >> (16 + SILK_GRID_SHIFT)];
+                PQ += dP;
+                o[3] = g_lut[(PQ + dq3) >> (16 + SILK_GRID_SHIFT)];
+                PQ += dP;
+                o[4] = g_lut[(PQ + dq0) >> (16 + SILK_GRID_SHIFT)];
+                PQ += dP;
+                o[5] = g_lut[(PQ + dq1) >> (16 + SILK_GRID_SHIFT)];
+                PQ += dP;
+                o[6] = g_lut[(PQ + dq2) >> (16 + SILK_GRID_SHIFT)];
+                PQ += dP;
+                o[7] = g_lut[(PQ + dq3) >> (16 + SILK_GRID_SHIFT)];
+                x += SILK_GRID;
+            } else {
+#ifdef GM_SILK_HOST_DIFF
+                g_silkSlowCells++;
+#endif
+                // EXACT cell (the pre-pass-4 body, verbatim): the contrast
+                // chord would deviate visibly here, so apply the curve at
+                // full resolution along the interpolated s.
+                const int32_t stepQ = (sNext - sCur) << (SILK_Q_BITS - SILK_GRID_SHIFT);
+                int32_t sQ = sCur << SILK_Q_BITS;
+                for (int i = 0; i < SILK_GRID; i++) {
+                    const int32_t s = sQ >> SILK_Q_BITS;
+                    // g_lut[s] (contrast curve) and g_lut[idx] (palette,
+                    // offset folded into ra[x].dith — see RowAux comment)
+                    // are ONE walking pointer with two precomputed offsets,
+                    // not two separate pointers — see the
+                    // g_lut/contrastLUT/paletteExt comment above.
+                    const int32_t nc_q8 = g_lut[s]; // already the biased index, Q8 (nc*256)
+                    // env_q8 in [0,256] always (see file header proof); no
+                    // clamp needed for any square panel (all current
+                    // display drivers are square).
+                    const int32_t env_q8 = envRowBase_q8 - ra[x].dx2;
+                    // nc_q8 (Q8) * env_q8 (Q8) = Q16; ra[x].dith is Q16 AND
+                    // pre-biased by PALETTE_REAL_OFF<<16 (see RowAux
+                    // comment), so one add combines them and one arithmetic
+                    // shift recovers g_lut's ABSOLUTE palette index.
+                    const int32_t idxq = nc_q8 * env_q8 + ra[x].dith;
+                    const int idx = static_cast<int>(idxq >> 16);
+                    out[x] = g_lut[idx];
+                    sQ += stepQ;
+                    x++;
+                }
             }
             sCur = sNext;
+            ncCur = ncNext;
+            Pcur = Pnext;
         }
         // Exact tail for the row's non-grid-aligned remainder (0..7 pixels):
         // same per-pixel math band() used everywhere before interpolation
@@ -587,6 +762,8 @@ void release() {
         releaseTable(rowAux[ph], static_cast<size_t>(rowAuxW[ph]) * sizeof(RowAux));
         rowAuxW[ph] = 0;
     }
+    releaseTable(g_dx2Node, static_cast<size_t>(g_dx2NodeN) * sizeof(int32_t));
+    g_dx2NodeN = 0;
     // Borrowed from BgAnimCommon, which owns it and shares it fleet-wide.
     g_sinLut = nullptr;
     lastThemeGen = 0xFFFFFFFF;

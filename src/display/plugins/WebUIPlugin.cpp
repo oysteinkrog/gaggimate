@@ -819,8 +819,25 @@ void WebUIPlugin::setupServer() {
         if (request->hasArg("half")) {
             a->setHalfRes(request->arg("half").toInt() != 0);
         }
+        // Both land on setInterlaceForce(), not setInterlace() directly: the
+        // latter is what DefaultUI::updateState() calls every UI pass with
+        // the persisted setting, so a direct call here would be silently
+        // reverted on the next pass (measured: an ilace=0/interlace=0 request
+        // that "did nothing" was this, not a parsing bug). setInterlaceForce
+        // pins the value against that periodic re-apply the same way
+        // forcehalf already pins resolution against it; -1 releases the pin
+        // and hands control back to the persisted setting, 0/1 hold it.
         if (request->hasArg("ilace")) {
-            a->setInterlace(request->arg("ilace").toInt() != 0);
+            a->setInterlaceForce(static_cast<int8_t>(request->arg("ilace").toInt()));
+        }
+        // interlace=-1|0|1 is the same knob as ilace= above, both landing on
+        // setInterlaceForce() -- it defaults false now that the direct-DMA
+        // path (SleepAnimation.h's interlace/renderHalf comments) also
+        // honours it, so the interlace lane's ladder has an explicit, named
+        // opt-in to rung against rather than inheriting whichever value
+        // ilace= last left behind under a name that predates this feature.
+        if (request->hasArg("interlace")) {
+            a->setInterlaceForce(static_cast<int8_t>(request->arg("interlace").toInt()));
         }
         // forcehalf pins the resolution: -1 auto, 0 full, 1 half. half= only
         // raises or drops the ceiling and autoResolution still gets the vote,
@@ -887,12 +904,28 @@ void WebUIPlugin::setupServer() {
             a->setHalfForce(static_cast<int8_t>(request->arg("forcehalf").toInt()));
         }
         AsyncResponseStream *response = request->beginResponseStream("application/json");
-        JsonDocument doc;
+        // PSRAM-backed like every other JsonDocument in this file that
+        // carries more than a couple of fields (lines 146/157/167/1148):
+        // this handler is polled every few seconds for tens of minutes by
+        // rig soaks, and the plain default allocator would keep growing and
+        // freeing an internal-heap block on every poll instead.
+        JsonDocument doc(&psramAllocator);
         doc["direct"] = a->directPush();
         doc["dma"] = a->dmaPathWanted();
         doc["rprio"] = a->renderPrioValue();
         doc["half"] = a->halfResOn();
         doc["forcehalf"] = a->halfForced();
+        // Reports which way ilace=/interlace= is actually set, not which one
+        // last asked -- see SleepAnimation::interlaceEnabled()'s comment. The
+        // ladder rungs this against need to read this back to confirm the
+        // rung landed, since a request that never arrives leaves the boot
+        // default (false) standing rather than erroring visibly.
+        doc["interlace"] = a->interlaceEnabled();
+        // -1/0/1, mirroring forcehalf: whether a debug-endpoint pin is
+        // currently holding interlace away from the persisted setting. A
+        // rung that expects to see interlace flip on the NEXT settings
+        // change (rather than staying pinned) should see -1 here first.
+        doc["interlace_force"] = a->interlaceForced();
         doc["pattern"] = a->debugPatternOn();
         doc["msync_fail"] = a->msyncFailCount();
         doc["msync_ok"] = a->msyncOkCount();
@@ -901,6 +934,11 @@ void WebUIPlugin::setupServer() {
         // a check that never ran.
         doc["tear_live"] = a->liveWriteCount();
         doc["tear_checked"] = a->liveWriteCheckedCount();
+        // Deliberately separate from tear_live: this is interlacing writing
+        // the live buffer ON PURPOSE (see interlacedLiveWriteCount()'s own
+        // comment), so it climbs continuously while interlace=1 is running
+        // and a nonzero tear_live stays a bug report the whole time.
+        doc["interlaced_live_writes"] = a->interlacedLiveWriteCount();
         doc["flip_timeouts"] = a->flipTimeoutCount();
         doc["frame_us"] = a->lastFrameUsValue();
         doc["work_us"] = a->lastWorkUsValue();
@@ -919,6 +957,36 @@ void WebUIPlugin::setupServer() {
             doc["band_align"][i] = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(bp) & 63u);
         }
         doc["dma_errors"] = a->dmaErrorCount();
+        // A subset of dma_errors above, specifically submitRows() failures --
+        // see dmaRowFallbackCount()'s own comment for why the two are watched
+        // separately (a rising count here implicates the row-group mount
+        // rather than the plain whole-band submit()).
+        doc["dma_row_fallbacks"] = a->dmaRowFallbackCount();
+        // Bands where interlace was requested but half resolution vetoed it
+        // outright (SleepAnimation.cpp's bandInterlaced comment): forcehalf=1
+        // with interlace/interlace_force on wedged the pipeline to ~0.2 fps
+        // before this existed. A soak run at that combination should see this
+        // climb by h/BAND_H every frame -- if it stays flat instead while
+        // half=1 and interlace=1 both read true, the veto is not firing and
+        // the wedge risk is back.
+        doc["half_ilace_veto"] = a->halfInterlaceVetoCount();
+        // Legitimate "this band's row-pair is the other phase's turn"
+        // no-ops -- confirmed root cause of the half+interlace wedge and
+        // its photographed corruption (see SleepAnimation.cpp's
+        // nothingOwnedThisBand comment): these used to be misrouted through
+        // dma_errors and a whole-band CPU pushColors fallback instead.
+        // dma_row_fallbacks never counted them (it only counts a genuine
+        // submitRows() failure), which is why it read 0 while dma_errors
+        // climbed into the thousands during the rig soak that caught this.
+        doc["interlace_band_skips"] = a->interlaceBandSkipCount();
+        // Bands the regional overlay-update warmup forced full this run
+        // (requestBandWarmup(), SleepAnimation.h's bandsForcedFullCount()
+        // comment): near zero on a static screen, a handful (2-12, not 240)
+        // right after one widget changes. Distinguishes "the regional
+        // mechanism is doing its job" from "it never got a dirty rect to
+        // work with", the same way half_ilace_veto and interlace_band_skips
+        // above distinguish their own mechanisms from a dead knob.
+        doc["bands_forced_full"] = a->bandsForcedFullCount();
         {
             // Band-DMA transfer durations. bdma_over512 climbing at the
             // refill's resync rate means a GDMA PSRAM access queues behind
@@ -1453,6 +1521,14 @@ void WebUIPlugin::setupServer() {
             SleepAnimation *a = sleep_animation_bench_instance();
             if (a != nullptr) {
                 a->benchSetPie(request->arg("pie").toInt() != 0);
+                a->benchRequestReset();
+            }
+        }
+        // ?bpie=0|1 -- vector or scalar composite (blendRowPie vs blendRow).
+        if (request->hasArg("bpie")) {
+            SleepAnimation *a = sleep_animation_bench_instance();
+            if (a != nullptr) {
+                a->benchSetBpie(request->arg("bpie").toInt() != 0);
                 a->benchRequestReset();
             }
         }
