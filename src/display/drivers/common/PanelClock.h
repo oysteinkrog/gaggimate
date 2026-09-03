@@ -48,6 +48,21 @@ void detach();
 // panel booted with. Values are clamped to [2, 16]. Safe to call from any task.
 void setDiv(int n);
 
+// Fastest pixel clock the stored setting may select. The bounce refill copies
+// the PSRAM framebuffer over the MSPI bus it shares with flash; whenever core 0
+// runs flash-resident code (the BLE host on every controller message, WiFi)
+// that bus is shared and the copy runs at ~28 MB/s. At n=5 (16 MHz, 61 Hz) the
+// panel consumes 28 MB/s, so the refill falls behind by a few buffers, stays
+// behind for milliseconds, and laps the 8-buffer pool: one band of the picture
+// displaced per lap (measured 2026-09-03 on the bench machine with the
+// controller connected, ~18 slow copies/s and 0.03 laps/s in standby; the
+// user's stored setting was 5). At n=6 (13.3 MHz, 51 Hz) consumption is
+// 24 MB/s and the same soak showed no copy over 190 us against 632 us of pool
+// slack, zero laps. A stored divider below this is applied as this; the debug
+// endpoint is not clamped so the fast clock stays available for measurement.
+constexpr int MIN_USER_DIV = 6;
+inline int clampUserDiv(int n) { return (n != 0 && n < MIN_USER_DIV) ? MIN_USER_DIV : n; }
+
 // Frequency the panel should be created with: the requested divider as a
 // frequency when one has been chosen, otherwise defaultHz unchanged. The panel
 // driver calls this instead of using its build-time constant directly, so a

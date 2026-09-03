@@ -227,7 +227,6 @@ function BackgroundAnimationSettings({ formData, onChange, setField }) {
             onChange={onChange('panelClockDiv')}
           >
             <option value={0}>Firmware default</option>
-            <option value={5}>61 Hz, smoothest, flickers if starved</option>
             <option value={6}>51 Hz, stable, slight gradient shimmer</option>
             <option value={7}>43 Hz, conservative</option>
             <option value={8}>38 Hz, most conservative</option>

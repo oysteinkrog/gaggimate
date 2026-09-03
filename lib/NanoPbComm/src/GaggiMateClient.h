@@ -56,6 +56,12 @@ class GaggiMateClient {
     // idle to give the shared radio back to Wi-Fi.
     void setLowLatency(bool active) { _transport.setLowLatency(active); }
 
+    // Runtime override of the idle connection interval (1.25ms units) for the
+    // within-boot coex A/B; forwards to the transport. mn==0 restores default.
+    void setIdleInterval(uint16_t mn, uint16_t mx) { _transport.setIdleInterval(mn, mx); }
+    uint16_t idleMinInterval() const { return _transport.idleMinInterval(); }
+    uint16_t idleMaxInterval() const { return _transport.idleMaxInterval(); }
+
     // Native NimBLE client handle, used by ControllerOTA / status RSSI (OTA uses
     // its own BLE service, independent of this protocol).
     NimBLEClient *getClient() const { return _transport.getNativeClient(); }

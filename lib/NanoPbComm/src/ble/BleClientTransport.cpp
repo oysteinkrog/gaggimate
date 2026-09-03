@@ -158,13 +158,22 @@ void BleClientTransport::setLowLatency(bool active) {
     applyConnParams();
 }
 
+void BleClientTransport::setIdleInterval(uint16_t mn, uint16_t mx) {
+    // mn==0 clears the override (both fields), so idleMin/MaxInterval() fall
+    // back to the compiled IDLE_*_INTERVAL. applyConnParams() only re-issues
+    // the update while idle (not mid-shot) and connected; harmless otherwise.
+    _idleMinOverride = mn;
+    _idleMaxOverride = mn ? mx : 0;
+    applyConnParams();
+}
+
 void BleClientTransport::applyConnParams() {
     if (_client == nullptr || !_client->isConnected())
         return;
     if (_lowLatency)
         _client->updateConnParams(ACTIVE_MIN_INTERVAL, ACTIVE_MAX_INTERVAL, CONN_LATENCY, CONN_TIMEOUT);
     else
-        _client->updateConnParams(IDLE_MIN_INTERVAL, IDLE_MAX_INTERVAL, CONN_LATENCY, CONN_TIMEOUT);
+        _client->updateConnParams(idleMinInterval(), idleMaxInterval(), CONN_LATENCY, CONN_TIMEOUT);
 }
 
 bool BleClientTransport::send(const uint8_t *data, size_t length) {

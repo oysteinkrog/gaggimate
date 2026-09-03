@@ -78,6 +78,10 @@ class WebUIPlugin : public Plugin {
     bool updating = false;
     bool apMode = false;
     bool serverRunning = false;
+    // /api/debug/radio: scheduled WiFi off/on for the scan-out A/B (see the
+    // endpoint comment). millis() deadlines, 0 == nothing scheduled.
+    unsigned long radioOffAtMs = 0;
+    unsigned long radioOnAtMs = 0;
     String updateComponent = "";
     float currentWeight = 0.0f;
     // Reused for every 500ms status broadcast. Allocating a fresh JsonDocument

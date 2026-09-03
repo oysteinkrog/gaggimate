@@ -1518,9 +1518,10 @@ void DefaultUI::updateState() {
     sleepAnimation.setHalfRes(settings.getBgAnimHalfRes() != 0);
     sleepAnimation.setInterlace(settings.getBgAnimInterlace() != 0);
     // Panel refresh rate: live pclk divider (0 = build default). One register
-    // poke, but only touch the peripheral on an actual change.
+    // poke, but only touch the peripheral on an actual change. Floored at
+    // MIN_USER_DIV: see PanelClock.h for the measurement behind it.
     static int lastPclkDiv = INT_MIN;
-    const int pclkDiv = settings.getPanelClockDiv();
+    const int pclkDiv = panelclock::clampUserDiv(settings.getPanelClockDiv());
     if (pclkDiv != lastPclkDiv) {
         lastPclkDiv = pclkDiv;
         panelclock::setDiv(pclkDiv);

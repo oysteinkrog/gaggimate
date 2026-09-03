@@ -179,6 +179,26 @@ void WebUIPlugin::setup(Controller *_controller, PluginManager *_pluginManager) 
 }
 
 void WebUIPlugin::loop() {
+    // Scheduled radio window from /api/debug/radio. Runs here, on loopTask, for
+    // the same reason the STA watchdog does its restarts from a task: WiFi mode
+    // changes are too heavy for the timer or web-server tasks. The off/on pair
+    // is the watchdog's own restartDriver() rung, so the recovery path is the
+    // field-tested one. Ahead of the serverRunning check so the "on" deadline
+    // can never be skipped.
+    {
+        const unsigned long tnow = millis();
+        if (radioOffAtMs != 0 && static_cast<long>(tnow - radioOffAtMs) >= 0) {
+            radioOffAtMs = 0;
+            ESP_LOGW("WebUIPlugin", "debug/radio: WiFi OFF for %lu ms", radioOnAtMs - tnow);
+            WiFi.mode(WIFI_OFF);
+        }
+        if (radioOnAtMs != 0 && static_cast<long>(tnow - radioOnAtMs) >= 0) {
+            radioOnAtMs = 0;
+            ESP_LOGW("WebUIPlugin", "debug/radio: WiFi back ON");
+            WiFi.mode(WIFI_STA);
+            WiFi.begin(controller->getSettings().getWifiSsid(), controller->getSettings().getWifiPassword());
+        }
+    }
     if (updating) {
         // Pass which component is being flashed: a controller update streams the
         // firmware over BLE (wants a low-latency link), a display update is over
@@ -410,6 +430,29 @@ extern volatile uint32_t gm_rgb_busy_hist[];
 extern volatile uint32_t gm_rgb_gap_hist[];
 extern volatile uint32_t gm_rgb_busy_max;
 extern volatile uint32_t gm_rgb_gap_max;
+// Gap logger from the GM_RGB_GAPLOG_PATCH hunk of scripts/patch_esp_lcd_rgb.py:
+// one event per long refill gap or slow refill copy, with what the two cores
+// were doing. Mirrors the driver's struct.
+struct gm_rgb_gap_ev_t {
+    uint32_t t_ms;
+    uint32_t gap_us;
+    uint32_t prev_busy_us; // copy time of the previous callback (inside gap_us)
+    uint32_t busy_us;      // copy time of this callback
+    uint32_t fills;        // buffers this callback refilled
+    uint32_t nest;
+    uint32_t pos; // buffers into the frame at entry
+    uint32_t pc;
+    uint32_t ps;
+    uint32_t stall_us; // longest 240 B chunk of this callback's copies
+    uint32_t stall_at; // byte offset of that chunk in its bounce buffer
+    const char *task;
+    const char *other; // task on the other core at entry
+};
+extern volatile gm_rgb_gap_ev_t gm_rgb_gaplog[];
+extern volatile uint32_t gm_rgb_gaplog_n;
+extern volatile uint32_t gm_rgb_chunk_hist[];
+extern volatile uint32_t gm_rgb_chunk_max_us;
+static constexpr int GM_RGB_GAPLOG_N = 32;
 }
 
 void WebUIPlugin::setupServer() {
@@ -589,10 +632,13 @@ void WebUIPlugin::setupServer() {
             gm_rgb_eof_max = 0;
             gm_rgb_busy_max = 0;
             gm_rgb_gap_max = 0;
+            gm_rgb_chunk_max_us = 0;
             for (int i = 0; i < 24; i++) {
                 gm_rgb_busy_hist[i] = 0;
                 gm_rgb_gap_hist[i] = 0;
+                gm_rgb_chunk_hist[i] = 0;
             }
+            gm_rgb_gaplog_n = 0;
         }
         // lagthresh=N also logs a correlation entry for every frame whose
         // refill headroom fell below N us. Set it one histogram bucket below
@@ -675,6 +721,37 @@ void WebUIPlugin::setupServer() {
         response->print("],\"gap_hist\":[");
         for (int i = 0; i < 24; i++) {
             response->printf("%s%u", i ? "," : "", static_cast<unsigned>(gm_rgb_gap_hist[i]));
+        }
+        // chunk_hist: every 240 B chunk of every refill copy, 16 us buckets. The
+        // shape of a slow copy: one 400 us chunk is a bus freeze, many 7 us
+        // chunks is a shared bus.
+        response->printf("],\"chunk_bucket_us\":16,\"chunk_max_us\":%u,\"chunk_hist\":[", static_cast<unsigned>(gm_rgb_chunk_max_us));
+        for (int i = 0; i < 24; i++) {
+            response->printf("%s%u", i ? "," : "", static_cast<unsigned>(gm_rgb_chunk_hist[i]));
+        }
+        // gaplog: one event per refill gap over 400 us or refill copy over 250 us
+        // (see the GM_RGB_GAPLOG_PATCH comment in scripts/patch_esp_lcd_rgb.py).
+        // gap_us - prev_busy_us is the true interrupt latency; fills is how far
+        // the DMA got ahead; stall_us over ~100 means a bus freeze rather than a
+        // shared bus; other is the task on the other core, the bus competitor.
+        // Run xtensa-esp32s3-elf-addr2line -e firmware.elf on the pcs. Newest
+        // last; gaplog_total is the count since reset so a full ring is not
+        // mistaken for exactly 32 events.
+        const uint32_t gapTotal = gm_rgb_gaplog_n;
+        const uint32_t gapN = gapTotal < static_cast<uint32_t>(GM_RGB_GAPLOG_N) ? gapTotal : GM_RGB_GAPLOG_N;
+        const uint32_t gapStart = gapTotal > static_cast<uint32_t>(GM_RGB_GAPLOG_N) ? gapTotal - GM_RGB_GAPLOG_N : 0;
+        response->printf("],\"gaplog_total\":%u,\"gaplog\":[", static_cast<unsigned>(gapTotal));
+        for (uint32_t i = 0; i < gapN; i++) {
+            const volatile gm_rgb_gap_ev_t &ev = gm_rgb_gaplog[(gapStart + i) % GM_RGB_GAPLOG_N];
+            const char *task = ev.task ? ev.task : "?";
+            const char *other = ev.other ? ev.other : "?";
+            response->printf("%s{\"t_ms\":%u,\"gap_us\":%u,\"prev_busy_us\":%u,\"busy_us\":%u,\"fills\":%u,\"nest\":%u,\"pos\":%u,"
+                             "\"stall_us\":%u,\"stall_at\":%u,\"pc\":\"0x%08x\",\"ps\":\"0x%08x\",\"task\":\"%s\",\"other\":\"%s\"}",
+                             i ? "," : "", static_cast<unsigned>(ev.t_ms), static_cast<unsigned>(ev.gap_us),
+                             static_cast<unsigned>(ev.prev_busy_us), static_cast<unsigned>(ev.busy_us),
+                             static_cast<unsigned>(ev.fills), static_cast<unsigned>(ev.nest), static_cast<unsigned>(ev.pos),
+                             static_cast<unsigned>(ev.stall_us), static_cast<unsigned>(ev.stall_at),
+                             static_cast<unsigned>(ev.pc), static_cast<unsigned>(ev.ps), task, other);
         }
         response->print("]}");
         request->send(response);
@@ -1025,6 +1102,83 @@ void WebUIPlugin::setupServer() {
         doc["c1load"] = s_c1LoadTask != nullptr;
         doc["c1load_iters"] = s_c1LoadIters;
 #endif
+        serializeJson(doc, *response);
+        request->send(response);
+    });
+
+    // /api/debug/radio?wifioff=SECS (bench only): take WiFi down for SECS
+    // seconds, then bring it back with the STA watchdog's restart sequence.
+    // The scan-out counters keep accumulating while the radio is off, so one
+    // /api/debug/scanout?reset=1 before and one read after the window gives a
+    // WiFi-off sample on exactly the same counters as a WiFi-on one, within one
+    // boot. That is the within-boot A/B the old "noradio" build could never
+    // give (it measured slips over serial, in a different memory layout).
+    // WiFi goes down 1.5 s after the reply so the response gets out. SECS is
+    // clamped to 20..180: below the STA watchdog's 20 s grace nothing new is
+    // learned, above three minutes the reboot rung starts to matter.
+    server.on("/api/debug/radio", [this](AsyncWebServerRequest *request) {
+        long secs = 0;
+        if (request->hasParam("wifioff")) {
+            secs = request->getParam("wifioff")->value().toInt();
+            if (secs < 20)
+                secs = 20;
+            if (secs > 180)
+                secs = 180;
+            const unsigned long tnow = millis();
+            radioOffAtMs = tnow + 1500;
+            radioOnAtMs = radioOffAtMs + static_cast<unsigned long>(secs) * 1000UL;
+        }
+        AsyncResponseStream *response = request->beginResponseStream("application/json");
+        response->printf("{\"scheduled_off_secs\":%ld,\"off_pending\":%d,\"on_pending\":%d,\"mode\":%d,\"status\":%d}", secs,
+                         radioOffAtMs != 0, radioOnAtMs != 0, static_cast<int>(WiFi.getMode()), static_cast<int>(WiFi.status()));
+        request->send(response);
+    });
+    // /api/debug/coex[?idlemin=N&idlemax=M] reads and live-sets the IDLE BLE
+    // connection interval (1.25ms units: 24 == 30ms), then reports the state.
+    //
+    // This is a within-boot A/B knob for the scan-out. The resync rate
+    // (displaced bands) is non-stationary -- it swings ~4x run-to-run -- so a
+    // compile-time interval change cannot be told apart from noise across two
+    // separate flashes. Toggle this live between intervals, resetting
+    // /api/debug/scanout per phase, and both configs are sampled against the
+    // SAME ambient conditions. Measured 2026-09-01: tight (7.5-10 ms) and wide
+    // (200-300 ms) intervals both resync more than the 30-50 ms default, so the
+    // default stays. idlemin=0 releases the override to it. The change only
+    // re-issues the connection-param update while idle (not mid-shot) and
+    // connected; it is volatile across boot.
+    server.on("/api/debug/coex", [this](AsyncWebServerRequest *request) {
+        GaggiMateClient *client = controller->getClientController();
+        if (client == nullptr) {
+            request->send(409, "application/json", "{\"error\":\"no client\"}");
+            return;
+        }
+        if (request->hasArg("idlemin")) {
+            long mn = request->arg("idlemin").toInt();
+            // idlemax defaults to idlemin when omitted (a single fixed interval).
+            long mx = request->hasArg("idlemax") ? request->arg("idlemax").toInt() : mn;
+            if (mn < 0)
+                mn = 0; // clamp; 0 clears the override
+            if (mx < mn)
+                mx = mn;
+            // Guard against nonsense that would trip NimBLE's own validation:
+            // interval units are 1.25ms and the spec caps at 0x0C80 (4000ms).
+            if (mn > 3200)
+                mn = 3200;
+            if (mx > 3200)
+                mx = 3200;
+            client->setIdleInterval(static_cast<uint16_t>(mn), static_cast<uint16_t>(mx));
+        }
+        AsyncResponseStream *response = request->beginResponseStream("application/json");
+        JsonDocument doc(&psramAllocator);
+        doc["connected"] = client->isConnected();
+        // The interval the link uses while idle right now (override or default).
+        doc["idle_min"] = client->idleMinInterval();
+        doc["idle_max"] = client->idleMaxInterval();
+        // Reported in ms for the operator; units above are 1.25ms.
+        doc["idle_min_ms"] = client->idleMinInterval() * 1.25f;
+        doc["idle_max_ms"] = client->idleMaxInterval() * 1.25f;
+        if (client->hasLatency())
+            doc["lat_ms"] = client->getLatencyMs();
         serializeJson(doc, *response);
         request->send(response);
     });
@@ -2132,10 +2286,11 @@ void WebUIPlugin::handleSettings(AsyncWebServerRequest *request) const {
                 settings->setBgAnimScrim(request->arg("bgAnimScrim").toInt());
             if (request->hasArg("panelClockDiv")) {
                 // 0 = firmware default; explicit dividers outside the sane
-                // 4-12 window (6.7-20 MHz pclk) could leave the panel
-                // unreadable, so reject them to default rather than persist.
+                // window (MIN_USER_DIV..12, 6.7-13.3 MHz pclk) could leave the
+                // panel unreadable or, below MIN_USER_DIV, garbling (see
+                // PanelClock.h), so reject them to default rather than persist.
                 int div = request->arg("panelClockDiv").toInt();
-                if (div != 0 && (div < 4 || div > 12))
+                if (div != 0 && (div < panelclock::MIN_USER_DIV || div > 12))
                     div = 0;
                 settings->setPanelClockDiv(div);
             }

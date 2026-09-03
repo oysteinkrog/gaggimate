@@ -124,7 +124,7 @@ void Controller::setup() {
     // Hand the stored panel refresh rate over before the panel exists, so it is
     // created at the chosen pixel clock instead of being retimed a second later
     // (and, on ESP-IDF 4.4, instead of never being applied at all).
-    panelclock::setDiv(settings.getPanelClockDiv());
+    panelclock::setDiv(panelclock::clampUserDiv(settings.getPanelClockDiv()));
     setupPanel();
     heap_checkpoint("setup/after-setup-panel");
 #endif

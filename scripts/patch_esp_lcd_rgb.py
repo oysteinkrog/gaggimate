@@ -49,6 +49,7 @@ this code fails the build loudly rather than silently reverting the fix.
 """
 
 import os
+import sys
 
 # Eight buffers of GM_LCD_BOUNCE_LINES scanlines each. Keep lines x buffers at
 # 15,360 bytes: platformio.ini documents the WiFi cliff that budget sits above,
@@ -537,6 +538,242 @@ HUNKS = [
 ]
 
 
+# ---------------------------------------------------------------------------
+# GM_RGB_GAPLOG_PATCH: what happened around a long refill gap.
+#
+# Built to name whatever kept the refill interrupt waiting: gap_hist showed
+# 600-1100 us between EOF callbacks while busy_max stayed under the pool slack,
+# which read as "the interrupt was late". It was not. gap is measured entry to
+# entry, so it contains the previous callback's own copy time, and once the
+# log stored that (prev_busy_us) every long gap resolved to a slow copy with a
+# latency of 1-2 us behind it. The copies are slow uniformly, never frozen: the
+# 240 B chunk timer never saw a chunk over 27 us. That is a shared bus, not a
+# blocker. Flash and PSRAM share the MSPI controller; when core 0 runs
+# flash-resident code (the BLE host and protobuf dispatch on every controller
+# message, WiFi) the refill's PSRAM reads drop to ~28 MB/s. At the stored
+# pixel clock of n=5 (16 MHz) the panel consumed 28 MB/s, so the refill fell a
+# few buffers behind and stayed there for milliseconds, and when the lag reached
+# the pool depth the VSYNC square-up displaced one band: the garbling. n=6 is
+# 24 MB/s and the same soak showed no copy over 190 us. The floor is in
+# PanelClock.h (MIN_USER_DIV).
+#
+# What the log records, per event (a gap over GM_RGB_GAPLOG_US, or a callback
+# whose own copies took over GM_RGB_BUSYLOG_US): gap, prev_busy (subtract for
+# the true interrupt latency), this callback's busy and fill count (how far the
+# DMA got ahead), the longest single chunk of its copies (stall_us: one long
+# chunk is a bus freeze, many short ones a shared bus), interrupt nesting at
+# entry, the interrupted task and its saved PC (_frxt_int_enter stores the
+# frame pointer in TCB.pxTopOfStack at nesting 0->1; XT_STK_PC=4, XT_STK_PS=8),
+# and the task on the other core (the bus competitor). Read it through
+# /api/debug/scanout ("gaplog", "chunk_hist"). Applied independently of the
+# catch-up patch so it lands on a driver that is already patched; both are
+# re-applied after a Windows-side clobber.
+# ---------------------------------------------------------------------------
+GAPLOG_MARKER = "GM_RGB_GAPLOG_PATCH"
+GL = GAPLOG_MARKER
+GAPLOG_HUNKS = [
+    # ---- globals -----------------------------------------------------------
+    (
+        "volatile uint32_t gm_rgb_cyc_per_us = 240;\n",
+        "volatile uint32_t gm_rgb_cyc_per_us = 240;\n"
+        "\n"
+        f"// {GL}: what happened around a long refill gap? Captured when the gap since\n"
+        "// the previous callback's ENTRY exceeds GM_RGB_GAPLOG_US. That gap includes\n"
+        "// the previous callback's own copy time, so prev_busy_us is stored beside it:\n"
+        "// gap - prev_busy is the true interrupt latency, prev_busy alone is a slow\n"
+        "// copy (PSRAM starved). fills/busy_us describe this callback (how far the DMA\n"
+        "// got ahead, how long the catch-up copy took). nest is port_interruptNesting\n"
+        "// on this core at entry (1 == a task was running), pc/ps come from the\n"
+        "// interrupted task's saved exception frame (TCB.pxTopOfStack, set by\n"
+        "// _frxt_int_enter). other is the task on the other core at entry: the\n"
+        "// competitor for the PSRAM bus while the copy ran.\n"
+        "extern unsigned port_interruptNesting[2];\n"
+        "extern void *volatile pxCurrentTCBs[2];\n"
+        "#define GM_RGB_GAPLOG_N 32\n"
+        "#define GM_RGB_GAPLOG_US 400\n"
+        "typedef struct {\n"
+        "    uint32_t t_ms;\n"
+        "    uint32_t gap_us;\n"
+        "    uint32_t prev_busy_us;  // copy time of the previous callback (inside gap_us)\n"
+        "    uint32_t busy_us;       // copy time of this callback\n"
+        "    uint32_t fills;         // buffers this callback refilled (DMA lead)\n"
+        "    uint32_t nest;\n"
+        "    uint32_t pos;    // buffers into the frame at entry (0 == first after VSYNC)\n"
+        "    uint32_t pc;\n"
+        "    uint32_t ps;\n"
+        "    uint32_t stall_us;      // longest single 240 B chunk of this callback's copies\n"
+        "    uint32_t stall_at;      // byte offset of that chunk within its bounce buffer\n"
+        "    const char *task;\n"
+        "    const char *other;      // task running on the other core at entry\n"
+        "} gm_rgb_gap_ev_t;\n"
+        "volatile gm_rgb_gap_ev_t gm_rgb_gaplog[GM_RGB_GAPLOG_N];\n"
+        "volatile uint32_t gm_rgb_gaplog_n = 0; // total captured; ring slot is n % N\n"
+        f"// {GL}: shape of a slow copy. Each bounce refill is copied in 240 B chunks and\n"
+        "// every chunk is timed: one chunk of 400 us is a bus freeze, sixty chunks of\n"
+        "// 7 us is a bus that is merely shared. 16 us buckets. GM_RGB_BUSYLOG_US logs a\n"
+        "// callback whose own copy time crossed it even when its gap did not, so the\n"
+        "// FIRST slow copy of a cascade (the trigger) is captured, not only the\n"
+        "// catch-ups that follow it.\n"
+        "#define GM_RGB_CHUNK_BYTES 240\n"
+        "#define GM_RGB_CHUNK_HIST_US 16\n"
+        "#define GM_RGB_BUSYLOG_US 250\n"
+        "volatile uint32_t gm_rgb_chunk_hist[GM_RGB_HIST_N];\n"
+        "volatile uint32_t gm_rgb_chunk_max_us = 0;\n"
+        "static uint32_t s_gm_chunk_cur_max_cyc;  // per-callback, reset at entry\n"
+        "static uint32_t s_gm_chunk_cur_max_at;\n",
+    ),
+    # ---- per-panel: remember the previous callback's copy time --------------
+    (
+        f"    uint32_t gm_last_entry_cyc;     // {M}: cycle count at the previous handler entry\n",
+        f"    uint32_t gm_last_entry_cyc;     // {M}: cycle count at the previous handler entry\n"
+        f"    uint32_t gm_last_busy_us;       // {GL}: copy time of the previous callback\n",
+    ),
+    # ---- capture in the EOF handler ----------------------------------------
+    (
+        "        const uint32_t gm_entry_cyc = esp_cpu_get_cycle_count();\n"
+        "        if (rgb_panel->gm_last_entry_cyc) {\n",
+        "        const uint32_t gm_entry_cyc = esp_cpu_get_cycle_count();\n"
+        f"        volatile gm_rgb_gap_ev_t *gm_ev = NULL; // {GL}: filled in after the copies\n"
+        "        uint32_t gm_gap_us = 0;\n"
+        "        s_gm_chunk_cur_max_cyc = 0;\n"
+        "        s_gm_chunk_cur_max_at = 0;\n"
+        "        if (rgb_panel->gm_last_entry_cyc) {\n",
+    ),
+    (
+        "            uint32_t b = g / GM_RGB_HIST_US;\n"
+        "            gm_rgb_gap_hist[b < GM_RGB_HIST_N ? b : GM_RGB_HIST_N - 1]++;\n"
+        "        }\n"
+        "        rgb_panel->gm_last_entry_cyc = gm_entry_cyc;\n",
+        "            uint32_t b = g / GM_RGB_HIST_US;\n"
+        "            gm_rgb_gap_hist[b < GM_RGB_HIST_N ? b : GM_RGB_HIST_N - 1]++;\n"
+        "            gm_gap_us = g;\n"
+        f"            // {GL}: pcTaskGetName lives in flash, so skip the capture while\n"
+        "            // a flash op has the cache down (flash_skips counts those anyway).\n"
+        "            // The first EOF after VSYNC follows the vertical porch, during which\n"
+        "            // the DMA idles and no refill is due: a ~970 us gap every frame that\n"
+        "            // is not a blocker. Skip it unless it is long enough (>1200 us) to\n"
+        "            // mean a blocker also spanned the porch.\n"
+        "            const bool gm_first_of_frame = rgb_panel->gm_eof_frame == 0;\n"
+        "            if (g >= GM_RGB_GAPLOG_US && !gm_flash_cache_down && !(gm_first_of_frame && g < 1200)) {\n"
+        "                const int core = xPortGetCoreID();\n"
+        "                void *tcb = pxCurrentTCBs[core];\n"
+        "                void *other = pxCurrentTCBs[core ^ 1];\n"
+        "                gm_ev = &gm_rgb_gaplog[gm_rgb_gaplog_n % GM_RGB_GAPLOG_N];\n"
+        "                gm_ev->t_ms = (uint32_t)xTaskGetTickCountFromISR();\n"
+        "                gm_ev->gap_us = g;\n"
+        "                gm_ev->prev_busy_us = rgb_panel->gm_last_busy_us;\n"
+        "                gm_ev->busy_us = 0;\n"
+        "                gm_ev->fills = 0;\n"
+        "                gm_ev->nest = port_interruptNesting[core];\n"
+        "                gm_ev->pos = (uint32_t)rgb_panel->gm_eof_frame;\n"
+        "                gm_ev->pc = 0;\n"
+        "                gm_ev->ps = 0;\n"
+        "                gm_ev->task = NULL;\n"
+        "                gm_ev->other = other ? pcTaskGetName((TaskHandle_t)other) : NULL;\n"
+        "                if (tcb) {\n"
+        "                    uint32_t *frame = *(uint32_t **)tcb; // TCB.pxTopOfStack == XtExcFrame*\n"
+        "                    if (frame) {\n"
+        "                        gm_ev->pc = frame[1]; // XT_STK_PC\n"
+        "                        gm_ev->ps = frame[2]; // XT_STK_PS\n"
+        "                    }\n"
+        "                    gm_ev->task = pcTaskGetName((TaskHandle_t)tcb);\n"
+        "                }\n"
+        "                gm_rgb_gaplog_n++;\n"
+        "            }\n"
+        "        }\n"
+        "        rgb_panel->gm_last_entry_cyc = gm_entry_cyc;\n",
+    ),
+    # ---- chunked, timed copy in the fill function --------------------------
+    (
+        "        memcpy(buffer, &panel->fbs[panel->bb_fb_index][panel->bounce_pos_px * bytes_per_pixel], panel->bb_size);\n",
+        f"        // {GL}: same copy, in timed chunks; see gm_rgb_chunk_hist.\n"
+        "        {\n"
+        "            const uint8_t *gm_src = &panel->fbs[panel->bb_fb_index][panel->bounce_pos_px * bytes_per_pixel];\n"
+        "            uint8_t *gm_dst = buffer;\n"
+        "            size_t gm_left = panel->bb_size;\n"
+        "            while (gm_left) {\n"
+        "                const size_t gm_n = gm_left < GM_RGB_CHUNK_BYTES ? gm_left : GM_RGB_CHUNK_BYTES;\n"
+        "                const uint32_t gm_c0 = esp_cpu_get_cycle_count();\n"
+        "                memcpy(gm_dst, gm_src, gm_n);\n"
+        "                const uint32_t gm_dc = esp_cpu_get_cycle_count() - gm_c0;\n"
+        "                if (gm_dc > s_gm_chunk_cur_max_cyc) {\n"
+        "                    s_gm_chunk_cur_max_cyc = gm_dc;\n"
+        "                    s_gm_chunk_cur_max_at = (uint32_t)(gm_dst - buffer);\n"
+        "                }\n"
+        "                const uint32_t gm_bk = gm_dc / (gm_rgb_cyc_per_us * GM_RGB_CHUNK_HIST_US);\n"
+        "                gm_rgb_chunk_hist[gm_bk < GM_RGB_HIST_N ? gm_bk : GM_RGB_HIST_N - 1]++;\n"
+        "                gm_dst += gm_n;\n"
+        "                gm_src += gm_n;\n"
+        "                gm_left -= gm_n;\n"
+        "            }\n"
+        "        }\n",
+    ),
+    # ---- after the copies: this callback's copy time and fill count --------
+    (
+        "            uint32_t b = bu / GM_RGB_HIST_US;\n"
+        "            gm_rgb_busy_hist[b < GM_RGB_HIST_N ? b : GM_RGB_HIST_N - 1]++;\n"
+        "        }\n",
+        "            uint32_t b = bu / GM_RGB_HIST_US;\n"
+        "            gm_rgb_busy_hist[b < GM_RGB_HIST_N ? b : GM_RGB_HIST_N - 1]++;\n"
+        f"            rgb_panel->gm_last_busy_us = bu; // {GL}\n"
+        "            const uint32_t gm_stall_us = s_gm_chunk_cur_max_cyc / gm_rgb_cyc_per_us;\n"
+        "            if (gm_stall_us > gm_rgb_chunk_max_us) {\n"
+        "                gm_rgb_chunk_max_us = gm_stall_us;\n"
+        "            }\n"
+        "            if (gm_ev == NULL && bu >= GM_RGB_BUSYLOG_US && !gm_flash_cache_down) {\n"
+        "                // A slow copy whose gap was ordinary: the trigger of a cascade.\n"
+        "                const int core = xPortGetCoreID();\n"
+        "                void *tcb = pxCurrentTCBs[core];\n"
+        "                void *other = pxCurrentTCBs[core ^ 1];\n"
+        "                gm_ev = &gm_rgb_gaplog[gm_rgb_gaplog_n % GM_RGB_GAPLOG_N];\n"
+        "                gm_ev->t_ms = (uint32_t)xTaskGetTickCountFromISR();\n"
+        "                gm_ev->gap_us = gm_gap_us;\n"
+        "                gm_ev->prev_busy_us = 0;\n"
+        "                gm_ev->nest = port_interruptNesting[core];\n"
+        "                gm_ev->pos = (uint32_t)(rgb_panel->gm_eof_frame - (size_t)fills);\n"
+        "                gm_ev->pc = 0;\n"
+        "                gm_ev->ps = 0;\n"
+        "                gm_ev->task = NULL;\n"
+        "                gm_ev->other = other ? pcTaskGetName((TaskHandle_t)other) : NULL;\n"
+        "                if (tcb) {\n"
+        "                    uint32_t *frame = *(uint32_t **)tcb;\n"
+        "                    if (frame) {\n"
+        "                        gm_ev->pc = frame[1];\n"
+        "                        gm_ev->ps = frame[2];\n"
+        "                    }\n"
+        "                    gm_ev->task = pcTaskGetName((TaskHandle_t)tcb);\n"
+        "                }\n"
+        "                gm_rgb_gaplog_n++;\n"
+        "            }\n"
+        "            if (gm_ev) {\n"
+        "                gm_ev->busy_us = bu;\n"
+        "                gm_ev->fills = (uint32_t)fills;\n"
+        "                gm_ev->stall_us = gm_stall_us;\n"
+        "                gm_ev->stall_at = s_gm_chunk_cur_max_at;\n"
+        "            }\n"
+        "        }\n",
+    ),
+]
+
+
+def apply_gaplog(path):
+    with open(path, "r", encoding="utf-8", newline="") as handle:
+        text = handle.read()
+    if GAPLOG_MARKER in text:
+        return "gaplog already patched"
+    for index, (old, new) in enumerate(GAPLOG_HUNKS, start=1):
+        count = text.count(old)
+        if count != 1:
+            raise SystemExit(
+                "patch_esp_lcd_rgb: gaplog hunk %d matched %d times in %s, expected exactly 1."
+                % (index, count, path)
+            )
+        text = text.replace(old, new)
+    with open(path, "w", encoding="utf-8", newline="") as handle:
+        handle.write(text)
+    return "gaplog patched"
+
+
 def find_driver():
     """Locate esp_lcd_panel_rgb.c in the framework package PlatformIO is using."""
     candidates = []
@@ -578,11 +815,30 @@ def apply(path):
     return "patched"
 
 
+def revert_gaplog(path):
+    """Reverse GAPLOG_HUNKS (new -> old) so a re-derived hunk set can be applied."""
+    with open(path, "r", encoding="utf-8", newline="") as handle:
+        text = handle.read()
+    if GAPLOG_MARKER not in text:
+        return "gaplog not present"
+    for index, (old, new) in enumerate(GAPLOG_HUNKS, start=1):
+        if text.count(new) != 1:
+            raise SystemExit("patch_esp_lcd_rgb: cannot revert gaplog hunk %d (text changed)" % index)
+        text = text.replace(new, old)
+    with open(path, "w", encoding="utf-8", newline="") as handle:
+        handle.write(text)
+    return "gaplog reverted"
+
+
 def main():
     path = find_driver()
     if path is None:
         raise SystemExit("patch_esp_lcd_rgb: could not find esp_lcd_panel_rgb.c")
+    if "--revert-gaplog" in sys.argv:
+        print("patch_esp_lcd_rgb: %s (%s)" % (revert_gaplog(path), path))
+        return
     print("patch_esp_lcd_rgb: %s (%s)" % (apply(path), path))
+    print("patch_esp_lcd_rgb: %s (%s)" % (apply_gaplog(path), path))
 
 
 main()

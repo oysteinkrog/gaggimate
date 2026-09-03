@@ -33,6 +33,19 @@ class BleClientTransport : public Transport, public NimBLEScanCallbacks, public 
     // the shared 2.4GHz radio leaves more contiguous airtime for Wi-Fi.
     void setLowLatency(bool active);
 
+    // Runtime override of the IDLE connection interval, in 1.25ms units (so
+    // 24 == 30ms). A within-boot A/B knob for the coex question: the standby
+    // resync rate is non-stationary (it swings ~4x run-to-run from ambient
+    // 2.4GHz), so a compile-time change cannot be told from noise across two
+    // flashes. Toggling this live and resetting the scan-out counters per
+    // phase interleaves both configs against the SAME ambient conditions,
+    // which is the only way to measure a coex lever on this bench without a
+    // physical power-cycle. mn==0 releases the override back to IDLE_*_INTERVAL.
+    // Takes effect immediately if connected and not in low-latency (shot) mode.
+    void setIdleInterval(uint16_t mn, uint16_t mx);
+    uint16_t idleMinInterval() const { return _idleMinOverride ? _idleMinOverride : IDLE_MIN_INTERVAL; }
+    uint16_t idleMaxInterval() const { return _idleMaxOverride ? _idleMaxOverride : IDLE_MAX_INTERVAL; }
+
     // Native client handle, needed by ControllerOTA (OTA uses its own service).
     NimBLEClient *getNativeClient() const { return _client; }
 
@@ -61,6 +74,10 @@ class BleClientTransport : public Transport, public NimBLEScanCallbacks, public 
     NimBLERemoteCharacteristic *_notifyChar = nullptr; // from server (TX_CHAR_UUID)
     bool _readyForConnection = false;
     bool _lowLatency = false;
+    // 0 == no override (use IDLE_*_INTERVAL). Set live via setIdleInterval()
+    // for the within-boot coex A/B; not persisted, gone on reboot.
+    uint16_t _idleMinOverride = 0;
+    uint16_t _idleMaxOverride = 0;
     bool _incompatible = false;
     std::function<void(const String &info)> _onIncompatible = nullptr;
 

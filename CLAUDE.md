@@ -18,9 +18,21 @@ for production, `-e display-loadtest` for the bench rig).
   Deeper pools starve the WiFi TX buffer pool: at 20+ lines two concurrent
   browser tabs kill the web UI (measured cliff between 14.7 and 18.3 kB DMA
   free). History in platformio.ini above `GM_LCD_BOUNCE_LINES`.
-- **Pixel clock is n=6 (13.33 MHz, 50.7 fps).** n=5's 453us of pool slack is
-  under the worst observed refill stall (638us), so it garbles rarely but
-  visibly. History in platformio.ini above `RGB_MAX_PIXEL_CLOCK_HZ`.
+- **Pixel clock is n=6 (13.33 MHz, 50.7 fps), and the stored setting can
+  override the build default.** `panelClockDiv` in the device settings (web
+  UI "Panel refresh rate") is applied over `RGB_MAX_PIXEL_CLOCK_HZ` at boot,
+  so a device can run n=5 while the build says n=6; the bench machine did,
+  and every garbling measurement before 2026-09-03 was taken at n=5 without
+  knowing it. `/api/debug/pclk` reports the live divider: check it before
+  measuring anything. At n=5 the panel consumes 28 MB/s of PSRAM and the
+  bounce refill copies at ~28 MB/s whenever core 0 runs flash-resident code
+  (BLE host on every controller message, WiFi), because flash and PSRAM
+  share the MSPI bus; the refill falls a few buffers behind, stays there for
+  milliseconds, laps the 8-buffer pool and the VSYNC square-up displaces one
+  band. At n=6 consumption is 24 MB/s and no copy exceeded 190 us against
+  632 us of slack. `panelclock::MIN_USER_DIV` floors the stored setting at 6
+  (the debug endpoint is not floored). History in platformio.ini above
+  `RGB_MAX_PIXEL_CLOCK_HZ`.
 - Vendored ESP-IDF files are patched by `scripts/patch_*.py` (pre-build
   extra_scripts). Each keeps a pristine `.gm-orig` beside the patched file.
   The Windows and WSL PlatformIO installs share `~/.platformio`; a
@@ -90,6 +102,14 @@ Debugging methodology that this codebase has already paid for:
 - Distinguish "the copy was slow" (bus contention) from "the interrupt was
   late" (preemption) before picking a fix: the busy/gap histograms and the
   catch-up counters in the patched esp_lcd driver exist for exactly this.
+  Mind what a metric contains: `gap` is callback entry to entry, so it holds
+  the previous callback's copy time, and a "1000 us gap" was a 990 us copy
+  with a 2 us interrupt latency behind it. The gaplog's `prev_busy_us` and
+  the chunk timer were added to stop that misreading (a lock probe over every
+  FreeRTOS critical section had already cleared the kernel of blame).
+- Include the device's stored settings in "static configuration". The stored
+  pixel-clock divider silently replaced the build's; enumerate what NVS can
+  override before trusting a compile-time constant.
 
 ## Bench facts
 
