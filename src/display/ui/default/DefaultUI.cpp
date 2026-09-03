@@ -1341,18 +1341,34 @@ void DefaultUI::buildScaleScreen() {
     lv_obj_set_style_text_color(title, fg, LV_PART_MAIN);
     lv_obj_align(title, LV_ALIGN_CENTER, 0, -140);
 
-    scaleWeightLabel = lv_label_create(cover);
+    // Readout as a flex row (number, unit) sized to its content and centred as
+    // a group. A one-shot lv_obj_align_to() of the unit against the number only
+    // holds for the width the number had at build time: "302.2" in a 48 pt face
+    // is ~60 px wider than "0.0", and a centre-aligned number grows both ways,
+    // so its last digits landed on top of the "g". Flex re-lays the pair on
+    // every width change, so the unit follows the number.
+    lv_obj_t *readout = lv_obj_create(cover);
+    lv_obj_remove_style_all(readout);
+    lv_obj_set_size(readout, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(readout, LV_FLEX_FLOW_ROW);
+    // Cross axis END puts both baselines on the row's bottom edge; the unit's
+    // bottom padding then lifts its glyph the 6 px the old alignment offset did.
+    lv_obj_set_flex_align(readout, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_END, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(readout, 8, LV_PART_MAIN);
+    lv_obj_clear_flag(readout, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_align(readout, LV_ALIGN_CENTER, 0, -15);
+
+    scaleWeightLabel = lv_label_create(readout);
     lv_label_set_text(scaleWeightLabel, "0.0");
     lv_obj_set_style_text_font(scaleWeightLabel, &lv_font_montserrat_48, LV_PART_MAIN);
     lv_obj_set_style_text_color(scaleWeightLabel, fg, LV_PART_MAIN);
-    lv_obj_align(scaleWeightLabel, LV_ALIGN_CENTER, -14, -15);
     lastShownScaleWeight = -1000.0f;
 
-    lv_obj_t *unit = lv_label_create(cover);
+    lv_obj_t *unit = lv_label_create(readout);
     lv_label_set_text(unit, "g");
     lv_obj_set_style_text_font(unit, &lv_font_montserrat_24, LV_PART_MAIN);
     lv_obj_set_style_text_color(unit, fg, LV_PART_MAIN);
-    lv_obj_align_to(unit, scaleWeightLabel, LV_ALIGN_OUT_RIGHT_BOTTOM, 8, -6);
+    lv_obj_set_style_pad_bottom(unit, 6, LV_PART_MAIN);
 
     // Tare as a standard pill (mode_switch1 geometry: 160x50, r10, 2px border).
     // Opaque, and on screen over the animation, so applyAnimPlates drives its
