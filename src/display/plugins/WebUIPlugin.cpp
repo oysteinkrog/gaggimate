@@ -34,6 +34,7 @@ extern uint32_t nebula_lerp_self_test(uint32_t *firstBad);
 #include <display/drivers/LilyGoDriver.h>
 #endif
 #include <display/drivers/common/PanelClock.h>
+#include <display/ui/default/bganim/BgAnim.h> // bg_library_valid / bg_map_valid for the settings writer
 #include <display/ui/default/bganim/BgAnimCommon.h>
 #include <display/util/PsramStlAllocator.h>
 #include <display/util/PsramWsBuffer.h>
@@ -2022,6 +2023,20 @@ void WebUIPlugin::handleWebSocketData(AsyncWebSocket *server, AsyncWebSocketClie
                         auto target = doc["target"].as<uint8_t>();
                         controller->getSettings().setVolumetricTarget(target);
                     }
+                } else if (msgType == "req:bganim:preview") {
+                    // Gradient editor live preview: show {anim} drawn with the
+                    // {stops} gradient string on the panel without saving
+                    // anything. The UI task owns the theme state, so this only
+                    // hands the request over (see DefaultUI::init).
+                    if (doc["anim"].is<int>() && doc["stops"].is<const char *>()) {
+                        Event ev;
+                        ev.id = "bganim:preview";
+                        ev.setInt("anim", doc["anim"].as<int>());
+                        ev.setString("stops", doc["stops"].as<String>());
+                        pluginManager->trigger(ev);
+                    }
+                } else if (msgType == "req:bganim:preview-end") {
+                    pluginManager->trigger("bganim:preview-end");
                 } else if (msgType == "req:history:rebuild") {
                     // Handle rebuild asynchronously - send immediate ack, progress comes via events
                     JsonDocument resp(&psramAllocator);
@@ -2303,6 +2318,13 @@ void WebUIPlugin::handleSettings(AsyncWebServerRequest *request) const {
             }
             if (request->hasArg("bgAnimCustomTheme"))
                 settings->setBgAnimCustomTheme(request->arg("bgAnimCustomTheme"));
+            // Structurally validated rather than trusted: a malformed library
+            // would make every animation that references it fall back to the
+            // global theme, and the strings come straight from the form.
+            if (request->hasArg("bgAnimGradients") && bg_library_valid(request->arg("bgAnimGradients").c_str()))
+                settings->setBgAnimGradients(request->arg("bgAnimGradients"));
+            if (request->hasArg("bgAnimThemeMap") && bg_map_valid(request->arg("bgAnimThemeMap").c_str()))
+                settings->setBgAnimThemeMap(request->arg("bgAnimThemeMap"));
             if (request->hasArg("bgAnimId") || request->hasArg("bgAnimParams"))
                 settings->setBgAnimAllScreens(request->hasArg("bgAnimAllScreens"));
             if (request->hasArg("smartGrindIp"))
@@ -2490,6 +2512,8 @@ void WebUIPlugin::handleSettings(AsyncWebServerRequest *request) const {
     // handler matches on explicit argument names, so echoing this is inert.
     doc["panelClockLive"] = panelclock::hasLiveControl();
     doc["bgAnimCustomTheme"] = settings.getBgAnimCustomTheme();
+    doc["bgAnimGradients"] = settings.getBgAnimGradients();
+    doc["bgAnimThemeMap"] = settings.getBgAnimThemeMap();
     doc["smartGrindIp"] = settings.getSmartGrindIp();
     doc["smartGrindMode"] = settings.getSmartGrindMode();
     doc["momentaryButtons"] = settings.isMomentaryButtons();

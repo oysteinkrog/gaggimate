@@ -277,9 +277,14 @@ const uint8_t *noiseTex256();
 // are double-buffered behind an atomic generation counter; animations poll
 // themeGen() in frame() and rebuild their palettes when it changes.
 void setThemeStops(const uint8_t (*stops)[3], int nStops);
+// Same, with a position per stop (0..255, ascending; the ends are pinned to
+// 0 and 255). pos == nullptr behaves as setThemeStops (equal spacing).
+void setThemeStopsPos(const uint8_t (*stops)[3], const uint8_t *pos, int nStops);
 uint32_t themeGen();
 int themeStopCount();
 const uint8_t (*themeStops())[3];
+const uint8_t *themeStopPositions();
+bool themeUniform(); // equal spacing: the original arithmetic is in use
 
 // Tone controls, applied to the stops before any animation sees them.
 //

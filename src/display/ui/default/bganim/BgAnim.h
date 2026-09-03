@@ -54,15 +54,27 @@ const BgAnimation &bg_animation(int id);
 void bg_parse_params(const char *packed, int animId, uint8_t out[4]);
 
 // ---- shared color themes -------------------------------------------------
-// Every animation draws its colors from one global gradient theme: 2-8 RGB
-// stops ordered dark -> bright (stop 0 is the background/darkest tone, the
-// last stop the brightest accent). Built-in themes have 6 stops and are
-// mirrored in web/src/config/bgAnimations.js — keep in sync. The selected
-// theme id and an optional custom stop list are persisted in Settings
-// (bgAnimTheme / bgAnimCustomTheme, custom = comma-separated hex like
-// "080402,2a1206,...", 2-8 stops).
+// Every animation draws its colors from one gradient: 2-16 RGB stops ordered
+// dark -> bright (stop 0 is the background/darkest tone, the last stop the
+// brightest accent), each at a position 0-255 along the ramp. Built-in
+// themes have 6 evenly spaced stops and are mirrored in
+// web/src/config/bgAnimations.js — keep in sync, append only (the index is
+// persisted). Which gradient an animation draws with comes from three
+// settings, resolved by bg_resolve_anim_theme:
+//   bgAnimThemeMap   "ref;ref;..." indexed by animation id, ref = built-in
+//                    index, "c<id>" for a library gradient, or empty
+//   bgAnimGradients  the user's library, "id|name|gradient;..." (<= 12)
+//   bgAnimTheme      built-in index used by animations with no map entry
+//                    (bg_theme_count() with bgAnimCustomTheme is the
+//                    pre-library custom gradient; still honoured)
+// A gradient string is "rrggbb[@pos],rrggbb[@pos],..."; without positions the
+// stops are spaced evenly, which is also the original palette arithmetic.
 
-constexpr int BG_THEME_MAX_STOPS = 8;
+constexpr int BG_THEME_MAX_STOPS = 16;
+constexpr int BG_GRADIENT_LIB_MAX = 12;       // library entries
+constexpr int BG_GRADIENT_LIB_MAX_LEN = 3800; // chars; NVS strings cap at 4000
+constexpr int BG_GRADIENT_NAME_MAX = 24;      // characters, as the UI counts them
+constexpr int BG_GRADIENT_STR_MAX = BG_THEME_MAX_STOPS * 11; // "rrggbb@255," per stop
 
 int bg_theme_count();                       // number of built-in themes
 const char *bg_theme_name(int i);           // clamped like bg_animation
@@ -72,5 +84,28 @@ const uint8_t (*bg_theme_stops(int i))[3];  // 6 RGB stops, dark -> bright
 // bg_theme_count() selects the custom string; invalid/empty custom (or any
 // out-of-range id) falls back to theme 0.
 void bg_resolve_theme(int themeId, const char *custom, uint8_t stops[BG_THEME_MAX_STOPS][3], int &nStops);
+
+// Parses one gradient string ('#', spaces tolerated). Returns the stop count,
+// 0 when malformed or fewer than 2 stops. uniform is true when no stop
+// carried a position; pos is then filled with the even spacing anyway.
+int bg_parse_gradient(const char *s, uint8_t stops[BG_THEME_MAX_STOPS][3], uint8_t pos[BG_THEME_MAX_STOPS],
+                      bool &uniform);
+// Writes the canonical form ("rrggbb,..." or "rrggbb@pos,..."); returns the
+// length, 0 if out is too small (BG_GRADIENT_STR_MAX always fits).
+int bg_format_gradient(const uint8_t stops[][3], const uint8_t *pos, int nStops, bool uniform, char *out, int outLen);
+
+// Library: every entry has a positive numeric id, a name, a parsable gradient.
+bool bg_library_valid(const char *lib);
+bool bg_library_lookup(const char *lib, int id, uint8_t stops[BG_THEME_MAX_STOPS][3], uint8_t pos[BG_THEME_MAX_STOPS],
+                       int &nStops, bool &uniform);
+
+// Map: each ref is empty, a built-in index, or "c<id>".
+bool bg_map_valid(const char *map);
+
+// The gradient animId draws with: its map entry when it resolves (a built-in
+// or a library id that exists), else the global theme via bg_resolve_theme.
+void bg_resolve_anim_theme(int animId, const char *map, const char *library, int themeId, const char *custom,
+                           uint8_t stops[BG_THEME_MAX_STOPS][3], uint8_t pos[BG_THEME_MAX_STOPS], int &nStops,
+                           bool &uniform);
 
 #endif // BGANIM_H

@@ -175,6 +175,16 @@ class DefaultUI {
     int overlayW[2] = {-1, -1};
     int overlayH[2] = {-1, -1};
     bool bgAnimAllScreens = false;         // settings.isBgAnimAllScreens(), cached per render
+    // Gradient editor live preview, handed over from the web socket task and
+    // applied by updateState on the UI task. While previewUntil is ahead of
+    // millis() the panel shows previewAnim drawn with previewStops instead of
+    // the saved selection; the editor re-sends while it is open, and a closed
+    // tab lapses back on its own.
+    std::mutex previewMutex;
+    String previewStops;
+    int previewAnim = 0;
+    bool previewDirty = false;
+    unsigned long previewUntil = 0;
     // millis() when setupPanel() finished building the UI, or 0 before that.
     // The animation needs a live screen to host its overlay snapshot, so it
     // cannot start earlier. `initialized` cannot serve this purpose: it is set
@@ -240,6 +250,7 @@ class DefaultUI {
     void positionMenuIcon(lv_obj_t *obj, int angle, int radius);
 
     void updateState();
+    void migrateBgAnimGradients();
     void updateSystemStatus();
     void updateProfileInfo();
     void updateBoiler();

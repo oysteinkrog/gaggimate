@@ -123,6 +123,9 @@ class Settings {
     bool isBgAnimAllScreens() const { return bgAnimAllScreens.get(); }
     int getBgAnimTheme() const { return bgAnimTheme.get(); }
     String getBgAnimCustomTheme() const { return bgAnimCustomTheme.get(); }
+    // By reference: the UI task compares these (up to a few KB) every pass.
+    const String &getBgAnimGradients() const { return bgAnimGradients.get(); }
+    const String &getBgAnimThemeMap() const { return bgAnimThemeMap.get(); }
     int getBgAnimFps() const { return bgAnimFps.get(); }
     int getBgAnimHalfRes() const { return bgAnimHalfRes.get(); }
     int getBgAnimInterlace() const { return bgAnimInterlace.get(); }
@@ -221,6 +224,8 @@ class Settings {
     void setBgAnimAllScreens(bool bg_anim_all_screens);
     void setBgAnimTheme(int bg_anim_theme);
     void setBgAnimCustomTheme(const String &bg_anim_custom_theme);
+    void setBgAnimGradients(const String &bg_anim_gradients);
+    void setBgAnimThemeMap(const String &bg_anim_theme_map);
     void setBgAnimFps(int bg_anim_fps);
     void setBgAnimHalfRes(int bg_anim_half_res);
     void setBgAnimInterlace(int bg_anim_interlace);
@@ -331,6 +336,10 @@ class Settings {
     Property<bool> bgAnimAllScreens{registry, "bg_all", false};
     Property<int> bgAnimTheme{registry, "bg_th", 0};
     Property<String> bgAnimCustomTheme{registry, "bg_ct", ""};
+    // Gradient library and per-animation assignment; formats documented at
+    // the theme section of display/ui/default/bganim/BgAnim.h.
+    Property<String> bgAnimGradients{registry, "bg_gl", ""};
+    Property<String> bgAnimThemeMap{registry, "bg_thm", ""};
     // Animation task frame-rate cap. Lower values cut the animation's PSRAM
     // write bandwidth (~460 KB/frame), which is the lever against RGB scan-out
     // underruns at high panel refresh rates.

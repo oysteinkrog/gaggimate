@@ -1,6 +1,7 @@
 #ifndef GAGGIMATE_SIM
 
 #include "BgAnimCommon.h"
+#include "BgAnim.h"
 #include <Arduino.h>
 #include <esp_heap_caps.h>
 #include <esp_wifi.h>
@@ -363,10 +364,16 @@ namespace {
 // Double buffer behind an atomic generation counter: the writer fills the
 // inactive buffer then increments the generation (buffer index = gen & 1).
 // A torn read would need two settings writes inside one frame — harmless.
-uint8_t g_themeBuf[2][8][3] = {
+uint8_t g_themeBuf[2][BG_THEME_MAX_STOPS][3] = {
     {{0x08, 0x04, 0x02}, {0x2a, 0x12, 0x06}, {0x6b, 0x34, 0x13}, {0xb8, 0x70, 0x3a}, {0xe8, 0xb2, 0x68}, {0xf8, 0xe6, 0xc8}},
     {{0x08, 0x04, 0x02}, {0x2a, 0x12, 0x06}, {0x6b, 0x34, 0x13}, {0xb8, 0x70, 0x3a}, {0xe8, 0xb2, 0x68}, {0xf8, 0xe6, 0xc8}},
 };
+// Stop positions, 0..255, ascending, first 0 and last 255. Only consulted
+// when g_themeUniform is false: uniform themes (every built-in, and any
+// custom string without positions) keep the original equal-spacing
+// arithmetic bit for bit, which is what tools/animbench's goldens encode.
+uint8_t g_themePos[2][BG_THEME_MAX_STOPS] = {{0}, {0}};
+bool g_themeUniform[2] = {true, true};
 int g_themeCount[2] = {6, 6};
 volatile uint32_t g_themeGen = 0;
 
@@ -375,9 +382,11 @@ volatile uint32_t g_themeGen = 0;
 // the caller re-resolving the theme, and applying them in place would compound:
 // two brightness writes would multiply, and a knee would clamp against the
 // already-kneed values rather than the original ones.
-uint8_t g_rawStops[8][3] = {
+uint8_t g_rawStops[BG_THEME_MAX_STOPS][3] = {
     {0x08, 0x04, 0x02}, {0x2a, 0x12, 0x06}, {0x6b, 0x34, 0x13}, {0xb8, 0x70, 0x3a}, {0xe8, 0xb2, 0x68}, {0xf8, 0xe6, 0xc8},
 };
+uint8_t g_rawPos[BG_THEME_MAX_STOPS] = {0};
+bool g_rawUniform = true;
 int g_rawCount = 6;
 int g_brightness256 = 256; // Q8, 256 = unchanged
 int g_knee = 255;          // 255 = shoulder off
@@ -410,8 +419,20 @@ void publishStops() {
             g_themeBuf[buf][i][c] = static_cast<uint8_t>(v);
         }
     }
+    for (int i = 0; i < g_rawCount; i++) {
+        g_themePos[buf][i] = g_rawPos[i];
+    }
+    g_themeUniform[buf] = g_rawUniform;
     g_themeCount[buf] = g_rawCount;
     g_themeGen = next;
+}
+
+// Positions as a positional theme would carry them: p_i = i * 255 / (n - 1).
+// Stored for uniform themes too so themeStopPositions() always answers.
+void fillUniformPositions(uint8_t *pos, int n) {
+    for (int i = 0; i < n; i++) {
+        pos[i] = static_cast<uint8_t>((i * 255) / (n - 1));
+    }
 }
 } // namespace
 
@@ -419,8 +440,8 @@ void setThemeStops(const uint8_t (*stops)[3], int nStops) {
     if (stops == nullptr || nStops < 2) {
         return;
     }
-    if (nStops > 8) {
-        nStops = 8;
+    if (nStops > BG_THEME_MAX_STOPS) {
+        nStops = BG_THEME_MAX_STOPS;
     }
     for (int i = 0; i < nStops; i++) {
         for (int c = 0; c < 3; c++) {
@@ -428,6 +449,44 @@ void setThemeStops(const uint8_t (*stops)[3], int nStops) {
         }
     }
     g_rawCount = nStops;
+    fillUniformPositions(g_rawPos, nStops);
+    g_rawUniform = true;
+    publishStops();
+}
+
+void setThemeStopsPos(const uint8_t (*stops)[3], const uint8_t *pos, int nStops) {
+    if (pos == nullptr) {
+        setThemeStops(stops, nStops);
+        return;
+    }
+    if (stops == nullptr || nStops < 2) {
+        return;
+    }
+    if (nStops > BG_THEME_MAX_STOPS) {
+        nStops = BG_THEME_MAX_STOPS;
+    }
+    // Positions must be ascending with the ends pinned; a caller that hands
+    // over something else gets it repaired rather than a gradient that reads
+    // backwards for part of its range.
+    int prev = 0;
+    for (int i = 0; i < nStops; i++) {
+        for (int c = 0; c < 3; c++) {
+            g_rawStops[i][c] = stops[i][c];
+        }
+        int p = pos[i];
+        if (i == 0) {
+            p = 0;
+        } else if (i == nStops - 1) {
+            p = 255;
+        }
+        if (p < prev) {
+            p = prev;
+        }
+        g_rawPos[i] = static_cast<uint8_t>(p);
+        prev = p;
+    }
+    g_rawCount = nStops;
+    g_rawUniform = false;
     publishStops();
 }
 
@@ -453,18 +512,36 @@ void setThemeTone(int brightness256, int knee) {
 uint32_t themeGen() { return g_themeGen; }
 int themeStopCount() { return g_themeCount[g_themeGen & 1]; }
 const uint8_t (*themeStops())[3] { return g_themeBuf[g_themeGen & 1]; }
+const uint8_t *themeStopPositions() { return g_themePos[g_themeGen & 1]; }
+bool themeUniform() { return g_themeUniform[g_themeGen & 1]; }
 
 void themeRGB(int pos, uint8_t out[3]) {
-    const uint8_t(*st)[3] = themeStops();
-    const int n = themeStopCount();
+    const int gen = g_themeGen & 1;
+    const uint8_t(*st)[3] = g_themeBuf[gen];
+    const int n = g_themeCount[gen];
     if (pos < 0) {
         pos = 0;
     } else if (pos > 255) {
         pos = 255;
     }
-    const int scaled = pos * (n - 1); // 0 .. 255*(n-1)
-    const int seg = scaled >> 8;      // stop index
-    const int f = scaled & 255;       // blend within segment
+    if (g_themeUniform[gen]) {
+        const int scaled = pos * (n - 1); // 0 .. 255*(n-1)
+        const int seg = scaled >> 8;      // stop index
+        const int f = scaled & 255;       // blend within segment
+        for (int c = 0; c < 3; c++) {
+            out[c] = static_cast<uint8_t>(st[seg][c] + (((st[seg + 1][c] - st[seg][c]) * f) >> 8));
+        }
+        return;
+    }
+    // Positional: find the segment holding pos. n is at most 16 and this runs
+    // at palette-build time, so a linear scan is the right tool.
+    const uint8_t *p = g_themePos[gen];
+    int seg = 0;
+    while (seg < n - 2 && pos >= p[seg + 1]) {
+        seg++;
+    }
+    const int width = p[seg + 1] - p[seg];
+    const int f = width > 0 ? ((pos - p[seg]) * 256) / width : 0; // 0..256
     for (int c = 0; c < 3; c++) {
         out[c] = static_cast<uint8_t>(st[seg][c] + (((st[seg + 1][c] - st[seg][c]) * f) >> 8));
     }
@@ -485,6 +562,31 @@ void buildThemeRamp(uint16_t *out, uint16_t brightness256, bool reversed) {
 void buildThemeWheel(uint16_t *out, uint16_t brightness256) {
     const uint8_t(*st)[3] = themeStops();
     const int n = themeStopCount();
+    if (!themeUniform()) {
+        // Positional theme: the ramp keeps its shape over the first
+        // 256 - W entries and the remaining W blend the last stop back into
+        // the first, W being one uniform segment's width so the wrap costs the
+        // same share of the wheel a uniform theme spends on it.
+        const int wrap = 256 / n;
+        const int rampLen = 256 - wrap;
+        for (int i = 0; i < 256; i++) {
+            uint8_t c[3];
+            if (i < rampLen) {
+                themeRGB((i * 255) / (rampLen - 1), c);
+            } else {
+                const int f = ((i - rampLen) * 256) / wrap;
+                for (int ch = 0; ch < 3; ch++) {
+                    c[ch] = static_cast<uint8_t>(st[n - 1][ch] + (((st[0][ch] - st[n - 1][ch]) * f) >> 8));
+                }
+            }
+            uint32_t r = (c[0] * brightness256) >> 8;
+            uint32_t g = (c[1] * brightness256) >> 8;
+            uint32_t b = (c[2] * brightness256) >> 8;
+            out[i] = rgb565(static_cast<uint8_t>(r > 255 ? 255 : r), static_cast<uint8_t>(g > 255 ? 255 : g),
+                            static_cast<uint8_t>(b > 255 ? 255 : b));
+        }
+        return;
+    }
     for (int i = 0; i < 256; i++) {
         const int scaled = i * n; // wrap: n segments, last blends into stop 0
         const int seg = scaled >> 8;

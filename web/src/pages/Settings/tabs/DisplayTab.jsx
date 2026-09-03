@@ -1,101 +1,11 @@
-import {
-  BG_ANIMATIONS,
-  BG_THEMES,
-  BG_THEME_CUSTOM,
-  BG_THEME_MAX_STOPS,
-  parseBgAnimParams,
-  parseCustomTheme,
-  serializeCustomTheme,
-  setBgAnimParam,
-  themeStopsFor,
-} from '../../../config/bgAnimations.js';
+import { BG_ANIMATIONS, parseBgAnimParams, setBgAnimParam } from '../../../config/bgAnimations.js';
 import Section from '../../../components/Card.jsx';
+import { GradientEditor } from '../../../components/GradientEditor.jsx';
 import {
   InputGroupField,
   SettingsFormField,
   ToggleField,
 } from '../../../components/SettingsFormField.jsx';
-
-// Global color theme picker: built-in gradient themes plus a custom editor
-// (2-8 hex stops, dark -> bright). The selected theme colors every animation.
-function ColorThemeSettings({ formData, onChange, setField }) {
-  const themeId = Math.min(BG_THEME_CUSTOM, Math.max(0, parseInt(formData.bgAnimTheme, 10) || 0));
-  const isCustom = themeId === BG_THEME_CUSTOM;
-  const customStops = parseCustomTheme(formData.bgAnimCustomTheme);
-  const editStops = customStops.length >= 2 ? customStops : BG_THEMES[0].stops.slice();
-  const previewStops = themeStopsFor(themeId, formData.bgAnimCustomTheme);
-  const setStops = stops => setField('bgAnimCustomTheme', serializeCustomTheme(stops));
-  return (
-    <>
-      <div className='grid grid-cols-1 gap-4 md:grid-cols-2'>
-        <SettingsFormField label='Color theme' htmlFor='bgAnimTheme' noMargin>
-          <select
-            id='bgAnimTheme'
-            name='bgAnimTheme'
-            className='select select-bordered w-full'
-            value={themeId}
-            onChange={e => {
-              setField('bgAnimTheme', parseInt(e.target.value, 10));
-              // Seed the custom editor from the last built-in theme selected.
-              if (parseInt(e.target.value, 10) === BG_THEME_CUSTOM && customStops.length < 2) {
-                setStops(themeStopsFor(Math.min(themeId, BG_THEMES.length - 1), ''));
-              }
-            }}
-          >
-            {BG_THEMES.map((t, i) => (
-              <option key={t.name} value={i}>
-                {t.name}
-              </option>
-            ))}
-            <option value={BG_THEME_CUSTOM}>Custom…</option>
-          </select>
-        </SettingsFormField>
-        <SettingsFormField label='Preview' htmlFor='bgAnimThemePreview' noMargin>
-          <div
-            id='bgAnimThemePreview'
-            className='border-base-content/10 h-10 w-full rounded-lg border'
-            style={{ background: `linear-gradient(to right, ${previewStops.join(', ')})` }}
-          />
-        </SettingsFormField>
-      </div>
-      {isCustom && (
-        <div className='mt-3 flex flex-wrap items-center gap-2'>
-          {editStops.map((stop, i) => (
-            <input
-              key={i}
-              type='color'
-              className='h-10 w-12 cursor-pointer rounded border-0 bg-transparent p-0'
-              value={stop}
-              aria-label={`Custom stop ${i + 1}`}
-              onChange={e => {
-                const next = editStops.slice();
-                next[i] = e.target.value;
-                setStops(next);
-              }}
-            />
-          ))}
-          <button
-            type='button'
-            className='btn btn-sm'
-            disabled={editStops.length >= BG_THEME_MAX_STOPS}
-            onClick={() => setStops([...editStops, editStops[editStops.length - 1]])}
-          >
-            + Stop
-          </button>
-          <button
-            type='button'
-            className='btn btn-sm'
-            disabled={editStops.length <= 2}
-            onClick={() => setStops(editStops.slice(0, -1))}
-          >
-            − Stop
-          </button>
-          <span className='text-base-content/60 text-sm'>dark → bright</span>
-        </div>
-      )}
-    </>
-  );
-}
 
 // Animation picker + parameter sliders for the selected animation only.
 // Params live in formData.bgAnimParams as the same packed string the firmware
@@ -190,7 +100,7 @@ function BackgroundAnimationSettings({ formData, onChange, setField }) {
       </div>
       {anim.description && <p className='text-base-content/60 mt-2 text-sm'>{anim.description}</p>}
       <div className='mt-4'>
-        <ColorThemeSettings formData={formData} onChange={onChange} setField={setField} />
+        <GradientEditor animIdx={animIdx} formData={formData} setField={setField} />
       </div>
       <div className='mt-4 grid grid-cols-1 gap-4 md:grid-cols-2'>
         <SettingsFormField
@@ -563,7 +473,6 @@ export function DisplayTab({ formData, onChange, setField }) {
             </InputGroupField>
           </div>
         </div>
-
       </Section>
 
       <Section title='Background Animation'>

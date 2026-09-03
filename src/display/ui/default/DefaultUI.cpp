@@ -87,6 +87,10 @@ extern const lv_img_dsc_t img_scale_80x80;
 static EffectManager effect_mgr;
 
 static constexpr uint32_t STARTUP_FADE_MS = 1000; // standby fade-in duration on power-up
+// How long one gradient-preview message holds the panel. The editor re-sends
+// on every edit and every few seconds while open, so this only needs to
+// outlast the gap between two of those.
+static constexpr uint32_t BGANIM_PREVIEW_HOLD_MS = 15000;
 
 namespace {
 inline bool areaEmpty(const lv_area_t &a) { return a.x1 > a.x2 || a.y1 > a.y2; }
@@ -162,6 +166,43 @@ void DefaultUI::updateTempStableFlag() {
 }
 
 void DefaultUI::reloadProfiles() { profileLoaded = 0; }
+
+#ifndef GAGGIMATE_SIM
+// One-time carry-over from the single custom gradient (bgAnimCustomTheme,
+// selected by bgAnimTheme == bg_theme_count()) to the library: the string
+// becomes library entry 1 "Custom", and if it was the active theme every
+// animation is pointed at it so nothing changes on screen. Runs only while
+// the library is empty, so a user who has since built their own is left
+// alone.
+void DefaultUI::migrateBgAnimGradients() {
+    ::Settings &settings = controller->getSettings();
+    if (!settings.getBgAnimGradients().isEmpty()) {
+        return;
+    }
+    uint8_t stops[BG_THEME_MAX_STOPS][3];
+    uint8_t pos[BG_THEME_MAX_STOPS];
+    bool uniform = true;
+    const int n = bg_parse_gradient(settings.getBgAnimCustomTheme().c_str(), stops, pos, uniform);
+    if (n == 0) {
+        return;
+    }
+    char gradient[BG_GRADIENT_STR_MAX];
+    bg_format_gradient(stops, pos, n, uniform, gradient, sizeof(gradient));
+    settings.setBgAnimGradients(String("1|Custom|") + gradient);
+    if (settings.getBgAnimTheme() == bg_theme_count() && settings.getBgAnimThemeMap().isEmpty()) {
+        String map;
+        for (int i = 0; i < bg_animation_count(); i++) {
+            if (i > 0) {
+                map += ';';
+            }
+            map += "c1";
+        }
+        settings.setBgAnimThemeMap(map);
+        settings.setBgAnimTheme(0);
+    }
+    ESP_LOGI("DefaultUI", "custom gradient moved to the library (%d stops)", n);
+}
+#endif
 
 DefaultUI::DefaultUI(Controller *controller, Driver *driver, PluginManager *pluginManager)
     : controller(controller), panelDriver(driver), pluginManager(pluginManager) {
@@ -276,6 +317,20 @@ void DefaultUI::init() {
         rerender = true;
         updateAvailable = event.getInt("value");
     });
+    pluginManager->on("bganim:preview", [this](Event const &event) {
+        std::lock_guard<std::mutex> guard(previewMutex);
+        previewAnim = event.getInt("anim");
+        previewStops = event.getString("stops");
+        previewDirty = true;
+        previewUntil = ::millis() + BGANIM_PREVIEW_HOLD_MS;
+    });
+    pluginManager->on("bganim:preview-end", [this](Event const &) {
+        std::lock_guard<std::mutex> guard(previewMutex);
+        previewUntil = 0;
+    });
+#ifndef GAGGIMATE_SIM
+    migrateBgAnimGradients();
+#endif
     pluginManager->on("controller:error", [this](Event const &) {
         rerender = true;
         changeScreen(SCREEN_ID_STANDBY_SCREEN);
@@ -1510,8 +1565,25 @@ void DefaultUI::updateState() {
 #else
     bgAnimAllScreens = settings.isBgAnimAllScreens();
 #endif
+    // A live gradient preview overrides both the animation shown and its
+    // gradient until it lapses; the saved selection is re-resolved after.
+    int animId = settings.getBgAnimId();
+    bool previewActive = false;
+    bool previewApply = false;
+    String previewGradient;
+    {
+        std::lock_guard<std::mutex> guard(previewMutex);
+        previewActive = previewUntil != 0 && static_cast<long>(::millis() - previewUntil) < 0;
+        if (previewActive) {
+            animId = previewAnim;
+            previewApply = previewDirty;
+            previewDirty = false;
+            if (previewApply) {
+                previewGradient = previewStops;
+            }
+        }
+    }
     uint8_t animP[4];
-    const int animId = settings.getBgAnimId();
     bg_parse_params(settings.getBgAnimParams().c_str(), animId, animP);
     sleepAnimation.configure(static_cast<uint8_t>(animId), animP);
     sleepAnimation.setMaxFps(static_cast<uint8_t>(settings.getBgAnimFps()));
@@ -1539,17 +1611,53 @@ void DefaultUI::updateState() {
     }
     // Publish the color theme only on change — setThemeStops bumps a
     // generation counter that makes every animation rebuild its palettes.
+    // The key covers everything the resolution depends on; the map and
+    // library strings are a few KB at most, read by reference, and equal on
+    // every ordinary tick, so the comparison is a length check plus memcmp.
+    static int lastThemeAnim = -1;
     static int lastThemeId = -1;
     static String lastCustom;
-    const int themeId = settings.getBgAnimTheme();
-    const String custom = settings.getBgAnimCustomTheme();
-    if (themeId != lastThemeId || custom != lastCustom) {
-        lastThemeId = themeId;
-        lastCustom = custom;
-        uint8_t stops[BG_THEME_MAX_STOPS][3];
-        int nStops = 0;
-        bg_resolve_theme(themeId, custom.c_str(), stops, nStops);
-        bganim::setThemeStops(stops, nStops);
+    static String lastMap;
+    static String lastLibrary;
+    if (previewActive) {
+        lastThemeAnim = -1; // force a re-resolve once the preview lapses
+        if (previewApply) {
+            uint8_t stops[BG_THEME_MAX_STOPS][3];
+            uint8_t pos[BG_THEME_MAX_STOPS];
+            bool uniform = true;
+            const int nStops = bg_parse_gradient(previewGradient.c_str(), stops, pos, uniform);
+            if (nStops > 0) {
+                if (uniform) {
+                    bganim::setThemeStops(stops, nStops);
+                } else {
+                    bganim::setThemeStopsPos(stops, pos, nStops);
+                }
+            }
+        }
+    } else {
+        const int themeId = settings.getBgAnimTheme();
+        const String custom = settings.getBgAnimCustomTheme();
+        const String &map = settings.getBgAnimThemeMap();
+        const String &library = settings.getBgAnimGradients();
+        if (animId != lastThemeAnim || themeId != lastThemeId || custom != lastCustom || map != lastMap ||
+            library != lastLibrary) {
+            lastThemeAnim = animId;
+            lastThemeId = themeId;
+            lastCustom = custom;
+            lastMap = map;
+            lastLibrary = library;
+            uint8_t stops[BG_THEME_MAX_STOPS][3];
+            uint8_t pos[BG_THEME_MAX_STOPS];
+            int nStops = 0;
+            bool uniform = true;
+            bg_resolve_anim_theme(animId, map.c_str(), library.c_str(), themeId, custom.c_str(), stops, pos, nStops,
+                                  uniform);
+            if (uniform) {
+                bganim::setThemeStops(stops, nStops);
+            } else {
+                bganim::setThemeStopsPos(stops, pos, nStops);
+            }
+        }
     }
     // Tone is published separately from the stops, and after them: it survives
     // a theme change (setThemeStops re-applies the stored tone), so a user who
