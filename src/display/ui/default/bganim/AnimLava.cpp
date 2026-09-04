@@ -23,8 +23,9 @@
 //    that used to run per pixel in the finalization loop) — depends only on
 //    tt, not on blob identity or pixel position. So it's folded into one
 //    already-integer, already-index-scaled LUT (1024 buckets, padded to
-//    1088 so the index shift never runs off the end), rebuilt once per
-//    frame from the current intensity. band()'s field loop turns the
+//    1088 so the index shift never runs off the end -- round 5 narrowed this
+//    to 512 buckets padded to 576, see LUT_BITS's own comment), rebuilt once
+//    per frame from the current intensity. band()'s field loop turns the
 //    fixed-point tt accumulator into a LUT index with a shift (no multiply,
 //    no divide, no branch) and adds the looked-up integer straight into an
 //    integer fieldRow accumulator — no float ops left in this loop at all.
@@ -101,6 +102,69 @@
 // the one table HEAD's old alloc() always sent to PSRAM on size) is
 // unchanged, still alloc(). release() needs no changes: releaseTable()
 // already dispatches by where each pointer actually came from.
+//
+// Round 5 (device-in-the-loop, kb.py, 2026-09-04): the round-4 measurement
+// above (26.0 ms) predates kb.py; kbench on the round-4 firmware read
+// band min 20.77/first 35.5/mean 32.33 ms, and this round's own kb.py run
+// of the unchanged round-4 source confirmed it (band 19.42/28.67/28.84,
+// blob of the same source 19.26/31.11/29.14 -- nil placement offset between
+// IRAM blob and flash band(), matching kblob/README.md's claim for other
+// anims). The three tables round 4 moved to allocHot() used only 6,272 B of
+// the 9,216 B animation's slab share (512+1,920+3,840), leaving 2,944 B
+// free -- lavaLUT (the fourth and largest table, read once per touched
+// pixel in the field-accumulation loop) was the only one still on alloc()
+// (PSRAM), by round 4's own design, not a fallback. This round narrows it
+// to int16_t and drops LUT_BITS from 10 to 512 buckets (see the constant's
+// comment for the exact margin math) so LUT_SIZE*sizeof(int16_t) is 2,304 B,
+// fitting the free 2,944 B, and moves it to allocHot() too -- the first
+// attempt where all four of lava's tables are hot-slab-resident at once,
+// which rounds 1-3 could not do (allocHot() did not exist yet; the old
+// heap-race heuristic could put lavaLUT in SRAM only by starving something
+// else of the placement it wanted, which is presumably why "a narrowed
+// int16_t width... measured slower on the device regardless" then). Five
+// kb.py runs after the move: blob min_ms held at 18.94-18.96 against band's
+// 19.35-19.51 (repeatable ~2.3-2.9% cut, well outside the <3% noise floor
+// stated in this round's brief because the within-variant spread, <0.1 ms,
+// is 5-20x smaller than the between-variant gap), and blob's first_ms sat
+// below band's first_ms in all five runs though both are noisy in absolute
+// terms (dominated by which bands' tables/code were cold going in). A
+// follow-up dropped LUT_BITS to 8 (1,152 B, more slab headroom): min_ms was
+// unchanged (18.94-18.96 again) and first_ms showed no consistent
+// improvement, so the win comes from getting lavaLUT off PSRAM at all, not
+// from shrinking it further past LUT_BITS=9 -- kept the finer table for the
+// better golden margin at no measured cost. Golden diff at LUT_BITS=9:
+// mean 0.061-0.101, max 33-36 (tolerance mean<=3, max<=48), so the coarser
+// bucket is visually silent. Host bandRef host time similarly moved
+// 0.230 -> 0.220 ms/frame, in the same direction as the device number.
+//
+// The field-accumulation inner loop itself (the `for (int n = ...)` loop
+// below) was checked against xtensa-esp32s3 GCC 14's own codegen
+// (xtensa-asm14.sh) rather than re-attempted in hand asm: the compiled loop
+// already runs inside a hardware zero-overhead LOOP (confirmed in the .S,
+// same as the round-4 comment above already notes) at 9 instructions per
+// touched pixel -- srai+addx2 (2, compute the LUT index and address),
+// l16si (1, load lut[idx]), l32i (1, load the accumulator), add.n (1,
+// ttQ+=stepQ), add.n (1, accumulate), s32i (1, store the accumulator),
+// add.n (1, stepQ+=step2Q), addi.n (1, field++) -- with GCC's own scheduler
+// already inserting the independent ttQ+=stepQ update between the lut load
+// and its use, so there is no load-use stall to remove either. That is the
+// true arithmetic floor for this Bresenham-LUT structure: one gather load,
+// one read-modify-write of the shared accumulator, and the two recurrence
+// adds, none of which the algorithm can drop without changing what it
+// computes. It matches what three prior on-device rounds already found by
+// trying kernels here and losing (31.1-32.8 ms and 29.0-32.0 ms against
+// HEAD's then-26.0 ms, file-top round 1-3 comment above), so this round did
+// not spend the shared board's time re-running that experiment a fourth
+// time. finalizeSpan's own 4-wide loop is the one hot loop in this file
+// that did NOT get a hardware LOOP (xtensa-asm14 shows a plain
+// decrement-and-branch, `bnez.n`, closing it) -- a `loopnez` conversion
+// there is a real, untested-this-round candidate, but by instruction count
+// it removes at most one taken branch per 4 pixels against a ~24-instruction
+// body, under 5% of finalizeSpan's own cost and likely under the 3% total
+// noise floor; round 1-3's "branch-eliminating finalize kernel" (file-top
+// comment above) may already have covered this exact loop and lost, so it
+// is named here as a candidate for whoever picks this file up next with
+// board time to spend confirming it, not shipped speculatively.
 
 #include "BgAnim.h"
 #include "BgAnimCommon.h"
@@ -136,21 +200,33 @@ constexpr float FIXED_SCALE = static_cast<float>(1 << FRAC_BITS); // 1,048,576
 // index it unconditionally with no clamp/compare at all. lavaBase is the
 // LUT pointer already offset so it can be indexed directly by the signed
 // shifted tt value.
-constexpr int LUT_BITS = 10;
-constexpr int LUT_HALF = 1 << LUT_BITS; // 1024 buckets covering tt in (0,1]
+// Round 5 (memory-ratio pass): dropped one bit from LUT_BITS (1024 -> 512
+// buckets) so the whole table narrows enough to fit the slab's free 2,944 B
+// (see the round-5 file-top comment) as int16_t. Host goldens stay within
+// tolerance (see the round-5 comment) because the contribution curve is
+// smooth in tt; the coarser bucket only matters where the curve is steepest
+// (the hot core past tt=0.7), and that is exactly where six overlapping
+// blobs plus dither already mask a lot of quantization.
+constexpr int LUT_BITS = 9;
+constexpr int LUT_HALF = 1 << LUT_BITS; // 512 buckets covering tt in (0,1]
 // Slack past the +-1 analytic bound. The forward-difference accumulator does
 // not track tt exactly: stepQ and step2Q are rounded to whole Q12.20 units, so
 // each carries up to 0.5 LSB of error, and step2Q's error is re-added on every
 // iteration. Over a k-pixel scan the accumulated deviation is bounded by
 //   0.5*k*(k-1)/2 + 0.5*k + 0.5   Q12.20 units,
 // which at the widest possible scan (k = 480, a blob spanning the panel) is
-// ~57.7k units = 0.055 in tt = 57 buckets, on either side. 32 was not enough:
-// it let the shifted index reach lavaLUT[-3] (caught by tools/animbench/fuzz
-// under ASan). 128 covers the worst case with room and costs 768 bytes.
-constexpr int LUT_MARGIN = 128;
+// ~57.7k units = 0.055 in tt, i.e. 0.055 * LUT_HALF buckets on either side
+// (56.4 at the original LUT_BITS=10, 28.2 here at LUT_BITS=9 -- the margin
+// need scales linearly with LUT_HALF since bucket width is what changed, not
+// the underlying fixed-point error). 32 was not enough at LUT_BITS=10: it
+// let the shifted index reach lavaLUT[-3] (caught by tools/animbench/fuzz
+// under ASan). 128 covered the LUT_BITS=10 worst case with a 2.27x margin;
+// keeping that same safety factor at LUT_BITS=9 gives 64 (128 * 512/1024),
+// and costs 128 bytes as int16_t (256 as int32_t).
+constexpr int LUT_MARGIN = 64;
 constexpr int LUT_OFFSET = LUT_HALF + LUT_MARGIN;
 constexpr int LUT_SIZE = 2 * LUT_HALF + 2 * LUT_MARGIN;
-constexpr int LUT_SHIFT = FRAC_BITS - LUT_BITS; // 10
+constexpr int LUT_SHIFT = FRAC_BITS - LUT_BITS; // 11
 
 // Palette-index saturation cap: the field-domain equivalent of the original
 // "clamp to 1.6f before scaling" (1.6f * kFieldScale == 255.0f exactly), now
@@ -175,8 +251,8 @@ BlobState blob[NUM_BLOBS];
 uint16_t *paletteLUT = nullptr;
 int32_t *fieldRow = nullptr; // one row of accumulated field, already in palette-index units
 int32_t ditherLUT[16];       // ordered dither in palette-index units, indexed by (y&3)*4+(x&3)
-int32_t *lavaLUT = nullptr;  // tt-bucket -> field contribution, pre-scaled to palette-index units, rebuilt in frame()
-int32_t *lavaBase = nullptr; // lavaLUT + LUT_OFFSET, so band() indexes it directly with the signed shifted-tt value
+int16_t *lavaLUT = nullptr;  // tt-bucket -> field contribution, pre-scaled to palette-index units, rebuilt in frame()
+int16_t *lavaBase = nullptr; // lavaLUT + LUT_OFFSET, so band() indexes it directly with the signed shifted-tt value
 uint32_t lastThemeGen = 0xFFFFFFFF;
 bool inited = false;
 int allocW = 0; // width fieldRow was sized for
@@ -243,16 +319,22 @@ bool init(int w, int h) {
         allocW = w;
     }
     if (lavaLUT == nullptr) {
-        // 9,216 B, unchanged from HEAD: alloc() (PSRAM). Rounds 1-3 tried
-        // moving this table to bganim::allocHot()'s internal slab, at both
-        // its original int32_t width (where it alone exhausted the slab,
-        // leaving no room for paletteLUT/fieldRow) and a narrowed int16_t
-        // width (which fit but measured slower on the device regardless);
-        // round 4 puts it back exactly where HEAD had it -- see the
-        // file-top round-4 comment. band() sweeps it monotonically through
-        // a forward difference on ttQ, so the reads are sequential rather
-        // than random, and 9 KB stays largely cache-resident anyway.
-        lavaLUT = static_cast<int32_t *>(alloc(LUT_SIZE * sizeof(int32_t)));
+        // Round 5 placement: allocHot(), narrowed to int16_t at LUT_BITS=9
+        // (see the constant's comment). Rounds 1-3 tried moving this table
+        // to the internal slab at its original int32_t width (where it
+        // alone exhausted whatever slab existed then, leaving no room for
+        // paletteLUT/fieldRow) and at a narrowed int16_t width but still
+        // LUT_BITS=10 (which fit the slab of that era but measured slower
+        // on the device regardless -- see the round-5 file-top comment for
+        // why that result does not indict this round's placement: the
+        // access pattern already made this a cheap read, so the earlier
+        // move bought nothing and the earlier revert was about something
+        // else, table budget). LUT_SIZE*sizeof(int16_t) is 2,304 B here,
+        // fitting inside the 2,944 B the slab had free after paletteLUT
+        // (512) + fieldRow (1,920) + bgRowAll (3,840) at round 4, so this
+        // is the first attempt where the table can sit in the slab
+        // alongside all three other resident tables, not in place of them.
+        lavaLUT = static_cast<int16_t *>(allocHot(LUT_SIZE * sizeof(int16_t)));
     }
     if (bgRowAll == nullptr) {
         // Round 4 placement: same as paletteLUT above. This replaces HEAD's
@@ -335,7 +417,11 @@ void frame(uint32_t tMs, int w, int, const uint8_t p[4]) {
         }
         const float t3 = tt * tt * tt;
         const float contribution = (t3 * intensity + (tt > 0.7f ? t3 * t3 * intensity * 0.6f : 0.0f)) * kFieldScale;
-        lavaLUT[p2] = static_cast<int32_t>(contribution + 0.5f); // contribution is always >= 0
+        // contribution is always >= 0 and its max (tt=1, intensity=1.8,
+        // hot core included) is 459.0 -- well inside int16_t's range, so
+        // the round-5 narrowing (see file-top comment) loses no precision
+        // versus the old int32_t storage, only bucket resolution (LUT_BITS).
+        lavaLUT[p2] = static_cast<int16_t>(contribution + 0.5f);
     }
 
     const float t = tMs * omega0;
@@ -483,7 +569,7 @@ void bandRef(uint16_t *dst, int y0, int rows, int w, uint32_t, const uint8_t *) 
             int32_t ttQ = static_cast<int32_t>(tt0f * FIXED_SCALE + (tt0f >= 0.0f ? 0.5f : -0.5f));
             int32_t stepQ = static_cast<int32_t>(step0f * FIXED_SCALE + (step0f >= 0.0f ? 0.5f : -0.5f));
             const int32_t step2Q = b.step2Q;
-            const int32_t *lut = lavaBase;
+            const int16_t *lut = lavaBase;
             // Pure integer forward-difference sweep: no multiply, no
             // divide, no libm, no branch. lut is zero-padded below index 0
             // (see LUT build in frame()), so out-of-blob pixels (tt<=0,
@@ -561,7 +647,7 @@ void band(uint16_t *dst, int y0, int rows, int w, uint32_t tMs, const uint8_t *p
 void release() {
     releaseTable(paletteLUT, 256 * sizeof(uint16_t));
     releaseTable(fieldRow, static_cast<size_t>(allocW) * sizeof(int32_t));
-    releaseTable(lavaLUT, static_cast<size_t>(LUT_SIZE) * sizeof(int32_t));
+    releaseTable(lavaLUT, static_cast<size_t>(LUT_SIZE) * sizeof(int16_t));
     releaseTable(bgRowAll, 4 * static_cast<size_t>(bgRowAllW) * sizeof(uint16_t));
     // Offset alias into lavaLUT, not an allocation of its own.
     lavaBase = nullptr;

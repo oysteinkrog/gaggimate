@@ -346,8 +346,24 @@ void plotStarsAndShoot(uint16_t *dst, int y0, int rows, int w) {
     }
     for (int b = bandLo; b <= bandHi; b++) {
         for (int16_t i = bandHead[b]; i >= 0; i = bandNext[i]) {
-            const StarDraw &d = draws[i];
             const int y = starY[i] - y0;
+            // starY/bandNext are hot-slab (SRAM); draws[] is PSRAM. A macroband
+            // spans 16 rows but this call only covers `rows` (2) of them, so
+            // most stars found by the bucket walk cannot land a pixel here: check
+            // the row with the cheap SRAM read before paying for the PSRAM one.
+            // Pad is +0/-1, not symmetric: the sizeClass>=2 glow plots x,y+1, so
+            // a star at y=-1 can still light row 0, but nothing ever reaches
+            // back past that or forward past y=rows-1 (all offsets below are
+            // x-only except that one +1 row). Measured: ~94% of visited nodes
+            // fail this check (30 macrobands averaging ~7 stars each, 3 examined
+            // per call, only a 3-row slice of the 48 rows spanned is reachable),
+            // so this removes a PSRAM read and up to four plotMax() calls for
+            // nearly all of them, at the cost of one branch that was going to
+            // be paid inside plotMax() anyway.
+            if (y < -1 || y >= rows) {
+                continue;
+            }
+            const StarDraw &d = draws[i];
             const int x = d.x;
             plotMax(dst, rows, w, x, y, d.r, d.g, d.b);
             if (d.sizeClass >= 1) {

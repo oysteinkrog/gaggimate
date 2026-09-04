@@ -127,6 +127,60 @@
 // (xtensa-asm14: 40/41 vs 45/46 -- see the round-2 report). See
 // mandalaBandFwd's comment for the register budget and the per-instruction
 // reasoning.
+//
+// Round 5 (2026-09-04, device-in-the-loop via tools/kblob): kb.py confirmed
+// band() and bandRef() still have the same min_ms on the bench board (both
+// ride GCC's own schedule, see round 2 above), so there was no arithmetic
+// edge left to take, and the round's brief pointed at first_ms/min_ms
+// instead: polarMap is the only table this file reads from PSRAM per pixel,
+// everything else (rParams, sin256, sinHalf256, rescaleLUT, paletteLUT) is
+// already in the hot SRAM slab.
+//
+// Tried: at the top of each band()/bandRef() call, memcpy the one or two
+// polarMap rows that call needs (mapDim entries, 482 B each) into a small
+// hot-slab scratch buffer once, then have mandalaBandFwd/Back and
+// mandalaRun<Step> read that copy instead of polarMap directly -- same
+// total bytes moved, but as one tight sequential copy loop (nothing but the
+// load, the store and two pointer steps between iterations) instead of one
+// PSRAM load sitting in the middle of ~20 instructions of per-pixel compute,
+// on the theory that back-to-back requests pipeline through the PSRAM
+// controller better than requests spaced out by unrelated arithmetic.
+//
+// Measured on the bench board, 7 kb.py runs before and after: blob's min_ms
+// went from matching band() exactly (27.6x ms, both variants, every run) to
+// a reproducible 27.65 -> 28.30 ms, +2.3%, with essentially no run-to-run
+// spread on either side of that comparison -- the extra copy is real,
+// measurable overhead even when every table is already warm. first_ms did
+// not move in compensation: band()'s own first_ms across those runs ranged
+// 35.4-47.6 ms and blob's 35.4-54.0 ms, and the mean difference (blob minus
+// band, paired within each run so both sides see the same board contention)
+// was -1.7 ms with a swing from +17.9 to -14.6 ms run to run -- indistin-
+// guishable from the noise floor, not the clear win the theory predicted.
+// Reverted; the diff is not in this file.
+//
+// Why the theory did not pay off, best guess: BgAnimCommon.h's own placement
+// note says a PSRAM table swept sequentially already streams close to SRAM
+// speed because the cache prefetches the run, and polarMap's access here
+// was already sequential (mapPtr walked ++/-- one row at a time, see
+// mandalaRun's comment) before this pass touched anything. Decoupling the
+// read from the per-pixel compute did not change the address stream the
+// prefetcher sees, so there was no latency left to hide this way; the copy
+// only added a second pass over the same bytes. This also means the round's
+// opening framing (first_ms/min_ms 1.9x, "second worst in the fleet") did
+// not reproduce here: the same board, same file, unmodified, measured 1.3x
+// to 1.5x across repeats with the same wide run-to-run spread noted above,
+// which reads more like a single high sample than a stable ratio. Left for
+// whoever measures this next: more repeats, and ideally a quieter board (kb.py's
+// own board is shared by seven workers this round; contention on it inflates
+// exactly the "first touch" numbers this metric depends on).
+//
+// Net for this round: band()'s per-pixel arithmetic is 27 instructions (5
+// loads, 1 store, one unavoidable load-use stall on the last, see
+// mandalaBandFwd's comment), matching min_ms's ~28.8 measured cycles/pixel
+// almost exactly and already at GCC's own proven schedule -- within ASM_
+// BRIEF.md's ~25 cycles/pixel target by about 15%, with no slack in that
+// schedule left to spend on anything else. Combined with the memory
+// experiment above coming back negative, this file did not move this round.
 #include "BgAnim.h"
 #include "BgAnimCommon.h"
 #include <esp_heap_caps.h>

@@ -122,6 +122,52 @@
 // bandRef AND emberGatherRow all three cost +502 B of internal RAM against
 // HEAD, which pinned only its one function. bandRef is off the per-frame
 // path in production (see its own comment, below) and is no longer pinned.
+//
+// --- Round 3, 2026-09-04 (flicker-gather kernel) ---------------------------
+//
+// Round 2 fixed table placement: all four of this file's own tables
+// (paletteExt, radiusLUT, flickerLUT, combRow) now come from allocHotOrPsram
+// and land in the hot SRAM slab, confirmed on the device (kbench's slab
+// report matches the 2,304 B this file's own init() comment predicts for all
+// four resident, not some smaller figure that would mean one fell back to
+// PSRAM). The remaining per-pixel PSRAM read is noiseTex256 itself, and that
+// one is not this file's to move: it is a 64 KB asset owned by BgAnimCommon
+// and shared with nebula, and BgAnimCommon.h's own placement note says a
+// bulk table swept sequentially -- which this access is, mostly: the
+// wrap-around index below covers the same 256-byte row twice per row call
+// but the two passes are seconds apart in wall time, not instructions, so
+// the second pass cannot rely on the first pass's cache lines surviving --
+// was never the case the hot slab was built for. Copying that row into a
+// hot-slab scratch buffer first would not remove the miss (the bytes are
+// still new to the cache the first time either way); it was tried on a
+// device build of this pass and measured within noise of leaving it alone,
+// so it is not in the file (see the round-3 measurement log in the pass
+// report for the numbers).
+//
+// So this round looked at the OTHER thing every pixel reads: the combRow
+// precompute in the doFlicker branch of band(), below. It computes
+// noiseRow[(x+g_sx)&255] and then flickerLUT[that byte] -- two genuinely
+// dependent loads, the exact same shape as emberGatherRow's
+// radiusLUT[ridx]-then-paletteExt[...] gather -- but nothing had ever
+// rewritten it: it was still the plain -O2 compiled loop. xtensa-asm14 on
+// the pre-round-3 file shows why that mattered: 13 scalar instructions per
+// pixel with TWO load-use stalls (the noiseRow byte consumed by the very
+// next instruction to address flickerLUT, and the flickerLUT byte consumed
+// by the very next instruction to sign-extend it), no unrolling, so nothing
+// hides either stall. That is a very plausible reason the round-2 kernel
+// only bought 6% at min against bandRef despite a hand-scheduled gather:
+// half of this loop's per-pixel work was never touched.
+//
+// emberFlickerRow below applies the same fix as emberGatherRow: interleave
+// two pixels so each one's independent address arithmetic fills the
+// load-use gap the other one's dependent chain leaves. See its own header
+// for the schedule proof. It replaces only the doFlicker branch's per-pixel
+// loop; the no-flicker branch (a plain 8-wide replicate of perCol, no
+// PSRAM access and no gather at all) is left as a compiler loop -- flicker
+// defaults to 20 (see the param table below), so doFlicker is true at
+// default params, which is what the fleet measurement this whole pass is
+// scoped against was taken at, and there is no dependent-load chain in the
+// no-flicker branch for a schedule to fix.
 
 #include "BgAnim.h"
 #include "BgAnimCommon.h"
@@ -165,7 +211,7 @@ constexpr int RLUT_N = 256 + RPAD;
 uint16_t *paletteExt = nullptr; // [PAL_EXT_N]; real ramp lives at paletteExt+PAD
 uint16_t *palette = nullptr;    // = paletteExt + PAD, 256 entries, reversed theme ramp
 uint8_t *radiusLUT = nullptr;   // [RLUT_N]; r^2>>RSHIFT -> normalized radius byte
-int8_t *flickerLUT = nullptr;   // noise byte -> signed flicker contribution
+int16_t *flickerLUT = nullptr;  // [256]; noise byte -> signed flicker contribution (int16_t, see buildFlickerLut)
 const uint8_t *noise = nullptr;
 int16_t *combRow = nullptr; // [allocW]; perCol+flicker combined, rebuilt per row (see file header)
 int allocW = 0;             // width combRow was sized for; release() needs it back
@@ -212,7 +258,13 @@ void extendPalette() {
 
 void buildFlickerLut(int flickerAmp) {
     for (int i = 0; i < 256; i++) {
-        flickerLUT[i] = static_cast<int8_t>(((i - 128) * flickerAmp) >> 7);
+        // int16_t, not int8_t (round 3): the kernel below reads this table
+        // with a sign-extending 16-bit load (L16SI) so the sign-extend is
+        // free instead of a separate SEXT instruction per pixel -- see
+        // emberFlickerRow's header. The values themselves are unchanged and
+        // still fit easily in an int8_t (flickerAmp maxes at 10, so the
+        // range here is about +-9.9), this only widens the storage.
+        flickerLUT[i] = static_cast<int16_t>(((i - 128) * flickerAmp) >> 7);
     }
 }
 
@@ -237,9 +289,11 @@ bool init(int w, int h) {
         // pixel too, but only on the doFlicker precompute pass) -- 230,400
         // reads/frame each at full res, exactly the "reads per frame, not
         // size" criterion BgAnimCommon.h's hot-slab comment asks for. Total
-        // is 768 + 320 + 256 + up to 960 = up to 2,304 B, comfortably inside
-        // the 9,216 B this animation gets while resident (round 2 report has
-        // the exact figure). noiseTex256 is NOT moved here: it is a 64 KB
+        // is 768 + 320 + 512 + up to 960 = up to 2,560 B (flickerLUT widened
+        // to int16_t in round 3, was 256 B; see buildFlickerLut), comfortably
+        // inside the 9,216 B this animation gets while resident (round 2
+        // report has the exact figure before the widening). noiseTex256 is
+        // NOT moved here: it is a 64 KB
         // fleet-shared asset owned by BgAnimCommon (borrowed via
         // noiseTex256(), never allocated by this file) and BgAnimCommon.h
         // says bulk sequentially-swept tables were never the ones placement
@@ -251,7 +305,7 @@ bool init(int w, int h) {
         // the pattern PSRAM latency hurts and sequential-stream tables do not.
         paletteExt = static_cast<uint16_t *>(allocHotOrPsram(PAL_EXT_N * sizeof(uint16_t)));
         radiusLUT = static_cast<uint8_t *>(allocHotOrPsram(RLUT_N));
-        flickerLUT = static_cast<int8_t *>(allocHotOrPsram(256));
+        flickerLUT = static_cast<int16_t *>(allocHotOrPsram(256 * sizeof(int16_t)));
         noise = noiseTex256();
         combRow = static_cast<int16_t *>(allocHotOrPsram(static_cast<size_t>(w) * sizeof(int16_t)));
         allocW = w;
@@ -516,6 +570,191 @@ __attribute__((noinline)) static void GM_ANIM_IRAM emberGatherRow(uint16_t *__re
                  : "memory");
 }
 
+// Hand-written Xtensa scalar kernel for the flicker/noise gather that fills
+// combRow before emberGatherRow's palette gather runs (doFlicker branch
+// only): idx = (x+gsx)&255, nb = noiseRow[idx], fb = flickerLUT[nb],
+// combRow[x] = perCol[x&7] + fb. Two genuinely dependent loads on the
+// critical path (noiseRow's byte selects the flickerLUT entry), the same
+// shape as emberGatherRow's radiusLUT-then-paletteExt gather above, fixed
+// the same way: interleave two pixels so each one's independent address
+// arithmetic fills the load-use gap the other one's dependent chain leaves
+// open. See the round-3 file-header note for why this loop had gone
+// unscheduled until now.
+//
+// perCol is read with L16UI (zero-extending) even though the array holds
+// signed int16_t: the store below truncates to int16_t, so only the low 16
+// bits of the sum matter and zero-extension gives byte-identical results to
+// a signed load here -- the same trick the -O2 compiler already used for
+// this exact load before this kernel replaced it (confirmed in
+// xtensa-asm14/AnimEmber.S's pre-round-3 dump: `l16ui a12, a12, 0
+// # perCol[_30]`), and the same reasoning combRow's own signed load relies
+// on elsewhere in this file (file header, top).
+//
+// flickerLUT is int16_t, not int8_t (round 3), purely so this kernel can
+// read it with L16SI (a sign-extending 16-bit load) instead of L8UI followed
+// by a separate SEXT -- one fewer instruction per pixel, at the cost of
+// doubling the table from 256 B to 512 B (still trivial against the 9,216 B
+// slab budget; see buildFlickerLut and init()). The address arithmetic uses
+// ADDX2 in place of ADD to scale the index by the now-2-byte entry size.
+//
+// Two earlier versions are worth recording since both were measured and
+// kept for a while before the next found more:
+//   - 2 pixels/iteration (wPairs trip count), x&7 recomputed with
+//     extui+addx2 every pixel like -O2 did: 24.45 ms/frame min on the
+//     device (see the round-3 report), a real win over the unscheduled
+//     compiler loop.
+//   - 8 pixels/iteration (this kernel's pairing) but still int8_t
+//     flickerLUT with L8UI+SEXT: 21.37-21.98 ms/frame min. x&7 has period 8
+//     and does not need recomputing at all once the loop is unrolled to an
+//     octet: every perCol access becomes a compile-time-constant byte
+//     offset, so that version already dropped the extui/addx2 pair for
+//     perCol in favour of a literal-offset L16UI, and combRow's store
+//     offsets became compile-time constants too, so cr only advanced once
+//     per iteration (by 16 bytes) instead of once per pair.
+// This version keeps the 8-pixel/iteration shape and both of those literal-
+// offset wins, and additionally removes the SEXT per pixel as described
+// above. The noise/flicker chain still needs a live index: ni carries
+// x+gsx unmasked across the whole row (not reset per octet) and is masked
+// with extui per pixel, since the wrap at 256 can land anywhere inside an
+// octet and a literal cannot express that. wOctets = w/8 (w is always a
+// multiple of 8 on this animation's real targets, 240/480 -- band()'s own
+// w%8 guard already establishes this).
+//
+// Register budget (9 live values: ni, noiseRow, flk, perCol, cr, idx0, idx1,
+// pc0, pc1), comfortably inside the ~13 usable ARs the windowed ABI leaves
+// an inline asm block (ASM_BRIEF.md). idx0/idx1 are reused across a chain of
+// roles (masked noise index -> noiseRow address -> loaded byte ->
+// flickerLUT address -> loaded, already-sign-extended value -> combined
+// sum), same technique emberGatherRow uses above and safe for the same
+// reason: a load's address operand is read before the load's destination
+// write lands, so reusing one register across that chain is a data
+// dependency the schedule below already respects, not a hazard. pc0/pc1 are
+// dedicated (no address role: the L16UI reads perCol directly at a literal
+// offset, so there is no address register to reuse them into).
+//
+// Schedule for one pair within the octet (verified by inspection: every
+// loaded value is consumed at least one instruction after the load that
+// produced it, so no load-use stall ever fires; the four pairs below are
+// independent of each other except for ni, ni's own two increments per pair,
+// and cr, which only advances once at the very end):
+//   1 extui  idx0 = ni & 255           2 addi ni += 1
+//   3 extui  idx1 = ni & 255           4 addi ni += 1
+//   5 add    idx0 = &noiseRow[idx0]
+//   6 l8ui   idx0 = noiseRow[idx0]                               <- load
+//   7 add    idx1 = &noiseRow[idx1]      (gap for #6; independent)
+//   8 l8ui   idx1 = noiseRow[idx1]                                <- load
+//   9 l16ui  pc0 = perCol[k]             (gap for #8; independent,     <- load
+//                                          literal byte offset 4*pairIndex)
+//  10 l16ui  pc1 = perCol[k+1]          (independent, literal offset+2) <- load
+//  11 addx2  idx0 = &flickerLUT[idx0]   (idx0 is nb0, 5 instrs old: safe)
+//  12 l16si  idx0 = flickerLUT[idx0]    (fb0, already sign-extended)     <- load
+//  13 addx2  idx1 = &flickerLUT[idx1]   (idx1 is nb1, 5 instrs old: safe;
+//                                         gap for #12)
+//  14 l16si  idx1 = flickerLUT[idx1]    (fb1)                            <- load
+//  15 add    idx0 = fb0 + pc0 (idx0 loaded #12, 2 instrs old: safe;
+//                               pc0 loaded #9: long safe)
+//  16 add    idx1 = fb1 + pc1 (idx1 loaded #14, 1 instr old: safe;
+//                               pc1 loaded #10: long safe)
+//  17 s16i   combRow[k]   = idx0   (literal byte offset 4*pairIndex)
+//  18 s16i   combRow[k+1] = idx1   (literal byte offset+2)
+// 18 instructions per pair, 4 pairs plus one closing "cr += 16" = 73
+// instructions for 8 pixels (9.125/pixel), zero stalls, zero per-iteration
+// branch cost (LOOPNEZ), confirmed by xtensa-asm14 to still fit inside the
+// LOOPNEZ body-size limit with no register spills (round-3 report has the
+// measured body size).
+__attribute__((noinline)) static void GM_ANIM_IRAM emberFlickerRow(int16_t *__restrict combRowOut,
+                                                                    const int16_t *__restrict perColIn,
+                                                                    const uint8_t *__restrict noiseRowIn,
+                                                                    const int16_t *__restrict flickerLUTIn,
+                                                                    int gsxIn, int wOctets) {
+    int ni = gsxIn; // x starts at 0, so x+gsx starts at gsx
+    int16_t *cr = combRowOut;
+    int idx0, idx1, pc0, pc1;
+    asm volatile("loopnez %[n], 2f\n"
+                 // pair 0: pixels x=0,1 -- perCol/combRow byte offsets 0,2
+                 "extui  %[idx0], %[ni], 0, 8\n"
+                 "addi   %[ni], %[ni], 1\n"
+                 "extui  %[idx1], %[ni], 0, 8\n"
+                 "addi   %[ni], %[ni], 1\n"
+                 "add    %[idx0], %[noiseRow], %[idx0]\n"
+                 "l8ui   %[idx0], %[idx0], 0\n"
+                 "add    %[idx1], %[noiseRow], %[idx1]\n"
+                 "l8ui   %[idx1], %[idx1], 0\n"
+                 "l16ui  %[pc0], %[perCol], 0\n"
+                 "l16ui  %[pc1], %[perCol], 2\n"
+                 "addx2  %[idx0], %[idx0], %[flk]\n"
+                 "l16si  %[idx0], %[idx0], 0\n"
+                 "addx2  %[idx1], %[idx1], %[flk]\n"
+                 "l16si  %[idx1], %[idx1], 0\n"
+                 "add    %[idx0], %[idx0], %[pc0]\n"
+                 "add    %[idx1], %[idx1], %[pc1]\n"
+                 "s16i   %[idx0], %[cr], 0\n"
+                 "s16i   %[idx1], %[cr], 2\n"
+                 // pair 1: pixels x=2,3 -- perCol/combRow byte offsets 4,6
+                 "extui  %[idx0], %[ni], 0, 8\n"
+                 "addi   %[ni], %[ni], 1\n"
+                 "extui  %[idx1], %[ni], 0, 8\n"
+                 "addi   %[ni], %[ni], 1\n"
+                 "add    %[idx0], %[noiseRow], %[idx0]\n"
+                 "l8ui   %[idx0], %[idx0], 0\n"
+                 "add    %[idx1], %[noiseRow], %[idx1]\n"
+                 "l8ui   %[idx1], %[idx1], 0\n"
+                 "l16ui  %[pc0], %[perCol], 4\n"
+                 "l16ui  %[pc1], %[perCol], 6\n"
+                 "addx2  %[idx0], %[idx0], %[flk]\n"
+                 "l16si  %[idx0], %[idx0], 0\n"
+                 "addx2  %[idx1], %[idx1], %[flk]\n"
+                 "l16si  %[idx1], %[idx1], 0\n"
+                 "add    %[idx0], %[idx0], %[pc0]\n"
+                 "add    %[idx1], %[idx1], %[pc1]\n"
+                 "s16i   %[idx0], %[cr], 4\n"
+                 "s16i   %[idx1], %[cr], 6\n"
+                 // pair 2: pixels x=4,5 -- perCol/combRow byte offsets 8,10
+                 "extui  %[idx0], %[ni], 0, 8\n"
+                 "addi   %[ni], %[ni], 1\n"
+                 "extui  %[idx1], %[ni], 0, 8\n"
+                 "addi   %[ni], %[ni], 1\n"
+                 "add    %[idx0], %[noiseRow], %[idx0]\n"
+                 "l8ui   %[idx0], %[idx0], 0\n"
+                 "add    %[idx1], %[noiseRow], %[idx1]\n"
+                 "l8ui   %[idx1], %[idx1], 0\n"
+                 "l16ui  %[pc0], %[perCol], 8\n"
+                 "l16ui  %[pc1], %[perCol], 10\n"
+                 "addx2  %[idx0], %[idx0], %[flk]\n"
+                 "l16si  %[idx0], %[idx0], 0\n"
+                 "addx2  %[idx1], %[idx1], %[flk]\n"
+                 "l16si  %[idx1], %[idx1], 0\n"
+                 "add    %[idx0], %[idx0], %[pc0]\n"
+                 "add    %[idx1], %[idx1], %[pc1]\n"
+                 "s16i   %[idx0], %[cr], 8\n"
+                 "s16i   %[idx1], %[cr], 10\n"
+                 // pair 3: pixels x=6,7 -- perCol/combRow byte offsets 12,14
+                 "extui  %[idx0], %[ni], 0, 8\n"
+                 "addi   %[ni], %[ni], 1\n"
+                 "extui  %[idx1], %[ni], 0, 8\n"
+                 "addi   %[ni], %[ni], 1\n"
+                 "add    %[idx0], %[noiseRow], %[idx0]\n"
+                 "l8ui   %[idx0], %[idx0], 0\n"
+                 "add    %[idx1], %[noiseRow], %[idx1]\n"
+                 "l8ui   %[idx1], %[idx1], 0\n"
+                 "l16ui  %[pc0], %[perCol], 12\n"
+                 "l16ui  %[pc1], %[perCol], 14\n"
+                 "addx2  %[idx0], %[idx0], %[flk]\n"
+                 "l16si  %[idx0], %[idx0], 0\n"
+                 "addx2  %[idx1], %[idx1], %[flk]\n"
+                 "l16si  %[idx1], %[idx1], 0\n"
+                 "add    %[idx0], %[idx0], %[pc0]\n"
+                 "add    %[idx1], %[idx1], %[pc1]\n"
+                 "s16i   %[idx0], %[cr], 12\n"
+                 "s16i   %[idx1], %[cr], 14\n"
+                 "addi   %[cr], %[cr], 16\n"
+                 "2:\n"
+                 : [ni] "+r"(ni), [cr] "+r"(cr), [idx0] "=&r"(idx0), [idx1] "=&r"(idx1), [pc0] "=&r"(pc0),
+                   [pc1] "=&r"(pc1)
+                 : [n] "r"(wOctets), [noiseRow] "r"(noiseRowIn), [flk] "r"(flickerLUTIn), [perCol] "r"(perColIn)
+                 : "memory");
+}
+
 #endif // __XTENSA__ && !GM_BGANIM_NO_ASM
 
 // band(): on real hardware this fills combRow (see file header for why one
@@ -541,6 +780,7 @@ GM_ANIM_IRAM void band(uint16_t *dst, int y0, int rows, int w, uint32_t tMs, con
     }
     const bool doFlicker = g_flickerAmp != 0;
     const int wPairs = w >> 1;
+    const int wOctets = w >> 3; // emberFlickerRow's trip count; exact since the w%8 guard above holds
     for (int r = 0; r < rows; r++) {
         const int y = y0 + r;
         const int dy = y - g_cy;
@@ -562,11 +802,11 @@ GM_ANIM_IRAM void band(uint16_t *dst, int y0, int rows, int w, uint32_t tMs, con
         const uint16_t *palOff = paletteExt + PAD;
 
         if (doFlicker) {
-            // Identical formula to bandRef's combRow precompute.
+            // Identical formula to bandRef's combRow precompute, now filled
+            // by a hand-scheduled kernel instead of a plain loop (round 3;
+            // see file header and emberFlickerRow's own header).
             const uint8_t *noiseRow = noise + ((y + g_sy) & 255) * 256;
-            for (int x = 0; x < w; x++) {
-                combRow[x] = static_cast<int16_t>(perCol[x & 7] + flickerLUT[noiseRow[(x + g_sx) & 255]]);
-            }
+            emberFlickerRow(combRow, perCol, noiseRow, flickerLUT, g_sx, wOctets);
         } else {
             // No flicker: combRow needs only the periodic dither/breathe
             // term, replicated, so the one gather kernel below can serve
@@ -594,7 +834,7 @@ void release() {
     // handing it to free() would be heap corruption. Just drop it.
     palette = nullptr;
     releaseTable(radiusLUT, RLUT_N);
-    releaseTable(flickerLUT, 256);
+    releaseTable(flickerLUT, 256 * sizeof(int16_t));
     releaseTable(combRow, static_cast<size_t>(allocW) * sizeof(int16_t));
     // Borrowed: noiseTex256() is a 64 KB fleet-wide asset owned by
     // BgAnimCommon and shared with nebula. Dropping the pointer is all this

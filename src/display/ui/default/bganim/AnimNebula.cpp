@@ -1370,18 +1370,72 @@ void band(uint16_t *dst, int y0, int rows, int w, uint32_t tMs, const uint8_t p[
         // difference terms and must not carry the dither (the first
         // sanity-check run against bandRef's formula caught exactly this
         // when tried the other way -- see nebulaFieldPie's header comment).
-        {
-            int bI = g_bx & 255;
-            int cI = g_cx & 255;
-            for (int k = 0; k < 128; k++) {
-                const int cv = rowC[cI];
-                bTable[k] = static_cast<uint16_t>(rowB[bI]);
-                cTable[k] = static_cast<uint16_t>(cv);
-                cDithTable[k] = static_cast<uint16_t>(cv + dith2[k & 7]);
-                bI = (bI + 2) & 255;
-                cI = (cI + 4) & 255;
-            }
+        //
+        // Round 5 (2026-09-04 kbench pass) tried copying rowB/rowC into two
+        // new slab buffers with one sequential 256 B sweep each, then
+        // walking the +2/+4 stride against that SRAM copy instead of PSRAM
+        // directly, on the theory that a strided PSRAM read is worse than a
+        // flat one. Measured on device (kb.py, min_ms filters interrupts):
+        // 12.93 -> 13.68/13.69 ms, reproduced exactly across repeated runs
+        // and a device reboot, so the ~5.8% is real, not noise. first_ms did
+        // not move outside its own run-to-run spread (21.5-26.6 ms across
+        // six runs of both the original and the changed code) in either
+        // direction. Reverted: the extra sequential copy is a real,
+        // unconditional cost every row, and nothing measurable came back
+        // for it. Most likely cause: the working set here is 256 B, small
+        // enough that the strided read was probably already landing mostly
+        // in the S3's external-memory cache after the first touch, so
+        // reordering the access pattern within that 256 B has little left
+        // to win -- consistent with the file's own 2026-08-25 finding that
+        // even eliminating all four samplers' PSRAM traffic outright
+        // (GM_NEBULA_CACHED_NOISE_PROBE, bandRef only) capped out at 16% on
+        // a slower pre-PIE-combine baseline. Do not retry this exact shape
+        // without a new device number to back it.
+        // cI steps by 4 mod 256, a period of 64, half of bI's own period of
+        // 128 (steps by 2 mod 256) -- so of the loop's 128 iterations, only
+        // the first 64 touch a cI value the second 64 have not already
+        // produced: cI(k+64) == cI(k) for every k in [0,64) (4*64 == 256, a
+        // full wrap), and since 8 | 64 too, k&7 == (k+64)&7, so dith2[k&7]
+        // repeats in step. That makes cTable[k+64] == cTable[k] and
+        // cDithTable[k+64] == cDithTable[k] bit for bit, not approximately:
+        // the second half was 64 redundant PSRAM reads (rowC[cI], same
+        // address as 64 iterations earlier) and 64 redundant dither adds,
+        // producing values the first half already computed. bI has no such
+        // period inside 128 (gcd(2,256)=2, period 256/2=128 exactly), so
+        // bTable alone still needs all 128 iterations; only the c-side
+        // splits into "compute 64, copy 64" (round 5, 2026-09-04 kbench
+        // pass; measured device delta at the end of this comment).
+        int bI = g_bx & 255;
+        int cI = g_cx & 255;
+        for (int k = 0; k < 64; k++) {
+            const int cv = rowC[cI];
+            bTable[k] = static_cast<uint16_t>(rowB[bI]);
+            cTable[k] = static_cast<uint16_t>(cv);
+            cDithTable[k] = static_cast<uint16_t>(cv + dith2[k & 7]);
+            bI = (bI + 2) & 255;
+            cI = (cI + 4) & 255;
         }
+        // SRAM-to-SRAM, both tables already in the slab: cheaper than
+        // redoing 64 more PSRAM reads that would produce the same bytes.
+        memcpy(cTable + 64, cTable, 64 * sizeof(uint16_t));
+        memcpy(cDithTable + 64, cDithTable, 64 * sizeof(uint16_t));
+        for (int k = 64; k < 128; k++) {
+            bTable[k] = static_cast<uint16_t>(rowB[bI]);
+            bI = (bI + 2) & 255;
+        }
+        // Measured on device (kb.py, min_ms filters interrupts): 12.92-12.93
+        // -> 11.71 ms per frame, reproduced bit-for-bit identical across
+        // three separate builds/uploads, so this is a real ~9.4% cut to the
+        // deterministic compute cost, not noise (ambient device load moved
+        // band()'s own min_ms by more than this between runs; blob's own
+        // min_ms did not move at all across those same runs). Correctness
+        // is a closed-form identity (see above), independently checked
+        // numerically over 20,000 random (g_cx, densOff, bayerRow) triples
+        // with zero mismatches, and confirmed on device once directly
+        // against the flashed firmware's band() before the on-device
+        // equality check's own scroll-state drift (unrelated to this
+        // change; see the file's other round-5 note above) made that
+        // comparison unreliable run to run.
 
         uint8_t *ixCur = curBuf == 0 ? ixBufs0 : ixBufs1;
         uint8_t *ixNext = curBuf == 0 ? ixBufs1 : ixBufs0;

@@ -105,6 +105,46 @@
 // the shading dimension changes only how many 8-byte steps exist per
 // rowPhase plane (ROWPHASE_STRIDE), which is a value the kernel already took
 // as a plain argument (rgbRowBase) rather than a compile-time constant.
+//
+// Round 3 (r5-caustics, 2026-09-04): device-in-the-loop pass using
+// tools/kblob (kb.py run), which hot-loads this file over HTTP and times it
+// on the real core without a flash. The round-4 starting point measured
+// blob min 11.05 ms, first 11.97-14.15 ms (the range across repeated runs;
+// first_ms is noisy, see below), matching band's own 11.06 ms min. The
+// ASK for this round guessed the per-row wave-sum gather (computeRowSetup,
+// called 240 times/frame) was a large share of what was left. Measured
+// instead: a probe build with the pixel loop stubbed out (row setup still
+// run, causticsRowKernel not called) brought blob min down to 0.06 ms, so
+// row setup is under 1% of the total and was not the bottleneck. All the
+// time is in causticsRowKernel's per-pixel gather-and-store body and the
+// fixed per-span wave-sum setup it amortizes across GRID pixels.
+//
+// The lever that moved: GRID (the coarse-interpolation stride, see its own
+// comment) doubled from 4 to 8, amortizing the same 16-instruction
+// per-span setup over twice as many pixels in both bandRef and
+// causticsRowKernel (both changed together, kept pixel-exact by
+// construction the same way the round-2 rgbLUT change was). Measured:
+// blob min 11.05 -> 9.01 ms (18.5% faster, reproduced across 3 separate
+// kb.py runs, all exactly 9.01), blobref (the C++ path in the same IRAM
+// placement) 13.82 -> 11.38-11.39 ms. Host golden diffs stayed well inside
+// tolerance (mean 0.39-0.48 vs a 3.0 bar, max 33 vs a 48 cap) even though
+// this is technically an algorithm change (coarser interpolation), so the
+// visual cost was judged acceptable. A further doubling to GRID=16 was
+// tried next and reverted: it failed the host golden compare outright
+// (max diff 91-107 against the 48 cap at all three checkpoints, caught
+// before it ever reached the device), so GRID=8 is what shipped. A
+// register-freeing idea for a deeper pixel-store pipeline (see
+// causticsRowKernel's comment) was analyzed on paper and rejected before a
+// device run, because the extra loads it would need cost about as much as
+// the stall it would remove.
+//
+// A note on first_ms: it varied by close to 2x between otherwise-identical
+// repeated runs of the unchanged round-4 source (11.97 to 24.09 ms for the
+// ref variant), which the kblob README attributes to the board being
+// shared with other workers in this pass; min_ms was stable to the
+// hundredth of a millisecond across every repeat (11.05/11.06, then
+// 9.01/9.01/9.01 after the GRID change), so min_ms is what this pass
+// tracked and first_ms is reported for completeness only.
 
 #include "BgAnim.h"
 #include "BgAnimCommon.h"
@@ -130,8 +170,32 @@ constexpr int PHASE_SHIFT = 22; // 32 - log2(SIN_N)
 // Coarse-grid stride in x: the wave-sum field is evaluated exactly every
 // GRID columns and linearly interpolated in between (see file header). Must
 // be a power of two (interpolation step uses a shift, not a divide) and a
-// multiple of 4 to keep the device kernel's 4-wide unroll exact.
-constexpr int GRID = 4;
+// multiple of 8 to keep the device kernel's 8-wide unroll exact.
+//
+// Doubled from 4 to 8 in round 3 (r5-caustics, 2026-09-04): the on-device
+// pixel-loop-stubbed probe (row-setup only, no gather) measured 0.06 ms of
+// the 11.05 ms band() minimum, so the per-row wave-sum gather itself was
+// never the cost; the ASK's guess that row setup was a large share of the
+// remaining time was wrong. What the gather DOES cost is span-level fixed
+// overhead (16 instructions gathering the 3 waves at the next grid point)
+// paid once per GRID pixels, so doubling GRID amortizes that same 16
+// instructions over twice as many pixels: 45 instr/4px = 11.25 instr/px at
+// GRID=4, 73 instr/8px = 9.125 instr/px at GRID=8, both counting the
+// unchanged 7-instruction-per-pixel gather-and-store body (see
+// causticsRowKernel's comment). Measured device win: see the file header's
+// round-3 section. colSlot (rgbLUT's dither phase) stays x&3 unrelated to
+// GRID, so an 8-wide span just repeats the 4-entry dither cycle twice.
+//
+// GRID=16 was tried next in the same pass and reverted: the host golden
+// compare (tools/animbench, --compare golden) failed outright at all three
+// checkpoints, mean diff 1.6-2.0 (still under the 3.0 bar) but max diff
+// 91-107 against the 48 cap, meaning some pixels visibly facet at wave
+// crossings even though the average frame looks close. This was caught
+// before ever reaching the device (rung 1 of the ladder), so GRID=16 has
+// no device numbers; GRID=8 is the value that shipped. Do not re-try 16
+// without also reworking the interpolation (e.g. a second interior sample)
+// to control the worst-pixel error, not just the mean.
+constexpr int GRID = 8;
 
 // |sum of 3 sin1024 outputs| ranges 0..K*SIN_AMP inclusive; shapeLUT maps
 // that magnitude straight to a shading index (0..255), threshold+square
@@ -339,15 +403,21 @@ void bandRef(uint16_t *dst, int y0, int rows, int w, uint32_t, const uint8_t *) 
 
         // Main loop: GRID is a compile-time constant here (the tail below
         // handles any remainder), so the step multiply becomes a shift and
-        // the 4-wide inner body is fully unrolled — no per-span branch, no
-        // loop-trip-count check inside the hot path.
+        // the 8-wide inner body is fully unrolled — no per-span branch, no
+        // loop-trip-count check inside the hot path. GRID doubled from 4 to
+        // 8 in round 3 (r5-caustics, 2026-09-04, see the GRID comment and
+        // the file header). A further doubling to 16 was tried in the same
+        // pass and reverted (failed the host golden max-diff check before
+        // ever reaching the device, see the GRID comment); this loop is the
+        // 8-wide shape that shipped. colSlot (x&3) still has period 4, so
+        // an 8-wide span runs the dither cycle twice.
         while (x + GRID <= w) {
-            const uint32_t np0 = phaseQ[0] + (g_stepQ[0] << 2);
-            const uint32_t np1 = phaseQ[1] + (g_stepQ[1] << 2);
-            const uint32_t np2 = phaseQ[2] + (g_stepQ[2] << 2);
+            const uint32_t np0 = phaseQ[0] + (g_stepQ[0] << 3);
+            const uint32_t np1 = phaseQ[1] + (g_stepQ[1] << 3);
+            const uint32_t np2 = phaseQ[2] + (g_stepQ[2] << 3);
             const int32_t sumNext = lut[(np0 >> PHASE_SHIFT) & (SIN_N - 1)] + lut[(np1 >> PHASE_SHIFT) & (SIN_N - 1)] +
                                      lut[(np2 >> PHASE_SHIFT) & (SIN_N - 1)];
-            const int32_t stepInterp = (sumNext - sumCur) >> 2; // GRID==4
+            const int32_t stepInterp = (sumNext - sumCur) >> 3; // GRID==8
 
             int32_t val = sumCur;
             int32_t m = val >> 31;
@@ -361,6 +431,18 @@ void bandRef(uint16_t *dst, int y0, int rows, int w, uint32_t, const uint8_t *) 
             val += stepInterp;
             m = val >> 31;
             row[x + 3] = rowBase[shapeLUT[(val ^ m) - m] * 4 + 3];
+            val += stepInterp;
+            m = val >> 31;
+            row[x + 4] = rowBase[shapeLUT[(val ^ m) - m] * 4 + 0];
+            val += stepInterp;
+            m = val >> 31;
+            row[x + 5] = rowBase[shapeLUT[(val ^ m) - m] * 4 + 1];
+            val += stepInterp;
+            m = val >> 31;
+            row[x + 6] = rowBase[shapeLUT[(val ^ m) - m] * 4 + 2];
+            val += stepInterp;
+            m = val >> 31;
+            row[x + 7] = rowBase[shapeLUT[(val ^ m) - m] * 4 + 3];
 
             phaseQ[0] = np0;
             phaseQ[1] = np1;
@@ -370,8 +452,11 @@ void bandRef(uint16_t *dst, int y0, int rows, int w, uint32_t, const uint8_t *) 
         }
 
         // Tail shorter than GRID (only when w % GRID != 0): exact per-pixel
-        // evaluation, no interpolation. 480 % 4 == 0 on the real panel (and
-        // 240 % 4 == 0 at half resolution), so this path is untaken there.
+        // evaluation, no interpolation. 480 % 8 == 0 on the real panel (and
+        // 240 % 8 == 0 at half resolution), so this path is untaken there.
+        // This loop already indexes g_stepQ[k] by a runtime multiply (not a
+        // compile-time shift), so it needed no change when GRID moved from
+        // 4 to 8.
         for (int i = 0; x < w; i++, x++) {
             const int32_t sum = lut[((phaseQ[0] + g_stepQ[0] * static_cast<uint32_t>(i)) >> PHASE_SHIFT) & (SIN_N - 1)] +
                                  lut[((phaseQ[1] + g_stepQ[1] * static_cast<uint32_t>(i)) >> PHASE_SHIFT) & (SIN_N - 1)] +
@@ -384,12 +469,12 @@ void bandRef(uint16_t *dst, int y0, int rows, int w, uint32_t, const uint8_t *) 
 
 #if defined(__XTENSA__) && !defined(GM_BGANIM_NO_ASM)
 // One row's GRID-aligned span loop (see the file header for the algorithm:
-// three DDS sine waves summed, coarse-grid interpolated every GRID=4
+// three DDS sine waves summed, coarse-grid interpolated every GRID=8
 // columns, then the branchless-abs + two-stage gather, shapeLUT, then the
 // per-column-phase RGB565 palette, that turns the wave-sum magnitude into
 // a pixel). w is guaranteed a multiple of GRID by the caller (band(), which
 // falls back to bandRef for the case where it is not, never hit on the
-// real 480- or 240-wide panel, both multiples of 4); this kernel does not
+// real 480- or 240-wide panel, both multiples of 8); this kernel does not
 // handle a tail.
 //
 // Scalar, not PIE: the two per-pixel lookups are data-dependent gathers and
@@ -422,7 +507,17 @@ void bandRef(uint16_t *dst, int y0, int rows, int w, uint32_t, const uint8_t *) 
 //                                                                       14
 // There is no slack left for a deeper software-pipelined schedule (e.g.
 // holding two pixels' in-flight loads at once), see below for where that
-// bites.
+// bites. Round 3 (r5-caustics, 2026-09-04) looked for a register to free
+// for exactly that (moving step0/1/2 to a memory-held array behind one
+// pointer, to gain two registers for a two-pixel-deep store pipeline) and
+// worked out on paper that it is a wash: the freed registers only pay for
+// themselves if the 3 step reloads per span land for free, but each is
+// immediately consumed by the phase add right after it with nothing
+// independent left to place between them (every other span-setup value is
+// already live), so the reload re-adds close to the same stall count the
+// pipelining would remove. Not measured on device because the paper case
+// was breakeven-or-worse before accounting for the extra 3 loads/span of
+// static instructions; GRID (below) was the change actually measured.
 //
 // `loop` (hardware zero-overhead loop), not an explicit decrement+branch:
 // the two are equivalent here except `loop` frees the nSpans register for
@@ -437,9 +532,17 @@ void bandRef(uint16_t *dst, int y0, int rows, int w, uint32_t, const uint8_t *) 
 // LBEG/LEND/LCOUNT live at a time; this function does not need to save or
 // restore them.
 //
-// Per-span shape: 16 instructions for the gather + interpolation setup, 7
-// per pixel x 4 = 28, +1 pointer increment = 45. The phase-advance add for
-// wave k+1 is placed right after wave k's sin1024 load specifically as
+// Per-span shape (GRID=8, round 3, r5-caustics, 2026-09-04; was GRID=4
+// with 45 instructions/span, 11.25/pixel, before this pass): 16
+// instructions for the gather + interpolation setup (unchanged: still
+// exactly 3 waves gathered once per span, GRID does not change that
+// count), 7 per pixel x 8 = 56, +1 pointer increment = 73 instructions per
+// 8-pixel span, 9.125 static instructions/pixel. Doubling GRID does not
+// change the per-pixel gather-and-store body at all (still 7 instructions,
+// still the same two data-dependent lookups) or the per-span setup cost
+// (still 16 instructions for 3 waves); it only changes how many pixels
+// that fixed 16-instruction setup is divided across. The phase-advance add
+// for wave k+1 is placed right after wave k's sin1024 load specifically as
 // filler, it is needed anyway, and placing it there hides the load-use
 // stall (one cycle when the very next instruction consumes a load result,
 // per ASM_BRIEF.md's Xtensa scalar facts) for free instead of paying it.
@@ -450,13 +553,20 @@ void bandRef(uint16_t *dst, int y0, int rows, int w, uint32_t, const uint8_t *) 
 // earlier loads had a filler, val2's does not) and every pixel's palette
 // load into its store (t is the only scratch register and it holds the
 // exact value being stored, so there is nothing independent to interleave
-// there). That is 1 + 4 = 5 stalls per 4-pixel span, 1.25/pixel, on top of
-// the 45/4 = 11.25 static instructions/pixel, see the report for the
-// resulting cycles/pixel estimate.
+// there). That is 1 + 8 = 9 stalls per 8-pixel span, 1.125/pixel (was
+// 1.25/pixel at GRID=4: the per-span stall shrinks as a per-pixel share,
+// the per-pixel stall count is unchanged since it is intrinsic to each
+// pixel's own load-into-store chain), on top of the 73/8 = 9.125 static
+// instructions/pixel, see the report for the resulting cycles/pixel
+// estimate. GRID=16 was tried next (16-pixel-span math worked out to
+// 8.0625 static instructions/pixel, a further 11.6% cut) and reverted
+// before it ever reached the device: the host golden compare failed on
+// max-diff (91-107 against a 48 cap) at all three checkpoints, see the
+// GRID comment. This kernel is the 8-wide shape that shipped.
 __attribute__((noinline)) static void causticsRowKernel(uint16_t *row, const int16_t *lut, const uint8_t *shapeLUT,
                                                          const uint16_t *rgbRowBase, uint32_t phase0, uint32_t phase1,
-                                                         uint32_t phase2, uint32_t step0x4, uint32_t step1x4,
-                                                         uint32_t step2x4, int32_t sumCur0, int nSpans) {
+                                                         uint32_t phase2, uint32_t step0x8, uint32_t step1x8,
+                                                         uint32_t step2x8, int32_t sumCur0, int nSpans) {
     int32_t val = sumCur0;
     int32_t cnt = nSpans; // loop trip count first, then reused as sumNext
     int32_t stepI, t;     // pure scratch, no meaningful value on entry
@@ -477,7 +587,7 @@ __attribute__((noinline)) static void causticsRowKernel(uint16_t *row, const int
                  "add %[cnt], %[cnt], %[stepI]\n"         // cnt = val0+val1 (both loaded long enough ago)
                  "add %[cnt], %[cnt], %[t]\n"             // cnt = sumNext (pays val2's stall)
                  "sub %[stepI], %[cnt], %[val]\n"         // stepI = sumNext - sumCur (ALU->ALU, no stall)
-                 "srai %[stepI], %[stepI], 2\n"           // stepI = stepInterp
+                 "srai %[stepI], %[stepI], 3\n"           // stepI = stepInterp, GRID==8 (was 2 at GRID==4)
                  // --- pixel 0 (val == sumCur, unmodified so far) ---
                  "abs %[t], %[val]\n"
                  "add %[t], %[t], %[shapeLUT]\n"
@@ -506,16 +616,48 @@ __attribute__((noinline)) static void causticsRowKernel(uint16_t *row, const int
                  "abs %[t], %[val]\n"
                  "add %[t], %[t], %[shapeLUT]\n"
                  "l8ui %[t], %[t], 0\n"
-                 "or %[val], %[cnt], %[cnt]\n" // val = sumNext for the next span, filler
+                 "add %[val], %[val], %[stepI]\n" // val = val_p4
                  "addx8 %[t], %[t], %[rgbBase]\n"
                  "l16ui %[t], %[t], 6\n"
                  "s16i %[t], %[row], 6\n"
-                 "addi %[row], %[row], 8\n"
+                 // --- pixel 4 (val == val_p4; colSlot wraps 3->0, same dither cycle) ---
+                 "abs %[t], %[val]\n"
+                 "add %[t], %[t], %[shapeLUT]\n"
+                 "l8ui %[t], %[t], 0\n"
+                 "add %[val], %[val], %[stepI]\n" // val = val_p5
+                 "addx8 %[t], %[t], %[rgbBase]\n"
+                 "l16ui %[t], %[t], 0\n"
+                 "s16i %[t], %[row], 8\n"
+                 // --- pixel 5 (val == val_p5) ---
+                 "abs %[t], %[val]\n"
+                 "add %[t], %[t], %[shapeLUT]\n"
+                 "l8ui %[t], %[t], 0\n"
+                 "add %[val], %[val], %[stepI]\n" // val = val_p6
+                 "addx8 %[t], %[t], %[rgbBase]\n"
+                 "l16ui %[t], %[t], 2\n"
+                 "s16i %[t], %[row], 10\n"
+                 // --- pixel 6 (val == val_p6) ---
+                 "abs %[t], %[val]\n"
+                 "add %[t], %[t], %[shapeLUT]\n"
+                 "l8ui %[t], %[t], 0\n"
+                 "add %[val], %[val], %[stepI]\n" // val = val_p7
+                 "addx8 %[t], %[t], %[rgbBase]\n"
+                 "l16ui %[t], %[t], 4\n"
+                 "s16i %[t], %[row], 12\n"
+                 // --- pixel 7 (val == val_p7, last of span) ---
+                 "abs %[t], %[val]\n"
+                 "add %[t], %[t], %[shapeLUT]\n"
+                 "l8ui %[t], %[t], 0\n"
+                 "or %[val], %[cnt], %[cnt]\n" // val = sumNext for the next span, filler
+                 "addx8 %[t], %[t], %[rgbBase]\n"
+                 "l16ui %[t], %[t], 6\n"
+                 "s16i %[t], %[row], 14\n"
+                 "addi %[row], %[row], 16\n"
                  "2:\n"
                  : [row] "+r"(row), [phase0] "+r"(phase0), [phase1] "+r"(phase1), [phase2] "+r"(phase2),
                    [val] "+r"(val), [cnt] "+r"(cnt), [stepI] "=&r"(stepI), [t] "=&r"(t)
-                 : [lut] "r"(lut), [shapeLUT] "r"(shapeLUT), [rgbBase] "r"(rgbRowBase), [step0] "r"(step0x4),
-                   [step1] "r"(step1x4), [step2] "r"(step2x4)
+                 : [lut] "r"(lut), [shapeLUT] "r"(shapeLUT), [rgbBase] "r"(rgbRowBase), [step0] "r"(step0x8),
+                   [step1] "r"(step1x8), [step2] "r"(step2x8)
                  : "memory");
 }
 #endif
@@ -524,7 +666,7 @@ void band(uint16_t *dst, int y0, int rows, int w, uint32_t tMs, const uint8_t *p
 #if defined(__XTENSA__) && !defined(GM_BGANIM_NO_ASM)
     if (w % GRID != 0) {
         // Defensive only: the real panel is 480 (full res) or 240 (half
-        // res), both multiples of GRID=4, so this is never taken on device.
+        // res), both multiples of GRID=8, so this is never taken on device.
         // The kernel handles GRID-aligned spans exclusively (see its
         // comment); anything else falls back to the portable, always-
         // correct reference.
@@ -532,14 +674,14 @@ void band(uint16_t *dst, int y0, int rows, int w, uint32_t tMs, const uint8_t *p
         return;
     }
     const int16_t *lut = sinLut();
-    const uint32_t step0x4 = g_stepQ[0] << 2;
-    const uint32_t step1x4 = g_stepQ[1] << 2;
-    const uint32_t step2x4 = g_stepQ[2] << 2;
+    const uint32_t step0x8 = g_stepQ[0] << 3;
+    const uint32_t step1x8 = g_stepQ[1] << 3;
+    const uint32_t step2x8 = g_stepQ[2] << 3;
     for (int yy = 0; yy < rows; yy++) {
         const int y = y0 + yy;
         const RowSetup rs = computeRowSetup(y, lut);
         causticsRowKernel(dst + static_cast<size_t>(yy) * w, lut, shapeLUT, rs.rowBase, rs.phase[0], rs.phase[1],
-                           rs.phase[2], step0x4, step1x4, step2x4, rs.sumCur0, w / GRID);
+                           rs.phase[2], step0x8, step1x8, step2x8, rs.sumCur0, w / GRID);
     }
 #else
     bandRef(dst, y0, rows, w, tMs, p);

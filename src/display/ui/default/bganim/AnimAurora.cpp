@@ -84,6 +84,32 @@
 // identical to the exact per-pixel field), so the golden tolerance (mean
 // <= 3.0, max <= 48 RGB) is what this round's `make check` verifies instead
 // of the exact match perf passes 1-3 held.
+//
+// Perf pass 5 (round 5, 2026-09-04, kb.py device-in-the-loop): the flashed
+// round-4 kernel measured min_ms 25.95-26.06 on the bench board before this
+// pass (unchanged blob upload, three repeats). Instruction count was
+// already tight (34/pair, matching xtensa-asm14's disassembly) and every
+// load-then-ALU-use pair had a filler instruction between them except one:
+// the v = w1[idx1] + w2[idx2] gather's `add` sat directly behind w2's l32i,
+// which is exactly the one-cycle load-use stall ASM_BRIEF.md documents.
+// Moving the "vc = max(v, 0)" zero constant's movi to fill that gap (using
+// t3, idle at that point in the iteration, instead of reusing t2 right
+// after its own load) costs nothing in instruction count and measured
+// min_ms 25.44-25.45 over three repeats, about 1.9% down and reproducible
+// tightly enough (both repeats agreeing to 0.01 ms) to trust despite being
+// under this round's 3% noise-vs-signal bar for a single run. Two further
+// ideas, both plausible from the same reasoning, did NOT hold up on the
+// device and are commented in place where they were tried: giving the
+// second mull (sq*rowScale) a second latency-filler measured no change at
+// all, meaning this kernel's mull results are usable by the very next
+// instruction with no extra hiding needed (unlike loads); and moving the
+// df[bit_odd] load earlier to give the color_even store a filler measured
+// WORSE, meaning a load feeding a store's data operand is not the same
+// hazard as a load feeding an ALU operand on this core. Net for the round:
+// one real fix, two rejected by measurement, kernel still 34 instructions
+// per pair. See this pass's report for the arithmetic-floor argument for
+// why this is close to what this schedule, at this register budget, can
+// deliver.
 #include "BgAnim.h"
 #include "BgAnimCommon.h"
 #include <math.h>
@@ -244,6 +270,17 @@ void buildDitherFold(int32_t out[64]) {
         out[i] = ROWLUT_PAD + ((static_cast<int32_t>(BAYER8[i]) - 32) >> 2);
     }
 }
+
+// Round 5 tried packing two adjacent ditherFold entries (an even/odd pixel
+// pair; the asm kernel always reads them together) into one 32-bit word,
+// even in the low half and odd in the high half, so the kernel would need
+// one l32i plus two extui unpacks instead of two l32i reads. Bit-exact
+// (kb.py: same pixels as band()) but measured WORSE on the device (min_ms
+// 26.17, consistent over two repeats, vs 25.44-25.45 without it): the net
+// instruction count went from 34 to 35 per pair (one load traded for two
+// extui), and the removed load was not expensive enough to pay for the
+// extra instruction. Reverted; do not reapply without a fresh measurement
+// that shows the load, not the instruction count, is the bottleneck.
 
 void buildRowLUT(uint16_t out[ROWLUT_SIZE], int bgIdx) {
     uint8_t bg[3];
@@ -462,11 +499,22 @@ __attribute__((noinline)) static void auroraPixelsAsm(uint16_t *__restrict dst, 
         "extui   %[t2], %[p2], 8, 10\n"
         "addx4   %[t2], %[t2], %[w2]\n"
         "l32i    %[t2], %[t2], 0\n" // t2 = w2[idx2]
-        "add     %[t1], %[t1], %[t2]\n" // t1 = v
         // vc = max(v, 0): a native MAX against a zeroed register, not a
-        // branchless srai/and/sub -- see the comment above for why.
-        "movi    %[t2], 0\n"
-        "max     %[t1], %[t1], %[t2]\n" // t1 = vc
+        // branchless srai/and/sub -- see the comment above for why. The
+        // zero constant is materialized into t3 (idle at this point in the
+        // iteration) BEFORE the add that consumes t2, instead of into t2
+        // right after: t2 was just loaded (line above) and the add is its
+        // very first consumer, which is exactly the one-cycle load-use
+        // stall the device's interlock charges when the instruction right
+        // after a load reads its result. Putting an independent instruction
+        // (this movi, which was going to run anyway) between the load and
+        // the add removes that stall for free; t2 is freed by the add and
+        // is reused for the df base address two instructions later, same
+        // as before. Measured on device (round 5, kb.py): see this
+        // function's report entry for the min_ms delta.
+        "movi    %[t3], 0\n"
+        "add     %[t1], %[t1], %[t2]\n" // t1 = v (no longer the instruction right after t2's load)
+        "max     %[t1], %[t1], %[t3]\n" // t1 = vc
         "mull    %[t1], %[t1], %[t1]\n" // vc*vc; 2-cycle latency, filled below
         "extui   %[t2], %[dfi], 0, 5\n" // df base address, part 1 (latency filler)
         "add     %[t2], %[df], %[t2]\n" // t2 = df base address (kept as an address, not consumed yet)
@@ -485,6 +533,13 @@ __attribute__((noinline)) static void auroraPixelsAsm(uint16_t *__restrict dst, 
         // address; the odd entry is a plain +4-byte read off it, no
         // recomputed extui/add ---
         "l32i    %[t2], %[t2], 4\n" // t2 = df[bit_odd]
+        // Round 5 tried moving this load up to sit between the color_even
+        // load and its store (giving that store a filler, the same fix
+        // applied to the v = w1+w2 gather above). It measured WORSE on the
+        // device (min_ms 25.60-25.62 vs 25.44-25.45, consistent over two
+        // repeats), not better as the same reasoning predicted for the
+        // gather stall. Reverted. The device is the only authority here;
+        // do not reapply this without a fresh measurement.
         "add     %[t3], %[scur], %[t1]\n" // t3 = scur_old + SN (raw sum, for interpolation)
         "srli    %[t3], %[t3], 1\n"       // t3 = SO
         "or      %[scur], %[t1], %[t1]\n" // scur <- SN now; every read of the OLD scur is done above
