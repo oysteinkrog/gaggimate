@@ -103,15 +103,15 @@ int parseGradient(const char *s, uint8_t stops[BG_THEME_MAX_STOPS][3], uint8_t p
     if (n < 2) {
         return 0;
     }
-    // Fill in what the string left out, then pin the ends and enforce
-    // monotonic order so a hand-edited string cannot fold the ramp back.
+    // Fill in what the string left out, then enforce monotonic order so a
+    // hand-edited string cannot fold the ramp back. The ends are not pinned:
+    // like a CSS gradient, the colour is held flat before the first stop and
+    // after the last, which lets the editor drag any stop.
     for (int i = 0; i < n; i++) {
         if (!hasPos[i]) {
             pos[i] = static_cast<uint8_t>((i * 255) / (n - 1));
         }
     }
-    pos[0] = 0;
-    pos[n - 1] = 255;
     for (int i = 1; i < n; i++) {
         if (pos[i] < pos[i - 1]) {
             pos[i] = pos[i - 1];

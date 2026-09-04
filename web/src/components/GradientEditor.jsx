@@ -1,4 +1,8 @@
 import { useCallback, useContext, useEffect, useMemo, useRef, useState } from 'preact/hooks';
+import { GradientPicker } from 'react-linear-gradient-picker';
+import { HexColorInput, HexColorPicker } from 'react-colorful';
+import 'react-linear-gradient-picker/dist/index.css';
+import './GradientEditor.css';
 import { ApiServiceContext } from '../services/ApiService.js';
 import {
   BG_ANIMATIONS,
@@ -14,7 +18,6 @@ import {
   parseGradientLibrary,
   parseThemeMap,
   rgbToHex,
-  sampleGradient,
   sanitizeGradientName,
   serializeGradient,
   serializeGradientLibrary,
@@ -30,6 +33,11 @@ import {
 // with) and bgAnimGradients (the named library). Built-in themes cannot be
 // edited in place; "Copy to my gradients" clones one into the library.
 //
+// The stop editing itself is react-linear-gradient-picker (drag to move,
+// click the bar to add, drag a stop downwards or double-click it to remove)
+// with react-colorful as the colour picker for the active stop. The picker
+// works in offsets 0..1 over a pixel width; positions here are 0..255.
+//
 // Whatever is selected is mirrored to the panel over the web socket while the
 // editor is mounted (req:bganim:preview), so the device shows the animation
 // being configured with the gradient being edited before anything is saved.
@@ -38,19 +46,38 @@ import {
 
 const PREVIEW_DEBOUNCE_MS = 80;
 const PREVIEW_KEEPALIVE_MS = 5000;
+const PREVIEW_RETRY_MS = 300;
+const BAR_HEIGHT = 40;
+const MIN_BAR_WIDTH = 240;
 
 function clamp(v, lo, hi) {
   return Math.min(hi, Math.max(lo, v));
 }
 
-function pinEnds(stops) {
-  const next = stops.map(s => ({ ...s }));
-  next[0].pos = 0;
-  next[next.length - 1].pos = 255;
-  for (let i = 1; i < next.length; i++) {
-    if (next[i].pos < next[i - 1].pos) next[i].pos = next[i - 1].pos;
-  }
-  return next;
+// The picker hands colours back as it received them (hex), but be safe about
+// an rgb()/rgba() string since the wire format only carries hex.
+function toHex(color) {
+  const c = String(color).trim();
+  if (/^#[0-9a-fA-F]{6}$/.test(c)) return c.toLowerCase();
+  const m = /^rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)/.exec(c);
+  if (m) return rgbToHex([Number(m[1]), Number(m[2]), Number(m[3])]);
+  return '#000000';
+}
+
+// What GradientPicker mounts below the bar for the active stop. It hands
+// over color/onSelect(color, opacity); opacity has no meaning on the panel.
+function StopColorPicker({ color, onSelect }) {
+  return (
+    <div className='gm-stop-picker'>
+      <HexColorPicker color={color} onChange={c => onSelect(c, 1)} />
+      <HexColorInput
+        className='input input-bordered input-sm w-28 font-mono'
+        color={color}
+        onChange={c => onSelect(c, 1)}
+        prefixed
+      />
+    </div>
+  );
 }
 
 export function GradientEditor({ animIdx, formData, setField }) {
@@ -72,10 +99,6 @@ export function GradientEditor({ animIdx, formData, setField }) {
       formData.bgAnimHighlightKnee === undefined ? 100 : parseInt(formData.bgAnimHighlightKnee, 10),
   };
 
-  const [selected, setSelected] = useState(0);
-  const selectedIdx = clamp(selected, 0, stops.length - 1);
-  const selectedStop = stops[selectedIdx];
-
   const writeLibrary = next => setField('bgAnimGradients', serializeGradientLibrary(next));
   const writeRefs = next => setField('bgAnimThemeMap', serializeThemeMap(next));
 
@@ -83,14 +106,14 @@ export function GradientEditor({ animIdx, formData, setField }) {
     const next = refs.slice();
     next[animIdx] = nextRef;
     writeRefs(next);
-    setSelected(0);
   };
 
   const assignAll = () => writeRefs(refs.map(() => ref));
 
   const updateStops = nextStops => {
     if (!current.editable) return;
-    writeLibrary(library.map(g => (g.id === current.id ? { ...g, stops: pinEnds(nextStops) } : g)));
+    const sorted = nextStops.slice().sort((a, b) => a.pos - b.pos);
+    writeLibrary(library.map(g => (g.id === current.id ? { ...g, stops: sorted } : g)));
   };
 
   const rename = name => {
@@ -113,43 +136,10 @@ export function GradientEditor({ animIdx, formData, setField }) {
     // Animations that used it fall back to the global theme, which is what
     // the firmware does with a dangling reference anyway.
     writeRefs(refs.map(r => (r === ref ? '' : r)));
-    setSelected(0);
-  };
-
-  const setStop = (idx, patch) => {
-    const next = stops.map((s, i) => (i === idx ? { ...s, ...patch } : s));
-    if (patch.pos !== undefined && idx > 0 && idx < stops.length - 1) {
-      next[idx].pos = clamp(patch.pos, stops[idx - 1].pos, stops[idx + 1].pos);
-    }
-    updateStops(next);
-  };
-
-  const addStopAt = pos => {
-    if (stops.length >= BG_THEME_MAX_STOPS) return;
-    pos = clamp(Math.round(pos), 1, 254);
-    const color = rgbToHex(sampleGradient(stops, pos));
-    let idx = 1;
-    while (idx < stops.length - 1 && stops[idx].pos <= pos) idx++;
-    const next = stops.slice();
-    next.splice(idx, 0, { color, pos });
-    updateStops(next);
-    setSelected(idx);
-  };
-
-  const removeStop = idx => {
-    if (stops.length <= 2) return;
-    updateStops(stops.filter((_, i) => i !== idx));
-    setSelected(Math.max(0, idx - 1));
   };
 
   const reverse = () => {
-    updateStops(
-      stops
-        .slice()
-        .reverse()
-        .map(s => ({ ...s, pos: 255 - s.pos })),
-    );
-    setSelected(stops.length - 1 - selectedIdx);
+    updateStops(stops.map(s => ({ ...s, pos: 255 - s.pos })));
   };
 
   const distribute = () => {
@@ -157,43 +147,40 @@ export function GradientEditor({ animIdx, formData, setField }) {
     updateStops(stops.map((s, i) => ({ ...s, pos: pos[i] })));
   };
 
-  // ---- drag handling on the gradient bar ---------------------------------
-  const barRef = useRef(null);
-  const dragRef = useRef(null); // { idx, moved }
-  const dragEndedAtRef = useRef(0); // a release after a drag must not read as a bar click
+  // ---- the picker ----------------------------------------------------------
+  // GradientPicker wants its width in pixels; follow the container.
+  const holderRef = useRef(null);
+  const [barWidth, setBarWidth] = useState(400);
+  useEffect(() => {
+    const el = holderRef.current;
+    if (!el || typeof ResizeObserver === 'undefined') return undefined;
+    const ro = new ResizeObserver(entries => {
+      const w = Math.floor(entries[0].contentRect.width);
+      if (w > 0) setBarWidth(Math.max(MIN_BAR_WIDTH, w));
+    });
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
 
-  const posFromEvent = e => {
-    const rect = barRef.current.getBoundingClientRect();
-    return ((e.clientX - rect.left) / rect.width) * 255;
+  const palette = stops.map(s => ({ color: s.color, offset: s.pos / 255 }));
+  const [activeIdx, setActiveIdx] = useState(0);
+  const activeStop = stops[clamp(activeIdx, 0, stops.length - 1)];
+
+  const onPaletteChange = next => {
+    const idx = next.findIndex(p => p.active);
+    if (idx >= 0) setActiveIdx(idx);
+    updateStops(
+      next.map(p => ({
+        color: toHex(p.color),
+        pos: clamp(Math.round(Number(p.offset) * 255), 0, 255),
+      })),
+    );
   };
 
-  const onHandlePointerDown = (idx, e) => {
-    e.preventDefault();
-    e.stopPropagation();
-    setSelected(idx);
-    if (idx === 0 || idx === stops.length - 1) return; // ends are pinned
-    dragRef.current = { idx, moved: false };
-    e.currentTarget.setPointerCapture(e.pointerId);
-  };
-
-  const onHandlePointerMove = e => {
-    const drag = dragRef.current;
-    if (!drag) return;
-    drag.moved = true;
-    setStop(drag.idx, { pos: Math.round(posFromEvent(e)) });
-  };
-
-  const onHandlePointerUp = e => {
-    if (!dragRef.current) return;
-    if (dragRef.current.moved) dragEndedAtRef.current = Date.now();
-    dragRef.current = null;
-    e.currentTarget.releasePointerCapture(e.pointerId);
-  };
-
-  const onBarClick = e => {
-    if (!current.editable) return;
-    if (Date.now() - dragEndedAtRef.current < 300) return;
-    addStopAt(posFromEvent(e));
+  const setActivePos = pct => {
+    const idx = clamp(activeIdx, 0, stops.length - 1);
+    const pos = clamp(Math.round((clamp(pct, 0, 100) * 255) / 100), 0, 255);
+    updateStops(stops.map((s, i) => (i === idx ? { ...s, pos } : s)));
   };
 
   // The name field shows what is being typed; the library gets the sanitized
@@ -207,12 +194,19 @@ export function GradientEditor({ animIdx, formData, setField }) {
   const latestRef = useRef({ apiService, animIdx, serialized });
   latestRef.current = { apiService, animIdx, serialized };
 
+  // A send that finds the socket closed (it reconnects on its own) is retried
+  // shortly rather than left to the 5 s keepalive: the firmware keeps showing
+  // the last preview it received for 15 s, so a lost message would leave the
+  // panel on a stale gradient for that long.
+  const retryRef = useRef(null);
   const sendPreview = useCallback(() => {
     const { apiService: api, animIdx: a, serialized: s } = latestRef.current;
+    clearTimeout(retryRef.current);
+    retryRef.current = null;
     try {
       api?.send({ tp: 'req:bganim:preview', anim: a, stops: s });
     } catch {
-      // Socket not connected; the next keepalive tries again.
+      retryRef.current = setTimeout(sendPreview, PREVIEW_RETRY_MS);
     }
   }, []);
 
@@ -225,6 +219,8 @@ export function GradientEditor({ animIdx, formData, setField }) {
     const t = setInterval(sendPreview, PREVIEW_KEEPALIVE_MS);
     return () => {
       clearInterval(t);
+      clearTimeout(retryRef.current);
+      retryRef.current = null;
       try {
         latestRef.current.apiService?.send({ tp: 'req:bganim:preview-end' });
       } catch {
@@ -312,108 +308,68 @@ export function GradientEditor({ animIdx, formData, setField }) {
         </div>
       )}
 
-      {/* Editing bar: raw colours, handles underneath. */}
-      <div className='mt-4 pb-5'>
-        <div
-          ref={barRef}
-          className={`relative h-10 w-full rounded-md border border-black/20 ${
-            current.editable ? 'cursor-copy' : ''
-          }`}
-          style={{ background: gradientCss(stops), touchAction: 'none' }}
-          onClick={onBarClick}
-          role={current.editable ? 'button' : undefined}
-          aria-label={current.editable ? 'Click to add a colour stop' : 'Gradient'}
-        >
-          {stops.map((s, i) => {
-            const pinned = i === 0 || i === stops.length - 1;
-            const isSel = i === selectedIdx;
-            return (
-              <button
-                key={i}
-                type='button'
-                className={`absolute top-full z-10 h-5 w-5 -translate-x-1/2 -translate-y-1/2 rounded-full border-2 shadow ${
-                  isSel ? 'border-primary ring-primary/40 ring-2' : 'border-white'
-                } ${pinned || !current.editable ? 'cursor-default' : 'cursor-ew-resize'}`}
-                style={{ left: `${(s.pos * 100) / 255}%`, background: s.color }}
-                aria-label={`Stop ${i + 1}, ${s.color} at ${Math.round((s.pos * 100) / 255)}%`}
-                onPointerDown={e => (current.editable ? onHandlePointerDown(i, e) : setSelected(i))}
-                onPointerMove={onHandlePointerMove}
-                onPointerUp={onHandlePointerUp}
-                onPointerCancel={onHandlePointerUp}
-                onClick={e => e.stopPropagation()}
-              />
-            );
-          })}
-        </div>
-      </div>
-
-      {current.editable ? (
-        <div className='mt-2 flex flex-wrap items-center gap-2'>
-          <input
-            type='color'
-            className='h-9 w-11 cursor-pointer rounded border-0 bg-transparent p-0'
-            value={selectedStop.color}
-            aria-label='Selected stop colour'
-            onInput={e => setStop(selectedIdx, { color: e.target.value })}
-          />
-          <input
-            type='text'
-            className='input input-bordered input-sm w-24 font-mono'
-            value={selectedStop.color}
-            aria-label='Selected stop colour as hex'
-            onChange={e => {
-              const v = e.target.value.trim();
-              if (/^#?[0-9a-fA-F]{6}$/.test(v)) {
-                setStop(selectedIdx, { color: `#${v.replace(/^#/, '').toLowerCase()}` });
-              }
-            }}
-          />
-          <label className='flex items-center gap-1 text-sm'>
-            <span>Position</span>
-            <input
-              type='number'
-              className='input input-bordered input-sm w-20'
-              min={0}
-              max={100}
-              step={1}
-              disabled={selectedIdx === 0 || selectedIdx === stops.length - 1}
-              value={Math.round((selectedStop.pos * 100) / 255)}
-              onChange={e => {
-                const pct = clamp(parseInt(e.target.value, 10) || 0, 0, 100);
-                setStop(selectedIdx, { pos: Math.round((pct * 255) / 100) });
+      <div className='gm-gradient mt-4' ref={holderRef}>
+        {current.editable ? (
+          <>
+            <GradientPicker
+              width={barWidth}
+              paletteHeight={BAR_HEIGHT}
+              palette={palette}
+              minStops={2}
+              maxStops={BG_THEME_MAX_STOPS}
+              stopRemovalDrop={40}
+              onPaletteChange={onPaletteChange}
+              onColorStopSelect={stop => {
+                if (typeof stop.id === 'number') setActiveIdx(stop.id);
               }}
+            >
+              <StopColorPicker />
+            </GradientPicker>
+            <div className='mt-2 flex flex-wrap items-center gap-3 text-sm'>
+              <label className='flex items-center gap-1'>
+                <span>Stop position</span>
+                <input
+                  type='number'
+                  className='input input-bordered input-sm w-20'
+                  min={0}
+                  max={100}
+                  step={1}
+                  value={Math.round((activeStop.pos * 100) / 255)}
+                  onChange={e => setActivePos(parseInt(e.target.value, 10) || 0)}
+                />
+                <span>%</span>
+              </label>
+              <span className='text-base-content/60'>
+                {stops.length}/{BG_THEME_MAX_STOPS} stops. Click the bar to add one, drag a stop
+                down or double-click it to remove it.
+              </span>
+              <span className='grow' />
+              <button type='button' className='btn btn-sm' onClick={reverse}>
+                Reverse
+              </button>
+              <button
+                type='button'
+                className='btn btn-sm'
+                disabled={isUniformStops(stops)}
+                onClick={distribute}
+              >
+                Space evenly
+              </button>
+            </div>
+          </>
+        ) : (
+          <>
+            <div
+              className='w-full rounded-md border border-black/20'
+              style={{ height: `${BAR_HEIGHT}px`, background: gradientCss(stops) }}
+              aria-label='Gradient'
             />
-            <span>%</span>
-          </label>
-          <button
-            type='button'
-            className='btn btn-sm'
-            disabled={stops.length <= 2}
-            onClick={() => removeStop(selectedIdx)}
-          >
-            Remove stop
-          </button>
-          <span className='text-base-content/60 text-sm'>
-            {stops.length}/{BG_THEME_MAX_STOPS} stops, click the bar to add one
-          </span>
-          <span className='grow' />
-          <button type='button' className='btn btn-sm' onClick={reverse}>
-            Reverse
-          </button>
-          <button
-            type='button'
-            className='btn btn-sm'
-            disabled={isUniformStops(stops)}
-            onClick={distribute}
-          >
-            Space evenly
-          </button>
-        </div>
-      ) : (
-        <p className='text-base-content/60 mt-2 text-sm'>
-          Built-in gradients cannot be changed. Copy one to your gradients to edit it.
-        </p>
-      )}
+            <p className='text-base-content/60 mt-2 text-sm'>
+              Built-in gradients cannot be changed. Copy one to your gradients to edit it.
+            </p>
+          </>
+        )}
+      </div>
 
       {/* What the panel makes of it: tone applied, and the plasma wrap. */}
       <div className='mt-4 grid grid-cols-1 gap-3 md:grid-cols-2'>

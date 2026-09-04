@@ -69,6 +69,8 @@ void bg_parse_params(const char *packed, int animId, uint8_t out[4]);
 //                    pre-library custom gradient; still honoured)
 // A gradient string is "rrggbb[@pos],rrggbb[@pos],..."; without positions the
 // stops are spaced evenly, which is also the original palette arithmetic.
+// With positions, the colour holds flat before the first stop and after the
+// last one, as a CSS gradient does.
 
 constexpr int BG_THEME_MAX_STOPS = 16;
 constexpr int BG_GRADIENT_LIB_MAX = 12;       // library entries
@@ -88,6 +90,7 @@ void bg_resolve_theme(int themeId, const char *custom, uint8_t stops[BG_THEME_MA
 // Parses one gradient string ('#', spaces tolerated). Returns the stop count,
 // 0 when malformed or fewer than 2 stops. uniform is true when no stop
 // carried a position; pos is then filled with the even spacing anyway.
+// Positions are forced ascending; the ends are left where the string put them.
 int bg_parse_gradient(const char *s, uint8_t stops[BG_THEME_MAX_STOPS][3], uint8_t pos[BG_THEME_MAX_STOPS],
                       bool &uniform);
 // Writes the canonical form ("rrggbb,..." or "rrggbb@pos,..."); returns the

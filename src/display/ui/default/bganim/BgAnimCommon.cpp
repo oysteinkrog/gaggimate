@@ -465,20 +465,15 @@ void setThemeStopsPos(const uint8_t (*stops)[3], const uint8_t *pos, int nStops)
     if (nStops > BG_THEME_MAX_STOPS) {
         nStops = BG_THEME_MAX_STOPS;
     }
-    // Positions must be ascending with the ends pinned; a caller that hands
-    // over something else gets it repaired rather than a gradient that reads
-    // backwards for part of its range.
+    // Positions must be ascending; a caller that hands over something else
+    // gets it repaired rather than a gradient that reads backwards for part
+    // of its range. Outside [pos[0], pos[n-1]] the end colours hold flat.
     int prev = 0;
     for (int i = 0; i < nStops; i++) {
         for (int c = 0; c < 3; c++) {
             g_rawStops[i][c] = stops[i][c];
         }
         int p = pos[i];
-        if (i == 0) {
-            p = 0;
-        } else if (i == nStops - 1) {
-            p = 255;
-        }
         if (p < prev) {
             p = prev;
         }
@@ -534,8 +529,21 @@ void themeRGB(int pos, uint8_t out[3]) {
         return;
     }
     // Positional: find the segment holding pos. n is at most 16 and this runs
-    // at palette-build time, so a linear scan is the right tool.
+    // at palette-build time, so a linear scan is the right tool. Before the
+    // first stop and after the last the end colour holds, as in CSS.
     const uint8_t *p = g_themePos[gen];
+    if (pos <= p[0]) {
+        for (int c = 0; c < 3; c++) {
+            out[c] = st[0][c];
+        }
+        return;
+    }
+    if (pos >= p[n - 1]) {
+        for (int c = 0; c < 3; c++) {
+            out[c] = st[n - 1][c];
+        }
+        return;
+    }
     int seg = 0;
     while (seg < n - 2 && pos >= p[seg + 1]) {
         seg++;

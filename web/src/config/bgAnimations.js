@@ -184,10 +184,10 @@ export const BG_GRADIENT_NAME_MAX = 24;
 
 // ---- gradients ---------------------------------------------------------
 // A gradient is { stops: [{ color: '#rrggbb', pos: 0..255 }] } with stops in
-// ascending position, the first at 0 and the last at 255. Its wire form
-// mirrors BgAnimThemes.cpp: "rrggbb,rrggbb,..." when the stops are spaced
-// evenly (the firmware then uses its original palette arithmetic), else
-// "rrggbb@pos,...".
+// ascending position. Its wire form mirrors BgAnimThemes.cpp:
+// "rrggbb,rrggbb,..." when the stops are spaced evenly (the firmware then
+// uses its original palette arithmetic), else "rrggbb@pos,...". Like a CSS
+// gradient, the colour holds flat before the first stop and after the last.
 
 export function uniformPositions(n) {
   return Array.from({ length: n }, (_, i) => Math.floor((i * 255) / (n - 1)));
@@ -224,8 +224,6 @@ export function parseGradient(str) {
   stops.forEach((s, i) => {
     if (s.pos === null) s.pos = uni[i];
   });
-  stops[0].pos = 0;
-  stops[stops.length - 1].pos = 255;
   for (let i = 1; i < stops.length; i++) {
     if (stops[i].pos < stops[i - 1].pos) stops[i].pos = stops[i - 1].pos;
   }
@@ -259,6 +257,8 @@ export function rgbToHex(rgb) {
 // integer blend so the on-page preview matches the panel.
 export function sampleGradient(stops, t) {
   t = Math.min(255, Math.max(0, Math.round(t)));
+  if (t <= stops[0].pos) return hexToRgb(stops[0].color);
+  if (t >= stops[stops.length - 1].pos) return hexToRgb(stops[stops.length - 1].color);
   let seg = 0;
   while (seg < stops.length - 2 && t >= stops[seg + 1].pos) seg++;
   const a = hexToRgb(stops[seg].color);

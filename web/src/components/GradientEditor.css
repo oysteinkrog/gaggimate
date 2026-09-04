@@ -1,0 +1,64 @@
+/* react-linear-gradient-picker restyled for GradientEditor.jsx. The class
+   names are the library's: .gp root, .palette the SVG bar, .csh the strip
+   under it that holds the stops (clicking it adds a stop), .cs one stop with
+   its colour swatch in the inner div. The library positions a stop by its
+   10 px box, so the box keeps that width and the visible handle is drawn on
+   the inner div, centred on it. */
+
+.gm-gradient .gp {
+  align-items: stretch;
+}
+
+.gm-gradient .palette {
+  overflow: hidden;
+  border: 1px solid rgb(0 0 0 / 0.2);
+  border-radius: 6px 6px 0 0;
+}
+
+.gm-gradient .csh {
+  height: 28px !important;
+  background: color-mix(in srgb, currentColor 8%, transparent);
+  border-radius: 0 0 6px 6px;
+}
+
+.gm-gradient .cs {
+  width: 10px;
+  height: 28px;
+  background: none !important;
+}
+
+.gm-gradient .cs div {
+  top: 4px;
+  left: -5px;
+  width: 20px;
+  height: 20px;
+  border: 2px solid #fff;
+  border-radius: 50%;
+  box-shadow:
+    0 0 0 1px rgb(0 0 0 / 0.45),
+    0 1px 3px rgb(0 0 0 / 0.4);
+}
+
+.gm-gradient .cs.active div {
+  border-color: var(--color-primary, #4374ad);
+  box-shadow:
+    0 0 0 3px color-mix(in srgb, var(--color-primary, #4374ad) 45%, transparent),
+    0 1px 3px rgb(0 0 0 / 0.4);
+}
+
+.gm-gradient .color-picker-wrapper {
+  width: 100%;
+  margin-top: 12px;
+}
+
+.gm-gradient .gm-stop-picker {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  gap: 12px;
+}
+
+.gm-gradient .gm-stop-picker .react-colorful {
+  width: 240px;
+  height: 160px;
+}
