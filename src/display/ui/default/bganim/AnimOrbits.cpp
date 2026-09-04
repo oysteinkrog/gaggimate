@@ -16,6 +16,14 @@ using namespace bganim;
 constexpr int MAX_ORBITS = 6;
 constexpr int NUM_BANDS = 30;
 constexpr int PTS_PER_BAND = 32;
+// Cap on orbit-body samples registered per 16-row spatial bin (see
+// sampleBinIdx below). MAX_SAMPLES is 108; a cap this generous only
+// truncates if most of one frame's samples land in the same bin, which
+// would need every orbit's trail to sit near its ellipse's flattest point
+// at the same y simultaneously -- theoretically possible, not seen in
+// practice. Truncation just drops the excess sample from that band's draw,
+// same silent-cap behavior pathBinCount already uses below.
+constexpr int SAMPLE_BIN_CAP = 48;
 constexpr float GOLDEN = 0.6180339887f;
 
 struct OrbitDef {
@@ -45,13 +53,32 @@ int g_w = 480;
 uint16_t g_bg = 0;
 
 // Per-frame body + trail samples, computed in frame(), drawn per band.
+// r2/invR/rr used to cost one sqrtf-free divide and one ceilf PER SAMPLE
+// PER BAND CALL that touched it -- a stamp up to 7px tall spans 3-4 of the
+// device's 2-row band() calls, so the same sample paid those libcalls
+// several times a frame. Both depend only on radius, which is fixed at
+// sample-creation time, so they are computed once here in frame() instead
+// (still real libm/divide cost, but O(samples) not O(samples x band calls
+// touching them), and frame()-time libm is explicitly fine per OPTIMIZE.md).
 struct Sample {
     float x, y, radius, alpha;
+    float r2;  // radius*radius, was recomputed per (sample, band-call)
+    float invR; // 1/radius, ditto -- one __divsf3 call each, now paid once
+    int rr;    // ceilf(radius), ditto -- one libcall each, now paid once
     uint8_t orbit;
 };
 constexpr int MAX_SAMPLES = MAX_ORBITS * 18;
 Sample *samples = nullptr;
 int sampleCount = 0;
+
+// Samples binned into the same 16-row grid rebuildGeometry uses for path
+// points (bandIdx = y / 16), so band() looks up only the handful of samples
+// whose y-reach can touch its call instead of scanning all ~100 per frame,
+// 240 times a frame. A sample can straddle a bin edge (bin height 16,
+// max reach 2.6px), so it is registered into every bin its [y-radius,
+// y+radius] span touches -- almost always one bin, occasionally two.
+uint8_t *sampleBinCount = nullptr;           // [NUM_BANDS]
+uint8_t *sampleBinIdx = nullptr;             // [NUM_BANDS][SAMPLE_BIN_CAP], indices into samples[]
 
 void rebuildGeometry(int countP, int eccP, int w, int h) {
     geomW = w;
@@ -101,21 +128,47 @@ void rebuildGeometry(int countP, int eccP, int w, int h) {
 
 bool init(int w, int h) {
     g_w = w;
+    // samples[] is read per candidate pixel inside every touched stamp's
+    // dx/dy loop (sm.x/y/r2/invR/alpha/orbit, up to ~49 reads per band call
+    // a sample overlaps) via an indirect index (sampleBinIdx), so the access
+    // pattern is a scattered gather across the whole table rather than a
+    // sequential sweep -- exactly the shape the hot-slab comment in
+    // BgAnimCommon.h calls out as not benefiting from PSRAM's prefetch.
+    // 3,456 B (108 x 32 B), well inside the 9,216 B per-animation budget.
     if (samples == nullptr) {
-        samples = static_cast<Sample *>(alloc(MAX_SAMPLES * sizeof(Sample)));
+        samples = static_cast<Sample *>(allocHot(MAX_SAMPLES * sizeof(Sample)));
         if (samples == nullptr) {
             return false;
         }
     }
+    // pathBins is 23,040 B, over twice the whole per-animation slab, so it
+    // cannot go hot regardless of access pattern -- but its access pattern
+    // does not want to: each band() call reads at most PTS_PER_BAND (32)
+    // contiguous PathPt entries from one (orbit, bin) run, a small
+    // sequential burst the PSRAM cache prefetches, not a scattered gather.
+    // pathBinCount is the loop bound for that read (n = pathBinCount[...]),
+    // touched once per (orbit, band-call) -- 180 B, trivial to keep hot.
     if (pathBins == nullptr) {
         pathBins = static_cast<PathPt *>(alloc(MAX_ORBITS * NUM_BANDS * PTS_PER_BAND * sizeof(PathPt)));
-        pathBinCount = static_cast<uint8_t *>(alloc(MAX_ORBITS * NUM_BANDS));
+        pathBinCount = static_cast<uint8_t *>(allocHot(MAX_ORBITS * NUM_BANDS));
         if (pathBins == nullptr || pathBinCount == nullptr) {
             return false;
         }
         rebuildGeometry(55, 55, w, h);
         lastCountP = 55;
         lastEccP = 55;
+    }
+    // sampleBinCount (30 B) and sampleBinIdx (1,440 B) are read once and
+    // nS times respectively per band call (240 calls/frame) to find which
+    // samples[] entries apply to this call -- small, frequent, and on the
+    // path to every sample read above, so hot for the same reason.
+    if (sampleBinCount == nullptr) {
+        sampleBinCount = static_cast<uint8_t *>(allocHot(NUM_BANDS));
+        sampleBinIdx = static_cast<uint8_t *>(allocHot(NUM_BANDS * SAMPLE_BIN_CAP));
+        if (sampleBinCount == nullptr || sampleBinIdx == nullptr) {
+            return false;
+        }
+        memset(sampleBinCount, 0, NUM_BANDS);
     }
     return true;
 }
@@ -134,6 +187,7 @@ void frame(uint32_t tMs, int w, int h, const uint8_t p[4]) {
     const float cx = w * 0.5f, cy = h * 0.5f;
 
     sampleCount = 0;
+    memset(sampleBinCount, 0, NUM_BANDS);
     for (int i = 0; i < orbitCount; i++) {
         const OrbitDef &o = orbits[i];
         const float T = o.T / spd;
@@ -147,33 +201,64 @@ void frame(uint32_t tMs, int w, int h, const uint8_t p[4]) {
             const float radius = (k == 0) ? 2.6f : 1.2f * f + 0.4f;
             float alpha = (k == 0) ? 0.95f : 0.55f * f * f * (0.4f + 0.8f * trailAmt); // f^2 ~ f^1.6, no powf
             if (sampleCount < MAX_SAMPLES) {
-                samples[sampleCount++] = {ex, ey, radius, alpha, static_cast<uint8_t>(i)};
+                // r2/invR/rr computed once here (frame() runs once per frame,
+                // not once per band() call) -- see the Sample comment above.
+                const float r2 = radius * radius;
+                const float invR = 1.0f / radius;
+                const int rr = static_cast<int>(ceilf(radius));
+                const int idx = sampleCount++;
+                samples[idx] = {ex, ey, radius, alpha, r2, invR, rr, static_cast<uint8_t>(i)};
+                // Register into every 16-row bin this sample's stamp can
+                // reach, clamped into range -- an off-screen sample (rare:
+                // trail arcs occasionally cross y=0 or y=h) still needs a
+                // valid bin, and clamping to the nearest edge bin is safe
+                // because band() re-checks the exact y-reach before drawing.
+                auto clampBand = [](float yy) -> int {
+                    if (yy < 0.0f) {
+                        return 0;
+                    }
+                    if (yy >= static_cast<float>(NUM_BANDS * 16)) {
+                        return NUM_BANDS - 1;
+                    }
+                    return static_cast<int>(yy) / 16;
+                };
+                const int binLo = clampBand(ey - radius);
+                const int binHi = clampBand(ey + radius);
+                for (int b = binLo; b <= binHi; b++) {
+                    uint8_t &n = sampleBinCount[b];
+                    if (n < SAMPLE_BIN_CAP) {
+                        sampleBinIdx[b * SAMPLE_BIN_CAP + n] = static_cast<uint8_t>(idx);
+                        n++;
+                    }
+                }
             }
         }
     }
 }
 
-void band(uint16_t *dst, int y0, int rows, int w, uint32_t, const uint8_t *) {
-    const uint16_t bg = g_bg;
-    const int total = rows * w;
-    for (int i = 0; i < total; i++) {
-        dst[i] = bg;
-    }
-
+// Path-point and orbit-body splats: identical for band() and bandRef(), so
+// this is the ONE place either path draws overlays -- pixel-exactness
+// between the PIE-fill kernel and the portable reference follows from
+// construction rather than needing to be checked pixel by pixel, since the
+// only thing that differs between the two callers is how the background got
+// filled beforehand.
+static void drawOverlays(uint16_t *dst, int y0, int rows, int w) {
     // Path points are pre-binned into fixed 16-row spatial bins by
-    // rebuildGeometry, and exactly ONE bin is consulted per call. So band()
-    // requires [y0, y0+rows) to lie inside a single bin: rows must divide 16
-    // with y0 a multiple of rows, or rows == 1 at any y. Both real callers
-    // satisfy that -- SleepAnimation renders 8-row bands, and its interlaced
-    // half-res path renders rows == 1 -- but nothing enforces it, and a caller
-    // that straddles a boundary gets no error, just silently missing path
-    // pixels for every bin but the first (a 40-row band drops two thirds of
-    // them). If a taller band is ever wanted, loop this block over the bins the
-    // range covers rather than widening the bins.
+    // rebuildGeometry, and orbit-body samples are now binned the same way by
+    // frame() (see sampleBinIdx above), so exactly ONE bin is consulted per
+    // call for both. So band() requires [y0, y0+rows) to lie inside a single
+    // bin: rows must divide 16 with y0 a multiple of rows, or rows == 1 at
+    // any y. Both real callers satisfy that -- SleepAnimation renders 8-row
+    // bands, and its interlaced half-res path renders rows == 1 -- but
+    // nothing enforces it, and a caller that straddles a boundary gets no
+    // error, just silently missing path pixels for every bin but the first
+    // (a 40-row band drops two thirds of them). If a taller band is ever
+    // wanted, loop this block over the bins the range covers rather than
+    // widening the bins.
     const int bandIdx = y0 / 16;
-    // Guards the pathBinCount/pathBins indexing below, which is otherwise
-    // unbounded in y0. Only the path pass is skipped; the orbit bodies after it
-    // clip themselves and stay correct.
+    // Guards the pathBinCount/pathBins/sampleBinCount/sampleBinIdx indexing
+    // below, which is otherwise unbounded in y0. Only these lookups are
+    // skipped when out of range; nothing else in the animation depends on it.
     for (int i = 0; bandIdx >= 0 && bandIdx < NUM_BANDS && i < orbitCount; i++) {
         const uint8_t n = pathBinCount[i * NUM_BANDS + bandIdx];
         const PathPt *pts = &pathBins[(i * NUM_BANDS + bandIdx) * PTS_PER_BAND];
@@ -190,17 +275,28 @@ void band(uint16_t *dst, int y0, int rows, int w, uint32_t, const uint8_t *) {
         }
     }
 
-    for (int s = 0; s < sampleCount; s++) {
-        const Sample &sm = samples[s];
+    if (bandIdx < 0 || bandIdx >= NUM_BANDS) {
+        return;
+    }
+    // Only the samples frame() binned into this 16-row slice are candidates
+    // -- typically a handful, against scanning all ~100 per-frame samples on
+    // every one of the device's 240 band() calls. The y-reach recheck stays:
+    // a sample can be binned here because it overlaps SOME sub-range of the
+    // bin's 16 rows while this particular call (rows can be 1, 2 or 8) covers
+    // a different sub-range that it does not actually reach.
+    const uint8_t nS = sampleBinCount[bandIdx];
+    const uint8_t *binIdx = &sampleBinIdx[bandIdx * SAMPLE_BIN_CAP];
+    for (int si = 0; si < nS; si++) {
+        const Sample &sm = samples[binIdx[si]];
         const float reach = sm.radius; // coverage is zero beyond radius
         if (sm.y + reach < y0 || sm.y - reach >= y0 + rows) {
             continue;
         }
         const OrbitDef &o = orbits[sm.orbit];
-        const int rr = static_cast<int>(ceilf(sm.radius));
+        const int rr = sm.rr; // cached in frame(): was a ceilf() call per (sample, band-call)
         const int x0i = static_cast<int>(sm.x) - rr, y0i = static_cast<int>(sm.y) - rr;
-        const float r2 = sm.radius * sm.radius; // cached: was recomputed per pixel
-        const float invR = 1.0f / sm.radius;    // cached: one divide per sample, not per pixel
+        const float r2 = sm.r2;     // cached in frame(): was recomputed per (sample, band-call)
+        const float invR = sm.invR; // cached in frame(): was a __divsf3 call per (sample, band-call)
         for (int dy = 0; dy <= rr * 2 + 1; dy++) {
             const int yy = y0i + dy - y0;
             if (yy < 0 || yy >= rows) {
@@ -238,10 +334,85 @@ void band(uint16_t *dst, int y0, int rows, int w, uint32_t, const uint8_t *) {
     }
 }
 
+// Portable spec: flat background fill (scalar), then the shared overlay
+// pass. This is what the host bench runs against golden/, and what the
+// device's on-chip equivalence test (SleepAnimation::runAnimTest) compares
+// band()'s kernel output against pixel for pixel.
+void bandRef(uint16_t *dst, int y0, int rows, int w, uint32_t, const uint8_t *) {
+    const uint16_t bg = g_bg;
+    const int total = rows * w;
+    for (int i = 0; i < total; i++) {
+        dst[i] = bg;
+    }
+    drawOverlays(dst, y0, rows, w);
+}
+
+#if defined(__XTENSA__) && !defined(GM_BGANIM_NO_ASM)
+// Flat-fill nOct groups of eight RGB565 pixels (128 bits) with bg, on the
+// ESP32-S3's PIE vector unit. This is the whole cost of band() that scales
+// with pixel count: 480x480 at 25fps is 230,400 background writes a frame,
+// every one of them the same constant, so it is the "obvious PIE store loop"
+// this file's per-pixel work otherwise has none of (path points and orbit
+// bodies are sparse scatter, a few hundred writes a frame combined).
+//
+// dst must be 16-byte aligned and nOct*8 must equal rows*w exactly: both
+// hold for every caller here (band buffer rows are 16-byte aligned per
+// CLAUDE.md; w is 480 or 240 and rows is 1, 2 or 8 on every real caller, so
+// rows*w is always a multiple of 8).
+//
+// PIE has no scalar-broadcast-into-lanes instruction (ASM_BRIEF's
+// ee.movi.32.q sets one 32-bit lane pair at a time, four instructions to
+// fill all eight lanes -- no better than this). Building the eight-times
+// value in a small 16-byte aligned stack buffer and loading it once with
+// ee.vld.128.ip is the idiom ASM_BRIEF recommends instead, and it is what
+// every other kernel in this codebase does for a runtime (non-compile-time)
+// constant.
+//
+// PIE is coprocessor CP3, thread context only; band() runs on the SleepAnim
+// render task, never an ISR, so this holds (see the longer version of this
+// note above SleepAnimation.cpp's scale565Oct). The compiler never touches
+// q registers, so no clobber list entry exists for them.
+__attribute__((noinline)) static void fillBgPie(uint16_t *dst, int nOct, uint16_t bg) {
+    alignas(16) uint16_t bcast[8] = {bg, bg, bg, bg, bg, bg, bg, bg};
+    uint16_t *wr = dst;
+    const uint16_t *src = bcast;
+    int n = nOct;
+    asm volatile("ee.vld.128.ip q0, %[src], 0\n" // q0 = bg x8, resident for the whole loop
+                 "1:\n"
+                 "ee.vst.128.ip q0, %[wr], 16\n"
+                 "addi %[n], %[n], -1\n"
+                 "bnez %[n], 1b\n"
+                 : [wr] "+r"(wr), [src] "+r"(src), [n] "+r"(n)
+                 :
+                 : "memory");
+}
+#endif
+
+// Device path: PIE-fill the background, then the shared scalar overlay pass
+// (sparse scatter -- path points and orbit-body stamps -- stays scalar; see
+// ASM_BRIEF's note that a gather/scatter shape with no vector equivalent is
+// written by hand in scalar form, not forced into PIE). Everything after the
+// fill is byte-for-byte the same code bandRef() runs, so kernel-vs-reference
+// pixel-exactness holds by construction rather than by a separately
+// maintained duplicate.
+//
+// Host / non-Xtensa builds: band() IS bandRef(), not merely equivalent to
+// it -- there is no second scalar fill to keep in sync.
+void band(uint16_t *dst, int y0, int rows, int w, uint32_t tMs, const uint8_t *p) {
+#if defined(__XTENSA__) && !defined(GM_BGANIM_NO_ASM)
+    fillBgPie(dst, (rows * w) >> 3, g_bg);
+    drawOverlays(dst, y0, rows, w);
+#else
+    bandRef(dst, y0, rows, w, tMs, p);
+#endif
+}
+
 void release() {
     releaseTable(samples, MAX_SAMPLES * sizeof(Sample));
     releaseTable(pathBins, MAX_ORBITS * NUM_BANDS * PTS_PER_BAND * sizeof(PathPt));
     releaseTable(pathBinCount, static_cast<size_t>(MAX_ORBITS) * NUM_BANDS);
+    releaseTable(sampleBinCount, static_cast<size_t>(NUM_BANDS));
+    releaseTable(sampleBinIdx, static_cast<size_t>(NUM_BANDS) * SAMPLE_BIN_CAP);
     // Every sentinel that gates a rebuild, or init() would hand back
     // reallocated tables that nothing refills.
     lastCountP = lastEccP = -1;
@@ -262,6 +433,7 @@ const BgAnimation bg_anim_orbits = {
     frame,
     band,
     release,
+    bandRef,
 };
 
 #endif // GAGGIMATE_SIM

@@ -154,6 +154,7 @@
 
 #include "BgAnim.h"
 #include "BgAnimCommon.h"
+#include <string.h> // memcpy, for the combine kernel's wrap-around double
 
 namespace {
 using namespace bganim;
@@ -171,6 +172,26 @@ uint16_t sAx = 0, sAy = 0, sBx = 0, sBy = 0, sCx = 0, sCy = 0;
 int g_wA = 32, g_wB = 20, g_wC = 12, g_densOff = 0;
 int g_axI = 0, g_axF = 0, g_ayI = 0, g_ayF = 0, g_bx = 0, g_by = 0, g_cx = 0, g_cy = 0;
 
+#if defined(__XTENSA__)
+// band()'s PIE combine-path tables. Round 1 made these function-local
+// `static` arrays to force them internal (2,304 B of new BSS, the largest
+// single addition in the fleet this round); round 2 moves them to the hot
+// slab via allocHot(), allocated once in init() and released in release(),
+// the same pattern paletteExt already used with alloc(). blendedA and
+// ixBufs are read/written per row by the row-building lerp kernels;
+// bTable/cTable/cDithTable and idxBuf are read per pixel by nebulaFieldPie
+// and nebulaGatherScalar. bandRef keeps its own separate blendedA/ixBufs/
+// bcTable statics (pre-dating this round, not something this pass added)
+// rather than sharing these -- see bandRef's header comment on why the two
+// paths are kept independent for equivalence-test integrity.
+uint8_t *hotBlendedA = nullptr;    // [512], doubled wrap-around buffer
+uint8_t *hotIxBufs = nullptr;      // [2][256] flattened; index with +curBuf*256
+uint16_t *hotBTable = nullptr;     // [128]
+uint16_t *hotCTable = nullptr;     // [128]
+uint16_t *hotCDithTable = nullptr; // [128]
+int16_t *hotIdxBuf = nullptr;      // [256]
+#endif
+
 // Fills the clamp padding around the freshly-rebuilt 256-entry ramp so
 // paletteExt[PAD + v] is valid for v in [-PAD, 255+PAD] with no branch.
 void extendPalette() {
@@ -184,13 +205,37 @@ void extendPalette() {
 
 bool init(int, int) {
     if (paletteExt == nullptr) {
-        paletteExt = static_cast<uint16_t *>(alloc(PAL_EXT_N * sizeof(uint16_t)));
+        // Read once per pixel by nebulaGatherScalar's palette lookup --
+        // the hottest table in the whole animation, and shared by band()
+        // and bandRef() through the one `palette` pointer, so hot-slab
+        // placement here helps both without any new duplication. alloc()
+        // is now always PSRAM (BgAnimCommon's round-2 API change), which
+        // would otherwise silently demote this from round 1's placement.
+        paletteExt = static_cast<uint16_t *>(allocHot(PAL_EXT_N * sizeof(uint16_t)));
         noise = noiseTex256();
         if (paletteExt == nullptr || noise == nullptr) {
             return false;
         }
         palette = paletteExt + PAD;
     }
+#if defined(__XTENSA__)
+    if (hotBlendedA == nullptr) {
+        // 2,304 B total (512 + 512 + 128*2 + 128*2 + 128*2 + 256*2), plus
+        // paletteExt's 800 B above = 3,104 B of the 9,216 B a resident
+        // animation gets from the 12 KB slab -- comfortably inside budget,
+        // nothing here needed shrinking.
+        hotBlendedA = static_cast<uint8_t *>(allocHot(512));
+        hotIxBufs = static_cast<uint8_t *>(allocHot(2 * 256));
+        hotBTable = static_cast<uint16_t *>(allocHot(128 * sizeof(uint16_t)));
+        hotCTable = static_cast<uint16_t *>(allocHot(128 * sizeof(uint16_t)));
+        hotCDithTable = static_cast<uint16_t *>(allocHot(128 * sizeof(uint16_t)));
+        hotIdxBuf = static_cast<int16_t *>(allocHot(256 * sizeof(int16_t)));
+        if (hotBlendedA == nullptr || hotIxBufs == nullptr || hotBTable == nullptr || hotCTable == nullptr ||
+            hotCDithTable == nullptr || hotIdxBuf == nullptr) {
+            return false;
+        }
+    }
+#endif
     lastThemeGen = 0xFFFFFFFF;
     return true;
 }
@@ -496,9 +541,400 @@ uint32_t nebulaShiftSelfTest(uint32_t *firstBad) {
     return bad;
 }
 
+// ---------------------------------------------------------------------------
+// Combine-stage kernel: computes the palette-relative blend index
+//   v(m) = c(m) + (((a(m)-c(m))*wA + (b(m)-c(m))*wB) >> 6) + dith2[m&7]
+// for n16*16 consecutive pixels m, on the PIE vector unit, leaving the actual
+// palette gather (a real, unvectorisable gather -- there is no EE.* gather
+// instruction) to a separate scalar pass. This is the per-pixel arithmetic
+// the file header's 2026-08-25 device measurement pointed at: with the
+// dominant-octave tables already on PIE (lerpRowPie/lerpShiftRowPie above),
+// the remaining ~19ms/frame at BAND_H=8 is this combine loop, run once per
+// output pixel (up to 256 times/row via the period-256 reuse already in
+// bandRef) across every row of every band() call.
+//
+// Two data-layout changes from bandRef's scalar version, both load-bearing
+// for vectorising this without spilling the 8-register PIE file:
+//
+//   1. blendedA is read at a runtime rotation (x0 = (axI+m)&255) that is not
+//      16-byte aligned in general, so EE.VLD.128.IP (which silently masks
+//      the low 4 address bits instead of trapping) cannot read it directly
+//      at an arbitrary m. bandRef masks per pixel (`x0 = (x0+1)&255`); this
+//      kernel instead takes a *doubled* 512-byte buffer (bytes 256..511 are
+//      a copy of bytes 0..255, built once per row by the caller) and reads
+//      it through EE.LD.128.USAR.IP + EE.SRC.Q, the same unaligned-window
+//      technique lerpShiftRowPie uses. The doubling is what makes this safe
+//      for a *sequence* of reads sweeping up to 256 bytes forward from an
+//      arbitrary start, not just one: the single extra aligned block
+//      lerpShiftRowPie relies on (noiseTex256's 16-byte slack) only covers a
+//      one-byte lookahead: this kernel's aOff can be anywhere in 0..255 and
+//      still needs up to 256 further bytes, so the tail has to be a full
+//      second copy, not 16 bytes of it. Proved algorithmically (not just
+//      argued) in the worklog before this was written into asm: see the
+//      2026-09-04 nebula-asm sanity checks, 5.12M-case and 2.4M-case
+//      comparisons against bandRef's exact 32-bit formula, zero mismatches.
+//   2. bandRef's b/c reads come from one packed uint16 bcTable (a real win
+//      for the *scalar* loop -- see the file header's mandala-trick note --
+//      but packed lanes need an AND-plus-shift to unpack per group, and the
+//      only shift PIE has is "multiply by 1 at a chosen SAR", which needs
+//      its own resident constant). This kernel instead takes b/c as three
+//      *separate* uint16 tables the caller builds per row: bTable (plain),
+//      cTable (plain, used in both difference terms AND the final add), and
+//      cDithTable (= cTable[k] + dith2[k&7], the Bayer dither/density offset
+//      pre-summed in at table-build time -- k is bandRef's `step`, and
+//      step&7 == m&7 always since 8 | 128, so this is exact, not an
+//      approximation). This is what makes an 8-register PIE budget work:
+//      4 resident constants (wA, wB, a "ones" vector for the final >>6
+//      arithmetic shift, and... no fourth is needed, because dith2 is baked
+//      into cDithTable instead of carried as a fifth resident register) plus
+//      4 rotating values (this group's a/a-next, b, c) fill exactly q0-q7
+//      with zero spill. Folding dith2 directly into cTable instead (saving
+//      the extra cDithTable read) was tried first and is WRONG: cTable's
+//      plain value is also used in the two difference terms, and dither must
+//      not perturb those, only the final additive base -- caught by the
+//      first sanity-check run (5.05M of 5.12M cases mismatched) before any
+//      asm was written, which is why the check exists as a separate step in
+//      the workflow.
+//
+// bandRef's period-256 reuse still applies: the caller only ever asks this
+// kernel for the first min(w,256) pixels, split in two at m=128 (see below).
+//
+// Register map, exactly q0-q7, no spills, verified by counting distinct live
+// ranges by hand (see the block comment in the .cpp history / report for the
+// full trace):
+//   q0 = P, the previous aligned 16-byte block of the rotated `a` source,
+//        persistent across outer-loop iterations (this is exactly
+//        lerpShiftRowPie's q6, renamed and playing the same role).
+//   q1 = wA broadcast (resident all call)
+//   q2 = wB broadcast (resident all call)
+//   q3 = "ones" broadcast, i.e. every lane = 1 (resident all call); multiplying
+//        by this at a chosen SAR is PIE's only right-shift, per ASM_BRIEF.md.
+//   q4 = scratch: next aligned `a` block, then b(pass0), then b(pass1).
+//   q5 = pass 0's pixel-0..7 pipeline register (a -> diffA -> product -> sum
+//        -> shifted -> v), reused in place at every step.
+//   q6 = the zero register for EE.VZIP.8, which becomes pass 1's pixels
+//        8..15 pipeline register (same in-place reuse as q5).
+//   q7 = scratch: c(pass0), then cDith(pass0), then c(pass1), then
+//        cDith(pass1).
+//
+// SAR is toggled 0 (for the two `diff*weight` multiplies, an exact multiply
+// with no truncation since every product fits in 16 bits -- see the block
+// comment above) then 6 (for the final arithmetic right shift) TWICE per
+// 16-pixel group, once per 8-lane pass, rather than batched once per group:
+// batching would need both passes' partial products alive across the SAR
+// change, which does not fit in the remaining 3 non-resident registers.
+// SSAI is a single, non-stalling instruction, so this costs a few extra
+// issue slots per 16 pixels, not a stall; not revisited unless a device
+// measurement says otherwise.
+//
+// out must be 16-byte aligned; aBase must be 16-byte aligned (blendedA is a
+// static aligned array) and at least aOff+16*n16+16 bytes long, i.e. sized
+// for the doubled-buffer read pattern above; bTab/cTab/cdTab must each hold
+// at least 16*n16 entries starting at index 0 (the caller resets these
+// pointers to each table's base for every call -- see band()'s two-call
+// split at m=128, which is exactly bTable/cTable/cDithTable's own period).
+__attribute__((noinline)) static void nebulaFieldPie(int16_t *__restrict out, const uint8_t *__restrict aBase,
+                                                     int aOff, const uint16_t *__restrict bTab,
+                                                     const uint16_t *__restrict cTab,
+                                                     const uint16_t *__restrict cdTab,
+                                                     const int16_t *__restrict consts, int n16) {
+    const uint8_t *pa = aBase + aOff; // SAR_BYTE = aOff & 15, captured by the usar load below
+    const uint16_t *pb = bTab;
+    const uint16_t *pc = cTab;
+    const uint16_t *pcd = cdTab;
+    int16_t *po = out;
+    // Broadcast tables for the three resident constants (wA, wB, ones),
+    // 24 x int16, 16-byte aligned, built by the caller. wA/wB are
+    // per-band()-call constants (frame() sets them; band() never does), so
+    // band() builds this array once before its row loop and passes the
+    // same pointer to every nebulaFieldPie call in the whole band() --
+    // round 1 rebuilt it here on every call (2x/row); the round-2 device
+    // numbers said table placement/access pattern is where the cycles are,
+    // so this redundant per-call rebuild is worth hoisting out even though
+    // it is a small, fixed instruction count.
+    const int16_t *pct = consts;
+    int n = n16;
+    asm volatile("ee.ld.128.usar.ip q0, %[pa], 16\n" // q0 = P, SAR_BYTE = aOff & 15
+                 "ee.vld.128.ip q1, %[ct], 16\n"      // q1 = wA broadcast
+                 "ee.vld.128.ip q2, %[ct], 16\n"      // q2 = wB broadcast
+                 "ee.vld.128.ip q3, %[ct], 16\n"      // q3 = ones broadcast
+                 "1:\n"
+                 "ee.vld.128.ip q4, %[pa], 16\n" // q4 = N, next aligned `a` block
+                 "ee.src.q q5, q0, q4\n"         // q5 = S = rotated 16 bytes (uses OLD P)
+                 "ee.orq q0, q4, q4\n"           // P := N, for the next iteration
+                 "ee.zero.q q6\n"
+                 "ee.vzip.8 q5, q6\n" // q5 = a[0..7] widened, q6 = a[8..15] widened
+                 // pass 0: pixels 0..7 (q5)
+                 "ee.vld.128.ip q4, %[pb], 16\n" // q4 = b0
+                 "ee.vld.128.ip q7, %[pc], 16\n" // q7 = c0
+                 "ee.vsubs.s16 q5, q5, q7\n"     // q5 = a0-c0
+                 "ee.vsubs.s16 q4, q4, q7\n"     // q4 = b0-c0
+                 "ssai 0\n"
+                 "ee.vmul.s16 q5, q5, q1\n" // q5 = (a0-c0)*wA
+                 "ee.vmul.s16 q4, q4, q2\n" // q4 = (b0-c0)*wB
+                 "ee.vadds.s16 q5, q5, q4\n" // q5 = sum0
+                 "ssai 6\n"
+                 "ee.vmul.s16 q5, q5, q3\n"       // q5 = sum0 >> 6 (arithmetic)
+                 "ee.vld.128.ip q7, %[pcd], 16\n" // q7 = cDith0 (c0 + dith2[.&7])
+                 "ee.vadds.s16 q5, q5, q7\n"      // q5 = v0
+                 "ee.vst.128.ip q5, %[po], 16\n"
+                 // pass 1: pixels 8..15 (q6)
+                 "ee.vld.128.ip q4, %[pb], 16\n" // q4 = b1
+                 "ee.vld.128.ip q7, %[pc], 16\n" // q7 = c1
+                 "ee.vsubs.s16 q6, q6, q7\n"
+                 "ee.vsubs.s16 q4, q4, q7\n"
+                 "ssai 0\n"
+                 "ee.vmul.s16 q6, q6, q1\n"
+                 "ee.vmul.s16 q4, q4, q2\n"
+                 "ee.vadds.s16 q6, q6, q4\n"
+                 "ssai 6\n"
+                 "ee.vmul.s16 q6, q6, q3\n"
+                 "ee.vld.128.ip q7, %[pcd], 16\n" // q7 = cDith1
+                 "ee.vadds.s16 q6, q6, q7\n"
+                 "ee.vst.128.ip q6, %[po], 16\n"
+                 "addi %[n], %[n], -1\n"
+                 "bnez %[n], 1b\n"
+                 : [pa] "+r"(pa), [pb] "+r"(pb), [pc] "+r"(pc), [pcd] "+r"(pcd), [po] "+r"(po), [ct] "+r"(pct),
+                   [n] "+r"(n)
+                 :
+                 : "memory");
+}
+
+// Reference for nebulaFieldPie, matching its exact 16-bit-lane arithmetic
+// (each intermediate value is what an int16 PIE lane would hold, including
+// the multiply-then-truncate order) rather than bandRef's plain-int formula
+// -- the two are equal for every input in range (see the header's proof
+// comment) but this makes the equality an executable check, not an argument.
+static void nebulaFieldRef(int16_t *out, const uint8_t *aBase, int aOff, const uint16_t *bTab, const uint16_t *cTab,
+                           const uint16_t *cdTab, int wA, int wB, int n16) {
+    for (int m = 0; m < n16 * 16; m++) {
+        const int16_t a = static_cast<int16_t>(aBase[aOff + m]);
+        const int16_t b = static_cast<int16_t>(bTab[m]);
+        const int16_t c = static_cast<int16_t>(cTab[m]);
+        const int16_t cd = static_cast<int16_t>(cdTab[m]);
+        const int16_t diffA = static_cast<int16_t>(a - c);
+        const int16_t diffB = static_cast<int16_t>(b - c);
+        const int16_t p1 = static_cast<int16_t>((diffA * wA) & 0xFFFF); // SAR=0: exact, always in range
+        const int16_t p2 = static_cast<int16_t>((diffB * wB) & 0xFFFF);
+        const int16_t sum = static_cast<int16_t>(p1 + p2);
+        const int16_t shifted = static_cast<int16_t>(sum >> 6); // arithmetic, matches ee.vmul.s16 SAR=6
+        out[m] = static_cast<int16_t>(cd + shifted);
+    }
+}
+
+// Exhaustive-ish arithmetic check, isolated from the addressing/rotation
+// logic (nebulaFieldAddrSelfTest below covers that): full a x c sweep, b
+// stepped, at the real per-frame wA/wB extremes (turbulence 0 and 100, plus
+// margin) and densOff extremes, aOff=0 (no rotation) so aBase can be a plain
+// ramp. Mirrors nebulaLerpSelfTest's structure (kernel vs scalar reference,
+// full range on the two operands that vary fastest).
+uint32_t nebulaFieldArithSelfTest(uint32_t *firstBad) {
+    alignas(16) uint8_t aBase[16]; // one 16-pixel group, aOff=0 so no rotation needed
+    alignas(16) uint16_t bTab[16], cTab[16], cdTab[16];
+    alignas(16) int16_t got[16];
+    uint32_t bad = 0;
+    const int wAs[] = {38, 28, 16, 40};
+    const int wBs[] = {16, 19, 10, 24};
+    const int densOffs[] = {-55, 0, 55};
+    for (int wi = 0; wi < 4; wi++) {
+        const int wA = wAs[wi], wB = wBs[wi];
+        alignas(16) const int16_t consts[24] = {
+            static_cast<int16_t>(wA), static_cast<int16_t>(wA), static_cast<int16_t>(wA), static_cast<int16_t>(wA),
+            static_cast<int16_t>(wA), static_cast<int16_t>(wA), static_cast<int16_t>(wA), static_cast<int16_t>(wA),
+            static_cast<int16_t>(wB), static_cast<int16_t>(wB), static_cast<int16_t>(wB), static_cast<int16_t>(wB),
+            static_cast<int16_t>(wB), static_cast<int16_t>(wB), static_cast<int16_t>(wB), static_cast<int16_t>(wB),
+            1, 1, 1, 1, 1, 1, 1, 1,
+        };
+        for (int di = 0; di < 3; di++) {
+            const int densOff = densOffs[di];
+            for (int a = 0; a < 256; a++) {
+                for (int c = 0; c < 256; c += 3) { // full a, stepped c -- b and dith vary per lane below
+                    for (int k = 0; k < 16; k++) {
+                        aBase[k] = static_cast<uint8_t>(a);
+                        bTab[k] = static_cast<uint16_t>((a * 7 + k * 37) & 0xFF); // varies per lane
+                        cTab[k] = static_cast<uint16_t>((c + k * 5) & 0xFF);
+                        const int bayer = (k * 11 + c) & 63;
+                        const int dith2 = (bayer - 31) / 4 + densOff;
+                        cdTab[k] = static_cast<uint16_t>(cTab[k] + dith2);
+                    }
+                    int16_t want[16];
+                    nebulaFieldRef(want, aBase, 0, bTab, cTab, cdTab, wA, wB, 1);
+                    nebulaFieldPie(got, aBase, 0, bTab, cTab, cdTab, consts, 1);
+                    for (int k = 0; k < 16; k++) {
+                        if (got[k] != want[k]) {
+                            if (bad == 0 && firstBad != nullptr) {
+                                *firstBad = static_cast<uint32_t>(a) | (static_cast<uint32_t>(c) << 8) |
+                                            (static_cast<uint32_t>(k) << 16) | (static_cast<uint32_t>(wi) << 24);
+                            }
+                            bad++;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return bad;
+}
+
+// Addressing check: fixed, simple arithmetic (a=x, b=c=0, wA=64/wB=0 so
+// v==a-0==a exactly, no truncation to reason about) but aOff swept over
+// every value in 0..255 and n16 over every size the caller actually uses
+// (1..8, i.e. up to one full 128-pixel bcTable sweep), which is what
+// exercises the doubled-buffer rotation and the persistent-P carry across
+// outer-loop iterations. This is the part most likely to have an off-by-one:
+// nebulaShiftSelfTest above proves EE.SRC.Q's addressing once; this proves
+// this kernel's own use of it (fresh pa/P setup, different SAR source) is
+// wired up the same way, across the same doubled-buffer scheme
+// band()'s blendedA now uses.
+uint32_t nebulaFieldAddrSelfTest(uint32_t *firstBad) {
+    // 512 = the real doubled-buffer size (256 real bytes + a full second
+    // copy), not just 16 bytes of slack -- see the kernel's header comment
+    // for why a single lerpShiftRowPie-style block is not enough here.
+    alignas(16) uint8_t aBase[512];
+    for (int i = 0; i < 256; i++) {
+        aBase[i] = static_cast<uint8_t>(i); // ramp -- every value distinct, settles addressing
+    }
+    for (int i = 0; i < 256; i++) {
+        aBase[256 + i] = aBase[i]; // the doubling band()'s caller must perform each row
+    }
+    alignas(16) uint16_t bTab[128], cTab[128], cdTab[128];
+    for (int k = 0; k < 128; k++) {
+        bTab[k] = 0;
+        cTab[k] = 0;
+        cdTab[k] = 0; // wB=0 and cTab=0 make b/c inert; only a's addressing is under test
+    }
+    alignas(16) int16_t got[128];
+    // wA=64: v == (a-0)*64>>6 == a
+    alignas(16) const int16_t consts[24] = {64, 64, 64, 64, 64, 64, 64, 64, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1};
+    uint32_t bad = 0;
+    for (int aOff = 0; aOff < 256; aOff++) {
+        for (int n16 = 1; n16 <= 8; n16++) {
+            nebulaFieldPie(got, aBase, aOff, bTab, cTab, cdTab, consts, n16);
+            for (int m = 0; m < n16 * 16; m++) {
+                const int want = aBase[(aOff + m) & 255]; // the real semantics: mod-256 rotation
+                if (got[m] != want) {
+                    if (bad == 0 && firstBad != nullptr) {
+                        *firstBad = static_cast<uint32_t>(aOff) | (static_cast<uint32_t>(m) << 16);
+                    }
+                    bad++;
+                }
+            }
+        }
+    }
+    return bad;
+}
+
+// ---------------------------------------------------------------------------
+// Scalar gather: row[m] = palette[idx[m]] for n4*4 pixels. There is no
+// EE.* gather instruction (ASM_BRIEF.md's PIE facts are explicit about
+// this), so nebulaFieldPie leaves the actual palette lookup to this
+// hand-scheduled loop rather than a plain per-pixel C store. Four pixels are
+// interleaved so a load's result is never consumed by the very next
+// instruction (the scalar one-cycle load-use interlock): all four indices
+// load first, then all four addresses compute (ALU, no load-use delay to
+// hide), then all four colors load, then the two pack/store pairs -- the
+// only two load-use pairs left are the two `slli` reading a color l16ui
+// just produced, which is the minimum given only two spare registers'
+// worth of scheduling slack once idx/row/n/palette occupy four more (see
+// ASM_BRIEF.md's ~13-usable-AR note; 4 scratch + 4 fixed stays well inside
+// that without pushing to an 8-wide unroll that would not).
+// `addx2` folds the *2 (uint16_t stride) into the add: addr = idx*2 + palette.
+// `l16si` sign-extends (idx can be negative -- see the file header's PAD
+// proof for the range), `l16ui` does not (a color's bits are not a signed
+// quantity). Two colors pack into one s32i, same trick as the tail copy and
+// scale565Oct: row is 4-byte aligned and n4 pixel-groups are even-based, so
+// this halves store traffic versus two s16i.
+__attribute__((noinline)) static void nebulaGatherScalar(uint16_t *__restrict row, const int16_t *__restrict idx,
+                                                         const uint16_t *__restrict palette, int n4) {
+    const int16_t *pi = idx;
+    uint16_t *pr = row;
+    int n = n4;
+    int s0, s1, s2, s3; // scratch, register-allocated by GCC (not hardcoded ARs)
+    asm volatile("1:\n"
+                 "l16si %[s0], %[pi], 0\n"
+                 "l16si %[s1], %[pi], 2\n"
+                 "l16si %[s2], %[pi], 4\n"
+                 "l16si %[s3], %[pi], 6\n"
+                 "addx2 %[s0], %[s0], %[pal]\n"
+                 "addx2 %[s1], %[s1], %[pal]\n"
+                 "addx2 %[s2], %[s2], %[pal]\n"
+                 "addx2 %[s3], %[s3], %[pal]\n"
+                 "l16ui %[s0], %[s0], 0\n"
+                 "l16ui %[s1], %[s1], 0\n"
+                 "l16ui %[s2], %[s2], 0\n"
+                 "l16ui %[s3], %[s3], 0\n"
+                 "slli %[s1], %[s1], 16\n"
+                 "or %[s0], %[s0], %[s1]\n"
+                 "slli %[s3], %[s3], 16\n"
+                 "or %[s2], %[s2], %[s3]\n"
+                 "s32i %[s0], %[pr], 0\n"
+                 "s32i %[s2], %[pr], 4\n"
+                 "addi %[pi], %[pi], 8\n"
+                 "addi %[pr], %[pr], 8\n"
+                 "addi %[n], %[n], -1\n"
+                 "bnez %[n], 1b\n"
+                 : [pi] "+r"(pi), [pr] "+r"(pr), [n] "+r"(n), [s0] "=&r"(s0), [s1] "=&r"(s1), [s2] "=&r"(s2),
+                   [s3] "=&r"(s3)
+                 : [pal] "r"(palette)
+                 : "memory");
+}
+
+// idx=[-300..300] step covers PAD's proven range (see file header) plus
+// margin; palette is a ramp so a wrong index reads a distinct, checkable
+// value. n4 covers every group count band() actually issues (240/4=60,
+// 256/4=64) plus 1 and a couple of odd small counts for the loop bound
+// itself.
+uint32_t nebulaGatherSelfTest(uint32_t *firstBad) {
+    constexpr int PAD_TEST = 300;
+    alignas(16) uint16_t pal[2 * PAD_TEST + 1];
+    for (int i = 0; i < 2 * PAD_TEST + 1; i++) {
+        pal[i] = static_cast<uint16_t>(i * 97 + 13); // distinct, checkable values
+    }
+    const uint16_t *palette = pal + PAD_TEST; // palette[v] valid for v in [-PAD_TEST, PAD_TEST]
+    alignas(16) int16_t idx[256];
+    alignas(16) uint16_t row[256];
+    uint32_t bad = 0;
+    const int n4Cases[] = {1, 2, 15, 16, 60, 64};
+    for (int ci = 0; ci < 6; ci++) {
+        const int n4 = n4Cases[ci];
+        const int n = n4 * 4;
+        for (int i = 0; i < n; i++) {
+            // Spread across the full proven range, including both signs and
+            // the exact endpoints, deterministically per (n4, i).
+            idx[i] = static_cast<int16_t>(((i * 131 + n4 * 17) % (2 * PAD_TEST + 1)) - PAD_TEST);
+            row[i] = 0xDEAD; // so a group the kernel skips cannot pass by luck
+        }
+        nebulaGatherScalar(row, idx, palette, n4);
+        for (int i = 0; i < n; i++) {
+            const uint16_t want = palette[idx[i]];
+            if (row[i] != want) {
+                if (bad == 0 && firstBad != nullptr) {
+                    *firstBad = static_cast<uint32_t>(static_cast<uint16_t>(idx[i])) |
+                                (static_cast<uint32_t>(i) << 16);
+                }
+                bad++;
+            }
+        }
+    }
+    return bad;
+}
+
 #endif
 
-void band(uint16_t *dst, int y0, int rows, int w, uint32_t, const uint8_t *) {
+// The portable reference implementation: the original per-pixel scalar
+// combine loop, unchanged. Kept verbatim (not merely "similar to") the
+// pre-asm-pass code so it stays trustworthy as the spec: the host bench and
+// golden compare run this exclusively (band() below only takes the vector
+// path on __XTENSA__), and the on-device equivalence test
+// (SleepAnimation::runAnimTest, /api/debug/animtest) renders every band
+// through both this and band() and reports the first differing pixel. Row
+// building (rowA0/rowA1 x-interpolation into blendedA) still uses the
+// existing lerpShiftRowPie/lerpRowPie PIE kernels on device -- those are
+// unrelated to this pass (already proven bit-exact by nebulaLerpSelfTest /
+// nebulaShiftSelfTest / nebulaRowSelfTest above) and reused unchanged; only
+// the combine step (the part actually being replaced) is genuinely
+// independent scalar code in both this function and band().
+void bandRef(uint16_t *dst, int y0, int rows, int w, uint32_t, const uint8_t *) {
 #if defined(__XTENSA__)
     // Every row of the texture sits at a 256-byte offset from its base, so one
     // test on the base settles it for all of them. The vector path needs it
@@ -836,6 +1272,195 @@ void band(uint16_t *dst, int y0, int rows, int w, uint32_t, const uint8_t *) {
     }
 }
 
+// The registry's band() entry. On device this dispatches to the PIE
+// combine kernel above (nebulaFieldPie + nebulaGatherScalar); everywhere
+// else -- host bench, and any real-width call that would violate the fast
+// path's precondition -- it is bandRef.
+//
+// Row building (blendedA via lerpRowPie/lerpShiftRowPie) is unchanged from
+// bandRef, copied rather than factored into a shared helper: this file's own
+// header already documents that a whole-function register/loop-budget
+// effect moves when live loop-carried state changes shape (the bcTable-
+// before-ixCur ordering note, the tail-copy split note), so a shared helper
+// used by both bandRef and this function would couple their codegen in a
+// way neither has been measured against. Kept as two independent, verified
+// copies instead, the same choice the file already makes for the r==0
+// ixCur/ixNext pass (see that comment).
+void band(uint16_t *dst, int y0, int rows, int w, uint32_t tMs, const uint8_t p[4]) {
+#if defined(__XTENSA__) && !defined(GM_BGANIM_NO_ASM)
+    // Fast-path precondition: w a multiple of 16. True for both of the
+    // panel's real widths (480 full-res, 240 half-res/interlaced -- see the
+    // file header) so every 16-pixel PIE group and the bcTable-period split
+    // at m=128 land exactly on group boundaries, with no scalar remainder
+    // to special-case. Only host tooling (interlace_check with a custom
+    // width) can violate this; bandRef is the general-w fallback.
+    if ((w & 15) != 0) {
+        bandRef(dst, y0, rows, w, tMs, p);
+        return;
+    }
+    // allocHot()'s bump allocator only guarantees 16-byte alignment for
+    // pointers actually carved from the slab; a request that overflows the
+    // slab falls back to alloc() (PSRAM), which does not promise 16-byte
+    // alignment. In practice this animation's whole hot footprint is a
+    // fraction of its 9,216 B budget so the fallback never triggers, but
+    // ee.vld.128.ip/ee.ld.128.usar.ip mask (not trap on) a misaligned
+    // address, so a silent fallback would corrupt output rather than crash
+    // -- checked once per band() call, the same defensive pattern rowAligned
+    // below already uses for noise.
+    const bool hotAligned = (reinterpret_cast<uintptr_t>(hotBlendedA) & 15) == 0 &&
+                             (reinterpret_cast<uintptr_t>(hotIxBufs) & 15) == 0 &&
+                             (reinterpret_cast<uintptr_t>(hotBTable) & 15) == 0 &&
+                             (reinterpret_cast<uintptr_t>(hotCTable) & 15) == 0 &&
+                             (reinterpret_cast<uintptr_t>(hotCDithTable) & 15) == 0 &&
+                             (reinterpret_cast<uintptr_t>(hotIdxBuf) & 15) == 0;
+    if (!hotAligned) {
+        bandRef(dst, y0, rows, w, tMs, p);
+        return;
+    }
+    const bool rowAligned = (reinterpret_cast<uintptr_t>(noise) & 15) == 0;
+    const int axF = g_axF, ayF = g_ayF;
+    const int wA = g_wA, wB = g_wB, densOff = g_densOff;
+    // Doubled: bytes 256..511 are a copy of 0..255, refreshed every row by
+    // the memcpy below. See nebulaFieldPie's header comment for why a full
+    // second copy is needed here and not just noiseTex256/lerpShiftRowPie's
+    // 16-byte slack: this buffer is read at an arbitrary rotation for up to
+    // 256 bytes forward, not looked ahead by one texel.
+    uint8_t *const blendedA = hotBlendedA;         // [512]
+    uint8_t *const ixBufs0 = hotIxBufs;             // [256], curBuf==0
+    uint8_t *const ixBufs1 = hotIxBufs + 256;       // [256], curBuf==1
+    // b/c/c+dith tables for nebulaFieldPie, sized to the bcTable period
+    // (128) rather than to w -- see the kernel's header comment for why
+    // this replaces bandRef's single packed bcTable with three plain ones.
+    uint16_t *const bTable = hotBTable;
+    uint16_t *const cTable = hotCTable;
+    uint16_t *const cDithTable = hotCDithTable;
+    int16_t *const idxBuf = hotIdxBuf;
+    // wA/wB broadcast table for nebulaFieldPie: built once here instead of
+    // once per call (2x/row) as round 1 had it -- wA/wB are per-band()-call
+    // constants (frame() sets them; nothing in this loop changes them), so
+    // every row and both combine-stage calls read the same 24 x int16
+    // table. Stack-local, not allocHot: 48 B, rebuilt once per band() call,
+    // not a persistent resource.
+    alignas(16) int16_t combineConsts[24];
+    for (int k = 0; k < 8; k++) {
+        combineConsts[k] = static_cast<int16_t>(wA);
+        combineConsts[8 + k] = static_cast<int16_t>(wB);
+        combineConsts[16 + k] = 1;
+    }
+    int curBuf = 0;
+    const int totalM = w <= 256 ? w : 256;
+    for (int r = 0; r < rows; r++) {
+        const int y = y0 + r;
+        uint16_t *row = dst + static_cast<size_t>(r) * w;
+        const uint8_t *bayerRow = &BAYER8[(y & 7) * 8];
+        int dith2[8];
+        for (int k = 0; k < 8; k++) {
+            dith2[k] = (static_cast<int>(bayerRow[k]) - 31) / 4 + densOff;
+        }
+        const uint8_t *rowA0 = noise + ((y + g_ayI) & 255) * 256;
+        const uint8_t *rowA1 = noise + ((y + g_ayI + 1) & 255) * 256;
+        const uint8_t *rowB = noise + ((y * 2 + g_by) & 255) * 256;
+        const uint8_t *rowC = noise + ((y * 4 + g_cy) & 255) * 256;
+
+        // Same 128-entry, period-128 walk as bandRef's bcTable, split into
+        // three plain uint16 arrays instead of one packed one (see
+        // nebulaFieldPie's header comment). dith2 is folded into
+        // cDithTable, not cTable: k&7 == step&7 == m&7 (8 | 128) makes this
+        // exact, but cTable's plain value is also read for the kernel's two
+        // difference terms and must not carry the dither (the first
+        // sanity-check run against bandRef's formula caught exactly this
+        // when tried the other way -- see nebulaFieldPie's header comment).
+        {
+            int bI = g_bx & 255;
+            int cI = g_cx & 255;
+            for (int k = 0; k < 128; k++) {
+                const int cv = rowC[cI];
+                bTable[k] = static_cast<uint16_t>(rowB[bI]);
+                cTable[k] = static_cast<uint16_t>(cv);
+                cDithTable[k] = static_cast<uint16_t>(cv + dith2[k & 7]);
+                bI = (bI + 2) & 255;
+                cI = (cI + 4) & 255;
+            }
+        }
+
+        uint8_t *ixCur = curBuf == 0 ? ixBufs0 : ixBufs1;
+        uint8_t *ixNext = curBuf == 0 ? ixBufs1 : ixBufs0;
+        if (r == 0) {
+            // First row of the call: no predecessor to reuse from -- see
+            // bandRef's identical comment for the full reasoning.
+            if (rowAligned) {
+                alignas(16) uint16_t fv[8];
+                for (int k = 0; k < 8; k++) {
+                    fv[k] = static_cast<uint16_t>(axF);
+                }
+                lerpShiftRowPie(ixCur, rowA0, fv, 16);
+                ixCur[255] = lerpScalar(rowA0[255], rowA0[0], axF);
+            } else {
+                lerpShiftRowScalar(ixCur, rowA0, axF);
+            }
+        }
+        if (rowAligned) {
+            alignas(16) uint16_t fv[8];
+            for (int k = 0; k < 8; k++) {
+                fv[k] = static_cast<uint16_t>(axF);
+            }
+            lerpShiftRowPie(ixNext, rowA1, fv, 16);
+            ixNext[255] = lerpScalar(rowA1[255], rowA1[0], axF);
+        } else {
+            lerpShiftRowScalar(ixNext, rowA1, axF);
+        }
+        {
+            alignas(16) uint16_t fv[8];
+            for (int k = 0; k < 8; k++) {
+                fv[k] = static_cast<uint16_t>(ayF);
+            }
+            lerpRowPie(blendedA, ixCur, ixNext, fv, 256 / 16);
+        }
+        // ixNext (this row's interpolated rowA1) is next row's rowA0 -- see
+        // bandRef's identical comment for the full reasoning.
+        curBuf ^= 1;
+
+        // Refresh the wrap-around double before nebulaFieldPie reads it --
+        // see the buffer's declaration comment above for why a full copy,
+        // not 16 bytes of slack, is what this rotation needs.
+        memcpy(blendedA + 256, blendedA, 256);
+
+        // Combine stage: two calls, one per half of the bcTable period,
+        // vectorising exactly bandRef's `x0`/`step` walk (see
+        // nebulaFieldPie's header comment for the full derivation and the
+        // 2026-09-04 proof this is bit-exact with bandRef's formula), then
+        // one gather call for the palette lookup PIE cannot do.
+        const int axI255 = g_axI & 255;
+        const int firstLen = totalM < 128 ? totalM : 128;
+        nebulaFieldPie(idxBuf, blendedA, axI255, bTable, cTable, cDithTable, combineConsts, firstLen / 16);
+        if (totalM > 128) {
+            const int secondLen = totalM - 128;
+            nebulaFieldPie(idxBuf + 128, blendedA, (axI255 + 128) & 255, bTable, cTable, cDithTable, combineConsts,
+                           secondLen / 16);
+        }
+        nebulaGatherScalar(row, idxBuf, palette, totalM / 4);
+
+        if (w > 256) {
+            // Tail copy: identical to bandRef's -- see its comment for the
+            // period-256 proof. Unchanged; this loop was never the cost.
+            const int tailN = w - 256;
+            uint16_t *rp = row + 256;
+            int i = tailN;
+            while (i >= 2) {
+                *reinterpret_cast<uint32_t *>(rp) = *reinterpret_cast<const uint32_t *>(rp - 256);
+                rp += 2;
+                i -= 2;
+            }
+            if (i) {
+                *rp = *(rp - 256);
+            }
+        }
+    }
+#else
+    bandRef(dst, y0, rows, w, tMs, p);
+#endif
+}
+
 void release() {
     releaseTable(paletteExt, PAL_EXT_N * sizeof(uint16_t));
     // An alias into paletteExt (paletteExt + PAD), not its own allocation.
@@ -843,6 +1468,14 @@ void release() {
     // Borrowed: noiseTex256() is a 64 KB fleet-wide asset owned by
     // BgAnimCommon and shared with ember.
     noise = nullptr;
+#if defined(__XTENSA__)
+    releaseTable(hotBlendedA, 512);
+    releaseTable(hotIxBufs, 2 * 256);
+    releaseTable(hotBTable, 128 * sizeof(uint16_t));
+    releaseTable(hotCTable, 128 * sizeof(uint16_t));
+    releaseTable(hotCDithTable, 128 * sizeof(uint16_t));
+    releaseTable(hotIdxBuf, 256 * sizeof(int16_t));
+#endif
     // The palette's content sentinel. init() resets it too, but a live
     // sentinel beside a null table is exactly the state this entry point
     // exists to prevent (see BgAnimCommon.h).
@@ -863,7 +1496,22 @@ uint32_t nebula_lerp_self_test(uint32_t *firstBad) {
     if (bad != 0) {
         return bad;
     }
-    return nebulaRowSelfTest(firstBad);
+    bad = nebulaRowSelfTest(firstBad);
+    if (bad != 0) {
+        return bad;
+    }
+    // Combine-kernel checks added for the PIE band() pass (2026-09-04): see
+    // nebulaFieldPie's header comment for the arithmetic/addressing split
+    // these two cover, and nebulaGatherScalar's for the third.
+    bad = nebulaFieldArithSelfTest(firstBad);
+    if (bad != 0) {
+        return bad;
+    }
+    bad = nebulaFieldAddrSelfTest(firstBad);
+    if (bad != 0) {
+        return bad;
+    }
+    return nebulaGatherSelfTest(firstBad);
 }
 #endif
 
@@ -876,6 +1524,7 @@ const BgAnimation bg_anim_nebula = {
     frame,
     band,
     release,
+    bandRef,
 };
 
 #endif // GAGGIMATE_SIM

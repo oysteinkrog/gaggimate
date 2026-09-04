@@ -81,6 +81,26 @@
 // invariant is untouched — nothing here is cached across band() calls, only
 // within one call's per-row loop, and the per-row span/merge state is fresh
 // every row and every call.
+//
+// Xtensa assembly pass, rounds 1-3 (2026-09-04, asm-lava), reverted round 4:
+// three rounds of hand-written Xtensa kernels and control-flow restructuring
+// (a software-pipelined field-accumulation gather, a branch-eliminating
+// finalize kernel, a PIE background-row copy, an aligned bgRowAll split, and
+// two different placements of a narrowed lavaLUT) were each measured against
+// HEAD's own band() on the device at matched table placement, and none beat
+// it -- 31.1-32.8 ms and then 29.0-32.0 ms per full-res frame against HEAD's
+// 26.0 ms, across every combination tried. None of it is carried forward.
+// This file is HEAD's band()/bandRef split verbatim (band() below is a
+// direct call to bandRef(), no kernel, no restructuring); the only change is
+// table placement, using the bganim::allocHot() API added this round: the
+// three tables HEAD itself allocated at or under 8 KB (paletteLUT 512 B,
+// fieldRow 1,920 B at w=480, bgRowAll 3,840 B at w=480 -- the set HEAD's own
+// alloc() used to land in internal DRAM when the pool allowed, per the
+// per-table comments below) now go through allocHot()'s reserved slab
+// instead of racing the general heap for that placement. lavaLUT (9,216 B,
+// the one table HEAD's old alloc() always sent to PSRAM on size) is
+// unchanged, still alloc(). release() needs no changes: releaseTable()
+// already dispatches by where each pointer actually came from.
 
 #include "BgAnim.h"
 #include "BgAnimCommon.h"
@@ -213,46 +233,35 @@ void buildBgRows(int w) {
 
 bool init(int w, int h) {
     if (paletteLUT == nullptr) {
-        paletteLUT = static_cast<uint16_t *>(alloc(256 * sizeof(uint16_t)));
+        // Round 4 placement: HEAD allocated this at or under 8 KB, so it
+        // moves to bganim::allocHot() (see the file-top round-4 comment).
+        paletteLUT = static_cast<uint16_t *>(allocHot(256 * sizeof(uint16_t))); // 512 B
     }
     if (fieldRow == nullptr) {
-        fieldRow = static_cast<int32_t *>(alloc(w * sizeof(int32_t)));
+        // Round 4 placement: same as paletteLUT above.
+        fieldRow = static_cast<int32_t *>(allocHot(w * sizeof(int32_t))); // 1,920 B at w=480
         allocW = w;
     }
     if (lavaLUT == nullptr) {
-        // 9,216 B. As a static array this was the largest single object in
-        // internal DRAM in the whole firmware, and it was resident for every
-        // animation, not just this one -- which is what left AsyncTCP unable to
-        // allocate the few dozen bytes it needs per ACK to keep a large
-        // response moving. alloc() sends anything over 8 KB to PSRAM, and this
-        // table suits that: band() sweeps it monotonically through a forward
-        // difference on ttQ, so the reads are sequential rather than random,
-        // and 9 KB stays largely cache-resident anyway.
+        // 9,216 B, unchanged from HEAD: alloc() (PSRAM). Rounds 1-3 tried
+        // moving this table to bganim::allocHot()'s internal slab, at both
+        // its original int32_t width (where it alone exhausted the slab,
+        // leaving no room for paletteLUT/fieldRow) and a narrowed int16_t
+        // width (which fit but measured slower on the device regardless);
+        // round 4 puts it back exactly where HEAD had it -- see the
+        // file-top round-4 comment. band() sweeps it monotonically through
+        // a forward difference on ttQ, so the reads are sequential rather
+        // than random, and 9 KB stays largely cache-resident anyway.
         lavaLUT = static_cast<int32_t *>(alloc(LUT_SIZE * sizeof(int32_t)));
     }
     if (bgRowAll == nullptr) {
-        // 4 * w * 2 B (3,840 B at w=480). Under the 8 KB per-allocation
-        // threshold, so it is not sent to PSRAM on size -- but alloc()'s budget
-        // is CUMULATIVE, and this is the last table lava asks for, which makes
-        // it the one that spills if the budget is short. It lands in internal
-        // DRAM today, and the reason is an invariant held elsewhere: only one
-        // animation's tables are live at a time, because SleepAnimation calls
-        // prev.release() on switch and all 13 animations have a release entry,
-        // and release() refunds g_allocSram from the pool the pointer actually
-        // came from. Live SRAM here is therefore the shared borrowed terms
-        // (sinLut 2,048 B + cosTableF 1,024 B; noiseTex256's 64 KB is over the
-        // limit and in PSRAM) plus lava's own 512 + 1,920 + 3,840, about 9.3 KB
-        // against SRAM_TOTAL_BUDGET's 28,672.
-        //
-        // The margin is thinner than that sounds. Silk asks 22,536 B, so a
-        // silk-then-lava sequence WITHOUT the release in between reaches 24,968
-        // and this request crosses the ceiling by 136 bytes. Adding an animation
-        // that omits release(), or growing any table by ~136 B, therefore
-        // degrades these rows to PSRAM -- read on every row of every band()
-        // call, which is exactly the large-table-with-per-pixel-index pattern
-        // alloc()'s own CAVEAT warns about and that cost aurora 21%. The spill
-        // is silent in the placement path but alloc() now logs the crossing.
-        bgRowAll = static_cast<uint16_t *>(alloc(4 * w * sizeof(uint16_t)));
+        // Round 4 placement: same as paletteLUT above. This replaces HEAD's
+        // own placement story for this table (a cumulative-SRAM-budget
+        // heuristic against the old plain alloc(), since retired along with
+        // the heuristic itself -- see the file-top round-4 comment): the
+        // pool-availability race that heuristic was exposed to is exactly
+        // what allocHot()'s fixed, reserved slab removes.
+        bgRowAll = static_cast<uint16_t *>(allocHot(4 * w * sizeof(uint16_t))); // 3,840 B at w=480
         bgRowAllW = w;
     }
     if (paletteLUT == nullptr || fieldRow == nullptr || lavaLUT == nullptr || bgRowAll == nullptr) {
@@ -440,7 +449,7 @@ void finalizeSpan(uint16_t *out, int lo, int hi, int yPhase) {
     }
 }
 
-void band(uint16_t *dst, int y0, int rows, int w, uint32_t, const uint8_t *) {
+void bandRef(uint16_t *dst, int y0, int rows, int w, uint32_t, const uint8_t *) {
     for (int row = 0; row < rows; row++) {
         const int y = y0 + row;
         memset(fieldRow, 0, w * sizeof(int32_t));
@@ -540,6 +549,15 @@ void band(uint16_t *dst, int y0, int rows, int w, uint32_t, const uint8_t *) {
     }
 }
 
+// Round 4: band() ships no hand asm and no restructuring -- every asm
+// kernel and every control-flow change tried in rounds 1-3 measured
+// slower than this shape on the device at equal table placement, so
+// band() is a direct call to the portable reference above. See the
+// file-top round-4 comment.
+void band(uint16_t *dst, int y0, int rows, int w, uint32_t tMs, const uint8_t *p) {
+    bandRef(dst, y0, rows, w, tMs, p);
+}
+
 void release() {
     releaseTable(paletteLUT, 256 * sizeof(uint16_t));
     releaseTable(fieldRow, static_cast<size_t>(allocW) * sizeof(int32_t));
@@ -564,6 +582,7 @@ const BgAnimation bg_anim_lava = {
     frame,
     band,
     release,
+    bandRef,
 };
 
 #endif // GAGGIMATE_SIM

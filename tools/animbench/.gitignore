@@ -17,3 +17,4 @@ old-src/
 #   git checkout 834b0338^ -- src/display/ui/default/bganim
 #   make && ./build/bench --golden golden
 #   git checkout HEAD -- src/display/ui/default/bganim
+xtensa-asm14/

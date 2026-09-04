@@ -80,21 +80,62 @@ uint32_t lastTMs = 0;
 uint32_t lastDriftMs = 0xFFFFFFFF; // sentinel: no drift step on the very first frame() call
 int allocW = 0, allocH = 0;        // dimensions dx2/dy2 were sized for
 
+// Hot-slab placement (BgAnimCommon.h's GM_BGANIM_HOT_SLAB): 9,216 B budget.
+// Round 2 ranked by reads/frame and left dx2 in PSRAM on the theory that its
+// sequential per-row sweep would stream at close to SRAM speed; production
+// proved that wrong (asm regressed from 12.7 ms with everything pinned SRAM
+// to 15.8 ms, ref went from faster-than-HEAD to tied with it, i.e. the
+// kernel's edge over the portable path vanished along with the placement
+// win) -- real PSRAM traffic from the panel's own DMA scanout and the other
+// core's LVGL contends for the same cache lines a synthetic sweep-only test
+// never has to share, so "small and sequential" was not sufficient evidence
+// on its own. This pass ranks by reads PER BYTE (what the fixed 9,216 B
+// budget actually buys) among every table band()/bandRef() touch, everyone
+// re-measured, nobody exempted by access-pattern theory a second time:
+//
+//   table      bytes  reads/frame  reads/byte
+//   dx2        1,920    230,400      120     once/pixel (sequential, but
+//                                              see above: no longer trusted
+//                                              to survive real PSRAM
+//                                              contention rent-free)
+//   vigColor   4,096    230,400       56.3   once/pixel, gather (no
+//                                              sequential run at all)
+//   starY        800      9,600       12     star-bucket walk (see below)
+//   bandNext     800      9,600       12     same walk -- it IS the list
+//   bandHead      64        720       11.3   macro-bands touched per call
+//   draws      2,400      9,600        4     same walk, LOWEST density
+//   dy2        1,920        480        0.25  once/row, not once/pixel
+//
+// dx2 and vigColor are a matched pair for the same loop -- every pixel
+// touches both, so either one left cold reintroduces a per-pixel PSRAM
+// stall regardless of the other -- and together they are the two highest-
+// density tables besides, so both are non-negotiable: 6,016 B, allocated
+// first (dx2 first by the numbers above) so neither can lose the slab to a
+// lower-density table if a future edit changes sizes. starY/bandNext/
+// bandHead (1,664 B) fit in what is left (3,200 B) with room to spare.
+// draws (2,400 B) does not fit in the 1,536 B left after that and is the
+// least dense of the four star-bucket tables by a wide margin (4 reads/byte
+// against 11-12 for its three neighbors), so it is the one demoted to
+// PSRAM: total 7,680 B, fits the 9,216 B budget with 1,536 B spare. dy2
+// (once/row, not once/pixel), stars (~400 reads/frame, the largest table in
+// the file at 12,800 B), driftQ, starCol (frame()-only) and vigLUT
+// (theme-rebuild only) are all far colder and stay in PSRAM; nothing here
+// needed shrinking to fit.
 bool init(int w, int h) {
     if (stars == nullptr) {
+        dx2 = static_cast<int32_t *>(allocHot(w * sizeof(int32_t)));
+        vigColor = static_cast<uint16_t *>(allocHot(128 * VIG_PHASES * sizeof(uint16_t)));
+        starY = static_cast<int16_t *>(allocHot(MAX_STARS * sizeof(int16_t)));
+        bandNext = static_cast<int16_t *>(allocHot(MAX_STARS * sizeof(int16_t)));
+        bandHead = static_cast<int16_t *>(allocHot(NUM_BANDS * sizeof(int16_t)));
         stars = static_cast<Star *>(alloc(MAX_STARS * sizeof(Star)));
         draws = static_cast<StarDraw *>(alloc(MAX_STARS * sizeof(StarDraw)));
-        starY = static_cast<int16_t *>(alloc(MAX_STARS * sizeof(int16_t)));
-        bandHead = static_cast<int16_t *>(alloc(NUM_BANDS * sizeof(int16_t)));
-        bandNext = static_cast<int16_t *>(alloc(MAX_STARS * sizeof(int16_t)));
         driftQ = static_cast<int32_t *>(alloc(MAX_STARS * sizeof(int32_t)));
         allocW = w;
         allocH = h;
-        dx2 = static_cast<int32_t *>(alloc(w * sizeof(int32_t)));
         dy2 = static_cast<int32_t *>(alloc(h * sizeof(int32_t)));
         vigLUT = static_cast<uint8_t *>(alloc(128));
         starCol = static_cast<uint8_t *>(alloc(MAX_STARS * 3));
-        vigColor = static_cast<uint16_t *>(alloc(128 * VIG_PHASES * sizeof(uint16_t)));
         if (stars == nullptr || draws == nullptr || starY == nullptr || bandHead == nullptr || bandNext == nullptr ||
             driftQ == nullptr || dx2 == nullptr || dy2 == nullptr || vigLUT == nullptr || starCol == nullptr ||
             vigColor == nullptr) {
@@ -273,55 +314,29 @@ inline void plotMax(uint16_t *dst, int rows, int w, int x, int y, uint8_t r, uin
     }
 }
 
-void band(uint16_t *dst, int y0, int rows, int w, uint32_t, const uint8_t *) {
-    // 1. vignette background (squared-distance LUT, no sqrt)
-    for (int ry = 0; ry < rows; ry++) {
-        const int y = y0 + ry;
-        const int32_t dyv = dy2[y];
-        uint16_t *row = dst + static_cast<size_t>(ry) * w;
-        // One base pointer per x&3 phase for this row, hoisted out of the loop:
-        // inside the unrolled body vp[k] is a register, so the indexed load is
-        // the same instruction the undithered version used.
-        // Four named pointers, not an array: an array indexed by the unroll
-        // counter can spill to the stack and cost a load per pixel, which
-        // measured +15% on band() where these cost nothing.
-        const uint16_t *const vb = vigColor + (y & 3) * 512;
-        const uint16_t *const p0 = vb;
-        const uint16_t *const p1 = vb + 128;
-        const uint16_t *const p2 = vb + 256;
-        const uint16_t *const p3 = vb + 384;
-        int x = 0;
-        for (; x + 3 < w; x += 4) {
-            int i0 = (dyv + dx2[x + 0]) >> 10; // 480x480: max r2 ~115200 -> 112
-            int i1 = (dyv + dx2[x + 1]) >> 10;
-            int i2 = (dyv + dx2[x + 2]) >> 10;
-            int i3 = (dyv + dx2[x + 3]) >> 10;
-            if (i0 > 127) {
-                i0 = 127;
-            }
-            if (i1 > 127) {
-                i1 = 127;
-            }
-            if (i2 > 127) {
-                i2 = 127;
-            }
-            if (i3 > 127) {
-                i3 = 127;
-            }
-            row[x + 0] = p0[i0];
-            row[x + 1] = p1[i1];
-            row[x + 2] = p2[i2];
-            row[x + 3] = p3[i3];
-        }
-        for (; x < w; x++) { // widths not a multiple of 4
-            int idx = (dyv + dx2[x]) >> 10;
-            if (idx > 127) {
-                idx = 127;
-            }
-            row[x] = vb[(x & 3) * 128 + idx];
-        }
-    }
-    // 2. stars bucketed for this band (plus neighbors for the 1px spill)
+// ---------------------------------------------------------------------
+// band() split in two, by cost, not by look: the vignette gather below
+// touches every one of the 230,400 pixels in a frame; the star and
+// shooting-star plotting after it touches at most a few hundred. Xtensa
+// asm effort (see starfieldVigRowAsm below) goes at the vignette gather
+// only, it is a per-pixel indexed load with no closed form, so PIE cannot
+// vectorise it (no vector gather on this chip; ASM_BRIEF.md), and it is
+// where the frame's time actually goes.
+//
+// plotStarsAndShoot() and vigRowScalar() are the exact per-pixel math
+// band() used before this pass, merely pulled out of the old single
+// function body, bandRef() below calls them in the same order the old
+// band() ran them, so it is pixel-identical to the pre-asm code. band()
+// (further below) calls plotStarsAndShoot() too, and only replaces the
+// vignette loop, so the two functions can never disagree about star or
+// shooting-star pixels, only the asm equivalence test at
+// /api/debug/animtest has to prove the vignette gather.
+// ---------------------------------------------------------------------
+
+// Piece 2: stars bucketed for this band (plus neighbors for the 1px
+// spill), then the shooting star trail. Unmodified extraction of the old
+// band()'s second and third sections.
+void plotStarsAndShoot(uint16_t *dst, int y0, int rows, int w) {
     int bandLo = (y0 >> 4) - 1, bandHi = ((y0 + rows - 1) >> 4) + 1;
     if (bandLo < 0) {
         bandLo = 0;
@@ -344,7 +359,7 @@ void band(uint16_t *dst, int y0, int rows, int w, uint32_t, const uint8_t *) {
             }
         }
     }
-    // 3. shooting star trail (14 segments, band-clipped by plotMax)
+    // shooting star trail (14 segments, band-clipped by plotMax)
     if (shoot.active) {
         // Both divides here used to run per band() call (up to 30x/frame while
         // active, x15 for the loop below = 450 __divsf3 libcalls/frame).
@@ -363,6 +378,173 @@ void band(uint16_t *dst, int y0, int rows, int w, uint32_t, const uint8_t *) {
                     clamp8f(shootCol[1] * fade), clamp8f(shootCol[2] * fade));
         }
     }
+}
+
+// Piece 1, portable: one row of the vignette gather (squared-distance LUT,
+// no sqrt). Used directly by bandRef() (the spec) and as band()'s fallback
+// for any w that is not a multiple of 4, never true in production (w is
+// always 480 or 240, both multiples of 16) but kept so the contract holds
+// for an arbitrary w, exactly as the old unrestricted loop did.
+void vigRowScalar(uint16_t *row, int y, int w) {
+    const int32_t dyv = dy2[y];
+    // One base pointer per x&3 phase for this row, hoisted out of the loop:
+    // inside the unrolled body vp[k] is a register, so the indexed load is
+    // the same instruction the undithered version used.
+    // Four named pointers, not an array: an array indexed by the unroll
+    // counter can spill to the stack and cost a load per pixel, which
+    // measured +15% on band() where these cost nothing.
+    const uint16_t *const vb = vigColor + (y & 3) * 512;
+    const uint16_t *const p0 = vb;
+    const uint16_t *const p1 = vb + 128;
+    const uint16_t *const p2 = vb + 256;
+    const uint16_t *const p3 = vb + 384;
+    int x = 0;
+    for (; x + 3 < w; x += 4) {
+        int i0 = (dyv + dx2[x + 0]) >> 10; // 480x480: max r2 ~115200 -> 112
+        int i1 = (dyv + dx2[x + 1]) >> 10;
+        int i2 = (dyv + dx2[x + 2]) >> 10;
+        int i3 = (dyv + dx2[x + 3]) >> 10;
+        if (i0 > 127) {
+            i0 = 127;
+        }
+        if (i1 > 127) {
+            i1 = 127;
+        }
+        if (i2 > 127) {
+            i2 = 127;
+        }
+        if (i3 > 127) {
+            i3 = 127;
+        }
+        row[x + 0] = p0[i0];
+        row[x + 1] = p1[i1];
+        row[x + 2] = p2[i2];
+        row[x + 3] = p3[i3];
+    }
+    for (; x < w; x++) { // widths not a multiple of 4
+        int idx = (dyv + dx2[x]) >> 10;
+        if (idx > 127) {
+            idx = 127;
+        }
+        row[x] = vb[(x & 3) * 128 + idx];
+    }
+}
+
+// The spec. Host bench goldens run against this, and the device equivalence
+// test (SleepAnimation::runAnimTest, /api/debug/animtest) checks band()'s
+// asm kernel against it pixel for pixel. Pixel-identical to this file's
+// band() before this pass: same two pieces, same order, just factored out
+// above so band() can reuse plotStarsAndShoot() without duplicating it.
+void bandRef(uint16_t *dst, int y0, int rows, int w, uint32_t, const uint8_t *) {
+    for (int ry = 0; ry < rows; ry++) {
+        vigRowScalar(dst + static_cast<size_t>(ry) * w, y0 + ry, w);
+    }
+    plotStarsAndShoot(dst, y0, rows, w);
+}
+
+#if defined(__XTENSA__) && !defined(GM_BGANIM_NO_ASM)
+// Vignette gather, four pixels per iteration, hand-written Xtensa scalar.
+// PIE has no vector gather instruction on this chip (ASM_BRIEF.md), so this
+// stays scalar; the win over vigRowScalar is replacing its four
+// `if (i > 127) i = 127;` branches with MIN (Miscellaneous Operations
+// option, present on this core), a compare-and-select instead of a
+// taken/not-taken branch, and packing each pixel pair into one 32-bit
+// store (dst rows are 4-byte aligned; w is always a multiple of 4 in
+// production, band() falls back to vigRowScalar() otherwise).
+//
+// Uses the hardware zero-overhead LOOP (LOOPNEZ) rather than the manual
+// `addi`/`bnez` this file's PIE-kernel siblings (SleepAnimation.cpp's
+// scale565Oct, AnimNebula.cpp's lerpRowPie) use for their own loops: those
+// run at most tens of iterations per call, where a taken branch each pass
+// is noise, but this loop runs w/4 times (120 or 60) per row, 480 rows a
+// frame, so paying zero cycles for the back edge instead of a taken-branch
+// penalty every iteration is worth the one extra setup instruction.
+//
+// idx0..idx3 never need a signed/unsigned check before the >>10: dyv =
+// dy2[y] and dx2[x] are both squared distances, so the sum is always >= 0
+// and SRAI (arithmetic) agrees with SRLI (logical) here; SRAI is used
+// because it is the shift int32_t dyv + dx2[x] uses in the C++ reference.
+//
+// A load's destination register doubles as its own base-address register
+// in the four L16UI below (e.g. `l16ui t1, t1, 0`): the effective address
+// is read from the base value before the load overwrites it, so this is
+// architecturally safe, and it is one of the moves this loop cannot spare
+// a register to avoid, see the budget note below. Confirmed assembling
+// and producing correct results in xtensa-asm14 and the QEMU test
+// (tools/qemubench/tests/anim_starfield/).
+//
+// Register budget: dxp, rowp, dyv, p0..p3, n (8, live for the whole loop)
+// + c127, t1..t4 (5, c127 set once before the loop, t1..t4 reused in place
+// for index then value) = 13, at the ~13-usable-AR ceiling ASM_BRIEF.md
+// documents for inline asm inside a windowed-ABI function. Checked in
+// xtensa-asm14/AnimStarfield.S: no spill around this block (report in this
+// pass's final message).
+__attribute__((noinline)) static void starfieldVigRowAsm(uint16_t *__restrict row, const int32_t *__restrict dx2Row,
+                                                          int32_t dyv, const uint16_t *__restrict p0,
+                                                          const uint16_t *__restrict p1, const uint16_t *__restrict p2,
+                                                          const uint16_t *__restrict p3, int n4) {
+    const int32_t *dxp = dx2Row;
+    uint16_t *rowp = row;
+    int32_t t1, t2, t3, t4, c127; // scratch; values unused after the block
+    asm volatile("movi %[c127], 127\n"
+                 "loopnez %[n], 2f\n"
+                 "l32i    %[t1], %[dxp], 0\n"  // dx2[x+0]
+                 "l32i    %[t2], %[dxp], 4\n"  // dx2[x+1]
+                 "add     %[t1], %[t1], %[dyv]\n"
+                 "add     %[t2], %[t2], %[dyv]\n"
+                 "l32i    %[t3], %[dxp], 8\n"  // dx2[x+2]
+                 "l32i    %[t4], %[dxp], 12\n" // dx2[x+3]
+                 "srai    %[t1], %[t1], 10\n"
+                 "srai    %[t2], %[t2], 10\n"
+                 "add     %[t3], %[t3], %[dyv]\n"
+                 "add     %[t4], %[t4], %[dyv]\n"
+                 "min     %[t1], %[t1], %[c127]\n"
+                 "min     %[t2], %[t2], %[c127]\n"
+                 "srai    %[t3], %[t3], 10\n"
+                 "srai    %[t4], %[t4], 10\n"
+                 "min     %[t3], %[t3], %[c127]\n"
+                 "min     %[t4], %[t4], %[c127]\n"
+                 "addx2   %[t1], %[t1], %[p0]\n" // t1 = &p0[idx0]
+                 "addx2   %[t2], %[t2], %[p1]\n" // t2 = &p1[idx1]
+                 "l16ui   %[t1], %[t1], 0\n"     // t1 = p0[idx0]
+                 "l16ui   %[t2], %[t2], 0\n"     // t2 = p1[idx1]
+                 "addx2   %[t3], %[t3], %[p2]\n" // t3 = &p2[idx2]
+                 "addx2   %[t4], %[t4], %[p3]\n" // t4 = &p3[idx3]
+                 "l16ui   %[t3], %[t3], 0\n"     // t3 = p2[idx2]
+                 "l16ui   %[t4], %[t4], 0\n"     // t4 = p3[idx3]
+                 "slli    %[t2], %[t2], 16\n"
+                 "slli    %[t4], %[t4], 16\n"
+                 "or      %[t1], %[t1], %[t2]\n" // pixels x+0,x+1 packed
+                 "or      %[t3], %[t3], %[t4]\n" // pixels x+2,x+3 packed
+                 "s32i    %[t1], %[rowp], 0\n"
+                 "s32i    %[t3], %[rowp], 4\n"
+                 "addi    %[dxp], %[dxp], 16\n" // four int32_t
+                 "addi    %[rowp], %[rowp], 8\n" // four uint16_t
+                 "2:\n"
+                 : [dxp] "+r"(dxp), [rowp] "+r"(rowp), [t1] "=&r"(t1), [t2] "=&r"(t2), [t3] "=&r"(t3),
+                   [t4] "=&r"(t4), [c127] "=&r"(c127)
+                 : [dyv] "r"(dyv), [p0] "r"(p0), [p1] "r"(p1), [p2] "r"(p2), [p3] "r"(p3), [n] "r"(n4)
+                 : "memory");
+}
+#endif
+
+void band(uint16_t *dst, int y0, int rows, int w, uint32_t tMs, const uint8_t *p) {
+#if defined(__XTENSA__) && !defined(GM_BGANIM_NO_ASM)
+    for (int ry = 0; ry < rows; ry++) {
+        const int y = y0 + ry;
+        uint16_t *row = dst + static_cast<size_t>(ry) * w;
+        if ((w & 3) == 0) {
+            const int32_t dyv = dy2[y];
+            const uint16_t *const vb = vigColor + (y & 3) * 512;
+            starfieldVigRowAsm(row, dx2, dyv, vb, vb + 128, vb + 256, vb + 384, w >> 2);
+        } else { // never hit in production: w is always 480 or 240
+            vigRowScalar(row, y, w);
+        }
+    }
+    plotStarsAndShoot(dst, y0, rows, w);
+#else
+    bandRef(dst, y0, rows, w, tMs, p);
+#endif
 }
 
 void release() {
@@ -394,6 +576,7 @@ const BgAnimation bg_anim_starfield = {
     frame,
     band,
     release,
+    bandRef,
 };
 
 #endif // GAGGIMATE_SIM
