@@ -2669,6 +2669,17 @@ void WebUIPlugin::handleSettings(AsyncWebServerRequest *request) const {
             settings->save(true);
         });
         pluginManager->trigger("settings:changed");
+        // A save supersedes the editor's live preview. The preview holds the
+        // panel for 15 s per message, so a preview the editor sent just before
+        // Save (or one that lost the race with a dropped socket) would
+        // otherwise keep showing a gradient that is not the one just saved;
+        // seen once in 80 scripted edit-and-save rounds. The editor re-sends
+        // its state every 5 s while it is open, so an unsaved edit still being
+        // previewed comes back on its own.
+        if (request->hasArg("bgAnimThemeMap") || request->hasArg("bgAnimGradients") || request->hasArg("bgAnimTheme") ||
+            request->hasArg("bgAnimId")) {
+            pluginManager->trigger("bganim:preview-end");
+        }
         controller->setTargetTemp(controller->getTargetTemp());
         controller->setScaleFactors();
         controller->setPumpModelCoeffs();
