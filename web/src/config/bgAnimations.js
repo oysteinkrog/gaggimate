@@ -143,6 +143,16 @@ export const BG_ANIMATIONS = [
       { key: 'turbulence', label: 'Turbulence', def: 40 },
     ],
   },
+  {
+    id: 'silk2',
+    name: 'Silk 2',
+    description: 'Light sweeping across flowing fabric, redesigned for speed.',
+    params: [
+      { key: 'speed', label: 'Speed', def: 50 },
+      { key: 'scale', label: 'Fringe density', def: 45 },
+      { key: 'glow', label: 'Sheen', def: 55 },
+    ],
+  },
 ];
 
 // Shared color themes — MUST mirror BgAnimThemes.cpp (append only, the theme
