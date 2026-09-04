@@ -4,6 +4,7 @@
 #define ELEGANTOTA_USE_ASYNC_WEBSERVER 1
 
 #include <DNSServer.h>
+#include <deque>
 
 #include "GitHubOTA.h"
 #include <ArduinoJson.h>
@@ -46,6 +47,8 @@ class WebUIPlugin : public Plugin {
     // Serves the web UI from the firmware-embedded, memory-mapped flash blob
     // (catch-all for any path not claimed by an explicit route). [GM-106]
     void serveWebAsset(AsyncWebServerRequest *request);
+    void startAssetStream(AsyncWebServerRequest *request);
+    void drainAssetQueue();
     void handleSettings(AsyncWebServerRequest *request) const;
     void handleBLEScaleList(AsyncWebServerRequest *request);
     void handleBLEScaleScan(AsyncWebServerRequest *request);
@@ -69,6 +72,12 @@ class WebUIPlugin : public Plugin {
     PluginManager *pluginManager = nullptr;
     DNSServer *dnsServer = nullptr;
     ProfileManager *profileManager = nullptr;
+
+    // Large-asset admission: how many big embedded assets stream at once, and
+    // the paused requests waiting for a slot (see serveWebAsset). Touched only
+    // from the async_tcp task (handlers and disconnect callbacks).
+    uint8_t assetStreams = 0;
+    std::deque<AsyncWebServerRequestPtr> assetQueue;
 
     long lastUpdateCheck = 0;
     long lastStatus = 0;

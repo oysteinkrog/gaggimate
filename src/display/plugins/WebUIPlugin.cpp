@@ -372,12 +372,13 @@ static const WebAsset *findWebAsset(const String &path) {
     return nullptr;
 }
 
-void WebUIPlugin::serveWebAsset(AsyncWebServerRequest *request) {
-    String path = request->url();
+// Maps a request URL to an embedded asset, filling `path` with the path that
+// was actually resolved. Returns nullptr for a genuine 404.
+static const WebAsset *resolveWebAsset(const String &url, String &path) {
+    path = url;
     if (path.isEmpty() || path == "/") {
         path = WEB_UI_INDEX_PATH;
     }
-
     const WebAsset *asset = findWebAsset(path);
     if (asset == nullptr && !path.startsWith("/assets/")) {
         // SPA client-side routes (e.g. /settings, /profiles) aren't real files —
@@ -385,9 +386,57 @@ void WebUIPlugin::serveWebAsset(AsyncWebServerRequest *request) {
         // route, so it is not rewritten.
         asset = findWebAsset(WEB_UI_INDEX_PATH);
     }
+    return asset;
+}
+
+// Every segment lwIP hands the WiFi driver becomes a ~1630-byte copy in
+// DMA-capable internal DRAM until it is on the air (the pbufs live in PSRAM
+// and the MAC cannot DMA from there), and a connection keeps up to
+// TCP_SND_BUF/MSS of them in flight. Big assets are the only responses that
+// stay in flight for long, so with N browsers cold-loading at once the
+// in-flight copies scale as N x (JS + CSS + logo) x 4 segments: three tabs
+// drained the 50 kB pool to under 400 bytes and logged 51 failed WiFi
+// allocations (2026-09-04). Capping how many big assets stream at once
+// bounds that term regardless of tab count; the rest of the traffic is
+// short JSON and websocket frames that finish within a round trip. Extra
+// requests are parked with request continuation and resumed as slots free
+// up, so nothing is refused. Everything here runs on the async_tcp task.
+static constexpr uint8_t kMaxAssetStreams = 3;
+static constexpr uint32_t kAssetGateMinBytes = 8192;
+
+void WebUIPlugin::serveWebAsset(AsyncWebServerRequest *request) {
+    String path;
+    const WebAsset *asset = resolveWebAsset(request->url(), path);
     if (asset == nullptr) {
         request->send(404, "text/plain", "Not found");
         return;
+    }
+    if (asset->length >= kAssetGateMinBytes && assetStreams >= kMaxAssetStreams) {
+        assetQueue.push_back(request->pause());
+        return;
+    }
+    startAssetStream(request);
+}
+
+void WebUIPlugin::startAssetStream(AsyncWebServerRequest *request) {
+    String path;
+    const WebAsset *asset = resolveWebAsset(request->url(), path);
+    if (asset == nullptr) {
+        request->send(404, "text/plain", "Not found");
+        return;
+    }
+    if (asset->length >= kAssetGateMinBytes) {
+        assetStreams++;
+        // Fires on normal completion too: the server closes the client once a
+        // response has been acked in full (AsyncWebServerRequest::_onAck), and
+        // AsyncTCP runs the disconnect callback on errors as well as closes,
+        // so every slot taken here is given back.
+        request->onDisconnect([this]() {
+            if (assetStreams > 0) {
+                assetStreams--;
+            }
+            drainAssetQueue();
+        });
     }
 
     // Serve straight from the memory-mapped flash blob — no copy into RAM, no
@@ -405,6 +454,17 @@ void WebUIPlugin::serveWebAsset(AsyncWebServerRequest *request) {
         response->addHeader("Cache-Control", "no-cache");
     }
     request->send(response);
+}
+
+void WebUIPlugin::drainAssetQueue() {
+    while (assetStreams < kMaxAssetStreams && !assetQueue.empty()) {
+        auto waiting = assetQueue.front().lock();
+        assetQueue.pop_front();
+        if (!waiting) {
+            continue; // the browser gave up while parked; the request is already gone
+        }
+        startAssetStream(waiting.get());
+    }
 }
 
 // Counters exported by the patched esp_lcd RGB driver (scripts/patch_esp_lcd_rgb.py).
@@ -557,7 +617,7 @@ void WebUIPlugin::setupServer() {
     });
 #endif
 
-    server.on("/api/debug/heap", [](AsyncWebServerRequest *request) {
+    server.on("/api/debug/heap", [this](AsyncWebServerRequest *request) {
     // anim_sram is the committed part of the animation budget and
     // anim_budget its ceiling. The gap between them is the important
     // figure: alloc() never frees, so every animation the user visits
@@ -583,11 +643,12 @@ void WebUIPlugin::setupServer() {
         // the fault is far too rare to catch by looking at it.
         uint32_t scFrames = 0, scRefills = 0, scSlips = 0;
         panelclock::scanoutStats(&scFrames, &scRefills, &scSlips);
-        char buf[420];
+        char buf[512];
         snprintf(buf, sizeof(buf),
                  "{\"int_free\":%u,\"int_largest\":%u,\"int_min\":%u,\"psram_free\":%u,\"psram_largest\":%u,"
                  "\"anim_sram\":%u,\"anim_psram\":%u,\"anim_budget\":%u,"
-                 "\"sc_frames\":%u,\"sc_refills\":%u,\"sc_slips\":%u}",
+                 "\"sc_frames\":%u,\"sc_refills\":%u,\"sc_slips\":%u,"
+                 "\"dma_free\":%u,\"dma_min\":%u,\"asset_streams\":%u,\"asset_queue\":%u}",
                  // heap_caps_get_largest_free_block walks every block in the heap,
                  // which costs about 1.3 ms across both regions and starves the
                  // RGB panel's bounce refill for the duration -- one displaced
@@ -602,7 +663,10 @@ void WebUIPlugin::setupServer() {
                  static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_SPIRAM)),
                  static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM)), static_cast<unsigned>(animSram),
                  static_cast<unsigned>(animPsram), static_cast<unsigned>(bganim::SRAM_TOTAL_BUDGET),
-                 static_cast<unsigned>(scFrames), static_cast<unsigned>(scRefills), static_cast<unsigned>(scSlips));
+                 static_cast<unsigned>(scFrames), static_cast<unsigned>(scRefills), static_cast<unsigned>(scSlips),
+                 static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_DMA)),
+                 static_cast<unsigned>(heap_caps_get_minimum_free_size(MALLOC_CAP_DMA)), static_cast<unsigned>(assetStreams),
+                 static_cast<unsigned>(assetQueue.size()));
         request->send(200, "application/json", buf);
     });
     // Which slips happened, and how long before each one the suspects last ran.

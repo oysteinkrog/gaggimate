@@ -157,37 +157,50 @@ CONFIG_MBEDTLS_HKDF_C=y
 CONFIG_LWIP_TCPIP_CORE_LOCKING=y
 CONFIG_LWIP_CHECK_THREAD_SAFETY=y
 
-# Two segments in flight per connection, not four. This is a memory setting
-# wearing a throughput costume.
+# Four segments in flight per connection for the send side, two for receive.
+# This is a memory setting wearing a throughput costume.
 #
 # SPIRAM_TRY_ALLOCATE_WIFI_LWIP puts lwIP's pbufs in PSRAM, and the WiFi MAC
 # cannot DMA out of PSRAM, so every outgoing segment is first copied into an
-# internal DMA-capable "cache TX" buffer of about 1630 bytes. Those come out of
-# the same ~12 kB DMA-capable pool the radios and the LCD bounce buffers live
-# in. At the 5760-byte default each connection can have four segments in
-# flight, so two connections are enough to claim the whole pool.
+# internal DMA-capable buffer of about 1630 bytes (the allocation that fails
+# under load, caps 0x80c). Each connection can hold TCP_SND_BUF/MSS of them
+# at once, so the send buffer times the connection count is the DMA-capable
+# transient a burst of browser traffic can take.
 #
-# Measured on the shipping build, browser-shaped load over the real 105 kB of
-# web UI assets (61 kB JS, 29 kB CSS, 12.9 kB PNG):
-#   1 connection:   28/28 requests ok
-#   4 connections:  61/84 ok, 23 timed out
-#   8 connections:  71/168 ok
-#   16 connections: 27/224 ok
-# with 547 failed allocations, 522 of them the 1630-byte cache TX buffer, and
-# DMA-capable free driven from 12.3 kB down to a 247-byte low-water mark. The
-# collateral damage reached past the web server: UDP sends returned ENOMEM, DNS
-# lookups failed, and the STA reported ESP_ERR_WIFI_STATE. A browser opens six
-# parallel connections, which is exactly the failing case.
+# History. At 5760 (the default) with ~12 kB of DMA-capable free, the
+# shipping build lost a two-tab load outright: 547 failed allocations, DMA
+# free driven to a 247-byte low-water mark, UDP sends returning ENOMEM, DNS
+# failing, the STA reporting ESP_ERR_WIFI_STATE. 2880 was the fix, and it
+# held while the assets were 61 kB of JS.
 #
-# 2880 costs nothing that matters here. On a LAN at a few ms RTT it still
-# permits roughly half a megabyte per second per connection, and the largest
-# asset is 61 kB.
+# The bundle is 437 kB now and the link is round-trip bound: with BLE coex
+# and modem sleep the effective RTT is ~18 ms, so two segments in flight is
+# ~160 kB/s and the bundle takes 2.75 s on one connection. Four segments
+# takes it to 1.39 s (10-run means, IRAM opts on) and a two-tab browser load
+# from 3.5 s to 2.3 s. The headroom that pays for it is the stack and IRAM
+# reclaim of 2026-09-03/04: idle DMA-capable free is ~49 kB, not 12. Measured
+# transient at 5760 with nothing else bounding it: a two-tab cold load takes
+# ~36 kB, three tabs ~40-49 kB (the driver takes what it can get), and with
+# the IRAM opts still on (39 kB pool) three tabs drove DMA free to 276 bytes
+# and logged 73 failed allocations, which is why the two settings above and
+# below travel together. The transient scales with connections, so the
+# other half of the fix is in WebUIPlugin: at most three big embedded assets
+# stream at once (kMaxAssetStreams), the rest wait. With that, two tabs
+# bottom out at ~22 kB internal free, three at ~20 kB, four at ~11 kB with a
+# handful of refused WiFi TX allocations and no failed requests. Assets are
+# served immutable, so a cold load happens once per browser per firmware
+# version; the everyday warm load is index.html plus JSON and does not
+# approach any of this.
+#
+# The receive window stays at 2880: uploads are the settings POST and OTA,
+# and the receive side has no PSRAM-copy cost to bound. Raising it is the
+# lever if OTA upload speed ever matters.
 CONFIG_LWIP_TCP_WND_DEFAULT=2880
-CONFIG_LWIP_TCP_SND_BUF_DEFAULT=2880
-# 2880 is the floor, not a choice. lwIP requires the send buffer to hold at
-# least two maximum segments, so 1440 (one segment) is rejected and the value
-# silently falls all the way back to the 5760 default. The build guard catches
-# it; do not "optimise" this downwards.
+CONFIG_LWIP_TCP_SND_BUF_DEFAULT=5760
+# 2880 is the floor for either value, not a choice. lwIP requires the send
+# buffer to hold at least two maximum segments, so 1440 (one segment) is
+# rejected and the value silently falls all the way back to the 5760 default.
+# The build guard catches it; do not "optimise" this downwards.
 
 # --- Admission control does not help: measured ---
 # Capping active PCBs at 10 with TCP_MSL cut to 5 s, on the theory that fewer
