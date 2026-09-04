@@ -1,4 +1,8 @@
 #include "PluginManager.h"
+#if GAGGIMATE_HEAP_PROFILE
+#include <cstdio>
+#include <display/core/utils.h> // heap_checkpoint
+#endif
 
 void PluginManager::registerPlugin(Plugin *plugin) { plugins.push_back(plugin); }
 
@@ -7,8 +11,15 @@ void PluginManager::setup(Controller *controller) {
     on("system:dummy", [](const Event &) {
         // Register a dummy event so the event map is initialized properly
     });
-    for (const auto &plugin : plugins) {
-        plugin->setup(controller, this);
+    for (size_t i = 0; i < plugins.size(); i++) {
+        plugins[i]->setup(controller, this);
+#if GAGGIMATE_HEAP_PROFILE
+        // Plugins carry no name; the index follows the registerPlugin order
+        // in Controller::setup.
+        char label[24];
+        snprintf(label, sizeof(label), "plugin/%u", static_cast<unsigned>(i));
+        heap_checkpoint(label);
+#endif
     }
     initialized = true;
 }

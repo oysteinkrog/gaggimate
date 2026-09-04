@@ -43,6 +43,7 @@ extern uint32_t nebula_lerp_self_test(uint32_t *firstBad);
 #include <esp_core_dump.h>
 #include <esp_err.h>
 #include <esp_heap_caps.h>
+#include <esp_private/freertos_debug.h> // uxTaskGetSnapshotAll, for /api/debug/heapmap
 #include <esp_partition.h>
 #include <esp_timer.h>
 #include <mbedtls/platform.h>
@@ -819,6 +820,171 @@ void WebUIPlugin::setupServer() {
                              static_cast<unsigned>(ev.pc), static_cast<unsigned>(ev.ps), task, other);
         }
         response->print("]}");
+        request->send(response);
+    });
+    // What the internal heap is made of. The free/min counters say how much
+    // is left, not where the rest went, and the WiFi TX path dies at ~8 KB
+    // of DMA-capable free, so reclaiming memory needs the composition: per
+    // region (the 8 KB RTC-fast region is internal but not DMA-capable,
+    // which is why int_largest can sit at 7.6 KB while a 1.6 KB TX buffer
+    // fails), a histogram of used block sizes (1600 B x16 is the static WiFi
+    // RX pool, 4-8 KB blocks are task stacks), and, in a build with
+    // CONFIG_HEAP_TASK_TRACKING, per-task totals. Walks every block under the
+    // heap lock: same cost class as heapwalk, debug use only.
+    server.on("/api/debug/heapmap", [](AsyncWebServerRequest *request) {
+        struct Region {
+            intptr_t start, end;
+            size_t used, free_, usedBlocks, freeBlocks, largestFree;
+        };
+        struct Bucket {
+            size_t size, count;
+        };
+        struct Big {
+            uintptr_t ptr;
+            size_t size;
+        };
+        struct Walk {
+            Region regions[8];
+            int nRegions;
+            Bucket buckets[192];
+            int nBuckets;
+            size_t overflowBytes, overflowBlocks;
+            // Every used block of 1 KB or more, so task stacks can be
+            // matched to their allocation afterwards.
+            Big big[160];
+            int nBig;
+        };
+        auto *w = static_cast<Walk *>(heap_caps_calloc(1, sizeof(Walk), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+        if (w == nullptr) {
+            request->send(500, "application/json", "{\"error\":\"alloc\"}");
+            return;
+        }
+        // Runs with the heap locked: no allocation in here.
+        heap_caps_walk(
+            MALLOC_CAP_INTERNAL,
+            [](walker_heap_into_t h, walker_block_info_t b, void *ud) -> bool {
+                auto *w = static_cast<Walk *>(ud);
+                Region *r = nullptr;
+                for (int i = 0; i < w->nRegions; i++) {
+                    if (w->regions[i].start == h.start) {
+                        r = &w->regions[i];
+                    }
+                }
+                if (r == nullptr && w->nRegions < 8) {
+                    r = &w->regions[w->nRegions++];
+                    r->start = h.start;
+                    r->end = h.end;
+                }
+                if (r != nullptr) {
+                    if (b.used) {
+                        r->used += b.size;
+                        r->usedBlocks++;
+                    } else {
+                        r->free_ += b.size;
+                        r->freeBlocks++;
+                        if (b.size > r->largestFree) {
+                            r->largestFree = b.size;
+                        }
+                    }
+                }
+                if (b.used) {
+                    if (b.size >= 1024 && w->nBig < 160) {
+                        w->big[w->nBig++] = Big{reinterpret_cast<uintptr_t>(b.ptr), b.size};
+                    }
+                    for (int i = 0; i < w->nBuckets; i++) {
+                        if (w->buckets[i].size == b.size) {
+                            w->buckets[i].count++;
+                            return true;
+                        }
+                    }
+                    if (w->nBuckets < 192) {
+                        w->buckets[w->nBuckets++] = Bucket{b.size, 1};
+                    } else {
+                        w->overflowBytes += b.size;
+                        w->overflowBlocks++;
+                    }
+                }
+                return true;
+            },
+            w);
+        std::sort(w->buckets, w->buckets + w->nBuckets,
+                  [](const Bucket &a, const Bucket &b) { return a.size * a.count > b.size * b.count; });
+        AsyncResponseStream *response = request->beginResponseStream("application/json");
+        response->print("{\"regions\":[");
+        for (int i = 0; i < w->nRegions; i++) {
+            const Region &r = w->regions[i];
+            response->printf("%s{\"start\":\"0x%08x\",\"end\":\"0x%08x\",\"size\":%u,\"used\":%u,\"free\":%u,\"largest_free\":%u,"
+                             "\"used_blocks\":%u,\"free_blocks\":%u}",
+                             i ? "," : "", static_cast<unsigned>(r.start), static_cast<unsigned>(r.end),
+                             static_cast<unsigned>(r.end - r.start), static_cast<unsigned>(r.used), static_cast<unsigned>(r.free_),
+                             static_cast<unsigned>(r.largestFree), static_cast<unsigned>(r.usedBlocks),
+                             static_cast<unsigned>(r.freeBlocks));
+        }
+        response->printf("],\"overflow_bytes\":%u,\"overflow_blocks\":%u,\"sizes\":[", static_cast<unsigned>(w->overflowBytes),
+                         static_cast<unsigned>(w->overflowBlocks));
+        const int shown = std::min(w->nBuckets, 80);
+        for (int i = 0; i < shown; i++) {
+            response->printf("%s[%u,%u]", i ? "," : "", static_cast<unsigned>(w->buckets[i].size),
+                             static_cast<unsigned>(w->buckets[i].count));
+        }
+        response->print("]");
+        // Task stacks, matched to the heap block that holds them: the
+        // snapshot walk gives each task's stack end (its highest address,
+        // fixed for the task's life, unlike the saved stack pointer), and the
+        // block containing it is the stack allocation, so that block's size is
+        // the stack size. A stack outside the internal heap (loopLogic and the
+        // animation tasks, in PSRAM) reports -1. uxTaskGetSystemState would
+        // need the trace facility, which production builds leave off; the
+        // panic handler's snapshot walk is always there but takes no locks, so
+        // the scheduler is held off around it and everything that touches a
+        // TCB (name, high-water mark) is read inside that window, into a
+        // copy, so a task that exits afterwards cannot leave a dangling
+        // handle in the loop that prints. vTaskSuspendAll holds off this core
+        // only; the other core can still create or delete a task meanwhile.
+        // Every task here is created at boot and lives as long as the
+        // firmware, which is what makes that acceptable for a diagnostic
+        // somebody fetches by hand. Do not poll it. (CONFIG_HEAP_TASK_TRACKING
+        // was tried for per-task totals and deadlocks IDF 5.5 inside
+        // vQueueDelete; do not retry.)
+        struct TaskRow {
+            char name[configMAX_TASK_NAME_LEN];
+            uintptr_t stackEnd;
+            uint32_t hwm;
+        };
+        const UBaseType_t cap = uxTaskGetNumberOfTasks() + 4;
+        auto *st = static_cast<TaskSnapshot_t *>(heap_caps_malloc(sizeof(TaskSnapshot_t) * cap, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+        auto *rows = static_cast<TaskRow *>(heap_caps_malloc(sizeof(TaskRow) * cap, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+        if (st != nullptr && rows != nullptr) {
+            vTaskSuspendAll();
+            const UBaseType_t live = uxTaskGetSnapshotAll(st, cap, nullptr);
+            for (UBaseType_t j = 0; j < live; j++) {
+                auto handle = static_cast<TaskHandle_t>(st[j].pxTCB);
+                strlcpy(rows[j].name, pcTaskGetName(handle), sizeof(rows[j].name));
+                rows[j].stackEnd = reinterpret_cast<uintptr_t>(st[j].pxEndOfStack);
+                rows[j].hwm = uxTaskGetStackHighWaterMark(handle);
+            }
+            xTaskResumeAll();
+            response->print(",\"tasks\":[");
+            for (UBaseType_t j = 0; j < live; j++) {
+                // pxEndOfStack points at the last word of the stack, inside
+                // the allocation.
+                const uintptr_t top = rows[j].stackEnd;
+                int stack = -1;
+                for (int i = 0; i < w->nBig; i++) {
+                    if (top >= w->big[i].ptr && top < w->big[i].ptr + w->big[i].size) {
+                        stack = static_cast<int>(w->big[i].size);
+                    }
+                }
+                response->printf("%s{\"n\":\"%s\",\"stack\":%d,\"hwm\":%u,\"psram\":%s}", j ? "," : "", rows[j].name, stack,
+                                 static_cast<unsigned>(rows[j].hwm),
+                                 esp_ptr_external_ram(reinterpret_cast<void *>(top)) ? "true" : "false");
+            }
+            response->print("]");
+        }
+        free(rows);
+        free(st);
+        response->print("}");
+        free(w);
         request->send(response);
     });
     // Times a full heap walk over each region, which is what a memory sample
