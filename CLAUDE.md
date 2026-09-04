@@ -166,8 +166,9 @@ survived, and what the device taught:
   lost to keeping the index in a register. The kernels that won transcribed
   GCC's loop first and then found an edge (orbits 2.0x, caustics 1.5x,
   nebula 1.3x, ripples 3x to 5x depending on ring state). Silk's kernels are
-  in the file but off (`GM_BGANIM_SILK_ASM 0`) and lava ships none: after
-  three rounds neither beat its own bandRef on the device.
+  in the file but off (`GM_BGANIM_SILK_ASM 0`; since the 16-pixel grid a
+  static_assert stops the flag building until they are ported) and lava
+  ships none: after three rounds neither beat its own bandRef on the device.
 - **Every kernel keeps its portable C++ as `bandRef` on the BgAnimation
   struct**, and the ladder to change one is: host goldens exact
   (`tools/animbench make check`), the real device compiler's disassembly
@@ -193,6 +194,42 @@ survived, and what the device taught:
   pointer; `allocHot` returns 16-byte-aligned tables for this reason.
 - BAND_H is 2 (240 band() calls per frame), so per-call setup is paid 240
   times: a kernel's row-state builder is as hot as its pixel loop.
+- **Iterate on the device, not on predictions**: the `display-kdev` env
+  hot-loads one animation source over HTTP into an IRAM buffer and times it
+  with the cycle counter (`tools/kblob/kb.py run Anim<X>.cpp --anim N`,
+  README alongside). Blob and firmware variants are timed in turn with the
+  whole hot slab each, min-of-n per band, and hashed against the firmware's
+  band() for equality; a round is seconds, not a flash. It needs memory
+  protection off (sdkconfig.kdev.defaults), so it is a bench env and never
+  a production knob, and it idles 16 KB lower on internal free than
+  production. `pio run -t compiledb` recreates the env's build tree (ELF
+  included) and writes the one project-wide compile_commands.json, so run
+  it before the build, not after, and never for another env in between.
+  Three things the first evening on it taught: never reflash the board
+  while a round is running (the `band` rows become a snapshot of whatever
+  the tree held at build time, and one worker spent an hour comparing
+  against its own change); a `kb: LEAK` line means a table without a
+  `release()`, and until the bench learned to reset the slab one leaking
+  candidate put every later bench on that boot into PSRAM (nebula 1.7x
+  slower, silently); and for an animation whose `frame()` carries state
+  (nebula's scroll, starfield's RNG) the check that holds is blobref vs
+  blob, not blob vs the firmware, whose globals hold the panel's history.
+  The rig also settles where a frame goes, which the loop body cannot:
+  silk's per-pixel body was already one add, one shift, one gather and one
+  store, yet the frame was 13.4 ms, and five probe blobs in twenty minutes
+  (probe off, grid 16, grid 32, pairs, both) showed the per-cell node work
+  was a third of it and the exact fallback 0.7 ms. Grid 16 plus paired
+  stores took it to 8.2 ms with the picture unchanged (goldens moved 2.0 of
+  255, all of it the dither grain going 2x1); a redesign for the same speed
+  (Silk 2, four rounds) never matched the look.
+- **The fuzzer is only a fuzzer with the sanitizers on**
+  (`tools/animbench/Makefile.fuzz`, run with
+  `ASAN_OPTIONS=verify_asan_link_order=0` on WSL1). Without ASan a
+  one-entry table overrun reads the neighbouring byte and passes; that is
+  how silk shipped a palette pad of 4 against a dither amplitude that
+  ditherAmp() caps at 16, reading past its LUT at the default parameters.
+  Any animation with an unclamped, padded gather sizes its pad from that
+  cap, and a change to a table's layout re-runs the fuzz for the fleet.
 
 ## Measuring the display rig
 

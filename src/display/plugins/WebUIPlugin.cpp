@@ -36,6 +36,9 @@ extern uint32_t nebula_lerp_self_test(uint32_t *firstBad);
 #include <display/drivers/common/PanelClock.h>
 #include <display/ui/default/bganim/BgAnim.h> // bg_library_valid / bg_map_valid for the settings writer
 #include <display/ui/default/bganim/BgAnimCommon.h>
+#ifdef GM_KBLOB
+#include <display/ui/default/bganim/KBlob.h>
+#endif
 #include <display/util/PsramStlAllocator.h>
 #include <display/util/PsramWsBuffer.h>
 #include <display/webassets/web_ui_manifest.h>
@@ -1170,6 +1173,169 @@ void WebUIPlugin::setupServer() {
                  static_cast<unsigned>(r.firstWant), static_cast<unsigned>(r.bandUs), static_cast<unsigned>(r.refUs));
         request->send(200, "application/json", buf);
     });
+#ifdef GM_KBLOB
+    // Hot-loaded kernel blob (bganim/KBlob.h, tools/kblob/kb.py).
+    //
+    //   GET  /api/debug/kblob   the two buffer addresses and capacities the
+    //                           host links against, the running firmware's
+    //                           ELF sha (the blob must be linked against the
+    //                           same ELF), and what is installed.
+    //   POST /api/debug/kblob   the container image as the raw body. The
+    //                           render task is asked to let go of the current
+    //                           blob first (SleepAnimation::kblobBeginInstall);
+    //                           a blob that stays resident, because the
+    //                           animation is stopped, refuses with 409.
+    //
+    // The body is staged in one PSRAM block hung on request->_tempObject and
+    // installed from the request handler, which the server calls once the
+    // last byte is parsed. A malloc'd block rather than an object because the
+    // request destructor free()s _tempObject itself, which is what reclaims
+    // the staging of an upload the client abandoned halfway.
+    struct KBlobStage {
+        uint32_t cap;
+        uint32_t len;
+        uint8_t data[];
+    };
+    server.on(
+        "/api/debug/kblob", HTTP_GET | HTTP_POST,
+        [](AsyncWebServerRequest *request) {
+            bool ok = true;
+            String err;
+            int status = 200;
+            if (request->method() == HTTP_POST) {
+                auto *stage = static_cast<KBlobStage *>(request->_tempObject);
+                request->_tempObject = nullptr;
+                if (stage == nullptr || stage->len != stage->cap) {
+                    ok = false;
+                    err = stage == nullptr ? "no body (or over the 64 KB cap)" : "body shorter than announced";
+                    status = 400;
+                } else {
+                    SleepAnimation *a = sleep_animation_bench_instance();
+                    if (a != nullptr && !a->kblobBeginInstall(2000)) {
+                        ok = false;
+                        err = "blob still resident (animation stopped with it active?)";
+                        status = 409;
+                    } else {
+                        if (!kblob::install(stage->data, stage->len)) {
+                            ok = false;
+                            err = kblob::info().err;
+                            status = 422;
+                        }
+                        if (a != nullptr) {
+                            a->kblobEndInstall();
+                        }
+                    }
+                }
+                heap_caps_free(stage);
+            }
+            const kblob::Info i = kblob::info();
+            JsonDocument doc(&psramAllocator);
+            doc["ok"] = ok;
+            if (!ok) {
+                doc["error"] = err;
+            }
+            doc["text_base"] = i.textBase;
+            doc["text_cap"] = i.textCap;
+            doc["data_base"] = i.dataBase;
+            doc["data_cap"] = i.dataCap;
+            doc["fw_sha"] = i.fwSha;
+            doc["loaded"] = i.loaded;
+            doc["gen"] = i.gen;
+            doc["name"] = i.name;
+            doc["text_size"] = i.textSize;
+            doc["data_size"] = i.dataSize;
+            doc["bss_size"] = i.bssSize;
+            doc["last_err"] = i.err;
+            SleepAnimation *a = sleep_animation_bench_instance();
+            doc["resident"] = a != nullptr && a->kblobResident();
+            doc["useblob"] = a != nullptr && a->useBlobOn();
+            AsyncResponseStream *response = request->beginResponseStream("application/json");
+            response->setCode(status);
+            serializeJson(doc, *response);
+            request->send(response);
+        },
+        nullptr,
+        [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total) {
+            constexpr size_t kMaxImage = 64 * 1024;
+            if (index == 0) {
+                heap_caps_free(request->_tempObject);
+                request->_tempObject = nullptr;
+                if (total == 0 || total > kMaxImage) {
+                    return;
+                }
+                auto *stage = static_cast<KBlobStage *>(heap_caps_malloc(sizeof(KBlobStage) + total, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+                if (stage == nullptr) {
+                    return;
+                }
+                stage->cap = static_cast<uint32_t>(total);
+                stage->len = 0;
+                request->_tempObject = stage;
+            }
+            auto *stage = static_cast<KBlobStage *>(request->_tempObject);
+            if (stage == nullptr || len > stage->cap - stage->len) {
+                return;
+            }
+            memcpy(stage->data + stage->len, data, len);
+            stage->len += static_cast<uint32_t>(len);
+        });
+
+    // Cycle-count microbench (SleepAnimation::requestKBench). ?anim=N
+    // [&n=8][&frames=2][&which=15] queues a run and returns at once; a plain
+    // GET returns the last result, `pending` true while one is queued. which
+    // is a bit mask: 1 firmware band(), 2 firmware bandRef(), 4 blob band(),
+    // 8 blob bandRef(). Cycles are at the CPU clock (240 MHz); min_cyc is the
+    // sum over bands of the best of n runs, first_cyc the sum of the first
+    // runs, mean_cyc the mean over all runs. mismatch_bands compares each
+    // variant's output hash with the firmware band()'s when both ran.
+    server.on("/api/debug/kbench", [](AsyncWebServerRequest *request) {
+        SleepAnimation *a = sleep_animation_bench_instance();
+        if (a == nullptr) {
+            request->send(409, "application/json", "{\"error\":\"animation not running\"}");
+            return;
+        }
+        if (request->hasArg("anim")) {
+            const int id = request->arg("anim").toInt();
+            if (id < 0 || id >= bg_animation_count()) {
+                request->send(400, "application/json", "{\"error\":\"bad anim\"}");
+                return;
+            }
+            a->requestKBench(id, request->hasArg("n") ? request->arg("n").toInt() : 8,
+                             request->hasArg("frames") ? request->arg("frames").toInt() : 2,
+                             request->hasArg("which") ? static_cast<uint32_t>(request->arg("which").toInt()) : 15u);
+        }
+        const SleepAnimation::KBenchResult r = a->kbenchResult();
+        JsonDocument doc(&psramAllocator);
+        doc["pending"] = a->kbenchPending();
+        doc["seq"] = r.seq;
+        doc["anim"] = r.anim;
+        doc["id"] = r.anim >= 0 ? bg_animation(r.anim).id : "";
+        doc["frames"] = r.frames;
+        doc["n"] = r.n;
+        doc["which"] = r.which;
+        doc["cpu_mhz"] = getCpuFrequencyMhz();
+        doc["hot_leak_before"] = r.hotLeakBefore;
+        doc["hot_leak_fw"] = r.hotLeakFw;
+        doc["hot_leak_blob"] = r.hotLeakBlob;
+        static const char *const names[4] = {"band", "ref", "blob", "blobref"};
+        for (int vi = 0; vi < 4; vi++) {
+            const SleepAnimation::KBenchVariant &v = r.v[vi];
+            JsonObject o = doc[names[vi]].to<JsonObject>();
+            o["ran"] = v.ran;
+            o["init_failed"] = v.initFailed;
+            o["bands"] = v.bands;
+            o["min_cyc"] = v.minCyc;
+            o["first_cyc"] = v.firstCyc;
+            o["mean_cyc"] = r.n > 0 ? v.sumCyc / static_cast<uint64_t>(r.n) : 0;
+            o["mismatch_bands"] = v.mismatchBands;
+            o["first_mismatch_frame"] = v.firstMismatchFrame;
+            o["first_mismatch_y"] = v.firstMismatchY;
+            o["mismatch_vs_blob"] = v.mismatchVsBlob;
+        }
+        AsyncResponseStream *response = request->beginResponseStream("application/json");
+        serializeJson(doc, *response);
+        request->send(response);
+    });
+#endif // GM_KBLOB
     server.on("/api/debug/anim", [](AsyncWebServerRequest *request) {
         SleepAnimation *a = sleep_animation_bench_instance();
         if (a == nullptr) {
@@ -1239,6 +1405,14 @@ void WebUIPlugin::setupServer() {
         if (request->hasArg("useref")) {
             a->setUseBandRef(request->arg("useref").toInt() != 0);
         }
+#ifdef GM_KBLOB
+        // useblob=0|1 renders through the hot-loaded blob's descriptor
+        // (/api/debug/kblob) instead of the stored animation: the visual
+        // check and the production A/B for a kernel that was never flashed.
+        if (request->hasArg("useblob")) {
+            a->setUseBlob(request->arg("useblob").toInt() != 0);
+        }
+#endif
         // reserve=N sets the internal-DRAM reserve the render task's band
         // buffers are gated on (bganim::internalHasRoomFor): 0 forces them
         // internal, anything above the pool forces them to PSRAM. Tables are
@@ -1294,6 +1468,10 @@ void WebUIPlugin::setupServer() {
         doc["dma"] = a->dmaPathWanted();
         doc["rprio"] = a->renderPrioValue();
         doc["useref"] = a->useBandRefOn();
+#ifdef GM_KBLOB
+        doc["useblob"] = a->useBlobOn();
+        doc["blob_resident"] = a->kblobResident();
+#endif
         doc["reserve"] = static_cast<uint32_t>(bganim::internalReserve());
         doc["anim_sram"] = static_cast<uint32_t>(bganim::g_allocSram);
         doc["anim_psram"] = static_cast<uint32_t>(bganim::g_allocPsram);

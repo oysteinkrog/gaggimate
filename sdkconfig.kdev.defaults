@@ -1,0 +1,19 @@
+# Kernel-development override, layered AFTER sdkconfig.gaggimate.defaults for
+# display-kdev only (platformio.ini).
+#
+# Memory protection off. The kdev build hot-loads animation code over HTTP into
+# a buffer inside .iram0.text and writes it through the buffer's DRAM alias
+# (src/display/ui/default/bganim/KBlob.cpp). With the PMS on, the IRAM half of
+# SRAM1 is execute-only from the instruction bus and its DRAM alias faults on
+# a write, which is exactly the W^X guarantee production keeps. Nothing else
+# in the build reads or times differently with the checks off: the PMS is a
+# permission filter on the bus, not a cache or an arbiter, so kbench cycle
+# counts taken on this build transfer to the production build.
+#
+# FEATURE_LOCK depends on FEATURE and disappears with it; no line needed.
+CONFIG_ESP_SYSTEM_MEMPROT_FEATURE=n
+
+# The blob loader refuses an image linked against any ELF but the running one,
+# by comparing sha256(firmware.elf) prefixes. The default retrieval length is
+# 9 hex digits; 16 makes the check use the whole 8-byte header field.
+CONFIG_APP_RETRIEVE_LEN_ELF_SHA=16

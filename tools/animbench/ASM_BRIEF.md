@@ -169,14 +169,29 @@ in QEMU first (see below) and say in your report that you did.
    on the verified list, write a one-instruction QEMU probe for it first;
    an unimplemented instruction shows up as garbage or an exception dump,
    never as a quiet pass.
-4. Device (leader runs this; you cannot flash): `/api/debug/animtest?anim=N`
-   renders 8 frames x 3 parameter sets (defaults, all 0, all 100) through
-   band() and bandRef() on the real chip and reports `mismatch_px` (must be
-   0), the first differing pixel, and `band_us` vs `ref_us` (your kernel's
-   speedup free of preemption noise, since both run back to back).
-   `anim_devbench.py N` gives the production band_us. Report your kernel
-   ready when rungs 1-3 hold; the leader flashes, runs rung 4 for the
-   fleet, and sends you the numbers or the first mismatch to fix.
+4. Device, self-service (tools/kblob/README.md): the bench board runs the
+   display-kdev build, which hot-loads one animation source over HTTP and
+   times it with the CPU cycle counter, no flash involved.
+
+       tools/kblob/kb.py run src/display/ui/default/bganim/Anim<X>.cpp --anim <N>
+
+   compiles your file with the firmware's own flags, links it against the
+   running firmware, uploads it and prints ms per frame for the firmware's
+   band() and bandRef() and for your file's band() (`blob`) and bandRef()
+   (`blobref`), min-of-8 per band summed over the frame, plus whether each
+   variant's pixels equal the firmware band()'s. Your two numbers are
+   `blob` vs `blobref` (your asm against your C++ reference, same placement)
+   and `blob` vs `band` (against what is flashed). Iterate on this; it is a
+   few seconds per round and the device is shared through a lock, so keep
+   to `kb.py run` (build + upload + bench as one unit) and expect to wait a
+   little when others are on it. The blob must compile from your one file
+   with what the firmware exports: a new bganim helper means a flash, so
+   put it in your report instead. Do not touch `useblob` (the live panel);
+   the leader uses that for the visual check and the production A/B.
+
+   The final word is still the leader's flash: `/api/debug/animtest?anim=N`
+   (8 frames x 3 parameter sets through band() and bandRef(), `mismatch_px`
+   must be 0) and `anim_devbench.py N` for the production band_us.
 
 ## Hard constraints
 
@@ -189,10 +204,12 @@ in QEMU first (see below) and say in your report that you did.
 - Public contract unchanged: registry id, name, param defs and semantics,
   init/frame/band/release signatures, theme reactivity (poll
   bganim::themeGen() in frame() and rebuild palettes on change).
-- Memory: `bganim::alloc` and `SRAM_TOTAL_BUDGET` (28 KB fleet ceiling,
-  8 KB per-table SRAM limit) are the law; every table you add gets a
-  matching entry in release(). Internal SRAM is what the web UI lives on
-  (see CLAUDE.md "Internal DRAM budget"); do not raise limits.
+- Memory: per-pixel and per-row tables come from `bganim::allocHot`
+  (9,216 B per animation, BgAnimCommon.h says what qualifies), everything
+  else from `bganim::alloc` (PSRAM); every table you add gets a matching
+  entry in release(). Internal SRAM is what the web UI lives on (see
+  CLAUDE.md "Internal DRAM budget"); do not raise limits, and never add a
+  static table (that is BSS the web UI pays for on every boot).
 - No commit. Leave your files modified; the leader builds the firmware,
   flashes, runs rung 4 and commits.
 - Comment style as in the file: algorithm and fixed-point scheme at the top

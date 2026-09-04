@@ -8,6 +8,7 @@
 #endif
 
 class Display;
+struct BgAnimation;
 
 #ifdef GAGGIMATE_SIM
 // The simulator has no panel/FreeRTOS; stub the whole feature out.
@@ -512,6 +513,107 @@ class SleepAnimation {
         return r;
     }
 
+#ifdef GM_KBLOB
+    // ---- hot-loaded kernel blob (bganim/KBlob.h, tools/kblob) -------------
+    // The blob is addressed as one more animation slot: renderFrame() and the
+    // benches resolve slots through animBySlot(), and the resident/initialised
+    // bookkeeping treats KBLOB_SLOT like any registry id, so switching to or
+    // away from the blob releases and re-inits tables the same way switching
+    // animations does.
+    static constexpr int KBLOB_SLOT = 1000;
+    // Routes the live render loop into the blob's descriptor (when one is
+    // installed) instead of the stored animation: the production-conditions
+    // A/B and the visual check for a kernel that has not been flashed.
+    // Ignored while an install is in progress: the loader is overwriting the
+    // blob's text, and this is the one path that could send the render task
+    // back into it before that finishes.
+    void setUseBlob(bool on) {
+        if (!on || !blobInstalling.load()) {
+            useBlob.store(on);
+        }
+    }
+    bool useBlobOn() const { return useBlob.load(); }
+    // Brackets kblob::install(). Begin stops dispatching into the blob, asks
+    // the render task to release its tables and waits up to timeoutMs for
+    // the acknowledgement; true means the blob is not resident and nothing
+    // will call into it until end() and a later setUseBlob(true) or a kbench
+    // naming it. With the render task not running the answer is immediate:
+    // whatever is resident stays resident, so begin fails if that is the
+    // blob. A failed begin leaves nothing to end.
+    bool kblobBeginInstall(uint32_t timeoutMs);
+    void kblobEndInstall() { blobInstalling.store(false); }
+    bool kblobResident() const { return blobResident.load(); }
+
+    // Cycle-count microbench, /api/debug/kbench. On the render task, at a
+    // frame boundary, for each requested variant in turn (firmware band(),
+    // firmware bandRef(), blob band(), blob bandRef()): release whatever is
+    // resident, init() the variant's descriptor at the panel size, then for
+    // `frames` frames call frame() and time every band `n` times with the CPU
+    // cycle counter. Sequential rather than interleaved so each variant gets
+    // the whole hot slab, which is what it gets in production. Per band the
+    // minimum of the n runs is what survives interrupts; the first run is the
+    // cold number; the sum gives the mean. The blob variants' output is
+    // hashed per band and compared with the firmware band()'s, so a blob that
+    // is meant to be the same algorithm is checked for equality in the same
+    // pass (mismatchBands, first differing frame and y0). Parameters are the
+    // animation's defaults; time base as runAnimTest().
+    //
+    // The two kernels of one object (firmware or blob) share one init() and
+    // one frame() per frame and are timed band by band on that state, in
+    // alternating order: an animation whose frame() carries state (nebula's
+    // scroll, starfield's RNG) would otherwise hand bandRef() a different
+    // frame than band() saw, and the equality column would report the drift
+    // as a kernel mismatch. Across objects the globals still differ (the
+    // firmware's carry the panel's history, the blob's start zeroed), so
+    // for those animations "blob vs band()" can legitimately differ while
+    // "blobref vs blob" is the check that holds.
+    //
+    // hotLeak* are the hot-slab bytes still allocated after the object's
+    // release() (leakBefore: before the bench, from whatever ran earlier);
+    // the bench resets the slab after recording them, so one leaking
+    // candidate does not push every later bench's tables into PSRAM.
+    struct KBenchVariant {
+        bool ran = false;
+        bool initFailed = false;
+        uint32_t bands = 0;
+        uint64_t minCyc = 0;   // sum over bands of min-of-n
+        uint64_t firstCyc = 0; // sum over bands of run 0
+        uint64_t sumCyc = 0;   // sum over bands and runs
+        uint32_t mismatchBands = 0; // vs the firmware band() (variant 0)
+        int firstMismatchFrame = -1;
+        int firstMismatchY = -1;
+        uint32_t mismatchVsBlob = 0; // blobref only: vs the blob's band() (variant 2)
+    };
+    enum KBenchWhich : uint32_t { KB_BAND = 1, KB_REF = 2, KB_BLOB = 4, KB_BLOBREF = 8 };
+    struct KBenchResult {
+        uint32_t seq = 0;
+        int anim = -1;
+        int frames = 0;
+        int n = 0;
+        uint32_t which = 0;
+        uint32_t hotLeakBefore = 0;
+        uint32_t hotLeakFw = 0;
+        uint32_t hotLeakBlob = 0;
+        KBenchVariant v[4]; // indexed by the bit position in KBenchWhich
+    };
+    void requestKBench(int anim, int n, int frames, uint32_t which) {
+        kbenchN.store(n < 1 ? 1 : (n > 32 ? 32 : n));
+        kbenchFrames.store(frames < 1 ? 1 : (frames > 16 ? 16 : frames));
+        kbenchWhich.store(which & 15u);
+        kbenchReq.store(anim);
+    }
+    bool kbenchPending() const { return kbenchReq.load() >= 0; }
+    KBenchResult kbenchResult() const {
+        KBenchResult r;
+        uint32_t s0;
+        do {
+            s0 = kbenchSeq.load(std::memory_order_acquire);
+            r = kbench;
+        } while ((s0 & 1u) != 0 || s0 != kbenchSeq.load(std::memory_order_acquire));
+        return r;
+    }
+#endif
+
   private:
   public:
     struct Overlay {
@@ -701,6 +803,25 @@ class SleepAnimation {
     std::atomic<uint32_t> animTestSeq{0};
     AnimTestResult animTest;
     void runAnimTest();
+#ifdef GM_KBLOB
+    std::atomic<bool> useBlob{false};
+    std::atomic<bool> blobInstalling{false};
+    std::atomic<bool> blobResident{false};
+    std::atomic<bool> blobDetachReq{false};
+    std::atomic<int> kbenchReq{-1};
+    std::atomic<int> kbenchN{8};
+    std::atomic<int> kbenchFrames{2};
+    std::atomic<uint32_t> kbenchWhich{0};
+    std::atomic<uint32_t> kbenchSeq{0};
+    KBenchResult kbench;
+    void runKBench();
+    void serviceBlobDetach();
+#endif
+    // Registry id, or KBLOB_SLOT for the hot-loaded blob when there is one.
+    int activeSlot() const;
+    const BgAnimation &animBySlot(int slot) const;
+    // Releases the resident animation's tables, if any, and clears residency.
+    void releaseResident();
     // Row-encoded test pattern; see the renderFrame() site for what it settles.
     std::atomic<int> debugPattern{0};
     // Set when something the decision depended on changed under it.

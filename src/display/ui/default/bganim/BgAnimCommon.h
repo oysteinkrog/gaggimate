@@ -107,6 +107,14 @@ size_t hotUsed();
 size_t hotShared();
 size_t hotPeak();
 uint32_t hotFailCount();
+#ifdef GM_KBLOB
+// Bench-only: forget every bottom-end table. Legal only when no animation
+// is resident, which the kernel bench guarantees before it inits the next
+// candidate; it exists because one blob that skips a release() otherwise
+// pins the live count above zero and every later bench on that boot runs
+// with its tables in PSRAM. Returns the bytes that were still allocated.
+size_t hotReset();
+#endif
 
 // Internal DRAM the animation must leave alone, whatever its own budget says.
 // Since the hot slab above, this gates only SleepAnimation's band buffers

@@ -114,6 +114,17 @@ size_t hotShared() { return HOT_SLAB_BYTES - g_hotTop; }
 size_t hotPeak() { return g_hotPeak; }
 uint32_t hotFailCount() { return g_hotFail; }
 
+#ifdef GM_KBLOB
+size_t hotReset() {
+    const size_t leaked = g_hotBottom;
+    g_hotBottom = 0;
+    g_hotLive = 0;
+    // Only the shared tables remain accounted for.
+    g_allocSram = hotShared();
+    return leaked;
+}
+#endif
+
 void *allocHot(size_t size) {
     const size_t n = hotRound(size);
     // The shared term is reserved whether or not the shared tables exist

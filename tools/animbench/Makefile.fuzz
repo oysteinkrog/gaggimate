@@ -2,10 +2,15 @@
 # Per-agent binary:                  make BIN=build/bench_myanim
 # The whole thing compiles monolithically (one g++ call) — ~3 s, no object
 # files to race on when several agents build concurrently.
+# The sanitizers are the point of this harness (fuzz.cpp's header): without
+# them a one-entry table overrun reads a neighbouring byte and passes, which
+# is how silk's PAD=4 survived until 2026-09-04. On WSL1 run the binary with
+# ASAN_OPTIONS=verify_asan_link_order=0 (libasan is not first in the initial
+# library list there; the check is advisory).
 BIN ?= build/fuzz
 ANIM_DIR := ../../src/display/ui/default/bganim
 SRCS := fuzz.cpp mathcount.cpp $(wildcard $(ANIM_DIR)/*.cpp)
-CXXFLAGS := -O2 -g -std=gnu++17 -Ishim -I. -include mathcount.h -Wall -Wno-unused-function
+CXXFLAGS := -O1 -g -std=gnu++17 -fsanitize=address,undefined -fno-omit-frame-pointer -Ishim -I. -include mathcount.h -Wall -Wno-unused-function
 
 $(BIN): $(SRCS) mathcount.h shim/Arduino.h shim/esp_heap_caps.h
 	@mkdir -p $(dir $(BIN))
