@@ -462,6 +462,56 @@ class SleepAnimation {
     bool benchBandsInternal() const;
 #endif
 
+    // On-device equivalence test for an animation's assembly kernel. The
+    // render task, at its next frame boundary, releases the resident animation,
+    // inits `anim` at the panel size and renders every band of `frames`
+    // frames through both band() and bandRef() (BgAnim.h) for three parameter
+    // sets (defaults, all 0, all 100), comparing pixel for pixel and timing
+    // both. Results are read back with animTestResult(); `seq` increments
+    // when a run completes, so a poller can tell a fresh result from the
+    // previous one. The resident animation re-inits on the following frame.
+    struct AnimTestResult {
+        uint32_t seq = 0;
+        int anim = -1;
+        int frames = 0;
+        bool hasRef = false;
+        bool initFailed = false;
+        uint32_t bands = 0;      // band pairs compared
+        uint32_t mismatchPx = 0; // pixels that differed, over all frames and param sets
+        int firstFrame = -1;     // first differing pixel: frame, param set, x, y
+        int firstPset = -1;
+        int firstX = -1;
+        int firstY = -1;
+        uint16_t firstGot = 0;   // band()'s pixel there
+        uint16_t firstWant = 0;  // bandRef()'s pixel there
+        uint32_t bandUs = 0;     // total band() time, all frames and param sets
+        uint32_t refUs = 0;      // same for bandRef()
+    };
+    void requestAnimTest(int anim, int frames) {
+        animTestFrames.store(frames < 1 ? 1 : (frames > 64 ? 64 : frames));
+        animTestReq.store(anim);
+    }
+    bool animTestPending() const { return animTestReq.load() >= 0; }
+    // Routes the render loop through bandRef() instead of band() for every
+    // animation that carries one: the within-boot A/B of a hand-written kernel
+    // against the compiler's code under production conditions (push task
+    // running, LVGL on the other core, real preemption), which the
+    // equivalence test's back-to-back timing cannot reproduce.
+    void setUseBandRef(bool on) { useBandRef.store(on); }
+    bool useBandRefOn() const { return useBandRef.load(); }
+    // Seqlock read: the render task takes animTestSeq odd while it writes the
+    // fields and even when it is done, so a copy taken between two equal even
+    // reads is a consistent snapshot.
+    AnimTestResult animTestResult() const {
+        AnimTestResult r;
+        uint32_t s0;
+        do {
+            s0 = animTestSeq.load(std::memory_order_acquire);
+            r = animTest;
+        } while ((s0 & 1u) != 0 || s0 != animTestSeq.load(std::memory_order_acquire));
+        return r;
+    }
+
   private:
   public:
     struct Overlay {
@@ -644,6 +694,13 @@ class SleepAnimation {
     // setInterlace(settings...) call stomps a debug-endpoint request within
     // one UI pass.
     std::atomic<int8_t> interlaceForce{-1};
+    // Equivalence test request and result; see requestAnimTest().
+    std::atomic<int> animTestReq{-1};
+    std::atomic<bool> useBandRef{false};
+    std::atomic<int> animTestFrames{8};
+    std::atomic<uint32_t> animTestSeq{0};
+    AnimTestResult animTest;
+    void runAnimTest();
     // Row-encoded test pattern; see the renderFrame() site for what it settles.
     std::atomic<int> debugPattern{0};
     // Set when something the decision depended on changed under it.

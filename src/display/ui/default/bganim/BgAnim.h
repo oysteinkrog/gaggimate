@@ -43,6 +43,15 @@ struct BgAnimation {
     // sized from w/h and init() alone will not resize them.
     // nullptr means "no teardown"; that animation simply keeps its tables.
     void (*release)();
+    // Optional. The portable C++ implementation of band(), kept alongside
+    // when band() dispatches to a hand-written Xtensa kernel. Same contract
+    // and the same output, pixel for pixel: the on-device equivalence test
+    // (SleepAnimation::runAnimTest, /api/debug/animtest) renders every band
+    // of several frames through both and reports the first pixel that
+    // differs, which is the only way an assembly kernel gets validated, since
+    // the host bench compiles the C++ path only. nullptr when band() is
+    // portable code and there is nothing to compare it against.
+    void (*bandRef)(uint16_t *dst, int y0, int rows, int w, uint32_t tMs, const uint8_t p[4]);
 };
 
 int bg_animation_count();

@@ -2560,6 +2560,12 @@ void SleepAnimation::renderLoop() {
                 }
             }
         }
+        // Kernel equivalence test, at a frame boundary so it owns the
+        // animation statics; renderFrame() re-inits the resident animation
+        // afterwards. See requestAnimTest() in the header.
+        if (animTestReq.load() >= 0) {
+            runAnimTest();
+        }
         const int64_t frameStart = esp_timer_get_time();
         renderFrame();
         // First frame of the direct path: fill the other buffer too, so the
@@ -2812,6 +2818,9 @@ void SleepAnimation::renderFrame() {
     const int rw = half ? w / 2 : w;
     const int rh = half ? h / 2 : h;
     const BgAnimation &anim = bg_animation(id);
+    // The band kernel this frame renders with: band() normally, bandRef()
+    // when the A/B knob is set and the animation carries one (setUseBandRef).
+    const auto bandFn = (useBandRef.load(std::memory_order_relaxed) && anim.bandRef != nullptr) ? anim.bandRef : anim.band;
     if (id != initializedAnimId || half != initializedHalf) {
         // Hand back the outgoing animation's tables before the incoming one
         // asks for its own. Two reasons, and the second is a correctness one.
@@ -3096,10 +3105,10 @@ void SleepAnimation::renderFrame() {
                     if (((srcBase + sr) & 1) != parityNow) {
                         continue;
                     }
-                    anim.band(halfBuf + static_cast<size_t>(sr) * rw, srcBase + sr, 1, rw, tMs, p);
+                    bandFn(halfBuf + static_cast<size_t>(sr) * rw, srcBase + sr, 1, rw, tMs, p);
                 }
             } else {
-                anim.band(halfBuf, srcBase, hrows, rw, tMs, p);
+                bandFn(halfBuf, srcBase, hrows, rw, tMs, p);
             }
             if (lockThisBand) {
                 xTaskResumeAll();
@@ -3166,10 +3175,10 @@ void SleepAnimation::renderFrame() {
                     if ((((y0 + r) ^ parityNow) & 1) != 0) {
                         continue;
                     }
-                    anim.band(band + static_cast<size_t>(r) * w, y0 + r, 1, w, tMs, p);
+                    bandFn(band + static_cast<size_t>(r) * w, y0 + r, 1, w, tMs, p);
                 }
             } else {
-                anim.band(band, y0, rows, w, tMs, p);
+                bandFn(band, y0, rows, w, tMs, p);
             }
             if (lockThisBand) {
                 xTaskResumeAll();
@@ -3830,6 +3839,143 @@ void SleepAnimation::renderFrame() {
         }
         renderSlot = (renderSlot + 1) % NUM_SLOTS;
     }
+}
+
+// Renders `frames` frames of one animation through band() and bandRef() into
+// two scratch band buffers and compares them pixel for pixel, for three
+// parameter sets: the defaults, every knob at 0, every knob at 100. The two
+// extremes are where fixed-point kernels overflow and LUT indices wrap, so
+// they are part of the contract, not an extra. Runs on the render task only
+// (the animation statics are single-owner), takes the panel's real
+// dimensions, and leaves the resident animation un-inited so the next
+// renderFrame() rebuilds it: the test animation's tables are released here
+// the same way a switch would release them.
+//
+// The scratch buffers are 64-byte aligned like bandBuf, so a kernel that
+// assumes the 16-byte alignment EE.VLD.128/EE.VST.128 need sees the same
+// alignment it will see in production. They are PSRAM: this is a diagnostic,
+// and the timing it reports is a ratio between two kernels writing the same
+// memory, not a production number.
+void SleepAnimation::runAnimTest() {
+    const int id = animTestReq.exchange(-1);
+    const int frames = animTestFrames.load();
+    const int w = display->width();
+    const int h = display->height();
+    const BgAnimation &anim = bg_animation(id);
+    AnimTestResult r;
+    r.anim = id;
+    r.frames = frames;
+    r.hasRef = anim.bandRef != nullptr;
+    const uint32_t seq = animTestSeq.load() + 2;
+    r.seq = seq;
+    auto publish = [&]() {
+        animTestSeq.store(seq - 1, std::memory_order_release); // odd: writing
+        animTest = r;
+        animTestSeq.store(seq, std::memory_order_release);
+    };
+    if (!r.hasRef) {
+        publish();
+        return;
+    }
+    // Same hand-over as renderFrame()'s switch branch: the resident
+    // animation's tables go back before the test animation asks for its own,
+    // and residency is recorded before init() so a partial failure is
+    // recoverable.
+    if (residentAnimId >= 0) {
+        const BgAnimation &prev = bg_animation(residentAnimId);
+        if (prev.release != nullptr) {
+            prev.release();
+        }
+        residentAnimId = -1;
+    }
+    initializedAnimId = -1;
+    if (anim.release != nullptr) {
+        residentAnimId = id;
+    }
+    if (!anim.init(w, h)) {
+        r.initFailed = true;
+        publish();
+        return;
+    }
+    const size_t bandBytes = static_cast<size_t>(w) * BAND_H * sizeof(uint16_t);
+    uint16_t *a = static_cast<uint16_t *>(heap_caps_aligned_alloc(64, bandBytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    uint16_t *b = static_cast<uint16_t *>(heap_caps_aligned_alloc(64, bandBytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    if (a == nullptr || b == nullptr) {
+        heap_caps_free(a);
+        heap_caps_free(b);
+        r.initFailed = true;
+        publish();
+        return;
+    }
+    uint8_t psets[3][4];
+    bg_parse_params(nullptr, id, psets[0]);
+    for (int i = 0; i < 4; i++) {
+        psets[1][i] = 0;
+        psets[2][i] = 100;
+    }
+    const uint32_t nPx = static_cast<uint32_t>(w) * BAND_H;
+    for (int ps = 0; ps < 3; ps++) {
+        const uint8_t *p = psets[ps];
+        for (int f = 0; f < frames; f++) {
+            // A fixed, non-zero time base: t=0 is a degenerate phase for
+            // several animations and a real boot never renders it.
+            const uint32_t tMs = 123456u + static_cast<uint32_t>(f) * 33u + static_cast<uint32_t>(ps) * 100000u;
+            anim.frame(tMs, w, h, p);
+            for (int y0 = 0; y0 < h; y0 += BAND_H) {
+                const int rows = (y0 + BAND_H <= h) ? BAND_H : (h - y0);
+                // Different fill so a kernel that leaves pixels unwritten
+                // cannot pass by luck.
+                memset(a, 0xA5, bandBytes);
+                memset(b, 0x5A, bandBytes);
+                // Whichever runs first pays the cache misses on the tables
+                // the two share, so the order alternates band by band and the
+                // two totals carry the same cold share.
+                const bool refFirst = ((y0 / BAND_H) & 1) != 0;
+                const int64_t t0 = esp_timer_get_time();
+                if (refFirst) {
+                    anim.bandRef(b, y0, rows, w, tMs, p);
+                } else {
+                    anim.band(a, y0, rows, w, tMs, p);
+                }
+                const int64_t t1 = esp_timer_get_time();
+                if (refFirst) {
+                    anim.band(a, y0, rows, w, tMs, p);
+                } else {
+                    anim.bandRef(b, y0, rows, w, tMs, p);
+                }
+                const int64_t t2 = esp_timer_get_time();
+                r.bandUs += static_cast<uint32_t>(refFirst ? (t2 - t1) : (t1 - t0));
+                r.refUs += static_cast<uint32_t>(refFirst ? (t1 - t0) : (t2 - t1));
+                r.bands++;
+                const uint32_t n = static_cast<uint32_t>(w) * rows;
+                if (memcmp(a, b, n * sizeof(uint16_t)) != 0) {
+                    for (uint32_t i = 0; i < n; i++) {
+                        if (a[i] != b[i]) {
+                            if (r.mismatchPx == 0) {
+                                r.firstFrame = f;
+                                r.firstPset = ps;
+                                r.firstX = static_cast<int>(i % w);
+                                r.firstY = y0 + static_cast<int>(i / w);
+                                r.firstGot = a[i];
+                                r.firstWant = b[i];
+                            }
+                            r.mismatchPx++;
+                        }
+                    }
+                }
+                (void)nPx;
+            }
+        }
+    }
+    heap_caps_free(a);
+    heap_caps_free(b);
+    if (anim.release != nullptr) {
+        anim.release();
+    }
+    residentAnimId = -1;
+    publish();
+    log_i("SleepAnimation: animtest %s frames=%d bands=%u mismatch=%u band_us=%u ref_us=%u", anim.id, frames, r.bands,
+          r.mismatchPx, r.bandUs, r.refUs);
 }
 
 #endif // GAGGIMATE_SIM

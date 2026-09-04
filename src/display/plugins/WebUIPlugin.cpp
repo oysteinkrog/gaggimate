@@ -1138,6 +1138,38 @@ void WebUIPlugin::setupServer() {
     //             while the picture tears.
     //
     // Live and not persisted; the next boot goes back to the compiled default.
+    // Kernel equivalence test (SleepAnimation::requestAnimTest). ?anim=N
+    // [&frames=K] queues a run on the render task and returns at once; a
+    // plain GET returns the last completed result, with `pending` true while a
+    // run is still queued. bandRef is BgAnim.h's portable band(); an animation
+    // without one reports has_ref=false and nothing else.
+    server.on("/api/debug/animtest", [](AsyncWebServerRequest *request) {
+        SleepAnimation *a = sleep_animation_bench_instance();
+        if (a == nullptr) {
+            request->send(409, "application/json", "{\"error\":\"animation not running\"}");
+            return;
+        }
+        if (request->hasArg("anim")) {
+            const int id = request->arg("anim").toInt();
+            if (id < 0 || id >= bg_animation_count()) {
+                request->send(400, "application/json", "{\"error\":\"bad anim\"}");
+                return;
+            }
+            a->requestAnimTest(id, request->hasArg("frames") ? request->arg("frames").toInt() : 8);
+        }
+        const SleepAnimation::AnimTestResult r = a->animTestResult();
+        char buf[512];
+        snprintf(buf, sizeof(buf),
+                 "{\"pending\":%s,\"seq\":%u,\"anim\":%d,\"id\":\"%s\",\"frames\":%d,\"has_ref\":%s,\"init_failed\":%s,"
+                 "\"bands\":%u,\"mismatch_px\":%u,\"first\":{\"frame\":%d,\"pset\":%d,\"x\":%d,\"y\":%d,\"got\":%u,\"want\":%u},"
+                 "\"band_us\":%u,\"ref_us\":%u}",
+                 a->animTestPending() ? "true" : "false", static_cast<unsigned>(r.seq), r.anim,
+                 r.anim >= 0 ? bg_animation(r.anim).id : "", r.frames, r.hasRef ? "true" : "false",
+                 r.initFailed ? "true" : "false", static_cast<unsigned>(r.bands), static_cast<unsigned>(r.mismatchPx),
+                 r.firstFrame, r.firstPset, r.firstX, r.firstY, static_cast<unsigned>(r.firstGot),
+                 static_cast<unsigned>(r.firstWant), static_cast<unsigned>(r.bandUs), static_cast<unsigned>(r.refUs));
+        request->send(200, "application/json", buf);
+    });
     server.on("/api/debug/anim", [](AsyncWebServerRequest *request) {
         SleepAnimation *a = sleep_animation_bench_instance();
         if (a == nullptr) {
@@ -1201,6 +1233,20 @@ void WebUIPlugin::setupServer() {
         if (request->hasArg("rprio")) {
             a->setRenderPrio(request->arg("rprio").toInt());
         }
+        // useref=0|1 renders through each animation's portable bandRef()
+        // instead of its hand-written band(): the production-conditions A/B
+        // behind every asm kernel's claimed win (see SleepAnimation::setUseBandRef).
+        if (request->hasArg("useref")) {
+            a->setUseBandRef(request->arg("useref").toInt() != 0);
+        }
+        // reserve=N sets the internal-DRAM reserve the render task's band
+        // buffers are gated on (bganim::internalHasRoomFor): 0 forces them
+        // internal, anything above the pool forces them to PSRAM. Tables are
+        // not affected; their placement is the hot slab (BgAnimCommon.h).
+        if (request->hasArg("reserve")) {
+            const long v = request->arg("reserve").toInt();
+            bganim::setInternalReserve(v < 0 ? 0 : static_cast<size_t>(v));
+        }
 #ifdef GM_TOUCH_PROBE
         // c1load=0|1 starts/stops the synthetic core-1 PSRAM load declared
         // above. Off is asynchronous (the task frees its buffers and deletes
@@ -1247,6 +1293,12 @@ void WebUIPlugin::setupServer() {
         doc["direct"] = a->directPush();
         doc["dma"] = a->dmaPathWanted();
         doc["rprio"] = a->renderPrioValue();
+        doc["useref"] = a->useBandRefOn();
+        doc["reserve"] = static_cast<uint32_t>(bganim::internalReserve());
+        doc["anim_sram"] = static_cast<uint32_t>(bganim::g_allocSram);
+        doc["anim_psram"] = static_cast<uint32_t>(bganim::g_allocPsram);
+        doc["hot_used"] = static_cast<uint32_t>(bganim::hotUsed());
+        doc["hot_fail"] = bganim::hotFailCount();
         doc["half"] = a->halfResOn();
         doc["forcehalf"] = a->halfForced();
         // Reports which way ilace=/interlace= is actually set, not which one
