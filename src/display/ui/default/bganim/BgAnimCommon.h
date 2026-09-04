@@ -26,79 +26,96 @@ constexpr int SIN_AMP = 512;
 const int16_t *sinLut();
 BGANIM_INLINE int16_t sin1024(uint32_t idx) { return sinLut()[idx & (SIN_N - 1)]; }
 
-// Buffers up to this size prefer internal SRAM (latency matters for small,
-// randomly-indexed LUTs); larger ones go to PSRAM first so an animation's
-// bulk tables cannot starve WiFi/BLE, which share the SRAM pool. See alloc().
-#ifndef GM_BGANIM_SRAM_LIMIT
-#define GM_BGANIM_SRAM_LIMIT 8192
+// Where an animation's tables live decides more of its band() time than the
+// kernel does. Measured 2026-09-04 with the same firmware and every table
+// pinned first to internal SRAM and then to PSRAM (full resolution,
+// interlace off, ms per frame): plasma 9.1 vs 17.8, caustics 22.6 vs 37.5,
+// starfield 15.6 vs 27.8, lava 26.0 vs 47.7, aurora 46.7 vs 67.6. A per-pixel
+// lookup into PSRAM is a cache miss whenever the panel's own PSRAM traffic
+// and LVGL on the other core have evicted the line, which is most of the
+// time, so a small table read 230,400 times a frame is worth more in SRAM
+// than any amount of instruction scheduling.
+//
+// Until this pass the placement was decided at init() against the free pool
+// (see INTERNAL_RESERVE below), and after the 2026-09-04 DRAM reclaim the
+// pool idles within a few kB of that reserve, so the same table landed in
+// SRAM on one boot and PSRAM on the next and band_us swung 2x with it. The
+// web UI paid the other side of the same coin: the internal DRAM left for
+// WiFi's frame copies depended on which animation happened to be running.
+//
+// So the hot tables now come from a slab of fixed size, allocated once at
+// build time in internal DRAM: the animation's cost to the pool is one
+// constant, visible in the linker's RAM figure and the same on every boot,
+// and the placement of a table is a decision the animation makes in source,
+// not a coin the allocator flips at init(). Two ends, one slab:
+//
+//   allocHot(size)        per-animation tables read per pixel or per row.
+//                         Bump-allocated from the bottom; the region resets
+//                         when the last hot table is release()d, which
+//                         SleepAnimation does before the next animation
+//                         init()s. nullptr when the slab is full: the caller
+//                         falls back to alloc() and the table lives in PSRAM,
+//                         so an animation that asks for more than fits still
+//                         renders, just slower. Choose what goes here by the
+//                         pixel count that reads it, not by size.
+//   allocHotShared(size)  boot-lifetime tables owned by BgAnimCommon and
+//                         borrowed by several animations (sinLut, cosTableF).
+//                         Carved from the top, never returned.
+//   alloc(size)           everything else: PSRAM, always. Bulk tables swept
+//                         sequentially (noise textures, per-frame fields)
+//                         stream from PSRAM at close to SRAM speed because the
+//                         cache prefetches the run; they were never the tables
+//                         the placement decision mattered for.
+//
+// The slab is 12 KB. The pool idles near 48 KB of DMA-capable internal DRAM
+// with both radios up and no animation; two browser tabs cold-loading died
+// at 15-18 KB free before the asset gate and the gate now keeps at most three
+// big responses in flight (~20 KB) and admits a second only while the pool
+// is above its floor (WebUIPlugin::serveWebAsset). 12 KB leaves 36 KB, which
+// the web UI's 2/3/4-tab tests are the acceptance for. It also caps a single
+// animation's appetite: silk asked for 23.8 KB and starfield 15.9 KB when
+// the pool allowed, and the measurements above show plasma's 11.6 KB and
+// caustics' 10.8 KB already buying most of the SRAM win, so the diet is to
+// rank tables by reads per frame and hand the slab to the top of the list.
+// The shared term is 3,072 B (sinLut 2,048 + cosTableF 1,024), leaving
+// 9,216 B for the resident animation.
+//
+// release() has to be called for every hot table, same as for alloc()ed
+// ones: the bottom region only resets when its live count reaches zero, so a
+// missed release keeps the slab from ever reusing that space and hotUsed()
+// never returns to zero between animations. Releasing the most recently
+// allocated hot table pops it immediately; releasing an older one does not
+// reclaim it until the reset, so a table that changes content at runtime (a
+// palette on a theme change) should be rebuilt in place, not freed and
+// re-allocated. /api/debug/heap shows
+// hot_used, hot_peak and hot_fail; a non-zero hot_fail is the count of
+// allocHot() calls that had to fall back to PSRAM since boot.
+#ifndef GM_BGANIM_HOT_SLAB
+#define GM_BGANIM_HOT_SLAB (12 * 1024)
 #endif
-constexpr size_t SRAM_ALLOC_LIMIT = GM_BGANIM_SRAM_LIMIT;
-
-// Ceiling on the TOTAL internal SRAM alloc() will ever hand out, across every
-// animation, for the life of the boot. The per-allocation limit above bounds
-// one table; this bounds the sum, which is what actually ran the pool dry --
-// the tables are never freed, so switching through the fleet accumulated 53 KB
-// and took the network stack down with it (see the analysis in alloc()).
-//
-// All thirteen animations now declare release() on the BgAnimation ABI, and
-// SleepAnimation frees the outgoing animation's tables before the incoming one
-// allocates. That changes what this number has to cover: the peak is
-// max-over-animations, not sum-over-animations, so the ceiling is a placement
-// policy -- it decides where the running animation's tables live -- rather than
-// the bare safety limit it used to be, when four animations claimed the pool by
-// position in the registry and the remaining nine got none of it.
-//
-// The peak has two terms. Some tables are shared fleet-wide, owned by
-// BgAnimCommon, and deliberately outlive any single animation, so they are
-// charged here permanently:
-//
-//   sinLut     2,048  shared by plasma, silk, caustics, aurora, ember, ...
-//   cosTableF  1,024  shared by ripples, starfield, aurora
-//   ---------------
-//              3,072  never released (correctly -- see release() below)
-//
-// noiseTex256's 65,536 B is shared too but exceeds SRAM_ALLOC_LIMIT, so it goes
-// to PSRAM and is not charged here. The second term is the largest single
-// animation, which is silk:
-//
-//   g_lut     7,176  LUT_N x 2
-//   rowAux   15,360  4 dither phases x 480 x 8
-//   ---------------
-//            22,536
-//
-// so the peak is 3,072 + 22,536 = 25,608 B. Nothing else comes close: the next
-// largest SRAM-eligible sets are starfield's 11,084, caustics' 9,744 and
-// aurora's 8,704, all of which now fit with room to spare.
-//
-// 28 KB covers the peak with 3,064 B of headroom and still leaves roughly 41 KB
-// of the pool for what WiFi, BLE and TLS allocate at runtime -- about half the
-// 53 KB at which the network stack died (see alloc()). The headroom is not
-// slack: at the previous 24 KB ceiling, measured, silk got 18,696 B in SRAM and
-// its FOURTH rowAux -- exactly 3,840 B -- spilled to PSRAM, and ra[x].dx2 /
-// ra[x].dith are read PER PIXEL, so one row in four paid bus latency on every
-// pixel to save 2 KB of a pool with 45 KB free. A ceiling that spills a
-// per-pixel table is mis-set, not conservative.
-//
-// Adding a release() is not purely mechanical, which is why the rollout took a
-// pass of its own: several animations gate their table CONTENT on separate
-// theme/param sentinels, and a free-and-null that leaves one of those set hands
-// back a reallocated buffer that nothing ever refills. release() has to reset
-// every such sentinel. That is a correctness requirement and not only a memory
-// one, since some tables are sized from w/h and init() alone will not resize
-// them. It also must NOT free a borrowed table: an animation that cached
-// sinLut() or noiseTex256() only drops its pointer, because those belong to the
-// shared term above and other animations still hold them.
-#ifndef GM_BGANIM_SRAM_BUDGET
-#define GM_BGANIM_SRAM_BUDGET (28 * 1024)
-#endif
-constexpr size_t SRAM_TOTAL_BUDGET = GM_BGANIM_SRAM_BUDGET;
+constexpr size_t HOT_SLAB_BYTES = GM_BGANIM_HOT_SLAB;
+// Kept clear of allocHot() for the shared tables even before they exist:
+// sinLut 2,048 + cosTableF 1,024. A new shared table adds its size here.
+constexpr size_t HOT_SHARED_RESERVE = 3072;
+void *allocHot(size_t size);
+void *allocHotShared(size_t size);
+// True for a pointer that came from either end of the slab.
+bool isHot(const void *p);
+// Bytes in use from the bottom (per-animation) end, from the top (shared)
+// end, the peak bottom watermark since boot, and the fall-back count.
+size_t hotUsed();
+size_t hotShared();
+size_t hotPeak();
+uint32_t hotFailCount();
 
 // Internal DRAM the animation must leave alone, whatever its own budget says.
+// Since the hot slab above, this gates only SleepAnimation's band buffers
+// (allocPreferInternal); table placement no longer consults the pool.
 //
-// SRAM_TOTAL_BUDGET above bounds what the animation takes. That is only half
-// the question, and the half that does not matter: what the radios need is not
-// a bound on the animation's appetite but a floor under what is left. A fixed
-// budget is a bound on the wrong side of the subtraction, and it was tuned on
+// A fixed budget on what the animation takes is only half the question, and
+// the half that does not matter: what the radios need is not a bound on the
+// animation's appetite but a floor under what is left. A fixed budget is a
+// bound on the wrong side of the subtraction, and the first one was tuned on
 // a build with GM_FAKE_CONTROLLER set, where BLE never starts and roughly 30 KB
 // more internal DRAM is free than production ever has.
 //
@@ -108,14 +125,23 @@ constexpr size_t SRAM_TOTAL_BUDGET = GM_BGANIM_SRAM_BUDGET;
 // allocation is small, so this is not fragmentation -- the pool was simply
 // gone. The display garbled at the same time and for the same reason.
 //
-// So placement is gated on the free pool as it actually is at the moment of
-// the request, not on a number chosen at build time. Reserve generously: the
-// radios allocate in bursts long after the animation has taken its share, and
-// there is nothing to reclaim it from once the animation holds it.
+// So the band buffers are gated on the free pool as it actually is at the
+// moment of the request, not on a number chosen at build time. Reserve
+// generously: the radios allocate in bursts long after the animation has
+// taken its share, and there is nothing to reclaim it from once the animation
+// holds it.
 #ifndef GM_INTERNAL_RESERVE
 #define GM_INTERNAL_RESERVE (48 * 1024)
 #endif
 constexpr size_t INTERNAL_RESERVE = GM_INTERNAL_RESERVE;
+
+// The reserve internalHasRoomFor() actually checks against. Boots at
+// INTERNAL_RESERVE; /api/debug/anim?reserve=N moves it for the life of the
+// boot so a build can be measured with the band buffers forced internal (0)
+// or forced to PSRAM (larger than the pool) without a rebuild between the
+// two. Takes effect at the next allocation.
+size_t internalReserve();
+void setInternalReserve(size_t bytes);
 
 // Whether `size` can come out of internal DRAM without cutting into that
 // reserve. Checked against the DMA-capable internal pool specifically, because
@@ -123,34 +149,20 @@ constexpr size_t INTERNAL_RESERVE = GM_INTERNAL_RESERVE;
 // subset of internal DRAM rather than all of it.
 bool internalHasRoomFor(size_t size);
 
-// The boot animation initialises when the UI is built, BEFORE either radio
-// has claimed its share, and internalHasRoomFor() rightly refuses internal
-// DRAM until they have -- so the boot animation's tables always land in
-// PSRAM, no matter what the reserve would later allow. alloc() raises this
-// flag when a table that qualified by size and budget was sent to PSRAM only
-// because the radios had not settled yet; it reads true only once they have,
-// so acting on it (release + re-init of the active animation, on the render
-// task) re-runs placement against the pool as it actually is. One-shot:
-// clear it before the re-init -- a table refused after settling does not
-// re-raise it, so this cannot loop.
-bool replaceWanted();
-void clearReplaceWanted();
-
-// Bytes alloc() has handed out from each pool since boot, so a bench run can
-// tell whether an animation's tables actually landed where the policy above
-// intends. Not synchronised: written on the render task at init, read over
+// Bytes alloc() and allocHot() have handed out from each pool since boot, so
+// a bench run can tell whether an animation's tables actually landed where
+// the policy above intends (hot slab bytes count as SRAM). Not synchronised: written on the render task at init, read over
 // HTTP, and a torn 32-bit read here would only misreport a diagnostic.
 extern size_t g_allocSram;
 extern size_t g_allocPsram;
 
-void *alloc(size_t size); // see SRAM_ALLOC_LIMIT for the placement policy
+void *alloc(size_t size); // PSRAM; see the hot slab above for the placement policy
 
-// Give back one table from alloc(). Takes the size because the budget counters
-// have to be decremented by the same amount they were charged -- otherwise
-// freeing would return the memory but not the right to allocate it again, and
-// the ceiling would still lock the fleet into PSRAM after a few switches.
+// Give back one table from alloc() or allocHot(). Takes the size because the
+// counters have to be decremented by the same amount they were charged.
 // Nulls the caller's pointer so the `if (ptr == nullptr)` init guards see a
-// clean slate. Safe on nullptr.
+// clean slate. Safe on nullptr. A hot table's bytes come back to the slab
+// only once every hot table has been released, so release all of them.
 void release(void *&p, size_t size);
 
 // Type-safe wrapper. Only ever pass the pointer that OWNS the allocation:

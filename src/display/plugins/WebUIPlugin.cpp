@@ -402,8 +402,28 @@ static const WebAsset *resolveWebAsset(const String &url, String &path) {
 // short JSON and websocket frames that finish within a round trip. Extra
 // requests are parked with request continuation and resumed as slots free
 // up, so nothing is refused. Everything here runs on the async_tcp task.
+//
+// The count is a ceiling, not the whole gate: the pool it protects is also
+// what the animation's hot slab and the radios' own bursts come out of, so
+// three streams that fit on an idle boot do not fit on every boot. A second
+// or third stream is admitted only while the DMA-capable pool is above
+// kAssetGateDmaFloor; the first is always admitted so a parked request can
+// never wait on a pool that nothing is draining. The floor is one stream's
+// in-flight copies (four segments, ~6.5 kB) on top of the 15-18 kB at which
+// the WiFi driver started failing its own allocations before the gate.
 static constexpr uint8_t kMaxAssetStreams = 3;
 static constexpr uint32_t kAssetGateMinBytes = 8192;
+static constexpr uint32_t kAssetGateDmaFloor = 20 * 1024;
+
+bool WebUIPlugin::assetSlotFree() const {
+    if (assetStreams == 0) {
+        return true;
+    }
+    if (assetStreams >= kMaxAssetStreams) {
+        return false;
+    }
+    return heap_caps_get_free_size(MALLOC_CAP_DMA) >= kAssetGateDmaFloor;
+}
 
 void WebUIPlugin::serveWebAsset(AsyncWebServerRequest *request) {
     String path;
@@ -412,7 +432,7 @@ void WebUIPlugin::serveWebAsset(AsyncWebServerRequest *request) {
         request->send(404, "text/plain", "Not found");
         return;
     }
-    if (asset->length >= kAssetGateMinBytes && assetStreams >= kMaxAssetStreams) {
+    if (asset->length >= kAssetGateMinBytes && !assetSlotFree()) {
         assetQueue.push_back(request->pause());
         return;
     }
@@ -458,7 +478,7 @@ void WebUIPlugin::startAssetStream(AsyncWebServerRequest *request) {
 }
 
 void WebUIPlugin::drainAssetQueue() {
-    while (assetStreams < kMaxAssetStreams && !assetQueue.empty()) {
+    while (assetSlotFree() && !assetQueue.empty()) {
         auto waiting = assetQueue.front().lock();
         assetQueue.pop_front();
         if (!waiting) {
@@ -632,9 +652,14 @@ void WebUIPlugin::setupServer() {
 #ifdef GAGGIMATE_HEADLESS
         const size_t animSram = 0;
         const size_t animPsram = 0;
+        const size_t hotUsed = 0, hotShared = 0, hotPeak = 0, hotSlab = 0;
+        const uint32_t hotFail = 0;
 #else
         const size_t animSram = bganim::g_allocSram;
         const size_t animPsram = bganim::g_allocPsram;
+        const size_t hotUsed = bganim::hotUsed(), hotShared = bganim::hotShared(), hotPeak = bganim::hotPeak(),
+                     hotSlab = bganim::HOT_SLAB_BYTES;
+        const uint32_t hotFail = bganim::hotFailCount();
 #endif
         // Scan-out health, from the panel's own interrupts. `slips` is the one
         // to watch: it counts frames whose bounce-buffer refill lost its race
@@ -647,7 +672,7 @@ void WebUIPlugin::setupServer() {
         char buf[512];
         snprintf(buf, sizeof(buf),
                  "{\"int_free\":%u,\"int_largest\":%u,\"int_min\":%u,\"psram_free\":%u,\"psram_largest\":%u,"
-                 "\"anim_sram\":%u,\"anim_psram\":%u,\"anim_budget\":%u,"
+                 "\"anim_sram\":%u,\"anim_psram\":%u,\"hot_used\":%u,\"hot_shared\":%u,\"hot_peak\":%u,\"hot_fail\":%u,\"hot_slab\":%u,"
                  "\"sc_frames\":%u,\"sc_refills\":%u,\"sc_slips\":%u,"
                  "\"dma_free\":%u,\"dma_min\":%u,\"asset_streams\":%u,\"asset_queue\":%u}",
                  // heap_caps_get_largest_free_block walks every block in the heap,
@@ -663,7 +688,8 @@ void WebUIPlugin::setupServer() {
                  static_cast<unsigned>(heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL)),
                  static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_SPIRAM)),
                  static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM)), static_cast<unsigned>(animSram),
-                 static_cast<unsigned>(animPsram), static_cast<unsigned>(bganim::SRAM_TOTAL_BUDGET),
+                 static_cast<unsigned>(animPsram), static_cast<unsigned>(hotUsed), static_cast<unsigned>(hotShared),
+                 static_cast<unsigned>(hotPeak), static_cast<unsigned>(hotFail), static_cast<unsigned>(hotSlab),
                  static_cast<unsigned>(scFrames), static_cast<unsigned>(scRefills), static_cast<unsigned>(scSlips),
                  static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_DMA)),
                  static_cast<unsigned>(heap_caps_get_minimum_free_size(MALLOC_CAP_DMA)), static_cast<unsigned>(assetStreams),
@@ -1984,12 +2010,12 @@ void WebUIPlugin::setupServer() {
         gate["half_res"] = anim0 != nullptr && anim0->benchHalfRes();
         gate["only"] = anim0 != nullptr ? anim0->benchGetOnly() : -1;
         gate["max_fps"] = anim0 != nullptr ? anim0->benchMaxFps() : 0;
-        // Where the animations' lookup tables actually landed. alloc() sends
-        // anything over SRAM_ALLOC_LIMIT to PSRAM on the assumption that big
-        // tables are swept sequentially; a table indexed by a computed value
-        // once per pixel is not, and pays a PSRAM round trip per miss.
+        // Where the animations' lookup tables actually landed: allocHot() is
+        // the fixed internal slab, alloc() is PSRAM (BgAnimCommon.h).
         gate["lut_sram_b"] = static_cast<uint32_t>(bganim::g_allocSram);
         gate["lut_psram_b"] = static_cast<uint32_t>(bganim::g_allocPsram);
+        gate["hot_used_b"] = static_cast<uint32_t>(bganim::hotUsed());
+        gate["hot_peak_b"] = static_cast<uint32_t>(bganim::hotPeak());
         // Direct-to-framebuffer push. wanted vs active is the difference
         // between asking and getting: the panel must hand over its framebuffer
         // and the engine must install. issued minus done is the liveness
@@ -2017,8 +2043,7 @@ void WebUIPlugin::setupServer() {
         gate["dma_issued"] = anim0 != nullptr ? anim0->benchDmaIssued() : 0;
         gate["dma_done"] = anim0 != nullptr ? anim0->benchDmaCompleted() : 0;
         gate["dma_err"] = anim0 != nullptr ? anim0->benchDmaErrors() : 0;
-        gate["sram_limit"] = static_cast<uint32_t>(bganim::SRAM_ALLOC_LIMIT);
-        gate["sram_budget"] = static_cast<uint32_t>(bganim::SRAM_TOTAL_BUDGET);
+        gate["hot_slab_b"] = static_cast<uint32_t>(bganim::HOT_SLAB_BYTES);
         gate["free_internal_b"] = static_cast<uint32_t>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
         // Largest contiguous block, not just the total. These diverge under
         // fragmentation, and the network stack needs whole blocks: lwIP drops

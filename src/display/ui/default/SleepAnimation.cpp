@@ -2812,21 +2812,7 @@ void SleepAnimation::renderFrame() {
     const int rw = half ? w / 2 : w;
     const int rh = half ? h / 2 : h;
     const BgAnimation &anim = bg_animation(id);
-    // Re-run table placement once after the radios settle. The boot animation
-    // initialises before either radio has claimed its internal DRAM, so
-    // bganim::alloc refuses SRAM for every table it asks for and the per-pixel
-    // LUTs land in PSRAM -- a cached-PSRAM load per pixel on the band's
-    // critical path, for the life of the boot. replaceWanted() reads true
-    // exactly once the radios have settled after such a refusal; taking the
-    // switch branch below releases and re-inits the same animation, and this
-    // time placement sees the real pool. Cleared before init: the flag is only
-    // ever raised pre-settle, and this path only runs post-settle, so it
-    // cannot re-raise and loop.
-    const bool replaceTables = bganim::replaceWanted();
-    if (replaceTables) {
-        bganim::clearReplaceWanted();
-    }
-    if (id != initializedAnimId || half != initializedHalf || replaceTables) {
+    if (id != initializedAnimId || half != initializedHalf) {
         // Hand back the outgoing animation's tables before the incoming one
         // asks for its own. Two reasons, and the second is a correctness one.
         //

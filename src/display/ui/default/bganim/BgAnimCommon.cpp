@@ -9,6 +9,7 @@
 #include <esp_bt.h>
 #endif
 #include <esp_memory_utils.h>
+#include <atomic>
 #include <math.h>
 
 namespace bganim {
@@ -16,7 +17,7 @@ namespace bganim {
 const int16_t *sinLut() {
     static int16_t *lut = nullptr;
     if (lut == nullptr) {
-        lut = static_cast<int16_t *>(alloc(SIN_N * sizeof(int16_t)));
+        lut = static_cast<int16_t *>(allocHotShared(SIN_N * sizeof(int16_t)));
         if (lut != nullptr) {
             for (int i = 0; i < SIN_N; i++) {
                 lut[i] = static_cast<int16_t>(lroundf(sinf(i * (2.0f * static_cast<float>(M_PI) / SIN_N)) * SIN_AMP));
@@ -67,153 +68,96 @@ bool radiosSettled() {
 #endif
     return true;
 }
-
-// Raised by alloc() when a qualifying table was refused internal DRAM only
-// because the radios had not settled yet. Render-task written and read; a
-// stale read costs one frame of delay, nothing else.
-bool g_replaceWanted = false;
 } // namespace
+
+namespace {
+// Written from the HTTP task, read on the render task.
+std::atomic<size_t> g_internalReserve{INTERNAL_RESERVE};
+}
+
+size_t internalReserve() { return g_internalReserve.load(std::memory_order_relaxed); }
+
+void setInternalReserve(size_t bytes) { g_internalReserve.store(bytes, std::memory_order_relaxed); }
 
 bool internalHasRoomFor(size_t size) {
     if (!radiosSettled()) {
         return false;
     }
     const size_t freeInternal = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
-    return freeInternal >= size + INTERNAL_RESERVE;
+    return freeInternal >= size + g_internalReserve.load(std::memory_order_relaxed);
 }
 
-bool replaceWanted() { return g_replaceWanted && radiosSettled(); }
+namespace {
+// The hot slab (see the header). Static so its cost to internal DRAM is fixed
+// at link time; 16-byte aligned so a PIE kernel can ee.vld a table straight
+// from its start. The bottom end is per-animation and resets when its live
+// count hits zero; the top end holds the shared tables for the life of the
+// boot. Both watermarks are render-task state read over HTTP, and a torn read
+// there misreports a diagnostic and nothing else.
+alignas(16) uint8_t g_hotSlab[HOT_SLAB_BYTES];
+size_t g_hotBottom = 0;
+size_t g_hotTop = HOT_SLAB_BYTES;
+size_t g_hotPeak = 0;
+uint32_t g_hotLive = 0;
+uint32_t g_hotFail = 0;
 
-void clearReplaceWanted() { g_replaceWanted = false; }
+constexpr size_t hotRound(size_t n) { return (n + 15u) & ~static_cast<size_t>(15u); }
+} // namespace
+
+bool isHot(const void *p) {
+    const uint8_t *q = static_cast<const uint8_t *>(p);
+    return q >= g_hotSlab && q < g_hotSlab + HOT_SLAB_BYTES;
+}
+
+size_t hotUsed() { return g_hotBottom; }
+size_t hotShared() { return HOT_SLAB_BYTES - g_hotTop; }
+size_t hotPeak() { return g_hotPeak; }
+uint32_t hotFailCount() { return g_hotFail; }
+
+void *allocHot(size_t size) {
+    const size_t n = hotRound(size);
+    // The shared term is reserved whether or not the shared tables exist
+    // yet: they are built lazily on first use, and an animation that filled
+    // the slab before calling sinLut() would otherwise push a table every
+    // later animation borrows out to PSRAM for the life of the boot.
+    const size_t limit = g_hotTop < HOT_SLAB_BYTES - HOT_SHARED_RESERVE ? g_hotTop : HOT_SLAB_BYTES - HOT_SHARED_RESERVE;
+    if (g_hotBottom + n > limit) {
+        g_hotFail++;
+        log_w("bganim: %u B hot table does not fit the slab (%u used, %u shared, %u total), falling back to PSRAM",
+              static_cast<unsigned>(size), static_cast<unsigned>(g_hotBottom), static_cast<unsigned>(hotShared()),
+              static_cast<unsigned>(HOT_SLAB_BYTES));
+        return alloc(size);
+    }
+    void *p = g_hotSlab + g_hotBottom;
+    g_hotBottom += n;
+    if (g_hotBottom > g_hotPeak) {
+        g_hotPeak = g_hotBottom;
+    }
+    g_hotLive++;
+    g_allocSram += size;
+    return p;
+}
+
+void *allocHotShared(size_t size) {
+    const size_t n = hotRound(size);
+    if (g_hotTop < g_hotBottom + n) {
+        g_hotFail++;
+        log_w("bganim: %u B shared table does not fit the slab, falling back to PSRAM", static_cast<unsigned>(size));
+        return alloc(size);
+    }
+    g_hotTop -= n;
+    g_allocSram += size;
+    return g_hotSlab + g_hotTop;
+}
 
 void *alloc(size_t size) {
-    // Animations allocate their LUTs lazily on first use and never free them,
-    // so switching through the whole fleet in one power cycle accumulates every
-    // table. Requesting all of that from internal SRAM first would be roughly
-    // 280 KB against a 327 KB pool the firmware has already claimed ~110 KB of
-    // — and WiFi/BLE/TLS allocate from the same pool at runtime, so an
-    // animation could starve the network stack.
-    //
-    // Small tables stay in SRAM, where their random-access latency actually
-    // matters. Anything large is a bulk table read in sequential sweeps, which
-    // PSRAM (8 MB, cache-line prefetched) serves fine.
-    //
-    // CAVEAT for future tables: this size test is a proxy for access pattern,
-    // and the proxy fails for a large table indexed by a value computed per
-    // pixel. Aurora used to keep (v*v)>>12 in a 16 KB table for exactly that
-    // kind of index; being over the threshold put it in PSRAM and every pixel
-    // paid a bus round trip to avoid one multiply. Deleting the table was
-    // worth -21% on that animation. If a new table is over the limit AND its
-    // index is not monotonic across a row, either shrink it under the limit or
-    // compute the value instead -- do not assume PSRAM will serve it.
-    //
-    // The per-allocation size test above is necessary but NOT sufficient, and
-    // that gap was a real bug: it bounds one table but says nothing about the
-    // sum. Measured on device, walking the bench sweep through the fleet took
-    // the internal-SRAM total to 4,992 -> 8,448 -> 30,984 -> 42,068 -> 50,772
-    // -> 53,396 bytes, monotonically, none of it ever freed. The web UI went
-    // unreachable the moment it crossed 53 KB, and stayed unreachable.
-    //
-    // The failure is silent and does not look like memory pressure. lwIP's
-    // tcp_listen_input() drops an incoming SYN with no RST when tcp_alloc()
-    // returns null, so the symptom is a TCP connect TIMEOUT, while ICMP -- which
-    // allocates nothing -- keeps answering normally and uptime keeps climbing.
-    // For most of a session that reads as "the board hung", which is what it
-    // was misdiagnosed as, repeatedly.
-    //
-    // So the budget is cumulative, checked before the request rather than after.
-    // The first tables to ask still land in SRAM where the latency matters; once
-    // the fleet has taken its share, later tables go to PSRAM instead of eating
-    // the pool the network stack lives in.
-    //
-    // The freeing-on-switch fix this comment used to describe as eventual has
-    // since landed: all 13 animations carry a release entry, SleepAnimation
-    // calls prev.release() when the selection changes, and release() below
-    // refunds the counter for the pool the pointer actually came from. So the
-    // live total is now max-over-animations, not sum-over-animations, and the
-    // 53 KB runaway above cannot recur by simply cycling the fleet. The budget
-    // stays as a backstop, because it still bounds the things release() does
-    // not reclaim -- the shared borrowed terms (sinLut, cosTableF, noiseTex256)
-    // are held by whoever asked first and deliberately never freed -- and
-    // because it is what catches a future animation that forgets its release
-    // entry, which is a silent regression rather than a visible one.
-    //
-    // The cumulative budget stays as the backstop it was built to be, but it is
-    // no longer what decides placement on its own: internalHasRoomFor() vetoes
-    // any request that would take the free pool below the radios' reserve. See
-    // INTERNAL_RESERVE for why a build-time budget alone was not enough.
-    // Three independent reasons send a table to PSRAM, and they used to be
-    // collapsed into one flag with one message. That message named the
-    // cumulative budget and a missing release() entry, so a run where the
-    // budget was untouched still reported "SRAM budget spent (0/28672) -- a
-    // release() entry is likely missing" on every allocation. It sent a real
-    // investigation looking for a leak that does not exist. Keep them apart.
-    const bool overSizeLimit = size > SRAM_ALLOC_LIMIT;
-    const bool overBudget = g_allocSram + size > SRAM_TOTAL_BUDGET;
-    const bool poolTooTight = !internalHasRoomFor(size);
-    if (overSizeLimit || overBudget || poolTooTight) {
-        // Over the per-allocation limit is by design: those tables are bulk
-        // sequential sweeps and PSRAM serves them fine, so logging every one
-        // would be noise.
-        if (!overSizeLimit) {
-            if (overBudget) {
-                // NOT expected under the release invariant above, and it
-                // silently relocates a table that was sized to be
-                // latency-sensitive -- which is how a per-row lookup ends up
-                // paying a bus round trip per pixel. Warn every time: it is
-                // rare, and it really does mean an animation forgot to release.
-                log_w("bganim: %u B to PSRAM, SRAM budget spent (%u/%u) -- a release() entry is likely missing",
-                      static_cast<unsigned>(size), static_cast<unsigned>(g_allocSram), static_cast<unsigned>(SRAM_TOTAL_BUDGET));
-            } else {
-                // The pool was too tight, which on this board is not an
-                // anomaly but the permanent state. internalHasRoomFor() only
-                // runs once both radios have claimed, and wants
-                // size + INTERNAL_RESERVE (48 KB) free of DMA-capable internal
-                // DRAM; measured on this panel that pool peaks at 18.6 KB with
-                // WiFi and BLE up. So the SRAM placement path is unreachable
-                // here by construction, every table lives in PSRAM, and
-                // anim_sram reads 0 for the life of the process.
-                //
-                // That is the correct outcome -- the 48 KB reserve is what
-                // stopped the animation eating the pool the network stack
-                // needs, back when cycling the fleet took internal SRAM to
-                // 53 KB and left the web UI permanently unreachable -- but it
-                // does mean SRAM_TOTAL_BUDGET and the size-based placement
-                // policy currently decide nothing. Anyone re-tuning either
-                // should know that before measuring.
-                //
-                // Once per boot, because it is the steady state and not news.
-                static bool reported = false;
-                if (!reported) {
-                    reported = true;
-                    log_i("bganim: internal DRAM below the %u B radio reserve, all tables go to PSRAM",
-                          static_cast<unsigned>(INTERNAL_RESERVE));
-                }
-                // Pre-settle refusals are provisional: the pool the check saw
-                // is not the pool the animation will live with. Flag it so the
-                // render task can re-run placement once the radios have
-                // claimed (see replaceWanted() in the header).
-                if (!radiosSettled()) {
-                    g_replaceWanted = true;
-                }
-            }
-        }
-        log_d("bganim: %u B -> PSRAM (internal free %u, sram budget %u/%u)", static_cast<unsigned>(size),
-              static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA | MALLOC_CAP_8BIT)),
-              static_cast<unsigned>(g_allocSram), static_cast<unsigned>(SRAM_TOTAL_BUDGET));
-        void *big = ps_malloc(size);
-        if (big != nullptr) {
-            g_allocPsram += size;
-            return big;
-        }
-        // No PSRAM (or it is exhausted): fall through and try SRAM anyway
-        // rather than failing the animation outright.
-    }
-    void *p = heap_caps_malloc(size, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    // PSRAM by policy (see the header). The internal fall-back is for a build
+    // without PSRAM or one that has exhausted it; on this board it never runs.
+    void *p = ps_malloc(size);
     if (p == nullptr) {
-        p = ps_malloc(size);
+        p = heap_caps_malloc(size, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
         if (p != nullptr) {
-            log_w("bganim: %u B in PSRAM (internal SRAM full)", static_cast<unsigned>(size));
+            log_w("bganim: %u B in internal SRAM (PSRAM exhausted)", static_cast<unsigned>(size));
         }
     }
     if (p != nullptr) {
@@ -226,10 +170,28 @@ void release(void *&p, size_t size) {
     if (p == nullptr) {
         return;
     }
-    // Decrement the pool the pointer actually came from, not the one the
-    // placement policy would have picked: a request over the per-allocation
-    // limit, or one made after the budget was spent, went to PSRAM, and an
-    // internal request can also have fallen back to PSRAM when SRAM was full.
+    if (isHot(p)) {
+        const uint8_t *q = static_cast<const uint8_t *>(p);
+        if (q < g_hotSlab + g_hotTop) {
+            g_allocSram = (g_allocSram > size) ? g_allocSram - size : 0;
+            // Bottom end. The most recent table pops straight back so a
+            // free-and-reallocate of one table (a palette rebuilt on a theme
+            // change) reuses its own bytes; anything older waits for the
+            // region reset, which is why in-place rebuilds are preferred.
+            if (q + hotRound(size) == g_hotSlab + g_hotBottom) {
+                g_hotBottom = static_cast<size_t>(q - g_hotSlab);
+            }
+            if (g_hotLive > 0 && --g_hotLive == 0) {
+                g_hotBottom = 0;
+            }
+        }
+        // Shared (top end) tables are never returned; a release() on one is
+        // an animation dropping a borrowed pointer, which costs nothing.
+        p = nullptr;
+        return;
+    }
+    // Decrement the pool the pointer actually came from: a request can have
+    // fallen back to the other pool when its own was exhausted.
     size_t &counter = isPsram(p) ? g_allocPsram : g_allocSram;
     counter = (counter > size) ? counter - size : 0;
     heap_caps_free(p);
@@ -239,7 +201,7 @@ void release(void *&p, size_t size) {
 const float *cosTableF() {
     static float *lut = nullptr;
     if (lut == nullptr) {
-        lut = static_cast<float *>(alloc(256 * sizeof(float)));
+        lut = static_cast<float *>(allocHotShared(256 * sizeof(float)));
         if (lut != nullptr) {
             for (int i = 0; i < 256; i++) {
                 lut[i] = cosf(i * (2.0f * static_cast<float>(M_PI) / 256.0f));
