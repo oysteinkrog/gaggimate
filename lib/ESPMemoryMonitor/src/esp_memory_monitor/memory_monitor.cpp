@@ -1,5 +1,6 @@
 #include "esp_memory_monitor/memory_monitor.h"
 
+#include <esp_heap_caps.h>
 #include <esp_log.h>
 #include <esp_system.h>
 
@@ -102,11 +103,19 @@ bool ESPMemoryMonitor::init(const MemoryMonitorConfig &config) {
     }
 
     _running = _config.enableSamplerTask && _config.sampleIntervalMs > 0;
+    _samplerExited = false;
 
     if (_running) {
-        const BaseType_t created =
-            xTaskCreatePinnedToCore(&ESPMemoryMonitor::samplerTaskThunk, kSamplerTaskName, _config.stackSize, this,
-                                    _config.priority, &_samplerTask, _config.coreId);
+        // A WithCaps task has to be deleted with vTaskDeleteWithCaps, so both
+        // placements go through the WithCaps call and the exit path is one.
+        const uint32_t caps = _config.stackInPSRAM ? (MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) : (MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+        BaseType_t created = xTaskCreatePinnedToCoreWithCaps(&ESPMemoryMonitor::samplerTaskThunk, kSamplerTaskName, _config.stackSize,
+                                                             this, _config.priority, &_samplerTask, _config.coreId, caps);
+        if (created != pdPASS && _config.stackInPSRAM) {
+            created = xTaskCreatePinnedToCoreWithCaps(&ESPMemoryMonitor::samplerTaskThunk, kSamplerTaskName, _config.stackSize, this,
+                                                      _config.priority, &_samplerTask, _config.coreId,
+                                                      MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+        }
 
         if (created != pdPASS) {
             _running = false;
@@ -129,14 +138,14 @@ void ESPMemoryMonitor::deinit() {
     _running = false;
 
     if (_samplerTask != nullptr) {
+        // Wait for the loop to let go of the stats lock, then free the task
+        // from here: a WithCaps task cannot free its own stack.
         TickType_t start = xTaskGetTickCount();
-        while (_samplerTask != nullptr && (xTaskGetTickCount() - start) <= pdMS_TO_TICKS(200)) {
+        while (!_samplerExited && (xTaskGetTickCount() - start) <= pdMS_TO_TICKS(200)) {
             vTaskDelay(pdMS_TO_TICKS(10));
         }
-        if (_samplerTask != nullptr) {
-            vTaskDelete(_samplerTask);
-            _samplerTask = nullptr;
-        }
+        vTaskDeleteWithCaps(_samplerTask);
+        _samplerTask = nullptr;
     }
 
     unregisterFailedAllocCallback();
@@ -385,8 +394,13 @@ void ESPMemoryMonitor::samplerTaskLoop() {
         sampleNow();
         vTaskDelay(delayTicks(_config.sampleIntervalMs));
     }
-    _samplerTask = nullptr;
-    vTaskDelete(nullptr);
+    // Park until deinit() deletes this task. Deleting a WithCaps task from
+    // inside itself spawns a helper task to free the stack, which needs
+    // internal heap the caller may be tearing things down for lack of.
+    _samplerExited = true;
+    for (;;) {
+        vTaskSuspend(nullptr);
+    }
 }
 
 ESPMemoryMonitor::InternalMemorySnapshot ESPMemoryMonitor::captureSnapshot() const {

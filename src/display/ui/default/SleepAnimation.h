@@ -517,6 +517,7 @@ class SleepAnimation {
     };
 
     static void taskEntry(void *arg);
+    void reapTasks(); // frees finished render/push tasks; owner side only
     void renderLoop();
     void renderFrame();
     // Chooses the render resolution for the running animation by measuring it.
@@ -536,9 +537,9 @@ class SleepAnimation {
     // pacing sleep takes it with the frame-period timeout; a touch-driven
     // overlay publish gives it so the frame that samples the new snapshot
     // starts immediately instead of waiting out the rest of the period. A
-    // semaphore rather than a task notify because taskHandle dangles after
-    // the render task self-deletes — giving a persistent semaphore is safe
-    // whatever the task lifecycle is doing.
+    // semaphore rather than a task notify because taskHandle is cleared by
+    // reapTasks after the render task finishes; giving a persistent
+    // semaphore is safe whatever the task lifecycle is doing.
     void *overlayWakeSem = nullptr;
     std::atomic<bool> running{false};
     std::atomic<bool> stopped{true};

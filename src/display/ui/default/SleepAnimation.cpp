@@ -28,6 +28,10 @@ static int64_t s_probeFrameEdgeUs = 0;
 static bool s_probeFramePress = false;
 #endif
 
+static BaseType_t createAnimTask(TaskFunction_t fn, const char *name, uint32_t stackBytes, void *arg, UBaseType_t prio,
+                                 TaskHandle_t *handle);
+static void parkForReap();
+
 // Stage timers for the bench build. These compile to nothing in a normal
 // build, so the shipping render path carries no measurement overhead.
 #ifdef GM_ANIM_BENCH
@@ -1106,6 +1110,7 @@ void SleepAnimation::start(Display *d) {
     frameGateHeld = false;
     g_sleepAnimFbGate = nullptr;
     initializedAnimId = -1; // force the animation's init on the render task
+    reapTasks();            // a previous run whose stop() timed out parks until here
     running = true;
     stopped = false;
     if (overlayWakeSem == nullptr) {
@@ -1125,7 +1130,17 @@ void SleepAnimation::start(Display *d) {
     // which is the invariant that keeps scan-out clean.
     // 8 KB stack: renderFrame itself is lean, but log_i's float formatting and
     // the esp_lcd draw path both burn stack; 4 KB was within canary distance.
-    if (xTaskCreatePinnedToCore(taskEntry, "SleepAnim", 8192, this, 1, &handle, 0) != pdPASS) {
+    //
+    // Both stacks live in PSRAM. Internal DRAM is the resource the web UI
+    // dies on (WiFi's TX buffers are DMA-capable internal allocations, and
+    // the device idled at ~8 KB of those free with the stacks internal), and
+    // a PSRAM stack is safe for a task that never runs with the flash cache
+    // disabled: neither task touches NVS, LittleFS, the SD card or any
+    // esp_flash API, and a flash write on the other core parks this one in
+    // the IPC task before the cache goes down. The same reasoning already
+    // places Controller::loopLogic's stack in PSRAM. The one price is that
+    // the tasks cannot delete themselves; see createAnimTask and reapTasks.
+    if (createAnimTask(taskEntry, "SleepAnim", 8192, this, 1, &handle) != pdPASS) {
         log_e("SleepAnimation: task creation failed");
         running = false;
         stopped = true;
@@ -1143,7 +1158,7 @@ void SleepAnimation::start(Display *d) {
     // and the pipeline stalls at the slower stage anyway.
     TaskHandle_t push = nullptr;
     pushStopped = false;
-    if (xTaskCreatePinnedToCore(pushTaskEntry, "SleepPush", 4096, this, 2, &push, 0) != pdPASS) {
+    if (createAnimTask(pushTaskEntry, "SleepPush", 4096, this, 2, &push) != pdPASS) {
         log_e("SleepAnimation: push task creation failed");
         pushStopped = true;
         running = false;
@@ -1194,6 +1209,9 @@ void SleepAnimation::stop() {
         vTaskDelay(pdMS_TO_TICKS(5));
     }
     endDirectPath();
+    // Whichever task has reported done is freed now; one that missed its
+    // deadline is still running and gets reaped by the next start().
+    reapTasks();
 }
 
 // Bring the direct push up. Called only from the render task: the completion
@@ -1350,8 +1368,86 @@ void SleepAnimation::computeChords(int w, int h) {
 void SleepAnimation::pushTaskEntry(void *arg) {
     auto *self = static_cast<SleepAnimation *>(arg);
     self->pushLoop();
-    self->pushStopped = true;
-    vTaskDelete(nullptr);
+    // Only the current generation reports through the flag: a run whose
+    // stop() timed out must not tell a later stop() that its task is done.
+    if (xTaskGetCurrentTaskHandle() == static_cast<TaskHandle_t>(self->pushHandle)) {
+        self->pushStopped = true;
+    }
+    parkForReap();
+}
+
+// Both animation tasks on core 0 with a PSRAM stack (see start() for why that
+// is safe here), falling back to an internal stack when PSRAM is exhausted.
+// A task created WithCaps cannot free its own stack: vTaskDeleteWithCaps on
+// the current task spawns a helper task to do it, and that helper needs
+// internal heap at exactly the moment (a wake from standby under browser
+// load) it may not have, in which case IDF aborts. So the tasks never delete
+// themselves. They flag that they are done and park in parkForReap, and the
+// owner frees them from stop() or the next start() with reapTasks, which
+// deletes a task that is not running and needs no helper. Both placements
+// use the WithCaps call so the reap path is one.
+static BaseType_t createAnimTask(TaskFunction_t fn, const char *name, uint32_t stackBytes, void *arg, UBaseType_t prio,
+                                 TaskHandle_t *handle) {
+    BaseType_t ok = xTaskCreatePinnedToCoreWithCaps(fn, name, stackBytes, arg, prio, handle, 0, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (ok != pdPASS) {
+        log_w("SleepAnimation: no PSRAM for the %s stack, using internal DRAM", name);
+        ok = xTaskCreatePinnedToCoreWithCaps(fn, name, stackBytes, arg, prio, handle, 0, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    }
+    return ok;
+}
+
+// Finished animation tasks hand their own handle to this list and park; the
+// owner deletes whatever is listed. Keyed on the handle the exiting task
+// reports, not on the shared stopped/pushStopped flags: a run whose stop()
+// timed out can finish after the next start() has already created its
+// replacement, and the flag alone could not say which task was done.
+static portMUX_TYPE s_reapLock = portMUX_INITIALIZER_UNLOCKED;
+static TaskHandle_t s_reapPending[4] = {};
+
+// Never returns: vTaskSuspend(nullptr) on the current task blocks until
+// something resumes it, and nothing does but the reap, which deletes it.
+static void parkForReap() {
+    TaskHandle_t me = xTaskGetCurrentTaskHandle();
+    bool listed = false;
+    portENTER_CRITICAL(&s_reapLock);
+    for (auto &slot : s_reapPending) {
+        if (slot == nullptr) {
+            slot = me;
+            listed = true;
+            break;
+        }
+    }
+    portEXIT_CRITICAL(&s_reapLock);
+    if (!listed) {
+        log_w("SleepAnimation: reap list full, %s parks unreaped", pcTaskGetName(me));
+    }
+    for (;;) {
+        vTaskSuspend(nullptr);
+    }
+}
+
+// Frees every animation task that has reported done. Called from the owner's
+// task (the UI task), never from the animation tasks themselves.
+void SleepAnimation::reapTasks() {
+    TaskHandle_t batch[4];
+    portENTER_CRITICAL(&s_reapLock);
+    for (size_t i = 0; i < 4; i++) {
+        batch[i] = s_reapPending[i];
+        s_reapPending[i] = nullptr;
+    }
+    portEXIT_CRITICAL(&s_reapLock);
+    for (TaskHandle_t h : batch) {
+        if (h == nullptr) {
+            continue;
+        }
+        if (h == static_cast<TaskHandle_t>(taskHandle)) {
+            taskHandle = nullptr;
+        }
+        if (h == static_cast<TaskHandle_t>(pushHandle)) {
+            pushHandle = nullptr;
+        }
+        vTaskDeleteWithCaps(h);
+    }
 }
 
 // The same retirement, for the native engine, which gives every transfer an arg
@@ -2016,8 +2112,10 @@ void SleepAnimation::buildScrimRegional(Overlay &ov, int cellY0, int cellY1) {
 void SleepAnimation::taskEntry(void *arg) {
     auto *self = static_cast<SleepAnimation *>(arg);
     self->renderLoop();
-    self->stopped = true;
-    vTaskDelete(nullptr);
+    if (xTaskGetCurrentTaskHandle() == static_cast<TaskHandle_t>(self->taskHandle)) {
+        self->stopped = true; // see pushTaskEntry
+    }
+    parkForReap();
 }
 
 // Show the frame that renderFrame just composed, and start composing into the

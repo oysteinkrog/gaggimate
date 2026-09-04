@@ -100,6 +100,12 @@ struct MemoryMonitorConfig {
     size_t leakNoiseBytes = 1024;
     size_t maxLeakChecksInHistory = 16;
     bool usePSRAMBuffers = false;
+    // GaggiMate change from upstream. Puts the sampler task's stack in PSRAM
+    // (xTaskCreatePinnedToCoreWithCaps). The sampler only reads heap counters
+    // and logs, so it never runs with the flash cache disabled, which is the
+    // condition a PSRAM stack must never meet. Internal DRAM is the scarce
+    // resource on the ESP32-S3 display; 4 KB of it matters.
+    bool stackInPSRAM = false;
 };
 
 struct WindowStats {
@@ -420,6 +426,7 @@ class ESPMemoryMonitor {
     bool _usePSRAMBuffers = false;
     SemaphoreHandle_t _mutex = nullptr;
     TaskHandle_t _samplerTask = nullptr;
+    volatile bool _samplerExited = false; // set by the sampler once its loop has returned
     MemoryMonitorDeque<InternalMemorySnapshot> _history;
     std::array<ThresholdState, 2> _thresholdStates{ThresholdState::Normal, ThresholdState::Normal};
     SampleCallback _sampleCallback;

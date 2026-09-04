@@ -100,7 +100,11 @@ void ShotHistoryPlugin::setup(Controller *c, PluginManager *pm) {
     if (fs->exists("/h/recent.bin")) {
         fs->remove("/h/recent.bin");
     }
-    xTaskCreatePinnedToCore(loopTask, "ShotHistoryPlugin::loop", configMINIMAL_STACK_SIZE * 6, this, 1, &taskHandle, 0);
+    // record() samples into a 4 KB buffer and flushes it to the filesystem;
+    // the index rebuild has its own, larger task. Measured idle high-water
+    // mark was ~500 B used of 9 KB; 6 KB leaves the flush path ample room and
+    // gives 3 KB back to the internal heap.
+    xTaskCreatePinnedToCore(loopTask, "ShotHistoryPlugin::loop", configMINIMAL_STACK_SIZE * 4, this, 1, &taskHandle, 0);
 }
 
 void ShotHistoryPlugin::record() {

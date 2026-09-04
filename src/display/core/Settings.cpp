@@ -91,7 +91,11 @@ void Settings::load() {
     }
     preferences.end();
 
-    xTaskCreate(loopTask, "Settings::loop", configMINIMAL_STACK_SIZE * 6, this, 1, &taskHandle);
+    // The task only flushes dirty properties to NVS every 5 s. Sized from a
+    // measured high-water mark of under 1 KB used on a 9 KB stack; 4.5 KB
+    // keeps room for the Preferences/NVS commit path and returns the rest to
+    // the internal heap the WiFi TX buffers live in.
+    xTaskCreate(loopTask, "Settings::loop", configMINIMAL_STACK_SIZE * 3, this, 1, &taskHandle);
 }
 
 void Settings::batchUpdate(const SettingsCallback &callback) {

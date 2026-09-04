@@ -64,6 +64,7 @@ void init() {
     cfg.maxScopesInHistory = 8;
     cfg.windowStatsSize = 5;
     cfg.stackSize = 4096;
+    cfg.stackInPSRAM = true; // the sampler never touches flash; see MemoryMonitorConfig
     cfg.priority = 1;
     cfg.coreId = MemoryMonitorConfig::any;
     cfg.usePSRAMBuffers = true;

@@ -337,7 +337,8 @@ void attach(void *panelHandle, uint32_t bootPclkHz) {
     // would have run the tick anyway; priority above the radio housekeeping
     // it replaces so the VSYNC release is not sat on.
     if (g_phyTrackTask == nullptr) {
-        xTaskCreatePinnedToCore(phyTrackTask, "gm_phy_trk", 3072, nullptr, 19, &g_phyTrackTask, 0);
+        // 2.5 KB: the runner used ~1 KB of its previous 3 KB at the high-water mark.
+        xTaskCreatePinnedToCore(phyTrackTask, "gm_phy_trk", 2560, nullptr, 19, &g_phyTrackTask, 0);
     }
     // A divider chosen before the panel existed (or before it was torn down for
     // a display OTA) is still the user's choice — re-apply it rather than

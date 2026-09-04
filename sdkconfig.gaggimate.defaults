@@ -408,3 +408,73 @@ CONFIG_LCD_RGB_ISR_IRAM_SAFE=y
 # ESP_PHY_DISABLE_PLL_TRACK was rejected because losing tracking entirely
 # next to a heat source is the one environment where it must keep working.
 CONFIG_ESP_PHY_PLL_TRACK_PERIOD_MS=5000
+
+# --- mDNS task and buffers in PSRAM ---
+# The responder's 4 KB task stack and its packet buffers were internal DRAM,
+# which is the pool WiFi's 1630-byte cache TX buffers come out of and the one
+# the web UI dies on (the device idled at ~8 KB of DMA-capable internal free
+# with every service task's stack internal). The mDNS task only touches lwIP
+# sockets and its own timers, never flash, so its stack can live in PSRAM
+# under the same rule Controller::loopLogic and the animation tasks follow:
+# a PSRAM stack is safe for a task that never runs with the flash cache
+# disabled. The component allocates the stack itself (mdns_mem_caps.c) and
+# frees it on stop, so the WiFi reconnect path that stops and restarts the
+# responder is covered.
+CONFIG_MDNS_TASK_CREATE_FROM_SPIRAM=y
+CONFIG_MDNS_MEMORY_ALLOC_SPIRAM=y
+
+# --- Internal DRAM reclaim, round 2 (2026-09-04) ---
+# Context for all three: the web UI dies by internal-DRAM starvation, not by
+# any bug in the server. WiFi's TX path allocates 1630-byte and 1115-byte
+# DMA-capable internal buffers per frame (caps 0x80c); when the pool cannot
+# satisfy one the driver logs "wifi:m f null", the socket stalls and the
+# NetworkWatchdog reconnect loop never recovers. Two browser tabs loading
+# the 440 kB bundle at once dipped internal free by ~21 kB below idle at the
+# old two-segment send buffer (~35 kB at the four-segment one), so idle free
+# has to sit comfortably above that, with the BLE controller link and a
+# LittleFS write on top.
+#
+# esp_timer task stack: the common default restores Arduino's 8192 on the
+# theory that our state machines run on it. They do not: nothing under
+# src/display calls esp_timer_create, and the only callers are IDF/WiFi/BLE
+# internals plus NimBLE's callouts, which just post to the host queue. The
+# measured high-water mark was 1.6 kB used (/api/debug/heapmap, hwm 7596 of
+# 9216) across boot, WiFi association, BLE connect and web UI load. 4096
+# is 2.5x that peak and above the IDF default of 3584. Saves 4 kB internal.
+CONFIG_ESP_TIMER_TASK_STACK_SIZE=4096
+
+# BLE advertising-report flow control: the controller queues up to this many
+# adv reports for the host before dropping. The display scans only to find
+# the controller and a scale; 50 reports per scan window is more than a
+# kitchen holds. Kconfig range 50-1000; 100 -> 50 saves ~1.75 kB internal.
+CONFIG_BT_CTRL_BLE_ADV_REPORT_FLOW_CTRL_NUM=50
+
+# WiFi IRAM speed optimisations off: IRAM and DRAM are one SRAM on the S3,
+# so WiFi hot-path code moved back to flash is heap. Measured 17.7 kB at
+# setup/enter (both options together; Kconfig quotes 10 + 17 kB, the
+# linker's alignment eats the difference). The cost is WiFi CPU efficiency:
+# the 437 kB JS bundle downloads in 2.75 s instead of 2.31 s at a
+# two-segment send buffer (10-run means, single connection), about 16%,
+# and browser page loads move the same way. Scan-out slips stayed at zero
+# through every multi-tab load with the code in flash, so the MSPI
+# contention this could add (flash-resident code on core 0 slows the
+# bounce refill; see CLAUDE.md) does not reach the panel at n=6.
+# Taken because the headroom is what keeps the web UI alive: with these on,
+# a two-tab cold load bottomed out at 19 kB internal free; with them off
+# and the four-segment send buffer below, at the same 19 kB while loading
+# 1.7x faster. The two settings are a pair: the send buffer spends the
+# headroom these free up. Distinct from ESP_WIFI_SLP_IRAM_OPT above, which
+# was about adding IRAM, not freeing it.
+CONFIG_ESP_WIFI_IRAM_OPT=n
+CONFIG_ESP_WIFI_RX_IRAM_OPT=n
+
+# --- WiFi cache TX queue cap: measured, no effect on the transient ---
+# ESP_WIFI_CACHE_TX_BUFFER_NUM 32 -> 12 was tried as a way to bound how much
+# DMA-capable memory a burst of browser connections can take, on the reading
+# that the 1630-byte allocations are the cache TX buffers. They are not, or
+# the cap does not gate them: a two-tab cold load still allocated them until
+# the pool ran dry (int_min 7.9 kB at 12 vs 9.4 kB at 32, 66 vs 73 failed
+# allocations, dma min 355 vs 276 bytes). The transient is the per-frame
+# internal copy of a PSRAM pbuf on its way to the MAC, and the only handles
+# on it from here are the number of connections and TCP_SND_BUF (segments
+# handed to the driver per connection). Left at the default.
