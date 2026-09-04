@@ -69,25 +69,32 @@
 // since powf(x,e) for x in [0,1] never leaves [0,1]) and env_q8 in [0, 256]
 // (envRowBase <= 1 always, dx2 >= 0 always, so env <= 1 always, clamped to
 // >= 0 as the compile-time-safe floor). Their product is therefore in
-// [0, 255<<16] exactly (65280*256 == 255*65536). dith_q16's real range is
-// [-0.796875, +0.697265625] (from BAYER4 in [(0,0.5*)) -> Q16 [-52224,
-// +45696]). Summing and shifting right 16 (floor) gives idxq>>16 in
-// [floor(-52224/65536), floor((255*65536+45696)/65536)] = [-1, 255] — a
-// provably tiny 1-step underflow and zero overflow. PAD=4 below covers that
-// with comfortable margin for the rounding choices made when building the
-// Q8/Q16 tables (round-to-nearest, not truncation), so band()'s final
-// lookup is a single unclamped, unbranched paletteExt[PAD+idx] read.
+// [0, 255<<16] exactly (65280*256 == 255*65536). The dither amplitude comes
+// from ditherAmp(): half the palette's RGB565 step spacing, capped at 16.0
+// index units for a palette flat enough to have only 8 distinct steps, so
+// dith_q16 is in [-16, +16] << 16 at the widest (the old fixed 255/160
+// amplitude that gave the [-1, 255] bound quoted in earlier revisions of
+// this comment is gone since the dither was derived from the palette).
+// Summing and shifting right 16 (floor) gives idxq>>16 in [-16, 271], so
+// PAD below is 16: with PAD=4 the fuzz harness under ASan read one entry
+// past g_lut at a parameter set that produced a coarse palette (2026-09-04),
+// which on the device is a wrong colour from whatever follows the table in
+// the slab. band()'s final lookup stays a single unclamped, unbranched
+// paletteExt[PAD+idx] read.
 //
 // Third pass (this one): one exact per-pixel constant-fold-out, plus a
 // coarse-grid interpolation of the wave field.
-//   - the dither table now has PALETTE_REAL_OFF<<16 baked in at build time, so
-//     band()'s final `idxq >> 16` is already g_lut's absolute palette
-//     index — no per-pixel `addmi PALETTE_REAL_OFF`. The folding is
-//     algebraically exact (arithmetic right shift distributes over adding an
-//     exact multiple of the shift base), not an approximation.
+//   - the dither table carried PALETTE_REAL_OFF<<16 baked in at build time
+//     from this pass to the fifth, so band()'s final `idxq >> 16` was
+//     already g_lut's absolute palette index — no per-pixel `addmi
+//     PALETTE_REAL_OFF`. The folding is algebraically exact (arithmetic
+//     right shift distributes over adding an exact multiple of the shift
+//     base). The sixth pass moved the offset into the palette base pointer
+//     instead; see SILK_GRID_SHIFT for why.
 //   - band() now evaluates the exact 3-LUT-read sine sum only once every
-//     SILK_GRID (8) pixels and linearly interpolates the contrastLUT index
-//     in between via a Q8 fixed-point ramp (one add + one shift per pixel)
+//     SILK_GRID pixels (8 then, 16 since the sixth pass) and linearly
+//     interpolates the contrastLUT index in between via a Q8 fixed-point
+//     ramp (one add + one shift per pixel)
 //     — the field is spatially smooth enough at this animation's fringe
 //     densities that the interpolation error is far below what
 //     contrastLUT's 3073-point resolution or the golden-frame comparison
@@ -140,10 +147,13 @@
 //     over h=8 is f''*h^2/8 = 2*vignK*256*64/8) — three orders of magnitude
 //     under one palette step.
 //   - Ranges/overflow: interior P is a convex combination of two node
-//     products, both in [0, 255<<16], so idx stays in [-1, 255] exactly as
-//     proven above (dither unchanged). PQ = P<<3 <= 255<<19 < 2^27.
-//     dq = dith<<3 <= (3328*65536 + 45696)*8 < 1.75e9, PQ + dq < 1.88e9 <
-//     2^31 — no int32 overflow anywhere in the fast path.
+//     products, both in [0, 255<<16], so idx stays in [-16, 271] exactly as
+//     proven above (dither unchanged). With the sixth pass's shift of 4:
+//     PQ = P<<4 <= 255<<20 < 2^28, |dq| = |dith|<<4 <= 16<<20 = 2^24, so
+//     |PQ + dq| < 2^29 — no int32 overflow anywhere in the fast path. (The
+//     fourth pass's bound also had the palette offset inside dq, 3328<<19;
+//     one more bit and that term alone passes 2^31, which is why the offset
+//     now lives in the palette pointer, see SILK_GRID_SHIFT.)
 //   - band() is now also IRAM-pinned (GM_ANIM_IRAM), AnimEmber.cpp's
 //     precedent: the S3 has one 16 KB flash icache shared by both cores,
 //     LVGL churns it from core 1, and refills queue on the MSPI bus behind
@@ -176,11 +186,29 @@
 //     instruction count bought back. See the kernel's own comment for the
 //     schedule and the report for the GCC comparison that found it.
 //
+// Sixth pass: the grid is 16 pixels and pixels are written in pairs. After
+// the fifth pass the per-pixel body was already one add, one shift, one
+// gather and one store, and the device measured 13.4 ms per frame; the
+// kblob rig (tools/kblob) then put numbers on where the rest went. Doubling
+// the grid alone gave 10.2 ms with the picture unchanged (goldens moved a
+// mean of 0.14 of 255, compiler-noise territory), because the node work
+// (three sine gathers, a contrast gather, the vignette product, the
+// curvature probe) had been a third of the frame. Writing each pixel pair
+// as one 32-bit store of one sample gave 8.3 ms; the field is sampled every
+// 16 pixels anyway, so the only visible change is a dither grain two pixels
+// wide (goldens moved a mean of 2.0, all of it that grain). A 32-pixel grid
+// was slower (9.8 ms), the wider chord failing the curvature probe far more
+// often, and the exact fallback that remains at 16 costs 0.7 ms of the 8.3.
+// The palette offset left the dither constants for the palette pointer
+// because the Q20 ramp cannot hold it (see SILK_GRID_SHIFT). The fifth
+// pass's Xtensa kernels are unported and gated off by a static_assert.
+//
 // Design: anim-fluid (Fable), 2026-08-15. Optimized: anim-fluid, 2026-08-15;
 // opt-silk2 (fixed-point tail), 2026-08-15; opt-silk3 (constant folding +
 // coarse-grid interpolation), 2026-08-17; opt-silk4 (per-cell product ramp +
 // IRAM pin), 2026-08-31; opt-silk5 (Xtensa kernels, allocHot placement,
-// mull scheduling), 2026-09-04.
+// mull scheduling), 2026-09-04; sixth pass (16-pixel grid, paired stores),
+// 2026-09-04.
 
 #include "BgAnim.h"
 #include "BgAnimCommon.h"
@@ -205,7 +233,10 @@
 // per-pixel tables in the hot slab is the fastest silk has measured (HEAD
 // needed 23.8 KB of SRAM for 18.2 ms). The kernels stay in the file, bit-exact
 // (QEMU test tools/qemubench/tests/anim_silk), for whoever finds the stall;
-// -DGM_BGANIM_SILK_ASM=1 re-enables them. Only the device settles it.
+// -DGM_BGANIM_SILK_ASM=1 re-enables them. Only the device settles it. Since
+// the sixth pass the flag does not build at all (see the static_assert at
+// the kernels): bandRef() moved to a 16-pixel grid and paired stores, and
+// the kernels would have to follow before a comparison means anything.
 #ifndef GM_BGANIM_SILK_ASM
 #define GM_BGANIM_SILK_ASM 0
 #endif
@@ -245,10 +276,11 @@ SilkWave wave[3] = {
 // [0,255] so this fits uint16_t) rather than float — see file header.
 constexpr int CONTRAST_N = 3073; // 2*1536 + 1
 // Palette is stored "padded" like AnimEmber.cpp's paletteExt: PAD clamp
-// entries on each side of the real 256-entry ramp so the (rare, 1-step)
-// out-of-range fixed-point index lands on a valid clamped entry with no
-// branch — see the file-header proof for the exact [-1,255] bound.
-constexpr int PAD = 4;
+// entries on each side of the real 256-entry ramp so an out-of-range
+// fixed-point index lands on a valid clamped entry with no branch. The
+// dither reaches +-16 index units at its ditherAmp() cap, so PAD is 16 (see
+// the file-header bound; 4 was one short of the cap and overran under ASan).
+constexpr int PAD = 16;
 constexpr int PAL_EXT_N = 256 + 2 * PAD;
 // contrastLUT and the padded palette are ONE allocation (contrast curve
 // first, palette immediately after) so band()'s hot loop only ever needs a
@@ -304,8 +336,8 @@ float ditherLUT[16];
 //   - g_ditherQ[16]: the dither term only ever takes 16 distinct values
 //     (4 y-phases x 4 x-phases, from BAYER4), so storing it once per pixel
 //     column was always 30x more entries than the value actually has.
-//     Indexed (y&3)*4+(x&3), same Q16-plus-PALETTE_REAL_OFF-bias encoding
-//     RowAux.dith used, see below for why Q16 and why the bias lives here.
+//     Indexed (y&3)*4 + ((x>>1)&3) since the sixth pass (the Bayer cell is
+//     two pixels wide, see the header), Q16, see below.
 // The two walking-pointer constraint that justified the AoS shape in the
 // first place no longer applies: band()'s asm kernels take explicit
 // pointer/register arguments instead of asking GCC to keep an
@@ -316,18 +348,13 @@ float ditherLUT[16];
 // and silkExactCell8Asm's d0..d3 comment.
 uint8_t *g_dx2Row = nullptr;
 int g_dx2RowW = 0; // width g_dx2Row was sized for
-// Q16: dither value * 65536, PLUS PALETTE_REAL_OFF<<16 baked in (see file
-// header for why Q16, not Q8, and band()'s comment for why the offset lives
-// here). Folding the constant palette-array offset into this table (built
-// once, not per pixel) means band()'s final `idxq >> 16` is already
-// g_lut's absolute index, dropping the `addmi PALETTE_REAL_OFF` that would
-// otherwise run on every pixel. This is exact, not approximate: for any
-// integer X and multiple-of-2^16 bias k*65536, (X + k*65536) >> 16 ==
-// (X >> 16) + k under arithmetic right shift (what C++ does for signed idxq
-// here, same as the pre-existing reliance on arithmetic shift for negative
-// dith), so this changes nothing about which palette entry is picked, in
-// any case including the underflow corner (old idx==-1 -> new
-// idx==PALETTE_REAL_OFF-1, still inside paletteExt's padding).
+// Q16: dither value * 65536 (see file header for why Q16, not Q8). From the
+// third pass to the fifth this table also carried PALETTE_REAL_OFF<<16 so
+// the final `idxq >> 16` was g_lut's absolute index; the sixth pass's Q20
+// ramp cannot hold that bias (see SILK_GRID_SHIFT), so the offset moved into
+// the palette base pointer the pixel loops index (pal = g_lut +
+// PALETTE_REAL_OFF), which costs one loop-invariant register and no
+// per-pixel instruction. Entries are in [-16, 16] << 16.
 //
 // Heap-allocated (allocHot(), not a plain static array) even though its
 // size never changes: BgAnimCommon.h is explicit that a table forced
@@ -363,9 +390,22 @@ uint32_t g_wtTurn[3]; // temporal phase at y=0, Q32 turns (already mod 2*pi via 
 // bound). SILK_GRID must be a power of two so both the per-cell step (divide
 // by SILK_GRID) and the tail-loop bound (mod SILK_GRID) reduce to shifts —
 // no runtime divide is introduced.
-constexpr int SILK_GRID = 8;       // coarse-grid cell width in pixels
-constexpr int SILK_GRID_SHIFT = 3; // log2(SILK_GRID)
+// 16 since the sixth pass (was 8): the node work (three sine gathers, a
+// contrast gather, the vignette product and the curvature probe) is paid
+// once per cell, and at 8 it was about a third of the frame. 32 was measured
+// too and lost (9.8 ms against 8.3 at 16 on the device) because the wider
+// chord sends far more cells down the exact fallback; at 16 the fallback
+// costs 0.7 ms of the 8.3 (7.6 with the probe forced off).
+constexpr int SILK_GRID = 16;      // coarse-grid cell width in pixels
+constexpr int SILK_GRID_SHIFT = 4; // log2(SILK_GRID)
 constexpr int SILK_Q_BITS = 8;     // interpolation fixed-point fractional bits
+// The fast ramp carries the Q16 product shifted up by SILK_GRID_SHIFT (Q20),
+// so per-pixel work is one add and one shift. The palette offset used to
+// ride in the dither constants (PALETTE_REAL_OFF<<16, 3328<<16) and at Q19
+// still fit; at Q20 it is 3328<<20 > 2^31. It lives in the palette base
+// pointer instead (g_lut + PALETTE_REAL_OFF, one register, loop-invariant),
+// and g_ditherQ is the plain Q16 dither again.
+static_assert(SILK_GRID_SHIFT <= 4, "the Q(16+SHIFT) ramp bound below assumes at most 4 extra bits");
 // The 3-wave sine sum is in [-1536,1536]; contrastLUT is indexed 0..3072. The
 // bias is added at the GRID NODES (once per SILK_GRID pixels) rather than at
 // every pixel: it cancels out of the ramp's delta, and seeding sQ from the
@@ -412,7 +452,7 @@ void buildContrastLUT(uint8_t glow) {
 // Fills the clamp padding around the freshly-rebuilt 256-entry ramp so
 // paletteExt[PAD + idx] is valid for idx in [-PAD, 255+PAD] with no branch
 // (same trick as AnimEmber.cpp's extendPalette — see file header for the
-// proof that idx only ever reaches [-1, 255] here).
+// proof that idx only ever reaches [-16, 271] here).
 void extendPalette() {
     const uint16_t lo = palette[0];
     const uint16_t hi = palette[255];
@@ -449,7 +489,7 @@ void buildDitherLUT() {
 void refreshDither() {
     buildDitherLUT();
     for (int k = 0; k < 16; k++) {
-        g_ditherQ[k] = static_cast<int32_t>(lroundf(ditherLUT[k] * 65536.0f)) + (PALETTE_REAL_OFF << 16);
+        g_ditherQ[k] = static_cast<int32_t>(lroundf(ditherLUT[k] * 65536.0f));
     }
 }
 
@@ -534,7 +574,7 @@ bool init(int w, int h) {
             // Q16 (not Q8): dith's real magnitude is < 1, so rounding it to
             // a plain integer here would collapse all 16 dither levels into
             // 2-3 buckets, see file header.
-            g_ditherQ[k] = static_cast<int32_t>(lroundf(ditherLUT[k] * 65536.0f)) + (PALETTE_REAL_OFF << 16);
+            g_ditherQ[k] = static_cast<int32_t>(lroundf(ditherLUT[k] * 65536.0f));
         }
     }
     // Node-column vignette table for the fourth pass's product ramp (see
@@ -603,6 +643,12 @@ void frame(uint32_t tMs, int, int, const uint8_t p[4]) {
 #if defined(__XTENSA__) && !defined(GM_BGANIM_NO_ASM) && GM_BGANIM_SILK_ASM
 // ---- Hand-written Xtensa kernels for band()'s per-cell inner loops -------
 //
+// These kernels predate the sixth pass: they write single pixels on the
+// 8-pixel grid with the palette offset baked into the dither constants, none
+// of which is true of bandRef() any more. Re-enabling them means porting
+// them first; the assert is here so the flag cannot quietly ship the old
+// algorithm as band() beside the new one as bandRef().
+static_assert(SILK_GRID == 8, "silk's Xtensa kernels are written for the 8-pixel grid of the fifth pass");
 // PIE (the S3's 128-bit vector coprocessor) does not help either loop below:
 // both are dominated by a LUT GATHER (g_lut[idx], idx data-dependent per
 // pixel), and there is no vector gather instruction on this hardware -- see
@@ -882,10 +928,10 @@ GM_ANIM_IRAM void bandRef(uint16_t *dst, int y0, int rows, int w, uint32_t, cons
         // call needed, keeping band() itself at zero libm calls.
         const int32_t envRowBase_q8 = static_cast<int32_t>((1.0f - g_vignK * dy * dy) * 256.0f + 0.5f);
         uint16_t *out = dst + static_cast<size_t>(row) * w;
-        // Dither y-phase for this row -- g_ditherQ is indexed (y&3)*4+(x&3),
-        // g_dx2Row by x alone (dx2 never varied by phase, see its
-        // declaration), so there is no per-row table SELECT left to do, only
-        // this one phase index to carry into the loop below.
+        // Dither y-phase for this row -- g_ditherQ is indexed
+        // (y&3)*4 + ((x>>1)&3), g_dx2Row by x alone (dx2 never varied by
+        // phase, see its declaration), so there is no per-row table SELECT
+        // left to do, only this one phase index to carry into the loop below.
         const int yph = y & 3;
         // --- Coarse-grid interpolation of the wave-interference field ---
         // `s` (the 3-wave sine sum that indexes contrastLUT) is spatially
@@ -925,26 +971,32 @@ GM_ANIM_IRAM void bandRef(uint16_t *dst, int y0, int rows, int w, uint32_t, cons
         // been up.
         //
         // Width isn't always a multiple of SILK_GRID (466 and 480 are both
-        // supported panel sizes; 466 % 8 == 2), so the trailing <SILK_GRID
+        // supported panel sizes; 466 % 16 == 2), so the trailing <SILK_GRID
         // pixels at the row's right edge fall back to the exact per-pixel
-        // path below — at most 7 pixels/row, not a per-band()-call cost.
+        // path below — at most 15 pixels/row, not a per-band()-call cost.
         uint32_t a = base[0], b = base[1], c = base[2];
         // Biased once per node, not per pixel (see SIN_SUM_BIAS).
         int32_t sCur = SIN_SUM_BIAS + sinFromTurn(a) + sinFromTurn(b) + sinFromTurn(c); // exact node @ x=0
         int32_t ncCur = g_lut[sCur];                            // Q8 contrast at the node
         int32_t Pcur = ncCur * (envRowBase_q8 - g_dx2Node[0]);  // Q16 nc*env product at the node
         // --- Fourth pass: per-cell PRODUCT ramp (see file header) ---
-        // The Bayer dither has period 4 in x and every cell starts at
-        // x % 8 == 0, so within ANY cell the dither values cycle phases
-        // 0,1,2,3,0,1,2,3 from the cell start. g_ditherQ[yph*4+0..3] is
-        // exactly those four values, pre-biased by PALETTE_REAL_OFF<<16.
-        // Shift them into the ramp's Q19 once per ROW and they live in
-        // registers for the whole row: the fast path reads no per-pixel
-        // tables at all except the palette itself.
-        const int32_t dq0 = g_ditherQ[yph * 4 + 0] << SILK_GRID_SHIFT;
-        const int32_t dq1 = g_ditherQ[yph * 4 + 1] << SILK_GRID_SHIFT;
-        const int32_t dq2 = g_ditherQ[yph * 4 + 2] << SILK_GRID_SHIFT;
-        const int32_t dq3 = g_ditherQ[yph * 4 + 3] << SILK_GRID_SHIFT;
+        // Pixels are written in pairs (sixth pass), and the Bayer cell is a
+        // pixel pair wide: pair k of a row takes dither phase k & 3. Every
+        // cell starts at x % 16 == 0, so within ANY cell the eight pairs
+        // cycle phases 0,1,2,3,0,1,2,3 from the cell start. g_ditherQ[yph*4 +
+        // 0..3] is exactly those four values; shift them into the ramp's Q20
+        // once per ROW and they live in registers for the whole row: the
+        // fast path reads no per-pixel tables at all except the palette.
+        // Multiplies, not shifts: the dither is signed now that the palette
+        // bias is out of it, and a left shift of a negative value is UB.
+        const int32_t dq0 = g_ditherQ[yph * 4 + 0] * (1 << SILK_GRID_SHIFT);
+        const int32_t dq1 = g_ditherQ[yph * 4 + 1] * (1 << SILK_GRID_SHIFT);
+        const int32_t dq2 = g_ditherQ[yph * 4 + 2] * (1 << SILK_GRID_SHIFT);
+        const int32_t dq3 = g_ditherQ[yph * 4 + 3] * (1 << SILK_GRID_SHIFT);
+        // Palette base: g_lut + PALETTE_REAL_OFF, indexed by the signed
+        // palette index in [-16, 271] (see the file-header bound), which
+        // lands inside paletteExt's padding at both ends.
+        const uint16_t *const pal = g_lut + PALETTE_REAL_OFF;
         const int cellsFull = w >> SILK_GRID_SHIFT;
         int x = 0;
         for (int cell = 0; cell < cellsFull; cell++) {
@@ -972,77 +1024,94 @@ GM_ANIM_IRAM void bandRef(uint16_t *dst, int y0, int rows, int w, uint32_t, cons
                 g_silkFastCells++;
 #endif
                 // FAST cell: ramp the Q16 product P from Pcur to Pnext in
-                // Q19 (<< SILK_GRID_SHIFT). Exact closure, same argument as
-                // the old s-ramp: 8 steps of (Pnext-Pcur) from Pcur<<3 land
-                // on Pnext<<3 exactly. Pixel 0 telescopes to the slow
-                // path's node value bit-for-bit: ((P + d) << 3) >> 19 ==
-                // (P + d) >> 16 (the <<3 is exact — see the header overflow
-                // bound — and arithmetic shifts compose), so fast and slow
-                // cells never seam.
+                // Q20 (<< SILK_GRID_SHIFT), two pixels per step. Exact
+                // closure, same argument as the old s-ramp: 8 steps of
+                // 2*(Pnext-Pcur) from Pcur<<4 land on Pnext<<4 exactly.
+                // Pixel 0 telescopes to the slow path's node value
+                // bit-for-bit: ((P + d) << 4) >> 20 == (P + d) >> 16 (the
+                // <<4 is exact, see the header overflow bound, and
+                // arithmetic shifts compose), so fast and slow cells never
+                // seam.
+                //
+                // Both pixels of a pair get the pair's first sample and one
+                // 32-bit store (AnimPlasma.cpp's precedent: bands start on a
+                // row boundary and w is even, so out + x is 4-byte aligned
+                // whenever x is). Halving the gathers and stores is what
+                // took the fast path from 10.2 to 8.3 ms on the device; the
+                // field itself is sampled on a 16-pixel grid, so the only
+                // thing the pairing changes is that the dither grain is two
+                // pixels wide (goldens moved by a mean of 2.0 of 255 from
+                // that alone; the grid change by itself moved them 0.14).
                 //
                 // This IS an 8x unroll, but not the one band()'s NOTE above
                 // warns about: that flat unroll replicated the whole 3-LUT
                 // pixel body (~20+ simultaneous live values, spilled, lost
                 // the hardware LOOP). This body keeps ~10 values live (PQ,
-                // dP, dq0-3, out, g_lut, temps) — inside the ~13-14 AR
-                // budget. Verified via xtensa-asm.sh; re-verify if touched.
+                // dP2, dq0-3, o, pal, v) -- inside the ~13-14 AR budget.
                 int32_t PQ = Pcur << SILK_GRID_SHIFT;
-                const int32_t dP = Pnext - Pcur;
-                uint16_t *const o = out + x;
-                o[0] = g_lut[(PQ + dq0) >> (16 + SILK_GRID_SHIFT)];
-                PQ += dP;
-                o[1] = g_lut[(PQ + dq1) >> (16 + SILK_GRID_SHIFT)];
-                PQ += dP;
-                o[2] = g_lut[(PQ + dq2) >> (16 + SILK_GRID_SHIFT)];
-                PQ += dP;
-                o[3] = g_lut[(PQ + dq3) >> (16 + SILK_GRID_SHIFT)];
-                PQ += dP;
-                o[4] = g_lut[(PQ + dq0) >> (16 + SILK_GRID_SHIFT)];
-                PQ += dP;
-                o[5] = g_lut[(PQ + dq1) >> (16 + SILK_GRID_SHIFT)];
-                PQ += dP;
-                o[6] = g_lut[(PQ + dq2) >> (16 + SILK_GRID_SHIFT)];
-                PQ += dP;
-                o[7] = g_lut[(PQ + dq3) >> (16 + SILK_GRID_SHIFT)];
+                const int32_t dP2 = (Pnext - Pcur) * 2;
+                uint32_t *const o = reinterpret_cast<uint32_t *>(out + x);
+                uint32_t v;
+                v = pal[(PQ + dq0) >> (16 + SILK_GRID_SHIFT)];
+                o[0] = v | (v << 16);
+                PQ += dP2;
+                v = pal[(PQ + dq1) >> (16 + SILK_GRID_SHIFT)];
+                o[1] = v | (v << 16);
+                PQ += dP2;
+                v = pal[(PQ + dq2) >> (16 + SILK_GRID_SHIFT)];
+                o[2] = v | (v << 16);
+                PQ += dP2;
+                v = pal[(PQ + dq3) >> (16 + SILK_GRID_SHIFT)];
+                o[3] = v | (v << 16);
+                PQ += dP2;
+                v = pal[(PQ + dq0) >> (16 + SILK_GRID_SHIFT)];
+                o[4] = v | (v << 16);
+                PQ += dP2;
+                v = pal[(PQ + dq1) >> (16 + SILK_GRID_SHIFT)];
+                o[5] = v | (v << 16);
+                PQ += dP2;
+                v = pal[(PQ + dq2) >> (16 + SILK_GRID_SHIFT)];
+                o[6] = v | (v << 16);
+                PQ += dP2;
+                v = pal[(PQ + dq3) >> (16 + SILK_GRID_SHIFT)];
+                o[7] = v | (v << 16);
                 x += SILK_GRID;
             } else {
 #ifdef GM_SILK_HOST_DIFF
                 g_silkSlowCells++;
 #endif
-                // EXACT cell (the pre-pass-4 body, verbatim): the contrast
-                // chord would deviate visibly here, so apply the curve at
-                // full resolution along the interpolated s.
-                const int32_t stepQ = (sNext - sCur) << (SILK_Q_BITS - SILK_GRID_SHIFT);
+                // EXACT cell (the pre-pass-4 body, per pixel pair since the
+                // sixth pass): the contrast chord would deviate visibly
+                // here, so apply the curve along the interpolated s at every
+                // pair. Exact closure as before: 8 steps of 2*(sNext-sCur)
+                // << (Q_BITS-GRID_SHIFT) land on sNext<<Q_BITS.
+                const int32_t stepQ2 = (sNext - sCur) * (2 << (SILK_Q_BITS - SILK_GRID_SHIFT)); // a multiply, not a shift: the difference can be negative
                 int32_t sQ = sCur << SILK_Q_BITS;
-                for (int i = 0; i < SILK_GRID; i++) {
+                for (int i = 0; i < SILK_GRID; i += 2) {
                     const int32_t s = sQ >> SILK_Q_BITS;
-                    // g_lut[s] (contrast curve) and g_lut[idx] (palette,
-                    // offset folded into g_ditherQ[], see its declaration)
-                    // are ONE walking pointer with two precomputed offsets,
-                    // not two separate pointers — see the
-                    // g_lut/contrastLUT/paletteExt comment above.
+                    // g_lut[s] (contrast curve) and pal[idx] (palette) are
+                    // ONE table with two base offsets, not two tables -- see
+                    // the g_lut/contrastLUT/paletteExt comment above.
                     const int32_t nc_q8 = g_lut[s]; // already the biased index, Q8 (nc*256)
                     // env_q8 in [0,256] always (see file header proof); no
                     // clamp needed for any square panel (all current
                     // display drivers are square).
                     const int32_t env_q8 = envRowBase_q8 - g_dx2Row[x];
-                    // nc_q8 (Q8) * env_q8 (Q8) = Q16; g_ditherQ[] is Q16 AND
-                    // pre-biased by PALETTE_REAL_OFF<<16 (see its
-                    // declaration), so one add combines them and one
-                    // arithmetic shift recovers g_lut's ABSOLUTE palette
-                    // index.
-                    const int32_t idxq = nc_q8 * env_q8 + g_ditherQ[yph * 4 + (x & 3)];
-                    const int idx = static_cast<int>(idxq >> 16);
-                    out[x] = g_lut[idx];
-                    sQ += stepQ;
-                    x++;
+                    // nc_q8 (Q8) * env_q8 (Q8) = Q16; g_ditherQ[] is Q16, so
+                    // one add combines them and one arithmetic shift gives
+                    // the signed palette index.
+                    const int32_t idxq = nc_q8 * env_q8 + g_ditherQ[yph * 4 + ((x >> 1) & 3)];
+                    const uint32_t v = pal[static_cast<int>(idxq >> 16)];
+                    *reinterpret_cast<uint32_t *>(out + x) = v | (v << 16);
+                    sQ += stepQ2;
+                    x += 2;
                 }
             }
             sCur = sNext;
             ncCur = ncNext;
             Pcur = Pnext;
         }
-        // Exact tail for the row's non-grid-aligned remainder (0..7 pixels):
+        // Exact tail for the row's non-grid-aligned remainder (0..15 pixels):
         // same per-pixel math band() used everywhere before interpolation
         // existed. `a,b,c` already sit at the last grid node's phase (== x
         // here), so this just resumes the ORIGINAL per-pixel g_step.
@@ -1053,9 +1122,8 @@ GM_ANIM_IRAM void bandRef(uint16_t *dst, int y0, int rows, int w, uint32_t, cons
             c += g_step[2];
             const int32_t nc_q8 = g_lut[s];
             const int32_t env_q8 = envRowBase_q8 - g_dx2Row[x];
-            const int32_t idxq = nc_q8 * env_q8 + g_ditherQ[yph * 4 + (x & 3)];
-            const int idx = static_cast<int>(idxq >> 16);
-            out[x] = g_lut[idx];
+            const int32_t idxq = nc_q8 * env_q8 + g_ditherQ[yph * 4 + ((x >> 1) & 3)];
+            out[x] = pal[static_cast<int>(idxq >> 16)];
         }
         base[0] += static_cast<uint32_t>(g_rowStep[0]);
         base[1] += static_cast<uint32_t>(g_rowStep[1]);
@@ -1128,7 +1196,7 @@ GM_ANIM_IRAM void band(uint16_t *dst, int y0, int rows, int w, uint32_t, const u
                 silkFastCell8Asm(out + x, Pcur << SILK_GRID_SHIFT, Pnext - Pcur, dqArr, g_lut);
             } else {
                 // EXACT cell: see silkExactCell8Asm's comment above.
-                const int32_t stepQ = (sNext - sCur) << (SILK_Q_BITS - SILK_GRID_SHIFT);
+                const int32_t stepQ = (sNext - sCur) * (1 << (SILK_Q_BITS - SILK_GRID_SHIFT)); // a multiply, not a shift: the difference can be negative
                 silkExactCell8Asm(out + x, sCur << SILK_Q_BITS, stepQ, envRowBase_q8, g_dx2Row + x, ditherRow,
                                    g_lut);
             }
