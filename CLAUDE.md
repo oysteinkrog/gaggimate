@@ -74,6 +74,59 @@ Measure with `-e display-loadtest` (`GM_TOUCH_PROBE`): `GM_UISTAT` lines give
 pass/snapshot/publish times and snapshot area per 5 s window; `GM_TOUCHLAT`
 lines stamp press→overlay_publish→anim_frame per tap.
 
+## Internal DRAM budget (violate these and the web UI dies)
+
+The web UI does not die of bugs in the server, it dies of internal DRAM
+starvation: every WiFi frame on its way out is a ~1630 B DMA-capable internal
+copy of a PSRAM pbuf, and when that allocation fails the driver logs
+`wifi:m f null`, the socket stalls and the NetworkWatchdog reconnect loop
+never recovers. The device used to idle at ~16 kB internal free (8 kB
+DMA-capable, largest block 7.7 kB) and two browser tabs killed it. After the
+2026-09-04 reclaim it idles at ~56 kB (48 kB DMA-capable). Rules:
+
+- **Service task stacks go in PSRAM when the task never runs with the flash
+  cache disabled** (`xTaskCreatePinnedToCoreWithCaps` with
+  `MALLOC_CAP_SPIRAM`): SleepAnim, SleepPush, Controller::loopLogic,
+  ESPMemoryMonitor, mdns. Anything that touches NVS, LittleFS, SD or
+  `esp_flash` stays internal (Settings::loop, ShotHistory, DefaultUI::loop,
+  async_tcp). A WithCaps task must never delete itself: that spawns a helper
+  task that needs internal heap and aborts without it. Finished tasks park
+  and the owner reaps them (`SleepAnimation::reapTasks`).
+- **`/api/debug/heapmap` is the instrument**: internal regions, block-size
+  histogram, and every task's stack size and high-water mark. Size stacks
+  from the measured `hwm`, not from guesses. `/api/debug/heap` carries
+  `dma_free`/`dma_min` and the asset gate counters.
+- **Big embedded assets stream at most three at a time**
+  (`kMaxAssetStreams`, WebUIPlugin). In-flight WiFi copies scale as
+  connections x TCP_SND_BUF/MSS; without the gate three cold tabs drained the
+  DMA pool to 276 bytes. Extra requests are parked with request continuation,
+  never refused. Four simultaneous cold tabs is the edge of the envelope
+  (dma min ~3 kB, a few refused WiFi TX allocations, no request failures).
+- **`TCP_SND_BUF=5760` and the WiFi IRAM opts off travel together**: the
+  four-segment send buffer is what makes the 437 kB bundle load in ~1.6 s
+  instead of 2.75 s (the link is round-trip bound at ~18 ms under BLE coex
+  and modem sleep), and the 17.7 kB the IRAM opts return is what pays for
+  the in-flight copies. Rationale and the measurements behind every knob,
+  including the ones tried and rejected, live above each setting in
+  `sdkconfig.gaggimate.defaults`; read them before touching WiFi or lwIP.
+- **Boots that fall back to the config AP idle ~7-11 kB lower** even after
+  the STA recovers (`WifiStaWd: AP fallback active`). The bench's mesh has
+  two BSSIDs and roams during boot, which trips the connect timeout about
+  one boot in four; check the serial log for `softAP` before comparing idle
+  numbers between boots.
+- **Every gradient-editor preview holds the panel for 15 s**; a settings save
+  that touches the animation fields ends the preview so the saved state wins
+  immediately (WebUIPlugin::handleSettings).
+
+Test rigs for all of this live in `C:\work\camshots` (Windows Playwright
+venv `pwenv`, real Chrome): `pw_gradient_rounds.py <n> [cold|warm] [drag]`
+(edit gradient, save, verify the framebuffer against the expected ramp via
+`fbclass.py`), `pw_multitab.py <rounds> <tabs>` (simultaneous cold loads),
+`pw_run.py` wrapper (required: a Windows Node process started from WSL1 needs
+its stdio redirected). Run them from WSL with `pwenv/Scripts/python.exe`.
+Verify the panel through `/api/debug/fb`, never the camera: the photos are
+too dark to classify.
+
 ## Measuring the display rig
 
 Use `tools/rig_soak.py` (build + flash + serial soak + analysis in one
