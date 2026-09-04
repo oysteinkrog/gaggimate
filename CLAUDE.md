@@ -1,4 +1,4 @@
-# GaggiMate (idf5 branch) — agent notes
+# GaggiMate (idf5 branch): agent notes
 
 ESP32-S3 espresso machine controller + display. The display is a LilyGo T-RGB
 480x480 round RGB panel scanning out of PSRAM; the controller is a separate
@@ -13,7 +13,7 @@ for production, `-e display-loadtest` for the bench rig).
   core 0 with it, every radio event preempted the bounce refill past its ~600us
   of slack and painted a displaced band. `Controller::setupPanel` therefore
   creates the panel from a task pinned to core 1 and logs `panel init on core
-  %d` — that line is the regression tripwire.
+  %d`; that line is the regression tripwire.
 - **Bounce pool stays at 16 scanlines total** (8 buffers x 2 lines, 15,360 B).
   Deeper pools starve the WiFi TX buffer pool: at 20+ lines two concurrent
   browser tabs kill the web UI (measured cliff between 14.7 and 18.3 kB DMA
@@ -37,7 +37,7 @@ for production, `-e display-loadtest` for the bench rig).
   extra_scripts). Each keeps a pristine `.gm-orig` beside the patched file.
   The Windows and WSL PlatformIO installs share `~/.platformio`; a
   Windows-side build can clobber the patched sources, and the patch scripts
-  re-apply on the next WSL build — if a display fault appears out of nowhere,
+  re-apply on the next WSL build; if a display fault appears out of nowhere,
   check the patches applied in the build log first. One patch targets the
   LVGL libdep rather than the framework: `scripts/patch_lvgl_meter_inv.py`
   (per-env, into `.pio/libdeps/<env>/lvgl`) gives lv_meter scale-lines
@@ -58,7 +58,7 @@ telemetry-driven screen from a 650 ms LVGL pass (1.5 Hz widget updates,
   round-robined and each ran at half speed exactly when both were busy.
   Only compute moved: the panel's interrupts stay on core 1 (setupPanel).
 - **While flushes are suppressed, LVGL must not render at all.**
-  `lvgl_helper_suppress_flush` parks the refresh timer (period, not pause —
+  `lvgl_helper_suppress_flush` parks the refresh timer (period, not pause;
   `_lv_inv_area` un-pauses on every invalidation) and
   `lvgl_helper_take_dirty_rects` harvests `disp->inv_areas` directly. The
   render-and-discard pass it replaces cost more than the snapshot render
@@ -96,12 +96,30 @@ DMA-capable, largest block 7.7 kB) and two browser tabs killed it. After the
   histogram, and every task's stack size and high-water mark. Size stacks
   from the measured `hwm`, not from guesses. `/api/debug/heap` carries
   `dma_free`/`dma_min` and the asset gate counters.
-- **Big embedded assets stream at most three at a time**
-  (`kMaxAssetStreams`, WebUIPlugin). In-flight WiFi copies scale as
-  connections x TCP_SND_BUF/MSS; without the gate three cold tabs drained the
-  DMA pool to 276 bytes. Extra requests are parked with request continuation,
-  never refused. Four simultaneous cold tabs is the edge of the envelope
-  (dma min ~3 kB, a few refused WiFi TX allocations, no request failures).
+- **Animation tables come from a fixed 12 KB slab, never from the heap
+  pool** (`bganim::allocHot`, BgAnimCommon.h; `bganim::alloc` is PSRAM,
+  always). Before the slab, placement was decided at init() against the free
+  pool, and after the reclaim the pool idled within a few kB of the 48 KB
+  reserve, so the same table landed in SRAM on one boot and PSRAM on the
+  next: band time swung 2x per boot, and the DRAM left for WiFi depended on
+  which animation was running. The slab is static (it is in the linker's RAM
+  figure: 98,312 B with it), 3,072 B hold the shared sine/cosine LUTs for the
+  boot, 9,216 B belong to the resident animation, and a table that does not
+  fit falls back to PSRAM and counts in `hot_fail` (`/api/debug/heap`). An
+  animation's static tables are not a way around it: BSS is the same pool.
+  With the slab a normal boot idles at ~53 kB internal (45 kB DMA-capable)
+  with the boot animation resident.
+- **Big embedded assets stream at most three at a time, and a second or
+  third only while `dma_free` is above 20 KB** (`kMaxAssetStreams`,
+  `kAssetGateDmaFloor`, `WebUIPlugin::assetSlotFree`). In-flight WiFi copies
+  scale as connections x TCP_SND_BUF/MSS; without the gate three cold tabs
+  drained the DMA pool to 276 bytes. Extra requests are parked with request
+  continuation, never refused; the first stream is always admitted so a
+  parked request cannot wait on a pool nothing drains. Measured 2026-09-04
+  with the slab, 3 rounds each: 2 tabs dma_min 15 kB, 3 tabs 6.8 kB, 4 tabs
+  2.3 kB, zero request failures and zero refused WiFi allocations on a
+  normal boot; on an AP-fallback boot 4 tabs produced 9 transient refused
+  1630 B allocations and still no request failures.
 - **`TCP_SND_BUF=5760` and the WiFi IRAM opts off travel together**: the
   four-segment send buffer is what makes the 437 kB bundle load in ~1.6 s
   instead of 2.75 s (the link is round-trip bound at ~18 ms under BLE coex
@@ -126,6 +144,55 @@ venv `pwenv`, real Chrome): `pw_gradient_rounds.py <n> [cold|warm] [drag]`
 its stdio redirected). Run them from WSL with `pwenv/Scripts/python.exe`.
 Verify the panel through `/api/debug/fb`, never the camera: the photos are
 too dark to classify.
+
+## Animation kernels (violate these and band time regresses silently)
+
+The 13 background animations' band() hot paths went through a hand-written
+Xtensa pass (2026-09-04, 13 Fable workers in parallel, four rounds). What
+survived, and what the device taught:
+
+- **Table placement beats instruction count.** The same kernel ran 1.3x to
+  2x slower with its per-pixel tables in PSRAM than in SRAM (plasma 9.1 vs
+  17.8 ms per full-res frame, caustics 22.6 vs 37.5, lava 26.0 vs 47.7,
+  aurora 46.7 vs 67.6). The hot slab (DRAM section above) makes that
+  placement a decision in source: `allocHot` for tables read per pixel or
+  per row, ranked by reads per frame within 9,216 B, `alloc` (PSRAM) for
+  bulk sequential sweeps. An animation that needs more than the slab shrinks
+  a table; it does not get more slab.
+- **GCC 14's schedule is the baseline, not the target.** Kernels that won on
+  static instruction count lost on the chip (mandala 0.85x, silk 0.73x of
+  the compiler's own bandRef) because the device pays for load-use stalls
+  and cache misses, not instructions; both PIE-decode-into-scratch designs
+  lost to keeping the index in a register. The kernels that won transcribed
+  GCC's loop first and then found an edge (orbits 2.0x, caustics 1.5x,
+  nebula 1.3x, ripples 3x to 5x depending on ring state). Silk's kernels are
+  in the file but off (`GM_BGANIM_SILK_ASM 0`) and lava ships none: after
+  three rounds neither beat its own bandRef on the device.
+- **Every kernel keeps its portable C++ as `bandRef` on the BgAnimation
+  struct**, and the ladder to change one is: host goldens exact
+  (`tools/animbench make check`), the real device compiler's disassembly
+  (`tools/animbench/xtensa-asm14.sh <name>`, flags and toolchain of the
+  firmware build, not the older xtensa-asm.sh), bit-exact execution in QEMU
+  (`tools/qemubench/build.sh tests/anim_<name>` then `run.sh`, greps
+  `GM_QEMUBENCH_PIE: PASS`), then the device: `/api/debug/animtest?anim=N`
+  renders 8 frames x 3 parameter sets through band() and bandRef() back to
+  back with alternating order and reports `mismatch_px` (must be 0) and the
+  first differing pixel; `/api/debug/anim?useref=1` swaps the render loop
+  to bandRef so the speed claim is measured under production conditions,
+  not estimated. `C:\work\camshots\anim_rung4.py [ids]` runs both for the
+  fleet; `anim_devbench.py` alone does the A/B (`RESERVE=` pins the band
+  buffers' pool). Nothing else is evidence: instruction counts and host
+  timings predicted wins the device reversed in 4 of 13 animations.
+- **A production kernel never writes CPENABLE.** FreeRTOS enables the FPU
+  and PIE lazily per task through the coprocessor-disabled exception, which
+  is also how another task's coprocessor state gets saved; a kernel that
+  sets CPENABLE itself skips that and can corrupt Controller::loopLogic's
+  float state. The bare-metal QEMU harness sets it once in its own main().
+- **ee.vld/vst.128.ip mask the low four address bits silently**, so a PIE
+  kernel aligns its spans with a scalar prefix, never by trusting the
+  pointer; `allocHot` returns 16-byte-aligned tables for this reason.
+- BAND_H is 2 (240 band() calls per frame), so per-call setup is paid 240
+  times: a kernel's row-state builder is as hot as its pixel loop.
 
 ## Measuring the display rig
 
@@ -171,7 +238,7 @@ Debugging methodology that this codebase has already paid for:
   Python313 silently lacks esptool and pyserial.
 - Camera verification: `C:\work\camshots\grab.bat <file>` (one frame),
   `burst.bat` (8s at 6fps). Photos land in C:\work\camshots.
-- `/api/settings` returns the WiFi password in cleartext — never dump it, and
+- `/api/settings` returns the WiFi password in cleartext: never dump it, and
   never POST to it by hand (the web UI is the only safe writer).
 
 ## Open cleanups
