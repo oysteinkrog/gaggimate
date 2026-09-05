@@ -1923,6 +1923,305 @@ void SleepAnimation::requestBandWarmup(const int (*ranges)[2], int n) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Layers (see the header's public section for the contract).
+
+int SleepAnimation::layerAcquire(int w, int h) {
+    if (w <= 0 || h <= 0 || w > 4096 || h > 4096) {
+        return -1;
+    }
+    for (int i = 0; i < MAX_LAYERS; i++) {
+        Layer &L = layers[i];
+        if (L.used.load() || L.releasePending.load()) {
+            continue;
+        }
+        // Pixels in PSRAM, same as the overlay snapshots: a full-screen
+        // layer is 691 KB. The run tables go there too, for the reason the
+        // overlay's do (read once per row, not per pixel).
+        uint8_t *buf = static_cast<uint8_t *>(heap_caps_aligned_alloc(16, static_cast<size_t>(w) * h * 3, MALLOC_CAP_SPIRAM));
+        uint32_t *runs = static_cast<uint32_t *>(heap_caps_malloc(static_cast<size_t>(h) * RUNS_PER_ROW * 4, MALLOC_CAP_SPIRAM));
+        uint8_t *runN = static_cast<uint8_t *>(heap_caps_malloc(static_cast<size_t>(h), MALLOC_CAP_SPIRAM));
+        if (buf == nullptr || runs == nullptr || runN == nullptr) {
+            heap_caps_free(buf);
+            heap_caps_free(runs);
+            heap_caps_free(runN);
+            log_w("SleepAnimation: layer %d alloc failed (%dx%d)", i, w, h);
+            return -1;
+        }
+        memset(buf, 0, static_cast<size_t>(w) * h * 3);
+        memset(runN, 0, static_cast<size_t>(h));
+        L.buf = buf;
+        L.runs = runs;
+        L.runN = runN;
+        L.w = w;
+        L.h = h;
+        L.seq.fetch_add(1);
+        L.x0 = L.y0 = L.x1 = L.y1 = 0;
+        L.t0Us = 0;
+        L.durUs = 0;
+        L.ease = 0;
+        L.seq.fetch_add(1);
+        L.visible.store(false);
+        L.used.store(true);
+        return i;
+    }
+    return -1;
+}
+
+void SleepAnimation::layerRelease(int id) {
+    if (id < 0 || id >= MAX_LAYERS || !layers[id].used.load()) {
+        return;
+    }
+    Layer &L = layers[id];
+    L.visible.store(false);
+    // The render task frees the buffers at the start of its next frame
+    // (evaluateLayers): at that point no band of the previous frame is still
+    // reading them, and the UI task never has to wait on the render task.
+    // The slot reads as used until then, so an acquire cannot take it early.
+    L.releasePending.store(true);
+}
+
+uint8_t *SleepAnimation::layerBuffer(int id) {
+    return (id >= 0 && id < MAX_LAYERS && layers[id].used.load()) ? layers[id].buf : nullptr;
+}
+int SleepAnimation::layerWidth(int id) const {
+    return (id >= 0 && id < MAX_LAYERS && layers[id].used.load()) ? layers[id].w : 0;
+}
+int SleepAnimation::layerHeight(int id) const {
+    return (id >= 0 && id < MAX_LAYERS && layers[id].used.load()) ? layers[id].h : 0;
+}
+
+void SleepAnimation::layerPublish(int id, int x, int y) {
+    if (id < 0 || id >= MAX_LAYERS || !layers[id].used.load()) {
+        return;
+    }
+    Layer &L = layers[id];
+    // Alpha runs per layer row, in layer x. The same scanner the overlay
+    // publish uses; no scrim cells for layers.
+    for (int r = 0; r < L.h; r++) {
+        const uint8_t *a = L.buf + static_cast<size_t>(r) * L.w * 3 + 2;
+        L.runN[r] = static_cast<uint8_t>(scanOverlayRow<false>(a, L.w, L.runs + static_cast<size_t>(r) * RUNS_PER_ROW, nullptr));
+    }
+    layerSetPos(id, x, y);
+    L.visible.store(true);
+}
+
+void SleepAnimation::layerSetPos(int id, int x, int y) {
+    if (id < 0 || id >= MAX_LAYERS || !layers[id].used.load()) {
+        return;
+    }
+    Layer &L = layers[id];
+    L.seq.fetch_add(1);
+    L.x0 = L.x1 = x;
+    L.y0 = L.y1 = y;
+    L.t0Us = 0;
+    L.durUs = 0;
+    L.seq.fetch_add(1);
+}
+
+void SleepAnimation::readLayerMotion(const Layer &L, LayerMotion &m) {
+    for (;;) {
+        const uint32_t s1 = L.seq.load();
+        if (s1 & 1u) {
+            continue;
+        }
+        m.x0 = L.x0;
+        m.y0 = L.y0;
+        m.x1 = L.x1;
+        m.y1 = L.y1;
+        m.t0Us = L.t0Us;
+        m.durUs = L.durUs;
+        m.ease = L.ease;
+        if (L.seq.load() == s1) {
+            return;
+        }
+    }
+}
+
+bool SleepAnimation::layerPosAt(const LayerMotion &m, int64_t nowUs, int &x, int &y) {
+    if (m.durUs == 0 || nowUs >= m.t0Us + static_cast<int64_t>(m.durUs)) {
+        x = m.x1;
+        y = m.y1;
+        return false;
+    }
+    const int64_t el = nowUs < m.t0Us ? 0 : nowUs - m.t0Us;
+    const uint32_t t = static_cast<uint32_t>((el << 16) / m.durUs); // Q16 in [0, 1)
+    uint32_t e = t;
+    if (m.ease == static_cast<uint8_t>(LayerEase::EaseOut)) {
+        // 1 - (1 - t)^2
+        const uint32_t u = 65536u - t;
+        e = 65536u - static_cast<uint32_t>((static_cast<uint64_t>(u) * u) >> 16);
+    } else if (m.ease == static_cast<uint8_t>(LayerEase::EaseInOut)) {
+        // 3t^2 - 2t^3 = t^2 (3 - 2t): Q16 x Q16 is Q32, one shift back.
+        const uint64_t t2 = (static_cast<uint64_t>(t) * t) >> 16;
+        e = static_cast<uint32_t>((t2 * (3u * 65536u - 2u * t)) >> 16);
+    }
+    x = m.x0 + static_cast<int>((static_cast<int64_t>(m.x1 - m.x0) * e) >> 16);
+    y = m.y0 + static_cast<int>((static_cast<int64_t>(m.y1 - m.y0) * e) >> 16);
+    return true;
+}
+
+void SleepAnimation::layerAnimate(int id, int x1, int y1, uint32_t durMs, LayerEase ease) {
+    if (id < 0 || id >= MAX_LAYERS || !layers[id].used.load()) {
+        return;
+    }
+    Layer &L = layers[id];
+    // From wherever the layer is right now, including mid-flight: the
+    // current position is evaluated here with the same curve the render
+    // task uses, so a retarget does not jump.
+    const int64_t now = esp_timer_get_time();
+    LayerMotion m;
+    readLayerMotion(L, m);
+    int cx, cy;
+    layerPosAt(m, now, cx, cy);
+    L.seq.fetch_add(1);
+    L.x0 = cx;
+    L.y0 = cy;
+    L.x1 = x1;
+    L.y1 = y1;
+    L.t0Us = now;
+    L.durUs = durMs * 1000u;
+    L.ease = static_cast<uint8_t>(ease);
+    L.seq.fetch_add(1);
+}
+
+bool SleepAnimation::layerAnimating(int id) const {
+    if (id < 0 || id >= MAX_LAYERS || !layers[id].used.load()) {
+        return false;
+    }
+    LayerMotion m;
+    readLayerMotion(layers[id], m);
+    int x, y;
+    return layerPosAt(m, esp_timer_get_time(), x, y);
+}
+bool SleepAnimation::layerVisible(int id) const {
+    return id >= 0 && id < MAX_LAYERS && layers[id].used.load() && layers[id].visible.load();
+}
+void SleepAnimation::layerHide(int id) {
+    if (id >= 0 && id < MAX_LAYERS) {
+        layers[id].visible.store(false);
+    }
+}
+SleepAnimation::LayerInfo SleepAnimation::layerInfo(int id) const {
+    LayerInfo info{};
+    if (id < 0 || id >= MAX_LAYERS) {
+        return info;
+    }
+    const Layer &L = layers[id];
+    info.used = L.used.load();
+    info.visible = L.visible.load();
+    info.animating = layerAnimating(id);
+    info.x = L.fx;
+    info.y = L.fy;
+    info.w = L.w;
+    info.h = L.h;
+    return info;
+}
+
+void SleepAnimation::evaluateLayers(int64_t nowUs) {
+    layersThisFrame = false;
+    if (display == nullptr) {
+        return;
+    }
+    const int panelH = display->height();
+    for (int i = 0; i < MAX_LAYERS; i++) {
+        Layer &L = layers[i];
+        if (L.releasePending.load()) {
+            heap_caps_free(L.buf);
+            heap_caps_free(L.runs);
+            heap_caps_free(L.runN);
+            L.buf = nullptr;
+            L.runs = nullptr;
+            L.runN = nullptr;
+            L.w = L.h = 0;
+            L.visible.store(false);
+            L.releasePending.store(false);
+            L.used.store(false);
+        }
+        const bool vis = L.used.load() && L.visible.load() && L.buf != nullptr;
+        int fx = L.fx, fy = L.fy;
+        if (vis) {
+            LayerMotion m;
+            readLayerMotion(L, m);
+            layerPosAt(m, nowUs, fx, fy);
+        }
+        // Rows entered or left since the last frame go out whole this frame
+        // and the next (requestBandWarmup's window), same as a widget update.
+        const bool moved = vis != L.lastVisible || (vis && (fy != L.fy || fx != L.fx));
+        if (moved) {
+            int ranges[2][2];
+            int n = 0;
+            if (L.lastVisible) {
+                ranges[n][0] = L.lastY0;
+                ranges[n][1] = L.lastY1;
+                n++;
+            }
+            if (vis) {
+                ranges[n][0] = fy < 0 ? 0 : fy;
+                ranges[n][1] = fy + L.h > panelH ? panelH : fy + L.h;
+                n++;
+            }
+            if (n > 0) {
+                requestBandWarmup(ranges, n);
+            }
+        }
+        L.fx = fx;
+        L.fy = fy;
+        L.fVisible = vis;
+        L.lastVisible = vis;
+        L.lastY0 = fy < 0 ? 0 : fy;
+        L.lastY1 = fy + L.h > panelH ? panelH : fy + L.h;
+        layersThisFrame = layersThisFrame || vis;
+    }
+}
+
+void SleepAnimation::compositeLayersRow(uint16_t *drow, int y, int w, bool pieBlend) {
+    for (int i = 0; i < MAX_LAYERS; i++) {
+        const Layer &L = layers[i];
+        if (!L.fVisible) {
+            continue;
+        }
+        const int ly = y - L.fy;
+        if (ly < 0 || ly >= L.h) {
+            continue;
+        }
+        const int n = L.runN[ly];
+        if (n == 0) {
+            continue;
+        }
+        // Runs are in layer x; shift them to the panel and clip to it. A run
+        // that leaves the panel on both sides is dropped, so the blend never
+        // reads outside the layer's row either (x - fx stays within [0, w)).
+        const uint32_t *src = L.runs + static_cast<size_t>(ly) * RUNS_PER_ROW;
+        uint32_t shifted[RUNS_PER_ROW];
+        int m = 0;
+        for (int k = 0; k < n; k++) {
+            int x0 = static_cast<int>(src[k] & 0xFFFFu) + L.fx;
+            int x1 = static_cast<int>(src[k] >> 16) + L.fx;
+            if (x0 < 0) {
+                x0 = 0;
+            }
+            if (x1 > w) {
+                x1 = w;
+            }
+            if (x1 > x0) {
+                shifted[m++] = static_cast<uint32_t>(x0) | (static_cast<uint32_t>(x1) << 16);
+            }
+        }
+        if (m == 0) {
+            continue;
+        }
+        // colour + x*3 must be the layer pixel at (x - fx, ly): offset the
+        // row base by -fx pixels.
+        const uint8_t *crow = L.buf + (static_cast<ptrdiff_t>(ly) * L.w - L.fx) * 3;
+        if (pieBlend) {
+            blendRowPie(drow, crow, shifted, m);
+        } else {
+            blendRow(drow, crow, shifted, m);
+        }
+    }
+}
+
 // Turns the per-cell coverage in ov.scrimSrc into the halo the composite reads,
 // then widens the span tables to cover it.
 //
@@ -2680,6 +2979,7 @@ void SleepAnimation::renderLoop() {
         lastFillUs.store(profFillUs);
         lastCopyUs.store(profCopyUs);
         lastBlendUs.store(profBlendUs);
+        lastLayerUs.store(profLayerUs);
         lastMsyncUs.store(profMsyncUs);
         lastPushUs.store(profPushUs);
 #endif
@@ -2803,6 +3103,7 @@ void SleepAnimation::renderFrame() {
     profFillUs = 0;
     profCopyUs = 0;
     profBlendUs = 0;
+    profLayerUs = 0;
     profMsyncUs = 0;
     profPushUs = 0;
     // Cropping to the round panel's visible chord trades render-side work
@@ -2904,6 +3205,7 @@ void SleepAnimation::renderFrame() {
         ofi = overlayFront.load();
         overlayInUse.store(ofi);
     } while (ofi != overlayFront.load());
+    evaluateLayers(esp_timer_get_time());
 #ifdef GM_TOUCH_PROBE
     // This sample is the moment a publish becomes part of a frame; a stamp
     // still pending here means this frame is the first to carry the response.
@@ -3472,6 +3774,26 @@ void SleepAnimation::renderFrame() {
         }
         BENCH_ACC(accBlendUs, tBlend);
         profBlendUs += static_cast<uint32_t>(esp_timer_get_time() - tBlend);
+        // Layers sit above the overlay; same row-parity rule as the blend
+        // loop above, since an interlaced band only pushes one parity. Bands
+        // no layer reaches skip the block, timer reads included: two of
+        // those per band is half a millisecond a frame.
+        if (layersThisFrame && !patternMode) {
+            bool hit = false;
+            for (int i = 0; i < MAX_LAYERS && !hit; i++) {
+                hit = layers[i].fVisible && layers[i].fy < y0 + rows && layers[i].fy + layers[i].h > y0;
+            }
+            if (hit) {
+                const int64_t tLayer = esp_timer_get_time();
+                for (int y = y0; y < y0 + rows; y++) {
+                    if (bandInterlaced && ((((pairMode ? (y >> 1) : y) ^ parityNow) & 1) != 0)) {
+                        continue;
+                    }
+                    compositeLayersRow(band + static_cast<size_t>(y - y0) * w, y, w, pieBlend);
+                }
+                profLayerUs += static_cast<uint32_t>(esp_timer_get_time() - tLayer);
+            }
+        }
 #ifdef GM_ANIM_BENCH
         accSpanPx += spanPxLocal;
         accScrimPx += scrimPxLocal;

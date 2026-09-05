@@ -29,6 +29,24 @@ class SleepAnimation {
     int overlayBackIndex() const { return 0; }
     void requestWholeFrames() {}
     void requestBandWarmup(const int (*)[2], int) {}
+    static constexpr int MAX_LAYERS = 3;
+    enum class LayerEase : uint8_t { Linear = 0, EaseOut = 1, EaseInOut = 2 };
+    struct LayerInfo {
+        bool used, visible, animating;
+        int x, y, w, h;
+    };
+    int layerAcquire(int, int) { return -1; }
+    void layerRelease(int) {}
+    uint8_t *layerBuffer(int) { return nullptr; }
+    int layerWidth(int) const { return 0; }
+    int layerHeight(int) const { return 0; }
+    void layerPublish(int, int, int) {}
+    void layerSetPos(int, int, int) {}
+    void layerAnimate(int, int, int, uint32_t, LayerEase) {}
+    bool layerAnimating(int) const { return false; }
+    bool layerVisible(int) const { return false; }
+    void layerHide(int) {}
+    LayerInfo layerInfo(int) const { return LayerInfo{}; }
 };
 #else
 
@@ -296,6 +314,52 @@ class SleepAnimation {
     // geometry change, host screen swap) covers every band, so this
     // subsumes the whole-frame cases without any special-casing of its own.
     void requestBandWarmup(const int (*ranges)[2], int n);
+
+    // Layers: prerendered RGB565+A8 sprites the render task composites over
+    // the overlay at a position IT computes every frame. This is how a
+    // foreground element moves smoothly: the LVGL path (snapshot the dirty
+    // rects, publish, composite) costs 45 to 140 ms per refresh on this chip
+    // and 1 to 4 us per redrawn pixel however the pixels are written
+    // (measured 2026-09-05 with the widget motion test, uianim= on
+    // /api/debug/anim: 4.5 to 7.7 Hz for a sliding plate), so a widget that
+    // moves through LVGL moves at 5 fps. A layer is rendered by LVGL once,
+    // into its own buffer, and from then on each frame only pays the blend
+    // of its pixels: motion runs at the animation loop's rate.
+    //
+    // Protocol, UI task side: layerAcquire (buffers come from PSRAM), draw
+    // into layerBuffer (LV_IMG_CF_TRUE_COLOR_ALPHA, w*h*3, row-major, alpha
+    // 0 = animation shows through), layerPublish at a panel position (scans
+    // the alpha runs, makes it visible), layerAnimate to a target position
+    // over a duration; poll layerAnimating() for the end, then layerHide or
+    // layerRelease. Content is immutable while visible: to change it, hide,
+    // redraw, publish again. The render task never writes a layer.
+    //
+    // Motion state crosses the cores through a seqlock (Layer::seq), and the
+    // render task latches every layer's position once per frame (evaluate
+    // Layers), so a frame never sees a layer in two places. Rows a layer
+    // enters or leaves are pushed whole for that frame (requestBandWarmup):
+    // the same rule as widget updates, since a moving hard-edged sprite
+    // split across interlace phases combs visibly.
+    static constexpr int MAX_LAYERS = 3;
+    enum class LayerEase : uint8_t { Linear = 0, EaseOut = 1, EaseInOut = 2 };
+    struct LayerInfo {
+        bool used, visible, animating;
+        int x, y, w, h;
+    };
+    // Returns the layer id, or -1 when none is free or PSRAM is short.
+    int layerAcquire(int w, int h);
+    void layerRelease(int id);
+    uint8_t *layerBuffer(int id);
+    int layerWidth(int id) const;
+    int layerHeight(int id) const;
+    void layerPublish(int id, int x, int y);
+    void layerSetPos(int id, int x, int y);
+    void layerAnimate(int id, int x1, int y1, uint32_t durMs, LayerEase ease);
+    bool layerAnimating(int id) const;
+    bool layerVisible(int id) const;
+    void layerHide(int id);
+    LayerInfo layerInfo(int id) const;
+    uint32_t lastLayerUsValue() const { return lastLayerUs.load(); }
 
     // Framebuffer-ownership controls, deliberately not behind GM_ANIM_BENCH.
     // Each setting produces a different visible defect and neither is visible
@@ -1257,6 +1321,57 @@ class SleepAnimation {
     Overlay overlays[2];
     uint32_t overlayCap = 0;
     std::atomic<int> overlayFront{-1}; // -1 = nothing published yet
+
+    struct Layer {
+        uint8_t *buf = nullptr;   // PSRAM, w*h*3 (RGB565 + A8)
+        uint32_t *runs = nullptr; // h * RUNS_PER_ROW, x relative to the layer
+        uint8_t *runN = nullptr;  // h
+        int w = 0;
+        int h = 0;
+        std::atomic<bool> used{false};
+        std::atomic<bool> visible{false};
+        std::atomic<bool> releasePending{false}; // layerRelease() asked; the render task frees
+        // Motion, UI task -> render task under seq (odd while being written).
+        // "Animating" is a property of this record (durUs != 0 and the clock
+        // has not reached t0Us + durUs), not a flag of its own: a flag the
+        // render task cleared at the end of one leg raced the UI task
+        // starting the next.
+        std::atomic<uint32_t> seq{0};
+        int32_t x0 = 0, y0 = 0, x1 = 0, y1 = 0;
+        int64_t t0Us = 0;
+        uint32_t durUs = 0;
+        uint8_t ease = 0;
+        // Latched by evaluateLayers() for the frame being rendered.
+        int fx = 0, fy = 0;
+        bool fVisible = false;
+        // Where it was on the previous frame, so the rows it left get pushed
+        // whole too.
+        int lastY0 = 0, lastY1 = 0;
+        bool lastVisible = false;
+    };
+    Layer layers[MAX_LAYERS];
+    struct LayerMotion {
+        int32_t x0, y0, x1, y1;
+        int64_t t0Us;
+        uint32_t durUs;
+        uint8_t ease;
+    };
+    // Seqlock read of a layer's motion record; either task may call it.
+    static void readLayerMotion(const Layer &L, LayerMotion &m);
+    // Position on the record's curve at nowUs; false when the motion has
+    // ended (or never was one), with the end point in (x, y).
+    static bool layerPosAt(const LayerMotion &m, int64_t nowUs, int &x, int &y);
+    // Once per frame on the render task: positions for this frame and warmup
+    // for the rows any layer entered or left.
+    void evaluateLayers(int64_t nowUs);
+    // Per panel row, after the overlay blend: every visible layer whose
+    // rows cover y, through the same blend kernels the overlay uses.
+    void compositeLayersRow(uint16_t *drow, int y, int w, bool pieBlend);
+    // Set by evaluateLayers: true when any layer is visible this frame, so
+    // the band loop can skip the composite (and its timing) outright.
+    bool layersThisFrame = false;
+    std::atomic<uint32_t> lastLayerUs{0};
+    uint32_t profLayerUs = 0; // compositing the layers into the band
     std::atomic<int> overlayInUse{-1}; // overlay the render task reads this frame
 
 #ifdef GM_ANIM_BENCH
