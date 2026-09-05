@@ -1,10 +1,10 @@
 #ifndef GAGGIMATE_SIM
 
-// "Lava" — six soft metaballs on incommensurate orbits, cubic falloff with a
+// "Lava": six soft metaballs on incommensurate orbits, cubic falloff with a
 // t^6 hot core, palette-mapped. Design: anim-fluid (Fable), 2026-08-15.
 // Perf pass (sleep17, round 2): band() previously recomputed, per pixel,
 // dx = x-bx, d2 = dx*dx+dy2, tt = 1-d2*invR2, then a t^3 term plus a
-// branchy t^6 hot-core add-on — around 8 float multiplies and 2 branches
+// branchy t^6 hot-core add-on: around 8 float multiplies and 2 branches
 // per touched pixel per blob, followed by a second float pipeline (scale,
 // dither, clamp) to turn the summed field into a palette index. The whole
 // thing is now integer end to end:
@@ -15,29 +15,29 @@
 //    a Bresenham-style forward-difference accumulator: two integer adds per
 //    pixel (tt += step; step += step2) reproduce the exact quadratic with no
 //    per-pixel multiply at all. tt0/step0 (the row-starting value/slope) and
-//    step2 (the constant curvature, truly per-blob-only — it doesn't even
+//    step2 (the constant curvature, truly per-blob-only. It doesn't even
 //    depend on row) are computed once per (blob,row) and once per blob
 //    respectively, both in the cheap outer loops, not the pixel loop.
-// 2. The nonlinear part — t3 = tt^3, plus the tt>0.7 hot-core t^6 term,
+// 2. The nonlinear part, t3 = tt^3, plus the tt>0.7 hot-core t^6 term,
 //    times intensity, times kFieldScale (the field->palette-index scale
-//    that used to run per pixel in the finalization loop) — depends only on
+//    that used to run per pixel in the finalization loop), depends only on
 //    tt, not on blob identity or pixel position. So it's folded into one
 //    already-integer, already-index-scaled LUT (1024 buckets, padded to
-//    1088 so the index shift never runs off the end -- round 5 narrowed this
+//    1088 so the index shift never runs off the end: round 5 narrowed this
 //    to 512 buckets padded to 576, see LUT_BITS's own comment), rebuilt once
 //    per frame from the current intensity. band()'s field loop turns the
 //    fixed-point tt accumulator into a LUT index with a shift (no multiply,
 //    no divide, no branch) and adds the looked-up integer straight into an
-//    integer fieldRow accumulator — no float ops left in this loop at all.
+//    integer fieldRow accumulator: no float ops left in this loop at all.
 // 3. The finalization loop (field -> palette index) used to do a float
 //    clamp-to-1.6, a float multiply by kFieldScale, and a float->int trunc
 //    per pixel. Since fieldRow is now already in palette-index units, the
-//    "clamp to 1.6f before scale" step becomes an integer min(fieldRow,255)
-//    — same saturation semantics (dither still perturbs saturated pixels,
+//    "clamp to 1.6f before scale" step becomes an integer min(fieldRow,255):
+//    same saturation semantics (dither still perturbs saturated pixels,
 //    matching the original's intent of avoiding banding at blob overlaps)
 //    but compiled as a branchless Xtensa MIN instruction instead of a float
 //    compare+branch. Same technique AnimEmber.cpp uses for its palette
-//    lookup (see its file header) — this file keeps a bounded min/max clamp
+//    lookup (see its file header): this file keeps a bounded min/max clamp
 //    rather than Ember's fully-padded array because up to 6 large,
 //    frequently-overlapping blobs make the worst-case index harder to bound
 //    tightly than Ember's single radial field.
@@ -47,13 +47,13 @@
 // add + 1 min + 1 max + 1 palette lookup + 1 store, zero float ops, zero
 // branches. Zero libm, zero float divides, zero float multiplies per pixel
 // anywhere in band(). xlo/xhi are still the full-radius per-blob column
-// window computed once in frame() — a safe superset of the true per-row
-// chord; the LUT's zero-padded low side folds the tt<=0 early-out into the
+// window computed once in frame() (a safe superset of the true per-row
+// chord); the LUT's zero-padded low side folds the tt<=0 early-out into the
 // table lookup instead of a per-pixel compare.
 //
 // Perf pass, 2026-08-18 (opt-lava): the finalization loop above was still
 // run over all 480 columns of every row, even though 6 blobs of radius
-// ~0.19*min(w,h) rarely cover the whole width — most touched pixels are
+// ~0.19*min(w,h) rarely cover the whole width: most touched pixels are
 // background, and the finalization formula for a background pixel
 // (fieldRow[x] == 0, always) collapses to a function of (x&3, y&3) alone.
 // That 16-value pattern is now precomputed once per theme change into four
@@ -61,25 +61,25 @@
 // right one into the output row before doing anything else. The field
 // accumulation loop is UNCHANGED (still walks every blob's own xlo/xhi
 // window, still the same forward-difference math); band() additionally now
-// records each touched blob's [xlo,xhi] as it accumulates (free — the
+// records each touched blob's [xlo,xhi] as it accumulates (free: the
 // values are already live locals in that loop), sorts and merges those into
 // the row's true touched-column union (at most NUM_BLOBS==6 intervals, so a
 // plain insertion sort), and re-runs the old finalization arithmetic
 // (moved verbatim into finalizeSpan(), just windowed to [lo,hi] instead of
 // always [0,w)) ONLY over that union, overwriting the memcpy'd background
-// there. A row no blob reaches skips finalization entirely -- one memcpy is
+// there. A row no blob reaches skips finalization entirely: one memcpy is
 // the whole cost. Measured host band_ms at BAND_H=8: 0.250 -> ~0.220 (five
 // medians measured directly; team-lead's independent 0.250 predates this
 // pass), a ~12% cut, comfortably outside the quoted 2-9% run-to-run spread,
 // and a genuine arithmetic reduction (not a locality effect), so this one
 // SHOULD show up on host and does. New static footprint: bgRowAll,
 // 4 * w * sizeof(uint16_t) = 3,840 B at w=480, alloc()'d (under the 8 KB
-// PSRAM threshold, so internal DRAM like paletteLUT/fieldRow, not PSRAM —
-// see the growth this cost in the commit message). Golden frames stay
+// PSRAM threshold, so internal DRAM like paletteLUT/fieldRow, not PSRAM.
+// See the growth this cost in the commit message). Golden frames stay
 // bit-exact (background pixels are byte-identical to what full computation
 // produced, by construction: same formula, same inputs, just computed once
 // and copied instead of recomputed per row) and band()'s call-shape
-// invariant is untouched — nothing here is cached across band() calls, only
+// invariant is untouched: nothing here is cached across band() calls, only
 // within one call's per-row loop, and the per-row span/merge state is fresh
 // every row and every call.
 //
@@ -89,13 +89,13 @@
 // finalize kernel, a PIE background-row copy, an aligned bgRowAll split, and
 // two different placements of a narrowed lavaLUT) were each measured against
 // HEAD's own band() on the device at matched table placement, and none beat
-// it -- 31.1-32.8 ms and then 29.0-32.0 ms per full-res frame against HEAD's
+// it: 31.1-32.8 ms and then 29.0-32.0 ms per full-res frame against HEAD's
 // 26.0 ms, across every combination tried. None of it is carried forward.
 // This file is HEAD's band()/bandRef split verbatim (band() below is a
 // direct call to bandRef(), no kernel, no restructuring); the only change is
 // table placement, using the bganim::allocHot() API added this round: the
 // three tables HEAD itself allocated at or under 8 KB (paletteLUT 512 B,
-// fieldRow 1,920 B at w=480, bgRowAll 3,840 B at w=480 -- the set HEAD's own
+// fieldRow 1,920 B at w=480, bgRowAll 3,840 B at w=480: the set HEAD's own
 // alloc() used to land in internal DRAM when the pool allowed, per the
 // per-table comments below) now go through allocHot()'s reserved slab
 // instead of racing the general heap for that placement. lavaLUT (9,216 B,
@@ -107,16 +107,16 @@
 // above (26.0 ms) predates kb.py; kbench on the round-4 firmware read
 // band min 20.77/first 35.5/mean 32.33 ms, and this round's own kb.py run
 // of the unchanged round-4 source confirmed it (band 19.42/28.67/28.84,
-// blob of the same source 19.26/31.11/29.14 -- nil placement offset between
+// blob of the same source 19.26/31.11/29.14: nil placement offset between
 // IRAM blob and flash band(), matching kblob/README.md's claim for other
 // anims). The three tables round 4 moved to allocHot() used only 6,272 B of
 // the 9,216 B animation's slab share (512+1,920+3,840), leaving 2,944 B
-// free -- lavaLUT (the fourth and largest table, read once per touched
+// free. lavaLUT (the fourth and largest table, read once per touched
 // pixel in the field-accumulation loop) was the only one still on alloc()
 // (PSRAM), by round 4's own design, not a fallback. This round narrows it
 // to int16_t and drops LUT_BITS from 10 to 512 buckets (see the constant's
 // comment for the exact margin math) so LUT_SIZE*sizeof(int16_t) is 2,304 B,
-// fitting the free 2,944 B, and moves it to allocHot() too -- the first
+// fitting the free 2,944 B, and moves it to allocHot() too: the first
 // attempt where all four of lava's tables are hot-slab-resident at once,
 // which rounds 1-3 could not do (allocHot() did not exist yet; the old
 // heap-race heuristic could put lavaLUT in SRAM only by starving something
@@ -131,7 +131,7 @@
 // follow-up dropped LUT_BITS to 8 (1,152 B, more slab headroom): min_ms was
 // unchanged (18.94-18.96 again) and first_ms showed no consistent
 // improvement, so the win comes from getting lavaLUT off PSRAM at all, not
-// from shrinking it further past LUT_BITS=9 -- kept the finer table for the
+// from shrinking it further past LUT_BITS=9: kept the finer table for the
 // better golden margin at no measured cost. Golden diff at LUT_BITS=9:
 // mean 0.061-0.101, max 33-36 (tolerance mean<=3, max<=48), so the coarser
 // bucket is visually silent. Host bandRef host time similarly moved
@@ -142,10 +142,10 @@
 // (xtensa-asm14.sh) rather than re-attempted in hand asm: the compiled loop
 // already runs inside a hardware zero-overhead LOOP (confirmed in the .S,
 // same as the round-4 comment above already notes) at 9 instructions per
-// touched pixel -- srai+addx2 (2, compute the LUT index and address),
+// touched pixel: srai+addx2 (2, compute the LUT index and address),
 // l16si (1, load lut[idx]), l32i (1, load the accumulator), add.n (1,
 // ttQ+=stepQ), add.n (1, accumulate), s32i (1, store the accumulator),
-// add.n (1, stepQ+=step2Q), addi.n (1, field++) -- with GCC's own scheduler
+// add.n (1, stepQ+=step2Q), addi.n (1, field++), with GCC's own scheduler
 // already inserting the independent ttQ+=stepQ update between the lut load
 // and its use, so there is no load-use stall to remove either. That is the
 // true arithmetic floor for this Bresenham-LUT structure: one gather load,
@@ -157,7 +157,7 @@
 // not spend the shared board's time re-running that experiment a fourth
 // time. finalizeSpan's own 4-wide loop is the one hot loop in this file
 // that did NOT get a hardware LOOP (xtensa-asm14 shows a plain
-// decrement-and-branch, `bnez.n`, closing it) -- a `loopnez` conversion
+// decrement-and-branch, `bnez.n`, closing it). A `loopnez` conversion
 // there is a real, untested-this-round candidate, but by instruction count
 // it removes at most one taken branch per 4 pixels against a ~24-instruction
 // body, under 5% of finalizeSpan's own cost and likely under the 3% total
@@ -165,6 +165,75 @@
 // comment above) may already have covered this exact loop and lost, so it
 // is named here as a candidate for whoever picks this file up next with
 // board time to spend confirming it, not shipped speculatively.
+//
+// Redesign, 2026-09-05 (design-lava): three more Xtensa rounds against this
+// file's own field-accumulation and finalize loops (see round 1-3 and round
+// 4/5 above) had already found the arithmetic floor for computing every
+// row; the only way further down was to compute fewer rows. Probe blobs
+// (kb.py, anim 1, isolating each half of a row's cost by stubbing the other
+// half) measured the split before changing anything: the field-accumulation
+// gather cost about 10.0 ms of the 19.1 ms frame, finalizeSpan (dither,
+// clamp, palette lookup over the touched-column union) about 6.1 ms, with
+// roughly 2.8 ms of shared per-row bookkeeping (the memset and the six-blob
+// dy2 span check) neither probe isolates cleanly. Reading the code first
+// suggested finalizeSpan was the larger cost; it is not, and the three
+// failed asm rounds above make sense in that light: the gather was never
+// a small piece of the frame, so no instruction-level trick to it was ever
+// going to move much.
+//
+// Since both costs (and the shared bookkeeping) scale with rows processed
+// rather than with anything asm can trim independently, band() now computes
+// one row of each vertical pair in full and duplicates it into the row
+// below, instead of running the gather and finalize passes on every row.
+// Production always calls this with rows==2 and y0 even (BAND_H,
+// SleepAnimation.cpp), so the common case is exactly one compute-and-
+// duplicate pair per call; nothing here carries state between calls, same
+// contract this file's bandRef always relied on. Blob positions, radii,
+// palette and the LUT are all unchanged: this is the same math, run over
+// half the rows. Measured: rig (kb.py blob min_ms) 19.1 -> 10.1 ms, a 1.88x
+// cut; golden diff (frames 30/120/210, defaults and both extremes of all
+// three parameters) 0.4 to 1.6 of 255, all from dither grain, no shape or
+// colour change.
+//
+// The dither phase needs care once rows are paired. The ordered dither is
+// keyed on a Bayer row phase (BAYER4's row period); a first cut passed the
+// source row's own y&3 into the shared per-row renderer and duplicated the
+// result verbatim. y is always even in every real caller, so y&3 only ever
+// comes out 0 or 2: rows with phase 1 or 3 never appear. In a 4x4 Bayer
+// matrix, rows 0 and 2 share the same column parity (both alternate low,
+// high, low, high across columns), so the two phases that do appear
+// reinforce the same per-column pattern in every displayed row instead of
+// alternating with their neighbours, and the texture reads as fine vertical
+// stripes in bright, flat regions (a blob's hot core, the glow falloff)
+// instead of a checkerboard grain. Confirmed by inspection against a
+// pre-fix render side by side with this file's own frames, which show no
+// such stripes. Fixed by keying the phase on the row PAIR, (y>>1)&3,
+// instead of the row: pair 0 (rows 0-1) uses Bayer row 0, pair 1 (rows 2-3)
+// row 1, pair 2 row 2, pair 3 row 3, pair 4 wraps back to row 0, and so on.
+// All four Bayer rows now appear, each stretched over two physical rows
+// instead of one (the same coarsening this redesign already trades for
+// speed, just applied along y instead of collapsed along y) and
+// successive pairs use different Bayer rows, so the grain is a 1x2
+// checkerboard again rather than a column of solid stripes. Cost: one shift
+// and one mask, already free next to the memset/gather/finalize below.
+// Confirmed at no measured timing cost (10.14 ms both before and after).
+//
+// A second bug surfaced at integration, caught by
+// tools/animbench/interlace_check.cpp: a row's content and dither phase
+// must depend only on its own absolute y, never on which other rows the
+// same band() call happened to also request. An earlier cut of bandRef
+// kept the pair phase, (y>>1)&3, only when both rows of a pair landed in
+// the same call, and fell back to a lone row's own y&3 otherwise, which
+// differs from its pair phase whenever y is even, so the same row rendered
+// two different ways depending on call shape. This is not a hypothetical:
+// SleepAnimation.cpp's row-level interlace path (splitRenderFull) calls
+// band() with rows==1, one row at a time, rendering only every other row
+// each frame, so a real production path requests rows individually with no
+// partner in the same call. Fixed by deriving ySrc = y & ~1 and phase =
+// (y>>1)&3 from y before deciding whether to duplicate, so a lone row
+// renders ySrc's content directly and gets exactly the pixels it would
+// have gotten as the duplicate half of a same-call pair. See bandRef's
+// own comment for the mechanism.
 
 #include "BgAnim.h"
 #include "BgAnimCommon.h"
@@ -177,11 +246,11 @@ using namespace bganim;
 constexpr int NUM_BLOBS = 6;
 // 1/1.6 exactly (1.6 = 8/5, so 1/1.6 = 0.625 = 5/8, exact in binary), folded
 // with the *255 index scale. Used only once per frame now (building
-// lavaLUT in frame()) — band() never multiplies by it per pixel.
+// lavaLUT in frame()). band() never multiplies by it per pixel.
 constexpr float kFieldScale = 0.625f * 255.0f; // 159.375, exact
 
 // Fixed-point scheme for the per-pixel tt accumulator (Bresenham-style
-// quadratic forward difference — see file-top comment). Q12.20: tt lives in
+// quadratic forward difference, see file-top comment). Q12.20: tt lives in
 // (0, 1] so 20 fractional bits give ample precision (worst-case curvature
 // step rounding drifts tt by well under 0.01 over a full blob-width scan,
 // negligible next to the LUT's own 1024-bucket quantization).
@@ -189,11 +258,11 @@ constexpr int FRAC_BITS = 20;
 constexpr float FIXED_SCALE = static_cast<float>(1 << FRAC_BITS); // 1,048,576
 
 // tt -> (t^3 + hot-core t^6) * intensity * kFieldScale LUT (already in
-// palette-index units — see file-top comment), indexed by the top LUT_BITS
+// palette-index units, see file-top comment), indexed by the top LUT_BITS
 // of the Q12.20 tt accumulator (arithmetic shift, so negative tt maps to
 // negative indices). band()'s row/blob setup guarantees dy2 < R2 (the row
 // early-out) and |dx| <= R (the xlo/xhi window), so d2 < 2*R^2 and therefore
-// tt = 1 - d2*invR2 is bounded in (-1, 1] — never more negative than -1. The
+// tt = 1 - d2*invR2 is bounded in (-1, 1]: never more negative than -1. The
 // table is padded on *both* ends (low side zero-filled, representing "no
 // contribution", so it doubles as the tt<=0 early-out with no branch; high
 // side clamped to the tt=1 blob-center value) so band()'s inner loop can
@@ -216,7 +285,7 @@ constexpr int LUT_HALF = 1 << LUT_BITS; // 512 buckets covering tt in (0,1]
 //   0.5*k*(k-1)/2 + 0.5*k + 0.5   Q12.20 units,
 // which at the widest possible scan (k = 480, a blob spanning the panel) is
 // ~57.7k units = 0.055 in tt, i.e. 0.055 * LUT_HALF buckets on either side
-// (56.4 at the original LUT_BITS=10, 28.2 here at LUT_BITS=9 -- the margin
+// (56.4 at the original LUT_BITS=10, 28.2 here at LUT_BITS=9: the margin
 // need scales linearly with LUT_HALF since bucket width is what changed, not
 // the underlying fixed-point error). 32 was not enough at LUT_BITS=10: it
 // let the shifted index reach lavaLUT[-3] (caught by tools/animbench/fuzz
@@ -231,7 +300,7 @@ constexpr int LUT_SHIFT = FRAC_BITS - LUT_BITS; // 11
 // Palette-index saturation cap: the field-domain equivalent of the original
 // "clamp to 1.6f before scaling" (1.6f * kFieldScale == 255.0f exactly), now
 // applied post-scale as an integer min() so overlapping hot blob cores
-// still saturate at the same brightness the original design intended —
+// still saturate at the same brightness the original design intended:
 // dither can then still jitter the result below the cap, avoiding a
 // flat/banded look at blob overlaps. Its swing is now one palette step
 // wide rather than +-1 index unit, so a saturated core still dithers.
@@ -243,7 +312,7 @@ struct BlobDef {
 struct BlobState {
     float bx, by, R2, invR2;
     int xlo, xhi;      // precomputed per-blob column window (superset of the true chord), hoisted out of band()
-    int32_t step2Q;    // constant curvature of tt(x) in Q12.20 (-2*invR2 scaled) — per-blob, row-independent
+    int32_t step2Q;    // constant curvature of tt(x) in Q12.20 (-2*invR2 scaled), per-blob, row-independent
 };
 
 BlobDef blobDef[NUM_BLOBS];
@@ -257,10 +326,10 @@ uint32_t lastThemeGen = 0xFFFFFFFF;
 bool inited = false;
 int allocW = 0; // width fieldRow was sized for
 
-// Precomputed "no blob touched this pixel" row, one per y&3 (Bayer4's row
-// period), rebuilt only when paletteLUT changes (theme change). A pixel no
-// blob writes into has fieldRow[x] == 0 for the whole frame, so band()'s
-// finalization formula collapses to a function of (x&3, y&3) alone:
+// Precomputed "no blob touched this pixel" row, one per Bayer row phase
+// 0..3, rebuilt only when paletteLUT changes (theme change). A pixel no
+// blob writes into has fieldRow[x] == 0 for the whole frame, so the
+// finalization formula collapses to a function of (x&3, phase) alone:
 //   idx = clamp(0 + ditherRow[x&3], 0, 255);  out[x] = paletteLUT[idx];
 // band() used to run that formula (with fieldRow[x] folded in, always 0
 // here) per pixel, every pixel, every row. Four blobs' worth of soft glow
@@ -274,14 +343,14 @@ int bgRowAllW = 0;            // width bgRowAll was sized for (mirrors allocW's 
 
 // Rebuilds the four background rows from the current paletteLUT/ditherLUT.
 // Must run after both are populated, and again any time paletteLUT changes
-// (theme change) -- which now also means rebuilding ditherLUT first, since
+// (theme change), which now also means rebuilding ditherLUT first, since
 // its amplitude is derived from the palette's step spacing. w is always bgRowAllW: bgRowAll is sized once like fieldRow/allocW,
 // so this never risks writing past the allocation even if a caller's w
 // argument were to differ from the size decided at first init().
 // Amplitude is half the spacing between the palette's RGB565 steps, so the
 // dither cell spans exactly one step. The old fixed 255/128 was +-1 index unit,
-// enough to break lava's own fixed-point index quantization but not the panel's
-// -- 9.9% of disc pixels sat on a monotone <=1 LSB staircase at brightness 100,
+// enough to break lava's own fixed-point index quantization but not the panel's:
+// 9.9% of disc pixels sat on a monotone <=1 LSB staircase at brightness 100,
 // 13.5% at 55. Deriving it gives 2.3% and 2.9%.
 void buildDitherLUT() {
     const float amp = ditherAmp(paletteLUT, 256);
@@ -325,7 +394,7 @@ bool init(int w, int h) {
         // alone exhausted whatever slab existed then, leaving no room for
         // paletteLUT/fieldRow) and at a narrowed int16_t width but still
         // LUT_BITS=10 (which fit the slab of that era but measured slower
-        // on the device regardless -- see the round-5 file-top comment for
+        // on the device regardless. See the round-5 file-top comment for
         // why that result does not indict this round's placement: the
         // access pattern already made this a cheap read, so the earlier
         // move bought nothing and the earlier revert was about something
@@ -340,7 +409,7 @@ bool init(int w, int h) {
         // Round 4 placement: same as paletteLUT above. This replaces HEAD's
         // own placement story for this table (a cumulative-SRAM-budget
         // heuristic against the old plain alloc(), since retired along with
-        // the heuristic itself -- see the file-top round-4 comment): the
+        // the heuristic itself. See the file-top round-4 comment): the
         // pool-availability race that heuristic was exposed to is exactly
         // what allocHot()'s fixed, reserved slab removes.
         bgRowAll = static_cast<uint16_t *>(allocHot(4 * w * sizeof(uint16_t))); // 3,840 B at w=480
@@ -418,7 +487,7 @@ void frame(uint32_t tMs, int w, int, const uint8_t p[4]) {
         const float t3 = tt * tt * tt;
         const float contribution = (t3 * intensity + (tt > 0.7f ? t3 * t3 * intensity * 0.6f : 0.0f)) * kFieldScale;
         // contribution is always >= 0 and its max (tt=1, intensity=1.8,
-        // hot core included) is 459.0 -- well inside int16_t's range, so
+        // hot core included) is 459.0: well inside int16_t's range, so
         // the round-5 narrowing (see file-top comment) loses no precision
         // versus the old int32_t storage, only bucket resolution (LUT_BITS).
         lavaLUT[p2] = static_cast<int16_t>(contribution + 0.5f);
@@ -458,14 +527,16 @@ void frame(uint32_t tMs, int w, int, const uint8_t p[4]) {
 
 // Finalizes fieldRow[lo..hi] into out[lo..hi], identical arithmetic to the
 // full-width loop this replaces (see the file's history for the pre-span
-// version) — just windowed to a sub-range instead of always [0, w). Pulled
+// version). Just windowed to a sub-range instead of always [0, w). Pulled
 // out of band() as a named function, not a lambda, so it reads once instead
 // of once per merged span in the disassembly, and so its own loops are not
 // re-examined by GCC's whole-function budget every time band() changes (see
 // the bcTable/tail-copy lesson in AnimNebula.cpp: unrelated loops in a
 // function can lose their hardware LOOP when the function grows unrelated
-// live state around them — keeping this arithmetic in its own function
-// keeps that risk local to this function alone).
+// live state around them: keeping this arithmetic in its own function
+// keeps that risk local to this function alone). yPhase selects which of
+// the four Bayer dither rows this call uses; see renderRow's comment for
+// why it is passed in rather than derived from a row number here.
 void finalizeSpan(uint16_t *out, int lo, int hi, int yPhase) {
     const int32_t *ditherRow = &ditherLUT[yPhase * 4];
     int x = lo;
@@ -488,8 +559,8 @@ void finalizeSpan(uint16_t *out, int lo, int hi, int yPhase) {
     const int32_t d3 = ditherRow[3];
     for (; x + 3 <= hi; x += 4) {
         // min(fieldRow, 255) reproduces the original "clamp field to 1.6f
-        // before scaling" (1.6f*kFieldScale == 255.0f exactly) — see
-        // file-top comment — as a branchless integer MIN. Dither is added
+        // before scaling" (1.6f*kFieldScale == 255.0f exactly, see
+        // file-top comment) as a branchless integer MIN. Dither is added
         // after the cap, exactly like the original float pipeline, so
         // saturated/overlapping pixels still get jittered instead of
         // pinning flat.
@@ -535,107 +606,168 @@ void finalizeSpan(uint16_t *out, int lo, int hi, int yPhase) {
     }
 }
 
+// Renders exactly one absolute row y into out[0..w), dithered with Bayer row
+// yPhase (0..3). Field accumulation, span merge and finalize are unchanged
+// from the pre-redesign band(); the only change from here down is that
+// bandRef() now calls this once per row PAIR instead of once per row, and
+// yPhase is a separate argument (rather than being derived from y here)
+// because bandRef keys it on the row pair, not the row. See bandRef's own
+// comment for why.
+void renderRow(uint16_t *out, int y, int w, int yPhase) {
+    memset(fieldRow, 0, static_cast<size_t>(w) * sizeof(int32_t));
+    // Spans of blobs that actually reach this row (dy2 < R2), collected
+    // in the same pass that accumulates the field: no extra iteration
+    // over blobs. Everywhere outside their union, fieldRow is provably
+    // 0 for the rest of this row (nothing else writes it), so
+    // finalization there is bit-identical to the precomputed background
+    // row and is copied instead of recomputed.
+    int spanLo[NUM_BLOBS];
+    int spanHi[NUM_BLOBS];
+    int nSpans = 0;
+    for (int i = 0; i < NUM_BLOBS; i++) {
+        const BlobState &b = blob[i];
+        const float dy = y - b.by;
+        const float dy2 = dy * dy;
+        if (dy2 >= b.R2) {
+            continue;
+        }
+        const float invR2 = b.invR2;
+        const int xlo = b.xlo;
+        const int xhi = b.xhi;
+        spanLo[nSpans] = xlo;
+        spanHi[nSpans] = xhi;
+        nSpans++;
+        const float dx0 = xlo - b.bx;
+        // Row-starting value and slope of the tt(x) parabola (one-time
+        // float setup per touched row per blob, not per pixel).
+        const float tt0f = 1.0f - invR2 * (dy2 + dx0 * dx0);
+        const float step0f = -invR2 * (2.0f * dx0 + 1.0f);
+        int32_t ttQ = static_cast<int32_t>(tt0f * FIXED_SCALE + (tt0f >= 0.0f ? 0.5f : -0.5f));
+        int32_t stepQ = static_cast<int32_t>(step0f * FIXED_SCALE + (step0f >= 0.0f ? 0.5f : -0.5f));
+        const int32_t step2Q = b.step2Q;
+        const int16_t *lut = lavaBase;
+        // Pure integer forward-difference sweep: no multiply, no
+        // divide, no libm, no branch. lut is zero-padded below index 0
+        // (see LUT build in frame()), so out-of-blob pixels (tt<=0,
+        // negative shifted index) just add zero: the tt<=0 early-out
+        // is folded into the table instead of a per-pixel compare.
+        // xlo/xhi are the precomputed full-radius window (superset of
+        // the true chord for this row).
+        //
+        // Counted-down form on purpose: it gives GCC a trip count known
+        // at loop entry, which is what lets it emit the Xtensa hardware
+        // zero-overhead LOOP instruction here (confirmed in the .S) and
+        // drop the per-iteration compare-and-branch entirely. Slightly
+        // slower on the x86 bench, which has no such instruction: the
+        // device is the one that has to hit 30 fps.
+        int32_t *field = fieldRow + xlo;
+        for (int n = xhi - xlo + 1; n > 0; n--) {
+            *field++ += lut[ttQ >> LUT_SHIFT];
+            ttQ += stepQ;
+            stepQ += step2Q;
+        }
+    }
+
+    const uint16_t *bg = bgRowAll + static_cast<size_t>(yPhase) * bgRowAllW;
+    memcpy(out, bg, static_cast<size_t>(w) * sizeof(uint16_t));
+    if (nSpans == 0) {
+        return; // no blob touched this row: background covers all of it, already copied
+    }
+
+    // Sort the (at most NUM_BLOBS==6) collected spans by lo, then sweep
+    // once to merge overlapping/adjacent ones into the true union.
+    // Insertion sort: cheap for this size, done once per row, not once
+    // per pixel.
+    for (int i = 1; i < nSpans; i++) {
+        const int lo = spanLo[i];
+        const int hi = spanHi[i];
+        int j = i - 1;
+        while (j >= 0 && spanLo[j] > lo) {
+            spanLo[j + 1] = spanLo[j];
+            spanHi[j + 1] = spanHi[j];
+            j--;
+        }
+        spanLo[j + 1] = lo;
+        spanHi[j + 1] = hi;
+    }
+    int mLo = spanLo[0];
+    int mHi = spanHi[0];
+    for (int i = 1; i < nSpans; i++) {
+        if (spanLo[i] <= mHi + 1) {
+            // Overlaps or is adjacent to the run so far: merging is a
+            // pure win (fewer finalizeSpan calls) and never wrong, since
+            // any gap it swallows has fieldRow == 0 there anyway.
+            if (spanHi[i] > mHi) {
+                mHi = spanHi[i];
+            }
+            continue;
+        }
+        finalizeSpan(out, mLo, mHi, yPhase);
+        mLo = spanLo[i];
+        mHi = spanHi[i];
+    }
+    finalizeSpan(out, mLo, mHi, yPhase);
+}
+
+// Computes the even row of a y/y+1 pair in full and duplicates it into the
+// odd row, instead of running renderRow on every row (see the 2026-09-05
+// file-top comment). Production's usual call is rows==2 with y0 even
+// (SleepAnimation.cpp's BAND_H), so the common case is exactly one
+// compute-and-duplicate pair per call; the host bench's rows==8 covers four
+// pairs the same way.
+//
+// A row's content and dither phase are always derived from ySrc = y & ~1
+// (its pair's even row) and phase = (y>>1)&3 (its pair's Bayer row), never
+// from y directly and never from anything about the call other than y
+// itself. That is what makes this safe under SleepAnimation.cpp's row-level
+// interlace path, which calls band() with rows==1 for one row at a time
+// (`bandFn(band + r*w, y0+r, 1, w, tMs, p)`, only every other row each
+// frame). interlace_check.cpp exists to catch exactly this class of bug
+// and caught an earlier version of this function that kept the pair phase
+// only when both rows of a pair were in the same call and fell back to
+// y&3 for a lone row: the same absolute row then rendered with a different
+// dither phase depending on whether its partner happened to be in the same
+// call, a real call-shape variance, not a test artifact, since
+// splitRenderFull's single-row calls are a real production path. Deriving
+// ySrc/phase from y alone before deciding whether to duplicate removes the
+// dependency on call shape entirely: a lone row (interlace, or any
+// y0/rows that splits a pair across two calls) computes ySrc's content
+// directly and gets exactly the pixels it would have gotten as the
+// duplicate half of a same-call pair, just without that call's memcpy
+// saving.
+//
+// Bayer row 0 backs pair 0 (rows 0-1), row 1 backs pair 1 (rows 2-3), row 2
+// backs pair 2, row 3 backs pair 3, pair 4 wraps back to row 0, and so on.
+// All four Bayer rows appear, each stretched over two physical rows, and
+// successive pairs use different rows, so the grain is a checkerboard
+// rather than the column of stripes an earlier cut of this design produced
+// (see the file-top comment).
 void bandRef(uint16_t *dst, int y0, int rows, int w, uint32_t, const uint8_t *) {
-    for (int row = 0; row < rows; row++) {
+    int row = 0;
+    while (row < rows) {
         const int y = y0 + row;
-        memset(fieldRow, 0, w * sizeof(int32_t));
-        // Spans of blobs that actually reach this row (dy2 < R2), collected
-        // in the same pass that accumulates the field -- no extra iteration
-        // over blobs. Everywhere outside their union, fieldRow is provably
-        // 0 for the rest of this row (nothing else writes it), so
-        // finalization there is bit-identical to the precomputed background
-        // row and is copied instead of recomputed.
-        int spanLo[NUM_BLOBS];
-        int spanHi[NUM_BLOBS];
-        int nSpans = 0;
-        for (int i = 0; i < NUM_BLOBS; i++) {
-            const BlobState &b = blob[i];
-            const float dy = y - b.by;
-            const float dy2 = dy * dy;
-            if (dy2 >= b.R2) {
-                continue;
-            }
-            const float invR2 = b.invR2;
-            const int xlo = b.xlo;
-            const int xhi = b.xhi;
-            spanLo[nSpans] = xlo;
-            spanHi[nSpans] = xhi;
-            nSpans++;
-            const float dx0 = xlo - b.bx;
-            // Row-starting value and slope of the tt(x) parabola (one-time
-            // float setup per touched row per blob — not per pixel).
-            const float tt0f = 1.0f - invR2 * (dy2 + dx0 * dx0);
-            const float step0f = -invR2 * (2.0f * dx0 + 1.0f);
-            int32_t ttQ = static_cast<int32_t>(tt0f * FIXED_SCALE + (tt0f >= 0.0f ? 0.5f : -0.5f));
-            int32_t stepQ = static_cast<int32_t>(step0f * FIXED_SCALE + (step0f >= 0.0f ? 0.5f : -0.5f));
-            const int32_t step2Q = b.step2Q;
-            const int16_t *lut = lavaBase;
-            // Pure integer forward-difference sweep: no multiply, no
-            // divide, no libm, no branch. lut is zero-padded below index 0
-            // (see LUT build in frame()), so out-of-blob pixels (tt<=0,
-            // negative shifted index) just add zero — the tt<=0 early-out
-            // is folded into the table instead of a per-pixel compare.
-            // xlo/xhi are the precomputed full-radius window (superset of
-            // the true chord for this row).
-            //
-            // Counted-down form on purpose: it gives GCC a trip count known
-            // at loop entry, which is what lets it emit the Xtensa hardware
-            // zero-overhead LOOP instruction here (confirmed in the .S) and
-            // drop the per-iteration compare-and-branch entirely. Slightly
-            // slower on the x86 bench, which has no such instruction — the
-            // device is the one that has to hit 30 fps.
-            int32_t *field = fieldRow + xlo;
-            for (int n = xhi - xlo + 1; n > 0; n--) {
-                *field++ += lut[ttQ >> LUT_SHIFT];
-                ttQ += stepQ;
-                stepQ += step2Q;
-            }
-        }
-
+        const int ySrc = y & ~1;
+        const int phase = (y >> 1) & 3;
         uint16_t *out = dst + static_cast<size_t>(row) * w;
-        const uint16_t *bg = bgRowAll + static_cast<size_t>(y & 3) * bgRowAllW;
-        memcpy(out, bg, static_cast<size_t>(w) * sizeof(uint16_t));
-        if (nSpans == 0) {
-            continue; // no blob touched this row -- background covers all of it, already copied
+        if ((y & 1) == 0 && row + 1 < rows) {
+            // y starts a pair and y+1 is also in this call: compute once,
+            // duplicate. The common case for every real caller.
+            renderRow(out, ySrc, w, phase);
+            memcpy(out + w, out, static_cast<size_t>(w) * sizeof(uint16_t));
+            row += 2;
+        } else {
+            // y is odd (its partner is the row behind it, not in this
+            // call) or y is even but the call ends before y+1 (row-level
+            // interlace). Either way, render ySrc's content directly so
+            // this row matches what it would be as half of a same-call
+            // pair.
+            renderRow(out, ySrc, w, phase);
+            row += 1;
         }
-
-        // Sort the (at most NUM_BLOBS==6) collected spans by lo, then sweep
-        // once to merge overlapping/adjacent ones into the true union.
-        // Insertion sort: cheap for this size, done once per row, not once
-        // per pixel.
-        for (int i = 1; i < nSpans; i++) {
-            const int lo = spanLo[i];
-            const int hi = spanHi[i];
-            int j = i - 1;
-            while (j >= 0 && spanLo[j] > lo) {
-                spanLo[j + 1] = spanLo[j];
-                spanHi[j + 1] = spanHi[j];
-                j--;
-            }
-            spanLo[j + 1] = lo;
-            spanHi[j + 1] = hi;
-        }
-        int mLo = spanLo[0];
-        int mHi = spanHi[0];
-        for (int i = 1; i < nSpans; i++) {
-            if (spanLo[i] <= mHi + 1) {
-                // Overlaps or is adjacent to the run so far: merging is a
-                // pure win (fewer finalizeSpan calls) and never wrong, since
-                // any gap it swallows has fieldRow == 0 there anyway.
-                if (spanHi[i] > mHi) {
-                    mHi = spanHi[i];
-                }
-                continue;
-            }
-            finalizeSpan(out, mLo, mHi, y & 3);
-            mLo = spanLo[i];
-            mHi = spanHi[i];
-        }
-        finalizeSpan(out, mLo, mHi, y & 3);
     }
 }
 
-// Round 4: band() ships no hand asm and no restructuring -- every asm
+// Round 4: band() ships no hand asm and no restructuring: every asm
 // kernel and every control-flow change tried in rounds 1-3 measured
 // slower than this shape on the device at equal table placement, so
 // band() is a direct call to the portable reference above. See the
