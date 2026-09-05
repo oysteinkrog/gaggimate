@@ -1696,7 +1696,15 @@ void DefaultUI::updateSystemStatus() {
     systemStatus.controller_version(controller->getSystemInfo().version.c_str());
     systemStatus.display_version(BUILD_GIT_VERSION);
     systemStatus.update_available(updateAvailable);
-    systemStatus.in_menu(currentScreen == SCREEN_ID_MENU_SCREEN_NEW);
+    // targetScreen, not currentScreen: this runs before handleScreenChange()
+    // in the same pass, so on the pass that switches screens currentScreen
+    // still names the screen being left. The dials widget's standby and menu
+    // icons share one slot with hidden flags that are exact complements of
+    // in_menu, so a stale value showed the power icon on the grind screen for
+    // one refresh, under the exit arrow buildScaleScreen draws in that slot.
+    // targetScreen is set synchronously by changeScreen() and already names
+    // the screen this pass is switching to.
+    systemStatus.in_menu(targetScreen == SCREEN_ID_MENU_SCREEN_NEW);
     systemStatus.pressure_available(pressureAvailable);
     // The Scale menu button reuses the grind slot, so the flow variable that
     // shows/hides that button must account for both.
