@@ -1359,11 +1359,12 @@ void WebUIPlugin::setupServer() {
                 g_overlayMinRefreshUs = v;
             }
         }
-        // uianim=0|1|2: the foreground motion test widget (LV_Helper.h's
-        // g_uiAnimTestReq), created and animated by the UI task.
+        // uianim=0|1|2|3|4: the foreground motion test widget (LV_Helper.h's
+        // g_uiAnimTestReq), created by the UI task; 1 and 2 move it through
+        // LVGL, 3 through a layer, 4 parks it in a layer.
         if (request->hasArg("uianim")) {
             const int v = request->arg("uianim").toInt();
-            if (v >= 0 && v <= 2) {
+            if (v >= 0 && v <= 4) {
                 g_uiAnimTestReq = v;
             }
         }
@@ -1545,6 +1546,24 @@ void WebUIPlugin::setupServer() {
         doc["ov_clips"] = g_overlayStats.lastClips;
         doc["ov_min_us"] = static_cast<int64_t>(g_overlayMinRefreshUs);
         doc["uianim"] = g_uiAnimTestReq;
+        doc["layer_us"] = a->lastLayerUsValue();
+        {
+            JsonArray ls = doc["layers"].to<JsonArray>();
+            for (int i = 0; i < SleepAnimation::MAX_LAYERS; i++) {
+                const SleepAnimation::LayerInfo li = a->layerInfo(i);
+                if (!li.used) {
+                    continue;
+                }
+                JsonObject o = ls.add<JsonObject>();
+                o["id"] = i;
+                o["visible"] = li.visible;
+                o["animating"] = li.animating;
+                o["x"] = li.x;
+                o["y"] = li.y;
+                o["w"] = li.w;
+                o["h"] = li.h;
+            }
+        }
         doc["band_us"] = a->lastBandUsValue();
         doc["expand_us"] = a->lastExpandUsValue();
         doc["fill_us"] = a->lastFillUsValue();

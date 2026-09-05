@@ -83,9 +83,12 @@ extern volatile int64_t g_overlayMinRefreshUs;
 // DefaultUI::loop on the UI task, since LVGL is single-threaded): 0 removes
 // the test widget, 1 slides an opaque 120x120 rounded plate with a label
 // back and forth across the current screen on an lv_anim, 2 the same at
-// 60x60. A continuous LVGL animation is the one input that measures what the
-// snapshot path can do for MOVING widgets, which telemetry (a few changes
-// per second) never exercises.
+// 60x60, 3 the 120x120 plate again but as a SleepAnimation layer moved by
+// the render task (the same travel and timing as 1, so the two paths are
+// directly comparable), 4 that layer parked at the far end of the travel
+// for a framebuffer grab. A continuous animation is the one input that
+// measures what each path can do for MOVING widgets, which telemetry (a few
+// changes per second) never exercises.
 extern volatile int g_uiAnimTestReq;
 
 #ifdef GM_TOUCH_PROBE

@@ -123,6 +123,13 @@ class DefaultUI {
     // Applies g_uiAnimTestReq (LV_Helper.h) on the UI task: creates, moves or
     // removes the foreground motion test widget.
     void serviceUiAnimTest();
+    // Renders obj and its children into buf as LV_IMG_CF_TRUE_COLOR_ALPHA
+    // (RGB565 + A8), sized to the object's coords grown by its ext draw size;
+    // *outArea receives that area in screen coordinates. False when the
+    // buffer is too small or the object has no size yet. Same rendering
+    // machinery as snapshotAreaToOverlay, but for a subtree into its own
+    // buffer: the layer path (SleepAnimation::layer*) starts here.
+    bool snapshotObjectToBuffer(lv_obj_t *obj, uint8_t *buf, uint32_t bufSize, lv_area_t *outArea);
     // Hide, restore or repaint the opaque background plates the generated
     // screens put behind their content. mode is Settings::getBgAnimClearPlates
     // (0 keep, 1 hide, 2 custom); color is 0xRRGGBB and opaPct 0-100, both used
@@ -196,6 +203,9 @@ class DefaultUI {
     lv_obj_t *animHostScreen = nullptr;    // screen whose bg was made transparent for the animation
     lv_obj_t *uiAnimTestObj = nullptr;     // the foreground motion test widget, when one is up
     int uiAnimTestMode = 0;                // g_uiAnimTestReq value the widget was built for
+    int uiAnimTestLayer = -1;              // mode 3: the layer the plate was snapshotted into
+    int uiAnimTestX0 = 0, uiAnimTestX1 = 0, uiAnimTestY = 0;
+    bool uiAnimTestFwd = true;
     // Number of entries in the plate table in applyAnimPlates.
     static constexpr int ANIM_PLATE_COUNT = 9;
     // Last applied (mode, color, opacity), so a no-op settings poll costs one

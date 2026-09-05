@@ -371,6 +371,10 @@ void DefaultUI::init() {
 
 void DefaultUI::loop() {
 #ifndef GAGGIMATE_SIM
+    // Here as well as in pumpSleepOverlay: a UI pass on a busy screen runs
+    // longer than UI_PERIOD_MS, so the task loop takes this branch every
+    // time and the pump branch never.
+    serviceUiAnimTest();
     if (panelStopRequested && !panelStopped) {
         panelStopped = true;
         stopSleepAnimation();
@@ -566,12 +570,22 @@ static void uiAnimTestSlideCb(void *var, int32_t v) { lv_obj_set_x(static_cast<l
 void DefaultUI::serviceUiAnimTest() {
     const int req = g_uiAnimTestReq;
     if (req == uiAnimTestMode) {
+        // Mode 3 ping-pongs the layer: when one leg lands, start the other.
+        if (req == 3 && uiAnimTestLayer >= 0 && !sleepAnimation.layerAnimating(uiAnimTestLayer)) {
+            uiAnimTestFwd = !uiAnimTestFwd;
+            sleepAnimation.layerAnimate(uiAnimTestLayer, uiAnimTestFwd ? uiAnimTestX1 : uiAnimTestX0, uiAnimTestY, 1200,
+                                        SleepAnimation::LayerEase::EaseInOut);
+        }
         return;
     }
     if (uiAnimTestObj != nullptr) {
         lv_anim_del(uiAnimTestObj, nullptr);
         lv_obj_del(uiAnimTestObj);
         uiAnimTestObj = nullptr;
+    }
+    if (uiAnimTestLayer >= 0) {
+        sleepAnimation.layerRelease(uiAnimTestLayer);
+        uiAnimTestLayer = -1;
     }
     uiAnimTestMode = req;
     if (req == 0) {
@@ -595,6 +609,41 @@ void DefaultUI::serviceUiAnimTest() {
     lv_label_set_text(l, req == 2 ? "1" : "9.2");
     lv_obj_set_style_text_color(l, lv_color_hex(0x1B1B1B), 0);
     lv_obj_center(l);
+    uiAnimTestObj = o;
+    if (req == 3 || req == 4) {
+        // The layer path: render the plate once into a layer, take it out of
+        // LVGL's picture, and let the render task move the layer. Same
+        // travel and duration as mode 1, so the two are directly comparable
+        // on the probe (ui_fpsprobe.py: mode 1 shows up as overlay
+        // refreshes, mode 3 as animation frames with layer_us). Mode 4 parks
+        // the layer at the far end instead of moving it, for a framebuffer
+        // grab that a moving sprite would tear.
+        lv_obj_update_layout(scr);
+        const lv_coord_t ext = _lv_obj_get_ext_draw_size(o);
+        const int lw = size + ext * 2, lh = size + ext * 2;
+        const int id = sleepAnimation.layerAcquire(lw, lh);
+        lv_area_t area;
+        if (id >= 0 && snapshotObjectToBuffer(o, sleepAnimation.layerBuffer(id), static_cast<uint32_t>(lw) * lh * 3, &area)) {
+            sleepAnimation.layerPublish(id, area.x1, area.y1);
+            lv_obj_add_flag(o, LV_OBJ_FLAG_HIDDEN);
+            uiAnimTestLayer = id;
+            uiAnimTestX0 = area.x1;
+            uiAnimTestX1 = area.x1 + (lv_obj_get_width(scr) - size - 80);
+            uiAnimTestY = area.y1;
+            uiAnimTestFwd = true;
+            if (req == 4) {
+                sleepAnimation.layerSetPos(id, uiAnimTestX1, uiAnimTestY);
+            } else {
+                sleepAnimation.layerAnimate(id, uiAnimTestX1, uiAnimTestY, 1200, SleepAnimation::LayerEase::EaseInOut);
+            }
+        } else {
+            log_w("uianim: layer snapshot failed (id %d)", id);
+            if (id >= 0) {
+                sleepAnimation.layerRelease(id);
+            }
+        }
+        return;
+    }
     lv_anim_t a;
     lv_anim_init(&a);
     lv_anim_set_var(&a, o);
@@ -605,7 +654,56 @@ void DefaultUI::serviceUiAnimTest() {
     lv_anim_set_repeat_count(&a, LV_ANIM_REPEAT_INFINITE);
     lv_anim_set_path_cb(&a, lv_anim_path_ease_in_out);
     lv_anim_start(&a);
-    uiAnimTestObj = o;
+}
+
+bool DefaultUI::snapshotObjectToBuffer(lv_obj_t *obj, uint8_t *buf, uint32_t bufSize, lv_area_t *outArea) {
+#ifndef GAGGIMATE_SIM
+    if (obj == nullptr || buf == nullptr) {
+        return false;
+    }
+    const lv_coord_t ext = _lv_obj_get_ext_draw_size(obj);
+    lv_area_t area;
+    lv_obj_get_coords(obj, &area);
+    lv_area_increase(&area, ext, ext);
+    const int w = lv_area_get_width(&area);
+    const int h = lv_area_get_height(&area);
+    if (w <= 0 || h <= 0 || static_cast<uint32_t>(w) * h * 3 > bufSize) {
+        return false;
+    }
+    memset(buf, 0, static_cast<size_t>(w) * h * 3);
+
+    lv_disp_t *objDisp = lv_obj_get_disp(obj);
+    lv_disp_drv_t driver;
+    lv_disp_drv_init(&driver);
+    driver.hor_res = lv_disp_get_hor_res(objDisp);
+    driver.ver_res = lv_disp_get_ver_res(objDisp);
+    lv_disp_drv_use_generic_set_px_cb(&driver, LV_IMG_CF_TRUE_COLOR_ALPHA);
+    lv_disp_t fakeDisp;
+    lv_memset_00(&fakeDisp, sizeof(lv_disp_t));
+    fakeDisp.driver = &driver;
+    lv_draw_ctx_t *drawCtx = static_cast<lv_draw_ctx_t *>(lv_mem_alloc(objDisp->driver->draw_ctx_size));
+    if (drawCtx == nullptr) {
+        return false;
+    }
+    objDisp->driver->draw_ctx_init(fakeDisp.driver, drawCtx);
+    fakeDisp.driver->draw_ctx = drawCtx;
+    drawCtx->clip_area = &area;
+    drawCtx->buf_area = &area;
+    drawCtx->buf = static_cast<void *>(buf);
+    driver.draw_ctx = drawCtx;
+    lv_disp_t *refrOri = _lv_refr_get_disp_refreshing();
+    _lv_refr_set_disp_refreshing(&fakeDisp);
+    lv_obj_redraw(drawCtx, obj);
+    _lv_refr_set_disp_refreshing(refrOri);
+    objDisp->driver->draw_ctx_deinit(fakeDisp.driver, drawCtx);
+    lv_mem_free(drawCtx);
+    if (outArea != nullptr) {
+        *outArea = area;
+    }
+    return true;
+#else
+    return false;
+#endif
 }
 
 void DefaultUI::loopProfiles() {
