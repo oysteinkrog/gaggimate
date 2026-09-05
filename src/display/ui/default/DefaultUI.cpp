@@ -16,7 +16,6 @@ const BenchGateState &bench_gate_state() {
 #include <display/drivers/AmoledDisplayDriver.h>
 #include <display/drivers/LilyGoDriver.h>
 #include <display/drivers/WaveshareDriver.h>
-#include <display/drivers/common/LV_Helper.h>
 #include <display/drivers/common/PanelClock.h>
 #include <display/gm_lv_mem.h>
 
@@ -69,6 +68,13 @@ extern int64_t gm_ws_arc_us;
 }
 #endif
 #endif
+// LV_Helper.h itself is portable (no hardware types), unlike the driver
+// headers above it used to sit beside: DefaultUI reads g_touchEdgeAtUs,
+// GM_TOUCH_GRACE_US, g_overlayMinRefreshUs and g_uiAnimTestReq on every path,
+// sim included. LV_Helper.cpp (the definitions) stays excluded with the rest
+// of drivers/; the sim's lv_helper_stub.cpp supplies them instead.
+#include "esp_timer.h"
+#include <display/drivers/common/LV_Helper.h>
 #include <display/main.h>
 #include <display/ui/utils/effects.h>
 #include <utility>

@@ -21,7 +21,7 @@ typedef enum {
     WL_DISCONNECTED = 6
 } wl_status_t;
 
-typedef enum { WIFI_MODE_NULL = 0, WIFI_STA = 1, WIFI_AP = 2, WIFI_AP_STA = 3 } wifi_mode_t;
+typedef enum { WIFI_MODE_NULL = 0, WIFI_OFF = WIFI_MODE_NULL, WIFI_STA = 1, WIFI_AP = 2, WIFI_AP_STA = 3 } wifi_mode_t;
 typedef enum { WIFI_POWER_19_5dBm = 78, WIFI_POWER_15dBm = 60, WIFI_POWER_7dBm = 28, WIFI_POWER_MINUS_1dBm = -4 } wifi_power_t;
 typedef enum { WIFI_PS_NONE = 0, WIFI_PS_MIN_MODEM = 1, WIFI_PS_MAX_MODEM = 2 } wifi_ps_type_t;
 typedef int wifi_err_reason_t;

@@ -68,7 +68,13 @@ using AwsResponseFiller = std::function<size_t(uint8_t *, size_t, size_t)>;
 
 class AsyncWebServer;
 
-class AsyncWebServerRequest {
+// Real library: a paused request is kept alive by the underlying AsyncClient
+// for as long as the connection stays open, and the caller only ever sees a
+// weak reference so it cannot outlive the connection by accident. The sim's
+// Conn (below) plays that role: while paused it holds the one shared_ptr that
+// keeps the request alive, so a weak_ptr the caller stashed (WebUIPlugin's
+// assetQueue) safely resolves to nothing if the browser gives up first.
+class AsyncWebServerRequest : public std::enable_shared_from_this<AsyncWebServerRequest> {
   public:
     AsyncWebServerRequest(int fd, AsyncWebServer *server) : _fd(fd), _server(server) {}
 
@@ -91,6 +97,32 @@ class AsyncWebServerRequest {
     void send(FS &fs, const String &path, const String &contentType);
     void redirect(const String &url);
 
+    // Defers the response: the handler returns without calling send(), and
+    // whoever locks the returned weak_ptr later calls it instead. The
+    // connection stays open (Conn::pendingRequest keeps this alive) until
+    // then; see AsyncWebServer::pump().
+    std::weak_ptr<AsyncWebServerRequest> pause() {
+        _paused = true;
+        return weak_from_this();
+    }
+    // Real semantics: fires once the connection actually closes, whether
+    // that is a normal completed response or the client dropping early.
+    void onDisconnect(std::function<void()> cb) { _onDisconnect = std::move(cb); }
+    // Called by every send() overload, and by the server for a paused
+    // request whose browser disconnected before it was ever resumed.
+    // Idempotent: firing twice would double-decrement a caller's own
+    // in-flight counter (WebUIPlugin's assetStreams).
+    void finish() {
+        if (_finished)
+            return;
+        _finished = true;
+        if (_onDisconnect) {
+            auto cb = std::move(_onDisconnect);
+            _onDisconnect = nullptr;
+            cb();
+        }
+    }
+
     // Populated by the server before dispatch.
     String _url;
     int _method = HTTP_GET;
@@ -98,8 +130,12 @@ class AsyncWebServerRequest {
     std::string _body;
     int _fd;
     AsyncWebServer *_server;
+    bool _paused = false;
+    bool _finished = false;
+    std::function<void()> _onDisconnect;
 };
 
+using AsyncWebServerRequestPtr = std::weak_ptr<AsyncWebServerRequest>;
 using ArRequestHandlerFunction = std::function<void(AsyncWebServerRequest *)>;
 
 // Matches the real library's queued-message payload type.
@@ -189,6 +225,10 @@ class AsyncWebServer {
         std::string inbuf;
         bool isWs = false;
         AsyncWebSocketClient *client = nullptr;
+        // Set only while a request on this connection is paused (see
+        // AsyncWebServerRequest::pause()): the one strong reference keeping
+        // it alive until send() marks it finished or the browser disconnects.
+        std::shared_ptr<AsyncWebServerRequest> pendingRequest;
     };
     std::vector<Conn> _conns;
 
@@ -196,7 +236,7 @@ class AsyncWebServer {
     void serviceConn(Conn &c);
     bool handleHttp(Conn &c); // returns true if a full request was handled
     void handleWsFrames(Conn &c);
-    void dispatch(Conn &c, AsyncWebServerRequest &req);
+    void dispatch(Conn &c, const std::shared_ptr<AsyncWebServerRequest> &req);
 };
 
 // Pump every running AsyncWebServer once (call from the simulator main loop).

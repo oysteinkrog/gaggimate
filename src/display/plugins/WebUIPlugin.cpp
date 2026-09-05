@@ -4,7 +4,9 @@
 extern uint32_t nebula_lerp_self_test(uint32_t *firstBad);
 #include <DNSServer.h>
 #include <LittleFS.h>
-#include <esp_cache.h>        // esp_cache_msync, so /api/debug/fb reads past the cache
+#ifndef GAGGIMATE_SIM
+#include <esp_cache.h> // esp_cache_msync, so /api/debug/fb reads past the cache
+#endif
 #include <esp_timer.h>        // esp_timer_dump, for /api/debug/timers
 #include <esp_memory_utils.h> // esp_ptr_external_ram, for the band-buffer placement report
 #include <SD_MMC.h>
@@ -30,7 +32,7 @@ extern uint32_t nebula_lerp_self_test(uint32_t *firstBad);
 // /api/settings echoes panelclock::hasLiveControl() so the form can tell the
 // user whether a new divider applies now or at the next boot.
 #include <display/core/utils.h>
-#ifndef GAGGIMATE_HEADLESS
+#if !defined(GAGGIMATE_HEADLESS) && !defined(GAGGIMATE_SIM) // real LilyGo panel, not the SDL stand-in
 #include <display/drivers/LilyGoDriver.h>
 #endif
 #include <display/drivers/common/LV_Helper.h> // g_overlayStats / g_overlayMinRefreshUs for /api/debug/anim
@@ -49,7 +51,9 @@ extern uint32_t nebula_lerp_self_test(uint32_t *firstBad);
 #include <esp_core_dump.h>
 #include <esp_err.h>
 #include <esp_heap_caps.h>
+#ifndef GAGGIMATE_SIM
 #include <esp_private/freertos_debug.h> // uxTaskGetSnapshotAll, for /api/debug/heapmap
+#endif
 #include <esp_partition.h>
 #include <esp_timer.h>
 #include <mbedtls/platform.h>
@@ -494,7 +498,10 @@ void WebUIPlugin::drainAssetQueue() {
     }
 }
 
-// Counters exported by the patched esp_lcd RGB driver (scripts/patch_esp_lcd_rgb.py).
+// Counters exported by the patched esp_lcd RGB driver (scripts/patch_esp_lcd_rgb.py),
+// which only exists in the real ESP-IDF component tree; the sim has no LCD_CAM
+// peripheral to patch and no /api/debug/scanout consumer of its own.
+#ifndef GAGGIMATE_SIM
 // restart is the one that matters: the driver restarts the transfer when it has
 // lost count of the DMA EOFs, and every restart is one visible block of
 // vertically displaced lines. catchup counts the coalesced EOFs the patch
@@ -542,6 +549,7 @@ extern volatile uint32_t gm_rgb_chunk_hist[];
 extern volatile uint32_t gm_rgb_chunk_max_us;
 static constexpr int GM_RGB_GAPLOG_N = 32;
 }
+#endif // GAGGIMATE_SIM
 
 void WebUIPlugin::setupServer() {
     server.on("/connecttest.txt", [](AsyncWebServerRequest *request) {
@@ -591,11 +599,13 @@ void WebUIPlugin::setupServer() {
     // The dump goes to the serial console because esp_timer_dump takes a FILE*
     // and there is no in-memory stream here; the HTTP response only confirms it
     // ran. Exposes no configuration and no secrets.
+#ifndef GAGGIMATE_SIM // esp_timer_dump walks the IDF esp_timer subsystem's own list
     server.on("/api/debug/timers", [](AsyncWebServerRequest *request) {
         esp_timer_dump(stdout);
         fflush(stdout);
         request->send(200, "application/json", "{\"dumped\":true}");
     });
+#endif
 
 #if CONFIG_FREERTOS_USE_TRACE_FACILITY && CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS
     // /api/debug/tasks: every task with its accumulated runtime counter, so
@@ -711,6 +721,7 @@ void WebUIPlugin::setupServer() {
     // masked for the write's whole duration; radio coexistence leaves every
     // source stale and the slips scattered. Exposes no configuration and no
     // secrets.
+#ifndef GAGGIMATE_SIM // the patched esp_lcd RGB driver counters this reports have no sim equivalent
     server.on("/api/debug/scanout", [](AsyncWebServerRequest *request) {
         // reset=1 zeroes the counters so two configurations can be compared as
         // rates rather than as totals accumulated since boot.
@@ -854,6 +865,7 @@ void WebUIPlugin::setupServer() {
         response->print("]}");
         request->send(response);
     });
+#endif // GAGGIMATE_SIM
     // What the internal heap is made of. The free/min counters say how much
     // is left, not where the rest went, and the WiFi TX path dies at ~8 KB
     // of DMA-capable free, so reclaiming memory needs the composition: per
@@ -863,6 +875,7 @@ void WebUIPlugin::setupServer() {
     // RX pool, 4-8 KB blocks are task stacks), and, in a build with
     // CONFIG_HEAP_TASK_TRACKING, per-task totals. Walks every block under the
     // heap lock: same cost class as heapwalk, debug use only.
+#ifndef GAGGIMATE_SIM // uxTaskGetSnapshotAll walks the real FreeRTOS scheduler's TCB list
     server.on("/api/debug/heapmap", [](AsyncWebServerRequest *request) {
         struct Region {
             intptr_t start, end;
@@ -1019,6 +1032,7 @@ void WebUIPlugin::setupServer() {
         free(w);
         request->send(response);
     });
+#endif // GAGGIMATE_SIM
     // Times a full heap walk over each region, which is what a memory sample
     // costs. Deliberately its own endpoint: calling it perturbs the display, so
     // it must not be folded into a status poll something scrapes on a timer.
@@ -1034,7 +1048,7 @@ void WebUIPlugin::setupServer() {
                  static_cast<unsigned>(c - b));
         request->send(200, "application/json", buf);
     });
-#ifndef GAGGIMATE_HEADLESS
+#if !defined(GAGGIMATE_HEADLESS) && !defined(GAGGIMATE_SIM) // real LilyGo panel, not the SDL stand-in
     // Live ST7701S inversion-mode tuning: /api/debug/panelreg?inv=49
     //
     // INVSET's first byte (BK0 0xC2) selects the inversion mode; the panel
@@ -1913,7 +1927,7 @@ void WebUIPlugin::setupServer() {
         response->addHeader("X-FB-Size", disposition);
         request->send(response);
     });
-#endif // GAGGIMATE_HEADLESS
+#endif // !GAGGIMATE_HEADLESS && !GAGGIMATE_SIM
     server.on("/api/status", [this](AsyncWebServerRequest *request) {
         AsyncResponseStream *response = request->beginResponseStream("application/json");
         JsonDocument doc(&psramAllocator);

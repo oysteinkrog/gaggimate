@@ -31,6 +31,24 @@ static inline BaseType_t xTaskCreatePinnedToCore(TaskFunction_t fn, const char *
     return pdPASS;
 }
 
+// Opaque TCB storage for the static task creator below. The real struct's
+// layout is FreeRTOS-internal and never inspected here; xTaskCreateStatic* is
+// a no-op, so nothing ever reads or writes through it.
+typedef struct {
+    unsigned char _unused;
+} StaticTask_t;
+
+static inline TaskHandle_t xTaskCreateStaticPinnedToCore(TaskFunction_t fn, const char *name, const uint32_t stack,
+                                                          void *param, UBaseType_t prio, StackType_t *stackBuffer,
+                                                          StaticTask_t *taskBuffer, BaseType_t core) {
+    (void)stack;
+    (void)stackBuffer;
+    (void)taskBuffer;
+    TaskHandle_t handle = GM_SIM_TASK_HANDLE;
+    xTaskCreatePinnedToCore(fn, name, stack, param, prio, &handle, core);
+    return handle;
+}
+
 static inline BaseType_t xTaskCreate(TaskFunction_t fn, const char *name, uint32_t stack, void *param, UBaseType_t prio,
                                      TaskHandle_t *handle) {
     return xTaskCreatePinnedToCore(fn, name, stack, param, prio, handle, tskNO_AFFINITY);

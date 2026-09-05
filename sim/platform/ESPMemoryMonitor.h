@@ -14,9 +14,10 @@
 // handle that -- WebUIPlugin's /api/debug/heap falls back to heap_caps_* when
 // it finds no matching region, which is the path this takes.
 //
-// Keep in sync with .pio/libdeps/display/ESPMemoryMonitor if the production
-// code starts using more of the API than is declared here. A missing member
-// surfaces as a sim-only compile error, which is the intended failure mode.
+// Keep in sync with lib/ESPMemoryMonitor/src/esp_memory_monitor/memory_monitor.h
+// if the production code starts using more of the API than is declared here.
+// A missing member surfaces as a sim-only compile error, which is the
+// intended failure mode.
 
 #include <cstddef>
 #include <cstdint>
@@ -55,6 +56,7 @@ struct MemoryMonitorConfig {
     RegionThreshold internal{};
     RegionThreshold psram{};
     bool enableSamplerTask = true;
+    bool enableHeapWalk = true;
     bool enableFragmentation = true;
     bool enableMinEverFree = true;
     bool enablePerTaskStacks = false;
@@ -69,6 +71,7 @@ struct MemoryMonitorConfig {
     size_t leakNoiseBytes = 1024;
     size_t maxLeakChecksInHistory = 16;
     bool usePSRAMBuffers = false;
+    bool stackInPSRAM = false;
 };
 
 struct WindowStats {

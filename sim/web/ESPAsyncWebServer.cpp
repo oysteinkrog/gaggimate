@@ -256,6 +256,7 @@ AsyncResponseStream *AsyncWebServerRequest::beginResponseStream(const String &co
 void AsyncWebServerRequest::send(AsyncWebServerResponse *response) {
     writeResponse(_fd, response);
     delete response;
+    finish();
 }
 void AsyncWebServerRequest::send(int code, const String &contentType, const String &body) {
     AsyncWebServerResponse r;
@@ -263,6 +264,7 @@ void AsyncWebServerRequest::send(int code, const String &contentType, const Stri
     r._contentType = contentType;
     r._body.assign(body.c_str(), body.length());
     writeResponse(_fd, &r);
+    finish();
 }
 void AsyncWebServerRequest::send(FS &fs, const String &path, const String &contentType) {
     File f = fs.open(path.c_str(), "r");
@@ -278,12 +280,14 @@ void AsyncWebServerRequest::send(FS &fs, const String &path, const String &conte
         r._body.append((const char *)chunk, n);
     f.close();
     writeResponse(_fd, &r);
+    finish();
 }
 void AsyncWebServerRequest::redirect(const String &url) {
     AsyncWebServerResponse r;
     r._code = 302;
     r.addHeader("Location", url);
     writeResponse(_fd, &r);
+    finish();
 }
 
 // ---- server ----------------------------------------------------------------
@@ -365,6 +369,12 @@ void AsyncWebServer::pump() {
         if (!dead) {
             if (c.isWs)
                 handleWsFrames(c);
+            else if (c.pendingRequest)
+                // A paused request's response arrives from outside this loop
+                // (WebUIPlugin's drainAssetQueue, on some other connection's
+                // dispatch), so there is nothing to recv/parse here; just
+                // watch for it to finish.
+                dead = c.pendingRequest->_finished;
             else
                 dead = handleHttp(c); // returns true => response sent, close
         }
@@ -374,6 +384,11 @@ void AsyncWebServer::pump() {
                 _ws->_clients.erase(std::remove(_ws->_clients.begin(), _ws->_clients.end(), c.client), _ws->_clients.end());
                 delete c.client;
             }
+            // Fires onDisconnect for a paused request the browser dropped
+            // before it was ever resumed; a no-op (finish() is idempotent)
+            // when send() already fired it.
+            if (c.pendingRequest)
+                c.pendingRequest->finish();
             close(c.fd);
             _conns.erase(_conns.begin() + i);
         } else {
@@ -501,10 +516,10 @@ bool AsyncWebServer::handleHttp(Conn &c) {
         query = target.substr(q + 1);
     }
 
-    AsyncWebServerRequest req(c.fd, this);
-    req._url = String(path.c_str());
-    req._body = body;
-    req._method = method == "POST" ? HTTP_POST : method == "PUT" ? HTTP_PUT : method == "DELETE" ? HTTP_DELETE : HTTP_GET;
+    auto req = std::make_shared<AsyncWebServerRequest>(c.fd, this);
+    req->_url = String(path.c_str());
+    req->_body = body;
+    req->_method = method == "POST" ? HTTP_POST : method == "PUT" ? HTTP_PUT : method == "DELETE" ? HTTP_DELETE : HTTP_GET;
     auto parseArgs = [&](const std::string &s) {
         size_t i = 0;
         while (i < s.size()) {
@@ -514,7 +529,7 @@ bool AsyncWebServer::handleHttp(Conn &c) {
             std::string kv = s.substr(i, amp - i);
             size_t eq = kv.find('=');
             if (eq != std::string::npos)
-                req._args[urlDecode(kv.substr(0, eq))] = urlDecode(kv.substr(eq + 1));
+                req->_args[urlDecode(kv.substr(0, eq))] = urlDecode(kv.substr(eq + 1));
             i = amp + 1;
         }
     };
@@ -525,32 +540,41 @@ bool AsyncWebServer::handleHttp(Conn &c) {
     } else if (ctype.find("multipart/form-data") != std::string::npos) {
         size_t bp = ctype.find("boundary=");
         if (bp != std::string::npos)
-            parseMultipart(body, ctype.substr(bp + 9), req._args);
+            parseMultipart(body, ctype.substr(bp + 9), req->_args);
     }
 
     dispatch(c, req);
+    if (req->_paused) {
+        // The handler deferred the response (WebUIPlugin's asset admission
+        // gate): keep the connection open and this the one strong reference
+        // that keeps it alive. The bytes already parsed must not be seen
+        // again by the next pump() tick's recv/parse.
+        c.inbuf.erase(0, bodyStart + contentLen);
+        c.pendingRequest = req;
+        return false;
+    }
     return true; // Connection: close
 }
 
-void AsyncWebServer::dispatch(Conn &c, AsyncWebServerRequest &req) {
-    std::string path(req._url.c_str());
+void AsyncWebServer::dispatch(Conn &c, const std::shared_ptr<AsyncWebServerRequest> &req) {
+    std::string path(req->_url.c_str());
     for (auto &r : _routes) {
-        if ((r.method == HTTP_ANY || (r.method & req._method)) && r.uri == path) {
-            r.handler(&req);
+        if ((r.method == HTTP_ANY || (r.method & req->_method)) && r.uri == path) {
+            r.handler(req.get());
             return;
         }
     }
     for (auto &s : _static) {
         if (path.rfind(s.uri, 0) == 0) { // prefix match
             std::string rel = path.substr(s.uri.size());
-            req.send(*s.fs, String((s.path + rel).c_str()), "application/octet-stream");
+            req->send(*s.fs, String((s.path + rel).c_str()), "application/octet-stream");
             return;
         }
     }
     if (_notFound)
-        _notFound(&req);
+        _notFound(req.get());
     else
-        req.send(404, "text/plain", "Not found");
+        req->send(404, "text/plain", "Not found");
 }
 
 void AsyncWebServer::handleWsFrames(Conn &c) {
