@@ -382,6 +382,15 @@ void action_on_screen_load(lv_event_t *e) {
     applyClickArea(objects.accept_button, 25);
     applyClickArea(objects.save_as_new_button, 25);
     applyClickArea(objects.save_button, 25);
+    // The profile name beside the profile button reads as the thing to tap
+    // to change profiles; make it one. Labels are not clickable by default,
+    // so the flag doubles as the once-per-object guard against stacking the
+    // callback on every screen load (the flow engine recreates screens).
+    if (objects.profile_name != nullptr && !lv_obj_has_flag(objects.profile_name, LV_OBJ_FLAG_CLICKABLE)) {
+        lv_obj_add_flag(objects.profile_name, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_event_cb(objects.profile_name, action_on_profile_select, LV_EVENT_CLICKED, nullptr);
+        applyClickArea(objects.profile_name, 15);
+    }
     // The grind screen's weight/time pill is one target, like the brew
     // screen's, but its icon is an lv_imgbtn (clickable by default) rather
     // than an lv_img: a tap on the icon landed on the icon, whose handler
