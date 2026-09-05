@@ -1,0 +1,31 @@
+# Host renderer for one animation descriptor, registered or not (see
+# render_one.cpp). Same monolithic compile as the bench, one binary per
+# candidate symbol so parallel workers never share an object file:
+#
+#   make -f Makefile.render CAND=bg_anim_mandala2 EXTRA_SRC=candidates/AnimMandala2.cpp
+#   ./build/render_bg_anim_mandala2 OUTDIR [frame ...]
+#
+# EXTRA_SRC is the candidate source when it lives outside src/ (candidates/
+# here, so no firmware build compiles it while it is being written); a
+# registered animation needs none. SAN=1 builds with ASan and UBSan (run with
+# ASAN_OPTIONS=verify_asan_link_order=0 on WSL1) into build/render_<CAND>_san.
+CAND ?= bg_anim_plasma
+EXTRA_SRC ?=
+SAN ?= 0
+ANIM_DIR := ../../src/display/ui/default/bganim
+SRCS := render_one.cpp mathcount.cpp $(wildcard $(ANIM_DIR)/*.cpp) $(EXTRA_SRC)
+CXXFLAGS := -std=gnu++17 -Ishim -I. -I$(ANIM_DIR) -include mathcount.h -Wall -Wno-unused-function -DGM_RENDER_CANDIDATE=$(CAND)
+ifeq ($(SAN),1)
+BIN := build/render_$(CAND)_san
+CXXFLAGS += -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer
+else
+BIN := build/render_$(CAND)
+CXXFLAGS += -O2 -g
+endif
+
+$(BIN): $(SRCS) mathcount.h shim/Arduino.h shim/esp_heap_caps.h shim/esp_memory_utils.h
+	@mkdir -p $(dir $(BIN))
+	g++ $(CXXFLAGS) $(SRCS) -o $(BIN) -lm
+
+.PHONY: all
+all: $(BIN)

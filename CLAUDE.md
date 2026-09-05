@@ -38,7 +38,15 @@ for production, `-e display-loadtest` for the bench rig).
   The Windows and WSL PlatformIO installs share `~/.platformio`; a
   Windows-side build can clobber the patched sources, and the patch scripts
   re-apply on the next WSL build; if a display fault appears out of nowhere,
-  check the patches applied in the build log first. One patch targets the
+  check the patches applied in the build log first. **One PlatformIO
+  install per checkout: the `pio` on PATH (`~/.local/bin/pio`, pipx, core
+  6.1.19), never `~/.platformio/penv/bin/pio` (6.1.18).** PlatformIO deletes
+  the whole `.pio/build` tree whenever the project checksum changes, and the
+  checksum includes the core version, so two installs used on one checkout
+  wipe each other's env trees on every build: on 2026-09-05 that happened
+  twice under four running rig workers, and each rebuilt kdev ELF has a new
+  sha (build metadata), so the board had to be reflashed before kb.py worked
+  again. `pio run -t compiledb` for kdev must follow the same rule. One patch targets the
   LVGL libdep rather than the framework: `scripts/patch_lvgl_meter_inv.py`
   (per-env, into `.pio/libdeps/<env>/lvgl`) gives lv_meter scale-lines
   indicators sector invalidation. If dial updates ever get slow again, check
@@ -213,7 +221,11 @@ survived, and what the device taught:
   candidate put every later bench on that boot into PSRAM (nebula 1.7x
   slower, silently); and for an animation whose `frame()` carries state
   (nebula's scroll, starfield's RNG) the check that holds is blobref vs
-  blob, not blob vs the firmware, whose globals hold the panel's history.
+  blob, not blob vs the firmware, whose globals hold the panel's history. And
+  kbench times each band as the minimum of n back-to-back calls, so a design
+  that caches a row across band() calls is mis-measured in either direction
+  (repeats hit the cache and sample nothing, or miss twice per call); those
+  designs are timed by the useblob production A/B, never by `min_ms`.
   The rig also settles where a frame goes, which the loop body cannot:
   silk's per-pixel body was already one add, one shift, one gather and one
   store, yet the frame was 13.4 ms, and five probe blobs in twenty minutes
@@ -230,6 +242,18 @@ survived, and what the device taught:
   ditherAmp() caps at 16, reading past its LUT at the default parameters.
   Any animation with an unclamped, padded gather sizes its pad from that
   cap, and a change to a table's layout re-runs the fuzz for the fleet.
+- **A row's pixels depend on its absolute y and the frame state, never on
+  which other rows share the band() call.** Production's interlaced path
+  (SleepAnimation.cpp, `splitRender`/`renderSkip`) calls band() with
+  rows==1 and parity-skipping sequences, and the half-resolution path hands
+  it 240-wide rows. Row doubling that copies from a neighbour inside the
+  call's buffer, or picks "the real row" from the call-local offset, passes
+  the golden diff and paints wrong rows on the device; three of the four
+  2026-09-05 redesigns did exactly that until `tools/animbench`'s
+  interlace_check caught the first at integration. The shape that passes:
+  derive everything from the pair row `y & ~1` and memcpy only when the
+  partner is in the same call. `render_one --shapes` runs the same check on
+  an unregistered candidate (480 and 240 wide) before it touches `src/`.
 
 ## Measuring the display rig
 

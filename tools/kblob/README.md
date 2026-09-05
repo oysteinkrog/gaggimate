@@ -117,3 +117,10 @@ others are active.
   firmware exports. A new `bganim::` helper means a flash.
 - Stand in for the production A/B. IRAM placement and warm caches flatter a
   blob; `min_ms` ranks variants, it does not predict the frame time.
+- Time a design that caches a row across band() calls. The bench calls the
+  same band n times back to back and keeps the minimum, so a cache keyed by
+  absolute row either hits on every repeat (the minimum is a call that did
+  no sampling at all) or misses twice per call (when the call ends with a
+  different row cached than it starts with). Mandala's interpolated design
+  measured 8.1 and 19.8 ms this way for variants that production runs a few
+  ms apart. A cross-call cache is timed by the useblob A/B only.

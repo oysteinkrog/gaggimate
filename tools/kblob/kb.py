@@ -48,6 +48,7 @@ import zlib
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.abspath(os.path.join(HERE, "..", ".."))
+ANIM_DIR = os.path.join(REPO, "src", "display", "ui", "default", "bganim")
 TOOLCHAIN = os.path.expanduser("~/.platformio/packages/toolchain-xtensa-esp-elf/bin")
 PREFIX = os.path.join(TOOLCHAIN, "xtensa-esp32s3-elf-")
 DEFAULT_DEVICE = os.environ.get("GM_DEVICE", "192.168.1.121")
@@ -298,7 +299,11 @@ def build(args):
     work = work_dir(args.env)
     name = os.path.splitext(os.path.basename(source))[0]
     obj = os.path.join(work, name + ".o")
-    cmd = compile_command(args.env) + ["-o", obj, "-c", source]
+    # The bganim directory is on the include path so a candidate source can
+    # live outside src/ (tools/animbench/candidates/) and still #include
+    # "BgAnim.h": a half-written file under src/ would be compiled into every
+    # firmware build of the tree while a design round is in progress.
+    cmd = compile_command(args.env) + ["-I", ANIM_DIR, "-o", obj, "-c", source]
     if args.define:
         cmd = cmd[:1] + ["-D" + d for d in args.define] + cmd[1:]
     run(cmd)
