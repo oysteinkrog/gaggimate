@@ -107,10 +107,26 @@ and `frames` is the scan-out's counter, so neither is a rate):
 - **The panel scans at 50.7 Hz** regardless (n=6), so a full-frame animation
   at the panel rate needs render+push under 19.7 ms per frame. Nothing in
   the fleet is within 4 ms of that on the standby screen.
-- **The LVGL overlay refreshes at ~7-9 Hz** (the ~110 ms pass above). UI
-  motion drawn by LVGL (transitions, parallax, dragging) is bounded by that,
-  not by the animation loop; motion at the loop's rate has to be composited
-  in the render task from prerendered layers.
+- **The LVGL overlay refreshes at ~7-9 Hz** (the ~110 ms pass above), and
+  a widget that moves through LVGL moves at that rate or less: the
+  motion test (`/api/debug/anim?uianim=1`, a 120 px plate on an lv_anim)
+  measured 3.9 to 5.4 refreshes a second, 45 to 140 ms per refresh, and
+  the pixel writer is not where the time goes (a plain-store writer
+  changed nothing). Motion at the loop's rate goes through **layers**
+  (`SleepAnimation::layer*`, `DefaultUI::moveObjectViaLayer`): the object
+  is rendered once into an RGB565+A8 sprite, hidden from LVGL, slid by
+  the render task, and handed back when it lands. `uianim=3` is the same
+  plate through a layer: 29.2 fps at cap 30, 32.7 at cap 60 (2026-09-05,
+  standby screen). What a layer costs is PSRAM reads, about 170 to 250 ns
+  per non-transparent pixel per frame (the vector and scalar blends measure
+  the same), plus the sprite's rows going out whole while it moves: a
+  120x120 plate is 2.5 ms of composite and about 6 ms of frame in all, so
+  moving elements should stay around 150 px, and a full-screen slide
+  through a layer (230k px, 40 ms a frame) is not a 30 fps transition.
+  The same rate applies to the overlay itself: the brew screen with 60%
+  plates is ~106k non-transparent pixels and 12 to 13 ms of blend a frame
+  at any render priority, so how much of the screen is translucent over
+  the animation is the budget knob for everything above.
 
 ## Internal DRAM budget (violate these and the web UI dies)
 
