@@ -239,6 +239,14 @@ void Controller::connect() {
     heap_checkpoint("connect/before-wifi");
 #ifndef GAGGIMATE_NO_RADIO
     setupWifi();
+#else
+    // No radio at all under NO_RADIO (sim, QEMU), so setupWifi() never runs and
+    // neither of its controller:wifi:connect triggers ever fires; WebUIPlugin::
+    // start() only listens for that event, so the embedded web server never came
+    // up once display-sim started sharing this guard with the QEMU env
+    // (e4ced4d5, GM-107). Fire it directly with the "connected" shape (AP=0),
+    // same as a normal STA connection landing.
+    pluginManager->trigger("controller:wifi:connect", "AP", 0);
 #endif
     heap_checkpoint("connect/after-wifi");
     setupBluetooth();
