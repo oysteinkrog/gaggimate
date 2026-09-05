@@ -1354,13 +1354,17 @@ void SleepAnimation::computeChords(int w, int h) {
                 x1 = w;
             }
         }
-        // Keep the start even and the width even: the animations' paired
-        // 32-bit stores assume 4-byte alignment, and the packing memmove below
-        // is cheaper on aligned words.
-        x0 &= ~1;
-        if ((x1 - x0) & 1) {
-            x1++;
-        }
+        // Chord ends on 32-pixel boundaries, rounded outwards so no visible
+        // pixel is ever cut. 32 pixels is 64 bytes: the data cache line,
+        // which esp_cache_msync demands of the address and size it is handed
+        // (a 16-pixel chord end met the band GDMA's 32-byte external-memory
+        // alignment but failed every per-row invalidate, and the error line
+        // each failure printed held the render task on the UART for a whole
+        // second per frame, 2026-09-05). It also satisfies the 4-byte
+        // alignment the CPU crop's paired 32-bit stores and packing copy
+        // relied on before.
+        x0 &= ~31;
+        x1 = (x1 + 31) & ~31;
         if (x1 > w) {
             x1 = w;
         }
@@ -2141,9 +2145,14 @@ void SleepAnimation::taskEntry(void *arg) {
 // on every band and holds the same black, so a signature taken there would be
 // identical for every band and the comparison would pass no matter where the
 // content landed. 32 pixels is one 64-byte cache line, which is also the
-// smallest read the framebuffer can serve.
+// smallest read the framebuffer can serve. Centred on the middle rather than
+// starting there: the direct path pushes only each row's chord, and at the
+// top and bottom rows that chord is [w/2-32, w/2+32) after computeChords()
+// rounds it out to 32-pixel ends, so a window starting at w/2 would read 16
+// pixels the DMA never wrote and flag every frame's first and last band as
+// displaced.
 static inline uint32_t bandSignature(const uint16_t *row, int w) {
-    const uint16_t *p = row + (w / 2);
+    const uint16_t *p = row + (w / 2 - 16);
     uint32_t h = 2166136261u;
     for (int i = 0; i < 32; i++) {
         h = (h ^ p[i]) * 16777619u;
@@ -2605,6 +2614,7 @@ void SleepAnimation::renderLoop() {
             warmupFrames.store(warm - 1);
         }
         fpsFrames++;
+        animFrames.fetch_add(1);
 #ifdef GM_ANIM_BENCH
         const uint32_t frameUs = static_cast<uint32_t>(esp_timer_get_time() - frameStart);
         accTotalUs += frameUs;
@@ -2810,6 +2820,7 @@ void SleepAnimation::renderFrame() {
     } else if (frameWaitUs < 400) {
         cropEnabled = false;
     }
+    lastSlotWaitUs.store(frameWaitUs);
     frameWaitUs = 0;
     const int w = display->width();
     const int h = display->height();
@@ -3598,16 +3609,38 @@ void SleepAnimation::renderFrame() {
             uint32_t rowGroupOffsets[BandDma::MAX_ROW_GROUPS];
             int nRowGroups = 0;
             size_t rowGroupBytes = 0;
-            if (bandInterlaced) {
-                const int unit = pairMode ? 2 : 1;
-                rowGroupBytes = static_cast<size_t>(w) * unit * 2;
-                for (int r = 0; r < rows && nRowGroups < BandDma::MAX_ROW_GROUPS; r += unit) {
+            // Chord crop. The panel is round and the framebuffer square, so a
+            // full-width row carries pixels no glass will ever show; on the
+            // widest rows none, at the top and bottom nearly all of them. The
+            // push stage is the one that sets the pace of a full-resolution
+            // frame (slotwait_us on the debug endpoint is the render task
+            // blocked on the band DMA), and it is priced per byte into PSRAM,
+            // so the transfer covers [bandX0, bandX1) of each row it pushes
+            // and nothing else: about a fifth of a frame's bytes never leave
+            // the chip. The crop rides the same row-group table interlacing
+            // uses, one descriptor per row instead of one per band, because a
+            // chord is not contiguous across rows the way a full band is;
+            // computeChords() keeps the chord ends on 32-pixel (64 B)
+            // boundaries so the destination address and length meet both the
+            // external-memory alignment gdma_link_mount_buffers enforces and
+            // the cache-line alignment the per-row esp_cache_msync needs.
+            // dmaCropOn is a measurement knob (crop= on /api/debug/anim), on
+            // in production.
+            const bool dmaCrop = dmaCropOn.load() && bi >= 0 && bi < MAX_BANDS && (bandX1[bi] - bandX0[bi]) < w;
+            const int dmaX0 = dmaCrop ? bandX0[bi] : 0;
+            const int dmaCw = dmaCrop ? (bandX1[bi] - bandX0[bi]) : w;
+            // Rows per group: an uncropped interlaced pair goes out as one
+            // 2-row descriptor; every other shape is single rows.
+            const int groupRows = (bandInterlaced && pairMode && !dmaCrop) ? 2 : 1;
+            if (bandInterlaced || dmaCrop) {
+                rowGroupBytes = static_cast<size_t>(dmaCw) * groupRows * 2;
+                for (int r = 0; r < rows && nRowGroups < BandDma::MAX_ROW_GROUPS; r += groupRows) {
                     const int y = y0 + r;
-                    if ((((pairMode ? (y >> 1) : y) ^ parityNow) & 1) != 0) {
+                    if (bandInterlaced && (((pairMode ? (y >> 1) : y) ^ parityNow) & 1) != 0) {
                         continue;
                     }
                     rowGroupRow[nRowGroups] = r;
-                    rowGroupOffsets[nRowGroups] = static_cast<uint32_t>(r) * w * 2;
+                    rowGroupOffsets[nRowGroups] = (static_cast<uint32_t>(r) * w + dmaX0) * 2;
                     nRowGroups++;
                 }
             }
@@ -3639,15 +3672,15 @@ void SleepAnimation::renderFrame() {
                 // that never ran look like it had worked.
                 const int64_t tMsync = esp_timer_get_time();
                 esp_err_t msyncErr = ESP_OK;
-                if (bandInterlaced) {
+                if (nRowGroups > 0) {
                     for (int i = 0; i < nRowGroups; i++) {
-                        msyncErr = esp_cache_msync(band + static_cast<size_t>(rowGroupRow[i]) * w, rowGroupBytes,
-                                                   ESP_CACHE_MSYNC_FLAG_DIR_C2M);
+                        msyncErr = esp_cache_msync(band + static_cast<size_t>(rowGroupRow[i]) * w + dmaX0,
+                                                   rowGroupBytes, ESP_CACHE_MSYNC_FLAG_DIR_C2M);
                         if (msyncErr != ESP_OK) {
                             break;
                         }
                     }
-                } else {
+                } else if (!bandInterlaced) {
                     msyncErr = esp_cache_msync(band, bytes, ESP_CACHE_MSYNC_FLAG_DIR_C2M);
                 }
                 if (msyncErr != ESP_OK) {
@@ -3751,7 +3784,7 @@ void SleepAnimation::renderFrame() {
                 }
             } else if (bandDma.ready()) {
                 dmaIssued++;
-                if (bandInterlaced) {
+                if (nRowGroups > 0) {
                     err = bandDma.submitRows(renderSlot, dstRow, band, rowGroupOffsets, nRowGroups, rowGroupBytes,
                                              &done);
                 } else {
@@ -3792,10 +3825,9 @@ void SleepAnimation::renderFrame() {
                 frameGateHeld = false;
                 if (bandInterlaced && nRowGroups > 0) {
                     dmaRowFallbacks++;
-                    const int unit = pairMode ? 2 : 1;
                     for (int i = 0; i < nRowGroups; i++) {
                         const int16_t ry0 = static_cast<int16_t>(y0 + rowGroupRow[i]);
-                        display->pushColors(0, ry0, w, static_cast<int16_t>(ry0 + unit),
+                        display->pushColors(0, ry0, w, static_cast<int16_t>(ry0 + groupRows),
                                             band + static_cast<size_t>(rowGroupRow[i]) * w);
                     }
                 } else {
@@ -3827,7 +3859,7 @@ void SleepAnimation::renderFrame() {
                 // presentFrame()), not a new failure mode this invalidate
                 // introduces.
                 for (int i = 0; i < nRowGroups; i++) {
-                    esp_cache_msync(dstRow + static_cast<size_t>(rowGroupRow[i]) * w, rowGroupBytes,
+                    esp_cache_msync(dstRow + static_cast<size_t>(rowGroupRow[i]) * w + dmaX0, rowGroupBytes,
                                     ESP_CACHE_MSYNC_FLAG_DIR_M2C);
                 }
             }

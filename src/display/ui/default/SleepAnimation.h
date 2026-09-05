@@ -215,6 +215,16 @@ class SleepAnimation {
     uint32_t flipTimeoutCount() const { return flipTimeouts.load(); }
     uint32_t lastFrameUsValue() const { return lastFrameUs.load(); }
     uint32_t lastWorkUsValue() const { return lastWorkUs.load(); }
+    // Frames the render loop has completed since start. frame_us excludes the
+    // pacing sleep and the panel's own counter (`frames`) runs at the scan
+    // rate whatever the animation does, so a rate read off either is an
+    // estimate; two reads of this over a known interval are the measurement.
+    uint32_t animFrameCount() const { return animFrames.load(); }
+    // Last frame's total block on bandFree (the band DMA still reading a
+    // slot the render task wants to refill): the part of frame_us that is
+    // the push stage setting the pace rather than band or blend work.
+    uint32_t lastSlotWaitUsValue() const { return lastSlotWaitUs.load(); }
+    uint8_t maxFpsValue() const { return maxFps.load(); }
     uint32_t lastWaitUsValue() const { return lastWaitUs.load(); }
     uint32_t lastBandUsValue() const { return lastBandUs.load(); }
     uint32_t lastExpandUsValue() const { return lastExpandUs.load(); }
@@ -295,6 +305,10 @@ class SleepAnimation {
     void setDirectPush(bool on) { directPushWanted.store(on); }
     bool directPush() const { return directPushWanted.load(); }
     void setDmaWanted(bool on) { dmaWanted.store(on); }
+    // Chord crop on the direct path (renderFrame's dmaCrop): a measurement
+    // knob only, production runs with it on.
+    void setDmaCrop(bool on) { dmaCropOn.store(on); }
+    bool dmaCropOnValue() const { return dmaCropOn.load(); }
     // Reports the resolution actually in effect. setHalfRes() already exists
     // above and owns the allow/reset logic; this is only so the debug endpoint
     // can show which way the auto-resolution logic landed.
@@ -861,6 +875,7 @@ class SleepAnimation {
     // the push falling from 9.7 ms per frame to 0.6, and no transfer errors in
     // 72k transfers. /api/animbench?dma=0 turns it off at runtime.
     std::atomic<bool> dmaWanted{true};
+    std::atomic<bool> dmaCropOn{true};
     // Whether bands go straight into the panel's framebuffer over GDMA, or
     // through the ordinary two-task CPU push. Live, unlike dmaWanted, which
     // only takes effect at the next start() -- and start() never happens while
@@ -1146,6 +1161,8 @@ class SleepAnimation {
     // guess at this (autoResolution being the cap) was wrong.
     std::atomic<uint32_t> lastFrameUs{0};
     std::atomic<uint32_t> lastWorkUs{0};
+    std::atomic<uint32_t> animFrames{0};
+    std::atomic<uint32_t> lastSlotWaitUs{0};
     std::atomic<uint32_t> lastWaitUs{0};
     std::atomic<uint32_t> lastBandUs{0};
     std::atomic<uint32_t> lastExpandUs{0};

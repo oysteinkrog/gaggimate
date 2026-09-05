@@ -82,6 +82,36 @@ Measure with `-e display-loadtest` (`GM_TOUCH_PROBE`): `GM_UISTAT` lines give
 pass/snapshot/publish times and snapshot area per 5 s window; `GM_TOUCHLAT`
 lines stamp press→overlay_publish→anim_frame per tap.
 
+Three refresh rates, none of them the panel's (measured 2026-09-05 with
+`C:\work\camshots\anim_fpsprobe.py`, which reads `anim_frames` on
+`/api/debug/anim` across a timed window; `frame_us` excludes the pacing sleep
+and `frames` is the scan-out's counter, so neither is a rate):
+
+- **The animation loop runs at the `bg_fps` setting (default 30), and with
+  the default interlace on, each pixel row is refreshed every other frame:
+  30 fps loop, 15 Hz per row.** With the slider at 60, nine animations reach
+  41-52 fps interlaced (20-26 Hz per row) and the five heavy ones (lava,
+  aurora, mandala, ember, nebula) 27-34, with zero scan-out slips in every
+  window. The same loop with interlace off (whole frame per frame) is 16-25
+  fps for every animation and cannot exceed 25.3: the cheapest full frame is
+  ~24 ms of work (orbits: band 3, blend 6-7, push handoff 3-4, band-DMA slot
+  wait 6-7, ~5 of per-band overhead over 240 bands) and the flip waits for
+  the scan-out, so anything over one 19.7 ms panel period takes two. Half
+  resolution buys nothing (the 2x expansion costs what the render saves),
+  the CPU push is slower than the GDMA (16 MB/s vs 21.5), and a slower pixel
+  clock (div 7, 8) does not shorten the work. `slotwait_us` on the debug
+  endpoint is the render task blocked on the band DMA. The direct path pushes
+  only each row's chord (`dmaCrop`, `crop=0` turns it off): 15% less work
+  per interlaced frame and +1-2 fps at cap 60, invisible at cap 30 or on the
+  quantised full-frame path.
+- **The panel scans at 50.7 Hz** regardless (n=6), so a full-frame animation
+  at the panel rate needs render+push under 19.7 ms per frame. Nothing in
+  the fleet is within 4 ms of that on the standby screen.
+- **The LVGL overlay refreshes at ~7-9 Hz** (the ~110 ms pass above). UI
+  motion drawn by LVGL (transitions, parallax, dragging) is bounded by that,
+  not by the animation loop; motion at the loop's rate has to be composited
+  in the render task from prerendered layers.
+
 ## Internal DRAM budget (violate these and the web UI dies)
 
 The web UI does not die of bugs in the server, it dies of internal DRAM

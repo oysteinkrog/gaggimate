@@ -1348,6 +1348,12 @@ void WebUIPlugin::setupServer() {
         if (request->hasArg("dma")) {
             a->setDmaWanted(request->arg("dma").toInt() != 0);
         }
+        // crop=0|1: the direct path's per-row chord crop (SleepAnimation's
+        // dmaCrop). Off pushes full-width rows again, for an A/B of what the
+        // corners of the square framebuffer cost the push stage.
+        if (request->hasArg("crop")) {
+            a->setDmaCrop(request->arg("crop").toInt() != 0);
+        }
         if (request->hasArg("half")) {
             a->setHalfRes(request->arg("half").toInt() != 0);
         }
@@ -1504,9 +1510,13 @@ void WebUIPlugin::setupServer() {
         // and a nonzero tear_live stays a bug report the whole time.
         doc["interlaced_live_writes"] = a->interlacedLiveWriteCount();
         doc["flip_timeouts"] = a->flipTimeoutCount();
+        doc["anim_frames"] = a->animFrameCount();
+        doc["fps_cap"] = a->maxFpsValue();
         doc["frame_us"] = a->lastFrameUsValue();
         doc["work_us"] = a->lastWorkUsValue();
         doc["wait_us"] = a->lastWaitUsValue();
+        doc["slotwait_us"] = a->lastSlotWaitUsValue();
+        doc["dma_crop"] = a->dmaCropOnValue();
         doc["band_us"] = a->lastBandUsValue();
         doc["expand_us"] = a->lastExpandUsValue();
         doc["fill_us"] = a->lastFillUsValue();
