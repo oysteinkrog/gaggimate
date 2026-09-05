@@ -305,6 +305,12 @@ static void disp_flush(lv_disp_drv_t *disp_drv, const lv_area_t *area, lv_color_
 volatile int64_t g_touchEdgeAtUs = 0;
 OverlayStats g_overlayStats;
 volatile int g_uiAnimTestReq = 0;
+TouchLogEntry g_touchLog[TOUCHLOG_N];
+volatile uint32_t g_touchLogCount = 0;
+volatile int g_touchMapReq = 0;
+volatile bool g_touchMapLoad = false;
+char *g_touchMapBuf = nullptr;
+volatile uint32_t g_touchMapLen = 0;
 volatile int64_t g_overlayMinRefreshUs = 250000; // DefaultUI's constructor sets OVERLAY_MIN_REFRESH_US
 
 /*Read the touchpad*/
@@ -320,6 +326,17 @@ static void touchpad_read(lv_indev_drv_t *indev_driver, lv_indev_data_t *data) {
         if (touched != edgeWasTouched) {
             edgeWasTouched = touched;
             g_touchEdgeAtUs = esp_timer_get_time();
+            TouchLogEntry &en = g_touchLog[g_touchLogCount % TOUCHLOG_N];
+            en.tMs = static_cast<uint32_t>(::millis());
+            en.x = x;
+            en.y = y;
+            en.press = touched != 0;
+            en.hit = nullptr;
+            if (touched) {
+                lv_point_t pt = {x, y};
+                en.hit = lv_indev_search_obj(lv_scr_act(), &pt);
+            }
+            g_touchLogCount = g_touchLogCount + 1;
         }
     }
 #ifdef GM_TOUCH_PROBE

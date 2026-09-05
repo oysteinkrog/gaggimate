@@ -91,6 +91,33 @@ extern volatile int64_t g_overlayMinRefreshUs;
 // changes per second) never exercises.
 extern volatile int g_uiAnimTestReq;
 
+// /api/debug/touchmap: the UI task walks one screen's object tree and writes
+// every object (class, coords, flags, ext click pad, event count, parent) as
+// a JSON array into g_touchMapBuf, so the hit rectangles LVGL will actually
+// use can be reviewed off the device. g_touchMapReq is the screen id to
+// dump (ScreensEnum), 0 when nothing is pending; g_touchMapLoad asks the UI
+// task to switch to that screen as well. g_touchMapLen is 0 until the dump
+// is ready. Written by the UI task, read by the web server task.
+extern volatile int g_touchMapReq;
+extern volatile bool g_touchMapLoad;
+extern char *g_touchMapBuf;
+extern volatile uint32_t g_touchMapLen;
+
+// /api/debug/touchlog: the last TOUCHLOG_N touch edges (press and release)
+// with the panel point and, for a press, the object LVGL's hit test finds
+// there, so a tap that missed can be compared against the hit rectangles
+// (tools/touchmap.py) instead of guessed at. Written by touchpad_read on the
+// UI task; entry i lives at i % TOUCHLOG_N.
+struct TouchLogEntry {
+    uint32_t tMs;
+    int16_t x, y;
+    bool press;
+    lv_obj_t *hit;
+};
+constexpr int TOUCHLOG_N = 32;
+extern TouchLogEntry g_touchLog[TOUCHLOG_N];
+extern volatile uint32_t g_touchLogCount;
+
 #ifdef GM_TOUCH_PROBE
 #include <atomic>
 // Touch-to-pixel latency probe (bench builds). touchpad_read stamps the edge;

@@ -2410,6 +2410,8 @@ void eez_flow_init_styles(void (*add_style)(lv_obj_t *obj, int32_t styleIndex),
 void eez_flow_init_groups(lv_group_t **groups, size_t numGroups);
 void eez_flow_init_screen_names(const char **screenNames, size_t numScreens);
 void eez_flow_init_object_names(const char **objectNames, size_t numObjects);
+// The table handed to eez_flow_init_object_names (one name per objects[] entry), for debug output.
+const char **eez_flow_object_names(void);
 void eez_flow_init_group_names(const char **groupNames, size_t numGroups);
 void eez_flow_init_style_names(const char **styleNames, size_t numStyles);
 void eez_flow_init_themes(const char **themeNames, size_t numThemes, void (*changeColorTheme)(uint32_t themeIndex),

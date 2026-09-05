@@ -34,6 +34,8 @@ extern uint32_t nebula_lerp_self_test(uint32_t *firstBad);
 #include <display/drivers/LilyGoDriver.h>
 #endif
 #include <display/drivers/common/LV_Helper.h> // g_overlayStats / g_overlayMinRefreshUs for /api/debug/anim
+#include <display/ui/default/eez/screens.h>  // objects, for /api/debug/touchlog
+#include <display/ui/default/eez/eez-flow.h> // eez_flow_object_names
 #include <display/drivers/common/PanelClock.h>
 #include <display/ui/default/bganim/BgAnim.h> // bg_library_valid / bg_map_valid for the settings writer
 #include <display/ui/default/bganim/BgAnimCommon.h>
@@ -1761,6 +1763,71 @@ void WebUIPlugin::setupServer() {
                  static_cast<unsigned>(80000000UL / (panelclock::currentDiv() > 0 ? panelclock::currentDiv() : 1)),
                  static_cast<unsigned>(frames), static_cast<unsigned>(refills), static_cast<unsigned>(slips));
         request->send(200, "application/json", buf);
+    });
+
+    // /api/debug/touchmap[?screen=N[&load=1]]: with screen=, asks the UI
+    // task to dump that screen's object tree (LV_Helper.h, g_touchMapReq);
+    // with load=1 it switches to the screen first. Without arguments, returns
+    // the last dump, or {"pending":true} while the UI task has not written
+    // it yet. tools/touchmap.py drives it and draws the hit rectangles.
+    server.on("/api/debug/touchmap", [](AsyncWebServerRequest *request) {
+        if (request->hasArg("screen")) {
+            const int id = request->arg("screen").toInt();
+            if (id < 1 || id > 11) {
+                request->send(400, "application/json", "{\"error\":\"screen 1..11\"}");
+                return;
+            }
+            g_touchMapLen = 0;
+            g_touchMapLoad = request->hasArg("load") && request->arg("load").toInt() != 0;
+            g_touchMapReq = id;
+            request->send(200, "application/json", "{\"queued\":true}");
+            return;
+        }
+        if (g_touchMapReq != 0 || g_touchMapLen == 0 || g_touchMapBuf == nullptr) {
+            request->send(200, "application/json", "{\"pending\":true}");
+            return;
+        }
+        request->send(200, "application/json", g_touchMapBuf);
+    });
+
+    // /api/debug/touchlog: the last touch edges (LV_Helper.h, g_touchLog),
+    // oldest first, each with the panel point and the object the press
+    // landed on, named by its objects[] entry when it is a generated one.
+    server.on("/api/debug/touchlog", [](AsyncWebServerRequest *request) {
+        // PSRAM, per request: a static buffer this size would be internal
+        // DRAM the WiFi stack needs more than a debug page does.
+        constexpr size_t CAP = TOUCHLOG_N * 96 + 64;
+        char *buf = static_cast<char *>(heap_caps_malloc(CAP, MALLOC_CAP_SPIRAM));
+        if (buf == nullptr) {
+            request->send(503, "application/json", "{\"error\":\"no memory\"}");
+            return;
+        }
+        size_t len = 0;
+        const uint32_t count = g_touchLogCount;
+        const uint32_t first = count > static_cast<uint32_t>(TOUCHLOG_N) ? count - TOUCHLOG_N : 0;
+        len += snprintf(buf + len, CAP - len, "{\"count\":%u,\"edges\":[", static_cast<unsigned>(count));
+        lv_obj_t **arr = reinterpret_cast<lv_obj_t **>(&objects);
+        const char **names = eez_flow_object_names();
+        const size_t nObj = sizeof(objects) / sizeof(lv_obj_t *);
+        for (uint32_t i = first; i < count && len + 96 < CAP; i++) {
+            const TouchLogEntry en = g_touchLog[i % TOUCHLOG_N];
+            const char *name = nullptr;
+            if (en.hit != nullptr) {
+                name = "(unnamed)";
+                for (size_t k = 0; k < nObj; k++) {
+                    if (arr[k] == en.hit) {
+                        name = names != nullptr ? names[k] : "?";
+                        break;
+                    }
+                }
+            }
+            len += snprintf(buf + len, CAP - len, "%s{\"t\":%u,\"press\":%d,\"x\":%d,\"y\":%d,\"hit\":%s%s%s}",
+                            i == first ? "" : ",", static_cast<unsigned>(en.tMs), en.press ? 1 : 0, en.x, en.y,
+                            name != nullptr ? "\"" : "", name != nullptr ? name : "null", name != nullptr ? "\"" : "");
+        }
+        len += snprintf(buf + len, CAP - len, "]}");
+        request->send(200, "application/json", buf);
+        heap_caps_free(buf);
     });
 
     // /api/debug/fb?n=0|1[&step=2] streams one panel framebuffer as raw

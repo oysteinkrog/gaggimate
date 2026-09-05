@@ -123,6 +123,9 @@ class DefaultUI {
     // Applies g_uiAnimTestReq (LV_Helper.h) on the UI task: creates, moves or
     // removes the foreground motion test widget.
     void serviceUiAnimTest();
+    // Serves /api/debug/touchmap (LV_Helper.h, g_touchMapReq): dumps a
+    // screen's object tree with the hit rectangles LVGL uses.
+    void serviceTouchMap();
     // Renders obj and its children into buf as LV_IMG_CF_TRUE_COLOR_ALPHA
     // (RGB565 + A8), sized to the object's coords grown by its ext draw size;
     // *outArea receives that area in screen coordinates. False when the
@@ -230,6 +233,7 @@ class DefaultUI {
     lv_obj_t *animHostScreen = nullptr;    // screen whose bg was made transparent for the animation
     lv_obj_t *uiAnimTestObj = nullptr;     // the foreground motion test widget, when one is up
     int uiAnimTestMode = 0;                // g_uiAnimTestReq value the widget was built for
+    unsigned long touchMapDumpAt = 0;      // touchmap: earliest millis() to dump after a load
     int uiAnimTestTravel = 0;              // mode 3: how far each leg slides the plate
     bool uiAnimTestFwd = true;
     struct LayerMove {

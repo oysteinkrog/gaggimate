@@ -6401,6 +6401,7 @@ void eez_flow_init_object_names(const char **objectNames, size_t numObjects) {
     g_objectNames = objectNames;
     EEZ_UNUSED(numObjects);
 }
+const char **eez_flow_object_names(void) { return g_objectNames; }
 void eez_flow_init_group_names(const char **groupNames, size_t numGroups) {
     g_groupNames = groupNames;
     EEZ_UNUSED(numGroups);

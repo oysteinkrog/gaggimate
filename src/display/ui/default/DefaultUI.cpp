@@ -376,6 +376,7 @@ void DefaultUI::loop() {
     // time and the pump branch never.
     serviceLayerMoves();
     serviceUiAnimTest();
+    serviceTouchMap();
     if (panelStopRequested && !panelStopped) {
         panelStopped = true;
         stopSleepAnimation();
@@ -643,6 +644,105 @@ void DefaultUI::serviceUiAnimTest() {
     lv_anim_set_repeat_count(&a, LV_ANIM_REPEAT_INFINITE);
     lv_anim_set_path_cb(&a, lv_anim_path_ease_in_out);
     lv_anim_start(&a);
+}
+
+#ifndef GAGGIMATE_SIM
+static const char *touchMapClass(const lv_obj_t *obj) {
+    struct Entry {
+        const lv_obj_class_t *cls;
+        const char *name;
+    };
+    static const Entry table[] = {
+        {&lv_btn_class, "btn"},       {&lv_imgbtn_class, "imgbtn"}, {&lv_img_class, "img"},
+        {&lv_label_class, "label"},   {&lv_meter_class, "meter"},   {&lv_switch_class, "switch"},
+        {&lv_bar_class, "bar"},       {&lv_arc_class, "arc"},       {&lv_line_class, "line"},
+        {&lv_slider_class, "slider"}, {&lv_roller_class, "roller"}, {&lv_dropdown_class, "dropdown"},
+        {&lv_checkbox_class, "checkbox"}, {&lv_textarea_class, "textarea"}, {&lv_btnmatrix_class, "btnmatrix"},
+        {&lv_obj_class, "obj"},
+    };
+    for (const Entry &e : table) {
+        if (obj->class_p == e.cls) {
+            return e.name;
+        }
+    }
+    return "other";
+}
+
+// One object per line of the JSON array: its objects[] index (-1 when it is
+// not a generated object), class, coords, hidden/clickable/overflow-visible
+// flags, ext click pad, event callback count, translate_y and depth.
+static void touchMapNode(lv_obj_t *obj, int parent, int depth, char *buf, size_t cap, size_t &len, int &nextId) {
+    const int id = nextId++;
+    int oi = -1;
+    lv_obj_t **arr = reinterpret_cast<lv_obj_t **>(&objects);
+    const size_t nObj = sizeof(objects) / sizeof(lv_obj_t *);
+    for (size_t i = 0; i < nObj; i++) {
+        if (arr[i] == obj) {
+            oi = static_cast<int>(i);
+            break;
+        }
+    }
+    lv_area_t a;
+    lv_obj_get_coords(obj, &a);
+    const int ext = obj->spec_attr != nullptr ? obj->spec_attr->ext_click_pad : 0;
+    const int ev = obj->spec_attr != nullptr ? obj->spec_attr->event_dsc_cnt : 0;
+    if (len + 200 < cap) {
+        len += snprintf(buf + len, cap - len,
+                        "%s{\"i\":%d,\"p\":%d,\"o\":%d,\"c\":\"%s\",\"x1\":%d,\"y1\":%d,\"x2\":%d,\"y2\":%d,\"h\":%d,\"k\":%d,"
+                        "\"e\":%d,\"n\":%d,\"v\":%d,\"ty\":%d,\"d\":%d}\n",
+                        id == 0 ? "" : ",", id, parent, oi, touchMapClass(obj), a.x1, a.y1, a.x2, a.y2,
+                        lv_obj_has_flag(obj, LV_OBJ_FLAG_HIDDEN) ? 1 : 0, lv_obj_has_flag(obj, LV_OBJ_FLAG_CLICKABLE) ? 1 : 0,
+                        ext, ev, lv_obj_has_flag(obj, LV_OBJ_FLAG_OVERFLOW_VISIBLE) ? 1 : 0,
+                        static_cast<int>(lv_obj_get_style_translate_y(obj, LV_PART_MAIN)), depth);
+    }
+    const uint32_t n = lv_obj_get_child_cnt(obj);
+    for (uint32_t i = 0; i < n; i++) {
+        touchMapNode(lv_obj_get_child(obj, i), id, depth + 1, buf, cap, len, nextId);
+    }
+}
+#endif
+
+void DefaultUI::serviceTouchMap() {
+#ifndef GAGGIMATE_SIM
+    const int req = g_touchMapReq;
+    if (req < 1 || req > _SCREEN_ID_LAST) {
+        return;
+    }
+    if (g_touchMapLoad) {
+        g_touchMapLoad = false;
+        changeScreen(static_cast<ScreensEnum>(req));
+        // The flow engine swaps the screen later this pass and its tick sets
+        // the flow-driven HIDDEN flags on the next; give it a few passes.
+        touchMapDumpAt = ::millis() + 400;
+        return;
+    }
+    if (::millis() < touchMapDumpAt) {
+        return;
+    }
+    constexpr size_t CAP = 64 * 1024;
+    if (g_touchMapBuf == nullptr) {
+        g_touchMapBuf = static_cast<char *>(heap_caps_malloc(CAP, MALLOC_CAP_SPIRAM));
+        if (g_touchMapBuf == nullptr) {
+            g_touchMapReq = 0;
+            return;
+        }
+    }
+    lv_obj_t *scr = reinterpret_cast<lv_obj_t **>(&objects)[req - 1];
+    if (scr == nullptr) {
+        snprintf(g_touchMapBuf, CAP, "{\"screen\":%d,\"error\":\"screen not created\"}", req);
+        g_touchMapLen = strlen(g_touchMapBuf);
+        g_touchMapReq = 0;
+        return;
+    }
+    lv_obj_update_layout(scr);
+    size_t len = 0;
+    len += snprintf(g_touchMapBuf, CAP, "{\"screen\":%d,\"active\":%d,\"objects\":[\n", req, lv_scr_act() == scr ? 1 : 0);
+    int nextId = 0;
+    touchMapNode(scr, -1, 0, g_touchMapBuf, CAP, len, nextId);
+    len += snprintf(g_touchMapBuf + len, CAP - len, "]}\n");
+    g_touchMapLen = static_cast<uint32_t>(len);
+    g_touchMapReq = 0;
+#endif
 }
 
 bool DefaultUI::snapshotObjectToBuffer(lv_obj_t *obj, uint8_t *buf, uint32_t bufSize, lv_area_t *outArea) {
