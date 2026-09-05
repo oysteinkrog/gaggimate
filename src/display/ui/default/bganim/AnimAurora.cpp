@@ -34,7 +34,9 @@
 //     alloc() (PSRAM, unconditionally, as of this round -- see
 //     BgAnimCommon.h's placement-API comment). The three tables total
 //     8,704 B (4,096 + 4,096 + 512), all 16-byte-aligned already, so they
-//     fit the slab with 512 B to spare and no shrinking was needed. Before
+//     fit the slab with 512 B to spare and no shrinking was needed. (Since
+//     the row-LUT cache fix, see g_rowLUT, the slab holds wLut1, wLut2 and
+//     the 768 B row table, 8,960 B, and glowLUT is in PSRAM.) Before
 //     this round, table placement was decided against the free internal
 //     pool at init() time, so the SAME table could land in SRAM on one boot
 //     and PSRAM on the next depending on radio/heap state; allocHot makes
@@ -110,15 +112,67 @@
 // per pair. See this pass's report for the arithmetic-floor argument for
 // why this is close to what this schedule, at this register budget, can
 // deliver.
+//
+// Redesign, 2026-09-05 (design worker aurora2): the row-LUT cache fix above
+// (g_rowLUT, g_lastBgIdx) took the rig from 25.5 to 17.2 ms per frame with
+// identical pixels. This pass changes what band() renders, not how it
+// schedules the rendering: for each y/y+1 row pair it computes the full row
+// (coarse-grid sample, clamp/square/scale, dither, rowLUT gather) once and
+// duplicates it into the other row with memcpy, instead of running the
+// per-pixel work on both. The two curtains are a slow, vertically smooth
+// field (warp1/warp2 change by only 0.021 and 0.013 rad per row, and env is
+// a smooth ramp in |y|), so a pair's two rows already differed by a small
+// fraction of a rowLUT step; collapsing that difference to zero trades a
+// little vertical smoothness for about half the per-pixel work and, on top
+// of the caching fix (each computed row now also costs one computeRowState
+// call and one buildRowLUT check instead of two), takes the rig from 17.2
+// to 9.5 ms. Golden diff against the pre-redesign frames (030/120/210) is
+// mean 0.65 to 0.87 of 255, well under the file's existing coarse-grid
+// tolerance. The dither phase stays keyed on the row PAIR, y >> 1, not on y
+// itself: keying it on y would only ever show four of BAYER8's eight row
+// phases (y is always even at the point renderAuroraRow* is called with it,
+// see below), and those four rows share the same column parity in the
+// matrix, so the grain lines up into visible vertical stripes through the
+// gradient instead of a checkerboard (found in frame review).
+//
+// A first cut of this pass computed the pair's row state from whichever row
+// happened to be first in a given band() call and fell back to a lone row's
+// own state otherwise, which tools/animbench/interlace_check.cpp caught: a
+// row's content and dither phase must depend only on its own absolute y,
+// never on which other rows the same call happened to also request.
+// SleepAnimation.cpp has a real row-level interlace path that calls band()
+// with rows==1, one row at a time, rendering only every other row each
+// frame, so a lone-row call is not a hypothetical shape, it is production
+// traffic. The fix: every row derives ySrc = y & ~1 (its pair's even row)
+// and renders ySrc's content, whether or not its partner is in this call;
+// the memcpy from one row to the other is only ever an optimization used
+// when both rows of a pair land in the same call (production's usual
+// rows==2, y0 even, so the common case still gets it), never a source of
+// different output depending on call shape. Confirmed with
+// render_one.cpp's --shapes mode (an interlace_check for one candidate
+// descriptor, added for the aurora2/lava2 redesign passes) before this
+// touched src/, and again here with tools/animbench/interlace_check.cpp
+// across the whole fleet.
 #include "BgAnim.h"
 #include "BgAnimCommon.h"
 #include <math.h>
+#include <string.h>
 
 namespace {
 using namespace bganim;
 
 uint16_t *glowLUT = nullptr; // [256 intensity] -> RGB565 glow color (theme-baked)
 uint32_t lastThemeGen = 0xFFFFFFFF;
+// The per-row colour table and the background index it was built for. These
+// used to be locals of band() and bandRef(), which was a caching bug: a local
+// lastBgIdx = -1 forces buildRowLUT's rebuild on every call, and with the
+// production BAND_H of 2 that is ~240 rebuilds a frame instead of the ~10 the
+// background actually changes (bgIdx = y/48). Measured 25.5 -> 17.2 ms per
+// frame on the rig with identical pixels once the cache survived across
+// calls. The table lives in the hot slab (read per pixel); frame() resets
+// the index so a theme or glow rebuild is never served from a stale table.
+uint16_t *g_rowLUT = nullptr;
+int g_lastBgIdx = -1;
 
 // f1 = 0.026, f1b = 0.017 rad/px -> phase steps in Q8 ticks of the 1024-LUT.
 constexpr float TICKS = 1024.0f * 256.0f / 6.2831853f; // rad -> Q8 LUT ticks
@@ -216,18 +270,17 @@ bool init(int, int) {
     if (lut == nullptr) {
         return false;
     }
-    // Round 2: allocHot(), not alloc(). All three tables are read every
-    // pixel or every row (glowLUT indirectly, through rowLUT which is
-    // rebuilt from it up to ~10x/frame), which is exactly the "per-pixel or
-    // per-row" criterion BgAnimCommon.h's placement comment names for the
-    // hot slab. Total 8,704 B (4,096 + 4,096 + 512), all 16-byte-aligned
-    // already, against the slab's 9,216 B per-animation share -- fits with
-    // 512 B to spare, no shrinking needed. alloc() is PSRAM unconditionally
-    // as of this round, so leaving these on alloc() would have made every
-    // boot pay the 46.7 -> 67.6 ms PSRAM penalty this file's header
-    // measured, not just some boots.
+    // Round 2: allocHot(), not alloc(), for the tables read every pixel or
+    // every row (BgAnimCommon.h's placement criterion): wLut1, wLut2 and,
+    // since the row-LUT cache fix, g_rowLUT. Total 8,960 B (4,096 + 4,096 +
+    // 768) against the slab's 9,216 B per-animation share. glowLUT moved the
+    // other way, to alloc() (PSRAM): it is only read while rebuilding
+    // g_rowLUT, ~10 times a frame, 256 entries each, and its 512 B were what
+    // the 768 B row table needed. alloc() is PSRAM unconditionally as of
+    // round 2, so the per-pixel tables must not fall back to it: this file's
+    // header measured the 46.7 -> 67.6 ms penalty when they did.
     if (glowLUT == nullptr) {
-        glowLUT = static_cast<uint16_t *>(allocHot(256 * sizeof(uint16_t)));
+        glowLUT = static_cast<uint16_t *>(alloc(256 * sizeof(uint16_t)));
     }
     if (wLut1 == nullptr) {
         wLut1 = static_cast<int32_t *>(allocHot(SIN_N * sizeof(int32_t)));
@@ -235,7 +288,14 @@ bool init(int, int) {
     if (wLut2 == nullptr) {
         wLut2 = static_cast<int32_t *>(allocHot(SIN_N * sizeof(int32_t)));
     }
-    if (glowLUT == nullptr || wLut1 == nullptr || wLut2 == nullptr) {
+    if (g_rowLUT == nullptr) {
+        g_rowLUT = static_cast<uint16_t *>(allocHot(ROWLUT_SIZE * sizeof(uint16_t)));
+        if (g_rowLUT == nullptr) {
+            g_rowLUT = static_cast<uint16_t *>(alloc(ROWLUT_SIZE * sizeof(uint16_t)));
+        }
+    }
+    g_lastBgIdx = -1;
+    if (glowLUT == nullptr || wLut1 == nullptr || wLut2 == nullptr || g_rowLUT == nullptr) {
         return false;
     }
     for (int i = 0; i < SIN_N; i++) {
@@ -252,6 +312,8 @@ void frame(uint32_t tMs, int, int, const uint8_t p[4]) {
         buildGlowLUT();
         lastThemeGen = themeGen();
     }
+    // One real rebuild per frame at most per background segment: see g_rowLUT.
+    g_lastBgIdx = -1;
     g_t = (tMs * 0.001f) * 0.45f * speedMul(p[0]);
     g_A1 = 0.6f + (p[2] / 100.0f) * 2.4f;
     g_A2 = 0.4f + (p[2] / 100.0f) * 1.6f;
@@ -346,7 +408,13 @@ RowState computeRowState(int y, float t, const float *ct, uint16_t rowLUT[ROWLUT
 
     st.ph1 = g_phBase1 + static_cast<uint32_t>(static_cast<int32_t>(warp1 * TICKS));
     st.ph2 = g_phBase2 + static_cast<uint32_t>(static_cast<int32_t>(warp2 * TICKS));
-    st.dbase = (y & 7) * 8;
+    // Dither row phase keyed by the ROW PAIR, y >> 1, not by y itself.
+    // Callers always pass ySrc (always even) as y here (see the 2026-09-05
+    // redesign note in the file header), so this is really the pair's
+    // phase, identical for both rows whether the second one is filled by
+    // memcpy or by its own call to this same function. Zero extra cost
+    // either way: same multiply-and-mask, just of a shifted y.
+    st.dbase = ((y >> 1) & 7) * 8;
     return st;
 }
 
@@ -356,52 +424,89 @@ RowState computeRowState(int y, float t, const float *ct, uint16_t rowLUT[ROWLUT
 // the device equivalence test (/api/debug/animtest) is checking two
 // separately-written implementations of the same math, not one path calling
 // the other.
+// Renders one row's full pixel content: computeRowState plus the coarse-
+// column-grid pair loop, unchanged per-pixel math. Takes ySrc, not the row
+// being written, because the caller always derives ySrc from y before
+// deciding whether to duplicate (see bandRef below and the file header's
+// 2026-09-05 note).
+void renderAuroraRowRef(uint16_t *__restrict row, int ySrc, float t, const int32_t *__restrict w1,
+                         const int32_t *__restrict w2, const float *__restrict ct, uint16_t rowLUT[ROWLUT_SIZE],
+                         int &lastBgIdx, const int32_t *ditherFold, int w) {
+    const RowState st = computeRowState(ySrc, t, ct, rowLUT, lastBgIdx);
+    uint32_t ph1 = st.ph1, ph2 = st.ph2;
+    const int32_t rowScale = st.rowScale;
+    const int32_t *rowDf = ditherFold + st.dbase;
+
+    // One sample: the two-curtain sum at the CURRENT ph1/ph2, clamped,
+    // squared and row-scaled down to a rowLUT index. Does not advance
+    // ph1/ph2 or touch dither, the caller owns both.
+    auto sampleScaledSq = [&]() -> int32_t {
+        const int32_t v = w1[(ph1 >> 8) & 1023] + w2[(ph2 >> 8) & 1023];
+        const int32_t vc = v > 0 ? v : 0;
+        return (((vc * vc) >> 12) * rowScale) >> 12;
+    };
+
+    // Coarse column grid, spacing 2: sample the field (and its downstream
+    // clamp/square/scale) at x=0,2,4,... and linearly interpolate the
+    // ROWLUT INDEX for the odd pixel in between. w is always even (480 or
+    // 240), so every pixel is covered by exactly one pair, no remainder
+    // loop.
+    int32_t scur = sampleScaledSq();
+    for (int x = 0; x + 2 <= w; x += 2) {
+        ph1 += STEP1;
+        ph1 += STEP1; // advance 2 pixels' worth to reach the next sample
+        ph2 += STEP2;
+        ph2 += STEP2;
+        const int32_t snext = sampleScaledSq();
+        row[x] = rowLUT[scur + rowDf[x & 7]];
+        // scur, snext are both >=0 (post-clamp), so a plain logical shift
+        // is an exact average, no sign handling needed.
+        const int32_t sodd = (scur + snext) >> 1;
+        row[x + 1] = rowLUT[sodd + rowDf[(x + 1) & 7]];
+        scur = snext;
+    }
+}
+
+// A row's content and dither phase are always derived from ySrc = y & ~1
+// (its pair's even row), never from y directly and never from anything
+// about the call other than y itself. That is what makes this safe under
+// SleepAnimation.cpp's row-level interlace path, which calls band() with
+// rows==1 for one row at a time: a lone row computes ySrc's content
+// directly and gets exactly the pixels it would have gotten as the
+// duplicate half of a same-call pair, just without that call's memcpy
+// saving. Production's usual call is rows==2 with y0 even (BAND_H), so the
+// common case is exactly one compute-and-duplicate pair per call. See the
+// file header's 2026-09-05 note for why this matters.
 void bandRef(uint16_t *dst, int y0, int rows, int w, uint32_t, const uint8_t *) {
     const float t = g_t;
     const int32_t *__restrict w1 = wLut1;
     const int32_t *__restrict w2 = wLut2;
     const float *__restrict ct = cosTableF();
 
-    uint16_t rowLUT[ROWLUT_SIZE];
-    int lastBgIdx = -1;
+    uint16_t *const rowLUT = g_rowLUT; // cached across calls, see its declaration
+    int &lastBgIdx = g_lastBgIdx;
     int32_t ditherFold[64];
     buildDitherFold(ditherFold);
 
-    for (int ry = 0; ry < rows; ry++) {
-        const int y = y0 + ry;
-        const RowState st = computeRowState(y, t, ct, rowLUT, lastBgIdx);
-        uint32_t ph1 = st.ph1, ph2 = st.ph2;
-        const int32_t rowScale = st.rowScale;
-        const int32_t *rowDf = ditherFold + st.dbase;
-        uint16_t *__restrict row = dst + static_cast<size_t>(ry) * w;
-
-        // One sample: the two-curtain sum at the CURRENT ph1/ph2, clamped,
-        // squared and row-scaled down to a rowLUT index. Does not advance
-        // ph1/ph2 or touch dither -- the caller owns both.
-        auto sampleScaledSq = [&]() -> int32_t {
-            const int32_t v = w1[(ph1 >> 8) & 1023] + w2[(ph2 >> 8) & 1023];
-            const int32_t vc = v > 0 ? v : 0;
-            return (((vc * vc) >> 12) * rowScale) >> 12;
-        };
-
-        // Coarse column grid, spacing 2: sample the field (and its
-        // downstream clamp/square/scale) at x=0,2,4,...  and linearly
-        // interpolate the ROWLUT INDEX for the odd pixel in between. w is
-        // always even (480 or 240), so every pixel is covered by exactly
-        // one pair, no remainder loop.
-        int32_t scur = sampleScaledSq();
-        for (int x = 0; x + 2 <= w; x += 2) {
-            ph1 += STEP1;
-            ph1 += STEP1; // advance 2 pixels' worth to reach the next sample
-            ph2 += STEP2;
-            ph2 += STEP2;
-            const int32_t snext = sampleScaledSq();
-            row[x] = rowLUT[scur + rowDf[x & 7]];
-            // scur, snext are both >=0 (post-clamp), so a plain logical
-            // shift is an exact average -- no sign handling needed.
-            const int32_t sodd = (scur + snext) >> 1;
-            row[x + 1] = rowLUT[sodd + rowDf[(x + 1) & 7]];
-            scur = snext;
+    int row = 0;
+    while (row < rows) {
+        const int y = y0 + row;
+        const int ySrc = y & ~1;
+        uint16_t *out = dst + static_cast<size_t>(row) * w;
+        if ((y & 1) == 0 && row + 1 < rows) {
+            // y starts a pair and y+1 is also in this call: compute once,
+            // duplicate. The common case for every real caller.
+            renderAuroraRowRef(out, ySrc, t, w1, w2, ct, rowLUT, lastBgIdx, ditherFold, w);
+            memcpy(out + w, out, static_cast<size_t>(w) * sizeof(uint16_t));
+            row += 2;
+        } else {
+            // y is odd (its partner is the row behind it, not in this
+            // call) or y is even but the call ends before y+1 (row-level
+            // interlace). Either way, render ySrc's content directly so
+            // this row matches what it would be as half of a same-call
+            // pair.
+            renderAuroraRowRef(out, ySrc, t, w1, w2, ct, rowLUT, lastBgIdx, ditherFold, w);
+            row += 1;
         }
     }
 }
@@ -556,33 +661,51 @@ __attribute__((noinline)) static void auroraPixelsAsm(uint16_t *__restrict dst, 
         : "memory");
 }
 
-// Device path: same row-constant math as bandRef (computeRowState is
-// shared; only the x loop after it differs -- a compiled C++ walk there,
-// one auroraPixelsAsm() call here). No GM_ANIM_IRAM this round: see the
-// file header's perf-pass-4 note for why it was dropped.
+// Computes ySrc's row state and runs the asm kernel into one row. Same
+// ySrc-derivation contract as renderAuroraRowRef above.
+void renderAuroraRowAsm(uint16_t *row, int ySrc, float t, const int32_t *__restrict w1,
+                         const int32_t *__restrict w2, const float *__restrict ct, uint16_t rowLUT[ROWLUT_SIZE],
+                         int &lastBgIdx, const int32_t *ditherFold, int w) {
+    const RowState st = computeRowState(ySrc, t, ct, rowLUT, lastBgIdx);
+
+    // Bootstrap sample at x=0, using the row's unadvanced ph1/ph2, matches
+    // renderAuroraRowRef's `scur = sampleScaledSq()` before its pair loop.
+    const int32_t v0 = w1[(st.ph1 >> 8) & 1023] + w2[(st.ph2 >> 8) & 1023];
+    const int32_t vc0 = v0 > 0 ? v0 : 0;
+    const int32_t scur0 = (((vc0 * vc0) >> 12) * st.rowScale) >> 12;
+    auroraPixelsAsm(row, w1, w2, rowLUT, ditherFold + st.dbase, st.ph1, st.ph2, st.rowScale, scur0, w >> 1);
+}
+
+// Device path. Same ySrc/row-stride structure as bandRef above, so the two
+// stay pixel-for-pixel identical to each other. The kernel call always
+// renders ySrc's content; the memcpy only fires when y's pair partner is
+// also in this call (see bandRef's comment for why this is call-shape
+// safe). No GM_ANIM_IRAM this round: see the file header's perf-pass-4 note
+// for why it was dropped.
 void band(uint16_t *dst, int y0, int rows, int w, uint32_t, const uint8_t *) {
     const float t = g_t;
     const int32_t *__restrict w1 = wLut1;
     const int32_t *__restrict w2 = wLut2;
     const float *__restrict ct = cosTableF();
 
-    uint16_t rowLUT[ROWLUT_SIZE];
-    int lastBgIdx = -1;
+    uint16_t *const rowLUT = g_rowLUT; // cached across calls, see its declaration
+    int &lastBgIdx = g_lastBgIdx;
     int32_t ditherFold[64];
     buildDitherFold(ditherFold);
 
-    for (int ry = 0; ry < rows; ry++) {
-        const int y = y0 + ry;
-        const RowState st = computeRowState(y, t, ct, rowLUT, lastBgIdx);
-
-        // Bootstrap sample at x=0, using the row's unadvanced ph1/ph2 --
-        // matches bandRef's `scur = sampleScaledSq()` before its pair loop.
-        const int32_t v0 = w1[(st.ph1 >> 8) & 1023] + w2[(st.ph2 >> 8) & 1023];
-        const int32_t vc0 = v0 > 0 ? v0 : 0;
-        const int32_t scur0 = (((vc0 * vc0) >> 12) * st.rowScale) >> 12;
-
-        uint16_t *row = dst + static_cast<size_t>(ry) * w;
-        auroraPixelsAsm(row, w1, w2, rowLUT, ditherFold + st.dbase, st.ph1, st.ph2, st.rowScale, scur0, w >> 1);
+    int row = 0;
+    while (row < rows) {
+        const int y = y0 + row;
+        const int ySrc = y & ~1;
+        uint16_t *out = dst + static_cast<size_t>(row) * w;
+        if ((y & 1) == 0 && row + 1 < rows) {
+            renderAuroraRowAsm(out, ySrc, t, w1, w2, ct, rowLUT, lastBgIdx, ditherFold, w);
+            memcpy(out + w, out, static_cast<size_t>(w) * sizeof(uint16_t));
+            row += 2;
+        } else {
+            renderAuroraRowAsm(out, ySrc, t, w1, w2, ct, rowLUT, lastBgIdx, ditherFold, w);
+            row += 1;
+        }
     }
 }
 
@@ -596,6 +719,8 @@ void release() {
     releaseTable(glowLUT, 256 * sizeof(uint16_t));
     releaseTable(wLut1, static_cast<size_t>(SIN_N) * sizeof(int32_t));
     releaseTable(wLut2, static_cast<size_t>(SIN_N) * sizeof(int32_t));
+    releaseTable(g_rowLUT, static_cast<size_t>(ROWLUT_SIZE) * sizeof(uint16_t));
+    g_lastBgIdx = -1;
     lastThemeGen = 0xFFFFFFFF;
 }
 
