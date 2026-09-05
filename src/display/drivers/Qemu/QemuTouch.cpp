@@ -7,6 +7,7 @@
 #include <esp_timer.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
+#include <hal/uart_ll.h>
 
 #include <atomic>
 #include <cstdlib>
@@ -16,11 +17,10 @@ namespace {
 
 constexpr const char *LOG_TAG = "QemuTouch";
 
-// The IDF console. Installing the receive driver on it is what esp_console does
-// too; transmit is unaffected because log output writes the FIFO directly
-// rather than going through the driver.
+// The IDF console. Records are read straight off the hardware RX FIFO (see
+// touchTask); log output already writes the TX FIFO the same way, and the
+// port's configuration, baud rate included, stays whatever the console set.
 constexpr uart_port_t TOUCH_UART = UART_NUM_0;
-constexpr size_t RX_BUFFER = 512;
 
 // A press is only believed this long after the record that reported it. Without
 // the expiry a bridge that is killed mid-drag would leave the UI stuck with a
@@ -84,10 +84,26 @@ void touchTask(void *arg) {
     char record[MAX_RECORD];
     size_t len = 0;
 
+    uart_dev_t *const hw = UART_LL_GET_HW(TOUCH_UART);
     uint8_t chunk[64];
     for (;;) {
-        const int n = uart_read_bytes(TOUCH_UART, chunk, sizeof(chunk), portMAX_DELAY);
-        for (int i = 0; i < n; i++) {
+        // Polled, not the uart driver. uart_read_bytes with portMAX_DELAY
+        // loops until it has the whole requested length, so a 64 byte chunk
+        // sat on a 12 byte tap record until two more taps arrived and then
+        // parsed all three inside one LVGL input poll, which read them as one
+        // press. Reading one byte at a time fixed that and still lost every
+        // tap after the first: this QEMU fork's UART model raises the RX
+        // interrupt once for a sparse host trickle and then not again, so the
+        // driver's ring buffer never saw a second delivery. Reading the FIFO
+        // length every 5 ms depends on neither.
+        const uint32_t avail = uart_ll_get_rxfifo_len(hw);
+        if (avail == 0) {
+            vTaskDelay(pdMS_TO_TICKS(5));
+            continue;
+        }
+        const uint32_t want = avail < sizeof(chunk) ? avail : sizeof(chunk);
+        uart_ll_read_rxfifo(hw, chunk, want);
+        for (uint32_t i = 0; i < want; i++) {
             const char c = static_cast<char>(chunk[i]);
             switch (state) {
             case State::Idle:
@@ -133,18 +149,10 @@ void begin() {
         return;
     }
 
-    // No transmit buffer and no event queue: this only ever reads. The port is
-    // already configured by the console, so deliberately no uart_param_config
-    // here -- reconfiguring it would reset the baud rate the log is using.
-    const esp_err_t err = uart_driver_install(TOUCH_UART, RX_BUFFER, 0, 0, nullptr, 0);
-    if (err != ESP_OK) {
-        ESP_LOGE(LOG_TAG, "uart_driver_install failed: %s", esp_err_to_name(err));
-        return;
-    }
-
+    // No uart_driver_install: touchTask polls the RX FIFO itself (its comment
+    // says why), so there is no ring buffer or ISR to set up.
     if (xTaskCreatePinnedToCore(touchTask, "QemuTouch", 2560, nullptr, 5, nullptr, 1) != pdPASS) {
         ESP_LOGE(LOG_TAG, "failed to start parser task");
-        uart_driver_delete(TOUCH_UART);
         return;
     }
 
