@@ -174,16 +174,17 @@ survived, and what the device taught:
   lost to keeping the index in a register. The kernels that won transcribed
   GCC's loop first and then found an edge (orbits 2.0x, caustics 1.5x,
   nebula 1.3x, ripples 3x to 5x depending on ring state). Lava, silk and
-  Silk 2 carry the fleet's three untimed kernels: written 2026-09-05 with
-  the board offline, on by default behind `GM_BGANIM_LAVA_ASM`,
-  `GM_BGANIM_SILK_ASM` and `GM_BGANIM_SILK2_ASM` (`-D<flag>=0` falls back to
-  bandRef), bit-exact under QEMU, and their dispatch glue proven on the host
-  because the flag-on build gives each kernel a portable twin so `make
-  check`, the interlace check and the fuzz run the glue too. Earlier lava
-  and silk kernels lost to the compiler on the device three times, and
-  these transcribe GCC's loops with at most a closed loop or a walking
-  pointer as the edge, so expect parity: the first production A/B
-  (`useref=1`) decides whether each flag stays on.
+  Silk 2 got their kernels last (2026-09-05, written with the board
+  offline, each behind a flag: `GM_BGANIM_LAVA_ASM`, `GM_BGANIM_SILK_ASM`,
+  `GM_BGANIM_SILK2_ASM`), bit-exact under QEMU and on the device, with
+  portable twins so the flag-on glue also runs through `make check`, the
+  interlace check and the fuzz. The device then decided the defaults: Silk 2
+  wins (1.16x, on), lava ties (0.99x, on), silk loses (0.87x, the third
+  silk kernel the compiler has beaten on the chip, so `GM_BGANIM_SILK_ASM`
+  defaults to 0 and bandRef renders; `-D<flag>=1` re-enables it for the
+  next attempt). Parity is the expected result of transcribing GCC's loop;
+  the wins came from an edge the compiler cannot take (a closed loop, a
+  walking pointer, a gather the PIE unit does in one instruction).
 - **Every kernel keeps its portable C++ as `bandRef` on the BgAnimation
   struct**, and the ladder to change one is: host goldens exact
   (`tools/animbench make check`), the real device compiler's disassembly

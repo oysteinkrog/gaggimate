@@ -226,27 +226,27 @@
 #endif
 
 // Master switch for the hand-written Xtensa kernels below (silkFastCell16Asm,
-// silkExactCell16Asm, and band()'s dispatch to them). ON by default now: the
+// silkExactCell16Asm, and band()'s dispatch to them). OFF by default: the
 // sixth pass's port of these kernels to the 16-pixel grid is bit-exact
-// against the current bandRef() under QEMU (tools/qemubench/tests/anim_silk),
-// and this pass added portable C++ twins of both kernels (same names and
-// signatures, see the #else branch below) so the dispatch band() compiles
-// and runs on the host too: tools/animbench's goldens and interlace check
-// pass with the flag on, render_one --shapes passes at both supported
-// widths and both row parities, and the ASan/UBSan fuzz harness ends "bands
-// rendered clean" with the flag on, which matters most for silk since its
-// palette pad of 16 exists for an unclamped gather at the ditherAmp() cap.
-// What this has NOT yet proven: real-device timing. The bench board was
-// offline while this was written, so there is no production A/B yet, and
-// the fifth pass's retired 8-pixel kernels lost to GCC 14's compile of
-// bandRef() twice already (2026-09-04, round 2 asm 22.5 ms vs ref 17.3,
-// round 3 asm 25.4 vs ref 18.6) before the sixth pass's 16-pixel grid and
-// paired stores made bandRef() itself faster still. The first production
-// A/B (camshots/anim_devbench.py, useref=1 swaps in bandRef) decides
-// whether this flag stays on. -DGM_BGANIM_SILK_ASM=0 falls back to
-// bandRef() unconditionally, same as before this flag existed.
+// against bandRef() under QEMU (tools/qemubench/tests/anim_silk) and on the
+// device (animtest 2026-09-05, 0 mismatched pixels over 5,760 bands), and
+// the portable C++ twins of both kernels (same names and signatures, see the
+// #else branch below) let the dispatch band() run through tools/animbench's
+// goldens, interlace check, render_one --shapes and the ASan/UBSan fuzz with
+// the flag on. But the device is the only evidence for speed, and it says
+// the kernels lose: the first production A/B on the bench board
+// (camshots/anim_devbench.py, standby screen, full resolution, asm/ref/ref/asm)
+// measured band() at 13.1 ms against bandRef() at 11.4 ms, 0.87x, and the
+// animtest bracket agreed at 0.86x (318.8 ms vs 274.6 ms over 5,760 bands).
+// That is the third silk kernel GCC 14's compile of bandRef() has beaten on
+// the chip (2026-09-04 round 2 asm 22.5 ms vs ref 17.3, round 3 asm 25.4
+// vs ref 18.6, both against the older 8-pixel bandRef), so the flag stays
+// off and bandRef() renders in production. The kernels stay in the file,
+// bit-exact and fuzzed, for the next attempt: -DGM_BGANIM_SILK_ASM=1 turns
+// them on, and the ladder in CLAUDE.md (QEMU PASS, animtest 0 mismatches,
+// then the useref=1 A/B) is what would let the default flip back.
 #ifndef GM_BGANIM_SILK_ASM
-#define GM_BGANIM_SILK_ASM 1
+#define GM_BGANIM_SILK_ASM 0
 #endif
 
 #ifdef GM_SILK_HOST_DIFF
