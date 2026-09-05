@@ -303,6 +303,9 @@ static void disp_flush(lv_disp_drv_t *disp_drv, const lv_area_t *area, lv_color_
 }
 
 volatile int64_t g_touchEdgeAtUs = 0;
+OverlayStats g_overlayStats;
+volatile int g_uiAnimTestReq = 0;
+volatile int64_t g_overlayMinRefreshUs = 250000; // DefaultUI's constructor sets OVERLAY_MIN_REFRESH_US
 
 /*Read the touchpad*/
 static void touchpad_read(lv_indev_drv_t *indev_driver, lv_indev_data_t *data) {

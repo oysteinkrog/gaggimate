@@ -59,6 +59,35 @@ extern volatile int64_t g_touchEdgeAtUs;
 // out a full gate period.
 constexpr int64_t GM_TOUCH_GRACE_US = 400000;
 
+// Foreground (overlay) refresh instrumentation and knob, production path.
+// The overlay is what the widgets look like to the render task: every LVGL
+// change reaches the panel through one refreshSleepOverlay() pass (snapshot
+// the dirty rects into the RGB565+A8 buffer, publish the alpha runs), so the
+// rate of those passes IS the foreground's refresh rate, and these counters
+// are how it is measured without a probe build. ovRefreshes counts passes
+// that published; the last* fields describe the most recent one.
+// g_overlayMinRefreshUs is the spacing gate refreshSleepOverlay applies
+// between partial refreshes (DefaultUI.h's OVERLAY_MIN_REFRESH_US is its
+// boot value); ovmin= on /api/debug/anim moves it live so the ungated rate
+// of the snapshot path can be measured on the device.
+struct OverlayStats {
+    volatile uint32_t refreshes = 0;
+    volatile uint32_t lastSnapUs = 0;
+    volatile uint32_t lastPubUs = 0;
+    volatile uint32_t lastAreaPx = 0;
+    volatile uint32_t lastClips = 0;
+};
+extern OverlayStats g_overlayStats;
+extern volatile int64_t g_overlayMinRefreshUs;
+// Foreground motion test (uianim= on /api/debug/anim, applied by
+// DefaultUI::loop on the UI task, since LVGL is single-threaded): 0 removes
+// the test widget, 1 slides an opaque 120x120 rounded plate with a label
+// back and forth across the current screen on an lv_anim, 2 the same at
+// 60x60. A continuous LVGL animation is the one input that measures what the
+// snapshot path can do for MOVING widgets, which telemetry (a few changes
+// per second) never exercises.
+extern volatile int g_uiAnimTestReq;
+
 #ifdef GM_TOUCH_PROBE
 #include <atomic>
 // Touch-to-pixel latency probe (bench builds). touchpad_read stamps the edge;

@@ -120,6 +120,9 @@ class DefaultUI {
     // 25 ms ui->loop() pass. Costs a bool check when the animation is off and
     // one comparison when it is on but nothing was drawn.
     void pumpSleepOverlay();
+    // Applies g_uiAnimTestReq (LV_Helper.h) on the UI task: creates, moves or
+    // removes the foreground motion test widget.
+    void serviceUiAnimTest();
     // Hide, restore or repaint the opaque background plates the generated
     // screens put behind their content. mode is Settings::getBgAnimClearPlates
     // (0 keep, 1 hide, 2 custom); color is 0xRRGGBB and opaPct 0-100, both used
@@ -191,6 +194,8 @@ class DefaultUI {
     // only when a controller connects, which is a different thing entirely.
     unsigned long uiBuiltAt = 0;
     lv_obj_t *animHostScreen = nullptr;    // screen whose bg was made transparent for the animation
+    lv_obj_t *uiAnimTestObj = nullptr;     // the foreground motion test widget, when one is up
+    int uiAnimTestMode = 0;                // g_uiAnimTestReq value the widget was built for
     // Number of entries in the plate table in applyAnimPlates.
     static constexpr int ANIM_PLATE_COUNT = 9;
     // Last applied (mode, color, opacity), so a no-op settings poll costs one

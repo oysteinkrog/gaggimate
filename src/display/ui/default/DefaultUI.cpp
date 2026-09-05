@@ -212,6 +212,7 @@ DefaultUI::DefaultUI(Controller *controller, Driver *driver, PluginManager *plug
 
 void DefaultUI::init() {
     profileManager = controller->getProfileManager();
+    g_overlayMinRefreshUs = OVERLAY_MIN_REFRESH_US;
     auto triggerRender = [this](Event const &) { rerender = true; };
     pluginManager->on("boiler:currentTemperature:change", [this](Event const &event) {
         int newTemp = static_cast<int>(event.getFloat("value"));
@@ -553,10 +554,58 @@ void DefaultUI::maintainSleepAnimation() {
 
 void DefaultUI::pumpSleepOverlay() {
 #ifndef GAGGIMATE_SIM
+    serviceUiAnimTest();
     if (sleepAnimation.isActive()) {
         refreshSleepOverlay();
     }
 #endif
+}
+
+static void uiAnimTestSlideCb(void *var, int32_t v) { lv_obj_set_x(static_cast<lv_obj_t *>(var), static_cast<lv_coord_t>(v)); }
+
+void DefaultUI::serviceUiAnimTest() {
+    const int req = g_uiAnimTestReq;
+    if (req == uiAnimTestMode) {
+        return;
+    }
+    if (uiAnimTestObj != nullptr) {
+        lv_anim_del(uiAnimTestObj, nullptr);
+        lv_obj_del(uiAnimTestObj);
+        uiAnimTestObj = nullptr;
+    }
+    uiAnimTestMode = req;
+    if (req == 0) {
+        return;
+    }
+    lv_obj_t *scr = lv_scr_act();
+    if (scr == nullptr) {
+        return;
+    }
+    const lv_coord_t size = req == 2 ? 60 : 120;
+    lv_obj_t *o = lv_obj_create(scr);
+    lv_obj_remove_style_all(o);
+    lv_obj_set_size(o, size, size);
+    lv_obj_set_pos(o, 40, (lv_obj_get_height(scr) - size) / 2);
+    lv_obj_set_style_radius(o, size / 6, 0);
+    lv_obj_set_style_bg_color(o, lv_color_hex(0xF4A261), 0);
+    lv_obj_set_style_bg_opa(o, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(o, 0, 0);
+    lv_obj_clear_flag(o, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_t *l = lv_label_create(o);
+    lv_label_set_text(l, req == 2 ? "1" : "9.2");
+    lv_obj_set_style_text_color(l, lv_color_hex(0x1B1B1B), 0);
+    lv_obj_center(l);
+    lv_anim_t a;
+    lv_anim_init(&a);
+    lv_anim_set_var(&a, o);
+    lv_anim_set_exec_cb(&a, uiAnimTestSlideCb);
+    lv_anim_set_values(&a, 40, lv_obj_get_width(scr) - size - 40);
+    lv_anim_set_time(&a, 1200);
+    lv_anim_set_playback_time(&a, 1200);
+    lv_anim_set_repeat_count(&a, LV_ANIM_REPEAT_INFINITE);
+    lv_anim_set_path_cb(&a, lv_anim_path_ease_in_out);
+    lv_anim_start(&a);
+    uiAnimTestObj = o;
 }
 
 void DefaultUI::loopProfiles() {
@@ -1163,7 +1212,7 @@ void DefaultUI::refreshSleepOverlay() {
     // of dropping.
     if (overlayValid[back]) {
         const int64_t nowUs = esp_timer_get_time();
-        if (nowUs - g_touchEdgeAtUs >= GM_TOUCH_GRACE_US && nowUs - lastOverlayRefreshUs < OVERLAY_MIN_REFRESH_US) {
+        if (nowUs - g_touchEdgeAtUs >= GM_TOUCH_GRACE_US && nowUs - lastOverlayRefreshUs < g_overlayMinRefreshUs) {
             return;
         }
     }
@@ -1208,10 +1257,8 @@ void DefaultUI::refreshSleepOverlay() {
     lastSleepOverlayRefresh = ::millis();
     lastOverlayRefreshUs = esp_timer_get_time();
     int w = 0, h = 0;
-#ifdef GM_TOUCH_PROBE
     const int64_t probeSnap0 = esp_timer_get_time();
     int64_t probeArea = 0;
-#endif
     for (int i = 0; i < clipN; i++) {
         if (!snapshotAreaToOverlay(scr, buf, sleepAnimation.overlayCapacity(), clips[i], &w, &h)) {
             // Leave the debt list intact; the next pass retries every rect.
@@ -1219,13 +1266,9 @@ void DefaultUI::refreshSleepOverlay() {
             log_w("Sleep overlay snapshot failed");
             return;
         }
-#ifdef GM_TOUCH_PROBE
         probeArea += static_cast<int64_t>(lv_area_get_width(&clips[i])) * lv_area_get_height(&clips[i]);
-#endif
     }
-#ifdef GM_TOUCH_PROBE
     const int64_t probeSnap1 = esp_timer_get_time();
-#endif
     // Marked here rather than at the call site, and after the snapshot rather
     // than before it, so the slip log measures the thing that actually costs
     // something. Every early return above is a pass that touched no memory --
@@ -1243,6 +1286,11 @@ void DefaultUI::refreshSleepOverlay() {
         ranges[i][1] = clips[i].y2 + 1;
     }
     sleepAnimation.publishOverlayRanges(w, h, ranges, clipN);
+    g_overlayStats.lastSnapUs = static_cast<uint32_t>(probeSnap1 - probeSnap0);
+    g_overlayStats.lastPubUs = static_cast<uint32_t>(esp_timer_get_time() - probeSnap1);
+    g_overlayStats.lastAreaPx = static_cast<uint32_t>(probeArea);
+    g_overlayStats.lastClips = static_cast<uint32_t>(clipN);
+    g_overlayStats.refreshes = g_overlayStats.refreshes + 1;
 #ifdef GM_TOUCH_PROBE
     {
         const int64_t snapUs = probeSnap1 - probeSnap0;

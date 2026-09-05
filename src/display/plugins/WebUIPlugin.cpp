@@ -33,6 +33,7 @@ extern uint32_t nebula_lerp_self_test(uint32_t *firstBad);
 #ifndef GAGGIMATE_HEADLESS
 #include <display/drivers/LilyGoDriver.h>
 #endif
+#include <display/drivers/common/LV_Helper.h> // g_overlayStats / g_overlayMinRefreshUs for /api/debug/anim
 #include <display/drivers/common/PanelClock.h>
 #include <display/ui/default/bganim/BgAnim.h> // bg_library_valid / bg_map_valid for the settings writer
 #include <display/ui/default/bganim/BgAnimCommon.h>
@@ -1348,6 +1349,24 @@ void WebUIPlugin::setupServer() {
         if (request->hasArg("dma")) {
             a->setDmaWanted(request->arg("dma").toInt() != 0);
         }
+        // ovmin=N: the overlay refresh spacing gate in microseconds (see
+        // g_overlayMinRefreshUs); 0 lets the foreground refresh as fast as
+        // the snapshot path can run, which is how that path's rate is
+        // measured. Not persisted; the boot value is OVERLAY_MIN_REFRESH_US.
+        if (request->hasArg("ovmin")) {
+            const long v = request->arg("ovmin").toInt();
+            if (v >= 0 && v <= 5000000) {
+                g_overlayMinRefreshUs = v;
+            }
+        }
+        // uianim=0|1|2: the foreground motion test widget (LV_Helper.h's
+        // g_uiAnimTestReq), created and animated by the UI task.
+        if (request->hasArg("uianim")) {
+            const int v = request->arg("uianim").toInt();
+            if (v >= 0 && v <= 2) {
+                g_uiAnimTestReq = v;
+            }
+        }
         // crop=0|1: the direct path's per-row chord crop (SleepAnimation's
         // dmaCrop). Off pushes full-width rows again, for an A/B of what the
         // corners of the square framebuffer cost the push stage.
@@ -1517,6 +1536,15 @@ void WebUIPlugin::setupServer() {
         doc["wait_us"] = a->lastWaitUsValue();
         doc["slotwait_us"] = a->lastSlotWaitUsValue();
         doc["dma_crop"] = a->dmaCropOnValue();
+        // Foreground: overlay refreshes (two reads over a window are the
+        // widgets' refresh rate) and the last pass's snapshot/publish cost.
+        doc["ov_refreshes"] = g_overlayStats.refreshes;
+        doc["ov_snap_us"] = g_overlayStats.lastSnapUs;
+        doc["ov_pub_us"] = g_overlayStats.lastPubUs;
+        doc["ov_area_px"] = g_overlayStats.lastAreaPx;
+        doc["ov_clips"] = g_overlayStats.lastClips;
+        doc["ov_min_us"] = static_cast<int64_t>(g_overlayMinRefreshUs);
+        doc["uianim"] = g_uiAnimTestReq;
         doc["band_us"] = a->lastBandUsValue();
         doc["expand_us"] = a->lastExpandUsValue();
         doc["fill_us"] = a->lastFillUsValue();
