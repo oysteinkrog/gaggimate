@@ -234,11 +234,92 @@
 // renders ySrc's content directly and gets exactly the pixels it would
 // have gotten as the duplicate half of a same-call pair. See bandRef's
 // own comment for the mechanism.
+//
+// Round 6 (2026-09-05, asm-lava), flag-gated, UNTESTED ON THE DEVICE: the
+// bench board was offline for this round (do not flash it, do not touch
+// COM3, do not call 192.168.1.121), so nothing below is a timing claim. It
+// is a candidate for whoever next has board time, picking up exactly what
+// round 5's file-top comment already named: "finalizeSpan's own 4-wide loop
+// is the one hot loop in this file that did NOT get a hardware LOOP... A
+// loopnez conversion there is a real, untested-this-round candidate."
+//
+// Two hand-written Xtensa kernels, both gated off by default
+// (GM_BGANIM_LAVA_ASM, same pattern as AnimSilk.cpp's GM_BGANIM_SILK_ASM).
+// With the flag off, band() is exactly what round 4 left it: a direct call
+// to bandRef(), byte for byte. Nothing here changes bandRef(), renderRow()
+// or finalizeSpan(): those stay the spec, unedited. The kernels sit beside
+// them (lavaFinalizeQuadAsm, lavaFieldGatherAsm) feeding a second, parallel
+// implementation (finalizeSpanAsm, renderRowAsm, bandAsm) that band() only
+// reaches when the flag is on.
+//
+// finalizeSpan's 4-wide loop (lavaFinalizeQuadAsm): xtensa-asm14.sh's
+// compiled .S for this file shows GCC 14 closing this loop with a plain
+// decrement-and-branch (addi.n + bnez.n), not a hardware LOOP, over a
+// 40-instruction body (42 counting those two branch instructions): 10.5
+// static instructions per pixel. The kernel is that same 40-instruction
+// body, transcribed instruction for instruction off the .S (same op order,
+// same data flow, even GCC's own pixel-3,pixel-1,pixel-2,pixel-0 evaluation
+// order and its apparently redundant 16-bit EXTUI after every clamp, kept
+// as found rather than "corrected": a transcription's job is to match what
+// was measured, not to guess at what the compiler meant), wrapped in a
+// `loopnez` instead of the branch: 40 static instructions over 4 pixels,
+// 10/pixel, and the taken branch every iteration is gone rather than merely
+// recounted. Three prior rounds (see the round 1-3 comment above) already
+// measured a branch-eliminating finalize kernel losing on the device
+// despite winning on paper, for reasons this loop's own instruction count
+// can't see (IRAM code size against the flash icache; see AnimSilk.cpp's
+// fifth/sixth-pass comments and this repo's CLAUDE.md "Animation kernels"
+// section), so this is offered as a candidate, not a claim: it may lose the
+// same way.
+//
+// The field-accumulation gather (lavaFieldGatherAsm): round 5's file-top
+// comment above already found that GCC's compiled loop for this exact C++
+// (`for (int n = xhi-xlo+1; n>0; n--) { *field++ += lut[ttQ>>LUT_SHIFT];
+// ttQ+=stepQ; stepQ+=step2Q; }`) is ALREADY a 9-instruction hardware
+// zero-overhead LOOP with no load-use stall left to remove (the scheduler
+// already inserts the independent ttQ+=stepQ add between the LUT load and
+// the add that consumes it). This kernel is a verbatim transcription of
+// that same 9-instruction body inside a hand-written `loopnez`, at parity
+// by construction: it cannot be faster than GCC's own loop, since it is the
+// same instructions in the same order. It exists so the on-device A/B, if
+// anyone runs it, compares two structurally identical loops (one compiled,
+// one hand-assembled) instead of the compiled loop against nothing. No edge
+// was taken past that transcription: the two candidates round 5 named
+// (keeping an accumulator load/store resident across iterations, or a
+// 2-wide unroll to overlap load-use latency) do not apply without changing
+// the arithmetic. Consecutive iterations touch DIFFERENT field[] addresses
+// (there is no accumulator living in a register across iterations to keep
+// resident), and the loop's one load-use gap is already filled, so a 2-wide
+// unroll would duplicate work without shortening any dependency chain.
+//
+// Both kernels are checked bit-exact against portable C references,
+// transcribed the same way, in tools/qemubench/tests/anim_lava/ (rewritten
+// this round; the previous version was a stub reporting that lava shipped
+// no kernel). Neither kernel has executed on real Xtensa silicon: only
+// through xtensa-asm14.sh's assembler and in QEMU. That is the gap between
+// this comment and a timing number. finalizeSpanAsm/renderRowAsm/bandAsm
+// are not new algorithm, just renderRow()'s and finalizeSpan()'s own
+// structure with the two hot loops swapped for calls into the kernels
+// above, so the eventual on-device A/B has a full band() to call.
 
 #include "BgAnim.h"
 #include "BgAnimCommon.h"
 #include <math.h>
 #include <string.h>
+
+// Master switch for the hand-written Xtensa kernels near the end of this
+// file (lavaFinalizeQuadAsm, lavaFieldGatherAsm, and the
+// finalizeSpanAsm/renderRowAsm/bandAsm chain that wires them into a second
+// band() implementation). OFF by default, same pattern as AnimSilk.cpp's
+// GM_BGANIM_SILK_ASM: with the flag off, band() is byte for byte what round
+// 4 shipped (bandRef() called directly), and the kernel code below does not
+// even compile on a non-Xtensa build (host bench, fuzzer) or with the flag
+// left at 0. See the round-6 file-top comment above for what each kernel is
+// and why it is a candidate, not a measured win: this round had no board to
+// measure on. -DGM_BGANIM_LAVA_ASM=1 turns it on.
+#ifndef GM_BGANIM_LAVA_ASM
+#define GM_BGANIM_LAVA_ASM 0
+#endif
 
 namespace {
 using namespace bganim;
@@ -767,14 +848,289 @@ void bandRef(uint16_t *dst, int y0, int rows, int w, uint32_t, const uint8_t *) 
     }
 }
 
-// Round 4: band() ships no hand asm and no restructuring: every asm
-// kernel and every control-flow change tried in rounds 1-3 measured
-// slower than this shape on the device at equal table placement, so
-// band() is a direct call to the portable reference above. See the
-// file-top round-4 comment.
+#if defined(__XTENSA__) && !defined(GM_BGANIM_NO_ASM) && GM_BGANIM_LAVA_ASM
+// ---- Hand-written Xtensa kernels, round 6 (see the file-top comment) ----
+//
+// Both kernels are noinline, take plain pointers/ints, and are transcribed
+// instruction-for-instruction into tools/qemubench/tests/anim_lava/ (not
+// regenerated), matching this project's established precedent (see
+// AnimSilk.cpp's kernels and tools/qemubench/tests/anim_ember/main.c): a
+// QEMU PASS is then evidence about this literal instruction sequence, not
+// about the algorithm being reimplemented correctly.
+
+static_assert(LUT_SHIFT == 11, "lavaFieldGatherAsm bakes LUT_SHIFT in as an immediate (srai ..., 11); "
+                                "update the asm if LUT_BITS/FRAC_BITS ever change this");
+static_assert(kIndexCap == 255, "lavaFinalizeQuadAsm bakes kIndexCap in as an immediate (movi ..., 255)");
+
+// lavaFinalizeQuadAsm: the 4-wide clamp/dither/palette-gather body from
+// finalizeSpan(), transcribed instruction-for-instruction off
+// xtensa-asm14.sh's compiled .S for this exact loop (see the round-6
+// file-top comment: 40 instructions here against GCC's 42, including its
+// own decrement-and-branch), closed with a hardware `loopnez` instead of
+// the compiled bnez.n so the per-iteration branch disappears rather than
+// just getting counted differently. Op order, register-to-register data
+// flow, and even GCC's own pixel evaluation order (3,1,2,0, not 0,1,2,3)
+// and its 16-bit EXTUI after every clamp (redundant once idx is known to be
+// in [0,255], but that is what the compiler emitted) are kept as found:
+// this is a transcription, not a rewrite. field/out both advance by one
+// quad (4 pixels) per iteration; the caller guarantees `out` is 4-pixel
+// (8-byte) aligned, the same precondition finalizeSpan()'s own comment
+// already documents for its unrolled C++ version of this loop.
+//
+//   out:    4 consecutive uint16_t outputs per iteration, x&3==0 at entry.
+//   field:  &fieldRow[x], one int32_t per pixel.
+//   d0..d3: the four dither constants for x&3 == 0,1,2,3 (ditherRow[0..3]),
+//           unchanged across iterations: the dither pattern repeats every 4
+//           pixels regardless of which quad is being processed.
+//   lut:    paletteLUT base (256 entries, indexed 0..255 only, post-clamp).
+//   nQuads: trip count. loopnez so nQuads==0 (a span with no full quad left
+//           after the alignment prefix) safely does nothing, rather than
+//           the one guaranteed iteration a plain `loop` would run.
+__attribute__((noinline)) void lavaFinalizeQuadAsm(uint16_t *out, const int32_t *field, int32_t d0, int32_t d1,
+                                                     int32_t d2, int32_t d3, const uint16_t *lut, int32_t nQuads) {
+    int32_t t0, t1, t2, t3, cap, zero;
+    asm volatile("movi    %[cap], 255\n"
+                 "movi    %[zero], 0\n"
+                 "loopnez %[n], 1f\n"
+                 "l32i    %[t3], %[field], 12\n" // fieldRow[x+3]
+                 "l32i    %[t1], %[field], 4\n"  // fieldRow[x+1]
+                 "l32i    %[t2], %[field], 8\n"  // fieldRow[x+2]
+                 "l32i    %[t0], %[field], 0\n"  // fieldRow[x]
+                 "min     %[t3], %[cap], %[t3]\n"
+                 "min     %[t1], %[cap], %[t1]\n"
+                 "min     %[t2], %[cap], %[t2]\n"
+                 "add     %[t3], %[t3], %[d3]\n"
+                 "add     %[t1], %[t1], %[d1]\n"
+                 "min     %[t0], %[cap], %[t0]\n"
+                 "add     %[t2], %[t2], %[d2]\n"
+                 "min     %[t3], %[t3], %[cap]\n"
+                 "min     %[t1], %[t1], %[cap]\n"
+                 "add     %[t0], %[t0], %[d0]\n"
+                 "min     %[t2], %[t2], %[cap]\n"
+                 "max     %[t3], %[t3], %[zero]\n"
+                 "max     %[t1], %[t1], %[zero]\n"
+                 "min     %[t0], %[t0], %[cap]\n"
+                 "max     %[t2], %[t2], %[zero]\n"
+                 "extui   %[t3], %[t3], 0, 16\n"
+                 "extui   %[t1], %[t1], 0, 16\n"
+                 "max     %[t0], %[t0], %[zero]\n"
+                 "extui   %[t2], %[t2], 0, 16\n"
+                 "addx2   %[t3], %[t3], %[lut]\n"
+                 "addx2   %[t1], %[t1], %[lut]\n"
+                 "extui   %[t0], %[t0], 0, 16\n"
+                 "l16ui   %[t3], %[t3], 0\n"
+                 "l16ui   %[t1], %[t1], 0\n"
+                 "addx2   %[t2], %[t2], %[lut]\n"
+                 "addx2   %[t0], %[t0], %[lut]\n"
+                 "l16ui   %[t2], %[t2], 0\n"
+                 "l16ui   %[t0], %[t0], 0\n"
+                 "slli    %[t1], %[t1], 16\n"
+                 "slli    %[t3], %[t3], 16\n"
+                 "or      %[t1], %[t1], %[t0]\n"
+                 "or      %[t3], %[t3], %[t2]\n"
+                 "s32i    %[t1], %[out], 0\n"
+                 "s32i    %[t3], %[out], 4\n"
+                 "addi    %[field], %[field], 16\n"
+                 "addi    %[out], %[out], 8\n"
+                 "1:\n"
+                 : [out] "+r"(out), [field] "+r"(field), [t0] "=&r"(t0), [t1] "=&r"(t1), [t2] "=&r"(t2),
+                   [t3] "=&r"(t3), [cap] "=&r"(cap), [zero] "=&r"(zero)
+                 : [d0] "r"(d0), [d1] "r"(d1), [d2] "r"(d2), [d3] "r"(d3), [lut] "r"(lut), [n] "r"(nQuads)
+                 : "memory");
+}
+
+// lavaFieldGatherAsm: the Bresenham-LUT field-accumulation loop from
+// renderRow(), transcribed instruction-for-instruction off the SAME .S (see
+// the round-5 file-top comment, which already found this loop compiles to a
+// 9-instruction hardware zero-overhead LOOP with the scheduler already
+// filling the LUT load's use-latency gap with the independent ttQ+=stepQ
+// add). This kernel is that identical 9-instruction body inside a
+// hand-written `loopnez`: at parity by construction, since it is the same
+// instructions in the same order. No edge was taken past the transcription:
+// consecutive iterations write DIFFERENT field[] addresses (there is no
+// accumulator living in a register across iterations to keep resident), and
+// the loop's one load-use gap is already filled by the scheduler, so a
+// 2-wide unroll would duplicate work without shortening any dependency
+// chain.
+//
+//   field:  &fieldRow[xlo], walked forward one int32_t per pixel.
+//   ttQ0:   the Q12.20 tt accumulator's starting value (tt0f<<FRAC_BITS,
+//           rounded).
+//   stepQ0: tt's starting per-pixel slope (step0f<<FRAC_BITS, rounded).
+//   step2Q: tt's constant curvature (per blob, row-independent).
+//   lut:    lavaBase (already offset so a signed shifted-tt value indexes
+//           it directly; see lavaBase's own comment).
+//   n:      trip count (xhi-xlo+1, always >=1 in production since xlo<=xhi
+//           by construction; loopnez costs nothing to keep that assumption
+//           from ever being load-bearing here).
+__attribute__((noinline)) void lavaFieldGatherAsm(int32_t *field, int32_t ttQ0, int32_t stepQ0, int32_t step2Q,
+                                                    const int16_t *lut, int32_t n) {
+    int32_t ttQ = ttQ0;
+    int32_t stepQ = stepQ0;
+    int32_t idx, acc;
+    asm volatile("loopnez %[n], 1f\n"
+                 "srai    %[idx], %[ttq], 11\n"      // idx = ttQ >> LUT_SHIFT
+                 "addx2   %[idx], %[idx], %[lut]\n"  // &lut[idx]
+                 "l32i    %[acc], %[field], 0\n"     // acc = *field
+                 "l16si   %[idx], %[idx], 0\n"       // val = lut[idx] (sign-extend: int16_t)
+                 "add     %[ttq], %[ttq], %[stepq]\n" // ttQ += stepQ (fills the load's use-latency gap)
+                 "add     %[idx], %[acc], %[idx]\n"  // acc + val
+                 "s32i    %[idx], %[field], 0\n"     // *field = acc + val
+                 "add     %[stepq], %[stepq], %[step2q]\n" // stepQ += step2Q
+                 "addi    %[field], %[field], 4\n"   // field++
+                 "1:\n"
+                 : [field] "+r"(field), [ttq] "+r"(ttQ), [stepq] "+r"(stepQ), [idx] "=&r"(idx), [acc] "=&r"(acc)
+                 : [step2q] "r"(step2Q), [lut] "r"(lut), [n] "r"(n)
+                 : "memory");
+}
+
+// finalizeSpanAsm: finalizeSpan() with its 4-wide loop swapped for
+// lavaFinalizeQuadAsm. The scalar alignment prefix and the scalar tail are
+// copied verbatim from finalizeSpan() (see that function's own comments for
+// why they exist): each is 0-3 pixels, never worth hand asm.
+void finalizeSpanAsm(uint16_t *out, int lo, int hi, int yPhase) {
+    const int32_t *ditherRow = &ditherLUT[yPhase * 4];
+    int x = lo;
+    for (; (x & 3) != 0 && x <= hi; x++) {
+        int idx = (fieldRow[x] < kIndexCap ? fieldRow[x] : kIndexCap) + ditherRow[x & 3];
+        if (idx < 0) {
+            idx = 0;
+        } else if (idx > 255) {
+            idx = 255;
+        }
+        out[x] = paletteLUT[idx];
+    }
+    const int32_t d0 = ditherRow[0];
+    const int32_t d1 = ditherRow[1];
+    const int32_t d2 = ditherRow[2];
+    const int32_t d3 = ditherRow[3];
+    if (x <= hi) {
+        // Same trip count as finalizeSpan()'s `for (; x + 3 <= hi; x += 4)`:
+        // x is 4-aligned here (the prefix loop above only exits early on
+        // x>hi, otherwise on x&3==0), so this is an exact floor division.
+        const int32_t nQuads = (hi - x + 1) / 4;
+        if (nQuads > 0) {
+            lavaFinalizeQuadAsm(out + x, fieldRow + x, d0, d1, d2, d3, paletteLUT, nQuads);
+            x += nQuads * 4;
+        }
+    }
+    for (; x <= hi; x++) {
+        int idx = (fieldRow[x] < kIndexCap ? fieldRow[x] : kIndexCap) + ditherRow[x & 3];
+        if (idx < 0) {
+            idx = 0;
+        } else if (idx > 255) {
+            idx = 255;
+        }
+        out[x] = paletteLUT[idx];
+    }
+}
+
+// renderRowAsm: renderRow() with its field-accumulation loop swapped for
+// lavaFieldGatherAsm and its finalizeSpan() call swapped for
+// finalizeSpanAsm. Everything else (the memset, the per-blob row-starting
+// setup, the span collection/sort/merge) is copied verbatim: see
+// renderRow() for what each part does and why.
+void renderRowAsm(uint16_t *out, int y, int w, int yPhase) {
+    memset(fieldRow, 0, static_cast<size_t>(w) * sizeof(int32_t));
+    int spanLo[NUM_BLOBS];
+    int spanHi[NUM_BLOBS];
+    int nSpans = 0;
+    for (int i = 0; i < NUM_BLOBS; i++) {
+        const BlobState &b = blob[i];
+        const float dy = y - b.by;
+        const float dy2 = dy * dy;
+        if (dy2 >= b.R2) {
+            continue;
+        }
+        const float invR2 = b.invR2;
+        const int xlo = b.xlo;
+        const int xhi = b.xhi;
+        spanLo[nSpans] = xlo;
+        spanHi[nSpans] = xhi;
+        nSpans++;
+        const float dx0 = xlo - b.bx;
+        const float tt0f = 1.0f - invR2 * (dy2 + dx0 * dx0);
+        const float step0f = -invR2 * (2.0f * dx0 + 1.0f);
+        int32_t ttQ = static_cast<int32_t>(tt0f * FIXED_SCALE + (tt0f >= 0.0f ? 0.5f : -0.5f));
+        int32_t stepQ = static_cast<int32_t>(step0f * FIXED_SCALE + (step0f >= 0.0f ? 0.5f : -0.5f));
+        const int32_t step2Q = b.step2Q;
+        lavaFieldGatherAsm(fieldRow + xlo, ttQ, stepQ, step2Q, lavaBase, xhi - xlo + 1);
+    }
+
+    const uint16_t *bg = bgRowAll + static_cast<size_t>(yPhase) * bgRowAllW;
+    memcpy(out, bg, static_cast<size_t>(w) * sizeof(uint16_t));
+    if (nSpans == 0) {
+        return;
+    }
+
+    for (int i = 1; i < nSpans; i++) {
+        const int lo = spanLo[i];
+        const int hi = spanHi[i];
+        int j = i - 1;
+        while (j >= 0 && spanLo[j] > lo) {
+            spanLo[j + 1] = spanLo[j];
+            spanHi[j + 1] = spanHi[j];
+            j--;
+        }
+        spanLo[j + 1] = lo;
+        spanHi[j + 1] = hi;
+    }
+    int mLo = spanLo[0];
+    int mHi = spanHi[0];
+    for (int i = 1; i < nSpans; i++) {
+        if (spanLo[i] <= mHi + 1) {
+            if (spanHi[i] > mHi) {
+                mHi = spanHi[i];
+            }
+            continue;
+        }
+        finalizeSpanAsm(out, mLo, mHi, yPhase);
+        mLo = spanLo[i];
+        mHi = spanHi[i];
+    }
+    finalizeSpanAsm(out, mLo, mHi, yPhase);
+}
+
+// bandAsm: bandRef() with renderRow() swapped for renderRowAsm(). The row
+// pairing/duplication logic (and its dither-phase derivation) is copied
+// verbatim: see bandRef()'s own comment for why ySrc/phase must be derived
+// from y alone, never from call shape.
+void bandAsm(uint16_t *dst, int y0, int rows, int w, uint32_t, const uint8_t *) {
+    int row = 0;
+    while (row < rows) {
+        const int y = y0 + row;
+        const int ySrc = y & ~1;
+        const int phase = (y >> 1) & 3;
+        uint16_t *out = dst + static_cast<size_t>(row) * w;
+        if ((y & 1) == 0 && row + 1 < rows) {
+            renderRowAsm(out, ySrc, w, phase);
+            memcpy(out + w, out, static_cast<size_t>(w) * sizeof(uint16_t));
+            row += 2;
+        } else {
+            renderRowAsm(out, ySrc, w, phase);
+            row += 1;
+        }
+    }
+}
+#endif // __XTENSA__ && !GM_BGANIM_NO_ASM && GM_BGANIM_LAVA_ASM
+
+// Round 4: with the flag off (default), band() ships no hand asm and no
+// restructuring: every asm kernel and every control-flow change tried in
+// rounds 1-3 measured slower than this shape on the device at equal table
+// placement, so band() is a direct call to the portable reference above.
+// See the file-top round-4 comment. Round 6 adds a flag-gated alternative
+// (bandAsm; see the round-6 file-top comment): -DGM_BGANIM_LAVA_ASM=1
+// routes band() there instead, on Xtensa builds only. Untested on the
+// device.
+#if defined(__XTENSA__) && !defined(GM_BGANIM_NO_ASM) && GM_BGANIM_LAVA_ASM
+void band(uint16_t *dst, int y0, int rows, int w, uint32_t tMs, const uint8_t *p) {
+    bandAsm(dst, y0, rows, w, tMs, p);
+}
+#else
 void band(uint16_t *dst, int y0, int rows, int w, uint32_t tMs, const uint8_t *p) {
     bandRef(dst, y0, rows, w, tMs, p);
 }
+#endif
 
 void release() {
     releaseTable(paletteLUT, 256 * sizeof(uint16_t));
