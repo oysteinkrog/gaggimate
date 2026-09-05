@@ -122,6 +122,12 @@ void SdlDriver::pumpAndRender() {
 
 bool SdlDriver::shouldQuit() const { return s_quit; }
 
+void SdlDriver::injectPointer(int x, int y, bool pressed) {
+    s_mouseX = x;
+    s_mouseY = y;
+    s_mousePressed = pressed;
+}
+
 void SdlDriver::screenshot(const char *path) {
     SDL_SetRenderDrawColor(s_renderer, BEZEL_R, BEZEL_G, BEZEL_B, 0xFF);
     SDL_RenderClear(s_renderer);

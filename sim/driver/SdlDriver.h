@@ -24,6 +24,11 @@ class SdlDriver : public Driver {
     bool shouldQuit() const;
     void screenshot(const char *path); // writes a BMP of the current frame
 
+    // Scripted-input test hook (sim/main.cpp --script mode): sets the mouse
+    // point LVGL's indev reads on the next pumpAndRender(), same as a real
+    // SDL_MOUSEMOTION/BUTTONDOWN/UP would. Not used by interactive runs.
+    void injectPointer(int x, int y, bool pressed);
+
   private:
     static SdlDriver *instance;
     SdlDriver() = default;
