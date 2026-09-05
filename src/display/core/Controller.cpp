@@ -26,7 +26,9 @@ extern volatile uint32_t gm_rgb_catchup_max;
 #include "ArduinoJson.h"
 #include "esp_coexist.h"
 #include "esp_sntp.h"
-#include "esp_intr_alloc.h"
+#ifdef GM_SYNTH_HANDSHAKE
+#include "esp_intr_alloc.h" // esp_intr_dump, the one-shot ISR-core map below
+#endif
 #include "esp_timer.h"
 #include <esp_heap_caps.h>
 #include <LittleFS.h>
@@ -604,8 +606,8 @@ void Controller::startNtp() {
         return;
     }
     ntpStarted = true;
-    configTzTime(resolve_timezone(settings.getTimezone()), NTP_SERVER);
-    setenv("TZ", resolve_timezone(settings.getTimezone()), 1);
+    configTzTime(resolve_timezone(settings.getTimezone().c_str()), NTP_SERVER);
+    setenv("TZ", resolve_timezone(settings.getTimezone().c_str()), 1);
     tzset();
     sntp_set_sync_mode(SNTP_SYNC_MODE_SMOOTH);
     esp_sntp_setservername(0, NTP_SERVER);
