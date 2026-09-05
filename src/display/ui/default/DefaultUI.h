@@ -130,6 +130,33 @@ class DefaultUI {
     // machinery as snapshotAreaToOverlay, but for a subtree into its own
     // buffer: the layer path (SleepAnimation::layer*) starts here.
     bool snapshotObjectToBuffer(lv_obj_t *obj, uint8_t *buf, uint32_t bufSize, lv_area_t *outArea);
+    // Moves an LVGL object smoothly while the animation owns the panel. The
+    // object is rendered once into a layer (snapshotObjectToBuffer), hidden
+    // from LVGL, and the render task slides the layer by (dx, dy) over durMs
+    // at the animation loop's rate (about 30 fps, against 5 through LVGL).
+    // When it lands, serviceLayerMoves moves the object to the end position
+    // and shows it again, and releases the layer once an overlay refresh has
+    // published it there, so the hand-back never shows a gap or a double.
+    // Both ends of the move bypass the overlay refresh gate (overlayUrgent
+    // UntilUs), so neither the copy left behind at the start nor the layer
+    // at the end outlives the next UI pass by more than it has to. The
+    // object's content is frozen for the duration: a label that changes
+    // mid-move shows the change when it lands. False, with the object
+    // untouched, when it is already moving, no layer is free, the animation
+    // is not running or the object has no size yet; the caller falls back to
+    // lv_anim. dx/dy add to the object's style x/y, so an aligned object
+    // moves relative to its alignment origin, same as lv_obj_set_x would.
+    bool moveObjectViaLayer(lv_obj_t *obj, lv_coord_t dx, lv_coord_t dy, uint32_t durMs, SleepAnimation::LayerEase ease);
+    // True from moveObjectViaLayer until the layer has been released again
+    // (landed, shown and published).
+    bool layerMoveInFlight(const lv_obj_t *obj) const;
+    // Once per UI pass: lands finished moves, releases published ones.
+    void serviceLayerMoves();
+    // Ends a move now: the object goes to its end position and is shown, the
+    // layer is released. Every move before a screen change (the flow engine
+    // may delete the objects) and one before deleting a moving object.
+    void cancelLayerMove(const lv_obj_t *obj);
+    void cancelLayerMoves();
     // Hide, restore or repaint the opaque background plates the generated
     // screens put behind their content. mode is Settings::getBgAnimClearPlates
     // (0 keep, 1 hide, 2 custom); color is 0xRRGGBB and opaPct 0-100, both used
@@ -203,9 +230,19 @@ class DefaultUI {
     lv_obj_t *animHostScreen = nullptr;    // screen whose bg was made transparent for the animation
     lv_obj_t *uiAnimTestObj = nullptr;     // the foreground motion test widget, when one is up
     int uiAnimTestMode = 0;                // g_uiAnimTestReq value the widget was built for
-    int uiAnimTestLayer = -1;              // mode 3: the layer the plate was snapshotted into
-    int uiAnimTestX0 = 0, uiAnimTestX1 = 0, uiAnimTestY = 0;
+    int uiAnimTestTravel = 0;              // mode 3: how far each leg slides the plate
     bool uiAnimTestFwd = true;
+    struct LayerMove {
+        lv_obj_t *obj = nullptr;
+        int layer = -1;
+        lv_coord_t dx = 0, dy = 0;
+        bool landed = false;         // object moved and shown, layer still up
+        uint32_t landedRefresh = 0;  // g_overlayStats.refreshes at that point
+    };
+    LayerMove layerMoves[SleepAnimation::MAX_LAYERS];
+    // refreshSleepOverlay's spacing gate is bypassed until this time: set by
+    // the layer moves, which need the next refresh out promptly.
+    int64_t overlayUrgentUntilUs = 0;
     // Number of entries in the plate table in applyAnimPlates.
     static constexpr int ANIM_PLATE_COUNT = 9;
     // Last applied (mode, color, opacity), so a no-op settings poll costs one

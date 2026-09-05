@@ -374,6 +374,7 @@ void DefaultUI::loop() {
     // Here as well as in pumpSleepOverlay: a UI pass on a busy screen runs
     // longer than UI_PERIOD_MS, so the task loop takes this branch every
     // time and the pump branch never.
+    serviceLayerMoves();
     serviceUiAnimTest();
     if (panelStopRequested && !panelStopped) {
         panelStopped = true;
@@ -558,6 +559,7 @@ void DefaultUI::maintainSleepAnimation() {
 
 void DefaultUI::pumpSleepOverlay() {
 #ifndef GAGGIMATE_SIM
+    serviceLayerMoves();
     serviceUiAnimTest();
     if (sleepAnimation.isActive()) {
         refreshSleepOverlay();
@@ -570,22 +572,20 @@ static void uiAnimTestSlideCb(void *var, int32_t v) { lv_obj_set_x(static_cast<l
 void DefaultUI::serviceUiAnimTest() {
     const int req = g_uiAnimTestReq;
     if (req == uiAnimTestMode) {
-        // Mode 3 ping-pongs the layer: when one leg lands, start the other.
-        if (req == 3 && uiAnimTestLayer >= 0 && !sleepAnimation.layerAnimating(uiAnimTestLayer)) {
+        // Mode 3 ping-pongs through the layer move: when one leg has landed
+        // and been handed back to LVGL, start the other.
+        if (req == 3 && uiAnimTestObj != nullptr && !layerMoveInFlight(uiAnimTestObj)) {
             uiAnimTestFwd = !uiAnimTestFwd;
-            sleepAnimation.layerAnimate(uiAnimTestLayer, uiAnimTestFwd ? uiAnimTestX1 : uiAnimTestX0, uiAnimTestY, 1200,
-                                        SleepAnimation::LayerEase::EaseInOut);
+            moveObjectViaLayer(uiAnimTestObj, static_cast<lv_coord_t>(uiAnimTestFwd ? uiAnimTestTravel : -uiAnimTestTravel), 0,
+                               1200, SleepAnimation::LayerEase::EaseInOut);
         }
         return;
     }
     if (uiAnimTestObj != nullptr) {
+        cancelLayerMove(uiAnimTestObj);
         lv_anim_del(uiAnimTestObj, nullptr);
         lv_obj_del(uiAnimTestObj);
         uiAnimTestObj = nullptr;
-    }
-    if (uiAnimTestLayer >= 0) {
-        sleepAnimation.layerRelease(uiAnimTestLayer);
-        uiAnimTestLayer = -1;
     }
     uiAnimTestMode = req;
     if (req == 0) {
@@ -610,37 +610,26 @@ void DefaultUI::serviceUiAnimTest() {
     lv_obj_set_style_text_color(l, lv_color_hex(0x1B1B1B), 0);
     lv_obj_center(l);
     uiAnimTestObj = o;
-    if (req == 3 || req == 4) {
-        // The layer path: render the plate once into a layer, take it out of
-        // LVGL's picture, and let the render task move the layer. Same
-        // travel and duration as mode 1, so the two are directly comparable
-        // on the probe (ui_fpsprobe.py: mode 1 shows up as overlay
-        // refreshes, mode 3 as animation frames with layer_us). Mode 4 parks
-        // the layer at the far end instead of moving it, for a framebuffer
-        // grab that a moving sprite would tear.
-        lv_obj_update_layout(scr);
-        const lv_coord_t ext = _lv_obj_get_ext_draw_size(o);
-        const int lw = size + ext * 2, lh = size + ext * 2;
-        const int id = sleepAnimation.layerAcquire(lw, lh);
-        lv_area_t area;
-        if (id >= 0 && snapshotObjectToBuffer(o, sleepAnimation.layerBuffer(id), static_cast<uint32_t>(lw) * lh * 3, &area)) {
-            sleepAnimation.layerPublish(id, area.x1, area.y1);
-            lv_obj_add_flag(o, LV_OBJ_FLAG_HIDDEN);
-            uiAnimTestLayer = id;
-            uiAnimTestX0 = area.x1;
-            uiAnimTestX1 = area.x1 + (lv_obj_get_width(scr) - size - 80);
-            uiAnimTestY = area.y1;
-            uiAnimTestFwd = true;
-            if (req == 4) {
-                sleepAnimation.layerSetPos(id, uiAnimTestX1, uiAnimTestY);
-            } else {
-                sleepAnimation.layerAnimate(id, uiAnimTestX1, uiAnimTestY, 1200, SleepAnimation::LayerEase::EaseInOut);
-            }
-        } else {
-            log_w("uianim: layer snapshot failed (id %d)", id);
-            if (id >= 0) {
-                sleepAnimation.layerRelease(id);
-            }
+    if (req == 3) {
+        // The layer path, through moveObjectViaLayer: same travel and
+        // duration as mode 1, so the two are directly comparable on the
+        // probe (ui_fpsprobe.py: mode 1 shows up as overlay refreshes, mode 3
+        // as animation frames with layer_us). Each leg re-snapshots the plate
+        // where it landed, which is what a real caller gets too.
+        uiAnimTestTravel = lv_obj_get_width(scr) - size - 80;
+        uiAnimTestFwd = true;
+        if (!moveObjectViaLayer(o, static_cast<lv_coord_t>(uiAnimTestTravel), 0, 1200, SleepAnimation::LayerEase::EaseInOut)) {
+            log_w("uianim: layer move refused");
+        }
+        return;
+    }
+    if (req == 4) {
+        // Parked in a layer at the far end of the travel, for a framebuffer
+        // grab that a moving sprite would tear: the plate is placed there
+        // through LVGL first, then snapshotted and moved by nothing.
+        lv_obj_set_x(o, static_cast<lv_coord_t>(lv_obj_get_width(scr) - size - 40));
+        if (!moveObjectViaLayer(o, 0, 0, 600000, SleepAnimation::LayerEase::Linear)) {
+            log_w("uianim: layer park refused");
         }
         return;
     }
@@ -704,6 +693,118 @@ bool DefaultUI::snapshotObjectToBuffer(lv_obj_t *obj, uint8_t *buf, uint32_t buf
 #else
     return false;
 #endif
+}
+
+bool DefaultUI::moveObjectViaLayer(lv_obj_t *obj, lv_coord_t dx, lv_coord_t dy, uint32_t durMs,
+                                   SleepAnimation::LayerEase ease) {
+#ifndef GAGGIMATE_SIM
+    if (obj == nullptr || !sleepAnimation.isActive() || layerMoveInFlight(obj)) {
+        return false;
+    }
+    LayerMove *slot = nullptr;
+    for (LayerMove &m : layerMoves) {
+        if (m.obj == nullptr) {
+            slot = &m;
+            break;
+        }
+    }
+    if (slot == nullptr) {
+        return false;
+    }
+    lv_obj_update_layout(obj);
+    const lv_coord_t ext = _lv_obj_get_ext_draw_size(obj);
+    const int lw = lv_obj_get_width(obj) + ext * 2;
+    const int lh = lv_obj_get_height(obj) + ext * 2;
+    const int id = sleepAnimation.layerAcquire(lw, lh);
+    if (id < 0) {
+        return false;
+    }
+    lv_area_t area;
+    if (!snapshotObjectToBuffer(obj, sleepAnimation.layerBuffer(id), static_cast<uint32_t>(lw) * lh * 3, &area)) {
+        sleepAnimation.layerRelease(id);
+        return false;
+    }
+    sleepAnimation.layerPublish(id, area.x1, area.y1);
+    // Hidden first, then the layer starts: the layer sits exactly over the
+    // object until the next refresh drops the object from the overlay, and
+    // that refresh goes out unthrottled.
+    lv_obj_add_flag(obj, LV_OBJ_FLAG_HIDDEN);
+    overlayUrgentUntilUs = esp_timer_get_time() + GM_TOUCH_GRACE_US;
+    sleepAnimation.layerAnimate(id, area.x1 + dx, area.y1 + dy, durMs, ease);
+    slot->obj = obj;
+    slot->layer = id;
+    slot->dx = dx;
+    slot->dy = dy;
+    slot->landed = false;
+    slot->landedRefresh = 0;
+    return true;
+#else
+    return false;
+#endif
+}
+
+bool DefaultUI::layerMoveInFlight(const lv_obj_t *obj) const {
+    for (const LayerMove &m : layerMoves) {
+        if (m.obj != nullptr && m.obj == obj) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void DefaultUI::serviceLayerMoves() {
+#ifndef GAGGIMATE_SIM
+    for (LayerMove &m : layerMoves) {
+        if (m.obj == nullptr) {
+            continue;
+        }
+        if (!m.landed) {
+            if (sleepAnimation.layerAnimating(m.layer)) {
+                continue;
+            }
+            lv_obj_set_pos(m.obj, static_cast<lv_coord_t>(lv_obj_get_style_x(m.obj, LV_PART_MAIN) + m.dx),
+                           static_cast<lv_coord_t>(lv_obj_get_style_y(m.obj, LV_PART_MAIN) + m.dy));
+            lv_obj_clear_flag(m.obj, LV_OBJ_FLAG_HIDDEN);
+            overlayUrgentUntilUs = esp_timer_get_time() + GM_TOUCH_GRACE_US;
+            m.landed = true;
+            m.landedRefresh = g_overlayStats.refreshes;
+            continue;
+        }
+        // The object is back in LVGL's picture; once a refresh has published
+        // it there (any refresh after the un-hide includes it: the
+        // invalidation and the snapshot are on this task), the layer is
+        // redundant. Until then it covers the object exactly.
+        if (g_overlayStats.refreshes != m.landedRefresh) {
+            sleepAnimation.layerRelease(m.layer);
+            m = LayerMove{};
+        }
+    }
+#endif
+}
+
+void DefaultUI::cancelLayerMove(const lv_obj_t *obj) {
+#ifndef GAGGIMATE_SIM
+    for (LayerMove &m : layerMoves) {
+        if (m.obj == nullptr || m.obj != obj) {
+            continue;
+        }
+        if (!m.landed) {
+            lv_obj_set_pos(m.obj, static_cast<lv_coord_t>(lv_obj_get_style_x(m.obj, LV_PART_MAIN) + m.dx),
+                           static_cast<lv_coord_t>(lv_obj_get_style_y(m.obj, LV_PART_MAIN) + m.dy));
+            lv_obj_clear_flag(m.obj, LV_OBJ_FLAG_HIDDEN);
+        }
+        sleepAnimation.layerRelease(m.layer);
+        m = LayerMove{};
+    }
+#endif
+}
+
+void DefaultUI::cancelLayerMoves() {
+    for (LayerMove &m : layerMoves) {
+        if (m.obj != nullptr) {
+            cancelLayerMove(m.obj);
+        }
+    }
 }
 
 void DefaultUI::loopProfiles() {
@@ -909,6 +1010,7 @@ void DefaultUI::handleScreenChange() {
         } else {
             stopSleepAnimation();
         }
+        cancelLayerMoves();
         eez_flow_set_screen(targetScreen, LV_SCR_LOAD_ANIM_NONE, 0, 0);
         animateGaugeTicks(currentScreen, targetScreen);
         // The flow engine may delete and later recreate the screen this
@@ -1310,7 +1412,8 @@ void DefaultUI::refreshSleepOverlay() {
     // of dropping.
     if (overlayValid[back]) {
         const int64_t nowUs = esp_timer_get_time();
-        if (nowUs - g_touchEdgeAtUs >= GM_TOUCH_GRACE_US && nowUs - lastOverlayRefreshUs < g_overlayMinRefreshUs) {
+        if (nowUs - g_touchEdgeAtUs >= GM_TOUCH_GRACE_US && nowUs >= overlayUrgentUntilUs &&
+            nowUs - lastOverlayRefreshUs < g_overlayMinRefreshUs) {
             return;
         }
     }
