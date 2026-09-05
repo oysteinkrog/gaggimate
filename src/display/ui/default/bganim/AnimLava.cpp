@@ -301,6 +301,33 @@
 // are not new algorithm, just renderRow()'s and finalizeSpan()'s own
 // structure with the two hot loops swapped for calls into the kernels
 // above, so the eventual on-device A/B has a full band() to call.
+//
+// Round 7 (2026-09-05): round 6 left the flag untestable off-device, since
+// the whole kernel/glue block above required __XTENSA__ to compile at all;
+// a host build with the flag on saw no glue and silently fell through to
+// bandRef() via the #else below, so nothing had ever exercised
+// finalizeSpanAsm/renderRowAsm/bandAsm outside the Xtensa assembler and
+// QEMU. This round gives lavaFinalizeQuadAsm and lavaFieldGatherAsm a
+// second body each: a plain C++ twin (identical to lavaFinalizeQuadRef and
+// lavaFieldGatherRef in tools/qemubench/tests/anim_lava/main.cpp), selected
+// on non-Xtensa builds and any GM_BGANIM_NO_ASM build, so the surrounding
+// glue is now real code on the host, not dead text. With the flag on:
+// tools/animbench's golden compare and interlace_check both pass through
+// bandAsm/renderRowAsm/finalizeSpanAsm calling the host twins
+// (`make ... -DGM_BGANIM_LAVA_ASM=1 check` -> GOLDENS OK, ALL OK);
+// render_one's shape check passes the same way
+// (`./render_... --shapes 30 120 210` -> "lava shapes: ALL OK"); the ASan
+// fuzzer renders 47,700 bands clean at anim index 1. On the device side,
+// xtensa-asm14.sh's own compile line plus -DGM_BGANIM_LAVA_ASM=1 still
+// assembles and links (both hand kernels present in the .o, each still a
+// single `loopnez`), and tools/qemubench/tests/anim_lava still reports
+// PASS, 0 mismatches. None of this is a timing claim: the host proves the
+// glue computes the right pixels through both kernel bodies and the device
+// side proves the asm still assembles the same way; only kb.py or a real
+// on-device A/B (bench board was unavailable again this round) can say
+// whether bandAsm is faster than bandRef. The flag now defaults to 1 (see
+// its own comment by the #define) on exactly that evidence: correctness is
+// covered on both bodies, speed is not measured on either.
 
 #include "BgAnim.h"
 #include "BgAnimCommon.h"
@@ -310,15 +337,22 @@
 // Master switch for the hand-written Xtensa kernels near the end of this
 // file (lavaFinalizeQuadAsm, lavaFieldGatherAsm, and the
 // finalizeSpanAsm/renderRowAsm/bandAsm chain that wires them into a second
-// band() implementation). OFF by default, same pattern as AnimSilk.cpp's
-// GM_BGANIM_SILK_ASM: with the flag off, band() is byte for byte what round
-// 4 shipped (bandRef() called directly), and the kernel code below does not
-// even compile on a non-Xtensa build (host bench, fuzzer) or with the flag
-// left at 0. See the round-6 file-top comment above for what each kernel is
-// and why it is a candidate, not a measured win: this round had no board to
-// measure on. -DGM_BGANIM_LAVA_ASM=1 turns it on.
+// band() implementation). ON by default: each kernel above has a portable
+// C++ twin (round 7, same name and signature, selected when the build is
+// not Xtensa or defines GM_BGANIM_NO_ASM), so the glue is real code on
+// every build, not dead text gated behind __XTENSA__. Bit-exact: the asm
+// kernels are checked against portable references under QEMU
+// (tools/qemubench/tests/anim_lava, PASS, 0 mismatches), and with the flag
+// on the host twins are proven against tools/animbench's own goldens and
+// interlace_check (GOLDENS OK, ALL OK), render_one's shape check (lava
+// shapes: ALL OK) and the ASan fuzzer (bands rendered clean). Not yet
+// timed on the device: the bench board was offline for round 6 and again
+// for round 7, so nothing here is a speed claim; the first production A/B
+// (camshots/anim_devbench.py, useref=1 swaps in bandRef) decides whether
+// this stays on. -DGM_BGANIM_LAVA_ASM=0 falls back to bandRef(), byte for
+// byte what round 4 shipped.
 #ifndef GM_BGANIM_LAVA_ASM
-#define GM_BGANIM_LAVA_ASM 0
+#define GM_BGANIM_LAVA_ASM 1
 #endif
 
 namespace {
@@ -848,9 +882,20 @@ void bandRef(uint16_t *dst, int y0, int rows, int w, uint32_t, const uint8_t *) 
     }
 }
 
-#if defined(__XTENSA__) && !defined(GM_BGANIM_NO_ASM) && GM_BGANIM_LAVA_ASM
-// ---- Hand-written Xtensa kernels, round 6 (see the file-top comment) ----
+#if GM_BGANIM_LAVA_ASM
+// ---- Round 6/7 kernels + glue (see the file-top comment) ----
 //
+// lavaFinalizeQuadAsm and lavaFieldGatherAsm have two bodies: hand-written
+// Xtensa asm on a real device build, a plain C++ twin everywhere else (host
+// bench, fuzzer, render_one, and any GM_BGANIM_NO_ASM build). Both bodies
+// share the same name and signature, so the glue below (finalizeSpanAsm,
+// renderRowAsm, bandAsm) is written once and compiles for either: on the
+// host it is exercising real code, not a stub, which is what lets
+// tools/animbench's golden/fuzz/interlace checks and render_one's shape
+// check run against this path with the flag on, something round 6 could
+// not do (the whole block used to require __XTENSA__, so a host build with
+// the flag on saw no glue at all and fell through to the #else below).
+#if defined(__XTENSA__) && !defined(GM_BGANIM_NO_ASM)
 // Both kernels are noinline, take plain pointers/ints, and are transcribed
 // instruction-for-instruction into tools/qemubench/tests/anim_lava/ (not
 // regenerated), matching this project's established precedent (see
@@ -984,6 +1029,54 @@ __attribute__((noinline)) void lavaFieldGatherAsm(int32_t *field, int32_t ttQ0, 
                  : "memory");
 }
 
+#else // !(__XTENSA__ && !GM_BGANIM_NO_ASM): portable host twins, round 7
+
+// Host twin of lavaFinalizeQuadAsm: same name, same signature, same
+// per-pixel result as the asm body above and as finalizeSpan()'s own 4-wide
+// loop. This is what lets a non-Xtensa build (host bench, fuzzer,
+// render_one) compile and run the glue below with the flag on: identical to
+// lavaFinalizeQuadRef in tools/qemubench/tests/anim_lava/main.cpp, which
+// checks the asm against this same arithmetic under QEMU.
+void lavaFinalizeQuadAsm(uint16_t *out, const int32_t *field, int32_t d0, int32_t d1, int32_t d2, int32_t d3,
+                          const uint16_t *lut, int32_t nQuads) {
+    for (int32_t q = 0; q < nQuads; q++) {
+        const int32_t *f = field + q * 4;
+        uint16_t *o = out + q * 4;
+        int32_t idx0 = f[0] < kIndexCap ? f[0] : kIndexCap;
+        idx0 += d0;
+        idx0 = idx0 < 0 ? 0 : (idx0 > 255 ? 255 : idx0);
+        int32_t idx1 = f[1] < kIndexCap ? f[1] : kIndexCap;
+        idx1 += d1;
+        idx1 = idx1 < 0 ? 0 : (idx1 > 255 ? 255 : idx1);
+        int32_t idx2 = f[2] < kIndexCap ? f[2] : kIndexCap;
+        idx2 += d2;
+        idx2 = idx2 < 0 ? 0 : (idx2 > 255 ? 255 : idx2);
+        int32_t idx3 = f[3] < kIndexCap ? f[3] : kIndexCap;
+        idx3 += d3;
+        idx3 = idx3 < 0 ? 0 : (idx3 > 255 ? 255 : idx3);
+        o[0] = lut[idx0];
+        o[1] = lut[idx1];
+        o[2] = lut[idx2];
+        o[3] = lut[idx3];
+    }
+}
+
+// Host twin of lavaFieldGatherAsm: same name, same signature, same
+// per-pixel result as the asm body above and as renderRow()'s own
+// Bresenham-LUT loop. Identical to lavaFieldGatherRef in
+// tools/qemubench/tests/anim_lava/main.cpp.
+void lavaFieldGatherAsm(int32_t *field, int32_t ttQ0, int32_t stepQ0, int32_t step2Q, const int16_t *lut, int32_t n) {
+    int32_t ttQ = ttQ0;
+    int32_t stepQ = stepQ0;
+    for (int32_t i = 0; i < n; i++) {
+        field[i] += lut[ttQ >> LUT_SHIFT];
+        ttQ += stepQ;
+        stepQ += step2Q;
+    }
+}
+
+#endif // __XTENSA__ && !GM_BGANIM_NO_ASM
+
 // finalizeSpanAsm: finalizeSpan() with its 4-wide loop swapped for
 // lavaFinalizeQuadAsm. The scalar alignment prefix and the scalar tail are
 // copied verbatim from finalizeSpan() (see that function's own comments for
@@ -1112,17 +1205,19 @@ void bandAsm(uint16_t *dst, int y0, int rows, int w, uint32_t, const uint8_t *) 
         }
     }
 }
-#endif // __XTENSA__ && !GM_BGANIM_NO_ASM && GM_BGANIM_LAVA_ASM
+#endif // GM_BGANIM_LAVA_ASM
 
-// Round 4: with the flag off (default), band() ships no hand asm and no
+// Round 4: with the flag off, band() ships no hand asm and no
 // restructuring: every asm kernel and every control-flow change tried in
 // rounds 1-3 measured slower than this shape on the device at equal table
 // placement, so band() is a direct call to the portable reference above.
-// See the file-top round-4 comment. Round 6 adds a flag-gated alternative
-// (bandAsm; see the round-6 file-top comment): -DGM_BGANIM_LAVA_ASM=1
-// routes band() there instead, on Xtensa builds only. Untested on the
-// device.
-#if defined(__XTENSA__) && !defined(GM_BGANIM_NO_ASM) && GM_BGANIM_LAVA_ASM
+// See the file-top round-4 comment. Round 6/7 add a flag-gated alternative
+// (bandAsm; see the round-6/7 file-top comments), ON by default since round
+// 7 (see the flag's own comment by the #define): -DGM_BGANIM_LAVA_ASM=1
+// routes band() there on every build (Xtensa runs the hand asm kernels,
+// everything else runs their host twins); -DGM_BGANIM_LAVA_ASM=0 falls
+// back to this bandRef() call.
+#if GM_BGANIM_LAVA_ASM
 void band(uint16_t *dst, int y0, int rows, int w, uint32_t tMs, const uint8_t *p) {
     bandAsm(dst, y0, rows, w, tMs, p);
 }

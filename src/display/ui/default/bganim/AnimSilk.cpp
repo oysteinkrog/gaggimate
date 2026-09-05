@@ -226,25 +226,27 @@
 #endif
 
 // Master switch for the hand-written Xtensa kernels below (silkFastCell16Asm,
-// silkExactCell16Asm, and band()'s dispatch to them). OFF by default: on the
-// device the fifth pass's kernels lost to GCC 14's compile of bandRef() in
-// all three passes that tried them (2026-09-04, production band time per
-// full-res frame: round 2 asm 22.5 ms vs ref 17.3, round 3 asm 25.4 vs ref
-// 18.6, with the same tables in the same places), while bandRef() itself
-// with the per-pixel tables in the hot slab is the fastest silk has
-// measured (HEAD needed 23.8 KB of SRAM for 18.2 ms). The sixth pass moved
-// bandRef() to a 16-pixel grid with paired stores, which those kernels did
-// not follow, so a static_assert stopped this flag from building at all
-// until the port was real. The port is done now (see the kernels' own
-// comments below): they are bit-exact against the current bandRef() under
-// QEMU (tools/qemubench/tests/anim_silk), but not yet measured on real
-// hardware, since the bench board was offline when this port was written.
-// -DGM_BGANIM_SILK_ASM=1 re-enables them for that measurement. The flag
-// stays off until a production A/B (camshots/anim_devbench.py) shows a
-// win on the device; only the device settles it, and it has said no twice
-// already for the retired kernels this replaces.
+// silkExactCell16Asm, and band()'s dispatch to them). ON by default now: the
+// sixth pass's port of these kernels to the 16-pixel grid is bit-exact
+// against the current bandRef() under QEMU (tools/qemubench/tests/anim_silk),
+// and this pass added portable C++ twins of both kernels (same names and
+// signatures, see the #else branch below) so the dispatch band() compiles
+// and runs on the host too: tools/animbench's goldens and interlace check
+// pass with the flag on, render_one --shapes passes at both supported
+// widths and both row parities, and the ASan/UBSan fuzz harness ends "bands
+// rendered clean" with the flag on, which matters most for silk since its
+// palette pad of 16 exists for an unclamped gather at the ditherAmp() cap.
+// What this has NOT yet proven: real-device timing. The bench board was
+// offline while this was written, so there is no production A/B yet, and
+// the fifth pass's retired 8-pixel kernels lost to GCC 14's compile of
+// bandRef() twice already (2026-09-04, round 2 asm 22.5 ms vs ref 17.3,
+// round 3 asm 25.4 vs ref 18.6) before the sixth pass's 16-pixel grid and
+// paired stores made bandRef() itself faster still. The first production
+// A/B (camshots/anim_devbench.py, useref=1 swaps in bandRef) decides
+// whether this flag stays on. -DGM_BGANIM_SILK_ASM=0 falls back to
+// bandRef() unconditionally, same as before this flag existed.
 #ifndef GM_BGANIM_SILK_ASM
-#define GM_BGANIM_SILK_ASM 0
+#define GM_BGANIM_SILK_ASM 1
 #endif
 
 #ifdef GM_SILK_HOST_DIFF
@@ -646,7 +648,8 @@ void frame(uint32_t tMs, int, int, const uint8_t p[4]) {
     }
 }
 
-#if defined(__XTENSA__) && !defined(GM_BGANIM_NO_ASM) && GM_BGANIM_SILK_ASM
+#if GM_BGANIM_SILK_ASM
+#if defined(__XTENSA__) && !defined(GM_BGANIM_NO_ASM)
 // Hand-written Xtensa kernels for band()'s per-cell inner loops.
 //
 // Ported for the sixth pass's 16-pixel grid and paired 32-bit stores (see
@@ -911,7 +914,55 @@ GM_ANIM_IRAM __attribute__((noinline)) void silkExactCell16Asm(uint16_t *out, in
                    [ditherrow] "r"(ditherRow)
                  : "memory");
 }
-#endif // __XTENSA__ && !GM_BGANIM_NO_ASM && GM_BGANIM_SILK_ASM
+#else
+// Portable twins of silkFastCell16Asm/silkExactCell16Asm above, same names
+// and signatures so band()'s dispatch below compiles unconditionally under
+// GM_BGANIM_SILK_ASM and needs no branch on which kernel implementation the
+// build has. Used on any non-Xtensa build with the flag on (the host bench,
+// this file's own GM_SILK_HOST_DIFF differ) and on a real device build with
+// GM_BGANIM_NO_ASM forcing the portable path. Transcribed straight from
+// bandRef()'s own FAST and EXACT cell bodies above (same arithmetic, same
+// per-store/per-pair order), not re-derived, matching
+// tools/qemubench/tests/anim_silk/main.c's silkFastCell16Ref/
+// silkExactCell16Ref, which check the real asm kernels in the branch above
+// against this same arithmetic under QEMU. IRAM-pinned like the asm kernels:
+// on a GM_BGANIM_NO_ASM device build these are what band() actually calls,
+// so they need the same protection from flash-icache contention (see
+// GM_ANIM_IRAM's comment).
+GM_ANIM_IRAM void silkFastCell16Asm(uint16_t *out, int32_t PQ0, int32_t dPhalf, const int32_t *dq,
+                                     const uint16_t *pal) {
+    int32_t pq = PQ0;
+    for (int k = 0; k < 8; k++) {
+        const int32_t idx = (pq + dq[k & 3]) >> (16 + SILK_GRID_SHIFT);
+        const uint16_t v = pal[idx];
+        out[2 * k] = v;
+        out[2 * k + 1] = v;
+        if (k != 7) {
+            pq += 2 * dPhalf;
+        }
+    }
+}
+
+GM_ANIM_IRAM void silkExactCell16Asm(uint16_t *out, int32_t sQ0, int32_t stepQ2, int32_t envBase,
+                                      const uint8_t *dx2AtX, const int32_t *ditherRow, const uint16_t *lut,
+                                      const uint16_t *pal) {
+    int32_t sq = sQ0;
+    for (int k = 0; k < 8; k++) {
+        const int32_t s = sq >> SILK_Q_BITS;
+        const int32_t nc = lut[s];
+        const int32_t dx2 = dx2AtX[2 * k];
+        const int32_t dith = ditherRow[k & 3];
+        const int32_t env = envBase - dx2;
+        const int32_t idxq = nc * env + dith;
+        const int32_t idx = idxq >> 16;
+        const uint16_t v = pal[idx];
+        out[2 * k] = v;
+        out[2 * k + 1] = v;
+        sq += stepQ2;
+    }
+}
+#endif // __XTENSA__ && !GM_BGANIM_NO_ASM
+#endif // GM_BGANIM_SILK_ASM
 
 // bandRef(): the portable, pixel-exact reference implementation (this
 // file's spec -- see BgAnim.h's bandRef field comment). Used directly as
@@ -1176,22 +1227,26 @@ GM_ANIM_IRAM void bandRef(uint16_t *dst, int y0, int rows, int w, uint32_t, cons
     }
 }
 
-#if defined(__XTENSA__) && !defined(GM_BGANIM_NO_ASM) && GM_BGANIM_SILK_ASM
-// On-device band(): identical algorithm to bandRef() above (the coarse-grid
-// node computation and curvature probe are unchanged C++), but the two
-// per-cell inner bodies, the 16-pixel product ramp and the 16-pixel exact
-// fallback, dispatch to the hand-written Xtensa kernels above instead of
-// the scalar C++ loops. See silkFastCell16Asm/silkExactCell16Asm's own
-// comments for why PIE doesn't apply here (gather-dominated, no vector
-// gather on this hardware) and for the scheduling. This dispatch is kept
-// pixel-exact with the current bandRef() by construction (every value it
-// hands the kernels is computed the same way bandRef() computes its own
-// C++ path, and the kernels are transcribed from bandRef()'s own compiled
-// form), and checked against portable references transcribed from
-// bandRef() under QEMU (tools/qemubench/tests/anim_silk/). Not yet
-// checked by SleepAnimation::runAnimTest (/api/debug/animtest) against
-// bandRef() on the real chip: the bench board was offline when this port
-// was written.
+#if GM_BGANIM_SILK_ASM
+// band(): identical algorithm to bandRef() above (the coarse-grid node
+// computation and curvature probe are unchanged C++), but the two per-cell
+// inner bodies, the 16-pixel product ramp and the 16-pixel exact fallback,
+// dispatch to silkFastCell16Asm/silkExactCell16Asm instead of the scalar
+// C++ loops inline here: the real Xtensa kernels on a build that has
+// them, their portable twins everywhere else the flag is on (see the
+// kernels' own #if/#else above), compiled unconditionally under this flag
+// with no branch here on which implementation the build resolved. See
+// silkFastCell16Asm/silkExactCell16Asm's own comments for why PIE doesn't
+// apply on the asm side (gather-dominated, no vector gather on this
+// hardware) and for the scheduling. This dispatch is kept pixel-exact with
+// the current bandRef() by construction (every value it hands the kernels
+// is computed the same way bandRef() computes its own C++ path, and both
+// kernel implementations are transcribed from bandRef()'s own body), and
+// checked against portable references transcribed from bandRef() under
+// QEMU (tools/qemubench/tests/anim_silk/) and, on the host, against
+// bandRef() itself via the animbench goldens. Not yet checked by
+// SleepAnimation::runAnimTest (/api/debug/animtest) against bandRef() on
+// the real chip: the bench board was offline when this port was written.
 GM_ANIM_IRAM void band(uint16_t *dst, int y0, int rows, int w, uint32_t, const uint8_t *) {
     const float cy = w * 0.5f;
     uint32_t base[3];
@@ -1301,7 +1356,7 @@ GM_ANIM_IRAM void band(uint16_t *dst, int y0, int rows, int w, uint32_t, const u
 void band(uint16_t *dst, int y0, int rows, int w, uint32_t tMs, const uint8_t *p) {
     bandRef(dst, y0, rows, w, tMs, p);
 }
-#endif // __XTENSA__ && !GM_BGANIM_NO_ASM && GM_BGANIM_SILK_ASM
+#endif // GM_BGANIM_SILK_ASM
 
 void release() {
     // releaseTable() works the same whether the pointer came from allocHot()

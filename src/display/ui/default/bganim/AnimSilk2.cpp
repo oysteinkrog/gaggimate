@@ -94,14 +94,12 @@
 #endif
 
 // Master switch for the hand-written Xtensa kernel below (silk2PairRowAsm
-// and band()'s dispatch to it). OFF by default: this is Silk 2's first
-// hand-written kernel (every other animation in the fleet either ships one
-// or carries one flag-gated off, see CLAUDE.md's "Animation kernels"
-// section), transcribed from GCC 14's own compile of bandRef()'s pixel-pair
-// loop (tools/animbench/xtensa-asm14.sh AnimSilk2, xtensa-asm14/AnimSilk2.S,
-// 2026-09-05) rather than reinvented: that loop was ALREADY a hardware
-// zero-overhead LOOP (GCC chose not to unroll it), 20 instructions per
-// pixel pair, and every load in it already has at least one independent
+// and band()'s dispatch to it). ON by default: this is Silk 2's first
+// hand-written kernel, transcribed from GCC 14's own compile of bandRef()'s
+// pixel-pair loop (tools/animbench/xtensa-asm14.sh AnimSilk2, xtensa-asm14/
+// AnimSilk2.S, 2026-09-05) rather than reinvented: that loop was ALREADY a
+// hardware zero-overhead LOOP (GCC chose not to unroll it), 20 instructions
+// per pixel pair, and every load in it already has at least one independent
 // instruction before its result is consumed (checked by hand against the
 // .S; the tightest gap, the palette low-half gather into the final OR, has
 // exactly one, matching the load-use latency this chip needs to hide a
@@ -110,15 +108,31 @@
 // data-dependent, cfA[x]+cfB[x]+sh, not a fixed stride), so
 // silk2PairRowAsm below is a straight transcription, mnemonic for
 // mnemonic, not a rescheduled one (the same outcome AnimSilk.cpp's own
-// port notes happened for some of its cells and not others). Verified
-// bit-exact against a portable C reference under QEMU
-// (tools/qemubench/tests/anim_silk2), not yet measured on real hardware:
-// the bench board was offline when this was written.
-// -DGM_BGANIM_SILK2_ASM=1 re-enables it for that measurement; the flag
-// stays off until a production A/B (camshots/anim_devbench.py) shows a
-// win, the same rule every other kernel in this file's family follows.
+// port notes happened for some of its cells and not others).
+//
+// Verified bit-exact against a portable C reference under QEMU
+// (tools/qemubench/tests/anim_silk2, real Xtensa instructions, not an
+// emulated ISA guess). The kernel-dispatching band() (per-row setup, lut,
+// cfA/cfB pointers, turn phase, same as bandRef()) is now also proven on
+// the host bench: silk2PairRowAsm has a portable C++ twin with the same
+// name and signature (see its own comment, below), copied from the QEMU
+// test's C reference, so with this flag on, the host toolchain compiles
+// and RUNS the exact dispatching band() the device runs, only the kernel
+// body itself differs. That closes the gap the flag-off default used to
+// leave: previously this band() had only ever been compiled, never
+// executed, anywhere but the device. Host goldens, the interlace check,
+// render_one --shapes, and the ASan/UBSan fuzz all pass with the flag on,
+// same as with it off.
+//
+// Not yet timed on real hardware: the bench board was offline throughout
+// this work. The kernel carries a zero instruction-count delta against
+// GCC's own schedule (see above), so it is expected to land near bandRef(),
+// not measurably faster. The first production A/B
+// (camshots/anim_devbench.py, useref=1 swaps in bandRef) is what decides
+// whether it stays on, the same rule every other kernel in this file's
+// family follows. -DGM_BGANIM_SILK2_ASM=0 falls back to bandRef() verbatim.
 #ifndef GM_BGANIM_SILK2_ASM
-#define GM_BGANIM_SILK2_ASM 0
+#define GM_BGANIM_SILK2_ASM 1
 #endif
 
 namespace {
@@ -551,7 +565,8 @@ void frame(uint32_t tMs, int w, int h, const uint8_t p[4]) {
     g_sheenWt = static_cast<uint32_t>(static_cast<int64_t>(wRateQ) * static_cast<int64_t>(tMs));
 }
 
-#if defined(__XTENSA__) && !defined(GM_BGANIM_NO_ASM) && GM_BGANIM_SILK2_ASM
+#if GM_BGANIM_SILK2_ASM
+#if defined(__XTENSA__) && !defined(GM_BGANIM_NO_ASM)
 // Hand-written Xtensa kernel for bandRef()'s pixel-pair loop (see the
 // master switch comment above for how this was derived and why it is a
 // straight transcription rather than a rescheduled one).
@@ -638,7 +653,33 @@ GM_ANIM_IRAM __attribute__((noinline)) uint32_t silk2PairRowAsm(uint16_t *out, c
                  : "memory");
     return turn;
 }
-#endif // __XTENSA__ && !GM_BGANIM_NO_ASM && GM_BGANIM_SILK2_ASM
+#else
+// Portable host twin of silk2PairRowAsm above: same name, signature, and
+// per-pair arithmetic (turn read before its own step, b = cfB[x] + sh,
+// idx0/idx1 = cfA[x]/cfA[x+1] + b, low pixel stored before high), copied
+// from tools/qemubench/tests/anim_silk2/main.c's silk2PairRowRef, the plain
+// C reference that file checks the asm kernel against under QEMU. This
+// branch compiles when GM_BGANIM_SILK2_ASM is 1 on a non-Xtensa build (the
+// host bench, where no compiler here can assemble the block above) or when
+// GM_BGANIM_NO_ASM forces the asm kernel off even on Xtensa. Either way the
+// dispatching band() below is one piece of source, unmodified by which
+// branch compiled: only the body of silk2PairRowAsm differs.
+uint32_t silk2PairRowAsm(uint16_t *out, const int16_t *cfA, const int16_t *cfB, const uint16_t *lut,
+                          const int16_t *sheenLut, uint32_t turn, int32_t step2, int nPairs) {
+    for (int i = 0; i < nPairs; i++) {
+        const int x = i * 2;
+        const int32_t sh = sheenLut[turn >> 22];
+        turn += static_cast<uint32_t>(step2);
+        const int32_t b = static_cast<int32_t>(cfB[x]) + sh;
+        const int32_t idx0 = static_cast<int32_t>(cfA[x]) + b;
+        const int32_t idx1 = static_cast<int32_t>(cfA[x + 1]) + b;
+        out[x] = lut[idx0];
+        out[x + 1] = lut[idx1];
+    }
+    return turn;
+}
+#endif // __XTENSA__ && !GM_BGANIM_NO_ASM
+#endif // GM_BGANIM_SILK2_ASM
 
 // bandRef(): the portable, pixel-exact reference implementation (this
 // file's spec, see BgAnim.h's bandRef field comment). Used directly as
@@ -754,14 +795,19 @@ GM_ANIM_IRAM void bandRef(uint16_t *__restrict dst, int y0, int rows, int w, uin
     }
 }
 
-#if defined(__XTENSA__) && !defined(GM_BGANIM_NO_ASM) && GM_BGANIM_SILK2_ASM
-// On-device band(): identical algorithm to bandRef() above (all per-row
-// setup, lut, cfA, cfB, turn, computed exactly the same way), but the
-// pixel-pair loop dispatches to silk2PairRowAsm above instead of the
-// scalar C++ loop. The row's non-grid-aligned tail (0 or 1 pixel; 0 at
-// this panel's 480/240 widths, see CLAUDE.md) resumes from the turn value
-// silk2PairRowAsm returns, so it runs bandRef()'s own scalar tail
-// verbatim.
+#if GM_BGANIM_SILK2_ASM
+// Kernel-dispatching band(): identical algorithm to bandRef() above (all
+// per-row setup, lut, cfA, cfB, turn, computed exactly the same way), but
+// the pixel-pair loop dispatches to silk2PairRowAsm above instead of the
+// scalar C++ loop (the hand-written Xtensa kernel on the device, its
+// portable host twin everywhere else, see silk2PairRowAsm's own comment),
+// same call and signature either way, so this function's source and its
+// behavior on the host bench (goldens, interlace check, shapes, fuzz) are
+// the same evidence as on the device modulo the kernel body itself, which
+// only QEMU and the real chip execute. The row's non-grid-aligned tail (0
+// or 1 pixel; 0 at this panel's 480/240 widths, see CLAUDE.md) resumes from
+// the turn value silk2PairRowAsm returns, so it runs bandRef()'s own scalar
+// tail verbatim.
 GM_ANIM_IRAM void band(uint16_t *__restrict dst, int y0, int rows, int w, uint32_t, const uint8_t *) {
     const int32_t sheenStep = g_sheenStep;
     const int32_t sheenStep2 = static_cast<int32_t>(static_cast<uint32_t>(sheenStep) * 2u);
@@ -783,13 +829,12 @@ GM_ANIM_IRAM void band(uint16_t *__restrict dst, int y0, int rows, int w, uint32
     }
 }
 #else
-// No Xtensa kernel to dispatch to on this build (host bench): band() is
-// bandRef() byte for byte, so the host golden comparison exercises the
-// same code either way.
+// Flag off (the default): band() is bandRef() byte for byte, so the host
+// golden comparison exercises the same code either way.
 void band(uint16_t *dst, int y0, int rows, int w, uint32_t tMs, const uint8_t *p) {
     bandRef(dst, y0, rows, w, tMs, p);
 }
-#endif // __XTENSA__ && !GM_BGANIM_NO_ASM && GM_BGANIM_SILK2_ASM
+#endif // GM_BGANIM_SILK2_ASM
 
 void release() {
     releaseTable(g_lut2, static_cast<size_t>(SUM_N) * sizeof(uint16_t));
