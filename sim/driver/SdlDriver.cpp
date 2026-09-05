@@ -47,8 +47,33 @@ void SdlDriver::init() {
     }
     s_window =
         SDL_CreateWindow("GaggiMate Simulator", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, DISP_W, DISP_H, SDL_WINDOW_SHOWN);
+    if (!s_window) {
+        fprintf(stderr, "SDL_CreateWindow failed: %s\n", SDL_GetError());
+        exit(1);
+    }
+    // SDL only offers renderers whose flags cover the request, and the dummy video
+    // driver (SDL_VIDEODRIVER=dummy, the headless CI and test runs) has no
+    // accelerated one: without the software fallback every frame and screenshot
+    // came out black while the process ran on as if nothing were wrong.
     s_renderer = SDL_CreateRenderer(s_window, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
+    if (!s_renderer) {
+        s_renderer = SDL_CreateRenderer(s_window, -1, SDL_RENDERER_SOFTWARE);
+    }
+    if (!s_renderer) {
+        fprintf(stderr, "SDL_CreateRenderer failed: %s\n", SDL_GetError());
+        exit(1);
+    }
+    {
+        SDL_RendererInfo info;
+        if (SDL_GetRendererInfo(s_renderer, &info) == 0) {
+            fprintf(stderr, "SDL renderer: %s\n", info.name);
+        }
+    }
     s_texture = SDL_CreateTexture(s_renderer, SDL_PIXELFORMAT_RGB565, SDL_TEXTUREACCESS_STREAMING, DISP_W, DISP_H);
+    if (!s_texture) {
+        fprintf(stderr, "SDL_CreateTexture failed: %s\n", SDL_GetError());
+        exit(1);
+    }
 
     // Build the round-display mask: the device panel is a 480px circle, so paint
     // everything outside that circle with the bezel colour and leave the inside
