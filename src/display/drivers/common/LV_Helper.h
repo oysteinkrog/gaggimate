@@ -107,11 +107,13 @@ extern volatile uint32_t g_touchMapLen;
 // with the panel point and, for a press, the object LVGL's hit test finds
 // there, so a tap that missed can be compared against the hit rectangles
 // (tools/touchmap.py) instead of guessed at. Written by touchpad_read on the
-// UI task; entry i lives at i % TOUCHLOG_N.
+// UI task; entry i lives at i % TOUCHLOG_N. syn is true when the edge came
+// from TouchInject (/api/debug/tap) rather than the touch controller.
 struct TouchLogEntry {
     uint32_t tMs;
     int16_t x, y;
     bool press;
+    bool syn;
     lv_obj_t *hit;
 };
 constexpr int TOUCHLOG_N = 32;

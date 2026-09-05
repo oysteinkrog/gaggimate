@@ -303,6 +303,16 @@ void AsyncWebServer::begin() {
     if (_listenFd >= 0)
         return;
     uint16_t port = _port < 1024 ? 8080 : _port; // avoid needing root for :80
+    // GM_SIM_PORT lets several simulators run on one host at once, each on
+    // its own debug-route port instead of colliding on 8080. Out-of-range or
+    // unset falls back to the port above; below 1024 needs root, which the
+    // fallback already avoids.
+    if (const char *envPort = getenv("GM_SIM_PORT")) {
+        const long parsed = strtol(envPort, nullptr, 10);
+        if (parsed >= 1024 && parsed <= 65535) {
+            port = static_cast<uint16_t>(parsed);
+        }
+    }
     _listenFd = socket(AF_INET, SOCK_STREAM, 0);
     int yes = 1;
     setsockopt(_listenFd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));

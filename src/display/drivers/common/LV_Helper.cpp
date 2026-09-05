@@ -8,6 +8,7 @@
  *
  */
 #include "LV_Helper.h"
+#include <display/core/TouchInject.h>
 #ifdef GM_TOUCH_PROBE
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -316,7 +317,21 @@ volatile int64_t g_overlayMinRefreshUs = 250000; // DefaultUI's constructor sets
 /*Read the touchpad*/
 static void touchpad_read(lv_indev_drv_t *indev_driver, lv_indev_data_t *data) {
     static int16_t x, y;
-    uint8_t touched = static_cast<Display *>(indev_driver->user_data)->getPoint(&x, &y, 1);
+    uint8_t touched;
+    bool synthetic;
+    {
+        int16_t injX, injY;
+        bool injPressed;
+        if (touchInjectPoll(injX, injY, injPressed)) {
+            x = injX;
+            y = injY;
+            touched = injPressed ? 1 : 0;
+            synthetic = true;
+        } else {
+            touched = static_cast<Display *>(indev_driver->user_data)->getPoint(&x, &y, 1);
+            synthetic = false;
+        }
+    }
     {
         // Production-path edge stamp (not probe-gated): DefaultUI::loop uses
         // it to let an interaction bypass the telemetry-pass spacing, so a
@@ -331,6 +346,7 @@ static void touchpad_read(lv_indev_drv_t *indev_driver, lv_indev_data_t *data) {
             en.x = x;
             en.y = y;
             en.press = touched != 0;
+            en.syn = synthetic;
             en.hit = nullptr;
             if (touched) {
                 lv_point_t pt = {x, y};

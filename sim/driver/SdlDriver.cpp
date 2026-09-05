@@ -1,7 +1,9 @@
 #include "SdlDriver.h"
 
 #include <SDL.h>
+#include <cstdio>
 #include <cstdlib>
+#include <display/core/TouchInject.h>
 #include <lvgl.h>
 #include <vector>
 
@@ -35,6 +37,23 @@ static void disp_flush(lv_disp_drv_t *drv, const lv_area_t *area, lv_color_t *co
 
 static void mouse_read(lv_indev_drv_t *drv, lv_indev_data_t *data) {
     (void)drv;
+    int16_t injX, injY;
+    bool injPressed;
+    if (touchInjectPoll(injX, injY, injPressed)) {
+        static bool wasPressed = false;
+        if (injPressed != wasPressed) {
+            wasPressed = injPressed;
+            if (injPressed) {
+                printf("[inject] press %d,%d\n", injX, injY);
+            } else {
+                printf("[inject] release\n");
+            }
+        }
+        data->point.x = injX;
+        data->point.y = injY;
+        data->state = injPressed ? LV_INDEV_STATE_PR : LV_INDEV_STATE_REL;
+        return;
+    }
     data->point.x = s_mouseX;
     data->point.y = s_mouseY;
     data->state = s_mousePressed ? LV_INDEV_STATE_PR : LV_INDEV_STATE_REL;

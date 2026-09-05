@@ -21,3 +21,16 @@ typedef uint8_t StackType_t;
 #define tskNO_AFFINITY 0x7fffffff
 #define pdMS_TO_TICKS(ms) ((TickType_t)(ms))
 #define pdTICKS_TO_MS(t) ((uint32_t)(t))
+
+// No-op critical section: the simulator has no second core and no ISRs, and
+// everything (LVGL, the web server, TouchInject) runs cooperatively on one
+// main-loop thread (see task.h above), so there is never a concurrent writer
+// to lock out. Real content, not just enough to link: TouchInject.cpp is
+// written once against this pair and the device's real spinlock.
+typedef struct {
+    int _unused;
+} portMUX_TYPE;
+#define portMUX_INITIALIZER_UNLOCKED \
+    {}
+static inline void portENTER_CRITICAL(portMUX_TYPE *mux) { (void)mux; }
+static inline void portEXIT_CRITICAL(portMUX_TYPE *mux) { (void)mux; }
