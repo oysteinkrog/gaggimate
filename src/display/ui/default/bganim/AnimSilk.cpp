@@ -201,7 +201,8 @@
 // often, and the exact fallback that remains at 16 costs 0.7 ms of the 8.3.
 // The palette offset left the dither constants for the palette pointer
 // because the Q20 ramp cannot hold it (see SILK_GRID_SHIFT). The fifth
-// pass's Xtensa kernels are unported and gated off by a static_assert.
+// pass's Xtensa kernels were left unported and gated off by a static_assert
+// until the port below (2026-09-05), which is still off by default.
 //
 // Design: anim-fluid (Fable), 2026-08-15. Optimized: anim-fluid, 2026-08-15;
 // opt-silk2 (fixed-point tail), 2026-08-15; opt-silk3 (constant folding +
@@ -224,19 +225,24 @@
 #define GM_ANIM_IRAM
 #endif
 
-// Master switch for the hand-written Xtensa kernels below (silkFastCell8Asm,
-// silkExactCell8Asm, and band()'s dispatch to them). OFF by default: on the
-// device the kernels lost to GCC 14's compile of bandRef() in all three
-// passes that tried them (2026-09-04, production band time per full-res
-// frame: round 2 asm 22.5 ms vs ref 17.3, round 3 asm 25.4 vs ref 18.6,
-// with the same tables in the same places), while bandRef() itself with the
-// per-pixel tables in the hot slab is the fastest silk has measured (HEAD
-// needed 23.8 KB of SRAM for 18.2 ms). The kernels stay in the file, bit-exact
-// (QEMU test tools/qemubench/tests/anim_silk), for whoever finds the stall;
-// -DGM_BGANIM_SILK_ASM=1 re-enables them. Only the device settles it. Since
-// the sixth pass the flag does not build at all (see the static_assert at
-// the kernels): bandRef() moved to a 16-pixel grid and paired stores, and
-// the kernels would have to follow before a comparison means anything.
+// Master switch for the hand-written Xtensa kernels below (silkFastCell16Asm,
+// silkExactCell16Asm, and band()'s dispatch to them). OFF by default: on the
+// device the fifth pass's kernels lost to GCC 14's compile of bandRef() in
+// all three passes that tried them (2026-09-04, production band time per
+// full-res frame: round 2 asm 22.5 ms vs ref 17.3, round 3 asm 25.4 vs ref
+// 18.6, with the same tables in the same places), while bandRef() itself
+// with the per-pixel tables in the hot slab is the fastest silk has
+// measured (HEAD needed 23.8 KB of SRAM for 18.2 ms). The sixth pass moved
+// bandRef() to a 16-pixel grid with paired stores, which those kernels did
+// not follow, so a static_assert stopped this flag from building at all
+// until the port was real. The port is done now (see the kernels' own
+// comments below): they are bit-exact against the current bandRef() under
+// QEMU (tools/qemubench/tests/anim_silk), but not yet measured on real
+// hardware, since the bench board was offline when this port was written.
+// -DGM_BGANIM_SILK_ASM=1 re-enables them for that measurement. The flag
+// stays off until a production A/B (camshots/anim_devbench.py) shows a
+// win on the device; only the device settles it, and it has said no twice
+// already for the retired kernels this replaces.
 #ifndef GM_BGANIM_SILK_ASM
 #define GM_BGANIM_SILK_ASM 0
 #endif
@@ -345,7 +351,7 @@ float ditherLUT[16];
 // for a merged struct to buy. g_ditherQ is small enough (64 B, 16 entries)
 // that the per-cell/per-row code below loads its 4 relevant phase values
 // into registers once rather than walking it at all, see band()'s dqArr
-// and silkExactCell8Asm's d0..d3 comment.
+// and silkExactCell16Asm's ditherRow comment.
 uint8_t *g_dx2Row = nullptr;
 int g_dx2RowW = 0; // width g_dx2Row was sized for
 // Q16: dither value * 65536 (see file header for why Q16, not Q8). From the
@@ -641,200 +647,236 @@ void frame(uint32_t tMs, int, int, const uint8_t p[4]) {
 }
 
 #if defined(__XTENSA__) && !defined(GM_BGANIM_NO_ASM) && GM_BGANIM_SILK_ASM
-// ---- Hand-written Xtensa kernels for band()'s per-cell inner loops -------
+// Hand-written Xtensa kernels for band()'s per-cell inner loops.
 //
-// These kernels predate the sixth pass: they write single pixels on the
-// 8-pixel grid with the palette offset baked into the dither constants, none
-// of which is true of bandRef() any more. Re-enabling them means porting
-// them first; the assert is here so the flag cannot quietly ship the old
-// algorithm as band() beside the new one as bandRef().
-static_assert(SILK_GRID == 8, "silk's Xtensa kernels are written for the 8-pixel grid of the fifth pass");
-// PIE (the S3's 128-bit vector coprocessor) does not help either loop below:
-// both are dominated by a LUT GATHER (g_lut[idx], idx data-dependent per
-// pixel), and there is no vector gather instruction on this hardware -- see
-// tools/animbench/ASM_BRIEF.md's PIE facts. So both kernels are
-// hand-scheduled SCALAR Xtensa, fully unrolled (SILK_GRID == 8 is a
-// compile-time constant here, not a runtime loop bound), which sidesteps
-// the register-pressure problem that sank a compiler-driven 4x unroll of
-// this same loop (see bandRef()'s "NOTE" comment below) -- an asm block
-// controls its own register allocation instead of asking GCC's windowed-ABI
-// allocator to find ~20 simultaneous live values in a ~13-14-register
-// budget. Every load's result here is consumed at least one instruction
-// after the load, so neither kernel pays the 1-cycle load-use stall
-// ASM_BRIEF.md's scalar facts describe.
+// Ported for the sixth pass's 16-pixel grid and paired 32-bit stores (see
+// the file header). The fifth pass's kernels below used to be written for
+// the 8-pixel grid, wrote one pixel at a time, and read a dither table
+// that carried PALETTE_REAL_OFF baked in, none of which bandRef() does any
+// more, so a static_assert stopped this flag from building until the port
+// was real.
 //
-// Both are noinline and take plain pointers/ints (the brief's requirement)
-// so the exact same bodies drop into the QEMU test at
-// tools/qemubench/tests/anim_silk/ unchanged -- transcribed there by hand,
-// not regenerated, so a QEMU PASS is evidence about this literal sequence.
+// Method: read GCC 14's own compile of the current bandRef()
+// (tools/animbench/xtensa-asm14.sh AnimSilk, then read
+// xtensa-asm14/AnimSilk.S) and transcribe its FAST cell (fully unrolled,
+// no loop instruction: GCC chose not to loop over just 8 independent
+// stores) and EXACT cell (a genuine hardware zero-overhead LOOP over a
+// compact per-pixel-pair body) instruction for instruction, then kept two
+// scheduling ideas from the retired kernels that still apply without
+// touching the arithmetic:
+//   - an independent instruction between MULL and the add that consumes
+//     it (the sq ramp step, in the EXACT kernel), matching the fifth
+//     pass's round 3 kernel;
+//   - a fresh 0-based counter standing in for the pixel-pair's phase
+//     (kctr, ANDed with 3) instead of tracking x itself, valid because
+//     every call site's x is a multiple of SILK_GRID (16, itself a
+//     multiple of 8), so pixel pair k's true (x>>1)&3 equals a fresh
+//     counter's k&3 exactly.
+// The FAST kernel keeps GCC's own trick for the ramp step too: bandRef()
+// computes dP2 = 2*(Pnext-Pcur) once and adds it each store, but GCC's
+// compiled loop never materializes dP2 as its own value. It passes the
+// undoubled half-step to ADDX2, which multiplies its first operand by 2
+// as part of the add, so "PQ += dP2" becomes one ADDX2 instead of a
+// separate multiply and add. That is exact (2*half is dP2 bit for bit,
+// multiplying by a power of two loses nothing), so silkFastCell16Asm
+// below takes dPhalf = Pnext - Pcur and steps with ADDX2, not dP2 with a
+// plain add.
+//
+// One thing this port does NOT copy from GCC: GCC's FAST cell computes
+// all 8 pre-shift index values before gathering any of them, which needs
+// 8 live registers simultaneously and only works there because the
+// surrounding function had already spilled most other state to the
+// stack. A standalone leaf function does not have that headroom (this
+// file's own ~13-14 AR register budget, see the file header), so
+// silkFastCell16Asm below computes and gathers one store at a time
+// instead, the same granularity the fifth pass's kernels used. The
+// arithmetic is identical either way; only the instruction interleaving
+// differs from GCC's literal schedule.
+//
+// Verified bit-exact against portable references transcribed from the
+// current bandRef() under QEMU (tools/qemubench/tests/anim_silk). Not
+// verified on real hardware: the bench board was offline when this port
+// was written, so there is no device timing and no
+// SleepAnimation::runAnimTest comparison for it yet. That measurement is
+// the next step before this flag means anything beyond a QEMU-verified
+// candidate, see the master switch comment above.
+//
+// PIE (the S3's 128-bit vector coprocessor) does not help either loop
+// below: both are dominated by a LUT GATHER (an index computed per pixel
+// or per pixel pair), and there is no vector gather instruction on this
+// hardware, see tools/animbench/ASM_BRIEF.md's PIE facts.
+//
+// Both are noinline and take plain pointers and ints so the exact same
+// bodies drop into the QEMU test at tools/qemubench/tests/anim_silk/
+// unchanged, transcribed there by hand, not regenerated, so a QEMU PASS
+// is evidence about this literal sequence.
 //
 // IRAM-pinned like band() itself: band() runs from IRAM specifically so
 // LVGL's icache churn on core 1 can't stall it behind an MSPI refill (see
 // the GM_ANIM_IRAM comment above), and calling out to a flash-resident
 // helper from an IRAM function would reopen exactly that stall on every
-// cell -- so these two callees must stay in IRAM too.
+// cell, so these two callees must stay in IRAM too.
+//
+// Neither kernel writes CPENABLE. FreeRTOS enables the FPU and PIE
+// coprocessors lazily per task through the coprocessor-disabled
+// exception; a kernel that set CPENABLE itself would skip that and could
+// corrupt another task's coprocessor state (Controller::loopLogic's float
+// state, in this codebase). Nothing here touches a coprocessor register,
+// so there is nothing to enable, this note exists only so the next kernel
+// added here does not have to rediscover the rule.
 
-// silkFastCell8Asm: the dominant per-cell path (see band()'s "FAST cell"
-// call below) -- ramps the precomputed Q16 nc*env product P linearly across
-// 8 pixels and gathers ONE palette entry per pixel. No contrast gather here;
-// that is the entire point of the pass-4 product ramp this mirrors.
+// silkFastCell16Asm: the dominant per-cell path (see band()'s "FAST cell"
+// call below). Ramps the precomputed Q16 nc*env product P linearly across
+// the cell's 16 pixels, written as 8 paired 32-bit stores (sixth pass):
+// each store gathers ONE palette entry and duplicates it into both halves
+// of the word, since the field is sampled once every 2 pixels now, not
+// once per pixel. That is 8 gathers for 16 pixels, half the rate a
+// hypothetical unpaired 16-pixel kernel would need, matching bandRef()
+// exactly and matching the reason the sixth pass adopted pairing in the
+// first place.
 //
-//   out:  8 consecutive uint16_t outputs to fill (== out+x in band())
-//   PQ0:  Pcur << SILK_GRID_SHIFT (Q19) -- the ramp's value at pixel 0
-//   dP:   Pnext - Pcur (Q16) -- the ramp's per-pixel step
-//   dq:   4-entry table, dq[k] applies to pixel k%4 (already
-//         <<SILK_GRID_SHIFT and PALETTE_REAL_OFF-biased -- see g_ditherQ's
-//         declaration above), so (PQ + dq[k%4]) >> 19 is g_lut's absolute
-//         index with no separate offset add (matches the scalar reference's
-//         `g_lut[(PQ+dqK)>>19]` exactly).
-//   lut:  g_lut base.
-//
-// Pixel pairs are packed into one 32-bit store (SleepAnimation.cpp's
-// scale565Oct precedent): `out` is the band row buffer, 4-byte aligned, and
-// x is always a multiple of SILK_GRID (8) here, so every pair starts on an
-// even pixel -- one aligned s32i instead of two s16i.
-//
-// PQ advances by dP seven times total (matching the scalar reference's
-// seven "PQ += dP" -- there is no increment after pixel 7); the four dq
-// values are each used twice (period 4 over 8 pixels).
-GM_ANIM_IRAM __attribute__((noinline)) void silkFastCell8Asm(uint16_t *out, int32_t PQ0, int32_t dP,
-                                                               const int32_t *dq, const uint16_t *lut) {
+//   out:    16 consecutive uint16_t outputs to fill (8 uint32_t stores),
+//           == out+x in band(); 4-byte aligned, since x is always a
+//           multiple of SILK_GRID at every call site.
+//   PQ0:    Pcur << SILK_GRID_SHIFT (Q20), the ramp's value for store 0.
+//   dPhalf: Pnext - Pcur (Q16). See the block comment above for why this
+//           is undoubled and stepped with ADDX2 rather than passed as
+//           bandRef()'s dP2.
+//   dq:     4-entry table, dq[k % 4] applies to store k (already
+//           <<SILK_GRID_SHIFT, see g_ditherQ's declaration and dqArr's
+//           construction in band()), matching bandRef()'s dq0..dq3
+//           cycling across o[0]..o[7].
+//   pal:    g_lut + PALETTE_REAL_OFF, the same pointer bandRef() reads
+//           through for this path. NOT g_lut itself: the sixth pass moved
+//           the palette offset out of the dither constants and into this
+//           pointer instead (see PALETTE_REAL_OFF's comment), so a bare
+//           g_lut base here would read the wrong table.
+GM_ANIM_IRAM __attribute__((noinline)) void silkFastCell16Asm(uint16_t *out, int32_t PQ0, int32_t dPhalf,
+                                                                const int32_t *dq, const uint16_t *pal) {
     int32_t pq = PQ0;
     const int32_t dq0v = dq[0];
     const int32_t dq1v = dq[1];
     const int32_t dq2v = dq[2];
     const int32_t dq3v = dq[3];
     int32_t t0, t1;
-    asm volatile("add    %[t0], %[pq], %[dq0]\n" // pixels 0,1
-                 "srai   %[t0], %[t0], 19\n"
-                 "add    %[pq], %[pq], %[dp]\n"
-                 "add    %[t1], %[pq], %[dq1]\n"
-                 "srai   %[t1], %[t1], 19\n"
-                 "addx2  %[t0], %[t0], %[lut]\n"
-                 "addx2  %[t1], %[t1], %[lut]\n"
+    asm volatile("add    %[t0], %[pq], %[dq0]\n" // store 0
+                 "srai   %[t0], %[t0], 20\n"
+                 "addx2  %[pq], %[dph], %[pq]\n" // PQ1 = PQ0 + dP2 (2*dPhalf via ADDX2)
+                 "addx2  %[t0], %[t0], %[pal]\n"
                  "l16ui  %[t0], %[t0], 0\n"
-                 "l16ui  %[t1], %[t1], 0\n"
-                 "add    %[pq], %[pq], %[dp]\n"
-                 "slli   %[t1], %[t1], 16\n"
-                 "or     %[t0], %[t0], %[t1]\n"
+                 "slli   %[t1], %[t0], 16\n"
+                 "add    %[t0], %[t0], %[t1]\n"
                  "s32i   %[t0], %[out], 0\n"
-                 "add    %[t0], %[pq], %[dq2]\n" // pixels 2,3
-                 "srai   %[t0], %[t0], 19\n"
-                 "add    %[pq], %[pq], %[dp]\n"
-                 "add    %[t1], %[pq], %[dq3]\n"
-                 "srai   %[t1], %[t1], 19\n"
-                 "addx2  %[t0], %[t0], %[lut]\n"
-                 "addx2  %[t1], %[t1], %[lut]\n"
+                 "add    %[t0], %[pq], %[dq1]\n" // store 1
+                 "srai   %[t0], %[t0], 20\n"
+                 "addx2  %[pq], %[dph], %[pq]\n" // PQ2
+                 "addx2  %[t0], %[t0], %[pal]\n"
                  "l16ui  %[t0], %[t0], 0\n"
-                 "l16ui  %[t1], %[t1], 0\n"
-                 "add    %[pq], %[pq], %[dp]\n"
-                 "slli   %[t1], %[t1], 16\n"
-                 "or     %[t0], %[t0], %[t1]\n"
+                 "slli   %[t1], %[t0], 16\n"
+                 "add    %[t0], %[t0], %[t1]\n"
                  "s32i   %[t0], %[out], 4\n"
-                 "add    %[t0], %[pq], %[dq0]\n" // pixels 4,5
-                 "srai   %[t0], %[t0], 19\n"
-                 "add    %[pq], %[pq], %[dp]\n"
-                 "add    %[t1], %[pq], %[dq1]\n"
-                 "srai   %[t1], %[t1], 19\n"
-                 "addx2  %[t0], %[t0], %[lut]\n"
-                 "addx2  %[t1], %[t1], %[lut]\n"
+                 "add    %[t0], %[pq], %[dq2]\n" // store 2
+                 "srai   %[t0], %[t0], 20\n"
+                 "addx2  %[pq], %[dph], %[pq]\n" // PQ3
+                 "addx2  %[t0], %[t0], %[pal]\n"
                  "l16ui  %[t0], %[t0], 0\n"
-                 "l16ui  %[t1], %[t1], 0\n"
-                 "add    %[pq], %[pq], %[dp]\n"
-                 "slli   %[t1], %[t1], 16\n"
-                 "or     %[t0], %[t0], %[t1]\n"
+                 "slli   %[t1], %[t0], 16\n"
+                 "add    %[t0], %[t0], %[t1]\n"
                  "s32i   %[t0], %[out], 8\n"
-                 "add    %[t0], %[pq], %[dq2]\n" // pixels 6,7
-                 "srai   %[t0], %[t0], 19\n"
-                 "add    %[pq], %[pq], %[dp]\n"
-                 "add    %[t1], %[pq], %[dq3]\n"
-                 "srai   %[t1], %[t1], 19\n"
-                 "addx2  %[t0], %[t0], %[lut]\n"
-                 "addx2  %[t1], %[t1], %[lut]\n"
+                 "add    %[t0], %[pq], %[dq3]\n" // store 3
+                 "srai   %[t0], %[t0], 20\n"
+                 "addx2  %[pq], %[dph], %[pq]\n" // PQ4
+                 "addx2  %[t0], %[t0], %[pal]\n"
                  "l16ui  %[t0], %[t0], 0\n"
-                 "l16ui  %[t1], %[t1], 0\n"
-                 "slli   %[t1], %[t1], 16\n"
-                 "or     %[t0], %[t0], %[t1]\n"
+                 "slli   %[t1], %[t0], 16\n"
+                 "add    %[t0], %[t0], %[t1]\n"
                  "s32i   %[t0], %[out], 12\n"
+                 "add    %[t0], %[pq], %[dq0]\n" // store 4
+                 "srai   %[t0], %[t0], 20\n"
+                 "addx2  %[pq], %[dph], %[pq]\n" // PQ5
+                 "addx2  %[t0], %[t0], %[pal]\n"
+                 "l16ui  %[t0], %[t0], 0\n"
+                 "slli   %[t1], %[t0], 16\n"
+                 "add    %[t0], %[t0], %[t1]\n"
+                 "s32i   %[t0], %[out], 16\n"
+                 "add    %[t0], %[pq], %[dq1]\n" // store 5
+                 "srai   %[t0], %[t0], 20\n"
+                 "addx2  %[pq], %[dph], %[pq]\n" // PQ6
+                 "addx2  %[t0], %[t0], %[pal]\n"
+                 "l16ui  %[t0], %[t0], 0\n"
+                 "slli   %[t1], %[t0], 16\n"
+                 "add    %[t0], %[t0], %[t1]\n"
+                 "s32i   %[t0], %[out], 20\n"
+                 "add    %[t0], %[pq], %[dq2]\n" // store 6
+                 "srai   %[t0], %[t0], 20\n"
+                 "addx2  %[pq], %[dph], %[pq]\n" // PQ7
+                 "addx2  %[t0], %[t0], %[pal]\n"
+                 "l16ui  %[t0], %[t0], 0\n"
+                 "slli   %[t1], %[t0], 16\n"
+                 "add    %[t0], %[t0], %[t1]\n"
+                 "s32i   %[t0], %[out], 24\n"
+                 "add    %[t0], %[pq], %[dq3]\n" // store 7 (no further PQ step: bandRef() steps PQ
+                                                  // seven times for eight stores, and this is the eighth)
+                 "srai   %[t0], %[t0], 20\n"
+                 "addx2  %[t0], %[t0], %[pal]\n"
+                 "l16ui  %[t0], %[t0], 0\n"
+                 "slli   %[t1], %[t0], 16\n"
+                 "add    %[t0], %[t0], %[t1]\n"
+                 "s32i   %[t0], %[out], 28\n"
                  : [pq] "+r"(pq), [t0] "=&r"(t0), [t1] "=&r"(t1)
-                 : [dp] "r"(dP), [dq0] "r"(dq0v), [dq1] "r"(dq1v), [dq2] "r"(dq2v), [dq3] "r"(dq3v),
-                   [lut] "r"(lut), [out] "r"(out)
+                 : [dph] "r"(dPhalf), [dq0] "r"(dq0v), [dq1] "r"(dq1v), [dq2] "r"(dq2v), [dq3] "r"(dq3v),
+                   [pal] "r"(pal), [out] "r"(out)
                  : "memory");
 }
 
-// silkExactCell8Asm: the curvature-fallback path (see band()'s "EXACT cell"
-// call below) -- ramps the interpolated contrast index s (Q8) across 8
-// pixels and evaluates the full per-pixel expression: TWO gathers (contrast,
-// palette) plus a 32x32 multiply, against the fast kernel's one gather. This
-// path is rare (only cells where the curvature probe trips) but not
-// provably negligible at parameter extremes (glow 0 or 100 sharpen the
-// contrast curve enough that more cells fail the probe), so it gets the
-// same scheduling care, not a leftover scalar loop.
+// silkExactCell16Asm: the curvature-fallback path (see band()'s "EXACT
+// cell" call below). Transcribed instruction for instruction from GCC's
+// own compiled EXACT-cell loop for the current bandRef() (see the block
+// comment above), which is the same shape the fifth pass's round 3
+// rewrite already established for this cell: a hardware zero-overhead
+// LOOP over a compact body, not an unrolled one, because IRAM has no
+// instruction cache and a loop's ~20 bytes of body are fetched once per
+// call where an unrolled body's several hundred bytes are fetched fresh
+// every time (see that history below the file header). The sixth pass
+// changed what the loop produces per iteration (one pixel pair instead of
+// one pixel) and where the palette offset lives (its own pointer, not
+// baked into the dither table); this kernel follows both.
 //
-//   out:       8 consecutive uint16_t outputs to fill.
-//   sQ0:       sCur << SILK_Q_BITS (Q8) -- the s-ramp's value at pixel 0.
-//   stepQ:     the s-ramp's per-pixel step.
+//   out:       16 consecutive uint16_t outputs to fill (8 uint32_t
+//              stores, one pixel pair each).
+//   sQ0:       sCur << SILK_Q_BITS (Q8), the s-ramp's value at pixel 0.
+//   stepQ2:    the PAIRED s-ramp step, bandRef()'s stepQ2. This is
+//              already doubled for the sixth pass's pixel-pair stride; it
+//              is not the fifth pass's per-pixel step.
 //   envBase:   envRowBase_q8 for this row (Q8).
-//   dx2AtX:    &g_dx2Row[x] -- one uint8_t per pixel, walked forward one
-//              byte per iteration.
-//   ditherRow: &g_ditherQ[yph*4] -- the caller folds the row's y-phase
-//              offset into the pointer once, so this kernel only ever
-//              indexes it by the pixel's x-phase (0..3, cycling); Q16,
-//              PALETTE_REAL_OFF-biased, unshifted (unlike the fast kernel's
-//              dq[], this feeds a Q16 mull result directly, not a Q19
-//              ramp).
-//   lut:       g_lut base.
+//   dx2AtX:    &g_dx2Row[x], one uint8_t PER PAIR, walked forward two
+//              bytes per iteration (only the pair's first pixel's dx2 is
+//              read, matching bandRef()'s g_dx2Row[x] with x advancing by
+//              2 each loop pass).
+//   ditherRow: &g_ditherQ[yph*4]. Indexed by the pair's phase (0..3,
+//              cycling) via a fresh 0-based counter, the same idea
+//              silkFastCell16Asm's dq[] cycling relies on: every call
+//              site's x is a multiple of SILK_GRID (16), so pair k's true
+//              (x>>1)&3 equals a fresh counter's k&3 exactly, with no
+//              need to carry the real x into this kernel at all.
+//   lut:       g_lut base, for the contrast gather. Index s is already in
+//              [0, CONTRAST_N-1], no offset needed, same as bandRef().
+//   pal:       g_lut + PALETTE_REAL_OFF, for the palette gather. A
+//              SEPARATE pointer from lut, since the sixth pass moved the
+//              offset out of the dither table and into this pointer (see
+//              PALETTE_REAL_OFF's comment); the fifth pass's retired
+//              kernel used one shared "lut" pointer for both gathers
+//              because its dither table carried the bias, which is no
+//              longer true.
 //
-// Round 3 rewrite: rounds 1 and 2 both fully unrolled this into 8 flat
-// copies of the pixel body (110-113 static instructions) on the theory that
-// an asm block controls its own register allocation, so unrolling can't
-// spill the way it did when band()'s NOTE above describes GCC's compiler
-// -driven 4x unroll losing the hardware LOOP. Round 2's device numbers
-// showed that theory was incomplete: the unrolled kernel still lost to
-// GCC's OWN compile of the identical algorithm by about a quarter, despite
-// matching or beating it on instruction count and matching its mull
-// -to-consumer gap. The missed variable was never register pressure -- it
-// was code size. Comparing this function's disassembly against GCC's
-// compiled bandRef() (tools/animbench/xtensa-asm14.sh AnimSilk, read the
-// .S) found that GCC does NOT unroll the EXACT cell's `for (i=0;i<8;i++)`
-// loop at all: it keeps it as a genuine hardware zero-overhead LOOP over an
-// 18-instruction body, the same body executed 8 times, roughly 60 bytes of
-// code. Round 2's unrolled kernel put 303 bytes of straight-line code in
-// IRAM for the same work. IRAM has no instruction cache: every one of those
-// 303 bytes is fetched fresh on every single call, where a flash-resident
-// loop that fits the 16 KB icache only pays that cost on a miss. A LOOP
-// -bodied kernel that stays IRAM-resident (see GM_ANIM_IRAM above -- IRAM
-// still buys freedom from LVGL's icache churn, this isn't reverting that)
-// gets the code-size benefit of the loop AND keeps the flash-icache
-// -contention immunity, instead of paying for neither: this is the
-// structural fix, not a scheduling tweak. Rewritten to match GCC's shape --
-// a real `loop` instruction over a compact per-pixel body, transcribed
-// instruction-for-instruction from GCC's own compiled EXACT-cell loop, not
-// re-derived by hand -- rather than attempt a third round of manual
-// unrolled scheduling.
-//
-// kctr (0..7, only the low 2 bits used) stands in for GCC's own `x & 3`
-// phase computation: x is always a multiple of SILK_GRID (8, itself a
-// multiple of 4) at every call site, so pixel k's true x&3 == k&3, and a
-// fresh 0-based counter's low 2 bits equal the real x's low 2 bits exactly
-// -- same argument silkFastCell8Asm's dq[] cycling already relies on, just
-// computed at runtime here (via EXTUI, matching GCC's own instruction
-// choice) instead of unrolled at compile time, since there is no unrolled
-// compile time left to fold it into.
-//
-// mull's result has ONE independent instruction before the add that
-// consumes it (the sq ramp-step add) -- not two. Round 2 targeted a
-// two-instruction gap based on a comparison against GCC's PRE-round-2
-// compiled output (the old RowAux table layout); with the current
-// g_dx2Row/g_ditherQ layout, GCC's OWN fresh compile of the same algorithm
-// only manages a one-instruction gap (the extra addx4/l32i work to walk
-// g_ditherQ leaves less independent work available to fill the gap with),
-// confirmed by direct inspection this round. Matching GCC's actual, current
-// schedule -- not a target inferred from a stale comparison -- is the
-// entire point of transcribing it directly instead of re-deriving it.
-GM_ANIM_IRAM __attribute__((noinline)) void silkExactCell8Asm(uint16_t *out, int32_t sQ0, int32_t stepQ,
-                                                                int32_t envBase, const uint8_t *dx2AtX,
-                                                                const int32_t *ditherRow, const uint16_t *lut) {
+// mull's result has one independent instruction (the sq ramp step) before
+// the add that consumes it, matching GCC's own schedule for this data
+// layout, the same idea the fifth pass's round 3 kernel already used for
+// this cell.
+GM_ANIM_IRAM __attribute__((noinline)) void silkExactCell16Asm(uint16_t *out, int32_t sQ0, int32_t stepQ2,
+                                                                 int32_t envBase, const uint8_t *dx2AtX,
+                                                                 const int32_t *ditherRow, const uint16_t *lut,
+                                                                 const uint16_t *pal) {
     int32_t sq = sQ0;
     const uint8_t *dx2p = dx2AtX;
     uint16_t *outp = out;
@@ -842,28 +884,31 @@ GM_ANIM_IRAM __attribute__((noinline)) void silkExactCell8Asm(uint16_t *out, int
     int32_t u, v1, ph;
     asm volatile("movi   %[u], 8\n"
                  "loop   %[u], 1f\n"
-                 "l8ui   %[v1], %[dx2p], 0\n"   // dx2
-                 "srai   %[u], %[sq], 8\n"      // s = sq >> 8
-                 "addx2  %[u], %[u], %[lut]\n"  // &lut[s]
-                 "extui  %[ph], %[kctr], 0, 2\n" // k & 3
-                 "l16ui  %[u], %[u], 0\n"       // nc_q8 = lut[s]
+                 "l8ui   %[v1], %[dx2p], 0\n"          // dx2
+                 "addi   %[dx2p], %[dx2p], 2\n"        // dx2p += 2 (next pair, done early: not needed again)
+                 "srai   %[u], %[sq], 8\n"             // s = sq >> 8
+                 "addx2  %[u], %[u], %[lut]\n"         // &lut[s]
+                 "extui  %[ph], %[kctr], 0, 2\n"       // k & 3
+                 "l16ui  %[u], %[u], 0\n"              // nc_q8 = lut[s]
+                 "sub    %[v1], %[envb], %[v1]\n"      // env_q8 = envBase - dx2
                  "addx4  %[ph], %[ph], %[ditherrow]\n" // &ditherRow[k&3]
-                 "sub    %[v1], %[envb], %[v1]\n" // env_q8 = envBase - dx2
-                 "l32i   %[ph], %[ph], 0\n"     // dith = ditherRow[k&3]
-                 "mull   %[u], %[u], %[v1]\n"   // nc_q8 * env_q8
-                 "add    %[sq], %[sq], %[stepq]\n" // sq += stepQ (mull-gap filler)
-                 "add    %[u], %[u], %[ph]\n"   // idxq = mull_result + dith
-                 "srai   %[u], %[u], 16\n"      // idx
-                 "addx2  %[u], %[u], %[lut]\n"  // &lut[idx]
-                 "addi   %[dx2p], %[dx2p], 1\n" // dx2p++
-                 "l16ui  %[u], %[u], 0\n"       // palette = lut[idx]
-                 "addi   %[kctr], %[kctr], 1\n" // kctr++
-                 "s16i   %[u], %[outp], 0\n"    // out[x] = palette
-                 "addi   %[outp], %[outp], 2\n" // outp++
+                 "l32i   %[ph], %[ph], 0\n"            // dith = ditherRow[k&3]
+                 "mull   %[u], %[u], %[v1]\n"          // nc_q8 * env_q8
+                 "add    %[sq], %[sq], %[stepq]\n"     // sq += stepQ2 (mull-gap filler)
+                 "add    %[u], %[u], %[ph]\n"          // idxq = mull_result + dith
+                 "srai   %[u], %[u], 16\n"             // idx
+                 "addx2  %[u], %[u], %[pal]\n"         // &pal[idx]
+                 "l16ui  %[u], %[u], 0\n"              // v = pal[idx]
+                 "addi   %[kctr], %[kctr], 1\n"        // kctr++
+                 "slli   %[v1], %[u], 16\n"            // v << 16
+                 "add    %[u], %[u], %[v1]\n"          // v | (v << 16)
+                 "s32i   %[u], %[outp], 0\n"           // out[pair] = v duplicated into both halves
+                 "addi   %[outp], %[outp], 4\n"        // outp += 4 (one pixel pair)
                  "1:\n"
                  : [sq] "+r"(sq), [dx2p] "+r"(dx2p), [outp] "+r"(outp), [kctr] "+r"(kctr), [u] "=&r"(u),
                    [v1] "=&r"(v1), [ph] "=&r"(ph)
-                 : [stepq] "r"(stepQ), [envb] "r"(envBase), [lut] "r"(lut), [ditherrow] "r"(ditherRow)
+                 : [stepq] "r"(stepQ2), [envb] "r"(envBase), [lut] "r"(lut), [pal] "r"(pal),
+                   [ditherrow] "r"(ditherRow)
                  : "memory");
 }
 #endif // __XTENSA__ && !GM_BGANIM_NO_ASM && GM_BGANIM_SILK_ASM
@@ -909,7 +954,7 @@ GM_ANIM_IRAM void bandRef(uint16_t *dst, int y0, int rows, int w, uint32_t, cons
     // pixel (one add + one shift, replacing three LUT reads), not the same
     // work four times over — so it doesn't reintroduce the register
     // pressure that sank the unroll. Don't conflate the two if revisiting
-    // this loop. (The asm pass's silkFastCell8Asm/silkExactCell8Asm above
+    // this loop. (The asm pass's silkFastCell16Asm/silkExactCell16Asm above
     // sidestep this whole problem by controlling register allocation
     // directly instead of asking GCC to find it.)
     for (int row = 0; row < rows; row++) {
@@ -1134,15 +1179,19 @@ GM_ANIM_IRAM void bandRef(uint16_t *dst, int y0, int rows, int w, uint32_t, cons
 #if defined(__XTENSA__) && !defined(GM_BGANIM_NO_ASM) && GM_BGANIM_SILK_ASM
 // On-device band(): identical algorithm to bandRef() above (the coarse-grid
 // node computation and curvature probe are unchanged C++), but the two
-// per-cell inner bodies -- the 8-pixel product ramp and the 8-pixel exact
-// fallback -- dispatch to the hand-written Xtensa kernels above instead of
-// the scalar C++ loops. See silkFastCell8Asm/silkExactCell8Asm's own
+// per-cell inner bodies, the 16-pixel product ramp and the 16-pixel exact
+// fallback, dispatch to the hand-written Xtensa kernels above instead of
+// the scalar C++ loops. See silkFastCell16Asm/silkExactCell16Asm's own
 // comments for why PIE doesn't apply here (gather-dominated, no vector
-// gather on this hardware) and for the scheduling. Kept pixel-exact with
-// bandRef() -- verified by tools/qemubench/tests/anim_silk/ against the
-// same scalar arithmetic transcribed by hand, and by
-// SleepAnimation::runAnimTest (/api/debug/animtest) against bandRef()
-// itself on the real chip.
+// gather on this hardware) and for the scheduling. This dispatch is kept
+// pixel-exact with the current bandRef() by construction (every value it
+// hands the kernels is computed the same way bandRef() computes its own
+// C++ path, and the kernels are transcribed from bandRef()'s own compiled
+// form), and checked against portable references transcribed from
+// bandRef() under QEMU (tools/qemubench/tests/anim_silk/). Not yet
+// checked by SleepAnimation::runAnimTest (/api/debug/animtest) against
+// bandRef() on the real chip: the bench board was offline when this port
+// was written.
 GM_ANIM_IRAM void band(uint16_t *dst, int y0, int rows, int w, uint32_t, const uint8_t *) {
     const float cy = w * 0.5f;
     uint32_t base[3];
@@ -1162,22 +1211,32 @@ GM_ANIM_IRAM void band(uint16_t *dst, int y0, int rows, int w, uint32_t, const u
         int32_t ncCur = g_lut[sCur];
         int32_t Pcur = ncCur * (envRowBase_q8 - g_dx2Node[0]);
         // dqArr holds the same four per-row dither constants bandRef()
-        // keeps as separate scalars -- the asm kernel needs them as an
-        // array to pass a single pointer argument (see
-        // silkFastCell8Asm's signature). Built once per row, like the
-        // scalar dq0..dq3 it replaces.
+        // keeps as separate scalars (dq0..dq3): the asm kernel needs them
+        // as an array to pass a single pointer argument (see
+        // silkFastCell16Asm's signature). Multiplied, not shifted, for the
+        // same reason bandRef() switched from a shift: the dither is
+        // signed now that the palette bias is out of it, and left-shifting
+        // a negative value is undefined behavior. Built once per row, like
+        // the scalar dq0..dq3 it mirrors.
         const int32_t dqArr[4] = {
-            g_ditherQ[yph * 4 + 0] << SILK_GRID_SHIFT,
-            g_ditherQ[yph * 4 + 1] << SILK_GRID_SHIFT,
-            g_ditherQ[yph * 4 + 2] << SILK_GRID_SHIFT,
-            g_ditherQ[yph * 4 + 3] << SILK_GRID_SHIFT,
+            g_ditherQ[yph * 4 + 0] * (1 << SILK_GRID_SHIFT),
+            g_ditherQ[yph * 4 + 1] * (1 << SILK_GRID_SHIFT),
+            g_ditherQ[yph * 4 + 2] * (1 << SILK_GRID_SHIFT),
+            g_ditherQ[yph * 4 + 3] * (1 << SILK_GRID_SHIFT),
         };
-        // silkExactCell8Asm's per-row dither operand (see its comment): the
-        // row's y-phase offset into g_ditherQ, folded into the pointer once
-        // here rather than into 4 preloaded scalars -- the round-3 kernel
-        // indexes it by the pixel's x-phase (0..3) at runtime inside its
-        // loop, matching GCC's own compiled schedule, so it takes the base
-        // pointer, not unshifted copies of its 4 entries.
+        // Palette base for both the fast and exact kernels below, same
+        // pointer and same reasoning as bandRef()'s own pal: the sixth
+        // pass moved the PALETTE_REAL_OFF bias out of the dither table and
+        // into this pointer, so the kernels index it directly instead of
+        // adding the bias per pixel.
+        const uint16_t *const pal = g_lut + PALETTE_REAL_OFF;
+        // silkExactCell16Asm's per-row dither operand (see its comment):
+        // the row's y-phase offset into g_ditherQ, folded into the pointer
+        // once here rather than into 4 preloaded scalars. The kernel
+        // indexes it by the pixel pair's phase (0..3) at runtime inside
+        // its loop via a fresh counter, matching GCC's own compiled
+        // schedule, so it takes the base pointer, not unshifted copies of
+        // its 4 entries.
         const int32_t *ditherRow = g_ditherQ + yph * 4;
         const int cellsFull = w >> SILK_GRID_SHIFT;
         int x = 0;
@@ -1192,23 +1251,32 @@ GM_ANIM_IRAM void band(uint16_t *dst, int y0, int rows, int w, uint32_t, const u
             int32_t bow = 2 * ncMid - (ncCur + ncNext);
             bow = bow < 0 ? -bow : bow;
             if (bow <= SILK_BOW_TOL) {
-                // FAST cell: see silkFastCell8Asm's comment above.
-                silkFastCell8Asm(out + x, Pcur << SILK_GRID_SHIFT, Pnext - Pcur, dqArr, g_lut);
+                // FAST cell: see silkFastCell16Asm's comment above. pal, not
+                // g_lut: the ramp's indices are relative to the palette base,
+                // not the combined contrast+palette table.
+                silkFastCell16Asm(out + x, Pcur << SILK_GRID_SHIFT, Pnext - Pcur, dqArr, pal);
             } else {
-                // EXACT cell: see silkExactCell8Asm's comment above.
-                const int32_t stepQ = (sNext - sCur) * (1 << (SILK_Q_BITS - SILK_GRID_SHIFT)); // a multiply, not a shift: the difference can be negative
-                silkExactCell8Asm(out + x, sCur << SILK_Q_BITS, stepQ, envRowBase_q8, g_dx2Row + x, ditherRow,
-                                   g_lut);
+                // EXACT cell: see silkExactCell16Asm's comment above. stepQ2
+                // is bandRef()'s paired step (the *2 accounts for the sixth
+                // pass's pixel-pair stride, matching bandRef()'s own
+                // stepQ2 exactly, not the pre-sixth-pass per-pixel step).
+                // a multiply, not a shift: the difference can be negative
+                const int32_t stepQ2 = (sNext - sCur) * (2 << (SILK_Q_BITS - SILK_GRID_SHIFT));
+                silkExactCell16Asm(out + x, sCur << SILK_Q_BITS, stepQ2, envRowBase_q8, g_dx2Row + x, ditherRow,
+                                   g_lut, pal);
             }
             x += SILK_GRID;
             sCur = sNext;
             ncCur = ncNext;
             Pcur = Pnext;
         }
-        // Exact tail for the row's non-grid-aligned remainder (0..7
-        // pixels; 0 at this panel's 480/240 widths, up to 2 at 466 -- see
+        // Exact tail for the row's non-grid-aligned remainder (0..15
+        // pixels; 0 at this panel's 480/240 widths, up to 2 at 466, see
         // bandRef()'s comment). Small and rare enough that hand-written
-        // asm is not worth it here; this is bandRef()'s tail, verbatim.
+        // asm is not worth it here; this is bandRef()'s tail, verbatim,
+        // including reading the output through pal (not g_lut: idxq's
+        // index is relative to the palette base since the sixth pass, see
+        // PALETTE_REAL_OFF's comment) and the pair-phase dither index.
         for (; x < w; x++) {
             const int32_t s = SIN_SUM_BIAS + sinFromTurn(a) + sinFromTurn(b) + sinFromTurn(c);
             a += g_step[0];
@@ -1216,9 +1284,9 @@ GM_ANIM_IRAM void band(uint16_t *dst, int y0, int rows, int w, uint32_t, const u
             c += g_step[2];
             const int32_t nc_q8 = g_lut[s];
             const int32_t env_q8 = envRowBase_q8 - g_dx2Row[x];
-            const int32_t idxq = nc_q8 * env_q8 + g_ditherQ[yph * 4 + (x & 3)];
+            const int32_t idxq = nc_q8 * env_q8 + g_ditherQ[yph * 4 + ((x >> 1) & 3)];
             const int idx = static_cast<int>(idxq >> 16);
-            out[x] = g_lut[idx];
+            out[x] = pal[idx];
         }
         base[0] += static_cast<uint32_t>(g_rowStep[0]);
         base[1] += static_cast<uint32_t>(g_rowStep[1]);
