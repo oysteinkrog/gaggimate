@@ -280,11 +280,21 @@ void action_on_brew_cancel(lv_event_t *e) {
 
 void action_on_standby(lv_event_t *e) { controller.activateStandby(); }
 
+// The pad only counts where LVGL will look: lv_indev_search_obj descends
+// into a container's children only for points inside the container's own
+// coords, unless the container has LV_OBJ_FLAG_OVERFLOW_VISIBLE. The
+// generated screens wrap most buttons in rows sized to the icons (a 50 px
+// value row, a 45 px save row), so a 15 px pad on a 40 px button used to be
+// a 50 px band: every ancestor short of the screen gets the flag. Measured
+// with tools/touchmap.py, which reports the effective rectangles.
 void applyClickArea(lv_obj_t *obj, lv_coord_t size) {
     if (obj == nullptr) {
         return;
     }
     lv_obj_set_ext_click_area(obj, size);
+    for (lv_obj_t *p = lv_obj_get_parent(obj); p != nullptr && lv_obj_get_parent(p) != nullptr; p = lv_obj_get_parent(p)) {
+        lv_obj_add_flag(p, LV_OBJ_FLAG_OVERFLOW_VISIBLE);
+    }
 }
 
 // Stop lv_meter drawing its own ticks (action_on_meter_draw takes over): stash the design count in the
@@ -314,6 +324,18 @@ static void suppressMeterTicks(lv_obj_t *obj) {
     }
 }
 
+// Hit areas, in panel pixels (0.111 mm/px on the 2.1" panel). Where two
+// pads overlap, the object created later wins (lv_indev_search_obj walks
+// children last to first), so a pad may only grow into a neighbour whose
+// action it is acceptable to lose that sliver to.
+//
+// The exit chevron sits at the bottom edge of the round glass (rows 430 to
+// 469), where the finger lands high and partly over the bezel: its box is
+// 175..304 x 385..479, of which the start/pause/select button above keeps
+// 195..284 x 385..414 (its own pad, created later), exactly what it kept
+// before. The menu's power button gets less (30): with 45 its box would
+// take the bottom-inner corners of the grind and water tiles' pads, and a
+// standby by mis-tap is worse than a missed one.
 void action_on_screen_load(lv_event_t *e) {
     suppressMeterTicks(lv_event_get_target(e));
     applyClickArea(objects.select_profile, 30);
@@ -325,15 +347,15 @@ void action_on_screen_load(lv_event_t *e) {
     applyClickArea(objects.btn_grind_1, 15);
     applyClickArea(objects.btn_settings_1, 15);
     applyClickArea(objects.info_btn, 15);
-    applyClickArea(objects.menu_dials__standby_icon, 20);
-    applyClickArea(objects.standby_btn, 20);
-    applyClickArea(objects.brew_dials__menu_icon, 20);
-    applyClickArea(objects.status_dials__menu_icon, 20);
-    applyClickArea(objects.steam_dials__menu_icon, 20);
-    applyClickArea(objects.water_dials__menu_icon, 20);
-    applyClickArea(objects.grind_dials__menu_icon, 20);
-    applyClickArea(objects.profile_dials__menu_icon, 20);
-    applyClickArea(objects.info_menu_icon, 20);
+    applyClickArea(objects.menu_dials__standby_icon, 30);
+    applyClickArea(objects.standby_btn, 30);
+    applyClickArea(objects.brew_dials__menu_icon, 45);
+    applyClickArea(objects.status_dials__menu_icon, 45);
+    applyClickArea(objects.steam_dials__menu_icon, 45);
+    applyClickArea(objects.water_dials__menu_icon, 45);
+    applyClickArea(objects.grind_dials__menu_icon, 45);
+    applyClickArea(objects.profile_dials__menu_icon, 45);
+    applyClickArea(objects.info_menu_icon, 45);
     applyClickArea(objects.start_button, 25);
     applyClickArea(objects.water_start_button, 25);
     applyClickArea(objects.grind_start_button, 25);
@@ -343,21 +365,30 @@ void action_on_screen_load(lv_event_t *e) {
     applyClickArea(objects.down_duration_button, 15);
     applyClickArea(objects.up_weight_button, 15);
     applyClickArea(objects.down_weight_button, 15);
+    // 20 px right of the weight "+": 10 keeps the boundary between them.
+    applyClickArea(objects.remove_volumetric_button, 10);
     applyClickArea(objects.up_temp_button, 15);
     applyClickArea(objects.down_temp_button, 15);
-    applyClickArea(objects.water_up_temp_button, 15);
-    applyClickArea(objects.water_down_temp_button, 15);
-    applyClickArea(objects.steam_up_temp_button, 15);
-    applyClickArea(objects.steam_down_temp_button, 15);
+    applyClickArea(objects.water_up_temp_button, 25);
+    applyClickArea(objects.water_down_temp_button, 25);
+    applyClickArea(objects.steam_up_temp_button, 25);
+    applyClickArea(objects.steam_down_temp_button, 25);
     applyClickArea(objects.grind_up_duration_button, 15);
     applyClickArea(objects.grind_down_duration_button, 15);
     applyClickArea(objects.grind_up_weight_button, 15);
     applyClickArea(objects.grind_down_weight_button, 15);
     applyClickArea(objects.pause_button, 25);
     applyClickArea(objects.check_button, 25);
-    applyClickArea(objects.accept_button, 20);
-    applyClickArea(objects.save_as_new_button, 20);
-    applyClickArea(objects.save_button, 20);
+    applyClickArea(objects.accept_button, 25);
+    applyClickArea(objects.save_as_new_button, 25);
+    applyClickArea(objects.save_button, 25);
+    // The grind screen's weight/time pill is one target, like the brew
+    // screen's, but its icon is an lv_imgbtn (clickable by default) rather
+    // than an lv_img: a tap on the icon landed on the icon, whose handler
+    // does nothing, instead of on the pill.
+    if (objects.obj24 != nullptr) {
+        lv_obj_clear_flag(objects.obj24, LV_OBJ_FLAG_CLICKABLE);
+    }
 }
 
 void action_on_screen_swipe(lv_event_t *e) {

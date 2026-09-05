@@ -1811,6 +1811,7 @@ void DefaultUI::buildScaleScreen() {
     lv_obj_t *exitBtn = lv_imgbtn_create(cover);
     lv_obj_set_size(exitBtn, 40, 40);
     lv_obj_align(exitBtn, LV_ALIGN_CENTER, 0, 210);
+    lv_obj_set_ext_click_area(exitBtn, 45); // same box as the dials' chevron (actions.cpp)
     lv_imgbtn_set_src(exitBtn, LV_IMGBTN_STATE_RELEASED, nullptr, &img_angle_up_40x40, nullptr);
     lv_obj_set_style_img_recolor(exitBtn, fg, LV_PART_MAIN);
     lv_obj_set_style_img_recolor_opa(exitBtn, LV_OPA_COVER, LV_PART_MAIN);
