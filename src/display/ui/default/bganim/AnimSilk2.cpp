@@ -93,6 +93,34 @@
 #define GM_ANIM_IRAM
 #endif
 
+// Master switch for the hand-written Xtensa kernel below (silk2PairRowAsm
+// and band()'s dispatch to it). OFF by default: this is Silk 2's first
+// hand-written kernel (every other animation in the fleet either ships one
+// or carries one flag-gated off, see CLAUDE.md's "Animation kernels"
+// section), transcribed from GCC 14's own compile of bandRef()'s pixel-pair
+// loop (tools/animbench/xtensa-asm14.sh AnimSilk2, xtensa-asm14/AnimSilk2.S,
+// 2026-09-05) rather than reinvented: that loop was ALREADY a hardware
+// zero-overhead LOOP (GCC chose not to unroll it), 20 instructions per
+// pixel pair, and every load in it already has at least one independent
+// instruction before its result is consumed (checked by hand against the
+// .S; the tightest gap, the palette low-half gather into the final OR, has
+// exactly one, matching the load-use latency this chip needs to hide a
+// 16-bit load for free). No stall to fix and no address recompute a
+// walking pointer could remove (the two lut gathers are genuinely
+// data-dependent, cfA[x]+cfB[x]+sh, not a fixed stride), so
+// silk2PairRowAsm below is a straight transcription, mnemonic for
+// mnemonic, not a rescheduled one (the same outcome AnimSilk.cpp's own
+// port notes happened for some of its cells and not others). Verified
+// bit-exact against a portable C reference under QEMU
+// (tools/qemubench/tests/anim_silk2), not yet measured on real hardware:
+// the bench board was offline when this was written.
+// -DGM_BGANIM_SILK2_ASM=1 re-enables it for that measurement; the flag
+// stays off until a production A/B (camshots/anim_devbench.py) shows a
+// win, the same rule every other kernel in this file's family follows.
+#ifndef GM_BGANIM_SILK2_ASM
+#define GM_BGANIM_SILK2_ASM 0
+#endif
+
 namespace {
 using namespace bganim;
 
@@ -523,13 +551,106 @@ void frame(uint32_t tMs, int w, int h, const uint8_t p[4]) {
     g_sheenWt = static_cast<uint32_t>(static_cast<int64_t>(wRateQ) * static_cast<int64_t>(tMs));
 }
 
-// The portable spec, registered as both band() and bandRef() below (see the
-// registry entry): this animation ships no hand-written kernel this round.
-// Stateless across calls -- the sheen row phase is rebuilt from the
-// absolute y every call (like AnimSilk.cpp's base[]), never carried from a
-// previous band() call -- so any band height, and the interlaced rows==1
-// path, render identically to a full-frame pass.
-GM_ANIM_IRAM void band(uint16_t *__restrict dst, int y0, int rows, int w, uint32_t, const uint8_t *) {
+#if defined(__XTENSA__) && !defined(GM_BGANIM_NO_ASM) && GM_BGANIM_SILK2_ASM
+// Hand-written Xtensa kernel for bandRef()'s pixel-pair loop (see the
+// master switch comment above for how this was derived and why it is a
+// straight transcription rather than a rescheduled one).
+//
+// Processes every full pixel PAIR in one row via a single hardware
+// zero-overhead LOOP (LOOPNEZ, not a plain LOOP: nPairs is a runtime value
+// here, w>>1, not a compile-time constant, so the zero-trip case must be
+// handled by the instruction itself, the same reason AnimPlasma.cpp's
+// plasmaRowAsm and AnimEmber.cpp's emberFinalizeRow both use LOOPNEZ for
+// their own data-dependent trip counts).
+//
+//   out:      row's output, w consecutive uint16_t (nPairs*2 filled, one
+//             s32i per pair).
+//   cfA:      colFoldA + padA + shiftTableA[y], read at offsets 0 and 2
+//             (cfA[x], cfA[x+1]) every pair, walked forward 4 bytes (one
+//             pixel pair) per iteration.
+//   cfB:      colFoldB + padB + shiftTableB[y], read once per pair at
+//             offset 0 (cfB[x]), same walking-pointer stride as cfA.
+//   lut:      g_lut2 + SUM_BIAS + rowVign[y], this row's palette base:
+//             bandRef()'s own lut, unchanged.
+//   sheenLut: g_sheenLut, the shared per-pixel sine gather, read once per
+//             pair at (turn >> 22).
+//   turn:     the row's starting Q32 turn phase (g_sheenWt this frame, plus
+//             g_sheenRowStep*y, already folded in by the caller); returned
+//             as the value AFTER nPairs pairs, so a caller with a
+//             non-grid-aligned tail (odd w; never happens at this panel's
+//             480/240 widths, see CLAUDE.md) can resume bandRef()'s own
+//             scalar tail from the exact phase it would have reached.
+//   step2:    static_cast<int32_t>(static_cast<uint32_t>(g_sheenStep)*2u),
+//             the per-PAIR turn step bandRef() adds once per iteration.
+//   nPairs:   w >> 1. Never negative (w is always non-negative); may be 0
+//             for a 0- or 1-pixel row, which LOOPNEZ skips cleanly with no
+//             separate C++ guard needed.
+//
+// Register budget: out, cfA, cfB, turn (4, updated every iteration) + lut,
+// sheenLut, step2, nPairs (4, live constants) + t0..t3 (4, scratch) = 12,
+// under the ~13-14 usable-AR ceiling ASM_BRIEF.md documents.
+//
+// Never writes CPENABLE (see CLAUDE.md's "Animation kernels" section): no
+// coprocessor instruction appears anywhere in this kernel.
+GM_ANIM_IRAM __attribute__((noinline)) uint32_t silk2PairRowAsm(uint16_t *out, const int16_t *cfA,
+                                                                  const int16_t *cfB, const uint16_t *lut,
+                                                                  const int16_t *sheenLut, uint32_t turn,
+                                                                  int32_t step2, int nPairs) {
+    uint16_t *outp = out;
+    const int16_t *cfap = cfA;
+    const int16_t *cfbp = cfB;
+    int32_t t0, t1, t2, t3;
+    // Instruction-for-instruction transcription of GCC 14's own compiled
+    // .L4/.L4_LEND loop body for this file's bandRef() (xtensa-asm14/
+    // AnimSilk2.S, 2026-09-05): 20 instructions per pair, zero unhidden
+    // load-use stalls (every loaded value has at least one independent
+    // instruction, usually two or three, before it is consumed; the
+    // tightest gap is the palette low-half gather (t0) into the final OR,
+    // one instruction, the same margin GCC itself used). No edit found:
+    // the two lut addresses are genuinely data-dependent gathers, not a
+    // fixed stride a walking pointer could replace, and nothing upstream
+    // of them was left with slack GCC had not already claimed.
+    asm volatile("loopnez %[n], 1f\n"
+                 "extui   %[t0], %[turn], 22, 10\n" // sh index = turn>>22 (10 bits: SIN_N==1024)
+                 "addx2   %[t0], %[t0], %[sl]\n"     // &sheenLut[idx]
+                 "l16si   %[t1], %[cfb], 0\n"        // cfB[x]
+                 "l16si   %[t0], %[t0], 0\n"         // sh = sheenLut[idx]
+                 "l16si   %[t2], %[cfa], 2\n"        // cfA[x+1]
+                 "l16si   %[t3], %[cfa], 0\n"        // cfA[x]
+                 "add     %[t0], %[t1], %[t0]\n"     // b = cfB[x] + sh
+                 "add     %[t2], %[t2], %[t0]\n"     // idx1 = cfA[x+1] + b
+                 "addx2   %[t2], %[t2], %[lut]\n"    // &lut[idx1]
+                 "add     %[t0], %[t3], %[t0]\n"     // idx0 = cfA[x] + b
+                 "l16ui   %[t2], %[t2], 0\n"         // p1 = lut[idx1]
+                 "addx2   %[t0], %[t0], %[lut]\n"    // &lut[idx0]
+                 "l16ui   %[t0], %[t0], 0\n"         // p0 = lut[idx0]
+                 "slli    %[t2], %[t2], 16\n"        // p1 << 16
+                 "or      %[t2], %[t2], %[t0]\n"     // pack p0 | (p1<<16)
+                 "s32i    %[t2], %[out], 0\n"        // store pair
+                 "add     %[turn], %[turn], %[step2]\n" // turn += step2 (per-pair)
+                 "addi    %[out], %[out], 4\n"       // out += 2 pixels
+                 "addi    %[cfb], %[cfb], 4\n"       // cfB pointer += 2 int16 (next pair's x)
+                 "addi    %[cfa], %[cfa], 4\n"       // cfA pointer += 2 int16
+                 "1:\n"
+                 : [out] "+r"(outp), [cfa] "+r"(cfap), [cfb] "+r"(cfbp), [turn] "+r"(turn), [t0] "=&r"(t0),
+                   [t1] "=&r"(t1), [t2] "=&r"(t2), [t3] "=&r"(t3)
+                 : [sl] "r"(sheenLut), [lut] "r"(lut), [step2] "r"(step2), [n] "r"(nPairs)
+                 : "memory");
+    return turn;
+}
+#endif // __XTENSA__ && !GM_BGANIM_NO_ASM && GM_BGANIM_SILK2_ASM
+
+// bandRef(): the portable, pixel-exact reference implementation (this
+// file's spec, see BgAnim.h's bandRef field comment). Used directly as
+// band() on non-Xtensa builds (host bench) and always as bandRef() so
+// SleepAnimation::runAnimTest (/api/debug/animtest) can compare it against
+// the hand-written Xtensa kernel on the device. Stateless across calls:
+// the sheen row phase is rebuilt from the absolute y every call (like
+// AnimSilk.cpp's base[]), never carried from a previous band() call, so
+// any band height, and the interlaced rows==1 path, render identically to
+// a full-frame pass. Unchanged by this round's kernel port: this is still
+// the spec, not touched.
+GM_ANIM_IRAM void bandRef(uint16_t *__restrict dst, int y0, int rows, int w, uint32_t, const uint8_t *) {
     // __restrict on dst/cfA/cfB/lut: the compiler otherwise has to assume a
     // write through dst could alias colFoldA/colFoldB/g_lut2 (int16_t and
     // uint16_t are distinct types but the same width, so a strict-aliasing
@@ -633,6 +754,43 @@ GM_ANIM_IRAM void band(uint16_t *__restrict dst, int y0, int rows, int w, uint32
     }
 }
 
+#if defined(__XTENSA__) && !defined(GM_BGANIM_NO_ASM) && GM_BGANIM_SILK2_ASM
+// On-device band(): identical algorithm to bandRef() above (all per-row
+// setup, lut, cfA, cfB, turn, computed exactly the same way), but the
+// pixel-pair loop dispatches to silk2PairRowAsm above instead of the
+// scalar C++ loop. The row's non-grid-aligned tail (0 or 1 pixel; 0 at
+// this panel's 480/240 widths, see CLAUDE.md) resumes from the turn value
+// silk2PairRowAsm returns, so it runs bandRef()'s own scalar tail
+// verbatim.
+GM_ANIM_IRAM void band(uint16_t *__restrict dst, int y0, int rows, int w, uint32_t, const uint8_t *) {
+    const int32_t sheenStep = g_sheenStep;
+    const int32_t sheenStep2 = static_cast<int32_t>(static_cast<uint32_t>(sheenStep) * 2u);
+    const uint16_t *__restrict lutBase = g_lut2 + SUM_BIAS;
+    for (int row = 0; row < rows; row++) {
+        const int y = y0 + row;
+        uint16_t *__restrict out = dst + static_cast<size_t>(row) * w;
+        uint32_t turn = g_sheenWt + static_cast<uint32_t>(g_sheenRowStep) * static_cast<uint32_t>(y);
+        const uint16_t *__restrict lut = lutBase + rowVign[y];
+        const int16_t *__restrict cfA = colFoldA + padA + shiftTableA[y];
+        const int16_t *__restrict cfB = colFoldB + padB + shiftTableB[y];
+        const int nPairs = w >> 1;
+        turn = silk2PairRowAsm(out, cfA, cfB, lut, g_sheenLut, turn, sheenStep2, nPairs);
+        for (int x = nPairs << 1; x < w; x++) {
+            const int32_t sh = sinFromTurn(turn);
+            turn += static_cast<uint32_t>(sheenStep);
+            out[x] = lut[cfA[x] + cfB[x] + sh];
+        }
+    }
+}
+#else
+// No Xtensa kernel to dispatch to on this build (host bench): band() is
+// bandRef() byte for byte, so the host golden comparison exercises the
+// same code either way.
+void band(uint16_t *dst, int y0, int rows, int w, uint32_t tMs, const uint8_t *p) {
+    bandRef(dst, y0, rows, w, tMs, p);
+}
+#endif // __XTENSA__ && !GM_BGANIM_NO_ASM && GM_BGANIM_SILK2_ASM
+
 void release() {
     releaseTable(g_lut2, static_cast<size_t>(SUM_N) * sizeof(uint16_t));
     releaseTable(g_sheenLut, static_cast<size_t>(SIN_N) * sizeof(int16_t));
@@ -663,7 +821,7 @@ const BgAnimation bg_anim_silk2 = {
     frame,
     band,
     release,
-    band, // bandRef == band: portable C++, no Xtensa kernel this round
+    bandRef,
 };
 
 #endif // GAGGIMATE_SIM
