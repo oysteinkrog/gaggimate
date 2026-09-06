@@ -3,7 +3,7 @@ title: esp-dsp, esp-nn and vendor kernel libraries as a frontier
 id: 08-frontiers/esp-dsp-esp-nn-and-vendor-kernel-libraries
 schema_version: 1
 doc_type: explanation
-status: draft
+status: review
 last_reviewed: 2026-09-06
 tags: [esp32s3, xtensa, pie, esp-nn, esp-dl, esp-dsp, esp32-p4, esp32-s31, roadmap]
 confidence: medium
@@ -44,8 +44,14 @@ push-on-master trigger, use directories-based upload (reads version from
 so the registry is the more current source for "what shipped," and a git
 tag list understates how many releases a project pinning
 `idf_component.yml` actually saw. `esp-dsp` has not adopted the same
-untagged cadence as of `v1.8.2`; its registry and tag histories still
-match[^2][^3].
+untagged cadence as of `v1.8.2`: its recent releases (`v1.6.0` onward)
+have a matching git tag and registry entry for each version. That is not
+true of its whole history: the registry also carries several older patch
+releases (`1.2.1`, `1.3.1`, `1.3.3` through `1.3.5`, `1.4.1`, `1.4.4`
+through `1.4.12`, among others) with no matching git tag at all, and the
+git history has at least one tag, `v1.4.14`, absent from the registry.
+So "registry and tags still match" holds for the release line this
+document tracks, not as a claim about the whole project[^2][^3].
 
 ## What the recent esp-nn releases added on ESP32-S3
 
@@ -91,10 +97,10 @@ that tag here.
 
 While reading `esp-nn` v1.3.0's dispatch code for this document, one
 target name did not match anything in this repository's build: `esp32s31`.
-It is not a typo for ESP32-S3. Espressif announced the ESP32-S31 in
-2026-04 as a dual-core RISC-V SoC (Wi-Fi 6, Bluetooth 5.4, IEEE 802.15.4,
-Gigabit Ethernet), with mass production and general availability
-confirmed by 2026-07[^9]. `esp-nn` added a merge request titled "feat: add
+It is not a typo for ESP32-S3. Espressif announced the ESP32-S31 on
+2026-03-26 as a dual-core RISC-V SoC (Wi-Fi 6, Bluetooth 5.4, IEEE 802.15.4,
+Ethernet), and confirmed mass production and general availability on
+2026-07-27[^9]. `esp-nn` added a merge request titled "feat: add
 ESP32-S31 support" that landed in `v1.3.0`[^6], and `esp-dsp`'s `v1.8.x`
 series added a parallel `_arp4`-suffixed kernel family (21 files at
 `v1.8.2`: dot products, FIR, biquad, FFT, matrix multiply) that both
@@ -123,17 +129,19 @@ internals are out of this document's scope. `[uncertain]`
 Unlike `esp-dsp`, `esp-dl` (Espressif's inference framework for
 quantized models, MIT-licensed[^15]) is not obviously a kernel library
 from its name, so it is worth confirming directly: at `v3.3.11` it
-carries 58 `.S` files under `dl/base/isa/tie728/` (Espressif's internal
-name for the ESP32-S3 TIE PIE core config) and a parallel set under
-`dl/base/isa/esp32p4/`[^16]. Coverage spans convolution, depthwise
+carries 58 `.S` files plus one `.h` file under `dl/base/isa/tie728/`
+(Espressif's internal name for the ESP32-S3 TIE PIE core config) and a
+parallel set under `dl/base/isa/esp32p4/`[^16]. Coverage spans convolution, depthwise
 convolution, matmul, add/sub/mul, pooling, requantization, PReLU, ReLU,
 transpose and comparison ops, each usually with a plain and an
 `_unaligned_` variant, dispatched at compile time through
 `CONFIG_PIE_V1_BOOST` (TIE728) versus `CONFIG_PIE_V2_BOOST`
-(ESP32-P4/ESP32-S31)[^17]. `[uncertain]`: this document did not locate
-which ESP-IDF version or component first defines those two Kconfig
-symbols; they do not exist in the copy of ESP-IDF 5.5.1 this repository
-builds against, so `esp-dl`'s PIE dispatch likely needs a newer IDF.
+(ESP32-P4/ESP32-S31)[^17]. These are not ESP-IDF Kconfig symbols at all:
+`esp-dl` defines both itself, as plain preprocessor macros gated on the
+real IDF target symbols (`CONFIG_IDF_TARGET_ESP32S3`,
+`CONFIG_IDF_TARGET_ESP32P4`, `CONFIG_IDF_TARGET_ESP32S31`), so any
+ESP-IDF version that knows those three targets is enough; no newer IDF
+is required for this specific dispatch[^17].
 
 `esp-dl`'s own conv2d kernel on ESP32-S3 uses the same instruction family
 this KB's `02-pie-vector` bucket already documents in full
@@ -165,10 +173,15 @@ own code[^20].
 ## A documented alignment bug, and what fixed it
 
 `esp-nn` issue #21, closed 2026-08-19, reported ESP32-S3's ReLU6 kernel
-returning wrong values at one specific unaligned position: a 17-element
-input produced a correct result everywhere except position 15, where a
-value of `23` should have clamped to `6` and instead passed through
-unclamped[^21]. The RISC-V port's ReLU kernel comment names this issue
+returning wrong values on an unaligned buffer. The reporter's own log shows
+a mismatch at one position in a 17-element run, but the number in that log
+does not match the array literal in the same report, so it is not a clean
+reproduction on its own. The maintainer's own follow-up isolates the real
+defect: passing the same kernel a pointer offset by one byte from a
+16-byte boundary, an input value of `127` at the last position is expected
+to clamp to `6` and instead passes through unclamped as `127`, confirming
+the kernel silently misreads an unaligned buffer rather than rejecting or
+correcting for it[^21]. The RISC-V port's ReLU kernel comment names this issue
 directly while explaining its own fix: "`esp.vld.128`/`esp.vst.128` need a
 16-byte aligned address (verified on ESP32-S31: unaligned pointers get
 processed lane-shifted, see github.com/espressif/esp-nn issue #21 for the
@@ -208,7 +221,7 @@ was not the operation the first pass optimized.
 
 | Idiom | Library | Where |
 |---|---|---|
-| Compile-time PIE-generation dispatch keyed to Kconfig (`PIE_V1_BOOST` / `PIE_V2_BOOST`), not a runtime chip check | esp-dl | `dl/base/isa/dl_base_isa.hpp`[^17] |
+| Compile-time PIE-generation dispatch keyed to its own local macros (`PIE_V1_BOOST` / `PIE_V2_BOOST`, derived from the real per-target Kconfig symbols), not a runtime chip check | esp-dl | `dl/base/isa/dl_base_isa.hpp`[^17] |
 | One reusable dot-product primitive (aligned and unaligned entry points) shared by every caller that reduces to a dot product, instead of each kernel inlining its own | esp-nn | `src/common/esp_nn_dot_s8_esp32s3.S`[^7] |
 | Route a small-channel-count case through a flattened dot product instead of running the general vector path with padded, wasted lanes | esp-nn | v1.2.0-v1.3.0 conv im2col change[^6] |
 | Choose `ACCX` for a single reduced scalar, `QACC` for one accumulator per output lane; do not default to one register for both shapes | esp-nn (ACCX) vs esp-dl (QACC) | [^7][^18], semantics in `02-pie-vector`[^19] |
@@ -218,9 +231,6 @@ was not the operation the first pass optimized.
 
 ## Open questions
 
-- Which ESP-IDF release first defines `CONFIG_PIE_V1_BOOST` and
-  `CONFIG_PIE_V2_BOOST`, and what selects between them per target.
-  `[uncertain]`, see above.
 - Whether ESP32-P4/ESP32-S31's RISC-V PIE extension and ESP32-S3's Xtensa
   PIE are the same microarchitectural design retargeted, or independently
   designed extensions that converged on a similar instruction shape
@@ -247,19 +257,19 @@ was not the operation the first pass optimized.
 [^5]: `github.com/espressif/esp-nn`, commit message "Bump version to 1.2.0, update component upload workflow, add P4 to README" (part of the `v1.1.2`-to-`v1.2.0` range), via `gh api repos/espressif/esp-nn/compare/v1.1.2...v1.2.0`, fetched 2026-09-06.
 [^6]: `github.com/espressif/esp-nn`, commit messages in the `v1.2.0`-to-`v1.3.0` range, via `gh api repos/espressif/esp-nn/compare/v1.2.0...v1.3.0`, fetched 2026-09-06. Commits quoted: "conv: S3 optimizations - im2col path, filter precompute, padding fix"; "depthwise_conv: S3 optimizations - dispatch, row-tiling, ch=8 fast path"; "fully_connected: S3 MAC16 assembly + C wrapper with multiple fast paths"; "softmax: add ESP32-S3 optimized implementation"; "avg_pool: add S3 C wrapper with int16 accumulation fallback"; "fix(depthwise/s3): initialize scratch for null bias" and its follow-up test commit; "fix(depthwise): size scratch for asymmetric padding on esp32s3"; "Merge branch 'feature/esp32s31_support'".
 [^7]: `esp-nn` `src/common/esp_nn_dot_s8_esp32s3.S`, same repo/tag, full file (142 lines): header comment lines 8-15; `esp_nn_dot_s8_aligned_esp32s3` label line 33, `ee.zero.accx` line 36, fused MAC-and-load `ee.vmulas.s8.accx.ld.ip` line 51, final MAC line 57, `rur.accx_0` readout line 63; `esp_nn_dot_s8_unaligned_esp32s3` label line 83, USAR/QUP body lines 105-131. Commit "Add shared esp_nn_dot_s8 assembly and use in FC + conv", same compare range as [^6].
-[^8]: `esp-nn` `README.md`, same repo/tag, "Kernelwise performance for s8 versions" ESP32-S3 table (lines approx. 62-77) and the commit "Bump version to 1.2.1, update S3 performance numbers in README" in the same compare range as [^6], which states the before/after ratios directly: "conv 1x1 14.24x (was 10.06x), FC 7.83x (was 2.77x), relu6 11.48x (was 9.87x), max_pool 7.83x (was 6.33x)."
-[^9]: Espressif Systems news pages, fetched via web search 2026-09-06: "ESP32-S31 Now in Mass Production and Available for Purchase," `espressif.com/en/news/ESP32_S31_Mass_Production`; "Espressif Unveils ESP32-S31: A Dual-Core RISC-V SoC with Wi-Fi 6, Bluetooth 5.4, and Advanced HMI Capabilities," `espressif.com/en/news/ESP32_S31_Release`; product page `espressif.com/en/products/socs/esp32-s31`. Announcement dated 2026-04 per contemporaneous coverage (Hackster.io, Adafruit blog, Hackaday, 2026-04-07/08); mass production coverage dated 2026-07/08. This document did not independently open the Espressif news pages beyond the search result; the announcement and mass-production dates are `[uncertain]` to the extent they rely on third-party tech-press summaries rather than a directly fetched Espressif page.
+[^8]: `esp-nn` `README.md`, same repo/tag, "Kernelwise performance for s8 versions" ESP32-S3 table (lines 64-81) and the commit "Bump version to 1.2.1, update S3 performance numbers in README" in the same compare range as [^6], which states the before/after ratios directly: "conv 1x1 14.24x (was 10.06x), FC 7.83x (was 2.77x), relu6 11.48x (was 9.87x), max_pool 7.83x (was 6.33x)."
+[^9]: Espressif Systems news and product pages, directly fetched 2026-09-06. `espressif.com/en/news/ESP32_S31_Release`, headline "Espressif Unveils ESP32-S31: A Dual-Core RISC-V SoC with Wi-Fi 6, Bluetooth 5.4, and Advanced HMI Capabilities," published 2026-03-26. `espressif.com/en/news/ESP32_S31_Mass_Production`, headline "ESP32-S31 Now in Mass Production and Available for Purchase," published 2026-07-27, opening line "Espressif Systems announces that its ESP32-S31 has entered mass production and is now available for purchase." Product page `espressif.com/en/products/socs/esp32-s31` describes the part as "a high-performance dual-core 32-bit RISC-V microcontroller running at up to 320 MHz" with 2.4 GHz Wi-Fi 6, IEEE 802.15.4, Bluetooth 5.4 LE plus Classic, and a 1000 Mbps Ethernet MAC, matching this document's chip description. All three pages were read directly, not taken from tech-press summaries.
 [^10]: `esp-dsp` `v1.8.2`, `find . -iname '*_arp4.S'` under `modules/`, 21 files, cloned repo, fetched 2026-09-06 (list includes `dspm_mult_s16_arp4.S`, `dspm_mult_ex_f32_arp4.S`, `dspm_mult_f32_arp4.S`, the `dspi_dotprod_*_arp4.S` family, `dsps_dotprod_s16_arp4.S`, `dsps_dotprode_f32_arp4.S`, `dsps_dotprod_f32_arp4.S`, `dsps_fft2r_sc16_arp4.S`, `dsps_fft2r_fc32_arp4.S`, `dsps_fft4r_fc32_arp4.S`, `dsps_fird_s16_arp4.S`, `dsps_fird_f32_arp4.S`, `dsps_biquad_f32_arp4.S`); dispatch guard `#if CONFIG_IDF_TARGET_ESP32P4 || CONFIG_IDF_TARGET_ESP32S31` in `modules/dotprod/include/dsps_dotprod_platform.h`, line 31.
 [^11]: `esp-nn` `include/esp_nn.h`, same repo/tag, lines 19-20; identical guard and comment also in top-level `CMakeLists.txt`, lines 57-58.
 [^12]: `esp-dl` `operator_support_state.md`, same repo/tag, "Quantization Strategy" section: "ESP32-S3 - PIE V1 instructions. Rounding strategy: rounding half up... ESP32-P4 / ESP32-S31 - PIE V2 instructions. Rounding strategy: rounding half to even."
 [^13]: `esp-nn` `src/activation_functions/esp_nn_relu_s8_riscv_pie.c`, same repo/tag, line 46 comment "esp.* GPR operands must be x26-x31 (required on S31)"; same constraint repeated in `src/convolution/esp_nn_conv_riscv_pie.c` line 348 and `src/softmax/esp_nn_softmax_s8_riscv_pie.c` line 77.
 [^14]: `github.com/espressif/esp-nn` issue #11, "Support for ESP32-P4?", fetched via `gh api repos/espressif/esp-nn/issues/11` and `.../issues/11/comments` 2026-09-06. Closed 2026-04-27. Quotes are the maintainer `vikramdattu`'s comments in that thread, in the order they appear there.
 [^15]: `esp-dl` `LICENSE`, same repo/tag: MIT License, Copyright (c) 2021 Espressif Systems (Shanghai) Co., Ltd. (`esp-nn` and `esp-dsp` are both Apache-2.0, confirmed from each repo's own `LICENSE` file, matching the citation in the sibling `esp-dsp` document.)
-[^16]: `esp-dl` `esp-dl/dl/base/isa/tie728/` and `esp-dl/dl/base/isa/esp32p4/`, same repo/tag, file counts by direct listing (58 `.S`/`.h` files under `tie728/`); "TIE728" naming confirmed in `tools/agents/skills/espdl-operator/SKILL.md`, "SIMD Architecture Overview": "ESP32-S3 (TIE728): Xtensa SIMD with 128-bit SIMD registers (Q registers)... ESP32-P4: RISC-V with PIE vector extension."
-[^17]: `esp-dl` `esp-dl/dl/base/isa/dl_base_isa.hpp`, same repo/tag, lines 1-14 (`#if CONFIG_XTENSA_BOOST` / `CONFIG_PIE_V1_BOOST` / `CONFIG_PIE_V2_BOOST` guarding the three ISA headers); same macros referenced through `esp-dl/dl/base/dl_base.hpp` lines 45, 207, 245, 433. `[uncertain]`: the Kconfig symbol definitions were not located in this repository's local ESP-IDF 5.5.1 checkout (`~/.platformio/packages/framework-espidf`); likely defined in a newer IDF's SoC capability headers, not confirmed here.
+[^16]: `esp-dl` `esp-dl/dl/base/isa/tie728/` and `esp-dl/dl/base/isa/esp32p4/`, same repo/tag, file counts via `gh api repos/espressif/esp-dl/git/trees/v3.3.11?recursive=1`, filtered to paths under `dl/base/isa/tie728/`: 58 files ending `.S`, 1 file ending `.h`, 59 total; "TIE728" naming confirmed in `tools/agents/skills/espdl-operator/SKILL.md`, "SIMD Architecture Overview": "ESP32-S3 (TIE728): Xtensa SIMD with 128-bit SIMD registers (Q registers)... ESP32-P4: RISC-V with PIE vector extension."
+[^17]: `esp-dl` `esp-dl/dl/base/isa/dl_base_isa.hpp`, same repo/tag, lines 1-14 (`#if CONFIG_XTENSA_BOOST` / `CONFIG_PIE_V1_BOOST` / `CONFIG_PIE_V2_BOOST` guarding the three ISA headers); same macros referenced through `esp-dl/dl/base/dl_base.hpp` lines 45, 207, 245, 433. The three macros are defined in `esp-dl/dl/dl_define_private.hpp`, lines 24-40: `CONFIG_XTENSA_BOOST` is 1 when `CONFIG_IDF_TARGET_ESP32 || CONFIG_IDF_TARGET_ESP32S3`, `CONFIG_PIE_V1_BOOST` is 1 when `CONFIG_IDF_TARGET_ESP32S3`, and `CONFIG_PIE_V2_BOOST` is 1 when `CONFIG_IDF_TARGET_ESP32P4 || CONFIG_IDF_TARGET_ESP32S31`, each 0 otherwise. These are `esp-dl`'s own local macros, not ESP-IDF Kconfig symbols; the real Kconfig inputs are the standard per-target `CONFIG_IDF_TARGET_*` symbols, which is why they were not found as their own entries in this repository's ESP-IDF 5.5.1 checkout.
 [^18]: `esp-dl` `esp-dl/dl/base/isa/tie728/dl_tie728_s8_conv2d.S`, same repo/tag, lines 9, 25-33: comment "scalar * vecter and accumulate into QACC", instruction `EE.VSMULAS.S8.QACC.LD.INCP`.
 [^19]: ESP32-S3 Technical Reference Manual, version 1.8 (local text, this repository's `docs-src/esp32s3-trm-v1.8.txt`), section 1.3.3 "QACC Accumulator Register" and 1.3.4 "ACCX Accumulator Register", page 41: "The QACC accumulator register is used for multiplication-accumulation operations on 8-bit or 16-bit data... QACC consists of 16 accumulator registers with 20-bit width [for 8-bit data]"; "Some operations require accumulating the result of all multipliers to one value. In this case, the ACCX accumulator should be used... ACCX is a 40-bit accumulator register." Full instruction semantics for both registers are in this KB's [`pie-arithmetic-multiply-saturate-and-shuffle`](../02-pie-vector/pie-arithmetic-multiply-saturate-and-shuffle.md), not repeated here.
-[^20]: `esp-dl` `tools/agents/skills/espdl-operator/SKILL.md` (773 lines) and `tools/agents/skills/espdl-operator/references/esp-dl-templates.md`, same repo/tag. Quotes: Phase 7.4 "Important SIMD Conventions" - "Do NOT use `.section .iram1`... Let the linker place functions in flash by default"; Phase 7.3 "Always handle both aligned and unaligned cases."
-[^21]: `github.com/espressif/esp-nn` issue #21, fetched via `gh api repos/espressif/esp-nn/issues/21` 2026-09-06. Closed 2026-08-19. Reproduction shows a ReLU6 kernel returning `23` (unclamped) instead of `6` at input position 15 of a 17-element buffer.
+[^20]: `esp-dl` `tools/agents/skills/espdl-operator/SKILL.md` (773 lines) and `tools/agents/skills/espdl-operator/references/esp-dl-templates.md`, same repo/tag. Quotes, both from Phase 7.4 "Important SIMD Conventions": "Do NOT use `.section .iram1`... Let the linker place functions in flash by default"; "Always handle both aligned and unaligned cases."
+[^21]: `github.com/espressif/esp-nn` issue #21, "incorrect result in rule6 running on esp32s3", fetched via `gh api repos/espressif/esp-nn/issues/21` and `.../issues/21/comments` 2026-09-06. Closed 2026-08-19. The reporter's own log (issue body) shows a mismatch at buffer position 15 of a 17-element `int8_t` array: it expects `6` and gets `23`. But the array literal in that same report's "steps to reproduce" code has `127`, not `23`, at that index. The two do not match, and the report does not say why. The maintainer's second comment gives a clean reproduction instead. It uses an 18-element buffer processed from offset 1, which puts the pointer one byte off a 16-byte boundary. The last position holds source value `127`, expected to clamp to `6`; it passes through unclamped as `127` instead.
 [^22]: `esp-nn` `src/activation_functions/esp_nn_relu_s8_riscv_pie.c`, same repo/tag, lines 26-30, comment directly citing issue #21 and describing the scalar head-alignment loop that follows.
 [^23]: Alignment-precondition idiom (OR-then-mask two pointers before the vector path, or a scalar head loop up to the next aligned address) documented with esp-dsp examples in [`esp-dsp-as-a-reference-kernel-library`](../06-kernel-patterns/esp-dsp-as-a-reference-kernel-library.md), "Alignment and length preconditions" section.

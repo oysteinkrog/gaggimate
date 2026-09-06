@@ -46,7 +46,7 @@ BUCKET_TO_SCHEMA: dict[str, str] = {}
 KNOWN_BUCKETS = frozenset(BUCKET_TO_SCHEMA)
 
 # Top-level docs that get the base schema regardless of which directory they
-# sit in (root or topic root). CLAUDE.md / AGENTS.md are excluded — they are
+# sit in (root or topic root). CLAUDE.md / AGENTS.md are excluded; they are
 # harness, not content.
 TOP_LEVEL_DOCS = {"README.md", "MASTER-PLAN.md", "COMPENDIUM.md", "PROGRESS.md",
                   "FINAL-CONVERGENCE-REPORT.md", "CONTRIBUTING.md"}

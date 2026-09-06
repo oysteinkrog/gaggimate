@@ -3,7 +3,7 @@ title: "ESP32-P4: what a move to RISC-V does to hand-written kernel work"
 id: 08-frontiers/esp32-p4-and-where-the-vector-work-moves
 schema_version: 1
 doc_type: explanation
-status: draft
+status: review
 last_reviewed: 2026-09-06
 tags: [esp32p4, riscv, pie, simd, hardware-loop, toolchain, psram, cache, frontier]
 confidence: medium
@@ -30,19 +30,21 @@ the chapter specifying the PIE instructions is marked "[to be added later]"
 |---|---|---|---|
 | Cores | 2 Xtensa LX7 | 2 RISC-V HP, plus 1 RISC-V LP core | [Espressif 2026a][^s3ds] p. 3; [Espressif 2026b][^p4ds] §4.1.1.1, §4.1.1.4 |
 | Clock ceiling | 240 MHz | 400 MHz per the datasheet, 360 MHz per the TRM `[uncertain]` | [Espressif 2026a][^s3ds] p. 3; [Espressif 2026b][^p4ds] §4.1.1.1; [Espressif 2026c][^p4trm] §1.2 |
-| Pipeline | five stage, in order | five stage, in order, scalar | [Espressif 2026a][^s3ds] p. 3; [Espressif 2026c][^p4trm] §1.1 |
-| Branch handling | no predictor documented | BHT plus BTB plus RAS | [Espressif 2026c][^p4trm] §1.2, §1.12.1 |
+| Pipeline | five stage, in order | five stage, in order, scalar | [Espressif 2026a][^s3ds] p. 36, §4.1.1.1; [Espressif 2026c][^p4trm] §1.1 |
+| Branch handling | no predictor documented | BHT plus BTB plus RAS | [Espressif 2026c][^p4trm] §1.2, §1.12.1, §1.12.2 |
 | Base ISA | Xtensa, windowed registers | RV32IMAFC plus Zc (Zcb, Zcmp, Zcmt) | [Espressif 2026b][^p4ds] §4.1.1.1; [Espressif 2026c][^p4trm] §1.2 |
 | Vector unit | PIE, `ee.*` mnemonics | PIE, `esp.*` mnemonics | [Espressif 2026c][^p4trm] §1.7.2; [esp-dsp][^espdsp] |
 | Hardware loop | `LOOP` family, in the core ISA | separate custom extension | [Espressif 2026c][^p4trm] §1.7.1 |
 
 Naming will confuse a document search. The datasheet calls the custom
 extensions `XespV` and `XespLoop` in §4.1.1.1 and `Xai` and `Xhwlp` in
-§4.1.1.3 [Espressif 2026b][^p4ds]; the toolchain uses neither, calling the
-vector extension `xesppie`, which is also the `-march` suffix
-[ESP-IDF][^idfgdb]. `[uncertain]` which is canonical; the `-march` string a
-released P4 build passes would settle it. The clock figures disagree the same
-way, probably by chip revision, though neither document says so `[uncertain]`.
+§4.1.1.3 [Espressif 2026b][^p4ds]; the toolchain uses neither. A released
+ESP-IDF build's own P4 toolchain file passes `-march=rv32imafc_zicsr_zifencei_xesppie
+-mabi=ilp32f` to the compiler for every C, C++ and assembly file
+[ESP-IDF][^idfgdb], so `xesppie` is the name that actually reaches GCC on
+the command line, whatever the datasheet's marketing name for the same
+feature. The clock figures disagree the same way, probably by chip revision,
+though neither document says so `[uncertain]`.
 
 The branch predictor is the one pipeline change that alters scheduling
 judgement. The LX7 cost model treats a taken branch as a fixed penalty (see
@@ -140,11 +142,29 @@ hits `vPortCoprocUsedInISR` [ESP-IDF][^idfcaps][^idfport].
 So the rule carries over with the register renamed. A production kernel does
 not write `mext_pie_status`, for the same reason it does not write `CPENABLE`:
 that bypasses the mechanism saving another task's vector state. The saved
-context is eight vector registers, four 128-bit pieces of the accumulator
-halves, `UA_STATE`, and a packed word holding the scalar accumulator with
-`SAR`, `SAR_BYTES` and `FFT_BIT_WIDTH` [ESP-IDF][^idfport]. One further trap:
-a fused load-and-arithmetic instruction naming one destination for both halves
-is ambiguous and raises a PIE illegal exception with `mcause` 0x1f.
+context is meant to be eight vector registers, four 128-bit pieces of the
+accumulator halves, `UA_STATE`, and a packed word holding the scalar
+accumulator with `SAR`, `SAR_BYTES` and `FFT_BIT_WIDTH` [ESP-IDF][^idfport].
+One further trap: a fused load-and-arithmetic instruction naming one
+destination for both halves is ambiguous and raises a PIE illegal exception
+with `mcause` 0x1f.
+
+**ESP-IDF 5.5.1's own implementation of that save is missing one register.**
+`pie_save_regs` and `pie_restore_regs` in this repository's vendored
+`portasm.S` store and load `q0`, `q1`, `q2`, `q4`, `q5`, `q6` and `q7`, but
+never `q3`, even though the frame layout in
+`components/riscv/include/riscv/rvruntime-frames.h` reserves a slot for it
+and P4 vendor assembly treats `q3` as an ordinary vector register (for
+example `esp-dsp`'s `dsps_fft2r_sc16_arp4.S` uses it inside its butterfly
+step) [ESP-IDF][^idfpieq3bug]. A task whose PIE state has a live `q3` value
+loses it across any contended coprocessor handoff on this ESP-IDF version.
+Upstream commit `b25cb2906`, "fix(freertos): fix xesppie registers
+save/restore" (2025-03-04), adds the missing `q3` save and load and also
+repacks the `XACC`/`SAR`/`SAR_BYTES`/`FFT_BIT_WIDTH` word into fewer bytes,
+but that commit sits on a line of history that diverged from the
+`release/v5.5` branch this repository's ESP-IDF 5.5.1 was tagged from
+(`git compare v5.5.1...b25cb2906` reports the histories diverged, 864
+commits behind) and was not backported to it [ESP-IDF][^idfpieq3bug].
 
 ## 5. What an S3 PIE kernel becomes
 
@@ -260,12 +280,21 @@ an L2, since both add ways for a host model to be wrong.
 `cycle` through `rdcycle` in user mode, both documented for the P4's HP core
 [Espressif 2026c][^p4trm] §1.5.1, and ESP-IDF's `esp_cpu_get_cycle_count()`
 already forwards to whichever a target uses. The HP core also has three event
-counters with selectors, `mhpmcounter8`, `mhpmcounter9` and `mhpmcounter13`,
-but this TRM revision does not say what they can count `[uncertain]`. The
-low-power core's table is documented and includes memory-access and
-instruction-fetch wait cycles [Espressif 2026c][^p4trm] §3.7. If the HP
-selectors reach comparable events that is a real gain over the S3, where a
-stall must be inferred from a cycle count rather than counted.
+counters, each hard-wired to a single event rather than a free-form
+selector: `mhpmcounter8` (`mhpmevent8` accepts only `0x6`) counts
+conditional-branch mispredictions, `mhpmcounter9` (event `0x7`) counts
+conditional-branch instructions, and `mhpmcounter13` (event `0xB`) counts
+store instructions [Espressif 2026c][^p4trm] §1.5.2. Read together, the
+first two give a mispredict rate directly, which is the exact number a
+loop-shape decision on this branch-predicted core would want and the S3
+has no equivalent for. The low-power core's table is wider, not more
+flexible: it dedicates ten counters (`mhpmcounter3` through
+`mhpmcounter12`), each hard-wired to its own event the same way the HP
+core's three are, and its list includes memory-access and
+instruction-fetch wait cycles that the HP core's three do not cover
+[Espressif 2026c][^p4trm] §3.7. Both cores fix each counter to one event;
+the difference is that the low-power core covers ten distinct events and
+the HP core three.
 
 **Lost.** The emulator rung. Espressif's QEMU fork has machines for the
 ESP32-C3 and ESP32-C6 under `hw/riscv`, and its most recent release notes
@@ -298,23 +327,22 @@ which predates the part.
 
 ## Open questions
 
-1. Is the vector extension canonically `Xai`, `XespV` or `xesppie`?
-2. What is the HP core's real clock ceiling, and does it vary by chip revision?
-3. Does the P4 PIE have any floating-point vector capability? Every published
+1. What is the HP core's real clock ceiling, and does it vary by chip revision?
+2. Does the P4 PIE have any floating-point vector capability? Every published
    float kernel is scalar and the TRM calls the registers integer registers.
-4. What does the configuration bit set before unaligned access control, and
+3. What does the configuration bit set before unaligned access control, and
    what does it cost?
-5. What events can the HP core's three counters be programmed to count?
-6. Does the hot-table placement rule still hold with a 64 KB L1 data cache, an
+4. Does the hot-table placement rule still hold with a 64 KB L1 data cache, an
    L2, and a PSRAM controller that no longer shares pins with flash?
-7. Will a P4 machine appear in Espressif's QEMU fork, restoring the emulation
+5. Will a P4 machine appear in Espressif's QEMU fork, restoring the emulation
    rung?
 
 ## Sources
 
 [^s3ds]: Espressif Systems, *ESP32-S3 Series Datasheet*, version 2.2. Page 3
-    for cores, clock and pipeline; the internal memory list for the 512 KB of
-    on-chip SRAM. https://documentation.espressif.com/esp32-s3_datasheet_en.pdf
+    for cores and clock, and for the internal memory list giving the 512 KB of
+    on-chip SRAM; page 36, section 4.1.1.1 "CPU", for the five-stage pipeline.
+    https://documentation.espressif.com/esp32-s3_datasheet_en.pdf
 
 [^p4ds]: Espressif Systems, *ESP32-P4 Series Datasheet*, Pre-release v0.7.
     Sections cited inline. Fetched 2026-09-06, converted with `pdftotext`.
@@ -359,8 +387,26 @@ which predates the part.
     of CSR 0x7F2 is in `components/riscv/include/riscv/csr_pie.h`, commit
     `55acc5e5`. https://github.com/espressif/esp-idf
 
-[^idfgdb]: Espressif Systems, ESP-IDF. `xesppie` appears as a filename and
-    identifier under `components/esp_gdbstub/` and
+[^idfpieq3bug]: Espressif Systems, ESP-IDF, tag `v5.5.1`, commit
+    `9d5ecb2ed`, `components/freertos/FreeRTOS-Kernel/portable/riscv/portasm.S`:
+    `pie_save_regs` and `pie_restore_regs` list `q0`, `q1`, `q2`, `q4`, `q5`,
+    `q6`, `q7`, omitting `q3`; `components/riscv/include/riscv/rvruntime-frames.h`
+    reserves `RV_PIE_Q3` in the frame layout regardless. `q3` used as an
+    ordinary vector register in `esp-dsp` v1.8.2,
+    `modules/fft/fixed/dsps_fft2r_sc16_arp4.S` (butterfly step). Fixed on
+    ESP-IDF's mainline by commit `b25cb2906`, "fix(freertos): fix xesppie
+    registers save/restore" (2025-03-04); `gh api
+    repos/espressif/esp-idf/compare/v5.5.1...b25cb2906` reports the two
+    histories diverged (864 commits behind `v5.5.1`), so the fix is not in
+    the `release/v5.5` line this repository's toolchain vendors. Confirmed
+    2026-09-06. https://github.com/espressif/esp-idf
+
+[^idfgdb]: Espressif Systems, ESP-IDF, tag `v5.5.1`, `tools/cmake/toolchain-esp32p4.cmake`,
+    lines 10-17: `remove_duplicated_flags("-march=rv32imafc_zicsr_zifencei_xesppie
+    -mabi=ilp32f ...")` applied to `CMAKE_C_FLAGS`, `CMAKE_CXX_FLAGS`,
+    `CMAKE_ASM_FLAGS` and `CMAKE_EXE_LINKER_FLAGS`, confirmed in the local
+    checkout at `~/.platformio/packages/framework-espidf`. `xesppie` also
+    appears as a filename and identifier under `components/esp_gdbstub/` and
     `tools/test_apps/system/gdbstub_runtime/`. Located by GitHub code search
     on 2026-09-06. https://github.com/espressif/esp-idf
 

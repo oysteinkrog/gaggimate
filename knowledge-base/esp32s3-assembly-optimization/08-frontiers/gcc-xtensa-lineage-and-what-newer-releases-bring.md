@@ -3,7 +3,7 @@ title: The Xtensa GCC lineage and what newer releases bring
 id: 08-frontiers/gcc-xtensa-lineage-and-what-newer-releases-bring
 schema_version: 1
 doc_type: reference
-status: draft
+status: review
 last_reviewed: 2026-09-06
 tags: [esp32s3, xtensa, gcc, toolchain, esp-idf, frontier]
 confidence: medium
@@ -110,19 +110,42 @@ Espressif's. Other commits in this same category:
 `-mdisable-hardware-atomics` (see `04-toolchain-and-codegen/gcc14-xtensa-flags-and-what-they-cost.md`,
 this KB, for what the flag does), the `xtensa*-esp*-elf` multilib wiring
 that the per-chip driver binaries depend on, and a workaround commit
-titled `xtensa: Add workaround for pSRAM cache issue in ESP32`, whose
-exact defect this page did not confirm against an errata document.
-`[uncertain]` what that pSRAM workaround changes in the generated code;
-worth its own page if a kernel ever needs to know.
+titled `xtensa: Add workaround for pSRAM cache issue in ESP32`. The
+switches it adds are named directly in `xtensa.opt`:
+`-mfix-esp32-psram-cache-issue`, described there as work "around a PSRAM
+cache issue in the ESP32 ECO1 chips", and
+`-mfix-esp32-psram-cache-strategy=`, an enum whose default value is
+`ESP32_PSRAM_FIX_MEMW`.[^10] That default names a memory-ordering barrier
+(`MEMW`) as the fix strategy, gated to ESP32 ECO1 silicon by the option's
+own text, not the ESP32-S3 this KB targets. The `MEMW` strategy's code
+lives in `xtensa_psram_cache_fix_memw_reorg`, a late RTL pass
+(`pass_xtensa_psram_nops`) that walks the final instruction stream
+tracking the most recent store: when a following non-volatile load, or
+an unconditional jump or call, could race the load-past-store reordering
+the pipeline performs, the pass inserts a `memory_barrier` (a `MEMW`
+instruction) immediately before it, and a narrow 8-bit or 16-bit store
+not yet followed by a confirming wider store gets its own trailing
+barrier. The comment above the pass names two distinct ESP32 ECO1 bugs
+this guards against: an interrupt landing inside the five-stage window
+where Xtensa reorders a load ahead of an immediately preceding store to
+the same address, which the PSRAM cache can mishandle; and a narrow
+store followed by a wider load from the same address within the roughly
+80-cycle PSRAM cacheline fetch, which can read back garbage in place of
+the narrow store's own bytes.[^15]
 
 The second kind is an upstream fix, cherry-picked onto the Espressif
 branch ahead of the next FSF release that will carry it anyway. Example:
 `xtensa: constantsynth: Reforge to fix some non-fatal issues` appears on
-`esp-14_2_0` as commit `994d2135b`, authored 2024-06-19T02:55:57Z; the
-identical fix exists upstream as commit `23141088e`, authored
-2024-06-19T11:55:57+09:00 (the same instant, different timezone
-notation).[^1][^6] Different commit hash, same author, same minute, same
-message: a backport, not an independent fix. This matters for reading
+`esp-14_2_0` as commit `994d2135b` and upstream as commit `23141088e`.
+Both carry the identical author timestamp, 2024-06-19T11:55:57+09:00,
+because a cherry-pick keeps the original author's date; what differs is
+the committer date, when each project actually applied the patch:
+`23141088e` was committed to `gcc-mirror/gcc` on 2024-06-19T08:21:11Z, a
+few hours after it was written, while `994d2135b` was committed to
+`espressif/gcc` on 2024-08-30T13:35:17Z, over two months later.[^1][^6]
+Different commit hash, same author, same author timestamp, same
+message, and a two-month-later committer date: a backport, not an
+independent fix. This matters for reading
 `espressif/gcc`'s history: a commit that looks Xtensa-specific and
 Espressif-only may just be a fix upstream had already written, pulled
 forward so Espressif's users get it one release early. Distinguishing
@@ -163,22 +186,27 @@ Comparing `xtensa.opt` across four packaged Xtensa toolchain branches
 addition. `-mstrict-align` ("Do not use unaligned memory references") is
 present starting at `esp-14_2_0` and absent from `esp-13_2_0`; it was
 added upstream by commit `gcc: xtensa: add -m[no-]strict-align option`,
-authored 2023-02-28.[^9] Every other `m*` option present in
-`esp-16_1_0` (`-mforce-no-pic`, `-mlongcalls`, `-mlra`, `-mtarget-align`,
-`-mtext-section-literals`, `-mauto-litpools`, `-mserialize-volatile`,
+authored 2023-02-28.[^9] Of the remaining `m*` options present in
+`esp-16_1_0` (`-mabi=`, `-mforce-no-pic`, `-mlongcalls`, `-mlra`,
+`-mtarget-align`, `-mtext-section-literals`, `-mauto-litpools`,
+`-mconst16`, `-mextra-l32r-costs=`, `-mserialize-volatile`,
 `-mstrict-align`, `-mdynconfig=`, `-malways-memw`,
-`-mdisable-hardware-atomics`) was already present at `esp-14_2_0`.[^10]
+`-mdisable-hardware-atomics`, `-mfix-esp32-psram-cache-issue`,
+`-mfix-esp32-psram-cache-strategy=`), every one this page checked was
+already present at `esp-13_2_0`, `-mstrict-align` being the sole
+addition across the four branches compared.[^10]
 
 One option this page found does not yet exist in any released branch.
 Upstream trunk carries `-mforce-l32`, a per-function attribute and a
 named address space (`__force_l32`) that forces a constant load through
 `L32R` rather than letting the compiler choose `MOVI` or literal-pool
-synthesis, added by three commits dated 2026-04-28 through 2026-05-03.[^11]
+synthesis, added by three commits dated 2026-04-28 through 2026-05-02.[^11]
 None of `esp-15_2_0` or `esp-16_1_0`'s `xtensa.opt` contain it, and the
-GitHub compare of the commit that adds it against the `releases/gcc-16.1.0`
-tag reports the two histories as diverged (447 commits ahead, 22
-behind), meaning the commit sits on trunk after the point GCC 16 branched
-and has not been backported to a 16.x release branch.[^12] The nearest
+GitHub compare of the commit that adds the option
+(`45f1fed76`) against the `releases/gcc-16.1.0` tag reports the two
+histories as diverged (298 commits ahead, 22 behind), meaning the commit
+sits on trunk after the point GCC 16 branched and has not been backported
+to a 16.x release branch.[^12] The nearest
 released Espressif branch that could carry it is a GCC 16.2.0 rebuild or
 a GCC 17 branch, neither of which exists as a packaged toolchain as of
 this page's research date.
@@ -207,9 +235,10 @@ written that has not reached any Espressif-shipped compiler yet:[^13]
   covers above.
 - `xtensa: Define HONOR_REG_ALLOC_ORDER as 1` (2026-05-08): tells the
   allocator to prefer hard registers in the target's stated order rather
-  than a generic heuristic order; on a diverged, trunk-only commit per
-  the same compare check as `-mforce-l32` above, so also not yet in any
-  released Espressif branch.[^12]
+  than a generic heuristic order; on a diverged, trunk-only commit
+  (`bb0cbdac1`, 447 ahead of `releases/gcc-16.1.0`, 22 behind), the same
+  compare check as `-mforce-l32` above but its own commit and its own
+  ahead-count, so also not yet in any released Espressif branch.[^12]
 
 None of these were tested by this page against real code; they are
 listed because they are exactly the class of change (constant loading,
@@ -245,9 +274,6 @@ and upstream-versus-fork provenance.
 
 ## Open questions
 
-- Whether the pSRAM cache-issue workaround commit changes generated code
-  in a way a kernel author would notice, or only fixes a narrow
-  correctness bug: not confirmed against an errata document.
 - Whether the Reload-to-LRA transition changed windowed-ABI register
   spill behavior specifically, versus general allocation quality: not
   tested here.
@@ -262,6 +288,9 @@ and upstream-versus-fork provenance.
 
 ## Sources
 
+<!-- plainlang: skip. Numbered citation footnotes below: commit hashes, refs
+and dates in the KB's required citation format, not flowing prose. -->
+
 [^1]: GitHub, `espressif/gcc`, compare `releases/gcc-14.2.0...esp-14_2_0` (`api.github.com/repos/espressif/gcc/compare/releases%2Fgcc-14.2.0...esp-14_2_0`) and branch listing (`api.github.com/repos/espressif/gcc/branches`), fetched via `gh api`, 2026-09-06.
 
 [^2]: GitHub, `espressif/esp-idf`, `tools/tools.json` at tags `v4.4`, `v5.0`, `v5.1`, `v5.2`, `v5.3`, `v5.4`, `v5.5`, `v6.0`, `v6.1` and branch `master`, fetched from `raw.githubusercontent.com/espressif/esp-idf/<ref>/tools/tools.json`, 2026-09-06. Local vendored copy for the 5.5.1 row: `~/.platformio/packages/framework-espidf/tools/tools.json`.
@@ -272,7 +301,7 @@ and upstream-versus-fork provenance.
 
 [^5]: GitHub, `gcc-mirror/gcc`, commit `ecb575d09`, "gcc: xtensa: allow dynamic configuration", 2017-05-08, path `gcc/config/xtensa/xtensa-dynconfig.c` history, fetched 2026-09-06.
 
-[^6]: GitHub, `gcc-mirror/gcc`, commit `23141088e`, "xtensa: constantsynth: Reforge to fix some non-fatal issues", authored 2024-06-19T11:55:57+09:00; `espressif/gcc` commit `994d2135b`, same message, authored 2024-06-19T02:55:57Z, on branch `esp-14_2_0`. Fetched via `gh api search/commits` and `gh api repos/espressif/gcc/commits`, 2026-09-06.
+[^6]: GitHub, `gcc-mirror/gcc`, commit `23141088e` ("xtensa: constantsynth: Reforge to fix some non-fatal issues"), author date 2024-06-19T11:55:57+09:00, committer date 2024-06-19T08:21:11Z; `espressif/gcc` commit `994d2135b`, same message and same author date, committer date 2024-08-30T13:35:17Z, on branch `esp-14_2_0`. Author date fetched via `gh api repos/<owner>/gcc/git/commits/<sha>` and the `.patch` endpoint (for the raw timezone); committer date from the same calls, 2026-09-06.
 
 [^7]: GitHub, `espressif/gcc`, `gcc/config/xtensa/xtensa.opt` at refs `esp-13_2_0` and `esp-14_2_0`, the `mlra` entry. Fetched via `gh api repos/espressif/gcc/contents/...`, 2026-09-06.
 
@@ -282,10 +311,12 @@ and upstream-versus-fork provenance.
 
 [^10]: GitHub, `espressif/gcc`, `gcc/config/xtensa/xtensa.opt` at refs `esp-13_2_0`, `esp-14_2_0`, `esp-15_1_0`, `esp-15_2_0`, `esp-16_1_0`, full `m*` option list diffed across refs. Fetched 2026-09-06.
 
-[^11]: GitHub, `gcc-mirror/gcc`, commits `45f1fed76` ("xtensa: Implement \"-mforce-l32\" target-specific option", 2026-05-02/03), `9eba97e41` ("xtensa: Implement \"force_l32\" target-specific attribute", 2026-04-28), `2379d07ac` ("xtensa: Implement \"__force_l32\" named address space", 2026-05-02). Fetched via `gh api repos/gcc-mirror/gcc/commits?path=gcc/config/xtensa`, 2026-09-06.
+[^11]: GitHub, `gcc-mirror/gcc`, commits `9eba97e41` ("xtensa: Implement \"force_l32\" target-specific attribute", authored 2026-04-28), `2379d07ac` ("xtensa: Implement \"__force_l32\" named address space", authored 2026-05-02), `45f1fed76` ("xtensa: Implement \"-mforce-l32\" target-specific option", authored 2026-05-02). Fetched via `gh api repos/gcc-mirror/gcc/commits?path=gcc/config/xtensa`, 2026-09-06.
 
 [^12]: GitHub, `gcc-mirror/gcc`, compare `releases/gcc-16.1.0...bb0cbdac1` and `releases/gcc-16.1.0...45f1fed76`-family commits, `status: "diverged"`, `ahead_by`/`behind_by` fields. Fetched via `gh api repos/gcc-mirror/gcc/compare/...`, 2026-09-06.
 
-[^13]: GitHub, `gcc-mirror/gcc`, `repos/gcc-mirror/gcc/commits?path=gcc/config/xtensa&per_page=15`, commits dated after 2026-06-09 (the `esp-16.1.0_20260609` package date): `fb178543e`, `a5da203dd`, `8682e3a54`, `c8c3988ef`, and the earlier-dated but still-unreleased register-allocation commits `bb0cbdac1`, `061949be5`, `b54491cec`. Fetched via `gh api`, 2026-09-06.
+[^13]: GitHub, `gcc-mirror/gcc`, `repos/gcc-mirror/gcc/commits?path=gcc/config/xtensa&per_page=15`. Commits dated after 2026-06-09 (the `esp-16.1.0_20260609` package date): `a5da203dd` (CONST.S, authored 2026-08-29), `8682e3a54` (the `xtensa_legitimize_address()` refurbish, authored 2026-07-17), `c8c3988ef` (`LOCAL_REGNO()`, authored 2026-07-17). Two earlier commits, cited above for continuity, predate the cutoff: `bba0342a5` (the first `xtensa_legitimize_address()` improvement pass, authored 2026-05-04) and `bb0cbdac1` (`HONOR_REG_ALLOC_ORDER`, authored 2026-05-08). Fetched via `gh api`, 2026-09-06.
 
 [^14]: GitHub code/commit search, `search/commits?q=repo:gcc-mirror/gcc+xtensa+ipa`, no Xtensa-specific IPA-pass result among the top matches. Fetched via `gh api`, 2026-09-06.
+
+[^15]: GitHub, `espressif/gcc`, `gcc/config/xtensa/xtensa.cc` at ref `esp-14_2_0`, functions `handle_fix_reorg_memw`, `xtensa_psram_cache_fix_memw_reorg`, `handle_fix_reorg_insn`, and the block comment above them describing the two ESP32 PSRAM cache bugs. Fetched via `gh api repos/espressif/gcc/contents/gcc/config/xtensa/xtensa.cc?ref=esp-14_2_0`, 2026-09-06.

@@ -3,7 +3,7 @@ title: What the runtime does to a kernel's measured time, and how that changes a
 id: 08-frontiers/rtos-and-runtime-effects-on-kernel-timing
 schema_version: 1
 doc_type: explanation
-status: draft
+status: review
 last_reviewed: 2026-09-06
 tags: [esp32s3, xtensa, freertos, zephyr, nuttx, bare-metal, interrupts, coprocessor, scheduling, measurement]
 confidence: medium
@@ -163,8 +163,10 @@ sets one up, no scheduler and so no task-priority axis at all, and no
 coprocessor-disabled *handler* unless startup installs one. That cuts
 both ways: without a handler, the first PIE or FPU instruction after
 reset, with `CPENABLE` still zero, takes an exception with nowhere to
-go, which is exactly that QEMU leaf's `[uncertain]` issue #154, a
-freestanding image hanging on this[^qemu26]. The convention that leaf
+go. That is QEMU issue #154, a freestanding image hanging on this, and it
+is an emulator defect: silicon resets `CPENABLE` to `0xff`, and the open
+pull request #155 traces the zero to the system-emulation reset
+hook[^qemu26]. The convention that leaf
 gives, set `CPENABLE` once at startup and never again, sidesteps the
 exception rather than handling it: a bare-metal benchmark pays no
 coprocessor-disabled cost because it never takes the exception, not
@@ -195,12 +197,13 @@ other's. `[uncertain]` No citable statement was found of whether the two
 images can cooperate more tightly than message passing; treat
 single-core-per-image AMP as the documented baseline.
 
-Symmetric multiprocessing proper is narrower still. A 2026 Zephyr issue
+Symmetric multiprocessing proper is narrower still. A 2024 Zephyr issue
 reports SMP broken even on the original ESP32, where it had previously
 worked, and the reporter asks whether SMP could instead be extended to
-the ESP32-S3, implying it is not there as of that report[^z-smp].
-Fetched 2026-09-06, no maintainer response confirming or denying that
-request was visible. Treat ESP32-S3 SMP under Zephyr as unsupported as
+the ESP32-S3, implying it is not there as of that report[^z-smp]. The
+reporter closed the issue themselves the same day, pointing at two
+older issues instead of waiting for a fix, so it never drew a maintainer
+reply either way; treat ESP32-S3 SMP under Zephyr as unsupported as
 of this writing, not merely undocumented.
 
 Zephyr's Xtensa architecture layer documents a lazy-versus-eager
@@ -300,7 +303,7 @@ always-save mode turns "cost paid once per contended handoff" into
 [^flash2]: ESP-IDF 5.5.1, `components/spi_flash/cache_utils.c`, `spi_flash_op_block_func()` (`IRAM_ATTR`): the other core's busy-wait, `while (!s_flash_op_complete) { /* busy loop */ }`, entered with its scheduler and non-IRAM interrupts disabled; and `spi_flash_enable_interrupts_caches_and_other_cpu()`, which restores cache and resumes both. Comment above `spi_flash_op_block_func`: "If you're going to modify this, keep in mind that while the flash caches of the pro and app cpu are separate, the psram cache is *not*."
 [^qemu26]: espressif/qemu issue #154, "ESP32-S3: qemu-system-xtensa boots with CPENABLE = 0; first FP op recurses through the Cp0Disabled handler (QEMU-293)", opened 2026-05-28, open as of 2026-09-06. Discussed in full in [QEMU for the ESP32-S3](../05-measurement/qemu-esp32s3-what-it-proves-and-what-it-cannot.md).
 [^z-soc]: Zephyr Project Documentation, "ESP32-S3 Features", `docs.zephyrproject.org/latest/boards/espressif/common/soc-esp32s3-features.html`, retrieved 2026-09-06: describes dual-core operation through Asymmetric Multiprocessing with OpenAMP, "each core can be enabled to execute customized tasks in stand-alone mode and/or exchanging data over OpenAMP framework", the limitation that Zephyr-managed serial drivers are "not yet implemented for applications running on the APPCPU", and "Additional vector instructions support for AI acceleration" as a listed chip feature.
-[^z-smp]: zephyrproject-rtos/zephyr, GitHub issue #83168, "SMP on ESP32 seems to be broken", retrieved 2026-09-06. Reporter: the classic ESP32 board is "one of the few targets I know for having SMP capabilities in Zephyr" and is now marked unsupported; asks "if you're dropping support for one of the few boards that feature SMP could you maybe extend this functionality for other targets (e.g. ESP32s3)?" No maintainer confirmation of ESP32-S3 SMP support was visible in the issue as fetched.
+[^z-smp]: zephyrproject-rtos/zephyr, GitHub issue #83168, "SMP on ESP32 seems to be broken", opened and closed by the reporter on 2024-12-18, retrieved 2026-09-06. Reporter: the classic ESP32 board is "one of the few targets I know for having SMP capabilities in Zephyr" and is now marked unsupported; asks "if you're dropping support for one of the few boards that feature SMP could you maybe extend this functionality for other targets (e.g. ESP32s3)?" The only comment is the reporter's own, closing the issue in favor of two earlier issues (#56011, #29394); no maintainer replied.
 [^z-xtensa]: Zephyr Project Documentation, "Xtensa Developer Guide", `docs.zephyrproject.org/latest/hardware/arch/xtensa.html`, retrieved 2026-09-06: describes `CONFIG_XTENSA_HIFI_SHARING` with eager mode ("the HiFi registers are saved and restored during every thread context switch, regardless of whether the thread used them or not") as default and lazy mode ("the kernel tracks the thread that 'owns' the coprocessor[;] if the 'owning' thread is switched out, the HiFi registers will not be saved until a new thread attempts to use the HiFi") as `CONFIG_XTENSA_LAZY_HIFI_SHARING`, with an SMP note that a lazy handoff to a still-live remote owner sends an IPI to force the save. The page names only Cadence's HiFi DSP coprocessor; ESP32-S3, Espressif, and PIE do not appear on it.
 [^nuttx-soc]: Apache NuttX, "Espressif ESP32-S3", `nuttx.apache.org/docs/latest/platforms/xtensa/esp32s3/index.html`, retrieved 2026-09-06: "On ESP32-S3, SMP is enabled to enhance Wi-Fi performance" (stated in the Wi-Fi and Wi-Fi SoftAP sections).
 [^nuttx-kconfig]: Apache NuttX source, `arch/xtensa/Kconfig`, retrieved 2026-09-06 (`raw.githubusercontent.com/apache/nuttx/master/arch/xtensa/Kconfig`): `ARCH_HAVE_MULTICPU` selected for both the ESP32 and ESP32-S3 SoC configurations.

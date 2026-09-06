@@ -114,14 +114,14 @@ carries it, and what kind of mistake produced the first version.
 
 Counting the eight rows above:
 
-1. **Unread source, three cases.** A file that settles the question exists, is
+1. **Unread or partly read source, three cases** (the table labels two rows "unread source" and one "partial reading"). A file that settles the question exists, is
    small, and was not opened. This is the most common kind and the cheapest to
    avoid. If a claim is about what a build does, the answer is in the build
    system or the backend, not in a manual.
 2. **Generalising, two cases.** A true rule from a neighbouring context was
    applied where it does not hold: another core's pipeline depth, or the
    callee's view of a register instead of the caller's.
-3. **Experiment not run or run once, two cases.** A number reported without
+3. **Experiment not run, run once or miscounted, two cases** (the table labels one row "miscount"). A number reported without
    recounting, and a codegen claim asserted without compiling. Both would have
    taken a minute.
 4. **Fabricated citation, one case.** A filename produced from a naming pattern

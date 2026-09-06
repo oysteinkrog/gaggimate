@@ -29,4 +29,4 @@ converged, promotion pending; `building` = waves in progress.
 
 | Topic | Query with `-c` | Covers | Status |
 |---|---|---|---|
-| [ESP32-S3 assembly optimization](./esp32s3-assembly-optimization/CLAUDE.md) | `esp32s3-assembly-optimization-kb` | Xtensa LX7 scalar and PIE vector kernels, the memory hierarchy, GCC 14 codegen, measurement, kernel patterns, this repo's kernel work | building |
+| [ESP32-S3 assembly optimization](./esp32s3-assembly-optimization/CLAUDE.md) | `esp32s3-assembly-optimization-kb` | Xtensa LX7 scalar and PIE vector kernels, the memory hierarchy, GCC 14 codegen, measurement, kernel patterns, this repo's kernel work | converged |

@@ -19,15 +19,28 @@ takes each `[uncertain]` seriously rather than filling it with a guess,
 and this register is what that discipline produces when you count it up.
 
 A search of the corpus (buckets `00` through `08`, about 55 leaf and
-`README.md` files, checked 2026-09-06) found 146 `[uncertain]` tags,
-excluding the two mentions inside this topic's own `CLAUDE.md` and
-`MASTER-PLAN.md`, which describe the tag convention rather than tag a
-claim. Every row below traces to one of the 146. Several rows repeat the
-same underlying question because a bucket `README.md` restates a leaf's
-open question in its own summary, or because two leaves hit the same gap
-from different angles (a PIE hazard and a fixed-point format table, for
-instance). Repetition is left visible rather than collapsed, because it
-shows which gaps the corpus keeps bumping into.
+`README.md` files) found 146 `[uncertain]` tags on an early pass on
+2026-09-06, excluding the two mentions inside this topic's own
+`CLAUDE.md` and `MASTER-PLAN.md`, which describe the tag convention
+rather than tag a claim. This register was reconciled once against a
+later state of the same corpus, once the rest of the topic's build had
+settled for the day: the same search found 138 tags across 39 files.
+Ten of the first 146 rows had been resolved by then (a claim settled
+with a citation or a device fact, so the tag came off); three new rows
+appeared, two of them in leaves that did not exist at the first count.
+Every row below traces to one of the 138 tags live at reconciliation.
+Several rows repeat the same underlying question because a bucket
+`README.md` restates a leaf's open question in its own summary, or
+because two leaves hit the same gap from different angles (a PIE hazard
+and a fixed-point format table, for instance). Repetition is left
+visible rather than collapsed, because it shows which gaps the corpus
+keeps bumping into.
+
+This bucket and `10-synthesis/` are excluded from the count by design,
+the same way `09-adversarial/` excludes its own tags from itself: this
+leaf catalogues buckets `00` through `08` only. Counted the same way at
+reconciliation, `09-adversarial/` carries 20 `[uncertain]` tags of its
+own and `10-synthesis/` carries 16; neither set is a row below.[^2]
 
 ## How to read this table
 
@@ -35,13 +48,10 @@ Each row names the leaf, states the claim as the corpus tagged it, and
 names one settling method:
 
 - **device measurement**: a specific instrument this corpus already
-  documents, most often `CCOUNT` (a device or QEMU test that runs the
-  operation in a timed loop; method in
-  [CCOUNT and timing a kernel](../05-measurement/ccount-cycle-counter-and-timing-a-kernel.md)),
-  a fuzz or bit-exact executed test (method in
-  [bit-exact reference tests and fuzzing](../05-measurement/bit-exact-reference-tests-and-fuzzing.md)),
-  or QEMU execution (method in
-  [QEMU: what it proves and what it cannot](../05-measurement/qemu-esp32s3-what-it-proves-and-what-it-cannot.md)).
+  documents, most often [CCOUNT](../05-measurement/ccount-cycle-counter-and-timing-a-kernel.md)
+  (a device or QEMU test that runs the operation in a timed loop), a
+  [bit-exact or fuzz test](../05-measurement/bit-exact-reference-tests-and-fuzzing.md),
+  or [QEMU execution](../05-measurement/qemu-esp32s3-what-it-proves-and-what-it-cannot.md).
 - **toolchain test**: a compiler or assembler invocation that answers the
   question without touching hardware; the command is given.
 - **document not yet read**: a specific named document, issue thread or
@@ -52,20 +62,20 @@ names one settling method:
   Espressif internal errata document, or hardware this repository does
   not have (ESP32-P4 silicon).
 
-## 1. Scalar and floating-point per-instruction latencies (40 tags)
+## 1. Scalar and floating-point per-instruction latencies (41 tags)
 
 The Xtensa ISA manual gives correctness and pipeline structure, not
 per-instruction cycle counts, and says so directly: it defers timing to
 "a specific Xtensa processor data book," which is not openly published
 for the LX7. Every scalar or floating-point latency this corpus could not
 get from a table therefore carries this tag, in one framing statement and
-39 specific instructions or table rows.
+40 specific instructions or table rows.
 
 | Leaf | Claim as tagged | Settling |
 |---|---|---|
 | [scalar arithmetic, shifts and bit tricks](../01-scalar-isa/scalar-arithmetic-shifts-and-bit-tricks.md) | Cycle costs are out of scope in general: Cadence publishes no per-instruction Xtensa latencies | unknowable here (LX7 data book) |
 | [scalar arithmetic, shifts and bit tricks](../01-scalar-isa/scalar-arithmetic-shifts-and-bit-tricks.md) | `mull`/`quos` are not fixed-cost; no per-core LX7 figure published | device measurement, CCOUNT loop |
-| [zero-overhead loops](../01-scalar-isa/zero-overhead-loops.md) | The LX7's taken-branch penalty the zero-overhead loop replaces is not stated; both are implementation-specific | device measurement, CCOUNT loop |
+| [zero-overhead loops](../01-scalar-isa/zero-overhead-loops.md) | The loop-back cost itself, distinct from the taken-branch cost the loop replaces (now cited at 2 cycles, TRM 1.7.3), is still unstated anywhere | device measurement, CCOUNT loop |
 | [kernel patterns README](../06-kernel-patterns/README.md) | Every scalar cycle count in the fixed-point leaf is uncertain because the manual publishes none | device measurement, CCOUNT loop |
 | [kernel patterns README](../06-kernel-patterns/README.md) | Whether `MUL16S` and `MULL` share a latency on this part | device measurement, CCOUNT loop |
 | [kernel patterns README](../06-kernel-patterns/README.md) | The tie rule for `ROUND.S` (manual says "nearest," does not define its own `rounds()` helper) | device measurement, CCOUNT loop on a tie-value input |
@@ -103,13 +113,14 @@ get from a table therefore carries this tag, in one framing statement and
 | [foundations README](../00-foundations/README.md) | Key claim: every latency the manual does not give is uncertain, with the CCOUNT method to settle it (LX7 pipeline leaf summary) | device measurement, CCOUNT loop |
 | [foundations README](../00-foundations/README.md) | Open question: closing the cost-table gaps needs a measurement campaign, not another document | device measurement, CCOUNT loop |
 | [our-work README](../07-our-work/README.md) | Measured cycle costs for the scalar multiply, divide and FP instructions on this board are what the generic buckets above leave uncertain | device measurement, CCOUNT loop (tracked as its own leaf in `07-our-work/`) |
+| [host versus device reversals measured here](../07-our-work/host-versus-device-reversals-measured-here.md) | Whether the hand-written kernel currently shipped for one of the two cases that won on paper and lost on the chip is the same version that produced the measured ratio, or a later rewrite; not recorded in the commit history read for this leaf | document not yet read, a closer read of the commit history around the file this leaf names |
 
 ## 2. PIE vector unit: resource reservation and undocumented stages (20 tags)
 
 TRM Table 1.7-2 gives pipeline stages for most `EE.*` instructions but
-omits several groups entirely, and never states how many cycles apart two
-instructions competing for the same execution unit must issue. That gap
-is the single largest undocumented area in the PIE bucket.
+omits several groups entirely, and never states the issue gap two
+instructions competing for one execution unit need. That gap is the
+single largest undocumented area in the PIE bucket.
 
 | Leaf | Claim as tagged | Settling |
 |---|---|---|
@@ -136,10 +147,9 @@ is the single largest undocumented area in the PIE bucket.
 
 ## 3. Cache, PSRAM bandwidth and MSPI bus costs (18 tags)
 
-Espressif's Technical Reference Manual (TRM) states the cache and bus
-topology but not a sustained-throughput or miss-cost figure, and the
-cache-control instructions (preload, lock) are documented as existing
-without a usage contract.
+The TRM states the cache and bus topology but not a sustained-throughput
+or miss-cost figure, and documents preload and lock as existing without
+a usage contract.
 
 | Leaf | Claim as tagged | Settling |
 |---|---|---|
@@ -162,7 +172,7 @@ without a usage contract.
 | [LX7 core pipeline and cost model](../00-foundations/lx7-core-pipeline-and-cost-model.md) | The magnitude of a cache miss in core cycles depends on what the other core and any bus master are doing | device measurement, CCOUNT loop under deliberate cross-core contention |
 | [LX7 core pipeline and cost model](../00-foundations/lx7-core-pipeline-and-cost-model.md) | Load or store, cache miss to flash or PSRAM (cost-table row, repeats the caches-leaf claim) | device measurement, CCOUNT loop with miss counters |
 
-## 4. Toolchain and codegen internals (16 tags)
+## 4. Toolchain and codegen internals (15 tags)
 
 These are questions about GCC 14.2 and the vendored dynamic configuration
 (`dynconfig`) that a compiler invocation, not a device run, would answer.
@@ -178,7 +188,6 @@ These are questions about GCC 14.2 and the vendored dynamic configuration
 | [MAC16, Boolean and other configured options](../01-scalar-isa/mac16-boolean-and-other-configured-options.md) | Why GCC's `-O2` MAC16 shape hoists `wsr.acclo`/`rsr.acclo` outside the loop while `-Os` does not | toolchain test: `-O2 -S` versus `-Os -S` on the same MAC16 loop, diff the RTL dump (`-fdump-rtl-all`) |
 | [code and data placement in ESP-IDF](../04-toolchain-and-codegen/code-and-data-placement-in-esp-idf.md) | How much scheduling freedom `restrict` is worth on this target (it buys no vectorization) | toolchain test: `-O2 -S` with and without `restrict` on a representative loop, compare instruction count and schedule |
 | [register windows and the windowed ABI](../00-foundations/register-windows-and-windowed-abi.md) | No single number for how many scalars GCC will keep live before spilling around an `asm` block | toolchain test: vary live scalar count around a fixed `asm` block, read the generated assembly for a spill |
-| [GCC/Xtensa lineage and what newer releases bring](../08-frontiers/gcc-xtensa-lineage-and-what-newer-releases-bring.md) | What the pSRAM-cache-issue workaround commit changes in the generated code | document not yet read, the commit's own diff against the toolchain source, or a before/after disassembly |
 | [GCC/Xtensa lineage and what newer releases bring](../08-frontiers/gcc-xtensa-lineage-and-what-newer-releases-bring.md) | Whether the earlier reload-based register allocator handled the windowed ABI's constraints differently enough to matter | toolchain test: build the same kernel with an older GCC (reload-based) and current GCC 14 (LRA), diff the assembly |
 | [GCC/Xtensa lineage and what newer releases bring](../08-frontiers/gcc-xtensa-lineage-and-what-newer-releases-bring.md) | Whether interprocedural optimization (`-fipa-*`) ever behaves differently on Xtensa (a code search found no on-topic patch, which is not proof of absence) | document not yet read, a closer read of `gcc-mirror/gcc`'s Xtensa backend for IPA hooks |
 | [what the headers say versus what the tools do](../04-toolchain-and-codegen/what-the-headers-say-versus-what-the-tools-do.md) | Whether Espressif treats `__XCHAL_HAVE_CLAMPS=0` in the dynconfig as a defect or a deliberate choice | document not yet read, an issue or commit in the toolchain's own repository |
@@ -188,8 +197,7 @@ These are questions about GCC 14.2 and the vendored dynamic configuration
 
 ## 5. Measurement methodology gaps (7 tags)
 
-Even the instrument this corpus recommends for everything above has its
-own unmeasured cost.
+Even the instrument this corpus recommends above has its own unmeasured cost.
 
 | Leaf | Claim as tagged | Settling |
 |---|---|---|
@@ -201,16 +209,20 @@ own unmeasured cost.
 | [CCOUNT, cycle counter and timing a kernel](../05-measurement/ccount-cycle-counter-and-timing-a-kernel.md) | The size of the effect an attached debugger (OpenOCD, breakpoints, single-stepping) has on a timing run | device measurement, same kernel timed with the debugger attached and detached |
 | [measurement README](../05-measurement/README.md) | A published per-instruction issue latency for `rsr.ccount` (repeats the CCOUNT-leaf claim) | device measurement, measure the empty interval |
 
-## 6. QEMU fidelity (4 tags)
+## 6. QEMU fidelity (2 tags)
+
+The issue-154 question is resolved in both leaves that raised it: QEMU's
+reset hook sets `CPENABLE` to `0xff` only in its user-mode build, never
+in the system emulation this corpus runs, confirmed against a silicon
+reading and an open, unmerged pull request fixing it. What remains is the
+`-icount` scaling nobody has run.
 
 | Leaf | Claim as tagged | Settling |
 |---|---|---|
-| [RTOS and runtime effects on kernel timing](../08-frontiers/rtos-and-runtime-effects-on-kernel-timing.md) | A freestanding image hangs on `CPENABLE = 0` with no installed handler, tracked as the QEMU leaf's own open issue | document not yet read, the upstream QEMU issue tracker for a fix or explanation |
 | [QEMU ESP32-S3: what it proves and what it cannot](../05-measurement/qemu-esp32s3-what-it-proves-and-what-it-cannot.md) | With `-icount`, a `CCOUNT` delta becomes a linear function of instructions retired, but the exact scaling was not run to confirm | toolchain/QEMU test: run `-icount` mode over a fixed instruction count, read the `CCOUNT` delta |
-| [QEMU ESP32-S3: what it proves and what it cannot](../05-measurement/qemu-esp32s3-what-it-proves-and-what-it-cannot.md) | Whether the ESP32-S3 machine hanging on `CPENABLE = 0` at reset is an emulator defect or a missing guest handler | document not yet read, the QEMU issue tracker |
 | [measurement README](../05-measurement/README.md) | QEMU's `-icount` combined with a `CCOUNT` delta was not run to confirm the scaling (repeats the QEMU-leaf claim) | toolchain/QEMU test, as above |
 
-## 7. RTOS, exceptions and coprocessor handoff costs (12 tags)
+## 7. RTOS, exceptions and coprocessor handoff costs (13 tags)
 
 Window overflow/underflow and the coprocessor-disabled exception are
 structural (the ISA requires them), but nobody publishes what one costs
@@ -232,32 +244,25 @@ kernels' Xtensa ports as closely as it read ESP-IDF's.
 | [LX7 core pipeline and cost model](../00-foundations/lx7-core-pipeline-and-cost-model.md) | Register window overflow/underflow cost (cost-table row, repeats the RTOS-leaf and register-windows-leaf claim) | device measurement, as above |
 | [register windows and the windowed ABI](../00-foundations/register-windows-and-windowed-abi.md) | The cost of one window overflow/underflow, not published by the architecture manual | device measurement, as above |
 | [foundations README](../00-foundations/README.md) | Key claim: the cost of one window overflow/underflow is not published and is uncertain (register-windows leaf summary) | device measurement, as above |
+| [frontiers bucket index](../08-frontiers/README.md) | Open question restating the per-exception cost of a window overflow/underflow handler and of a coprocessor-disabled handler, shared across this bucket and `00-foundations/` | device measurement, as above |
 
-## 8. Vendor roadmap: ESP32-P4, esp-dsp/esp-nn/esp-dl, ESP32-S31, and the LLVM/Clang fork (19 tags)
+## 8. Vendor roadmap: ESP32-P4, esp-dsp/esp-nn/esp-dl, ESP32-S31, and the LLVM/Clang fork (12 tags)
 
 Everything in this group is about hardware this repository does not
 target (the ESP32-P4, the announced ESP32-S31) or a toolchain fork this
 repository does not build with. Several rows need documents this corpus
-could not fetch (Cadence and Espressif pages returned HTTP 403, or a
-GitHub thread's resolution postdates the last check).
+could not fetch, including pages that returned HTTP 403.
 
 | Leaf | Claim as tagged | Settling |
 |---|---|---|
 | [esp-dsp, esp-nn and vendor kernel libraries](../08-frontiers/esp-dsp-esp-nn-and-vendor-kernel-libraries.md) | Whether the ESP32-P4/S31 RISC-V PIE extension and the ESP32-S3 Xtensa PIE are the same microarchitectural design retargeted, or independent designs | document not yet read, an Espressif architecture document naming both explicitly |
-| [esp-dsp, esp-nn and vendor kernel libraries](../08-frontiers/esp-dsp-esp-nn-and-vendor-kernel-libraries.md) | Which ESP-IDF release first defines the `CONFIG_PIE_V1_BOOST`/`CONFIG_PIE_V2_BOOST` Kconfig symbols | document not yet read, a newer ESP-IDF release than the 5.5.1 checkout used here |
-| [esp-dsp, esp-nn and vendor kernel libraries](../08-frontiers/esp-dsp-esp-nn-and-vendor-kernel-libraries.md) | Open question restating the Kconfig-origin claim above | document not yet read, as above |
-| [esp-dsp, esp-nn and vendor kernel libraries](../08-frontiers/esp-dsp-esp-nn-and-vendor-kernel-libraries.md) | The ESP32-S31 announcement and mass-production dates rely on third-party tech-press coverage, not a directly fetched Espressif page | document not yet read, Espressif's own news pages, once reachable |
-| [esp-dsp, esp-nn and vendor kernel libraries](../08-frontiers/esp-dsp-esp-nn-and-vendor-kernel-libraries.md) | The `CONFIG_PIE_V1_BOOST`/`CONFIG_PIE_V2_BOOST` symbol definitions were not located in this repository's local ESP-IDF 5.5.1 checkout | document not yet read, a newer IDF's SoC capability headers |
 | [ESP32-P4 and where the vector work moves](../08-frontiers/esp32-p4-and-where-the-vector-work-moves.md) | The P4's clock ceiling: 400 MHz per the datasheet, 360 MHz per the TRM | document not yet read, whichever Espressif document resolves the discrepancy by chip revision |
-| [ESP32-P4 and where the vector work moves](../08-frontiers/esp32-p4-and-where-the-vector-work-moves.md) | Which name is canonical for the P4 vector extension: `XespV`/`Xai`/`Xhwlp` (datasheet) or `xesppie` (toolchain `-march`) | toolchain test: read the `-march` string a released P4 build actually passes |
 | [ESP32-P4 and where the vector work moves](../08-frontiers/esp32-p4-and-where-the-vector-work-moves.md) | The clock figures disagree the same way, probably by chip revision, but neither document says so | unknowable here (needs P4 hardware or an Espressif revision table) |
 | [ESP32-P4 and where the vector work moves](../08-frontiers/esp32-p4-and-where-the-vector-work-moves.md) | The semantics of the P4's unaligned-access enable bit are unpublished | document not yet read, a P4 register reference beyond the TRM excerpt read here |
 | [ESP32-P4 and where the vector work moves](../08-frontiers/esp32-p4-and-where-the-vector-work-moves.md) | Whether the P4's 128-bit `UA_STATE` is in fact unaligned-access state (the name is suggestive, no source confirms it) | document not yet read, a P4 architecture document naming `UA_STATE` explicitly |
 | [ESP32-P4 and where the vector work moves](../08-frontiers/esp32-p4-and-where-the-vector-work-moves.md) | Whether the P4 lacks `ee.src.q` and the `.qup` register-rotating MAC forms, or simply has no esp-dsp kernel needing them | document not yet read, a P4 ISA chapter enumerating its full vector instruction set |
 | [ESP32-P4 and where the vector work moves](../08-frontiers/esp32-p4-and-where-the-vector-work-moves.md) | Whether the P4's PIE has any floating-point vector capability at all | unknowable here (needs P4 hardware or the missing ISA chapter) |
-| [ESP32-P4 and where the vector work moves](../08-frontiers/esp32-p4-and-where-the-vector-work-moves.md) | What events the P4 HP core's three extra hardware performance counters can count; this TRM revision does not say | document not yet read, a later P4 TRM revision or the low-power core's documented table by comparison |
 | [ESP32-P4 and where the vector work moves](../08-frontiers/esp32-p4-and-where-the-vector-work-moves.md) | Whether GCC's auto-vectoriser can target `xesppie` at all | toolchain test: `-O3 -fopt-info-vec-all` on a vectorisable loop with the P4 `-march` string |
-| [LLVM/Clang for Xtensa: status and what it changes](../08-frontiers/llvm-clang-for-xtensa-status-and-what-it-changes.md) | Whether the `lld` Xtensa relocation-handling RFC has merged since this page's last fetch (2026-09-06) | document not yet read, the RFC thread and `lld`'s `ELF/Arch/` directory for an `Xtensa.cpp` file |
 | [LLVM/Clang for Xtensa: status and what it changes](../08-frontiers/llvm-clang-for-xtensa-status-and-what-it-changes.md) | Whether the fork's ability to call PIE operations as ordinary function calls changes code quality, or is usable for this repo's pointer-incrementing idioms | toolchain test: build a representative kernel with the fork's Clang, compare generated code to the GCC 14 baseline |
 | [LLVM/Clang for Xtensa: status and what it changes](../08-frontiers/llvm-clang-for-xtensa-status-and-what-it-changes.md) | Which loop shapes the fork's zero-overhead-loop pass recognises, versus GCC's doloop pass; no side-by-side comparison run | toolchain test: compile the same set of loop shapes under both compilers, diff the emitted loop instructions |
 | [LLVM/Clang for Xtensa: status and what it changes](../08-frontiers/llvm-clang-for-xtensa-status-and-what-it-changes.md) | How the fork's inline-asm constraints (`a`, `f`, no memory or paired-register constraints) compare to GCC 14's full Xtensa constraint set | toolchain test: compile the same inline-asm block under both compilers |
@@ -265,9 +270,8 @@ GitHub thread's resolution postdates the last check).
 
 ## 9. Manual, documentation and citation gaps (8 tags)
 
-These are not chip questions at all; they are places a source this corpus
-wanted to read was unreachable, and the corpus recorded that rather than
-pretend otherwise.
+These are not chip questions; they are places a source this corpus
+wanted to read was unreachable, recorded rather than papered over.
 
 | Leaf | Claim as tagged | Settling |
 |---|---|---|
@@ -293,42 +297,35 @@ register fact.
 
 ## Ranked: the ten uncertainties that would change the most kernel decisions
 
-1. **Scalar `MULL`/`MULSH`/`MULUH`/`QUOS` result latency.** Every fixed-point
-   format decision in [fixed-point arithmetic on LX7](../06-kernel-patterns/fixed-point-arithmetic-on-lx7.md)
-   compares a scalar sequence against a PIE one without a scalar cycle
-   count; one CCOUNT run would fill 13 table rows at once.
-2. **`EE.VMUL.*`/`EE.VMULAS.*` back-to-back issue rate.** This gates
-   whether a PIE-vectorised kernel is really bound by lane count or by a
-   hidden multiplier reservation; it decides how aggressively to unroll
-   PIE multiply chains.
+1. **Scalar `MULL`/`MULSH`/`MULUH`/`QUOS` result latency.** One CCOUNT run
+   would fill 13 rows of [fixed-point arithmetic on LX7](../06-kernel-patterns/fixed-point-arithmetic-on-lx7.md)
+   at once, every one a format decision made without a scalar cycle count.
+2. **`EE.VMUL.*`/`EE.VMULAS.*` back-to-back issue rate.** Decides whether
+   a PIE kernel is bound by lane count or a hidden multiplier reservation,
+   and so how aggressively to unroll a PIE multiply chain.
 3. **Whether the PIE unit shares the scalar load-store port on a PSRAM
-   miss.** If it does not, a 128-bit PIE load is a straight win over four
-   scalar loads on every miss; if it does, the load-store leaf's alignment
-   advice needs a cost caveat attached.
-4. **Cache-miss cycle cost for flash and PSRAM.** Two `[uncertain]` rows in
-   the memory-hierarchy cost table are the floor every other latency in
-   this corpus is compared against; nothing else in the corpus can be
-   turned into a wall-clock estimate without it.
+   miss.** If not, a 128-bit PIE load beats four scalar loads on every
+   miss; if it does, the load-store leaf's alignment advice needs a cost
+   caveat attached.
+4. **Cache-miss cycle cost for flash and PSRAM.** The floor every other
+   latency in this corpus is compared against; nothing else here becomes
+   a wall-clock estimate without it.
 5. **Register window overflow/underflow handler cost.** Call depth is a
    named tuning knob in [register windows and the windowed ABI](../00-foundations/register-windows-and-windowed-abi.md),
-   but the decision of CALL0 versus windowed ABI for a hot path has no
-   number behind it.
-6. **`WSR.SAR`-to-`EE.VMUL.S16` issue distance.** Every kernel that scales
-   through `SAR` right before a PIE multiply (the common case) may be
-   paying a stall this corpus cannot currently warn about.
-7. **The write side of `S32I` in cached external memory.** The corpus's
-   standing advice ("align the rows; it is free") rests on the assumption
-   that an unaligned scalar store never gets slower or wrong there;
-   nobody has run the sweep.
-8. **Whether `-mno-strict-align` is safe project-wide.** A single build
-   flag decision, currently advised against for exactly this reason.
-9. **Whether PIE instructions are supported inside an ISR.** This is a
-   correctness question, not a speed one: a kernel that assumes lazy
-   coprocessor save covers this case may be silently wrong.
-10. **Reset values of the PIE state registers.** Any kernel that skips an
-    explicit initial write on the assumption of a zeroed state is one
-    device or QEMU register dump away from either confirmation or a
-    real bug report.
+   but CALL0 versus windowed ABI for a hot path has no number behind it.
+6. **`WSR.SAR`-to-`EE.VMUL.S16` issue distance.** Any kernel that scales
+   through `SAR` right before a PIE multiply may pay a stall this corpus
+   cannot currently warn about.
+7. **The write side of `S32I` in cached external memory.** The standing
+   advice ("align the rows; it is free") assumes an unaligned scalar
+   store never gets slower or wrong there; nobody has run the sweep.
+8. **Whether `-mno-strict-align` is safe project-wide.** A build flag
+   decision, currently advised against for exactly this reason.
+9. **Whether PIE instructions are supported inside an ISR.** A
+   correctness question: a kernel trusting lazy coprocessor save here may
+   be silently wrong.
+10. **Reset values of the PIE state registers.** One register dump after
+    reset, on device or in QEMU, away from confirmation or a bug report.
 
 ## Open questions
 
@@ -336,15 +333,15 @@ register fact.
   at once was not evaluated; this register lists the gaps, not a plan.
 - Whether any "document not yet read" row in groups 8 and 9 has since
   become reachable (the HTTP 403s and bot-detection pages were all hit on
-  2026-09-06) was not re-checked while writing this leaf.
-- This register was not re-run against a later state of the corpus; a
-  leaf edited after 2026-09-06 that resolves a tag makes a row here stale
-  until the next audit.
+  2026-09-06) was not re-checked at reconciliation.
+- This register has now been reconciled once against a later corpus
+  state (see the intro); a leaf edited after that pass makes a row here
+  stale again until the next audit.
 
 ## Sources
 
-Every claim in this leaf is a restatement of a tag already present in the
-cited leaf; no new primary-source citation is introduced here beyond the
-counting method itself.
+Every claim here restates a tag already present in the cited leaf; no
+new primary-source citation is introduced beyond the counting method.
 
-[^1]: Count method: `grep -rn '[uncertain]' --include=*.md knowledge-base/esp32s3-assembly-optimization/` excluding `09-adversarial/`, `CLAUDE.md` and `MASTER-PLAN.md`, run 2026-09-06, 146 matching lines across 36 files. `[measured]`.
+[^1]: Count method: `grep -rnF '[uncertain]' --include=*.md knowledge-base/esp32s3-assembly-optimization/` (the `-F` is load-bearing: an unescaped `[uncertain]` is a bracket-expression character class, not the literal string, and undercounts) restricted to buckets `00` through `08`, excluding `09-adversarial/`, `10-synthesis/`, `CLAUDE.md` and `MASTER-PLAN.md`. First run 2026-09-06: 146 matching lines across 36 files. Reconciliation run, same day, once the topic's build had settled: 138 matching lines across 39 files. `[measured]`.
+[^2]: The two buckets this register excludes by design carry their own `[uncertain]` tags: `09-adversarial/` (this bucket) has 20, `10-synthesis/` has 16, counted the same way on the reconciliation date. Neither count is folded into the 138 above; this register catalogues buckets `00` through `08` only. `[measured]`.
