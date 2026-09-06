@@ -213,7 +213,7 @@ python3 tools/settings_ui_test.py --sim-port 8099 --report-dir out/settings
 
 It launches the simulator itself, in a fresh directory under the report
 dir, seeded from `fixtures/controller.json` (see "Fixtures" below), and
-tears it down at the end. A full run takes about seven minutes on this
+tears it down at the end. A full run takes about ten minutes on this
 machine, most of it the scenarios; the first 90 seconds are the warm-up
 waiting out the boot churn, which the measuring rules in the repo's
 `CLAUDE.md` require before any rate or heap figure is worth recording.
