@@ -323,6 +323,40 @@ static void test_schedule_toggle_day_and_step_time() {
     TEST_ASSERT_EQUAL_STRING("08:59", s.time.c_str());
 }
 
+// The web handler stores any time string the browser sends, so a stored
+// entry's time can be empty or otherwise malformed; the editor rows read it
+// through scheduleTimeParts, which must answer 00:00 for those rather than
+// let the caller slice the string (substr past the end throws, and the
+// firmware is built without exceptions).
+static void test_schedule_time_parts_reads_malformed_as_midnight() {
+    int hour = -1;
+    int minute = -1;
+
+    ScheduleDraft ok = scheduleDefault();
+    ok.time = "23:45";
+    scheduleTimeParts(ok, hour, minute);
+    TEST_ASSERT_EQUAL(23, hour);
+    TEST_ASSERT_EQUAL(45, minute);
+
+    ScheduleDraft empty = scheduleDefault();
+    empty.time = "";
+    scheduleTimeParts(empty, hour, minute);
+    TEST_ASSERT_EQUAL(0, hour);
+    TEST_ASSERT_EQUAL(0, minute);
+
+    ScheduleDraft truncated = scheduleDefault();
+    truncated.time = "07:";
+    scheduleTimeParts(truncated, hour, minute);
+    TEST_ASSERT_EQUAL(0, hour);
+    TEST_ASSERT_EQUAL(0, minute);
+
+    ScheduleDraft garbage = scheduleDefault();
+    garbage.time = "ab:cd";
+    scheduleTimeParts(garbage, hour, minute);
+    TEST_ASSERT_EQUAL(0, hour);
+    TEST_ASSERT_EQUAL(0, minute);
+}
+
 static void test_schedule_summary_strings() {
     ScheduleDraft everyDay = scheduleDefault();
     TEST_ASSERT_EQUAL_STRING("Every day", scheduleDaysSummary(everyDay).c_str());
@@ -411,6 +445,7 @@ int main(int argc, char **argv) {
     RUN_TEST(test_schedule_add_remove_floor_and_can_add);
     RUN_TEST(test_schedule_import_9_entries_kept_whole);
     RUN_TEST(test_schedule_toggle_day_and_step_time);
+    RUN_TEST(test_schedule_time_parts_reads_malformed_as_midnight);
     RUN_TEST(test_schedule_summary_strings);
     RUN_TEST(test_schedule_serialize_parse_round_trip_and_malformed_dropped);
     return UNITY_END();

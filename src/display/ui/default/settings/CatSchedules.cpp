@@ -94,21 +94,35 @@ struct DayToggleCtx {
     int day; // 0=Monday..6=Sunday
 };
 
+// Both value rows go through the model rather than slicing schedule.time:
+// a stored entry only looks like "HH:MM" when the display or the web UI's
+// own form wrote it. The web handler stores whatever string the browser
+// sent (WebUIPlugin.cpp), so a stored "|1111111" reaches here as an empty
+// time, and substr on it throws out_of_range, which aborts a firmware
+// built without exceptions. scheduleTimeParts reads anything malformed as
+// 00:00, matching what the first stepper tap would then write.
 void setHourValue(ScheduleEditorCtx *ctx) {
     if (ctx->hourRow == nullptr || ctx->index >= ctx->draft->schedules.size()) {
         return;
     }
-    // schedule.time is always "HH:MM" (scheduleDefault/scheduleStepHour/
-    // scheduleStepMinute all format it that way), so the first two
-    // characters are already the zero-padded hour; no formatter needed.
-    settingsRowSetValue(ctx->hourRow, ctx->draft->schedules[ctx->index].time.substr(0, 2).c_str());
+    int hour = 0;
+    int minute = 0;
+    settingsui::scheduleTimeParts(ctx->draft->schedules[ctx->index], hour, minute);
+    char buf[4];
+    std::snprintf(buf, sizeof(buf), "%02d", hour);
+    settingsRowSetValue(ctx->hourRow, buf);
 }
 
 void setMinuteValue(ScheduleEditorCtx *ctx) {
     if (ctx->minuteRow == nullptr || ctx->index >= ctx->draft->schedules.size()) {
         return;
     }
-    settingsRowSetValue(ctx->minuteRow, ctx->draft->schedules[ctx->index].time.substr(3, 2).c_str());
+    int hour = 0;
+    int minute = 0;
+    settingsui::scheduleTimeParts(ctx->draft->schedules[ctx->index], hour, minute);
+    char buf[4];
+    std::snprintf(buf, sizeof(buf), "%02d", minute);
+    settingsRowSetValue(ctx->minuteRow, buf);
 }
 
 void hourOnStep(void *user, int dir, bool fast) {

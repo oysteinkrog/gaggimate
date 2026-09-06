@@ -446,6 +446,8 @@ std::string formatTime(int hour, int minute) {
 
 } // namespace
 
+void scheduleTimeParts(const ScheduleDraft &schedule, int &hour, int &minute) { parseTime(schedule.time, hour, minute); }
+
 void scheduleStepHour(ScheduleDraft &schedule, int direction, bool fast) {
     int hour;
     int minute;

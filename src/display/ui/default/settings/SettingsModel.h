@@ -175,6 +175,14 @@ ScheduleDraft scheduleDefault();
 bool scheduleCanAdd(const std::vector<ScheduleDraft> &schedules); // false at 8 or more
 bool scheduleAdd(std::vector<ScheduleDraft> &schedules);          // no-op when !canAdd
 bool scheduleRemove(std::vector<ScheduleDraft> &schedules, size_t index); // never below one
+// The schedule's "HH:MM" split into its two numbers, reading anything
+// malformed (including an empty string) as 00:00, the same rule the two
+// step functions below already apply internally. A caller must go through
+// this rather than slicing schedule.time: the web handler stores whatever
+// string the browser sent (WebUIPlugin.cpp), so "|1111111" is a legal
+// stored entry and substr(3, 2) on it throws out_of_range, which on a
+// firmware built without exceptions aborts.
+void scheduleTimeParts(const ScheduleDraft &schedule, int &hour, int &minute);
 void scheduleStepHour(ScheduleDraft &schedule, int direction, bool fast);
 void scheduleStepMinute(ScheduleDraft &schedule, int direction, bool fast);
 void scheduleToggleDay(ScheduleDraft &schedule, int dayOfWeek); // 0=Mon..6=Sun
