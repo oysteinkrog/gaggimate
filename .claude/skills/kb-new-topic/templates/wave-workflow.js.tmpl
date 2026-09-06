@@ -1,0 +1,252 @@
+// kb-new-topic — wave workflow template
+// =====================================================================
+// One KB build WAVE as a single deterministic Workflow.
+//
+// The coordinator (main loop, opus) plans the wave, then fires this via
+// the Workflow tool, passing the plan + locked execution contract as
+// `args`. It runs UNATTENDED — no AskUserQuestion anywhere in here.
+//
+// Shape: a per-leaf PIPELINE so each leaf verifies the moment it is
+// written (no barrier waiting on the slowest writer):
+//   write+validate  →  triple-verify (3 independent lenses)  →  fix loop
+// then the wave returns a STRUCTURED object the coordinator uses to
+// update the three convergence axes.
+//
+// COMMIT MODEL — leader-commit, NOT per-agent. Up to ~16 leaves run
+// concurrently; concurrent `git commit` races on .git/index.lock. So
+// agents write+validate their disjoint file and RETURN — they do not
+// commit. The coordinator (main loop) commits each wave's files once
+// this Workflow returns. Files persist on disk, so a workflow death
+// loses nothing (resume via resumeFromRunId, or commit the worktree).
+// Disjoint paths also mean no agent-mail reservation is needed in-wave.
+//
+// Adapt freely per topic. This is a reference shape, not a frozen API.
+//
+// args = {
+//   topicSlug,              // e.g. "force-measurement"
+//   topicDir,              // "knowledge-base/<slug>"
+//   waveType,             // "foundations" | "core" | "sota" |
+//                         // "synthesis" | "our-work" | "adversarial"
+//   waveNo,             // integer, for commit subjects + audit names
+//   leaves: [            // 8–16 entries (the locked wave width)
+//     { bucket, file, topic, model, brief, citationContract }
+//   ],
+//   sotaContext,        // forward-looking framing for synthesis waves
+//   contract,           // locked interview decisions (scope, taxonomy…)
+// }
+// =====================================================================
+
+export const meta = {
+  name: 'kb-wave',
+  description: 'One autonomous KB build wave: write+commit leaves, triple-verify every load-bearing claim, fix loop, return convergence deltas.',
+  phases: [
+    { title: 'Write' },
+    { title: 'Verify' },
+    { title: 'Fix' },
+  ],
+}
+
+const A = args
+const LEAVES = A.leaves || []
+
+// ---- schemas ---------------------------------------------------------
+
+const LEAF_RESULT = {
+  type: 'object',
+  required: ['file', 'claims', 'sources', 'subAreas', 'insights', 'written'],
+  properties: {
+    file: { type: 'string' },
+    written: { type: 'boolean', description: 'true once the file is written to disk and frontmatter validates (invalid=0)' },
+    claims: { type: 'array', items: { type: 'string' }, description: 'load-bearing claim fingerprints (short, stable)' },
+    sources: { type: 'array', items: { type: 'string' }, description: 'canonical source ids: DOI / URL / SHA / file:line' },
+    subAreas: { type: 'array', items: { type: 'string' } },
+    insights: { type: 'array', items: { type: 'string' }, description: 'past-SOTA synthesis insights, empty for pure collection leaves' },
+    notes: { type: 'string' },
+  },
+}
+
+const VERDICT = {
+  type: 'object',
+  required: ['lens', 'pass', 'findings'],
+  properties: {
+    lens: { type: 'string', enum: ['resolvability', 'fidelity', 'coherence'] },
+    pass: { type: 'boolean' },
+    findings: {
+      type: 'array',
+      items: {
+        type: 'object',
+        required: ['severity', 'claim', 'problem'],
+        properties: {
+          severity: { type: 'string', enum: ['P1', 'P2', 'P3'] },
+          claim: { type: 'string' },
+          problem: { type: 'string' },
+          suggestedFix: { type: 'string' },
+        },
+      },
+    },
+  },
+}
+
+const FIX_RESULT = {
+  type: 'object',
+  required: ['file', 'resolved', 'unresolved'],
+  properties: {
+    file: { type: 'string' },
+    resolved: { type: 'array', items: { type: 'string' } },
+    unresolved: { type: 'array', items: { type: 'string' }, description: 'claims left as [uncertain] or removed' },
+  },
+}
+
+// ---- prompts ---------------------------------------------------------
+
+const writePrompt = (leaf) => `
+You are writing ONE leaf of the ${A.topicSlug} knowledge base.
+
+FIRST read ${A.topicDir}/MASTER-PLAN.md and ${A.topicDir}/CLAUDE.md, and the
+repo CLAUDE.md. Honour the locked citation contract: ${leaf.citationContract}.
+
+Leaf: ${A.topicDir}/${leaf.bucket}/${leaf.file}
+Topic: ${leaf.topic}
+Brief: ${leaf.brief}
+${A.waveType === 'synthesis' ? `This is a SYNTHESIS leaf — go PAST current SOTA. Framing: ${A.sotaContext}. Tag forward-looking claims [projection]; cite where you can, [uncertain] where you cannot.` : ''}
+${A.waveType === 'adversarial' ? `This is an ADVERSARIAL leaf — your job is to FIND coverage gaps, cross-leaf contradictions, and unsupported assertions across the existing corpus. Survey sibling leaves; cite file:line for every issue you raise.` : ''}
+
+Rules:
+- Every load-bearing claim (numbers, bounds, "X does Y", API/operator
+  semantics, version facts, code paths, SHAs) MUST carry a verifiable
+  source. No source → write [uncertain], never fabricate.
+- Write exactly this ONE file (a disjoint path — no other agent touches
+  it, so no agent-mail reservation is needed).
+- After writing, VALIDATE frontmatter and ensure invalid=0:
+    python3 knowledge-base/scripts/validate-frontmatter.py ${A.topicDir}/${leaf.bucket}/${leaf.file}
+- Do NOT git commit. Do NOT touch any other file. The coordinator
+  commits the whole wave once this Workflow returns; concurrent commits
+  would race on .git/index.lock. Your file persists on disk regardless.
+- NO worktree isolation.
+Return ONLY the structured result (written=true once the file is on disk
+and frontmatter validates).
+`
+
+const verifyPrompt = (leaf, lens) => `
+Independently verify the leaf ${A.topicDir}/${leaf.bucket}/${leaf.file}
+through the ${lens} lens ONLY. You have not seen any other verifier's work.
+
+${lens === 'resolvability' ? 'For every citation: confirm the DOI/URL resolves, the SHA exists, the file:line is real. A dead or placeholder reference FAILS.' : ''}
+${lens === 'fidelity' ? 'For every load-bearing claim: open the cited source and confirm it ACTUALLY SAYS what the leaf claims (the specific number/quote/section). "Source exists but says something else" is the failure to catch — be ruthless.' : ''}
+${lens === 'coherence' ? 'Check the leaf is internally consistent AND not contradicted by any sibling leaf in the corpus. Read the siblings. Flag any cross-leaf contradiction with both file:line refs.' : ''}
+
+Default to pass=false if you cannot positively confirm. Return ONLY the verdict.
+`
+
+const fixPrompt = (leaf, findings) => `
+Apply SURGICAL corrections to ${A.topicDir}/${leaf.bucket}/${leaf.file} for
+these verified findings, then re-confirm each.
+
+Findings:
+${JSON.stringify(findings, null, 2)}
+
+For each: correct the claim/citation if a true source exists; otherwise
+mark the claim [uncertain] (or remove it if it is the leaf's load-bearing
+core). Do NOT introduce new claims. Re-validate after editing:
+  python3 knowledge-base/scripts/validate-frontmatter.py ${A.topicDir}/${leaf.bucket}/${leaf.file}
+Do NOT git commit — the coordinator commits the wave. Return ONLY the
+fix result.
+`
+
+// ---- the wave --------------------------------------------------------
+
+const LENSES = ['resolvability', 'fidelity', 'coherence']
+
+const results = await pipeline(
+  LEAVES,
+
+  // Stage 1: write + validate (NO commit — leader commits the wave)
+  // Default writer is SONNET (breadth work). The coordinator overrides
+  // per-leaf to 'opus' for the hardest leaves (derivations, architecture
+  // synthesis, contested claims, frontier synthesis / adversarial
+  // leaves) — set in args.leaves[].model, not here.
+  (leaf) => agent(writePrompt(leaf), {
+    label: `write:${leaf.bucket}/${leaf.file}`,
+    phase: 'Write',
+    model: leaf.model || 'sonnet',
+    schema: LEAF_RESULT,
+  }),
+
+  // Stage 2: triple-verify — 3 independent lenses in parallel (barrier
+  // is correct HERE: we need all three verdicts before deciding to fix).
+  // Model per lens by cognitive load: resolvability (does the URL/SHA/
+  // file:line exist) and coherence (internal + cross-leaf consistency)
+  // are mechanical → SONNET. Fidelity (open the source, confirm it says
+  // what the leaf claims) is the subtle-hallucination catch and the whole
+  // point of the pipeline → OPUS. This is the one verify lane worth opus.
+  async (leafResult, leaf) => {
+    if (!leafResult) return null
+    const lensModel = (lens) => (lens === 'fidelity' ? 'opus' : 'sonnet')
+    const verdicts = (await parallel(
+      LENSES.map((lens) => () =>
+        agent(verifyPrompt(leaf, lens), {
+          label: `verify:${lens}:${leaf.file}`,
+          phase: 'Verify',
+          model: lensModel(lens),
+          schema: VERDICT,
+        })
+      )
+    )).filter(Boolean)
+    return { leaf, leafResult, verdicts }
+  },
+
+  // Stage 3: fix loop only if any lens failed. The hard cognitive work
+  // (detecting the bad claim) already happened in verify; applying the
+  // surgical correction is lower-judgment → SONNET.
+  async (vr, leaf) => {
+    if (!vr) return null
+    const findings = vr.verdicts.flatMap((v) => v.findings || [])
+    const blocking = findings.filter((f) => f.severity === 'P1' || f.severity === 'P2')
+    if (blocking.length === 0) {
+      return { ...vr.leafResult, audit: { p1: 0, p2: 0, p3: findings.length, fixed: 0, unresolved: [] } }
+    }
+    const fix = await agent(fixPrompt(leaf, blocking), {
+      label: `fix:${leaf.file}`,
+      phase: 'Fix',
+      model: 'sonnet',
+      schema: FIX_RESULT,
+    })
+    return {
+      ...vr.leafResult,
+      audit: {
+        p1: blocking.filter((f) => f.severity === 'P1').length,
+        p2: blocking.filter((f) => f.severity === 'P2').length,
+        p3: findings.filter((f) => f.severity === 'P3').length,
+        fixed: fix?.resolved?.length || 0,
+        unresolved: fix?.unresolved || [],
+      },
+    }
+  }
+)
+
+// ---- aggregate convergence deltas (coordinator reads this) -----------
+
+const ok = results.filter(Boolean)
+const flat = (k) => ok.flatMap((r) => r[k] || [])
+
+return {
+  waveType: A.waveType,
+  waveNo: A.waveNo,
+  leaves: ok.map((r) => r.file),
+  // Axis 1 — collection (coordinator diffs these against cumulative sets)
+  newClaims: flat('claims'),
+  newSources: flat('sources'),
+  newSubAreas: flat('subAreas'),
+  // Axis 2 — synthesis
+  newInsights: flat('insights'),
+  // Axis 3 — review
+  audit: {
+    p1: ok.reduce((n, r) => n + (r.audit?.p1 || 0), 0),
+    p2: ok.reduce((n, r) => n + (r.audit?.p2 || 0), 0),
+    p3: ok.reduce((n, r) => n + (r.audit?.p3 || 0), 0),
+    fixed: ok.reduce((n, r) => n + (r.audit?.fixed || 0), 0),
+    unresolved: flat('audit.unresolved'),
+  },
+  // forward-planning fuel for the next wave
+  gaps: flat('notes'),
+}

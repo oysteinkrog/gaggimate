@@ -5,6 +5,17 @@ ESP32-S3 espresso machine controller + display. The display is a LilyGo T-RGB
 board reached over BLE. Firmware builds with PlatformIO (`pio run -e display`
 for production, `-e display-loadtest` for the bench rig).
 
+## Knowledge base (`knowledge-base/`)
+
+Curated, citation-strict qmd collections, same harness as the Initial Force
+monorepo. Before writing or tuning a kernel, reading a cycle number, or
+making a load-bearing claim about the Xtensa core, query the KB first:
+`qmd query "<question>" -c esp32s3-assembly-optimization-kb --limit 10`
+(`-c` is mandatory). Routing table and conventions in
+`knowledge-base/CLAUDE.md`; query craft in `/kb-query`; new topics via
+`/kb-new-topic`. The Animation kernels section below is the operational
+summary; the KB carries the sources and the measurements behind it.
+
 ## Hardware invariants (violate these and the display regresses)
 
 - **The panel's interrupts must live on core 1.** `esp_intr_alloc` pins an

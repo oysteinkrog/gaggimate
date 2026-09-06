@@ -1,0 +1,100 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://initialforce.com/gaggimate-kb/schemas/base.schema.json",
+  "title": "GaggiMate KB Base Document",
+  "description": "Base frontmatter schema applied to every .md file under knowledge-base/. Bucket-specific schemas extend this via allOf composition.",
+  "type": "object",
+  "additionalProperties": true,
+  "required": [
+    "title",
+    "id",
+    "last_reviewed",
+    "status",
+    "doc_type",
+    "schema_version"
+  ],
+  "properties": {
+    "title": {
+      "type": "string",
+      "minLength": 4,
+      "description": "Human-readable title; not a slug."
+    },
+    "id": {
+      "type": "string",
+      "pattern": "^[0-9a-z][0-9a-z\\-/_.]+$",
+      "description": "Stable identifier; conventionally <bucket>/<subarea>/<slug> matching the file path."
+    },
+    "created": {
+      "type": "string",
+      "format": "date",
+      "description": "ISO-8601 date the file was first created."
+    },
+    "updated": {
+      "type": "string",
+      "format": "date",
+      "description": "ISO-8601 date of most recent material change."
+    },
+    "last_reviewed": {
+      "type": "string",
+      "format": "date",
+      "description": "ISO-8601 date this file was last verified for correctness."
+    },
+    "owner": {
+      "type": "string",
+      "description": "Person or agent name responsible for maintenance. Optional; default unset."
+    },
+    "tags": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "pattern": "^[a-z0-9][a-z0-9\\-]*$"
+      },
+      "uniqueItems": true,
+      "description": "Lowercase-kebab tags. Use sparingly; not a substitute for bucket placement."
+    },
+    "status": {
+      "type": "string",
+      "enum": ["draft", "review", "stable", "superseded", "speculative"],
+      "description": "Lifecycle state. 'superseded' files must set superseded_by. 'speculative' is for far-future or pre-citation content where normal review standards do not apply."
+    },
+    "superseded_by": {
+      "type": "string",
+      "description": "Required when status=superseded; path to the replacement file."
+    },
+    "doc_type": {
+      "type": "string",
+      "enum": ["tutorial", "how-to", "reference", "explanation"],
+      "description": "Diátaxis quadrant. Files mixing quadrants must be split."
+    },
+    "confidence": {
+      "type": "string",
+      "enum": ["low", "medium", "high"],
+      "description": "Author's confidence in the correctness of the file."
+    },
+    "schema_version": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Frontmatter schema version. Bump when fields change incompatibly."
+    },
+    "sources": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "Cited source identifiers (BibTeX keys or DOIs). Optional helper field."
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "required": ["status"],
+        "properties": {
+          "status": { "const": "superseded" }
+        }
+      },
+      "then": {
+        "required": ["superseded_by"]
+      }
+    }
+  ]
+}

@@ -1,0 +1,171 @@
+#!/usr/bin/env python3
+"""Aggregate kb-validate eval results.
+
+Copy this file to /tmp/kb-eval/aggregate.py. Fill TREATMENT_SIDE with the
+campaign's per-trial randomization. Paste each judge's SCORES block into
+RAW. Run.
+
+Each trial: control audit vs treatment audit, judged blind with a
+randomized A/B label. This script normalizes to (treatment - control)
+deltas regardless of which side was labelled A.
+"""
+import statistics
+from math import sqrt
+
+# ---------------------------------------------------------------------------
+# 1. Per-trial randomization: which side was the treatment audit?
+#    Set 'A' if the treatment audit's path went into the judge's "Audit A"
+#    slot, 'B' if it went into "Audit B". Balance ~50/50 across the campaign.
+# ---------------------------------------------------------------------------
+TREATMENT_SIDE = {
+    # 'trial-id': 'A' or 'B',
+    # e.g.
+    # 'A1': 'B',
+    # 'A2': 'B',
+    # 'B1': 'A',
+}
+
+# ---------------------------------------------------------------------------
+# 2. Judge SCORES blocks pasted in raw. The (A, B) tuples are the judge's
+#    A-side score and B-side score for each dimension.
+# ---------------------------------------------------------------------------
+RAW = {
+    # 'A1': {'corr': (5, 5), 'depth': (4, 5), 'mech': (4, 5),
+    #        'cov':  (5, 4), 'anti':  (4, 5),
+    #        'total_A': 22, 'total_B': 24},
+}
+
+# ---------------------------------------------------------------------------
+# 3. File-of-trial: first character of trial-id maps to the target file.
+#    Customise FILES with the human-readable name for each file.
+# ---------------------------------------------------------------------------
+FILES = {
+    # 'A': 'TargetFileA.cs',
+    # 'B': 'TargetFileB.cs',
+    # 'C': 'TargetFileC.cs',
+}
+DIMS = ['corr', 'depth', 'mech', 'cov', 'anti']
+DIM_LABELS = {
+    'corr': 'Correctness',
+    'depth': 'Depth',
+    'mech': 'Mechanism',
+    'cov': 'Coverage',
+    'anti': 'Anti-pattern',
+}
+
+
+def delta(trial):
+    """(treatment - control) total for one trial."""
+    side = TREATMENT_SIDE[trial]
+    a, b = RAW[trial]['total_A'], RAW[trial]['total_B']
+    return (a - b) if side == 'A' else (b - a)
+
+
+def dim_delta(trial, dim):
+    side = TREATMENT_SIDE[trial]
+    a, b = RAW[trial][dim]
+    return (a - b) if side == 'A' else (b - a)
+
+
+def file_of(trial):
+    return trial[0]
+
+
+def sign(d):
+    return '+' + str(d) if d >= 0 else str(d)
+
+
+# --- Per-trial table ---
+print("=" * 78)
+print("PER-TRIAL TREATMENT MINUS CONTROL")
+print("=" * 78)
+print(f"{'Trial':<8}{'File':<10}{'Δtotal':<10}{'Winner':<12}")
+print("-" * 78)
+deltas = []
+for tid in sorted(RAW.keys()):
+    d = delta(tid)
+    deltas.append(d)
+    winner = "TREATMENT" if d > 0 else ("CONTROL" if d < 0 else "TIE")
+    print(f"{tid:<8}{file_of(tid):<10}{sign(d):<10}{winner:<12}")
+
+# --- Per-file aggregates ---
+print()
+print("=" * 78)
+print("PER-FILE AGGREGATES")
+print("=" * 78)
+print(f"{'File':<35}{'N':<4}{'Mean Δ':<10}{'Median':<10}{'Std':<10}"
+      f"{'T-wins':<8}{'C-wins':<8}{'Ties':<6}")
+print("-" * 78)
+for f in sorted(FILES.keys()):
+    trials = [t for t in sorted(RAW.keys()) if file_of(t) == f]
+    ds = [delta(t) for t in trials]
+    if not ds:
+        continue
+    tw = sum(1 for d in ds if d > 0)
+    cw = sum(1 for d in ds if d < 0)
+    tt = sum(1 for d in ds if d == 0)
+    m = statistics.mean(ds)
+    med = statistics.median(ds)
+    sd = statistics.stdev(ds) if len(ds) > 1 else 0
+    print(f"{FILES[f]:<35}{len(ds):<4}{m:+.2f}    {med:+.1f}      "
+          f"{sd:.2f}      {tw:<8}{cw:<8}{tt:<6}")
+
+# --- Overall ---
+print()
+print(f"=" * 78)
+print(f"OVERALL ({len(deltas)} trials)")
+print(f"=" * 78)
+N = len(deltas)
+if N >= 2:
+    m = statistics.mean(deltas)
+    med = statistics.median(deltas)
+    sd = statistics.stdev(deltas)
+    se = sd / sqrt(N)
+    t = m / se if se > 0 else float('inf')
+    tw = sum(1 for d in deltas if d > 0)
+    cw = sum(1 for d in deltas if d < 0)
+    tt = sum(1 for d in deltas if d == 0)
+    print(f"Trials:                 {N}")
+    print(f"Treatment wins:         {tw}/{N}")
+    print(f"Control wins:           {cw}/{N}")
+    print(f"Ties:                   {tt}/{N}")
+    print(f"Mean Δ (T - C):         {m:+.3f}")
+    print(f"Median Δ:               {med:+.1f}")
+    print(f"Std dev:                {sd:.3f}")
+    print(f"Std error of mean:      {se:.3f}")
+    print(f"t-statistic (df={N - 1}):    {t:.3f}")
+    # rough critical values; for N=15 (df=14)
+    if N - 1 == 14:
+        crit_05, crit_01 = 2.145, 2.977
+        print(f"Critical t @ p<0.05:    {crit_05} (df=14)")
+        print(f"Critical t @ p<0.01:    {crit_01} (df=14)")
+        if abs(t) > crit_01:
+            sig = "p<0.01 — strongly significant"
+        elif abs(t) > crit_05:
+            sig = "p<0.05 — significant"
+        elif abs(t) > 1.761:
+            sig = "p<0.10 — marginally significant"
+        else:
+            sig = "not significant"
+        print(f"Conclusion:             {sig}")
+        print(f"95% CI of mean:         "
+              f"[{m - crit_05 * se:+.2f}, {m + crit_05 * se:+.2f}]")
+
+# --- Per-dimension ---
+print()
+print("=" * 78)
+print("PER-DIMENSION BREAKDOWN")
+print("=" * 78)
+print(f"{'Dimension':<18}{'Sum Δ':<10}{'Mean Δ':<10}{'T-wins':<10}"
+      f"{'C-wins':<10}{'Ties':<8}")
+print("-" * 78)
+dim_trials = [t for t in sorted(RAW.keys()) if 'corr' in RAW[t]]
+for dim in DIMS:
+    ds = [dim_delta(t, dim) for t in dim_trials]
+    s = sum(ds)
+    m = statistics.mean(ds) if ds else 0
+    tw = sum(1 for d in ds if d > 0)
+    cw = sum(1 for d in ds if d < 0)
+    tt = sum(1 for d in ds if d == 0)
+    print(f"{DIM_LABELS[dim]:<18}{sign(s):<10}{m:+.2f}      "
+          f"{tw:<10}{cw:<10}{tt:<8}")
