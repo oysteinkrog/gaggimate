@@ -7,16 +7,25 @@
 // (pio test -e native_settingsui), so every rule here is proved on the host
 // before a screen bead wires a row to it.
 //
-// Firmware tables this model does not own -- the animation roster and the
-// built-in gradient themes, both function-pointer tables that pull in the
-// animation kernels -- are reached through the provider structs below,
-// which a screen bead wires to the real bg_animation()/bg_theme_name() and
-// the test wires to a stub. The zone table is reached the same way through
-// ZoneProvider; unlike the other two it has a cheap, dependency-free real
-// implementation (zones_count()/zones_entry(), zones.h/zones.cpp), so the
-// test wires ZoneProvider to that for the round-trip check instead of a
-// stub. Mirrored (not read) by the web UI: web/src/config/zones.js,
-// web/src/config/bgAnimations.js.
+// Two firmware tables this model does not own, the animation roster and the
+// built-in gradient themes, are function-pointer tables that pull in the
+// animation kernels, so they are reached through the provider structs below.
+// A screen bead wires those to the real bg_animation()/bg_theme_name() and
+// the test wires them to a stub. The zone table is reached the same way
+// through ZoneProvider; unlike the other two it has a cheap, dependency-free
+// real implementation (zones_count()/zones_entry(), zones.h/zones.cpp), so
+// the test wires ZoneProvider to that for the round-trip check instead of a
+// stub.
+//
+// Three places hold the same lists and ranges and must agree. This file owns
+// the display's editing ranges, steps, wrap rules and formats. The web UI
+// mirrors (never reads) the roster in web/src/config/bgAnimations.js and the
+// zone table in web/src/config/zones.js, and holds the web form's own input
+// constraints in web/src/pages/Settings/tabs/*.jsx. Settings itself clamps
+// only a few fields on store (Settings.cpp) and takes the rest as given, so
+// a value that reaches the display from the web path can be off this file's
+// grid or outside its range: read it through clampOrWrap, and clamp any id
+// before indexing with it.
 
 #include <cstddef>
 #include <functional>

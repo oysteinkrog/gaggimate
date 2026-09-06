@@ -128,6 +128,187 @@ and `frames` is the scan-out's counter, so neither is a rate):
   at any render priority, so how much of the screen is translucent over
   the animation is the budget knob for everything above.
 
+## On-display settings (violate these and an edit is lost or a target is unreachable)
+
+The settings screens are code-built LVGL in
+`src/display/ui/default/settings/`: a host-testable value model
+(`SettingsModel`), the shell (`SettingsUI`), seven row widgets
+(`SettingsRows`) and one `Cat<Name>.cpp` per category.
+`src/display/ui/default/settings/README.md` is the working guide: file
+map, how to add a category, how to run the tests. This section is what
+the design cannot show and what the runs measured.
+
+- **Settings is a cover on the menu screen, not a screen.** `SettingsUI::open`
+  creates one full-screen child of `objects.menu_screen_new`, hides every
+  other direct child except `objects.status_icons`, and restores their
+  captured visibility on close. `currentScreen` stays
+  `SCREEN_ID_MENU_SCREEN_NEW` for the whole visit, so the animation host,
+  the plate handling and the screen-change path in `DefaultUI` never see a
+  settings visit at all. The runtime-built scale overlay
+  (`DefaultUI::buildScaleScreen`) is the precedent for the construction and
+  for the delete-event pointer cleanup.
+- **No translucent plate on a settings page.** The cover sets `bg_opa` to
+  `LV_OPA_TRANSP` and every row is text and icons on the screen background
+  (`SettingsUI.cpp`). Translucent pixels are the render task's budget knob:
+  the brew screen's plates are about 106k non-transparent pixels and 12 to
+  13 ms of blend a frame (UI-pipeline invariants above). The bench board
+  measured 29.7 to 30.6 fps on all nine settings pages against a 27.9 fps
+  menu-screen baseline at cap 30, so the cover costs the animation nothing
+  (device runner report, `report.json` pages and the `baseline` step,
+  2026-09-06).
+- **Every route out of a category commits it.** Visual fields apply on every
+  change and call `DefaultUI::markDirty()` so the next UI pass shows them
+  rather than the 2.5 s idle rerender: main and standby brightness
+  (`CatDisplay.cpp`), and animation, frame rate, all-screens, theme,
+  gradient, plates, tint and scrim (`CatAnimation.cpp`). Everything else is
+  written to `Settings` by the category's `commit`, which runs when its page
+  is removed by any route, and writes only the fields the visit touched.
+- **`handleScreenChange` calls `SettingsUI::onExternalLeave()` before
+  `eez_flow_set_screen`** (`DefaultUI.cpp`). A standby timeout, a controller
+  mode change or a brew start mid-edit therefore commits and tears down the
+  same way the exit chevron does, instead of leaving a stale cover on a
+  screen that has moved underneath it.
+- **A web save while a category is open is per-field last writer wins.** The
+  web values land first, `settings:changed` sets the shell's flag,
+  `SettingsUI::service()` refreshes on the next pass every row the user has
+  not touched, and the touched fields keep their draft and win at commit. A
+  web-requested restart reboots from the web task at once and an uncommitted
+  draft is lost, the same as a power cut, and that is accepted.
+- **`reconcile` reaches only the top page.** A pushed child page (the
+  schedule list, the schedule editor) refreshes its parent's draft itself
+  through `machineDraftReconcile` (`CatMachine.h`), because `kCatMachine`'s
+  own `reconcile` never runs while a child is on top.
+- **Lifecycle order is fixed.** `pushPage` runs `enter` under
+  `Settings::Guard`; `popPage` and `teardownAll` run `commit` under the
+  guard, delete the page root, then call `destroyCtx`. Root before ctx,
+  because a row's DELETE callback can still hold the ctx. `refresh` and
+  `reconcile` take the guard too.
+- **Deleting a page from inside one of its own row callbacks is safe in
+  LVGL 8.4 and an upgrade must keep it that way.** `lv_obj_destructor` marks
+  in-flight events deleted and `event_send_core` stops dispatching after the
+  callback returns (`lv_event.c`), which is what `openCategory`, `pushPage`
+  and `popPage` called from click handlers rely on.
+- **Row widgets clear `LV_OBJ_FLAG_PRESS_LOCK`, which `lv_obj_create` sets on
+  every child** (`SettingsRows.cpp`, `createRowContainer`). With the flag on,
+  a press stays glued to the object it started on, so a finger sliding off a
+  row or a row being disabled would never produce the `PRESS_LOST` that
+  cancels the hold.
+- **Holds are driven only by the events LVGL delivers to the row**, never by
+  an `lv_timer` that could outlive it. Steppers step once on `PRESSED` and
+  once per `LONG_PRESSED_REPEAT` (LVGL default: 400 ms, then every 100 ms)
+  and never on `CLICKED`; a hold reports fast after 2 s
+  (`kSettingsRowFastHoldMs`, `SettingsRows.h`) and the field's own `fastStep`
+  applies, since there is no universal multiplier. Locked rows unlock after
+  a 1 s press (`kSettingsRowUnlockHoldMs`) and relock when the category is
+  left. Confirm rows act after a 2 s hold (`kSettingsRowConfirmHoldMs`).
+- **Geometry: 320x56 rows, five per page** (`SettingsUI::kRowW`, `kRowH`,
+  `kRowsPerPage`), 96x96 tiles on a 145 px ring (`SettingsUI.cpp`,
+  `buildTile`). Every tappable target except the exit chevron needs an
+  effective hit rectangle of at least 56x56 px, no overlap with another on
+  the same page, and 12 px of clearance from the panel's edge circle. The
+  chevron is exempt from the size and edge rules and its ext click pad is
+  34 px on settings pages, not the 45 px the generated screens use: at 45 px
+  it reached 10x6 px into the two lower tiles (measured by the runner's
+  audit, 91cb0ed5). `Rig.audit()` in `tools/settings_ui_tests/rig.py` is the
+  check, and the runner audits every page on every run.
+- **Ranges live in three places that must agree.** `SettingsModel.h` owns the
+  display's editing ranges, steps, wrap rules and formats. `Settings` clamps
+  a few fields on store (`setBrewDelay` and `setGrindDelay` to 0 to 4000,
+  `setBgAnimPlateColor` to 24 bits) and stores the rest as given, including
+  `setMainBrightness`, `setStandbyBrightness` and `setBgAnimFps`. The web
+  form has its own input constraints in `web/src/pages/Settings/tabs/*.jsx`.
+  The animation roster comes from `BgAnim.h` and is mirrored by
+  `web/src/config/bgAnimations.js`; the zone table comes from `zones.h` and
+  is mirrored by `web/src/config/zones.js`.
+- **Nothing range-checks a stored value on the web path, so a category that
+  indexes with one clamps first.** `CatAnimation.cpp` clamps `bgAnimId` into
+  the live registry at `enter` and at `reconcile`: a stored id from a longer
+  registry, after a rollback to a build with fewer animations, wrote past
+  the end of a heap vector on the first Gradient arrow press (91cb0ed5).
+- **`Settings::lock()` orders whole transactions, not fields.** It covers the
+  web save's `batchUpdate`, `doSave`, a category's `enter`, `commit`,
+  `refresh` and `reconcile`, `Controller::loopLogic`'s delay auto-adjust
+  writes, and since 91cb0ed5 the web settings GET and the auto-wakeup minute
+  tick, both of which copy container-typed properties. `Property::get` still
+  hands out a reference, so any new cross-task reader of a `String` or a
+  vector property must take the guard as well.
+- **A failed NVS write is reported, not swallowed.** `Settings::flushNow()`
+  returns false and the Restart row shows "Save failed, hold to retry"
+  (`CatStatus.cpp`). `GM_SIM_FAIL_FLUSH=1` on the simulator arms one forced
+  failure (`Settings::debugFailNextFlush`) so the path is testable.
+- **The Fixture tile (the sixth) exists only under `GM_TOUCH_PROBE` or
+  `GAGGIMATE_SIM`** (`SettingsFixture.cpp`): one of each row widget, so the
+  shell and the widgets stay exercisable whatever the five real categories
+  do. Production links five tiles.
+
+Instruments, and where each one exists:
+
+- `/api/debug/tap?x=&y=[&ms=]` queues one synthetic tap through
+  `TouchInject`; compiled where `GM_TOUCH_PROBE` or `GAGGIMATE_SIM` is set.
+- `/api/debug/touchmap?screen=0` dumps the active screen's object tree with
+  every settings object's `SettingsDebugTag` and, for value rows, the
+  untruncated canonical text; compiled unless `GAGGIMATE_HEADLESS`.
+- `/api/debug/settingsui` opens, closes and navigates the shell and reports
+  its state; `GM_TOUCH_PROBE` or `GAGGIMATE_SIM`.
+- `/api/debug/heap` carries `int_free`, `dma_free`, `dma_min` and `hot_fail`;
+  everywhere.
+- `/api/debug/synth?brew=0` stops the loadtest build's synthetic brew
+  lifecycle so a measurement is not dragged back to the status screen;
+  `GM_SYNTH_HANDSHAKE`, which only `display-loadtest` and `display-blestress`
+  set.
+- `/api/debug/anim` (frame counters, `anim_id`, `uptime_ms`) and
+  `/api/debug/pclk` (the live pixel-clock divider) are device-only: both sit
+  inside `WebUIPlugin.cpp`'s real-panel block, which `GAGGIMATE_SIM` and
+  `GAGGIMATE_HEADLESS` exclude.
+
+Three test commands, and what each proves:
+
+- `pio test -e native_settingsui` runs the value model on the host, 28 cases,
+  no LVGL and no Arduino. It proves ranges, steps, wrap, formats, the zone
+  split, the gradient map and schedule parsing.
+- `python3 tools/settings_ui_test.py` builds nothing and launches
+  `.pio/build/display-sim/program` itself, seeded from
+  `tools/settings_ui_tests/fixtures/controller.json`. It proves navigation,
+  interaction, values, persistence, theme colours and the geometry audit.
+  Last full run: PASS, 316 checks across 7 scenarios, 16 pages audited clean,
+  smallest target 56x56 px, about 10 minutes wall time (`out_sim2/report.json`,
+  2026-09-06).
+- `python3 tools/settings_ui_test.py --host 192.168.1.121` drives the bench
+  board on a `display-loadtest` build and adds what the simulator cannot do:
+  frame rates, heap, and a 20-cycle leak phase. Last run: PASS with
+  `--only temps,display,machine,schedules,status,rig`, 120 checks across 6
+  scenarios, 9 pages audited clean, page rates 29.7 to 30.6 fps against a
+  27.9 fps baseline at cap 30, `dma_min` 32067 B, sampled `int_free` minimum
+  46907 B, `hot_fail` 0 (`out_device6/report.json`, 2026-09-06).
+
+What the device runs taught, beyond the numbers:
+
+- **The bench board stores pixel-clock divider 8**, not the build default 6,
+  so its rates are not comparable with a run at the default. The runner reads
+  `/api/debug/pclk` and warns. This is the stored-settings trap from the
+  hardware invariants above, hit again.
+- **The Animation scenario cannot run on that board as it stands.** Its stored
+  `elementTintColor` is `#FEC4A4`, which is not one of the twelve palette
+  colours the tint row cycles through, so the preflight reports an unsupported
+  fixture rather than changing a stored value it could not put back.
+- **The board shows 12-hour times with a space-padded hour** (` 1:09:27 PM`)
+  and its NTP clock sat 4 to 5 minutes off the host's, so a test compares
+  parsed fields, never strings or the host's own clock.
+- **Opening the shell through the debug route is not a touch.** On a board
+  idle past its 60 s standby timeout the standby screen can take over right
+  after the open and close the cover, which is why `tools/settings_ui_test.py`
+  retries the open after a reboot (`_open_after_boot`).
+
+Known limits, recorded rather than fixed:
+
+- A malformed stored schedule time, which the web UI can write because its
+  handler stores whatever string the browser sent, shows as 00:00 in the
+  editor and as the raw string in the list (`CatSchedules.cpp`, through
+  `settingsui::scheduleTimeParts`).
+- `buildRegions` rebuilds the whole region span list, one `std::string` per
+  zone entry, on every region or city arrow press (`SettingsModel.cpp`). The
+  churn is unmeasured.
+
 ## Internal DRAM budget (violate these and the web UI dies)
 
 The web UI does not die of bugs in the server, it dies of internal DRAM
