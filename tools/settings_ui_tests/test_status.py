@@ -67,17 +67,32 @@ def build_git_version():
     return m.group(1)
 
 
+def _cmd(rig, timeout=5.0, **cmd):
+    """One settingsui command, retried while the route answers 409 (the
+    previous command is still in flight on the UI task; the state can show
+    the earlier command's result a pass before the pending flag clears, so
+    a wait on state alone is not enough on the device)."""
+    deadline = time.time() + timeout
+    while True:
+        try:
+            return rig.settingsui(**cmd)
+        except RigHTTPError as e:
+            if "409" not in str(e) or time.time() > deadline:
+                raise
+            time.sleep(0.1)
+
+
 def open_to_status_page(rig, page=0):
     """Opens the settings shell (a no-op if already open) and navigates to
     the Status category's given page, polling settingsui_state() after each
     command the same way DefaultUI::serviceSettingsUi documents (a command
     is accepted, then executed across one or more UI-task passes)."""
-    rig.settingsui(open=1)
+    _cmd(rig, open=1)
     rig.wait_until(lambda: rig.settingsui_state().get("open") is True, timeout=8)
-    rig.settingsui(cat=STATUS_CATEGORY)
+    _cmd(rig, cat=STATUS_CATEGORY)
     rig.wait_until(lambda: rig.settingsui_state().get("category") == STATUS_CATEGORY, timeout=8)
     if page != 0:
-        rig.settingsui(page=page)
+        _cmd(rig, page=page)
         rig.wait_until(lambda: rig.settingsui_state().get("page") == page, timeout=8)
     time.sleep(0.2)  # one more UI pass so buildRow's initial fill is in the dump
     return rig.touchmap(screen=0)
@@ -137,10 +152,14 @@ def check_page0_rows(rig, expected_version):
     if s10_display_fw is not None:
         check(rig, "display_firmware_matches_info_screen", display_fw == s10_display_fw, "%r vs %r" % (display_fw, s10_display_fw))
     if s10_controller_fw is not None:
+        # The info screen's flow expression shortens a long controller
+        # version (the device showed 'v1.9.8-sle' for 'v1.9.8-sleep9-272-
+        # gf828'); the row carries the whole string, so the info text
+        # must be a prefix of it, equal when it fits.
         check(
             rig,
             "controller_firmware_matches_info_screen",
-            controller_fw == s10_controller_fw,
+            controller_fw == s10_controller_fw or (len(s10_controller_fw) >= 6 and controller_fw.startswith(s10_controller_fw)),
             "%r vs %r" % (controller_fw, s10_controller_fw),
         )
     if s10_network is not None:
@@ -164,7 +183,9 @@ def check_page1_rows(rig):
     check(
         rig,
         "time_value_shape",
-        time_val == "Not synchronised" or re.match(r"^\d{1,2}:\d{2}:\d{2}( [AP]M)?$", time_val) is not None,
+        # CatStatus pads a one-digit 12-hour hour with a space (' 1:09:27 PM')
+        # to match the standby clock label; the simulator's fixture is 24 h.
+        time_val == "Not synchronised" or re.match(r"^\s?\d{1,2}:\d{2}:\d{2}( [AP]M)?$", time_val) is not None,
         repr(time_val),
     )
     return d1
@@ -177,12 +198,16 @@ def check_audit(rig, d0, d1):
 
 
 def _time_to_seconds(s):
-    parts = s.split(" ")[0].split(":")
-    h, m, sec = (int(p) for p in parts)
+    """Seconds of day from "HH:MM:SS" or " h:MM:SS AM/PM" (the 12-hour form
+    the device shows, one-digit hour space-padded)."""
+    fields = s.strip().split(" ")
+    h, m, sec = (int(p) for p in fields[0].split(":"))
+    if len(fields) > 1:
+        h = h % 12 + (12 if fields[1].upper() == "PM" else 0)
     return h * 3600 + m * 60 + sec
 
 
-def check_time_progression(rig):
+def check_time_progression(rig, venue):
     """Two Time dumps 3s apart: the row must advance by 2..4s (the bead's
     own tolerance) and, since getLocalTime() on the simulator is always the
     host's real wall clock (sim/platform/Arduino.h), match this script's own
@@ -204,7 +229,14 @@ def check_time_progression(rig):
 
     py_seconds = py_a.hour * 3600 + py_a.minute * 60 + py_a.second
     diff = min((sa - py_seconds) % 86400, (py_seconds - sa) % 86400)
-    check(rig, "time_matches_host_clock", diff <= 2, "sim=%r host_seconds=%r diff=%r" % (t_a, py_seconds, diff))
+    if venue.is_device:
+        # The device keeps its own zone (Europe/Stockholm on the bench) and
+        # an NTP clock that sat 4 to 5 min from this host on 2026-09-06, so
+        # whole hours are folded away and a few minutes of skew allowed.
+        diff = min(diff % 3600, 3600 - diff % 3600)
+        check(rig, "time_matches_host_clock", diff <= 360, "device=%r host_seconds=%r diff_mod_hour=%r" % (t_a, py_seconds, diff))
+    else:
+        check(rig, "time_matches_host_clock", diff <= 2, "sim=%r host_seconds=%r diff=%r" % (t_a, py_seconds, diff))
 
 
 def check_short_hold_noop(rig, d1):
@@ -230,9 +262,9 @@ def check_restart_persistence_and_relaunch(rig, sim):
     process from the same sim_data and re-reads Settings from NVS, so a
     stale value here would mean flushNow() did not actually persist the
     other category's pending write."""
-    rig.settingsui(open=1)
+    _cmd(rig, open=1)
     rig.wait_until(lambda: rig.settingsui_state().get("open") is True, timeout=8)
-    rig.settingsui(cat=DISPLAY_CATEGORY)
+    _cmd(rig, cat=DISPLAY_CATEGORY)
     rig.wait_until(lambda: rig.settingsui_state().get("category") == DISPLAY_CATEGORY, timeout=8)
     time.sleep(0.3)
     d_disp = rig.touchmap(screen=0)
@@ -248,9 +280,9 @@ def check_restart_persistence_and_relaunch(rig, sim):
 
     # cat= pops the Display page (committing it: the bumped field is now
     # dirty in Settings, unflushed) before pushing Status.
-    rig.settingsui(cat=STATUS_CATEGORY)
+    _cmd(rig, cat=STATUS_CATEGORY)
     rig.wait_until(lambda: rig.settingsui_state().get("category") == STATUS_CATEGORY, timeout=8)
-    rig.settingsui(page=1)
+    _cmd(rig, page=1)
     rig.wait_until(lambda: rig.settingsui_state().get("page") == 1, timeout=8)
     time.sleep(0.3)
     d_status = rig.touchmap(screen=0)
@@ -273,16 +305,16 @@ def check_restart_persistence_and_relaunch(rig, sim):
 
     # Put the bumped field back through the same stepper, so the venue is
     # left as this check found it.
-    rig.settingsui(open=1)
+    _cmd(rig, open=1)
     rig.wait_until(lambda: rig.settingsui_state().get("open") is True, timeout=8)
-    rig.settingsui(cat=DISPLAY_CATEGORY)
+    _cmd(rig, cat=DISPLAY_CATEGORY)
     rig.wait_until(lambda: rig.settingsui_state().get("category") == DISPLAY_CATEGORY, timeout=8)
     time.sleep(0.3)
     d_back = rig.touchmap(screen=0)
     back_btn = rig.find_tag(d_back, "Standby brightness", "minus" if direction == "plus" else "plus")
     if back_btn is not None:
         rig.tap_target(back_btn, ms=80)
-    rig.settingsui(close=1)
+    _cmd(rig, close=1)
     rig.wait_until(lambda: rig.settingsui_state().get("open") is False, timeout=8)
     restored = rig.wait_until(lambda: int(rig.settings_value("standbyBrightness")) == current, timeout=6)
     check(rig, "standby_brightness_restored_after_check", bool(restored),
@@ -303,11 +335,11 @@ def check_fail_flush_scenario(program, workdir, port):
         with Sim(program, data_dir, port=port) as sim:
             rig = sim.rig
             rig.log("fail_flush_boot", program=program, port=port, workdir=workdir)
-            rig.settingsui(open=1)
+            _cmd(rig, open=1)
             rig.wait_until(lambda: rig.settingsui_state().get("open") is True, timeout=8)
-            rig.settingsui(cat=STATUS_CATEGORY)
+            _cmd(rig, cat=STATUS_CATEGORY)
             rig.wait_until(lambda: rig.settingsui_state().get("category") == STATUS_CATEGORY, timeout=8)
-            rig.settingsui(page=1)
+            _cmd(rig, page=1)
             rig.wait_until(lambda: rig.settingsui_state().get("page") == 1, timeout=8)
             time.sleep(0.3)
             d = rig.touchmap(screen=0)
@@ -352,7 +384,7 @@ def _sequence(rig, venue):
     d0 = check_page0_rows(rig, build_git_version())
     d1 = check_page1_rows(rig)
     check_audit(rig, d0, d1)
-    check_time_progression(rig)
+    check_time_progression(rig, venue)
     if not venue.can_restart:
         rig.log(
             "skipped",

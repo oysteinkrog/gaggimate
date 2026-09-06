@@ -393,12 +393,15 @@ def leak_phase(rig, report, venue, page_key, baseline):
         report.step("leak_phase", supported=0, reason="the simulator's heap figures are shims")
         return
     spec = next(p for p in audit_pages.CATEGORY_PAGES if p.key == page_key)
+    # Each command is waited out (audit_pages.command): the route answers
+    # 409 while the previous command is still in flight, and on the device
+    # a UI pass is long enough for back-to-back commands to collide.
     for _ in range(LEAK_CYCLES):
-        rig.settingsui(open=1)
-        rig.settingsui(cat=spec.cat)
+        audit_pages.command(rig, open=1)
+        audit_pages.command(rig, cat=spec.cat)
         if spec.page:
-            rig.settingsui(page=spec.page)
-        rig.settingsui(close=1)
+            audit_pages.command(rig, page=spec.page)
+        audit_pages.command(rig, close=1)
     close_shell(rig)
     after = heap_sample(rig)
     report.number("leak_int_free_before", baseline["heap"]["int_free"])
@@ -495,8 +498,8 @@ def restart_round_trip(rig, report, venue):
         close_shell(rig)
         return
 
-    rig.settingsui(cat=audit_pages.CAT_STATUS)
-    rig.settingsui(page=1)
+    audit_pages.command(rig, cat=audit_pages.CAT_STATUS)
+    audit_pages.command(rig, page=1)
     status_dump = rig.touchmap(screen=0)
     confirm = rig.find_tag(status_dump, "Restart", "confirm")
     if confirm is None:
@@ -530,14 +533,41 @@ def restart_round_trip(rig, report, venue):
     if after != expected:
         report.violation("RESTART LOST VALUE", key="standbyBrightness", expected=expected, actual=after)
 
-    back = audit_pages.open_category_page(rig, audit_pages.CAT_DISPLAY, 0)
+    back = _open_after_boot(rig, report, audit_pages.CAT_DISPLAY, 0)
     opposite = "minus" if direction == "plus" else "plus"
     rig.tap_target(rig.find_tag(back, "Standby brightness", opposite))
     close_shell(rig)
+    # The close is queued to the UI task and the field is deferred, so the
+    # write lands on the pass that tears the page down, not at the HTTP
+    # return; poll for it (the device measured the immediate read stale).
+    try:
+        rig.wait_until(lambda: int(rig.settings_value("standbyBrightness")) == current, timeout=6)
+    except TimeoutError:
+        pass
     restored = int(rig.settings_value("standbyBrightness"))
     if restored != current:
         report.finding("RESTORE FAILED", scenario="restart", key="standbyBrightness",
                        expected=current, actual=restored)
+
+
+def _open_after_boot(rig, report, cat, page, timeout=60.0):
+    """open_category_page on a venue that has just booted. The device keeps
+    changing screens for a while after HTTP is back (the controller link
+    comes up and the flow picks its screen), and each change closes the
+    cover through onExternalLeave; a fourth device run saw the open land
+    and the following category command find the shell closed. So the open
+    is retried until it holds, for up to `timeout` seconds."""
+    deadline = time.time() + timeout
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            return audit_pages.open_category_page(rig, cat, page)
+        except (RuntimeError, RigHTTPError, TimeoutError) as e:
+            if time.time() > deadline:
+                raise
+            report.step("restart_open_retry", attempt=attempt, detail=str(e)[:120])
+            time.sleep(3.0)
 
 
 # ---- assembly ---------------------------------------------------------------
@@ -675,6 +705,12 @@ def drive(rig, report, venue, selected, only, args):
         summarise(report, venue)
         return 1
     for u in pre.unsupported:
+        if only is not None and u["scenario"] not in only:
+            # A fixture for a scenario this run does not select is worth
+            # knowing but is not this run's failure.
+            report.note("unsupported fixture for unselected scenario %s: %s=%s (want %s)"
+                        % (u["scenario"], u["key"], u["value"], u["want"]))
+            continue
         report.violation("UNSUPPORTED FIXTURE", key=u["key"], value=u["value"], scenario=u["scenario"],
                          want=u["want"])
     if fixtures.RESTART_KEY in pre.blocked_keys:

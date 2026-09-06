@@ -17,6 +17,7 @@ Exits 0 if every check passes, 1 otherwise. Logs each step (Rig.log) and
 prints a PASS/FAIL summary at the end.
 """
 import argparse
+import re
 import datetime
 import os
 import sys
@@ -125,6 +126,26 @@ def standby_clock_text(rig):
         if object_name(o) == "time":
             return o.get("t")
     return None
+
+
+def clock_minutes(text):
+    """Minutes of day from a clock label in either "HH:MM" or "h:MM AM/PM"
+    form; None when it is not a time."""
+    if not text:
+        return None
+    m = re.match(r"\s*(\d{1,2}):(\d{2})\s*([AaPp][Mm])?\s*$", text)
+    if not m:
+        return None
+    hour, minute, ampm = int(m.group(1)), int(m.group(2)), m.group(3)
+    if ampm:
+        hour = hour % 12 + (12 if ampm.lower() == "pm" else 0)
+    return (hour * 60 + minute) % 1440
+
+
+def clock_delta_minutes(shown, expected):
+    """Signed difference on the 24 h circle, in minutes."""
+    d = (shown - expected) % 1440
+    return d - 1440 if d > 720 else d
 
 
 def expected_region_city(tz):
@@ -419,15 +440,15 @@ def check_zone_change_and_clock(rig):
 
     clock_text = standby_clock_text(rig)
     now_utc = datetime.datetime.now(datetime.timezone.utc)
-    expected = (now_utc + datetime.timedelta(hours=14)).strftime("%H:%M")
-    if clock_text != expected:
-        # Minute-boundary race between the device's ~1Hz clock refresh and
-        # this check's own clock read, not a real mismatch; one immediate
-        # retry resolves it without loosening the assertion.
-        clock_text = standby_clock_text(rig)
-        now_utc = datetime.datetime.now(datetime.timezone.utc)
-        expected = (now_utc + datetime.timedelta(hours=14)).strftime("%H:%M")
-    check(rig, "standby_clock_utc_plus_14", clock_text == expected, "got %r want %r (utc=%s)" % (clock_text, expected, now_utc.isoformat()))
+    expected_min = ((now_utc.hour + 14) * 60 + now_utc.minute) % 1440
+    shown_min = clock_minutes(clock_text)
+    delta = None if shown_min is None else clock_delta_minutes(shown_min, expected_min)
+    # The label follows the device's own 12/24-hour setting, and the device
+    # clock is NTP-set and can sit a few minutes from this host's (the bench
+    # board read 5 min behind on 2026-09-06), so the check is the UTC+14
+    # offset within a small window, not an exact string.
+    check(rig, "standby_clock_utc_plus_14", delta is not None and abs(delta) <= 6,
+          "got %r want %02d:%02d (utc=%s, delta_min=%r)" % (clock_text, expected_min // 60, expected_min % 60, now_utc.isoformat(), delta))
 
     # Region wrap + city-hold-repeat, before restoring: from Pacific, one
     # step reaches the last region (Etc, moved there by buildRegions), a

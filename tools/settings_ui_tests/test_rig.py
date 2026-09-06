@@ -98,10 +98,19 @@ def check_touchmap_seq(rig):
     check(rig, "touchmap_seq_increases", d1["seq"] != d0["seq"], "%r -> %r" % (d0["seq"], d1["seq"]))
 
 
-def check_brew_baseline_and_audit(rig):
+# Targets the device's brew screen carries on top of the baseline: the
+# generated screen shows the mode switch only while a controller is linked
+# (device run 2026-09-06), so the simulator, which has no controller, never
+# dumps it.
+BREW_TARGETS_DEVICE_EXTRA = ["mode_switch"]
+
+
+def check_brew_baseline_and_audit(rig, venue):
     d_brew = rig.touchmap(screen=2, load=True)
     names = sorted(object_name(t) for t in rig.targets(d_brew))
-    check(rig, "brew_target_baseline", names == sorted(BREW_TARGETS), "got %r" % (names,))
+    allowed_extra = set(BREW_TARGETS_DEVICE_EXTRA) if venue.is_device else set()
+    baseline_ok = set(BREW_TARGETS) <= set(names) and set(names) - set(BREW_TARGETS) <= allowed_extra
+    check(rig, "brew_target_baseline", baseline_ok, "got %r" % (names,))
     # Informational only: the generated screens are not held to the
     # settings geometry rules beyond the baseline above (bead text), so
     # violations here are not a rig bug. brew_dials__menu_icon's hit rect
@@ -228,7 +237,7 @@ def _sequence(rig, venue):
     check_wifi_password_grep(rig)
     s = check_settings(rig)
     check_touchmap_seq(rig)
-    check_brew_baseline_and_audit(rig)
+    check_brew_baseline_and_audit(rig, venue)
     check_audit_exemptions(rig)
     check_tap_opens_menu(rig)
     if not venue.is_device:

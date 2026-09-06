@@ -323,10 +323,25 @@ def open_schedule_list(rig):
     if row is None:
         raise RuntimeError("no Schedules row on the Machine page: %r" % rows_on_page(dump))
     rig.tap_target(row)
-    state = rig.settingsui_state()
-    if int(state.get("depth", 0)) != 2:
-        raise RuntimeError("tapping Schedules did not push the list: %r" % state)
+    # The shell publishes its state on the UI task's next pass, which on the
+    # device can be later than tap_target's 150 ms settle (measured: the
+    # list was pushed, the state read once still said depth 1). Wait for it.
+    state = _wait_depth(rig, 2)
+    if state is None:
+        raise RuntimeError("tapping Schedules did not push the list: %r" % rig.settingsui_state())
     return rig.touchmap(screen=0), state
+
+
+def _wait_depth(rig, depth, timeout=5):
+    try:
+        return rig.wait_until(lambda: _state_at_depth(rig, depth), timeout)
+    except TimeoutError:
+        return None
+
+
+def _state_at_depth(rig, depth):
+    state = rig.settingsui_state()
+    return state if int(state.get("depth", -1)) == int(depth) else None
 
 
 def open_schedule_editor(rig, n=1):
@@ -336,9 +351,9 @@ def open_schedule_editor(rig, n=1):
     if row is None:
         raise RuntimeError("no Schedule %d row in the list: %r" % (n, rows_on_page(dump)))
     rig.tap_target(row)
-    state = rig.settingsui_state()
-    if int(state.get("depth", 0)) != 3:
-        raise RuntimeError("tapping Schedule %d did not push the editor: %r" % (n, state))
+    state = _wait_depth(rig, 3)
+    if state is None:
+        raise RuntimeError("tapping Schedule %d did not push the editor: %r" % (n, rig.settingsui_state()))
     return rig.touchmap(screen=0), state
 
 

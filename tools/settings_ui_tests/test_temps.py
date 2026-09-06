@@ -642,18 +642,26 @@ def _step_row_to(rig, row, target, tolerance):
         d = rig.touchmap(screen=0)
     current = _row_number(rig.row_value(d, row))
     presses = 0
+    step = 2 * tolerance # the row's grid: offset 1, pressure 0.1, delays 50
+    crossed = False      # once the target has been passed, single taps only
     while current is not None and abs(current - target) > tolerance and presses < 120:
         role = "plus" if current < target else "minus"
         btn = rig.find_tag(d, row, role)
         if btn is None or btn.get("hidden"):
             break
-        far = abs(current - target) > 6 * tolerance
-        rig.tap_target(btn, ms=2600 if far else 80)
+        # A 1500 ms hold is one press plus about eleven 100 ms repeats (fewer
+        # on a slow UI pass), so it moves at most about 12 steps and never
+        # reaches the 2 s fast-step threshold; use it only while the target
+        # is well beyond that, so a hold cannot overshoot and oscillate.
+        far = not crossed and abs(current - target) > 20 * step
+        rig.tap_target(btn, ms=1500 if far else 80)
         presses += 1
         d = rig.touchmap(screen=0)
         nxt = _row_number(rig.row_value(d, row))
-        if nxt == current and not far:
+        if nxt is None or (nxt == current and not far):
             break # clamped at a limit, or the row stopped responding
+        if (nxt - target) * (current - target) < 0:
+            crossed = True
         current = nxt
     pop_temps(rig)
     return current
