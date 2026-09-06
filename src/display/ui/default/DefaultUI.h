@@ -98,6 +98,48 @@ class DefaultUI {
     void closeSettings();
     SettingsUI &getSettingsUI() { return settingsUI; }
 
+#if defined(GM_TOUCH_PROBE) || defined(GAGGIMATE_SIM)
+    // /api/debug/settingsui (WebUIPlugin.cpp, bench and sim builds only):
+    // opens, closes and navigates the settings shell from a script and
+    // reports where it is. One command in flight at a time:
+    // queueSettingsUiCommand (web/async task) accepts it if none is
+    // pending; serviceSettingsUi (UI task, called every DefaultUI::loop())
+    // executes it, staging Open across passes when the active screen is
+    // not the menu screen, and publishes the resulting state. Every
+    // executed command logs "SettingsDbg: <cmd> -> depth=.. category=..
+    // page=..".
+    enum class SettingsUiCmd : uint8_t { Open, Close, Cat, Page, Pop };
+    struct SettingsUiState {
+        uint32_t seq = 0;
+        bool open = false;
+        int depth = 0;
+        int category = -1;
+        int page = 0;
+        int pages = 0;
+        char title[24] = "Settings";
+        int fixtureEnter = 0;
+        int fixtureCommit = 0;
+        int fixtureDraft = 0;
+    };
+    // Valid range for a Cat command's arg: SettingsUI.cpp's kCategories
+    // holds the five real categories plus the Fixture tile that
+    // GM_TOUCH_PROBE and GAGGIMATE_SIM builds carry as a sixth, but
+    // SettingsUI.h exports neither the array nor its size, so this is kept
+    // in step with it by hand. The shared contract fixes this roster (five
+    // categories plus Fixture) for the epic's life, so it will not drift
+    // out from under a hardcoded count here.
+    static constexpr int kSettingsUiCategoryCount = 6;
+    // Queues cmd/arg if no command is already in flight and returns true
+    // with seqOut set to the seq a caller should poll settingsUiState()
+    // for; returns false, seqOut untouched, when a command is already
+    // pending (caller reports 409). Called from the web/async task.
+    bool queueSettingsUiCommand(SettingsUiCmd cmd, int arg, uint32_t &seqOut);
+    // Copies the last-published state out, as one struct under a critical
+    // section so a reader never observes a stale title paired with new
+    // counters. Called from the web/async task.
+    void settingsUiState(SettingsUiState &out) const;
+#endif
+
     // Styles just the subtree at root (the existing applyPressedRecurse
     // walk), skipping applyPressedFeedback's lv_scr_act()-vs-pressedStyledRoot
     // check: for a freshly built settings tile page or category page, so a
@@ -143,6 +185,16 @@ class DefaultUI {
     // with the hit rectangles LVGL uses, label text, settings debug tags and
     // a seq/uptime_ms pair. Runs on the simulator too.
     void serviceTouchMap();
+#if defined(GM_TOUCH_PROBE) || defined(GAGGIMATE_SIM)
+    // Executes the pending /api/debug/settingsui command, if any (see the
+    // public settingsui block above). Called every DefaultUI::loop() pass
+    // on both venues, same as serviceTouchMap(): an Open command needs the
+    // active screen to become the menu screen first (changeScreen(), whose
+    // actual eez_flow_set_screen() only runs inside the rerender-gated
+    // half of loop()), so this polls the live current screen across passes
+    // rather than assuming one call is enough.
+    void serviceSettingsUi();
+#endif
     // Renders obj and its children into buf as LV_IMG_CF_TRUE_COLOR_ALPHA
     // (RGB565 + A8), sized to the object's coords grown by its ext draw size;
     // *outArea receives that area in screen coordinates. False when the
@@ -350,29 +402,6 @@ class DefaultUI {
     PluginManager *pluginManager;
     ProfileManager *profileManager;
     SettingsUI settingsUI;
-#ifdef GAGGIMATE_SIM
-    // GM_SIM_OPEN_SETTINGS debug hook, driven from loop(): opening straight
-    // off setupPanel() would build the cover on menu_screen_new while
-    // standby was still the active screen (invisible to a screenshot), so
-    // this instead requests the menu screen and waits for it to become
-    // current. 0 = done/inactive, 1 = requested, waiting for currentScreen
-    // to become the menu screen, 2 = menu screen was current as of the
-    // PREVIOUS pass: open now (and push GM_SIM_OPEN_SETTINGS_CATEGORY's
-    // page, if set), 3 = category page opened as of the PREVIOUS pass: now
-    // apply GM_SIM_OPEN_SETTINGS_PAGE. Every stage's one-pass wait matters
-    // for the same reason: acting on an object in the same call that
-    // created it, before a single lv_task_handler()/tick pass has run for
-    // it, crashed intermittently (see the comment above
-    // applyPressedFeedback() in loop() for the eez-flow-screen case this
-    // was first found on).
-    int simOpenSettingsStage = 0;
-    // GM_SIM_SETTINGS_POP_AT_MS / GM_SIM_SETTINGS_CLOSE_AT_MS: fire popPage()
-    // / close() once, this many milliseconds after boot (time-gated, not
-    // pass-gated, so each lands several tick passes after whatever opened
-    // the page it acts on).
-    bool simPopFired = false;
-    bool simCloseFired = false;
-#endif
 
     // Screen state
     int updateAvailable = false;

@@ -2079,6 +2079,89 @@ void WebUIPlugin::setupServer() {
     });
 #endif
 
+#if defined(GM_TOUCH_PROBE) || defined(GAGGIMATE_SIM)
+    // /api/debug/settingsui[?open=1|close=1|cat=N|page=N|pop=1]: opens,
+    // closes and navigates the on-display settings shell from a script and
+    // reports where it is. Queued here (DefaultUI::queueSettingsUiCommand)
+    // and executed on the UI task (DefaultUI::serviceSettingsUi), same
+    // split as /api/debug/tap: LVGL is touched only from that task. One
+    // command per request (400 for two at once, or an out-of-range cat/
+    // negative page, before anything is queued); a request while a command
+    // is already in flight (an Open can span several UI passes while it
+    // waits for the menu screen) is 409, never silently dropped. Without
+    // arguments, returns the shell's last published state plus the
+    // Fixture counters (the bench/sim-only category the shared contract
+    // exercises the lifecycle against before any real category exists)
+    // and the seq of the last completed command.
+    server.on("/api/debug/settingsui", [this](AsyncWebServerRequest *request) {
+        const bool hasOpen = request->hasArg("open");
+        const bool hasClose = request->hasArg("close");
+        const bool hasCat = request->hasArg("cat");
+        const bool hasPage = request->hasArg("page");
+        const bool hasPop = request->hasArg("pop");
+        const int argCount = hasOpen + hasClose + hasCat + hasPage + hasPop;
+        if (argCount > 1) {
+            request->send(400, "application/json", "{\"error\":\"one command per request\"}");
+            return;
+        }
+        if (argCount == 1) {
+            DefaultUI::SettingsUiCmd cmd;
+            int arg = 0;
+            if (hasOpen) {
+                if (request->arg("open").toInt() == 0) {
+                    request->send(400, "application/json", "{\"error\":\"open must be 1\"}");
+                    return;
+                }
+                cmd = DefaultUI::SettingsUiCmd::Open;
+            } else if (hasClose) {
+                if (request->arg("close").toInt() == 0) {
+                    request->send(400, "application/json", "{\"error\":\"close must be 1\"}");
+                    return;
+                }
+                cmd = DefaultUI::SettingsUiCmd::Close;
+            } else if (hasCat) {
+                arg = request->arg("cat").toInt();
+                if (arg < 0 || arg >= DefaultUI::kSettingsUiCategoryCount) {
+                    request->send(400, "application/json", "{\"error\":\"cat out of range\"}");
+                    return;
+                }
+                cmd = DefaultUI::SettingsUiCmd::Cat;
+            } else if (hasPage) {
+                arg = request->arg("page").toInt();
+                if (arg < 0) {
+                    request->send(400, "application/json", "{\"error\":\"page must be >= 0\"}");
+                    return;
+                }
+                cmd = DefaultUI::SettingsUiCmd::Page;
+            } else {
+                if (request->arg("pop").toInt() == 0) {
+                    request->send(400, "application/json", "{\"error\":\"pop must be 1\"}");
+                    return;
+                }
+                cmd = DefaultUI::SettingsUiCmd::Pop;
+            }
+            uint32_t seq = 0;
+            if (!controller->getUI()->queueSettingsUiCommand(cmd, arg, seq)) {
+                request->send(409, "application/json", "{\"error\":\"busy\"}");
+                return;
+            }
+            char buf[48];
+            snprintf(buf, sizeof(buf), "{\"seq\":%u,\"accepted\":true}", static_cast<unsigned>(seq));
+            request->send(200, "application/json", buf);
+            return;
+        }
+        DefaultUI::SettingsUiState st;
+        controller->getUI()->settingsUiState(st);
+        char buf[256];
+        snprintf(buf, sizeof(buf),
+                 "{\"seq\":%u,\"open\":%s,\"depth\":%d,\"category\":%d,\"page\":%d,\"pages\":%d,\"title\":\"%s\","
+                 "\"fixture\":{\"enter\":%d,\"commit\":%d,\"draft\":%d}}",
+                 static_cast<unsigned>(st.seq), st.open ? "true" : "false", st.depth, st.category, st.page, st.pages,
+                 st.title, st.fixtureEnter, st.fixtureCommit, st.fixtureDraft);
+        request->send(200, "application/json", buf);
+    });
+#endif
+
     server.on("/api/status", [this](AsyncWebServerRequest *request) {
         AsyncResponseStream *response = request->beginResponseStream("application/json");
         JsonDocument doc(&psramAllocator);

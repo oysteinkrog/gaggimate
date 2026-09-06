@@ -5,9 +5,9 @@
 // logs on both the device and the simulator, and the simulator's esp_log.h shim
 // is only pulled in here, not through any device driver header.
 #include "esp_log.h"
-#include <cstdlib> // getenv, for the GM_SIM_OPEN_SETTINGS debug hook below
 #include <cstring>       // memcpy, for the touchmap dump's per-object line copy
 #include <esp_heap_caps.h> // heap_caps_malloc/realloc, for the touchmap dump's growable PSRAM buffer (both venues)
+#include <freertos/FreeRTOS.h> // portMUX_TYPE / portENTER_CRITICAL / portEXIT_CRITICAL, for the settingsui request queue
 #ifdef GM_ANIM_BENCH
 #include <display/ui/default/SleepAnimation.h>
 const BenchGateState &bench_gate_state() {
@@ -428,6 +428,9 @@ void DefaultUI::loop() {
     // tick and theme restyle checks there regardless of venue.
     serviceTouchMap();
     settingsUI.service();
+#if defined(GM_TOUCH_PROBE) || defined(GAGGIMATE_SIM)
+    serviceSettingsUi();
+#endif
 
     const unsigned long now = ::millis();
     const unsigned long diff = now - lastRender;
@@ -482,54 +485,6 @@ void DefaultUI::loop() {
         currentScreen = static_cast<ScreensEnum>(eez_flow_get_current_screen());
         effect_mgr.evaluate_all();
 
-#ifdef GAGGIMATE_SIM
-        // Stage 1 is re-asserted every pass the menu screen is not current:
-        // one or more MODE_STANDBY broadcasts (controller:mode:change,
-        // registered in init(), which runs after the constructor's
-        // setupPanel() already requested the menu screen) race the request
-        // during boot and can send targetScreen back to standby, sometimes
-        // more than once, so a single request is not enough to land
-        // reliably. Stage 2 requires the menu screen to still be current on
-        // the pass AFTER it was first seen current, so the screen has been
-        // through ui_tick() at least once before open() walks it (see the
-        // comment above applyPressedFeedback() in this same function) and
-        // so a late bounce back to standby is caught (drops back to stage 1
-        // instead of opening on a screen that is no longer current). Stage 3
-        // (GM_SIM_OPEN_SETTINGS_PAGE) similarly waits a pass after the
-        // category page opens before switching page: deleting the page-0
-        // root immediately after creating it, in the same call that created
-        // it, crashed intermittently (nothing about it has had a single
-        // lv_task_handler()/tick pass yet either).
-        if (simOpenSettingsStage == 1 || simOpenSettingsStage == 2) {
-            if (currentScreen != SCREEN_ID_MENU_SCREEN_NEW) {
-                simOpenSettingsStage = 1;
-                changeScreen(SCREEN_ID_MENU_SCREEN_NEW);
-            } else if (simOpenSettingsStage == 1) {
-                simOpenSettingsStage = 2;
-            } else {
-                openSettings();
-                // GM_SIM_OPEN_SETTINGS_CATEGORY=<index>: also push that tile's
-                // category page, so a screenshot can show the list page (rows,
-                // page arrows, header) without needing a real tap: the sim
-                // has no input injection path yet (gm-flw.15's touchmap route
-                // is the planned one). Safe on the same pass as open(): unlike
-                // the menu screen above, a category page is plain LVGL objects
-                // built directly by SettingsUI, not an eez flow screen swap.
-                if (const char *catEnv = getenv("GM_SIM_OPEN_SETTINGS_CATEGORY")) {
-                    settingsUI.openCategory(atoi(catEnv));
-                    simOpenSettingsStage = getenv("GM_SIM_OPEN_SETTINGS_PAGE") != nullptr ? 3 : 0;
-                } else {
-                    simOpenSettingsStage = 0;
-                }
-            }
-        } else if (simOpenSettingsStage == 3) {
-            simOpenSettingsStage = 0;
-            if (const char *pageEnv = getenv("GM_SIM_OPEN_SETTINGS_PAGE")) {
-                settingsUI.gotoPage(atoi(pageEnv));
-            }
-        }
-#endif
-
         if (currentScreen == SCREEN_ID_STANDBY_SCREEN) {
             if (standbyEnterTime > 0) {
                 const Settings &settings = controller->getSettings();
@@ -540,34 +495,6 @@ void DefaultUI::loop() {
             }
         }
     }
-
-#ifdef GAGGIMATE_SIM
-    // GM_SIM_SETTINGS_POP_AT_MS / GM_SIM_SETTINGS_CLOSE_AT_MS: exercise
-    // popPage()/close() (the same calls the exit chevron's click handler
-    // makes) a fixed time after boot, each fired once. Checked every pass,
-    // not just rerender passes, and gated on wall time rather than a stage
-    // count so each always lands several tick passes after whatever
-    // opened the page or category it acts on.
-    if (uiBuiltAt != 0) {
-        const unsigned long sinceBoot = ::millis() - uiBuiltAt;
-        if (!simPopFired) {
-            if (const char *popEnv = getenv("GM_SIM_SETTINGS_POP_AT_MS")) {
-                if (sinceBoot >= strtoul(popEnv, nullptr, 10)) {
-                    simPopFired = true;
-                    settingsUI.popPage();
-                }
-            }
-        }
-        if (!simCloseFired) {
-            if (const char *closeEnv = getenv("GM_SIM_SETTINGS_CLOSE_AT_MS")) {
-                if (sinceBoot >= strtoul(closeEnv, nullptr, 10)) {
-                    simCloseFired = true;
-                    settingsUI.close();
-                }
-            }
-        }
-    }
-#endif
 
     // ui_tick() first: it runs the generated tick_screen_*, which is what derives
     // widget visibility from flow state. Running it after the maintain calls
@@ -1012,6 +939,187 @@ void DefaultUI::serviceTouchMap() {
     g_touchMapPending = false;
 }
 
+#if defined(GM_TOUCH_PROBE) || defined(GAGGIMATE_SIM)
+namespace {
+
+portMUX_TYPE g_settingsUiMux = portMUX_INITIALIZER_UNLOCKED;
+
+// One pending command, written by the web/async task under g_settingsUiMux
+// and consumed by DefaultUI::serviceSettingsUi on the UI task. pending
+// stays true for an Open command's whole multi-pass stage, not just until
+// it is first looked at, so a second request arriving mid-stage still sees
+// a command in flight and is refused with 409.
+struct SettingsUiSlot {
+    bool pending = false;
+    DefaultUI::SettingsUiCmd cmd = DefaultUI::SettingsUiCmd::Open;
+    int arg = 0;
+    uint32_t seq = 0;
+};
+SettingsUiSlot g_settingsUiSlot;
+uint32_t g_settingsUiSeqCounter = 0;
+DefaultUI::SettingsUiState g_settingsUiPublished;
+
+// Open staging: changeScreen() only queues a screen change (targetScreen +
+// rerender=true); the actual eez_flow_set_screen() runs inside
+// handleScreenChange(), which only executes on a rerender pass, so this
+// polls the live current screen (eez_flow_get_current_screen(), not the
+// currentScreen member, which is stale between rerender passes) across
+// as many DefaultUI::loop() calls as it takes. WaitMenu: the request is
+// issued, or re-issued every check while the screen has not arrived yet
+// (one or more MODE_STANDBY broadcasts race a boot-time request and can
+// send it back to standby more than once). Settling: the menu screen was
+// seen current on a previous check; wait kOpenSettleMs before touching it,
+// so it has been through at least one ui_tick()/lv_task_handler() pass
+// (acting on a screen in the same pass it became current crashed the
+// simulator intermittently: see tools/settings_ui_tests/rig.py's Sim class
+// for the same hazard on a screen-changing touchmap request), then
+// re-verify it is still current (a late bounce drops this back to
+// WaitMenu instead of opening on a screen that is no longer active).
+enum class OpenStage : uint8_t { Idle, WaitMenu, Settling };
+OpenStage g_openStage = OpenStage::Idle;
+unsigned long g_openSettleAt = 0;
+constexpr unsigned long kOpenSettleMs = 60;
+
+const char *settingsUiCmdName(DefaultUI::SettingsUiCmd cmd) {
+    switch (cmd) {
+    case DefaultUI::SettingsUiCmd::Open:
+        return "open";
+    case DefaultUI::SettingsUiCmd::Close:
+        return "close";
+    case DefaultUI::SettingsUiCmd::Cat:
+        return "cat";
+    case DefaultUI::SettingsUiCmd::Page:
+        return "page";
+    case DefaultUI::SettingsUiCmd::Pop:
+        return "pop";
+    }
+    return "?";
+}
+
+} // namespace
+
+bool DefaultUI::queueSettingsUiCommand(SettingsUiCmd cmd, int arg, uint32_t &seqOut) {
+    bool queued = false;
+    portENTER_CRITICAL(&g_settingsUiMux);
+    if (!g_settingsUiSlot.pending) {
+        g_settingsUiSlot.pending = true;
+        g_settingsUiSlot.cmd = cmd;
+        g_settingsUiSlot.arg = arg;
+        g_settingsUiSlot.seq = ++g_settingsUiSeqCounter;
+        seqOut = g_settingsUiSlot.seq;
+        queued = true;
+    }
+    portEXIT_CRITICAL(&g_settingsUiMux);
+    if (queued) {
+        markDirty(); // wake a pass promptly instead of waiting out RERENDER_INTERVAL_IDLE
+    }
+    return queued;
+}
+
+void DefaultUI::settingsUiState(SettingsUiState &out) const {
+    portENTER_CRITICAL(&g_settingsUiMux);
+    out = g_settingsUiPublished;
+    portEXIT_CRITICAL(&g_settingsUiMux);
+}
+
+void DefaultUI::serviceSettingsUi() {
+    bool pending;
+    SettingsUiCmd cmd;
+    int arg;
+    uint32_t seq;
+    portENTER_CRITICAL(&g_settingsUiMux);
+    pending = g_settingsUiSlot.pending;
+    cmd = g_settingsUiSlot.cmd;
+    arg = g_settingsUiSlot.arg;
+    seq = g_settingsUiSlot.seq;
+    portEXIT_CRITICAL(&g_settingsUiMux);
+    if (!pending) {
+        return;
+    }
+
+    bool done = true;
+    switch (cmd) {
+    case SettingsUiCmd::Open:
+        if (settingsUI.isOpen()) {
+            // Already open: a second ?open=1 in a row is a no-op, not an
+            // error (the shared contract's one-cover guarantee holds either
+            // way since open() itself no-ops while already open).
+            g_openStage = OpenStage::Idle;
+            break;
+        }
+        if (eez_flow_get_current_screen() != SCREEN_ID_MENU_SCREEN_NEW) {
+            changeScreen(SCREEN_ID_MENU_SCREEN_NEW);
+            g_openStage = OpenStage::WaitMenu;
+            done = false;
+            break;
+        }
+        if (g_openStage != OpenStage::Settling) {
+            g_openStage = OpenStage::Settling;
+            g_openSettleAt = ::millis() + kOpenSettleMs;
+            done = false;
+            break;
+        }
+        if (::millis() < g_openSettleAt) {
+            done = false;
+            break;
+        }
+        if (eez_flow_get_current_screen() != SCREEN_ID_MENU_SCREEN_NEW) {
+            g_openStage = OpenStage::WaitMenu; // bounced back; re-request
+            done = false;
+            break;
+        }
+        openSettings();
+        g_openStage = OpenStage::Idle;
+        break;
+    case SettingsUiCmd::Close:
+        closeSettings();
+        break;
+    case SettingsUiCmd::Cat:
+        // From inside a category, pop back to the tiles first (committing
+        // each level), then push the requested one; from the tile page
+        // this loop does nothing and openCategory pushes directly.
+        while (settingsUI.state().depth > 0) {
+            settingsUI.popPage();
+        }
+        settingsUI.openCategory(arg);
+        break;
+    case SettingsUiCmd::Page:
+        settingsUI.gotoPage(arg);
+        break;
+    case SettingsUiCmd::Pop:
+        settingsUI.popPage();
+        break;
+    }
+
+    if (!done) {
+        markDirty(); // keep a staged Open moving without waiting on the idle interval
+        return;
+    }
+
+    const SettingsUI::State st = settingsUI.state();
+    const SettingsUI::FixtureCounters fc = settingsUI.fixtureCounters();
+    SettingsUiState pub;
+    pub.seq = seq;
+    pub.open = st.open;
+    pub.depth = st.depth;
+    pub.category = st.category;
+    pub.page = st.page;
+    pub.pages = st.pages;
+    snprintf(pub.title, sizeof(pub.title), "%s", st.title);
+    pub.fixtureEnter = fc.enter;
+    pub.fixtureCommit = fc.commit;
+    pub.fixtureDraft = fc.draft;
+
+    portENTER_CRITICAL(&g_settingsUiMux);
+    g_settingsUiPublished = pub;
+    g_settingsUiSlot.pending = false;
+    portEXIT_CRITICAL(&g_settingsUiMux);
+
+    ESP_LOGI("SettingsUI", "SettingsDbg: %s -> depth=%d category=%d page=%d", settingsUiCmdName(cmd), st.depth,
+             st.category, st.page);
+}
+#endif // GM_TOUCH_PROBE || GAGGIMATE_SIM
+
 bool DefaultUI::snapshotObjectToBuffer(lv_obj_t *obj, uint8_t *buf, uint32_t bufSize, lv_area_t *outArea) {
 #ifndef GAGGIMATE_SIM
     if (obj == nullptr || buf == nullptr) {
@@ -1275,20 +1383,6 @@ void DefaultUI::setupPanel() {
     const ::Settings &settings = controller->getSettings();
     setBrightness(settings.getMainBrightness());
     uiBuiltAt = ::millis();
-
-#ifdef GAGGIMATE_SIM
-    // Temporary debug hook, until gm-flw.6 adds /api/debug/settingsui: opens
-    // the settings shell so it can be screenshotted headlessly. lv_scr_act()
-    // is still standby here (setupPanel's own fade-in above), and open()
-    // builds the cover on objects.menu_screen_new regardless of which screen
-    // is active, so opening straight away would be invisible to a
-    // screenshot; request the menu screen instead and let loop() open
-    // settings once currentScreen actually becomes it (see below).
-    if (getenv("GM_SIM_OPEN_SETTINGS") != nullptr) {
-        simOpenSettingsStage = 1;
-        changeScreen(SCREEN_ID_MENU_SCREEN_NEW);
-    }
-#endif
 }
 
 void DefaultUI::setupState() {
