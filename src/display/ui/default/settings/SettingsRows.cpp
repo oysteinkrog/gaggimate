@@ -114,6 +114,13 @@ TextCol buildTextCol(lv_obj_t *parent, const char *labelText, lv_coord_t width) 
     lv_obj_t *label = lv_label_create(col);
     lv_label_set_text(label, labelText);
     lv_obj_set_width(label, width);
+    // LV_LABEL_LONG_DOT keeps the label's own size and dots the overflow;
+    // a label defaults to LV_SIZE_CONTENT height, which has no fixed size
+    // to keep, so it wraps to a second line instead of dotting (found by
+    // rendering "America/Argentina/ComodRivadavia": the value label grew to
+    // two lines rather than truncating). Pinning height to one line of the
+    // font is what makes LONG_DOT truncate instead of wrap.
+    lv_obj_set_height(label, lv_font_get_line_height(&lv_font_montserrat_18));
     lv_label_set_long_mode(label, LV_LABEL_LONG_DOT);
     lv_obj_set_style_text_font(label, &lv_font_montserrat_18, LV_PART_MAIN);
     lv_obj_set_style_text_color(label, fg, LV_PART_MAIN);
@@ -121,6 +128,7 @@ TextCol buildTextCol(lv_obj_t *parent, const char *labelText, lv_coord_t width) 
     lv_obj_t *value = lv_label_create(col);
     lv_label_set_text(value, "");
     lv_obj_set_width(value, width);
+    lv_obj_set_height(value, lv_font_get_line_height(&lv_font_montserrat_20)); // see label above
     lv_label_set_long_mode(value, LV_LABEL_LONG_DOT);
     lv_obj_set_style_text_font(value, &lv_font_montserrat_20, LV_PART_MAIN);
     lv_obj_set_style_text_color(value, fg, LV_PART_MAIN);
