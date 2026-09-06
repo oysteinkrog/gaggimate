@@ -1,4 +1,4 @@
-# knowledge-base/esp32s3-assembly-optimization/ — Agent harness
+# knowledge-base/esp32s3-assembly-optimization/: agent harness
 
 This file is the agent contract for everything under this directory.
 Claude Code loads it when you cross into the subtree. Read it once per
@@ -44,7 +44,7 @@ should look like.
 04-toolchain-and-codegen/  GCC 14 Xtensa: flags, inline asm constraints and clobbers, attributes, when the zero-overhead loop is emitted, register pressure and spills, reading .S, LLVM status
 05-measurement/            CCOUNT and esp_timer, min-of-n, preemption and interrupts, QEMU fidelity, bit-exact reference tests, fuzzing with sanitizers, host versus device
 06-kernel-patterns/        fixed-point formats, LUT gathers and palettes, RGB565 arithmetic, incremental stepping, interleaving for load-use, pixel pairs, row-state builders, esp-dsp as reference kernels
-07-our-work/               this repo: the 13 animation kernels, the animbench ladder, kblob, qemubench, the hot slab, what the device reversed
+07-our-work/               this repo: the animation kernel pass (13 kernels in 2026-09, 14 animations registered), the animbench ladder, kblob, qemubench, the hot slab, what the device reversed
 08-frontiers/              ESP32-P4 and its vector extension, esp-dsp and toolchain roadmaps, LLVM Xtensa upstreaming, GCC 15, research on in-order DSP scheduling
 09-adversarial/            myths, contradictions, the uncertainty log
 10-synthesis/              the decision flow (assembly or not), the cycle budget framework, cross-bucket narrative, where the frontier is moving
