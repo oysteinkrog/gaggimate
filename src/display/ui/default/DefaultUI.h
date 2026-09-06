@@ -47,6 +47,10 @@ constexpr int RERENDER_MIN_INTERVAL = 250;
 // that was removed for holding tap feedback a second (see maintain call
 // site). Full-buffer fills (screen change, geometry move) also bypass.
 constexpr int64_t OVERLAY_MIN_REFRESH_US = 250000;
+// How long a multi-clip overlay pass runs before it polls the touch
+// controller between clips (gm-qo3.2). Shorter than one clip's snapshot on
+// a telemetry screen, so any pass long enough to hide a tap gets polled.
+constexpr int64_t OVERLAY_INPUT_SLICE_US = 20000;
 // The touch grace window that holds both gates above open after an edge
 // (GM_TOUCH_GRACE_US) lives in LV_Helper.h beside the edge stamp it reads:
 // the overlay publish in SleepAnimation uses the same window to wake the

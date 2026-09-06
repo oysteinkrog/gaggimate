@@ -40,6 +40,7 @@ extern uint32_t nebula_lerp_self_test(uint32_t *firstBad);
 #endif
 #include <display/core/TouchInject.h> // /api/debug/tap
 #include <display/drivers/common/LV_Helper.h> // g_overlayStats / g_overlayMinRefreshUs for /api/debug/anim
+#include <display/ui/default/eez/MeterTickCache.h> // tick_cache_bytes on /api/debug/anim
 #include <display/ui/default/eez/screens.h>  // objects, for /api/debug/touchlog
 #include <display/ui/default/eez/eez-flow.h> // eez_flow_object_names
 #include <display/drivers/common/PanelClock.h>
@@ -1379,6 +1380,15 @@ void WebUIPlugin::setupServer() {
                 g_overlayMinRefreshUs = v;
             }
         }
+        // fps=N: temporary animation frame cap, 5..60, 0 restores the stored
+        // setting. For the contention A/B (how much of a UI pass is the
+        // render task's PSRAM traffic); DefaultUI applies it next pass.
+        if (request->hasArg("fps")) {
+            const long v = request->arg("fps").toInt();
+            if (v == 0 || (v >= 5 && v <= 60)) {
+                g_animFpsOverride = static_cast<uint8_t>(v);
+            }
+        }
         // uianim=0|1|2|3|4: the foreground motion test widget (LV_Helper.h's
         // g_uiAnimTestReq), created by the UI task; 1 and 2 move it through
         // LVGL, 3 through a layer, 4 parks it in a layer.
@@ -1565,6 +1575,8 @@ void WebUIPlugin::setupServer() {
         doc["ov_area_px"] = g_overlayStats.lastAreaPx;
         doc["ov_clips"] = g_overlayStats.lastClips;
         doc["ov_min_us"] = static_cast<int64_t>(g_overlayMinRefreshUs);
+        doc["fps_override"] = g_animFpsOverride;
+        doc["tick_cache_bytes"] = meterticks::bytesAllocated();
         doc["uianim"] = g_uiAnimTestReq;
         doc["layer_us"] = a->lastLayerUsValue();
         {

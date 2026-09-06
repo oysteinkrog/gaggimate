@@ -513,9 +513,16 @@ void DefaultUI::loop() {
     // grind screen publishes it bare - one refresh of naked grind widgets -
     // before the scale cover is up.
     maintainScaleScreen();
-    maintainSleepAnimation();
-
+    // Input before the snapshot (gm-qo3.2): lv_task_handler() is where the
+    // touch controller is polled, and it used to run after
+    // maintainSleepAnimation() took the pass's snapshot, so a tap read here
+    // showed up one whole pass later. Polled first, the tap's pressed style
+    // is among the dirty rects this pass publishes. The refresh timer is
+    // parked while the animation owns the panel, so this renders nothing
+    // by itself; when the animation is off it is the same flush pass as
+    // before, a few lines earlier.
     lv_task_handler();
+    maintainSleepAnimation();
 }
 
 // Runs every UI-task pass. Starts/stops the background animation and keeps
@@ -2014,7 +2021,10 @@ void DefaultUI::refreshSleepOverlay() {
     // One snapshot per owed rectangle rather than one of their bounding box:
     // the snapshot render is the expensive stage, and its cost has to scale
     // with what actually changed, not with how far apart the changes sit.
-    lv_area_t clips[OVERLAY_DIRTY_RECTS];
+    // Twice the cap: the second half takes what the mid-pass input read
+    // below turns up, kept apart from the first so a merge can never fold a
+    // fresh rect into a clip this pass has already snapshotted.
+    lv_area_t clips[2 * OVERLAY_DIRTY_RECTS];
     int clipN = 0;
     if (overlayValid[back]) {
         clipN = overlayDirtyN[back];
@@ -2035,7 +2045,10 @@ void DefaultUI::refreshSleepOverlay() {
     int w = 0, h = 0;
     const int64_t probeSnap0 = esp_timer_get_time();
     int64_t probeArea = 0;
-    for (int i = 0; i < clipN; i++) {
+    const int baseN = clipN;
+    int extraN = 0;
+    const int front = back ^ 1;
+    for (int i = 0; i < baseN + extraN; i++) {
         if (!snapshotAreaToOverlay(scr, buf, sleepAnimation.overlayCapacity(), clips[i], &w, &h)) {
             // Leave the debt list intact; the next pass retries every rect.
             // Rects already snapshotted this pass just render identically then.
@@ -2043,7 +2056,32 @@ void DefaultUI::refreshSleepOverlay() {
             return;
         }
         probeArea += static_cast<int64_t>(lv_area_get_width(&clips[i])) * lv_area_get_height(&clips[i]);
+        // gm-qo3.2: a pass with several clips can run past 100 ms, and the
+        // touch controller is only polled from lv_task_handler(), so a tap
+        // that lands during such a pass used to wait for all of it, then for
+        // the next pass to snapshot its effect. Between clips, once the pass
+        // has run a while, poll input and pull whatever it invalidated into
+        // THIS pass, so the tap rides the publish already under way. Only
+        // during the original clips: the extras live in the second half of
+        // clips[] and merging into them once they are being snapshotted
+        // would break the same invariant the split exists for. The other
+        // buffer is owed the same rects as always.
+        if (i + 1 < baseN && esp_timer_get_time() - probeSnap0 >= OVERLAY_INPUT_SLICE_US) {
+            lv_task_handler();
+            if (animHostScreen != scr) {
+                // A click changed screens. Debt is intact; the next pass
+                // starts over on the new host.
+                return;
+            }
+            lv_area_t more[OVERLAY_DIRTY_RECTS];
+            const int moreN = lvgl_helper_take_dirty_rects(more, OVERLAY_DIRTY_RECTS);
+            for (int k = 0; k < moreN; k++) {
+                lvgl_helper_rect_add(overlayDirty[front], &overlayDirtyN[front], OVERLAY_DIRTY_RECTS, more[k]);
+                lvgl_helper_rect_add(clips + baseN, &extraN, OVERLAY_DIRTY_RECTS, more[k]);
+            }
+        }
     }
+    clipN = baseN + extraN;
     const int64_t probeSnap1 = esp_timer_get_time();
     // Marked here rather than at the call site, and after the snapshot rather
     // than before it, so the slip log measures the thing that actually costs
@@ -2056,7 +2094,7 @@ void DefaultUI::refreshSleepOverlay() {
     // Only the rows that changed need their alpha spans recomputed. The clips
     // are in screen coordinates and the host object is the screen, so screen
     // row and panel row are the same number.
-    int ranges[OVERLAY_DIRTY_RECTS][2];
+    int ranges[2 * OVERLAY_DIRTY_RECTS][2];
     for (int i = 0; i < clipN; i++) {
         ranges[i][0] = clips[i].y1;
         ranges[i][1] = clips[i].y2 + 1;
@@ -2411,7 +2449,10 @@ void DefaultUI::updateState() {
     uint8_t animP[4];
     bg_parse_params(settings.getBgAnimParams().c_str(), animId, animP);
     sleepAnimation.configure(static_cast<uint8_t>(animId), animP);
-    sleepAnimation.setMaxFps(static_cast<uint8_t>(settings.getBgAnimFps()));
+    // fps= on /api/debug/anim overrides the stored cap for a measurement
+    // (0 = stored). Applied here because this line re-applies the cap every
+    // pass, so a value poked into the animation alone would not stick.
+    sleepAnimation.setMaxFps(static_cast<uint8_t>(g_animFpsOverride != 0 ? g_animFpsOverride : settings.getBgAnimFps()));
     sleepAnimation.setHalfRes(settings.getBgAnimHalfRes() != 0);
     sleepAnimation.setInterlace(settings.getBgAnimInterlace() != 0);
     // Panel refresh rate: live pclk divider (0 = build default). One register

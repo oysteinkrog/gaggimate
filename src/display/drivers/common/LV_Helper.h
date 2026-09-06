@@ -79,6 +79,10 @@ struct OverlayStats {
 };
 extern OverlayStats g_overlayStats;
 extern volatile int64_t g_overlayMinRefreshUs;
+// fps= on /api/debug/anim: a temporary animation frame cap for A/B runs
+// (0 = the stored setting). DefaultUI applies it where it re-applies the
+// stored cap each pass. Not persisted.
+extern volatile uint8_t g_animFpsOverride;
 // Foreground motion test (uianim= on /api/debug/anim, applied by
 // DefaultUI::loop on the UI task, since LVGL is single-threaded): 0 removes
 // the test widget, 1 slides an opaque 120x120 rounded plate with a label
