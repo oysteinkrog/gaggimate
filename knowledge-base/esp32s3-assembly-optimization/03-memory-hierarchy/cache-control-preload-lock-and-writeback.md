@@ -3,7 +3,7 @@ title: "Cache control from software: preload, lock and writeback"
 id: 03-memory-hierarchy/cache-control-preload-lock-and-writeback
 schema_version: 1
 doc_type: reference
-status: draft
+status: review
 last_reviewed: 2026-09-06
 tags: [esp32s3, xtensa, cache, preload, cache-lock, writeback, esp-idf]
 confidence: medium
@@ -19,7 +19,7 @@ instructions; the ESP32-S3 chip defines a separate cache-management
 peripheral with its own preload, lock and writeback operations, reached
 through ROM and ESP-IDF functions, not through those instructions. The two
 caches' geometry, and what a miss costs, is covered in
-[caches-sram-psram-and-the-mspi-bus.md](./caches-sram-psram-and-the-mspi-bus.md);
+[caches, SRAM, PSRAM and the shared MSPI bus](./caches-sram-psram-and-the-mspi-bus.md);
 read that first.
 
 ## 1. The Xtensa ISA defines cache-control instructions ESP32-S3 does not have
@@ -77,12 +77,13 @@ real, and the CPU does miss on them, but they are not the architectural
 Xtensa cache these instructions control.
 
 **[measured]** The consequence carries all the way to the assembler. Every
-one of the fourteen instructions named above (`dhwb`, `dhwbi`, `dhi`, `dii`,
+one of the eighteen instructions named above (`dhwb`, `dhwbi`, `dhi`, `dii`,
 `diwb`, `diwbi`, `dpfr`, `dpfw`, `dpfro`, `dpfwo`, `dpfl`, `dhu`, `diu`,
 `ipfl`, `ihu`, `iiu`, `ihi`, `iii`) fails to assemble for this target with
 "Error: unknown opcode or format name", tested one at a time against
 `xtensa-esp32s3-elf-gcc` (crosstool-NG esp-14.2.0_20241119, GCC 14.2.0) with
-`-mlongcalls`, the flag set the firmware build uses. This is a target
+`-mlongcalls`, the flag set the firmware build uses. A plain `l32i` in the
+same harness assembles, so the rejection is the mnemonic and not the test. This is a target
 configuration fact, not a runtime trap: the toolchain that ships for
 ESP32-S3 was built without these mnemonics in its instruction table, so a
 kernel cannot reach them even in hand-written assembly. They are absent from
@@ -102,8 +103,12 @@ for a different core configuration than the one shipped.
 
 The TRM describes the real ICache and DCache as a peripheral sitting between
 the CPU buses and external memory, with its own operation set: write-back,
-clean, invalidate, and preload and lock, each split into a manual and an
-automatic form.[^trm-cacheops] These are chip-specific register-level
+clean, invalidate, preload and lock. Write-back and clean exist on the DCache
+only. Three of the five come in two forms: invalidate is automatic (the whole
+cache) or manual (a named area), preload is automatic (following the hit or
+miss stream) or manual (a named area), and lock is a prelock applied as lines
+are filled or a manual lock applied to lines already resident, with unlocking
+manual only.[^trm-cacheops] These are chip-specific register-level
 operations, documented in TRM chapter 4.3.3 and reached from software
 through ROM functions and ESP-IDF wrappers, never through the ISA
 instructions above. The full text of each operation, and the "16 KB DCache
@@ -148,7 +153,7 @@ header names, and without the alignment- and direction-checking
 
 Manual preload starts a hardware fetch of a region into the cache ahead of
 the CPU asking for it, and is meant to hide the miss latency
-[caches-sram-psram-and-the-mspi-bus.md §3-4](./caches-sram-psram-and-the-mspi-bus.md)
+[the sibling file §4](./caches-sram-psram-and-the-mspi-bus.md#4-miss-cost-and-how-to-measure-it)
 measures, by overlapping the fetch with unrelated work. `Cache_Start_DCache_Preload(addr, size, order)`
 suspends auto-preload, issues the fetch, and returns whether auto-preload
 was running before the call, which the caller is expected to feed back into
@@ -188,15 +193,21 @@ Lock keeps a line resident after it has been fetched, so ordinary misses
 elsewhere in the cache cannot evict it: "the cache checks the data that is
 already in the cache memory and locks the data only if it falls in the
 specified area", and while any way remains unlocked the cache replaces there
-first.[^trm-cacheops] The TRM's own caveat is important for a kernel that
-also uses writeback or clean: those two operations, plus manual invalidate,
-"will only work on the unlocked data", so a locked line must be unlocked
-before it can be written back or invalidated on purpose.[^trm-cacheops]
+first.[^trm-cacheops] Locking is therefore not a guarantee: the TRM adds that
+"when all ways within the cache are locked, the cache will replace data, as if
+it was not locked", so a lock region larger than the ways can hold silently
+stops protecting anything.[^trm-cacheops] The TRM's second caveat is important
+for a kernel that also uses writeback or clean: those two operations, plus
+manual invalidate, "will only work on the unlocked data", so a locked line must
+be unlocked before it can be written back or invalidated on
+purpose.[^trm-cacheops]
 
 `Cache_Lock_Addr(addr, size)` and `Cache_Unlock_Addr(addr, size)` are the ROM
-entry points, both declared with "operation will be done CACHE_LINE_SIZE
-aligned" and both carrying the same "do not call in your SDK application"
-comment as the rest of the ROM surface.[^romcache] This search found no
+entry points, both carrying the same "do not call in your SDK application"
+comment as the rest of the ROM surface. Neither one documents its alignment
+behaviour: the "operation will be done CACHE_LINE_SIZE aligned" note in that
+header belongs to the `_Items` forms, `Cache_Lock_DCache_Items` and its
+siblings, not to the `_Addr` pair.[^romcache] This search found no
 caller of either function anywhere in the ESP-IDF 5.5.1 component tree, so
 there is no worked example, in the framework itself, of a safe calling
 convention for locking from application code: whether it needs an interrupt
@@ -238,20 +249,23 @@ distinction:
   function rejects an address or size that is not a multiple of the data
   cache's line size, and that flag is refused outright on the
   memory-to-cache direction.[^msync-src] Query the real line size with
-  `esp_cache_get_alignment()`, which resolves to
-  `cache_hal_get_cache_line_size(cache_level, CACHE_TYPE_DATA)` and falls
-  back to 4 only if that HAL call reports zero.[^msync-src]
+  `esp_cache_get_alignment()`, which returns
+  `cache_hal_get_cache_line_size(cache_level, CACHE_TYPE_DATA)` unchanged, with
+  no fallback if that HAL call reports zero. The 4-byte default alignment does
+  exist in the same file, but inside `esp_cache_aligned_malloc`, not inside the
+  query function.[^msync-src]
 - `esp_cache_msync` is the one layer in this file's hierarchy documented as
   callable without special care about concurrency: its header calls it
   "cache-safe and thread-safe" outright.[^espcache] The ROM functions one
   layer down make no such claim either way.
 
 The note this file's sibling already raised still applies here from the
-other direction: do not call `esp_cache_msync` during a flash operation,
-unless execute-in-place from PSRAM is enabled, because the same
-cache-disabled window that removes flash and PSRAM from the address space
-(TRM 4.3.3.3's operations assume the cache is enabled) also removes the
-cache this function manages.[^espcache]
+other direction. The header says not to call `esp_cache_msync` during a flash
+operation, and that the exception is execute-in-place from PSRAM, which needs
+both `CONFIG_SPIRAM_FETCH_INSTRUCTIONS` and `CONFIG_SPIRAM_RODATA`.[^espcache]
+A flash write takes the caches away from both cores, so the window that removes
+flash and PSRAM from the address space also removes the cache this function
+manages; the sibling file documents that window.[^espcache]
 
 ## 6. Summary: which tool for which job
 
@@ -261,7 +275,7 @@ cache this function manages.[^espcache]
 | Hide a coming miss by fetching ahead | `Cache_Start_ICache_Preload` / `Cache_Start_DCache_Preload` | Undocumented; the only working example found is from an ISR | Yes, by example | [^lcdrgb][^romcache] |
 | Keep a region resident against eviction | `Cache_Lock_Addr` / `Cache_Unlock_Addr` | Undocumented, no example found | Undocumented, no example found | [^romcache] |
 | Permanently trade cache capacity for a fixed internal-speed window | `Cache_Occupy_Addr`, boot only | N/A, this is a startup-time decision | N/A | [^cpustart] |
-| Any Xtensa `DPF*`/`DH*`/`DI*`/`IH*`/`I*` cache-control instruction from the ISA manual | None; not assembled for this target | N/A | N/A | [measured], §1 |
+| Any of the eighteen Xtensa cache-control instructions from the ISA manual (`DPF*`, `DH*`, `DI*`, `IPFL`, `IHI`, `IHU`, `III`, `IIU`) | None; the assembler for this target does not know the mnemonics | N/A | N/A | [measured], §1 |
 
 The pattern across every row: the chip's cache peripheral is real and does
 have preload and lock capability, but ESP-IDF 5.5.1 turns only writeback and
@@ -284,16 +298,16 @@ contract. Lock has neither.
 ## Sources
 
 [^isa-general]: Cadence/Tensilica, *Xtensa Instruction Set Architecture (ISA) Reference Manual*, RC-2010.1 (April 2010), Section 4.5.1 "General Cache Option Features" and 4.5.1.2 "Cache Tag Format", pages 111 to 112.
-[^isa-prefetch]: Cadence/Tensilica, *Xtensa ISA Reference Manual*, RC-2010.1, Section 4.5.1.3 "Cache Prefetch", page 112.
-[^isa-dcache]: Cadence/Tensilica, *Xtensa ISA Reference Manual*, RC-2010.1, Section 4.5.2 "Instruction Cache Option" (page 114) and Section 4.5.5 "Data Cache Option" (page 118), and the DHI, DII, DHWB, DHWBI, DIWB, DIWBI instruction descriptions in Chapter 6, pages 312 to 320.
-[^isa-lock]: Cadence/Tensilica, *Xtensa ISA Reference Manual*, RC-2010.1, Section 4.5.4 "Instruction Cache Index Lock Option" (page 117, Table 4-82) and Section 4.5.7 "Data Cache Index Lock Option" (page 121, Table 4-86).
-[^isa-dhi]: Cadence/Tensilica, *Xtensa ISA Reference Manual*, RC-2010.1, "Data Cache Hit Invalidate (DHI)" instruction description, "Required Configuration Option: Data Cache Option", page 312.
-[^isa-s32c1i]: Cadence/Tensilica, *Xtensa ISA Reference Manual*, RC-2010.1, Section 4.3.13 discussion of the S32C1I instruction's RCW Transaction path and its DHWBI-equivalent cache flush, page 78.
+[^isa-prefetch]: Cadence/Tensilica, *Xtensa ISA Reference Manual*, RC-2010.1, Section 4.5.1.3 "Cache Prefetch", page 113.
+[^isa-dcache]: Cadence/Tensilica, *Xtensa ISA Reference Manual*, RC-2010.1, Section 4.5.2 "Instruction Cache Option" (page 115) and Section 4.5.5 "Data Cache Option" (page 118), whose Table 4-84 "Data Cache Option Instruction Additions" on pages 119 to 120 carries the DPFR/DPFW/DPFRO/DPFWO, DHWB, DHWBI, DIWB, DIWBI, DHI and DII definitions and the "If not IsWriteback, DHWB is a no-op" line. The per-instruction descriptions are in Chapter 6, DHI on page 313 through DIWB on page 325.
+[^isa-lock]: Cadence/Tensilica, *Xtensa ISA Reference Manual*, RC-2010.1, Section 4.5.4 "Instruction Cache Index Lock Option" (page 117, Table 4-82 on page 118) and Section 4.5.7 "Data Cache Index Lock Option" (page 122, Table 4-86 on the same page). The illegal-instruction sentence is in the IPFL and DPFL rows of those two tables; the unlock instructions carry no such sentence.
+[^isa-dhi]: Cadence/Tensilica, *Xtensa ISA Reference Manual*, RC-2010.1, "Data Cache Hit Invalidate (DHI)" instruction description, "Required Configuration Option: Data Cache Option", page 313.
+[^isa-s32c1i]: Cadence/Tensilica, *Xtensa ISA Reference Manual*, RC-2010.1, Section 4.3.13.3 "Use Models for the S32C1I Instruction", the RCW Transaction bullet and its DHWBI-equivalent cache flush, page 79.
 [^core-isa]: ESP-IDF 5.5.1, `components/xtensa/esp32s3/include/xtensa/config/core-isa.h`, lines 246 to 298 (`XCHAL_ICACHE_SIZE`, `XCHAL_DCACHE_SIZE`, `XCHAL_DCACHE_IS_WRITEBACK`, `XCHAL_HAVE_PREFETCH`, `XCHAL_HAVE_CACHE_BLOCKOPS`, `XCHAL_ICACHE_LINE_LOCKABLE`, `XCHAL_DCACHE_LINE_LOCKABLE`), local install path `~/.platformio/packages/framework-espidf/`.
-[^trm-cacheops]: Espressif, *ESP32-S3 Technical Reference Manual*, Version 1.8, Section 4.3.3.3 "Cache Operations", pages 405 to 406. https://documentation.espressif.com/esp32-s3_technical_reference_manual_en.pdf
-[^romcache]: ESP-IDF 5.5.1, `components/esp_rom/esp32s3/include/esp32s3/rom/cache.h`: `Cache_Invalidate_Addr` (line 473), `Cache_Clean_Addr` (line 484), `Cache_WriteBack_Addr` (line 501), `Cache_Start_ICache_Preload` (line 616), `Cache_Start_DCache_Preload` (line 650), `Cache_Lock_Addr` (line 862), `Cache_Unlock_Addr` (line 875), `Cache_Occupy_Addr` (line 1019).
+[^trm-cacheops]: Espressif Systems, 2026. *ESP32-S3 Technical Reference Manual*, Version 1.8, Section 4.3.3.3 "Cache Operations", pages 405 to 406, the five numbered operations. <https://documentation.espressif.com/esp32-s3_technical_reference_manual_en.pdf>
+[^romcache]: ESP-IDF 5.5.1, `components/esp_rom/esp32s3/include/esp32s3/rom/cache.h`: `Cache_Invalidate_Addr` (line 473), `Cache_Clean_Addr` (line 487), `Cache_WriteBack_Addr` (line 501), `Cache_Start_ICache_Preload` (line 616), `Cache_Start_DCache_Preload` (line 650), `Cache_Lock_Addr` (line 862), `Cache_Unlock_Addr` (line 875), `Cache_Occupy_Items` (line 1007), `Cache_Occupy_Addr` (line 1019), `Cache_Suspend_ICache` (line 925) and `Cache_Suspend_DCache` (line 947) with their `Resume` pairs. The "Operation will be done CACHE_LINE_SIZE aligned" note appears on the `_Items` forms (lines 407, 421, 435, 449, 776, 790, 825, 839, 997, 1011) and not on `Cache_Lock_Addr` or `Cache_Unlock_Addr`. 75 of the header's 83 function declarations carry "Please do not call this function in your SDK application".
 [^cachell]: ESP-IDF 5.5.1, `components/hal/esp32s3/include/hal/cache_ll.h`, `cache_ll_invalidate_addr` (line 358) and `cache_ll_writeback_addr` (line 401).
 [^espcache]: ESP-IDF 5.5.1, `components/esp_mm/include/esp_cache.h`, `esp_cache_msync()` and the `ESP_CACHE_MSYNC_FLAG_*` definitions, including the "cache-safe and thread-safe" statement and the flash-operation caveat in the function's doc comment.
-[^msync-src]: ESP-IDF 5.5.1, `components/esp_mm/esp_cache_msync.c`: the unaligned-address check against `cache_line_size` (around line 110 to 112), the memory-to-cache rejection of `ESP_CACHE_MSYNC_FLAG_UNALIGNED` (line 120), and `esp_cache_get_alignment()` (lines 269 to 282).
+[^msync-src]: ESP-IDF 5.5.1, `components/esp_mm/esp_cache_msync.c`. The address and size check against `cache_line_size` is on lines 109 to 112. The memory-to-cache path rejects `ESP_CACHE_MSYNC_FLAG_UNALIGNED` on line 120. `esp_cache_get_alignment()` is on lines 268 to 284 and returns the HAL line size as it comes. The 4-byte default sits in `esp_cache_aligned_malloc_internal`, lines 167 to 170.
 [^cpustart]: ESP-IDF 5.5.1, `components/esp_system/port/cpu_start.c`, lines 715 and 717, the `CONFIG_ESP32S3_DATA_CACHE_16KB` block calling `Cache_Occupy_Addr(SOC_DROM_LOW, 0x4000)`.
-[^lcdrgb]: ESP-IDF 5.5.1, `components/esp_lcd/rgb/esp_lcd_panel_rgb.c`, the `IRAM_ATTR` bounce-buffer refill path calling `Cache_Start_DCache_Preload` under `CONFIG_IDF_TARGET_ESP32S3`, around line 1045.
+[^lcdrgb]: ESP-IDF 5.5.1, `components/esp_lcd/rgb/esp_lcd_panel_rgb.c`. The `IRAM_ATTR` function `lcd_rgb_panel_fill_bounce_buffer` starts on line 877 and calls `Cache_Start_DCache_Preload` on line 914, under `CONFIG_IDF_TARGET_ESP32S3`. It is the only caller of either preload function in the component tree.

@@ -346,4 +346,4 @@ differ.
 [^isafp]: Xtensa ISA Reference Manual RC-2010.1, `TRUNC.S` page 548, `ROUND.S` page 497, `FLOAT.S` page 346, and Table 4-47 "FCR fields", announced on page 69 and printed on page 70; the manual's `rounds()` helper is used in the `ROUND.S` operation but is defined nowhere in the document.
 [^trmvmul]: ESP32-S3 TRM v1.8, section 1.8.122 `EE.VMUL.S16`, page 198, and section 1.5.1.2 on `SAR`, page 46.
 [^trmregs]: ESP32-S3 TRM v1.8, Table 1.5-1 "Register List of ESP32-S3 Extended Instruction Set", page 45, and Table 1.6-1 "Extended Instruction List", shift instruction group, section 1.6.7.
-[^trmpipe]: ESP32-S3 TRM v1.8, section 1.7.1 "Data Hazard" and Table 1.7-2 "Extended Instruction Pipeline Stages", from page 65.
+[^trmpipe]: ESP32-S3 TRM v1.8, section 1.7.1 "Data Hazard" and Table 1.7-2 "Extended Instruction Pipeline Stages", from page 66.

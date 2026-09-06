@@ -91,7 +91,7 @@ stages. If instruction A defines a value at the end of stage `SA`, and
 instruction B uses it at the start of stage `SB`, then B can issue no
 earlier than `max(SA - SB + 1, 0)` cycles after A issued
 [Tensilica 2010][^1] §8.4.1 p. 605. The TRM restates the same formula for
-this chip [Espressif 2026b][^3] §1.7.1 p. 65, and Table 1.7-2 (pp. 66-73)
+this chip [Espressif 2026b][^3] §1.7.1 p. 65, and Table 1.7-2 (pp. 66-74)
 gives the use and def stage of every operand of every extended (PIE)
 instruction, which is the only published per-instruction stage table for
 this part. Delaying B for this reason is called an interlock. A small set of dependencies, mainly around exception, interrupt
@@ -370,7 +370,7 @@ covers what the emulator does and does not reproduce.
     Figure 4.3-1 "Cache Structure", p. 405; Section 1.7 "Instruction
     Performance" with Table 1.7-1 "Five-Stage Pipeline of Xtensa
     Processor" and Section 1.7.1 "Data Hazard", p. 65, Table 1.7-2
-    "Extended Instruction Pipeline Stages", pp. 66-73, Section 1.7.2
+    "Extended Instruction Pipeline Stages", pp. 66-74, Section 1.7.2
     "Hardware Resource Hazard" and Section 1.7.3 "Control Hazard", p. 74;
     Section 30.1 "Overview",
     p. 1106 ("SPI0 and SPI1 controllers are primarily reserved for

@@ -422,7 +422,7 @@ unless noted.
 
 ## Footnotes
 
-[^trm-align]: Espressif, 2024. *ESP32-S3 Technical Reference Manual*, version 1.8, section 1.5.3 "Data Format and Alignment", pages 48 to 49. https://www.espressif.com/sites/default/files/documentation/esp32-s3_technical_reference_manual_en.pdf
+[^trm-align]: Espressif, 2026. *ESP32-S3 Technical Reference Manual*, version 1.8, section 1.5.3 "Data Format and Alignment", pages 48 to 49. https://www.espressif.com/sites/default/files/documentation/esp32-s3_technical_reference_manual_en.pdf
 [^trm-read]: Same manual, section 1.6.1 "Read Instructions" and Table 1.6-2, pages 53 to 54.
 [^trm-write]: Same manual, section 1.6.2 "Write Instructions" and Table 1.6-3, pages 54 to 55.
 [^trm-list]: Same manual, Table 1.6-1 "Extended Instruction List", pages 51 to 53, and the category tables 1.6-2 to 1.6-17, pages 54 to 65. Section 1.8 numbers 220 entries: 1.8.1 to 1.8.217 are the `EE.*` instructions, 1.8.218 to 1.8.220 are `LD.QR`, `ST.QR` and `MV.QR`.

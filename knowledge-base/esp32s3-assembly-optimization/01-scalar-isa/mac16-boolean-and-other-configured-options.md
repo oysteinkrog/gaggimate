@@ -3,7 +3,7 @@ title: MAC16, Boolean, and the other configured scalar options on the LX7
 id: 01-scalar-isa/mac16-boolean-and-other-configured-options
 schema_version: 1
 doc_type: reference
-status: draft
+status: review
 last_reviewed: 2026-09-06
 tags: [esp32s3, xtensa, lx7, mac16, boolean-option, gcc, codegen, core-isa, conditional-store]
 confidence: medium
@@ -42,8 +42,9 @@ partner, clamping an accumulator result to 16 bits before a store, though
 nothing in `CLAMPS` itself requires MAC16.[^isa-mac16-clamps]
 
 [The configured-options leaf](./core-isa-and-configured-options.md) states
-that "modern GCC does not generate it from ordinary C; reaching it needs
-inline asm or a compiler builtin." That is only true part of the time.
+that GCC 14.2 reaches MAC16 from ordinary C for one shape only, the 16x16
+accumulate-reduction loop measured below, and needs inline asm for every
+other use. This leaf works through that measurement in detail.
 Compiling this reduction loop over 16-bit inputs,
 
 ```c
@@ -70,8 +71,8 @@ multiplier only ever takes 16-bit operands.[^gcc] The rule this supports: a
 16x16 accumulate-into-32-bit reduction loop is exactly the shape GCC's
 Xtensa backend recognizes for MAC16, but only at `-O2` and above, so check
 the disassembly at your project's actual optimization level rather than
-assume it. This contradicts the configured-options leaf's blanket claim;
-see Open questions.
+assume it. This matches the configured-options leaf's own statement of the
+same measurement.
 
 ## Boolean Option: present, and it is how a float compare reaches a branch
 
@@ -227,15 +228,12 @@ scope for a generic options leaf.
 
 ## Open questions
 
-- This leaf's MAC16 measurement contradicts
-  [the configured-options leaf](./core-isa-and-configured-options.md),
-  which says "modern GCC does not generate it from ordinary C." That leaf
-  needs a reconciling edit; this leaf does not touch it, out of scope for
-  this pass. The two claims likely describe different things: general
-  MAC16 forms with address-register operands may still need inline asm,
-  while the 16x16 accumulate-reduction shape measured here is reached by
-  ordinary, optimization-level-dependent pattern matching. A future edit
-  should state the claim at that finer grain, not as a blanket no.
+- [The configured-options leaf](./core-isa-and-configured-options.md) has
+  since been reconciled with this leaf's MAC16 measurement: it now states
+  the finer-grained claim (GCC 14.2 reaches `mula.aa.ll` for a 16x16
+  accumulate-into-32-bit loop at `-O2` and `-Os`, not at `-O1` and not with
+  32-bit operands) instead of a blanket "modern GCC does not generate it
+  from ordinary C." The two leaves agree as of this review.
 - Why GCC's `-O2` MAC16 shape hoists `wsr.acclo`/`rsr.acclo` outside the
   loop while `-Os` does not is unexplained by anything read here. [uncertain]
 - No cycle cost for `RSIL`, `RSR`, `QUOS`/`QUOU`/`REMS`/`REMU`, or `MULL`
@@ -264,23 +262,22 @@ Instruction," p. 62.
 Table 4-43, Table 4-44, and Section 4.3.10.2 "Booleans," p. 66.
 
 [^isa-fp-prereq]: Same manual, Section 4.3.11 "Floating-Point Coprocessor
-Option," p. 66, "Prerequisites: Coprocessor Option (page 63) and Boolean
+Option," p. 67, "Prerequisites: Coprocessor Option (page 63) and Boolean
 Option (page 65)."
 
 [^isa-div]: Same manual, Section 4.3.6 "32-bit Integer Divide Option," p.
 59 (the "may be slower than software" caveat is stated for this option and
 for 4.3.5, 32-bit Integer Multiply, in the same terms).
 
-[^isa-cas]: Same manual, Section 4.3.13 "Conditional Store Option," p. 77,
-Table 4-52/4-53, and Section 4.3.13.2, p. 78 (the atomic-increment
-example).
+[^isa-cas]: Same manual, Section 4.3.13 "Conditional Store Option," p. 77;
+Table 4-52 and Table 4-53, p. 78; and Section 4.3.13.2, p. 78 (the
+atomic-increment example).
 
 [^isa-sync]: Same manual, Section 3.8.10 "Processor Control Instructions,"
-p. 45, Table 3-23, including the RSR latency note.
+p. 45, including the RSR latency note; Table 3-23, p. 46.
 
 [^isa-rsil]: Same manual, Chapter 6, "RSIL, Read and Set Interrupt Level,"
-pp. 497-498, including the RSIL latency note and the ESYNC-after-WSR.PS
-rule.
+p. 498, including the RSIL latency note and the ESYNC-after-WSR.PS rule.
 
 [^gcc]: Measured on this machine, 2026-09-06, crosstool-NG
 `esp-14.2.0_20241119`, `xtensa-esp32s3-elf-gcc (crosstool-NG

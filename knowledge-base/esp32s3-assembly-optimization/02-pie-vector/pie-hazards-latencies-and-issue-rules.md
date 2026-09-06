@@ -3,7 +3,7 @@ title: "PIE hazards, latencies and issue rules"
 id: 02-pie-vector/pie-hazards-latencies-and-issue-rules
 schema_version: 1
 doc_type: reference
-status: draft
+status: review
 last_reviewed: 2026-09-06
 tags: [esp32s3, xtensa, pie, simd, pipeline, latency, hazards, scheduling]
 confidence: medium
@@ -50,8 +50,14 @@ uses only stage numbers 1 and 2, so the model collapses to four cases:
 | 2 | 2 | 1 | 0, back to back is free |
 | 1 | 2 | 0 | 0, no constraint at all |
 
-The single question for any pair of PIE instructions is whether the producer's
-def stage is 1 or 2.
+So the whole model reduces to one question for any pair of PIE instructions:
+does the producer define at stage 2 and the consumer use at stage 1? Only that
+pairing costs a slot. Consumers that use at stage 2 are rare and always free:
+the only ones in the table are the four store forms that read `qv` at stage 2,
+`EE.CMUL.S16.ST.INCP`, `EE.FFT.CMUL.S16.ST.XP`, `EE.FFT.AMS.S16.ST.INCP` and
+`EE.FFT.VST.R32.DECP`, which can therefore follow the load that produced the
+stored register with nothing in between.[^trm-perf] Every other store form
+reads its `qv` at stage 1.
 
 ## 2. What defines at stage 2
 
@@ -60,12 +66,13 @@ consumer. Everything else in the table defines at stage 1.[^trm-perf]
 
 | Producer group | Operand defined at 2 |
 |---|---|
-| Every 128-bit and 64-bit vector load, broadcast and fused load forms included, plus `EE.LDXQ.32` | `qu` |
+| Every 128-bit and 64-bit vector load, broadcast and fused load forms included, plus `EE.LDXQ.32` | `qu`, and `qu1` as well for `EE.VLDHBC.16.INCP`, the one form that loads two |
 | `EE.LDF.128.*` and `EE.LDF.64.*` | `fu0` to `fu3` |
 | `EE.VMUL.S8/U8/S16/U16`, `EE.CMUL.S16`, the FFT multiplies, `EE.VPRELU.S8/S16` | `qz`, `qz1` |
 | `EE.VRELU.S8/S16` | `qs`, which is also its input |
 | Multiply accumulate into `ACCX`, `QACC_H`, `QACC_L` | the accumulator state |
 | `EE.LD.ACCX.IP`, `EE.LD.QACC_*`, `EE.LDQA.*`, `EE.LD.UA_STATE.IP` | the state register they load |
+| `EE.FFT.AMS.S16.ST.INCP` | `as0`, its second address register, the only address register in the table defined late |
 
 Two consequences are easy to get wrong. **Multiplies are load-shaped**:
 `EE.VMUL.S16` defines `qz` at stage 2 exactly as a load does, while adds,
@@ -73,7 +80,10 @@ subtracts, min, max, compares, the bitwise ops, the vector shifts, the zips and
 unzips and `EE.SRC.Q` all define `qa` at stage 1 and chain with no gap.
 **`EE.VRELU` is in place and slow**: it uses `qs` at stage 1 and defines the
 same `qs` at stage 2, so a second `EE.VRELU` on that register, or any stage 1
-read of it, needs the gap.[^trm-perf]
+read of it, needs the gap.[^trm-perf] The table above is the whole of it:
+apart from the special registers, `qu`, `qu1`, `qz`, `qz1`, `fu0` to `fu3`,
+`EE.VRELU`'s `qs` and that one `as0` are the only operands the table defines
+at stage 2.[^trm-perf]
 
 ## 3. Accumulators
 
@@ -124,7 +134,10 @@ reason: those are base instructions too.
 ## 5. Pointers and shuffles are free
 
 Every post-increment form uses `as` at stage 1 and defines `as` at stage 1, so
-a walking pointer costs no interlock however tight the loop. `EE.VZIP.*`,
+a walking pointer costs no interlock however tight the loop. The one exception
+is `EE.FFT.AMS.S16.ST.INCP`, which defines its second address register `as0` at
+stage 2 while defining `as` at stage 1, so a stage 1 read of `as0` right after
+it needs the gap.[^trm-perf] `EE.VZIP.*`,
 `EE.VUNZIP.*`, `EE.SLCI.2Q`, `EE.SRCI.2Q`, `EE.SLCXXP.2Q` and `EE.SRCXXP.2Q`
 use `qs0` and `qs1` at stage 1 and define both at stage 1, so a run of them
 chains with no gap. `EE.MOVI.32.A` defines its `au` result at stage 1, so
@@ -260,7 +273,7 @@ and
 
 ## Footnotes
 
-[^trm-perf]: Espressif Systems, 2025. *ESP32-S3 Technical Reference Manual*,
+[^trm-perf]: Espressif Systems, 2026. *ESP32-S3 Technical Reference Manual*,
     version 1.8, section 1.7 "Instruction Performance", pages 65 to 75:
     Table 1.7-1 and the interlock formula page 65, Figure 1.7-1 page 66,
     Table 1.7-2 "Extended Instruction Pipeline Stages" pages 66 to 74,
@@ -272,7 +285,7 @@ and
     `SAR_BYTE` entries, pages 46 to 48.
 
 [^trm-ldqr]: Same manual, section 1.8.218 `LD.QR` page 301, section 1.8.219
-    `ST.QR` page 302, section 1.8.220 `MV.QR` page 302. The `ST.QR` entry
+    `ST.QR` page 302, section 1.8.220 `MV.QR` page 303. The `ST.QR` entry
     prints its assembler syntax line as `LD.QR qs, as, imm`, which is a defect
     in the manual.
 
@@ -293,8 +306,9 @@ and
     defined (SAR and ACC are exceptions)", plus the warning on the same page
     that on some implementations the latency of `RSR` exceeds one cycle.
 
-[^isa-user]: Same manual, section 5.4.1, page 237: "The User Registers are
-    fully interlocked in hardware and do not need SYNC instructions."
+[^isa-user]: Same manual, section 5.4.1 "Reading and Writing User Registers",
+    pages 237 to 238: "The User Registers are fully interlocked in hardware and
+    do not need SYNC instructions."
 
 [^coreisa]: ESP-IDF 5.5.1,
     `components/xtensa/esp32s3/include/xtensa/config/core-isa.h`:
@@ -306,7 +320,10 @@ and
     accumulator and `SAR_BYTE` sequences above, assembled with
     `xtensa-esp-elf-as --dynconfig=<toolchain>/lib/xtensa_esp32s3.so`, GNU
     assembler 2.43.1 (crosstool-NG esp-14.2.0_20241119), and disassembled with
-    `xtensa-esp-elf-objdump -d`. Every mnemonic encoded to one word.
+    `xtensa-esp32s3-elf-objdump -d`, which is the objdump that knows the
+    extension: the plain `xtensa-esp-elf-objdump` prints `excw` for every
+    `EE.*` word. Each mnemonic in the fragments encoded to a single 24-bit
+    instruction and disassembled back to what was written.
 
 [^m-gcc]: `[measured]` 2026-09-06. `xtensa-esp-elf-gcc -O2 -mlongcalls -S`,
     GCC 14.2.0 from the same toolchain, on a four-line integer dot product. The

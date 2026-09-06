@@ -106,8 +106,16 @@ because the device pays for load-use stalls and cache misses, not
 instructions"[^claude-md-kernels]. Those two ratios are the fifth pass's
 hand-written 8-pixel-grid kernels for mandala and silk: each had fewer
 static instructions than the compiler's own generated loop, and each still
-ran slower once timed on real silicon, so both were retired rather than
-shipped[^claude-md-kernels].
+ran slower once timed on real silicon[^claude-md-kernels]. What happened
+next differs: silk's kernel sits behind `GM_BGANIM_SILK_ASM`, which
+defaults to 0, so `bandRef` renders; mandala has no flag and its `band()`
+still carries a hand-written loop (`AnimMandala.cpp`, the `asm volatile`
+at about line 822 at commit 3008ba94) beside its `bandRef`, so a kernel
+ships. `[uncertain]` Whether the shipped mandala loop is the 0.85x
+eight-pixel-grid kernel or a later rewrite is not recorded in the commit
+history read for this leaf; the
+[kernel pass leaf](animation-kernel-pass-2026-09-what-the-device-decided.md)
+lists mandala as 0.85x and on.
 
 Silk's kernels came back a third time, written to transcribe GCC 14's own
 compiled loop mnemonic for mnemonic rather than to out-clever it, alongside

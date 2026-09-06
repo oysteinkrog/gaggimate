@@ -3,7 +3,7 @@ title: "LLVM/Clang for Xtensa: Status and What It Changes"
 id: 08-frontiers/llvm-clang-for-xtensa-status-and-what-it-changes
 schema_version: 1
 doc_type: explanation
-status: draft
+status: review
 last_reviewed: 2026-09-06
 created: 2026-09-06
 tags: [esp32s3, xtensa, llvm, clang, toolchain, frontiers]
@@ -77,9 +77,9 @@ reason lld cannot simply be dropped in. Sterling Augustine, a former
 GNU `ld` Xtensa maintainer, offered to review; as of the RFC's most
 recent visible activity (around 2026-08-31 to 2026-09-01) the discussion
 had reached rough consensus on relocation handling, with no merge
-confirmed as of this page's last fetch (2026-09-06)[^7]. `[uncertain]`
-whether this has since merged; check the thread and `lld`'s
-`ELF/Arch/` directory for an `Xtensa.cpp` file to confirm.
+confirmed as of this page's last fetch (2026-09-06)[^7]. As of that same
+date, `llvm-project`'s `lld/ELF/Arch/` directory upstream (`main` branch)
+has no `Xtensa.cpp` file: the RFC has not merged.[^7b]
 
 ## The Espressif fork: well ahead of upstream on ESP32-S3 and PIE
 
@@ -102,7 +102,7 @@ Three concrete differences follow from that:
   not present upstream[^10], and `XtensaS3DSPInstrInfo.td` defines the Q
   register file and the PIE instruction encodings (`EE.ANDQ`,
   `EE.BITREV`, `EE.CMUL.S16`, and so on) gated behind
-  `Requires<[HasESP32S3Ops]>`[^9]. Clang exposes 269 of these as
+  `Requires<[HasESP32S3Ops]>`[^9]. Clang exposes 252 of these as
   compiler builtins in `BuiltinsXtensaESP32S3.def`
   (`__builtin_xtensa_ee_andq`, `__builtin_xtensa_ee_ldqa_s8_128_ip`,
   and so on)[^11]. That is a real difference from this project's GCC 14
@@ -166,11 +166,12 @@ locate and so does not assert.
 ## Open questions
 
 - Does `espressif/llvm-project`'s `esp32s3` PIE support cover every
-  EE.* instruction this repo's kernels use, or only a subset? The 269
+  EE.* instruction this repo's kernels use, or only a subset? The 252
   builtins were counted but not matched one-to-one against the
   instructions named in `02-pie-vector/pie-arithmetic-multiply-saturate-and-shuffle.md`.
-- Has the 2026-08-19 lld/ELF Xtensa RFC merged since this page's last
-  fetch (2026-09-06)? Check `lld/ELF/Arch/Xtensa.cpp` upstream.
+- As of 2026-09-06 the 2026-08-19 lld/ELF Xtensa RFC has not merged: no
+  `Xtensa.cpp` file exists in `lld/ELF/Arch/` upstream[^7b]. Recheck that
+  path for later dates.
 - No codegen or cycle-count comparison between GCC 14 and `esp-clang`
   exists for any kernel in this repo. Everything about register
   allocation quality and loop-recognition quality above is structural
@@ -191,8 +192,9 @@ locate and so does not assert.
 [^8]: espressif/llvm-project repository metadata (`default_branch: release/esp_22.x`, `pushed_at: 2026-09-06`) and releases list (`esp-21.1.3_20260408`, published 2026-04-15), github.com/espressif/llvm-project, fetched 2026-09-06 via `gh api`.
 [^9]: espressif/llvm-project, tag `esp-21.1.3_20260408`, directory listing of `llvm/lib/Target/Xtensa` and file contents of `XtensaS3DSPInstrInfo.td`, `XtensaHardwareLoops.cpp`, `XtensaTargetTransformInfo.h`, fetched 2026-09-06.
 [^10]: espressif/llvm-project, tag `esp-21.1.3_20260408`, `llvm/lib/Target/Xtensa/XtensaProcessors.td` and `XtensaFeatures.td` (`esp32s3` processor def, `FeatureESP32S3Ops`), fetched 2026-09-06.
-[^11]: espressif/llvm-project, tag `esp-21.1.3_20260408`, `clang/include/clang/Basic/BuiltinsXtensaESP32S3.def` (269 lines, `__builtin_xtensa_ee_*`), fetched 2026-09-06.
+[^11]: espressif/llvm-project, tag `esp-21.1.3_20260408`, `clang/include/clang/Basic/BuiltinsXtensaESP32S3.def` (269 lines total; 252 `BUILTIN(...)` entries, all `__builtin_xtensa_*`, 213 of them `__builtin_xtensa_ee_*`, the rest reading and writing special registers such as `ACCX`, `QACC_H`, `QACC_L` and `SAR_BYTE`), fetched 2026-09-06.
 [^12]: espressif/llvm-project, tag `esp-21.1.3_20260408`, `llvm/lib/Target/Xtensa/XtensaHardwareLoops.cpp`, file header comment, fetched 2026-09-06.
 [^13]: espressif/llvm-project, tag `esp-21.1.3_20260408`, `clang/lib/Basic/Targets/Xtensa.h` (`validateAsmConstraint`, `NoAsmVariants`, `getClobbers`), fetched 2026-09-06.
 [^14]: espressif/esp-idf, `master` branch, `tools/tools.json` (`esp-clang`, `esp-clang-libs`, `esp-clangd` entries, recommended version `esp-21.1.3_20260408`), github.com/espressif/esp-idf, fetched 2026-09-06.
 [^15]: espressif/esp-toolchain-docs, `main` branch, `clang/esp-idf-app-clang-build.md`, github.com/espressif/esp-toolchain-docs, fetched 2026-09-06.
+[^7b]: llvm/llvm-project, `main` branch, `lld/ELF/Arch/` file list, fetched 2026-09-06: `AArch64.cpp`, `AMDGPU.cpp`, `ARM.cpp`, `AVR.cpp`, `Hexagon.cpp`, `LoongArch.cpp`, `MSP430.cpp`, `Mips.cpp`, `MipsArchTree.cpp`, `PPC.cpp`, `PPC64.cpp`, `PPCInsns.def`, `RISCV.cpp`, `SPARCV9.cpp`, `SystemZ.cpp`, `TargetImpl.h`, `X86.cpp`, `X86_64.cpp`. No `Xtensa.cpp` in the list.

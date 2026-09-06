@@ -3,7 +3,7 @@ title: Where the Xtensa headers and the tools disagree
 id: 04-toolchain-and-codegen/what-the-headers-say-versus-what-the-tools-do
 schema_version: 1
 doc_type: reference
-status: draft
+status: review
 last_reviewed: 2026-09-06
 created: 2026-09-06
 tags: [esp32s3, xtensa, gcc, toolchain, dynconfig, clamps, inline-asm, codegen]
@@ -86,12 +86,12 @@ instruction did not trap. `[measured]`[^qemu] That is the emulator's core model,
 so it is Espressif's own answer to what the S3 core contains, not a hardware
 measurement.
 
-One correction to a neighbouring leaf. [The configured-options
-leaf](../01-scalar-isa/core-isa-and-configured-options.md) says of `CLAMPS` that
-"GCC does not generate it from ordinary saturating-add C idioms, so reaching it
-needs inline asm or a builtin." Right about the first, and the builtin is not an
-option: GCC 14.2 for Xtensa defines no `__builtin_xtensa_*` functions at all,
-and the `cc1` binary contains no such string.[^tc]
+This agrees with [the configured-options
+leaf](../01-scalar-isa/core-isa-and-configured-options.md), which already notes
+that GCC 14.2 for Xtensa defines no `__builtin_xtensa_*` functions at all, so
+`CLAMPS` is reachable only from inline asm, not from a builtin. That check is
+repeated here directly against the compiler binary: the `cc1` binary contains
+no `__builtin_xtensa` string at all.[^tc]
 
 ## 2. Float divide and square root: the option bits are about seeds
 
@@ -169,7 +169,7 @@ resolves only through the per-chip driver, which supplies the search path; the
 generic driver needs an absolute path.[^tc]
 
 The diff that does exist is generic driver versus ESP32-S3 dynconfig, and it is
-what a portable `#if` sees. Thirty macro lines differ:[^tc]
+what a portable `#if` sees. Thirty-seven macro lines differ:[^tc]
 
 | Macro group | Generic default | ESP32-S3 dynconfig |
 |---|---|---|
@@ -287,7 +287,10 @@ carry-free byte-add idiom of masks, adds and exclusive-ors.[^tc] Adding
     <https://gcc.gnu.org/onlinedocs/gcc-14.2.0/gcc/Xtensa-Options.html>, fetched
     2026-09-06, for the quoted `-mstrict-align` default. The page documents
     eleven options and neither `-mcpu=` nor `-mdynconfig=`; the installed
-    driver's `--help=target` lists five more, `-mdynconfig=` among them.
+    driver's `--help=target` lists six more (`-mdynconfig=`,
+    `-malways-memw`, `-mdisable-hardware-atomics`,
+    `-mfix-esp32-psram-cache-issue`, `-mfix-esp32-psram-cache-strategy=`,
+    `-mlra`), all Espressif additions absent from the upstream FSF manual.
 
 [^isa]: Tensilica, *Xtensa Instruction Set Architecture (ISA) Reference
     Manual*, issue date 4/2010 (for all Xtensa processor cores). Section 4.3.8

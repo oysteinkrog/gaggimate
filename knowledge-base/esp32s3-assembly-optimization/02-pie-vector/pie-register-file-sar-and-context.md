@@ -326,7 +326,7 @@ portable reference.
 
 ## Footnotes
 
-[^trm]: Espressif Systems, 2025. *ESP32-S3 Technical Reference Manual*,
+[^trm]: Espressif Systems, 2026. *ESP32-S3 Technical Reference Manual*,
     Version 1.8, Chapter 1 "Processor Instruction Extensions (PIE)",
     pages 39 to 303. Sections used: 1.2 Features, 1.3.1 to 1.3.5 structure
     and accumulators, 1.4.2 instruction field definition, 1.5.1 Table 1.5-1

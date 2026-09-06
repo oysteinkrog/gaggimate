@@ -3,7 +3,7 @@ title: Branches, jumps and control flow on the ESP32-S3 (LX7)
 id: 01-scalar-isa/branches-jumps-and-control-flow-costs
 schema_version: 1
 doc_type: reference
-status: draft
+status: review
 last_reviewed: 2026-09-06
 tags: [esp32s3, xtensa, lx7, branch, jump, call, control-flow, gcc, pipeline]
 confidence: medium
@@ -48,17 +48,17 @@ branch instruction plus one; every worked range below already includes it.
 forms are `BEQ`, `BNE`, `BLT` (signed less than), `BGE` (signed greater or
 equal); the unsigned forms are `BLTU`, `BGEU`
 [Tensilica 2010][^isa-cond-table] p. 40. Each is its own inverse pair:
-`BEQ`/`BNE`, `BLT`/`BGE`, `BLTU`/`BGEU` [Tensilica 2010][^isa-beq] p. 271,
-[^isa-bge] p. 276, [^isa-blt] p. 281.
+`BEQ`/`BNE`, `BLT`/`BGE`, `BLTU`/`BGEU` [Tensilica 2010][^isa-beq] p. 272,
+[^isa-bge] p. 277, [^isa-blt] p. 282.
 
 Offset field is a signed 8-bit immediate, so the range relative to the
 branch instruction's own address is **-124 to +131 bytes**
-(`-128 + 4` to `127 + 4`) [Tensilica 2010][^isa-beq] p. 271 (`BEQ`'s
+(`-128 + 4` to `127 + 4`) [Tensilica 2010][^isa-beq] p. 272 (`BEQ`'s
 operation equation is representative of the whole `RRI8` family). The
 assembler substitutes an equivalent multi-instruction sequence when a
 label is out of range for any of these, unless the mnemonic is prefixed
 with an underscore (`_BEQ`, `_BNE`, ...), which forces an assembly error
-instead [Tensilica 2010][^isa-beq] p. 271.
+instead [Tensilica 2010][^isa-beq] p. 272.
 
 Measured codegen for a comparison against a small constant, not zero
 (`xtensa-esp32s3-elf-gcc -O2 -mlongcalls -S`, 14.2.0,
@@ -103,13 +103,13 @@ depends on what the two arms do, not just on the source having an `if`.
 Same `RRI8` word as §2, but the second operand is a 4-bit field decoded
 through a lookup table instead of a register, so a compare against one of
 sixteen common constants costs no register load
-[Tensilica 2010][^isa-beqi] p. 272. `BEQI`/`BNEI` and `BGEI`/`BLTI` are
+[Tensilica 2010][^isa-beqi] p. 273. `BEQI`/`BNEI` and `BGEI`/`BLTI` are
 inverse pairs, likewise `BGEUI`/`BLTUI`
-[Tensilica 2010][^isa-beqi] p. 272, [^isa-bgei] p. 277,
-[^isa-bgeui] p. 279. Offset range is the same `RRI8` -124 to +131 bytes.
+[Tensilica 2010][^isa-beqi] p. 273, [^isa-bgei] p. 278,
+[^isa-bgeui] p. 280. Offset range is the same `RRI8` -124 to +131 bytes.
 The assembler will fold a `BEQI`/`BNEI` against zero down to `BEQZ`,
 `BNEZ` or the narrow `BEQZ.N` automatically unless the mnemonic has the
-disabling underscore prefix [Tensilica 2010][^isa-beqi] p. 272.
+disabling underscore prefix [Tensilica 2010][^isa-beqi] p. 273.
 
 The 4-bit field is not `0..15`. It is looked up in one of two 16-entry
 tables, reproduced in full
@@ -153,11 +153,11 @@ encoding 3 in Table 3-17.
 These use the wider `BRI12` word: a signed 12-bit offset instead of the
 8-bit field the rest of the family gets, because comparing against zero is
 common enough to spend the extra format on more reach
-[Tensilica 2010][^isa-beqz] p. 273 ("`BEQZ` provides 12 bits of target
+[Tensilica 2010][^isa-beqz] p. 274 ("`BEQZ` provides 12 bits of target
 range instead of the eight bits available in most conditional branches").
 `BEQZ`/`BNEZ` are inverses, as are `BGEZ`/`BLTZ`
-[Tensilica 2010][^isa-beqz] p. 273, [^isa-bnez] p. 289,
-[^isa-bgez] p. 280, [^isa-bltz] p. 285. Range: **-2044 to +2051 bytes**
+[Tensilica 2010][^isa-beqz] p. 274, [^isa-bnez] p. 290,
+[^isa-bgez] p. 281, [^isa-bltz] p. 286. Range: **-2044 to +2051 bytes**
 (`-2048 + 4` to `2047 + 4`).
 
 **Narrow forms, `BEQZ.N` and `BNEZ.N`.** With the Code Density Option on
@@ -165,11 +165,11 @@ range instead of the eight bits available in most conditional branches").
 16-bit encoding for these two only. The instruction word is `RI6`: a
 6-bit unsigned, zero-extended offset, so the branch can only go **forward**,
 by **+4 to +67 bytes** from its own address
-[Tensilica 2010][^isa-beqzn] p. 274. There is no narrow `BLTZ.N` or
+[Tensilica 2010][^isa-beqzn] p. 275. There is no narrow `BLTZ.N` or
 `BGEZ.N`; only equal-to-zero and not-equal-to-zero get the narrow
 encoding. The assembler substitutes the narrow form automatically when the
 target is in range and the wide form was not forced with the `_BEQZ`
-underscore prefix [Tensilica 2010][^isa-beqz] p. 273.
+underscore prefix [Tensilica 2010][^isa-beqz] p. 274.
 
 Measured: a bit test compiled with side effects, so the compiler could not
 fold it to a plain `EXTUI` (see §9):
@@ -201,38 +201,38 @@ mask is a single bit known at compile time.
 `RRI8` format. `BBCI`/`BBSI` test one bit of a register against a 5-bit
 immediate index (0 to 31, split across two word fields), `BBC`/`BBS` test
 one bit of a register against an index held in another register
-[Tensilica 2010][^isa-bbci] p. 266, [^isa-bbc] p. 265. All four use the
+[Tensilica 2010][^isa-bbci] p. 267, [^isa-bbc] p. 266. All four use the
 core's bit-numbering convention: little-endian processors (this one) treat
-bit 0 as least significant [Tensilica 2010][^isa-bbc] p. 265. `BBCI` is
+bit 0 as least significant [Tensilica 2010][^isa-bbc] p. 266. `BBCI` is
 the inverse of `BBSI`; `BBC` is the inverse of `BBS`
-[Tensilica 2010][^isa-bbci] p. 266, [^isa-bbc] p. 265. Offset range is the
+[Tensilica 2010][^isa-bbci] p. 267, [^isa-bbc] p. 266. Offset range is the
 same `RRI8` -124 to +131 bytes as §2. `BBCI.L` and `BBSI.L` are assembler
 macros over `BBCI`/`BBSI` that force little-endian bit numbering
 explicitly; on this little-endian core they assemble identically to the
-plain form [Tensilica 2010][^isa-bbcil] p. 267.
+plain form [Tensilica 2010][^isa-bbcil] p. 268.
 
 ## 6. Mask branches: `BALL`, `BANY`, `BNALL`, `BNONE`
 
 `RRI8` format, testing several bits at once against a mask held in a
 second register, useful for "any of these flags set" checks without a
-separate `AND` [Tensilica 2010][^isa-ball] p. 263. `BALL` branches when
+separate `AND` [Tensilica 2010][^isa-ball] p. 264. `BALL` branches when
 every masked bit is set, `BANY` when at least one is, and their inverses
-`BNALL` and `BNONE` do the opposite [Tensilica 2010][^isa-ball] p. 263,
-[^isa-bany] p. 264, [^isa-bnall] p. 286, [^isa-bnone] p. 291. `BALL`'s
+`BNALL` and `BNONE` do the opposite [Tensilica 2010][^isa-ball] p. 264,
+[^isa-bany] p. 265, [^isa-bnall] p. 287, [^isa-bnone] p. 292. `BALL`'s
 test is `(NOT as) AND at = 0`; `BANY`'s is `as AND at != 0`
-[Tensilica 2010][^isa-ball] p. 263, [^isa-bany] p. 264. Same -124 to +131
+[Tensilica 2010][^isa-ball] p. 264, [^isa-bany] p. 265. Same -124 to +131
 byte range as the rest of the `RRI8` family.
 
 ## 7. Unconditional jumps: `J` and `JX`
 
 `J` is `CALL` format: a signed 18-bit PC-relative offset, giving a range of
 **-131068 to +131075 bytes**
-[Tensilica 2010][^isa-j] p. 365. `JX` is `CALLX` format: it jumps to
+[Tensilica 2010][^isa-j] p. 366. `JX` is `CALLX` format: it jumps to
 whatever address sits in a general register, so its reach is the full
-32-bit address space [Tensilica 2010][^isa-jx] p. 367. `J.L` is an
+32-bit address space [Tensilica 2010][^isa-jx] p. 368. `J.L` is an
 assembler macro: it emits a plain `J` when the target is in range, and
 falls back to a literal load (`L32R`) into a register followed by `JX` on
-that register when it is not [Tensilica 2010][^isa-jl] p. 366.
+that register when it is not [Tensilica 2010][^isa-jl] p. 367.
 
 Measured: GCC's own switch-statement lowering uses exactly that
 `L32R` + `JX` pattern once the case values do not simplify to arithmetic
@@ -304,35 +304,35 @@ All five call instructions store a return address in `a0` (`CALL0`) or in
 (`CALL4`/`CALL8`/`CALL12`), and none of them touch the register window
 themselves; the corresponding `ENTRY` instruction at the callee's first
 address performs the actual rotation
-[Tensilica 2010][^isa-call0] p. 296, [^isa-call4] p. 297. `CALL0` needs no
+[Tensilica 2010][^isa-call0] p. 297, [^isa-call4] p. 298. `CALL0` needs no
 `Windowed Register Option`; `CALL4`/`CALL8`/`CALL12` do
-[Tensilica 2010][^isa-call4] p. 297. `[[Register windows and the windowed
-ABI]](../00-foundations/register-windows-and-windowed-abi.md)` covers the
-overflow and underflow mechanics that a windowed call can trigger; this
-page only covers the call instruction's own encoding.
+[Tensilica 2010][^isa-call4] p. 298.
+[Register windows and the windowed ABI](../00-foundations/register-windows-and-windowed-abi.md)
+covers the overflow and underflow mechanics that a windowed call can
+trigger; this page only covers the call instruction's own encoding.
 
 | Instruction | Format | Return via | Requires |
 |---|---|---|---|
-| `CALL0` | `CALL` | `a0`, plain address | Core Architecture [^isa-call0] p. 296 |
-| `CALL4` | `CALL` | `a4` (caller) / `a0` (callee), plus window-increment tag | Windowed Register Option [^isa-call4] p. 297 |
-| `CALL8` | `CALL` | `a8` / `a0`, same tag mechanism | Windowed Register Option [^isa-call8] p. 299 |
-| `CALL12` | `CALL` | `a12` / `a0`, same tag mechanism | Windowed Register Option [^isa-call12] p. 301 |
-| `CALLX0` | `CALLX` | same as `CALL0`, register-indirect target | Core Architecture [^isa-callx0] p. 303 |
-| `CALLX4`/`CALLX8`/`CALLX12` | `CALLX` | same as their non-X counterparts, register-indirect target | Windowed Register Option [^isa-callx4] p. 304, [^isa-callx8] p. 306, [^isa-callx12] p. 308 |
+| `CALL0` | `CALL` | `a0`, plain address | Core Architecture [^isa-call0] p. 297 |
+| `CALL4` | `CALL` | `a4` (caller) / `a0` (callee), plus window-increment tag | Windowed Register Option [^isa-call4] p. 298 |
+| `CALL8` | `CALL` | `a8` / `a0`, same tag mechanism | Windowed Register Option [^isa-call8] p. 300 |
+| `CALL12` | `CALL` | `a12` / `a0`, same tag mechanism | Windowed Register Option [^isa-call12] p. 302 |
+| `CALLX0` | `CALLX` | same as `CALL0`, register-indirect target | Core Architecture [^isa-callx0] p. 304 |
+| `CALLX4`/`CALLX8`/`CALLX12` | `CALLX` | same as their non-X counterparts, register-indirect target | Windowed Register Option [^isa-callx4] p. 305, [^isa-callx8] p. 307, [^isa-callx12] p. 309 |
 
 All four `CALL`-format instructions (`J`, `CALL0`, `CALL4`, `CALL8`,
 `CALL12`) require their target to be 32-bit aligned, which lets the
 offset field be interpreted as a word count and shifted left by two before
 being added. That gives the call forms four times the reach of `J`'s raw
 18-bit field: **-524284 to +524288 bytes**
-[Tensilica 2010][^isa-call0] p. 296. `CALLX0`/`CALLX4`/`CALLX8`/`CALLX12`
+[Tensilica 2010][^isa-call0] p. 297. `CALLX0`/`CALLX4`/`CALLX8`/`CALLX12`
 have no offset field at all; the target comes entirely from a register, so
-reach is unlimited [Tensilica 2010][^isa-callx0] p. 303.
+reach is unlimited [Tensilica 2010][^isa-callx0] p. 304.
 
 `RET`/`RET.N` return from a `CALL0`/`CALLX0` call; `RETW`/`RETW.N` return
 from a windowed call and restore the two window-increment bits that the
 call packed into the high bits of the return-address register
-[Tensilica 2010][^isa-call4] p. 297. Measured across every example on
+[Tensilica 2010][^isa-call4] p. 298. Measured across every example on
 this page: `xtensa-esp32s3-elf-gcc -O2` always paired an `ENTRY` at
 function entry with a `RETW.N`, because the toolchain's default ABI for
 ESP32-S3 is the windowed one; `CALL0`-ABI code exists in ESP-IDF (interrupt
@@ -419,44 +419,45 @@ branch family is in use, only its encoding width.
 [^isa-b4const]: Same manual, Table 3-17 "Branch Immediate (b4const)
     Encodings" and Table 3-18 "Branch Unsigned Immediate (b4constu)
     Encodings", pp. 41-42.
-[^isa-beq]: Same manual, `BEQ` instruction description, Chapter 6, p. 271.
-[^isa-beqi]: Same manual, `BEQI`, p. 272.
-[^isa-beqz]: Same manual, `BEQZ`, p. 273.
-[^isa-beqzn]: Same manual, `BEQZ.N`, p. 274.
-[^isa-bge]: Same manual, `BGE`, p. 276.
-[^isa-bgei]: Same manual, `BGEI`, p. 277.
-[^isa-bgeu]: Same manual, `BGEU`, p. 278.
-[^isa-bgeui]: Same manual, `BGEUI`, p. 279.
-[^isa-bgez]: Same manual, `BGEZ`, p. 280.
-[^isa-blt]: Same manual, `BLT`, p. 281.
-[^isa-blti]: Same manual, `BLTI`, p. 282.
-[^isa-bltu]: Same manual, `BLTU`, p. 283.
-[^isa-bltui]: Same manual, `BLTUI`, p. 284.
-[^isa-bltz]: Same manual, `BLTZ`, p. 285.
-[^isa-bnall]: Same manual, `BNALL`, p. 286.
-[^isa-bne]: Same manual, `BNE`, p. 287.
-[^isa-bnei]: Same manual, `BNEI`, p. 288.
-[^isa-bnez]: Same manual, `BNEZ`, p. 289.
-[^isa-bnezn]: Same manual, `BNEZ.N`, p. 290.
-[^isa-bnone]: Same manual, `BNONE`, p. 291.
-[^isa-bbc]: Same manual, `BBC`, p. 265.
-[^isa-bbci]: Same manual, `BBCI`, p. 266.
-[^isa-bbcil]: Same manual, `BBCI.L`, p. 267.
-[^isa-ball]: Same manual, `BALL`, p. 263.
-[^isa-bany]: Same manual, `BANY`, p. 264.
-[^isa-j]: Same manual, `J`, p. 365.
-[^isa-jl]: Same manual, `J.L`, p. 366.
-[^isa-jx]: Same manual, `JX`, p. 367.
-[^isa-call0]: Same manual, `CALL0`, pp. 296-297.
-[^isa-call4]: Same manual, `CALL4`, pp. 297-298.
-[^isa-call8]: Same manual, `CALL8`, pp. 299-300.
-[^isa-call12]: Same manual, `CALL12`, pp. 301-302.
-[^isa-callx0]: Same manual, `CALLX0`, pp. 303-304.
-[^isa-callx4]: Same manual, `CALLX4`, pp. 304-305.
-[^isa-callx8]: Same manual, `CALLX8`, pp. 306-307.
-[^isa-callx12]: Same manual, `CALLX12`, pp. 308-309.
-[^isa-pipeline]: Same manual, Section 8.4.2, "Register-Use Timing
-    Examples", Table 8-247 and Figures 8-54 to 8-56, pp. 605-609.
+[^isa-beq]: Same manual, `BEQ` instruction description, Chapter 6, p. 272.
+[^isa-beqi]: Same manual, `BEQI`, p. 273.
+[^isa-beqz]: Same manual, `BEQZ`, p. 274.
+[^isa-beqzn]: Same manual, `BEQZ.N`, p. 275.
+[^isa-bge]: Same manual, `BGE`, p. 277.
+[^isa-bgei]: Same manual, `BGEI`, p. 278.
+[^isa-bgeu]: Same manual, `BGEU`, p. 279.
+[^isa-bgeui]: Same manual, `BGEUI`, p. 280.
+[^isa-bgez]: Same manual, `BGEZ`, p. 281.
+[^isa-blt]: Same manual, `BLT`, p. 282.
+[^isa-blti]: Same manual, `BLTI`, p. 283.
+[^isa-bltu]: Same manual, `BLTU`, p. 284.
+[^isa-bltui]: Same manual, `BLTUI`, p. 285.
+[^isa-bltz]: Same manual, `BLTZ`, p. 286.
+[^isa-bnall]: Same manual, `BNALL`, p. 287.
+[^isa-bne]: Same manual, `BNE`, p. 288.
+[^isa-bnei]: Same manual, `BNEI`, p. 289.
+[^isa-bnez]: Same manual, `BNEZ`, p. 290.
+[^isa-bnezn]: Same manual, `BNEZ.N`, p. 291.
+[^isa-bnone]: Same manual, `BNONE`, p. 292.
+[^isa-bbc]: Same manual, `BBC`, p. 266.
+[^isa-bbci]: Same manual, `BBCI`, p. 267.
+[^isa-bbcil]: Same manual, `BBCI.L`, p. 268.
+[^isa-ball]: Same manual, `BALL`, p. 264.
+[^isa-bany]: Same manual, `BANY`, p. 265.
+[^isa-j]: Same manual, `J`, p. 366.
+[^isa-jl]: Same manual, `J.L`, p. 367.
+[^isa-jx]: Same manual, `JX`, p. 368.
+[^isa-call0]: Same manual, `CALL0`, p. 297.
+[^isa-call4]: Same manual, `CALL4`, pp. 298-299.
+[^isa-call8]: Same manual, `CALL8`, pp. 300-301.
+[^isa-call12]: Same manual, `CALL12`, pp. 302-303.
+[^isa-callx0]: Same manual, `CALLX0`, p. 304.
+[^isa-callx4]: Same manual, `CALLX4`, pp. 305-306.
+[^isa-callx8]: Same manual, `CALLX8`, pp. 307-308.
+[^isa-callx12]: Same manual, `CALLX12`, pp. 309-310.
+[^isa-pipeline]: Same manual, Sections 8.4.1-8.4.2, "Processor
+    Performance Terminology and Modeling" and "Xtensa Processor Family",
+    Table 8-247 and Figures 8-54 to 8-56, pp. 605-609.
 [^trm-branch]: Espressif Systems, *ESP32-S3 Technical Reference Manual*,
     version 1.8, PDF dated 2026-03-04. Section 1.7.3, p. 74.
     <https://www.espressif.com/sites/default/files/documentation/esp32-s3_technical_reference_manual_en.pdf>

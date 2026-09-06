@@ -8,8 +8,11 @@ conventions (anti-patterns, validation, retrieval) are in
 
 Durable content: [`MASTER-PLAN.md`](./MASTER-PLAN.md) (the locked plan),
 [`README.md`](./README.md) (reader-facing intro), [`PROGRESS.md`](./PROGRESS.md)
-(wave log), [`COMPENDIUM.md`](./COMPENDIUM.md) (the cross-bucket synthesis,
-written at consolidation).
+(wave log), [`COMPENDIUM.md`](./COMPENDIUM.md) (the forty load-bearing
+facts, one link each, the place to start reading), [`sources.md`](./sources.md)
+(every external source the corpus cites, pinned by version or fetch date),
+and [`FINAL-CONVERGENCE-REPORT.md`](./FINAL-CONVERGENCE-REPORT.md) (what
+the build converged on and what it left open).
 
 ## 1. Purpose
 
