@@ -1458,6 +1458,15 @@ void DefaultUI::setupState() {
 
 void DefaultUI::handleScreenChange() {
     if (currentScreen != targetScreen) {
+        // While an animated screen load is in progress (only the power-up
+        // fade in setupPanel), lv_scr_load_anim for another screen deletes
+        // the screen it is fading in: LVGL 8.4 honours auto_del by deleting
+        // lv_scr_act(), which during the animation is already the incoming
+        // screen, and then dereferences it. Keep targetScreen pending until
+        // the fade has finished; scr_anim_ready clears the field.
+        if (lv_disp_get_default()->scr_to_load != nullptr) {
+            return;
+        }
         // The standby timeout, a mode change, a brew start or any other route
         // that lands here must never lose a pending settings edit or leave
         // the cover behind on a screen the flow engine is about to tear down.
