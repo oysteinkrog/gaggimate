@@ -22,6 +22,7 @@ import json
 import os
 import re
 import sys
+import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO_ROOT = os.path.abspath(os.path.join(HERE, "..", ".."))
@@ -142,22 +143,28 @@ def check_tap_opens_menu(rig):
 def check_device_only_routes_unavailable(rig):
     """/api/debug/anim and /api/debug/synth are compiled only for the real
     LilyGo panel (WebUIPlugin.cpp guards the whole block with
-    !GAGGIMATE_HEADLESS && !GAGGIMATE_SIM); /api/debug/settingsui does not
-    exist yet (gm-flw.6). All three fall through to the sim's static/SPA
-    handler on this build (200, the web UI bundle, not JSON), which
-    get_json() turns into a clean RigHTTPError instead of a raw decode
+    !GAGGIMATE_HEADLESS && !GAGGIMATE_SIM). Both fall through to the sim's
+    static/SPA handler on this build (200, the web UI bundle, not JSON),
+    which get_json() turns into a clean RigHTTPError instead of a raw decode
     exception; this confirms that path, not the routes themselves (those
-    are the leader's device runs / a later bead)."""
+    are the leader's device runs)."""
     for name, call in (
         ("anim", rig.anim),
         ("synth", lambda: rig.synth(0)),
-        ("settingsui_state", rig.settingsui_state),
     ):
         try:
             call()
             check(rig, "%s_unavailable_on_sim" % name, False, "unexpectedly returned JSON")
         except RigHTTPError as e:
             check(rig, "%s_unavailable_on_sim" % name, True, str(e))
+
+
+def check_settingsui_state(rig):
+    """/api/debug/settingsui is compiled for the sim (GAGGIMATE_SIM) as well
+    as the bench builds; with nothing open it reports the closed shell."""
+    st = rig.settingsui_state()
+    check(rig, "settingsui_state_shape", all(k in st for k in ("seq", "open", "depth", "category", "page", "pages", "title", "fixture")), repr(st))
+    check(rig, "settingsui_state_closed", st.get("open") is False and st.get("depth") == 0, repr(st))
 
 
 def check_fb_png(rig, workdir):
@@ -186,8 +193,10 @@ def check_restart_persistence(rig, sim, data_dir):
     number), restart, and read it back over the wire."""
     nvs_path = os.path.join(data_dir, "nvs", "controller.json")
     before = seconds(rig.settings_value("standbyTimeout"))
-    new_ms = 555000
-    new_s = new_ms // 1000
+    # A reused workdir starts where the previous run left it, so the value
+    # written must differ from whatever is stored now.
+    new_s = 555 if before != 555 else 556
+    new_ms = new_s * 1000
     sim.stop()
     with open(nvs_path, encoding="utf-8") as f:
         store = json.load(f)
@@ -202,7 +211,7 @@ def check_restart_persistence(rig, sim, data_dir):
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--program", default=DEFAULT_PROGRAM)
-    ap.add_argument("--workdir", default=os.path.join(HERE, "_test_run"))
+    ap.add_argument("--workdir", default=os.path.join(tempfile.gettempdir(), "gm_settings_ui_tests", "test_rig"))
     ap.add_argument("--port", type=int, default=int(os.environ.get("GM_SIM_PORT", "8084")))
     args = ap.parse_args()
 
@@ -224,6 +233,7 @@ def main():
         check_audit_exemptions(rig)
         check_tap_opens_menu(rig)
         check_device_only_routes_unavailable(rig)
+        check_settingsui_state(rig)
         check_fb_png(rig, args.workdir)
         check_wire_format_helpers(rig, s)
         check_restart_persistence(rig, sim, data_dir)
