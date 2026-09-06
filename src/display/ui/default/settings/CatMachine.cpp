@@ -58,6 +58,11 @@ std::vector<AutoWakeupSchedule> toAutoWakeupSchedules(const std::vector<settings
     return out;
 }
 
+} // namespace
+
+// Moved out of the anonymous namespace above (CatMachine.h) so the schedule
+// editor's own file (gm-flw.11) can call it too, to re-read the stored
+// vector into the shared MachineDraft on reconcile.
 std::vector<settingsui::ScheduleDraft> fromAutoWakeupSchedules(const std::vector<AutoWakeupSchedule> &schedules) {
     std::vector<settingsui::ScheduleDraft> out;
     out.reserve(schedules.size());
@@ -71,6 +76,8 @@ std::vector<settingsui::ScheduleDraft> fromAutoWakeupSchedules(const std::vector
     }
     return out;
 }
+
+namespace {
 
 void setStartupValue(MachineCtx *ctx) {
     if (ctx->startupRow != nullptr) {

@@ -12,6 +12,7 @@
 #include "SettingsModel.h"
 #include "SettingsUI.h"
 
+#include <display/core/Settings.h> // AutoWakeupSchedule, for fromAutoWakeupSchedules below
 #include <display/core/constants.h>
 
 #include <vector>
@@ -44,5 +45,15 @@ struct MachineDraft {
 // row's onActivate with `draft` as the pushed page's ctx.
 int settingsMachineExtraRowCount(MachineDraft *draft);
 void settingsMachineBuildExtraRow(MachineDraft *draft, int index, lv_obj_t *parent, SettingsUI &ui);
+
+// Converts the stored AutoWakeupSchedule vector into the model's
+// ScheduleDraft vector. Defined in CatMachine.cpp (gm-flw.10), at file scope
+// rather than that file's own anonymous namespace so the schedule editor
+// (gm-flw.11, CatSchedules.cpp) can call it too, to re-read the stored
+// vector into the shared MachineDraft on reconcile without duplicating the
+// conversion. toAutoWakeupSchedules (the other direction, used only by
+// CatMachine.cpp's own commit) stays anonymous: nothing outside that file
+// needs it.
+std::vector<settingsui::ScheduleDraft> fromAutoWakeupSchedules(const std::vector<AutoWakeupSchedule> &schedules);
 
 #endif // GM_CAT_MACHINE_H
