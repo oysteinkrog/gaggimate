@@ -1481,28 +1481,26 @@ void DefaultUI::setupState() {
     effect_mgr.use_effect([this]() { return currentScreen == SCREEN_ID_MENU_SCREEN_NEW; },
                           [this]() {
                               const bool fourTiles = grindAvailable || scaleMenuSwap;
-                              // The settings tile sits at the centre (decided 2026-09-06,
-                              // bead gm-z7x); the info button and the mode word that used
-                              // to live there are hidden, and the info screen is reached
-                              // from the Status category ("Device info"). The ring keeps
-                              // the five-tile geometry that was verified against
-                              // tools/settings_ui_tests/rig.py's audit() model (74 px
-                              // tiles, 104x104 hit boxes, radius 121, 72 degree slots), so
-                              // every pairwise gap on the ring is unchanged; the slots are
-                              // simply the four (or three) nearest the top, which keeps the
-                              // bottom clear for standby_btn. The centre tile gives up
-                              // its 15 px click pad (a 74 px target, above the 56 px
-                              // floor): with the pad its 104 px box overlapped the 144
-                              // degree slot's box by 33x7 px, since the audit works in
-                              // axis-aligned rectangles, not radial gaps. Without it the
-                              // closest box on the ring is 9 px away.
-                              constexpr int kTileSize = 74;
-                              constexpr int kRadius = 121;
-                              lv_obj_t *tiles[] = {objects.btn_brew_1, objects.btn_steam_1, objects.btn_water_1,
-                                                   objects.btn_grind_1, objects.btn_settings_1};
-                              for (lv_obj_t *tile : tiles) {
+                              // The ring is the one the menu had before the settings work
+                              // (8f77807e): the mode tiles evenly spread, four at 45 degree
+                              // offsets or three at 120 degree steps, brew first, clockwise
+                              // from the top. The settings tile sits at the centre (gm-z7x)
+                              // where the info button and the mode word used to be; the
+                              // info screen is reached from the Status category. The gear
+                              // gives up its click pad and the ring tiles keep a smaller
+                              // one, so with 100 px ring tiles at radius 140 the hit boxes
+                              // stay clear of each other (rig.py audit, 2026-09-06): the
+                              // 80 px icons look the same at any tile size.
+                              constexpr int kRingTile = 100;
+                              constexpr int kRingPad = 8;
+                              constexpr int kCentreTile = 80;
+                              constexpr int kRadius = 140;
+                              lv_obj_t *ring[] = {objects.btn_brew_1, objects.btn_steam_1, objects.btn_water_1,
+                                                  objects.btn_grind_1};
+                              for (lv_obj_t *tile : ring) {
                                   if (tile != nullptr) {
-                                      lv_obj_set_size(tile, kTileSize, kTileSize);
+                                      lv_obj_set_size(tile, kRingTile, kRingTile);
+                                      lv_obj_set_ext_click_area(tile, kRingPad);
                                   }
                               }
                               if (objects.info_btn != nullptr) {
@@ -1512,18 +1510,18 @@ void DefaultUI::setupState() {
                                   lv_obj_add_flag(objects.obj13, LV_OBJ_FLAG_HIDDEN);
                               }
                               if (objects.btn_settings_1 != nullptr) {
+                                  lv_obj_set_size(objects.btn_settings_1, kCentreTile, kCentreTile);
                                   lv_obj_set_pos(objects.btn_settings_1, 0, 0);
                                   lv_obj_set_ext_click_area(objects.btn_settings_1, 0);
                               }
+                              const int count = fourTiles ? 4 : 3;
+                              const int step = 360 / count;
+                              const int rotation = fourTiles ? 45 : 0;
+                              positionMenuIcon(objects.btn_brew_1, step * 0 - rotation, kRadius);
+                              positionMenuIcon(objects.btn_steam_1, step * 1 - rotation, kRadius);
+                              positionMenuIcon(objects.btn_water_1, step * 2 - rotation, kRadius);
                               if (fourTiles) {
-                                  positionMenuIcon(objects.btn_brew_1, 288, kRadius);
-                                  positionMenuIcon(objects.btn_steam_1, 0, kRadius);
-                                  positionMenuIcon(objects.btn_water_1, 72, kRadius);
-                                  positionMenuIcon(objects.btn_grind_1, 144, kRadius);
-                              } else {
-                                  positionMenuIcon(objects.btn_brew_1, 288, kRadius);
-                                  positionMenuIcon(objects.btn_steam_1, 0, kRadius);
-                                  positionMenuIcon(objects.btn_water_1, 72, kRadius);
+                                  positionMenuIcon(objects.btn_grind_1, step * 3 - rotation, kRadius);
                               }
                               // Grind slot doubles as the Scale button.
                               if (objects.btn_grind_1 != nullptr) {

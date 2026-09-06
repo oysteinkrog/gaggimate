@@ -141,13 +141,17 @@ the design cannot show and what the runs measured.
 - **The settings tile is the centre of the menu** (decided 2026-09-06, gm-z7x).
   `DefaultUI`'s menu-screen effect puts `btn_settings_1` at (0, 0) without
   its 15 px click pad, hides the generated info button and the
-  BREW/STEAM/WATER word, and keeps the mode tiles on the 121 px ring in the
-  slots nearest the top (74 px tiles, 72 degree steps). The info screen,
+  BREW/STEAM/WATER word, and spreads the mode tiles evenly on a 140 px ring
+  as the menu did before the settings work: four at 45 degree offsets, or
+  three at 120 degree steps, brew first, clockwise from the top (100 px
+  tiles with an 8 px click pad; the icons are 80 px whatever the tile
+  size). The info screen,
   the only place that shows the WiFi setup QR code while the config access
   point is active, is opened by the Status category's "Device info" row.
-  The menu audits clean on the simulator and the bench board; with the pad
-  the centre box overlapped the grind tile's by 33x7 px, because the audit
-  works in axis-aligned rectangles.
+  The menu audits clean on the simulator and the bench board; the audit
+  works in axis-aligned rectangles, so the pads are what set the spacing
+  (an 80 px gear with no pad and 100 px ring tiles with 8 px pads leave
+  1 px between the centre box and the corner tiles' boxes).
 - **Settings is a cover on the menu screen, not a screen.** `SettingsUI::open`
   creates one full-screen child of `objects.menu_screen_new`, hides every
   other direct child except `objects.status_icons`, and restores their
