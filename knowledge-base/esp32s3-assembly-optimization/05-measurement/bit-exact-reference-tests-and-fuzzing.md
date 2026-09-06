@@ -1,0 +1,280 @@
+---
+title: "Bit-exact reference tests and fuzzing"
+id: 05-measurement/bit-exact-reference-tests-and-fuzzing
+schema_version: 1
+doc_type: how-to
+status: draft
+last_reviewed: 2026-09-06
+tags: [esp32s3, xtensa, testing, fuzzing, sanitizers, differential-testing]
+confidence: high
+---
+
+# Bit-exact reference tests and fuzzing
+
+This page is about proving a hand-written kernel computes the same
+thing as a portable version of the same function, a claim that needs
+its own test discipline, separate from timing. A kernel can be fast
+and wrong; the tests here catch the wrong half, so the timing work
+elsewhere in this bucket only has to prove the fast half.
+
+## 1. Why compare two implementations at all
+
+Comparing two independent implementations of the same function against
+the same inputs, and reporting any difference, is called differential
+testing, a general technique, not specific to this chip or to
+assembly: McKeeman's original description runs the same input through
+multiple similar programs and treats any difference in their output as
+a signal worth investigating [McKeeman1998][^1]. It catches bugs that
+do not crash and do not trip an assertion: a wrong pixel value, a
+wrong rounding, a table index off by one. Only a second implementation,
+computing the same answer a different way, exposes those. For a
+hand-written kernel, that second implementation is the portable
+reference it replaces.
+
+## 2. The reference-twin pattern
+
+Keep a portable implementation of every kernel, in plain C or C++, next
+to the hand-written one: the optimized path and the reference twin.
+
+- **The specification.** When the two disagree, the twin is assumed
+  correct until proven otherwise: it is short enough to read in one
+  pass and does not depend on an instruction set's tricky semantics
+  (saturation, funnel shifts, packed lane order). The optimized path's
+  job is to reach the same answer faster, never a different one.
+- **The fallback.** If the platform lacks the instruction the kernel
+  needs, or a build disables it behind a flag, the twin runs instead
+  and the program still produces a correct answer, only slower.
+- **The host test target.** It has no dependency on the target's
+  instruction set, so it compiles and runs on a development machine,
+  where fuzzing and sanitizers are cheap to run (Section 6).
+
+A deliberate change to a kernel's behavior, such as a rounding change,
+is also a change to the twin, made first and reviewed as a
+specification change, then matched by the kernel. Silent drift between
+the two is the failure this page exists to prevent.
+
+## 3. Choosing inputs
+
+Four input kinds cover different failure classes:
+
+- **Full-range sweeps**, for any domain small enough to exhaust: an
+  8-bit lookup index, a 4-bit blend factor. Enumerate every value; a
+  sweep either passes completely or names the first failing value.
+- **Random inputs with a fixed seed**, for domains too large to sweep.
+  A fixed seed makes a failing run reproducible: it regenerates the
+  same input sequence, so a bug found once can be found again. Re-seed
+  occasionally so the suite is not permanently blind to what the first
+  seed happened to avoid.
+- **Parameter extremes**, chosen by hand: zero, the domain's maximum,
+  a negative value where the type allows one, and the boundary index
+  of every lookup table (index 0, the last valid index, one past the
+  last valid index when a bounds check itself is under test). Random
+  sampling reaches these only by chance.
+- **Adversarial shapes for whatever the kernel branches on**: if a
+  fast path and a slow path are chosen by some property of the input,
+  build inputs that hit both, rather than trust a random generator to
+  find the rare path.
+
+None of these replace the others: a sweep proves a small domain
+exhaustively, and says nothing about a large, only-sampled domain.
+
+## 4. Property tests for partial work units
+
+Some kernels are called repeatedly on slices of a larger job: a row of
+an image, a block of a stream. That hides a specific bug: output
+correct when the whole buffer is processed in one call, wrong when
+processed in pieces, because the kernel quietly depended on seeing its
+neighbors.
+
+The property to test: a unit's output depends only on its own inputs
+and on state the caller explicitly threads through, never on which
+other units share the same call. Call the kernel once on the whole
+domain, then again split into pieces of different sizes and offsets,
+and require bit-exact agreement between the two callings. A kernel
+that indexes a "current" element relative to where a previous call
+stopped, rather than from an explicit parameter, passes a whole-buffer
+test and fails a split-buffer test, the only test that catches this
+bug before production does.
+
+## 5. Golden outputs and a tolerance metric
+
+A golden output is a saved, known-good result, checked in alongside the
+test rather than regenerated by the reference twin every run. It
+catches a regression even when both implementations changed together
+and now agree with each other but not with the previously accepted
+answer.
+
+Golden comparisons on image-like or signal-like output need a
+tolerance metric, not bitwise equality, since two implementations can
+legitimately differ by a rounding unit at the last bit. Report both
+the mean and the maximum per-channel difference: a mean near zero can
+hide one badly wrong pixel that a maximum catches immediately.
+
+Whether a nonzero tolerance is legitimate or masks a defect is a
+judgment call. Legitimate: a deliberate, documented change to rounding
+or dither, where the golden is regenerated and reviewed as part of the
+change, and the tolerance bounds the expected noise. A defect: a
+tolerance that exists only because two implementations disagree and
+nobody explained why, or one wide enough to also pass a broken kernel.
+An unexplained tolerance is an open bug, not a passing test.
+
+## 6. Host-side fuzzing with sanitizers
+
+Fuzzing generates inputs automatically, usually mutating a small seed
+corpus, and runs the code under test against all of them, watching for
+a crash or a sanitizer report rather than a specific expected output.
+It belongs on the host, against the reference twin and any portable
+kernel variant, since host fuzzing runs millions of inputs in the time
+a device round trip runs one.
+
+Two runtime checkers must be compiled in for the fuzzing to be worth
+anything. **AddressSanitizer** instruments every memory access and
+reports an out-of-bounds read or write against a heap, stack, or
+global array, a use-after-free, or a double-free, at the moment it
+happens rather than only when the corrupted memory is later read as
+if valid, at a typical overhead of about 2x, which is why it belongs
+on the fuzzing build and not on the kernel's own timing measurements
+[Clang2026a][^2]. **UndefinedBehaviorSanitizer** instruments
+arithmetic and pointer operations and reports signed integer overflow,
+out-of-range shifts, misaligned pointer dereference, and other
+undefined behavior a compiler is otherwise free to treat as
+unreachable [Clang2026b][^3]. GCC ships the same `-fsanitize=address`
+and `-fsanitize=undefined` flags, plus finer-grained flags such as
+`-fsanitize=alignment` and `-fsanitize=signed-integer-overflow`
+[GCC2026a][^4].
+
+The specific reason both matter for a kernel with lookup tables: a
+one-entry table overrun reads whatever byte sits next to the table
+and, on most allocators, that read succeeds and returns a plausible
+value rather than crashing [experience]. A functional test comparing
+outputs often passes by accident, because the neighboring byte was
+close enough, or the difference was smaller than the tolerance.
+AddressSanitizer turns that overrun into an immediate failure, because
+it tracks the exact bounds of the allocation. The rule that follows:
+size a padded lookup table's pad from the maximum index the code can
+produce, and treat a fuzz suite that passed without the sanitizer as
+not yet having run.
+
+LLVM's libFuzzer is a coverage-guided fuzzing engine that links into
+the binary under test and repeatedly calls one entry point,
+conventionally `LLVMFuzzerTestOneInput`, with mutated byte buffers,
+using coverage instrumentation to bias mutation toward new code paths.
+It is enabled with `-fsanitize=fuzzer` and meant to be combined with a
+sanitizer in the same build (`-fsanitize=fuzzer,address`): the fuzzer
+finds inputs, the sanitizer notices when one is bad [LLVM2026a][^5].
+Where a coverage-guided engine is not set up, a simple seeded-random
+driver, compiled with the same sanitizers, is worse at finding rare
+inputs but still catches everything a sanitizer alone catches on the
+inputs it does try; do not skip sanitizers for lack of a fuzzing
+engine.
+
+## 7. Overflow analysis and alignment
+
+A kernel using fixed-point arithmetic (a Q-format such as Q8.8, or a
+plain integer at an implicit scale) needs a written argument for why
+every intermediate value fits the width that holds it, not just a
+passing test suite: a test suite proves the inputs it tried did not
+overflow, not that no input can. State each operand's range, the
+operation, and the resulting worst-case range, and compare it against
+the intermediate type's width. Where a multiply widens, show either
+that the result is captured in a wide-enough type before truncation,
+or that the input range is provably narrower than the type's full
+range for a stated reason, such as a known clamp earlier in the
+pipeline. UBSan's overflow check catches an overflow that happens to
+occur in the tests run; the written argument is what makes it
+provably impossible rather than merely unobserved.
+
+Some vector or wide-access load and store instructions accept a
+misaligned address by silently masking off its low bits, rather than
+faulting or reading the intended bytes. A kernel that assumes an
+aligned input pointer, without checking or having its caller
+guarantee it, needs a test with a deliberately misaligned pointer:
+either the kernel rejects or corrects the misalignment, or the calling
+convention guarantees it first, and the test proves whichever is
+claimed. This bug does not crash; it computes from the wrong bytes,
+caught only by comparing against the twin with a misaligned input.
+
+## 8. Testing the glue, and the layered ladder
+
+A kernel behind a compile-time flag has two states to test: flag on
+and flag off. Continuous testing often runs only the flag-off,
+portable path, because that build compiles everywhere, leaving the
+flag-on path and its glue untested until it reaches whatever machine
+finally builds with the flag on. Where the flag-on path needs an
+instruction set the host lacks, compile and run it in an emulator
+instead of skipping it; that still tests the glue, before it can even
+measure the flag-on path's speed.
+
+No single environment is sufficient proof by itself. Evidence
+accumulates in layers, each cheaper and faster than the next but less
+like the final target:
+
+| Layer | What runs | What it proves |
+|---|---|---|
+| 1. Host reference and fuzz | Reference twin, on a development machine, both sanitizers on, fuzzed against Section 3's input classes | Cheapest and fastest; the largest share of bugs found here |
+| 2. Cross-compile, read the assembly | The optimized kernel, built with the target's real compiler and flags, read by a person | The kernel does what its author intended, before it ever runs |
+| 3. Bit-exact execution in an emulator | The optimized kernel in an instruction-level emulator, compared element by element against the twin over the host fuzz layer's inputs | Real instruction semantics execute for the first time, at host-adjacent speed |
+| 4. Bit-exact execution on the device | The same comparison on real hardware; reuse a vendor's on-target unit test framework where one exists, such as ESP-IDF's Unity-based unit test app, distinct from its separate host-based mocking mode [Espressif2026g][^6] | Device-specific effects the emulator does not model |
+| 5. Device timing | A timing measurement, only once layers 1-4 agree bit for bit | A fast wrong answer is not a result |
+
+A kernel is not done at layer 2 or 3 because it looked right; it is
+done once every earlier layer has passed and stayed passing, because a
+later layer sometimes contradicts an earlier one. Treat a disagreement
+as a defect in whichever layer is easier to inspect, never as a reason
+to drop the layer that disagreed.
+
+## 9. A compact test-harness skeleton
+
+Language-neutral scaffolding, not a specific project's file:
+
+```c
+void kernel_ref(const int16_t *in, int16_t *out, size_t n); /* twin */
+void kernel_opt(const int16_t *in, int16_t *out, size_t n); /* optimized */
+
+/* Reused by the sweep, the random driver, and the fuzz target below.
+ * Returns the first mismatching index, or -1 if outputs agree. */
+static long compare_once(const int16_t *in, size_t n) {
+    int16_t *ref = malloc(n * sizeof(int16_t));
+    int16_t *opt = malloc(n * sizeof(int16_t));
+    kernel_ref(in, ref, n);
+    kernel_opt(in, opt, n);
+    long mismatch = -1;
+    for (size_t i = 0; i < n && mismatch < 0; i++)
+        if (ref[i] != opt[i]) mismatch = (long)i;
+    free(ref); free(opt);
+    return mismatch;
+}
+
+/* Section 4: split-buffer property test, kernel_opt against itself. */
+static int partition_independent(const int16_t *in, size_t n, size_t k) {
+    int16_t *whole = malloc(n * sizeof(int16_t));
+    int16_t *piece = malloc(n * sizeof(int16_t));
+    kernel_opt(in, whole, n);
+    kernel_opt(in, piece, k);
+    kernel_opt(in + k, piece + k, n - k);
+    int ok = memcmp(whole, piece, n * sizeof(int16_t)) == 0;
+    free(whole); free(piece);
+    return ok;
+}
+
+/* Section 6: libFuzzer entry, -fsanitize=fuzzer,address,undefined. */
+#ifdef FUZZING_BUILD
+int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+    size_t n = size / sizeof(int16_t);
+    if (n && compare_once((const int16_t *)data, n) >= 0) abort();
+    return 0;
+}
+#endif
+```
+
+The same `compare_once` backs the sweep, the random driver, and the
+fuzz target, so a bug the fuzzer finds can be pulled back into the
+sweep or random suite as a fixed input once understood.
+
+## Footnotes
+[^1]: William M. McKeeman, "Differential Testing for Software," *Digital Technical Journal*, vol. 10, no. 1, 1998, pp. 100-107. Corroborated via a secondary summary (Wikipedia, "Differential testing," `https://en.wikipedia.org/wiki/Differential_testing`, fetched 2026-09-06); the original journal PDF was not directly reachable. [uncertain]: the page range is not independently confirmed against the primary issue.
+[^2]: LLVM Project, *AddressSanitizer*, Clang documentation, `https://clang.llvm.org/docs/AddressSanitizer.html` (fetched 2026-09-06): detection scope (heap, stack and global out-of-bounds accesses, use-after-free, use-after-return, use-after-scope, double-free), flag `-fsanitize=address`, and the stated typical runtime slowdown of about 2x.
+[^3]: LLVM Project, *UndefinedBehaviorSanitizer*, Clang documentation, `https://clang.llvm.org/docs/UndefinedBehaviorSanitizer.html` (fetched 2026-09-06): detection scope (signed and unsigned integer overflow, misaligned pointer dereference, out-of-range shifts), flag `-fsanitize=undefined`, and per-check flags such as `-fsanitize=alignment` and `-fsanitize=signed-integer-overflow`.
+[^4]: GNU Project, *GCC Instrumentation Options*, GCC Online Documentation, `https://gcc.gnu.org/onlinedocs/gcc/Instrumentation-Options.html` (fetched 2026-09-06): `-fsanitize=address` as a fast memory error detector, `-fsanitize=undefined` as a fast undefined behavior detector, and the separate `-fsanitize=alignment`, `-fsanitize=signed-integer-overflow` and `-fsanitize=bounds` options.
+[^5]: LLVM Project, *libFuzzer, a library for coverage-guided fuzz testing*, `https://llvm.org/docs/LibFuzzer.html` (fetched 2026-09-06): in-process, coverage-guided, evolutionary fuzzing engine; the `LLVMFuzzerTestOneInput` entry point signature; enabling via `-fsanitize=fuzzer` combined with a sanitizer in the same build (`-fsanitize=fuzzer,address`).
+[^6]: Espressif Systems, *Unit Testing in ESP-IDF*, ESP-IDF Programming Guide, `https://docs.espressif.com/projects/esp-idf/en/stable/esp32s3/api-guides/unit-tests.html` (fetched 2026-09-06): the on-target unit test app built on the Unity framework (`TEST_CASE` macro, `UNITY_BEGIN()`), distinct from ESP-IDF's separate Linux-host test mode, described on the same page as having limited component support and relying on CMock-based mocking rather than the target instruction set.

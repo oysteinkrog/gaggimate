@@ -35,6 +35,8 @@ alignment
 misaligned
 unaligned
 latency
+coherency
+errata
 throughput
 bandwidth
 vectorise
@@ -47,6 +49,13 @@ firmware
 toolchain
 linker
 compiler
+optimization
+optimizations
+optimize
+optimizes
+optimized
+optimizing
+optimizer
 frontmatter
 scaffold
 scaffolds

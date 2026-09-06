@@ -18,6 +18,15 @@ SELF_REAL="$(readlink -f "${BASH_SOURCE[0]}")"
 SCRIPT_DIR="$(cd "$(dirname "$SELF_REAL")" && pwd)"
 KB_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
+# On WSL the qmd on PATH is usually the Windows-native build behind a
+# wrapper, and it resolves paths on the Windows side. A WSL path such as
+# /mnt/c/work/... is then taken relative to the Windows home and the
+# collection indexes nothing (seen 2026-09-06). Register the Windows form.
+KB_DIR_REG="$KB_DIR"
+if [[ -r /proc/version ]] && grep -qi microsoft /proc/version && command -v wslpath >/dev/null 2>&1; then
+  KB_DIR_REG="$(wslpath -w "$KB_DIR")"
+fi
+
 if ! command -v qmd >/dev/null 2>&1; then
   echo "error: qmd not on PATH." >&2
   echo >&2
@@ -27,7 +36,7 @@ if ! command -v qmd >/dev/null 2>&1; then
 fi
 
 echo "==> registering qmd collection: $COLLECTION_NAME"
-echo "    path: $KB_DIR"
+echo "    path: $KB_DIR_REG"
 
 # Probe the current registration. `qmd collection show <name>` exits non-zero
 # when the collection does not exist; on success it prints "  Path: <abs>".
@@ -39,11 +48,11 @@ fi
 
 if [[ -z "$existing_path" ]]; then
   echo "    (registering new)"
-  qmd collection add "$KB_DIR" --name "$COLLECTION_NAME"
-elif [[ "$existing_path" != "$KB_DIR" ]]; then
-  echo "    (path drift: registered at $existing_path; re-registering at $KB_DIR)"
+  qmd collection add "$KB_DIR_REG" --name "$COLLECTION_NAME"
+elif [[ "${existing_path//\\//}" != "${KB_DIR_REG//\\//}" ]]; then
+  echo "    (path drift: registered at $existing_path; re-registering at $KB_DIR_REG)"
   qmd collection remove "$COLLECTION_NAME"
-  qmd collection add "$KB_DIR" --name "$COLLECTION_NAME"
+  qmd collection add "$KB_DIR_REG" --name "$COLLECTION_NAME"
 else
   echo "    (already registered at correct path — skipping add)"
 fi
