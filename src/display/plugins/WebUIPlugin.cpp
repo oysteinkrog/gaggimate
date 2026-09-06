@@ -1944,24 +1944,29 @@ void WebUIPlugin::setupServer() {
             step = 1;
         const int ow = w / step;
         const int oh = h / step;
-        // Chunked, mirroring the device branch: the callback fills whole
-        // output rows only, so a partial pixel never has to carry across
-        // chunks. frame (and state) are freed once the last chunk is drained.
-        auto *state = new int(0);
-        AsyncWebServerResponse *response = request->beginChunkedResponse(
-            "application/octet-stream", [frame, w, step, ow, oh, state](uint8_t *out, size_t maxLen, size_t) -> size_t {
+        const size_t total = static_cast<size_t>(ow) * static_cast<size_t>(oh) * 2;
+        // The sim shim (sim/web/ESPAsyncWebServer.h) has no beginChunkedResponse;
+        // its beginResponse(contentType, len, filler) calls the filler exactly
+        // once with maxLen == len, unlike the device's chunked callback above
+        // (repeated calls, each bounded by the TCP send buffer). Deriving the
+        // starting row from index rather than a separate row counter keeps this
+        // correct either way, and frees frame once index+written reaches total
+        // instead of waiting on a since-nonexistent extra all-zero call.
+        AsyncWebServerResponse *response = request->beginResponse(
+            "application/octet-stream", total,
+            [frame, w, step, ow, oh, total](uint8_t *out, size_t maxLen, size_t index) -> size_t {
                 const size_t rowBytes = static_cast<size_t>(ow) * 2;
                 size_t written = 0;
-                while (*state < oh && written + rowBytes <= maxLen) {
-                    const uint16_t *src = frame->data() + static_cast<size_t>(*state) * step * w;
+                int row = static_cast<int>(index / rowBytes);
+                while (row < oh && written + rowBytes <= maxLen) {
+                    const uint16_t *src = frame->data() + static_cast<size_t>(row) * step * w;
                     uint16_t *dst = reinterpret_cast<uint16_t *>(out + written);
                     for (int x = 0; x < ow; x++)
                         dst[x] = src[x * step];
                     written += rowBytes;
-                    (*state)++;
+                    row++;
                 }
-                if (written == 0) {
-                    delete state;
+                if (index + written >= total) {
                     delete frame;
                 }
                 return written;
