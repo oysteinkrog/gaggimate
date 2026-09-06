@@ -143,9 +143,11 @@ back of certain loops. In addition, certain instructions (such as `ISYNC` or
 a write to `LEND`) may cause an additional cycle on the following loop
 back."[^isa-loop] The manual does not give a cycle count for either the loop
 back or the ordinary taken branch it replaces, because both are
-implementation-specific. `[uncertain]` The LX7's taken-branch penalty is not
-stated in the ISA manual; treat any specific number as needing a device
-measurement.
+implementation-specific. The ESP32-S3 TRM does give the taken-branch cost
+for this core: 2 cycles, section 1.7.3 [Espressif 2026][^trm-branch]; see
+[branches, jumps and control-flow costs](branches-jumps-and-control-flow-costs.md).
+`[uncertain]` The loop-back cost itself is still unstated anywhere and needs
+a device measurement.
 
 The ESP32-S3 core configuration declares `XCHAL_LOOP_BUFFER_SIZE` of 256
 bytes, described in the header as the "zero-ov. loop instr buffer
@@ -312,6 +314,7 @@ Rules for hand-written loops:
 
 ## Footnotes
 
+[^trm-branch]: Espressif Systems, ESP32-S3 Technical Reference Manual, version 1.8, PDF dated 2026-03-04, section 1.7.3, page 74: a taken branch flushes the R and E stages, a 2-cycle cost.
 [^coreisa]: ESP-IDF 5.5.1, `components/xtensa/esp32s3/include/xtensa/config/core-isa.h`, lines 56 to 57: `#define XCHAL_HAVE_LOOPS 1` and `#define XCHAL_LOOP_BUFFER_SIZE 256`.
 [^isa-loopopt]: Tensilica, *Xtensa Instruction Set Architecture (ISA) Reference Manual*, issue date 4/2010, Section 4.3.2 "Loop Option" and 4.3.2.1 to 4.3.2.2, pages 54 to 56. https://0x04.net/~mwk/doc/xtensa.pdf
 [^isa-loop]: Same manual, Chapter 6, `LOOP` instruction description, pages 391 to 393.
