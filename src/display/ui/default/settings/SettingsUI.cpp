@@ -462,6 +462,10 @@ void SettingsUI::buildCategoryPage(PageEntry &entry) {
     lv_obj_set_size(header, 200, 56);
     lv_obj_align(header, LV_ALIGN_CENTER, 0, -160);
     lv_obj_clear_flag(header, LV_OBJ_FLAG_SCROLLABLE);
+    // Every container between a clickable and the cover must bubble, or the
+    // cover's PRESSED handler (the standby timer's only view of settings
+    // activity) never sees the arrow presses.
+    lv_obj_add_flag(header, LV_OBJ_FLAG_EVENT_BUBBLE);
     lv_obj_set_style_bg_opa(header, LV_OPA_TRANSP, LV_PART_MAIN);
     lv_obj_set_flex_flow(header, LV_FLEX_FLOW_ROW);
     lv_obj_set_flex_align(header, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
