@@ -6,6 +6,7 @@
 // same Settings::Guard, possibly finishing after the UI has moved on) are
 // never clobbered by an untouched delay row here (CLAUDE.md, gm-flw.7).
 #include "SettingsModel.h"
+#include "SettingsLog.h"
 #include "SettingsRows.h"
 #include "SettingsUI.h"
 
@@ -244,25 +245,25 @@ void tempsCommit(void *ctx0) {
     if (ctx->offsetTouched) {
         const int offset = static_cast<int>(ctx->offset);
         settings.setTemperatureOffset(offset);
-        used += std::snprintf(log + used, sizeof(log) - used, " offset=%d", offset);
+        settingsLogAppend(log, sizeof(log), used, " offset=%d", offset);
         wrote = true;
     }
     if (ctx->scalingTouched) {
         const float scaling = static_cast<float>(ctx->scaling) / 10.0f;
         settings.setPressureScaling(scaling);
-        used += std::snprintf(log + used, sizeof(log) - used, " scaling=%.1f", scaling);
+        settingsLogAppend(log, sizeof(log), used, " scaling=%.1f", scaling);
         wrote = true;
     }
     if (ctx->brewTouched) {
         const int brew = static_cast<int>(ctx->brewDelay);
         settings.setBrewDelay(static_cast<double>(brew));
-        used += std::snprintf(log + used, sizeof(log) - used, " brew=%d", brew);
+        settingsLogAppend(log, sizeof(log), used, " brew=%d", brew);
         wrote = true;
     }
     if (ctx->grindTouched) {
         const int grind = static_cast<int>(ctx->grindDelay);
         settings.setGrindDelay(static_cast<double>(grind));
-        used += std::snprintf(log + used, sizeof(log) - used, " grind=%d", grind);
+        settingsLogAppend(log, sizeof(log), used, " grind=%d", grind);
         wrote = true;
     }
     if (ctx->delayAdjustTouched) {

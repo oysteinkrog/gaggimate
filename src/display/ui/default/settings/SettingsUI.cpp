@@ -72,6 +72,14 @@ void SettingsUI::open() {
         coverObj,
         [](lv_event_t *e) {
             auto *self = static_cast<SettingsUI *>(lv_event_get_user_data(e));
+            // teardownAll() empties the stack before deleting the cover;
+            // anything else deleting it (a menu screen deleted under us)
+            // would drop every open page's draft uncommitted and leak its
+            // ctx, so say so rather than fail silently.
+            if (!self->pageStack.empty()) {
+                ESP_LOGW("SettingsUI", "SettingsUI: cover deleted with %d page(s) open, edits dropped",
+                         static_cast<int>(self->pageStack.size()));
+            }
             self->coverObj = nullptr;
             self->tilePageObj = nullptr;
             self->pageStack.clear();
@@ -159,18 +167,28 @@ void SettingsUI::service() {
     }
 
     const unsigned long now = millis();
+    // refresh and reconcile read Settings into the draft the same way enter
+    // does, so they take the same guard: reconcile in particular runs right
+    // after a web save's batchUpdate, the one moment another task is
+    // replacing the container-typed properties (schedules, theme map).
     if (!pageStack.empty() && now - lastRefreshMs >= 1000) {
         lastRefreshMs = now;
         PageEntry &top = pageStack.back();
         if (top.def->refresh) {
+            Settings::Guard guard(controller_.getSettings());
             top.def->refresh(top.ctx);
         }
     }
 
     if (webSaved && !pageStack.empty()) {
-        PageEntry &top = pageStack.back();
-        if (top.def->reconcile) {
-            top.def->reconcile(top.ctx);
+        // The def and ctx are read before the call: a reconcile may pop its
+        // own page (the schedule editor does when its entry vanished), and
+        // rebuildPage() below then rebuilds whatever is on top afterwards.
+        const SettingsCategoryDef *def = pageStack.back().def;
+        void *ctx = pageStack.back().ctx;
+        if (def->reconcile) {
+            Settings::Guard guard(controller_.getSettings());
+            def->reconcile(ctx);
         }
         rebuildPage();
         ui_.markDirty();
@@ -359,9 +377,11 @@ void SettingsUI::buildExitChevron(lv_obj_t *parent, lv_color_t fg, bool topLevel
     // Same place as every other screen's exit chevron, but a smaller click
     // pad: the fifth row slot ends at y 394 and a 45 px pad reaches up to
     // 385, so a whole-row target in that slot (toggle, action, confirm)
-    // would overlap the chevron's hit rectangle. 34 keeps the hit box
-    // 108x84 px and clear of the rows by 2 px.
-    lv_obj_set_ext_click_area(exitBtn, topLevel ? 45 : 34);
+    // would overlap the chevron's hit rectangle, and on the tile page the
+    // 45 px pad reached 10x6 px into the two lower tiles' hit rectangles
+    // (the runner's audit measured it). 34 keeps the hit box 108x84 px and
+    // clear of both by 2 px or more.
+    lv_obj_set_ext_click_area(exitBtn, 34);
     lv_obj_set_style_img_recolor(exitBtn, fg, LV_PART_MAIN);
     lv_obj_set_style_img_recolor_opa(exitBtn, LV_OPA_COVER, LV_PART_MAIN);
     lv_obj_add_flag(exitBtn, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_EVENT_BUBBLE);
@@ -555,6 +575,9 @@ void SettingsUI::tag(lv_obj_t *obj, const char *row, const char *role, const cha
     }
     PageEntry &top = pageStack.back();
     if (top.tagsUsed >= PageEntry::kMaxTags) {
+        // An untagged value label makes settingsRowSetValue a silent no-op
+        // (findByRole finds nothing), so the row would render blank forever.
+        ESP_LOGW("SettingsUI", "SettingsUI: tag cap %d reached, %s/%s untagged", PageEntry::kMaxTags, row, role);
         return;
     }
     SettingsDebugTag *t = &top.tags[top.tagsUsed++];

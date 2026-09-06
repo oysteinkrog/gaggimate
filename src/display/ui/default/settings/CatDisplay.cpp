@@ -8,6 +8,7 @@
 // CatTemps.cpp. The zone commits through Controller::applyTimezone() so a
 // changed zone reaches the running clock without a reboot.
 #include "SettingsModel.h"
+#include "SettingsLog.h"
 #include "SettingsRows.h"
 #include "SettingsUI.h"
 
@@ -309,23 +310,23 @@ void displayCommit(void *ctx0) {
         if (ctx->ui != nullptr) {
             ctx->ui->setBrightness(static_cast<int>(ctx->mainBrightnessLastWritten));
         }
-        used += std::snprintf(log + used, sizeof(log) - used, " mainBrightness=%ld", ctx->mainBrightnessLastWritten);
+        settingsLogAppend(log, sizeof(log), used, " mainBrightness=%ld", ctx->mainBrightnessLastWritten);
         wrote = true;
         liveReasserted = true;
     }
     if (ctx->standbyBrightnessTouched) {
         settings.setStandbyBrightness(static_cast<int>(ctx->standbyBrightness));
-        used += std::snprintf(log + used, sizeof(log) - used, " standbyBrightness=%ld", ctx->standbyBrightness);
+        settingsLogAppend(log, sizeof(log), used, " standbyBrightness=%ld", ctx->standbyBrightness);
         wrote = true;
     }
     if (ctx->timeoutTouched) {
         settings.setStandbyBrightnessTimeout(static_cast<int>(ctx->standbyBrightnessTimeout));
-        used += std::snprintf(log + used, sizeof(log) - used, " dimAfter=%ld", ctx->standbyBrightnessTimeout);
+        settingsLogAppend(log, sizeof(log), used, " dimAfter=%ld", ctx->standbyBrightnessTimeout);
         wrote = true;
     }
     if (ctx->clock24hTouched) {
         settings.setClockFormat(ctx->clock24h);
-        used += std::snprintf(log + used, sizeof(log) - used, " clock24h=%d", ctx->clock24h ? 1 : 0);
+        settingsLogAppend(log, sizeof(log), used, " clock24h=%d", ctx->clock24h ? 1 : 0);
         wrote = true;
     }
     if (ctx->zoneTouched) {
@@ -333,7 +334,7 @@ void displayCommit(void *ctx0) {
         const std::string name = settingsui::zoneName(zones, ctx->zoneRegion, ctx->zoneCity);
         settings.setTimezone(name.c_str());
         controller.applyTimezone();
-        used += std::snprintf(log + used, sizeof(log) - used, " timezone=%s", name.c_str());
+        settingsLogAppend(log, sizeof(log), used, " timezone=%s", name.c_str());
         wrote = true;
     }
 

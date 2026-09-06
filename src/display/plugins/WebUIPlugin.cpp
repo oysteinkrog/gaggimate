@@ -3338,6 +3338,12 @@ void WebUIPlugin::handleSettings(AsyncWebServerRequest *request) const {
 
     AsyncResponseStream *response = request->beginResponseStream("application/json");
     JsonDocument doc(&psramAllocator);
+    // The on-display settings write the container-typed properties (theme
+    // map, timezone, schedules) from the UI task; Property::set replaces the
+    // String or vector, and a read here that overlaps it copies from a freed
+    // buffer. Hold the settings transaction lock while the document is
+    // built from them (the UI task's writes are single sets and commits).
+    Settings::Guard settingsGuard(controller->getSettings());
     Settings const &settings = controller->getSettings();
     doc["startupMode"] = settings.getStartupMode() == MODE_BREW ? "brew" : "standby";
     doc["startupProfile"] = settings.getStartupProfile();

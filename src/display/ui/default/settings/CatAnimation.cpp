@@ -7,6 +7,7 @@
 // touched-field precedence rule: if a web save landed on a touched field
 // while this page was open, re-assert this visit's value (gm-flw.9).
 #include "SettingsModel.h"
+#include "SettingsLog.h"
 #include "SettingsRows.h"
 #include "SettingsUI.h"
 
@@ -75,6 +76,24 @@ constexpr int kPlatesCount = sizeof(settingsui::kPlatesLabels) / sizeof(settings
 
 std::vector<settingsui::GradientChoice> currentGradientChoices() {
     return settingsui::gradientChoices(kThemeProvider, std::string(controller.getSettings().getBgAnimGradients().c_str()));
+}
+
+// The stored bgAnimId is not range-checked anywhere on its way in (the web
+// handler and Settings::setBgAnimId store whatever arrives; every renderer
+// clamps at use), and this category indexes two per-animation vectors sized
+// to the live registry with it, so an id from a longer registry (a build
+// rolled back to fewer animations) would index past their end. Clamp once
+// on the way into the draft; a cycle from the clamped id then wraps within
+// the registry like any other.
+int clampAnimId(int id) {
+    const int count = animCountFn();
+    if (count <= 0) {
+        return 0;
+    }
+    if (id < 0) {
+        return 0;
+    }
+    return id >= count ? count - 1 : id;
 }
 
 // The choice index bgAnimThemeMap's stored ref resolves to for animId, 0
@@ -488,7 +507,7 @@ void animBuildRow(void *ctx0, int index, lv_obj_t *parent, SettingsUI &ui) {
 void animEnter(void *ctx0) {
     auto *ctx = static_cast<CatAnimationCtx *>(ctx0);
     Settings &settings = controller.getSettings();
-    ctx->animId = settings.getBgAnimId();
+    ctx->animId = clampAnimId(settings.getBgAnimId());
     ctx->fps = settings.getBgAnimFps();
     ctx->allScreens = settings.isBgAnimAllScreens();
     ctx->themeMode = settings.getThemeMode();
@@ -530,7 +549,7 @@ void animReconcile(void *ctx0) {
     auto *ctx = static_cast<CatAnimationCtx *>(ctx0);
     Settings &settings = controller.getSettings();
     if (!ctx->animIdTouched) {
-        ctx->animId = settings.getBgAnimId();
+        ctx->animId = clampAnimId(settings.getBgAnimId());
     }
     if (!ctx->fpsTouched) {
         ctx->fps = settings.getBgAnimFps();
@@ -588,22 +607,22 @@ void animCommit(void *ctx0) {
 
     if (ctx->animIdTouched && settings.getBgAnimId() != ctx->animId) {
         settings.setBgAnimId(ctx->animId);
-        used += std::snprintf(log + used, sizeof(log) - used, " anim=%d", ctx->animId);
+        settingsLogAppend(log, sizeof(log), used, " anim=%d", ctx->animId);
         wrote = true;
     }
     if (ctx->fpsTouched && settings.getBgAnimFps() != static_cast<int>(ctx->fps)) {
         settings.setBgAnimFps(static_cast<int>(ctx->fps));
-        used += std::snprintf(log + used, sizeof(log) - used, " fps=%ld", ctx->fps);
+        settingsLogAppend(log, sizeof(log), used, " fps=%ld", ctx->fps);
         wrote = true;
     }
     if (ctx->allScreensTouched && settings.isBgAnimAllScreens() != ctx->allScreens) {
         settings.setBgAnimAllScreens(ctx->allScreens);
-        used += std::snprintf(log + used, sizeof(log) - used, " allScreens=%d", ctx->allScreens ? 1 : 0);
+        settingsLogAppend(log, sizeof(log), used, " allScreens=%d", ctx->allScreens ? 1 : 0);
         wrote = true;
     }
     if (ctx->themeModeTouched && settings.getThemeMode() != ctx->themeMode) {
         settings.setThemeMode(ctx->themeMode);
-        used += std::snprintf(log + used, sizeof(log) - used, " theme=%d", ctx->themeMode);
+        settingsLogAppend(log, sizeof(log), used, " theme=%d", ctx->themeMode);
         wrote = true;
     }
     {
@@ -626,7 +645,7 @@ void animCommit(void *ctx0) {
                 continue;
             }
             map = settingsui::gradientMapWriteRef(map, static_cast<int>(animId), wanted);
-            used += std::snprintf(log + used, sizeof(log) - used, " gradient[%d]=%s", static_cast<int>(animId),
+            settingsLogAppend(log, sizeof(log), used, " gradient[%d]=%s", static_cast<int>(animId),
                                    wanted.c_str());
             gradientWrote = true;
         }
@@ -637,32 +656,32 @@ void animCommit(void *ctx0) {
     }
     if (ctx->platesTouched && settings.getBgAnimClearPlates() != ctx->plates) {
         settings.setBgAnimClearPlates(ctx->plates);
-        used += std::snprintf(log + used, sizeof(log) - used, " plates=%d", ctx->plates);
+        settingsLogAppend(log, sizeof(log), used, " plates=%d", ctx->plates);
         wrote = true;
     }
     if (ctx->plateColorTouched && settings.getBgAnimPlateColor() != ctx->plateColor) {
         settings.setBgAnimPlateColor(ctx->plateColor);
-        used += std::snprintf(log + used, sizeof(log) - used, " plateColor=%06x", ctx->plateColor);
+        settingsLogAppend(log, sizeof(log), used, " plateColor=%06x", ctx->plateColor);
         wrote = true;
     }
     if (ctx->plateOpacityTouched && settings.getBgAnimPlateOpacity() != static_cast<int>(ctx->plateOpacity)) {
         settings.setBgAnimPlateOpacity(static_cast<int>(ctx->plateOpacity));
-        used += std::snprintf(log + used, sizeof(log) - used, " plateOpacity=%ld", ctx->plateOpacity);
+        settingsLogAppend(log, sizeof(log), used, " plateOpacity=%ld", ctx->plateOpacity);
         wrote = true;
     }
     if (ctx->tintEnabledTouched && settings.getElementTintEnabled() != ctx->tintEnabled) {
         settings.setElementTintEnabled(ctx->tintEnabled);
-        used += std::snprintf(log + used, sizeof(log) - used, " tintEnabled=%d", ctx->tintEnabled ? 1 : 0);
+        settingsLogAppend(log, sizeof(log), used, " tintEnabled=%d", ctx->tintEnabled ? 1 : 0);
         wrote = true;
     }
     if (ctx->tintColorTouched && settings.getElementTintColor() != ctx->tintColor) {
         settings.setElementTintColor(ctx->tintColor);
-        used += std::snprintf(log + used, sizeof(log) - used, " tintColor=%06x", ctx->tintColor);
+        settingsLogAppend(log, sizeof(log), used, " tintColor=%06x", ctx->tintColor);
         wrote = true;
     }
     if (ctx->scrimTouched && settings.getBgAnimScrim() != static_cast<int>(ctx->scrim)) {
         settings.setBgAnimScrim(static_cast<int>(ctx->scrim));
-        used += std::snprintf(log + used, sizeof(log) - used, " scrim=%ld", ctx->scrim);
+        settingsLogAppend(log, sizeof(log), used, " scrim=%ld", ctx->scrim);
         wrote = true;
     }
     (void)used;

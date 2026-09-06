@@ -206,8 +206,15 @@ struct RepeatBtn {
 };
 
 void repeatBtnEvent(lv_event_t *e) {
+    // Same exposure as lockedBtnEvent: registered for LV_EVENT_ALL, and the
+    // button's own DELETE arrives after the row's DELETE freed the ctx that
+    // owns this slot. Check the code before touching the slot.
+    const lv_event_code_t code = lv_event_get_code(e);
+    if (code != LV_EVENT_PRESSED && code != LV_EVENT_LONG_PRESSED_REPEAT) {
+        return;
+    }
     auto *btn = static_cast<RepeatBtn *>(lv_event_get_user_data(e));
-    switch (lv_event_get_code(e)) {
+    switch (code) {
     case LV_EVENT_PRESSED:
         btn->pressedAtMs = lv_tick_get();
         if (btn->onFire != nullptr) {

@@ -8,6 +8,7 @@
 // weak default (below) leaves that row absent (rowCount 3).
 #include "CatMachine.h"
 #include "SettingsModel.h"
+#include "SettingsLog.h"
 #include "SettingsRows.h"
 #include "SettingsUI.h"
 
@@ -207,23 +208,23 @@ void machineCommit(void *ctx0) {
 
     if (ctx->draft.startupModeTouched) {
         settings.setStartupMode(ctx->draft.startupMode);
-        used += std::snprintf(log + used, sizeof(log) - used, " startup=%s",
+        settingsLogAppend(log, sizeof(log), used, " startup=%s",
                                ctx->draft.startupMode == MODE_BREW ? "brew" : "standby");
         wrote = true;
     }
     if (ctx->draft.standbyTimeoutTouched) {
         settings.setStandbyTimeout(static_cast<int>(ctx->draft.standbyTimeoutMs));
-        used += std::snprintf(log + used, sizeof(log) - used, " standby=%ld", ctx->draft.standbyTimeoutMs);
+        settingsLogAppend(log, sizeof(log), used, " standby=%ld", ctx->draft.standbyTimeoutMs);
         wrote = true;
     }
     if (ctx->draft.autowakeupEnabledTouched) {
         settings.setAutoWakeupEnabled(ctx->draft.autowakeupEnabled);
-        used += std::snprintf(log + used, sizeof(log) - used, " autowakeup=%d", ctx->draft.autowakeupEnabled ? 1 : 0);
+        settingsLogAppend(log, sizeof(log), used, " autowakeup=%d", ctx->draft.autowakeupEnabled ? 1 : 0);
         wrote = true;
     }
     if (ctx->draft.schedulesTouched) {
         settings.setAutoWakeupSchedules(toAutoWakeupSchedules(ctx->draft.schedules));
-        used += std::snprintf(log + used, sizeof(log) - used, " schedules=%d", static_cast<int>(ctx->draft.schedules.size()));
+        settingsLogAppend(log, sizeof(log), used, " schedules=%d", static_cast<int>(ctx->draft.schedules.size()));
         wrote = true;
     }
 
