@@ -88,19 +88,33 @@ class Report:
         self.pages = []
         self.scenarios = {}
         self.violations = []
+        self.findings = []
         self.numbers = {}
         self.notes = []
 
-    def step(self, name, **kv):
+    def step(self, name, /, **kv):
         line = "%s step=%s %s" % (_iso_now(), name, " ".join("%s=%s" % kv_ for kv_ in kv.items()))
         print(line.rstrip(), flush=True)
         self.steps.append({"time": _iso_now(), "step": name, **{k: _plain(v) for k, v in kv.items()}})
         return line
 
-    def violation(self, kind, **kv):
-        """A failed assertion. Recorded and printed; never raises, so one
-        bad page does not hide the rest of the run."""
+    def violation(self, kind, /, **kv):
+        """A failed assertion: the run fails on it. Recorded and printed;
+        never raises, so one bad page does not hide the rest of the run."""
         self.violations.append({"kind": kind, **{k: _plain(v) for k, v in kv.items()}})
+        self.step(kind, **kv)
+
+    def finding(self, kind, /, **kv):
+        """Something the report must carry that is not one of the run's
+        assertions. A scenario that did not put a value back is the main
+        one: the bead lists the assertions the exit code answers to (the
+        audit, the scenarios, the preflight, the restart round trip, and on
+        the device the rates and the leak phase) and asks for a restoration
+        failure to be logged without stopping the run. Several of these are
+        a check's own deliberate residue, such as the Status scenario's
+        surviving brightness bump, so failing on them would fail every
+        healthy run."""
+        self.findings.append({"kind": kind, **{k: _plain(v) for k, v in kv.items()}})
         self.step(kind, **kv)
 
     def note(self, text):
@@ -125,6 +139,7 @@ class Report:
             "pages": self.pages,
             "scenarios": self.scenarios,
             "violations": self.violations,
+            "findings": self.findings,
             "notes": self.notes,
             "steps": self.steps,
         }
@@ -271,7 +286,7 @@ def restore_all_screens(rig, report, original):
     close_shell(rig)
     after = str(rig.settings().get("bgAnimAllScreens", "")).lower() in ("1", "true")
     if after != original:
-        report.violation("RESTORE FAILED", key="bgAnimAllScreens", expected=original, actual=after)
+        report.finding("RESTORE FAILED", key="bgAnimAllScreens", expected=original, actual=after)
 
 
 class PushedPage:
@@ -416,7 +431,7 @@ def report_restore_failures(report, scenario, before, after):
     for key in sorted(set(before) | set(after)):
         b, a = before.get(key), after.get(key)
         if b != a:
-            report.violation("RESTORE FAILED", scenario=scenario, key=key, expected=b, actual=a)
+            report.finding("RESTORE FAILED", scenario=scenario, key=key, expected=b, actual=a)
 
 
 def run_scenarios(rig, report, venue, selected, preflight_result):
@@ -521,8 +536,8 @@ def restart_round_trip(rig, report, venue):
     close_shell(rig)
     restored = int(rig.settings_value("standbyBrightness"))
     if restored != current:
-        report.violation("RESTORE FAILED", scenario="restart", key="standbyBrightness",
-                         expected=current, actual=restored)
+        report.finding("RESTORE FAILED", scenario="restart", key="standbyBrightness",
+                       expected=current, actual=restored)
 
 
 # ---- assembly ---------------------------------------------------------------
@@ -539,8 +554,10 @@ def summarise(report, venue):
     print()
     print("Scenarios")
     for name, e in report.scenarios.items():
-        print("  %-12s %-8s %5ss  checks=%s failed=%s" %
-              (name, e["status"], e["seconds"], e["checks"], e["failed"]))
+        secs = "-" if e["seconds"] is None else "%.1fs" % e["seconds"]
+        print("  %-12s %-8s %7s  checks=%s failed=%s" %
+              (name, e["status"], secs, e["checks"] if e["checks"] is not None else "-",
+               e["failed"] if e["failed"] is not None else "-"))
     print()
     for key in ("dma_free_sampled_min", "dma_min", "int_free_sampled_min", "hot_fail"):
         if key in report.numbers:
@@ -548,6 +565,12 @@ def summarise(report, venue):
     if not venue.is_device:
         print("  frame rate and heap: recorded, not asserted (simulator)")
     print()
+    if report.findings:
+        print("Recorded, not asserted (%d):" % len(report.findings))
+        for f in report.findings:
+            rest = " ".join("%s=%s" % (k, val) for k, val in f.items() if k != "kind")
+            print("  %s %s" % (f["kind"], rest))
+        print()
     if report.violations:
         print("FAIL (%d violation(s)):" % len(report.violations))
         for v in report.violations:
@@ -606,7 +629,7 @@ def run(args):
             workdir = os.path.join(report_dir, "sim")
             data_dir = os.path.join(workdir, "sim_data")
             os.makedirs(workdir, exist_ok=True)
-            seeded = fixtures.seed(data_dir)
+            seeded = fixtures.seed(data_dir, args.fixture)
             report.step("seed", path=seeded)
             sim = Sim(args.sim_program, data_dir, port=args.sim_port)
             sim.__enter__()
@@ -642,7 +665,9 @@ def drive(rig, report, venue, selected, only, args):
         except RigHTTPError as e:
             report.step("pclk_unavailable", detail=str(e))
 
-    pre = fixtures.preflight(rig, log=report.step)
+    # No log callback: every unmet condition is printed once, below, as the
+    # violation it is, rather than twice.
+    pre = fixtures.preflight(rig)
     report.numbers["preflight_unsupported"] = len(pre.unsupported)
     for missing in pre.missing_instruments:
         report.violation("MISSING INSTRUMENT", route=missing[0], detail=missing[1])
@@ -652,7 +677,7 @@ def drive(rig, report, venue, selected, only, args):
     for u in pre.unsupported:
         report.violation("UNSUPPORTED FIXTURE", key=u["key"], value=u["value"], scenario=u["scenario"],
                          want=u["want"])
-    if pre.blocks(fixtures.RESTART_SCENARIO):
+    if fixtures.RESTART_KEY in pre.blocked_keys:
         report.note("the restart round trip steps %s, which preflight reported unsupported" % fixtures.RESTART_KEY)
 
     samples = []
@@ -678,7 +703,7 @@ def drive(rig, report, venue, selected, only, args):
 
     if args.skip_restart:
         report.step("restart", skipped=1, reason="--skip-restart")
-    elif pre.blocks(fixtures.RESTART_SCENARIO):
+    elif fixtures.RESTART_KEY in pre.blocked_keys:
         report.violation("RESTART SKIPPED", reason="preflight blocked %s" % fixtures.RESTART_KEY)
     else:
         restart_round_trip(rig, report, venue)
@@ -703,6 +728,9 @@ def main(argv=None):
     ap.add_argument("--sim-port", type=int, default=int(os.environ.get("GM_SIM_PORT", "8080")))
     ap.add_argument("--only", default=None, help="comma-separated scenario names (%s)" % ",".join(SCENARIO_ORDER))
     ap.add_argument("--skip-restart", action="store_true", help="skip the restart round trip and every check that reboots")
+    ap.add_argument("--fixture", default=fixtures.FIXTURE_PATH,
+                    help="the NVS fixture the simulator is seeded from; an edited copy is how a value the "
+                         "display cannot reach is put in front of the preflight")
     ap.add_argument("--report-dir",
                     default=os.path.join(tempfile.gettempdir(), "gm_settings_ui_tests", "runner"),
                     help="where report.json and the per-page PNGs are written")

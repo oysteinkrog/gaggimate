@@ -104,11 +104,10 @@ CHECKS = (
      "one of the twelve named palette colours"),
 )
 
-# The runner's own restart round trip steps Standby brightness, so it needs
-# the same condition the Display scenario does; named here so a caller can
-# ask whether the restart phase is supported without duplicating the map.
+# The runner's own restart round trip steps Standby brightness, so it is
+# gated on that one key rather than on the whole Display scenario: a
+# different Display field being unreachable says nothing about this one.
 RESTART_KEY = "standbyBrightness"
-RESTART_SCENARIO = "display"
 
 # Fixtures the display cannot create for itself. Each is (name, scenario,
 # predicate over the settings dict).
@@ -165,8 +164,9 @@ class Preflight:
 
     def __init__(self):
         self.missing_instruments = []
-        self.unsupported = []  # {"key", "value", "scenario", "want"}
-        self.blocked = set()   # scenario names
+        self.unsupported = []      # {"key", "value", "scenario", "want"}
+        self.blocked = set()       # scenario names
+        self.blocked_keys = set()  # the individual settings keys behind them
         self.settings = None
 
     @property
@@ -204,6 +204,7 @@ def preflight(rig, log=None):
         if not good:
             result.unsupported.append({"key": key, "value": raw, "scenario": scenario, "want": want})
             result.blocked.add(scenario)
+            result.blocked_keys.add(key)
             if log:
                 log("UNSUPPORTED FIXTURE", key=key, value=raw, scenario=scenario, want=want)
     for name, scenario, present in FIXTURE_ROWS:
@@ -211,6 +212,7 @@ def preflight(rig, log=None):
             result.unsupported.append({"key": name, "value": "(absent)", "scenario": scenario,
                                        "want": "at least one, seeded before boot"})
             result.blocked.add(scenario)
+            result.blocked_keys.add(name)
             if log:
                 log("UNSUPPORTED FIXTURE", key=name, value="(absent)", scenario=scenario)
     return result

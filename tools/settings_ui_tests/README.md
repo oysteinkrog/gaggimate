@@ -7,9 +7,13 @@ a WiFi-password-filtered settings reader with wire-format parsers, and a
 simulator launcher. Category scenario scripts and the end-to-end runner
 (gm-flw.13) are built on this; it carries no scenario logic of its own.
 
-Two files: `rig.py` (the module) and `test_rig.py` (its own runnable check,
-also the acceptance test for this bead). `python3 -m py_compile rig.py`
-passes; `python3 -c "from tools.settings_ui_tests import rig"` imports.
+`rig.py` is the module and `test_rig.py` its own runnable check. Beside them
+sit the seven category scenarios (`test_<name>.py`), the end-to-end runner's
+page inventory and audit (`audit_pages.py`), its preflight and simulator
+seeding (`fixtures.py`), and the seeded NVS fixture
+(`fixtures/controller.json`). The runner itself is one directory up, at
+`tools/settings_ui_test.py`; see "The end-to-end runner" at the bottom of
+this file.
 
 ## Rig(host)
 
@@ -81,10 +85,12 @@ use the `Sim` context manager below, which builds this for you).
   a list of `{"time", "days"}` dicts).
 - `settingsui(**args)` / `settingsui_state()`: `/api/debug/settingsui`
   (`open=1`, `close=1`, `cat=N`, `page=N`, `pop=1`; GET with no arguments
-  returns the shell's state). **This route does not exist yet** (gm-flw.6
-  adds it); these methods are written to its documented shape so callers do
-  not change when it lands, and are untested here (see "Not verified"
-  below).
+  returns the shell's state). The route landed with gm-flw.6 and is compiled
+  for the simulator and the bench builds alike. It reports that a command was
+  queued, not that it ran, and answers 409 while one is still in flight, so a
+  caller waits on the published `seq` before sending the next one:
+  `audit_pages.command` does both, and every scenario here has its own
+  equivalent.
 - `heap()`, `anim(**args)`, `synth(brew=None)`: `/api/debug/heap`,
   `/api/debug/anim`, `/api/debug/synth`. **`anim()` and `synth()` do not
   exist on the simulator**: both routes are compiled only for the real
@@ -190,3 +196,128 @@ make. `settingsui()`/`settingsui_state()` are untested everywhere (the
 route does not exist until gm-flw.6 lands); `anim()`/`synth()` are
 confirmed unavailable on the simulator (see above) but not exercised
 against the device build (`display-loadtest`) where they do exist.
+
+## The end-to-end runner: `tools/settings_ui_test.py`
+
+One command drives the whole on-display settings feature and prints a
+pass/fail report. It audits every settings page's touch targets, runs the
+seven scenarios above, records the animation frame rate and the heap while
+settings is open, and checks that a value survives a restart.
+
+### Against the simulator
+
+```
+pio run -e display-sim
+python3 tools/settings_ui_test.py --sim-port 8099 --report-dir out/settings
+```
+
+It launches the simulator itself, in a fresh directory under the report
+dir, seeded from `fixtures/controller.json` (see "Fixtures" below), and
+tears it down at the end. A full run takes about seven minutes on this
+machine, most of it the scenarios; the first 90 seconds are the warm-up
+waiting out the boot churn, which the measuring rules in the repo's
+`CLAUDE.md` require before any rate or heap figure is worth recording.
+
+### Against the bench device
+
+```
+python3 tools/settings_ui_test.py --host 192.168.1.121 --report-dir out/settings
+```
+
+The device run adds what the simulator cannot do. It stops the synthetic
+brew handshake first (`synth(0)`, restored on exit) so the load rig's
+lifecycle does not move the UI underneath the taps, reads
+`/api/debug/pclk` and warns when the stored pixel-clock divider is not the
+build's 6, turns All screens on through the UI if it is off (and puts it
+back), records a menu-screen baseline frame rate and a 5 s window per page,
+and runs a leak phase of 20 open and close cycles of the largest page
+before any scenario that can restart. The device is shared and is flashed
+only by the epic's lead; nothing here writes to it except through the UI.
+
+Useful flags:
+
+- `--only rig,temps,display,animation,machine,schedules,status` runs a
+  subset. Only those scenarios and their own pages are visited, so
+  `--only status --skip-restart` is the quickest way to exercise the
+  plumbing.
+- `--skip-restart` skips the restart round trip and every scenario check
+  that reboots the venue.
+- `--fixture PATH` seeds the simulator from an edited copy of the fixture,
+  which is how a value the display cannot reach is put in front of the
+  preflight.
+- `--sim-program`, `--sim-port`, `--report-dir`.
+
+### Reading the report
+
+Every step prints one line as it happens: an ISO-8601 UTC timestamp,
+`step=<name>`, then `key=value` pairs. At the end come a table of the pages
+(targets, smallest target, frame rate), a table of the scenarios (status,
+wall time, checks run, checks failed), the sampled heap minima and then
+either `PASS` or `FAIL` with every violation listed. The exit code is 0
+only on `PASS`.
+
+`<report-dir>/report.json` carries all of it, plus every step in order.
+`<report-dir>/<page>.png` is each page's framebuffer with its targets' hit
+rectangles drawn on it, at half resolution.
+
+Two lists, and the difference between them matters:
+
+- **violations** are the run's assertions and the exit code answers to
+  them: a page that failed its audit, a scenario that failed, an unmet
+  preflight condition, a restart that lost the value, and on the device a
+  page rate below 90 percent of the menu baseline or a leak phase that
+  lost internal DRAM.
+- **findings** are recorded and printed but do not fail the run. In
+  practice they are `RESTORE FAILED` lines: a scenario that did not put a
+  value back where it found it. Several are a check's own deliberate
+  residue (the Status scenario proves a brightness bump survives a restart
+  by leaving it bumped), so the bead asks for them to be logged without
+  stopping the run.
+
+Two heap numbers look similar and are not: `dma_free_sampled_min` is the
+smallest value this run happened to sample, and `dma_min` is the venue's
+own boot-lifetime minimum, which no sampling can see.
+
+### Fixtures and the preflight
+
+`fixtures/controller.json` is the simulator's NVS namespace, written before
+the process starts: one JSON object, string values under the short NVS keys
+`src/display/core/Settings.h` registers. It exists for two reasons. Some
+starting values cannot be reached from the display's own steppers (a 45 s
+dim timeout is not on the 30 s grid, a colour outside the twelve named
+palette entries survives only one visit), so a scenario that stepped away
+from one could never put it back. And some data the display cannot create
+at all: the Animation scenario needs a gradient in the library, which
+defaults empty, and the Schedules scenario needs a schedule to work around.
+
+Before anything is changed, the preflight confirms the three instruments
+answer (`/api/debug/tap`, `/api/debug/touchmap`, `/api/debug/settingsui`)
+and that every checked starting value is on its stepper's grid. An unmet
+condition prints `UNSUPPORTED FIXTURE key=... value=... scenario=...` and
+that scenario is failed without being run, so its unreachable value is
+never stepped away from. Pointing `--host` at a production build fails here
+too, naming the routes that build does not compile.
+
+The runner never POSTs `/api/settings`, never prints the WiFi password, and
+puts back through the UI every value it changes itself.
+
+### Adding a scenario
+
+A scenario is `test_<name>.py` in this directory. Give it:
+
+- module-level `FAILURES` (a list of `(name, detail)` pairs) and `TOTAL`
+  (an int), both maintained by a small `check(rig, name, cond, detail)`
+  helper, which is the shape every scenario here already uses;
+- a `_sequence(rig, venue)` holding the checks in order, so `main()` and
+  `run()` cannot drift apart;
+- `run(rig, report, venue)`, which calls `_sequence`, logs one
+  `scenario_checks` step through `report.step`, and raises `AssertionError`
+  listing anything that failed;
+- a `main()` that builds its own `Venue` (from `fixtures.py`) and launches
+  a simulator, so the script stays runnable alone.
+
+Then add its name to `SCENARIO_ORDER` in `tools/settings_ui_test.py` and
+its pages to `CATEGORY_PAGES` in `audit_pages.py`. Read `venue.sim` before
+restarting anything and `venue.can_restart` before doing it, `venue.log_path`
+before reading the simulator's log, and skip with a logged reason rather
+than silently when the venue cannot support a check.
