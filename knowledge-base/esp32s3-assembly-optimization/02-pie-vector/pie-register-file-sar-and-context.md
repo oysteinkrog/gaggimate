@@ -3,7 +3,7 @@ title: PIE register file, state registers and context save
 id: 02-pie-vector/pie-register-file-sar-and-context
 schema_version: 1
 doc_type: reference
-status: draft
+status: review
 last_reviewed: 2026-09-06
 tags: [esp32s3, xtensa, pie, simd, registers, coprocessor, context-switch, inline-asm, toolchain]
 confidence: high
@@ -21,7 +21,10 @@ it.
 
 Instruction semantics per mnemonic are not here. TRM Section 1.6 lists the
 instructions by category and Section 1.8 gives the per-instruction
-description.[^trm]
+description.[^trm] The load and store forms are in
+[PIE load and store instructions and their alignment rules](./pie-load-store-and-alignment.md);
+the compute forms are in
+[PIE compute instructions](./pie-arithmetic-multiply-saturate-and-shuffle.md).
 
 ## 1. PIE is coprocessor 3
 
@@ -96,14 +99,22 @@ accumulators of 20 bits, and for 16-bit multiplies it is 8 accumulators of
 a whole vector multiply down to one 40-bit value, which is what a dot
 product needs.[^trm]
 
-There is no instruction that moves QACC directly to or from memory. The
-manual says the transfer goes through five AR registers or two QR
-registers.[^trm] The register-numbered `rur`/`wur` forms exist for exactly
-that: `QACC_H_0` through `QACC_H_4` and `QACC_L_0` through `QACC_L_4` are
-the five 32-bit windows onto each 160-bit half, and `ACCX_0` and `ACCX_1`
-are the low 32 bits and high 8 bits of ACCX.[^tie] The `_n` suffix
-convention for registers wider than 32 bits is stated in TRM Section
-1.6.10.[^trm]
+No single instruction moves a whole 160-bit QACC half to or from memory.
+Section 1.5.3 says the transfer goes through five AR registers or two QR
+registers.[^trm-153] The register-numbered `rur`/`wur` forms exist for
+exactly that: `QACC_H_0` through `QACC_H_4` and `QACC_L_0` through
+`QACC_L_4` are the five 32-bit windows onto each 160-bit half, and
+`ACCX_0` and `ACCX_1` are the low 32 bits and high 8 bits of ACCX.[^tie]
+The `_n` suffix convention for registers wider than 32 bits is stated in
+TRM Section 1.6.10.[^trm]
+
+Section 1.5.3's "no direct way" reads as out of date against Section 1.8,
+which does give memory instructions for these registers, two per half:
+`EE.LD.QACC_H.L.128.IP` and `EE.ST.QACC_H.L.128.IP` move the low 128 bits
+and the `.H.32.IP` pair moves the top 32, with the same pair for
+`QACC_L`.[^trm-qaccmem] `EE.LDQA.*` is the widening load that fills both
+halves from packed 8-bit or 16-bit memory. All of them are listed in
+[PIE load and store instructions and their alignment rules](./pie-load-store-and-alignment.md).
 
 ## 4. State registers
 
@@ -114,7 +125,7 @@ instructions that look unrelated.
 
 | Register | Width | Set by | Read by | Source |
 |---|---|---|---|---|
-| `SAR` | 6 bits | `wsr.sar`, `ssr`, `ssl` and friends (base ISA) | `EE.VSR.32` and `EE.VSL.32` use the low 5 bits as the shift; `EE.VMUL.*`, `EE.CMUL.*`, `EE.FFT.AMS.*`, `EE.FFT.CMUL.*` use it as the right shift applied to the intermediate product | TRM Table 1.5-1, Section 1.5.1.2[^trm] |
+| `SAR` | 6 bits | `wsr.sar` writes all six bits; `ssr`, `ssl` and `ssai` reach only 0 to 31 (base ISA) | `EE.VSR.32` and `EE.VSL.32` read `SAR[5:0]` as the shift; `EE.VMUL.*`, `EE.CMUL.*`, `EE.FFT.AMS.*`, `EE.FFT.CMUL.*` use it as the right shift applied to the intermediate product | TRM Table 1.5-1, Sections 1.8.186 and 1.8.191[^trm][^trm-vsx]; ISA RM `SSR` and `SSAI`[^isa-ssr] |
 | `SAR_BYTE` | 4 bits | `EE.LD.128.USAR.IP` and `EE.LD.128.USAR.XP` write the low 4 bits of the address register; also `wur.sar_byte` | `EE.SRCQ.*` and `EE.SRC.Q*`, and any instruction with a `.QUP` suffix | TRM Section 1.5.1.2[^trm] |
 | `FFT_BIT_WIDTH` | 4 bits | `wur.fft_bit_width` | `EE.BITREV` only. Value 0 to 7 selects 3-bit to 10-bit mode | TRM Section 1.5.1.2[^trm] |
 | `UA_STATE` | 128 bits | `EE.LD.UA_STATE.IP`, `EE.ST.UA_STATE.IP`, `wur.ua_state_n` | `EE.FFT.AMS.S16.LD.INCP.UAUP` only | TRM Section 1.5.1.2[^trm] |
@@ -129,6 +140,17 @@ special register rather than a custom one.[^trm] A scalar `ssr` or `ssl`
 between two vector multiplies changes the rounding of the second multiply.
 The esp-dsp fixed-point add kernel sets it with an ordinary `wsr.sar` before
 entering the vector loop.[^espdsp-add]
+
+How many bits of it a vector shift reads is stated twice in the manual and
+not the same way. Section 1.5.1.2 says `EE.VSR.32` and `EE.VSL.32` use "the
+lower 5 bits of SAR". Their own entries at 1.8.186 and 1.8.191 call the
+register 6 bits and shift by `SAR[5:0]`, and Espressif's QEMU model hands
+its helper the whole register with no 5-bit mask.[^trm-vsx][^qemu-vsx] Take
+the per-instruction entries as the authority. Note also that only `wsr.sar`
+can put a value above 31 in there: `ssr` writes `AR[s][4:0]` and clears the
+top bit of SAR, and `ssai` takes 0 to 31.[^isa-ssr] Nothing states what a
+32-bit lane does when shifted by 32 or more, so keep the amount inside 0 to
+31, where the two readings agree.
 
 **SAR_BYTE is the unaligned load path.** PIE loads and stores force their
 addresses to be aligned by replacing the low address bits with zero, so a
@@ -158,13 +180,15 @@ instruction names it.
 | Mnemonic strings in the ESP32-S3 dynconfig | 217 beginning with `ee.` | [measured][^m-enc] |
 | Same count in the ESP32 dynconfig | 0 | [measured][^m-enc] |
 
-Most PIE instructions are 24 bits. The manual works through the encoding of
-`EE.ZERO.QACC` and calls it a 24-bit instruction.[^trm] Assembling a sample
-of 37 PIE instruction encodings gave 34 at three bytes and 3 at four. The
-four-byte ones were the heavily fused forms that name six or more operands:
-`ee.vmulas.s8.accx.ld.ip`, `ee.ldf.128.ip` and
-`ee.fft.ams.s16.ld.incp`.[^m-enc] Since FLIX is off, those are single wide
-instructions and not bundles.[^coreisa]
+PIE instructions come in two widths, and the split is not lopsided. The
+manual works through the encoding of `EE.ZERO.QACC` and calls it a 24-bit
+instruction.[^trm] The ESP32-S3 dynconfig sorts its 217 `ee.` opcodes into
+two slot formats: 128 sit in the 24-bit `inst` slot and 89 in the 32-bit
+slot.[^m-enc] What decides the width is the memory access, not the operand
+count. Every form that fuses a load or a store on to an operation is 32
+bits, and so are `ee.ldf.*`, `ee.stf.*`, `ee.ldxq.32` and `ee.stxq.32`.
+`ld.qr`, `st.qr` and `mv.qr` are 24 bits.[^m-enc] Since FLIX is off, the
+32-bit ones are single wide instructions and not bundles.[^coreisa]
 
 The opcode table is not in the assembler. It lives in a per-target dynconfig
 shared library that the driver passes with `--dynconfig`. `xtensa-esp-elf-as`
@@ -242,13 +266,16 @@ For inline assembly this cuts both ways.
   intervene.
 - The AR registers you use for addresses and scalars are ordinary operands
   and follow the normal constraint and clobber rules.
-- `SAR` is the exception that needs care. It is a base-ISA register, and
-  GCC does emit `ssr`, `ssl` and `sll` for ordinary variable shifts. An asm
-  block that sets `SAR` for a vector multiply and then lets compiler-emitted
-  code run before the multiply can have its shift amount replaced.
-  [uncertain] Whether GCC 14.2 tracks `SAR` liveness across an asm block
-  well enough to be relied on either way was not tested. Keeping the `wsr.sar`
-  and its dependent instructions inside one asm block avoids the question.
+- `SAR` is the exception that needs care, and the hazard runs one way.
+  GCC 14.2 has no model of `SAR` either. It re-emits `ssr` or `ssl` before
+  every variable shift and never reuses a value it did not just write, and
+  a constant shift compiles to `srai` or `slli`, which do not touch the
+  register at all. So compiler-emitted code never depends on a `SAR` an asm
+  block left behind. The reverse is not safe: a variable shift placed
+  between two asm blocks overwrites `SAR`, and the second block then reads
+  the compiler's amount rather than the one the first block set.[^m-sar]
+  Keep the `wsr.sar` and every instruction that depends on it inside one
+  asm block.
 
 ## 8. esp-dsp as the reference corpus
 
@@ -275,13 +302,18 @@ mask the address.[^espdsp-add]
   resource and control hazards, including a per-instruction table of
   operand and special-register pipeline stages.[^trm] Turning that into a
   cost model belongs in a sibling leaf.
-- **The exact `CPENABLE` bit layout beyond bit 3** was not verified against
-  the ISA manual. The value used here follows from the coprocessor ID and
-  the handler's own arithmetic.[^vectors] [uncertain]
-- **Whether the 217 dynconfig strings are exactly the architectural
-  instruction count** is not established. Some may be format or alias
-  names. TRM Section 1.6 is the authority on the instruction list; the count
-  here is a measurement of one toolchain artifact.[^m-enc]
+- **Writing `CPENABLE` needs an `RSYNC` after it.** Bit *n* enables
+  coprocessor *n*, the register is 8 bits and privileged, and it is
+  undefined after reset. An `RSYNC` must run between a write to `CPENABLE`
+  and any instruction that references state the changed bits
+  control.[^isa-cpen] A kernel does not write the register at all (Section
+  6), but a bare-metal harness that does needs the sync.
+- **The 217 dynconfig mnemonics match the manual's instruction count
+  exactly.** TRM Section 1.8 numbers 220 entries, of which 1.8.1 to 1.8.217
+  are `EE.*` and 1.8.218 to 1.8.220 are `LD.QR`, `ST.QR` and
+  `MV.QR`.[^trm-1820] The dynconfig holds 217 unique `ee.` strings plus
+  separate `ld.qr`, `st.qr` and `mv.qr` opcodes, so neither list carries
+  aliases the other lacks.[^m-enc]
 - **Reset values of the state registers** are given as 0 in the save-area
   description,[^tie] but the manual does not state them for PIE. Treat every
   state register as undefined at the start of a kernel and set what you
@@ -302,6 +334,46 @@ portable reference.
     1.5.3 data format and alignment, 1.6.10 processor control instructions,
     1.7 instruction performance.
     <https://documentation.espressif.com/esp32-s3_technical_reference_manual_en.pdf>
+
+[^trm-153]: Same manual, Section 1.5.3 "Data Format and Alignment", pages
+    48 to 49: "there is no direct way to switch the data between the two
+    special registers and memory. You can read and write data of QACC_H and
+    QACC_L via five 4-byte (AR) registers or two 16-byte (QR) registers."
+
+[^trm-qaccmem]: Same manual, Sections 1.8.20 to 1.8.23 and 1.8.60 to
+    1.8.63, pages 96 to 99 and 136 to 139, the `EE.LD.QACC_*` and
+    `EE.ST.QACC_*` forms, and Sections 1.8.29 to 1.8.36, pages 105 to 112,
+    `EE.LDQA.*`.
+
+[^trm-vsx]: Same manual, Sections 1.8.186 `EE.VSL.32` (page 268) and
+    1.8.191 `EE.VSR.32` (page 274). Both read "the value in the 6-bit
+    special register SAR" and both operate as a shift by `SAR[5:0]`,
+    against Section 1.5.1.2's "the lower 5 bits of SAR" on page 47.
+
+[^trm-1820]: Same manual, Sections 1.8.218 `LD.QR` (page 301), 1.8.219
+    `ST.QR` (page 302) and 1.8.220 `MV.QR` (page 303). 1.8.220 is the last
+    numbered entry of Chapter 1.
+
+[^qemu-vsx]: Espressif QEMU fork, branch `esp-develop`, commit
+    `febae182e132e4055529be423a818225ebddaa3a`,
+    `target/xtensa/translate_tie_esp32s3.c`, `translate_vsx32_s3` and
+    `HELPER(vsx32_s3)`. The translate function passes `cpu_SR[SAR]`
+    unmasked. <https://github.com/espressif/qemu>
+
+[^isa-ssr]: Cadence Tensilica, 2010. *Xtensa Instruction Set Architecture
+    (ISA) Reference Manual*, issue 4/2010 (RC-2010.1). `SSR`, page 539:
+    "The least significant five bits of address register as are written to
+    SAR. The most significant bit of SAR is cleared. This instruction is
+    similar to a WSR.SAR, but differs in that only AR[s]4..0 is used,
+    instead of AR[s]5..0." `SSAI`, page 533: syntax `SSAI 0..31`, operation
+    `SAR <- 0||sa`.
+
+[^isa-cpen]: Same ISA manual, Section 4.3.9 "Coprocessor Option", page 64,
+    and Table 5-184 "CPENABLE - Special Register #224", page 236. Bit *n*
+    is coprocessor *n*; the register is 8 bits, privileged, and undefined
+    after reset; "An RSYNC instruction must be executed after writing
+    CPENABLE before executing any instruction that references state
+    controlled by the changed bits of CPENABLE."
 
 [^tie]: Cadence Design Systems, 2021 (Customer ID 15128, Build 0x90f1f).
     `xtensa/config/tie.h`, shipped in ESP-IDF 5.5.1 at
@@ -365,14 +437,20 @@ portable reference.
 
 [^m-enc]: [measured] 2026-09-06, host assembly only, no device needed.
     Toolchain `xtensa-esp-elf` GCC 14.2.0 and GNU as 2.43.1, crosstool-NG
-    `esp-14.2.0_20241119`. Method: assemble a `.S` file of PIE mnemonics
-    with `xtensa-esp32s3-elf-gcc -c`, then read instruction lengths from
-    `xtensa-esp32s3-elf-objdump -d`. 37 encodings assembled across 36
-    distinct mnemonics, 34 at three bytes and 3 at four. The dynconfig counts come from
-    `strings lib/xtensa_esp32s3.so | grep -c '^ee\.'` (217, all unique) and
-    the same over `lib/xtensa_esp32.so` (0). The unknown-opcode and `excw`
-    results come from running the same input through `xtensa-esp-elf-as`
-    and `xtensa-esp-elf-objdump` with no `--dynconfig`.
+    `esp-14.2.0_20241119`. Mnemonic count:
+    `strings lib/xtensa_esp32s3.so | grep -c '^ee\.'` gives 217, all
+    unique, and the same over `lib/xtensa_esp32.so` gives 0. Width census:
+    counting `Opcode_ee_*_Slot_inst_encode` strings in the same library
+    gives 128 and counting `Opcode_ee_*_Slot_slot_format_32_0_encode`
+    gives 89, which sum to 217; `ld.qr`, `st.qr` and `mv.qr` each carry an
+    `_Slot_inst_encode` string. Individual encodings were confirmed by
+    assembling with `xtensa-esp32s3-elf-as` and reading lengths from
+    `xtensa-esp32s3-elf-objdump -d`: `ee.vld.128.ip`, `ee.src.q`,
+    `ee.vadds.s16` and `ee.zero.qacc` are three bytes;
+    `ee.vmulas.s8.accx.ld.ip` and `ee.ldf.128.ip` are four. The
+    unknown-opcode and `excw` results come from running the same input
+    through `xtensa-esp-elf-as` and `xtensa-esp-elf-objdump` with no
+    `--dynconfig`.
 
 [^m-ureg]: [measured] 2026-09-06, same toolchain and method as above.
     `rur.gpio_out a2` assembles to `e320c0`, `rur.qacc_l_4 a2` to `e320b0`,
@@ -387,3 +465,12 @@ portable reference.
     in 'asm'". `typedef int v __attribute__((vector_size(16))); v g(v a, v b)
     { return a+b; }` at `-O2` emits four `add.n` instructions on AR
     registers and no PIE instruction.
+
+[^m-sar]: [measured] 2026-09-06, same toolchain, `-O2`. A function with two
+    variable right shifts by the same amount emits `ssr` twice, once before
+    each `sra`, so no `SAR` value is reused. A function whose body is
+    `asm volatile("ssai 7" ::: "memory")`, then `p[0] = x >> n`, then
+    `asm volatile("sll %0, %1" ...)` emits `ssr a3` between the two asm
+    blocks, so the second block reads the compiler's shift amount and not
+    the 7 the first block set. `return x >> 7` compiles to `srai`, which
+    does not write `SAR`.

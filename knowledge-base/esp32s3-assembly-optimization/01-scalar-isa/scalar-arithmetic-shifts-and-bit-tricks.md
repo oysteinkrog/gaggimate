@@ -3,7 +3,7 @@ title: Scalar Arithmetic, Shifts, and Bit Tricks
 id: 01-scalar-isa/scalar-arithmetic-shifts-and-bit-tricks
 schema_version: 1
 doc_type: reference
-status: draft
+status: review
 last_reviewed: 2026-09-06
 tags: [esp32s3, xtensa, scalar-isa, instruction-encoding, shifts, branches]
 confidence: high
@@ -37,8 +37,10 @@ The ESP32-S3's LX7 configuration enables the Code Density Option, the
 Boolean Option, the 16-bit and 32-bit Integer Multiply Options (including the
 Mul32High sub-option for `mulsh`/`muluh`), the 32-bit Integer Divide Option,
 and the Miscellaneous Operations Option (`min`/`max`/`minu`/`maxu`, `nsa`/
-`nsau`, `sext`, `clamps`). All of the mnemonics in this page assembled
-without error against the local toolchain[^4]; none needed a workaround.
+`nsau`, `sext`, `clamps`). Each of those is an `XCHAL_HAVE_*` macro set to 1
+in this chip's `core-isa.h`[^6], and all of the mnemonics in this page
+assembled without error against the local toolchain[^4]; none needed a
+workaround.
 
 ## Loads and stores
 
@@ -52,13 +54,13 @@ offset divided by 2 or 4.
 | Instruction | Format | Offset range (assembler syntax) | Notes |
 |---|---|---|---|
 | `l8ui at, as, 0..255` | RRI8 | 0 to 255, unscaled | Zero-extends the byte. No sign-extending byte load exists[^1] (Core Architecture, p. 369). |
-| `l16ui at, as, 0..510` | RRI8 | 0 to 510, multiples of 2 | Zero-extends the halfword[^1] (p. 370). |
+| `l16ui at, as, 0..510` | RRI8 | 0 to 510, multiples of 2 | Zero-extends the halfword[^1] (p. 372). |
 | `l16si at, as, 0..510` | RRI8 | 0 to 510, multiples of 2 | Sign-extends the halfword[^1] (p. 370). Without the Unaligned Exception Option the low address bit is ignored rather than faulting. |
 | `l32i at, as, 0..1020` | RRI8 | 0 to 1020, multiples of 4 | One of the few load forms that can also read instruction RAM/ROM[^1]. |
 | `l32r at, label` | RI16 | -262141 to -4 bytes from the `l32r` instruction | PC-relative load from the literal pool; see below[^1] (p. 382). |
-| `s8i at, as, 0..255` | RRI8 | 0 to 255, unscaled | [^1] (p. 503). |
+| `s8i at, as, 0..255` | RRI8 | 0 to 255, unscaled | [^1] (p. 504). |
 | `s16i at, as, 0..510` | RRI8 | 0 to 510, multiples of 2 | [^1] (p. 505). |
-| `s32i at, as, 0..1020` | RRI8 | 0 to 1020, multiples of 4 | [^1] (pp. 509-511). |
+| `s32i at, as, 0..1020` | RRI8 | 0 to 1020, multiples of 4 | [^1] (p. 510). |
 
 `l32r`'s range is asymmetric and PC-relative rather than register-relative:
 the target address is `(PC + 3)` with its low two bits cleared, plus a
@@ -99,8 +101,8 @@ the standard way to pull a bit field out of a word.
 
 | Instruction | Format | Range | Notes |
 |---|---|---|---|
-| `slli ar, as, 1..31` | RRR | 1 to 31 | Left shift by a constant. A shift amount of 0 is undefined in the encoding; the assembler turns `slli ar, as, 0` into `or` (register move) unless prefixed `_slli`, in which case it errors[^1] (p. 525). |
-| `srli at, at2... ` (`srli ar, at, 0..15`) | RRR | 0 to 15 only | There is no `srli` for shifts of 16 or above; the assembler substitutes `extui` automatically, or errors if prefixed `_srli`[^1] (p. 530). |
+| `slli ar, as, 1..31` | RRR | 1 to 31 | Left shift by a constant. The `sa` field is encoded as `32 - shift`, so a shift amount of 0 has an undefined result; the assembler converts `slli ar, as, 0` into a register move instead, emitting `mov.n` with the Code Density Option on. Prefixing `_slli` makes a zero shift an error[^1] (p. 525), confirmed against the assembler[^4]. |
+| `srli ar, at, 0..15` | RRR | 0 to 15 only | There is no `srli` for shifts of 16 or above; the manual says outright "EXTUI replaces these shifts". The assembler substitutes `extui` automatically (`srli a2, a3, 16` assembles as `extui a2, a3, 16, 16`) and errors if prefixed `_srli`[^1] (p. 530), confirmed against the assembler[^4]. |
 | `srai ar, at, 0..31` | RRR | 0 to 31 | Arithmetic (sign-preserving) right shift[^1] (p. 527). |
 | `extui ar, at, shiftimm, maskimm` | RRR | `shiftimm` 0..31, `maskimm` 1..16 | Shifts `at` right by `shiftimm`, then masks to the low `maskimm` bits. `shiftimm + maskimm > 31` is undefined[^1] (p. 344, Core Architecture). |
 
@@ -124,20 +126,26 @@ lets two registers be combined into one wider shift (a funnel shift):
 All four belong to the Miscellaneous Operations Option, which is enabled
 per-instruction-group on the processor configuration; this core has all
 four groups (`InstructionSEXT`, `InstructionCLAMPS`, `InstructionMINMAX`,
-`InstructionNSA`) turned on[^1] (§4.3.8, Table 4-40, pp. 62-63).
+`InstructionNSA`) turned on[^1] (§4.3.8 on p. 62, Table 4-39 on p. 62 and
+Table 4-40 on p. 63; the header macros are `XCHAL_HAVE_SEXT`,
+`XCHAL_HAVE_CLAMPS`, `XCHAL_HAVE_MINMAX` and `XCHAL_HAVE_NSA`, all 1 on
+this core[^6]).
 
 | Instruction | Format | Operation |
 |---|---|---|
-| `sext ar, as, imm` (imm = 0..24, bit position `t+7`) | RRR | Sign-extends `as` from bit `t+7` upward: `sign = as[t+7]`, `ar = sign-extend(as[t+7:0])`[^1]. |
-| `clamps ar, as, imm` | RRR | Clamps `as` to a signed power-of-two range: if the top bits above position `t+7` already match the sign, `as` passes through; otherwise the result saturates to the largest or smallest representable value for that width[^1]. |
-| `min ar, as, at` / `max ar, as, at` | RRR | Signed minimum/maximum of two registers[^1]. |
-| `minu ar, as, at` / `maxu ar, as, at` | RRR | Unsigned minimum/maximum[^1]. |
-| `nsa ar, as` | RRR | Number of redundant sign bits: how many leading bits (not counting the sign bit) equal the sign bit, or 31 if `as` is 0 or -1. Usable as a left-shift amount before the value overflows 32 bits[^1]. |
-| `nsau ar, as` | RRR | Number of leading zero bits, or 32 if `as` is 0. The unsigned counterpart of `nsa`, used for normalization and for a fast "count leading zeros"[^1]. |
+| `sext ar, as, 7..22` | RRR | Sign-extends `as` from the named bit upward: `ar = sign-extend(as[imm:0])`. The assembler takes the bit position, 7 to 22, and encodes it in the 4-bit `t` field as 0 to 15[^1] (p. 518). Anything outside 7 to 22 is an assemble-time error, `0` and `23` included[^4]. |
+| `clamps ar, as, 7..22` | RRR | Tests whether `as` fits as a signed value of `imm+1` bits and, if not, writes the largest value of `imm+1` bits with the same sign. The manual states the function as `y = min(max(x, -2^imm), 2^imm - 1)`. Same immediate encoding and same 7 to 22 range as `sext`[^1] (p. 312), confirmed against the assembler[^4]. |
+| `min ar, as, at` / `max ar, as, at` | RRR | Signed minimum/maximum of two registers[^1] (pp. 410, 407). |
+| `minu ar, as, at` / `maxu ar, as, at` | RRR | Unsigned minimum/maximum[^1] (pp. 411, 408). |
+| `nsa ar, as` | RRR | Number of redundant sign bits: how many leading bits (not counting the sign bit) equal the sign bit, or 31 if `as` is 0 or -1. Usable as a left-shift amount before the value overflows 32 bits[^1] (p. 461). |
+| `nsau ar, as` | RRR | Number of leading zero bits, result in the range 0 to 32, or 32 if `as` is 0. The manual notes that shifting `as` left by the `nsau` result with `ssl`/`sll` yields the smallest value with bit 31 set, unless `as` is 0[^1] (p. 462). |
 
 `clamps` is documented in the manual as pairing with the MAC16 Option, to
 clamp an accumulator result to 16 bits before storing it to memory, though
-nothing about `clamps` itself requires MAC16 to be present[^1] (§4.3.7.2).
+nothing about `clamps` itself requires MAC16 to be present[^1] (§4.3.7.2
+"Use With CLAMPS Instruction", p. 62). The `clamps` description itself says
+it "may be used in conjunction with instructions such as ADD, SUB, MUL16S,
+and so forth to implement saturating arithmetic"[^1] (p. 312).
 
 ## Conditional moves
 
@@ -146,12 +154,12 @@ Option, which this core has.
 
 | Instruction | Format | Condition | Option |
 |---|---|---|---|
-| `moveqz ar, as, at` | RRR | Move `as` to `ar` if `at == 0` | Core Architecture[^1] (Table 4-26, p. 51; description p. 414). |
-| `movnez ar, as, at` | RRR | Move `as` to `ar` if `at != 0` | Core Architecture[^1] (p. 417). |
-| `movltz ar, as, at` | RRR | Move `as` to `ar` if `at < 0` (signed) | Core Architecture[^1] (p. 421). |
+| `moveqz ar, as, at` | RRR | Move `as` to `ar` if `at == 0` | Core Architecture[^1] (Table 4-26, pp. 51-53; description p. 415). |
+| `movnez ar, as, at` | RRR | Move `as` to `ar` if `at != 0` | Core Architecture[^1] (p. 425). |
+| `movltz ar, as, at` | RRR | Move `as` to `ar` if `at < 0` (signed) | Core Architecture[^1] (p. 423). |
 | `movgez ar, as, at` | RRR | Move `as` to `ar` if `at >= 0` (signed) | Core Architecture[^1] (p. 419). |
-| `movt ar, as, bt` | RRR | Move `as` to `ar` if Boolean register `bt` is true | Boolean Option[^1] (§4.3.10, p. 427). |
-| `movf ar, as, bt` | RRR | Move `as` to `ar` if Boolean register `bt` is false | Boolean Option[^1] (§4.3.10, p. 417). |
+| `movt ar, as, bt` | RRR | Move `as` to `ar` if Boolean register `bt` is true | Boolean Option[^1] (§4.3.10 on p. 65; description p. 428). |
+| `movf ar, as, bt` | RRR | Move `as` to `ar` if Boolean register `bt` is false | Boolean Option[^1] (§4.3.10 on p. 65; description p. 417). |
 
 Every conditional move is a full no-op on the untaken side: the destination
 register is left completely unchanged, not merged bit-by-bit, so a
@@ -166,15 +174,15 @@ multiply-accumulate instructions are out of scope for this page.
 
 | Instruction | Format | Option | Operation |
 |---|---|---|---|
-| `mul16s ar, as, at` | RRR | 16-bit Integer Multiply[^1] (§4.3.4, p. 57) | Signed 16x16 multiply of the low 16 bits of `as` and `at`, full 32-bit product. |
-| `mul16u ar, as, at` | RRR | 16-bit Integer Multiply[^1] | Unsigned counterpart. |
-| `mull ar, as, at` | RRR | 32-bit Integer Multiply[^1] (§4.3.5, p. 450) | Low 32 bits of a 32x32 product. Valid for both signed and unsigned inputs, since the low half does not depend on sign. |
-| `mulsh ar, as, at` | RRR | 32-bit Integer Multiply, Mul32High sub-option[^1] (p. 452) | High 32 bits of a signed 32x32 product. |
-| `muluh ar, as, at` | RRR | 32-bit Integer Multiply, Mul32High sub-option[^1] (p. 451) | High 32 bits of an unsigned 32x32 product. |
-| `quos ar, as, at` | RRR | 32-bit Integer Divide[^1] (§4.3.6, p. 471) | Signed quotient; truncates toward zero (the manual specifies the quotient times the divisor stays smaller in magnitude than the dividend). Raises Integer Divide by Zero if `at` is 0. |
+| `mul16s ar, as, at` | RRR | 16-bit Integer Multiply[^1] (§4.3.4 on p. 57; description p. 436) | Signed 16x16 multiply of the low 16 bits of `as` and `at`, full 32-bit product. |
+| `mul16u ar, as, at` | RRR | 16-bit Integer Multiply[^1] (p. 437) | Unsigned counterpart. |
+| `mull ar, as, at` | RRR | 32-bit Integer Multiply[^1] (§4.3.5 on p. 58; description p. 450) | Low 32 bits of a 32x32 product. Valid for both signed and unsigned inputs, since the low half does not depend on sign. |
+| `mulsh ar, as, at` | RRR | 32-bit Integer Multiply, Mul32High sub-option[^1] (p. 455) | High 32 bits of a signed 32x32 product. |
+| `muluh ar, as, at` | RRR | 32-bit Integer Multiply, Mul32High sub-option[^1] (p. 456) | High 32 bits of an unsigned 32x32 product. |
+| `quos ar, as, at` | RRR | 32-bit Integer Divide[^1] (§4.3.6 on p. 59; description p. 471) | Signed quotient; truncates toward zero (the manual specifies the quotient times the divisor stays smaller in magnitude than the dividend). Raises Integer Divide by Zero if `at` is 0. |
 | `quou ar, as, at` | RRR | 32-bit Integer Divide[^1] (p. 472) | Unsigned quotient. |
-| `rems ar, as, at` | RRR | 32-bit Integer Divide[^1] (p. 474) | Signed remainder. |
-| `remu ar, as, at` | RRR | 32-bit Integer Divide[^1] (p. 475) | Unsigned remainder. |
+| `rems ar, as, at` | RRR | 32-bit Integer Divide[^1] (p. 475) | Signed remainder. |
+| `remu ar, as, at` | RRR | 32-bit Integer Divide[^1] (p. 476) | Unsigned remainder. |
 
 The manual gives semantics but never a cycle count or a pipelining model for
 any of these: the ISA reference explicitly leaves algorithm and speed to the
@@ -220,30 +228,30 @@ bytes[^1] (p. 274, `beqz`).
 | `bnone as, at, label` | RRI8 | no bit set in mask `at` is set in `as` (inverse of `bany`) |
 
 All of these are Core Architecture, no option gate[^1] (Table 4-26, pp.
-51-52; individual descriptions pp. 263-274). Every instruction in this table
+51-53; individual descriptions pp. 263-291). Every instruction in this table
 assembled and produced the expected bit pattern against the local
-toolchain[^4]. Every conditional branch here has an unconditional-move-style
-escape hatch when the target is out of range: the assembler substitutes an
-equivalent instruction sequence automatically, unless the mnemonic is
-prefixed with an underscore, in which case an out-of-range target is a hard
-assemble-time error instead of a silent long-branch sequence[^1].
+toolchain[^4]. When a branch target is out of range the assembler
+substitutes an equivalent instruction sequence rather than failing;
+prefixing the mnemonic with an underscore disables that and makes an
+out-of-range target a hard assemble-time error instead of a silent
+multi-instruction expansion[^1].
 
 ## Narrow (`.n`) encodings and the literal pool
 
 The Code Density Option adds a second, 16-bit-wide encoding for a handful of
 very common instructions, each with a correspondingly smaller immediate
-range[^1] (§4.3.1, Table 4-27, p. 53):
+range[^1] (§4.3.1 on p. 53, Table 4-27 on p. 54):
 
 | 16-bit form | Format | Range vs. the 24-bit form |
 |---|---|---|
 | `add.n ar, as, at` | RRRN | Same as `add`, no immediate to shrink. |
-| `addi.n ar, as, imm` | RRRN | Immediate is -1 or 1..15 (0 is not encodable; -1 is encoded as the field value 0)[^1] (p. 252). |
+| `addi.n ar, as, imm` | RRRN | Immediate is -1 or 1..15 (0 is not encodable; -1 is encoded as the field value 0)[^1] (p. 252). `addi.n a2, a3, 0` is an assemble-time error[^4]. |
 | `l32i.n at, as, 0..60` | RRRN | 4-bit offset, multiples of 4, so 0 to 60 instead of `l32i`'s 0 to 1020[^1]. |
 | `s32i.n at, as, 0..60` | RRRN | Same restriction as `l32i.n`[^1]. |
 | `mov.n ar, as` | RRRN | Plain register move, no immediate. |
-| `movi.n ar, imm` | RI7 | Immediate -32..95, versus `movi`'s -2048..2047[^1] (Table 4-27). |
+| `movi.n ar, imm` | RI7 | Immediate -32..95, versus `movi`'s -2048..2047[^1] (Table 4-27, p. 54; `movi` p. 421, `movi.n` p. 422). Both ends confirmed: -32 and 95 assemble, -33 and 96 do not[^4]. `movi` with a wider immediate becomes a literal load[^1]. |
 | `beqz.n as, label` | RI6 | 6-bit **unsigned** offset, forward only: target is `PC + imm6 + 4`, so 4 to 67 bytes forward, and only forward[^1] (p. 275). |
-| `bnez.n as, label` | RI6 | Same restriction as `beqz.n`[^1]. |
+| `bnez.n as, label` | RI6 | Same restriction as `beqz.n`[^1] (p. 291). |
 | `ret.n` | RRRN | Same as `ret`, 16-bit encoding. |
 
 The assembler, not the programmer, decides which form to emit. Writing the
@@ -343,8 +351,17 @@ substitution is unconditional whenever the target supports it[^2][^3].
   to confirm that Cadence does not publish per-instruction Xtensa latency
   figures; not cited for any semantic or numeric claim.
 
+Two neighbouring leaves carry what this page leaves out: which of these
+options the ESP32-S3 was actually configured with is in
+[the configured-options leaf](./core-isa-and-configured-options.md), and the
+`LOOP` family and its restrictions are in
+[the zero-overhead loops leaf](./zero-overhead-loops.md). Floating-point
+scalar instructions are in
+[the floating-point leaf](./floating-point-option-on-lx7.md).
+
 [^1]: Tensilica, Inc., *Xtensa Instruction Set Architecture (ISA) Reference Manual*, Issue Date 4/2010, "For All Xtensa Processor Cores". Section and page numbers given inline above; public mirror <https://0x04.net/~mwk/doc/xtensa.pdf>.
 [^2]: GNU Binutils, `as` manual, "Xtensa Options" and neighboring Xtensa sections, <https://sourceware.org/binutils/docs/as/Xtensa-Options.html>, fetched 2026-09-06.
-[^3]: GCC online documentation, "Xtensa Options", <https://gcc.gnu.org/onlinedocs/gcc/Xtensa-Options.html>, fetched 2026-09-06.
-[^4]: [measured] `xtensa-esp32s3-elf-as` / `xtensa-esp32s3-elf-objdump`, crosstool-NG `esp-14.2.0_20241119`, GNU assembler 2.43.1. Test sources assembled and disassembled locally, not retained in this repository.
+[^3]: GCC online documentation, "Xtensa Options", version 14.2.0, <https://gcc.gnu.org/onlinedocs/gcc-14.2.0/gcc/Xtensa-Options.html>, fetched 2026-09-06. The version-pinned page lists eleven distinct options: `-mconst16`, `-mfused-madd`, `-mserialize-volatile`, `-mforce-no-pic`, `-mtext-section-literals`, `-mauto-litpools`, `-mtarget-align`, `-mlongcalls`, `-mabi=`, `-mextra-l32r-costs=` and `-mstrict-align`.
+[^4]: [measured] 2026-09-06, `xtensa-esp32s3-elf-as` / `xtensa-esp32s3-elf-objdump`, crosstool-NG `esp-14.2.0_20241119`, GNU assembler 2.43.1, one instruction per source file, disassembled back. Accepted and rejected immediates, each checked at both ends: `sext` and `clamps` accept 7 and 22 and reject 0, 6, 23 and 24; `movi.n` accepts -32 and 95 and rejects -33 and 96; `addi.n` accepts -1 and 15 and rejects 0. Substitutions observed with transforms on: `slli a2, a3, 0` becomes `mov.n a2, a3`; `srli a2, a3, 16` becomes `extui a2, a3, 16, 16`; `l32i a2, a3, 40` becomes `l32i.n`; `addi a2, a3, 5` becomes `addi.n`; a forward `beqz` becomes `beqz.n` while a backward `bnez` stays in the 24-bit form. With `_` prefixes (`_slli`, `_srli`, `_s32i`, `_addi`) the substitutions do not happen and the out-of-range cases become errors. Test sources not retained in this repository.
+[^6]: ESP-IDF 5.5.1, `components/xtensa/esp32s3/include/xtensa/config/core-isa.h`, the `XCHAL_HAVE_*` option macros. The full table for this core is in [the configured-options leaf](./core-isa-and-configured-options.md).
 [^5]: Tensilica ISA Reference Manual, §4.3.5 and §4.3.6 (multiply/divide algorithm and speed left to the implementation)[^1]; corroborated by an esp32.com forum thread noting Cadence does not publish Xtensa per-instruction cycle counts, consulted for that observation only, not as a semantic source.

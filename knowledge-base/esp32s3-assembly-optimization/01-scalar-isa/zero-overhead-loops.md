@@ -3,7 +3,7 @@ title: Zero-overhead loops on the ESP32-S3 (LOOP, LOOPNEZ, LOOPGTZ)
 id: 01-scalar-isa/zero-overhead-loops
 schema_version: 1
 doc_type: reference
-status: draft
+status: review
 last_reviewed: 2026-09-06
 tags: [esp32s3, xtensa, lx7, loop, hardware-loop, gcc, binutils, inline-asm]
 confidence: high
@@ -17,7 +17,12 @@ penalty.[^coreisa][^isa-loopopt] The feature is three instructions (`LOOP`,
 `LOOPNEZ`, `LOOPGTZ`), three special registers, and a set of restrictions
 that are easy to trip over. This page covers those restrictions, the
 conditions GCC 14 needs before it emits a hardware loop, and how to check
-that you got one.
+that you got one. For the option in the wider table of what this core was
+configured with, see
+[the configured-options leaf](./core-isa-and-configured-options.md); for
+reading a lost loop out of a real function's assembly alongside its other
+symptoms, see
+[the register-pressure leaf](../04-toolchain-and-codegen/register-pressure-spills-and-reading-the-assembly.md).
 
 ## The three instructions
 
@@ -177,9 +182,21 @@ The backend's own conditions, from `xtensa.cc`:[^gcc-cc]
 - `xtensa_invalid_within_doloop` rejects a body containing a call
   ("Function call in the loop.") or a return.
 - `hwloop_optimize`, the callback run from `machine_dependent_reorg`,
-  rejects the loop if `loop->depth > 1`, if it has more than one entry, if
-  it is not entered from its head, if `loop->has_call || loop->has_asm`, or
-  if the iteration register is used inside or outside the loop.
+  rejects the loop for any of six reasons, each with its own line in the
+  RTL dump: `loop->depth > 1` ("is not innermost"), no single incoming
+  destination ("has more than one entry"), `loop->incoming_dest !=
+  loop->head` ("is not entered from head"), `loop->has_call ||
+  loop->has_asm` ("has invalid insn"), `loop->iter_reg_used ||
+  loop->iter_reg_used_outside` ("uses iterator"), and the start label not
+  preceding the loop end ("start_label not before loop_end").
+
+The two lists overlap but are not the same test. `xtensa_can_use_doloop_p`
+and `xtensa_invalid_within_doloop` run in the earlier `loop2_doloop` pass,
+which decides whether to insert the `doloop` pattern at all;
+`hwloop_optimize` runs late, in `machine_dependent_reorg`, and can still
+throw the loop away after the pattern is in place. Inline asm is only
+caught by the late one, which is why a loop can look accepted in the
+`loop2_doloop` dump and still come out as `bnez`.
 
 **Any inline asm in the body kills the hardware loop.** That is the
 `loop->has_asm` test, and it applies to an `__asm__` statement anywhere in
@@ -195,6 +212,7 @@ rules above.[^gcc-emit] The generated shape, from `-O2 -S` on
 `for (i = 0; i < n; i++) d[i] = s[i] + k;`:[^measured-codegen]
 
 ```
+	extui	a5, a5, 0, 16     # narrow k to 16 bits
 	blti	a4, 1, .L1        # GCC's own zero-trip guard
 	add.n	a4, a4, a4
 	addi	a8, a4, -2
@@ -240,14 +258,14 @@ Assembled and disassembled with the same toolchain:[^measured-example]
 
 ```
 00000000 <inc16>:
-   0:	3df0        nop.n              # inserted by gas for loop alignment
-   2:	76940b      loopnez a4, 11
-   5:	521300      l16ui   a5, a3, 0
-   8:	1b55        addi.n  a5, a5, 1  # gas narrowed addi to addi.n
-   a:	525200      s16i    a5, a2, 0
-   d:	2b33        addi.n  a3, a3, 2
-   f:	2b22        addi.n  a2, a2, 2
-  11:	0df0        ret.n
+   0:	f03d        nop.n              # inserted by gas for loop alignment
+   2:	0b9476      loopnez a4, 11
+   5:	001352      l16ui   a5, a3, 0
+   8:	551b        addi.n  a5, a5, 1  # gas narrowed addi to addi.n
+   a:	005252      s16i    a5, a2, 0
+   d:	332b        addi.n  a3, a3, 2
+   f:	222b        addi.n  a2, a2, 2
+  11:	f00d        ret.n
 ```
 
 Rules for hand-written loops:
@@ -303,13 +321,13 @@ Rules for hand-written loops:
 [^gas-align]: GNU binutils, GNU assembler manual, "Xtensa Automatic Alignment": "the first instruction in the loop body does not cross an instruction fetch boundary (e.g., with a 32-bit fetch width, a `LOOP` instruction must be on either a 1 or 2 mod 4 byte boundary)". https://sourceware.org/binutils/docs/as/Xtensa-Automatic-Alignment.html
 [^idf-ctx]: ESP-IDF 5.5.1, `components/xtensa/xtensa_context.S`, lines 133 to 140 (save) and 274 to 281 (restore), both guarded by `#if XCHAL_HAVE_LOOPS`.
 [^idf-portasm]: ESP-IDF 5.5.1, `components/freertos/FreeRTOS-Kernel/portable/xtensa/portasm.S`, lines 133 and 263: `call0 _xt_context_save` / `call0 _xt_context_restore`.
-[^idf-vectors]: ESP-IDF 5.5.1, `components/xtensa/xtensa_vectors.S`, "Set up PS for C, enable interrupts above this level and clear EXCM" at lines 744 and 1229, and the high priority interrupt commentary at line 1674.
+[^idf-vectors]: ESP-IDF 5.5.1, `components/xtensa/xtensa_vectors.S`: the comment "Set up PS for C, enable interrupts above this level and clear EXCM" at line 1229 and repeated at 1318, 1398, 1477, 1556 and 1635, one per interrupt level; the debug vector at line 744 clears EXCM with its own wording ("re-enable debug and NMI interrupts"); the high priority interrupt commentary is the block at lines 1674 to 1687, which states that such handlers "cannot interact with the RTOS".
 [^gcc-h]: GCC 14 branch, `gcc/config/xtensa/xtensa.h`, line 52: `#define TARGET_LOOPS XCHAL_HAVE_LOOPS`. https://github.com/gcc-mirror/gcc/blob/releases/gcc-14/gcc/config/xtensa/xtensa.h
 [^gcc-md]: GCC 14 branch, `gcc/config/xtensa/xtensa.md`, "Zero-overhead looping support" section: `zero_cost_loop_start` (output template `"loop\t%0, %l1_LEND"`), `zero_cost_loop_end`, `loop_end` and `doloop_end`, all with condition `"TARGET_LOOPS && optimize"`. https://github.com/gcc-mirror/gcc/blob/releases/gcc-14/gcc/config/xtensa/xtensa.md
 [^gcc-cc]: GCC 14 branch, `gcc/config/xtensa/xtensa.cc`: `xtensa_can_use_doloop_p`, `xtensa_invalid_within_doloop`, `hwloop_optimize`, `hwloop_fail` and `xtensa_reorg`'s call to `reorg_loops`. https://github.com/gcc-mirror/gcc/blob/releases/gcc-14/gcc/config/xtensa/xtensa.cc
 [^gcc-emit]: Same file, `xtensa_emit_loop_end` and its comment explaining why a `nop` is needed when the body ends in a label or a branch.
 [^measured-range]: `[measured]` 2026-09-06, `xtensa-esp-elf-as --no-transform` from `xtensa-esp-elf` GCC 14.2.0 (crosstool-NG esp-14.2.0_20241119). Bodies of 250, 254 and 256 bytes assemble; 258 and 260 fail with `Error: operand 2 of 'loop' has out of range value '261'` and `'263'`.
-[^measured-align]: `[measured]` 2026-09-06, same assembler. A `loop` whose body starts with a 2-byte instruction at 3 mod 4 gets a `nop.n` inserted ahead of it; with `--no-transform` the same input warns `unaligned loop: 2 bytes at 0x3`; `--no-target-align` does not suppress the inserted no-op.
+[^measured-align]: `[measured]` 2026-09-06, same assembler. Two mechanisms were seen, both documented: in one input a `nop.n` was inserted ahead of the `loop`, in another a preceding `nop.n` was widened to a 3-byte `nop` instead, which is what the ISA manual describes for this case ("the insertion of NOP instructions or adjustment of which instructions are 16-bit density instructions").[^isa-loop] With `--no-transform` the same input warns `unaligned loop: N bytes at 0xM` and emits nothing to fix it; `--no-target-align` does not suppress the fix.
 [^measured-asm]: `[measured]` 2026-09-06, `xtensa-esp32s3-elf-gcc -O2 -S` (14.2.0, esp-14.2.0_20241119). Two 16-bit copy loops in one translation unit: the one whose load is written as `__asm__ ("l16ui %0, %1, 0")` ends in `bnez.n`, the plain C one gets `loop a8, .L9_LEND`.
 [^measured-codegen]: `[measured]` 2026-09-06, same compiler and flags, on `void f(uint16_t *d, const uint16_t *s, int n, uint16_t k) { for (int i = 0; i < n; i++) d[i] = s[i] + k; }`. A two-level nest compiled with `-fno-unroll-loops` puts `loop` on the inner loop only and re-runs the four-instruction setup inside the outer `bne` loop.
 [^measured-example]: `[measured]` 2026-09-06, `xtensa-esp-elf-as` then `xtensa-esp-elf-objdump -d`, same toolchain, on the `inc16` listing above.

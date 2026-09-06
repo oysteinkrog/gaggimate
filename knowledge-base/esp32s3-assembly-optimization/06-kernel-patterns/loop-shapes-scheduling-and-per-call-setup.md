@@ -3,7 +3,7 @@ title: Loop shapes, scheduling, and per-call setup on the LX7
 id: 06-kernel-patterns/loop-shapes-scheduling-and-per-call-setup
 schema_version: 1
 doc_type: how-to
-status: draft
+status: review
 last_reviewed: 2026-09-06
 tags: [esp32s3, xtensa, lx7, loops, scheduling, software-pipelining, memcpy, register-pressure, gcc]
 confidence: medium
@@ -13,7 +13,7 @@ confidence: medium
 
 The LX7 issues at most one instruction per cycle, in order, with no branch
 prediction beyond the Loop Option's hardware loop and no out-of-order
-window to hide a stall behind. `00-foundations/lx7-core-pipeline-and-cost-model.md`
+window to hide a stall behind. [LX7 core pipeline and cost model](../00-foundations/lx7-core-pipeline-and-cost-model.md)
 gives the full cost model; the fact this page leans on is that a loaded
 value is not ready for the instruction right after the load, so a
 dependent instruction issued back to back stalls one cycle, and one
@@ -23,7 +23,7 @@ so that gap gets filled and the loop's own overhead is not paid at all.
 
 ## 1. Give the compiler a trip count it can hand to LOOPNEZ
 
-`01-scalar-isa/zero-overhead-loops.md` covers the instruction-level
+[Zero-overhead loops](../01-scalar-isa/zero-overhead-loops.md) covers the instruction-level
 mechanics of `LOOP`/`LOOPNEZ`/`LOOPGTZ`: one set of loop registers, no
 nesting, a 256-byte body cap, and a trip count read once at loop entry.
 The consequence for how you write the loop: state the iteration count as
@@ -147,38 +147,58 @@ about avoiding sub-word writes, not a published cycle cost on this core.
 
 ## 9. memcpy and memset: what actually runs, and when a hand loop wins
 
-On the ESP32-S3, `memcpy` is not a byte loop and does not come from the
-boot ROM. The ROM's linker script exports exactly one memcpy-shaped
-symbol, `xthal_memcpy`[^romld], the Tensilica HAL bulk-copy helper, not
-the C library's `memcpy`. The C library's own optimized override for
-misaligned access, gated by `CONFIG_LIBC_OPTIMIZED_MISALIGNED_ACCESS`,
-depends on a ROM capability, `ESP_ROM_HAS_SUBOPTIMAL_NEWLIB_ON_MISALIGNED_MEMORY`,
-defined only for this chip family's RISC-V members (C2, C3, C5, C6, C61,
-H2, H21, P4)[^idfcaps], never for the ESP32-S3. So on the ESP32-S3 that
-override never compiles in, and `memcpy` resolves to the `xtensa-esp-elf`
-GCC 14 toolchain's own bundled C library.
+On the ESP32-S3 under ESP-IDF, `memcpy` is a call into the boot ROM. A
+linker fragment, `components/esp_rom/esp32s3/ld/esp32s3.rom.libc.ld`,
+assigns `memset`, `memcpy` and `memmove` absolute ROM addresses, and the
+`esp_rom` component links that fragment whenever the target declares
+`ESP_ROM_HAS_NEWLIB`, which the ESP32-S3 does[^romld]. Because a linker
+script assignment defines the symbol, no library member supplying `memcpy`
+is ever pulled in. A firmware ELF built with ESP-IDF 5.5.1 and this
+toolchain shows it: `memcpy` is an absolute symbol at `0x400011f4`, and
+the ROM at that address is a two-instruction trampoline (`l32r`, `jx`)
+into the real body at `0x40056f44`[^romelf], inside Internal ROM 1, so
+the copy runs from on-chip ROM and never occupies the instruction
+cache[^trmrom].
 
-That implementation is a hand-written Xtensa assembly kernel, not a
-portable C loop: newlib's `libc/machine/xtensa/memcpy.S`. Its own header
-gives the algorithm: align the destination with conditional 1- and 2-byte
-copies, then "if the source is aligned, copy 16 bytes with a loop... Else
-(if source is unaligned), do the same, but use SRC to align the source
-data"[^newlibmemcpy]. Disassembling the object actually linked for this
-target confirms the same shape: a `LOOPNEZ`-driven aligned path moving 16
-bytes per iteration with `l32i.n`/`s32i.n`, and a misaligned path that uses
-`SSA8L` to set a shift amount and `SRC` to combine two loaded words before
-each store, so even a misaligned source still produces word-sized
-stores[^toolchainmemcpy]. It never touches the PIE vector unit (see
-`02-pie-vector/`).
+The ROM body is newlib's Xtensa `memcpy`, not a portable C loop. Its
+source header gives the algorithm: align the destination with conditional
+1- and 2-byte copies, then "if the source is aligned, copy 16 bytes with a
+loop... Else (if source is unaligned), do the same, but use SRC to align
+the source data"[^newlibmemcpy]. Disassembling the ROM confirms exactly
+that shape: `bbsi` tests on the destination's low bits, a `loopnez`-driven
+aligned path moving 16 bytes per iteration with `l32i.n`/`s32i.n`, `bbci`
+and `bbsi` tails for 8, 4, 2 and 1 bytes, and a misaligned-source path
+that uses `SSA8L` to set a shift amount and `SRC` to combine two loaded
+words before each store, so even a misaligned source still produces
+word-sized stores[^romelf]. The ROM even carries newlib's own internal
+label for the byte-by-byte prologue, `__memcpy_aux`[^romelf]. The same code
+is in the toolchain's own
+`libc.a` as `libc_a-memcpy.o`, which is what would link if the ROM
+fragment were absent[^toolchainmemcpy]. Neither touches the PIE vector
+unit (see
+[PIE load, store and alignment](../02-pie-vector/pie-load-store-and-alignment.md)).
+
+Two things this does not mean. ESP-IDF does ship its own tuned string
+routines, but not for this chip: `components/newlib/CMakeLists.txt` gates
+them behind `CONFIG_LIBC_OPTIMIZED_MISALIGNED_ACCESS`, that option
+`depends on ESP_ROM_HAS_SUBOPTIMAL_NEWLIB_ON_MISALIGNED_MEMORY`, and that
+capability is declared only by the family's RISC-V members (C2, C3, C5,
+C6, C61, H2, H21, P4)[^idfcaps], never by the ESP32-S3, whose sources for
+it live under `src/port/riscv/` anyway. And `xthal_memcpy` at `0x40001ba8`
+is a separate ROM symbol, the Tensilica HAL bulk-copy helper, not what a C
+`memcpy` call reaches[^romld]. Which implementation the build links is
+also why ESP-IDF passes `-fno-builtin-memcpy` and friends; see
+[GCC 14 Xtensa flags and what they cost](../04-toolchain-and-codegen/gcc14-xtensa-flags-and-what-they-cost.md).
 
 A hand-written copy loop wins only where one of the library's fixed costs
-does not apply: a compile-time-constant length short enough that the
-library's own alignment and tail-length dispatch cost more than the copy;
-a length and alignment known to be a multiple of 16 bytes, making the tail
-handling dead weight; or a throughput need above what word-sized transfers
-give, which needs the PIE unit this library never reaches for. Absent one
-of those, the shipped `memcpy` already does what this page recommends: a
-hardware loop, hoisted alignment handling, and word-sized stores.
+does not apply: a compile-time-constant length short enough that the ROM
+call, its trampoline hop and its alignment and tail-length dispatch cost
+more than the copy; a length and alignment known to be a multiple of 16
+bytes, making the tail handling dead weight; or a throughput need above
+what word-sized transfers give, which needs the PIE unit this code never
+reaches for. Absent one of those, the shipped `memcpy` already does what
+this page recommends: a hardware loop, hoisted alignment handling, and
+word-sized stores.
 
 ## 10. Branchless selection instead of compare-and-branch
 
@@ -213,9 +233,9 @@ enough to stay resident across both passes.
 ## 12. Confirming the shape actually landed
 
 None of this is real until it is checked in the compiler's own output.
-`04-toolchain-and-codegen/` covers producing the `.S` for one file and
-reading it for spills, a lost hardware loop, and libcalls in place of
-inline instructions. The checklist specific to this page: confirm a
+[Register pressure, spills and reading the assembly](../04-toolchain-and-codegen/register-pressure-spills-and-reading-the-assembly.md)
+covers producing the `.S` for one file and reading it for spills, a lost
+hardware loop, and libcalls in place of inline instructions. The checklist specific to this page: confirm a
 `LOOPNEZ`/`LOOPGTZ`/`LOOP` actually appears rather than a
 compare-and-branch (§1, §2); confirm hoisted values are computed once,
 above the loop label (§3); confirm an interleaved or unrolled body's live
@@ -233,14 +253,23 @@ a fact about the build in hand.
     issue, so put one independent instruction between a load and its
     consumer. Mirror: <https://0x04.net/~mwk/doc/xtensa.pdf>, read
     2026-09-06. Restated for this chip in
-    `00-foundations/lx7-core-pipeline-and-cost-model.md` §3.
-[^loopnez]: Same manual, "LOOPNEZ" instruction description, pp. 396-397
-    (no mid-loop restart; no nesting; calls inside a loop are usually
-    inappropriate), and Section 4.3.2/4.3.2.2, pp. 54-55 (256-byte body
-    cap: `LEND` is the `LOOP` address plus an unsigned 8-bit immediate plus
-    4). Full instruction-level treatment:
-    `01-scalar-isa/zero-overhead-loops.md`.
-[^windows]: This collection, `00-foundations/register-windows-and-windowed-abi.md`:
+    [LX7 core pipeline and cost model](../00-foundations/lx7-core-pipeline-and-cost-model.md).
+[^loopnez]: Same manual, "LOOPNEZ" instruction description, pp. 396-397:
+    "There is no mechanism to proceed to the next iteration of the loop
+    from the middle of the loop" (p. 396); "Branches and jumps to the
+    address contained in LEND do not cause a loop back, and therefore may
+    be used to exit the loop prematurely" (p. 396); "Because loops cannot
+    be nested, it is usually inappropriate to include a procedure call
+    inside a loop (the callee might itself use a zero-overhead loop)"
+    (p. 397). The 256-byte body cap is in the same description, p. 396:
+    `LEND` is the instruction's own address plus four plus a zero-extended
+    8-bit immediate, "therefore, the loop code may be up to 256 bytes in
+    length" (identically worded for `LOOP`, p. 392). Section 4.3.2.2,
+    pp. 55-56, adds the separate alignment and last-instruction
+    restrictions. Full instruction-level treatment:
+    [Zero-overhead loops](../01-scalar-isa/zero-overhead-loops.md).
+[^windows]: This collection,
+    [Register windows and the windowed ABI](../00-foundations/register-windows-and-windowed-abi.md):
     every `CALLn`/`CALLXn` rotates `WindowBase`; a window overflow or
     underflow costs an exception, a handler that spills or reloads 4, 8, or
     12 registers, and an exception return.
@@ -263,7 +292,8 @@ a fact about the build in hand.
     Technique for VLIW Machines", *Proceedings of the ACM SIGPLAN 1988
     Conference on Programming Language Design and Implementation*,
     pp. 318-328. DOI: 10.1145/53990.54022.
-[^regs]: This collection, `00-foundations/register-windows-and-windowed-abi.md`:
+[^regs]: This collection,
+    [Register windows and the windowed ABI](../00-foundations/register-windows-and-windowed-abi.md):
     `a0`/`a1` reserved for return address and stack pointer under the
     windowed ABI, leaving `a2`-`a15` (14 registers) for a leaf function; a
     function issuing a `call8` has only `a2`-`a7` (6) live across the call.
@@ -274,10 +304,15 @@ a fact about the build in hand.
 [^unroll2]: Same manual, same section, `-funroll-all-loops`.
 [^storeinterlock]: Tensilica ISA manual (see [^pipe]), Section 8.4.2,
     p. 609.
-[^romld]: ESP-IDF v5.5.1 (PlatformIO package `framework-espidf` 3.50501),
-    `components/esp_rom/esp32s3/ld/esp32s3.rom.ld`, line 496:
-    `xthal_memcpy = 0x40001ba8;`. No `memcpy`/`memset`/`memmove` symbol
-    appears in this chip's ROM link fragments.
+[^romld]: ESP-IDF v5.5.1 (PlatformIO package `framework-espidf` 3.50501).
+    `components/esp_rom/esp32s3/ld/esp32s3.rom.libc.ld`, lines 7 to 9:
+    `memset = 0x400011e8;`, `memcpy = 0x400011f4;`,
+    `memmove = 0x40001200;`. `components/esp_rom/CMakeLists.txt` links that
+    fragment for every target except esp32 and esp32s2 when
+    `CONFIG_ESP_ROM_HAS_NEWLIB` is set;
+    `components/esp_rom/esp32s3/esp_rom_caps.h`, line 26, sets it to 1.
+    `xthal_memcpy = 0x40001ba8;` is a separate symbol in
+    `components/esp_rom/esp32s3/ld/esp32s3.rom.ld`, line 496.
 [^idfcaps]: ESP-IDF v5.5.1: `components/newlib/CMakeLists.txt` gates
     `src/port/riscv/memcpy.c` and siblings behind
     `CONFIG_LIBC_OPTIMIZED_MISALIGNED_ACCESS`; `components/newlib/Kconfig`
@@ -289,16 +324,35 @@ a fact about the build in hand.
     repository, `xtensa` branch, same path, read 2026-09-06.
 [^toolchainmemcpy]: Toolchain observation, `xtensa-esp-elf-gcc` 14.2.0
     (crosstool-NG `esp-14.2.0_20241119`), target `xtensa-esp32s3-elf`,
-    2026-09-06: `memcpy` extracted from `xtensa-esp-elf/lib/esp32s3/libc.a`
-    (member `libc_a-memcpy.o`), disassembled with `xtensa-esp-elf-objdump
-    -d`; matches [^newlibmemcpy] instruction for instruction.
+    2026-09-06: `libc_a-memcpy.o` extracted from
+    `xtensa-esp-elf/lib/esp32s3/libc.a` and disassembled with
+    `xtensa-esp-elf-objdump -d`; it is [^newlibmemcpy] assembled. It is
+    present in the archive but not linked into an ESP-IDF image, because
+    the ROM fragment has already defined the symbol[^romld].
+
+[^romelf]: Two observations, 2026-09-06. First, `xtensa-esp32s3-elf-nm` on
+    an ESP32-S3 firmware ELF built with ESP-IDF 5.5.1 and this toolchain
+    lists `memcpy`, `memmove` and `memset` as absolute (`A`) symbols at
+    `0x400011f4`, `0x40001200` and `0x400011e8`, and `xthal_memcpy` at
+    `0x40001ba8`. Second, `xtensa-esp32s3-elf-objdump -d` on
+    `esp32s3_rev0_rom.elf` (Espressif `esp-rom-elfs` 20241011) shows
+    `__call_memcpy` at `0x400011f4` as `l32r a9, ...` then `jx a9`, and
+    `memcpy` at `0x40056f44` as the algorithm described.
+
+[^trmrom]: ESP32-S3 Technical Reference Manual v1.8, Chapter 4 "System and
+    Memory", Table 4.3-1 and Section 4.3, p. 403: Internal ROM 1 occupies
+    `0x4004_0000` to `0x4005_FFFF` (128 KB) on the instruction bus, which
+    contains `0x40056f44`.
 [^moveqz]: Tensilica ISA manual (see [^pipe]), "MOVEQZ" instruction
     description, p. 415: Required Configuration Option "Core Architecture".
     `MOVNEZ`, `MOVLTZ`, `MOVGEZ` are the same option.
-[^maxu]: Same manual, "MAXU" instruction description, p. 407: Required
+[^maxu]: Same manual, "MAXU" instruction description, p. 408: Required
     Configuration Option "Miscellaneous Operations Option" (Section 4.3.8,
-    p. 62), not core architecture. `MINU` and signed `MAX`/`MIN` are the
-    same family and option.
+    p. 62), not core architecture. `MINU` (p. 411) and signed `MAX`
+    (p. 407) and `MIN` (p. 410) are the same family and option, and the
+    ESP32-S3 configures it: `XCHAL_HAVE_MINMAX` is 1 in
+    `components/xtensa/esp32s3/include/xtensa/config/core-isa.h`
+    (ESP-IDF 5.5.1).
 [^distribute]: Free Software Foundation, *GCC*, 14.2.0, "Optimize
     Options", `-ftree-loop-distribution`.
     gcc.gnu.org/onlinedocs/gcc-14.2.0/gcc/Optimize-Options.html, read

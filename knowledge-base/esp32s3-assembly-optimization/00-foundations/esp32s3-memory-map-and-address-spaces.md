@@ -3,7 +3,7 @@ title: "ESP32-S3 memory map and address spaces"
 id: 00-foundations/esp32s3-memory-map-and-address-spaces
 schema_version: 1
 doc_type: reference
-status: draft
+status: review
 last_reviewed: 2026-09-06
 tags: [esp32s3, xtensa, memory-map, iram, dram, psram, heap-caps]
 confidence: high
@@ -16,7 +16,8 @@ address a pointer must hold to land in a given kind of memory, which bus
 reaches it, what access widths are legal there, and which ESP-IDF macro or
 heap-capability flag asks for it. Cache behaviour (hit and miss cost,
 associativity, prefetch) is not repeated here; see
-`03-memory-hierarchy/` for that.
+[caches, SRAM, PSRAM and the MSPI bus](../03-memory-hierarchy/caches-sram-psram-and-the-mspi-bus.md)
+for that.
 
 ## 1. Two buses, one CPU, one shared boundary
 
@@ -76,8 +77,9 @@ SRAM 2 is data-side only.
 
 Total internal SRAM after subtracting any cache-repurposed portion is what
 ESP-IDF's linker script and heap allocator actually have to place things
-in; the icache/dcache size trade-off (16 vs 32 KB, 32 vs 64 KB) is a
-`03-memory-hierarchy/` topic, not repeated here.
+in; the icache/dcache size trade-off (16 or 32 KB, 32 or 64 KB) belongs to
+[caches, SRAM, PSRAM and the MSPI bus](../03-memory-hierarchy/caches-sram-psram-and-the-mspi-bus.md),
+not here.
 
 ## 4. RTC memory: 16 KB, two independent blocks
 
@@ -96,6 +98,12 @@ the block used to hand data back and forth with the ULP
 [Espressif2026a][^1]. RTC SLOW also has a second, peripheral-style address
 (`0x6002_1000`-`0x6002_2FFF`) in the module/peripheral address map; that
 is the same 8 KB, not a second copy [Espressif2026a][^1].
+
+One warning about the source. TRM v1.8's prose for RTC SLOW gives its
+shared address as `0x5000_E000`-`0x5001_FFFF`, which is neither 8 KB nor
+what Table 4.3-1 in the same section says. Table 4.3-1 is the row used
+here and everywhere below; the prose figure is a defect in the manual
+[Espressif2026a][^1].
 
 ## 5. External memory: flash and PSRAM through the cache
 
@@ -123,24 +131,29 @@ instruction bus address space can be mapped ... as individual 64 KB
 blocks via the ICache," and the same for the data-bus window and DCache
 [Espressif2026a][^1]. That 64 KB figure is the cache's MMU page size on
 this chip's usual configuration. ESP-IDF's flash MMU uses the same
-`SPI_FLASH_MMU_PAGE_SIZE`, which Kconfig sets from the flash size: 64 KB
-above 2 MB of flash, 32 KB for 2 MB flash, 16 KB for 1 MB flash, with an
-8 KB option gated behind per-chip support [ESPIDF2026b][^3]. The chip
-this repo targets ships with flash well above 2 MB, so 64 KB is the page
-size in practice; `03-memory-hierarchy/` covers what a page fault and a
-cache miss cost, not this page.
+`SPI_FLASH_MMU_PAGE_SIZE`, which Kconfig sets from the flash size on
+chips that allow it: `0x4000` (16 KB) for a 1 MB flash, `0x8000` (32 KB)
+for 2 MB, `0x2000` (8 KB) only where the chip declares support, and
+`0x10000` (64 KB) in every other case, which is the default a board with
+more than 2 MB of flash gets [ESPIDF2026b][^3].
+[Caches, SRAM, PSRAM and the MSPI bus](../03-memory-hierarchy/caches-sram-psram-and-the-mspi-bus.md)
+covers what a cache miss costs, not this page.
 
 Up to 1 GB of external flash and up to 1 GB of external RAM are
 addressable through the MMU's remapping, far more than the 32 MB windows
 above can hold mapped at once [Espressif2026a][^1]. Swapping which 64 KB
 pages are mapped where is an MMU operation, covered in
-`03-memory-hierarchy/`.
+[caches, SRAM, PSRAM and the MSPI bus](../03-memory-hierarchy/caches-sram-psram-and-the-mspi-bus.md).
 
 ## 6. Access-width rules, and what breaks them
 
 The instruction bus is 4-byte-access only, everywhere it reaches: internal
-ROM and SRAM over that bus, and the external instruction-bus cache window
-[Espressif2026a][^1]. The data bus tolerates byte, halfword, word and
+ROM and SRAM over that bus, and the external instruction-bus cache window.
+The TRM states the rule once, for the bus rather than per region: "The CPU
+can access data via the data bus using single-byte, double-byte, 4-byte
+and 16-byte alignment. The CPU can also access data via the instruction
+bus, but only in 4-byte aligned manner; non-aligned data access will cause
+a CPU exception" [Espressif2026a][^1] §4.3.1 p. 401. The data bus tolerates byte, halfword, word and
 16-byte accesses on internal SRAM and on the PSRAM side of the data-bus
 cache window; ROM over the data bus and flash over the data-bus window are
 read-only regardless of width.
@@ -166,11 +179,11 @@ does not offer that opt-in workaround on the S3
 (`IRAM_8BIT_ACCESSIBLE` is defined as false whenever the target is not the
 original ESP32 [ESPIDF2026f][^7]), so on this chip the rule is not "byte
 access to IRAM is slow," it is "byte access to IRAM is not offered as a
-supported path" and code should not depend on it. [uncertain] whether an
-unhandled fault of either cause simply is not installed for other
-regions on the S3, or whether the general panic handler always catches
-it; the S3-specific Kconfig text for this option was not found and only
-the ESP32-original Kconfig entry documents the cycle cost.
+supported path" and code should not depend on it. [uncertain] The cycle
+cost of the software handler on the S3 is not documented anywhere found:
+only the ESP32-original Kconfig entry gives a number, 167 cycles, and it
+is for that chip. Settling it needs a measurement on the S3, not another
+document.
 
 ## 7. DMA-capable memory
 
@@ -249,7 +262,7 @@ marks a figure not confirmed against a primary source.
 
 ## Footnotes
 
-[^1]: Espressif Systems, *ESP32-S3 Technical Reference Manual*, Version 1.8, Chapter 4 "System and Memory," Sections 4.2, 4.3.1-4.3.5, Tables 4.3-1, 4.3-2, 4.3-3. `https://documentation.espressif.com/esp32-s3_technical_reference_manual_en.pdf` (fetched 2026-09-06). Datasheet size figures cross-checked against Espressif Systems, *ESP32-S3 Datasheet*, Version 2.2, p.6 ("ROM: 384 KB," "SRAM: 512 KB," "SRAM in RTC: 16 KB"), `https://documentation.espressif.com/esp32-s3_datasheet_en.pdf` (fetched 2026-09-06).
+[^1]: Espressif Systems, *ESP32-S3 Technical Reference Manual*, Version 1.8, Chapter 4 "System and Memory": Section 4.3.1 "Address Mapping" (p. 401, the bus split and the access-width rule), Section 4.3.2 "Internal Memory" with Table 4.3-1 "Internal Memory Address Mapping" (pp. 402-404), Section 4.3.3.1 "External Memory Address Mapping" with Table 4.3-2 (pp. 404-405), and Section 4.2 with Table 4.3-3. Every address range in this document was read from Table 4.3-1 or Table 4.3-2. `https://documentation.espressif.com/esp32-s3_technical_reference_manual_en.pdf` (fetched 2026-09-06). Datasheet size figures cross-checked against Espressif Systems, *ESP32-S3 Datasheet*, Version 2.2, p.6 ("ROM: 384 KB," "SRAM: 512 KB," "SRAM in RTC: 16 KB"), `https://documentation.espressif.com/esp32-s3_datasheet_en.pdf` (fetched 2026-09-06).
 
 [^2]: ESP-IDF 5.5.1, `components/soc/esp32s3/include/soc/soc.h`, lines 167-200 (`SOC_IRAM_LOW`, `SOC_DRAM_LOW`, `SOC_DIRAM_IRAM_LOW`, `SOC_DIRAM_DRAM_LOW`, `SOC_I_D_OFFSET`, `MAP_DRAM_TO_IRAM`, `MAP_IRAM_TO_DRAM`); local path `~/.platformio/packages/framework-espidf/components/soc/esp32s3/include/soc/soc.h`.
 

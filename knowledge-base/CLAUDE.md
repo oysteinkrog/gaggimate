@@ -1,4 +1,4 @@
-# knowledge-base/ — Multi-topic knowledge base
+# knowledge-base/: multi-topic knowledge base
 
 This directory hosts curated, citation-strict knowledge bases. Each topic
 lives in its own subdirectory and is registered as its own qmd collection.

@@ -3,7 +3,7 @@ title: CCOUNT and timing a kernel on the ESP32-S3
 id: 05-measurement/ccount-cycle-counter-and-timing-a-kernel
 schema_version: 1
 doc_type: how-to
-status: draft
+status: review
 last_reviewed: 2026-09-06
 tags: [esp32s3, xtensa, measurement, ccount, esp-timer, benchmarking]
 confidence: medium
@@ -133,7 +133,9 @@ LX7 cores are separate pipelines. It does contend for shared memory, so a
 kernel whose operands live in PSRAM or in flash-cached `.rodata` can
 measure slower while the other core is busy on the same bus.
 `[uncertain]` The exact cache and bus arbitration is a memory-hierarchy
-question; see `03-memory-hierarchy/`. Measure under the neighbouring load
+question; see
+[caches, SRAM, PSRAM and the MSPI bus](../03-memory-hierarchy/caches-sram-psram-and-the-mspi-bus.md).
+Measure under the neighbouring load
 you expect in production, and say what that load was.
 
 **Preemption.** A context switch inside the interval adds another task's
@@ -295,7 +297,7 @@ nothing is that one of them changed.
 
 ESP-IDF paths are relative to an ESP-IDF 5.5.1 checkout (`version.txt`).
 
-[^isa]: Cadence/Tensilica, *Xtensa Instruction Set Architecture (ISA) Reference Manual*, Timer Interrupt Option, which defines `CCOUNT` and the `CCOMPAREn` registers. `[uncertain]` Edition and section are not confirmed here. The register number and the option name are confirmed from the Tensilica-generated headers below, not from the manual text.
+[^isa]: Cadence/Tensilica, *Xtensa Instruction Set Architecture (ISA) Reference Manual*, issue 4/2010 (RC-2010.1), Section 4.4.6 "Timer Interrupt Option" (p. 110), Table 5-175 "CCOUNT - Special Register #234" (p. 232) and Table 5-176 "CCOMPARE0..2 - Special Register #240-242" (p. 233): "The CCOUNT register increments on every processor-clock cycle."
 [^coreisa]: `components/xtensa/esp32s3/include/xtensa/config/core-isa.h`: `XCHAL_HAVE_CCOUNT 1 /* CCOUNT reg. (timer option) */` (354), `XCHAL_NUM_TIMERS 3` (355), `XCHAL_NUM_INTLEVELS 6` (359), `XCHAL_EXCM_LEVEL 3` (361).
 [^specreg]: `components/xtensa/include/xtensa/specreg.h`: `#define CCOUNT 234` (100), `CCOMPARE_0` 240 to `CCOMPARE_2` 242.
 [^espcpu]: `components/esp_hw_support/include/esp_cpu.h`, `esp_cpu_get_cycle_count()` (181) and its doc comment: "Each CPU core maintains an internal counter (i.e., cycle count) that increments every CPU clock cycle."

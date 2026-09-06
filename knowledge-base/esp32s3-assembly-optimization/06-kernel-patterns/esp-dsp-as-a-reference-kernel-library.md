@@ -3,7 +3,7 @@ title: Espressif's esp-dsp as a reference kernel library
 id: 06-kernel-patterns/esp-dsp-as-a-reference-kernel-library
 schema_version: 1
 doc_type: reference
-status: draft
+status: review
 last_reviewed: 2026-09-06
 tags: [esp32s3, xtensa, pie, esp-dsp, kernel-patterns, fixed-point, benchmarks]
 confidence: medium
@@ -45,19 +45,23 @@ than one input type or layout goes one level deeper (`matrix/mul/`,
 Every optimized file's suffix names its target: `_ansi` (portable C),
 `_ae32` (ESP32's Xtensa config, which has MAC16 and FP but no PIE), `_aes3`
 (ESP32-S3, PIE `ee.*` instructions), `_arp4` (ESP32-P4)[^2]. `find modules
--name '*_aes3.S'` at this tag lists: the fixed-point dot products
+-name '*_aes3*.S'` at this tag lists 29 files: the fixed-point dot products
 (`dsps_dp_s8_aes3.S` and the eight `dspi_dotprod_*_aes3.S` image
-variants), the float dot product pair (`dsps_dotprod_f32_aes3.S`,
-`dsps_dotprode_f32_aes3.S`), FIR (`dsps_fird_s16_aes3.S`,
+variants, four plain and four `_off_`), the float dot product
+(`dsps_dotprod_f32_aes3.S`), FIR (`dsps_fird_s16_aes3.S`,
 `dsps_fir_f32_aes3.S`, `dsps_fird_f32_aes3.S`), biquad
-(`dsps_biquad_f32_aes3.S`, `dsps_biquad_sf32_aes3.S`), FFT
+(`dsps_biquad_f32_aes3.S`), FFT
 (`dsps_fft2r_sc16_aes3.S`, `dsps_bit_rev_lookup_fc32_aes3.S`,
 `dsps_fft2r_fc32_aes3_.S`, `dsps_fft4r_fc32_aes3_.S`), matrix multiply
-(`dspm_mult_ex_f32_aes3.S`, `dspm_mult_s16_aes3.S`), elementwise math
+(`dspm_mult_f32_aes3.S`, `dspm_mult_ex_f32_aes3.S`,
+`dspm_mult_s16_aes3.S`), elementwise math
 (`dsps_add_s16_aes3.S`, `dsps_add_s8_aes3.S`, `dsps_sub_s16_aes3.S`,
 `dsps_sub_s8_aes3.S`, `dsps_mul_s16_aes3.S`, `dsps_mul_s8_aes3.S`), and
 `modules/support/mem/esp32s3/dsps_memcpy_aes3.S` /
-`dsps_memset_aes3.S`[^2].
+`dsps_memset_aes3.S`[^2]. Two of these do not match `'*_aes3.S'`, because
+the FFT pair carries a trailing underscore; there is no `_aes3` file for
+`dsps_dotprode_f32` or for the transposed biquad `dsps_biquad_sf32`, which
+have `_ae32`, `_ansi` and `_arp4` variants only[^2].
 
 `conv/` (convolution, correlation, circular correlation) has **no**
 `_aes3` files at all: its platform header defines only
@@ -66,12 +70,23 @@ variants), the float dot product pair (`dsps_dotprod_f32_aes3.S`,
 convolution on ESP32-S3 runs the ESP32 FPU code path or the ANSI
 fallback[^3].
 
-Not every "float `aes3`" file is actually PIE: `dsps_dotprod_f32_aes3.S`
-uses the scalar FPU coprocessor (`wfr`, `madd.s`, `add.s`) after an
-alignment/length check, falling through to the ESP32 body when the
-operands are not eligible[^4]. The genuinely PIE-vectorized kernels are the
-fixed-point ones and the newer `_aes3` matrix-multiply and biquad files,
-which use `ee.vld`/`ee.vmulas`/`q` registers.
+**No float kernel here is PIE-vectorized.** Every `q` register in the tree
+belongs to a fixed-point kernel: `dsps_dp_s8_aes3.S`, the eight image dot
+products, `dsps_fird_s16_aes3.S`, `dsps_fft2r_sc16_aes3.S`,
+`dspm_mult_s16_aes3.S`, the six elementwise `add`/`sub`/`mul` files, and
+the `memcpy`/`memset` pair[^23]. What the float `_aes3` files take from the
+extension is its wide floating-point load and store, `EE.LDF.128.IP` and
+its `.XP`, `.64` and `EE.STF.*` relatives, which move two or four `f`
+registers to or from memory in one instruction against a 16-byte-aligned
+address[^24]; the arithmetic that follows is scalar `madd.s` and `add.s` on
+one register pair at a time. That is what `dsps_dotprod_f32_aes3.S` does,
+after an alignment and length check that falls through to the ESP32 body
+when the operands are not eligible[^4], and what the float FIR, the float
+FFTs and the two float matrix multiplies do[^23]. One file goes further and
+uses no extended instruction at all: `dsps_biquad_f32_aes3.S` is scalar FPU
+inside a `loopnez`, and its `_aes3` suffix names the target, not the
+instruction set it reaches for[^23]. A reader looking here for a float
+vector template will not find one.
 
 ## Build-time selection: a compile-time macro, not a runtime dispatch
 
@@ -88,19 +103,29 @@ last[^6]:
 ```c
 #if (dsps_dotprod_f32_aes3_enabled == 1)
 #define dsps_dotprod_f32 dsps_dotprod_f32_aes3
+#define dsps_dotprode_f32 dsps_dotprode_f32_ae32
 #elif (dsps_dotprod_f32_arp4_enabled == 1)
 #define dsps_dotprod_f32 dsps_dotprod_f32_arp4
+#define dsps_dotprode_f32 dsps_dotprode_f32_arp4
 #elif (dotprod_f32_ae32_enabled == 1)
 #define dsps_dotprod_f32 dsps_dotprod_f32_ae32
+#define dsps_dotprode_f32 dsps_dotprode_f32_ae32
 #else
 #define dsps_dotprod_f32 dsps_dotprod_f32_ansi
-#endif
+#define dsps_dotprode_f32 dsps_dotprode_f32_ansi
+#endif // dsps_dotprod_f32_ae32_enabled
 ```
 
-(`modules/dotprod/include/dsps_dotprod.h`, lines 136-149[^6]; with
-`CONFIG_DSP_OPTIMIZED` off, all four names collapse to `_ansi`.)
-Application and test code calls the suffix-free name and gets whatever
-the build's Kconfig target selected, at zero runtime dispatch cost. A
+(`modules/dotprod/include/dsps_dotprod.h`, lines 136-148[^6]; with
+`CONFIG_DSP_OPTIMIZED` off, all four suffix-free names in this header
+collapse to `_ansi`.) Application and test code calls the suffix-free name
+and gets whatever the build's Kconfig target selected, at zero runtime
+dispatch cost. Read the branches, not the macro names: the block above
+selects the ESP32 kernel for `dsps_dotprode_f32` even when the ESP32-S3
+branch is taken, and the block that precedes it does the same for
+`dsps_dotprod_s16`, which has no `_aes3` implementation at all. A macro
+called `dsps_dotprod_s16_aes3_enabled` is what turns on the `_aes3` `s8`
+dot product, not an `_aes3` `s16` one[^6]. A
 second, narrower fallback lives inside some `_aes3` kernels themselves:
 `dsps_dotprod_f32_aes3` checks length and 16-byte alignment at entry and
 jumps to the ESP32 FPU body when unmet, rather than to `_ansi`[^4];
@@ -129,9 +154,9 @@ directly: "For esp32s3 length should be divided by 4 and aligned to
 free function "frees allocated memory in case the length of the filter
 (and the delay line) is not divisible by 8 and new delay line and filter
 coefficients arrays are created for the purpose of the esp32s3
-assembly"[^13] — the init/free path pads and reallocates so the assembly's
-fixed vector width is always satisfied, rather than the assembly handling
-an arbitrary length itself. Where a kernel checks alignment itself, it
+assembly"[^13]. The init and free path pads and reallocates so the
+assembly's fixed vector width is always satisfied, rather than the
+assembly handling an arbitrary length itself. Where a kernel checks alignment itself, it
 does so before the vector path, never by trusting the pointer:
 `dsps_dotprod_f32_aes3` ORs the two source pointers, masks the low 4
 bits, and checks `len % 4`, sending any failure to the scalar
@@ -152,13 +177,16 @@ the next chunk (`modules/fir/fixed/dsps_fird_s16_aes3.S`, lines
 
 **SAR setup, the accumulator, and readout.** Fixed-point kernels clear the
 `accx` accumulator explicitly before the main loop with
-`wur.accx_0`/`wur.accx_1` (write user register), and separately zero
-`SAR_BYTE` with `wur.sar_byte` when the loop's own address arithmetic, not
-an unaligned load, needs a known shift state[^7][^16]. The
-multiply-accumulate is one fused instruction, `ee.vmulas.<type>.accx...`,
-which multiplies two `q` registers' lanes into `accx` and, in its `.ld`
-forms, also loads the next vector, rotating a software-pipelined set of
-in-flight loads in the `.qup` forms[^7][^10][^17]:
+`wur.accx_0`/`wur.accx_1` (write user register)[^7]. A loop that uses the
+`.qup` forms on already-aligned data also zeroes `SAR_BYTE` with
+`wur.sar_byte` first, because those forms carry a shift-merge whose byte
+count comes from `SAR_BYTE`; zeroing it makes the merge a pass-through and
+the aligned loop correct[^16][^22]. The multiply-accumulate is one fused
+instruction, `ee.vmulas.<type>.accx...`, which multiplies two `q`
+registers' lanes into `accx`, saturates the sum, and in its `.ld` forms
+also loads the next vector; the `.qup` forms add the `SAR_BYTE` shift-merge
+of two further `q` registers into the first of them[^22], which is what
+lets the same instruction feed an unaligned stream[^7][^10][^17]:
 
 ```
 loopnez a5, .loop_dsps_dp_s8_aes3
@@ -166,7 +194,10 @@ loopnez a5, .loop_dsps_dp_s8_aes3
     ee.vld.128.ip           q0, a2, 16
 ```
 
-(`modules/dotprod/fixed/dsps_dp_s8_aes3.S`, lines 51-54[^7].) Readout takes
+(`modules/dotprod/fixed/dsps_dp_s8_aes3.S`, lines 51-54[^7]. The file also
+carries a stray Russian debug comment on line 41, "always ANSI, remove
+before release", which describes nothing the code does; it is in the
+published tag.) Readout takes
 two forms: `rur.accx_0`/`rur.accx_1` (read user register) pull the raw
 accumulator into two general registers unshifted, for callers that scale
 afterward[^7][^18]; `ee.srs.accx <dest>, <shift>, <round-flag>` shifts by a
@@ -177,12 +208,13 @@ by FIR to apply the filter's final shift and rounding together
 **Loop structure: `LOOP` plus manual unrolling.** Every hot loop uses the
 zero-overhead hardware loop (`loopnez`/`loopgtz`, Xtensa's `LOOP`
 family[^19]) and is also manually unrolled 2 to 4 times inside that body,
-rotating 4 to 6 `q` registers so a load issued this iteration is consumed
-later and the MAC never stalls on its own load[^7][^10][^17].
+rotating 4 to 6 `q` registers by hand so a load issued this iteration is
+consumed later and the MAC never stalls on its own load[^7][^10][^17].
 `dspi_dotprod_s16_aes3`'s main loop issues four
 `ee.vld.128.ip`/`ee.vmulas.s16.accx.ld.ip.qup` pairs per hardware-loop
-pass, each `.qup` consuming the vector loaded three instructions earlier
-and rotating the `q0`-`q3` set (`modules/dotprod/fixed/dspi_dotprod_s16_aes3.S`,
+pass and cycles six registers, `q0` to `q5`, through the load, multiply
+and merge operand slots, so no instruction reads a register the one before
+it wrote (`modules/dotprod/fixed/dspi_dotprod_s16_aes3.S`,
 lines 156-166[^17]).
 
 **Tails that are not a multiple of the vector width.** FIR handles a
@@ -242,8 +274,8 @@ TEST_ASSERT_EQUAL(check_bin, max_pos);
 TEST_ASSERT_EQUAL(6 * 10, round(max * 10));
 ```
 
-(`modules/fft/test/test_dsps_fft2r_fc32_ae32.c`, lines 55-84[^15].) The dot
-product test instead sweeps every length 1 to 1024 through the
+(`modules/fft/test/test_dsps_fft2r_fc32_ae32.c`, lines 57-88[^15].) The dot
+product test instead sweeps every length 1 to 1023 through the
 suffix-free (dispatched) function and checks against a value computed by
 hand from constant inputs, exercising every alignment and remainder
 branch without a second reference implementation[^14]. Buffers in both
@@ -270,16 +302,16 @@ obligations travel with the copy.
 
 | Idiom | File | Lines |
 |---|---|---|
-| Compile-time suffix-free dispatch via chained `#if`/`#define`, ANSI last | `modules/dotprod/include/dsps_dotprod.h` | 120-152 |
+| Compile-time suffix-free dispatch via chained `#if`/`#define`, ANSI last | `modules/dotprod/include/dsps_dotprod.h` | 120-155 |
 | Alignment + length precondition check, OR-then-mask on two pointers | `modules/dotprod/float/dsps_dotprod_f32_aes3.S` | 42-52 |
 | Length-only precondition check, `call8` fallback to ANSI | `modules/dotprod/fixed/dsps_dp_s8_aes3.S` | 34-40, 66-74 |
-| Accumulator zero-init, fused load+MAC in the loop body | `modules/dotprod/fixed/dsps_dp_s8_aes3.S` | 44-54 |
+| Accumulator zero-init, fused load+MAC in the loop body | `modules/dotprod/fixed/dsps_dp_s8_aes3.S` | 43-54 |
 | SAR-latched unaligned load pair for a circular buffer at an arbitrary offset | `modules/fir/fixed/dsps_fird_s16_aes3.S` | 243-250 |
-| 4-register software-pipelined MAC loop using `.qup` chaining | `modules/dotprod/fixed/dspi_dotprod_s16_aes3.S` | 156-166 |
+| 6-register software-pipelined MAC loop using `.qup` chaining | `modules/dotprod/fixed/dspi_dotprod_s16_aes3.S` | 156-166 |
 | Rounding shift-and-store of the accumulator in one instruction | `modules/fir/fixed/dsps_fird_s16_aes3.S` | 169 |
 | Six-way remainder decision tree for a non-vector-width tail | `modules/fir/fixed/dsps_fird_s16_aes3.S` | 262-267 |
-| Sweep every length through the dispatched function to force every branch | `modules/dotprod/test/test_dotprod_f32.c` | 26-56 |
-| Dual-implementation comparison plus a downstream-metric acceptance check | `modules/fft/test/test_dsps_fft2r_fc32_ae32.c` | 55-84 |
+| Sweep every length through the dispatched function to force every branch | `modules/dotprod/test/test_dotprod_f32.c` | 26-58 |
+| Dual-implementation comparison plus a downstream-metric acceptance check | `modules/fft/test/test_dsps_fft2r_fc32_ae32.c` | 57-88 |
 
 ## What esp-dsp does not cover
 
@@ -288,6 +320,10 @@ stop being a direct template outside that domain. It has **no
 gather-based lookups**: every kernel surveyed streams contiguous or
 fixed-stride memory, none index a `q` register's lanes from a table by a
 data-dependent index, so no palette or LUT-gather analogue exists here.
+The one instruction that could serve, `EE.LDXQ.32`, appears nowhere in the
+tree at either revision[^22b]; see
+[Table lookups, palettes and RGB565 arithmetic](./lut-gathers-palettes-and-rgb565.md)
+for what it does and what it costs.
 It has **no RGB565 or packed-pixel arithmetic**: fixed-point types are
 treated as PCM-style samples or matrix elements, not packed sub-byte
 colour channels, so there is no unpack/blend/repack idiom to borrow. It
@@ -312,19 +348,27 @@ specific `ee.*` sequences do not.
 [^3]: `modules/conv/include/dsps_conv_platform.h`, same repo/tag: defines only `dsps_conv_f32_ae32_enabled`, `dsps_ccorr_f32_ae32_enabled`, `dsps_corr_f32_ae32_enabled`; `find modules/conv -name '*_aes3.S'` returns no files at this tag.
 [^4]: `modules/dotprod/float/dsps_dotprod_f32_aes3.S`, same repo/tag, lines 36-84 (label, argument comment, alignment/length check, branch to `.dsps_dotprod_f32_ae32_body`, FPU MAC body using `wfr`/`madd.s`/`add.s`).
 [^5]: `modules/dotprod/include/dsps_dotprod_platform.h`, same repo/tag: `#if CONFIG_IDF_TARGET_ESP32S3` guards `dsps_dotprod_s16_aes3_enabled`/`dsps_dotprod_f32_aes3_enabled`; ESP32-path macros guarded by `XCHAL_HAVE_FP`, `XCHAL_HAVE_LOOPS`, `XCHAL_HAVE_MAC16` from `<xtensa/config/core-isa.h>`.
-[^6]: `modules/dotprod/include/dsps_dotprod.h`, same repo/tag, lines 120-152 (`#if CONFIG_DSP_OPTIMIZED` block chaining `_aes3`/`_arp4`/`_ae32`/`_ansi` into the suffix-free names; `#else` collapses all to `_ansi`).
-[^7]: `modules/dotprod/fixed/dsps_dp_s8_aes3.S`, same repo/tag, full file (34 lines of code): length check against a multiple of 16, `wur.accx_0`/`wur.accx_1` zero-init, `ee.vld.128.ip` preload, `loopnez`-wrapped `ee.vmulas.s8.accx.ld.ip` fused MAC-and-load, `rur.accx_0` readout, `.dsps_dp_s8_aes3_via_ansi` fallback via `call8 dsps_dp_s8_ansi`.
-[^8]: Pattern observed across every `_aes3.S` file opened in this repo/tag (`dsps_dotprod_f32_aes3.S`, `dsps_dp_s8_aes3.S`, `dspi_dotprod_s16_aes3.S`, `dsps_fird_s16_aes3.S`, `dsps_biquad_f32_aes3.S`): each begins `entry a1, <N>`, ends `retw.n`. The windowed ABI itself is documented in [[register-windows-and-windowed-abi]] in this knowledge base's `00-foundations` bucket.
-[^9]: `modules/iir/biquad/dsps_biquad_f32_aes3.S`, same repo/tag, lines 20-38 (comment block naming `a2`-`a5`).
-[^10]: `modules/fir/fixed/dsps_fird_s16_aes3.S`, same repo/tag: register map lines 20-28; `entry`/unpack lines 30-37; aligned fill loop lines 108-118; `main_loop_decim_16` MAC loop and `ee.srs.accx` readout lines 123-180; SAR unaligned load/shift-merge lines 243-250; six-way remainder tree lines 262-267 (repeated per decimation factor through line 1021); full file 1,027 lines.
+[^6]: `modules/dotprod/include/dsps_dotprod.h`, same repo/tag, lines 120-155: the `#if CONFIG_DSP_OPTIMIZED` block chains `_aes3`/`_arp4`/`_ae32`/`_ansi` into the suffix-free names, `s16` and `dp_s8` at lines 122-134 and `f32` and `dotprode_f32` at 136-148; the `#else` at 150-155 collapses all four to `_ansi`. Line 123 defines `dsps_dotprod_s16` to `dsps_dotprod_s16_ae32` inside the `_aes3_enabled` branch, and line 138 defines `dsps_dotprode_f32` to `dsps_dotprode_f32_ae32` in the same way.
+[^7]: `modules/dotprod/fixed/dsps_dp_s8_aes3.S`, same repo/tag, 76 lines: minimum-length and multiple-of-16 checks at lines 34-40, `wur.accx_0`/`wur.accx_1` zero-init at 43-45, `ee.vld.128.ip` preloads at 46-47, `loopnez`-wrapped `ee.vmulas.s8.accx.ld.ip` fused MAC-and-load at 51-54, `rur.accx_0` readout at 56, `.dsps_dp_s8_aes3_via_ansi` fallback via `call8 dsps_dp_s8_ansi` at 66-74.
+[^8]: Pattern observed across every `_aes3.S` file opened in this repo/tag (`dsps_dotprod_f32_aes3.S`, `dsps_dp_s8_aes3.S`, `dspi_dotprod_s16_aes3.S`, `dsps_fird_s16_aes3.S`, `dsps_biquad_f32_aes3.S`): each begins `entry a1, <N>`, ends `retw.n`. The windowed ABI itself is documented in [Register windows and the windowed ABI](../00-foundations/register-windows-and-windowed-abi.md).
+[^9]: `modules/iir/biquad/dsps_biquad_f32_aes3.S`, same repo/tag: the label is at line 36 and the register comment naming `a2` to `a6` runs 37-41; the C the kernel implements is quoted in a comment at lines 23-34.
+[^10]: `modules/fir/fixed/dsps_fird_s16_aes3.S`, same repo/tag: register map lines 20-28; `entry` and struct unpack lines 31-37; aligned fill loop lines 105-118; `main_loop_decim_16` at line 123, its MAC loop and the `ee.srs.accx a15, a11, 0` readout at line 169; SAR-latched unaligned load and shift-merge lines 243-250; six-way remainder tree lines 262-267, the pattern repeating per decimation factor and circular-buffer half through the end; full file 1,026 lines.
 [^11]: `modules/dotprod/fixed/dspi_dotprod_s16_aes3.S`, same repo/tag, lines 61-73 and 201-212 (`call8 dspi_dotprod_s16_ansi` fallback sites).
 [^12]: `modules/fir/include/dsps_fir.h`, same repo/tag, line 86, doc comment on `dsps_fir_init_f32`'s `coeffs_len`: "For esp32s3 length should be divided by 4 and aligned to 16."
-[^13]: `modules/fir/include/dsps_fir.h`, same repo/tag, lines 285-289, doc comment on the FIR freeing function, point 3: "frees allocated memory in case the length of the filter (and the delay line) is not divisible by 8 and new delay line and filter coefficients arrays are created for the purpose of the esp32s3 assembly."
-[^14]: `modules/dotprod/test/test_dotprod_f32.c`, same repo/tag, lines 26-56 (`memalign(16, ...)` allocation; loop over length 1 to 1024 through the suffix-free `dsps_dotprod_f32`, checked against a value derived from the fixed test inputs).
-[^15]: `modules/fft/test/test_dsps_fft2r_fc32_ae32.c`, same repo/tag: `__attribute__((aligned(16)))` buffers lines 27-29; `memalign` lines 36, 127, 130; comparison loop and pass/fail assertions lines 55-84.
-[^16]: `wur.sar_byte` appears in `modules/dotprod/fixed/dspi_dotprod_s16_aes3.S`, line 105 (same repo/tag), zeroing SAR before an aligned vector loop that needs no shift-merge loads.
-[^17]: `modules/dotprod/fixed/dspi_dotprod_s16_aes3.S`, same repo/tag, lines 156-166 (`.LBB219_dspi_dotprod_s16_aes3` loop body: four `ee.vld.128.ip`/`ee.vmulas.s16.accx.ld.ip.qup` pairs per pass, `.qup` rotating `q0`-`q3` across iterations).
+[^13]: `modules/fir/include/dsps_fir.h`, same repo/tag, lines 289-290, point 3 of the doc comment on the `fir_s16_t` freeing function (comment block 283-296): "frees allocated memory in case the length of the filter (and the delay line) is not divisible by 8 and new delay line and filter coefficients arrays are created for the purpose of the esp32s3 assembly."
+[^14]: `modules/dotprod/test/test_dotprod_f32.c`, same repo/tag, lines 26-58: `memalign(16, ...)` allocation at 29-31, then two sweeps of every length 1 to 1023 through the suffix-free `dsps_dotprod_f32` (41-47 and 52-58), each checked against a value derived from the fixed test inputs and against guard values written either side of the destination.
+[^15]: `modules/fft/test/test_dsps_fft2r_fc32_ae32.c`, same repo/tag: `__attribute__((aligned(16)))` buffers lines 28-31; `memalign` at lines 36 (1024-byte alignment), 127 and 130 (16-byte); the two transforms at 57-58, the logging-only `1e-5` comparison loop at 60-66, and the pass/fail assertions at 86 and 88.
+[^16]: `wur.sar_byte` appears in `modules/dotprod/fixed/dspi_dotprod_s16_aes3.S`, line 105 (same repo/tag), immediately before the `wur.accx_0`/`wur.accx_1` pair at 106-107, zeroing `SAR_BYTE` for an aligned vector loop whose `.qup` instructions still perform their shift-merge.
+[^17]: `modules/dotprod/fixed/dspi_dotprod_s16_aes3.S`, same repo/tag, lines 156-166: `loopnez` at 156, `.LBB219_dspi_dotprod_s16_aes3` body at 158-166, four `ee.vld.128.ip`/`ee.vmulas.s16.accx.ld.ip.qup` pairs per pass cycling `q0` through `q5`.
 [^18]: `modules/dotprod/fixed/dspi_dotprod_s16_aes3.S`, same repo/tag, lines 185-198 (`rur.accx_0`/`rur.accx_1` raw readout followed by a manual funnel-shift `src`).
-[^19]: Cadence/Tensilica, *Xtensa Instruction Set Architecture (ISA) Reference Manual* — the `LOOP`/`LOOPNEZ`/`LOOPGTZ` zero-overhead-loop family; not re-verified against the manual for this document, though `loopnez`/`loopgtz` match the standard Xtensa assembler names. `[uncertain]` pending a direct manual-section citation.
+[^19]: Cadence/Tensilica, *Xtensa Instruction Set Architecture (ISA) Reference Manual*, RC-2010.1 Release, issue date April 2010: the Loop Option, Section 4.3.2, p. 54, and the instruction descriptions `LOOP` p. 392, `LOOPGTZ` p. 394 and `LOOPNEZ` p. 396. The ESP32-S3 configures the option: `XCHAL_HAVE_LOOPS` is 1 in `components/xtensa/esp32s3/include/xtensa/config/core-isa.h` (ESP-IDF 5.5.1). Full treatment: [Zero-overhead loops](../01-scalar-isa/zero-overhead-loops.md).
+
+[^22]: Espressif, *ESP32-S3 Technical Reference Manual*, version 1.8, Section 1.8.136 `EE.VMULAS.S16.ACCX.LD.IP.QUP`, p. 212: the instruction multiply-accumulates `qx` and `qy` into `ACCX` with saturation, forces the low 4 bits of `as` to 0 and loads 16 bytes into `qu`, and "obtains 16-byte unaligned data by concatenating and shifting consecutive aligned data stored in the two registers `qs0` and `qs1` and stores it to `qs0`. The shift byte is stored in special register SAR_BYTE."; also Table 1.5-1, p. 45, which lists `SAR_BYTE` as a 4-bit customized special register. <https://documentation.espressif.com/esp32-s3_technical_reference_manual_en.pdf>
 [^20]: `docs/esp_bm_results.csv` and `docs/build_bm_table.py`, same repo/tag. Each CSV row is `<name>, <optimized-cycles>, <ansi-cycles>, <opt-flag: 1=O2/2=Os>, <cpu: 1=ESP32/3=ESP32-S3/4=ESP32-P4>`, confirmed against `build_bm_table.py`'s parsing logic and the CSV's `Esp32`/`Esp32s3`/`Esp32p4` section headers. Figures quoted here are the `-O2` rows.
-[^21]: `esp-dsp` `LICENSE` file, same repo/tag: Apache License, Version 2.0.
+[^21]: `esp-dsp` `LICENSE` file, same repo/tag: Apache License, Version 2.0, January 2004.
+
+[^22b]: Case-insensitive search of the whole tree for `ldxq` at tag `v1.8.2` (`a53a0756833c045311ea1d79a2badf495cdfde4c`) and at `master` sha `3c8ac0fdfec83740b783e200862c8d0c056de0ad`: no matches at either.
+
+[^23]: Counted at tag `v1.8.2` over all 29 files matching `*_aes3*.S`: a case-insensitive count of `ee.` mnemonics per file, and a count of `q0` to `q7` operands per file. Every file with a `q` operand is fixed-point. The float files (`dsps_dotprod_f32_aes3.S`, `dsps_fir_f32_aes3.S`, `dsps_fird_f32_aes3.S`, `dsps_fft2r_fc32_aes3_.S`, `dsps_fft4r_fc32_aes3_.S`, `dsps_bit_rev_lookup_fc32_aes3.S`, `dspm_mult_f32_aes3.S`, `dspm_mult_ex_f32_aes3.S`) use only `EE.LDF.*` and `EE.STF.*` and have zero `q` operands. `dsps_biquad_f32_aes3.S` has zero `ee.` mnemonics.
+
+[^24]: Espressif, *ESP32-S3 Technical Reference Manual*, version 1.8, Sections 1.8.25 to 1.8.28 (`EE.LDF.128.IP`, p. 101, `EE.LDF.128.XP`, p. 102, `EE.LDF.64.IP`, p. 103, `EE.LDF.64.XP`, p. 104) and 1.8.65 to 1.8.68 (`EE.STF.*`, pp. 141 to 144). `EE.LDF.128.IP fu3, fu2, fu1, fu0, as, -128..112` "forces the lower 4 bits of the access address in register `as` to 0, loads 16-byte data from memory, and stores it in order from low bit to high bit to floating-point registers `fu0`, `fu1`, `fu2`, and `fu3`". <https://documentation.espressif.com/esp32-s3_technical_reference_manual_en.pdf>

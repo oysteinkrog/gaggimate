@@ -3,7 +3,7 @@ title: Table lookups, palettes and RGB565 arithmetic on the ESP32-S3
 id: 06-kernel-patterns/lut-gathers-palettes-and-rgb565
 schema_version: 1
 doc_type: reference
-status: draft
+status: review
 last_reviewed: 2026-09-06
 tags: [esp32s3, xtensa, pie, lut, gather, palette, rgb565, dithering, fixed-point]
 confidence: medium
@@ -17,7 +17,8 @@ budget for the scalar lookup loop, the packing rules for 16-bit pixels, the
 split-channel blend that weights all three colour channels in one multiply, and the
 parts of the PIE vector unit that do and do not help. No cycle claims are made: the
 sequences below are code shape, confirmed by assembling them and by reading what GCC
-14.2 emits. Turning a shape into a time needs a measurement; see `05-measurement/`.
+14.2 emits. Turning a shape into a time needs a measurement; see
+[CCOUNT and timing a kernel](../05-measurement/ccount-cycle-counter-and-timing-a-kernel.md).
 
 ## Instruction semantics used below
 
@@ -98,7 +99,8 @@ store. GCC 14.2 emits exactly that. For a byte-indexed 16-bit palette written as
 the manual names address calculation as their intended use[^3]. The defect in this
 body is that `l16ui` writes `a9` and `s16i` reads it immediately. The LX7 interlocks
 operand dependencies in hardware, so the code is correct, but the pipeline stalls
-instead of retiring[^24]. See `00-foundations/` for the cost model. The fix is to
+instead of retiring[^24]. See
+[LX7 core pipeline and cost model](../00-foundations/lx7-core-pipeline-and-cost-model.md). The fix is to
 keep more than one lookup in flight. Interleaving two of them, and walking the
 pointers instead of indexing, gives eleven instructions for two pixels[^23]:
 
@@ -120,11 +122,12 @@ pointers instead of indexing, gives eleven instructions for two pixels[^23]:
 The same loop written with an index variable and `dst[i>>1]` costs thirteen
 instructions for those two pixels, because GCC keeps a separate counter and rebuilds
 the address with `SRAI` and `ADDX4` every iteration[^23]. Walk pointers. Four
-lookups per iteration reach twenty-two instructions for four pixels, the same rate
-per pixel, but every table load then has two or more instructions before its first
-use[^23]. That is the version to write when the loop is load-bound. One toolchain
-caveat: GCC 14.2 emitted the zero-overhead `LOOP` for the one- and two-pixel
-versions and a counted branch for the four-pixel one[^23].
+lookups per iteration reach twenty instructions for four pixels, five per pixel
+against the two-pixel version's five and a half, and every table load then has two
+or more instructions before its first use[^23]. That is the version to write when
+the loop is load-bound. All four shapes kept the zero-overhead `LOOP`[^23]; what
+ends that is the 256-byte body cap, not the unroll factor
+([Zero-overhead loops](../01-scalar-isa/zero-overhead-loops.md)).
 
 Keep every table base and constant in a register for the whole loop. A base reloaded
 per iteration is an extra load with its own interlock, and the `L8UI` and `L16UI`
@@ -153,7 +156,8 @@ whole 64 KB of Internal SRAM 2, depending on configuration[^26], so a randomly
 indexed read stream into a table that size misses on nearly every access and runs at
 external memory speed. That is a placement rule, not an instruction-count rule: rank
 tables by reads per frame and give internal memory to the ones read per pixel. See
-`03-memory-hierarchy/` for the miss costs.
+[Caches, SRAM, PSRAM and the MSPI bus](../03-memory-hierarchy/caches-sram-psram-and-the-mspi-bus.md)
+for the miss costs.
 
 One trick buys a register and a load. When two 8-bit tables are always read at the
 same index, interleave them into one 16-bit table and split the loaded halfword. GCC
@@ -168,8 +172,9 @@ the expression can produce, not the largest one you have seen: if a signed offse
 bounded by B is added to an index, the table needs B extra entries above the top and
 B below the base. Be strict, because the test that should catch an overrun does not
 unless the sanitizers are on: a one-entry overrun reads the adjacent byte, returns a
-plausible value, and a golden-output comparison passes. See `05-measurement/` for
-the rule that a fuzzer without AddressSanitizer is not a fuzzer.
+plausible value, and a golden-output comparison passes. See
+[Bit-exact reference tests and fuzzing](../05-measurement/bit-exact-reference-tests-and-fuzzing.md)
+for the rule that a fuzzer without AddressSanitizer is not a fuzzer.
 
 ## RGB565 layout and channel extraction
 
@@ -206,17 +211,26 @@ uint16_t out = (uint16_t)((r >> 16) | r);
 ```
 
 LVGL 8.4.0 uses the difference form of the same identity and reduces an 8-bit `mix`
-to the 0..32 range with `(mix + 4) >> 3`[^28]. Both forms reproduce per-channel
-arithmetic exactly: checked over 1.56 billion (foreground, background, weight)
-samples for weights 0 to 32 with zero mismatches, and the same check at weight 33
-fails, as the headroom argument predicts [experience]. Truncation biases the result
-down; adding a half-step to each field before the shift rounds instead. That
-constant is 16 at each field's base position, `16 | (16 << 11) | (16 << 21)`, which
-is `0x02008010`, checked against per-channel rounding over 2.58 billion samples with
-zero mismatches [experience].
+to the 0..32 range with `(mix + 4) >> 3`[^28]. Truncation biases the result down;
+adding a half-step to each field before the shift rounds instead. That constant is
+16 at each field's base position, `16 | (16 << 11) | (16 << 21)`, which is
+`0x02008010`.
+
+Both forms reproduce per-channel arithmetic exactly, and the check is cheap to
+repeat[^34]. No carry can cross a field boundary, because the largest packed
+contribution any channel can make is bounded by its own field width: with the
+rounding constant added, blue reaches 1008 against the 2048 that would reach red,
+red reaches 1008 against the 1024 that would reach green, and green reaches 2032
+against the 2048 that is the top of the word. Green is the binding case and it just
+fits, which is what caps the weight at 32: at 33 the green field reaches 2095, needs
+twelve bits, and runs off the end of the word. A run over every weight 0 to 32,
+every 16-bit foreground and 4096 structured backgrounds, 8.86 billion comparisons
+for each of the truncating and rounding forms, found zero mismatches against
+per-channel arithmetic, and the same code at weight 33 mismatches [experience].
 
 Both weighted products are `MULL`[^12], and the pack at the end is the `SLLI`/`OR`
-pair from the pixel-pair section:
+pair from the pixel-pair section. Written out as a hand-scheduled sequence, with
+every constant already in a register:
 
 ```
         extui   a8, a2, 0, 16   ; fg
@@ -234,9 +248,12 @@ pair from the pixel-pair section:
         or      a2, a8, a9      ; result in the low half
 ```
 
-Keep the mask, the weight, its complement and the rounding constant in registers.
-`MOVI` cannot carry a full 32-bit constant, so a reload becomes a literal-pool load
-with its own interlock.
+Compiled from the C above rather than written by hand, GCC 14.2 emits the same two
+`MULL`s and the same shift-mask-pack tail, but duplicates the pixel with `EXTUI`
+plus `SLLI` plus `ADD.N` rather than `OR`, and loads the mask and the rounding
+constant with `L32R` from the literal pool[^30b]. Keep the mask, the weight, its
+complement and the rounding constant in registers. `MOVI` cannot carry a full
+32-bit constant, so a reload becomes a literal-pool load with its own interlock.
 
 ## The same blend across PIE lanes
 
@@ -327,17 +344,21 @@ and odd planes with `EE.VUNZIP.8`[^16][^17].
 [^17]: TRM[^2], Section 1.8.209 "EE.VUNZIP.8", p. 292.
 [^18]: TRM[^2], Section 1.8.131 "EE.VMUL.U8", p. 207.
 [^19]: TRM[^2], Section 1.8.122 "EE.VMUL.S16", p. 198.
-[^20]: TRM[^2], Chapter 1, Section 1.8. Count of numbered instruction subsections in the chapter text of version 1.8.
+[^20]: TRM[^2], Chapter 1, Section 1.8: subsections 1.8.1 through 1.8.220, one per instruction. 217 carry an `EE.` mnemonic; the last three are `LD.QR`, `ST.QR` and `MV.QR`.
 [^21]: TRM[^2], Section 1.8.69 "EE.STXQ.32", p. 145.
-[^22]: Espressif, esp-dsp, commit `3c8ac0fdfec83740b783e200862c8d0c056de0ad` (2026-05-12). A case-insensitive search of the whole tree for `ldxq` returns no matches. https://github.com/espressif/esp-dsp
-[^23]: Compiled with `xtensa-esp32s3-elf-gcc` (crosstool-NG `esp-14.2.0_20241119`) 14.2.0 at `-O2 -mlongcalls`, reading the emitted `.s`. Instruction counts are of the loop body only and are code shape, not timings.
-[^24]: ISA manual[^1], Section 8.4.1 "Processor Performance Terminology and Modeling", Figure 8-54 "Instruction Operand Dependency Interlock", p. 607, and Section 5.1 "General Registers": "Reads from and writes to the AR register file are always interlocked by hardware."
+[^22]: Espressif, esp-dsp, `master` at commit `3c8ac0fdfec83740b783e200862c8d0c056de0ad` (2026-05-12, one commit after tag `v1.8.2` = `a53a0756833c045311ea1d79a2badf495cdfde4c`). A case-insensitive search of the whole tree for `ldxq` returns no matches, at either revision. https://github.com/espressif/esp-dsp
+[^23]: Compiled with `xtensa-esp32s3-elf-gcc` (crosstool-NG `esp-14.2.0_20241119`) 14.2.0 at `-O2 -mlongcalls`, reading the emitted `.s`; re-run 2026-09-06. The four sources are `dst[i] = pal[src[i]]`; the same with two lookups packed into one `uint32_t` store through walked pointers; the same again indexed with `i` and `d[i>>1]`; and four lookups into two stores through walked pointers. Instruction counts are of the loop body only and are code shape, not timings.
+[^24]: ISA manual[^1], Section 8.4.1 "Processor Performance Terminology and Modeling" (from p. 605), Figure 8-54 "Instruction Operand Dependency Interlock", p. 607, and Section 5.1 "General Registers", p. 208: "Reads from and writes to the AR register file are always interlocked by hardware."
 [^25]: ESP-IDF 5.5.1, `components/xtensa/esp32s3/include/xtensa/config/core-isa.h`: `XCHAL_UNALIGNED_LOAD_EXCEPTION` 0, `XCHAL_UNALIGNED_STORE_EXCEPTION` 0, `XCHAL_UNALIGNED_LOAD_HW` 1, `XCHAL_UNALIGNED_STORE_HW` 1.
-[^26]: TRM[^2], Chapter 4 "System and Memory", Section 4.3, p. 403: Internal SRAM 2 is 64 KB, of which 32 KB or all 64 KB can be configured as data cache; Internal SRAM 0 is 32 KB, of which 16 KB or all 32 KB can be instruction cache.
+[^26]: TRM[^2], Chapter 4 "System and Memory", Section 4.3 "Functional Description", pp. 403 to 404: Internal SRAM 0 is 32 KB, of which 16 KB or all 32 KB can be instruction cache (p. 403); Internal SRAM 2 is 64 KB, of which 32 KB or all 64 KB can be configured as data cache (p. 404).
 [^27]: Same toolchain and flags as[^23], comparing a two-table byte-lookup loop against the same loop reading one interleaved 16-bit table.
-[^28]: LVGL 8.4.0, `src/misc/lv_color.h`, `lv_color_mix()`. The 16-bit path masks with `0x7E0F81F`, reduces `mix` with `(mix + 4) >> 3`, and shifts back by 5. `LV_COLOR_16_SWAP` applies the byte swap on entry and exit of that function. `LV_COLOR_MIX_ROUND_OFS` is the rounding offset on the per-channel path. https://github.com/lvgl/lvgl/blob/v8.4.0/src/misc/lv_color.h
-[^29]: LVGL 8.4.0, `src/misc/lv_math.h`: `#define LV_UDIV255(x) (((x) * 0x8081U) >> 0x17)`. https://github.com/lvgl/lvgl/blob/v8.4.0/src/misc/lv_math.h
+[^28]: LVGL 8.4.0, `src/misc/lv_color.h`, `lv_color_mix()`, lines 438 to 465. The 16-bit path masks with `0x7E0F81F`, reduces `mix` with `(mix + 4) >> 3`, computes `(((fg - bg) * mix) >> 5) + bg`, and packs with `(result >> 16) | result`. `LV_COLOR_16_SWAP` applies the byte swap on entry and exit of that function. `LV_COLOR_MIX_ROUND_OFS` is the rounding offset on the per-channel path (lines 459 to 465), and the 16-bit fast path is taken only when it is 0. https://github.com/lvgl/lvgl/blob/v8.4.0/src/misc/lv_color.h
+[^29]: LVGL 8.4.0, `src/misc/lv_math.h`, line 132: `#define LV_UDIV255(x) (((x) * 0x8081U) >> 0x17)`. The bound is a host check: `(x * 0x8081) >> 23` equals `x / 255` for every `x` from 0 to 66298 and differs first at 66299 [experience].
 [^30]: Same toolchain and flags as[^23], compiling `(x * 0x8081U) >> 23`.
-[^31]: C. A. Bouman, *Digital Image Processing Laboratory: Image Halftoning*, Purdue University, 11 May 2011, Section 4 "Ordered Dithering", equations 6 to 9. Gives the Bayer recurrence, the threshold formula and the decorrelation argument. https://engineering.purdue.edu/~bouman/grad-labs/Image-Halftoning/pdf/lab.pdf
+[^31]: C. A. Bouman, *Digital Image Processing Laboratory: Image Halftoning*, Purdue University, 11 May 2011. Section 4 "Ordered Dithering": equation 6 the index matrix, equation 7 the Bayer recurrence, equation 8 the threshold formula `T(i,j) = 255 * (I(i,j) + 0.5) / N^2`, equation 9 the thresholding itself. The decorrelation argument is in Section 3, which notes that adding uniform noise "can achieve this decorrelation" and that an ordered matrix achieves "some decorrelation from the quantization error". https://engineering.purdue.edu/~bouman/grad-labs/Image-Halftoning/pdf/lab.pdf
 [^32]: B. E. Bayer, "An optimum method for two-level rendition of continuous-tone pictures", *IEEE International Conference on Communications*, vol. 1, 11-13 June 1973, pp. 11-15. Cited as reference [1] of[^31]; the paper itself was not consulted directly [uncertain].
-[^33]: LVGL 8.4.0, `src/draw/sw/lv_draw_sw_dither.c`, `dither_ordered_threshold_matrix` (8 by 8, values 0 to 63) and `lv_dither_ordered_hor()`. The comment on the table reads "Shift by 6 to normalize"; the code subtracts 32 and clamps each 8-bit channel before conversion. https://github.com/lvgl/lvgl/blob/v8.4.0/src/draw/sw/lv_draw_sw_dither.c
+[^33]: LVGL 8.4.0, `src/draw/sw/lv_draw_sw_dither.c`: `dither_ordered_threshold_matrix` at lines 30 to 39 (8 by 8, values 0 to 63), `lv_dither_ordered_hor()` from line 41. The comment on the table reads "Shift by 6 to normalize"; line 54 subtracts 32 to form a signed `factor`, lines 57 to 59 add it to red, green and blue and clamp each to 0 to 255, and only then does line 61 convert. https://github.com/lvgl/lvgl/blob/v8.4.0/src/draw/sw/lv_draw_sw_dither.c
+
+[^30b]: Same toolchain and flags as[^23], compiling the C blend above with the mask, the weight and the rounding constant as ordinary values rather than pinned registers.
+
+[^34]: Host check, 2026-09-06 [experience]: a C program that computes the packed form and the per-channel form and compares them, run over every weight 0 to 32, every 16-bit foreground and 4096 backgrounds covering all red and green field values against a black or white blue field. 8,858,370,048 comparisons per form, zero mismatches for both the truncating and the `0x02008010` rounding variant. The same program reports the per-field maxima quoted above and, at weight 33, mismatches.

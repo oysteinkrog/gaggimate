@@ -3,7 +3,7 @@ title: Fixed-point arithmetic on the Xtensa LX7
 id: 06-kernel-patterns/fixed-point-arithmetic-on-lx7
 schema_version: 1
 doc_type: reference
-status: draft
+status: review
 last_reviewed: 2026-09-06
 tags: [esp32s3, xtensa, lx7, fixed-point, pie, kernel-patterns]
 confidence: medium
@@ -73,7 +73,9 @@ here are claims about code shape only.[^isamul]
 
 Which one you need depends on where the binary point sits relative to the
 register boundary. When the product fits 32 bits, use `MULL` or `MUL16S` plus
-one arithmetic shift; Q15 is the clean case, `MUL16S` then `SRAI 15`. When the
+one arithmetic shift; Q15 is the clean case, `MUL16S` then `SRAI 15`, with a
+`SEXT ar, as, 15` after it whenever the result is stored back into an `int16_t`
+and the compiler cannot see the top bits are already correct [measured]. When the
 shift lands at the register boundary the high-word multiply is the whole
 answer: Q1.31 squared is `A(1,62)`, whose top 32 bits are `A(1,30)`, one bit
 short of Q1.31, so `MULSH` then `SLLI 1`, losing the low bit. When the shift
@@ -85,10 +87,16 @@ is that extraction, with `SSAI` setting `SAR`;[^isamisc] GCC emits
 
 The shortcut worth knowing: if one factor fits 16 bits, pre-shift it left by 16
 and a single `MULSH` gives the Q16.16 product, because the high word of `a * (b
-<< 16)` is `(a * b) >> 16`. GCC emits `slli a3, a3, 16` then `mulsh a2, a3, a2`
-for that C [measured], and where `b` is a per-row constant the `slli` hoists
-out, leaving one instruction per pixel. So choose formats such that the scale
-factor sits in the high half of a register and the multiply is `MULSH` alone.
+<< 16)` is `(a * b) >> 16`. Two things have to be true in the C for GCC to emit
+it. The pre-shift must be a 32-bit shift, not a shift of a 64-bit value, and the
+multiply must be written as the high word of a 64-bit product. Given both, a
+loop over `(int32_t)(((int64_t)src[i] * (int64_t)s) >> 32)` with `s = scale <<
+16` built above the loop compiles to one `slli` outside the loop and a body of
+`l32i.n; addi.n; mulsh; s32i; addi.n` [measured]. Write the shift in 64-bit
+instead and GCC builds the full 64x64 product: `srai; slli; ssai 16; src; srai;
+mull; mull; muluh; add.n; add.n`, ten instructions where one would do
+[measured]. So choose formats such that the scale factor sits in the high half
+of a register and the multiply is `MULSH` alone.
 
 ## Rounding
 
@@ -125,7 +133,7 @@ instruction, `imm` from 7 to 22, computing `min(max(x, -2^imm), 2^imm - 1)`, so
 for the Q15 overflow above `CLAMPS ar, as, 15` is the entire fix, while `MIN`
 and `MAX` handle arbitrary bounds in two instructions plus the bound
 setup.[^isasat] GCC does not connect the two. For a plain C clamp to `[-32768,
-32767]` it emits `l32r; max; l32r; min`, four instructions where `CLAMPS` would
+32767]` it emits `l32r; min; l32r; max`, four instructions where `CLAMPS` would
 do, and the code is the same whether the clamp is written with a conditional
 operator or two `if` statements [measured]. As inline asm, `clamps a2, a2, 15`
 is one instruction with identical values, so it is one of the few places where
@@ -185,7 +193,9 @@ with `max|f''| = 1`. So 1024 entries with a rounded index give `h/2 = pi/1024 =
 `h^2/8 = 7.5e-5`, about 13.7 bits from a table one quarter the size.
 Interpolation costs one subtract, one multiply and one shift-add per sample and
 buys roughly five bits, so where table placement decides whether a gather is
-fast, the smaller interpolated table usually wins.
+fast (see
+[Caches, SRAM, PSRAM and the MSPI bus](../03-memory-hierarchy/caches-sram-psram-and-the-mspi-bus.md)),
+the smaller interpolated table usually wins.
 
 ## Linear interpolation and the sign trap
 
@@ -255,7 +265,9 @@ eight values in one instruction, with the shift free. Set `SAR` with `wsr.sar`
 before the loop, as Espressif's own vector multiply kernel does before running
 `ee.vmul.s16.ld.incp` inside a `loopnez`.[^espdsp] Four consequences follow.
 
-- **`SAR` is the core's own register, not a PIE-private one.** The TRM lists it
+- **`SAR` is the core's own register, not a PIE-private one**
+  ([PIE register file, SAR and context](../02-pie-vector/pie-register-file-sar-and-context.md)
+  carries the full register story). The TRM lists it
   as a plain "Special register" of 6 bits, against `SAR_BYTE` and the
   accumulators, which it labels "Customized special register".[^trmregs] The
   scalar `SRC`, `SLL` and `SRL` read the same register,[^isamisc] so a loop
@@ -312,23 +324,26 @@ implementation-dependent,[^isamul] so every scalar cycle count below is
 | Q15 to float | `float.s f, r, 15` | [uncertain] | none |
 | Divide | `quos` | implementation-dependent[^isadiv] | none |
 
-Two gaps remain, both [uncertain]. The stage at which a scalar `WSR.SAR` makes
-`SAR` visible to a following `EE.VMUL.S16` is not in the PIE operand table,
-which covers extended instructions only. And whether `MUL16S` and `MULL` share
-a latency here is not published, which would change the format choice for
-16-bit data if they differ.
+Two gaps remain, both [uncertain]. Table 1.7-2 gives the read side of the `SAR`
+hand-off: `EE.VMUL.S16` uses `SAR` at stage 1.[^trmpipe] What is not published
+is the write side, because a scalar `WSR.SAR` is a core instruction and the PIE
+operand table covers extended instructions only, so the distance a kernel must
+leave between setting `SAR` and the first multiply that reads it has to be
+measured. And whether `MUL16S` and `MULL` share a latency here is not
+published, which would change the format choice for 16-bit data if they
+differ.
 
 [^coreisa]: Espressif, ESP-IDF v5.5.1, `components/xtensa/esp32s3/include/xtensa/config/core-isa.h`. The same file records `XCHAL_CORE_ID "LX7_ESP32_S3_MP"` and `XCHAL_HW_VERSION_NAME "LX7.0.12"`.
 [^isadiv]: Tensilica, *Xtensa Instruction Set Architecture (ISA) Reference Manual*, RC-2010.1 release, issue date 4/2010, section 4.3.6 "32-bit Integer Divide Option", page 59. <https://0x04.net/~mwk/doc/xtensa.pdf>
-[^yatesrange]: Randy Yates, *Fixed-Point Arithmetic: An Introduction*, Digital Signal Labs technical reference, rev PA11, 14 August 2026: sections 4.3 and 4.4 for range and resolution, 4.5 for bit growth on addition, 4.8 for signed multiplication. <http://www.digitalsignallabs.com/downloads/fp.pdf>
-[^isamul]: Xtensa ISA Reference Manual RC-2010.1, `MULL` page 450, `MULSH` page 455, `MULUH` page 456, `MUL16S` page 436, `MUL16U` page 437, section 4.3.4 page 57 and section 4.3.5 with Table 4-32 page 58, which names `MulAlgorithm` as implementation-dependent.
+[^yatesrange]: Randy Yates, *Fixed-Point Arithmetic: An Introduction*, Digital Signal Labs technical reference, rev PA11, 14 August 2026: section 3.2 for the `A(a,b)` notation and `N = a+b+1`, section 4.4 for the signed range, section 4.5 for bit growth on addition, section 4.8 for signed multiplication, section 5.2 for resolution. <http://www.digitalsignallabs.com/downloads/fp.pdf>
+[^isamul]: Xtensa ISA Reference Manual RC-2010.1, `MULL` page 450, `MULSH` page 455, `MULUH` page 456, `MUL16S` page 436, `MUL16U` page 437, section 4.3.4 page 57 and section 4.3.5 page 58, whose Table 4-32 on page 59 names `MulAlgorithm` as implementation-dependent.
 [^isamisc]: Xtensa ISA Reference Manual RC-2010.1: `SRC` page 528, `SRAI` page 527, `ADDMI` page 253, `NSAU` page 462, and the conditional moves `MOVEQZ`, `MOVNEZ`, `MOVLTZ`, `MOVGEZ` in the core architecture instruction summary, section 4.2.
-[^espdsp]: Espressif esp-dsp, sha 3c8ac0fdfec83740b783e200862c8d0c056de0ad: `modules/math/mulc/fixed/dsps_mulc_s16_ansi.c` for the truncating Q15 multiply, `modules/dotprod/fixed/dsps_dotprod_s16_ansi.c` for the seeded rounding term (its comment reads "To make correct round operation we have to shift round value"), and `modules/math/mul/fixed/dsps_mul_s16_aes3.S` for the `wsr.sar a9` before a `loopnez` over `ee.vmul.s16.ld.incp`. <https://github.com/espressif/esp-dsp>
+[^espdsp]: Espressif esp-dsp, `master` branch at sha 3c8ac0fdfec83740b783e200862c8d0c056de0ad (2026-05-12, one commit after tag `v1.8.2`): `modules/math/mulc/fixed/dsps_mulc_s16_ansi.c` for the truncating Q15 multiply, `modules/dotprod/fixed/dsps_dotprod_s16_ansi.c` for the seeded rounding term (its comment reads "To make correct round operation we have to shift round value"), and `modules/math/mul/fixed/dsps_mul_s16_aes3.S` for the `wsr.sar a9` before a `loopnez` over `ee.vmul.s16.ld.incp`. <https://github.com/espressif/esp-dsp>
 [^isasat]: Xtensa ISA Reference Manual RC-2010.1, `CLAMPS` page 312, which the manual describes as intended for use with `ADD`, `SUB` and `MUL16S` to implement saturating arithmetic, plus `MAX` page 407 and `MIN` page 410.
 [^trmvadds]: Espressif, *ESP32-S3 Technical Reference Manual*, version 1.8, section 1.8.70 `EE.VADDS.S16`, page 146. <https://documentation.espressif.com/esp32-s3_technical_reference_manual_en.pdf>
 [^trmsat]: ESP32-S3 TRM v1.8, section 1.5.4 "Data Overflow and Saturation Handling", page 49.
 [^bresenham]: J. E. Bresenham, "Algorithm for computer control of a digital plotter", *IBM Systems Journal*, vol. 4, no. 1, 1965, pages 25 to 30. DOI 10.1147/sj.41.0025.
-[^isafp]: Xtensa ISA Reference Manual RC-2010.1, `TRUNC.S` page 548, `ROUND.S` page 497, `FLOAT.S` page 346, and Table 4-47 "FCR fields" page 69.
+[^isafp]: Xtensa ISA Reference Manual RC-2010.1, `TRUNC.S` page 548, `ROUND.S` page 497, `FLOAT.S` page 346, and Table 4-47 "FCR fields", announced on page 69 and printed on page 70; the manual's `rounds()` helper is used in the `ROUND.S` operation but is defined nowhere in the document.
 [^trmvmul]: ESP32-S3 TRM v1.8, section 1.8.122 `EE.VMUL.S16`, page 198, and section 1.5.1.2 on `SAR`, page 46.
 [^trmregs]: ESP32-S3 TRM v1.8, Table 1.5-1 "Register List of ESP32-S3 Extended Instruction Set", page 45, and Table 1.6-1 "Extended Instruction List", shift instruction group, section 1.6.7.
 [^trmpipe]: ESP32-S3 TRM v1.8, section 1.7.1 "Data Hazard" and Table 1.7-2 "Extended Instruction Pipeline Stages", from page 65.

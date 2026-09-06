@@ -3,7 +3,7 @@ title: GCC 14 Xtensa Flags and What They Cost
 id: 04-toolchain-and-codegen/gcc14-xtensa-flags-and-what-they-cost
 schema_version: 1
 doc_type: reference
-status: draft
+status: review
 last_reviewed: 2026-09-06
 created: 2026-09-06
 tags: [esp32s3, xtensa, gcc, toolchain, codegen, esp-idf]
@@ -17,8 +17,10 @@ that change instruction selection, call sequences, and switch-statement
 codegen before your code ever runs. This page lists each flag, what it
 does to the generated instructions, and what ESP-IDF's build system
 actually passes, checked against the local toolchain and the vendored
-ESP-IDF 5.5.1 source. `03-memory-hierarchy/` and
-`code-and-data-placement-in-esp-idf.md` (this bucket) cover where code and
+ESP-IDF 5.5.1 source. [Caches, SRAM, PSRAM and the MSPI
+bus](../03-memory-hierarchy/caches-sram-psram-and-the-mspi-bus.md) and
+[Code and data placement in
+ESP-IDF](./code-and-data-placement-in-esp-idf.md) cover where code and
 data end up. This page covers how the compiler shapes the code that goes
 there.
 
@@ -51,7 +53,7 @@ default `Debug`:[^3]
 |---|---|---|
 | `COMPILER_OPTIMIZATION_NONE` | `-O0` | No optimization |
 | `COMPILER_OPTIMIZATION_DEBUG` (default) | `-Og` | "Optimize debugging experience," fast compilation, good debugging |
-| `COMPILER_OPTIMIZATION_SIZE` | `-Os` (`-Oz` under Clang) | `-O2` minus optimizations that typically grow code size |
+| `COMPILER_OPTIMIZATION_SIZE` | `-Os` plus `-freorder-blocks` under GCC (`-Oz` under Clang) | `-O2` minus optimizations that typically grow code size |
 | `COMPILER_OPTIMIZATION_PERF` | `-O2` | Nearly every optimization that does not trade space for speed |
 
 GCC 14's manual describes `-O1` as reducing code size and execution time
@@ -60,7 +62,9 @@ optimization on top of `-O2`.[^4] Neither is an ESP-IDF Kconfig choice in
 5.5.1: there is no `COMPILER_OPTIMIZATION_LEVEL3` option in the
 framework's top-level `Kconfig`, so getting `-O3` on an ESP-IDF component
 means a per-file override (see below), not a `menuconfig` pick.
-`[measured]`, `Kconfig` at the framework root, lines 338 to 374.[^3]
+`[measured]`, `Kconfig` at the framework root, lines 340 to 374, and a
+search of the whole vendored tree for an `O3` Kconfig string, which
+returns nothing.[^3]
 
 The Kconfig choice maps to a flag through a plain `if/elseif` chain in
 the framework's top-level `CMakeLists.txt`, lines 47 to 67: `-Os` for
@@ -91,11 +95,18 @@ text, shows the real difference:
 The `.s` text GCC emits still shows a plain `call8` pseudo-mnemonic
 either way. GCC's manual is explicit that the translation happens in the
 assembler, not the compiler, and that the disassembled object is where
-the real instructions are visible.[^5] The `R_XTENSA_ASM_EXPAND`
-relocation marks the expanded form as a candidate for the linker to relax
-back to a direct `call8` if the final link places the callee in range,
-so `-mlongcalls` costs an extra `L32R` (one load-use latency, one
-literal-pool slot) only where the linker cannot prove it is unnecessary.
+the real instructions are visible.[^5] It also warns that the assembler
+expands "every cross-file call, not just those that really are out of
+range."[^5]
+
+The linker takes most of that back. The `R_XTENSA_ASM_EXPAND` relocation
+marks the expanded form as a candidate for relaxation, and linking the
+two objects above put `call8 far_func` back in the caller, one direct
+call and no literal; passing `-Wl,--no-relax` kept the `L32R` plus
+`CALLX8` pair. `[measured]`, same two objects linked both ways,
+disassembled with `objdump -d`, 2026-09-06.[^1] So `-mlongcalls` costs an
+extra `L32R` (one load-use latency, one literal-pool slot) only where the
+final link cannot place the callee in range.
 
 ESP-IDF passes `-mlongcalls` unconditionally, for every language and
 every target, in each `toolchain-<chip>.cmake` file. It is not a Kconfig
@@ -105,32 +116,41 @@ application is assembled from many components as separate archives, and
 nothing in one component's compile step can bound the eventual
 link-time distance to every other component's code.
 
-## -mtext-section-literals vs. -mauto-litpools
+## Literal pools: the default, -mtext-section-literals and -mauto-litpools
 
 Xtensa has no immediate-load-anything instruction. A 32-bit constant that
 does not fit `MOVI`'s encoding is loaded with `L32R`, which reads a
-PC-relative literal from a pool placed somewhere reachable. GCC has two
-ways to decide where that pool goes.[^6] `-mtext-section-literals`
-(ESP-IDF's default[^2]) has the compiler interleave literals into the
-`.text` section itself, placing each function's literals right before
-that function. `-mauto-litpools` has the compiler emit `MOVI`, not
+PC-relative literal from a pool placed somewhere reachable. GCC has three
+possible arrangements, and ESP-IDF picks none of them explicitly. No
+`toolchain-<chip>.cmake` file, and no line of the framework's own CMake
+or Kconfig, names either of the two flags, so every Xtensa ESP-IDF build
+runs on the compiler default.[^2]
+
+That default is `-mno-text-section-literals`, which puts literals in a
+separate section for the linker to place.[^6] The two overrides:
+`-mtext-section-literals` has the literals "interspersed in the text
+section in order to keep them as close as possible to their
+references,"[^6] and `-mauto-litpools` has the compiler emit `MOVI`, not
 `L32R`, for every out-of-range constant and defer the encoding choice to
 the assembler, which is free to relax `MOVI` into an `L32R` plus a nearby
 literal and to create as many litpools per function as needed. GCC's
-manual: with `-mauto-litpools` the compiler "does not produce explicit
-`.literal` directives and loads literals into registers with `MOVI`
-instructions instead of `L32R` to let the assembler do relaxation," for
-"very big functions, which may not be possible with
-`-mtext-section-literals`."[^6]
+manual gives the reason for the third: "very big functions, which may not
+be possible with `-mtext-section-literals`."[^6]
 
-For one small function compiled in isolation, both modes produced an
-identical literal-plus-`L32R` sequence. The difference only shows at the
-scale of a translation unit with many functions and constants competing
-for `L32R`'s addressing range, which a two-function toy file cannot
-demonstrate. `[measured]`, both flags on the same one-constant test
-function, identical disassembly. `[uncertain]` the file size at which
-`-mauto-litpools` starts to matter; not measured on a file large enough
-to trigger the difference.
+One function loading one out-of-range constant, compiled all three ways,
+shows where the difference lives. The compiler's `.s` output is identical
+for the default and for `-mtext-section-literals` (both emit
+`.literal_position` and a `.literal` directive) and differs for
+`-mauto-litpools` (a plain `MOVI`). The object files are the other way
+round: the default lands the constant in a separate `.literal` input
+section, while both overrides land it inside `.text` four bytes before
+the function's first instruction. The flag reaches the assembler, not the
+compiler: `-###` shows `--text-section-literals` and `--auto-litpools`
+passed to `as`, and nothing passed in the default case. `[measured]`,
+`-O2 -S` and `-O2 -c` on the same one-constant function, `objdump -d -r`
+and `objdump -h`, 2026-09-06.[^1] `[uncertain]` the function or file size
+at which `-mauto-litpools` starts to matter for correctness; not measured
+on a file large enough to exhaust `L32R`'s range.
 
 ## -fno-jump-tables and -fno-tree-switch-conversion
 
@@ -146,34 +166,51 @@ other code generation strategies" when left enabled, is disabled by
 `-fno-jump-tables`.[^8] Both transformations put table data in
 `.rodata`, which lives in flash by default, so these flags guarantee
 every `switch` in the build compiles to a compare-and-branch chain
-instead, whether or not the function is ever placed in IRAM. Compiling an
-eight-case dense `switch` on int, with and without the two flags: the
-default form is nine instructions with one indirect jump through a
-computed index; the suppressed form is nineteen instructions of chained
-compares. `[measured]`, both forms at `-O2`, 2026-09-06.[^1] The cost is
-paid once per `switch`, in code size and worst-case compares to reach the
-last arm, not per call the way `-mlongcalls` is.
+instead, whether or not the function is ever placed in IRAM.
+
+The two transformations are separate, and turning off only one shows
+which is which. An eight-case dense `switch` on `int` returning
+unrelated constants, at `-O2`, compiled three ways:
+
+| Flags | Whole function | Shape |
+|---|---|---|
+| neither flag | 8 instructions | switch conversion: `addx4` into a `CSWTCH` word array in `.rodata`, then one `l32i` |
+| `-fno-tree-switch-conversion` only | 24 instructions | jump table: `l32i` from a `.rodata` array of label addresses, then `jx a8` |
+| both, as ESP-IDF builds | 26 instructions | chained `beqi`/`bgei` compares, no `.rodata` table |
+
+`[measured]`, 2026-09-06.[^1] Two cautions on reading those counts. The
+totals are for the whole function, and the compare chain reaches an early
+case in far fewer instructions than a late one, so the worst case is what
+the last arm costs. And the counts move with the case values: the same
+switch returning an arithmetic progression is recognised as arithmetic
+and compiles to six instructions with no table at all, flags or no flags.
+The cost is paid once per `switch`, in code size and worst-case compares,
+not per call the way `-mlongcalls` is.
 
 ## -fstack-protector and its cost
 
 ESP-IDF exposes four modes as `CONFIG_COMPILER_STACK_CHECK_MODE`, default
 `None`:[^9]
 
-| Mode | Flag | GCC's description |
+| Mode | Flag | What it protects |
 |---|---|---|
 | None (default) | (nothing added) | no canary, no check |
-| Normal | `-fstack-protector` | "functions that call alloca, and functions with buffers larger than 8 bytes are protected"[^9] |
-| Strong | `-fstack-protector-strong` | adds "those that have local array definitions, or have references to local frame addresses"[^10] |
-| Overall | `-fstack-protector-all` | "all functions are protected"[^10] |
+| Normal | `-fstack-protector` | "only functions that call alloca, and functions with buffers larger than 8 bytes are protected"[^9] |
+| Strong | `-fstack-protector-strong` | "like NORMAL, but includes additional functions to be protected: those that have local array definitions, or have references to local frame addresses"[^9] |
+| Overall | `-fstack-protector-all` | "all functions are protected"[^9] |
 
-Compiling a function with a 32-byte stack buffer whose address escapes to
+The quoted wording is ESP-IDF's own Kconfig help, which restates GCC's
+definitions of the same three flags.[^10] Compiling a function with a 32-byte stack buffer whose address escapes to
 another function, with and without `-fstack-protector-strong`, measured
 the concrete cost: the stack frame grew from 64 to 80 bytes, and the
-function gained a load of a global canary before the buffer is touched,
-a matching compare after, a branch, and a call to `__stack_chk_fail` on
-mismatch, nine extra instructions and two `MEMW` memory-ordering
-barriers around the canary load and store. `[measured]`,
-`xtensa-esp32s3-elf-gcc -O2 -fstack-protector-strong -S`, 2026-09-06.[^1]
+function grew from 5 instructions to 18. The added work is a load of the
+global `__stack_chk_guard` into the frame before the buffer is touched, a
+reload and a second read of the global after the call returns, a compare,
+a branch, and a `call8 __stack_chk_fail` on mismatch, with four `MEMW`
+memory-ordering barriers around the canary reads and write.
+`[measured]`, `xtensa-esp32s3-elf-gcc -O2 -fstack-protector-strong -S`,
+2026-09-06.[^1] The exact count moves with the function; the frame growth
+and the pair of guarded accesses do not.
 ESP-IDF's own Kconfig help states the ordering plainly, "performance:
 NORMAL > STRONG > OVERALL" and "coverage: NORMAL < STRONG < OVERALL,"
 and notes the cost "includes increasing the amount of stack memory
@@ -196,14 +233,18 @@ emitting `S32C1I` inline, and one file inside the framework's own
 atomics fallback is compiled back with `-mno-disable-hardware-atomics`,
 because that file's job is to be the software fallback and needs the
 real instruction to implement it.[^12] `[uncertain]` the exact hardware
-defect this works around: PSRAM cache-line coherency under a `S32C1I`
-read-modify-write is the implication of the option's name and scope
-condition, not confirmed against an errata document in this session.
+defect this works around. The option's name and scope condition imply a
+problem with `S32C1I` against PSRAM addresses, but neither the vendored
+5.5.1 tree (searched for every `S32C1I` and
+`STDATOMIC_S32C1I_SPIRAM_WORKAROUND` occurrence) nor the v5.5.1 external
+RAM guide, whose own restrictions list covers cache, DMA and task stacks,
+says what goes wrong.[^11] Treat the flag as a fact about the build, not
+as an explanation.
 
 ## -ffunction-sections / -fdata-sections
 
-Covered in depth in `code-and-data-placement-in-esp-idf.md` (this
-bucket) as the mechanism that makes per-symbol linker-fragment mappings
+Covered in depth in [Code and data placement in
+ESP-IDF](./code-and-data-placement-in-esp-idf.md) as the mechanism that makes per-symbol linker-fragment mappings
 possible; noted here only for the codegen angle. `xtensa-esp32s3-elf-gcc
 --help=common` documents them as "Place each function into its own
 section" and "Place data items into their own section,"[^1] applied
@@ -221,12 +262,29 @@ The per-chip toolchain CMake files add `-fno-builtin-memcpy
 Without these, GCC can recognize a hand-written byte-copy loop as
 equivalent to `memcpy` and replace it with a call to its own builtin,
 which may inline a sequence tuned for a generic target rather than
-calling the platform's actual `memcpy`. ESP-IDF ships its own
-implementations of these functions in `components/newlib`, tuned for the
-chip and sometimes hand-written in assembly, and the flags stop GCC from
-silently substituting a different one than the project actually links.
-For a kernel author writing a byte-copy loop expecting it to run
-verbatim, this is why it does.
+calling the platform's actual function. The flags stop GCC from silently
+substituting a different implementation than the project links. For a
+kernel author writing a byte-copy loop expecting it to run verbatim, this
+is why it does.
+
+Which implementation that is, on the ESP32-S3, is worth stating plainly
+because it is easy to get wrong. `memcpy`, `memset`, `memmove`, `bzero`
+and `strncpy` are all absolute addresses in the chip's boot ROM, assigned
+by a linker fragment: `components/esp_rom/esp32s3/ld/esp32s3.rom.libc.ld`
+holds `memcpy = 0x400011f4;` and its siblings, and the build includes
+that fragment whenever the target declares `ESP_ROM_HAS_NEWLIB`, which
+the ESP32-S3 does.[^16] Because a linker-script assignment defines the
+symbol, no library member supplying `memcpy` is ever pulled in.
+
+ESP-IDF does compile its own tuned string routines, but not for this
+chip. `components/newlib/CMakeLists.txt` gates them behind
+`CONFIG_LIBC_OPTIMIZED_MISALIGNED_ACCESS`, that option `depends on
+ESP_ROM_HAS_SUBOPTIMAL_NEWLIB_ON_MISALIGNED_MEMORY`, and that capability
+is declared only by the family's RISC-V members; the ESP32-S3's
+`esp_rom_caps.h` does not define it, and the sources themselves live
+under `src/port/riscv/`.[^16] See [Loop shapes, scheduling and per-call
+setup](../06-kernel-patterns/loop-shapes-scheduling-and-per-call-setup.md)
+for when a hand-written copy loop beats the shipped one.
 
 ## -fstrict-volatile-bitfields
 
@@ -260,14 +318,22 @@ component boundaries.
 Neither the `xtensa-esp32s3-elf-gcc` chip-specific driver nor any
 `toolchain-<xtensa-chip>.cmake` file passes `-mabi=`. Only the RISC-V
 chip toolchain files set an ABI flag (`-mabi=ilp32` / `-mabi=ilp32f`).[^2]
-So Xtensa ESP-IDF builds run on GCC's own default, confirmed here as
-windowed: a trivial function compiled with no ABI flag opens with `entry
-sp, 32` and closes with `retw.n`, the windowed convention's frame setup
-and register-window rotation. The same function under `-mabi=call0`
-produces no frame instructions at all, a plain `ret.n`, because `call0`
-uses a flat register set with no windowing. `[measured]`, both forms,
-2026-09-06.[^1] GCC's manual is terse on the tradeoff, "Generate code
-for the specified ABI."[^14] A project chooses `call0` to avoid the
+So Xtensa ESP-IDF builds run on the default, and the manual says where
+that default comes from: "Default ABI is chosen by the Xtensa core
+configuration,"[^14] which here is the dynconfig the chip-specific driver
+loads. For the ESP32-S3 it is windowed: a trivial function compiled with
+no ABI flag opens with `entry sp, 32` and closes with `retw.n`, the
+windowed convention's frame setup and register-window rotation. The same
+function under `-mabi=call0` produces no frame instructions at all, a
+plain `ret.n`. `[measured]`, both forms, 2026-09-06.[^1]
+
+The manual states the register consequences of each. Under `call0`,
+"function parameters are passed in registers `a2` through `a7`, registers
+`a12` through `a15` are caller-saved, and register `a15` may be used as a
+frame pointer." Under `windowed`, "function parameters are passed in
+registers `a10` through `a15`, and called function rotates register
+window by 8 registers on entry so that its arguments are found in
+registers `a2` through `a7`."[^14] A project chooses `call0` to avoid the
 windowed ABI's register-window spill and fill machinery in code paths
 where that machinery cannot safely run, historically low-level
 interrupt or boot code before the window overflow/underflow handlers are
@@ -303,13 +369,16 @@ every file in one component without touching the top-level
 ## What to keep identical when compiling a kernel out of tree
 
 Compiling one file's kernel outside the project only matches the
-in-tree build's codegen if the optimization level, `-mlongcalls`,
-`-mtext-section-literals`/`-mauto-litpools`, the
+in-tree build's codegen if the optimization level, `-mlongcalls`, the
 `-fno-jump-tables`/`-fno-tree-switch-conversion` pair, the active
 `-fstack-protector*` mode, `-mdisable-hardware-atomics`, and the ABI
-(`-mabi=`, windowed by default and never overridden by ESP-IDF for
-Xtensa) all match: each changes instruction selection, call sequences,
-or the calling convention itself, as shown above. Mixing a
+(`-mabi=`, windowed by the core configuration and never overridden by
+ESP-IDF for Xtensa) all match: each changes instruction selection, call
+sequences, or the calling convention itself, as shown above. Add
+`-mtext-section-literals` or `-mauto-litpools` only if the real build
+passes one, which for ESP-IDF it does not: adding either out of tree
+moves literals into `.text` and makes an otherwise clean disassembly
+diff look wrong. Mixing a
 `call0`-compiled snippet into a windowed-ABI project silently corrupts
 the register windows. `-ffunction-sections -fdata-sections` and
 `-fstrict-volatile-bitfields` matter less for instruction selection but
@@ -352,11 +421,11 @@ project-specific include paths or macros that change which branch of an
 
 ## Footnotes
 
-[^1]: [measured] Local toolchain, `xtensa-esp32s3-elf-gcc` and `xtensa-esp-elf-gcc`, `gcc version 14.2.0 (crosstool-NG esp-14.2.0_20241119)`, at `~/.platformio/packages/toolchain-xtensa-esp-elf/bin/`. Commands run: `-v`, `-print-multi-lib`, `--help=target`, `--help=common`, `-O2 -S [-fverbose-asm]` and `-O2 -c` (disassembled with `objdump -d -r`) against small standalone test files under `/tmp`, none part of any project source tree. All runs 2026-09-06.
+[^1]: [measured] Local toolchain, `xtensa-esp32s3-elf-gcc` and `xtensa-esp-elf-gcc`, `gcc version 14.2.0 (crosstool-NG esp-14.2.0_20241119)`, at `~/.platformio/packages/toolchain-xtensa-esp-elf/bin/`. Commands run: `-v`, `-print-multi-lib`, `--help=target`, `--help=common`, `-###`, `-O2 -S [-fverbose-asm]`, `-O2 -c` (disassembled with `objdump -d -r` and inspected with `objdump -h`), and a two-object link with and without `-Wl,--no-relax`. All against small standalone test files under `/tmp`, none part of any project source tree. All runs 2026-09-06.
 
-[^2]: Source, `framework-espidf` package under `~/.platformio/packages/`, ESP-IDF 5.5.1 (`version.txt`): `CMakeLists.txt` (root, lines 47-67 optimization mapping, 160-165 stack-protector mapping, 199 `-fstrict-volatile-bitfields`, 217 `-fno-lto`, 262-267 `-fno-jump-tables`/`-fno-tree-switch-conversion`); `tools/cmake/toolchain-esp32s3.cmake` (`-mlongcalls`, the `-fno-builtin-*` list); `tools/cmake/build.cmake` (lines 129-130, `-ffunction-sections -fdata-sections`); `tools/cmake/project.cmake` (line 593, `CMAKE_EXPORT_COMPILE_COMMANDS ON`).
+[^2]: Source, `framework-espidf` package under `~/.platformio/packages/`, ESP-IDF 5.5.1 (`version.txt`): `CMakeLists.txt` (root, lines 47-67 optimization mapping, 160-165 stack-protector mapping, 199 `-fstrict-volatile-bitfields`, 217 `-fno-lto`, 262-267 `-fno-jump-tables`/`-fno-tree-switch-conversion`); `tools/cmake/toolchain-esp32s3.cmake` (`-mlongcalls`, the `-fno-builtin-*` list); `tools/cmake/build.cmake` (lines 129-130, `-ffunction-sections -fdata-sections`); `tools/cmake/project.cmake` (line 593, `CMAKE_EXPORT_COMPILE_COMMANDS ON`). Neither flag naming a literal-pool mode appears anywhere in the package's CMake or Kconfig files, checked by searching the whole tree for `text-section-literals` and `auto-litpools`.
 
-[^3]: Source, `framework-espidf` package, root `Kconfig`, lines 338-374, `choice COMPILER_OPTIMIZATION`.
+[^3]: Source, `framework-espidf` package, root `Kconfig`, lines 340-374, `choice COMPILER_OPTIMIZATION` (`endchoice` at 374; the enclosing `menu "Compiler options"` opens at 338).
 
 [^4]: Free Software Foundation, *Using the GNU Compiler Collection (GCC)*, 14.2.0, "Optimize Options" (gcc.gnu.org/onlinedocs/gcc-14.2.0/gcc/Optimize-Options.html), read 2026-09-06.
 
@@ -368,11 +437,11 @@ project-specific include paths or macros that change which branch of an
 
 [^8]: Free Software Foundation, *GCC*, 14.2.0, "Options for Code Generation Conventions," `-fno-jump-tables` (gcc.gnu.org/onlinedocs/gcc-14.2.0/gcc/Code-Gen-Options.html), read 2026-09-06.
 
-[^9]: Source, `framework-espidf` package, root `Kconfig`, lines 505-543, `choice COMPILER_STACK_CHECK_MODE` and its help text, read 2026-09-06.
+[^9]: Source, `framework-espidf` package, root `Kconfig`, lines 505-539, `choice COMPILER_STACK_CHECK_MODE` and its help text, read 2026-09-06.
 
 [^10]: Free Software Foundation, *GCC*, 14.2.0, "Instrumentation Options," `-fstack-protector-strong` and `-fstack-protector-all` (gcc.gnu.org/onlinedocs/gcc-14.2.0/gcc/Instrumentation-Options.html), read 2026-09-06.
 
-[^11]: Source, `framework-espidf` package, `components/newlib/Kconfig`, lines 165-167, config `STDATOMIC_S32C1I_SPIRAM_WORKAROUND`.
+[^11]: Source, `framework-espidf` package, `components/newlib/Kconfig`, lines 165-167, config `STDATOMIC_S32C1I_SPIRAM_WORKAROUND`. Also Espressif Systems, *ESP-IDF Programming Guide* v5.5.1, "Support for External RAM," Restrictions section (docs.espressif.com/projects/esp-idf/en/v5.5.1/esp32s3/api-guides/external-ram.html), read 2026-09-06. It names cache, DMA descriptors and task stacks, but not atomics.
 
 [^12]: Source, `framework-espidf` package, `components/newlib/project_include.cmake` (lines 1-2, appends `-mdisable-hardware-atomics` when the workaround config is on) and `components/newlib/CMakeLists.txt` (lines 89-93, `heap.c` compiled with `-fno-builtin`, `src/port/xtensa/stdatomic_s32c1i.c` compiled with `-mno-disable-hardware-atomics`).
 
@@ -381,3 +450,5 @@ project-specific include paths or macros that change which branch of an
 [^14]: Free Software Foundation, *GCC*, 14.2.0, "Xtensa Options," `-mabi=call0`/`-mabi=windowed` (gcc.gnu.org/onlinedocs/gcc-14.2.0/gcc/Xtensa-Options.html), read 2026-09-06.
 
 [^15]: Free Software Foundation, *GCC*, 14.2.0, "Common Function Attributes," `optimize` (gcc.gnu.org/onlinedocs/gcc-14.2.0/gcc/Common-Function-Attributes.html), read 2026-09-06; source examples, `components/bootloader_support/src/esp_image_format.c` line 669 and `components/esp_hw_support/port/esp32/rtc_clk.c` line 424, `framework-espidf` package.
+
+[^16]: Source, `framework-espidf` package, ESP-IDF 5.5.1: `components/esp_rom/esp32s3/ld/esp32s3.rom.libc.ld` lines 7-17 (`memset`, `memcpy`, `memmove`, `strncpy`, `bzero` as absolute ROM addresses); `components/esp_rom/CMakeLists.txt` line 308, which includes that fragment when `CONFIG_ESP_ROM_HAS_NEWLIB` is set; `components/esp_rom/esp32s3/esp_rom_caps.h` line 26, `ESP_ROM_HAS_NEWLIB (1)`. For the override that does not apply here: `components/newlib/CMakeLists.txt` lines 41-55, `components/newlib/Kconfig` lines 146-149, and the absence of `ESP_ROM_HAS_SUBOPTIMAL_NEWLIB_ON_MISALIGNED_MEMORY` from `components/esp_rom/esp32s3/esp_rom_caps.h`. Read 2026-09-06.

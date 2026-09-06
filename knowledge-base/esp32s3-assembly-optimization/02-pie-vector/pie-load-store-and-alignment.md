@@ -3,7 +3,7 @@ title: PIE load and store instructions and their alignment rules
 id: 02-pie-vector/pie-load-store-and-alignment
 schema_version: 1
 doc_type: reference
-status: draft
+status: review
 last_reviewed: 2026-09-06
 tags: [esp32s3, xtensa, pie, simd, alignment, load-store]
 confidence: high
@@ -17,7 +17,8 @@ low address bits to zero before the access. Nothing traps. A misaligned pointer
 gives you the wrong 16 bytes, and on a store it overwrites the wrong 16 bytes.
 This leaf lists the forms, their operands, their immediate ranges, and the rules
 that keep them correct. For what a `q` register is and how it is saved across a
-context switch, see the register leaf in this bucket.
+context switch, see
+[PIE register file, state registers and context save](./pie-register-file-sar-and-context.md).
 
 ## The addressing model
 
@@ -65,13 +66,14 @@ overview,[^trm-read][^trm-write] and again in every individual entry in section
 
 Only the 8-bit broadcast load takes the address as given.[^trm-vldbc8]
 
-Espressif's own QEMU fork implements the mask the same way: `ee.vld.128.*`
-translates to `tcg_gen_andi_i32(addr, arg[1].in, 0xfffffff0)` before the memory
-op, and `ee.ld.128.usar.*` additionally captures `arg[1].in & 0xf` into
-`SAR_BYTE`.[^qemu-tie] Masking, not trapping, is also what a bare-metal test on
-silicon shows [experience]. To confirm it on a new part, put a known 16-byte
-pattern in a buffer, run one `ee.vld.128.ip` from `base + k` for `k = 0..15`,
-and compare: all sixteen results come back identical.
+This is documented behaviour, not an observation. Section 1.5.3 states the
+rule, every entry in Section 1.8 repeats it with its own bit count, and
+Espressif's own QEMU fork implements it the same way: `ee.vld.128.*` translates
+to `tcg_gen_andi_i32(addr, arg[1].in, 0xfffffff0)` before the memory op, and
+`ee.ld.128.usar.*` additionally captures `arg[1].in & 0xf` into
+`SAR_BYTE`.[^trm-align][^qemu-tie] To demonstrate it on hardware, put a known
+16-byte pattern in an aligned buffer, run one `ee.vld.128.ip` from `base + k`
+for `k = 0..15`, and compare: all sixteen results come back identical.
 
 ### Why this is dangerous rather than merely surprising
 
@@ -117,16 +119,21 @@ The 128-bit immediate is an 8-bit signed field left-shifted by 4 and the 64-bit
 one is left-shifted by 3, which fixes the range and the granularity
 together.[^trm-vld128ip][^trm-vst128ip][^trm-vld64] The assembler enforces both:
 `ee.vld.128.ip q0, a2, 8` and `ee.vld.128.ip q0, a2, 2048` are rejected as an
-invalid operand value, while 16, `-2048` and 2032 assemble [experience].[^gas]
+invalid operand value, while 16, `-2048` and 2032 assemble [measured].[^gas]
 The half forms are the only way to touch half a vector, useful for an 8-byte
 tail and for building a 128-bit value from two 8-byte sources.
 
-Note the missing `ee.` prefix on `ld.qr`, `st.qr` and `mv.qr`. The TRM lists
-them as instruction group headings but gives them no numbered entry, so their
-operand form is `[uncertain]` against the manual.[^trm-list] The assembler and
-QEMU both accept them: the range `-128..112` in steps of 16 was established by
-assembling every candidate value, and QEMU translates `ld.qr` as a masked load
-with an immediate displacement and no write-back to `as`.[^gas][^qemu-tie]
+Note the missing `ee.` prefix on `ld.qr`, `st.qr` and `mv.qr`. They are the
+last three numbered entries of the chapter, 1.8.218 to 1.8.220, and the
+assembler accepts `-128..112` in steps of 16, which matches the entry's own
+syntax line.[^trm-ldqr][^gas] Two things about `LD.QR` are worth knowing. Its
+pseudocode is written `qu = load128(as + imm)` with no masking, unlike every
+other load entry, but Section 1.5.3's rule covers the whole extended
+instruction set and QEMU does mask; QEMU masks `as` with `0xfffffff0` first and
+adds the displacement afterwards, which comes to the same address because the
+displacement is always a multiple of 16.[^trm-align][^trm-ldqr][^qemu-tie] And
+the `ST.QR` entry's syntax line reads `LD.QR`, a typographical slip in the
+manual.[^trm-ldqr]
 
 ## The broadcast loads
 
@@ -137,14 +144,18 @@ post-increment forms.
 ```
 ee.vldbc.8  qu, as / .ip qu, as, 0..127 / .xp qu, as, ad   # 16 lanes, no mask
 ee.vldbc.16 qu, as / .ip qu, as, 0..254 / .xp qu, as, ad   # 8 lanes, low 1 bit forced
-ee.vldbc.32 qu, as / .ip qu, as, -256..252 / .xp qu, as, ad # 4 lanes, low 2 bits forced
+ee.vldbc.32 qu, as / .ip qu, as, -512..508 / .xp qu, as, ad # 4 lanes, low 2 bits forced
 ee.vldhbc.16.incp qu, qu1, as                              # +16, low 4 bits forced
 ```
 
 The 8-bit and 16-bit immediates are unsigned 7-bit fields, so they cannot walk
-backwards; the 32-bit immediate is signed 8-bit.[^trm-vldbc] The half-broadcast
-form reads 16 bytes and spreads eight 16-bit elements across two registers with
-each element doubled.[^trm-vldhbc]
+backwards; the 32-bit immediate is signed 8-bit.[^trm-vldbc] That last one is a
+documentation defect of the same shape as `EE.ST.ACCX.IP` below: the syntax line
+for `EE.VLDBC.32.IP` reads `-256..252`, while its own description says the
+8-bit signed field is left-shifted by 2, which is `-512..508`, and that is what
+the assembler accepts.[^trm-vldbc][^gas] The half-broadcast form reads 16 bytes
+and spreads eight 16-bit elements across two registers with each element
+doubled.[^trm-vldhbc]
 
 ## The unaligned path: SAR_BYTE and the funnel shift
 
@@ -225,13 +236,18 @@ standalone form. These are the suffixes and which operations carry them:
 | `.LD.IP` | 128-bit load into `qu` | signed immediate, 16-byte steps | `EE.VMULAS.[U/S][8/16].ACCX`, `EE.VMULAS.[U/S][8/16].QACC`, `EE.SRC.Q` |
 | `.LD.XP` | 128-bit load into `qu` | register `ad` | the same three |
 | `.LDBC.INCP` | 16-bit broadcast load into `qu` | +2 | `EE.VMULAS.[U/S][8/16].QACC` |
-| `.QUP` | no extra access | n/a | appended to the `EE.VMULAS.*.LD.IP/LD.XP/LDBC.INCP` forms; adds the unaligned funnel shift on `qs0, qs1` |
+| `.QUP` | no extra access | n/a | appended to the `EE.VMULAS.*.LD.IP/LD.XP/LDBC.INCP` forms and to `EE.SRC.Q`; adds the unaligned funnel shift on `qs0, qs1` |
 [^trm-list]
+
+The FFT family carries its own fused forms outside this table:
+`EE.FFT.CMUL.S16.LD.XP` and `.ST.XP` take a register step, and
+`EE.FFT.AMS.S16` exists in four addressing flavours including a `.LD.R32.DECP`
+that steps backwards.[^trm-list]
 
 The fused immediate is narrower than the standalone one. `EE.VMULAS.*.LD.IP`
 encodes a 6-bit signed field left-shifted by 4, so its range is `-512..496`,
 not `-2048..2032`.[^trm-vmulas-ldip] The assembler agrees: 496 and `-512`
-assemble, 512 does not [experience].[^gas]
+assemble, 512 does not [measured].[^gas]
 
 In the same DSP library the fused add makes a saturating 8-sample add loop three
 instructions long: `ee.vld.128.ip`, `ee.vadds.s16.ld.incp`, `ee.vst.128.ip`,
@@ -257,11 +273,13 @@ bits, which is why the raw spill of a `QACC` half needs both a 128-bit and a
 32-bit instruction.[^trm-regs]
 
 The TRM has a documentation defect here. The syntax line for `EE.ST.ACCX.IP`
-gives `-512..508`, but its own pseudocode shifts the 8-bit immediate left by 3,
-which is `-1024..1016`, and that is what the assembler
-accepts.[^trm-staccx][^gas] Trust the pseudocode and the assembler.
+gives `-512..508`, but the description right below it says the 8-bit
+sign-extended constant is left-shifted by 3, which is `-1024..1016`, and that
+is what the assembler accepts.[^trm-staccx][^gas] Trust the description and the
+assembler. The matching load, `EE.LD.ACCX.IP`, has the correct range on its
+syntax line.[^trm-ldaccx]
 
-## Gather and scatter
+## Indexed load and store: a one-lane gather, not a vector one
 
 Two instructions compute the address from a `q` register instead of taking it
 from `as` alone:
@@ -271,11 +289,14 @@ ee.ldxq.32  qu, qs, as, 0..3, 0..7
 ee.stxq.32  qv, qs, as, 0..3, 0..7
 ```
 
+These are the extension's only indexed accesses, and they are one lane wide.
 `EE.LDXQ.32` picks the 16-bit lane of `qs` named by the second immediate,
 multiplies it by 4, adds it to `as`, forces the low 2 bits of the result to
 zero, and writes the loaded word into the 32-bit lane of `qu` named by the first
-immediate.[^trm-ldxq] `EE.STXQ.32` mirrors it. Both selectors are encoded in the
-instruction, so a four-word gather is four instructions, not a loop.
+immediate.[^trm-ldxq] `EE.STXQ.32` mirrors it. There is no multi-lane gather:
+both selectors are encoded in the instruction, so filling all four 32-bit lanes
+of `qu` from four table entries costs four instructions plus the index setup,
+not one.
 
 ## The `f` register forms
 
@@ -293,7 +314,8 @@ The 128-bit forms carry only a 4-bit signed immediate, so their reach is
 `-128..112`, far shorter than the `q`-register forms, and the lowest `f`
 register in the list takes the lowest 32 bits.[^trm-ldf128] These touch the FPU
 register file, so the lazy coprocessor context rules apply as for any float
-code; see the coprocessor leaf in `00-foundations/`.
+code; see
+[coprocessors, CPENABLE and lazy context](../00-foundations/coprocessors-cpenable-and-lazy-context.md).
 
 ## Where the operand lives
 
@@ -302,7 +324,9 @@ code; see the coprocessor leaf in `00-foundations/`.
   the same cache path and the same miss cost as a scalar load of the same
   address. That the PIE unit has no separate port or bypass is `[uncertain]`:
   the TRM states the rule for CPU access to external memory but does not restate
-  it for the extension. See `03-memory-hierarchy/` for the miss costs.
+  it for the extension. See
+  [caches, SRAM, PSRAM and the MSPI bus](../03-memory-hierarchy/caches-sram-psram-and-the-mspi-bus.md)
+  for the miss costs.
 - **Internal DRAM.** The data bus accepts single-byte, double-byte, 4-byte and
   16-byte aligned access, so both scalar byte access and PIE 128-bit access are
   fine.[^trm-addrmap]
@@ -313,17 +337,25 @@ code; see the coprocessor leaf in `00-foundations/`.
   address is serviced correctly is `[uncertain]`: the address would satisfy the
   4-byte rule, but the TRM does not say the instruction bus carries a 16-byte
   data access. Keep PIE-read tables in DRAM, where the data bus is documented to
-  carry the 16-byte form. See the memory map leaf in `00-foundations/`.
+  carry the 16-byte form. See
+  [the ESP32-S3 memory map and address spaces](../00-foundations/esp32s3-memory-map-and-address-spaces.md).
 
 ## Pipeline note
 
 Table 1.7-2 of the TRM gives the use and def pipeline stage of every operand.
 For every 128-bit load the loaded register `qu` is defined at stage 2 while the
-updated `as` is defined at stage 1, and every arithmetic instruction uses its
-`q` operands at stage 1.[^trm-pipeline] That one-stage gap is the load-use
-distance a PIE loop has to hide, which is why the loop bodies above load one
-iteration ahead. The cycle arithmetic belongs to the cost model leaf in
-`00-foundations/`.
+updated `as` is defined at stage 1, and the plain arithmetic instructions
+use their `q` operands at stage 1.[^trm-pipeline] That one-stage gap is the
+load-use distance a PIE loop has to hide, which is why the loop bodies above
+load one iteration ahead. Every 128-bit load defines its `qu` at stage 2,
+with no exceptions. The use side does have exceptions: the four FFT store
+forms (`EE.CMUL.S16.ST.INCP`, `EE.FFT.CMUL.S16.ST.XP`,
+`EE.FFT.AMS.S16.ST.INCP`, `EE.FFT.VST.R32.DECP`) read their `qv` at stage 2,
+and `EE.VRELU.S8` and `EE.VRELU.S16` define `qs` at stage 2, the same as a
+load.[^trm-pipeline] The per-instruction tables and the interlock arithmetic
+are in [the PIE hazards and latency leaf](pie-hazards-latencies-and-issue-rules.md);
+the scalar pipeline model is in
+[the LX7 core pipeline and cost model](../00-foundations/lx7-core-pipeline-and-cost-model.md).
 
 ## Every load and store mnemonic
 
@@ -333,8 +365,9 @@ unless noted.
 
 | Mnemonic | Width | Forced | Increment | Source |
 |---|---|---|---|---|
-| `ld.qr qu, as, imm` | 128 | 4 | none (displacement `-128..112`) | assembler and QEMU; TRM lists the group only[^trm-list][^gas][^qemu-tie] |
-| `st.qr qv, as, imm` | 128 | 4 | none (displacement `-128..112`) | as above |
+| `ld.qr qu, as, imm` | 128 | 4 | none (displacement `-128..112`, step 16) | 1.8.218; the entry's own pseudocode shows no mask[^trm-ldqr][^qemu-tie] |
+| `st.qr qv, as, imm` | 128 | 4 | none (displacement `-128..112`, step 16) | 1.8.219; as above[^trm-ldqr][^qemu-tie] |
+| `mv.qr qu, qs` | none | n/a | none | 1.8.220[^trm-ldqr] |
 | `ee.vld.128.ip qu, as, imm` | 128 | 4 | imm `-2048..2032`, step 16 | 1.8.88[^trm-vld128ip] |
 | `ee.vld.128.xp qu, as, ad` | 128 | 4 | `ad` | 1.8.89[^trm-vld128xp] |
 | `ee.vst.128.ip qv, as, imm` | 128 | 4 | imm `-2048..2032`, step 16 | 1.8.192[^trm-vst128ip] |
@@ -354,7 +387,7 @@ unless noted.
 | `ee.vldbc.16.ip qu, as, imm` | 16 | 1 | imm `0..254`, step 2 | 1.8.95[^trm-vldbc] |
 | `ee.vldbc.16.xp qu, as, ad` | 16 | 1 | `ad` | 1.8.96[^trm-vldbc] |
 | `ee.vldbc.32 qu, as` | 32 | 2 | none | 1.8.97[^trm-vldbc] |
-| `ee.vldbc.32.ip qu, as, imm` | 32 | 2 | imm `-256..252`, step 4 | 1.8.98[^trm-vldbc] |
+| `ee.vldbc.32.ip qu, as, imm` | 32 | 2 | imm `-512..508`, step 4, per the description and the assembler; the syntax line says `-256..252` | 1.8.98[^trm-vldbc][^gas] |
 | `ee.vldbc.32.xp qu, as, ad` | 32 | 2 | `ad` | 1.8.99[^trm-vldbc] |
 | `ee.vldhbc.16.incp qu, qu1, as` | 128 | 4 | +16 | 1.8.103[^trm-vldhbc] |
 | `ee.ld.128.usar.ip qu, as, imm` | 128 | 4 | imm `-2048..2032`, step 16 | 1.8.17[^trm-usar] |
@@ -392,7 +425,8 @@ unless noted.
 [^trm-align]: Espressif, 2024. *ESP32-S3 Technical Reference Manual*, version 1.8, section 1.5.3 "Data Format and Alignment", pages 48 to 49. https://www.espressif.com/sites/default/files/documentation/esp32-s3_technical_reference_manual_en.pdf
 [^trm-read]: Same manual, section 1.6.1 "Read Instructions" and Table 1.6-2, pages 53 to 54.
 [^trm-write]: Same manual, section 1.6.2 "Write Instructions" and Table 1.6-3, pages 54 to 55.
-[^trm-list]: Same manual, Table 1.6-1 "Extended Instruction List", pages 51 to 53. `LD.QR`, `ST.QR` and `MV.QR` appear as group headings with no numbered entry in section 1.8.
+[^trm-list]: Same manual, Table 1.6-1 "Extended Instruction List", pages 51 to 53, and the category tables 1.6-2 to 1.6-17, pages 54 to 65. Section 1.8 numbers 220 entries: 1.8.1 to 1.8.217 are the `EE.*` instructions, 1.8.218 to 1.8.220 are `LD.QR`, `ST.QR` and `MV.QR`.
+[^trm-ldqr]: Same manual, sections 1.8.218 `LD.QR` (page 301), 1.8.219 `ST.QR` (page 302) and 1.8.220 `MV.QR` (page 303). `LD.QR`'s operation reads `qu = load128(as + imm)`, with no address masking shown, and its syntax line reads `LD.QR qu, as, imm, -128..112`. The `ST.QR` entry's syntax line reads `LD.QR`, not `ST.QR`.
 [^trm-regs]: Same manual, Table 1.5-1 "Register List of ESP32-S3 Extended Instruction Set", page 45. Eight 128-bit `QR`, one 4-bit `SAR_BYTE`, one 40-bit `ACCX`, two 160-bit `QACC`, one 128-bit `UA_STATE`.
 [^trm-vld128ip]: Same manual, section 1.8.88 `EE.VLD.128.IP`, page 164.
 [^trm-vld128xp]: Same manual, section 1.8.89 `EE.VLD.128.XP`, page 165.
@@ -400,7 +434,7 @@ unless noted.
 [^trm-vld64]: Same manual, sections 1.8.90 to 1.8.93, pages 166 to 169.
 [^trm-vst64]: Same manual, sections 1.8.194 to 1.8.197, pages 277 to 280.
 [^trm-vldbc8]: Same manual, section 1.8.100 `EE.VLDBC.8`, page 176. It is the only load with no forced bits.
-[^trm-vldbc]: Same manual, sections 1.8.94 to 1.8.102, pages 170 to 178.
+[^trm-vldbc]: Same manual, sections 1.8.94 to 1.8.102, pages 170 to 178. `EE.VLDBC.32.IP` (1.8.98, page 174) carries the range defect: syntax line `-256..252`, description "8-bit sign-extended constant in the instruction code segment left-shifted by 2".
 [^trm-vldhbc]: Same manual, section 1.8.103 `EE.VLDHBC.16.INCP`, page 179.
 [^trm-usar]: Same manual, sections 1.8.17 and 1.8.18 `EE.LD.128.USAR.IP` and `.XP`, pages 93 to 94.
 [^trm-srcq]: Same manual, sections 1.8.49 `EE.SRC.Q` and 1.8.52 `EE.SRC.Q.QUP`, pages 125 and 128.
@@ -412,7 +446,7 @@ unless noted.
 [^trm-ldqa]: Same manual, sections 1.8.29 to 1.8.36 `EE.LDQA.*`, pages 105 to 112, and Table 1.6-2, page 54.
 [^trm-qacc]: Same manual, sections 1.8.20 to 1.8.23 and 1.8.60 to 1.8.63, pages 96 to 99 and 136 to 139.
 [^trm-ldaccx]: Same manual, section 1.8.19 `EE.LD.ACCX.IP`, page 95.
-[^trm-staccx]: Same manual, section 1.8.59 `EE.ST.ACCX.IP`, page 135. The syntax line reads `-512..508`; the operation shifts the 8-bit immediate left by 3.
+[^trm-staccx]: Same manual, section 1.8.59 `EE.ST.ACCX.IP`, page 135. The syntax line reads `-512..508`; the description says the 8-bit sign-extended constant is left-shifted by 3, and the operation line writes only `as += imm8`.
 [^trm-uastate]: Same manual, sections 1.8.24 and 1.8.64, pages 100 and 140.
 [^trm-ldxq]: Same manual, sections 1.8.37 `EE.LDXQ.32` and 1.8.69 `EE.STXQ.32`, pages 113 and 145.
 [^trm-vadds-ld-incp]: Same manual, section 1.8.71 `EE.VADDS.S16.LD.INCP`, page 147.
@@ -421,8 +455,8 @@ unless noted.
 [^trm-vmulas-ldbc]: Same manual, section 1.8.144 `EE.VMULAS.S16.QACC.LDBC.INCP`, page 220.
 [^trm-pipeline]: Same manual, Table 1.7-2 "Extended Instruction Pipeline Stages", section 1.7.1, pages 66 to 74.
 [^trm-addrmap]: Same manual, chapter 4 "System and Memory", section 4.3.1 "Address Mapping", page 402.
-[^qemu-tie]: Espressif QEMU fork, branch `esp-develop`, commit `febae182e132e4055529be423a818225ebddaa3a`, file `target/xtensa/translate_tie_esp32s3.c`. `translate_vld_128_s3` masks with `0xfffffff0`; `translate_ld_128_usar_s3` additionally sets `SAR_BYTE` from `arg[1].in & 0xf`; `ld.qr` and `st.qr` are registered as opcodes with an immediate displacement. https://github.com/espressif/qemu
+[^qemu-tie]: Espressif QEMU fork, branch `esp-develop`, commit `febae182e132e4055529be423a818225ebddaa3a`, file `target/xtensa/translate_tie_esp32s3.c`. `translate_vld_128_s3` masks with `0xfffffff0`; `translate_ld_128_usar_s3` additionally sets `SAR_BYTE` from `arg[1].in & 0xf`; `translate_ld_qr_s3` and `translate_st_qr_s3` mask `arg[1].in` with `0xfffffff0` and then add `arg[2].imm`. https://github.com/espressif/qemu
 [^espdsp-add]: Espressif esp-dsp, tag v1.8.2, commit `7a0f3edf86dd530f7a7f42a4b54eb04a0cd57384`, file `modules/math/add/fixed/dsps_add_s16_aes3.S`. The vector path is guarded by `movi a15, 0xF` and `bany` on both input pointers. https://github.com/espressif/esp-dsp
 [^espdsp-memcpy]: Same repository and commit, file `modules/support/mem/esp32s3/dsps_memcpy_aes3.S`, label `._main_loop_unaligned`.
-[^gas]: GNU assembler (crosstool-NG esp-14.2.0_20241119) 2.43.1, `xtensa-esp32s3-elf-as`, run 2026-09-06. Immediate ranges and granularity were established by assembling candidate values and recording acceptance or the "invalid value" diagnostic.
+[^gas]: [measured] GNU assembler (crosstool-NG esp-14.2.0_20241119) 2.43.1, `xtensa-esp32s3-elf-as`, run 2026-09-06. Immediate ranges and granularity were established by assembling candidate values and recording acceptance or the "operand N has invalid value" diagnostic. Confirmed at both ends and one step past each end: `ld.qr` and `st.qr` `-128..112` step 16, `ee.vld.128.ip` `-2048..2032` step 16, `ee.vld.l.64.ip` and `ee.ldf.64.ip` `-1024..1016` step 8, `ee.ldf.128.ip` and `ee.stf.128.ip` `-128..112` step 16, `ee.ldqa.u8.128.ip` and `ee.ld.ua_state.ip` `-2048..2032` step 16, `ee.ld.qacc_h.h.32.ip` `-512..508` step 4, `ee.src.q.ld.ip` `-2048..2032` step 16, `ee.vmulas.s16.qacc.ld.ip` `-512..496` step 16, `ee.st.accx.ip` `-1024..1016` step 8, `ee.vldbc.8.ip` `0..127`, `ee.vldbc.16.ip` `0..254` step 2, `ee.vldbc.32.ip` `-512..508` step 4, and `ee.ldxq.32` selectors `0..3` and `0..7`.
 [^idf-memtypes]: Espressif, 2026. *ESP-IDF Programming Guide*, ESP32-S3, "Memory Types". Instruction memory "can only be read or written via 4-byte aligned words"; data memory "can be accessed via individual byte operations". https://docs.espressif.com/projects/esp-idf/en/stable/esp32s3/api-guides/memory-types.html

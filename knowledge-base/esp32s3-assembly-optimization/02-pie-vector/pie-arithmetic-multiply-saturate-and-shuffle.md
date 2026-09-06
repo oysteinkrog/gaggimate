@@ -3,7 +3,7 @@ title: "PIE compute instructions: multiply, saturate, compare and shuffle"
 id: 02-pie-vector/pie-arithmetic-multiply-saturate-and-shuffle
 schema_version: 1
 doc_type: reference
-status: draft
+status: review
 last_reviewed: 2026-09-06
 tags: [esp32s3, xtensa, pie, simd, fixed-point, saturation, shuffle]
 confidence: high
@@ -18,9 +18,12 @@ naming.[^trm-pie][^trm-regs]
 
 This file covers the compute half of the set: multiplies, multiply accumulate, adds,
 compares, bitwise ops, shifts, lane moves, interleaves, the activation instructions and
-the FFT helpers. Loads, stores, the `q` registers themselves and the coprocessor context
-rules are separate topics. Everything below is the ESP32-S3 Technical Reference Manual
-version 1.8 unless a footnote says otherwise.[^trm-pie]
+the FFT helpers. Loads and stores are in
+[PIE load and store instructions and their alignment rules](./pie-load-store-and-alignment.md);
+the `q` registers themselves and the coprocessor context rules are in
+[PIE register file, state registers and context save](./pie-register-file-sar-and-context.md).
+Everything below is the ESP32-S3 Technical Reference Manual version 1.8 unless a
+footnote says otherwise.[^trm-pie]
 
 ## The shape of the set
 
@@ -28,7 +31,7 @@ version 1.8 unless a footnote says otherwise.[^trm-pie]
 |---|---|
 | Vector registers | 8, named `q0` to `q7`, 128 bits each[^trm-regs] |
 | Lane widths | 16 x 8-bit, 8 x 16-bit, or 4 x 32-bit, chosen by the instruction[^trm-regs] |
-| Scalar shift register | `SAR`, 6 bits, read by every multiply and by the 32-bit lane shifts[^trm-regs] |
+| Scalar shift register | `SAR`, 6 bits, read by every multiply and by the 32-bit lane shifts[^trm-regs][^trm-shift] |
 | Byte shift register | `SAR_BYTE`, 4 bits, read by the funnel shifts[^trm-regs] |
 | Wide accumulator, flat | `ACCX`, 40 bits, one lane[^trm-regs] |
 | Wide accumulator, per lane | `QACC_L` and `QACC_H`, 160 bits each[^trm-regs] |
@@ -43,10 +46,11 @@ destination and drops the rest.[^trm-sat]
 `EE.VMUL.*` has no shift operand. It multiplies each pair of lanes at full product
 width, shifts the product right by `SAR`, then writes the low bits of that back to a
 lane as wide as the inputs.[^trm-mul] `SAR` is part of the multiply's meaning, not a
-separate step. Set it before the loop with `wsr.sar a3`, which writes the register
-directly, or with `ssr a3` or `ssai <imm>`; the immediate form takes 0 to
-31.[^dsp-mul][^gas-test] Signedness picks the shift kind: `EE.VMUL.S16` shifts the
-product arithmetically, `EE.VMUL.U16` logically.[^trm-mul]
+separate step. Set it before the loop with `wsr.sar a3`, which is the only writer that
+reaches all six bits. `ssr a3` writes `AR[3][4:0]` and clears the top bit of `SAR`, and
+`ssai <imm>` takes 0 to 31, so neither can express a shift of 32 or
+more.[^dsp-mul][^isa-ssr][^gas-test] Signedness picks the shift kind: `EE.VMUL.S16`
+shifts the product arithmetically, `EE.VMUL.U16` logically.[^trm-mul]
 
 | Instruction | Lanes | Product | Written back | Overflow |
 |---|---|---|---|---|
@@ -83,7 +87,7 @@ instructions keep the lanes apart.[^trm-regs]
 | Instruction | Reads | Accumulates into | Saturates at |
 |---|---|---|---|
 | `EE.VMULAS.S16.ACCX qx, qy` | 8 x s16 pairs | one 40-bit `ACCX` | +/- 2^39[^trm-mac] |
-| `EE.VMULAS.S8.ACCX qx, qy` | 16 x s8 pairs | one 40-bit `ACCX` | +/- 2^39[^trm-list] |
+| `EE.VMULAS.S8.ACCX qx, qy` | 16 x s8 pairs | one 40-bit `ACCX` | +/- 2^39[^trm-mac] |
 | `EE.VMULAS.S16.QACC qx, qy` | 8 x s16 pairs | 8 x 40-bit lanes | +/- 2^39 per lane[^trm-mac] |
 | `EE.VMULAS.S8.QACC qx, qy` | 16 x s8 pairs | 16 x 20-bit lanes | +/- 2^19 per lane[^trm-mac] |
 | `EE.VSMULAS.S16.QACC qx, qy, sel8` | 8 x s16 against one lane of `qy` | 8 x 40-bit lanes | +/- 2^39 per lane[^trm-mac] |
@@ -105,9 +109,9 @@ suffix on top realigns the loaded data using `SAR_BYTE`.[^trm-list]
 
 | Path | What it does |
 |---|---|
-| `EE.SRCMB.S16.QACC qu, as, sel` | Shifts all 8 40-bit lanes right by `as[5:0]`, writes them back into `QACC`, and writes each lane saturated to s16 into `qu`[^trm-mac] |
-| `EE.SRCMB.S8.QACC qu, as, sel` | Same for 16 20-bit lanes, shift `as[4:0]`, saturated to s8[^trm-mac] |
-| `EE.SRS.ACCX au, as, sel` | Shifts `ACCX` right by `as[5:0]`, writes it back, and writes the value saturated to s32 into an `a` register[^trm-mac] |
+| `EE.SRCMB.S16.QACC qu, as, sel2` | Shifts all 8 40-bit lanes right by `as[5:0]`, writes them back into `QACC`, and writes each lane saturated to s16 into `qu`[^trm-mac] |
+| `EE.SRCMB.S8.QACC qu, as, sel2` | Same for 16 20-bit lanes, shift `as[4:0]`, saturated to s8[^trm-mac] |
+| `EE.SRS.ACCX au, as, sel2` | Shifts `ACCX` right by `as[5:0]`, writes it back, and writes the value saturated to s32 into an `a` register[^trm-mac] |
 | `RUR.ACCX_0`, `RUR.ACCX_1` | Read the raw 40 bits of `ACCX` as two `a` register halves[^gas-test][^dsp-dp8] |
 | `RUR.QACC_L_0` to `_L_4`, `RUR.QACC_H_0` to `_H_4` | Read each 160-bit accumulator through five `a` register windows[^gas-test] |
 | `EE.ST.QACC_[H/L].*`, `EE.LD.QACC_[H/L].*` | Move the accumulators to and from memory[^trm-list] |
@@ -154,8 +158,8 @@ This is the sharpest hole in the set. Lane shifts exist for 32-bit lanes only.
 
 | Instruction | Shift amount | Lanes |
 |---|---|---|
-| `EE.VSL.32 qa, qs` | `SAR`, zero fill | 4 x 32-bit, left[^trm-shift] |
-| `EE.VSR.32 qa, qs` | `SAR`, sign fill | 4 x 32-bit, arithmetic right[^trm-shift] |
+| `EE.VSL.32 qa, qs` | `SAR[5:0]`, zero fill | 4 x 32-bit, left[^trm-shift] |
+| `EE.VSR.32 qa, qs` | `SAR[5:0]`, sign fill | 4 x 32-bit, arithmetic right[^trm-shift] |
 
 There is no 8-bit or 16-bit lane shift at all.[^trm-list] The substitute is a multiply,
 and it is exact:
@@ -190,7 +194,7 @@ uses `SAR_BYTE` directly.[^trm-shift]
 |---|---|
 | `EE.MOVI.32.A qs, au, sel4` | Copy one of four 32-bit lanes of `qs` into an `a` register[^trm-lane] |
 | `EE.MOVI.32.Q qu, as, sel4` | Copy an `a` register into one of four 32-bit lanes of `qu`[^trm-lane] |
-| `MV.QR qu, qs` | Copy a whole `q` register[^trm-list] |
+| `MV.QR qu, qs` | Copy a whole `q` register. No `EE.` prefix, and it is the manual's last numbered entry[^trm-mvqr] |
 
 Granularity is 32 bits in both directions, so reaching one byte or one 16-bit lane needs
 a scalar shift or mask around the move. Building a constant vector from an immediate
@@ -236,19 +240,23 @@ Five families exist only for fixed-point FFTs. `EE.FFT.R2BF.S16` does a radix-2
 butterfly, `EE.FFT.CMUL.S16.[LD.XP/ST.XP]` the complex butterfly multiply, and
 `EE.FFT.AMS.S16.*` a whole add, multiply and shift step in four addressing flavours, one
 of which carries unaligned state across calls in the `UA_STATE` register.
-`EE.FFT.VST.R32.DECP` stores with the word order reversed. `EE.BITREV qa, as` generates
-eight bit-reversed indices from a counter in `as`, at a width set by `FFT_BIT_WIDTH`, and
-post-increments `as` by 8.[^trm-list][^trm-act] `EE.CMUL.S16` sits with the arithmetic
-instructions but is the same complex multiply in general form: an immediate picks one of
-four 32-bit pairs and chooses `ac - bd` or `ac + bd` for the real part.[^trm-mul] All of
-them assume the interleaved complex layout, so outside an FFT they rarely fit.
+`EE.FFT.VST.R32.DECP` swaps the two 16-bit halves of each 32-bit word on the way out,
+optionally shifting each half right by 1, and steps `as` back 16.[^trm-fftvst]
+`EE.BITREV qa, as` is not a plain bit reversal: for eight consecutive values of a counter
+in `as` it writes the larger of the value and its bit reversal, at a width set by
+`FFT_BIT_WIDTH`, then adds 8 to `as`.[^trm-act] `EE.CMUL.S16` sits with the arithmetic
+instructions but is the same complex multiply in general form. Its immediate does two
+things at once: `sel4` of 0 or 2 works on the low 64 bits and 1 or 3 on the high 64 bits,
+two complex pairs either way, and 0 or 1 gives `ac - bd` for the real part while 2 or 3
+gives `ac + bd`, which is the conjugate.[^trm-mul] All of them assume the interleaved
+complex layout, so outside an FFT they rarely fit.
 
 ## What is not there
 
 | Missing | What you do instead |
 |---|---|
-| Vector gather | `EE.LDXQ.32 qu, qs, as, sel4, sel8` loads one 32-bit word using one 16-bit lane of `qs` scaled by 4 as the index, into one lane of `qu`. A 4-wide gather is 4 instructions plus the index setup[^trm-act] |
-| Vector scatter | `EE.STXQ.32` is the matching one-lane store[^trm-list] |
+| Multi-lane gather | There is none, but there is a one-lane indexed load. `EE.LDXQ.32 qu, qs, as, sel4, sel8` loads one 32-bit word using one 16-bit lane of `qs` scaled by 4 as the index, into one lane of `qu`. Filling all four lanes is 4 instructions plus the index setup[^trm-act] |
+| Multi-lane scatter | `EE.STXQ.32` is the matching one-lane indexed store[^trm-list] |
 | Per-lane variable shift | Every shift takes `SAR`, `SAR_BYTE` or an immediate, one value for the whole register[^trm-list] |
 | 8-bit or 16-bit lane shift | Multiply by a power of two, with `SAR` for the right shift |
 | 32-bit lane multiply | Nothing. Split into 16-bit pieces or leave the loop scalar |
@@ -367,16 +375,28 @@ are one instruction:[^dsp-dp8]
   prose above it is correct, and Espressif's QEMU model sign-extends each lane on its
   own.[^trm-mac][^qemu-mov]
 - `EE.SRCMB.*.QACC` and `EE.SRS.ACCX` take a third operand that the manual writes as a
-  literal `0` and never describes. The assembler accepts 0 or 1 and encodes a different
-  word for each, esp-dsp passes 1, and the QEMU model reads it then ignores
-  it.[^gas-test][^dsp-dp8][^qemu-srcmb] What the bit does on silicon is `[uncertain]`,
-  and QEMU cannot answer it.
+  literal `0` and never describes. Its instruction-word diagram shows no field for it at
+  all: the bit it actually uses is drawn as a constant `0` inside the fixed field the
+  diagram writes as `010` for `EE.SRCMB.*` and `001` for `EE.SRS.ACCX`. Four sources say
+  four partial things. The toolchain's own configuration names the operand `sel2` and
+  accepts 0 or 1, encoding a different word for each. esp-dsp passes 1, once, with no
+  comment. Espressif's QEMU calls it `sel2` too, hands it to the `EE.SRCMB.*` helper,
+  which never reads it, and for `EE.SRS.ACCX` does not decode it at all. The manual says
+  nothing. What the bit does on silicon is therefore `[uncertain]`, and only a device
+  test can settle it.[^gas-test][^dsp-dp8][^qemu-srcmb][^trm-mac]
 - The register overview says `EE.VSR.32` and `EE.VSL.32` use "the lower 5 bits of SAR",
-  while both instruction entries call the register 6 bits and read `SAR[5:0]`.
-  `[uncertain]` which is right, and a shift above 31 on a 32-bit lane is best
-  avoided.[^trm-regs][^trm-shift]
+  while both instruction entries call the register 6 bits and read `SAR[5:0]`, and the
+  QEMU model passes the register unmasked. Take the entries as the
+  authority.[^trm-regs][^trm-shift][^qemu-vsx] What a 32-bit lane does when shifted by 32
+  or more is stated nowhere, so keep the amount inside 0 to 31, where the two readings
+  agree.
 - `EE.CMUL.S16`'s prose puts the real part in the upper 16 bits of each 32-bit pair, but
-  its pseudo-code treats the low 16 bits as the real part. `[uncertain]`.[^trm-mul]
+  its own operation section treats the low 16 bits as the real part, and QEMU does the
+  same. Follow the operation section: real in the low half, imaginary in the high half,
+  which is also the order a `re, im` array lands in on a little-endian
+  machine.[^trm-mul][^qemu-cmul] The two agreeing sources are not independent, since the
+  QEMU model was plainly written from the operation section, so a device test would still
+  be worth having.
 - In esp-dsp's `dsps_add_s16_aes3`, the vector path writes `SAR` then runs
   `EE.VADDS.S16`, which does not read `SAR`, while the scalar fallback in the same file
   applies the shift. The two paths disagree about the `shift` argument. Read from the
@@ -386,15 +406,25 @@ are one instruction:[^dsp-dp8]
 [^trm-regs]: Same manual, section 1.5.1 "Registers" (table 1.5-1) and section 1.5.1.2 "Special Registers".
 [^trm-sat]: Same manual, section 1.5.4, "Data Overflow and Saturation Handling".
 [^trm-list]: Same manual, section 1.6, "Extended Instruction List": table 1.6-1 and tables 1.6-2 through 1.6-17.
-[^trm-mul]: Same manual, sections 1.8.122 `EE.VMUL.S16`, 1.8.123 `EE.VMUL.S16.LD.INCP`, 1.8.125 `EE.VMUL.S8`, 1.8.128 `EE.VMUL.U16`, 1.8.131 `EE.VMUL.U8`, 1.8.4 `EE.CMUL.S16`.
-[^trm-mac]: Same manual, sections 1.8.134 `EE.VMULAS.S16.ACCX`, 1.8.139 `EE.VMULAS.S16.QACC`, 1.8.151 `EE.VMULAS.S8.QACC`, 1.8.187 `EE.VSMULAS.S16.QACC`, 1.8.54 and 1.8.55 `EE.SRCMB.S16/S8.QACC`, 1.8.58 `EE.SRS.ACCX`, 1.8.38 to 1.8.41 `EE.MOV.[S/U][8/16].QACC`, 1.8.215 to 1.8.217 `EE.ZERO.ACCX`, `EE.ZERO.Q`, `EE.ZERO.QACC`.
+[^trm-mul]: Same manual, sections 1.8.122 `EE.VMUL.S16` (page 198), 1.8.123 `EE.VMUL.S16.LD.INCP`, 1.8.125 `EE.VMUL.S8`, 1.8.128 `EE.VMUL.U16`, 1.8.131 `EE.VMUL.U8`, 1.8.4 `EE.CMUL.S16` (page 80). `EE.CMUL.S16`'s description sentence reads "The real and imaginary parts of complex numbers are stored in the upper 16 bits and lower 16 bits of the 32 bits respectively", while its operation section computes `qz[15:0] = (qx[15:0]*qy[15:0] - qx[31:16]*qy[31:16]) >> SAR[5:0]`, which puts the real part in the low half.
+[^trm-mac]: Same manual, sections 1.8.134 `EE.VMULAS.S16.ACCX` (page 210), 1.8.146 `EE.VMULAS.S8.ACCX`, 1.8.139 `EE.VMULAS.S16.QACC` (page 215), 1.8.151 `EE.VMULAS.S8.QACC` (page 227), 1.8.187 `EE.VSMULAS.S16.QACC` (page 269), 1.8.189 `EE.VSMULAS.S8.QACC`, 1.8.54 and 1.8.55 `EE.SRCMB.S16/S8.QACC` (pages 130 and 131), 1.8.58 `EE.SRS.ACCX` (page 134), 1.8.38 to 1.8.41 `EE.MOV.[S/U][8/16].QACC` (from page 114), 1.8.215 to 1.8.217 `EE.ZERO.ACCX`, `EE.ZERO.Q`, `EE.ZERO.QACC` (from page 298). Both `EE.VMULAS.*.ACCX` forms saturate the 41-bit sum to +/- 2^39. Neither `EE.SRCMB.*` nor `EE.SRS.ACCX` shows a field for its third operand in its instruction-word diagram.
 [^trm-cmp]: Same manual, sections 1.8.70 `EE.VADDS.S16`, 1.8.79 `EE.VCMP.EQ.S16`, 1.8.104 `EE.VMAX.S16`. Bitwise ops: 1.8.1 `EE.ANDQ`, 1.8.44 `EE.NOTQ`, 1.8.45 `EE.ORQ`.
-[^trm-shift]: Same manual, sections 1.8.186 `EE.VSL.32`, 1.8.191 `EE.VSR.32`, 1.8.49 `EE.SRC.Q`, 1.8.53 `EE.SRCI.2Q`, 1.8.47 `EE.SLCI.2Q`, 1.8.57 `EE.SRCXXP.2Q`, 1.8.48 `EE.SLCXXP.2Q`.
+[^trm-shift]: Same manual, sections 1.8.186 `EE.VSL.32` (page 268), 1.8.191 `EE.VSR.32` (page 274), 1.8.49 `EE.SRC.Q` (page 125), 1.8.53 `EE.SRCI.2Q`, 1.8.47 `EE.SLCI.2Q`, 1.8.57 `EE.SRCXXP.2Q`, 1.8.48 `EE.SLCXXP.2Q`. `EE.VSL.32` and `EE.VSR.32` both read "the value in the 6-bit special register SAR" and both operate as a shift by `SAR[5:0]`.
 [^trm-lane]: Same manual, sections 1.8.42 `EE.MOVI.32.A`, 1.8.43 `EE.MOVI.32.Q`, 1.8.207 `EE.VUNZIP.16`, 1.8.209 `EE.VUNZIP.8`, 1.8.210 `EE.VZIP.16`, 1.8.212 `EE.VZIP.8`.
-[^trm-act]: Same manual, sections 1.8.182 `EE.VPRELU.S16`, 1.8.184 `EE.VRELU.S16`, 1.8.2 `EE.BITREV`, 1.8.37 `EE.LDXQ.32`.
-[^gas-test]: Assembled with `xtensa-esp32s3-elf-as`, GNU assembler 2.43.1 (crosstool-NG esp-14.2.0_20241119), 2026-09-06. Confirms the mnemonics and operand ranges quoted here: `EE.SLCI.2Q` immediates 0 to 15, `EE.SRS.ACCX` and `EE.SRCMB.*` third operand 0 or 1 with different encodings, `EE.MOVI.32.A` selector 0 to 3, `EE.VSMULAS.S16.QACC` selector 0 to 7, `EE.CMUL.S16` selector 0 to 3, `SSAI` immediate 0 to 31, and the `RUR`/`WUR` names `ACCX_0` to `ACCX_1`, `QACC_L_0` to `QACC_L_4`, `QACC_H_0` to `QACC_H_4`. Assembling proves the syntax the toolchain accepts, not the semantics.
+[^trm-act]: Same manual, sections 1.8.182 `EE.VPRELU.S16` (page 264), 1.8.184 `EE.VRELU.S16` (page 266), 1.8.2 `EE.BITREV` (page 77), 1.8.37 `EE.LDXQ.32` (page 113). `EE.BITREV` writes `max(tmpN, SwitchW(tmpN))` for `tmp0 = as[15:0]` through `tmp7 = as[15:0] + 7`, zero-extends each to 16 bits, and ends with `as = as + 8`.
+
+[^trm-mvqr]: Same manual, section 1.8.220 `MV.QR`, page 303, the last numbered entry of Chapter 1.
+
+[^trm-fftvst]: Same manual, section 1.8.15 `EE.FFT.VST.R32.DECP`, page 91. It stores `{qv[31:16], qv[15:0], qv[63:48], qv[47:32], ...}`, each half shifted right by the immediate `sar2` of 0 or 1, then does `as = as - 16`.
+
+[^isa-ssr]: Cadence Tensilica, 2010. *Xtensa Instruction Set Architecture (ISA) Reference Manual*, issue 4/2010 (RC-2010.1). `SSR`, page 539: only `AR[s]4..0` is written to SAR and the most significant bit of SAR is cleared, unlike `WSR.SAR`, which writes `AR[t]5..0`. `SSAI`, page 533: syntax `SSAI 0..31`.
+[^gas-test]: [measured] Assembled with `xtensa-esp32s3-elf-as`, GNU assembler 2.43.1 (crosstool-NG esp-14.2.0_20241119), 2026-09-06. `ee.srcmb.s16.qacc q2, a4, 0` encodes as `dd7244` and `..., 1` as `dd7644`; `ee.srs.accx a5, a4, 0` encodes as `7e1544` and `..., 1` as `7e5544`; a third operand of 2 or more is rejected as an invalid value. Confirms the mnemonics and operand ranges quoted here: `EE.SLCI.2Q` immediates 0 to 15, `EE.SRS.ACCX` and `EE.SRCMB.*` third operand 0 or 1 with different encodings, `EE.MOVI.32.A` selector 0 to 3, `EE.VSMULAS.S16.QACC` selector 0 to 7, `EE.CMUL.S16` selector 0 to 3, `SSAI` immediate 0 to 31, and the `RUR`/`WUR` names `ACCX_0` to `ACCX_1`, `QACC_L_0` to `QACC_L_4`, `QACC_H_0` to `QACC_H_4`. Assembling proves the syntax the toolchain accepts, not the semantics.
 [^dsp-mul]: espressif/esp-dsp, `modules/math/mul/fixed/dsps_mul_s16_aes3.S`, commit `3c8ac0fdfec83740b783e200862c8d0c056de0ad`. https://github.com/espressif/esp-dsp
 [^dsp-add]: espressif/esp-dsp, same commit, `modules/math/add/fixed/dsps_add_s16_aes3.S`.
 [^dsp-dp8]: espressif/esp-dsp, same commit, `modules/dotprod/fixed/dsps_dp_s8_aes3.S`; `modules/matrix/mul/fixed/dspm_mult_s16_aes3.S` is the `EE.SRCMB` and `EE.VMULAS.*.LDBC` example.
 [^qemu-mov]: espressif/qemu, `target/xtensa/translate_tie_esp32s3.c`, `HELPER(mov_qacc_s3)`, branch `esp-develop`, commit `febae182e132e4055529be423a818225ebddaa3a`. https://github.com/espressif/qemu
-[^qemu-srcmb]: espressif/qemu, same file and commit, `HELPER(srcmb_qacc_s3)` and `HELPER(srs_accx_s3)`. Both receive the third operand and neither reads it.
+
+[^qemu-vsx]: Same file and commit, `translate_vsx32_s3`, which hands `HELPER(vsx32_s3)` the value of `cpu_SR[SAR]` with no mask applied.
+
+[^qemu-cmul]: Same file and commit, `HELPER(cmul_s3)`. For `op_type` 0 it writes `Q[qz].s16[0] = (Q[qx].s16[0]*Q[qy].s16[0] - Q[qx].s16[1]*Q[qy].s16[1]) >> sar`, so lane 0, the low 16 bits, holds the real part.
+[^qemu-srcmb]: espressif/qemu, same file and commit. `translate_srcmb_qacc_s3` passes `arg[2].imm` to `HELPER(srcmb_qacc_s3)` as a parameter named `sel`, which the helper body never reads; the opcode table comments the syntax as `qu, as, sel2`. `translate_srs_accx_s3` does not read `arg[2]` at all. The toolchain names the same operand `sel2`: the ESP32-S3 dynconfig carries `fld_semantic.SRCMB_QACC_sel2` and `fld_ee_srs_accx_sel2`.

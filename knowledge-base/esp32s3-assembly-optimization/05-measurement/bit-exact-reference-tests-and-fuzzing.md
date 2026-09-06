@@ -3,7 +3,7 @@ title: "Bit-exact reference tests and fuzzing"
 id: 05-measurement/bit-exact-reference-tests-and-fuzzing
 schema_version: 1
 doc_type: how-to
-status: draft
+status: review
 last_reviewed: 2026-09-06
 tags: [esp32s3, xtensa, testing, fuzzing, sanitizers, differential-testing]
 confidence: high

@@ -3,7 +3,7 @@ title: Code and Data Placement in ESP-IDF
 id: 04-toolchain-and-codegen/code-and-data-placement-in-esp-idf
 schema_version: 1
 doc_type: how-to
-status: stable
+status: review
 last_reviewed: 2026-09-06
 tags: [esp32s3, xtensa, esp-idf, linker, iram, dram, psram, heap-caps]
 confidence: high
@@ -22,8 +22,12 @@ sources (`esp_attr.h`, `esp_system/ld/`, the `.lf` files, and
 online documentation.[^1]
 
 What each memory type costs in cycles once code or data lands there is
-covered in `03-memory-hierarchy/`, not here: this page is only about how
-to put something in a given place.
+covered in [Caches, SRAM, PSRAM and the MSPI
+bus](../03-memory-hierarchy/caches-sram-psram-and-the-mspi-bus.md), not
+here: this page is only about how to put something in a given place. For
+the compiler flags that shape the code before it is placed, see [GCC 14
+Xtensa flags and what they
+cost](./gcc14-xtensa-flags-and-what-they-cost.md).
 
 ## IRAM_ATTR: code in instruction RAM
 
@@ -51,9 +55,12 @@ size-files` break the same totals down per archive and per source file,
 both sorted by contribution and both accepting `--diff` to compare two
 builds.[^2]
 
-A related macro, `FORCE_IRAM_ATTR`, is the same placement but bypasses the
-usual "is this ever called" pruning; ESP-IDF uses it for a handful of
-functions the linker would otherwise discard.
+A related macro, `FORCE_IRAM_ATTR`, is the same placement plus `noinline`:
+`_SECTION_FORCE_ATTR_IMPL` expands to `__attribute__((noinline,
+section(...)))`.[^1] Without it the compiler can inline the function into a
+flash-resident caller, which leaves the IRAM copy unused and the hot path
+still in flash. Both macros append a `__COUNTER__` suffix to the section
+name, so the real section is `.iram1.<n>`, not `.iram1`.
 
 ## DRAM_ATTR: data that must stay internal
 
@@ -139,9 +146,13 @@ applies to every symbol in that one object file, as used throughout
 the same three-level syntax and register through
 `idf_component_register(... LDFRAGMENTS "linker.lf")`.
 
-The `extram_bss` category routes zero-initialized variables to PSRAM, only
-when `CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY` is set; otherwise
-`extram_bss -> dram0_bss` and the variables stay internal.[^4]
+The `extram_bss` category routes zero-filled variables to PSRAM, but only
+when `CONFIG_ESP_ALLOW_BSS_SEG_EXTERNAL_MEMORY` is set; otherwise
+`extram_bss -> dram0_bss` and the variables stay internal.[^4] That is not
+the option you set in `menuconfig`. The user-facing one is
+`SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY`, and it `select`s the `ESP_` name
+that `app.lf` actually tests, so searching the linker fragments for the
+option you enabled finds nothing.[^5]
 
 ## CONFIG_SPIRAM_* options: what moves to PSRAM and when
 
@@ -178,9 +189,12 @@ Flags combine with bitwise OR; `heap_caps_malloc(n, MALLOC_CAP_INTERNAL |
 MALLOC_CAP_DMA)` asks for internal, DMA-capable memory in one call. For a
 table read by a PIE (vector) load or store instruction, use
 `heap_caps_aligned_alloc(16, size, MALLOC_CAP_INTERNAL)` so the pointer is
-16-byte aligned up front: the PIE aligned load/store forms mask low
-address bits rather than faulting on misalignment, so an unaligned
-pointer silently reads the wrong bytes instead of erroring.[^9]
+16-byte aligned up front. Every 128-bit access in the extended instruction
+set replaces the low four address bits with zero rather than faulting, so
+an unaligned pointer silently reads or writes the wrong sixteen bytes
+instead of erroring.[^9] [PIE load, store and
+alignment](../02-pie-vector/pie-load-store-and-alignment.md) covers the
+instruction forms that exist for handling an unaligned source.
 
 ## GCC attributes for kernel code
 
@@ -213,11 +227,13 @@ Attributes that matter when hand-tuning a kernel, from the GCC 14 manual's
   assembly or a linker-fragment entry point: "code must be emitted for the
   function even if it appears that the function is not referenced."[^10]
 - **`__restrict`**: a C99/C++ type qualifier, not a GCC attribute, but the
-  same toolbox: it tells the compiler two pointers do not alias, unlocking
-  vectorization aliasing rules would otherwise forbid. Apply it only when
-  the caller actually guarantees non-aliasing; a false promise is
-  undefined behavior. [uncertain] whether GCC 14's Xtensa backend acts on
-  it more aggressively than a generic target; not confirmed here.
+  same toolbox: it tells the compiler two pointers do not alias, which lets
+  it reorder a load past a store it would otherwise have to keep behind.
+  Apply it only when the caller actually guarantees non-aliasing; a false
+  promise is undefined behavior. Do not expect it to produce vector code:
+  the Xtensa backend has no pattern for the PIE unit, so `restrict` buys
+  scheduling freedom, not vectorization.[^13] [uncertain] how much that is
+  worth on this target; not measured here.
 
 ## -ffunction-sections and -fdata-sections
 
@@ -245,9 +261,12 @@ needs its own `DRAM_ATTR` (or `DRAM_STR` for a string).[^12] In practice:
 a function marked `IRAM_ATTR` for this reason must not call a function
 that is not itself IRAM-resident, and must not read `const` data that is
 not `DRAM_ATTR`: either could be a flash read that returns garbage or
-faults while the cache is down. [uncertain] the precise trigger list for
-cache-disable windows beyond flash erase/write and `ESP_INTR_FLAG_IRAM`
-ISRs; not confirmed against the concurrency-control source for this page.
+faults while the cache is down. PSRAM is not a way out, because it goes
+down with the same cache: "When flash cache is disabled (for example, if
+the flash is being written to), the external RAM also becomes
+inaccessible."[^12] [uncertain] the precise trigger list for cache-disable
+windows beyond flash erase and write and `ESP_INTR_FLAG_IRAM` handlers.
+The v5.5.1 guide names only those, so a longer list would be a guess.
 
 ## Finding where a symbol actually landed
 
@@ -262,8 +281,8 @@ linker honored it is a separate step. Three tools, cheapest first:
    symbol with its address and size; the address range says which region
    it landed in, once you know the project's region map from the linker
    script (`xtensa-esp32s3-elf-nm <elf> | grep <symbol>` for one symbol).
-   The binary ships in the `toolchain-xtensa-esp32s3` package and is on
-   the build's `PATH` during a `pio run`.
+   The binary ships in the same `xtensa-esp-elf` toolchain package as the
+   compiler, so it is already on the build's `PATH`.
 3. **The `.map` file** the linker writes alongside the ELF is ground
    truth: every input section, which object file it came from, which
    output section it landed in, and the exact address. It is the only one
@@ -281,7 +300,9 @@ linker honored it is a separate step. Three tools, cheapest first:
 | Table in PSRAM (`EXT_RAM_BSS_ATTR`, `MALLOC_CAP_SPIRAM`, or plain `malloc()` above the `ALWAYSINTERNAL` threshold) | Effectively unlimited capacity | Higher and less consistent per-access latency; shares a bus with flash |
 
 The cycle-level cost of each row, and when the difference is worth
-fighting the linker for, is the subject of `03-memory-hierarchy/`: this
+fighting the linker for, is the subject of [Caches, SRAM, PSRAM and the
+MSPI bus](../03-memory-hierarchy/caches-sram-psram-and-the-mspi-bus.md):
+this
 page only covers making the placement happen once that analysis decides.
 
 ## Footnotes
@@ -294,7 +315,8 @@ page only covers making the placement happen once that analysis decides.
 [^6]: Espressif Systems, *ESP-IDF Programming Guide* v5.5.1, "Support for External RAM" (api-guides/external-ram.html), config `CONFIG_SPIRAM_USE_MALLOC`, read 2026-09-06.
 [^7]: Source: `components/esp_psram/Kconfig.spiram.common`, configs `SPIRAM_MALLOC_ALWAYSINTERNAL` and `SPIRAM_TRY_ALLOCATE_WIFI_LWIP`, `framework-espidf` package.
 [^8]: Source: `components/heap/include/esp_heap_caps.h`, macros `MALLOC_CAP_INTERNAL`, `MALLOC_CAP_DMA`, `MALLOC_CAP_SPIRAM`, `MALLOC_CAP_32BIT`, and `heap_caps_malloc`/`heap_caps_aligned_alloc`, `framework-espidf` package.
-[^9]: [uncertain] PIE address-masking on unaligned `EE.VLD`/`EE.VST.128.IP` forms is stated from the ISA reference and a device/QEMU test recorded in `02-pie-vector/`; not re-verified against the manual on this page.
+[^9]: Espressif Systems, *ESP32-S3 Technical Reference Manual* v1.8, section 1.5.3 "Data Format and Alignment", page 48: "all access addresses in the extended instruction set are forced to be aligned, i.e., the lowest bits will be replaced by 0", four bits for 128-bit data, and "Otherwise, the data read will not be what you expected." The same section recommends 16-byte alignment as sufficient for most cases. Read 2026-09-06.
 [^10]: Free Software Foundation, *Using the GNU Compiler Collection (GCC)* v14.2.0, "Common Function Attributes" (gcc.gnu.org/onlinedocs/gcc-14.2.0/gcc/Common-Function-Attributes.html), read 2026-09-06.
 [^11]: Source: `tools/cmake/build.cmake`, `framework-espidf` package, compile option list including `-ffunction-sections` and `-fdata-sections`.
-[^12]: Espressif Systems, *ESP-IDF Programming Guide* v5.5.1, "Memory Types," sections "When to Place Code in IRAM" and "How to Place Code in IRAM" (api-guides/memory-types.html), read 2026-09-06.
+[^12]: Espressif Systems, *ESP-IDF Programming Guide* v5.5.1, "Memory Types," sections "When to Place Code in IRAM" and "How to Place Code in IRAM" (api-guides/memory-types.html), read 2026-09-06. Also "Support for External RAM," Restrictions (api-guides/external-ram.html): "When flash cache is disabled (for example, if the flash is being written to), the external RAM also becomes inaccessible."
+[^13]: GCC 14 source, `gcc/config/xtensa/xtensa.md`, `releases/gcc-14` branch, read 2026-09-06: no `EE.*` pattern, no vector machine mode, and no `vec_*` `define_insn` or `define_expand`. https://github.com/gcc-mirror/gcc/blob/releases/gcc-14/gcc/config/xtensa/xtensa.md

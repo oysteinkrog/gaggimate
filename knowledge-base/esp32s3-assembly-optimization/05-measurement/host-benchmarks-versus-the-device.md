@@ -3,7 +3,7 @@ title: "Host benchmarks versus the device"
 id: 05-measurement/host-benchmarks-versus-the-device
 schema_version: 1
 doc_type: explanation
-status: draft
+status: review
 last_reviewed: 2026-09-06
 tags: [esp32s3, xtensa, measurement, benchmarking, host-vs-device, ooo, cache]
 confidence: medium
@@ -83,12 +83,26 @@ own instruction-set summary for the Xtensa LX family lists "Divide and
 Square Root Sequences" as a topic separate from the coprocessor's
 instruction list [CadenceISA2026][^7], consistent with those two operations
 not being single hardware instructions and instead needing a short software
-sequence to reach an IEEE-correct result. [uncertain]: the page describing
-that sequence could not be fetched (a bot challenge, not the document), so
-the exact sequence and its cost are unconfirmed; treat divide and square
-root on the LX7 as materially more expensive than an add or multiply until
-a device measurement says otherwise, and do not assume the host's
-single-instruction latency transfers.
+sequence to reach an IEEE-correct result.
+
+This is confirmed, not merely suspected. The ESP32-S3 core configuration
+enables `div0.s`, `divn.s`, `recip0.s`, `sqrt0.s`, `rsqrt0.s`, `nexp01.s`
+and `maddn.s`, a begin-then-Newton-Raphson-refine family, but has no single
+divide or square-root instruction (`div.s` does not exist on this core).
+GCC 14.2 does not use the seed-and-refine sequence for a plain `float`
+divide or square root: `a / b` compiles to `call8 __divsf3` and
+`sqrtf(x)` to `call8 sqrtf`, a windowed library call of 30
+instructions for the divide (`entry`, 28 FPU and integer instructions, `retw.n`), `[measured]` on this toolchain. See
+[the floating-point option leaf](../01-scalar-isa/floating-point-option-on-lx7.md)
+for the seed instructions and their use in a hand-written refinement
+sequence, and
+[the cost-model leaf](../00-foundations/lx7-core-pipeline-and-cost-model.md)
+for the compiled call sequence and its instruction count. Treat divide and
+square root on the LX7 as materially more expensive than an add or
+multiply, and do not assume the host's single-instruction latency
+transfers: on the host both are single hardware instructions, and on the
+device both are library calls unless a kernel hand-writes the seed-and-refine
+sequence itself.
 
 Double precision is a sharper trap because it changes silently. Espressif's
 own developer documentation states "all currently available [Espressif]
@@ -109,8 +123,16 @@ A host comparison between two kernel versions differing only in where a
 The LX7's instruction cache configures to 16 KB or 32 KB and its data cache
 to 32 KB or 64 KB, each backed by a small internal SRAM block that can also
 serve as plain memory instead of cache [Espressif2026a][^8]. Behind that
-cache sits octal SPI PSRAM rated for a maximum clock of 80 MHz
-[Espressif2026b][^9], sharing its SPI bus with flash and the DMA engines. A
+cache sits SPI PSRAM: the in-package PSRAM chip itself is rated for a
+maximum clock of 80 MHz [Espressif2026b][^9], the figure to use for a
+default build. ESP-IDF also offers a 120 MHz `CONFIG_SPIRAM_SPEED` option,
+stable for quad-mode PSRAM but marked experimental for octal mode, with a
+documented risk of random access failures after a roughly 20-degree-Celsius
+temperature swing; see
+[caches, SRAM, PSRAM and the MSPI bus](../03-memory-hierarchy/caches-sram-psram-and-the-mspi-bus.md)
+for the full 40/80/120 MHz picture and the bandwidth arithmetic that
+follows from it. Either way the bus is shared with flash and the DMA
+engines. A
 laptop or desktop CPU has two or three cache levels sized in the hundreds of
 kilobytes to tens of megabytes, backed by DRAM delivering tens of gigabytes
 per second, roughly two to three orders of magnitude more than the LX7's
@@ -134,13 +156,19 @@ that load several non-contiguous elements, indexed by an offset vector, in
 one instruction; these are "efficient for gathering non-contiguous data into
 vectors, and for vectorizing table-based lookup functions" from Haswell on,
 improving further on Broadwell [AgnerFog2026][^10]. A table-driven kernel
-vectorized with a gather has no equivalent on the LX7's PIE vector
-extension: narrower 128-bit vectors and no gather instruction at all, so the
-same algorithm must be restructured into scalar-address, vector-arithmetic
-form to use the vector unit. A host build that auto-vectorizes a table
-lookup into a gather is measuring an execution strategy the device cannot
-use, which makes a direct timing comparison meaningless for that kernel
-shape even before clock speed and cache differences enter.
+vectorized with a gather has no true equivalent on the LX7's PIE vector
+extension: narrower 128-bit vectors and no multi-lane gather instruction.
+`EE.LDXQ.32` loads one 32-bit lane by an index taken from a q register,
+one lane and one instruction at a time, not several non-contiguous
+elements in a single instruction; see
+[PIE load, store and alignment](../02-pie-vector/pie-load-store-and-alignment.md)
+for the instruction. So the same algorithm must be restructured into
+scalar-address, vector-arithmetic form, or into a sequence of one-lane
+indexed loads, to use the vector unit. A host build that auto-vectorizes a
+table lookup into a gather is measuring an execution strategy the device
+cannot use in one instruction, which makes a direct timing comparison
+meaningless for that kernel shape even before clock speed and cache
+differences enter.
 
 ## 6. It is not the same compiler either
 
@@ -236,18 +264,25 @@ since none of these come from a citable manual section.
     (fetched 2026-09-06).
 
 [^4]: Agner Fog, same manual as [^2], Chapter 22 "AMD Zen 1-2 pipeline,"
-    Section 22.8, p. 233 (168 physical integer registers on Zen 1, 180 on
-    Zen 2).
+    Section 22.8 "Register renaming and out-of-order schedulers," p. 234
+    (168 physical integer registers on Zen 1, 180 on Zen 2).
 
 [^5]: Espressif Developer Portal, "Floating-Point Units on Espressif SoCs:
     Why (and when) they matter," 2025-10.
     `https://developer.espressif.com/blog/2025/10/cores_with_fpu/` (fetched
     2026-09-06).
 
-[^6]: GNU Compiler Collection manual, "Xtensa Options," `-mfused-madd` entry.
-    `https://gcc.gnu.org/onlinedocs/gcc/Xtensa-Options.html` (fetched
-    2026-09-06; cross-checked against the GCC 9.1.0 revision of the same
-    page).
+[^6]: GNU Compiler Collection manual, "Xtensa Options," `-mfused-madd` entry:
+    "Enable or disable use of fused multiply/add and multiply/subtract
+    instructions in the floating-point option. This has no effect if the
+    floating-point option is not also enabled."
+    `https://gcc.gnu.org/onlinedocs/gcc-14.2.0/gcc/Xtensa-Options.html`
+    (fetched 2026-09-06), the version matching the `xtensa-esp-elf` GCC
+    14.2.0 toolchain this KB cites elsewhere. The flag predates this
+    version too: same entry present in the GCC 9.1.0 revision of the page.
+    The unversioned `.../gcc/Xtensa-Options.html` tracks the newest GCC
+    release and no longer carries this flag as of 2026-09-06; cite the
+    versioned URL, not the rolling one.
 
 [^7]: Cadence Design Systems, *Xtensa Instruction Set Architecture (ISA)
     Summary for all Xtensa LX Processors*, contents entry "Divide and
@@ -267,4 +302,4 @@ since none of these come from a citable manual section.
     2026-09-06).
 
 [^10]: Agner Fog, same manual as [^2], Chapter 10 "Intel Haswell and
-    Broadwell pipeline," "Execution ports and execution units," p. 149.
+    Broadwell pipeline," "Execution ports and execution units," pp. 149-150.

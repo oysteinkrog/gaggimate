@@ -3,10 +3,10 @@ title: "The floating-point option on the LX7"
 id: 01-scalar-isa/floating-point-option-on-lx7
 schema_version: 1
 doc_type: reference
-status: draft
+status: review
 last_reviewed: 2026-09-06
 tags: [esp32s3, xtensa, lx7, floating-point, fpu, codegen, fixed-point]
-confidence: medium
+confidence: high
 ---
 
 # The floating-point option on the LX7
@@ -14,10 +14,10 @@ confidence: medium
 The ESP32-S3's Xtensa LX7 core is built with the single-precision
 Floating-Point Coprocessor Option. This is a real hardware unit with its
 own register file and instructions, not software emulation. But it is
-smaller than most programmers expect: no divide, no square root, and no
-double precision, all as single instructions. This page covers what the
-option gives you, what it does not, and what GCC 14 actually does with
-it, measured on the toolchain this project uses.
+smaller than most programmers expect. There is no divide instruction, no
+square-root instruction, and no double precision at all. This page covers
+what the option gives you, what it does not, and what GCC 14 actually does
+with it, measured on the toolchain this project uses.
 
 ## Confirming the option is present
 
@@ -35,47 +35,58 @@ option directly:
 
 read from
 `framework-espidf/components/xtensa/esp32s3/include/xtensa/config/core-isa.h`,
-lines 130 to 134 and 136, in the local PlatformIO package tree
+lines 130 to 135, in the local PlatformIO package tree
 `~/.platformio/packages/`. [measured]
 
 Two things follow, and both are easy to misread. First,
 `XCHAL_HAVE_FP_DIV`, `_RECIP`, `_SQRT` and `_RSQRT` being `1` does
 **not** mean the core has one-instruction hardware divide or square
 root; it means the *begin* instructions for an iterative refinement
-sequence exist (below). Second, `XCHAL_HAVE_DFP` is `0`: there is no
+sequence exist (below). The local assembler settles it: `div.s` and
+`sqrt.s` are rejected as unknown opcodes, while `div0.s`, `recip0.s`,
+`sqrt0.s`, `rsqrt0.s`, `nexp01.s`, `maddn.s`, `divn.s` and `const.s` all
+assemble.[^7] Second, `XCHAL_HAVE_DFP` is `0`: there is no
 double-precision hardware at all, not even a refinement sequence. Every
 `double` operation is software.
 
-GCC exposes no command-line switch to turn the FP option on or off for
-Xtensa: the GCC 14 manual's Xtensa options page lists eleven flags
-(`-mconst16`, `-mserialize-volatile`, `-mforce-no-pic`,
-`-mtext-section-literals`, `-mauto-litpools`, `-mtarget-align`,
-`-mlongcalls`, `-mabi=`, `-mextra-l32r-costs=`, `-mstrict-align`,
-`-mforce-l32`) and none about floating point.[^1] Whether the compiler
-can use the FP registers is baked into the target it was configured for
-(`xtensa-esp32s3-elf-gcc`), not something toggled per file.
+GCC has no command-line switch that turns the FP option on or off for
+Xtensa. The GCC 14.2 manual's Xtensa options page lists eleven distinct
+options: `-mconst16`, `-mfused-madd`, `-mserialize-volatile`,
+`-mforce-no-pic`, `-mtext-section-literals`, `-mauto-litpools`,
+`-mtarget-align`, `-mlongcalls`, `-mabi=`, `-mextra-l32r-costs=` and
+`-mstrict-align`.[^1] Exactly one of them is about floating point:
+`-mfused-madd`/`-mno-fused-madd`, which enables or disables the fused
+multiply-add and multiply-subtract instructions and "has no effect if the
+floating-point option is not also enabled".[^1] Whether the compiler can
+use the FP registers at all is baked into the target it was configured
+for (`xtensa-esp32s3-elf-gcc`), not something toggled per file.
 
 ## The register file: 16 f registers, FCR, FSR
 
-The option adds 16 single-precision registers, `f0` through `f15`, each
-32 bits, separate from the `a0`-`a15` address/data registers used by the
-rest of the ISA.[^2] They hold IEEE-754 single-precision values only;
-there is no wider mode.
+The option adds a register file `FR` of 16 registers, 32 bits each,
+named `f0` through `f15`, separate from the `a0`-`a15` address/data
+registers used by the rest of the ISA.[^2] They hold IEEE-754
+single-precision values only; there is no wider mode.
 
 Two special registers travel with the option, both accessed as user
 registers through `rur`/`wur` rather than as ordinary `a` or `f`
-registers:
+registers:[^2]
 
 - **FCR** (Floating-Point Control Register), user register 232.
 - **FSR** (Floating-Point Status Register), user register 233.
 
-Both numbers come from the vendored assembly macros in
+Both numbers are also in the vendored assembly macros in
 `.../xtensa/config/tie-asm.h`, lines 206 and 208 (`rur.FCR`, `rur.FSR`)
 and 249 and 251 (`wur.FCR`, `wur.FSR`), commented `// ureg 232` and `//
-ureg 233`. [measured] FCR carries the rounding mode; FSR carries the
-sticky exception flags (invalid, divide-by-zero, overflow, underflow,
-inexact), the same shape as the status register on most IEEE-754
-FPUs.[^3]
+ureg 233`. [measured]
+
+FCR holds a 2-bit rounding mode (0 nearest, 1 toward zero, 2 toward
++infinity, 3 toward -infinity) and five exception-enable bits, one each
+for invalid, divide-by-zero, overflow, underflow and inexact. FSR holds
+the five matching IEEE-754 status flags.[^3] One caveat matters more than
+the layout: the manual states that current implementations neither raise
+the exceptions FCR enables nor set the flag bits in FSR.[^3] Do not build
+a numerical check on reading FSR back.
 
 ## The instruction set
 
@@ -100,25 +111,40 @@ not simply each other's negation.[^1]
 
 **Conversions:** `float.s`/`ufloat.s` convert signed/unsigned integer to
 float; `trunc.s`, `utrunc.s`, `round.s`, `floor.s`, `ceil.s` convert
-float to signed/unsigned integer under the named rounding rule. All six
-take a 4-bit immediate, 0-15, that scales the value by a power of two as
-part of the conversion: a free multiply or divide by `2^n` folded into
-the int/float conversion, exactly what a Q-format fixed-point load or
-store needs.[^1] See below for what GCC does with that immediate.
+float to signed/unsigned integer under the named rounding rule. All seven
+take a 4-bit immediate `t`, range 0 to 15, that scales the value by a
+power of two as part of the conversion. The sign of the exponent depends
+on which way you are converting: the two integer-to-float instructions
+multiply by `2^-t`, the five float-to-integer ones multiply by `2^t`
+before rounding.[^1]
+That is a free multiply or divide by a power of two folded into the
+conversion, exactly what a Q-format fixed-point load or store needs. The
+assembler accepts 0 through 15 and rejects 16.[^7] See below for what GCC
+does with that immediate.
 
 **Loads, stores, moves:** `lsi`/`ssi` (float load/store, immediate
-offset) and `lsiu`/`ssiu` (same, base register updated afterward) move a
-32-bit value directly between memory and an `f` register. `rfr`/`wfr`
-move a value between an `f` register and an `a` register without
-touching memory.[^1]
+offset) and `lsx`/`ssx` (indexed by a second `a` register) move a 32-bit
+value directly between memory and an `f` register. `rfr`/`wfr` move a
+value between an `f` register and an `a` register without touching
+memory.[^1] The manual also defines base-update forms `lsiu`, `ssiu`,
+`lsxu` and `ssxu` for this option, but all four are rejected as unknown
+opcodes by the toolchain this project builds with, so they are not
+reachable from inline assembly here.[^7]
 
 ## What is not there
 
-No divide instruction produces a correctly-rounded quotient in one step,
-and there is no single-instruction square root. Instead there is a
-**begin-then-refine** sequence: `div0.s`/`recip0.s` (reciprocal begin)
-and `sqrt0.s`/`rsqrt0.s` (reciprocal square root begin) each produce a
-low-precision seed, which a short Newton-Raphson-style loop then
+There is no divide instruction and no square-root instruction. The 2010
+ISA manual's tables for this option list neither: Table 4-46 (the option
+summary), Table 4-49 (loads and stores) and Table 4-50 (operations) name
+add, subtract, multiply, multiply-add, multiply-subtract, negate,
+absolute value, moves, compares and conversions, and nothing else.[^1]
+The strings `DIV.S` and `SQRT.S` do not occur anywhere in that 662-page
+manual, and the shipping assembler rejects both mnemonics.[^7]
+
+Instead there is a **begin-then-refine** sequence. `div0.s` and
+`recip0.s` (divide begin and reciprocal begin) and `sqrt0.s` and
+`rsqrt0.s` (square root begin and reciprocal square root begin) each
+produce a low-precision seed, which a short Newton-Raphson-style loop then
 sharpens using ordinary multiply-add instructions plus two
 refinement-specific ones, `nexp01.s` and `maddn.s`.[^4] A worked example
 chains `rsqrt0.s` into two refinement stages built from `mul.s`,
@@ -131,6 +157,11 @@ that division becomes one instruction.
 Double precision is absent entirely, seed instructions included
 (`XCHAL_HAVE_DFP` is `0`). Every `double` add, multiply, compare and
 conversion is a libgcc or newlib software routine.
+
+What the software divide costs, and how it compares with a multiply, is
+in [the cost model leaf](../00-foundations/lx7-core-pipeline-and-cost-model.md).
+The full option table for this core is in
+[the configured-options leaf](./core-isa-and-configured-options.md).
 
 ## What GCC 14.2 actually emits
 
@@ -160,11 +191,12 @@ all.
 `-ffast-math`.** `float fma_(float a, float b, float c) { return a * b +
 c; }` compiles to one `madd.s`, no library call, no separate multiply
 and add. GCC's default floating-point contraction setting folds a
-multiply-then-add into a fused instruction unless `-ffp-contract=off` is
-given. This is a genuine single-rounding-step fused multiply-add: the
-intermediate product is not rounded before the add, a correctness-
-relevant difference from separate multiply and add, and it happens by
-default.
+multiply-then-add into a fused instruction. Two flags undo it, and both
+produce the same `mul.s` then `add.s` pair: `-ffp-contract=off`, and the
+Xtensa-specific `-mno-fused-madd`. This is a genuine single-rounding-step
+fused multiply-add: the intermediate product is not rounded before the
+add, a correctness-relevant difference from separate multiply and add,
+and it happens by default.
 
 **Comparisons produce a boolean register, then a conditional move or
 branch, never a flags-register branch.** `int lt(float a, float b) {
@@ -223,9 +255,9 @@ often pulls the whole expression into software.
 ## Cycle costs: what is and is not confirmed
 
 The sources checked for this page, the Cadence ISA Summary[^4] and the
-ISA Reference Manual's floating-point coprocessor chapter[^1], describe
-instruction semantics and the divide/sqrt refinement structure, but no
-per-instruction cycle-latency table turned up. Treat any specific cycle
+ISA Reference Manual's floating-point coprocessor option[^1], describe
+instruction semantics, but no per-instruction cycle-latency table turned
+up: section 4.3.11 has no timing table at all. Treat any specific cycle
 count for `add.s`, `mul.s`, `madd.s` or a compare as `[uncertain]` until
 measured on the device or in QEMU, the rule this KB applies to every
 instruction class. What can be said with more confidence,
@@ -242,6 +274,10 @@ FP registers being saved first, so touching a `float` inside an ISR can
 corrupt the interrupted task's floating-point state.[^6] Only the lowest
 interrupt priority level (level 1) can opt in, via
 `CONFIG_FREERTOS_FPU_IN_ISR`; higher levels cannot use `float` at all.
+The Kconfig entry is "Use float in Level 1 ISR", default off, offered
+only on the ESP32 and the ESP32-S3, and its help text says plainly that
+"usage of float types in higher level interrupts is still not
+permitted".[^7]
 `double` arithmetic never touches the FP coprocessor registers (it is
 pure software on the integer pipeline), so this restriction does not
 apply to it: a `double` computation is safe in any interrupt context
@@ -265,27 +301,37 @@ being much slower than hardware single precision.
 
 ## Footnotes
 
-[^1]: Cadence/Tensilica, *Xtensa ISA Reference Manual*, Floating-Point
-    Coprocessor Option chapter (search-indexed as section 4.3.11, with a
-    "Divide and Square Root Sequences" subsection). The manual PDF
-    exceeds this page's fetch-tool size limit, so the exact page numbers
-    and edition are `[uncertain]`; mnemonics above are corroborated by
-    GCC's own Xtensa backend output (`[measured]` sections) and the
-    Cadence ISA Summary[^4]. Confirmed directly: GCC 14, "Xtensa
-    Options", <https://gcc.gnu.org/onlinedocs/gcc/Xtensa-Options.html>,
-    lists no floating-point-related flag.
+[^1]: Tensilica, *Xtensa Instruction Set Architecture (ISA) Reference
+    Manual*, issue date 4/2010 (for all Xtensa processor cores), section
+    4.3.11 "Floating-Point Coprocessor Option", pages 67 to 74: 4.3.11.1
+    with Table 4-45 (processor state) and Table 4-46 (instruction
+    additions) on pages 67 to 68, 4.3.11.2 "Floating-Point
+    Representation" and 4.3.11.3 "Floating-Point State" on pages 69 to
+    70, 4.3.11.4 "Floating-Point Exceptions" on page 71, and 4.3.11.5
+    "Floating-Point Instructions" with Table 4-49 (load/store) and Table
+    4-50 (operations) on pages 71 to 74. Public mirror:
+    <https://0x04.net/~mwk/doc/xtensa.pdf>. Also cited for the GCC
+    option list: GNU Project, *Using the GNU Compiler Collection (GCC)*
+    14.2.0, "Xtensa Options",
+    <https://gcc.gnu.org/onlinedocs/gcc-14.2.0/gcc/Xtensa-Options.html>,
+    fetched 2026-09-06, which is the source of the eleven-option list and
+    of the quoted `-mfused-madd` description.
 
-[^2]: Register count/naming (`f0`-`f15`): public GCC development
-    discussion of the Xtensa target (mail-archive.com/gcc-patches, 2021,
-    "xtensa: Allow SImode GENERAL_REGS pseudos to spill into FP_REGS
-    hardregs"). Not checked against the primary ISA manual, so
-    `[uncertain]` pending that.
+[^2]: Same manual, Table 4-45 "Floating-Point Coprocessor Option
+    Processor-State Additions", section 4.3.11.1, page 67: `FR`,
+    quantity 16, width 32 bits; `FCR`, user register 232; `FSR`, user
+    register 233. Section 4.3.11.3 on page 69 repeats that the FR file
+    "consists of 16 registers of 32 bits each".
 
-[^3]: FCR/FSR register numbers: local vendored file
+[^3]: Same manual, section 4.3.11.3 "Floating-Point State", pages 69 to
+    70, with Table 4-47 (FCR fields: `RM` rounding mode plus `I`, `U`,
+    `O`, `Z`, `V` exception-enable bits) and Table 4-48 (FSR fields: the
+    five matching status flags), and section 4.3.11.4 "Floating-Point
+    Exceptions", page 71: "Current implementations neither raise
+    exceptions enabled by FCR bits nor set flag bits in FSR." Register
+    numbers cross-checked in the local vendored file
     `.../xtensa/config/tie-asm.h`, lines 206, 208, 249, 251 (PlatformIO
-    package tree). [measured] FCR/FSR's general shape (rounding mode;
-    sticky IEEE-754 exception flags) follows the standard Xtensa FP
-    option description; the bit layout itself is `[uncertain]`.
+    package tree). [measured]
 
 [^4]: Cadence, *Xtensa ISA Summary for all Xtensa LX Processors*,
     RI-2021.8, 04/2022. Search-indexed content names `DIV0.S` ("Divide
@@ -293,6 +339,10 @@ being much slower than hardware single precision.
     ("Reciprocal Sqrt Begin Single") as refinement starters, not
     complete operations. The PDF returned HTTP 403 when fetched
     directly, so exact wording is `[uncertain]` pending a direct read.
+    The seed instructions are absent from the 2010 manual in [^1]
+    entirely, so a later ISA revision added them; which one is
+    `[uncertain]`. Their presence on this target is settled by the
+    assembler instead[^7].
 
 [^5]: "Xtensa LX Square Root/Reciprocal Square Root Inline ASM
     Sequence", Giga Bowser, <https://gigabowser.dev/posts/xtensa-rsqrt/>.
@@ -304,7 +354,20 @@ being much slower than hardware single precision.
     Units on Espressif SoCs: Why (and when) they matter", October 2025,
     <https://developer.espressif.com/blog/2025/10/cores_with_fpu/>
     (single-precision-only hardware, software double); cross-checked
-    against the esp32.com forum thread "Floating point in ISR?" and
-    GitHub issue espressif/esp-idf#722 on the lazy FPU-context-switch
-    design and `CONFIG_FREERTOS_FPU_IN_ISR`. Exact Kconfig path not
-    opened against current ESP-IDF source: `[uncertain]`.
+    against GitHub issue espressif/esp-idf#722 on the lazy
+    FPU-context-switch design.
+
+[^7]: [measured] 2026-09-06, `xtensa-esp32s3-elf-as` and
+    `xtensa-esp32s3-elf-gcc` from `xtensa-esp-elf` GCC 14.2.0
+    (crosstool-NG esp-14.2.0_20241119, GNU assembler 2.43.1). One
+    mnemonic per source file, assembled and disassembled. Rejected as
+    "unknown opcode or format name": `div.s`, `sqrt.s`, `lsiu`, `ssiu`,
+    `lsxu`, `ssxu`. Accepted: `div0.s` (two operands), `recip0.s`,
+    `sqrt0.s`, `rsqrt0.s`, `nexp01.s`, `maddn.s`, `divn.s`, `const.s`,
+    `addexp.s`, `addexpm.s`, `mkdadj.s`, `mksadj.s`, `lsi`, `ssi`,
+    `lsx`, `ssx`, `rfr`, `wfr`, `rur.fcr`, `wur.fsr`, and every
+    arithmetic, compare, move and conversion mnemonic named on this
+    page. `float.s f0, a2, 15` and `trunc.s a2, f0, 15` assemble;
+    both fail at 16 with "operand 3 has invalid value '16'". Kconfig
+    citation: ESP-IDF 5.5.1, `components/freertos/Kconfig`, lines 464 to
+    470, `config FREERTOS_FPU_IN_ISR`.

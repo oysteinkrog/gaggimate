@@ -33,3 +33,4 @@ linked from each leaf.
 - The overlay and scrim kernels in `tools/overlaybench` and `SleepAnimation.cpp` (blend, span scan, half-res expand) as their own leaf.
 - A record of the QEMU-versus-silicon differences this repo has actually hit (the `ee.vadds.s8` floor is mentioned in the kernel-pass leaf).
 - Measured cycle costs for the scalar multiply, divide and FP instructions on this board, which the generic buckets leave `[uncertain]`.
+- The flash-cache patch (`scripts/patch_flash_cache_flag.py`), which exposes a flag to the panel refill interrupt while `spi_flash_disable_interrupts_caches_and_other_cpu` has the caches off; the runtime leaf in `08-frontiers` describes the generic mechanism only.

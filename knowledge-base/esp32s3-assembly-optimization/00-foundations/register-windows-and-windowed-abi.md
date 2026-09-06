@@ -3,7 +3,7 @@ title: Xtensa register windows and the windowed calling convention
 id: 00-foundations/register-windows-and-windowed-abi
 schema_version: 1
 doc_type: reference
-status: draft
+status: review
 last_reviewed: 2026-09-06
 tags: [esp32s3, xtensa, register-windows, windowed-abi, calling-convention, gcc, call0]
 confidence: medium
@@ -87,10 +87,13 @@ From the *caller's* side, before the call, the same physical registers
 have different names depending on which `CALLn` is used: for a `call8`
 the caller places the first six outgoing arguments in its own
 `a10`-`a15`, and after the call those become the callee's `a2`-`a7`[^8].
-Return values follow the same rule in reverse, up to 4 values coming
-back in `a2`-`a5` of the caller's window once `retw` has rotated
-back[^8][^6]. In general, for a `CALLn`/`CALLXn` call, the caller's
-`a_n` becomes the callee's `a0`, `a_(n+1)` becomes `a1`, and so on[^1].
+Return values follow the same rotation. A value of four words or less
+comes back in the callee's `a2` upward, and the caller reads it in
+`a_(n+2)` through `a_(n+5)`: for a `call8` that is the caller's
+`a10`-`a13`, not its `a2`-`a5`[^17]. This is also what limits `call12`,
+where only `a14` and `a15` are left, so a `call12` can only return two
+words[^17]. In general, for a `CALLn`/`CALLXn` call, the caller's `a_n`
+becomes the callee's `a0`, `a_(n+1)` becomes `a1`, and so on[^1].
 `call4` is the shallowest rotation and `call12` the deepest; the
 compiler picks whichever hides the registers live at the call site[^1].
 
@@ -157,7 +160,8 @@ An overflow or underflow is a full exception: entry, the handler body
 above, and an exception return. The architecture manual gives no cycle
 count and this document invents none; treat it as materially more
 expensive than a register move, and measure it on the core itself if a
-hot path's call depth is in question. `[uncertain]`
+hot path's call depth is in question. `[uncertain]` The method is in
+[timing a kernel with CCOUNT](../05-measurement/ccount-cycle-counter-and-timing-a-kernel.md).
 
 ## PS.WOE and PS.CALLINC
 
@@ -189,12 +193,14 @@ words, sized `N-4` where `N` is the widest `CALLn`/`CALLXn` the
 function issues: this is where `a4`-`a11` (as applicable) land, at the
 *top* of the frame the call originated from, not the callee's[^6].
 
-The handler code above shows the exact offsets. For a `call8` overflow,
-`a0`-`a3` go into the callee-to-be's base save area at offsets -16,
--12, -8, -4 from that frame's stack pointer, while `a4`-`a7` go into
-the *caller's own* frame at offsets -32, -28, -24, -20[^5][^12]. For
-`call12` the same pattern extends to `a0`-`a11`, spilling `a4`-`a11` at
-offsets -48 through -20[^5].
+The handler code above shows the exact offsets, and the manual's own
+comments name each destination. Writing the frame whose registers are
+being spilled as `call[j]`, a `WindowOverflow8` puts `a0`-`a3` into
+`call[j+1]`'s frame at offsets -16, -12, -8 and -4 from `call[j+1]`'s
+stack pointer, then loads `call[j-1]`'s stack pointer and puts `a4`-`a7`
+into `call[j]`'s frame at offsets -32, -28, -24 and -20 from it[^5][^12].
+`WindowOverflow12` extends the same pattern to `a0`-`a11`, spilling
+`a4`-`a11` at offsets -48 through -20[^5].
 
 The stack pointer must stay 16-byte aligned and should only be touched
 by `ENTRY` and `MOVSP`; anything else risks leaving the register-spill
@@ -238,15 +244,22 @@ ABIs and is not part of the windowed mechanism itself[^14].
 
 ## Register pressure: what the ABI guarantees, and what it does not
 
+What a real function does with those registers, and how to read a spill
+out of a disassembly, is in
+[register pressure, spills and reading the assembly](../04-toolchain-and-codegen/register-pressure-spills-and-reading-the-assembly.md).
+
 The windowed ABI reserves `a0` and `a1` outright. GCC's Xtensa backend
-marks both `FIXED_REGISTERS` (unavailable to the register allocator at
-all) in the windowed configuration, leaving `a2`-`a15`, 14 registers,
-as the pool the compiler can assign values to inside one window[^15].
+sets the first two entries of `FIXED_REGISTERS` to 1 and the next
+fourteen to 0, so `a0` and `a1` are unavailable to the register allocator
+and `a2`-`a15`, 14 registers, are the pool the compiler can assign values
+to inside one window[^15].
 The register constraint used for general-purpose values in inline
 assembly (constraint `a`) is documented the same way: "General-purpose
 AR registers a0-a15, except a1 (sp)"[^16], with `a0` excluded from
 practical use by the fixed-register rule above rather than by the
-constraint syntax itself.
+constraint syntax itself. The rest of the constraint set, and what
+happens when a block asks for too much, is in
+[GCC extended inline asm on Xtensa](../04-toolchain-and-codegen/gcc-extended-inline-asm-on-xtensa.md).
 
 That 14-register figure is a hard ABI fact, but not the same question
 as how many scalars a leaf function or an inline assembly block can
@@ -256,7 +269,8 @@ arguments and the callee's rotation depth (a `call8` needs `a8`-`a15`
 free of values the caller still needs after the call, since those are
 what the callee spills on overflow), so a function that calls out has
 less headroom than a true leaf. And GCC's allocation order for the
-windowed ABI assigns `a8`-`a15` before `a7`-`a2`[^15], deliberately,
+windowed ABI begins `8, 9, 10, 11, 12, 13, 14, 15, 7, 6, 5, 4, 3, 2`,
+that is `a8`-`a15` before `a7` down to `a2`[^15], deliberately,
 since a shallow `call4` never touches `a8`-`a15`; a kernel already
 holding its live values in `a2`-`a7` (a `call8`'s incoming arguments)
 competes with the compiler's own preferred range.
@@ -286,13 +300,13 @@ than assuming a budget.
 
 ## Footnotes
 
-[^1]: Cadence/Tensilica, *Xtensa Instruction Set Architecture (ISA) Reference Manual*, Section 4.7.1.1 "Windowed Register Option Architectural Additions" and Table 4-112, pp. 179-182. Copy consulted: https://0x04.net/~mwk/doc/xtensa.pdf
+[^1]: Cadence/Tensilica, *Xtensa Instruction Set Architecture (ISA) Reference Manual*, issue 4/2010, release RC-2010.1, Section 4.7.1 "Windowed Register Option" (p. 180), Section 4.7.1.1 "Windowed Register Option Architectural Additions" and Tables 4-112 and 4-113, pp. 181-182. Table 4-112 gives `WindowBase` as special register 72, width `log2(NAREG/4)`, and `WindowStart` as special register 73, width `NAREG/4`; it also places `PS.CALLINC` (2 bits), `PS.OWB` (4 bits) and `PS.WOE` (1 bit) in special register 230. Copy consulted: https://0x04.net/~mwk/doc/xtensa.pdf
 [^2]: Same manual, Section 4.7.1.2 "Managing Physical Registers", p. 183.
 [^3]: Same manual, Section 4.7.1.3 "Window Overflow Check", pp. 184-185.
 [^4]: Same manual, Section 4.7.1.4 "Call, Entry, and Return Mechanism", p. 186.
 [^5]: Same manual, Section 4.7.1.6 "Window Overflow and Underflow to and from the Program Stack", pp. 192-193.
 [^6]: Same manual, Chapter 8 "Using the Xtensa Architecture", Section 8.1.1 "Windowed Register Usage and Stack Layout", Table 8-242 and Figure 8-53, pp. 587-588.
-[^7]: Same manual, Section 8.1.2 "CALL0 Register Usage and Stack Layout", Table 8-243, p. 588.
+[^7]: Same manual, Section 8.1.2 "CALL0 Register Usage and Stack Layout" and Table 8-243, p. 589.
 [^8]: Espressif Systems, *Overview of Xtensa ISA*, version 0021604, 2021-02-17, Section 1.3 "Windowed Register" and Section 1.4.1 "Windowed register calling convention", pp. 4-6. https://dl.espressif.com/github_assets/espressif/xtensa-isa-doc/releases/download/latest/Xtensa.pdf
 [^9]: ESP-IDF 5.5.1, `components/xtensa/esp32s3/include/xtensa/config/core-isa.h`: `XCHAL_HAVE_WINDOWED` (1) and `XCHAL_NUM_AREGS` (64).
 [^10]: ESP-IDF 5.5.1, `components/xtensa/include/xtensa/corebits.h`: `PS_WOE_SHIFT`/`PS_WOE_MASK`, `PS_CALLINC_SHIFT`/`PS_CALLINC_MASK`, `PS_OWB_SHIFT`/`PS_OWB_MASK`.
@@ -301,4 +315,6 @@ than assuming a budget.
 [^13]: ESP-IDF 5.5.1, `components/xtensa/xtensa_context.S`, file header comment.
 [^14]: GNU Project, GCC documentation, "Xtensa Options" (`-mabi=windowed`, `-mabi=call0`, `-mlongcalls`). https://gcc.gnu.org/onlinedocs/gcc/Xtensa-Options.html
 [^15]: GCC 14.2.0 source, `gcc/config/xtensa/xtensa.h`: `FIXED_REGISTERS`, `CALL_REALLY_USED_REGISTERS`, `REG_ALLOC_ORDER`. https://github.com/gcc-mirror/gcc/blob/releases/gcc-14.2.0/gcc/config/xtensa/xtensa.h (this is the GCC release the ESP32-S3 `xtensa-esp-elf` toolchain, crosstool-NG `esp-14.2.0_20241119`, is built from)
-[^16]: GCC 14.2.0 source, `gcc/config/xtensa/constraints.md`: register constraint `a`. https://github.com/gcc-mirror/gcc/blob/releases/gcc-14.2.0/gcc/config/xtensa/constraints.md
+[^16]: GCC 14.2.0 source, `gcc/config/xtensa/constraints.md`: register constraint `a`, `(define_register_constraint "a" "TARGET_WINDOWED_ABI ? GR_REGS : AR_REGS" "General-purpose AR registers a0-a15, except a1 (sp).")`. https://github.com/gcc-mirror/gcc/blob/releases/gcc-14.2.0/gcc/config/xtensa/constraints.md
+[^17]: Same manual as [^1], Section 8.1.5 "Return Values", p. 591: "The callee places the return value in registers beginning with AR[2] and continuing up to (and including) AR[5] ... For a CALLN instruction ... the caller receives these values in registers AR[N+2] through AR[N+5]."
+

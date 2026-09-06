@@ -3,7 +3,7 @@ title: Caches, internal SRAM, PSRAM and the shared MSPI bus
 id: 03-memory-hierarchy/caches-sram-psram-and-the-mspi-bus
 schema_version: 1
 doc_type: reference
-status: draft
+status: review
 last_reviewed: 2026-09-06
 tags: [esp32s3, xtensa, cache, psram, mspi, memory-hierarchy, dma]
 confidence: medium
@@ -332,7 +332,7 @@ core is.
 [^trm-gdma]: Espressif, *ESP32-S3 Technical Reference Manual*, Version 1.8, Section 4.3.4 "GDMA Address Space", pages 406 to 407.
 [^trm-gdma-align]: Espressif, *ESP32-S3 Technical Reference Manual*, Version 1.8, Table 3.4-2 "Descriptor Field Alignment Requirements for Accessing Internal RAM", page 363.
 [^trm-gdma-ext]: Espressif, *ESP32-S3 Technical Reference Manual*, Version 1.8, Section 3.4.9 "Accessing External RAM", Tables 3.4-3 and 3.4-4, pages 363 to 364.
-[^trm-buses]: Espressif, *ESP32-S3 Technical Reference Manual*, Version 1.8, Section 4.2 "Address Mapping", page 401.
+[^trm-buses]: Espressif, *ESP32-S3 Technical Reference Manual*, Version 1.8, Section 4.3.1 "Address Mapping", page 401.
 [^ds-spi]: Espressif, *ESP32-S3 Series Datasheet*, Version 2.2, Section 4.2.1.5 "Serial Peripheral Interface (SPI)". https://documentation.espressif.com/esp32-s3_datasheet_en.pdf
 [^ds-pins]: Espressif, *ESP32-S3 Series Datasheet*, Version 2.2, Section 2.6 and Table 2-14 "Pin Mapping Between Chip and Flash or PSRAM", page 31.
 [^ds-psram]: Espressif, *ESP32-S3 Series Datasheet*, Version 2.2, Table 5-12 "PSRAM Specifications", page 69.

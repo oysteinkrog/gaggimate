@@ -3,7 +3,7 @@ title: Reading GCC 14 Xtensa assembly for a hot loop
 id: 04-toolchain-and-codegen/register-pressure-spills-and-reading-the-assembly
 schema_version: 1
 doc_type: how-to
-status: draft
+status: review
 last_reviewed: 2026-09-06
 tags: [esp32s3, xtensa, gcc, codegen, register-pressure, spills, loop, abi]
 confidence: high
@@ -35,8 +35,10 @@ ships.[^idf]
 
 `-fverbose-asm` puts the source line and variable name beside each instruction,
 which turns a wall of registers into something readable. Two more flags help when
-the output surprises you: `-fdump-rtl-loop2_doloop-details` says why the hardware
-loop was refused, and `-Q --help=optimizers` says which passes are on.
+the output surprises you: `-fdump-rtl-loop2_doloop-details` says whether the
+early pass refused the hardware loop and why, and `-Q --help=optimizers` says
+which passes are on. A loop the early dump accepts can still be thrown away
+later, so a silent dump is not proof (section 5).
 
 ## 2. Anatomy of a windowed function
 
@@ -96,18 +98,22 @@ writes `a1` as `sp`, so grep the loop body for `sp,`:
 
 Any `sp` reference between the loop label and the closing branch is work paid on
 every iteration. Stack traffic in the prologue and epilogue is free by
-comparison; ignore it. The same reduction written with twelve live accumulators
-and with six, at `-O2` `[measured]`:
+comparison; ignore it.
+
+The shape that shows this: a reduction over a `uint32_t` array carrying twelve
+running accumulators and reading four elements per iteration, against the same
+reduction carrying six and reading two. At `-O2` `[measured]`:
 
 | Variant | Frame | Body insns | `sp` refs in body | Hardware loop |
 |---|---|---|---|---|
-| 12 accumulators, unrolled by 4 | `entry sp, 64` | 32 | 9 | no, `bnez.n` |
-| 6 accumulators, unrolled by 2 | `entry sp, 32` | 11 | 0 | yes, `loop` |
+| 12 accumulators, unrolled by 4 | `entry sp, 48` | 25 | 2 | no, `bnez.n` |
+| 6 accumulators, unrolled by 2 | `entry sp, 32` | 9 | 0 | yes, `loop` |
 
-Per element that is 8.0 instructions against 5.5, so the deeper unroll made the
-loop worse. In the twelve-accumulator version even the incoming pointer argument
-was spilled so its register could be reused, which is the signature of an
-allocator out of room.
+Per element that is 6.25 instructions against 4.5, so the deeper unroll made the
+loop worse. The two `sp` references in the twelve-accumulator body are the loop
+counter itself, spilled so its register could carry a value, which is the
+signature of an allocator out of room. Exact counts depend on the source; the
+direction does not.
 
 ## 5. Recognising a lost hardware loop
 
@@ -118,25 +124,66 @@ then `bnez.n a6, .L5`.
 `LOOP` sets `LCOUNT`, `LBEG` and `LEND`, and the fetch engine handles the branch
 back, so it should cost no mispredict and no taken-branch penalty.[^loop] Losing
 it adds an add and a branch per iteration, against a `BRANCH_COST` of 3 in the
-backend.[^fixedregs] Four causes, all checkable:
+backend.[^fixedregs]
+
+Two separate passes can refuse it, which is why a loop can look accepted in one
+dump and still come out as `bnez`. [Zero-overhead
+loops](../01-scalar-isa/zero-overhead-loops.md) has the full test list from
+`xtensa.cc`; the causes you will actually meet while tuning are these:
 
 - **A call in the body.** `xtensa_invalid_within_doloop` returns "Function call
-  in the loop." for any call insn.[^doloop] The hardware reason is in the ISA:
-  `LCOUNT`, `LBEG` and `LEND` are single registers, so loops cannot nest and a
-  callee might use a loop of its own.[^loop] A `return` as the last instruction
-  is refused for the same reason: a return at `LEND` does not trigger the loop
+  in the loop." for any call insn, and the late `hwloop_optimize` refuses again
+  on `loop->has_call`.[^doloop] The hardware reason is in the ISA: `LCOUNT`,
+  `LBEG` and `LEND` are single registers, so loops cannot nest and a callee
+  might use a loop of its own.[^loop] A `return` as the last instruction is
+  refused for the same reason: a return at `LEND` does not trigger the loop
   back.[^loop][^doloop]
+- **Any inline asm in the body.** `hwloop_optimize` refuses on `loop->has_asm`,
+  which no amount of smallness gets you past.[^doloop] `[measured]` Adding a
+  single `__asm__ volatile("nop")` to the body of the good loop in section 9
+  turned its `loop` into `addi.n` plus `bnez.n`, with nothing else changed. This
+  test lives only in the late pass, so the earlier dump still reports the doloop
+  pattern inserted.
 - **Not innermost, or not entered at the top.** `xtensa_can_use_doloop_p` returns
-  false when `loop_depth > 1` or `entered_at_top` is false.[^doloop]
-- **A body over 256 bytes.** `LEND` is the `LOOP` address plus four plus a
-  zero-extended 8-bit offset, so the body can be at most 256 bytes.[^loop]
+  false when `loop_depth > 1` or `entered_at_top` is false, and `hwloop_optimize`
+  repeats both tests and adds "has more than one entry" for a loop with several
+  incoming edges.[^doloop]
+- **The counter is used as a value.** `hwloop_optimize` refuses on
+  `loop->iter_reg_used || loop->iter_reg_used_outside`, logged as "uses
+  iterator."[^doloop] `LOOP` keeps the count in `LCOUNT`, not in a register, so a
+  body that reads or writes the induction variable for anything other than
+  counting, or code after the loop that reads it, leaves nothing for the
+  hardware to count with. Deriving the pointer from the counter inside the body
+  is the usual way to trip this; walking a pointer instead is the usual fix, and
+  it is what the good loop in section 9 does.
 - **`-Os`.** `[measured]` The same countable loop that gets `loop` at `-O1` and
   `-O2` gets `blt` at `-Os`. The dump names it: `Loop rejected by
-  can_use_doloop_p`, because at `-Os` the loop was not shaped so that it is
-  entered from the top.
+  can_use_doloop_p`, because at `-Os` the loop was reshaped to enter at the
+  bottom test.
 
-To confirm which applies, read the dump. A good run says `Doloop: Inserting
-doloop pattern (runtime iterations).`
+Body size is not on that list, and it is worth being exact about why, because it
+is easy to assume the compiler guards it. It does not: neither pass tests the
+body's byte size, and no length attribute in the machine description does
+either.[^doloop] `LEND` is the `LOOP` address plus four plus a zero-extended
+8-bit offset, so a body over 256 bytes is out of range,[^loop] and GCC emits
+`loop` for it regardless. The assembler is what deals with it, expanding `LOOP`
+into a ten-instruction sequence that writes `LBEG` and `LEND` by hand. That is
+still a hardware loop, not a compare-and-branch fallback.
+
+`[measured]` A countable innermost loop with no call and no asm, written so its
+body compiles to 479 bytes, kept `loop a10, .L3_LEND` in the `.S` and came out of
+the assembler with the expanded form, `rsr.lend`, `wsr.lbeg`, `wsr.lend`,
+`isync` and `rsr.lcount` all present in the object. So an oversized body costs
+you a longer prologue and a literal, not the hardware loop. [GCC extended inline
+asm on Xtensa](./gcc-extended-inline-asm-on-xtensa.md) has the full sequence and
+what it does to the count register.
+
+To confirm which applies, read the dump. A good run through the early pass says
+`Doloop: Inserting doloop pattern (runtime iterations).`, and a refused one names
+the test, as in `Loop rejected by can_use_doloop_p.` `[measured]` Both lines came
+from the same source file at `-O2` and `-Os`. If the dump says the pattern went
+in and the `.S` still ends in `bnez`, the late pass is the one that refused, and
+a call or an `__asm__` in the body is the first thing to look for.
 
 ```sh
 xtensa-esp32s3-elf-gcc -O2 -S -mlongcalls -fdump-rtl-loop2_doloop-details -o /dev/null loop.c
@@ -164,7 +211,10 @@ are hardware here, so `__udivsi3` and `__floatsisf` do not appear; expect those
 only on a configuration without DIV32 or without the FPU. Single-precision divide
 has no instruction, so a divide per element is a call per element, and every
 `double` in a hot loop is a call per operation because the FPU is single
-precision.
+precision. [The floating-point option on the
+LX7](../01-scalar-isa/floating-point-option-on-lx7.md) has the instruction-level
+account: the seed instructions for a divide and a square root exist, `div.s` and
+`sqrt.s` do not, and the assembler rejects them by name.
 
 The fix for a divide is almost always a hoisted reciprocal: compute `1.0f /
 scale` once before the loop and multiply inside it. That turns a per-element
@@ -192,10 +242,11 @@ first load can take an instruction-fetch miss. `L32R` is one of the few memory
 instructions that can read instruction RAM or ROM, which is why the pool can live
 there.[^l32r]
 
-GCC does hoist it. In a loop multiplying by `0x9E3779B9`, the `l32r` lands above
-the `loop` instruction and the body holds only the `mull` `[measured]`. An `l32r`
-inside the body means the constant could not stay in a register. That is a
-pressure symptom, not a constant problem.
+GCC does hoist it. In a loop multiplying each element by `0x9E3779B9`, the `l32r`
+lands above the `loop` instruction and the body is only the load, the `mull`, the
+store and the pointer bump `[measured]`. An `l32r` inside the body means the
+constant could not stay in a register. That is a pressure symptom, not a constant
+problem.
 
 ## 8. Load-use pairs and what the scheduler does
 
@@ -219,7 +270,11 @@ move.
 
 Do not read this as "the scheduler will handle it". The model has no memory
 hierarchy in it. A load whose data is in PSRAM costs far more than 2 and the
-scheduler does not know that, so latency 2 is the floor.
+scheduler does not know that, so latency 2 is the floor. [The LX7 core pipeline
+and cost model](../00-foundations/lx7-core-pipeline-and-cost-model.md) covers
+what the real cost depends on, and [Caches, SRAM, PSRAM and the MSPI
+bus](../03-memory-hierarchy/caches-sram-psram-and-the-mspi-bus.md) covers what a
+miss costs in each memory.
 
 ## 9. A good loop, annotated
 
@@ -305,7 +360,7 @@ Work down this list and stop when the `.S` is clean.
 
 1. **Drop an unroll.** Fewer live values is the cheapest fix and often the only
    one needed. The 12-versus-6 accumulator pair in section 4 is the shape: the
-   deeper unroll cost 45% more instructions per element.
+   deeper unroll cost 39% more instructions per element.
 2. **Hoist the call out.** A reciprocal instead of a divide, a hoisted `sqrtf`, a
    table instead of `fmodf`. This alone can restore the hardware loop and free
    `a8` to `a15`.
@@ -367,11 +422,19 @@ be nested"; "a return from a call instruction as the last instruction of the loo
 would not trigger loop back".
 
 [^doloop]: GCC 14 `gcc/config/xtensa/xtensa.cc`, `releases/gcc-14` branch of the
-gcc-mirror repository, read 2026-09-06. `xtensa_invalid_within_doloop` returns
-"Function call in the loop." for `CALL_P (insn)` and "Return from a call
-instruction in the loop." for a `return` jump. `xtensa_can_use_doloop_p` returns
-false when `loop_depth > 1 || !entered_at_top`, commented "only use doloop for
-innermost loops which must be entered from the top".
+gcc-mirror repository, read 2026-09-06. In the early `loop2_doloop` pass:
+`xtensa_invalid_within_doloop` returns "Function call in the loop." for
+`CALL_P (insn)` and "Return from a call instruction in the loop." for a `return`
+jump; `xtensa_can_use_doloop_p` returns false when
+`loop_depth > 1 || !entered_at_top`, commented "only use doloop for innermost
+loops which must be entered from the top". In the late pass, reached through
+`xtensa_reorg` calling `reorg_loops` with `xtensa_doloop_hooks`,
+`hwloop_optimize` returns false on six conditions, each with its own dump line:
+`loop->depth > 1`, no `loop->incoming_dest`, `loop->incoming_dest != loop->head`,
+`loop->has_call || loop->has_asm`, `loop->iter_reg_used ||
+loop->iter_reg_used_outside`, and the start label not preceding the loop end.
+Neither pass tests the body's byte size.
+https://github.com/gcc-mirror/gcc/blob/releases/gcc-14/gcc/config/xtensa/xtensa.cc
 
 [^movi]: ISA manual, MOVI page 421: `MOVI at, -2048..2047`.
 

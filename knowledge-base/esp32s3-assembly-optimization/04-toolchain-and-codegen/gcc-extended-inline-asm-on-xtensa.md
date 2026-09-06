@@ -3,7 +3,7 @@ title: Writing GCC extended inline assembly for the Xtensa LX7
 id: 04-toolchain-and-codegen/gcc-extended-inline-asm-on-xtensa
 schema_version: 1
 doc_type: how-to
-status: draft
+status: review
 last_reviewed: 2026-09-06
 tags: [esp32s3, xtensa, gcc, inline-asm, constraints, clobbers, codegen]
 confidence: high
@@ -32,8 +32,9 @@ estimate.[^gccasm]
 
 The authority is the backend's `constraints.md`, not the manual. The GCC 14.2
 manual page for Xtensa lists only `a`, `b`, `A`, `I`, `J`, `K` and `L`, and
-omits letters the backend defines and documents: `f`, `M`, `N`, `O`, `P`, `R`,
-`T`, `U`.[^machconstr] Register constraints:[^constraints]
+omits nine letters the backend defines with public documentation strings: `f`,
+`M`, `N`, `O`, `P`, `Y`, `R`, `T` and `U`.[^machconstr] Register
+constraints:[^constraints]
 
 | Letter | Meaning | Available when |
 |---|---|---|
@@ -126,7 +127,11 @@ the only way to say so. Both worked examples below do that.
   `BR_REGS`, `FP_REGS`, `ACC_REG`, `SP_REG`, `ISC_REGS`, `RL_REGS`,
   `GR_REGS`, `AR_REGS`, `ALL_REGS`. There is no vector class, and no `q`
   register appears in `REGISTER_NAMES`.[^xtensah] The assembler knows the
-  instructions; the compiler does not know the registers exist.
+  instructions; the compiler does not know the registers exist. That is
+  also why no clobber is needed for them: the allocator has no class that
+  contains `q0` to `q7`, so it can never put a C value there. [Coprocessors,
+  CPENABLE and lazy context](../00-foundations/coprocessors-cpenable-and-lazy-context.md)
+  covers what the block does owe, which is the coprocessor state.
 - **`SAR` and `SAR_BYTE`.** Not nameable either.[^tc] The block that sets
   the shift amount and the block that consumes it must be one block.
 - **`LBEG`, `LEND`, `LCOUNT`.** A block using `LOOP` owns them, and
@@ -164,33 +169,50 @@ number unique to each instance, so `"%=:"` defines a local numeric label and
 `"%=f"` branches forward to it. Plain local numeric labels (`1:`, `1f`, `1b`)
 work too, but prefer `%=`.
 
-### `LOOP` needs a reachable label, and can cost you a register
+### `LOOP` needs a reachable label, and a long body costs a prologue
 
 `LOOP`, `LOOPNEZ` and `LOOPGTZ` take a count register and a label marking the
 end of the body. Both must be inside the same asm block, because GCC is free to
-place its own code between blocks. The body also has a size limit: on this
-assembler 256 bytes assembles as a plain `loopnez`, and at 258 bytes the
-assembler relaxes it to
+place its own code between blocks. Writing one by hand is also the only way to
+get a hardware loop around hand-written code at all: any `__asm__` statement in
+a C loop body makes GCC refuse the loop, which
+[Zero-overhead loops](../01-scalar-isa/zero-overhead-loops.md) covers.
+
+The body has a size limit: on this assembler 256 bytes assembles as a plain
+`loopnez`, and at 258 bytes the assembler relaxes it to
 
 ```
-beqz     a5, <end>
-loopnez  a5, <short end>
-rsr.lend a5
-wsr.lbeg a5
-l32r     a5, <literal>
-wsr.lend a5
+beqz       a5, <end>
+loopnez    a5, <short end>
+rsr.lend   a5
+wsr.lbeg   a5
+l32r       a5, <literal>
+nop
+wsr.lend   a5
 isync
+rsr.lcount a5
+addi       a5, a5, 1
 ```
 
-which destroys `a5`, the register that carried the count, and needs a literal
-pool entry.[^tc] Reproduced inside a real C block with the count declared
-`"r"(n)`: GCC allocated `n` to `a2`, and the relaxed sequence overwrote `a2`
-while GCC still believed `a2` held `n`.[^tc] So keep a hardware-loop body under
-256 bytes, and declare the count `"+r"`, not `"r"`, so GCC cannot assume it
-survives. Separately, the assembler always aligns `LOOP`, by widening density
-instructions or inserting `NOP`s, and `-mno-target-align` does not disable
-that.[^xtopts] Your block is therefore not exactly the size you wrote, and a
-cycle claim about a `LOOP` body needs a measurement.
+One instruction becomes ten, plus a literal-pool entry.[^tc] The sequence writes
+`LBEG` and `LEND` by hand, so it is still a hardware loop; it is not a
+compare-and-branch fallback. Read the last two lines before assuming the worst:
+the assembler uses the count register as its own scratch and then puts the count
+back, reading `LCOUNT` and adding the one that `LOOPNEZ` took off. Reproduced
+inside a real C block with the count declared `"r"(n)` and read again after the
+block: GCC allocated `n` to `a8`, the relaxed sequence used `a8` as scratch and
+restored it, and the value stored afterwards was the original count.[^tc] So a
+plain `"r"` count is safe here, and `"+r"` is not needed for this reason. It is
+still needed whenever the body itself advances the count.
+
+Three real costs remain, so keep a hardware-loop body under 256 bytes anyway:
+eight extra instructions in the loop prologue, a literal that has to be
+reachable, and no relaxation at all if the assembler is not allowed to transform.
+`--no-transform` turns the same source into `Error: operand 2 of 'loop' has out
+of range value`.[^tc] Separately, the assembler always aligns `LOOP`, by widening
+density instructions or inserting `NOP`s, and `-mno-target-align` does not
+disable that.[^xtopts] Your block is therefore not exactly the size you wrote,
+and a cycle claim about a `LOOP` body needs a measurement.
 
 ## `asm goto`
 
@@ -242,8 +264,8 @@ look for.
 block with four early-clobbered outputs, seven inputs and
 `"a8", "a9", "a10", "a11"` in the clobber list was rejected with `'asm'
 operand has impossible constraints or there are not enough registers`;
-removing the four named clobbers compiled it with no stack traffic at
-all.[^tc] Below that
+removing the four named clobbers compiled it, with no `sp` reference inside
+the block.[^tc] Below that
 threshold you get silent `s32i`/`l32i` pairs around the block instead of an
 error. Count live operands, and prefer packing values behind one pointer
 operand over adding operands.
@@ -300,11 +322,18 @@ GCC allocated `dst`, `src` and `pairs` to `a2`, `a3`, `a4`, the temporaries to
 
 ## Worked example 2: an unaligned PIE streaming load
 
-`EE.LD.128.USAR.IP` loads sixteen bytes and sets `SAR_BYTE` from the low
-address bits. `EE.SRC.Q.LD.IP` combines a funnel shift of two `q` registers
-with the next load and pointer bump. Neither can be declared, so the block owns
-them. The rotation over three `q` registers, and moving 48 bytes per iteration,
-follow the shape esp-dsp uses in its ESP32-S3 `memcpy`.[^espdsp]
+`EE.LD.128.USAR.IP qu, as, imm` forces the low four bits of the address in `as`
+to zero, loads the sixteen bytes there into `qu`, saves the four bits it just
+cleared into `SAR_BYTE`, and then advances `as` by the sign-extended immediate
+shifted left by four.[^trmusar] `EE.SRC.Q.LD.IP qu, as, imm, qs0, qs1` does two
+things at once: it shifts the 32-byte concatenation of `qs1` and `qs0` right by
+`SAR_BYTE` bytes and writes the result back into `qs0`, which is the unaligned
+sixteen bytes, and it loads the next aligned sixteen bytes into `qu` and advances
+`as` the same way.[^trmsrcq] So the shifted data comes out of `qs0`, not `qu`,
+which is why the store below names the register that was just consumed. Neither
+`SAR_BYTE` nor the `q` registers can be declared, so the block owns them. The
+rotation over three `q` registers, and moving 48 bytes per iteration, follow the
+shape esp-dsp uses in its ESP32-S3 `memcpy`.[^espdsp]
 
 ```c
 __attribute__((noinline))
@@ -331,12 +360,13 @@ void stream_copy_u(uint8_t *dst, const uint8_t *src, unsigned triples)
 
 All three pointers and the count are `+r`: the auto-increment loads and stores
 advance the pointers, and `LOOPNEZ` consumes the count. It assembled to exactly
-the eight instructions above.[^tc] Two cautions. The semantics of
-`EE.SRC.Q.LD.IP` and of `SAR_BYTE` are taken from esp-dsp's usage, not from a
-primary instruction reference [uncertain]; confirm against an ISA reference or
-an executed bit-exactness test before relying on them. And the block leaves the
-PIE coprocessor state dirty, which interacts with lazy coprocessor context
-switching.
+the eight instructions above.[^tc] Two cautions. The destination really must be
+16-byte aligned, because every 128-bit access in this instruction set forces the
+low four address bits to zero rather than faulting, so a misaligned `dst` writes
+to the wrong place in silence.[^trmalign] And the block leaves the PIE
+coprocessor state dirty, which interacts with lazy coprocessor context switching;
+see [Coprocessors, CPENABLE and lazy
+context](../00-foundations/coprocessors-cpenable-and-lazy-context.md).
 
 ## Worked example 3: the wrong one
 
@@ -376,5 +406,8 @@ and it moves when the optimisation level changes.
 [^constraints]: GCC source, `gcc/config/xtensa/constraints.md`, `releases/gcc-14` branch, retrieved 2026-09-06. https://github.com/gcc-mirror/gcc/blob/releases/gcc-14/gcc/config/xtensa/constraints.md
 [^xtensah]: GCC source, `gcc/config/xtensa/xtensa.h`, `releases/gcc-14` branch, retrieved 2026-09-06: `FIXED_REGISTERS`, `REGISTER_NAMES`, `ADDITIONAL_REGISTER_NAMES`, `enum reg_class`, `REG_CLASS_NAMES`, `REG_CLASS_CONTENTS` and `#define GENERAL_REGS AR_REGS`. https://github.com/gcc-mirror/gcc/blob/releases/gcc-14/gcc/config/xtensa/xtensa.h
 [^xtopts]: GNU Compiler Collection 14.2.0 manual, "Xtensa Options", entries `-mlongcalls` and `-mtarget-align`. https://gcc.gnu.org/onlinedocs/gcc-14.2.0/gcc/Xtensa-Options.html
-[^espdsp]: esp-dsp, `modules/support/mem/esp32s3/dsps_memcpy_aes3.S`, repository tree sha `3c8ac0fdfec83740b783e200862c8d0c056de0ad` (master, retrieved 2026-09-06), the `_main_loop_unaligned` block. https://github.com/espressif/esp-dsp
+[^espdsp]: esp-dsp, `modules/support/mem/esp32s3/dsps_memcpy_aes3.S`, repository tree sha `3c8ac0fdfec83740b783e200862c8d0c056de0ad` (master, retrieved 2026-09-06), the `_main_loop_unaligned` block: a `loopnez` moving 48 bytes an iteration through `ee.src.q.ld.ip` and `ee.vst.128.ip` over `q2`, `q3` and `q4`, with the file's own header note that the destination must always be aligned. https://github.com/espressif/esp-dsp
+[^trmusar]: Espressif Systems, *ESP32-S3 Technical Reference Manual* v1.8, section 1.8.17 `EE.LD.128.USAR.IP`, page 93. Operation: `qu[127:0] = load128({as[31:4],4{0}})`, `SAR_BYTE = as[3:0]`, `as = as + {20{imm16[7]},imm16[7:0],4{0}}`.
+[^trmsrcq]: Same manual, section 1.8.50 `EE.SRC.Q.LD.IP`, page 126. Operation: `qs0[127:0] = {qs1[127:0], qs0[127:0]} >> {SAR_BYTE[3:0] << 3}`, `qu[127:0] = load128({as[31:4],4{0}})`, `as = as + {20{imm16[7]},imm16[7:0],4{0}}`. The `SAR_BYTE` special register is described in section 1.4 under "SAR_BYTE", which points at section 1.5.3 for the alignment rule.
+[^trmalign]: Same manual, section 1.5.3 "Data Format and Alignment", page 48: "all access addresses in the extended instruction set are forced to be aligned, i.e., the lowest bits will be replaced by 0", four bits for 128-bit data, three for 64-bit, two for 32-bit, one for 16-bit; "Otherwise, the data read will not be what you expected."
 [^idf]: ESP-IDF v5.5.1, `components/xtensa/include/xt_utils.h`, `xt_utils_compare_and_set`: a shipped inline asm block that writes the `SCOMPARE1` special register, and uses the older matching-operand form `"0"(old_value)` where `"+r"` would serve today.

@@ -3,7 +3,7 @@ title: QEMU for the ESP32-S3, what it proves and what it cannot
 id: 05-measurement/qemu-esp32s3-what-it-proves-and-what-it-cannot
 schema_version: 1
 doc_type: explanation
-status: draft
+status: review
 last_reviewed: 2026-09-06
 tags: [esp32s3, xtensa, qemu, pie, measurement, verification, gdb]
 confidence: medium

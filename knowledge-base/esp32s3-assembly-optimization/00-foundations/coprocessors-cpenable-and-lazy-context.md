@@ -3,10 +3,10 @@ title: Coprocessors, CPENABLE, and lazy context switching on the ESP32-S3
 id: 00-foundations/coprocessors-cpenable-and-lazy-context
 schema_version: 1
 doc_type: explanation
-status: draft
+status: review
 last_reviewed: 2026-09-06
 tags: [esp32s3, xtensa, coprocessor, cpenable, freertos, fpu, pie, context-switch]
-confidence: medium
+confidence: high
 ---
 
 # Coprocessors, CPENABLE, and lazy context switching on the ESP32-S3
@@ -22,19 +22,24 @@ inline assembly block that touches either unit.
 
 Xtensa's Coprocessor Option lets a core designer attach extra execution
 units, each with its own register state, and gate each one behind a bit
-in a single special register, `CPENABLE`[^1]. On the ESP32-S3,
-`CPENABLE` is special register number 224[^2]. Each bit `n` of
-`CPENABLE` enables coprocessor `n`; the core supports up to 8
-coprocessors (CP0 through CP7)[^3].
+in a single special register, `CPENABLE`[^1]. The architecture makes
+`CPENABLE` 8 bits wide at special register number 224, one enable bit per
+coprocessor, so the ceiling is 8 coprocessors, CP0 through CP7[^1].
+ESP-IDF's headers for this chip carry the same number, 224[^2], and the
+same architectural ceiling of 8[^3]. What the ESP32-S3 actually has is 2
+coprocessors with a highest ID of 3, `XCHAL_CP_NUM` 2 and `XCHAL_CP_MAX` 4,
+present as the bitmask `XCHAL_CP_MASK` `0x09`, that is CP0 and CP3[^6].
 
 When code executes an instruction that belongs to coprocessor `n` while
 bit `n` of `CPENABLE` is clear, the core raises a **Coprocessor `n`
 Disabled** exception instead of executing the instruction. The exception
-cause codes are contiguous: `EXCCAUSE_CP0_DISABLED` is 32, and
-`EXCCAUSE_CPn_DISABLED` is `32 + n` up to `EXCCAUSE_CP7_DISABLED` at
-39[^4]. ESP-IDF's exception dispatcher relies on this: it routes any
-cause number at or above `EXCCAUSE_CP0_DISABLED` to the coprocessor
-exception handler, with a single range check[^5].
+cause codes are contiguous: Coprocessor0Disabled is EXCCAUSE 32 and
+Coprocessor`n`Disabled is `32 + n`, up to Coprocessor7Disabled at 39[^1].
+ESP-IDF's header spells the same table out as `EXCCAUSE_CP_DISABLED(n)`
+= `32+(n)` with the eight individual defines[^4]. ESP-IDF's exception
+dispatcher relies on the codes being contiguous: it routes any cause
+number at or above `EXCCAUSE_CP0_DISABLED` to the coprocessor exception
+handler, with a single range check[^5].
 
 This is the hook the operating system uses to avoid saving coprocessor
 state it does not need to save. A task that never executes a
@@ -52,15 +57,22 @@ core-configuration header assigns:
 |---|---|---|---|
 | CP0 | `FPU` | 72 bytes | The single-precision floating-point registers `f0`-`f15` and the FP control/status registers `FCR`/`FSR`[^6] |
 | CP1, CP2 | (unused) | 0 bytes | Not present on this core[^6] |
-| CP3 | `cop_ai` (internal name) | 208 bytes | The vector/DSP state: the accumulator registers (`ACCX`), the Q-accumulators (`QACC_H`/`QACC_L`), a byte-granular shift-amount register, an FFT bit-width register, and the "unaligned load" state registers[^7] |
+| CP3 | `cop_ai` (internal name) | 208 bytes | The vector/DSP state: the eight 128-bit vector registers `q0`-`q7` (128 bytes of the 208), plus the accumulator registers (`ACCX`), the Q-accumulators (`QACC_H`/`QACC_L`), a byte-granular shift-amount register, an FFT bit-width register, and four "unaligned load" state registers[^7] |
 | CP4-CP7 | (unused) | 0 bytes | Not present on this core[^6] |
 
-CP3's register list is the tell: `accx_0`, `accx_1`, `qacc_h_0..4`,
-`qacc_l_0..4`, `sar_byte`, `fft_bit_width`, and `ua_state_0`/`ua_state_1`
-are the architectural names for the PIE (vector) unit's own state[^7].
-The generated header calls this coprocessor `cop_ai` internally, but
-its register list identifies it as the PIE unit beyond doubt; nothing
-else on this chip owns an `ACCX` or `QACC` register.
+CP3's register list is the tell: `q0` through `q7`, `accx_0`, `accx_1`,
+`qacc_h_0..4`, `qacc_l_0..4`, `sar_byte`, `fft_bit_width` and
+`ua_state_0..3` are the architectural names for the PIE (vector) unit's
+own state[^7]. The generated header calls this coprocessor `cop_ai`
+internally, but its register list identifies it as the PIE unit beyond
+doubt; nothing else on this chip owns a `q` or `QACC` register.
+
+The 208 bytes add up: eight `q` registers at 16 bytes each is 128, the
+eighteen 4-byte user registers are 72, and the save area is padded to its
+16-byte alignment[^7]. So the q registers are coprocessor state and are
+covered by the lazy scheme below, which is the same statement as
+[the PIE register file leaf](../02-pie-vector/pie-register-file-sar-and-context.md)
+makes from the vector side.
 
 Only two coprocessors exist on the ESP32-S3, then: the scalar FPU at
 CP0, and the PIE vector unit at CP3. Every mention of "the coprocessor
@@ -93,7 +105,10 @@ The sequence when a task executes a coprocessor instruction:
    `n`, so the instruction can now be retried and will succeed.
 4. It reads `_xt_coproc_owner_sa[n]` for the current core to find the
    **previous owner** (if any), and immediately overwrites the entry
-   with the trapping task, making it the new owner.
+   with the trapping task, making it the new owner. On a dual-core build
+   that read-and-write pair is taken under a spinlock,
+   `_xt_coproc_owner_sa_lock`, because both cores can reach the same
+   array[^8].
 5. If there was a previous owner, and that owner's own saved
    `CPENABLE` still shows the coprocessor bit set (meaning it has live,
    unsaved state in the physical registers), the handler saves that
@@ -105,12 +120,20 @@ The sequence when a task executes a coprocessor instruction:
    physical registers[^12].
 7. The interrupted instruction resumes.
 
+There is a second path, and on this chip it does nothing.
 `_xt_coproc_savecs` and `_xt_coproc_restorecs` (in `xtensa_context.S`)
-implement the same save and restore logic from the other direction, for
-FreeRTOS's normal solicited context-switch path, using the coprocessor
-save-area offset table `_xt_coproc_sa_offset` and the per-coprocessor
-`xchal_cpN_store`/`xchal_cpN_load` HAL macros generated for this
-core[^13].
+run on FreeRTOS's solicited context switch, the voluntary yield, and drive
+the same `xchal_cpN_store`/`xchal_cpN_load` HAL macros through the
+save-area offset table `_xt_coproc_sa_offset`. But they pass
+`select=XTHAL_SAS_TIE|XTHAL_SAS_NOCC|XTHAL_SAS_CALE`, which asks for the
+callee-saved subset only[^13]. In this core's generated `tie-asm.h`, every
+CP0 and CP3 register sits in a caller-saved (`XTHAL_SAS_CALR`) block and
+no block is emitted for `XTHAL_SAS_CALE` at all[^20]. So a voluntary yield
+saves no floating-point register and no `q` register: the ABI already
+treats them as dead across a call. Only the disabled-exception path above
+ever moves this state. The same conclusion, reached from the vector side,
+is in
+[the PIE register file leaf](../02-pie-vector/pie-register-file-sar-and-context.md).
 
 What this buys: a full save of both coprocessors' state is roughly
 280 bytes of register file (72 for the FPU, 208 for PIE) plus the
@@ -157,15 +180,14 @@ That escape hatch is `CONFIG_FREERTOS_FPU_IN_ISR`. Its help text: "When
 enabled, the usage of float type is allowed inside Level 1 ISRs. Note
 that usage of float types in higher level interrupts is still not
 permitted."[^16] It is gated on `SOC_CPU_HAS_FPU` and is specifically
-about the FPU (CP0); it is off by default, and this repository's
-display and controller builds all leave it off[^17]. The assembly gate
+about the FPU (CP0), and it is off by default[^16]. The assembly gate
 that this option controls is shared code that also runs for a CP3 (PIE)
 disabled exception, so the same bypass would mechanically apply if a
 PIE instruction executed inside a Level-1 ISR while the option is
-enabled — but Espressif's documentation only describes and endorses
-this for the FPU. **[uncertain]**: whether using PIE instructions inside
-an ISR is a supported configuration is not confirmed by any source this
-document could verify; treat PIE-in-ISR as unsupported.
+enabled. Espressif's documentation only describes and endorses this for
+the FPU. **[uncertain]**: whether using PIE instructions inside an ISR is
+a supported configuration is not confirmed by any source this document
+could verify; treat PIE in an ISR as unsupported.
 
 ## Where SAR lives, and why it is not "lazy"
 
@@ -183,9 +205,12 @@ This is a different register from the PIE-specific `sar_byte` entry
 inside CP3's own save area (`XCHAL_CP3_SA_LIST`, register `ur,13`)[^7].
 That one is PIE's own byte-granular addressing state, used by some
 `EE.*` instructions, and it is saved and restored lazily along with the
-rest of CP3's register file by the mechanism described above. A kernel
-that reasons about "does my shift amount survive a context switch"
-needs to know which of the two registers it is using.
+rest of CP3's register file by the disabled-exception mechanism described
+above.
+[The PIE register file leaf](../02-pie-vector/pie-register-file-sar-and-context.md)
+covers what each of the two shift-amount registers is for. A kernel that
+reasons about "does my shift amount survive a context switch" needs to
+know which of the two it is using.
 
 ## Core affinity
 
@@ -206,33 +231,46 @@ content exists only on the core it was pinned to.
 ## Consequence for inline assembly and the PIE's Q registers
 
 The PIE unit's 128-bit vector registers, `q0` through `q7`, are named
-directly by `EE.*` instruction mnemonics in assembly, but none of the
-core-configuration headers this document could inspect expose them as
-C-visible register names, register classes, or inline-asm constraints.
-**[uncertain]**: this document could not open GCC 14.2.0's own Xtensa
-backend sources (register definitions and constraint tables) to confirm
-directly, so the following is inferred rather than sourced: if the
-compiler's register allocator has no register class that includes
-`q0`-`q7`, it can never choose to spill a C-level value into one of
-them on its own, and it can never silently need one of them across a
-call. Under that assumption, a hand-written inline `asm` block that
-uses `EE.*` instructions on `q` registers as scratch space does not
-need to list them in its clobber list, because the compiler was never
-going to touch them anyway. Any kernel relying on this should still
-state the assumption in a comment next to the `asm` block, both because
-it could not be confirmed against GCC's own source here, and because a
-future toolchain version could in principle add support for allocating
-into these registers.
+directly by `EE.*` instruction mnemonics in assembly, and the assembler
+knows them. GCC 14.2.0 does not. Its Xtensa backend declares ten register
+classes, `NO_REGS`, `BR_REGS`, `FP_REGS`, `ACC_REG`, `SP_REG`, `ISC_REGS`,
+`RL_REGS`, `GR_REGS`, `AR_REGS` and `ALL_REGS`, none of them a vector
+class, and `REGISTER_NAMES` lists only the sixteen address registers, the
+frame and argument pointers, `b0`, `f0`-`f15` and `acc`: no `q`[^21]. The
+letter `q` is taken, and not by a vector class: in the Xtensa
+`constraints.md` it is an internal register constraint for the stack
+pointer, register `a1`[^22]. The shipping compiler agrees. Listing `"q0"`
+in a clobber list is rejected with `error: unknown register name 'q0' in
+'asm'`, and asking for a `"=q"` output on a 32-bit value is rejected with
+`inconsistent operand constraints in an 'asm'`[^23].
+
+Two consequences, which
+[GCC extended inline asm on Xtensa](../04-toolchain-and-codegen/gcc-extended-inline-asm-on-xtensa.md)
+covers in full:
+
+- You cannot name a `q` register as an operand or a clobber. A value
+  enters and leaves an `asm` block through memory or through an address
+  register the block loads itself.
+- You do not need to. The allocator has no class containing `q0`-`q7`, so
+  it can never place a C-level value there and can never need one live
+  across the block. A comment at the top of the block is the only way to
+  record that the block owns them, and it is worth writing, because the
+  guarantee is a property of GCC 14.2 and not of the ISA.
+
+Within one task, the `q` registers are yours between the points where the
+scheduler can intervene. Across a call or a yield they are not: the ABI
+classifies every coprocessor 3 register as caller-saved, which is why
+`_xt_coproc_savecs` saves none of them (above).
 
 ## Footnotes
 
-[^1]: Cadence/Tensilica, *Xtensa Instruction Set Architecture (ISA) Reference Manual*, Coprocessor Option chapter (register `CPENABLE`, one enable bit per coprocessor, up to 8 coprocessors). Copy consulted: https://0x04.net/~mwk/doc/xtensa.pdf
+[^1]: Cadence/Tensilica, *Xtensa Instruction Set Architecture (ISA) Reference Manual*, issue 4/2010, release RC-2010.1, Section 4.3.9 "Coprocessor Option" and Section 4.3.9.1, pp. 63-64: Table 4-41 "Coprocessor Option Exception Additions" (Coprocessor0Disabled through Coprocessor7Disabled, EXCCAUSE 32 to 39) and Table 4-42 "Coprocessor Option Processor-State Additions" (`CPENABLE`, quantity 1, width 8 bits, special register number 224). Copy consulted: https://0x04.net/~mwk/doc/xtensa.pdf
 [^2]: ESP-IDF 5.5.1, `components/xtensa/esp32s3/include/xtensa/config/specreg.h`: `#define CPENABLE 224`.
 [^3]: ESP-IDF 5.5.1, `components/xtensa/esp32s3/include/xtensa/config/core-isa.h`: `XCHAL_HAVE_CP` (1, "CPENABLE reg (coprocessor)"), `XCHAL_CP_MAXCFG` (8, "max allowed cp id plus one").
 [^4]: ESP-IDF 5.5.1, `components/xtensa/include/xtensa/corebits.h`: `EXCCAUSE_CP_DISABLED(n)` = `32+(n)`, and the individual `EXCCAUSE_CP0_DISABLED` (32) through `EXCCAUSE_CP7_DISABLED` (39) defines.
 [^5]: ESP-IDF 5.5.1, `components/xtensa/xtensa_vectors.S`, comment: "Handle any coprocessor exceptions. Rely on the fact that exception numbers above EXCCAUSE_CP0_DISABLED all relate to the coprocessors", and the `bgeui a0, EXCCAUSE_CP0_DISABLED, _xt_to_coproc_exc` dispatch.
-[^6]: ESP-IDF 5.5.1, `components/xtensa/esp32s3/include/xtensa/config/tie.h`: `XCHAL_CP0_NAME` "FPU", `XCHAL_CP0_SA_SIZE` 72; `XCHAL_CP1_SA_SIZE` 0, `XCHAL_CP2_SA_SIZE` 0, `XCHAL_CP4_SA_SIZE`..`XCHAL_CP7_SA_SIZE` 0.
-[^7]: ESP-IDF 5.5.1, `components/xtensa/esp32s3/include/xtensa/config/tie.h`: `XCHAL_CP3_NAME` "cop_ai", `XCHAL_CP3_SA_SIZE` 208, and the `XCHAL_CP3_SA_LIST` register list (`accx_0`, `accx_1`, `qacc_h_0`..`qacc_h_4`, `qacc_l_0`..`qacc_l_4`, `sar_byte`, `fft_bit_width`, `ua_state_0`, `ua_state_1`, plus additional entries in the same list).
+[^6]: ESP-IDF 5.5.1, `components/xtensa/esp32s3/include/xtensa/config/tie.h`: `XCHAL_CP_NUM` 2, `XCHAL_CP_MAX` 4, `XCHAL_CP_MASK` `0x09`; `XCHAL_CP0_NAME` "FPU", `XCHAL_CP0_SA_SIZE` 72, `XCHAL_CP0_SA_ALIGN` 4; `XCHAL_CP1_SA_SIZE` 0, `XCHAL_CP2_SA_SIZE` 0, `XCHAL_CP4_SA_SIZE`..`XCHAL_CP7_SA_SIZE` 0.
+[^7]: ESP-IDF 5.5.1, `components/xtensa/esp32s3/include/xtensa/config/tie.h`: `XCHAL_CP3_NAME` "cop_ai", `XCHAL_CP3_SA_SIZE` 208, `XCHAL_CP3_SA_ALIGN` 16, and the full `XCHAL_CP3_SA_LIST`: user registers `accx_0`, `accx_1`, `qacc_h_0`..`qacc_h_4`, `qacc_l_0`..`qacc_l_4`, `sar_byte`, `fft_bit_width`, `ua_state_0`..`ua_state_3` (18 entries, `ur,0`..`ur,11` and `ur,13`..`ur,18`, 4 bytes each), then `q0`..`q7` (16 bytes each, 16-byte aligned).
 [^8]: ESP-IDF 5.5.1, `components/xtensa/xtensa_vectors.S`: `_xt_coproc_owner_sa` array declaration, comment "Owner thread of CP n, identified by thread's CP save area (0 = unowned)".
 [^9]: ESP-IDF 5.5.1, `components/xtensa/xtensa_vectors.S`: `_xt_coproc_owner_sa: .space (XCHAL_CP_MAX * portNUM_PROCESSORS) << 2`.
 [^10]: ESP-IDF 5.5.1, `components/xtensa/xtensa_vectors.S`, `_xt_coproc_exc` label and the `addi a5, a0, -EXCCAUSE_CP0_DISABLED` computation of the coprocessor index from `EXCCAUSE`.
@@ -242,6 +280,9 @@ into these registers.
 [^14]: ESP-IDF 5.5.1, `components/xtensa/xtensa_vectors.S`, comment above the coprocessor exception handler section.
 [^15]: ESP-IDF 5.5.1, `components/xtensa/xtensa_vectors.S`, `_xt_coproc_exc`: `#if !CONFIG_FREERTOS_FPU_IN_ISR` / `beqz a15, .L_goto_invalid` ("not in a thread (invalid)").
 [^16]: ESP-IDF 5.5.1, `components/freertos/Kconfig`: `config FREERTOS_FPU_IN_ISR`, `depends on SOC_CPU_HAS_FPU && (IDF_TARGET_ESP32 || IDF_TARGET_ESP32S3)`, `default n`, help text quoted verbatim.
-[^17]: This repository, `sdkconfig.display` and sibling `sdkconfig.*` files: `# CONFIG_FREERTOS_FPU_IN_ISR is not set` in every build's saved configuration as of 2026-09-06.
 [^18]: ESP-IDF 5.5.1, `components/xtensa/xtensa_context.S`, `_xt_context_save`: unconditional `rsr a3, SAR` / `s32i a3, sp, XT_STK_SAR`; and `components/xtensa/include/xtensa_context.h`: `STRUCT_FIELD (long, 4, XT_STK_SAR, sar)` in the base register-save-area layout.
 [^19]: ESP-IDF 5.5.1, `components/freertos/FreeRTOS-Kernel/portable/xtensa/portasm.S`, `_frxt_coproc_exc_hook`, comment "CP operations are incompatible with unpinned tasks. Thus we pin the task to the current running core", writing the core ID through `offset_xCoreID`; and `components/freertos/FreeRTOS-Kernel/portable/xtensa/port.c`, comment above `offset_xCoreID`: "Used to pin unpinned tasks that use the FPU."
+[^20]: ESP-IDF 5.5.1, `components/xtensa/esp32s3/include/xtensa/config/tie-asm.h`. `XTHAL_SAS_CALR` is `0x0010` ("caller-saved") and `XTHAL_SAS_CALE` is `0x0020` ("callee-saved"). Inside `xchal_cp0_store`, `xchal_cp0_load`, `xchal_cp3_store` and `xchal_cp3_load`, every guarded block tests a select mask built from `XTHAL_SAS_CALR`; the string `CALE` appears nowhere in the file except its own `#define`.
+[^21]: GCC 14.2.0 source, `gcc/config/xtensa/xtensa.h`: `enum reg_class` (lines 341-354) and `REGISTER_NAMES` (lines 652-660). https://raw.githubusercontent.com/gcc-mirror/gcc/releases/gcc-14.2.0/gcc/config/xtensa/xtensa.h
+[^22]: GCC 14.2.0 source, `gcc/config/xtensa/constraints.md`: `(define_register_constraint "q" "TARGET_WINDOWED_ABI ? SP_REG : NO_REGS" "@internal The stack pointer (register @code{a1}).")`. https://raw.githubusercontent.com/gcc-mirror/gcc/releases/gcc-14.2.0/gcc/config/xtensa/constraints.md
+[^23]: Toolchain observation, `xtensa-esp32s3-elf-gcc` 14.2.0 (crosstool-NG `esp-14.2.0_20241119`), 2026-09-06. `void f(void){ __asm__ volatile("" ::: "q0"); }` fails with `error: unknown register name 'q0' in 'asm'`. An `asm` with a `"=q"` output on an `int` fails with `error: inconsistent operand constraints in an 'asm'`.

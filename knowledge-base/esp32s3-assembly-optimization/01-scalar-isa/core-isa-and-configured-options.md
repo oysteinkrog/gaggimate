@@ -3,10 +3,10 @@ title: Xtensa LX7 configured ISA options on the ESP32-S3
 id: 01-scalar-isa/core-isa-and-configured-options
 schema_version: 1
 doc_type: reference
-status: draft
+status: review
 last_reviewed: 2026-09-06
 tags: [esp32s3, xtensa, lx7, lx6, core-isa, coprocessor, cache, isa-options]
-confidence: medium
+confidence: high
 ---
 
 # Xtensa LX7 configured ISA options on the ESP32-S3
@@ -23,7 +23,11 @@ This page reads that header for the ESP32-S3 (LX7) and, next to it, for the
 original ESP32 (LX6), so a reader can see which options are new on the S3 and
 which have been there since the first chip. Both headers come from the same
 ESP-IDF package on this machine: ESP-IDF 5.5.1, packaged toolchain
-`xtensa-esp-elf`.[^1][^2]
+`xtensa-esp-elf`.[^1][^2] Three options get a leaf of their own, because the
+detail matters more than one table row can carry:
+[zero-overhead loops](./zero-overhead-loops.md),
+[the floating-point option](./floating-point-option-on-lx7.md), and
+[the scalar instruction forms and their immediate ranges](./scalar-arithmetic-shifts-and-bit-tricks.md).
 
 ## The configured options
 
@@ -42,9 +46,9 @@ ESP-IDF package on this machine: ESP-IDF 5.5.1, packaged toolchain
 | Windowed registers | `XCHAL_HAVE_WINDOWED`, `XCHAL_NUM_AREGS` | 1, 64 physical `a` registers | 1, 64 | A 16-register window rotated through the 64 physical registers by `ENTRY`/`RETW` and the `CALL`n family | This is the ABI the whole toolchain assumes (`-mabi=windowed`, GCC 14's default). It makes an ordinary function call cheap, since callee-saved registers do not need explicit spilling, but it makes interrupt entry expensive: a window overflow can force a spill to memory inside the exception path.[^1][^2][^6] |
 | Call-window variants | `XCHAL_HAVE_CALL4AND12` | 1 (the header itself marks this "(obsolete option)") | 1 | `CALL4`, `CALL8`, `CALL12` and the matching `ENTRY` sizes | GCC's own code generation only ever emits `CALL4` (a 4-register window); `CALL8`/`CALL12` exist for compatibility, not because the compiler chooses them.[^1][^2] |
 | Boolean registers | `XCHAL_HAVE_BOOLEANS` | 1 | 1 | 16 one-bit registers `b0`-`b15`, written by floating-point compares | Every FP comparison result lands in one of these, not in an integer register; plain integer code never touches them.[^1][^2] |
-| Single-precision FP | `XCHAL_HAVE_FP`, `XCHAL_HAVE_FP_DIV`, `XCHAL_HAVE_FP_RECIP`, `XCHAL_HAVE_FP_SQRT`, `XCHAL_HAVE_FP_RSQRT` | all 1 | all 1 | `ADD.S`, `MUL.S`, `MADD.S`, `DIV.S`, `SQRT.S`, `RSQRT0.S`, FP compares into a boolean register | Both chips carry a hardware single-precision FPU, including hardware divide and square root. This is worth stating plainly because "the ESP32 has no FPU" is a common claim and it is wrong at the ISA-option level: what the ESP32 (and the S3) actually lack is double precision, next row.[^1][^2] |
+| Single-precision FP | `XCHAL_HAVE_FP`, `XCHAL_HAVE_FP_DIV`, `XCHAL_HAVE_FP_RECIP`, `XCHAL_HAVE_FP_SQRT`, `XCHAL_HAVE_FP_RSQRT` | all 1 | all 1 | `ADD.S`, `MUL.S`, `MADD.S`, `MSUB.S`, `ABS.S`, `NEG.S`, the conversions, and FP compares into a boolean register; plus the refinement seeds `DIV0.S`, `RECIP0.S`, `SQRT0.S`, `RSQRT0.S`, `NEXP01.S`, `MADDN.S`, `DIVN.S` | Both chips carry a hardware single-precision FPU. This is worth stating plainly because "the ESP32 has no FPU" is a common claim and it is wrong at the ISA-option level.[^1][^2] Read the four `FP_DIV`/`FP_RECIP`/`FP_SQRT`/`FP_RSQRT` macros carefully: they mean the seed instructions of an iterative refinement sequence are built in, not that one instruction produces a quotient or a root. `DIV.S` and `SQRT.S` do not exist on this core and the assembler rejects both.[^8] The two things these chips actually lack are a one-instruction divide and double precision, next row. See [the floating-point leaf](./floating-point-option-on-lx7.md). |
 | Double-precision FP | `XCHAL_HAVE_DFP` | 0 | 0 | none | `double` is always software-emulated on both chips. A hot path that can tolerate single precision should be written in `float`, not `double`, to reach the hardware unit at all.[^1][^2] |
-| MAC16 package | `XCHAL_HAVE_MAC16` | 1 | 1 | `MUL.AA.*`, `MUL.AD.*`, `MUL.DA.*`, `MUL.DD.*` and accumulate forms into a 40-bit `ACCLO`/`ACCHI` pair | An older 16x16 multiply-accumulate unit that predates `MUL32`. Modern GCC does not generate it from ordinary C; reaching it needs inline asm or a compiler builtin.[^1][^2] |
+| MAC16 package | `XCHAL_HAVE_MAC16` | 1 | 1 | `MUL.AA.*`, `MUL.AD.*`, `MUL.DA.*`, `MUL.DD.*` and accumulate forms into a 40-bit `ACCLO`/`ACCHI` pair | An older 16x16 multiply-accumulate unit that predates `MUL32`. GCC 14.2 reaches it from ordinary C for one shape only: a loop that multiplies two 16-bit arrays and accumulates into a 32-bit sum compiles to `mula.aa.ll` with `wsr.acclo` and `rsr.acclo` at `-O2` and `-Os`, but not at `-O1` and not with 32-bit operands `[measured]` (see [the MAC16 and Boolean leaf](mac16-boolean-and-other-configured-options.md)). Every other use needs inline asm.[^1][^2] |
 | Atomic compare-and-set | `XCHAL_HAVE_S32C1I` (vs. `XCHAL_HAVE_EXCLUSIVE`) | `S32C1I`=1, `EXCLUSIVE`=0 | `S32C1I`=1 (no `EXCLUSIVE` macro defined at all in this header) | `S32C1I`: store a value into `SCOMPARE1`, then conditionally store to memory if it still matches | The only hardware read-modify-write primitive on this core. There is no load-linked/store-conditional pair (`L32EX`/`S32EX`); a single-word atomic compiles to `S32C1I`, anything wider needs a lock.[^1][^2] |
 | Thread pointer | `XCHAL_HAVE_THREADPTR` | 1 | 1 | `RUR.THREADPTR` / `WUR.THREADPTR` | Gives thread-local storage a dedicated register reached by one instruction instead of a table lookup.[^1][^2] |
 | Literal loads | `XCHAL_HAVE_L32R` | 1 | 1 | `L32R`: PC-relative load from a literal pool | The only way this core loads a 32-bit constant that does not fit in an immediate field. The literal pool must be within `L32R`'s PC-relative reach, which is why GCC's `-mlongcalls`, `-mtext-section-literals` and `-mauto-litpools` options exist.[^1][^2][^6] |
@@ -72,9 +76,8 @@ Both chips report the same interrupt and debug configuration in
   because the C runtime assumes `EXCM` is set and cannot be safely entered
   from a level where it isn't.
 - `XCHAL_NUM_TIMERS` is 3: three `CCOMPARE`n registers compared against the
-  free-running `CCOUNT`. Every hardware timer a program wants — an RTOS
-  tick, a high-resolution timer, anything else — competes for one of these
-  three per core.
+  free-running `CCOUNT`. Every hardware timer a program wants, an RTOS tick, a high-resolution timer, anything else, competes for
+  one of these three per core.
 - `XCHAL_NUM_INTERRUPTS` is 32 (`XCHAL_NUM_EXTINTERRUPTS` = 26 of those are
   external).
 - The debug option (`XCHAL_HAVE_DEBUG`) is on, with on-chip debug (OCD), 2
@@ -88,7 +91,7 @@ Both chips report the same interrupt and debug configuration in
 
 `core-isa.h` on both chips sets `XCHAL_HAVE_CP` (the coprocessor option) to 1
 and `XCHAL_CP_MAXCFG` to 8, meaning up to 8 coprocessor IDs could exist.[^1][^2]
-Which ones actually do is not in `core-isa.h` at all — it is in the
+Which ones actually do is not in `core-isa.h` at all. That is in the
 neighboring `tie.h`:[^3][^4]
 
 - **ESP32 (LX6):** `XCHAL_CP_NUM` is 1. The only coprocessor is id 0, named
@@ -103,12 +106,12 @@ not appear anywhere in `core-isa.h` or `tie.h`.** It is Espressif's public
 name for the unit; the Xtensa configuration tooling only knows it as a
 custom TIE coprocessor with HAL identifier `cop_ai` and coprocessor id 3.
 A reader who greps the vendored headers for "PIE" and finds nothing has not
-found a documentation gap — they are looking in the wrong file. The
+found a documentation gap. They are looking in the wrong file. The
 coprocessor's context is saved and restored through the same generic
 mechanism as the FPU: the `CPENABLE` register and FreeRTOS's lazy
 coprocessor-context switch, gated by the coprocessor-disabled exception, not
 by anything specific to `cop_ai`.[^3] This is also the reason a hand-written
-kernel must never write `CPENABLE` directly — doing so bypasses the OS's
+kernel must never write `CPENABLE` directly: doing so bypasses the OS's
 lazy-save bookkeeping for whichever task's FPU or vector state was live.
 
 ## Cache: what the core header says, and where the real numbers live
@@ -117,8 +120,8 @@ This is the one area where reading `core-isa.h` alone is actively
 misleading. On **both** chips, the header reports:[^1][^2]
 
 - `XCHAL_ICACHE_SIZE` = 0, `XCHAL_DCACHE_SIZE` = 0 ("I-cache size in bytes
-  or 0" — the comment in the header itself flags 0 as a real, meaningful
-  value, not a placeholder)
+  or 0", the comment in the header itself flagging 0 as a real, meaningful
+  value rather than a placeholder)
 - `XCHAL_ICACHE_WAYS` = 1, `XCHAL_DCACHE_WAYS` = 1, `XCHAL_ICACHE_SETWIDTH`
   = 0, `XCHAL_DCACHE_SETWIDTH` = 0
 - `XCHAL_ICACHE_LINESIZE` = 4 bytes on both chips; `XCHAL_DCACHE_LINESIZE`
@@ -126,17 +129,17 @@ misleading. On **both** chips, the header reports:[^1][^2]
 
 A cache reported as zero-size, one-way, is not a core with no cache. It
 means the Xtensa core generator was configured with the cache's capacity and
-associativity left external to the CPU macro itself — on these Espressif
-parts, the real instruction and data caches are a separate, software
--configurable block controlled by ESP-IDF at boot, not a fixed property of
-the Xtensa core IP. The actual sizes live in the SoC build configuration,
+associativity left external to the CPU macro itself. On these Espressif
+parts the real instruction and data caches are a separate,
+software-configurable block controlled by ESP-IDF at boot, not a fixed
+property of the Xtensa core IP. The actual sizes live in the SoC build configuration,
 not in `core-isa.h`:[^5]
 
 - Instruction cache: selectable 16 KB or 32 KB (default 16 KB), 4-way or
   8-way associative (default 8-way), 16-byte or 32-byte line (default 32
   bytes; 16-byte lines are only available when the 16 KB size is chosen).
   Choosing the 16 KB size still leaves the full 32 KB of physical cache SRAM
-  in place — the unused half is handed to the heap allocator instead of the
+  in place: the unused half is handed to the heap allocator instead of the
   cache, per the Kconfig help text.[^5]
 - Data cache: selectable 16 KB, 32 KB or 64 KB (default 32 KB), 4-way or
   8-way (default 8-way), 16, 32 or 64-byte line (default 32 bytes). The 16
@@ -173,7 +176,10 @@ a build choice, not a silicon constant.
    with a clear diagnostic, rather than trapping as an illegal instruction
    at runtime the way a missing CPU feature typically would on a general
    -purpose ISA. Treat an assembler error on an unfamiliar mnemonic as a
-   signal to check the option, not to look for a typo first.
+   signal to check the option, not to look for a typo first. Assembling one
+   mnemonic per file is also the cheapest way to settle an argument about
+   whether an instruction exists on a target: `div.s` fails here, `div0.s`
+   assembles.[^8]
 4. **Coprocessor instructions need `tie.h`, not `core-isa.h`.** As the
    comparison above shows, `XCHAL_HAVE_CP` being 1 only says the core
    supports having coprocessors; which ones exist, their IDs, and their
@@ -201,4 +207,6 @@ a build choice, not a silicon constant.
 
 [^6]: GNU Project, *Using the GNU Compiler Collection (GCC)*, version 14.2.0, "Xtensa Options" section (`gcc.gnu.org/onlinedocs/gcc-14.2.0/gcc/Xtensa-Options.html`), for `-mconst16`/`-mno-const16`, `-mabi=call0|windowed`, `-mlongcalls`, `-mtext-section-literals`/`-mauto-litpools`, and `-mfused-madd`, fetched 2026-09-06.
 
-[^7]: Cadence/Tensilica, *Xtensa Instruction Set Architecture (ISA) Reference Manual*. [uncertain] This reference names the manual as the authority for per-option instruction semantics (Loop Option, Boolean Option, Miscellaneous Operations Option, Coprocessor Option, and so on), but this leaf does not cite specific page or section numbers from it: the copies available to fetch during this session were either too large to retrieve in full or returned an access error, so no edition or section number could be verified firsthand. Every option-to-instruction mapping stated above is instead cross-checked directly against the vendored header comments and, where noted, the GCC 14.2 manual. Do not add a section number to this manual for these options without opening a verified copy first.
+[^7]: Tensilica, *Xtensa Instruction Set Architecture (ISA) Reference Manual*, issue date 4/2010 ("For All Xtensa Processor Cores"), chapter 4 "Architectural Options". Public mirror: <https://0x04.net/~mwk/doc/xtensa.pdf>. The manual is the authority for per-option instruction semantics, and its option sections are: 4.2 Core Architecture (page 50), 4.3.1 Code Density (53), 4.3.2 Loop (54), 4.3.3 Extended L32R (56), 4.3.4 16-bit Integer Multiply (57), 4.3.5 32-bit Integer Multiply (58), 4.3.6 32-bit Integer Divide (59), 4.3.7 MAC16 (60), 4.3.8 Miscellaneous Operations (62, holding SEXT, CLAMPS, MIN/MAX and NSA/NSAU), 4.3.9 Coprocessor (63), 4.3.10 Boolean (65), 4.3.11 Floating-Point Coprocessor (67), 4.3.12 Multiprocessor Synchronization (74, holding L32AI and S32RI), 4.3.13 Conditional Store (77, holding S32C1I), 4.7.1 Windowed Register (180), 4.7.4 Thread Pointer (196), 4.7.6 Debug (197). The manual describes the architecture, not this chip: which of these options Espressif configured in is what `core-isa.h` says, and the header is the authority for that half.
+
+[^8]: [measured] 2026-09-06, `xtensa-esp32s3-elf-as` from `xtensa-esp-elf` GCC 14.2.0 (crosstool-NG esp-14.2.0_20241119, GNU assembler 2.43.1), one mnemonic per source file. `div.s` and `sqrt.s` fail with "unknown opcode or format name"; `div0.s`, `recip0.s`, `sqrt0.s`, `rsqrt0.s`, `nexp01.s`, `maddn.s`, `divn.s` and `const.s` assemble. Same result recorded independently in [the floating-point leaf](./floating-point-option-on-lx7.md) and [the cost model leaf](../00-foundations/lx7-core-pipeline-and-cost-model.md).
