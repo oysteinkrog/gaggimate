@@ -338,8 +338,19 @@ class Rig:
             raise RigHTTPError("%s -> %s" % (url, e)) from e
 
     def get_json(self, path, timeout=None):
+        """GET path and parse the body as JSON. Raises RigHTTPError (with
+        the URL, status and Content-Type) rather than a bare json/unicode
+        exception when the body is not JSON: a debug route this build does
+        not compile falls through to the static handler and answers 200
+        with the gzip-compressed web UI bundle, not a 404, and that must
+        not look like a JSON parse bug in the caller's traceback."""
         with self._open(path, timeout) as resp:
-            return json.load(resp)
+            ctype = resp.headers.get("Content-Type", "")
+            data = resp.read()
+        try:
+            return json.loads(data)
+        except (ValueError, UnicodeDecodeError) as e:
+            raise RigHTTPError("%s: not JSON (Content-Type=%r): %s" % (self._url(path), ctype, e)) from e
 
     def get_bytes(self, path, timeout=None):
         with self._open(path, timeout) as resp:
@@ -375,18 +386,26 @@ class Rig:
         every object with its effective hit rect and hidden state (see
         _annotate). screen=0 is the active screen (no load, no settle
         delay); other ids load that screen first unless load=False, in
-        which case the last dump for that id is returned as-is."""
+        which case the last dump for that id is returned as-is.
+
+        The poll loop sleeps before every read, including the first: a
+        second request that lands on the simulator's single cooperative
+        thread with no gap after the queueing request can arrive while
+        serviceTouchMap's changeScreen() is mid-rebuild and kill the whole
+        process (reproduced: identical request, only a 0.25s gap before it
+        separates a clean "pending" reply from the simulator dying with no
+        log line). tools/touchmap.py's dump_screen() already sleeps first
+        for this reason; this matches it rather than polling immediately."""
         q = "/api/debug/touchmap?screen=%d" % screen
         if load and screen != 0:
             q += "&load=1"
         self.get_json(q)
         t0 = time.time()
-        d = None
         while time.time() - t0 < timeout:
+            time.sleep(0.25)
             d = self.get_json("/api/debug/touchmap")
             if not d.get("pending") and d.get("screen") == screen:
                 return _annotate(d)
-            time.sleep(0.1)
         raise TimeoutError("touchmap for screen %d did not arrive within %.1fs" % (screen, timeout))
 
     def wait_dump_change(self, prev_seq, timeout=8, screen=0, load=False):
@@ -516,6 +535,22 @@ class Sim:
     """
 
     READY_BANNER = "Started webserver"
+    # Extra settle time after the banner, before Sim is handed to the caller.
+    # Measured (2026-09-06): a /api/debug/touchmap?screen=N&load=1 request
+    # (any screen id, any N) that reaches serviceTouchMap's changeScreen()
+    # while the process is under ~1s old kills the simulator outright, no
+    # log line, connection then refused; a plain GET (settings, heap, the
+    # queueing request itself) is safe at any age, and a load=1 request past
+    # ~1.2s old was safe in every trial (10 trials at 1.0s, 0 failures; 10
+    # trials at 0.5s, 10 failures). The banner alone prints at ~0.2s, well
+    # inside the unsafe window, so a caller that starts driving the shell
+    # immediately after __enter__ returns without this would hit it on its
+    # first screen load. Root cause is unconfirmed (something the UI task's
+    # early passes have not finished, not a race with this rig's request
+    # cadence: see touchmap()'s own comment) and is in sim/ or src/display/,
+    # outside this bead's file list; flagged to the leader rather than fixed
+    # here.
+    BOOT_SETTLE_S = 1.5
 
     def __init__(self, program_path, data_dir, port=8080, log_path=None):
         if os.path.basename(os.path.normpath(data_dir)) != "sim_data":
@@ -534,14 +569,24 @@ class Sim:
         self.proc = None
 
     def _check_port_free(self):
+        """Connects rather than binds: on WSL1 (this dev machine; see
+        CLAUDE.md's WSL1/wslfs note) a bare bind() with SO_REUSEADDR
+        succeeds even when another process already has the exact same
+        address:port bound and listening (verified: two plain Python
+        sockets, both SO_REUSEADDR, both bind 127.0.0.1 to the same port
+        with no error; real Linux refuses the second). A bind-based check
+        is silently useless here. Connecting is also simply the more
+        direct question: is something already answering on this address,
+        which is what would actually go wrong."""
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s.settimeout(0.5)
         try:
-            s.bind(("127.0.0.1", self.port))
-        except OSError as e:
-            raise SimError("127.0.0.1:%d is already bound: %s" % (self.port, e)) from e
+            s.connect(("127.0.0.1", self.port))
+        except OSError:
+            return  # nothing answering: the port is free
         finally:
             s.close()
+        raise SimError("127.0.0.1:%d is already answering connections (another process is using this port)" % self.port)
 
     def _launch(self):
         self._check_port_free()
@@ -582,6 +627,13 @@ class Sim:
             self.rig.wait_until(lambda: self._settings_answers(), timeout=10)
         except TimeoutError as e:
             raise SimError("simulator did not answer GET /api/settings within 10s: %s" % e) from e
+        # See BOOT_SETTLE_S: a screen-changing touchmap request too soon
+        # after boot kills the process outright. remaining, not a flat
+        # sleep, so a slow machine (banner + settings check already past
+        # the margin) does not pay it twice.
+        remaining = self.BOOT_SETTLE_S - (time.time() - t0)
+        if remaining > 0:
+            time.sleep(remaining)
 
     def _settings_answers(self):
         try:
