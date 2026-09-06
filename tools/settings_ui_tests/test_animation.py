@@ -171,7 +171,7 @@ def web_save(rig, overrides):
         else:
             form[key] = str(value)
     data = urllib.parse.urlencode(form).encode("utf-8")
-    req = urllib.request.Request("http://%s/api/settings" % host, data=data, method="POST")
+    req = urllib.request.Request(rig.base + "/api/settings", data=data, method="POST")
     with urllib.request.urlopen(req, timeout=rig.timeout) as resp:
         resp.read()
 
