@@ -54,6 +54,16 @@ void settingsRowSetValue(lv_obj_t *row, const char *value);
 // was already reset by the PRESS_LOST that disabling produced.
 void settingsRowSetEnabled(lv_obj_t *row, bool enabled);
 
+// The pressed colour every settings target uses: 40% of the way from its
+// rest colour toward the touch dim colour (Settings::getTouchDimColor),
+// the same shift DefaultUI::applyPressedFeedbackTo gives the generated
+// screens' icons and buttons, so a held tile, row, arrow or chevron reads
+// the same as a held menu button. Measured 2026-09-06 on the simulator:
+// the generated menu buttons dim 19 to 29 units per pixel of hit box, the
+// settings tiles dimmed 0 (no feedback at all) and the whole-row targets
+// went fully black; both now use this.
+lv_color_t settingsPressedColor(lv_color_t rest, lv_color_t dim);
+
 using SettingsRowStepFn = void (*)(void *user, int dir, bool fast);
 using SettingsRowCycleFn = void (*)(void *user, int dir);
 using SettingsRowToggleFn = void (*)(void *user, bool value);

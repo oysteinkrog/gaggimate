@@ -183,7 +183,15 @@ void applyPressDim(const PressDim &pd, bool pressed) {
     }
 }
 
-PressDim makePressDim(const TextCol &col, lv_color_t fg, lv_color_t dim) { return {col.label, col.value, fg, dim}; }
+PressDim makePressDim(const TextCol &col, lv_color_t fg, lv_color_t dim) {
+    return {col.label, col.value, fg, settingsPressedColor(fg, dim)};
+}
+
+} // namespace
+
+lv_color_t settingsPressedColor(lv_color_t rest, lv_color_t dim) { return lv_color_mix(dim, rest, LV_OPA_40); }
+
+namespace {
 
 lv_color_t touchDimColor(SettingsUI &ui) {
     return lv_color_hex(static_cast<uint32_t>(ui.controller().getSettings().getTouchDimColor()));

@@ -1,4 +1,5 @@
 #include "SettingsUI.h"
+#include "SettingsRows.h"
 
 #include <display/core/Controller.h>
 #include <display/core/PluginManager.h>
@@ -366,6 +367,37 @@ void SettingsUI::buildTile(lv_obj_t *parent, int index, const SettingsCategoryDe
             ctx->self->openCategory(ctx->index);
         },
         LV_EVENT_CLICKED, &tileClickCtx[index]);
+    // Press feedback. The tile is a plain lv_obj whose icon is not itself
+    // clickable, so DefaultUI::applyPressedFeedbackTo's walk (lv_btn and
+    // clickable lv_img only) does nothing for it, and LVGL puts the PRESSED
+    // state on the tile, never on its children: the icon and caption are
+    // recoloured by hand, the same 40% shift toward the touch dim colour
+    // every other target gets (settingsPressedColor). Measured before this
+    // existed: 0 change per pixel while held, against 19 to 29 for the
+    // generated menu buttons.
+    lv_obj_add_event_cb(
+        tileObj,
+        [](lv_event_t *e) {
+            const lv_event_code_t code = lv_event_get_code(e);
+            if (code != LV_EVENT_PRESSED && code != LV_EVENT_RELEASED && code != LV_EVENT_PRESS_LOST) {
+                return;
+            }
+            auto *ctx = static_cast<TileClickCtx *>(lv_event_get_user_data(e));
+            lv_obj_t *tile = lv_event_get_target(e);
+            lv_obj_t *icon = lv_obj_get_child(tile, 0);
+            lv_obj_t *caption = lv_obj_get_child(tile, 1);
+            const lv_color_t rest = lv_color_hex(theme_colors[eez_flow_get_selected_theme_index()][0]);
+            const lv_color_t dim =
+                lv_color_hex(static_cast<uint32_t>(ctx->self->controller().getSettings().getTouchDimColor()));
+            const lv_color_t c = code == LV_EVENT_PRESSED ? settingsPressedColor(rest, dim) : rest;
+            if (icon != nullptr) {
+                lv_obj_set_style_img_recolor(icon, c, LV_PART_MAIN);
+            }
+            if (caption != nullptr) {
+                lv_obj_set_style_text_color(caption, c, LV_PART_MAIN);
+            }
+        },
+        LV_EVENT_ALL, &tileClickCtx[index]);
 
     tagTilePage(tileObj, def->title, "tile");
 }
