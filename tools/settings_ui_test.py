@@ -316,16 +316,14 @@ def schedule_pages_for(rig, only):
         def opener(rig_, page=i):
             dump, _ = audit_pages.open_schedule_list(rig_)
             if page:
-                rig_.settingsui(page=page)
-                dump = rig_.touchmap(screen=0)
+                dump = audit_pages.goto_page(rig_, page)
             return dump
         pages.append(PushedPage("schedule-list-p%d" % i, opener, rows, "schedules"))
     for spec in audit_pages.SCHEDULE_EDITOR_PAGES:
         def opener(rig_, page=spec.page):
             dump, _ = audit_pages.open_schedule_editor(rig_, 1)
             if page:
-                rig_.settingsui(page=page)
-                dump = rig_.touchmap(screen=0)
+                dump = audit_pages.goto_page(rig_, page)
             return dump
         pages.append(PushedPage(spec.key, opener, spec.rows, "schedules"))
     return pages
