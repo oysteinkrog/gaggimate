@@ -594,6 +594,36 @@ def check_plates_and_tint_coupling(rig):
     close_animation(rig)
 
 
+# Every check, in order. One list, read by main() and by run() below, so a
+# standalone invocation and the end-to-end runner cannot drift apart.
+CHECKS = [
+    ("rows_match_settings", check_rows_match_settings),
+    ("no_op_visit", check_no_op_visit),
+    ("frame_rate_live_and_precedence", check_frame_rate_live_and_precedence),
+    ("theme_recolor", check_theme_recolor),
+    ("gradient_default_and_builtin", check_gradient_default_and_builtin),
+    ("gradient_precedence_across_animations", check_gradient_precedence_across_animations),
+    ("plates_and_tint_coupling", check_plates_and_tint_coupling),
+]
+
+
+def run(rig, report, venue):
+    """Entry point for the end-to-end runner (tools/settings_ui_test.py).
+    Raises AssertionError listing the checks that failed, naming the row and
+    value each one saw. Every check here works on both venues; the ones the
+    simulator cannot reach (a library gradient, an external write to the
+    theme map) already assert the simulator's own refusal internally."""
+    del venue  # nothing here restarts the process or reads the log file
+    first_fail, first_total = len(FAILURES), TOTAL
+    for name, fn in CHECKS:
+        run_check(rig, name, fn)
+    report.step("scenario_checks", scenario="animation", checks=TOTAL - first_total,
+                failed=len(FAILURES) - first_fail)
+    new_failures = FAILURES[first_fail:]
+    if new_failures:
+        raise AssertionError("; ".join("%s: %s" % (n, d) for n, d in new_failures))
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--program", default=DEFAULT_PROGRAM)
@@ -602,15 +632,7 @@ def main():
     ap.add_argument("--host", default=None, help="run against a device/loadtest build instead of the simulator")
     args = ap.parse_args()
 
-    checks = [
-        ("rows_match_settings", check_rows_match_settings),
-        ("no_op_visit", check_no_op_visit),
-        ("frame_rate_live_and_precedence", check_frame_rate_live_and_precedence),
-        ("theme_recolor", check_theme_recolor),
-        ("gradient_default_and_builtin", check_gradient_default_and_builtin),
-        ("gradient_precedence_across_animations", check_gradient_precedence_across_animations),
-        ("plates_and_tint_coupling", check_plates_and_tint_coupling),
-    ]
+    checks = CHECKS
 
     if args.host:
         rig = Rig(args.host)

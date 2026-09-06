@@ -859,6 +859,71 @@ def check_external_leave_persists(rig, s0):
     check(rig, "leave_check_restores_list", ok, repr(schedules(rig.settings_value("autowakeupSchedules"))))
 
 
+def _sequence(rig, venue=None):
+    """Every check, in order. Shared by main() and by run() below so the
+    runner and a standalone invocation cannot drift apart; nothing here
+    restarts the process, so the venue is only along for the signature."""
+    del venue
+    s0 = rig.settings()
+    rig.log("initial_settings", autowakeupSchedules=s0["autowakeupSchedules"])
+
+    run_check(rig, "row_and_list_match_wire", check_row_and_list_match_wire, s0)
+    run_check(rig, "hour_minute_wrap", check_hour_minute_wrap, s0)
+    n = run_check(rig, "add_edit_persist", check_add_edit_and_pop_persists, s0)
+    if n is not None:
+        run_check(rig, "remove_restores", check_remove_restores, s0, n)
+    if is_web_save_host(rig):
+        run_check(rig, "remove_disabled_at_one", check_remove_disabled_at_one, s0)
+        run_check(rig, "eight_and_nine_and_audit", check_eight_and_nine_and_audit, s0)
+        run_check(rig, "web_save_reconcile_editor", check_web_save_reconcile_editor, s0)
+        run_check(rig, "malformed_time_editor", check_malformed_time_editor, s0)
+        run_check(rig, "web_save_reconciles_machine_row", check_web_save_reconciles_machine_row, s0)
+    else:
+        rig.log(
+            "skip", reason="web-save emulation is simulator-only",
+            checks="remove_disabled_at_one,eight_and_nine_and_audit,web_save_reconcile_editor,"
+                   "malformed_time_editor,web_save_reconciles_machine_row",
+        )
+    run_check(rig, "external_leave_persists", check_external_leave_persists, s0)
+
+    s_final = rig.settings()
+    same = schedules(s_final["autowakeupSchedules"]) == schedules(s0["autowakeupSchedules"])
+    if not same and is_web_save_host(rig):
+        # Safety net, not the primary restoration path: every check
+        # above restores through the UI (or, where noted, the
+        # bead-sanctioned web-save emulation) on its own before
+        # returning; this only fires if one of them left the list
+        # dirty despite that.
+        rig.log("restore_safety_net", before=s0["autowakeupSchedules"], after=s_final["autowakeupSchedules"])
+        web_save_change(rig, "autowakeupSchedules", s0["autowakeupSchedules"])
+    check(
+        rig, "final_schedules_match_initial",
+        schedules(rig.settings_value("autowakeupSchedules")) == schedules(s0["autowakeupSchedules"]),
+        "before=%r after=%r" % (s0["autowakeupSchedules"], rig.settings_value("autowakeupSchedules")),
+    )
+    # check_web_save_reconciles_machine_row is the only check here that
+    # moves a Machine field other than the schedules, and it restores
+    # standbyTimeout itself; this is the standing proof that it did.
+    check(
+        rig, "final_standby_timeout_matches_initial",
+        seconds(rig.settings_value("standbyTimeout")) == seconds(s0["standbyTimeout"]),
+        "before=%r after=%r" % (s0["standbyTimeout"], rig.settings_value("standbyTimeout")),
+    )
+
+
+def run(rig, report, venue):
+    """Entry point for the end-to-end runner (tools/settings_ui_test.py).
+    Raises AssertionError listing the checks that failed, naming the row and
+    value each one saw."""
+    first_fail, first_total = len(FAILURES), TOTAL
+    _sequence(rig, venue)
+    report.step("scenario_checks", scenario="schedules", checks=TOTAL - first_total,
+                failed=len(FAILURES) - first_fail)
+    new_failures = FAILURES[first_fail:]
+    if new_failures:
+        raise AssertionError("; ".join("%s: %s" % (n, d) for n, d in new_failures))
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--program", default=DEFAULT_PROGRAM)
@@ -867,57 +932,10 @@ def main():
     ap.add_argument("--host", default=None, help="run against a device/loadtest build instead of the simulator")
     args = ap.parse_args()
 
-    def run(rig):
-        s0 = rig.settings()
-        rig.log("initial_settings", autowakeupSchedules=s0["autowakeupSchedules"])
-
-        run_check(rig, "row_and_list_match_wire", check_row_and_list_match_wire, s0)
-        run_check(rig, "hour_minute_wrap", check_hour_minute_wrap, s0)
-        n = run_check(rig, "add_edit_persist", check_add_edit_and_pop_persists, s0)
-        if n is not None:
-            run_check(rig, "remove_restores", check_remove_restores, s0, n)
-        if is_web_save_host(rig):
-            run_check(rig, "remove_disabled_at_one", check_remove_disabled_at_one, s0)
-            run_check(rig, "eight_and_nine_and_audit", check_eight_and_nine_and_audit, s0)
-            run_check(rig, "web_save_reconcile_editor", check_web_save_reconcile_editor, s0)
-            run_check(rig, "malformed_time_editor", check_malformed_time_editor, s0)
-            run_check(rig, "web_save_reconciles_machine_row", check_web_save_reconciles_machine_row, s0)
-        else:
-            rig.log(
-                "skip", reason="web-save emulation is simulator-only",
-                checks="remove_disabled_at_one,eight_and_nine_and_audit,web_save_reconcile_editor,"
-                       "malformed_time_editor,web_save_reconciles_machine_row",
-            )
-        run_check(rig, "external_leave_persists", check_external_leave_persists, s0)
-
-        s_final = rig.settings()
-        same = schedules(s_final["autowakeupSchedules"]) == schedules(s0["autowakeupSchedules"])
-        if not same and is_web_save_host(rig):
-            # Safety net, not the primary restoration path: every check
-            # above restores through the UI (or, where noted, the
-            # bead-sanctioned web-save emulation) on its own before
-            # returning; this only fires if one of them left the list
-            # dirty despite that.
-            rig.log("restore_safety_net", before=s0["autowakeupSchedules"], after=s_final["autowakeupSchedules"])
-            web_save_change(rig, "autowakeupSchedules", s0["autowakeupSchedules"])
-        check(
-            rig, "final_schedules_match_initial",
-            schedules(rig.settings_value("autowakeupSchedules")) == schedules(s0["autowakeupSchedules"]),
-            "before=%r after=%r" % (s0["autowakeupSchedules"], rig.settings_value("autowakeupSchedules")),
-        )
-        # check_web_save_reconciles_machine_row is the only check here that
-        # moves a Machine field other than the schedules, and it restores
-        # standbyTimeout itself; this is the standing proof that it did.
-        check(
-            rig, "final_standby_timeout_matches_initial",
-            seconds(rig.settings_value("standbyTimeout")) == seconds(s0["standbyTimeout"]),
-            "before=%r after=%r" % (s0["standbyTimeout"], rig.settings_value("standbyTimeout")),
-        )
-
     if args.host:
         rig = Rig(args.host)
         rig.log("boot", host=args.host)
-        run(rig)
+        _sequence(rig)
     else:
         if not os.path.isfile(args.program):
             print("simulator binary not found at %r; build it first: pio run -e display-sim" % args.program, file=sys.stderr)
@@ -927,7 +945,7 @@ def main():
         with Sim(args.program, data_dir, port=args.port) as sim:
             rig = sim.rig
             rig.log("boot", program=args.program, port=args.port, workdir=args.workdir)
-            run(rig)
+            _sequence(rig)
 
     print()
     if FAILURES:

@@ -29,6 +29,7 @@ REPO_ROOT = os.path.abspath(os.path.join(HERE, "..", ".."))
 sys.path.insert(0, REPO_ROOT)
 
 from tools.settings_ui_tests import Rig, RigHTTPError, Sim, color_hex, num, schedules, seconds  # noqa: E402
+from tools.settings_ui_tests.fixtures import Venue  # noqa: E402
 from tools.settings_ui_tests.rig import object_name  # noqa: E402
 
 DEFAULT_PROGRAM = os.path.join(REPO_ROOT, ".pio", "build", "display-sim", "program")
@@ -208,6 +209,46 @@ def check_restart_persistence(rig, sim, data_dir):
     check(rig, "restart_preserves_setting", after == new_s and after != before, "before=%r after=%r want=%r" % (before, after, new_s))
 
 
+def _sequence(rig, venue):
+    """Every check, in order, against an already-launched venue. Shared by
+    main() and by run() below so the runner and a standalone invocation
+    cannot drift apart."""
+    check_wifi_password_grep(rig)
+    s = check_settings(rig)
+    check_touchmap_seq(rig)
+    check_brew_baseline_and_audit(rig)
+    check_audit_exemptions(rig)
+    check_tap_opens_menu(rig)
+    if not venue.is_device:
+        # Asserts that /api/debug/anim and /api/debug/synth are absent,
+        # which is true only of a build without the panel: the device has
+        # both, so this check would be exactly backwards there.
+        check_device_only_routes_unavailable(rig)
+    check_settingsui_state(rig)
+    check_fb_png(rig, venue.workdir)
+    check_wire_format_helpers(rig, s)
+    if venue.can_restart:
+        check_restart_persistence(rig, venue.sim, os.path.join(venue.workdir, "sim_data"))
+
+
+def run(rig, report, venue):
+    """Entry point for the end-to-end runner (tools/settings_ui_test.py).
+    Raises AssertionError listing the checks that failed, so the runner can
+    record this scenario as failed with the detail its report needs.
+
+    Note for the runner's own ordering: check_restart_persistence leaves
+    standbyTimeout at 555 s, which is deliberately off the Machine page's
+    one minute grid, and does not put it back; that is why the runner
+    schedules this scenario last."""
+    first_fail, first_total = len(FAILURES), TOTAL
+    _sequence(rig, venue)
+    report.step("scenario_checks", scenario="rig", checks=TOTAL - first_total,
+                failed=len(FAILURES) - first_fail)
+    new = FAILURES[first_fail:]
+    if new:
+        raise AssertionError("; ".join("%s: %s" % (name, detail) for name, detail in new))
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--program", default=DEFAULT_PROGRAM)
@@ -225,18 +266,8 @@ def main():
     with Sim(args.program, data_dir, port=args.port) as sim:
         rig = sim.rig
         rig.log("boot", program=args.program, port=args.port, workdir=args.workdir)
-
-        check_wifi_password_grep(rig)
-        s = check_settings(rig)
-        check_touchmap_seq(rig)
-        check_brew_baseline_and_audit(rig)
-        check_audit_exemptions(rig)
-        check_tap_opens_menu(rig)
-        check_device_only_routes_unavailable(rig)
-        check_settingsui_state(rig)
-        check_fb_png(rig, args.workdir)
-        check_wire_format_helpers(rig, s)
-        check_restart_persistence(rig, sim, data_dir)
+        _sequence(rig, Venue(sim=sim, program=args.program, workdir=args.workdir, port=args.port,
+                             host="127.0.0.1:%d" % args.port, log_path=sim.log_path))
 
     print()
     if FAILURES:

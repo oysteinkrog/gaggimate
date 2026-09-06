@@ -489,6 +489,25 @@ def _new_lines_contain(path, offset, needle):
         return False
 
 
+def run(rig, report, venue):
+    """Entry point for the end-to-end runner (tools/settings_ui_test.py).
+    Raises AssertionError listing the checks that failed, naming the row and
+    value each one saw. preflight()'s own refusal (a stored value this
+    category's steppers cannot reach) is a RuntimeError; it becomes an
+    AssertionError here so the runner records it as this scenario's failure
+    rather than as a crash."""
+    first_fail, first_total = len(FAILURES), TOTAL
+    try:
+        run_checks(rig, venue.log_path)
+    except RuntimeError as e:
+        raise AssertionError("preflight refused: %s" % e) from e
+    report.step("scenario_checks", scenario="display", checks=TOTAL - first_total,
+                failed=len(FAILURES) - first_fail)
+    new = FAILURES[first_fail:]
+    if new:
+        raise AssertionError("; ".join("%s: %s" % (name, detail) for name, detail in new))
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--program", default=DEFAULT_PROGRAM)

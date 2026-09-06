@@ -34,6 +34,7 @@ REPO_ROOT = os.path.abspath(os.path.join(HERE, "..", ".."))
 sys.path.insert(0, REPO_ROOT)
 
 from tools.settings_ui_tests import Rig, RigHTTPError, Sim  # noqa: E402
+from tools.settings_ui_tests.fixtures import Venue  # noqa: E402
 
 DEFAULT_PROGRAM = os.path.join(REPO_ROOT, ".pio", "build", "display-sim", "program")
 VERSION_H = os.path.join(REPO_ROOT, "src", "version.h")
@@ -320,6 +321,50 @@ def check_fail_flush_scenario(program, workdir, port):
             os.environ["GM_SIM_FAIL_FLUSH"] = prior
 
 
+def _sequence(rig, venue):
+    """Every check, in order, against an already-launched venue. Shared by
+    main() and by run() below so the runner and a standalone invocation
+    cannot drift apart.
+
+    The last two checks end the process: one holds Restart and relaunches
+    the simulator from the same data directory, the other launches a second
+    simulator with the forced-flush-failure environment variable set. Both
+    need a Sim to relaunch, and both are skipped when the caller asked for
+    no restarts. The forced-failure simulator takes the next port up,
+    because the caller's own simulator is still listening on venue.port."""
+    d0 = check_page0_rows(rig, build_git_version())
+    d1 = check_page1_rows(rig)
+    check_audit(rig, d0, d1)
+    check_time_progression(rig)
+    if not venue.can_restart:
+        rig.log(
+            "skipped",
+            reason="restart-persistence and fail-flush scenarios need a simulator to relaunch and are destructive",
+        )
+        return
+    check_short_hold_noop(rig, rig.touchmap(screen=0))
+    check_restart_persistence_and_relaunch(rig, venue.sim)
+    check_fail_flush_scenario(venue.program, os.path.join(venue.workdir, "fail_flush"), venue.port + 1)
+
+
+def run(rig, report, venue):
+    """Entry point for the end-to-end runner (tools/settings_ui_test.py).
+    Raises AssertionError listing the checks that failed, naming the row and
+    value each one saw.
+
+    Note for the runner: check_restart_persistence_and_relaunch leaves
+    Standby brightness one step from where it found it and does not put it
+    back, on purpose (that surviving bump is what it proves). The runner
+    reports the difference as a restoration failure for this scenario."""
+    first_fail, first_total = len(FAILURES), TOTAL
+    _sequence(rig, venue)
+    report.step("scenario_checks", scenario="status", checks=TOTAL - first_total,
+                failed=len(FAILURES) - first_fail)
+    new_failures = FAILURES[first_fail:]
+    if new_failures:
+        raise AssertionError("; ".join("%s: %s" % (n, d) for n, d in new_failures))
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--program", default=DEFAULT_PROGRAM)
@@ -328,19 +373,10 @@ def main():
     ap.add_argument("--host", default=None, help="run the read-only checks against a live device/sim instead of launching one")
     args = ap.parse_args()
 
-    expected_version = build_git_version()
-
     if args.host:
         rig = Rig(args.host)
         rig.log("boot", host=args.host)
-        d0 = check_page0_rows(rig, expected_version)
-        d1 = check_page1_rows(rig)
-        check_audit(rig, d0, d1)
-        check_time_progression(rig)
-        rig.log(
-            "skipped",
-            reason="restart-persistence and fail-flush scenarios are destructive/sim-only; not run against --host",
-        )
+        _sequence(rig, Venue(host=args.host, workdir=args.workdir, is_device=True))
     else:
         if not os.path.isfile(args.program):
             print("simulator binary not found at %r; build it first: pio run -e display-sim" % args.program, file=sys.stderr)
@@ -352,17 +388,8 @@ def main():
         with Sim(args.program, data_dir, port=args.port) as sim:
             rig = sim.rig
             rig.log("boot", program=args.program, port=args.port, workdir=args.workdir)
-
-            d0 = check_page0_rows(rig, expected_version)
-            d1 = check_page1_rows(rig)
-            check_audit(rig, d0, d1)
-            check_time_progression(rig)
-            check_short_hold_noop(rig, rig.touchmap(screen=0))
-            # Destructive: exits the process via ESP.restart() and relaunches
-            # it, so this runs last against this Sim.
-            check_restart_persistence_and_relaunch(rig, sim)
-
-        check_fail_flush_scenario(args.program, os.path.join(args.workdir, "fail_flush"), args.port)
+            _sequence(rig, Venue(sim=sim, program=args.program, workdir=args.workdir, port=args.port,
+                                 host="127.0.0.1:%d" % args.port, log_path=sim.log_path))
 
     print()
     if FAILURES:

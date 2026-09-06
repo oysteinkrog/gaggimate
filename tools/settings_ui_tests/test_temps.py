@@ -34,6 +34,7 @@ REPO_ROOT = os.path.abspath(os.path.join(HERE, "..", ".."))
 sys.path.insert(0, REPO_ROOT)
 
 from tools.settings_ui_tests import Rig, Sim, num  # noqa: E402
+from tools.settings_ui_tests.fixtures import Venue  # noqa: E402
 from tools.settings_ui_tests.rig import tag_role, tag_row  # noqa: E402
 
 DEFAULT_PROGRAM = os.path.join(REPO_ROOT, ".pio", "build", "display-sim", "program")
@@ -617,6 +618,42 @@ def run_simulator_only_checks(rig, sim):
     check_forced_external_leave(rig, sim)
 
 
+def _sequence(rig, venue):
+    """Every check, in order, against an already-launched venue. Shared by
+    main() and by run() below so the runner and a standalone invocation
+    cannot drift apart. The commit checks read the firmware's own category
+    log line out of the simulator's log file, which has no HTTP equivalent,
+    so they are skipped (logged, not silently) against the device."""
+    ensure_open(rig)
+    check_row_order_and_initial_values(rig)
+    check_offset_locked_plus_noop(rig)
+    if venue.sim is None:
+        skip(rig, "temps_device_commit_checks", "log/timing checks need the sim's log file; run this script on the simulator for those, and separately against the device for synth(0)/comms-trace checks the leader owns")
+        close_shell(rig)
+        return
+    check_offset_unlock_step_and_commit(rig, venue.sim)
+    check_offset_relocks_on_second_visit(rig)
+    check_pressure_step_and_commit(rig, venue.sim)
+    check_brew_delay_hold_and_clamp(rig, venue.sim)
+    check_toggle_delay_adjust(rig, venue.sim)
+    check_no_edit_writes_nothing(rig, venue.sim)
+    run_simulator_only_checks(rig, venue.sim)
+    close_shell(rig)
+
+
+def run(rig, report, venue):
+    """Entry point for the end-to-end runner (tools/settings_ui_test.py).
+    Raises AssertionError listing the checks that failed, naming the row
+    and value each one saw."""
+    first_fail, first_total = len(FAILURES), TOTAL
+    _sequence(rig, venue)
+    report.step("scenario_checks", scenario="temps", checks=TOTAL - first_total,
+                failed=len(FAILURES) - first_fail)
+    new = FAILURES[first_fail:]
+    if new:
+        raise AssertionError("; ".join("%s: %s" % (name, detail) for name, detail in new))
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--program", default=DEFAULT_PROGRAM)
@@ -628,11 +665,7 @@ def main():
     if args.host:
         rig = Rig(args.host)
         rig.log("boot", host=args.host)
-        ensure_open(rig)
-        check_row_order_and_initial_values(rig)
-        check_offset_locked_plus_noop(rig)
-        skip(rig, "temps_device_commit_checks", "log/timing checks need the sim's log file; run this script on the simulator for those, and separately against the device for synth(0)/comms-trace checks the leader owns")
-        close_shell(rig)
+        _sequence(rig, Venue(host=args.host, workdir=args.workdir, is_device=True))
     else:
         if not os.path.isfile(args.program):
             print("simulator binary not found at %r; build it first: pio run -e display-sim" % args.program, file=sys.stderr)
@@ -642,17 +675,8 @@ def main():
         with Sim(args.program, data_dir, port=args.port) as sim:
             rig = sim.rig
             rig.log("boot", program=args.program, port=args.port, workdir=args.workdir)
-            ensure_open(rig)
-            check_row_order_and_initial_values(rig)
-            check_offset_locked_plus_noop(rig)
-            check_offset_unlock_step_and_commit(rig, sim)
-            check_offset_relocks_on_second_visit(rig)
-            check_pressure_step_and_commit(rig, sim)
-            check_brew_delay_hold_and_clamp(rig, sim)
-            check_toggle_delay_adjust(rig, sim)
-            check_no_edit_writes_nothing(rig, sim)
-            run_simulator_only_checks(rig, sim)
-            close_shell(rig)
+            _sequence(rig, Venue(sim=sim, program=args.program, workdir=args.workdir, port=args.port,
+                                 host="127.0.0.1:%d" % args.port, log_path=sim.log_path))
 
     print()
     if SKIPPED:

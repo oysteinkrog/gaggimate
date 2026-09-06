@@ -32,6 +32,7 @@ REPO_ROOT = os.path.abspath(os.path.join(HERE, "..", ".."))
 sys.path.insert(0, REPO_ROOT)
 
 from tools.settings_ui_tests import Rig, RigHTTPError, Sim  # noqa: E402
+from tools.settings_ui_tests.fixtures import Venue  # noqa: E402
 from tools.settings_ui_tests.rig import find_tag, row_value  # noqa: E402
 
 DEFAULT_PROGRAM = os.path.join(REPO_ROOT, ".pio", "build", "display-sim", "program")
@@ -436,8 +437,60 @@ def sim_tail():
     return sim._tail()  # noqa: SLF001 -- the rig's own test_rig.py reaches into Sim this way (sim.stop()/restart())
 
 
-def main():
+def _sequence(rig, venue):
+    """Every check, in order, against an already-launched venue. Shared by
+    main() and by run() below so the runner and a standalone invocation
+    cannot drift apart. Every check past the first reads the firmware's own
+    log line out of the simulator's log file or emulates a web save against
+    127.0.0.1, neither of which has a device equivalent, so on the device
+    only the read-only value check runs."""
     global sim
+    sim = venue.sim
+
+    s0 = rig.settings()
+    rig.log("initial_settings", startupMode=s0["startupMode"], standbyTimeout=s0["standbyTimeout"],
+            autowakeupEnabled=s0["autowakeupEnabled"])
+
+    check_initial_values(rig, s0)
+    do(rig, pop=1)
+    do(rig, close=1)
+
+    if venue.sim is None:
+        rig.log("skip", reason="log and web-save emulation checks are simulator-only",
+                checks="leave_no_change_writes_nothing,startup_mode,standby_timeout_and_standby_entry,"
+                       "autowakeup_toggle,web_save_reconcile")
+        return
+
+    check_leave_no_change_writes_nothing(rig, s0)
+    check_startup_mode(rig, s0)
+    check_standby_timeout_and_standby_entry(rig, s0)
+    check_autowakeup_toggle(rig, s0)
+    check_web_save_reconcile(rig, s0)
+
+    s_final = rig.settings()
+    check(
+        rig, "final_settings_match_initial",
+        s_final["startupMode"] == s0["startupMode"]
+        and int(s_final["standbyTimeout"]) == int(s0["standbyTimeout"])
+        and s_final["autowakeupEnabled"] == s0["autowakeupEnabled"],
+        "initial=%r final=%r" % (s0, s_final),
+    )
+
+
+def run(rig, report, venue):
+    """Entry point for the end-to-end runner (tools/settings_ui_test.py).
+    Raises AssertionError listing the checks that failed, naming the row and
+    value each one saw."""
+    first_fail, first_total = len(FAILURES), TOTAL
+    _sequence(rig, venue)
+    report.step("scenario_checks", scenario="machine", checks=TOTAL - first_total,
+                failed=len(FAILURES) - first_fail)
+    new_failures = FAILURES[first_fail:]
+    if new_failures:
+        raise AssertionError("; ".join("%s: %s" % (n, d) for n, d in new_failures))
+
+
+def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--program", default=DEFAULT_PROGRAM)
     ap.add_argument("--workdir", default=os.path.join(tempfile.gettempdir(), "gm_settings_ui_tests", "test_machine"))
@@ -452,32 +505,10 @@ def main():
     os.makedirs(args.workdir, exist_ok=True)
 
     with Sim(args.program, data_dir, port=args.port) as s:
-        sim = s
-        rig = sim.rig
+        rig = s.rig
         rig.log("boot", program=args.program, port=args.port, workdir=args.workdir)
-
-        s0 = rig.settings()
-        rig.log("initial_settings", startupMode=s0["startupMode"], standbyTimeout=s0["standbyTimeout"],
-                 autowakeupEnabled=s0["autowakeupEnabled"])
-
-        check_initial_values(rig, s0)
-        do(rig, pop=1)
-        do(rig, close=1)
-
-        check_leave_no_change_writes_nothing(rig, s0)
-        check_startup_mode(rig, s0)
-        check_standby_timeout_and_standby_entry(rig, s0)
-        check_autowakeup_toggle(rig, s0)
-        check_web_save_reconcile(rig, s0)
-
-        s_final = rig.settings()
-        check(
-            rig, "final_settings_match_initial",
-            s_final["startupMode"] == s0["startupMode"]
-            and int(s_final["standbyTimeout"]) == int(s0["standbyTimeout"])
-            and s_final["autowakeupEnabled"] == s0["autowakeupEnabled"],
-            "initial=%r final=%r" % (s0, s_final),
-        )
+        _sequence(rig, Venue(sim=s, program=args.program, workdir=args.workdir, port=args.port,
+                             host="127.0.0.1:%d" % args.port, log_path=s.log_path))
 
     print()
     if FAILURES:
