@@ -241,21 +241,25 @@ void scheduleEditorBuildRow(void *ctx0, int index, lv_obj_t *parent, SettingsUI 
     }
 }
 
-// After a web save: re-reads the vector from Settings only when this visit
+// After a web save: refreshes every untouched field of the shared Machine
+// draft, not just the schedules. SettingsUI::service() reconciles only the
+// top page, so while this editor is open kCatMachine's own reconcile never
+// runs and machineDraftReconcile (CatMachine.h) is the only thing that
+// keeps startup mode, standby timeout and auto wake-up current; without it
+// the Machine page would show pre-save values on pop and the next tap on
+// one of its rows would overwrite the web edit at commit.
+//
+// The schedules half of that pass replaces the vector only when this visit
 // never touched it (shared contract, same as every other category's
-// reconcile); if the position this editor was opened for no longer exists
-// in the replacement vector, pops back to the list without committing or
-// re-snapshotting the Machine draft (the editor's commit is nullptr, so
+// reconcile). If the position this editor was opened for no longer exists
+// in the replacement vector, this pops back to the list without committing
+// or re-snapshotting the Machine draft (the editor's commit is nullptr, so
 // popPage() writes nothing). Otherwise the pending rebuildPage() the shell
 // runs right after this call rebuilds the editor's rows from whatever is
 // now at that position.
 void scheduleEditorReconcile(void *ctx0) {
     auto *ctx = static_cast<ScheduleEditorCtx *>(ctx0);
-    if (ctx->draft->schedulesTouched) {
-        return;
-    }
-    Settings &settings = controller.getSettings();
-    ctx->draft->schedules = fromAutoWakeupSchedules(settings.getAutoWakeupSchedules());
+    machineDraftReconcile(ctx->draft, controller.getSettings());
     if (ctx->index >= ctx->draft->schedules.size() && ctx->ui != nullptr) {
         ctx->ui->popPage();
     }
@@ -329,12 +333,12 @@ void scheduleListBuildRow(void *ctx0, int index, lv_obj_t *parent, SettingsUI &u
     }
 }
 
+// Same whole-draft pass as scheduleEditorReconcile above, for the same
+// reason (only the top page reconciles); the list has no index of its own
+// to check afterwards.
 void scheduleListReconcile(void *ctx0) {
     auto *ctx = static_cast<ScheduleListCtx *>(ctx0);
-    if (!ctx->draft->schedulesTouched) {
-        Settings &settings = controller.getSettings();
-        ctx->draft->schedules = fromAutoWakeupSchedules(settings.getAutoWakeupSchedules());
-    }
+    machineDraftReconcile(ctx->draft, controller.getSettings());
 }
 
 void scheduleListDestroyCtx(void *ctx) { delete static_cast<ScheduleListCtx *>(ctx); }

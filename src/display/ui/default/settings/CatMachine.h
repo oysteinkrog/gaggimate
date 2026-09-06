@@ -56,4 +56,16 @@ void settingsMachineBuildExtraRow(MachineDraft *draft, int index, lv_obj_t *pare
 // needs it.
 std::vector<settingsui::ScheduleDraft> fromAutoWakeupSchedules(const std::vector<AutoWakeupSchedule> &schedules);
 
+// Re-reads every field of the Machine draft that this visit has not touched
+// from Settings, the shared contract's reconcile rule for the whole draft
+// rather than for the schedules alone. Shared with the schedule pages
+// because SettingsUI::service() reconciles only the top page: while a
+// schedule list or editor is pushed, kCatMachine's own reconcile never
+// runs, so a web save that changed startup mode, standby timeout or auto
+// wake-up would leave the draft stale, the Machine page would show the old
+// value on pop, and the next stepper tap would mark the field touched and
+// overwrite the web edit at commit. Both schedule pages call this from
+// their own reconcile, so whichever page is on top refreshes all four.
+void machineDraftReconcile(MachineDraft *draft, Settings &settings);
+
 #endif // GM_CAT_MACHINE_H

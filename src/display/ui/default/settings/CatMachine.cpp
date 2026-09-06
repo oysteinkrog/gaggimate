@@ -77,6 +77,24 @@ std::vector<settingsui::ScheduleDraft> fromAutoWakeupSchedules(const std::vector
     return out;
 }
 
+// At file scope, and declared in CatMachine.h, for the same reason as
+// fromAutoWakeupSchedules above: the schedule pages call it too, because
+// only the top page's reconcile runs (CatMachine.h).
+void machineDraftReconcile(MachineDraft *draft, Settings &settings) {
+    if (!draft->startupModeTouched) {
+        draft->startupMode = settings.getStartupMode();
+    }
+    if (!draft->standbyTimeoutTouched) {
+        draft->standbyTimeoutMs = settings.getStandbyTimeout();
+    }
+    if (!draft->autowakeupEnabledTouched) {
+        draft->autowakeupEnabled = settings.isAutoWakeupEnabled();
+    }
+    if (!draft->schedulesTouched) {
+        draft->schedules = fromAutoWakeupSchedules(settings.getAutoWakeupSchedules());
+    }
+}
+
 namespace {
 
 void setStartupValue(MachineCtx *ctx) {
@@ -177,19 +195,7 @@ void machineEnter(void *ctx0) {
 // leave the draft holding the value that redraw should show.
 void machineReconcile(void *ctx0) {
     auto *ctx = static_cast<MachineCtx *>(ctx0);
-    Settings &settings = controller.getSettings();
-    if (!ctx->draft.startupModeTouched) {
-        ctx->draft.startupMode = settings.getStartupMode();
-    }
-    if (!ctx->draft.standbyTimeoutTouched) {
-        ctx->draft.standbyTimeoutMs = settings.getStandbyTimeout();
-    }
-    if (!ctx->draft.autowakeupEnabledTouched) {
-        ctx->draft.autowakeupEnabled = settings.isAutoWakeupEnabled();
-    }
-    if (!ctx->draft.schedulesTouched) {
-        ctx->draft.schedules = fromAutoWakeupSchedules(settings.getAutoWakeupSchedules());
-    }
+    machineDraftReconcile(&ctx->draft, controller.getSettings());
 }
 
 void machineCommit(void *ctx0) {
