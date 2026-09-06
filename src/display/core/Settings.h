@@ -88,6 +88,34 @@ class Settings {
     void batchUpdate(const SettingsCallback &callback);
     void save(bool noDelay = false);
 
+    // Flushes every dirty property to NVS right now, out of band from the
+    // periodic 5 s flush: used by the Status category's Restart row, since a
+    // restart right after save(true) can lose the change save(true) just
+    // requested if doSave()'s NVS open or a per-key write failed and left it
+    // pending for the next periodic retry. Takes Settings::lock() itself (a
+    // caller does not need its own Guard), so it serialises against the
+    // periodic flush, a web save's batchUpdate and a settings-UI category's
+    // enter/commit the same way doSave() already does. Returns true only when
+    // doSave() opened NVS (or had nothing to write) and every property comes
+    // out not dirty afterwards. Known limit: PreferencesCodec<String>::write
+    // treats an empty-string write as success (nvsPutString), so a failed
+    // clear of a string property never re-marks itself dirty and is
+    // invisible to this check, same as it is to doSave() itself.
+    bool flushNow();
+
+#if defined(GM_TOUCH_PROBE) || defined(GAGGIMATE_SIM)
+    // Arms a one-shot flag: the next doSave() call clears it and reports
+    // failure without touching NVS. Compiled for GM_TOUCH_PROBE so bench
+    // builds link, but nothing there calls it. flushNow() itself is the only
+    // caller in this tree, arming it from GM_SIM_FAIL_FLUSH=1 lazily on its
+    // own first call rather than at construction: the periodic loopTask's
+    // first pass runs within milliseconds of boot (a startup profile
+    // selection marks a property dirty before anything else touches
+    // Settings), so arming any earlier loses the flag to that pass before a
+    // test can ever reach the Restart row that calls flushNow().
+    void debugFailNextFlush();
+#endif
+
     // Serialises a whole transaction (batchUpdate, doSave, a settings-UI
     // category's enter/commit, Controller::loopLogic's delay auto-adjust
     // writes) against every other one; recursive, so a transaction that
@@ -515,11 +543,14 @@ class Settings {
     Property<float> integralGain{registry, "p_ig", DEFAULT_INTEGRAL_GAIN};
     Property<float> maxPumpPower{registry, "p_mp", 1.0f};
 
-    void doSave();
+    bool doSave();
     void lock();
     void unlock();
 #ifndef GAGGIMATE_SIM
     SemaphoreHandle_t mutex = nullptr;
+#endif
+#if defined(GM_TOUCH_PROBE) || defined(GAGGIMATE_SIM)
+    bool debugFailNextFlush_ = false;
 #endif
     TaskHandle_t taskHandle = nullptr;
     [[noreturn]] static void loopTask(void *arg);

@@ -3,6 +3,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
+#include <cstring>
 #include <display/util/ColorConversion.h>
 #include <utility>
 
@@ -374,8 +376,18 @@ void Settings::setIntegralGain(float integral_gain) { integralGain.set(integral_
 
 void Settings::setMaxPumpPower(float max_pump_power) { maxPumpPower.set(max_pump_power); }
 
-void Settings::doSave() {
+bool Settings::doSave() {
     Guard guard(*this);
+#if defined(GM_TOUCH_PROBE) || defined(GAGGIMATE_SIM)
+    // Consumed before anything else so a forced failure never touches NVS
+    // and applies regardless of whether a property happens to be dirty
+    // (debugFailNextFlush() and the Restart acceptance test in
+    // test_status.py both rely on this failing even with nothing pending).
+    if (debugFailNextFlush_) {
+        debugFailNextFlush_ = false;
+        return false;
+    }
+#endif
     bool dirty = false;
     for (auto *property : registry) {
         if (property->isDirty()) {
@@ -384,7 +396,7 @@ void Settings::doSave() {
         }
     }
     if (!dirty) {
-        return;
+        return true;
     }
     // Marked for the scan-out slip log. A flash write disables the cache, and
     // the RGB panel ISR is not IRAM-safe, so the bounce refill cannot run at
@@ -398,7 +410,7 @@ void Settings::doSave() {
     // try the same values against a hopefully recovered NVS.
     if (!preferences.begin(PREFERENCES_KEY, false)) {
         ESP_LOGE("Settings", "Could not open NVS namespace '%s' for writing; keeping changes pending", PREFERENCES_KEY);
-        return;
+        return false;
     }
     // A per-key failure does not abort the flush: the other properties can still
     // be written, and the ones that failed stay dirty for the next pass. Counted
@@ -418,8 +430,57 @@ void Settings::doSave() {
     if (failed > 0) {
         ESP_LOGE("Settings", "%u setting(s) could not be written to NVS (first: %s); retrying in 5 s", failed,
                  firstFailed != nullptr ? firstFailed : "?");
+        return false;
     }
+    return true;
 }
+
+bool Settings::flushNow() {
+    Guard guard(*this);
+#ifdef GAGGIMATE_SIM
+    // GM_SIM_FAIL_FLUSH=1 arms a one-shot forced failure for
+    // test_status.py's Restart-row scenario. Read here, lazily, rather than
+    // at construction: the periodic loopTask's very first pass runs within
+    // milliseconds of boot (ProfileManager's startup profile selection
+    // marks a property dirty before anything else touches Settings), so
+    // arming any earlier loses the flag to that pass long before a test can
+    // reach the Restart row. Arming and consuming happen inside this one
+    // locked call, so the periodic flush (a different task, blocked on the
+    // same recursive mutex the whole time) can never observe the flag in
+    // between; whichever doSave() call reads it below is guaranteed to be
+    // this flushNow() call's own nested one. sim/main.cpp is not this
+    // bead's file to edit, so the environment is read here instead of at
+    // sim startup as the variable's name implies.
+    static bool envChecked = false;
+    if (!envChecked) {
+        envChecked = true;
+        const char *fail = getenv("GM_SIM_FAIL_FLUSH");
+        if (fail != nullptr && strcmp(fail, "1") == 0) {
+            debugFailNextFlush_ = true;
+        }
+    }
+#endif
+    const bool saved = doSave();
+    // PreferencesCodec<String>::write treats an empty-string write as
+    // success (nvsPutString), so a failed clear of a string property never
+    // re-marks itself dirty and is invisible to this scan, same as it is to
+    // doSave()'s own accounting.
+    bool stillDirty = false;
+    for (auto *property : registry) {
+        if (property->isDirty()) {
+            stillDirty = true;
+            break;
+        }
+    }
+    return saved && !stillDirty;
+}
+
+#if defined(GM_TOUCH_PROBE) || defined(GAGGIMATE_SIM)
+void Settings::debugFailNextFlush() {
+    Guard guard(*this);
+    debugFailNextFlush_ = true;
+}
+#endif
 
 [[noreturn]] void Settings::loopTask(void *arg) {
     auto *settings = static_cast<Settings *>(arg);

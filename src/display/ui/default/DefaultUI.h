@@ -97,6 +97,11 @@ class DefaultUI {
     void openSettings();
     void closeSettings();
     SettingsUI &getSettingsUI() { return settingsUI; }
+    // Read-only view of the private apActive flag (updateSystemStatus/the
+    // config-AP fallback), so the Status category can show "Access point"
+    // and the AP's fixed 4.4.4.1 the same way the standby screen already
+    // does, without a setter this bead has no reason to add.
+    bool isApActive() const { return apActive != 0; }
 
 #if defined(GM_TOUCH_PROBE) || defined(GAGGIMATE_SIM)
     // /api/debug/settingsui (WebUIPlugin.cpp, bench and sim builds only):
