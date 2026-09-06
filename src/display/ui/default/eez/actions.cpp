@@ -346,6 +346,9 @@ void action_on_screen_load(lv_event_t *e) {
     applyClickArea(objects.btn_water_1, 15);
     applyClickArea(objects.btn_grind_1, 15);
     applyClickArea(objects.btn_settings_1, 15);
+    // The generated screen creates this tile LV_OBJ_FLAG_HIDDEN (it used to
+    // be dead code); the settings shell is built now, so show it every load.
+    lv_obj_clear_flag(objects.btn_settings_1, LV_OBJ_FLAG_HIDDEN);
     applyClickArea(objects.info_btn, 15);
     applyClickArea(objects.menu_dials__standby_icon, 30);
     applyClickArea(objects.standby_btn, 30);
@@ -420,3 +423,5 @@ void action_on_screen_swipe(lv_event_t *e) {
 }
 
 void action_on_info_screen(lv_event_t *e) { controller.getUI()->changeScreen(SCREEN_ID_INFO_SCREEN); }
+
+void action_on_settings_screen(lv_event_t *e) { controller.getUI()->openSettings(); }

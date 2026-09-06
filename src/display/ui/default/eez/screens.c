@@ -656,7 +656,10 @@ static void event_handler_cb_menu_screen_new_btn_settings_1(lv_event_t *e) {
 
     if (event == LV_EVENT_CLICKED) {
         e->user_data = (void *)0;
-        action_on_info_screen(e);
+        // Hand-patched (gm-flw.4): the generated call here was
+        // action_on_info_screen, a leftover from before this tile had its
+        // own handler; retargeted to open the settings shell instead.
+        action_on_settings_screen(e);
     }
 }
 
