@@ -36,8 +36,9 @@ to run the tests, and what never to do here.
 - `CatSchedules.cpp` / `.h`: the schedule list page and the schedule editor
   page, both pushed with the Machine draft as their ctx.
 - `CatStatus.cpp`: display and controller firmware, network and IP address,
-  the controller and scale link state, the clock, and the Restart confirm
-  row.
+  the controller and scale link state, the clock, the Device info row that
+  opens the info screen (the WiFi setup QR code lives there), and the
+  Restart confirm row.
 - `SettingsFixture.cpp`: the sixth tile. One of each row widget, and the
   counters the Fixture scenario asserts on. Compiled only under
   `GM_TOUCH_PROBE` or `GAGGIMATE_SIM`.

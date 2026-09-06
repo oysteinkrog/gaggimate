@@ -138,6 +138,16 @@ The settings screens are code-built LVGL in
 map, how to add a category, how to run the tests. This section is what
 the design cannot show and what the runs measured.
 
+- **The settings tile is the centre of the menu** (decided 2026-09-06, gm-z7x).
+  `DefaultUI`'s menu-screen effect puts `btn_settings_1` at (0, 0) without
+  its 15 px click pad, hides the generated info button and the
+  BREW/STEAM/WATER word, and keeps the mode tiles on the 121 px ring in the
+  slots nearest the top (74 px tiles, 72 degree steps). The info screen,
+  the only place that shows the WiFi setup QR code while the config access
+  point is active, is opened by the Status category's "Device info" row.
+  The menu audits clean on the simulator and the bench board; with the pad
+  the centre box overlapped the grind tile's by 33x7 px, because the audit
+  works in axis-aligned rectangles.
 - **Settings is a cover on the menu screen, not a screen.** `SettingsUI::open`
   creates one full-screen child of `objects.menu_screen_new`, hides every
   other direct child except `objects.status_icons`, and restores their
