@@ -106,6 +106,17 @@ def map_ref(theme_map, anim_id):
     return parts[anim_id] if 0 <= anim_id < len(parts) else ""
 
 
+def map_write_ref(theme_map, anim_id, ref):
+    """Python mirror of SettingsModel.cpp's gradientMapWriteRef: sets slot
+    anim_id to ref in the ";"-separated map, padding shorter maps with
+    empty slots, without disturbing any other slot."""
+    parts = theme_map.split(";") if theme_map else [""]
+    while len(parts) <= anim_id:
+        parts.append("")
+    parts[anim_id] = ref
+    return ";".join(parts)
+
+
 def expected_gradient_text(settings, anim_id=None):
     """Python mirror of gradientChoices()/gradientChoiceIndexForRef() plus
     CatAnimation.cpp's "Default (<name>)" formatting, for the built-in-theme
@@ -396,6 +407,106 @@ def check_gradient_default_and_builtin(rig):
     close_animation(rig)
 
 
+def check_gradient_precedence_across_animations(rig):
+    """Regression for the gm-flw.9 review on eed10a33: CatAnimation.cpp
+    originally tracked only the most recently touched animation's gradient
+    edit (a single gradientTouchedAnimId/gradientLastRef pair). Touch
+    Gradient for animation A, switch to B, touch Gradient for B too: both
+    are now touched this visit, not just B, and commit() must write both
+    slots (one setBgAnimThemeMap call covering every touched entry whose
+    stored ref no longer matches this visit's last write), not just the
+    last one touched.
+
+    The review's own scenario adds a web save that replaces the whole map
+    with a different value for A's slot while both are touched, then
+    checks the display's value for A wins at pop. That step cannot run
+    here: sim/platform/bganim_stub.cpp's bg_map_valid() always returns
+    false, and WebUIPlugin.cpp gates every POST to bgAnimThemeMap behind
+    it (`if (request->hasArg("bgAnimThemeMap") && bg_map_valid(...))
+    settings->setBgAnimThemeMap(...)`), so no POST -- built-in ref or
+    library ref alike -- can ever change that field on the simulator; the
+    line below confirms this by attempting exactly the review's POST and
+    asserting the sim's own gate holds. This is a wider version of the
+    already-documented library-only gap: the sim cannot exercise an
+    external write to bgAnimThemeMap at all, not just a library one. What
+    is verified here instead: both A's and B's live-written slots survive
+    an ordinary pop with no interference (the commit loop does not drop
+    an earlier touched entry just because a later one was touched too),
+    which is the one piece of this criterion the simulator can observe.
+    The interference half needs the device (POST is not gated there)."""
+    s0 = rig.settings()
+    anim_a = int(s0["bgAnimId"])
+    anim_b = (anim_a + 1) % len(ANIM_NAMES)
+
+    d = open_animation(rig)
+    grad_a_btn = rig.find_tag(d, "Gradient", "next")
+    if grad_a_btn is None:
+        check(rig, "precedence_gradient_next_found", False)
+        close_animation(rig)
+        return
+    rig.tap_target(grad_a_btn)
+    ref_a = map_ref(rig.settings()["bgAnimThemeMap"], anim_a)
+    check(rig, "precedence_setup_touch_a", ref_a != "", "anim %d ref=%r" % (anim_a, ref_a))
+
+    rig.tap_target(rig.find_tag(rig.touchmap(screen=0), "Animation", "next"))
+    check(rig, "precedence_moved_to_b", int(rig.settings()["bgAnimId"]) == anim_b, rig.settings()["bgAnimId"])
+
+    rig.tap_target(rig.find_tag(rig.touchmap(screen=0), "Gradient", "next"))
+    map_after_b = rig.settings()["bgAnimThemeMap"]
+    ref_b = map_ref(map_after_b, anim_b)
+    check(rig, "precedence_setup_touch_b", ref_b != "", "anim %d ref=%r" % (anim_b, ref_b))
+
+    # The review's own interference step: a web save replacing the whole
+    # map with a different value for A's slot. Confirmed rejected outright
+    # by the sim's bg_map_valid() gate (see docstring); this asserts that
+    # rejection rather than skipping it, so a future change loosening the
+    # host stub is caught here instead of silently going untested.
+    web_ref_a = "1" if ref_a != "1" else "2"
+    web_map = map_write_ref(map_after_b, anim_a, web_ref_a)
+    try:
+        web_save(rig, {"bgAnimThemeMap": web_map})
+        after_post = map_ref(rig.settings()["bgAnimThemeMap"], anim_a)
+        check(rig, "webpost_bgAnimThemeMap_rejected_on_sim", after_post == ref_a,
+              "anim %d ref after the POST attempt: got %r, want unchanged %r (a mismatch means the sim's "
+              "bg_map_valid stub started accepting writes; revisit this test's device-only note)" %
+              (anim_a, after_post, ref_a))
+    except RuntimeError as e:
+        rig.log("gradient_precedence_web_save_unavailable", reason=str(e))
+
+    rig.settingsui(pop=1)
+
+    def restored():
+        m = rig.settings()["bgAnimThemeMap"]
+        return map_ref(m, anim_a) == ref_a and map_ref(m, anim_b) == ref_b
+
+    ok = rig.wait_until(restored, timeout=6)
+    final_map = rig.settings()["bgAnimThemeMap"]
+    check(rig, "gradient_precedence_a_survives", map_ref(final_map, anim_a) == ref_a,
+          "anim %d got %r want %r" % (anim_a, map_ref(final_map, anim_a), ref_a))
+    check(rig, "gradient_precedence_b_survives", map_ref(final_map, anim_b) == ref_b,
+          "anim %d got %r want %r" % (anim_b, map_ref(final_map, anim_b), ref_b))
+    check(rig, "gradient_precedence_both_survive", bool(ok))
+
+    # Restore both to Default through the UI, never by a second POST. This
+    # visit opens on animId==anim_b (bgAnimId was written live by the
+    # "Animation next" tap above), Gradient showing ref_b one step from
+    # Default; undo it, step Animation back to A, undo A's edit the same
+    # way.
+    d = open_animation(rig)
+    rig.tap_target(rig.find_tag(d, "Gradient", "prev"))
+    rig.tap_target(rig.find_tag(rig.touchmap(screen=0), "Animation", "prev"))
+    rig.tap_target(rig.find_tag(rig.touchmap(screen=0), "Gradient", "prev"))
+    close_animation(rig)
+
+    restored_map = rig.settings()["bgAnimThemeMap"]
+    a_default = map_ref(restored_map, anim_a) == ""
+    b_default = map_ref(restored_map, anim_b) == ""
+    check(rig, "gradient_precedence_restored", a_default and b_default,
+          "anim_a=%r anim_b=%r" % (map_ref(restored_map, anim_a), map_ref(restored_map, anim_b)))
+    if not (a_default and b_default):
+        rig.log("could_not_restore", bgAnimThemeMap=restored_map)
+
+
 def check_plates_and_tint_coupling(rig):
     """Acceptance: Plate colour/opacity are enabled only when Plates is
     Custom; Tint colour only when Element tint is on; a tap on a disabled
@@ -497,6 +608,7 @@ def main():
         ("frame_rate_live_and_precedence", check_frame_rate_live_and_precedence),
         ("theme_recolor", check_theme_recolor),
         ("gradient_default_and_builtin", check_gradient_default_and_builtin),
+        ("gradient_precedence_across_animations", check_gradient_precedence_across_animations),
         ("plates_and_tint_coupling", check_plates_and_tint_coupling),
     ]
 
@@ -558,5 +670,20 @@ if __name__ == "__main__":
 #   library entry created through the web UI, then chosen): the simulator's
 #   bg_library_valid always returns false (sim/platform/bganim_stub.cpp), so
 #   no POST can create one there; needs a browser and the loadtest device.
+# - The touched-field-precedence half of the gradient regression (gm-flw.9
+#   review on eed10a33): a web save landing on a touched animation's slot
+#   while a different animation's slot is also touched, verifying the
+#   display's value wins for both. Not just the library case: bg_map_valid
+#   (sim/platform/bganim_stub.cpp) unconditionally returns false, so
+#   WebUIPlugin.cpp's `hasArg("bgAnimThemeMap") && bg_map_valid(...)` gate
+#   rejects every POST to that field on the simulator, built-in refs
+#   included, not only library ones. check_gradient_precedence_across_
+#   animations asserts that gate holds, then verifies only the interference
+#   -free half (both slots survive an ordinary pop). Command for the
+#   leader against the device: repeat that check's setup (touch Gradient
+#   for animation A, tap Animation once, touch Gradient for B), POST a
+#   third value for A's slot from the web UI while the category is still
+#   open, pop, and confirm /api/settings bgAnimThemeMap holds A's and B's
+#   display-set refs, not the POSTed one.
 # - "the web UI still loads the Display tab" after a gradient change: needs
 #   a real browser.

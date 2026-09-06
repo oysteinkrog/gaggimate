@@ -104,15 +104,18 @@ struct CatAnimationCtx {
     int themeMode = 0; // 0 Dark, 1 Light
 
     // Gradient lives in one ";"-separated slot of the shared bgAnimThemeMap
-    // string, not its own property, so its touched-ness is tracked against
-    // the specific animation id it was written for rather than against
-    // ctx->animId, which may move to a different animation afterward
-    // without the user re-touching Gradient there.
+    // string, not its own property, so its touched-ness is tracked per
+    // animation id, not against a single "last touched" id: the map is one
+    // field per animation, and the touched-field precedence rule applies
+    // per field. Switching from A to B and touching Gradient on both in the
+    // same visit touches both slots; a web save (which replaces the whole
+    // map string) must not clobber either one at commit. Sized to
+    // animCountFn() in animEnter and never resized after, so no heap growth
+    // per step (gm-flw.9 review).
     int gradientIndex = 0;
     std::string gradientRef;
-    bool gradientTouched = false;
-    int gradientTouchedAnimId = -1;
-    std::string gradientLastRef;
+    std::vector<bool> gradientTouched;   // per animId
+    std::vector<std::string> gradientLastRef; // per animId, valid where gradientTouched[i]
 
     int plates = 0; // 0 Keep, 1 Hide, 2 Custom
 
@@ -181,8 +184,9 @@ void animIdOnCycle(void *user, int dir) {
     // exact animation earlier in the visit, that choice stands; otherwise
     // read the map fresh for the newly selected animation.
     const auto choices = currentGradientChoices();
-    if (ctx->gradientTouched && ctx->gradientTouchedAnimId == ctx->animId) {
-        ctx->gradientIndex = settingsui::gradientChoiceIndexForRef(choices, ctx->gradientLastRef);
+    if (ctx->gradientTouched[static_cast<size_t>(ctx->animId)]) {
+        ctx->gradientIndex =
+            settingsui::gradientChoiceIndexForRef(choices, ctx->gradientLastRef[static_cast<size_t>(ctx->animId)]);
     } else {
         ctx->gradientIndex = gradientIndexForAnim(ctx->animId, choices);
     }
@@ -253,9 +257,8 @@ void gradientOnCycle(void *user, int dir) {
     const auto choices = currentGradientChoices();
     ctx->gradientIndex = settingsui::wrapIndex(ctx->gradientIndex, static_cast<int>(choices.size()), dir);
     ctx->gradientRef = choices[static_cast<size_t>(ctx->gradientIndex)].ref;
-    ctx->gradientTouched = true;
-    ctx->gradientTouchedAnimId = ctx->animId;
-    ctx->gradientLastRef = ctx->gradientRef;
+    ctx->gradientTouched[static_cast<size_t>(ctx->animId)] = true;
+    ctx->gradientLastRef[static_cast<size_t>(ctx->animId)] = ctx->gradientRef;
     {
         // Read-modify-write of the whole map string: guarded so a web save's
         // batchUpdate touching a different animation's slot in the same
@@ -508,9 +511,8 @@ void animEnter(void *ctx0) {
     ctx->fpsTouched = false;
     ctx->allScreensTouched = false;
     ctx->themeModeTouched = false;
-    ctx->gradientTouched = false;
-    ctx->gradientTouchedAnimId = -1;
-    ctx->gradientLastRef.clear();
+    ctx->gradientTouched.assign(static_cast<size_t>(animCountFn()), false);
+    ctx->gradientLastRef.assign(static_cast<size_t>(animCountFn()), std::string());
     ctx->platesTouched = false;
     ctx->plateColorTouched = false;
     ctx->plateOpacityTouched = false;
@@ -562,14 +564,15 @@ void animReconcile(void *ctx0) {
         ctx->scrim = settings.getBgAnimScrim();
     }
 
-    // Gradient: this visit's touched choice stands only while it still
-    // applies to the animation currently on screen; otherwise (never
-    // touched, or touched for a different animation than the one now
-    // selected) re-derive fresh from the map for ctx->animId, which above
-    // may itself have just moved if Animation was untouched.
+    // Gradient row on screen: shows this visit's touched choice for
+    // ctx->animId if there is one, otherwise re-derives fresh from the map
+    // (which above may itself have just moved if Animation was untouched).
+    // A web save's map replacement never overwrites a touched animation's
+    // slot here or in commit(); only untouched animations re-read the map.
     const auto choices = currentGradientChoices();
-    if (ctx->gradientTouched && ctx->gradientTouchedAnimId == ctx->animId) {
-        ctx->gradientIndex = settingsui::gradientChoiceIndexForRef(choices, ctx->gradientLastRef);
+    if (ctx->gradientTouched[static_cast<size_t>(ctx->animId)]) {
+        ctx->gradientIndex =
+            settingsui::gradientChoiceIndexForRef(choices, ctx->gradientLastRef[static_cast<size_t>(ctx->animId)]);
     } else {
         ctx->gradientIndex = gradientIndexForAnim(ctx->animId, choices);
     }
@@ -603,16 +606,32 @@ void animCommit(void *ctx0) {
         used += std::snprintf(log + used, sizeof(log) - used, " theme=%d", ctx->themeMode);
         wrote = true;
     }
-    if (ctx->gradientTouched) {
-        // Already inside the shell's Settings::Guard (SettingsUI::popPage/
-        // teardownAll wrap the whole commit() call), so no separate guard is
-        // needed here the way gradientOnCycle needs its own.
-        const std::string map(settings.getBgAnimThemeMap().c_str());
-        if (settingsui::gradientMapReadRef(map, ctx->gradientTouchedAnimId) != ctx->gradientLastRef) {
-            settings.setBgAnimThemeMap(
-                settingsui::gradientMapWriteRef(map, ctx->gradientTouchedAnimId, ctx->gradientLastRef).c_str());
-            used += std::snprintf(log + used, sizeof(log) - used, " gradient[%d]=%s", ctx->gradientTouchedAnimId,
-                                   ctx->gradientLastRef.c_str());
+    {
+        // Re-assert every touched animation's gradient ref, not just the
+        // last one touched: the map is one field per animation, and a web
+        // save replaces the whole string, so a web save landing on animId A
+        // while this visit's last edit was to animId B must not cost A its
+        // touched value at commit (gm-flw.9 review). Already inside the
+        // shell's Settings::Guard (SettingsUI::popPage/teardownAll wrap the
+        // whole commit() call), so no separate guard is needed here the way
+        // gradientOnCycle needs its own.
+        std::string map(settings.getBgAnimThemeMap().c_str());
+        bool gradientWrote = false;
+        for (size_t animId = 0; animId < ctx->gradientTouched.size(); ++animId) {
+            if (!ctx->gradientTouched[animId]) {
+                continue;
+            }
+            const std::string &wanted = ctx->gradientLastRef[animId];
+            if (settingsui::gradientMapReadRef(map, static_cast<int>(animId)) == wanted) {
+                continue;
+            }
+            map = settingsui::gradientMapWriteRef(map, static_cast<int>(animId), wanted);
+            used += std::snprintf(log + used, sizeof(log) - used, " gradient[%d]=%s", static_cast<int>(animId),
+                                   wanted.c_str());
+            gradientWrote = true;
+        }
+        if (gradientWrote) {
+            settings.setBgAnimThemeMap(map.c_str());
             wrote = true;
         }
     }
