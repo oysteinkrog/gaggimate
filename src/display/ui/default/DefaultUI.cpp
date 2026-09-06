@@ -1034,10 +1034,27 @@ void DefaultUI::serviceSettingsUi() {
     seq = g_settingsUiSlot.seq;
     portEXIT_CRITICAL(&g_settingsUiMux);
     if (!pending) {
+        // Taps, the exit chevron and external leaves move the shell without
+        // a command, so the state is republished whenever it differs from
+        // the last publication; seq stays that of the last completed
+        // command.
+        publishSettingsUiState(g_settingsUiPublished.seq, /*force=*/false);
         return;
     }
 
     bool done = true;
+    // Navigation commands need the cover: openCategory on a closed shell
+    // would build the page under a null parent (a stray LVGL screen) and
+    // push a ctx that nothing can pop.
+    const bool navigation = cmd == SettingsUiCmd::Cat || cmd == SettingsUiCmd::Page || cmd == SettingsUiCmd::Pop;
+    if (navigation && !settingsUI.isOpen()) {
+        ESP_LOGW("SettingsUI", "SettingsDbg: %s ignored, settings closed", settingsUiCmdName(cmd));
+        publishSettingsUiState(seq, /*force=*/true);
+        portENTER_CRITICAL(&g_settingsUiMux);
+        g_settingsUiSlot.pending = false;
+        portEXIT_CRITICAL(&g_settingsUiMux);
+        return;
+    }
     switch (cmd) {
     case SettingsUiCmd::Open:
         if (settingsUI.isOpen()) {
@@ -1087,7 +1104,12 @@ void DefaultUI::serviceSettingsUi() {
         settingsUI.gotoPage(arg);
         break;
     case SettingsUiCmd::Pop:
-        settingsUI.popPage();
+        // One chevron: pops a category page, closes from the tile page.
+        if (settingsUI.state().depth > 0) {
+            settingsUI.popPage();
+        } else {
+            closeSettings();
+        }
         break;
     }
 
@@ -1096,9 +1118,24 @@ void DefaultUI::serviceSettingsUi() {
         return;
     }
 
+    const SettingsUI::State st = publishSettingsUiState(seq, /*force=*/true);
+    portENTER_CRITICAL(&g_settingsUiMux);
+    g_settingsUiSlot.pending = false;
+    portEXIT_CRITICAL(&g_settingsUiMux);
+
+    ESP_LOGI("SettingsUI", "SettingsDbg: %s -> depth=%d category=%d page=%d", settingsUiCmdName(cmd), st.depth,
+             st.category, st.page);
+}
+
+// Copies the shell's state and the Fixture counters into the published
+// struct the web task reads. Without force, only writes when something other
+// than seq changed, so the per-pass call costs a compare, not a critical
+// section, while the shell is idle.
+SettingsUI::State DefaultUI::publishSettingsUiState(uint32_t seq, bool force) {
     const SettingsUI::State st = settingsUI.state();
     const SettingsUI::FixtureCounters fc = settingsUI.fixtureCounters();
     SettingsUiState pub;
+    memset(&pub, 0, sizeof(pub)); // padding included, so the memcmp below is meaningful
     pub.seq = seq;
     pub.open = st.open;
     pub.depth = st.depth;
@@ -1115,13 +1152,16 @@ void DefaultUI::serviceSettingsUi() {
     pub.fixtureRepeats = fc.repeats;
     pub.fixtureFastRepeats = fc.fastRepeats;
 
+    // Only the UI task writes g_settingsUiPublished, so reading it here
+    // without the lock is safe; the lock orders the write against the web
+    // task's copy.
+    if (!force && memcmp(&pub, &g_settingsUiPublished, sizeof(pub)) == 0) {
+        return st;
+    }
     portENTER_CRITICAL(&g_settingsUiMux);
     g_settingsUiPublished = pub;
-    g_settingsUiSlot.pending = false;
     portEXIT_CRITICAL(&g_settingsUiMux);
-
-    ESP_LOGI("SettingsUI", "SettingsDbg: %s -> depth=%d category=%d page=%d", settingsUiCmdName(cmd), st.depth,
-             st.category, st.page);
+    return st;
 }
 #endif // GM_TOUCH_PROBE || GAGGIMATE_SIM
 

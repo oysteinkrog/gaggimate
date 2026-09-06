@@ -2093,7 +2093,24 @@ void WebUIPlugin::setupServer() {
     // Fixture counters (the bench/sim-only category the shared contract
     // exercises the lifecycle against before any real category exists)
     // and the seq of the last completed command.
-    server.on("/api/debug/settingsui", [this](AsyncWebServerRequest *request) {
+    // String::toInt() turns "oops" and "" into 0 and accepts numeric
+    // prefixes, so every argument is parsed as a whole decimal string here
+    // before anything is queued (a malformed cat would otherwise pop and
+    // commit the open category).
+    auto parseWholeInt = [](const String &s, int &out) -> bool {
+        const char *p = s.c_str();
+        if (*p == '\0') {
+            return false;
+        }
+        char *end = nullptr;
+        const long v = strtol(p, &end, 10);
+        if (end == p || *end != '\0' || v < INT32_MIN || v > INT32_MAX) {
+            return false;
+        }
+        out = static_cast<int>(v);
+        return true;
+    };
+    server.on("/api/debug/settingsui", [this, parseWholeInt](AsyncWebServerRequest *request) {
         const bool hasOpen = request->hasArg("open");
         const bool hasClose = request->hasArg("close");
         const bool hasCat = request->hasArg("cat");
@@ -2108,33 +2125,31 @@ void WebUIPlugin::setupServer() {
             DefaultUI::SettingsUiCmd cmd;
             int arg = 0;
             if (hasOpen) {
-                if (request->arg("open").toInt() == 0) {
+                if (request->arg("open") != "1") {
                     request->send(400, "application/json", "{\"error\":\"open must be 1\"}");
                     return;
                 }
                 cmd = DefaultUI::SettingsUiCmd::Open;
             } else if (hasClose) {
-                if (request->arg("close").toInt() == 0) {
+                if (request->arg("close") != "1") {
                     request->send(400, "application/json", "{\"error\":\"close must be 1\"}");
                     return;
                 }
                 cmd = DefaultUI::SettingsUiCmd::Close;
             } else if (hasCat) {
-                arg = request->arg("cat").toInt();
-                if (arg < 0 || arg >= DefaultUI::kSettingsUiCategoryCount) {
+                if (!parseWholeInt(request->arg("cat"), arg) || arg < 0 || arg >= DefaultUI::kSettingsUiCategoryCount) {
                     request->send(400, "application/json", "{\"error\":\"cat out of range\"}");
                     return;
                 }
                 cmd = DefaultUI::SettingsUiCmd::Cat;
             } else if (hasPage) {
-                arg = request->arg("page").toInt();
-                if (arg < 0) {
+                if (!parseWholeInt(request->arg("page"), arg) || arg < 0) {
                     request->send(400, "application/json", "{\"error\":\"page must be >= 0\"}");
                     return;
                 }
                 cmd = DefaultUI::SettingsUiCmd::Page;
             } else {
-                if (request->arg("pop").toInt() == 0) {
+                if (request->arg("pop") != "1") {
                     request->send(400, "application/json", "{\"error\":\"pop must be 1\"}");
                     return;
                 }

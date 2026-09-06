@@ -354,7 +354,12 @@ void SettingsUI::buildExitChevron(lv_obj_t *parent, lv_color_t fg, bool topLevel
     lv_obj_t *exitBtn = lv_img_create(parent);
     lv_img_set_src(exitBtn, &img_angle_up_40x40);
     lv_obj_align(exitBtn, LV_ALIGN_CENTER, 0, 210);
-    lv_obj_set_ext_click_area(exitBtn, 45); // matches every other screen's exit chevron
+    // Same place as every other screen's exit chevron, but a smaller click
+    // pad: the fifth row slot ends at y 394 and a 45 px pad reaches up to
+    // 385, so a whole-row target in that slot (toggle, action, confirm)
+    // would overlap the chevron's hit rectangle. 34 keeps the hit box
+    // 108x84 px and clear of the rows by 2 px.
+    lv_obj_set_ext_click_area(exitBtn, topLevel ? 45 : 34);
     lv_obj_set_style_img_recolor(exitBtn, fg, LV_PART_MAIN);
     lv_obj_set_style_img_recolor_opa(exitBtn, LV_OPA_COVER, LV_PART_MAIN);
     lv_obj_add_flag(exitBtn, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_EVENT_BUBBLE);

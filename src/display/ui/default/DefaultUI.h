@@ -142,6 +142,8 @@ class DefaultUI {
     // for; returns false, seqOut untouched, when a command is already
     // pending (caller reports 409). Called from the web/async task.
     bool queueSettingsUiCommand(SettingsUiCmd cmd, int arg, uint32_t &seqOut);
+    // Republishes the shell state for the debug route; see the definition.
+    SettingsUI::State publishSettingsUiState(uint32_t seq, bool force);
     // Copies the last-published state out, as one struct under a critical
     // section so a reader never observes a stale title paired with new
     // counters. Called from the web/async task.
