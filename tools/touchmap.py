@@ -164,11 +164,16 @@ def do_tap(host, spec):
         raise SystemExit('--tap expects x,y[,ms]')
     x, y = int(parts[0]), int(parts[1])
     q = 'x=%d&y=%d' % (x, y)
+    hold_ms = 80
     if len(parts) == 3:
-        q += '&ms=%d' % int(parts[2])
+        hold_ms = int(parts[2])
+        q += '&ms=%d' % hold_ms
     get(host, '/api/debug/tap?%s' % q).read()
+    # The hold clock starts at the UI task's first poll of the request, not
+    # at the HTTP accept, so the wait is the hold plus dispatch slack.
+    deadline = hold_ms / 1000.0 + 5.0
     t0 = time.time()
-    while time.time() - t0 < 10:
+    while time.time() - t0 < deadline:
         state = json.load(get(host, '/api/debug/tap'))
         if state.get('released_at_ms'):
             time.sleep(0.15)
