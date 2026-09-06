@@ -48,6 +48,10 @@ static void mouse_read(lv_indev_drv_t *drv, lv_indev_data_t *data) {
             } else {
                 printf("[inject] release\n");
             }
+            // Redirected stdout is fully buffered, not line-buffered; a
+            // script tailing the sim's log for this line should not wait on
+            // whatever fills the C library's buffer next.
+            fflush(stdout);
         }
         data->point.x = injX;
         data->point.y = injY;

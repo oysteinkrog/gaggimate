@@ -1846,52 +1846,6 @@ void WebUIPlugin::setupServer() {
         heap_caps_free(buf);
     });
 
-#if GM_TOUCH_INJECT
-    // /api/debug/tap?x=<0..479>&y=<0..479>[&ms=<hold, default 80>]: queues one
-    // synthetic tap (TouchInject.h). touchpad_read (LV_Helper.cpp) and, on the
-    // simulator, mouse_read (SdlDriver.cpp) poll it ahead of their own reads,
-    // so a scripted request drives the same screen-change code a finger does.
-    // Without x/y, returns the in-flight request's observed timing so a
-    // script can wait out a hold before reading the result.
-    server.on("/api/debug/tap", [](AsyncWebServerRequest *request) {
-        if (request->hasArg("x") || request->hasArg("y")) {
-            if (!request->hasArg("x") || !request->hasArg("y")) {
-                request->send(400, "application/json", "{\"error\":\"x and y both required\"}");
-                return;
-            }
-            const int x = request->arg("x").toInt();
-            const int y = request->arg("y").toInt();
-            const int ms =
-                request->hasArg("ms") ? request->arg("ms").toInt() : static_cast<int>(TOUCH_INJECT_DEFAULT_HOLD_MS);
-            if (x < TOUCH_INJECT_MIN_COORD || x > TOUCH_INJECT_MAX_COORD || y < TOUCH_INJECT_MIN_COORD ||
-                y > TOUCH_INJECT_MAX_COORD || ms < static_cast<int>(TOUCH_INJECT_MIN_HOLD_MS) ||
-                ms > static_cast<int>(TOUCH_INJECT_MAX_HOLD_MS)) {
-                request->send(400, "application/json", "{\"error\":\"x,y 0..479, ms 20..10000\"}");
-                return;
-            }
-            if (!touchInjectRequest(static_cast<int16_t>(x), static_cast<int16_t>(y), static_cast<uint32_t>(ms))) {
-                bool active;
-                uint32_t remainingMs, pressedAtMs, releasedAtMs;
-                touchInjectState(active, remainingMs, pressedAtMs, releasedAtMs);
-                char buf[64];
-                snprintf(buf, sizeof(buf), "{\"error\":\"busy\",\"remaining_ms\":%u}", static_cast<unsigned>(remainingMs));
-                request->send(409, "application/json", buf);
-                return;
-            }
-            request->send(200, "application/json", "{\"queued\":true}");
-            return;
-        }
-        bool active;
-        uint32_t remainingMs, pressedAtMs, releasedAtMs;
-        touchInjectState(active, remainingMs, pressedAtMs, releasedAtMs);
-        char buf[128];
-        snprintf(buf, sizeof(buf), "{\"active\":%s,\"remaining_ms\":%u,\"pressed_at_ms\":%u,\"released_at_ms\":%u}",
-                 active ? "true" : "false", static_cast<unsigned>(remainingMs), static_cast<unsigned>(pressedAtMs),
-                 static_cast<unsigned>(releasedAtMs));
-        request->send(200, "application/json", buf);
-    });
-#endif
-
     // /api/debug/fb?n=0|1[&step=2] streams one panel framebuffer as raw
     // RGB565, little-endian, row-major, step**2 decimated.
     //
@@ -1976,6 +1930,55 @@ void WebUIPlugin::setupServer() {
         request->send(response);
     });
 #endif // !GAGGIMATE_HEADLESS && !GAGGIMATE_SIM
+
+#if GM_TOUCH_INJECT
+    // /api/debug/tap?x=<0..479>&y=<0..479>[&ms=<hold, default 80>]: queues one
+    // synthetic tap (TouchInject.h). touchpad_read (LV_Helper.cpp) and, on the
+    // simulator, mouse_read (SdlDriver.cpp) poll it ahead of their own reads,
+    // so a scripted request drives the same screen-change code a finger does.
+    // Without x/y, returns the in-flight request's observed timing so a
+    // script can wait out a hold before reading the result. Registered
+    // outside the real-panel-only block above: the simulator needs this
+    // route too, unlike most of the routes in that block.
+    server.on("/api/debug/tap", [](AsyncWebServerRequest *request) {
+        if (request->hasArg("x") || request->hasArg("y")) {
+            if (!request->hasArg("x") || !request->hasArg("y")) {
+                request->send(400, "application/json", "{\"error\":\"x and y both required\"}");
+                return;
+            }
+            const int x = request->arg("x").toInt();
+            const int y = request->arg("y").toInt();
+            const int ms =
+                request->hasArg("ms") ? request->arg("ms").toInt() : static_cast<int>(TOUCH_INJECT_DEFAULT_HOLD_MS);
+            if (x < TOUCH_INJECT_MIN_COORD || x > TOUCH_INJECT_MAX_COORD || y < TOUCH_INJECT_MIN_COORD ||
+                y > TOUCH_INJECT_MAX_COORD || ms < static_cast<int>(TOUCH_INJECT_MIN_HOLD_MS) ||
+                ms > static_cast<int>(TOUCH_INJECT_MAX_HOLD_MS)) {
+                request->send(400, "application/json", "{\"error\":\"x,y 0..479, ms 20..10000\"}");
+                return;
+            }
+            if (!touchInjectRequest(static_cast<int16_t>(x), static_cast<int16_t>(y), static_cast<uint32_t>(ms))) {
+                bool active;
+                uint32_t remainingMs, pressedAtMs, releasedAtMs;
+                touchInjectState(active, remainingMs, pressedAtMs, releasedAtMs);
+                char buf[64];
+                snprintf(buf, sizeof(buf), "{\"error\":\"busy\",\"remaining_ms\":%u}", static_cast<unsigned>(remainingMs));
+                request->send(409, "application/json", buf);
+                return;
+            }
+            request->send(200, "application/json", "{\"queued\":true}");
+            return;
+        }
+        bool active;
+        uint32_t remainingMs, pressedAtMs, releasedAtMs;
+        touchInjectState(active, remainingMs, pressedAtMs, releasedAtMs);
+        char buf[128];
+        snprintf(buf, sizeof(buf), "{\"active\":%s,\"remaining_ms\":%u,\"pressed_at_ms\":%u,\"released_at_ms\":%u}",
+                 active ? "true" : "false", static_cast<unsigned>(remainingMs), static_cast<unsigned>(pressedAtMs),
+                 static_cast<unsigned>(releasedAtMs));
+        request->send(200, "application/json", buf);
+    });
+#endif
+
     server.on("/api/status", [this](AsyncWebServerRequest *request) {
         AsyncResponseStream *response = request->beginResponseStream("application/json");
         JsonDocument doc(&psramAllocator);
