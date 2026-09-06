@@ -41,7 +41,9 @@ use the `Sim` context manager below, which builds this for you).
   of its `"row/value"` object, falling back to `"t"` when `"val"` was not
   emitted); raises `ValueError` naming the visible rows when the row has no
   value object. `rows_on_page(dump)`: settings row names on the page, top to
-  bottom. `targets(dump, include_hidden=False)`: clickable objects with an
+  bottom (a row's outer container carries role `row`, or `toggle`/`action`/
+  `confirm` when the whole row is the tap target; the shell's five slot
+  containers `row0`..`row4` are role `slot` and are not rows). `targets(dump, include_hidden=False)`: clickable objects with an
   event callback, excluding the settings shell's cover and any object
   covering at least 90 percent of the panel (a generated screen's own
   tap-anywhere-to-standby background).

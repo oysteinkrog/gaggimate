@@ -140,14 +140,20 @@ def row_value(dump, row):
     return val if val is not None else obj.get("t")
 
 
+ROW_CONTAINER_ROLES = ("row", "toggle", "action", "confirm")
+
+
 def rows_on_page(dump):
-    """Settings row names on the dumped page (SettingsDebugTag role "row"),
-    top to bottom by hit rect. Row widgets are 320x56, five to a page, so
-    this is at most 5 entries for a settings category page; for a generated
-    screen (no rows tagged) it is empty."""
+    """Settings row names on the dumped page, top to bottom by hit rect. A
+    row widget's outer container is tagged with role "row" (stepper, choice,
+    locked, info) or with the whole-row target role it doubles as ("toggle",
+    "action", "confirm"); the shell's five slot containers are role "slot"
+    and never listed. Row widgets are 320x56, five to a page, so this is at
+    most 5 entries for a settings category page; for a generated screen (no
+    rows tagged) it is empty."""
     by_y = {}
     for o in dump["objects"]:
-        if tag_role(o) != "row":
+        if tag_role(o) not in ROW_CONTAINER_ROLES:
             continue
         row = tag_row(o)
         y = o["hit"][1] if "hit" in o else o["y1"]

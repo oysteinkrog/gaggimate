@@ -520,7 +520,10 @@ void SettingsUI::buildCategoryPage(PageEntry &entry) {
         // so this has no visual effect for any category.
         lv_obj_add_flag(slot, LV_OBJ_FLAG_OVERFLOW_VISIBLE);
         lv_obj_set_style_bg_opa(slot, LV_OPA_TRANSP, LV_PART_MAIN);
-        tag(slot, kRowNames[i], "row");
+        // Role "slot", not "row": a category row widget tags its own outer
+        // container "row" (or the whole-row target role: toggle, action,
+        // confirm), and rig.rows_on_page() lists those; the slot is chrome.
+        tag(slot, kRowNames[i], "slot");
         const int globalIndex = entry.page * kRowsPerPage + i;
         if (globalIndex < totalRows && entry.def->buildRow) {
             entry.def->buildRow(entry.ctx, globalIndex, slot, *this);
