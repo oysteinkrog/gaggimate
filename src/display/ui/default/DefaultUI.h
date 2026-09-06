@@ -138,8 +138,10 @@ class DefaultUI {
     // Applies g_uiAnimTestReq (LV_Helper.h) on the UI task: creates, moves or
     // removes the foreground motion test widget.
     void serviceUiAnimTest();
-    // Serves /api/debug/touchmap (LV_Helper.h, g_touchMapReq): dumps a
-    // screen's object tree with the hit rectangles LVGL uses.
+    // Serves /api/debug/touchmap (LV_Helper.h, g_touchMapReq/g_touchMapPending):
+    // dumps a screen's (or, for screen=0, the active screen's) object tree
+    // with the hit rectangles LVGL uses, label text, settings debug tags and
+    // a seq/uptime_ms pair. Runs on the simulator too.
     void serviceTouchMap();
     // Renders obj and its children into buf as LV_IMG_CF_TRUE_COLOR_ALPHA
     // (RGB565 + A8), sized to the object's coords grown by its ext draw size;

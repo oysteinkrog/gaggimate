@@ -6,6 +6,8 @@
 // is only pulled in here, not through any device driver header.
 #include "esp_log.h"
 #include <cstdlib> // getenv, for the GM_SIM_OPEN_SETTINGS debug hook below
+#include <cstring>       // memcpy, for the touchmap dump's per-object line copy
+#include <esp_heap_caps.h> // heap_caps_malloc/realloc, for the touchmap dump's growable PSRAM buffer (both venues)
 #ifdef GM_ANIM_BENCH
 #include <display/ui/default/SleepAnimation.h>
 const BenchGateState &bench_gate_state() {
@@ -405,7 +407,6 @@ void DefaultUI::loop() {
     // time and the pump branch never.
     serviceLayerMoves();
     serviceUiAnimTest();
-    serviceTouchMap();
     if (panelStopRequested && !panelStopped) {
         panelStopped = true;
         stopSleepAnimation();
@@ -421,8 +422,11 @@ void DefaultUI::loop() {
     }
 #endif
     // Unconditional (not inside the ifndef block above): the simulator has no
-    // serviceTouchMap/serviceUiAnimTest, but the settings shell still needs its
-    // web-save reconciliation, refresh tick and theme restyle checks there.
+    // serviceLayerMoves/serviceUiAnimTest (both drive the panel scan-out
+    // path), but /api/debug/touchmap needs serviceTouchMap serviced there
+    // too, and the settings shell needs its web-save reconciliation, refresh
+    // tick and theme restyle checks there regardless of venue.
+    serviceTouchMap();
     settingsUI.service();
 
     const unsigned long now = ::millis();
@@ -755,7 +759,6 @@ void DefaultUI::serviceUiAnimTest() {
     lv_anim_start(&a);
 }
 
-#ifndef GAGGIMATE_SIM
 static const char *touchMapClass(const lv_obj_t *obj) {
     struct Entry {
         const lv_obj_class_t *cls;
@@ -777,11 +780,91 @@ static const char *touchMapClass(const lv_obj_t *obj) {
     return "other";
 }
 
+// The screen id (1-based index into the EEZ `objects` table) that lv_scr_act()
+// currently resolves to, or 0 if it is not one of the top-level screens (should
+// not happen: the flow engine only ever activates one of them, and the
+// settings shell mounts as a child object rather than a new screen). Used for
+// screen_id when the dump was requested as screen=0 (the active screen,
+// whichever it is), since the request itself carries no screen id then.
+static int touchMapFindScreenId(const lv_obj_t *scr) {
+    lv_obj_t **arr = reinterpret_cast<lv_obj_t **>(&objects);
+    const size_t nObj = sizeof(objects) / sizeof(lv_obj_t *);
+    for (size_t i = 0; i < nObj; i++) {
+        if (arr[i] == scr) {
+            return static_cast<int>(i) + 1;
+        }
+    }
+    return 0;
+}
+
+// Appends `,"key":"<json-escaped src, up to maxBytes source bytes, UTF-8
+// safe>"` to buf, advancing len. maxBytes == 0 means no limit (the full
+// string). Sets truncated and writes nothing when the escaped field would not
+// fit in the remaining capacity, the same contract touchMapNode's own fields
+// use, so a caller can grow the buffer and retry the whole dump rather than
+// reason about a half-written object line.
+static void touchMapAppendString(char *buf, size_t cap, size_t &len, bool &truncated, const char *key, const char *src,
+                                  size_t maxBytes) {
+    size_t srcLen = strlen(src);
+    if (maxBytes != 0 && srcLen > maxBytes) {
+        srcLen = maxBytes;
+        // Back off if the cut lands inside a multi-byte UTF-8 sequence: a
+        // continuation byte is 10xxxxxx (0x80..0xBF).
+        while (srcLen > 0 && (static_cast<unsigned char>(src[srcLen]) & 0xC0) == 0x80) {
+            srcLen--;
+        }
+    }
+    // Worst case every source byte becomes a two-character escape, plus the
+    // key, quotes, colon, comma and the fixed tail margin the caller reserves.
+    const size_t need = strlen(key) + srcLen * 2 + 8;
+    if (truncated || len + need >= cap) {
+        truncated = true;
+        return;
+    }
+    len += snprintf(buf + len, cap - len, ",\"%s\":\"", key);
+    for (size_t i = 0; i < srcLen; i++) {
+        const unsigned char c = static_cast<unsigned char>(src[i]);
+        if (c == '"' || c == '\\') {
+            buf[len++] = '\\';
+            buf[len++] = static_cast<char>(c);
+        } else if (c == '\n') {
+            buf[len++] = '\\';
+            buf[len++] = 'n';
+        } else if (c < 0x20) {
+            continue; // rare in UI text; drop rather than \u-escape it
+        } else {
+            buf[len++] = static_cast<char>(c);
+        }
+    }
+    buf[len++] = '"';
+    buf[len] = '\0';
+}
+
 // One object per line of the JSON array: its objects[] index (-1 when it is
 // not a generated object), class, coords, hidden/clickable/overflow-visible
-// flags, ext click pad, event callback count, translate_y and depth.
-static void touchMapNode(lv_obj_t *obj, int parent, int depth, char *buf, size_t cap, size_t &len, int &nextId) {
+// flags, ext click pad, event callback count, translate_y and depth, plus (for
+// lv_label objects) its text and (for descendants of the open settings shell's
+// cover, SettingsUI::cover()) its debug tag. underCover is carried down from
+// the parent rather than walked up per object: cheaper for a screen with many
+// objects, and the only ancestor that can ever match is the cover itself,
+// created once per settings-open as a child of the menu screen.
+//
+// Writes straight into the shared buffer (no per-object local copy: this runs
+// on DefaultUI's UI task, whose stack is sized for LVGL work, not a few KB of
+// scratch per recursion level). A field that does not fit sets truncated and
+// leaves this object's line unclosed; serviceTouchMap's caller either grows
+// the buffer and re-walks the whole tree from scratch (the unclosed line is
+// simply overwritten, never published), or, at its size ceiling, closes the
+// array after the last object that DID finish -- len only ever advances past
+// a fully-written, newline-terminated object, since every write here is
+// itself capacity-checked before it happens.
+static void touchMapNode(lv_obj_t *obj, int parent, int depth, const lv_obj_t *cover, bool underCover, char *buf, size_t cap,
+                         size_t &len, int &nextId, bool &truncated) {
+    if (truncated) {
+        return; // the dump is being retried (or closed out) at this size; do no more work for it
+    }
     const int id = nextId++;
+    underCover = underCover || obj == cover;
     int oi = -1;
     lv_obj_t **arr = reinterpret_cast<lv_obj_t **>(&objects);
     const size_t nObj = sizeof(objects) / sizeof(lv_obj_t *);
@@ -795,63 +878,138 @@ static void touchMapNode(lv_obj_t *obj, int parent, int depth, char *buf, size_t
     lv_obj_get_coords(obj, &a);
     const int ext = obj->spec_attr != nullptr ? obj->spec_attr->ext_click_pad : 0;
     const int ev = obj->spec_attr != nullptr ? obj->spec_attr->event_dsc_cnt : 0;
-    if (len + 200 < cap) {
-        len += snprintf(buf + len, cap - len,
-                        "%s{\"i\":%d,\"p\":%d,\"o\":%d,\"c\":\"%s\",\"x1\":%d,\"y1\":%d,\"x2\":%d,\"y2\":%d,\"h\":%d,\"k\":%d,"
-                        "\"e\":%d,\"n\":%d,\"v\":%d,\"ty\":%d,\"d\":%d}\n",
-                        id == 0 ? "" : ",", id, parent, oi, touchMapClass(obj), a.x1, a.y1, a.x2, a.y2,
-                        lv_obj_has_flag(obj, LV_OBJ_FLAG_HIDDEN) ? 1 : 0, lv_obj_has_flag(obj, LV_OBJ_FLAG_CLICKABLE) ? 1 : 0,
-                        ext, ev, lv_obj_has_flag(obj, LV_OBJ_FLAG_OVERFLOW_VISIBLE) ? 1 : 0,
-                        static_cast<int>(lv_obj_get_style_translate_y(obj, LV_PART_MAIN)), depth);
+    const size_t lineStart = len;
+    // Reserve enough for the fixed fields below; "t"/"tag"/"val" carry their
+    // own reserve in touchMapAppendString, and the tail margin serviceTouchMap
+    // holds back from `cap` is never spent here, so "]}\n" always has room.
+    constexpr size_t kBaseReserve = 200;
+    if (len + kBaseReserve >= cap) {
+        truncated = true;
+        return;
     }
+    len += snprintf(buf + len, cap - len,
+                    "%s{\"i\":%d,\"p\":%d,\"o\":%d,\"c\":\"%s\",\"x1\":%d,\"y1\":%d,\"x2\":%d,\"y2\":%d,\"h\":%d,\"k\":%d,"
+                    "\"e\":%d,\"n\":%d,\"v\":%d,\"ty\":%d,\"d\":%d",
+                    id == 0 ? "" : ",", id, parent, oi, touchMapClass(obj), a.x1, a.y1, a.x2, a.y2,
+                    lv_obj_has_flag(obj, LV_OBJ_FLAG_HIDDEN) ? 1 : 0, lv_obj_has_flag(obj, LV_OBJ_FLAG_CLICKABLE) ? 1 : 0, ext, ev,
+                    lv_obj_has_flag(obj, LV_OBJ_FLAG_OVERFLOW_VISIBLE) ? 1 : 0,
+                    static_cast<int>(lv_obj_get_style_translate_y(obj, LV_PART_MAIN)), depth);
+    if (obj->class_p == &lv_label_class) {
+        const char *text = lv_label_get_text(obj);
+        if (text != nullptr) {
+            touchMapAppendString(buf, cap, len, truncated, "t", text, 48);
+        }
+    }
+    if (underCover) {
+        if (const auto *tag = static_cast<const SettingsDebugTag *>(lv_obj_get_user_data(obj))) {
+            char rowRole[80];
+            snprintf(rowRole, sizeof(rowRole), "%s/%s", tag->row, tag->role);
+            touchMapAppendString(buf, cap, len, truncated, "tag", rowRole, 0);
+            if (tag->text != nullptr) {
+                touchMapAppendString(buf, cap, len, truncated, "val", tag->text, 0);
+            }
+        }
+    }
+    if (truncated) {
+        len = lineStart; // undo this object's partial write; nothing after it is valid either
+        return;
+    }
+    buf[len++] = '}';
+    buf[len++] = '\n';
+    buf[len] = '\0';
+
     const uint32_t n = lv_obj_get_child_cnt(obj);
     for (uint32_t i = 0; i < n; i++) {
-        touchMapNode(lv_obj_get_child(obj, i), id, depth + 1, buf, cap, len, nextId);
+        touchMapNode(lv_obj_get_child(obj, i), id, depth + 1, cover, underCover, buf, cap, len, nextId, truncated);
     }
 }
-#endif
 
 void DefaultUI::serviceTouchMap() {
-#ifndef GAGGIMATE_SIM
+    if (!g_touchMapPending) {
+        return;
+    }
     const int req = g_touchMapReq;
-    if (req < 1 || req > _SCREEN_ID_LAST) {
+    if (req < 0 || req > _SCREEN_ID_LAST) {
+        g_touchMapPending = false;
         return;
     }
-    if (g_touchMapLoad) {
-        g_touchMapLoad = false;
-        changeScreen(static_cast<ScreensEnum>(req));
-        // The flow engine swaps the screen later this pass and its tick sets
-        // the flow-driven HIDDEN flags on the next; give it a few passes.
-        touchMapDumpAt = ::millis() + 400;
-        return;
+    lv_obj_t *scr;
+    if (req == 0) {
+        // The active screen, dumped immediately: no changeScreen/g_touchMapLoad
+        // path (nothing was just switched to) and no settle delay.
+        scr = lv_scr_act();
+    } else {
+        if (g_touchMapLoad) {
+            g_touchMapLoad = false;
+            changeScreen(static_cast<ScreensEnum>(req));
+            // The flow engine swaps the screen later this pass and its tick sets
+            // the flow-driven HIDDEN flags on the next; give it a few passes.
+            touchMapDumpAt = ::millis() + 400;
+            return;
+        }
+        if (::millis() < touchMapDumpAt) {
+            return;
+        }
+        scr = reinterpret_cast<lv_obj_t **>(&objects)[req - 1];
     }
-    if (::millis() < touchMapDumpAt) {
-        return;
-    }
-    constexpr size_t CAP = 64 * 1024;
+
+    static size_t s_cap = 0;
+    constexpr size_t kInitialCap = 64 * 1024;
+    constexpr size_t kMaxCap = 4 * 1024 * 1024; // PSRAM, not the animation hot slab; a debug endpoint's ceiling, not a budget
+    constexpr size_t kTailMargin = 8;           // headroom the retry loop never spends, so "]}\n" always fits
     if (g_touchMapBuf == nullptr) {
-        g_touchMapBuf = static_cast<char *>(heap_caps_malloc(CAP, MALLOC_CAP_SPIRAM));
+        s_cap = kInitialCap;
+        g_touchMapBuf = static_cast<char *>(heap_caps_malloc(s_cap, MALLOC_CAP_SPIRAM));
         if (g_touchMapBuf == nullptr) {
-            g_touchMapReq = 0;
+            s_cap = 0;
+            g_touchMapPending = false;
             return;
         }
     }
-    lv_obj_t *scr = reinterpret_cast<lv_obj_t **>(&objects)[req - 1];
     if (scr == nullptr) {
-        snprintf(g_touchMapBuf, CAP, "{\"screen\":%d,\"error\":\"screen not created\"}", req);
-        g_touchMapLen = strlen(g_touchMapBuf);
-        g_touchMapReq = 0;
+        snprintf(g_touchMapBuf, s_cap, "{\"screen\":%d,\"error\":\"screen not created\"}", req);
+        g_touchMapLen = static_cast<uint32_t>(strlen(g_touchMapBuf));
+        g_touchMapPending = false;
         return;
     }
+
     lv_obj_update_layout(scr);
+    const lv_obj_t *cover = settingsUI.isOpen() ? settingsUI.cover() : nullptr;
+    const int screenId = req != 0 ? req : touchMapFindScreenId(scr);
+    static uint32_t s_seq = 0;
+    const uint32_t seq = s_seq + 1;
+
+    // Grows g_touchMapBuf and re-walks the whole tree when it does not fit
+    // (touchMapNode/touchMapAppendString's truncated flag): a screen has, at
+    // most, a few hundred objects, so re-walking on a miss costs far less
+    // than sizing up front for a worst case that almost never happens.
     size_t len = 0;
-    len += snprintf(g_touchMapBuf, CAP, "{\"screen\":%d,\"active\":%d,\"objects\":[\n", req, lv_scr_act() == scr ? 1 : 0);
-    int nextId = 0;
-    touchMapNode(scr, -1, 0, g_touchMapBuf, CAP, len, nextId);
-    len += snprintf(g_touchMapBuf + len, CAP - len, "]}\n");
+    for (;;) {
+        len = 0;
+        bool truncated = false;
+        len += snprintf(g_touchMapBuf, s_cap - kTailMargin,
+                        "{\"screen\":%d,\"screen_id\":%d,\"active\":%d,\"uptime_ms\":%lu,\"seq\":%u,\"objects\":[\n", req,
+                        screenId, lv_scr_act() == scr ? 1 : 0, static_cast<unsigned long>(::millis()), seq);
+        int nextId = 0;
+        touchMapNode(scr, -1, 0, cover, false, g_touchMapBuf, s_cap - kTailMargin, len, nextId, truncated);
+        if (!truncated || s_cap >= kMaxCap) {
+            len += snprintf(g_touchMapBuf + len, s_cap - len, "]}\n");
+            break;
+        }
+        const size_t nextCap = s_cap * 2;
+        char *grown = static_cast<char *>(heap_caps_realloc(g_touchMapBuf, nextCap, MALLOC_CAP_SPIRAM));
+        if (grown == nullptr) {
+            // Out of PSRAM for this: close out whatever fit at the current
+            // size rather than serve nothing.
+            len += snprintf(g_touchMapBuf + len, s_cap - len, "]}\n");
+            break;
+        }
+        g_touchMapBuf = grown;
+        s_cap = nextCap;
+    }
+    s_seq = seq;
     g_touchMapLen = static_cast<uint32_t>(len);
-    g_touchMapReq = 0;
-#endif
+    g_touchMapPending = false;
 }
 
 bool DefaultUI::snapshotObjectToBuffer(lv_obj_t *obj, uint8_t *buf, uint32_t bufSize, lv_area_t *outArea) {

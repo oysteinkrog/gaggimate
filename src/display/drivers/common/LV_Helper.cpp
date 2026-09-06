@@ -310,6 +310,7 @@ TouchLogEntry g_touchLog[TOUCHLOG_N];
 volatile uint32_t g_touchLogCount = 0;
 volatile int g_touchMapReq = 0;
 volatile bool g_touchMapLoad = false;
+volatile bool g_touchMapPending = false;
 char *g_touchMapBuf = nullptr;
 volatile uint32_t g_touchMapLen = 0;
 volatile int64_t g_overlayMinRefreshUs = 250000; // DefaultUI's constructor sets OVERLAY_MIN_REFRESH_US

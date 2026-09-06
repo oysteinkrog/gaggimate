@@ -162,6 +162,14 @@ class Controller {
 
 #ifdef GM_SYNTH_HANDSHAKE
     bool synthLinkUp = false;
+    // /api/debug/synth (WebUIPlugin.cpp): brew=0/1 queues a request here from
+    // the web server task; Controller::loop consumes it on its own thread
+    // (-1 once consumed), so the toggle and a synthetic brew's own start/end
+    // decision never race each other. synthBrewCycleOn/synthBrewingNow mirror
+    // the loop-local state so the GET response can read it from any task.
+    volatile int synthBrewCycleRequest = -1;
+    volatile bool synthBrewCycleOn = true;
+    volatile bool synthBrewingNow = false;
 #endif
 
   private:

@@ -3,6 +3,7 @@
 #include <SDL.h>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <display/core/TouchInject.h>
 #include <lvgl.h>
 #include <vector>
@@ -169,6 +170,37 @@ void SdlDriver::pumpAndRender() {
 }
 
 bool SdlDriver::shouldQuit() const { return s_quit; }
+
+int SdlDriver::width() { return DISP_W; }
+int SdlDriver::height() { return DISP_H; }
+
+bool SdlDriver::copyFrameRGB565(uint16_t *dst, size_t dstBytes) {
+    if (dst == nullptr || dstBytes < static_cast<size_t>(DISP_W) * DISP_H * 2) {
+        return false;
+    }
+    // Same three draws as screenshot(): the mask keeps the corners at the
+    // bezel colour so a /api/debug/fb reader sees the same round panel the
+    // window shows, not the underlying square texture's corners.
+    SDL_SetRenderDrawColor(s_renderer, BEZEL_R, BEZEL_G, BEZEL_B, 0xFF);
+    SDL_RenderClear(s_renderer);
+    SDL_RenderCopy(s_renderer, s_texture, nullptr, nullptr);
+    SDL_RenderCopy(s_renderer, s_mask, nullptr, nullptr);
+    SDL_Surface *surface = SDL_CreateRGBSurfaceWithFormat(0, DISP_W, DISP_H, 16, SDL_PIXELFORMAT_RGB565);
+    if (surface == nullptr) {
+        return false;
+    }
+    SDL_RenderReadPixels(s_renderer, nullptr, SDL_PIXELFORMAT_RGB565, surface->pixels, surface->pitch);
+    // surface->pitch can exceed DISP_W*2 (row alignment padding some
+    // backends add), so copy row by row rather than a single memcpy of the
+    // whole surface.
+    for (int y = 0; y < DISP_H; y++) {
+        memcpy(reinterpret_cast<uint8_t *>(dst) + static_cast<size_t>(y) * DISP_W * 2,
+               static_cast<const uint8_t *>(surface->pixels) + static_cast<size_t>(y) * surface->pitch, DISP_W * 2);
+    }
+    SDL_FreeSurface(surface);
+    SDL_RenderPresent(s_renderer); // restore the on-screen frame, same as screenshot() does
+    return true;
+}
 
 void SdlDriver::injectPointer(int x, int y, bool pressed) {
     s_mouseX = x;

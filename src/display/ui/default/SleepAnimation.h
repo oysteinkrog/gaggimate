@@ -84,6 +84,11 @@ class SleepAnimation {
     // Safe to call while running — params apply on the next frame, an id
     // change triggers the new animation's lazy init on the render task.
     void configure(uint8_t animId, const uint8_t p[4]);
+    // The id currently configured (not gated behind GM_ANIM_BENCH like
+    // benchCurrentAnim() below, so /api/debug/anim can report it in every
+    // build): the same value GET /api/settings reports as bgAnimId once the
+    // animation has actually switched to it.
+    int currentAnimId() const { return animId.load(); }
     // Frame-rate cap (clamped 5-60). Lower caps cut the animation's PSRAM
     // write bandwidth — the tuning lever against scan-out underruns when the
     // panel refresh (pclk) is raised. Applies on the next frame.

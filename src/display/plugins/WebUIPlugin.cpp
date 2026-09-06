@@ -35,6 +35,9 @@ extern uint32_t nebula_lerp_self_test(uint32_t *firstBad);
 #if !defined(GAGGIMATE_HEADLESS) && !defined(GAGGIMATE_SIM) // real LilyGo panel, not the SDL stand-in
 #include <display/drivers/LilyGoDriver.h>
 #endif
+#ifdef GAGGIMATE_SIM
+#include <SdlDriver.h> // /api/debug/fb's sim frame source
+#endif
 #include <display/core/TouchInject.h> // /api/debug/tap
 #include <display/drivers/common/LV_Helper.h> // g_overlayStats / g_overlayMinRefreshUs for /api/debug/anim
 #include <display/ui/default/eez/screens.h>  // objects, for /api/debug/touchlog
@@ -691,7 +694,7 @@ void WebUIPlugin::setupServer() {
                  "{\"int_free\":%u,\"int_largest\":%u,\"int_min\":%u,\"psram_free\":%u,\"psram_largest\":%u,"
                  "\"anim_sram\":%u,\"anim_psram\":%u,\"hot_used\":%u,\"hot_shared\":%u,\"hot_peak\":%u,\"hot_fail\":%u,\"hot_slab\":%u,"
                  "\"sc_frames\":%u,\"sc_refills\":%u,\"sc_slips\":%u,"
-                 "\"dma_free\":%u,\"dma_min\":%u,\"asset_streams\":%u,\"asset_queue\":%u}",
+                 "\"dma_free\":%u,\"dma_min\":%u,\"asset_streams\":%u,\"asset_queue\":%u,\"uptime_ms\":%lu}",
                  // heap_caps_get_largest_free_block walks every block in the heap,
                  // which costs about 1.3 ms across both regions and starves the
                  // RGB panel's bounce refill for the duration -- one displaced
@@ -710,7 +713,7 @@ void WebUIPlugin::setupServer() {
                  static_cast<unsigned>(scFrames), static_cast<unsigned>(scRefills), static_cast<unsigned>(scSlips),
                  static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_DMA)),
                  static_cast<unsigned>(heap_caps_get_minimum_free_size(MALLOC_CAP_DMA)), static_cast<unsigned>(assetStreams),
-                 static_cast<unsigned>(assetQueue.size()));
+                 static_cast<unsigned>(assetQueue.size()), static_cast<unsigned long>(millis()));
         request->send(200, "application/json", buf);
     });
     // Which slips happened, and how long before each one the suspects last ran.
@@ -1663,6 +1666,13 @@ void WebUIPlugin::setupServer() {
         doc["c1load"] = s_c1LoadTask != nullptr;
         doc["c1load_iters"] = s_c1LoadIters;
 #endif
+        // Which animation is configured (SleepAnimation::currentAnimId(),
+        // not the GM_ANIM_BENCH-only benchCurrentAnim() below: this route
+        // exists in every build, not just the bench one) and millis(), so a
+        // touchmap dump and this poll can be lined up without a separate
+        // round trip to some other endpoint.
+        doc["anim_id"] = a->currentAnimId();
+        doc["uptime_ms"] = millis();
         serializeJson(doc, *response);
         request->send(response);
     });
@@ -1778,31 +1788,6 @@ void WebUIPlugin::setupServer() {
                  static_cast<unsigned>(80000000UL / (panelclock::currentDiv() > 0 ? panelclock::currentDiv() : 1)),
                  static_cast<unsigned>(frames), static_cast<unsigned>(refills), static_cast<unsigned>(slips));
         request->send(200, "application/json", buf);
-    });
-
-    // /api/debug/touchmap[?screen=N[&load=1]]: with screen=, asks the UI
-    // task to dump that screen's object tree (LV_Helper.h, g_touchMapReq);
-    // with load=1 it switches to the screen first. Without arguments, returns
-    // the last dump, or {"pending":true} while the UI task has not written
-    // it yet. tools/touchmap.py drives it and draws the hit rectangles.
-    server.on("/api/debug/touchmap", [](AsyncWebServerRequest *request) {
-        if (request->hasArg("screen")) {
-            const int id = request->arg("screen").toInt();
-            if (id < 1 || id > 11) {
-                request->send(400, "application/json", "{\"error\":\"screen 1..11\"}");
-                return;
-            }
-            g_touchMapLen = 0;
-            g_touchMapLoad = request->hasArg("load") && request->arg("load").toInt() != 0;
-            g_touchMapReq = id;
-            request->send(200, "application/json", "{\"queued\":true}");
-            return;
-        }
-        if (g_touchMapReq != 0 || g_touchMapLen == 0 || g_touchMapBuf == nullptr) {
-            request->send(200, "application/json", "{\"pending\":true}");
-            return;
-        }
-        request->send(200, "application/json", g_touchMapBuf);
     });
 
     // /api/debug/touchlog: the last touch edges (LV_Helper.h, g_touchLog),
@@ -1931,6 +1916,95 @@ void WebUIPlugin::setupServer() {
     });
 #endif // !GAGGIMATE_HEADLESS && !GAGGIMATE_SIM
 
+#ifdef GAGGIMATE_SIM
+    // /api/debug/fb?step=1..8: the simulator's equivalent of the device
+    // branch above, same query semantics and X-FB-Size header. The device
+    // reads a real panel framebuffer directly; the simulator has none, so
+    // SdlDriver::copyFrameRGB565 renders the accumulated SDL texture (what
+    // pumpAndRender() would show onscreen) into a full-frame RGB565 snapshot
+    // and this subsamples and streams it the same way. n= is accepted only
+    // as 0 (there is one "framebuffer") so a script written against the
+    // device branch needs no venue-specific code.
+    server.on("/api/debug/fb", [](AsyncWebServerRequest *request) {
+        if (request->hasArg("n") && request->arg("n").toInt() != 0) {
+            request->send(400, "application/json", "{\"error\":\"bad buffer index\"}");
+            return;
+        }
+        SdlDriver *drv = SdlDriver::getInstance();
+        const int w = drv->width();
+        const int h = drv->height();
+        auto *frame = new std::vector<uint16_t>(static_cast<size_t>(w) * static_cast<size_t>(h));
+        if (!drv->copyFrameRGB565(frame->data(), frame->size() * sizeof(uint16_t))) {
+            delete frame;
+            request->send(503, "application/json", "{\"error\":\"no frame\"}");
+            return;
+        }
+        int step = request->hasArg("step") ? request->arg("step").toInt() : 1;
+        if (step < 1 || step > 8)
+            step = 1;
+        const int ow = w / step;
+        const int oh = h / step;
+        // Chunked, mirroring the device branch: the callback fills whole
+        // output rows only, so a partial pixel never has to carry across
+        // chunks. frame (and state) are freed once the last chunk is drained.
+        auto *state = new int(0);
+        AsyncWebServerResponse *response = request->beginChunkedResponse(
+            "application/octet-stream", [frame, w, step, ow, oh, state](uint8_t *out, size_t maxLen, size_t) -> size_t {
+                const size_t rowBytes = static_cast<size_t>(ow) * 2;
+                size_t written = 0;
+                while (*state < oh && written + rowBytes <= maxLen) {
+                    const uint16_t *src = frame->data() + static_cast<size_t>(*state) * step * w;
+                    uint16_t *dst = reinterpret_cast<uint16_t *>(out + written);
+                    for (int x = 0; x < ow; x++)
+                        dst[x] = src[x * step];
+                    written += rowBytes;
+                    (*state)++;
+                }
+                if (written == 0) {
+                    delete state;
+                    delete frame;
+                }
+                return written;
+            });
+        char disposition[64];
+        snprintf(disposition, sizeof(disposition), "%dx%d", ow, oh);
+        response->addHeader("X-FB-Size", disposition);
+        request->send(response);
+    });
+#endif // GAGGIMATE_SIM
+
+#ifndef GAGGIMATE_HEADLESS
+    // /api/debug/touchmap[?screen=N[&load=1]]: with screen=, asks the UI
+    // task to dump that screen's object tree (LV_Helper.h, g_touchMapReq).
+    // screen=0 dumps the active screen (lv_scr_act()) without loading
+    // anything, so load= is ignored there. Without arguments, returns the
+    // last dump, or {"pending":true} while the UI task has not written it
+    // yet: g_touchMapPending tracks that separately from g_touchMapReq now
+    // that 0 is a real request rather than "nothing queued". Registered
+    // outside the real-panel-only block above (like /api/debug/tap): the
+    // simulator's UI task services this too (DefaultUI::serviceTouchMap).
+    server.on("/api/debug/touchmap", [](AsyncWebServerRequest *request) {
+        if (request->hasArg("screen")) {
+            const int id = request->arg("screen").toInt();
+            if (id < 0 || id > 11) {
+                request->send(400, "application/json", "{\"error\":\"screen 0..11\"}");
+                return;
+            }
+            g_touchMapLen = 0;
+            g_touchMapLoad = id != 0 && request->hasArg("load") && request->arg("load").toInt() != 0;
+            g_touchMapReq = id;
+            g_touchMapPending = true;
+            request->send(200, "application/json", "{\"queued\":true}");
+            return;
+        }
+        if (g_touchMapPending || g_touchMapLen == 0 || g_touchMapBuf == nullptr) {
+            request->send(200, "application/json", "{\"pending\":true}");
+            return;
+        }
+        request->send(200, "application/json", g_touchMapBuf);
+    });
+#endif // !GAGGIMATE_HEADLESS
+
 #if GM_TOUCH_INJECT
     // /api/debug/tap?x=<0..479>&y=<0..479>[&ms=<hold, default 80>]: queues one
     // synthetic tap (TouchInject.h). touchpad_read (LV_Helper.cpp) and, on the
@@ -1975,6 +2049,27 @@ void WebUIPlugin::setupServer() {
         snprintf(buf, sizeof(buf), "{\"active\":%s,\"remaining_ms\":%u,\"pressed_at_ms\":%u,\"released_at_ms\":%u}",
                  active ? "true" : "false", static_cast<unsigned>(remainingMs), static_cast<unsigned>(pressedAtMs),
                  static_cast<unsigned>(releasedAtMs));
+        request->send(200, "application/json", buf);
+    });
+#endif
+
+#ifdef GM_SYNTH_HANDSHAKE
+    // /api/debug/synth[?brew=0|1]: quiets or restores the load rig's
+    // synthetic brew lifecycle (Controller.cpp, GM_SYNTH_HANDSHAKE), so a rig
+    // soak can sit on the menu or settings screens instead of being dragged
+    // back to the status screen every 45 s or forced to the brew screen after
+    // 60 s idle. brew=0 while a synthetic brew is in progress ends it (one
+    // controller:brew:end, so ShotHistoryPlugin's recording closes) before
+    // quieting; the handshake itself and the temperature/pressure telemetry
+    // ramp keep running either way. The request is queued here and consumed
+    // by Controller::loop on its own thread, never applied from this task.
+    server.on("/api/debug/synth", [this](AsyncWebServerRequest *request) {
+        if (request->hasArg("brew")) {
+            controller->synthBrewCycleRequest = request->arg("brew").toInt() != 0 ? 1 : 0;
+        }
+        char buf[64];
+        snprintf(buf, sizeof(buf), "{\"brew_cycle\":%s,\"brewing\":%s}",
+                 controller->synthBrewCycleOn ? "true" : "false", controller->synthBrewingNow ? "true" : "false");
         request->send(200, "application/json", buf);
     });
 #endif

@@ -819,6 +819,31 @@ void Controller::loop() {
         // GM_FAKE_CONTROLLER feeds, which is visually alive but repaints almost
         // nothing.
         if (synthDone) {
+            // Declared here, not inside the cycling block below, so the
+            // /api/debug/synth request below can end an in-progress
+            // synthetic brew without waiting for the next phase comparison.
+            static bool synthBrewing = false;
+
+            // /api/debug/synth (WebUIPlugin.cpp): brew=0/1 queued from the
+            // web server task. Consumed every Controller::loop() call, not
+            // gated behind the telemetry tick below, so a quiet request lands
+            // before the next forced-mode or cycling decision can act on the
+            // old state.
+            const int synthReq = synthBrewCycleRequest;
+            if (synthReq >= 0) {
+                synthBrewCycleRequest = -1;
+                const bool enable = synthReq != 0;
+                if (enable != synthBrewCycleOn) {
+                    synthBrewCycleOn = enable;
+                    if (!enable && synthBrewing) {
+                        synthBrewing = false;
+                        synthBrewingNow = false;
+                        pluginManager->trigger("controller:brew:end");
+                    }
+                    ESP_LOGW(LOG_TAG, "GM_SYNTH_HANDSHAKE: brew cycle %s", enable ? "on" : "off");
+                }
+            }
+
             static unsigned long lastSynthTel = 0;
             const unsigned long telNow = millis();
             if (telNow - lastSynthTel >= GM_SYNTH_TELEMETRY_MS) {
@@ -837,7 +862,13 @@ void Controller::loop() {
                 // (g_touchEdgeAtUs starts at 0, so the hold first engages at
                 // ~60 s uptime) sits inside the >=90 s churn window rig
                 // analysis already discards.
-                if (getMode() != MODE_BREW && esp_timer_get_time() - g_touchEdgeAtUs >= 60LL * 1000 * 1000) {
+                //
+                // synthBrewCycleOn gates this along with the cycling below:
+                // /api/debug/synth?brew=0 quiets both so a rig soak can sit on
+                // the menu or settings screens without either dragging it
+                // away.
+                if (synthBrewCycleOn && getMode() != MODE_BREW &&
+                    esp_timer_get_time() - g_touchEdgeAtUs >= 60LL * 1000 * 1000) {
                     setMode(MODE_BREW);
                 }
                 const float cycle = fmodf(static_cast<float>(telNow) / 1000.0f, 48.0f);
@@ -865,13 +896,15 @@ void Controller::loop() {
                 // lands every ~42.5 s of recording, so the writes are at the
                 // production cadence rather than an amplified one: the point is
                 // to reproduce the fault, not to manufacture a worse one.
-                static bool synthBrewing = false;
-                const unsigned long phase = (telNow / 1000UL) % 45UL;
-                const bool wantBrew = phase < 30UL;
-                if (wantBrew != synthBrewing) {
-                    synthBrewing = wantBrew;
-                    pluginManager->trigger(wantBrew ? "controller:brew:start" : "controller:brew:end");
-                    ESP_LOGW(LOG_TAG, "GM_SYNTH_HANDSHAKE: synthetic brew %s", wantBrew ? "start" : "end");
+                if (synthBrewCycleOn) {
+                    const unsigned long phase = (telNow / 1000UL) % 45UL;
+                    const bool wantBrew = phase < 30UL;
+                    if (wantBrew != synthBrewing) {
+                        synthBrewing = wantBrew;
+                        synthBrewingNow = wantBrew;
+                        pluginManager->trigger(wantBrew ? "controller:brew:start" : "controller:brew:end");
+                        ESP_LOGW(LOG_TAG, "GM_SYNTH_HANDSHAKE: synthetic brew %s", wantBrew ? "start" : "end");
+                    }
                 }
 
                 // Scan-out counters on the serial log, because HTTP is the

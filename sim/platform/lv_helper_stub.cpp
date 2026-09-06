@@ -6,11 +6,12 @@
 // translation unit. Initial values match LV_Helper.cpp's so a reader
 // comparing sim and device boot state sees the same numbers.
 //
-// The sim has no touch driver yet (TouchInject lands in a later bead) and
-// never calls DefaultUI::serviceTouchMap or serviceUiAnimTest (both guarded
-// out under GAGGIMATE_SIM), so g_touchMapReq/g_touchLog and friends are read
-// by WebUIPlugin's debug routes but never serviced here; those routes report
-// "nothing pending" until a later bead wires up the sim UI task.
+// Touch injection (TouchInject.h) lives outside this stub; g_touchLog and
+// friends are read by WebUIPlugin's debug routes but nothing on the sim
+// writes touch edges into g_touchLog yet, so /api/debug/touchlog stays empty
+// there. g_touchMapReq/g_touchMapPending ARE serviced on the sim as of
+// gm-flw.15: DefaultUI::serviceTouchMap runs under GAGGIMATE_SIM too, called
+// from DefaultUI::loop every pass same as the device.
 #include <display/drivers/common/LV_Helper.h>
 
 volatile int64_t g_touchEdgeAtUs = 0;
@@ -21,5 +22,6 @@ TouchLogEntry g_touchLog[TOUCHLOG_N];
 volatile uint32_t g_touchLogCount = 0;
 volatile int g_touchMapReq = 0;
 volatile bool g_touchMapLoad = false;
+volatile bool g_touchMapPending = false;
 char *g_touchMapBuf = nullptr;
 volatile uint32_t g_touchMapLen = 0;
