@@ -119,11 +119,11 @@ void SettingsUI::teardownAll() {
                 def->commit(ctx);
             }
         }
+        if (root) {
+            lv_obj_del(root); // before the ctx, as in popPage
+        }
         if (def->destroyCtx && ctx) {
             def->destroyCtx(ctx);
-        }
-        if (root) {
-            lv_obj_del(root);
         }
     }
     restoreMenuChildren();
@@ -237,11 +237,13 @@ void SettingsUI::popPage() {
             def->commit(ctx);
         }
     }
-    if (def->destroyCtx && ctx) {
-        def->destroyCtx(ctx);
-    }
+    // The page's objects go before the ctx: row DELETE callbacks a category
+    // registered with its ctx as user data run during lv_obj_del.
     if (root) {
         lv_obj_del(root);
+    }
+    if (def->destroyCtx && ctx) {
+        def->destroyCtx(ctx);
     }
     if (pageStack.empty()) {
         buildTilePage();

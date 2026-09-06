@@ -75,6 +75,12 @@ lv_obj_t *createRowContainer(lv_obj_t *parent) {
     // overlapping them. Toggle, action, confirm and locked re-add this
     // explicitly, since for those the whole row is meant to be one target.
     lv_obj_clear_flag(row, LV_OBJ_FLAG_CLICKABLE);
+    // lv_obj's constructor also sets LV_OBJ_FLAG_PRESS_LOCK on every child
+    // object, which makes the indev keep the pressed object even when the
+    // finger leaves it; a hold could then never be cancelled by PRESS_LOST
+    // (sliding off, or the row being disabled mid-hold). Cleared here and in
+    // buildIconButton so every target here re-hit-tests on each poll.
+    lv_obj_clear_flag(row, LV_OBJ_FLAG_PRESS_LOCK);
     // A button flush against this row's own edge needs its ext click pad to
     // extend past the row's bounds: several rows fill kRowW exactly (label
     // column + gaps + two 40 px buttons), leaving no margin inside the row
@@ -148,6 +154,7 @@ lv_obj_t *buildIconButton(lv_obj_t *parent, const lv_img_dsc_t *icon, lv_color_t
     lv_obj_set_style_img_recolor(img, fg, LV_PART_MAIN);
     lv_obj_set_style_img_recolor_opa(img, LV_OPA_COVER, LV_PART_MAIN);
     lv_obj_add_flag(img, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_EVENT_BUBBLE);
+    lv_obj_clear_flag(img, LV_OBJ_FLAG_PRESS_LOCK); // see createRowContainer
     lv_obj_set_ext_click_area(img, 8);
     return img;
 }
@@ -253,10 +260,10 @@ void settingsRowSetEnabled(lv_obj_t *row, bool enabled) {
     applyEnabledRecurse(row, enabled);
     // No separate hold-cancellation step: lv_obj_hit_test refuses a
     // LV_STATE_DISABLED object, and indev_proc_press re-searches for a hit
-    // on every poll (it is not "sticky" to the previously-pressed object
-    // unless that object sets LV_OBJ_FLAG_PRESS_LOCK, which nothing here
-    // does), so disabling mid-hold sends the held button a PRESS_LOST on
-    // the very next poll, same as if the finger had slid off it. Every hold
+    // on every poll for objects without LV_OBJ_FLAG_PRESS_LOCK (the LVGL
+    // default is on; createRowContainer and buildIconButton clear it), so
+    // disabling mid-hold sends the held button a PRESS_LOST on the very
+    // next poll, same as if the finger had slid off it. Every hold
     // handler in this file resets its own progress on PRESS_LOST, so
     // re-enabling afterwards starts clean: nothing here can wake up
     // mid-progress.
@@ -674,11 +681,20 @@ void lockedRowEvent(lv_event_t *e) {
 // both the chevron's zone and the panel's edge circle with room to spare
 // (see settingsRowLockedCreate).
 void lockedBtnEvent(lv_event_t *e) {
+    // Registered for LV_EVENT_ALL, so this also runs for lockBtn's own
+    // LV_EVENT_DELETE, which LVGL delivers after the row's DELETE handler
+    // has already freed ctx (a parent's DELETE precedes its children's):
+    // the event code is checked before ctx is touched.
+    const lv_event_code_t code = lv_event_get_code(e);
+    if (code != LV_EVENT_PRESSED && code != LV_EVENT_LONG_PRESSED_REPEAT && code != LV_EVENT_RELEASED &&
+        code != LV_EVENT_PRESS_LOST) {
+        return;
+    }
     auto *ctx = static_cast<LockedCtx *>(lv_event_get_user_data(e));
     if (!ctx->locked) {
         return; // lockBtn is hidden while unlocked; stay defensive anyway
     }
-    switch (lv_event_get_code(e)) {
+    switch (code) {
     case LV_EVENT_PRESSED:
         ctx->pressedAtMs = lv_tick_get();
         applyPressDim(ctx->pd, true);
