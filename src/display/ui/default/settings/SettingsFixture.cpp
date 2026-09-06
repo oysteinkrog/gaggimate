@@ -205,8 +205,18 @@ void fixtureBuildRow(void *ctx, int index, lv_obj_t *parent, SettingsUI &ui) {
         break;
     }
     default: { // rows 8..11 (index 7..10): plain info, no state
-        char rowName[16];
-        snprintf(rowName, sizeof(rowName), "info%d", index + 1);
+        // SettingsUI::tag stores the row-name pointer, never a copy (see
+        // its header comment in SettingsUI.h), so it must outlive the row,
+        // not just this call: a stack buffer here left every one of these
+        // four rows' debug tag pointing at whatever the stack held after
+        // fixtureBuildRow returned (found via the touchmap route returning
+        // a "row" field of a few raw, non-UTF8 bytes for these rows). One
+        // static slot per possible index keeps each name stable for the
+        // process's lifetime, which comfortably outlives the row.
+        static char rowNames[4][16];
+        const int slot = (index >= 7 && index < 7 + 4) ? index - 7 : 0;
+        char *rowName = rowNames[slot];
+        snprintf(rowName, sizeof(rowNames[0]), "info%d", index + 1);
         char label[24];
         snprintf(label, sizeof(label), "Fixture row %d", index + 1);
         lv_obj_t *row = settingsRowInfoCreate(ui, parent, rowName, label);

@@ -413,6 +413,12 @@ void SettingsUI::buildCategoryPage(PageEntry &entry) {
     // cover's PRESSED handler (the standby timer's only view of settings
     // activity) never sees the arrow presses.
     lv_obj_add_flag(header, LV_OBJ_FLAG_EVENT_BUBBLE);
+    // Same clipping the row slots below need the flag for (see the loop
+    // building kRowY): the up/down arrows' 8 px ext click pad has to reach
+    // past this container's own 200 px width to make their 56x56 hit box,
+    // and with no spare margin between them and the title column there was
+    // nowhere for that pad to go (measured: both arrows audited at 48x56).
+    lv_obj_add_flag(header, LV_OBJ_FLAG_OVERFLOW_VISIBLE);
     lv_obj_set_style_bg_opa(header, LV_OPA_TRANSP, LV_PART_MAIN);
     lv_obj_set_flex_flow(header, LV_FLEX_FLOW_ROW);
     lv_obj_set_flex_align(header, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
@@ -494,6 +500,18 @@ void SettingsUI::buildCategoryPage(PageEntry &entry) {
         lv_obj_align(slot, LV_ALIGN_CENTER, 0, kRowY[i]);
         lv_obj_clear_flag(slot, LV_OBJ_FLAG_SCROLLABLE);
         lv_obj_add_flag(slot, LV_OBJ_FLAG_EVENT_BUBBLE);
+        // A row widget's rightmost control can sit flush against this
+        // slot's own edge (no spare margin, by design: label column + gaps
+        // + two 40 px controls fill kRowW exactly), so its ext click pad
+        // needs to extend past the slot's bounds for hit-testing. Without
+        // this flag the slot clips that pad a second time at the same
+        // boundary its own row container already stopped clipping at
+        // (SettingsRows.cpp's createRowContainer sets the same flag on the
+        // row itself; both ancestors need it, since lv_indev_search_obj
+        // clips at every ancestor lacking it, not just the nearest one).
+        // No row widget draws visible content past its own 320x56 bounds,
+        // so this has no visual effect for any category.
+        lv_obj_add_flag(slot, LV_OBJ_FLAG_OVERFLOW_VISIBLE);
         lv_obj_set_style_bg_opa(slot, LV_OPA_TRANSP, LV_PART_MAIN);
         tag(slot, kRowNames[i], "row");
         const int globalIndex = entry.page * kRowsPerPage + i;

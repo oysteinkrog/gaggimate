@@ -66,6 +66,23 @@ lv_obj_t *createRowContainer(lv_obj_t *parent) {
     lv_obj_remove_style_all(row);
     lv_obj_set_size(row, SettingsUI::kRowW, SettingsUI::kRowH);
     lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+    // lv_obj_create defaults to clickable (obj->flags = LV_OBJ_FLAG_CLICKABLE
+    // at construction, lv_obj.c's object constructor). Every row here gets
+    // an LV_EVENT_DELETE callback to free its ctx, which is enough for the
+    // touchmap audit's targets() to count a clickable object with a
+    // callback as a tap target; left on, a stepper, choice or info row
+    // would audit as a target the size of its own child buttons, always
+    // overlapping them. Toggle, action, confirm and locked re-add this
+    // explicitly, since for those the whole row is meant to be one target.
+    lv_obj_clear_flag(row, LV_OBJ_FLAG_CLICKABLE);
+    // A button flush against this row's own edge needs its ext click pad to
+    // extend past the row's bounds: several rows fill kRowW exactly (label
+    // column + gaps + two 40 px buttons), leaving no margin inside the row
+    // for the pad to grow into. Without this flag that pad is clipped to
+    // nothing on the outward side (eez/actions.cpp's applyClickArea works
+    // around the same clipping the same way, on every ancestor short of the
+    // screen).
+    lv_obj_add_flag(row, LV_OBJ_FLAG_OVERFLOW_VISIBLE);
     lv_obj_add_flag(row, LV_OBJ_FLAG_EVENT_BUBBLE);
     lv_obj_set_style_bg_opa(row, LV_OPA_TRANSP, LV_PART_MAIN);
     return row;
@@ -86,6 +103,7 @@ TextCol buildTextCol(lv_obj_t *parent, const char *labelText, lv_coord_t width) 
     lv_obj_remove_style_all(col);
     lv_obj_set_size(col, width, SettingsUI::kRowH);
     lv_obj_clear_flag(col, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_clear_flag(col, LV_OBJ_FLAG_CLICKABLE); // see createRowContainer: lv_obj_create defaults this on
     lv_obj_add_flag(col, LV_OBJ_FLAG_EVENT_BUBBLE);
     lv_obj_set_style_bg_opa(col, LV_OPA_TRANSP, LV_PART_MAIN);
     lv_obj_set_flex_flow(col, LV_FLEX_FLOW_COLUMN);
@@ -544,6 +562,7 @@ lv_obj_t *settingsRowConfirmCreate(SettingsUI &ui, lv_obj_t *parent, const char 
     // edge while textCol occupies the flow normally.
     lv_obj_t *bar = lv_obj_create(row);
     lv_obj_remove_style_all(bar);
+    lv_obj_clear_flag(bar, LV_OBJ_FLAG_CLICKABLE); // see createRowContainer: lv_obj_create defaults this on
     lv_obj_add_flag(bar, LV_OBJ_FLAG_IGNORE_LAYOUT);
     lv_obj_set_size(bar, 0, 3);
     lv_obj_align(bar, LV_ALIGN_BOTTOM_LEFT, 0, 0);
@@ -580,6 +599,7 @@ struct LockedCtx {
     lv_obj_t *row = nullptr;
     lv_obj_t *minusBtn = nullptr;
     lv_obj_t *plusBtn = nullptr;
+    lv_obj_t *lockBtn = nullptr;
     lv_obj_t *progressBar = nullptr;
     RepeatBtn minus;
     RepeatBtn plus;
@@ -605,38 +625,52 @@ void lockedApplyVisual(LockedCtx *ctx) {
     if (ctx->locked) {
         lv_obj_add_flag(ctx->minusBtn, LV_OBJ_FLAG_HIDDEN);
         lv_obj_add_flag(ctx->plusBtn, LV_OBJ_FLAG_HIDDEN);
-        lv_obj_add_flag(ctx->row, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_clear_flag(ctx->lockBtn, LV_OBJ_FLAG_HIDDEN);
         snprintf(ctx->value, sizeof(ctx->value), "%s", LV_SYMBOL_EYE_CLOSE " Hold to unlock");
         lv_label_set_text(ctx->valueLabel, ctx->value);
     } else {
         lv_obj_clear_flag(ctx->minusBtn, LV_OBJ_FLAG_HIDDEN);
         lv_obj_clear_flag(ctx->plusBtn, LV_OBJ_FLAG_HIDDEN);
-        // Cleared, not just left alone: once revealed, the buttons are
-        // children positioned inside this row's own 320x56 bounds, and a
-        // touchmap audit treats any two overlapping clickable targets as a
-        // violation regardless of role. The row has done its job (either
-        // the unlock gesture, or nothing, since it is inert once unlocked)
-        // and settingsRowSetLocked(row, true) restores it.
-        lv_obj_clear_flag(ctx->row, LV_OBJ_FLAG_CLICKABLE);
+        // Hidden, not just left alone: a hidden object is skipped by
+        // hit-testing entirely, which is what stops the very press that
+        // just unlocked this row from also landing on lockBtn on the next
+        // poll (see the RELEASED case below), and once the buttons are
+        // revealed they sit where lockBtn does, so a touchmap audit would
+        // otherwise see two overlapping clickable targets stacked up.
+        lv_obj_add_flag(ctx->lockBtn, LV_OBJ_FLAG_HIDDEN);
     }
     lv_obj_set_width(ctx->progressBar, 0);
 }
 
-void lockedEvent(lv_event_t *e) {
+// The custom set-locked event and the delete cleanup live on the row
+// itself: settingsRowSetLocked(row, ...) only ever has the row pointer, and
+// ctx's lifetime matches the row's, not lockBtn's (a child, torn down
+// before the row during a delete cascade).
+void lockedRowEvent(lv_event_t *e) {
     auto *ctx = static_cast<LockedCtx *>(lv_event_get_user_data(e));
-    const lv_event_code_t code = lv_event_get_code(e);
-    if (code == lockedSetEventCode()) {
-        const bool want = *static_cast<const bool *>(lv_event_get_param(e));
-        if (want != ctx->locked) {
-            ctx->locked = want;
-            lockedApplyVisual(ctx);
-        }
-        return;
+    const bool want = *static_cast<const bool *>(lv_event_get_param(e));
+    if (want != ctx->locked) {
+        ctx->locked = want;
+        lockedApplyVisual(ctx);
     }
+}
+
+// The hold-to-unlock gesture: registered on lockBtn, not the row. The
+// row's own hit rect is the full 320x56 slot, and that overlaps the exit
+// chevron's clipped hit box whenever this row lands in a page's last slot
+// (measured: row4's own bounds reach 9-10 px into the chevron's ext-padded
+// reach, independent of what is drawn inside row4; the shell's per-page
+// row positions leave no spare margin against either the header above or
+// the chevron below, only enough for content that does not span the row's
+// full height). lockBtn sits inset from the row's right edge, clear of
+// both the chevron's zone and the panel's edge circle with room to spare
+// (see settingsRowLockedCreate).
+void lockedBtnEvent(lv_event_t *e) {
+    auto *ctx = static_cast<LockedCtx *>(lv_event_get_user_data(e));
     if (!ctx->locked) {
-        return; // unlocked: the row itself is not clickable, so these should not fire, but stay defensive
+        return; // lockBtn is hidden while unlocked; stay defensive anyway
     }
-    switch (code) {
+    switch (lv_event_get_code(e)) {
     case LV_EVENT_PRESSED:
         ctx->pressedAtMs = lv_tick_get();
         applyPressDim(ctx->pd, true);
@@ -651,10 +685,10 @@ void lockedEvent(lv_event_t *e) {
         if (elapsed >= kSettingsRowUnlockHoldMs) {
             // Revealing the buttons only now, at release, is what stops the
             // very press that crossed the threshold from landing on one of
-            // them: while locked this row (not the buttons, which stay
-            // hidden the whole press) is the only clickable object here, so
-            // LVGL's indev keeps re-targeting it every poll for the rest of
-            // this press regardless of when the threshold is crossed.
+            // them: while locked, lockBtn (not the buttons, which stay
+            // hidden the whole press) is the only clickable object here,
+            // so LVGL's indev keeps re-targeting it every poll for the
+            // rest of this press regardless of when the threshold crossed.
             ctx->locked = false;
             lockedApplyVisual(ctx);
             if (ctx->onUnlocked != nullptr) {
@@ -708,8 +742,26 @@ lv_obj_t *settingsRowLockedCreate(SettingsUI &ui, lv_obj_t *parent, const char *
     ui.tag(plusBtn, rowName, "plus");
     ctx->plusBtn = plusBtn;
 
+    // Outside the row's flex flow (minus/plus hide while locked and locked
+    // and unlocked never show at once, so there is no layout to share) and
+    // inset from the row's right edge: at x_ofs=0 its ext-padded hit rect
+    // would reach x=407, only 0.8 px inside the panel's 228 px safety
+    // radius; -20 clears both the radius and the exit chevron's clipped
+    // hit box, with roughly 15 px and 28 px of margin respectively (see
+    // lockedBtnEvent's comment for why this needs its own hit rect at all
+    // rather than the whole row). No lock glyph exists among the shared
+    // icon set, so this reuses img_check_40x40; the primary "hold to
+    // unlock" affordance is the value text, this is a secondary, discoverable
+    // tap target sized and placed to pass the geometry audit.
+    lv_obj_t *lockBtn = buildIconButton(row, &img_check_40x40, fg);
+    lv_obj_add_flag(lockBtn, LV_OBJ_FLAG_IGNORE_LAYOUT);
+    lv_obj_align(lockBtn, LV_ALIGN_RIGHT_MID, -20, 0);
+    ui.tag(lockBtn, rowName, "unlock");
+    ctx->lockBtn = lockBtn;
+
     lv_obj_t *bar = lv_obj_create(row);
     lv_obj_remove_style_all(bar);
+    lv_obj_clear_flag(bar, LV_OBJ_FLAG_CLICKABLE); // see createRowContainer: lv_obj_create defaults this on
     lv_obj_add_flag(bar, LV_OBJ_FLAG_IGNORE_LAYOUT);
     lv_obj_set_size(bar, 0, 3);
     lv_obj_align(bar, LV_ALIGN_BOTTOM_LEFT, 0, 0);
@@ -717,12 +769,13 @@ lv_obj_t *settingsRowLockedCreate(SettingsUI &ui, lv_obj_t *parent, const char *
     lv_obj_set_style_bg_opa(bar, LV_OPA_COVER, LV_PART_MAIN);
     ctx->progressBar = bar;
 
-    lv_obj_add_event_cb(row, lockedEvent, LV_EVENT_ALL, ctx);
+    lv_obj_add_event_cb(row, lockedRowEvent, lockedSetEventCode(), ctx);
     lv_obj_add_event_cb(
         row, [](lv_event_t *e) { delete static_cast<LockedCtx *>(lv_event_get_user_data(e)); }, LV_EVENT_DELETE, ctx);
-    ui.tag(row, rowName, "unlock");
+    lv_obj_add_event_cb(lockBtn, lockedBtnEvent, LV_EVENT_ALL, ctx);
+    ui.tag(row, rowName, "row");
 
-    lockedApplyVisual(ctx); // starts locked: hides the buttons, shows "hold to unlock"
+    lockedApplyVisual(ctx); // starts locked: hides the buttons, shows lockBtn and "hold to unlock"
     return row;
 }
 
