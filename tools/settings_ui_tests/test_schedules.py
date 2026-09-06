@@ -208,8 +208,15 @@ def check_row_and_list_match_wire(rig, s0):
     st = rig.settingsui_state()
     check(rig, "schedule_list_title", st.get("title") == "Schedules", repr(st))
 
+    # The list is one row per schedule plus "Add schedule", five rows to a
+    # page, so a one-entry list is a single page; asking goto_page for a
+    # page the shell does not have never publishes that page number and
+    # times out.
+    want_pages = (len(wire) + 1 + 4) // 5
+    check(rig, "list_page_count", st.get("pages") == want_pages, "got=%r want=%r" % (st.get("pages"), want_pages))
+
     seen = {}
-    for page in range(0, (len(wire) + 5) // 5 + 1):
+    for page in range(want_pages):
         d = goto_page(rig, page)
         a = rig.audit(d)
         check(rig, "list_page%d_audit_clean" % page, not a["violations"], repr(a["violations"]))
@@ -240,7 +247,7 @@ def check_hour_minute_wrap(rig, s0):
     if list_dump is None:
         check(rig, "wrap_list_opens", False, "")
         return
-    page = n // 5  # "Add schedule" is row n (0-based index n-1), same page math as a schedule row
+    page = (n - 1) // 5  # "Add schedule" is the list's last row, 0-based index n-1
     dump = goto_page(rig, page) if page != 0 else list_dump
     add_row = find_tag(dump, "Add schedule", "action")
     if not check(rig, "wrap_add_row_present", add_row is not None, ""):
@@ -316,7 +323,7 @@ def check_add_edit_and_pop_persists(rig, s0):
     list_dump = open_schedule_list(rig)
     if not check(rig, "add_list_opens", list_dump is not None, ""):
         return None
-    page = n // 5
+    page = (n - 1) // 5
     dump = goto_page(rig, page) if page != 0 else list_dump
     add_row = find_tag(dump, "Add schedule", "action")
     if not check(rig, "add_row_present", add_row is not None, ""):
@@ -790,7 +797,7 @@ def check_external_leave_persists(rig, s0):
     list_dump = open_schedule_list(rig)
     if not check(rig, "leave_list_opens", list_dump is not None, ""):
         return
-    page = n // 5
+    page = (n - 1) // 5
     dump = goto_page(rig, page) if page != 0 else list_dump
     add_row = find_tag(dump, "Add schedule", "action")
     if not check(rig, "leave_add_row_present", add_row is not None, ""):
