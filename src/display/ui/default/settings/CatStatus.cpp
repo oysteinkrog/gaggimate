@@ -11,6 +11,7 @@
 #include <display/core/Settings.h>
 #include <display/main.h>
 #include <display/ui/default/eez/images.h>
+#include <display/ui/default/eez/screens.h>
 
 #include <cstdio>
 #include <cstring>
@@ -109,6 +110,11 @@ void updateTime(CatStatusCtx *ctx) {
     setIfChanged(ctx->timeRow, ctx->lastTime, buf);
 }
 
+// Leaves settings the same way a standby timeout does: changeScreen only
+// queues the target, and handleScreenChange commits and tears the cover down
+// on the next UI pass before the info screen loads.
+void deviceInfoOnActivate(void * /*user*/) { controller.getUI()->changeScreen(SCREEN_ID_INFO_SCREEN); }
+
 void restartOnConfirm(void *user) {
     auto *ctx = static_cast<CatStatusCtx *>(user);
     Settings &settings = controller.getSettings();
@@ -127,7 +133,7 @@ void restartOnConfirm(void *user) {
     }
 }
 
-int statusRowCount(void * /*ctx*/) { return 8; }
+int statusRowCount(void * /*ctx*/) { return 9; }
 
 void statusBuildRow(void *ctx0, int index, lv_obj_t *parent, SettingsUI &ui) {
     auto *ctx = static_cast<CatStatusCtx *>(ctx0);
@@ -203,6 +209,12 @@ void statusBuildRow(void *ctx0, int index, lv_obj_t *parent, SettingsUI &ui) {
         break;
     }
     case 7: {
+        // The only place that shows the WiFi setup QR code while the config
+        // access point is active, since the menu's info button went (gm-z7x).
+        settingsRowActionCreate(ui, parent, "Device info", "Device info", deviceInfoOnActivate, nullptr);
+        break;
+    }
+    case 8: {
         lv_obj_t *row = settingsRowConfirmCreate(ui, parent, "Restart", "Restart", restartOnConfirm, ctx);
         ctx->restartRow = row;
         lv_obj_add_event_cb(

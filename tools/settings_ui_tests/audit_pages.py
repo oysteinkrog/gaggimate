@@ -84,7 +84,7 @@ CATEGORY_PAGES = [
              ["Startup mode", "Standby timeout", "Auto wake-up", "Schedules"], "machine"),
     PageSpec("status-p0", CAT_STATUS, 0,
              ["Display firmware", "Controller firmware", "Network", "IP address", "Controller"], "status"),
-    PageSpec("status-p1", CAT_STATUS, 1, ["Scale", "Time", "Restart"], "status"),
+    PageSpec("status-p1", CAT_STATUS, 1, ["Scale", "Time", "Device info", "Restart"], "status"),
     PageSpec("fixture-p0", CAT_FIXTURE, 0, ["stepper", "choice", "toggle", "action", "locked"], None),
     PageSpec("fixture-p1", CAT_FIXTURE, 1, ["confirm", "uptime", "info8", "info9", "info10"], None),
     PageSpec("fixture-p2", CAT_FIXTURE, 2, ["info11"], None),

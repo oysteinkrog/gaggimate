@@ -173,6 +173,7 @@ def check_page1_rows(rig):
     d1 = open_to_status_page(rig, page=1)
     check(rig, "page1_row_present_Scale", rig.find_tag(d1, "Scale", "row") is not None)
     check(rig, "page1_row_present_Time", rig.find_tag(d1, "Time", "row") is not None)
+    check(rig, "page1_row_present_Device_info", rig.find_tag(d1, "Device info", "action") is not None)
     check(rig, "page1_row_present_Restart", rig.find_tag(d1, "Restart", "confirm") is not None)
 
     scale = rig.row_value(d1, "Scale")
@@ -237,6 +238,32 @@ def check_time_progression(rig, venue):
         check(rig, "time_matches_host_clock", diff <= 360, "device=%r host_seconds=%r diff_mod_hour=%r" % (t_a, py_seconds, diff))
     else:
         check(rig, "time_matches_host_clock", diff <= 2, "sim=%r host_seconds=%r diff=%r" % (t_a, py_seconds, diff))
+
+
+INFO_SCREEN_ID = 10
+
+
+def check_device_info_row(rig):
+    """Tapping Device info leaves settings and shows the info screen (the
+    menu's own info button is gone, so this row is the only way to the WiFi
+    setup QR code). The debug open brings the menu and the shell back."""
+    d1 = open_to_status_page(rig, page=1)
+    target = rig.find_tag(d1, "Device info", "action")
+    check(rig, "device_info_row_found", target is not None)
+    if target is None:
+        return
+    rig.tap_target(target, ms=80)
+    try:
+        rig.wait_until(lambda: rig.touchmap(screen=0).get("screen_id") == INFO_SCREEN_ID or None, timeout=6)
+    except TimeoutError:
+        pass
+    d_after = rig.touchmap(screen=0)
+    check(rig, "device_info_opens_info_screen", d_after.get("screen_id") == INFO_SCREEN_ID,
+          "screen_id=%r" % d_after.get("screen_id"))
+    check(rig, "device_info_closes_settings", rig.settingsui_state().get("open") is False, repr(rig.settingsui_state()))
+    # Back to where the caller's page-1 dump was taken, so the checks that
+    # follow find the same rows on screen.
+    open_to_status_page(rig, page=1)
 
 
 def check_short_hold_noop(rig, d1):
@@ -385,6 +412,7 @@ def _sequence(rig, venue):
     d1 = check_page1_rows(rig)
     check_audit(rig, d0, d1)
     check_time_progression(rig, venue)
+    check_device_info_row(rig)
     if not venue.can_restart:
         rig.log(
             "skipped",

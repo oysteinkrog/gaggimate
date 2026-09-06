@@ -1480,21 +1480,24 @@ void DefaultUI::setupState() {
                           &wifiConnected, &apActive);
     effect_mgr.use_effect([this]() { return currentScreen == SCREEN_ID_MENU_SCREEN_NEW; },
                           [this]() {
-                              const bool fiveTiles = grindAvailable || scaleMenuSwap;
-                              // Five 150x150 hit boxes (the eez-generated 120 px tile plus
-                              // its 15 px click pad) cannot sit on one circle without
-                              // overlapping each other or info_btn/standby_btn; a 74 px
-                              // tile (104x104 hit box, above the 100 px floor) does, at its
-                              // own radius and rotation per count, with the settings tile
-                              // in the slot nearest bottom-left and every pairwise gap
-                              // checked at 10+ px against tools/settings_ui_tests/rig.py's
-                              // audit() model (info_btn's own gap is the tightest at 9-10 px;
-                              // nothing here is a bare pass). One tile size serves both
-                              // layouts, so an in-flight grind/scale toggle never changes
-                              // the tiles' size, only their positions.
+                              const bool fourTiles = grindAvailable || scaleMenuSwap;
+                              // The settings tile sits at the centre (decided 2026-09-06,
+                              // bead gm-z7x); the info button and the mode word that used
+                              // to live there are hidden, and the info screen is reached
+                              // from the Status category ("Device info"). The ring keeps
+                              // the five-tile geometry that was verified against
+                              // tools/settings_ui_tests/rig.py's audit() model (74 px
+                              // tiles, 104x104 hit boxes, radius 121, 72 degree slots), so
+                              // every pairwise gap on the ring is unchanged; the slots are
+                              // simply the four (or three) nearest the top, which keeps the
+                              // bottom clear for standby_btn. The centre tile gives up
+                              // its 15 px click pad (a 74 px target, above the 56 px
+                              // floor): with the pad its 104 px box overlapped the 144
+                              // degree slot's box by 33x7 px, since the audit works in
+                              // axis-aligned rectangles, not radial gaps. Without it the
+                              // closest box on the ring is 9 px away.
                               constexpr int kTileSize = 74;
-                              constexpr int kRadiusFive = 121;
-                              constexpr int kRadiusFour = 99;
+                              constexpr int kRadius = 121;
                               lv_obj_t *tiles[] = {objects.btn_brew_1, objects.btn_steam_1, objects.btn_water_1,
                                                    objects.btn_grind_1, objects.btn_settings_1};
                               for (lv_obj_t *tile : tiles) {
@@ -1502,22 +1505,25 @@ void DefaultUI::setupState() {
                                       lv_obj_set_size(tile, kTileSize, kTileSize);
                                   }
                               }
-                              // info_btn used to sit at (0, 30); centring it is the only
-                              // spot both rings leave clear at every rotation they use.
                               if (objects.info_btn != nullptr) {
-                                  lv_obj_set_pos(objects.info_btn, 0, 0);
+                                  lv_obj_add_flag(objects.info_btn, LV_OBJ_FLAG_HIDDEN);
                               }
-                              if (fiveTiles) {
-                                  positionMenuIcon(objects.btn_brew_1, 288, kRadiusFive);
-                                  positionMenuIcon(objects.btn_steam_1, 0, kRadiusFive);
-                                  positionMenuIcon(objects.btn_water_1, 72, kRadiusFive);
-                                  positionMenuIcon(objects.btn_grind_1, 144, kRadiusFive);
-                                  positionMenuIcon(objects.btn_settings_1, 216, kRadiusFive);
+                              if (objects.obj13 != nullptr) { // the BREW/STEAM/WATER word
+                                  lv_obj_add_flag(objects.obj13, LV_OBJ_FLAG_HIDDEN);
+                              }
+                              if (objects.btn_settings_1 != nullptr) {
+                                  lv_obj_set_pos(objects.btn_settings_1, 0, 0);
+                                  lv_obj_set_ext_click_area(objects.btn_settings_1, 0);
+                              }
+                              if (fourTiles) {
+                                  positionMenuIcon(objects.btn_brew_1, 288, kRadius);
+                                  positionMenuIcon(objects.btn_steam_1, 0, kRadius);
+                                  positionMenuIcon(objects.btn_water_1, 72, kRadius);
+                                  positionMenuIcon(objects.btn_grind_1, 144, kRadius);
                               } else {
-                                  positionMenuIcon(objects.btn_brew_1, 280, kRadiusFour);
-                                  positionMenuIcon(objects.btn_steam_1, 10, kRadiusFour);
-                                  positionMenuIcon(objects.btn_water_1, 100, kRadiusFour);
-                                  positionMenuIcon(objects.btn_settings_1, 190, kRadiusFour);
+                                  positionMenuIcon(objects.btn_brew_1, 288, kRadius);
+                                  positionMenuIcon(objects.btn_steam_1, 0, kRadius);
+                                  positionMenuIcon(objects.btn_water_1, 72, kRadius);
                               }
                               // Grind slot doubles as the Scale button.
                               if (objects.btn_grind_1 != nullptr) {
