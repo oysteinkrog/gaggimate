@@ -207,6 +207,18 @@ def check_restart_persistence(rig, sim, data_dir):
     sim.restart()
     after = seconds(rig.settings_value("standbyTimeout"))
     check(rig, "restart_preserves_setting", after == new_s and after != before, "before=%r after=%r want=%r" % (before, after, new_s))
+    # Put the original back the same way, so the venue leaves this check as
+    # it found it (555 s is off the Machine page's one-minute grid and would
+    # otherwise trip a later scenario's start-on-grid preflight).
+    sim.stop()
+    with open(nvs_path, encoding="utf-8") as f:
+        store = json.load(f)
+    store["sbt"] = str(before * 1000)
+    with open(nvs_path, "w", encoding="utf-8") as f:
+        json.dump(store, f)
+    sim.restart()
+    restored = seconds(rig.settings_value("standbyTimeout"))
+    check(rig, "restart_check_restored_setting", restored == before, "before=%r restored=%r" % (before, restored))
 
 
 def _sequence(rig, venue):

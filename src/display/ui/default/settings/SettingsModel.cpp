@@ -244,6 +244,12 @@ std::string gradientMapWriteRef(const std::string &map, int animId, const std::s
         parts.push_back("");
     }
     parts[static_cast<size_t>(animId)] = newRef;
+    // Trailing empty slots carry no information and would turn an all-default
+    // map back into ";" (or ";;") after a ref was set and cleared again; the
+    // web UI stores the same state as "". Trim them so the two writers agree.
+    while (!parts.empty() && parts.back().empty()) {
+        parts.pop_back();
+    }
     std::string out;
     for (size_t i = 0; i < parts.size(); i++) {
         if (i != 0) {

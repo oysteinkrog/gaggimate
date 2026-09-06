@@ -183,6 +183,16 @@ static void test_gradient_map_read_write_shorter_than_n() {
     TEST_ASSERT_EQUAL_STRING("1", gradientMapReadRef(written, 0).c_str());
 }
 
+static void test_gradient_map_write_trims_trailing_empty_slots() {
+    // Clearing the only set ref returns the map to "", the web UI's own
+    // representation of an all-default map, instead of ";" or ";;".
+    TEST_ASSERT_EQUAL_STRING("1", gradientMapWriteRef("1;c3", 1, "").c_str());
+    TEST_ASSERT_EQUAL_STRING("", gradientMapWriteRef(";", 1, "").c_str());
+    TEST_ASSERT_EQUAL_STRING("", gradientMapWriteRef("", 3, "").c_str());
+    // Interior empty slots stay, since later slots depend on their position.
+    TEST_ASSERT_EQUAL_STRING("1;;c5", gradientMapWriteRef("1;c7;c5", 1, "").c_str());
+}
+
 static void test_gradient_map_write_preserves_neighbours() {
     // Entries before and after N must survive a write to N.
     const std::string map = "2;c7;;5";
@@ -432,6 +442,7 @@ int main(int argc, char **argv) {
     RUN_TEST(test_gradient_choices_real_themes);
     RUN_TEST(test_gradient_map_read_write_empty);
     RUN_TEST(test_gradient_map_read_write_shorter_than_n);
+    RUN_TEST(test_gradient_map_write_trims_trailing_empty_slots);
     RUN_TEST(test_gradient_map_write_preserves_neighbours);
 
     RUN_TEST(test_palette_on_palette_lookup);

@@ -271,6 +271,23 @@ def check_restart_persistence_and_relaunch(rig, sim):
         "before=%r bumped_to=%r after_restart=%r" % (current, expected, after),
     )
 
+    # Put the bumped field back through the same stepper, so the venue is
+    # left as this check found it.
+    rig.settingsui(open=1)
+    rig.wait_until(lambda: rig.settingsui_state().get("open") is True, timeout=8)
+    rig.settingsui(cat=DISPLAY_CATEGORY)
+    rig.wait_until(lambda: rig.settingsui_state().get("category") == DISPLAY_CATEGORY, timeout=8)
+    time.sleep(0.3)
+    d_back = rig.touchmap(screen=0)
+    back_btn = rig.find_tag(d_back, "Standby brightness", "minus" if direction == "plus" else "plus")
+    if back_btn is not None:
+        rig.tap_target(back_btn, ms=80)
+    rig.settingsui(close=1)
+    rig.wait_until(lambda: rig.settingsui_state().get("open") is False, timeout=8)
+    restored = rig.wait_until(lambda: int(rig.settings_value("standbyBrightness")) == current, timeout=6)
+    check(rig, "standby_brightness_restored_after_check", bool(restored),
+          "want=%r got=%r" % (current, rig.settings_value("standbyBrightness")))
+
 
 def check_fail_flush_scenario(program, workdir, port):
     """GM_SIM_FAIL_FLUSH=1 (read once, lazily, on Settings::flushNow()'s own

@@ -23,6 +23,7 @@ Exits 0 if every check passes, 1 otherwise. Logs each step (Rig.log) and
 prints a PASS/FAIL summary at the end.
 """
 import argparse
+import re
 import os
 import sys
 import tempfile
@@ -618,12 +619,87 @@ def run_simulator_only_checks(rig, sim):
     check_forced_external_leave(rig, sim)
 
 
+# ---- restoration ---------------------------------------------------------------
+
+
+def _row_number(text):
+    """First signed number in a row's value text ("2 C", "16.1 bar",
+    "1500 ms", "Hold to unlock" -> None)."""
+    m = re.search(r"-?\d+(?:\.\d+)?", text)
+    return float(m.group(0)) if m else None
+
+
+def _step_row_to(rig, row, target, tolerance):
+    """Drives one Temps stepper row back to `target` through its own
+    buttons: unlocks the row if it is locked, holds the right button for
+    fast steps while far away, then single-taps. Returns the final number
+    the row shows. Bounded, so a row that cannot reach the target (a value
+    off its grid) gives up after a fixed number of presses."""
+    d = enter_temps(rig)
+    unlock = rig.find_tag(d, row, "unlock")
+    if unlock is not None and not unlock.get("hidden"):
+        rig.tap_target(unlock, ms=1200)
+        d = rig.touchmap(screen=0)
+    current = _row_number(rig.row_value(d, row))
+    presses = 0
+    while current is not None and abs(current - target) > tolerance and presses < 120:
+        role = "plus" if current < target else "minus"
+        btn = rig.find_tag(d, row, role)
+        if btn is None or btn.get("hidden"):
+            break
+        far = abs(current - target) > 6 * tolerance
+        rig.tap_target(btn, ms=2600 if far else 80)
+        presses += 1
+        d = rig.touchmap(screen=0)
+        nxt = _row_number(rig.row_value(d, row))
+        if nxt == current and not far:
+            break # clamped at a limit, or the row stopped responding
+        current = nxt
+    pop_temps(rig)
+    return current
+
+
+def restore_temps(rig, s0):
+    """Puts back every field a check changed, through the UI only (the
+    grind delay was moved by the emulated web save, and comes back through
+    its stepper like the rest). Reports what it could not restore; never
+    POSTs."""
+    targets = (
+        ("Temperature offset", "temperatureOffset", int(num(s0["temperatureOffset"])), 0.5),
+        ("Pressure sensor", "pressureScaling", round(num(s0["pressureScaling"]), 1), 0.05),
+        ("Brew delay", "brewDelay", int(s0["brewDelay"]), 25),
+        ("Grind delay", "grindDelay", int(s0["grindDelay"]), 25),
+    )
+    ensure_open(rig)
+    for row, key, target, tol in targets:
+        shown = _step_row_to(rig, row, target, tol)
+
+        def restored(key=key, target=target, tol=tol):
+            return abs(num(rig.settings()[key]) - target) <= tol
+
+        ok = False
+        try:
+            ok = rig.wait_until(restored, timeout=6)
+        except TimeoutError:
+            pass
+        rig.log("restore", key=key, target=target, shown=shown, ok=int(bool(ok)))
+        check(rig, "temps_restored_%s" % key, bool(ok), "want %r got %r" % (target, rig.settings()[key]))
+    if s0["delayAdjust"] != rig.settings()["delayAdjust"]:
+        d = enter_temps(rig)
+        toggle = rig.find_tag(d, "Delay auto-adjust", "toggle")
+        if toggle is not None:
+            rig.tap_target(toggle)
+        pop_temps(rig)
+        check(rig, "temps_restored_delayAdjust", rig.wait_until(lambda: rig.settings()["delayAdjust"] == s0["delayAdjust"], timeout=6))
+
+
 def _sequence(rig, venue):
     """Every check, in order, against an already-launched venue. Shared by
     main() and by run() below so the runner and a standalone invocation
     cannot drift apart. The commit checks read the firmware's own category
     log line out of the simulator's log file, which has no HTTP equivalent,
     so they are skipped (logged, not silently) against the device."""
+    s_start = rig.settings()
     ensure_open(rig)
     check_row_order_and_initial_values(rig)
     check_offset_locked_plus_noop(rig)
@@ -638,6 +714,7 @@ def _sequence(rig, venue):
     check_toggle_delay_adjust(rig, venue.sim)
     check_no_edit_writes_nothing(rig, venue.sim)
     run_simulator_only_checks(rig, venue.sim)
+    restore_temps(rig, s_start)
     close_shell(rig)
 
 
