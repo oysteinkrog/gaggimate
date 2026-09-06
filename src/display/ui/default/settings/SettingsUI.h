@@ -59,10 +59,11 @@ struct SettingsCategoryDef {
     void (*destroyCtx)(void *ctx);
 };
 
-// The five real categories. Defined `__attribute__((weak))` with placeholder
-// content in SettingsPlaceholders.cpp; a category bead's own Cat<Name>.cpp
-// defines the strong symbol and replaces the placeholder at link time,
-// touching neither this header, SettingsUI.cpp nor SettingsPlaceholders.cpp.
+// The five real categories, one definition each in its own Cat<Name>.cpp.
+// While the category beads landed one at a time these were stand-ins in a
+// file of their own, overridden at link time; that file is gone now that all
+// five are real, so a category with no definition is a link error rather
+// than a page of numbered stub labels nobody notices.
 extern const SettingsCategoryDef kCatTemps;
 extern const SettingsCategoryDef kCatDisplay;
 extern const SettingsCategoryDef kCatAnimation;
@@ -70,10 +71,9 @@ extern const SettingsCategoryDef kCatMachine;
 extern const SettingsCategoryDef kCatStatus;
 
 // The sixth, bench/sim-only tile (SettingsFixture.cpp): one of each row
-// widget, so the shell's lifecycle and the widgets themselves are
-// exercisable before any real category exists. Not weak/placeholder like
-// the five above: this is the one category with a single, permanent
-// implementation.
+// widget, so the shell's lifecycle and the widgets themselves stay
+// exercisable on their own, whatever the five real categories do. It never
+// had a stand-in and never needed one.
 #if defined(GM_TOUCH_PROBE) || defined(GAGGIMATE_SIM)
 extern const SettingsCategoryDef kCatFixture;
 #endif
