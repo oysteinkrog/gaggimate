@@ -4,6 +4,7 @@
 #include <Arduino.h>
 #include <display/main.h>
 #include <display/plugins/BLEScalePlugin.h>
+#include "MeterTickCache.h"
 
 void action_on_wakeup(lv_event_t *e) {
     if (controller.isUpdating() || controller.isErrorState() || controller.isAutotuning() || !controller.isLinkUp()) {
@@ -171,6 +172,35 @@ static void gm_meter_draw_inner(lv_event_t *e) {
     const lv_coord_t ri = (lv_coord_t)lroundf(rad);
     constexpr float DEG2RAD = 3.14159265358979323846f / 180.0f;
 
+    // Every tick's shape is fixed by this key; only the colour moves with
+    // the value. The sprite cache (MeterTickCache.h) renders each shape once
+    // and blits it after, byte for byte what the direct draw below writes.
+    const meterticks::Key tickKey = {obj,
+                                     cnt,
+                                     scale->tick_width,
+                                     scale->tick_length,
+                                     (int16_t)scale->angle_range,
+                                     (int16_t)scale->rotation,
+                                     cx,
+                                     cy,
+                                     r_edge};
+    struct TickDraw {
+        bool pill;
+        lv_draw_line_dsc_t *line;
+        lv_point_t *inner;
+        lv_point_t *outer;
+        lv_draw_rect_dsc_t *dot;
+        lv_area_t *area;
+    };
+    auto renderTick = [](lv_draw_ctx_t *ctx, void *user) {
+        auto *d = static_cast<TickDraw *>(user);
+        if (d->pill) {
+            lv_draw_line(ctx, d->line, d->inner, d->outer);
+        } else {
+            lv_draw_rect(ctx, d->dot, d->area);
+        }
+    };
+
     for (uint16_t i = 0; i < cnt; i++) {
         const float angle = ((float)i * scale->angle_range / (cnt - 1) + scale->rotation) * DEG2RAD;
         const float ux = cosf(angle);
@@ -229,14 +259,17 @@ static void gm_meter_draw_inner(lv_event_t *e) {
             }
         }
 
-        if (pill) {
-            line_dsc.color = color;
-            lv_draw_line(draw_ctx, &line_dsc, &inner, &outer);
-        } else {
-            dot_dsc.bg_color = color;
-            lv_area_t area = {(lv_coord_t)(dx - ri), (lv_coord_t)(dy - ri), (lv_coord_t)(dx + ri), (lv_coord_t)(dy + ri)};
-            lv_draw_rect(draw_ctx, &dot_dsc, &area);
+        lv_area_t area = {(lv_coord_t)(dx - ri), (lv_coord_t)(dy - ri), (lv_coord_t)(dx + ri), (lv_coord_t)(dy + ri)};
+        line_dsc.color = color;
+        dot_dsc.bg_color = color;
+        TickDraw td = {pill, &line_dsc, &inner, &outer, &dot_dsc, &area};
+        // The sprite is the tick's coverage in a colour-free form, so the
+        // build renders with the colour of the moment and the blit applies
+        // the current one. The direct draw is the fallback and the reference.
+        if (meterticks::draw(draw_ctx, tickKey, i, tickBox, color, renderTick, &td)) {
+            continue;
         }
+        renderTick(draw_ctx, &td);
     }
 };
 
