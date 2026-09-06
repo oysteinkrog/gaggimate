@@ -78,6 +78,12 @@ class Controller {
     Process *getLastProcess() const { return lastProcess; }
     std::recursive_mutex &getProcessLock() const { return processMutex; }
     Settings &getSettings() { return settings; }
+    // Re-applies the stored zone to the C runtime's TZ (setenv + tzset);
+    // safe to call at any time after boot and does not touch SNTP, unlike
+    // startNtp which owns the one-time sync setup. Used by the settings UI's
+    // Display category so a zone change takes effect on the running clock
+    // without a reboot.
+    void applyTimezone();
     ProfileManager *getProfileManager() { return profileManager; }
 #ifndef GAGGIMATE_HEADLESS
     DefaultUI *getUI() const { return ui; }

@@ -615,11 +615,18 @@ void Controller::startNtp() {
     }
     ntpStarted = true;
     configTzTime(resolve_timezone(settings.getTimezone().c_str()), NTP_SERVER);
-    setenv("TZ", resolve_timezone(settings.getTimezone().c_str()), 1);
-    tzset();
+    applyTimezone();
     sntp_set_sync_mode(SNTP_SYNC_MODE_SMOOTH);
     esp_sntp_setservername(0, NTP_SERVER);
     esp_sntp_init();
+}
+
+// See Controller.h: called by startNtp at boot and by the settings UI's
+// Display category whenever the stored zone changes, so an edit reaches the
+// standby clock without waiting for the next reboot.
+void Controller::applyTimezone() {
+    setenv("TZ", resolve_timezone(settings.getTimezone().c_str()), 1);
+    tzset();
 }
 
 void Controller::setupWifi() {
