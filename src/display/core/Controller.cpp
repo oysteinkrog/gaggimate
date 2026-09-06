@@ -1067,11 +1067,16 @@ void Controller::loopLogic() {
         }
     }
     dispatchEvents(events);
-    if (newBrewDelay >= 0) {
-        settings.setBrewDelay(newBrewDelay);
-    }
-    if (newGrindDelay >= 0) {
-        settings.setGrindDelay(newGrindDelay);
+    if (newBrewDelay >= 0 || newGrindDelay >= 0) {
+        // Guarded so this can never interleave with a web save's batchUpdate
+        // or a settings-UI category's enter/commit (Settings::lock()).
+        Settings::Guard guard(settings);
+        if (newBrewDelay >= 0) {
+            settings.setBrewDelay(newBrewDelay);
+        }
+        if (newGrindDelay >= 0) {
+            settings.setGrindDelay(newGrindDelay);
+        }
     }
 
     unsigned long now = millis();

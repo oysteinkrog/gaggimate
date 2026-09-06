@@ -1,6 +1,11 @@
 #include "DefaultUI.h"
 
 #include <WiFi.h>
+// Unconditional (unlike the GM_TOUCH_PROBE-guarded include below): setBrightness
+// logs on both the device and the simulator, and the simulator's esp_log.h shim
+// is only pulled in here, not through any device driver header.
+#include "esp_log.h"
+#include <cstdlib> // getenv, for the GM_SIM_OPEN_SETTINGS debug hook below
 #ifdef GM_ANIM_BENCH
 #include <display/ui/default/SleepAnimation.h>
 const BenchGateState &bench_gate_state() {
@@ -173,6 +178,19 @@ void DefaultUI::updateTempStableFlag() {
 
 void DefaultUI::reloadProfiles() { profileLoaded = 0; }
 
+void DefaultUI::setBrightness(int brightness) {
+    // The Display category's tests read this line on both the device and the
+    // simulator (neither has a way to sample backlight PWM directly).
+    ESP_LOGI("DefaultUI", "Display: brightness %d", brightness);
+    if (panelDriver) {
+        panelDriver->setBrightness(brightness);
+    }
+}
+
+void DefaultUI::openSettings() { settingsUI.open(); }
+
+void DefaultUI::closeSettings() { settingsUI.close(); }
+
 #ifndef GAGGIMATE_SIM
 // One-time carry-over from the single custom gradient (bgAnimCustomTheme,
 // selected by bgAnimTheme == bg_theme_count()) to the library: the string
@@ -211,7 +229,8 @@ void DefaultUI::migrateBgAnimGradients() {
 #endif
 
 DefaultUI::DefaultUI(Controller *controller, Driver *driver, PluginManager *pluginManager)
-    : controller(controller), panelDriver(driver), pluginManager(pluginManager) {
+    : controller(controller), panelDriver(driver), pluginManager(pluginManager),
+      settingsUI(*controller, *this, *pluginManager) {
     setupPanel();
     xTaskCreatePinnedToCore(loopTask, "DefaultUI::loop", configMINIMAL_STACK_SIZE * 6, this, 1, &taskHandle, 1);
 }
@@ -335,6 +354,10 @@ void DefaultUI::init() {
         std::lock_guard<std::mutex> guard(previewMutex);
         previewUntil = 0;
     });
+    // Fired from WebUIPlugin's async task after a web save; consumed on the
+    // UI task by settingsUI.service() so an open category page reconciles
+    // its untouched fields instead of showing a stale draft.
+    pluginManager->on("settings:changed", [this](Event const &) { settingsUI.notifyWebSaved(); });
 #ifndef GAGGIMATE_SIM
     migrateBgAnimGradients();
 #endif
@@ -397,6 +420,10 @@ void DefaultUI::loop() {
         ESP.restart();
     }
 #endif
+    // Unconditional (not inside the ifndef block above): the simulator has no
+    // serviceTouchMap/serviceUiAnimTest, but the settings shell still needs its
+    // web-save reconciliation, refresh tick and theme restyle checks there.
+    settingsUI.service();
 
     const unsigned long now = ::millis();
     const unsigned long diff = now - lastRender;
@@ -1014,6 +1041,16 @@ void DefaultUI::setupPanel() {
     const ::Settings &settings = controller->getSettings();
     setBrightness(settings.getMainBrightness());
     uiBuiltAt = ::millis();
+
+#ifdef GAGGIMATE_SIM
+    // Temporary debug hook, until gm-flw.6 adds /api/debug/settingsui: opens
+    // the settings shell once at boot so it can be screenshotted headlessly.
+    // Checked once, here, because the UI (and objects.menu_screen_new) must
+    // exist first.
+    if (getenv("GM_SIM_OPEN_SETTINGS") != nullptr) {
+        openSettings();
+    }
+#endif
 }
 
 void DefaultUI::setupState() {
@@ -1089,6 +1126,12 @@ void DefaultUI::setupState() {
 
 void DefaultUI::handleScreenChange() {
     if (currentScreen != targetScreen) {
+        // The standby timeout, a mode change, a brew start or any other route
+        // that lands here must never lose a pending settings edit or leave
+        // the cover behind on a screen the flow engine is about to tear down.
+        if (settingsUI.isOpen()) {
+            settingsUI.onExternalLeave();
+        }
         if (targetScreen == SCREEN_ID_STANDBY_SCREEN) {
             standbyEnterTime = ::millis();
         } else if (currentScreen == SCREEN_ID_STANDBY_SCREEN) {
@@ -1178,6 +1221,14 @@ void DefaultUI::applyPressedFeedback() {
     appliedDimColor = dim;
     applyPressedRecurse(scr, lv_color_hex(static_cast<uint32_t>(dim)));
     pressedStyledRoot = scr;
+}
+
+void DefaultUI::applyPressedFeedbackTo(lv_obj_t *root) {
+    if (root == nullptr) {
+        return;
+    }
+    const int dim = controller->getSettings().getTouchDimColor();
+    applyPressedRecurse(root, lv_color_hex(static_cast<uint32_t>(dim)));
 }
 
 void DefaultUI::startSleepAnimation() {

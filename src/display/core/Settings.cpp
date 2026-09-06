@@ -60,7 +60,32 @@ bool PreferencesCodec<std::vector<AutoWakeupSchedule>>::write(Preferences &prefs
     return nvsPutString(prefs, key, serialized);
 }
 
-Settings::Settings() = default;
+Settings::Settings()
+#ifndef GAGGIMATE_SIM
+    : mutex(xSemaphoreCreateRecursiveMutex())
+#endif
+{
+}
+
+void Settings::lock() {
+#ifndef GAGGIMATE_SIM
+    if (mutex != nullptr) {
+        xSemaphoreTakeRecursive(mutex, portMAX_DELAY);
+    }
+#endif
+}
+
+void Settings::unlock() {
+#ifndef GAGGIMATE_SIM
+    if (mutex != nullptr) {
+        xSemaphoreGiveRecursive(mutex);
+    }
+#endif
+}
+
+Settings::Guard::Guard(Settings &settings) : settings(settings) { settings.lock(); }
+
+Settings::Guard::~Guard() { settings.unlock(); }
 
 void Settings::load() {
     if (taskHandle != nullptr) {
@@ -99,7 +124,11 @@ void Settings::load() {
 }
 
 void Settings::batchUpdate(const SettingsCallback &callback) {
-    // Changed properties mark themselves dirty; the next flush writes them in one NVS session
+    // Changed properties mark themselves dirty; the next flush writes them in one NVS session.
+    // Guarded so a web save can never interleave with a settings-UI category's
+    // enter/commit or with the periodic doSave() this callback may itself
+    // trigger via save(true) (the recursive mutex tolerates the re-entry).
+    Guard guard(*this);
     callback(this);
 }
 
@@ -346,6 +375,7 @@ void Settings::setIntegralGain(float integral_gain) { integralGain.set(integral_
 void Settings::setMaxPumpPower(float max_pump_power) { maxPumpPower.set(max_pump_power); }
 
 void Settings::doSave() {
+    Guard guard(*this);
     bool dirty = false;
     for (auto *property : registry) {
         if (property->isDirty()) {

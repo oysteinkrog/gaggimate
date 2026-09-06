@@ -1,0 +1,628 @@
+#include "SettingsUI.h"
+
+#include <display/core/Controller.h>
+#include <display/core/PluginManager.h>
+#include <display/core/Settings.h>
+#include <display/ui/default/DefaultUI.h>
+#include <display/ui/default/eez/images.h>
+#include <display/ui/default/eez/screens.h>
+#include <display/ui/default/eez/ui.h>
+
+#include <Arduino.h>
+#include <cmath>
+#include <cstdio>
+
+#include "esp_log.h"
+
+namespace {
+
+// ---- Fixture category (GM_TOUCH_PROBE and GAGGIMATE_SIM builds only) ------
+//
+// 11 info rows over 3 pages, an enter/commit counter pair and a one-integer
+// draft, so the lifecycle (push/page/pop, commit-once, web-save reconcile)
+// is exercisable on the bench and the simulator before any real category
+// exists. The counters live for the process lifetime, not the ctx's: a
+// second open must show enter=2, not enter=1 again.
+#if defined(GM_TOUCH_PROBE) || defined(GAGGIMATE_SIM)
+
+struct FixtureCtx {
+    int draft = 0;
+};
+
+int g_fixtureEnterCount = 0;
+int g_fixtureCommitCount = 0;
+int g_fixtureLastDraft = 0;
+
+int fixtureRowCount(void * /*ctx*/) { return 11; }
+
+void fixtureBuildRow(void *ctx, int index, lv_obj_t *parent, SettingsUI & /*ui*/) {
+    auto *fc = static_cast<FixtureCtx *>(ctx);
+    lv_obj_t *label = lv_label_create(parent);
+    char buf[24];
+    if (index == 0) {
+        snprintf(buf, sizeof(buf), "Fixture row 0 (%d)", fc->draft);
+    } else {
+        snprintf(buf, sizeof(buf), "Fixture row %d", index);
+    }
+    lv_label_set_text(label, buf);
+    lv_obj_center(label);
+    lv_obj_set_style_text_color(label, lv_color_hex(theme_colors[eez_flow_get_selected_theme_index()][0]), LV_PART_MAIN);
+}
+
+void fixtureEnter(void * /*ctx*/) { g_fixtureEnterCount++; }
+
+void fixtureCommit(void *ctx) {
+    g_fixtureCommitCount++;
+    auto *fc = static_cast<FixtureCtx *>(ctx);
+    g_fixtureLastDraft = fc->draft;
+    ESP_LOGI("SettingsUI", "SettingsFixture: enter=%d commit=%d draft=%d", g_fixtureEnterCount, g_fixtureCommitCount,
+             fc->draft);
+}
+
+void *fixtureCreateCtx() { return new FixtureCtx(); }
+
+void fixtureDestroyCtx(void *ctx) { delete static_cast<FixtureCtx *>(ctx); }
+
+const SettingsCategoryDef kCatFixtureImpl = {
+    "Fixture", &img_check_40x40, fixtureRowCount, fixtureBuildRow, fixtureEnter, nullptr, fixtureCommit, nullptr,
+    fixtureCreateCtx, fixtureDestroyCtx,
+};
+
+#endif // GM_TOUCH_PROBE || GAGGIMATE_SIM
+
+// Category registry, in the epic's order. The tile page and openCategory()
+// index into this; production builds carry five tiles, GM_TOUCH_PROBE and
+// GAGGIMATE_SIM builds carry the bench-only Fixture tile as a sixth.
+const SettingsCategoryDef *const kCategories[] = {
+    &kCatTemps, &kCatDisplay, &kCatAnimation, &kCatMachine, &kCatStatus,
+#if defined(GM_TOUCH_PROBE) || defined(GAGGIMATE_SIM)
+    &kCatFixtureImpl,
+#endif
+};
+constexpr int kCategoryCount = sizeof(kCategories) / sizeof(kCategories[0]);
+
+} // namespace
+
+SettingsUI::SettingsUI(Controller &controller, DefaultUI &ui, PluginManager &plugins)
+    : controller_(controller), ui_(ui), plugins_(plugins) {}
+
+// ---------------------------------------------------------------------------
+// Lifecycle
+
+void SettingsUI::open() {
+    if (coverObj != nullptr) {
+        return; // already open
+    }
+    lv_obj_t *menu = objects.menu_screen_new;
+    if (menu == nullptr) {
+        return; // menu screen not built yet
+    }
+
+    capturedVisible.clear();
+    const uint32_t n = lv_obj_get_child_cnt(menu);
+    capturedVisible.reserve(n);
+    for (uint32_t i = 0; i < n; i++) {
+        lv_obj_t *child = lv_obj_get_child(menu, i);
+        const bool wasHidden = lv_obj_has_flag(child, LV_OBJ_FLAG_HIDDEN);
+        capturedVisible.emplace_back(child, wasHidden);
+        // The tile-holder container and every other direct child except the
+        // status icons is hidden as a whole; the flow tick keeps driving
+        // per-tile HIDDEN flags on ITS children (btn_grind_1 and friends),
+        // which this never touches.
+        if (child != objects.status_icons) {
+            lv_obj_add_flag(child, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+
+    coverObj = lv_obj_create(menu);
+    lv_obj_remove_style_all(coverObj);
+    lv_obj_set_size(coverObj, LV_PCT(100), LV_PCT(100));
+    lv_obj_set_pos(coverObj, 0, 0);
+    lv_obj_clear_flag(coverObj, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(coverObj, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_set_style_bg_opa(coverObj, LV_OPA_TRANSP, LV_PART_MAIN);
+    lv_obj_add_event_cb(
+        coverObj,
+        [](lv_event_t *e) {
+            auto *self = static_cast<SettingsUI *>(lv_event_get_user_data(e));
+            self->coverObj = nullptr;
+            self->tilePageObj = nullptr;
+            self->pageStack.clear();
+        },
+        LV_EVENT_DELETE, this);
+    lv_obj_add_event_cb(
+        coverObj,
+        [](lv_event_t *e) {
+            auto *self = static_cast<SettingsUI *>(lv_event_get_user_data(e));
+            self->controller_.updateLastAction();
+        },
+        LV_EVENT_PRESSED, this);
+    coverTag = {"cover", "cover", nullptr};
+    lv_obj_set_user_data(coverObj, &coverTag);
+
+    // The cover changes what is on screen without lv_scr_act() changing, so
+    // applyPressedFeedback's own re-walk gate would never fire for it.
+    ui_.resetPressedFeedbackRoot();
+    buildTilePage();
+}
+
+void SettingsUI::close() {
+    if (coverObj == nullptr) {
+        return;
+    }
+    teardownAll();
+}
+
+void SettingsUI::onExternalLeave() {
+    if (coverObj == nullptr) {
+        return;
+    }
+    teardownAll();
+}
+
+void SettingsUI::teardownAll() {
+    while (!pageStack.empty()) {
+        const SettingsCategoryDef *def = pageStack.back().def;
+        void *ctx = pageStack.back().ctx;
+        lv_obj_t *root = pageStack.back().root;
+        pageStack.pop_back();
+        {
+            Settings::Guard guard(controller_.getSettings());
+            if (def->commit) {
+                def->commit(ctx);
+            }
+        }
+        if (def->destroyCtx && ctx) {
+            def->destroyCtx(ctx);
+        }
+        if (root) {
+            lv_obj_del(root);
+        }
+    }
+    restoreMenuChildren();
+    if (coverObj) {
+        // Cascades tilePageObj; the DELETE callback above nulls coverObj and
+        // tilePageObj and clears pageStack (already empty here, harmless).
+        lv_obj_del(coverObj);
+    }
+}
+
+void SettingsUI::restoreMenuChildren() {
+    for (auto &entry : capturedVisible) {
+        lv_obj_t *child = entry.first;
+        if (entry.second) {
+            lv_obj_add_flag(child, LV_OBJ_FLAG_HIDDEN);
+        } else {
+            lv_obj_clear_flag(child, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+    capturedVisible.clear();
+}
+
+void SettingsUI::service() {
+    // Always consumed, whether or not settings is open: a flag left set
+    // while closed would otherwise cause a spurious immediate reconcile the
+    // next time a category page is opened.
+    const bool webSaved = webSaved_.exchange(false, std::memory_order_relaxed);
+    if (webSaved) {
+        ESP_LOGI("SettingsUI", "SettingsUI: reconcile");
+    }
+    if (coverObj == nullptr) {
+        return;
+    }
+
+    const unsigned long now = millis();
+    if (!pageStack.empty() && now - lastRefreshMs >= 1000) {
+        lastRefreshMs = now;
+        PageEntry &top = pageStack.back();
+        if (top.def->refresh) {
+            top.def->refresh(top.ctx);
+        }
+    }
+
+    if (webSaved && !pageStack.empty()) {
+        PageEntry &top = pageStack.back();
+        if (top.def->reconcile) {
+            top.def->reconcile(top.ctx);
+        }
+        rebuildPage();
+        ui_.markDirty();
+    }
+
+    const uint32_t themeIdx = eez_flow_get_selected_theme_index();
+    const uint32_t accent = theme_colors[themeIdx][0];
+    if (static_cast<int>(themeIdx) != builtThemeIdx || accent != builtAccent) {
+        if (pageStack.empty()) {
+            buildTilePage();
+        } else {
+            rebuildPage();
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Navigation
+
+void SettingsUI::openCategory(int index) {
+    if (index < 0 || index >= kCategoryCount) {
+        return;
+    }
+    const SettingsCategoryDef *def = kCategories[index];
+    void *ctx = def->createCtx ? def->createCtx() : nullptr;
+    pushPage(def, ctx);
+}
+
+void SettingsUI::pushPage(const SettingsCategoryDef *def, void *ctx) {
+    if (pageStack.empty()) {
+        if (tilePageObj) {
+            lv_obj_del(tilePageObj);
+            tilePageObj = nullptr;
+        }
+    } else if (pageStack.back().root) {
+        lv_obj_del(pageStack.back().root);
+        pageStack.back().root = nullptr;
+    }
+    {
+        Settings::Guard guard(controller_.getSettings());
+        if (def->enter) {
+            def->enter(ctx);
+        }
+    }
+    PageEntry entry;
+    entry.def = def;
+    entry.ctx = ctx;
+    entry.page = 0;
+    pageStack.push_back(entry);
+    rebuildPage();
+}
+
+void SettingsUI::popPage() {
+    if (pageStack.empty()) {
+        return;
+    }
+    const SettingsCategoryDef *def = pageStack.back().def;
+    void *ctx = pageStack.back().ctx;
+    lv_obj_t *root = pageStack.back().root;
+    pageStack.pop_back();
+    {
+        Settings::Guard guard(controller_.getSettings());
+        if (def->commit) {
+            def->commit(ctx);
+        }
+    }
+    if (def->destroyCtx && ctx) {
+        def->destroyCtx(ctx);
+    }
+    if (root) {
+        lv_obj_del(root);
+    }
+    if (pageStack.empty()) {
+        buildTilePage();
+    } else {
+        // The child may have edited the parent's draft through the ctx it
+        // was handed; rebuild so the parent's rows show it, without
+        // re-entering (which would overwrite the draft from Settings).
+        rebuildPage();
+    }
+}
+
+void SettingsUI::gotoPage(int page) {
+    if (pageStack.empty()) {
+        return;
+    }
+    pageStack.back().page = page; // clamped inside buildCategoryPage
+    rebuildPage();
+}
+
+void SettingsUI::rebuildPage() {
+    if (pageStack.empty()) {
+        return;
+    }
+    buildCategoryPage(pageStack.back());
+}
+
+// ---------------------------------------------------------------------------
+// Building
+
+void SettingsUI::buildTilePage() {
+    if (tilePageObj != nullptr) {
+        lv_obj_del(tilePageObj);
+        tilePageObj = nullptr;
+    }
+    tilePageTagsUsed = 0;
+
+    const uint32_t themeIdx = eez_flow_get_selected_theme_index();
+    const lv_color_t fg = lv_color_hex(theme_colors[themeIdx][0]);
+
+    lv_obj_t *page = lv_obj_create(coverObj);
+    tilePageObj = page;
+    lv_obj_remove_style_all(page);
+    lv_obj_set_size(page, LV_PCT(100), LV_PCT(100));
+    lv_obj_set_pos(page, 0, 0);
+    lv_obj_clear_flag(page, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(page, LV_OBJ_FLAG_EVENT_BUBBLE);
+    lv_obj_set_style_bg_opa(page, LV_OPA_TRANSP, LV_PART_MAIN);
+
+    for (int i = 0; i < kCategoryCount; i++) {
+        buildTile(page, i, kCategories[i], fg);
+    }
+    buildExitChevron(page, fg, /*topLevel=*/true);
+
+    ui_.applyPressedFeedbackTo(page);
+    builtThemeIdx = static_cast<int>(themeIdx);
+    builtAccent = theme_colors[themeIdx][0];
+}
+
+void SettingsUI::buildTile(lv_obj_t *parent, int index, const SettingsCategoryDef *def, lv_color_t fg) {
+    // Six slots around the panel, avoiding the status icons at the top and
+    // the exit chevron's clipped hit box at the bottom: hand-verified against
+    // the 96x96/12px-edge/56x56-arrow rules in the epic's shared contract
+    // (kTileRadius=145, kSize=96 keeps every corner inside radius 228 with
+    // 15-30 px to spare, and every pair of adjacent tiles at least a few px
+    // apart). Production uses the first five; Fixture (bench/sim only) takes
+    // the sixth.
+    static constexpr int16_t kAngles[6] = {45, 90, 135, 225, 270, 315};
+    static constexpr int kRadius = 145;
+    static constexpr int kSize = 96;
+
+    lv_obj_t *tileObj = lv_obj_create(parent);
+    lv_obj_remove_style_all(tileObj);
+    lv_obj_set_size(tileObj, kSize, kSize);
+    const double angleRad = kAngles[index % 6] * M_PI / 180.0;
+    const int x = static_cast<int>(lround(sin(angleRad) * kRadius));
+    const int y = static_cast<int>(lround(-cos(angleRad) * kRadius));
+    lv_obj_align(tileObj, LV_ALIGN_CENTER, x, y);
+    lv_obj_clear_flag(tileObj, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(tileObj, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_EVENT_BUBBLE);
+    lv_obj_set_style_bg_opa(tileObj, LV_OPA_TRANSP, LV_PART_MAIN);
+    lv_obj_set_flex_flow(tileObj, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(tileObj, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+
+    lv_obj_t *icon = lv_img_create(tileObj);
+    lv_img_set_src(icon, def->icon);
+    lv_obj_set_style_img_recolor(icon, fg, LV_PART_MAIN);
+    lv_obj_set_style_img_recolor_opa(icon, LV_OPA_COVER, LV_PART_MAIN);
+
+    lv_obj_t *caption = lv_label_create(tileObj);
+    lv_label_set_text(caption, def->title);
+    lv_obj_set_width(caption, kSize - 4);
+    lv_label_set_long_mode(caption, LV_LABEL_LONG_DOT);
+    lv_obj_set_style_text_align(caption, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
+    lv_obj_set_style_text_font(caption, &lv_font_montserrat_16, LV_PART_MAIN);
+    lv_obj_set_style_text_color(caption, fg, LV_PART_MAIN);
+
+    tileClickCtx[index] = {this, index};
+    lv_obj_add_event_cb(
+        tileObj,
+        [](lv_event_t *e) {
+            auto *ctx = static_cast<TileClickCtx *>(lv_event_get_user_data(e));
+            ctx->self->openCategory(ctx->index);
+        },
+        LV_EVENT_CLICKED, &tileClickCtx[index]);
+
+    tagTilePage(tileObj, def->title, "tile");
+}
+
+void SettingsUI::buildExitChevron(lv_obj_t *parent, lv_color_t fg, bool topLevel) {
+    lv_obj_t *exitBtn = lv_img_create(parent);
+    lv_img_set_src(exitBtn, &img_angle_up_40x40);
+    lv_obj_align(exitBtn, LV_ALIGN_CENTER, 0, 210);
+    lv_obj_set_ext_click_area(exitBtn, 45); // matches every other screen's exit chevron
+    lv_obj_set_style_img_recolor(exitBtn, fg, LV_PART_MAIN);
+    lv_obj_set_style_img_recolor_opa(exitBtn, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_add_flag(exitBtn, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_EVENT_BUBBLE);
+    if (topLevel) {
+        lv_obj_add_event_cb(
+            exitBtn, [](lv_event_t *e) { static_cast<SettingsUI *>(lv_event_get_user_data(e))->close(); },
+            LV_EVENT_CLICKED, this);
+        tagTilePage(exitBtn, "exit", "exit");
+    } else {
+        lv_obj_add_event_cb(
+            exitBtn, [](lv_event_t *e) { static_cast<SettingsUI *>(lv_event_get_user_data(e))->popPage(); },
+            LV_EVENT_CLICKED, this);
+        tag(exitBtn, "exit", "exit");
+    }
+}
+
+void SettingsUI::buildCategoryPage(PageEntry &entry) {
+    if (entry.root != nullptr) {
+        lv_obj_del(entry.root);
+        entry.root = nullptr;
+    }
+    entry.tagsUsed = 0;
+
+    const uint32_t themeIdx = eez_flow_get_selected_theme_index();
+    const lv_color_t fg = lv_color_hex(theme_colors[themeIdx][0]);
+
+    lv_obj_t *root = lv_obj_create(coverObj);
+    entry.root = root;
+    lv_obj_remove_style_all(root);
+    lv_obj_set_size(root, LV_PCT(100), LV_PCT(100));
+    lv_obj_set_pos(root, 0, 0);
+    lv_obj_clear_flag(root, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(root, LV_OBJ_FLAG_EVENT_BUBBLE);
+    lv_obj_set_style_bg_opa(root, LV_OPA_TRANSP, LV_PART_MAIN);
+
+    const int totalRows = entry.def->rowCount ? entry.def->rowCount(entry.ctx) : 0;
+    const int totalPages = totalRows > 0 ? (totalRows + kRowsPerPage - 1) / kRowsPerPage : 1;
+    if (entry.page >= totalPages) {
+        entry.page = totalPages - 1;
+    }
+    if (entry.page < 0) {
+        entry.page = 0;
+    }
+
+    // Header: up arrow, title+indicator column, down arrow, all centred on
+    // one row so the up/down arrows' 56x56 hit pad never has to compete with
+    // a stacked title band for the ~68 px available between the status icons
+    // and the row block (hand-verified against the 12 px edge rule and the
+    // row block's own chevron clearance; see the epic's shared contract).
+    lv_obj_t *header = lv_obj_create(root);
+    lv_obj_remove_style_all(header);
+    lv_obj_set_size(header, 200, 56);
+    lv_obj_align(header, LV_ALIGN_CENTER, 0, -160);
+    lv_obj_clear_flag(header, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_style_bg_opa(header, LV_OPA_TRANSP, LV_PART_MAIN);
+    lv_obj_set_flex_flow(header, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(header, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(header, 12, LV_PART_MAIN);
+
+    lv_obj_t *upArrow = lv_img_create(header);
+    lv_img_set_src(upArrow, &img_angle_up_40x40);
+    lv_obj_set_style_img_recolor(upArrow, fg, LV_PART_MAIN);
+    lv_obj_set_style_img_recolor_opa(upArrow, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_add_flag(upArrow, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_EVENT_BUBBLE);
+    lv_obj_set_ext_click_area(upArrow, 8); // 40x40 visual -> 56x56 hit box
+    lv_obj_add_event_cb(
+        upArrow,
+        [](lv_event_t *e) {
+            auto *self = static_cast<SettingsUI *>(lv_event_get_user_data(e));
+            if (!self->pageStack.empty()) {
+                self->gotoPage(self->pageStack.back().page - 1);
+            }
+        },
+        LV_EVENT_CLICKED, this);
+    if (entry.page == 0) {
+        lv_obj_add_flag(upArrow, LV_OBJ_FLAG_HIDDEN);
+    }
+    tag(upArrow, "page_up", "page_up");
+
+    lv_obj_t *mid = lv_obj_create(header);
+    lv_obj_remove_style_all(mid);
+    lv_obj_set_size(mid, 96, LV_SIZE_CONTENT);
+    lv_obj_clear_flag(mid, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_style_bg_opa(mid, LV_OPA_TRANSP, LV_PART_MAIN);
+    lv_obj_set_flex_flow(mid, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(mid, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+
+    lv_obj_t *title = lv_label_create(mid);
+    lv_label_set_text(title, entry.def->title);
+    lv_obj_set_width(title, 96);
+    lv_label_set_long_mode(title, LV_LABEL_LONG_DOT);
+    lv_obj_set_style_text_align(title, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_24, LV_PART_MAIN);
+    lv_obj_set_style_text_color(title, fg, LV_PART_MAIN);
+
+    lv_obj_t *indicator = lv_label_create(mid);
+    char indBuf[12];
+    snprintf(indBuf, sizeof(indBuf), "%d/%d", entry.page + 1, totalPages);
+    lv_label_set_text(indicator, indBuf);
+    lv_obj_set_style_text_font(indicator, &lv_font_montserrat_16, LV_PART_MAIN);
+    lv_obj_set_style_text_color(indicator, fg, LV_PART_MAIN);
+
+    lv_obj_t *downArrow = lv_img_create(header);
+    lv_img_set_src(downArrow, &img_angle_down_40x40);
+    lv_obj_set_style_img_recolor(downArrow, fg, LV_PART_MAIN);
+    lv_obj_set_style_img_recolor_opa(downArrow, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_add_flag(downArrow, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_EVENT_BUBBLE);
+    lv_obj_set_ext_click_area(downArrow, 8);
+    lv_obj_add_event_cb(
+        downArrow,
+        [](lv_event_t *e) {
+            auto *self = static_cast<SettingsUI *>(lv_event_get_user_data(e));
+            if (!self->pageStack.empty()) {
+                self->gotoPage(self->pageStack.back().page + 1);
+            }
+        },
+        LV_EVENT_CLICKED, this);
+    if (entry.page >= totalPages - 1) {
+        lv_obj_add_flag(downArrow, LV_OBJ_FLAG_HIDDEN);
+    }
+    tag(downArrow, "page_down", "page_down");
+
+    // Five 320x56 row slots, contiguous and centred (matches the epic's
+    // shared contract); positions hand-verified to keep every corner inside
+    // the 228 px safety radius and clear of the header above and the
+    // chevron below.
+    static constexpr int kRowY[kRowsPerPage] = {-97, -41, 15, 71, 127};
+    static constexpr const char *const kRowNames[kRowsPerPage] = {"row0", "row1", "row2", "row3", "row4"};
+    for (int i = 0; i < kRowsPerPage; i++) {
+        lv_obj_t *slot = lv_obj_create(root);
+        lv_obj_remove_style_all(slot);
+        lv_obj_set_size(slot, kRowW, kRowH);
+        lv_obj_align(slot, LV_ALIGN_CENTER, 0, kRowY[i]);
+        lv_obj_clear_flag(slot, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_add_flag(slot, LV_OBJ_FLAG_EVENT_BUBBLE);
+        lv_obj_set_style_bg_opa(slot, LV_OPA_TRANSP, LV_PART_MAIN);
+        tag(slot, kRowNames[i], "row");
+        const int globalIndex = entry.page * kRowsPerPage + i;
+        if (globalIndex < totalRows && entry.def->buildRow) {
+            entry.def->buildRow(entry.ctx, globalIndex, slot, *this);
+        }
+    }
+
+    buildExitChevron(root, fg, /*topLevel=*/false);
+
+    ui_.applyPressedFeedbackTo(root);
+    builtThemeIdx = static_cast<int>(themeIdx);
+    builtAccent = theme_colors[themeIdx][0];
+}
+
+// ---------------------------------------------------------------------------
+// Debug tags
+
+void SettingsUI::tagTilePage(lv_obj_t *obj, const char *row, const char *role) {
+    if (tilePageTagsUsed >= kMaxTilePageTags) {
+        return;
+    }
+    SettingsDebugTag *t = &tilePageTags[tilePageTagsUsed++];
+    *t = {row, role, nullptr};
+    lv_obj_set_user_data(obj, t);
+}
+
+void SettingsUI::tag(lv_obj_t *obj, const char *row, const char *role, const char *text) {
+    if (pageStack.empty()) {
+        return;
+    }
+    PageEntry &top = pageStack.back();
+    if (top.tagsUsed >= PageEntry::kMaxTags) {
+        return;
+    }
+    SettingsDebugTag *t = &top.tags[top.tagsUsed++];
+    *t = {row, role, text};
+    lv_obj_set_user_data(obj, t);
+}
+
+// ---------------------------------------------------------------------------
+// Debug-route accessors
+
+SettingsUI::State SettingsUI::state() const {
+    State s;
+    s.open = coverObj != nullptr;
+    s.depth = static_cast<int>(pageStack.size());
+    if (pageStack.empty()) {
+        s.category = -1;
+        s.page = 0;
+        s.pages = 0;
+        s.title = "Settings";
+        return s;
+    }
+    const PageEntry &top = pageStack.back();
+    s.category = -1;
+    for (int i = 0; i < kCategoryCount; i++) {
+        if (kCategories[i] == top.def) {
+            s.category = i;
+            break;
+        }
+    }
+    s.page = top.page;
+    const int rowCount = top.def->rowCount ? top.def->rowCount(top.ctx) : 0;
+    s.pages = rowCount > 0 ? (rowCount + kRowsPerPage - 1) / kRowsPerPage : 1;
+    s.title = top.def->title;
+    return s;
+}
+
+SettingsUI::FixtureCounters SettingsUI::fixtureCounters() const {
+#if defined(GM_TOUCH_PROBE) || defined(GAGGIMATE_SIM)
+    FixtureCounters c;
+    c.enter = g_fixtureEnterCount;
+    c.commit = g_fixtureCommitCount;
+    c.draft = g_fixtureLastDraft;
+    if (!pageStack.empty() && pageStack.back().def == &kCatFixtureImpl) {
+        c.draft = static_cast<FixtureCtx *>(pageStack.back().ctx)->draft;
+    }
+    return c;
+#else
+    return FixtureCounters{};
+#endif
+}

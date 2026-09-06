@@ -10,6 +10,10 @@
 #include <functional>
 #include <vector>
 
+#ifndef GAGGIMATE_SIM
+#include <freertos/semphr.h>
+#endif
+
 constexpr uint16_t DEFAULT_HARDWARE_SCALE_SAMPLE_RATE_SPS = 10;
 constexpr float DEFAULT_HARDWARE_SCALE_IDLE_ALPHA = 0.80f;
 constexpr float DEFAULT_HARDWARE_SCALE_ACTIVE_ALPHA = 0.80f;
@@ -83,6 +87,25 @@ class Settings {
 
     void batchUpdate(const SettingsCallback &callback);
     void save(bool noDelay = false);
+
+    // Serialises a whole transaction (batchUpdate, doSave, a settings-UI
+    // category's enter/commit, Controller::loopLogic's delay auto-adjust
+    // writes) against every other one; recursive, so a transaction that
+    // itself calls batchUpdate (the periodic save calling doSave from inside
+    // a web save's batchUpdate) does not deadlock itself. A no-op under
+    // GAGGIMATE_SIM: the simulator's FreeRTOS shim has no semaphores and
+    // everything runs on one cooperative thread. Property::get/set stay
+    // lock-free; this only orders whole transactions against each other.
+    class Guard {
+      public:
+        explicit Guard(Settings &settings);
+        ~Guard();
+        Guard(const Guard &) = delete;
+        Guard &operator=(const Guard &) = delete;
+
+      private:
+        Settings &settings;
+    };
 
     // Getters and setters
     int getTargetSteamTemp() const { return targetSteamTemp.get(); }
@@ -493,6 +516,11 @@ class Settings {
     Property<float> maxPumpPower{registry, "p_mp", 1.0f};
 
     void doSave();
+    void lock();
+    void unlock();
+#ifndef GAGGIMATE_SIM
+    SemaphoreHandle_t mutex = nullptr;
+#endif
     TaskHandle_t taskHandle = nullptr;
     [[noreturn]] static void loopTask(void *arg);
 };

@@ -10,6 +10,7 @@
 #include <display/ui/default/SleepAnimation.h>
 #include <display/ui/default/eez/screens.h>
 #include <display/ui/default/eez/structs.h>
+#include <display/ui/default/settings/SettingsUI.h>
 #include <mutex>
 
 class Controller;
@@ -75,11 +76,7 @@ class DefaultUI {
     void onNextProfile();
     void onPreviousProfile();
     void onProfileSelect();
-    void setBrightness(int brightness) {
-        if (panelDriver) {
-            panelDriver->setBrightness(brightness);
-        }
-    };
+    void setBrightness(int brightness);
 
     void onVolumetricDelete();
 
@@ -93,6 +90,24 @@ class DefaultUI {
     void markProfileClean() { profileDirty = false; }
 
     void applyTheme();
+
+    // Settings shell lifecycle: SettingsUI owns the cover and its pages,
+    // DefaultUI owns the instance and the entry points a caller (the menu
+    // tile, the debug route) reaches it through.
+    void openSettings();
+    void closeSettings();
+    SettingsUI &getSettingsUI() { return settingsUI; }
+
+    // Styles just the subtree at root (the existing applyPressedRecurse
+    // walk), skipping applyPressedFeedback's lv_scr_act()-vs-pressedStyledRoot
+    // check: for a freshly built settings tile page or category page, so a
+    // page turn styles only what it just created instead of re-walking the
+    // whole menu screen underneath the cover.
+    void applyPressedFeedbackTo(lv_obj_t *root);
+    // Forces the next applyPressedFeedback() pass to re-walk the active
+    // screen once. SettingsUI::open() calls this because the cover changes
+    // what is on screen without lv_scr_act() itself changing.
+    void resetPressedFeedbackRoot() { pressedStyledRoot = nullptr; }
 
     bool isTaskHealthy() const {
         return is_task_healthy(eTaskGetState(taskHandle)) && is_task_healthy(eTaskGetState(profileTaskHandle));
@@ -332,6 +347,7 @@ class DefaultUI {
     Controller *controller;
     PluginManager *pluginManager;
     ProfileManager *profileManager;
+    SettingsUI settingsUI;
 
     // Screen state
     int updateAvailable = false;
