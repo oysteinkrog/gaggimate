@@ -203,6 +203,20 @@ the design cannot show and what the runs measured.
   a press stays glued to the object it started on, so a finger sliding off a
   row or a row being disabled would never produce the `PRESS_LOST` that
   cancels the hold.
+- **Every target presses the same way: 40% toward the touch dim colour.**
+  `settingsPressedColor(rest, dim)` (`SettingsRows.h`) is the one rule. The
+  generated screens get it from `DefaultUI::applyPressedFeedbackTo`, which
+  walks lv_btn and clickable lv_img objects and so covers the arrows and
+  chevrons; the tiles are plain lv_obj with a non-clickable icon and LVGL
+  puts PRESSED on the tile, never its children, so `buildTile` recolours
+  icon and caption by hand; the whole-row targets (toggle, action, confirm,
+  unlock) dim their text through `PressDim`. Measured 2026-09-06 on the
+  simulator as the mean framebuffer change per pixel inside the hit box
+  while held: menu buttons 19 to 29, tiles 0 before the rule and 42 after,
+  rows 32 to 49 before (text jumped to the dim colour itself and vanished)
+  and 13 to 27 after. The probe is a hold through `/api/debug/tap` with a
+  framebuffer read mid-hold; the device only delivers `/api/debug/fb` at
+  step 2.
 - **Holds are driven only by the events LVGL delivers to the row**, never by
   an `lv_timer` that could outlive it. Steppers step once on `PRESSED` and
   once per `LONG_PRESSED_REPEAT` (LVGL default: 400 ms, then every 100 ms)

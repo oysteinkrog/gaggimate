@@ -161,11 +161,12 @@ lv_obj_t *buildIconButton(lv_obj_t *parent, const lv_img_dsc_t *icon, lv_color_t
 
 // Whole-row targets (toggle, action, confirm, the locked row's unlock
 // gesture) are plain lv_obj, not lv_btn or a clickable lv_img, so
-// applyPressedFeedbackTo's walk does nothing for them (CLAUDE.md: "transparent
-// text rows get nothing from it and must style their own pressed text/image
-// colour"); this is that styling, applied directly rather than through the
-// LV_STATE_PRESSED selector because LVGL only adds that state to the object
-// actually hit (the row), never to its child labels.
+// applyPressedFeedbackTo's walk does nothing for them; this is their
+// styling, applied directly rather than through the LV_STATE_PRESSED
+// selector because LVGL only adds that state to the object actually hit
+// (the row), never to its child labels. `dim` here is already the pressed
+// colour (settingsPressedColor), not the raw touch dim colour: with the raw
+// colour the text jumped to black and the row went blank while held.
 struct PressDim {
     lv_obj_t *label = nullptr;
     lv_obj_t *value = nullptr;
