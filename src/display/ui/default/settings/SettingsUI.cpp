@@ -16,67 +16,14 @@
 
 namespace {
 
-// ---- Fixture category (GM_TOUCH_PROBE and GAGGIMATE_SIM builds only) ------
-//
-// 11 info rows over 3 pages, an enter/commit counter pair and a one-integer
-// draft, so the lifecycle (push/page/pop, commit-once, web-save reconcile)
-// is exercisable on the bench and the simulator before any real category
-// exists. The counters live for the process lifetime, not the ctx's: a
-// second open must show enter=2, not enter=1 again.
-#if defined(GM_TOUCH_PROBE) || defined(GAGGIMATE_SIM)
-
-struct FixtureCtx {
-    int draft = 0;
-};
-
-int g_fixtureEnterCount = 0;
-int g_fixtureCommitCount = 0;
-int g_fixtureLastDraft = 0;
-
-int fixtureRowCount(void * /*ctx*/) { return 11; }
-
-void fixtureBuildRow(void *ctx, int index, lv_obj_t *parent, SettingsUI & /*ui*/) {
-    auto *fc = static_cast<FixtureCtx *>(ctx);
-    lv_obj_t *label = lv_label_create(parent);
-    char buf[24];
-    if (index == 0) {
-        snprintf(buf, sizeof(buf), "Fixture row 0 (%d)", fc->draft);
-    } else {
-        snprintf(buf, sizeof(buf), "Fixture row %d", index);
-    }
-    lv_label_set_text(label, buf);
-    lv_obj_center(label);
-    lv_obj_set_style_text_color(label, lv_color_hex(theme_colors[eez_flow_get_selected_theme_index()][0]), LV_PART_MAIN);
-}
-
-void fixtureEnter(void * /*ctx*/) { g_fixtureEnterCount++; }
-
-void fixtureCommit(void *ctx) {
-    g_fixtureCommitCount++;
-    auto *fc = static_cast<FixtureCtx *>(ctx);
-    g_fixtureLastDraft = fc->draft;
-    ESP_LOGI("SettingsUI", "SettingsFixture: enter=%d commit=%d draft=%d", g_fixtureEnterCount, g_fixtureCommitCount,
-             fc->draft);
-}
-
-void *fixtureCreateCtx() { return new FixtureCtx(); }
-
-void fixtureDestroyCtx(void *ctx) { delete static_cast<FixtureCtx *>(ctx); }
-
-const SettingsCategoryDef kCatFixtureImpl = {
-    "Fixture", &img_check_40x40, fixtureRowCount, fixtureBuildRow, fixtureEnter, nullptr, fixtureCommit, nullptr,
-    fixtureCreateCtx, fixtureDestroyCtx,
-};
-
-#endif // GM_TOUCH_PROBE || GAGGIMATE_SIM
-
 // Category registry, in the epic's order. The tile page and openCategory()
 // index into this; production builds carry five tiles, GM_TOUCH_PROBE and
-// GAGGIMATE_SIM builds carry the bench-only Fixture tile as a sixth.
+// GAGGIMATE_SIM builds carry the bench-only Fixture tile (SettingsFixture.cpp)
+// as a sixth.
 const SettingsCategoryDef *const kCategories[] = {
     &kCatTemps, &kCatDisplay, &kCatAnimation, &kCatMachine, &kCatStatus,
 #if defined(GM_TOUCH_PROBE) || defined(GAGGIMATE_SIM)
-    &kCatFixtureImpl,
+    &kCatFixture,
 #endif
 };
 constexpr int kCategoryCount = sizeof(kCategories) / sizeof(kCategories[0]);
@@ -618,14 +565,8 @@ SettingsUI::State SettingsUI::state() const {
 
 SettingsUI::FixtureCounters SettingsUI::fixtureCounters() const {
 #if defined(GM_TOUCH_PROBE) || defined(GAGGIMATE_SIM)
-    FixtureCounters c;
-    c.enter = g_fixtureEnterCount;
-    c.commit = g_fixtureCommitCount;
-    c.draft = g_fixtureLastDraft;
-    if (!pageStack.empty() && pageStack.back().def == &kCatFixtureImpl) {
-        c.draft = static_cast<FixtureCtx *>(pageStack.back().ctx)->draft;
-    }
-    return c;
+    void *liveCtx = (!pageStack.empty() && pageStack.back().def == &kCatFixture) ? pageStack.back().ctx : nullptr;
+    return fixtureCountersFor(liveCtx);
 #else
     return FixtureCounters{};
 #endif

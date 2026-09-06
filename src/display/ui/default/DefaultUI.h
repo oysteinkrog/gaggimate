@@ -120,6 +120,14 @@ class DefaultUI {
         int fixtureEnter = 0;
         int fixtureCommit = 0;
         int fixtureDraft = 0;
+        // Added for the row-widget bead (gm-flw.3), which is also when the
+        // Fixture category grew stepper/choice/toggle/action/locked/confirm
+        // rows to expose these from: see SettingsUI::FixtureCounters.
+        int fixtureAction = 0;
+        int fixtureConfirm = 0;
+        bool fixtureLocked = true;
+        int fixtureRepeats = 0;
+        int fixtureFastRepeats = 0;
     };
     // Valid range for a Cat command's arg: SettingsUI.cpp's kCategories
     // holds the five real categories plus the Fixture tile that

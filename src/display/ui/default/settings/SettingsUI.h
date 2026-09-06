@@ -69,6 +69,15 @@ extern const SettingsCategoryDef kCatAnimation;
 extern const SettingsCategoryDef kCatMachine;
 extern const SettingsCategoryDef kCatStatus;
 
+// The sixth, bench/sim-only tile (SettingsFixture.cpp): one of each row
+// widget, so the shell's lifecycle and the widgets themselves are
+// exercisable before any real category exists. Not weak/placeholder like
+// the five above: this is the one category with a single, permanent
+// implementation.
+#if defined(GM_TOUCH_PROBE) || defined(GAGGIMATE_SIM)
+extern const SettingsCategoryDef kCatFixture;
+#endif
+
 class SettingsUI {
   public:
     SettingsUI(Controller &controller, DefaultUI &ui, PluginManager &plugins);
@@ -143,6 +152,14 @@ class SettingsUI {
         int enter = 0;
         int commit = 0;
         int draft = 0;
+        // Added for the row-widget bead (gm-flw.3): live while the Fixture
+        // category is open, default otherwise (see fixtureCounters()'s
+        // definition and fixtureCountersFor() below).
+        int action = 0;
+        int confirm = 0;
+        bool locked = true;
+        int repeats = 0;
+        int fastRepeats = 0;
     };
     FixtureCounters fixtureCounters() const;
 
@@ -204,5 +221,18 @@ class SettingsUI {
     };
     TileClickCtx tileClickCtx[8]{};
 };
+
+#if defined(GM_TOUCH_PROBE) || defined(GAGGIMATE_SIM)
+// Defined in SettingsFixture.cpp. liveCtx is the Fixture category's ctx
+// (a FixtureCtx*, opaque here) when it is the currently open page, else
+// nullptr. enter/commit/draft come from SettingsFixture.cpp's own
+// process-lifetime counters either way (draft is overwritten from liveCtx
+// when non-null, same as before this bead); action/confirm/locked/repeats/
+// fastRepeats reflect the live session and read as their default (0/0/
+// true/0/0) when liveCtx is null. SettingsUI::fixtureCounters() (SettingsUI.cpp)
+// is the only caller, so SettingsUI.cpp itself never needs FixtureCtx's
+// layout.
+SettingsUI::FixtureCounters fixtureCountersFor(void *liveCtx);
+#endif
 
 #endif // GM_SETTINGS_UI_H

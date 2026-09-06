@@ -1109,6 +1109,11 @@ void DefaultUI::serviceSettingsUi() {
     pub.fixtureEnter = fc.enter;
     pub.fixtureCommit = fc.commit;
     pub.fixtureDraft = fc.draft;
+    pub.fixtureAction = fc.action;
+    pub.fixtureConfirm = fc.confirm;
+    pub.fixtureLocked = fc.locked;
+    pub.fixtureRepeats = fc.repeats;
+    pub.fixtureFastRepeats = fc.fastRepeats;
 
     portENTER_CRITICAL(&g_settingsUiMux);
     g_settingsUiPublished = pub;
@@ -1435,17 +1440,45 @@ void DefaultUI::setupState() {
                           &wifiConnected, &apActive);
     effect_mgr.use_effect([this]() { return currentScreen == SCREEN_ID_MENU_SCREEN_NEW; },
                           [this]() {
-                              const bool fourthButton = grindAvailable || scaleMenuSwap;
-                              int radius = 135;
-                              int count = fourthButton ? 4 : 3;
-                              int step = 360 / (fourthButton ? 4 : 3);
-                              int iconOffset = fourthButton ? 1 : 0;
-                              int rotationOffset = count == 4 ? 45 : 0;
-                              positionMenuIcon(objects.btn_brew_1, step * 0 - rotationOffset, radius);
-                              positionMenuIcon(objects.btn_steam_1, step * 1 - rotationOffset, radius);
-                              positionMenuIcon(objects.btn_water_1, step * 2 - rotationOffset, radius);
-                              positionMenuIcon(objects.btn_grind_1, step * 3 - rotationOffset, radius);
-                              // positionMenuIcon(objects.btn_settings_1, step * (3 + iconOffset) - rotationOffset, radius);
+                              const bool fiveTiles = grindAvailable || scaleMenuSwap;
+                              // Five 150x150 hit boxes (the eez-generated 120 px tile plus
+                              // its 15 px click pad) cannot sit on one circle without
+                              // overlapping each other or info_btn/standby_btn; a 74 px
+                              // tile (104x104 hit box, above the 100 px floor) does, at its
+                              // own radius and rotation per count, with the settings tile
+                              // in the slot nearest bottom-left and every pairwise gap
+                              // checked at 10+ px against tools/settings_ui_tests/rig.py's
+                              // audit() model (info_btn's own gap is the tightest at 9-10 px;
+                              // nothing here is a bare pass). One tile size serves both
+                              // layouts, so an in-flight grind/scale toggle never changes
+                              // the tiles' size, only their positions.
+                              constexpr int kTileSize = 74;
+                              constexpr int kRadiusFive = 121;
+                              constexpr int kRadiusFour = 99;
+                              lv_obj_t *tiles[] = {objects.btn_brew_1, objects.btn_steam_1, objects.btn_water_1,
+                                                   objects.btn_grind_1, objects.btn_settings_1};
+                              for (lv_obj_t *tile : tiles) {
+                                  if (tile != nullptr) {
+                                      lv_obj_set_size(tile, kTileSize, kTileSize);
+                                  }
+                              }
+                              // info_btn used to sit at (0, 30); centring it is the only
+                              // spot both rings leave clear at every rotation they use.
+                              if (objects.info_btn != nullptr) {
+                                  lv_obj_set_pos(objects.info_btn, 0, 0);
+                              }
+                              if (fiveTiles) {
+                                  positionMenuIcon(objects.btn_brew_1, 288, kRadiusFive);
+                                  positionMenuIcon(objects.btn_steam_1, 0, kRadiusFive);
+                                  positionMenuIcon(objects.btn_water_1, 72, kRadiusFive);
+                                  positionMenuIcon(objects.btn_grind_1, 144, kRadiusFive);
+                                  positionMenuIcon(objects.btn_settings_1, 216, kRadiusFive);
+                              } else {
+                                  positionMenuIcon(objects.btn_brew_1, 280, kRadiusFour);
+                                  positionMenuIcon(objects.btn_steam_1, 10, kRadiusFour);
+                                  positionMenuIcon(objects.btn_water_1, 100, kRadiusFour);
+                                  positionMenuIcon(objects.btn_settings_1, 190, kRadiusFour);
+                              }
                               // Grind slot doubles as the Scale button.
                               if (objects.btn_grind_1 != nullptr) {
                                   lv_obj_set_style_bg_img_src(objects.btn_grind_1,

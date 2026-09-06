@@ -2152,12 +2152,21 @@ void WebUIPlugin::setupServer() {
         }
         DefaultUI::SettingsUiState st;
         controller->getUI()->settingsUiState(st);
-        char buf[256];
+        // action/confirm/locked/repeats/fast_repeats added for the row-widget
+        // bead (gm-flw.3): action and confirm are the Fixture category's
+        // action/confirm row counters, locked is the locked row's current
+        // state, and repeats/fast_repeats are the plain stepper row's
+        // LV_EVENT_PRESSED + slow-repeat count and fast-repeat count
+        // respectively (see SettingsFixture.cpp's stepRepeats/stepFastRepeats
+        // comment for why a press and a slow repeat are counted together).
+        char buf[320];
         snprintf(buf, sizeof(buf),
                  "{\"seq\":%u,\"open\":%s,\"depth\":%d,\"category\":%d,\"page\":%d,\"pages\":%d,\"title\":\"%s\","
-                 "\"fixture\":{\"enter\":%d,\"commit\":%d,\"draft\":%d}}",
+                 "\"fixture\":{\"enter\":%d,\"commit\":%d,\"draft\":%d,\"action\":%d,\"confirm\":%d,\"locked\":%s,"
+                 "\"repeats\":%d,\"fast_repeats\":%d}}",
                  static_cast<unsigned>(st.seq), st.open ? "true" : "false", st.depth, st.category, st.page, st.pages,
-                 st.title, st.fixtureEnter, st.fixtureCommit, st.fixtureDraft);
+                 st.title, st.fixtureEnter, st.fixtureCommit, st.fixtureDraft, st.fixtureAction, st.fixtureConfirm,
+                 st.fixtureLocked ? "true" : "false", st.fixtureRepeats, st.fixtureFastRepeats);
         request->send(200, "application/json", buf);
     });
 #endif
