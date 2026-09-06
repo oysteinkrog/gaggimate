@@ -478,6 +478,54 @@ void DefaultUI::loop() {
         currentScreen = static_cast<ScreensEnum>(eez_flow_get_current_screen());
         effect_mgr.evaluate_all();
 
+#ifdef GAGGIMATE_SIM
+        // Stage 1 is re-asserted every pass the menu screen is not current:
+        // one or more MODE_STANDBY broadcasts (controller:mode:change,
+        // registered in init(), which runs after the constructor's
+        // setupPanel() already requested the menu screen) race the request
+        // during boot and can send targetScreen back to standby, sometimes
+        // more than once, so a single request is not enough to land
+        // reliably. Stage 2 requires the menu screen to still be current on
+        // the pass AFTER it was first seen current, so the screen has been
+        // through ui_tick() at least once before open() walks it (see the
+        // comment above applyPressedFeedback() in this same function) and
+        // so a late bounce back to standby is caught (drops back to stage 1
+        // instead of opening on a screen that is no longer current). Stage 3
+        // (GM_SIM_OPEN_SETTINGS_PAGE) similarly waits a pass after the
+        // category page opens before switching page: deleting the page-0
+        // root immediately after creating it, in the same call that created
+        // it, crashed intermittently (nothing about it has had a single
+        // lv_task_handler()/tick pass yet either).
+        if (simOpenSettingsStage == 1 || simOpenSettingsStage == 2) {
+            if (currentScreen != SCREEN_ID_MENU_SCREEN_NEW) {
+                simOpenSettingsStage = 1;
+                changeScreen(SCREEN_ID_MENU_SCREEN_NEW);
+            } else if (simOpenSettingsStage == 1) {
+                simOpenSettingsStage = 2;
+            } else {
+                openSettings();
+                // GM_SIM_OPEN_SETTINGS_CATEGORY=<index>: also push that tile's
+                // category page, so a screenshot can show the list page (rows,
+                // page arrows, header) without needing a real tap: the sim
+                // has no input injection path yet (gm-flw.15's touchmap route
+                // is the planned one). Safe on the same pass as open(): unlike
+                // the menu screen above, a category page is plain LVGL objects
+                // built directly by SettingsUI, not an eez flow screen swap.
+                if (const char *catEnv = getenv("GM_SIM_OPEN_SETTINGS_CATEGORY")) {
+                    settingsUI.openCategory(atoi(catEnv));
+                    simOpenSettingsStage = getenv("GM_SIM_OPEN_SETTINGS_PAGE") != nullptr ? 3 : 0;
+                } else {
+                    simOpenSettingsStage = 0;
+                }
+            }
+        } else if (simOpenSettingsStage == 3) {
+            simOpenSettingsStage = 0;
+            if (const char *pageEnv = getenv("GM_SIM_OPEN_SETTINGS_PAGE")) {
+                settingsUI.gotoPage(atoi(pageEnv));
+            }
+        }
+#endif
+
         if (currentScreen == SCREEN_ID_STANDBY_SCREEN) {
             if (standbyEnterTime > 0) {
                 const Settings &settings = controller->getSettings();
@@ -488,6 +536,34 @@ void DefaultUI::loop() {
             }
         }
     }
+
+#ifdef GAGGIMATE_SIM
+    // GM_SIM_SETTINGS_POP_AT_MS / GM_SIM_SETTINGS_CLOSE_AT_MS: exercise
+    // popPage()/close() (the same calls the exit chevron's click handler
+    // makes) a fixed time after boot, each fired once. Checked every pass,
+    // not just rerender passes, and gated on wall time rather than a stage
+    // count so each always lands several tick passes after whatever
+    // opened the page or category it acts on.
+    if (uiBuiltAt != 0) {
+        const unsigned long sinceBoot = ::millis() - uiBuiltAt;
+        if (!simPopFired) {
+            if (const char *popEnv = getenv("GM_SIM_SETTINGS_POP_AT_MS")) {
+                if (sinceBoot >= strtoul(popEnv, nullptr, 10)) {
+                    simPopFired = true;
+                    settingsUI.popPage();
+                }
+            }
+        }
+        if (!simCloseFired) {
+            if (const char *closeEnv = getenv("GM_SIM_SETTINGS_CLOSE_AT_MS")) {
+                if (sinceBoot >= strtoul(closeEnv, nullptr, 10)) {
+                    simCloseFired = true;
+                    settingsUI.close();
+                }
+            }
+        }
+    }
+#endif
 
     // ui_tick() first: it runs the generated tick_screen_*, which is what derives
     // widget visibility from flow state. Running it after the maintain calls
@@ -1044,11 +1120,15 @@ void DefaultUI::setupPanel() {
 
 #ifdef GAGGIMATE_SIM
     // Temporary debug hook, until gm-flw.6 adds /api/debug/settingsui: opens
-    // the settings shell once at boot so it can be screenshotted headlessly.
-    // Checked once, here, because the UI (and objects.menu_screen_new) must
-    // exist first.
+    // the settings shell so it can be screenshotted headlessly. lv_scr_act()
+    // is still standby here (setupPanel's own fade-in above), and open()
+    // builds the cover on objects.menu_screen_new regardless of which screen
+    // is active, so opening straight away would be invisible to a
+    // screenshot; request the menu screen instead and let loop() open
+    // settings once currentScreen actually becomes it (see below).
     if (getenv("GM_SIM_OPEN_SETTINGS") != nullptr) {
-        openSettings();
+        simOpenSettingsStage = 1;
+        changeScreen(SCREEN_ID_MENU_SCREEN_NEW);
     }
 #endif
 }

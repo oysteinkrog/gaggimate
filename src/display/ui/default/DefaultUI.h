@@ -348,6 +348,29 @@ class DefaultUI {
     PluginManager *pluginManager;
     ProfileManager *profileManager;
     SettingsUI settingsUI;
+#ifdef GAGGIMATE_SIM
+    // GM_SIM_OPEN_SETTINGS debug hook, driven from loop(): opening straight
+    // off setupPanel() would build the cover on menu_screen_new while
+    // standby was still the active screen (invisible to a screenshot), so
+    // this instead requests the menu screen and waits for it to become
+    // current. 0 = done/inactive, 1 = requested, waiting for currentScreen
+    // to become the menu screen, 2 = menu screen was current as of the
+    // PREVIOUS pass: open now (and push GM_SIM_OPEN_SETTINGS_CATEGORY's
+    // page, if set), 3 = category page opened as of the PREVIOUS pass: now
+    // apply GM_SIM_OPEN_SETTINGS_PAGE. Every stage's one-pass wait matters
+    // for the same reason: acting on an object in the same call that
+    // created it, before a single lv_task_handler()/tick pass has run for
+    // it, crashed intermittently (see the comment above
+    // applyPressedFeedback() in loop() for the eez-flow-screen case this
+    // was first found on).
+    int simOpenSettingsStage = 0;
+    // GM_SIM_SETTINGS_POP_AT_MS / GM_SIM_SETTINGS_CLOSE_AT_MS: fire popPage()
+    // / close() once, this many milliseconds after boot (time-gated, not
+    // pass-gated, so each lands several tick passes after whatever opened
+    // the page it acts on).
+    bool simPopFired = false;
+    bool simCloseFired = false;
+#endif
 
     // Screen state
     int updateAvailable = false;

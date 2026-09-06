@@ -4,7 +4,7 @@
 // The on-display settings shell: a full-screen cover over the menu screen,
 // a tile page (one tile per category) and a paged list page (title, page
 // arrows, five row slots, exit chevron). This file is the contract the
-// category beads code against -- the struct shapes and extern symbols below
+// category beads code against: the struct shapes and extern symbols below
 // must keep their names; only the categories' own content is out of scope
 // here (see CLAUDE.md, on-display settings epic).
 //
@@ -31,7 +31,7 @@ class SettingsUI;
 // row, a tile, an arrow, the exit chevron, the cover itself), not literally
 // limited to row objects. `text` is non-null only for role "value": the
 // address of the row-owned canonical string, set once, whose contents
-// settingsRowSetValue (a later bead) rewrites in place -- the label's own
+// settingsRowSetValue (a later bead) rewrites in place: the label's own
 // buffer holds truncation dots when long, this pointer holds the real value.
 struct SettingsDebugTag {
     const char *row;
@@ -104,8 +104,8 @@ class SettingsUI {
     // runs under Settings::Guard.
     void pushPage(const SettingsCategoryDef *def, void *ctx);
     // Commits the top page (Settings::Guard), destroys its ctx and root,
-    // and reveals whatever is now on top (the tile page, or the parent page
-    // -- rebuilt so it reflects any edit the child made to a shared draft,
+    // and reveals whatever is now on top (the tile page, or the parent page,
+    // rebuilt so it reflects any edit the child made to a shared draft,
     // without re-entering it).
     void popPage();
     // Clamps `page` to the top category's current page count and rebuilds
