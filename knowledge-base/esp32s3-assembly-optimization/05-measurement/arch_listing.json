@@ -1,0 +1,290 @@
+[
+  {
+    "name": "AArch64.cpp",
+    "path": "lld/ELF/Arch/AArch64.cpp",
+    "sha": "223f0ecdd3ccdb407c4f972aa49e130ec57ac2af",
+    "size": 55047,
+    "url": "https://api.github.com/repos/llvm/llvm-project/contents/lld/ELF/Arch/AArch64.cpp?ref=main",
+    "html_url": "https://github.com/llvm/llvm-project/blob/main/lld/ELF/Arch/AArch64.cpp",
+    "git_url": "https://api.github.com/repos/llvm/llvm-project/git/blobs/223f0ecdd3ccdb407c4f972aa49e130ec57ac2af",
+    "download_url": "https://raw.githubusercontent.com/llvm/llvm-project/main/lld/ELF/Arch/AArch64.cpp",
+    "type": "file",
+    "_links": {
+      "self": "https://api.github.com/repos/llvm/llvm-project/contents/lld/ELF/Arch/AArch64.cpp?ref=main",
+      "git": "https://api.github.com/repos/llvm/llvm-project/git/blobs/223f0ecdd3ccdb407c4f972aa49e130ec57ac2af",
+      "html": "https://github.com/llvm/llvm-project/blob/main/lld/ELF/Arch/AArch64.cpp"
+    }
+  },
+  {
+    "name": "AMDGPU.cpp",
+    "path": "lld/ELF/Arch/AMDGPU.cpp",
+    "sha": "52fc779855a36e36288aaa2a1e285648aa18ba60",
+    "size": 6545,
+    "url": "https://api.github.com/repos/llvm/llvm-project/contents/lld/ELF/Arch/AMDGPU.cpp?ref=main",
+    "html_url": "https://github.com/llvm/llvm-project/blob/main/lld/ELF/Arch/AMDGPU.cpp",
+    "git_url": "https://api.github.com/repos/llvm/llvm-project/git/blobs/52fc779855a36e36288aaa2a1e285648aa18ba60",
+    "download_url": "https://raw.githubusercontent.com/llvm/llvm-project/main/lld/ELF/Arch/AMDGPU.cpp",
+    "type": "file",
+    "_links": {
+      "self": "https://api.github.com/repos/llvm/llvm-project/contents/lld/ELF/Arch/AMDGPU.cpp?ref=main",
+      "git": "https://api.github.com/repos/llvm/llvm-project/git/blobs/52fc779855a36e36288aaa2a1e285648aa18ba60",
+      "html": "https://github.com/llvm/llvm-project/blob/main/lld/ELF/Arch/AMDGPU.cpp"
+    }
+  },
+  {
+    "name": "ARM.cpp",
+    "path": "lld/ELF/Arch/ARM.cpp",
+    "sha": "e1f73b991f1f31b9b30548c803b170120fb7df9f",
+    "size": 63024,
+    "url": "https://api.github.com/repos/llvm/llvm-project/contents/lld/ELF/Arch/ARM.cpp?ref=main",
+    "html_url": "https://github.com/llvm/llvm-project/blob/main/lld/ELF/Arch/ARM.cpp",
+    "git_url": "https://api.github.com/repos/llvm/llvm-project/git/blobs/e1f73b991f1f31b9b30548c803b170120fb7df9f",
+    "download_url": "https://raw.githubusercontent.com/llvm/llvm-project/main/lld/ELF/Arch/ARM.cpp",
+    "type": "file",
+    "_links": {
+      "self": "https://api.github.com/repos/llvm/llvm-project/contents/lld/ELF/Arch/ARM.cpp?ref=main",
+      "git": "https://api.github.com/repos/llvm/llvm-project/git/blobs/e1f73b991f1f31b9b30548c803b170120fb7df9f",
+      "html": "https://github.com/llvm/llvm-project/blob/main/lld/ELF/Arch/ARM.cpp"
+    }
+  },
+  {
+    "name": "AVR.cpp",
+    "path": "lld/ELF/Arch/AVR.cpp",
+    "sha": "5276ff9840591f7b6519aa6d25fac660ef7bdf58",
+    "size": 8676,
+    "url": "https://api.github.com/repos/llvm/llvm-project/contents/lld/ELF/Arch/AVR.cpp?ref=main",
+    "html_url": "https://github.com/llvm/llvm-project/blob/main/lld/ELF/Arch/AVR.cpp",
+    "git_url": "https://api.github.com/repos/llvm/llvm-project/git/blobs/5276ff9840591f7b6519aa6d25fac660ef7bdf58",
+    "download_url": "https://raw.githubusercontent.com/llvm/llvm-project/main/lld/ELF/Arch/AVR.cpp",
+    "type": "file",
+    "_links": {
+      "self": "https://api.github.com/repos/llvm/llvm-project/contents/lld/ELF/Arch/AVR.cpp?ref=main",
+      "git": "https://api.github.com/repos/llvm/llvm-project/git/blobs/5276ff9840591f7b6519aa6d25fac660ef7bdf58",
+      "html": "https://github.com/llvm/llvm-project/blob/main/lld/ELF/Arch/AVR.cpp"
+    }
+  },
+  {
+    "name": "Hexagon.cpp",
+    "path": "lld/ELF/Arch/Hexagon.cpp",
+    "sha": "985f9c365bd37b897d237c5864cd7a78b14b9266",
+    "size": 22703,
+    "url": "https://api.github.com/repos/llvm/llvm-project/contents/lld/ELF/Arch/Hexagon.cpp?ref=main",
+    "html_url": "https://github.com/llvm/llvm-project/blob/main/lld/ELF/Arch/Hexagon.cpp",
+    "git_url": "https://api.github.com/repos/llvm/llvm-project/git/blobs/985f9c365bd37b897d237c5864cd7a78b14b9266",
+    "download_url": "https://raw.githubusercontent.com/llvm/llvm-project/main/lld/ELF/Arch/Hexagon.cpp",
+    "type": "file",
+    "_links": {
+      "self": "https://api.github.com/repos/llvm/llvm-project/contents/lld/ELF/Arch/Hexagon.cpp?ref=main",
+      "git": "https://api.github.com/repos/llvm/llvm-project/git/blobs/985f9c365bd37b897d237c5864cd7a78b14b9266",
+      "html": "https://github.com/llvm/llvm-project/blob/main/lld/ELF/Arch/Hexagon.cpp"
+    }
+  },
+  {
+    "name": "LoongArch.cpp",
+    "path": "lld/ELF/Arch/LoongArch.cpp",
+    "sha": "224c31d5a2f1dab568ac6532733f0bc94828cb9a",
+    "size": 65020,
+    "url": "https://api.github.com/repos/llvm/llvm-project/contents/lld/ELF/Arch/LoongArch.cpp?ref=main",
+    "html_url": "https://github.com/llvm/llvm-project/blob/main/lld/ELF/Arch/LoongArch.cpp",
+    "git_url": "https://api.github.com/repos/llvm/llvm-project/git/blobs/224c31d5a2f1dab568ac6532733f0bc94828cb9a",
+    "download_url": "https://raw.githubusercontent.com/llvm/llvm-project/main/lld/ELF/Arch/LoongArch.cpp",
+    "type": "file",
+    "_links": {
+      "self": "https://api.github.com/repos/llvm/llvm-project/contents/lld/ELF/Arch/LoongArch.cpp?ref=main",
+      "git": "https://api.github.com/repos/llvm/llvm-project/git/blobs/224c31d5a2f1dab568ac6532733f0bc94828cb9a",
+      "html": "https://github.com/llvm/llvm-project/blob/main/lld/ELF/Arch/LoongArch.cpp"
+    }
+  },
+  {
+    "name": "MSP430.cpp",
+    "path": "lld/ELF/Arch/MSP430.cpp",
+    "sha": "03d34436d2959f25865586eeed0265f4649cf3fb",
+    "size": 2787,
+    "url": "https://api.github.com/repos/llvm/llvm-project/contents/lld/ELF/Arch/MSP430.cpp?ref=main",
+    "html_url": "https://github.com/llvm/llvm-project/blob/main/lld/ELF/Arch/MSP430.cpp",
+    "git_url": "https://api.github.com/repos/llvm/llvm-project/git/blobs/03d34436d2959f25865586eeed0265f4649cf3fb",
+    "download_url": "https://raw.githubusercontent.com/llvm/llvm-project/main/lld/ELF/Arch/MSP430.cpp",
+    "type": "file",
+    "_links": {
+      "self": "https://api.github.com/repos/llvm/llvm-project/contents/lld/ELF/Arch/MSP430.cpp?ref=main",
+      "git": "https://api.github.com/repos/llvm/llvm-project/git/blobs/03d34436d2959f25865586eeed0265f4649cf3fb",
+      "html": "https://github.com/llvm/llvm-project/blob/main/lld/ELF/Arch/MSP430.cpp"
+    }
+  },
+  {
+    "name": "Mips.cpp",
+    "path": "lld/ELF/Arch/Mips.cpp",
+    "sha": "ba751660df1fa62a0ef01904cc4b22c4131b58ff",
+    "size": 38664,
+    "url": "https://api.github.com/repos/llvm/llvm-project/contents/lld/ELF/Arch/Mips.cpp?ref=main",
+    "html_url": "https://github.com/llvm/llvm-project/blob/main/lld/ELF/Arch/Mips.cpp",
+    "git_url": "https://api.github.com/repos/llvm/llvm-project/git/blobs/ba751660df1fa62a0ef01904cc4b22c4131b58ff",
+    "download_url": "https://raw.githubusercontent.com/llvm/llvm-project/main/lld/ELF/Arch/Mips.cpp",
+    "type": "file",
+    "_links": {
+      "self": "https://api.github.com/repos/llvm/llvm-project/contents/lld/ELF/Arch/Mips.cpp?ref=main",
+      "git": "https://api.github.com/repos/llvm/llvm-project/git/blobs/ba751660df1fa62a0ef01904cc4b22c4131b58ff",
+      "html": "https://github.com/llvm/llvm-project/blob/main/lld/ELF/Arch/Mips.cpp"
+    }
+  },
+  {
+    "name": "MipsArchTree.cpp",
+    "path": "lld/ELF/Arch/MipsArchTree.cpp",
+    "sha": "91588590450877d1a629cd9b46c6544509dec487",
+    "size": 12315,
+    "url": "https://api.github.com/repos/llvm/llvm-project/contents/lld/ELF/Arch/MipsArchTree.cpp?ref=main",
+    "html_url": "https://github.com/llvm/llvm-project/blob/main/lld/ELF/Arch/MipsArchTree.cpp",
+    "git_url": "https://api.github.com/repos/llvm/llvm-project/git/blobs/91588590450877d1a629cd9b46c6544509dec487",
+    "download_url": "https://raw.githubusercontent.com/llvm/llvm-project/main/lld/ELF/Arch/MipsArchTree.cpp",
+    "type": "file",
+    "_links": {
+      "self": "https://api.github.com/repos/llvm/llvm-project/contents/lld/ELF/Arch/MipsArchTree.cpp?ref=main",
+      "git": "https://api.github.com/repos/llvm/llvm-project/git/blobs/91588590450877d1a629cd9b46c6544509dec487",
+      "html": "https://github.com/llvm/llvm-project/blob/main/lld/ELF/Arch/MipsArchTree.cpp"
+    }
+  },
+  {
+    "name": "PPC.cpp",
+    "path": "lld/ELF/Arch/PPC.cpp",
+    "sha": "e09ecb5c2cff6be16afbbe7620a15c9a065ed2e7",
+    "size": 21481,
+    "url": "https://api.github.com/repos/llvm/llvm-project/contents/lld/ELF/Arch/PPC.cpp?ref=main",
+    "html_url": "https://github.com/llvm/llvm-project/blob/main/lld/ELF/Arch/PPC.cpp",
+    "git_url": "https://api.github.com/repos/llvm/llvm-project/git/blobs/e09ecb5c2cff6be16afbbe7620a15c9a065ed2e7",
+    "download_url": "https://raw.githubusercontent.com/llvm/llvm-project/main/lld/ELF/Arch/PPC.cpp",
+    "type": "file",
+    "_links": {
+      "self": "https://api.github.com/repos/llvm/llvm-project/contents/lld/ELF/Arch/PPC.cpp?ref=main",
+      "git": "https://api.github.com/repos/llvm/llvm-project/git/blobs/e09ecb5c2cff6be16afbbe7620a15c9a065ed2e7",
+      "html": "https://github.com/llvm/llvm-project/blob/main/lld/ELF/Arch/PPC.cpp"
+    }
+  },
+  {
+    "name": "PPC64.cpp",
+    "path": "lld/ELF/Arch/PPC64.cpp",
+    "sha": "17ee2f723e7b2ff7ce3a385b67fd56e75379d599",
+    "size": 68080,
+    "url": "https://api.github.com/repos/llvm/llvm-project/contents/lld/ELF/Arch/PPC64.cpp?ref=main",
+    "html_url": "https://github.com/llvm/llvm-project/blob/main/lld/ELF/Arch/PPC64.cpp",
+    "git_url": "https://api.github.com/repos/llvm/llvm-project/git/blobs/17ee2f723e7b2ff7ce3a385b67fd56e75379d599",
+    "download_url": "https://raw.githubusercontent.com/llvm/llvm-project/main/lld/ELF/Arch/PPC64.cpp",
+    "type": "file",
+    "_links": {
+      "self": "https://api.github.com/repos/llvm/llvm-project/contents/lld/ELF/Arch/PPC64.cpp?ref=main",
+      "git": "https://api.github.com/repos/llvm/llvm-project/git/blobs/17ee2f723e7b2ff7ce3a385b67fd56e75379d599",
+      "html": "https://github.com/llvm/llvm-project/blob/main/lld/ELF/Arch/PPC64.cpp"
+    }
+  },
+  {
+    "name": "PPCInsns.def",
+    "path": "lld/ELF/Arch/PPCInsns.def",
+    "sha": "1baa8fd6c2ad0e45590ae5460249ab5f6a062a56",
+    "size": 894,
+    "url": "https://api.github.com/repos/llvm/llvm-project/contents/lld/ELF/Arch/PPCInsns.def?ref=main",
+    "html_url": "https://github.com/llvm/llvm-project/blob/main/lld/ELF/Arch/PPCInsns.def",
+    "git_url": "https://api.github.com/repos/llvm/llvm-project/git/blobs/1baa8fd6c2ad0e45590ae5460249ab5f6a062a56",
+    "download_url": "https://raw.githubusercontent.com/llvm/llvm-project/main/lld/ELF/Arch/PPCInsns.def",
+    "type": "file",
+    "_links": {
+      "self": "https://api.github.com/repos/llvm/llvm-project/contents/lld/ELF/Arch/PPCInsns.def?ref=main",
+      "git": "https://api.github.com/repos/llvm/llvm-project/git/blobs/1baa8fd6c2ad0e45590ae5460249ab5f6a062a56",
+      "html": "https://github.com/llvm/llvm-project/blob/main/lld/ELF/Arch/PPCInsns.def"
+    }
+  },
+  {
+    "name": "RISCV.cpp",
+    "path": "lld/ELF/Arch/RISCV.cpp",
+    "sha": "13c919c195e2efeca6f21081d383a9d5f6b7f72f",
+    "size": 56329,
+    "url": "https://api.github.com/repos/llvm/llvm-project/contents/lld/ELF/Arch/RISCV.cpp?ref=main",
+    "html_url": "https://github.com/llvm/llvm-project/blob/main/lld/ELF/Arch/RISCV.cpp",
+    "git_url": "https://api.github.com/repos/llvm/llvm-project/git/blobs/13c919c195e2efeca6f21081d383a9d5f6b7f72f",
+    "download_url": "https://raw.githubusercontent.com/llvm/llvm-project/main/lld/ELF/Arch/RISCV.cpp",
+    "type": "file",
+    "_links": {
+      "self": "https://api.github.com/repos/llvm/llvm-project/contents/lld/ELF/Arch/RISCV.cpp?ref=main",
+      "git": "https://api.github.com/repos/llvm/llvm-project/git/blobs/13c919c195e2efeca6f21081d383a9d5f6b7f72f",
+      "html": "https://github.com/llvm/llvm-project/blob/main/lld/ELF/Arch/RISCV.cpp"
+    }
+  },
+  {
+    "name": "SPARCV9.cpp",
+    "path": "lld/ELF/Arch/SPARCV9.cpp",
+    "sha": "7797990571def83faad5dbb6bc31b8c89d715d2c",
+    "size": 13097,
+    "url": "https://api.github.com/repos/llvm/llvm-project/contents/lld/ELF/Arch/SPARCV9.cpp?ref=main",
+    "html_url": "https://github.com/llvm/llvm-project/blob/main/lld/ELF/Arch/SPARCV9.cpp",
+    "git_url": "https://api.github.com/repos/llvm/llvm-project/git/blobs/7797990571def83faad5dbb6bc31b8c89d715d2c",
+    "download_url": "https://raw.githubusercontent.com/llvm/llvm-project/main/lld/ELF/Arch/SPARCV9.cpp",
+    "type": "file",
+    "_links": {
+      "self": "https://api.github.com/repos/llvm/llvm-project/contents/lld/ELF/Arch/SPARCV9.cpp?ref=main",
+      "git": "https://api.github.com/repos/llvm/llvm-project/git/blobs/7797990571def83faad5dbb6bc31b8c89d715d2c",
+      "html": "https://github.com/llvm/llvm-project/blob/main/lld/ELF/Arch/SPARCV9.cpp"
+    }
+  },
+  {
+    "name": "SystemZ.cpp",
+    "path": "lld/ELF/Arch/SystemZ.cpp",
+    "sha": "b76baf464a5e712601825572842ef5bfc60dc14f",
+    "size": 19611,
+    "url": "https://api.github.com/repos/llvm/llvm-project/contents/lld/ELF/Arch/SystemZ.cpp?ref=main",
+    "html_url": "https://github.com/llvm/llvm-project/blob/main/lld/ELF/Arch/SystemZ.cpp",
+    "git_url": "https://api.github.com/repos/llvm/llvm-project/git/blobs/b76baf464a5e712601825572842ef5bfc60dc14f",
+    "download_url": "https://raw.githubusercontent.com/llvm/llvm-project/main/lld/ELF/Arch/SystemZ.cpp",
+    "type": "file",
+    "_links": {
+      "self": "https://api.github.com/repos/llvm/llvm-project/contents/lld/ELF/Arch/SystemZ.cpp?ref=main",
+      "git": "https://api.github.com/repos/llvm/llvm-project/git/blobs/b76baf464a5e712601825572842ef5bfc60dc14f",
+      "html": "https://github.com/llvm/llvm-project/blob/main/lld/ELF/Arch/SystemZ.cpp"
+    }
+  },
+  {
+    "name": "TargetImpl.h",
+    "path": "lld/ELF/Arch/TargetImpl.h",
+    "sha": "0d4793afbb2eda40d00d7de991751634f4bf45fa",
+    "size": 4136,
+    "url": "https://api.github.com/repos/llvm/llvm-project/contents/lld/ELF/Arch/TargetImpl.h?ref=main",
+    "html_url": "https://github.com/llvm/llvm-project/blob/main/lld/ELF/Arch/TargetImpl.h",
+    "git_url": "https://api.github.com/repos/llvm/llvm-project/git/blobs/0d4793afbb2eda40d00d7de991751634f4bf45fa",
+    "download_url": "https://raw.githubusercontent.com/llvm/llvm-project/main/lld/ELF/Arch/TargetImpl.h",
+    "type": "file",
+    "_links": {
+      "self": "https://api.github.com/repos/llvm/llvm-project/contents/lld/ELF/Arch/TargetImpl.h?ref=main",
+      "git": "https://api.github.com/repos/llvm/llvm-project/git/blobs/0d4793afbb2eda40d00d7de991751634f4bf45fa",
+      "html": "https://github.com/llvm/llvm-project/blob/main/lld/ELF/Arch/TargetImpl.h"
+    }
+  },
+  {
+    "name": "X86.cpp",
+    "path": "lld/ELF/Arch/X86.cpp",
+    "sha": "5b95ccdf50e46508b2fcc8db5d42cc2aa93e911d",
+    "size": 26485,
+    "url": "https://api.github.com/repos/llvm/llvm-project/contents/lld/ELF/Arch/X86.cpp?ref=main",
+    "html_url": "https://github.com/llvm/llvm-project/blob/main/lld/ELF/Arch/X86.cpp",
+    "git_url": "https://api.github.com/repos/llvm/llvm-project/git/blobs/5b95ccdf50e46508b2fcc8db5d42cc2aa93e911d",
+    "download_url": "https://raw.githubusercontent.com/llvm/llvm-project/main/lld/ELF/Arch/X86.cpp",
+    "type": "file",
+    "_links": {
+      "self": "https://api.github.com/repos/llvm/llvm-project/contents/lld/ELF/Arch/X86.cpp?ref=main",
+      "git": "https://api.github.com/repos/llvm/llvm-project/git/blobs/5b95ccdf50e46508b2fcc8db5d42cc2aa93e911d",
+      "html": "https://github.com/llvm/llvm-project/blob/main/lld/ELF/Arch/X86.cpp"
+    }
+  },
+  {
+    "name": "X86_64.cpp",
+    "path": "lld/ELF/Arch/X86_64.cpp",
+    "sha": "f172080dc2b6a6c59c3d75b326759d2217d523ac",
+    "size": 62291,
+    "url": "https://api.github.com/repos/llvm/llvm-project/contents/lld/ELF/Arch/X86_64.cpp?ref=main",
+    "html_url": "https://github.com/llvm/llvm-project/blob/main/lld/ELF/Arch/X86_64.cpp",
+    "git_url": "https://api.github.com/repos/llvm/llvm-project/git/blobs/f172080dc2b6a6c59c3d75b326759d2217d523ac",
+    "download_url": "https://raw.githubusercontent.com/llvm/llvm-project/main/lld/ELF/Arch/X86_64.cpp",
+    "type": "file",
+    "_links": {
+      "self": "https://api.github.com/repos/llvm/llvm-project/contents/lld/ELF/Arch/X86_64.cpp?ref=main",
+      "git": "https://api.github.com/repos/llvm/llvm-project/git/blobs/f172080dc2b6a6c59c3d75b326759d2217d523ac",
+      "html": "https://github.com/llvm/llvm-project/blob/main/lld/ELF/Arch/X86_64.cpp"
+    }
+  }
+]

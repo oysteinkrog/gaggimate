@@ -91,8 +91,11 @@ it.
   not strictly a count of cycles executed since reset. It can jump.
 
 The runtime scaling switch does not rescale it: `esp_pm` calls
-`on_freq_update`, which recomputes the tick divisor and the `CCOMPARE`
-target and leaves `CCOUNT` alone.[^pmimpl] That is right for a cycle
+`on_freq_update`, which never writes `CCOUNT`. On this chip that function
+does almost nothing else either: its tick-divisor and `CCOMPARE` body is
+compiled only under `CONFIG_FREERTOS_SYSTICK_USES_CCOUNT`, which the
+ESP32-S3 does not set because its tick comes from the system
+timer.[^pmimpl] That is right for a cycle
 counter, and it is why a cycles-to-microseconds conversion taken across a
 frequency switch is wrong.
 
@@ -311,7 +314,7 @@ ESP-IDF paths are relative to an ESP-IDF 5.5.1 checkout (`version.txt`).
 [^pmdoc]: Espressif, *ESP-IDF Programming Guide* v5.5.1, ESP32-S3, "Power Management". https://docs.espressif.com/projects/esp-idf/en/v5.5.1/esp32s3/api-reference/system/power_management.html
 [^rtcclk]: `components/esp_hw_support/port/esp32s3/rtc_clk_init.c` (62 to 63): `esp_cpu_set_cycle_count((uint64_t)esp_cpu_get_cycle_count() * cfg.cpu_freq_mhz / freq_before);`.
 [^clk]: `components/esp_system/port/soc/esp32s3/clk.c` (137 to 138), the same rescale on a frequency change.
-[^pmimpl]: `components/esp_pm/pm_impl.c`: the frequency switch (668 to 680) calls `rtc_clk_cpu_freq_set_config_fast()` in a critical section then `on_freq_update()`; `on_freq_update()` (573) recomputes `_xt_tick_divisor` and the `CCOMPARE` target and does not write `CCOUNT`.
+[^pmimpl]: `components/esp_pm/pm_impl.c`: the frequency switch (668 to 680) calls `rtc_clk_cpu_freq_set_config_fast()` in a critical section then `on_freq_update()`; `on_freq_update()` (573) does not write `CCOUNT`; its `_xt_tick_divisor` and `CCOMPARE` update (575 to 598) sits inside `#ifdef CONFIG_FREERTOS_SYSTICK_USES_CCOUNT`, which `components/freertos/Kconfig` enables only for the ESP32 and ESP32-S2 tick source, so on the ESP32-S3 it is compiled out.
 [^esptimerhdr]: `components/esp_timer/include/esp_timer.h` (223): `int64_t esp_timer_get_time(void);`, "Get time in microseconds since boot".
 [^esptimerdoc]: Espressif, *ESP-IDF Programming Guide* v5.5.1, ESP32-S3, "ESP Timer": "The time resolution: one microsecond." https://docs.espressif.com/projects/esp-idf/en/v5.5.1/esp32s3/api-reference/system/esp_timer.html
 [^systimer]: `components/esp_hw_support/port/esp32s3/systimer.c` (9 to 22): "systimer's clock source is fixed to XTAL (40MHz), and has a fixed fractional divider (2.5). So the resolution of the systimer is 40MHz/2.5 = 16MHz." `systimer_ticks_to_us()` returns `ticks / 16`.

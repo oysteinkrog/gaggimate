@@ -3,7 +3,7 @@
 # "esp32s3-assembly-optimization-kb" and build/refresh its lexical index + vector
 # embeddings.
 #
-# Run from anywhere — the script resolves the topic dir relative to itself
+# Run from anywhere: the script resolves the topic dir relative to itself
 # (symlink-safe via readlink -f). Re-runnable: if the collection is already
 # registered at the same path, just refreshes the indices; if registered at a
 # different path (e.g. after a checkout move), removes and re-adds it.
@@ -54,10 +54,10 @@ elif [[ "${existing_path//\\//}" != "${KB_DIR_REG//\\//}" ]]; then
   qmd collection remove "$COLLECTION_NAME"
   qmd collection add "$KB_DIR_REG" --name "$COLLECTION_NAME"
 else
-  echo "    (already registered at correct path — skipping add)"
+  echo "    (already registered at correct path, skipping add)"
 fi
 
-# `qmd update` re-indexes every registered collection — it does not take a
+# `qmd update` re-indexes every registered collection; it does not take a
 # per-collection flag. That is fine for our workflow but be aware that this
 # also refreshes any sibling collections the user has registered.
 echo "==> indexing (lexical, all collections)"

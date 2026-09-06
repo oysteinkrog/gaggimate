@@ -141,9 +141,14 @@ testing.
 One caveat sits on top of that. Issue #154 reports a freestanding image
 hanging under the ESP32-S3 machine because it boots with `CPENABLE = 0`
 and the first floating-point operation recurses through the Cp0Disabled
-handler.[^26] Whether that is an emulator defect or a missing handler in
-the guest is unresolved. [uncertain] Either way, set `CPENABLE` in your
-own startup rather than relying on the reset state.
+handler.[^26] It is an emulator defect: the open pull request #155 on
+that issue measured `CPENABLE = 0xff` at reset on silicon and traces the
+QEMU behaviour to `target/xtensa/cpu.c`, whose reset hook sets `CPENABLE`
+to `0xff` only in the user-mode build, never in the system emulation that
+`qemu-system-xtensa` runs.[^26] The fix was unmerged as of 2026-09-06, so
+set `CPENABLE` in your own startup rather than relying on the reset state.
+The [adversarial register of QEMU divergences](../09-adversarial/qemu-versus-silicon-known-and-suspected-divergences.md)
+carries the details.
 
 ## What QEMU does not prove
 
@@ -308,4 +313,4 @@ last step, and a claim about speed never comes from it.
 [^24]: espressif/qemu, `target/xtensa/gdbstub.c`, branch `esp-develop`. `xtensa_cpu_gdb_read_register` and `xtensa_cpu_gdb_write_register` handle `xtRegisterTypeTieRegfile` only for `reg->size` 4 and 8; other sizes hit the default arm, which calls `qemu_log_mask(LOG_UNIMP, ...)` and `gdb_get_zeroes(mem_buf, reg->size)` on read. `xtRegisterTypeUserReg` reads and writes `env->uregs[...]` directly.
 [^25]: espressif/qemu, `target/xtensa/core-esp32s3/gdb-config.inc.c`, branch `esp-develop`. `q0` to `q7` are declared with bit size 128, byte size 16 and type 4 (`xtRegisterTypeTieRegfile`); `accx_0`, `accx_1`, `qacc_h_0` to `qacc_h_4` and `qacc_l_0` to `qacc_l_4` are declared with type 3 (`xtRegisterTypeUserReg`). Field order per the `XTREG` macro in `target/xtensa/overlay_tool.h`.
 
-[^26]: espressif/qemu issue #154, "ESP32-S3: qemu-system-xtensa boots with CPENABLE = 0; first FP op recurses through the Cp0Disabled handler (QEMU-293)", opened 2026-05-28, open as of 2026-09-06. The reproducer is a Rust `no_std` binary run from a flash image.
+[^26]: espressif/qemu issue #154, "ESP32-S3: qemu-system-xtensa boots with CPENABLE = 0; first FP op recurses through the Cp0Disabled handler (QEMU-293)", opened 2026-05-28, open as of 2026-09-06. The reproducer is a Rust `no_std` binary run from a flash image. Pull request #155 on the same repository (open as of 2026-09-06) carries the silicon measurement and the `cpu.c` root cause.
