@@ -1396,6 +1396,19 @@ void WebUIPlugin::setupServer() {
                 a->rampOverlayGain(a->overlayGainTarget() > 128 ? 0 : 256, static_cast<uint32_t>(v));
             }
         }
+#ifdef GM_BLEND_PROBE
+        // probe=0..7 -- blend-stage decomposition, see benchSetBlendProbe.
+        if (request->hasArg("probe")) {
+            a->setBlendProbe(request->arg("probe").toInt());
+        }
+        if (request->hasArg("probereps")) {
+            a->setProbeReps(request->arg("probereps").toInt());
+        }
+        // bpie=0|1 -- scalar or vector composite kernel (blendRow vs blendRowPie).
+        if (request->hasArg("bpie")) {
+            a->setBpie(request->arg("bpie").toInt() != 0);
+        }
+#endif
         // elemtest=1 shows a 120x120 test plate at the centre through element
         // slot 7 (the press highlight's cost, measured on elem_us); 0 clears.
         if (request->hasArg("elemtest")) {
@@ -1620,6 +1633,13 @@ void WebUIPlugin::setupServer() {
         doc["elem_us"] = a->lastElementUsValue();
         doc["elem_rings"] = a->ringElementCount();
         doc["dials"] = g_dialElementsReq;
+        doc["band_internal"] = a->bandBufInternal();
+#ifdef GM_BLEND_PROBE
+        doc["probe"] = a->blendProbeLevel();
+        doc["probe_px"] = a->probePixels();
+        doc["probe_reps"] = a->probeRepsValue();
+        doc["bpie"] = a->bpie();
+#endif
         doc["ov_gain_target"] = a->overlayGainTarget();
         doc["tick_cache_bytes"] = meterticks::bytesAllocated();
         doc["uianim"] = g_uiAnimTestReq;

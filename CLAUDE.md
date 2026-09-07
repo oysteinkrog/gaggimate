@@ -131,8 +131,28 @@ telemetry-driven screen from a 650 ms LVGL pass (1.5 Hz widget updates,
   LVGL's drawing and the snapshot copy contend with the render task for the
   bus. Compositing only the overlay's non-transparent runs (gm-2cl.11) saved
   12% of blend with plates on and nothing without them, so it was measured
-  and not shipped. The lever is fewer LVGL passes (gm-2cl.5, .6, .7), not a
-  cheaper blend.
+  and not shipped. The lever against churn is fewer LVGL passes (gm-2cl.5,
+  .6, .7).
+- **The blend kernel itself is compute-bound, not bus-bound** (gm-2cl.14,
+  2026-09-07, bench board, brew screen, cap 45, interlace pinned on). The
+  blend probe (`/api/debug/anim?probe=4..7&probereps=1|2&bpie=0|1`,
+  loadtest builds, `tools/blend_probe.py`) blends one captured overlay row
+  into every band with the source and destination each placed in internal
+  SRAM or PSRAM, once and twice per band so fixed costs cancel: 95 ns per
+  pixel from SRAM, 75 from PSRAM, 79 for the scalar kernel with everything
+  internal, so the memory does not set the cost and the vector kernel
+  (`blendRowPie`, default on) buys nothing on that row. That is about 20
+  cycles for a 16-bit alpha blend, and gm-2cl.16 is the kernel work it
+  justifies. About 3 ms a frame of the blend stage is fixed cost (scrim
+  pass, row and run walk, per-band timer reads), not pixels. Stage
+  breakdown at rest on the brew screen: band 9.5 ms, push 8.3, blend 5.7,
+  element 3.4, frame 32; under an LVGL pass band and blend nearly double
+  with the same pixels, which is the contention above.
+- **The bench board stores `bgAnimInterlace` 0**, whatever the runner
+  fixtures say, so a measurement that assumes the interlaced path must pin
+  it (`interlace=1` on the debug endpoint, not stored) and say so. Every
+  dial-element number above was taken on the whole-frame path (frame 52 to
+  78 ms). gm-2cl.9 (the default) is still open.
 - **Rendering straight into the bounce ring without a framebuffer does not
   work on this bus** (gm-2cl.13, killed 2026-09-07). Two rounds, Starfield,
   standby screen, divider 8 (110 us per 2-row band): 36 to 45% of the 9,200
