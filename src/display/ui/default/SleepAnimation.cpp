@@ -831,7 +831,10 @@ static uint32_t pieSelfTest(uint32_t *firstBad) {
     return bad;
 }
 
-// Bench only: the blend walk with its work removed, so the pixel loop can be
+#endif // GM_ANIM_BENCH
+
+#ifdef GM_BLEND_PROBE
+// Probe builds: the blend walk with its work removed, so the pixel loop can be
 // split into what it computes and what it waits on.
 //   2 -- read the coverage byte and nothing else (the PSRAM load on its own)
 //   3 -- coverage plus the band read-modify-write (adds the SRAM traffic)
@@ -853,7 +856,92 @@ __attribute__((noinline)) static uint32_t blendRowProbe(uint16_t *__restrict dst
     }
     return acc;
 }
-#endif
+
+} // namespace
+
+static_assert(SleepAnimation::kProbeRuns == RUNS_PER_ROW, "probe run capture mirrors the overlay's run table");
+
+// Levels 4 to 7 (benchSetBlendProbe): the production blend kernel over one
+// captured overlay row, the same bytes and the same runs for every band, with
+// the source and the destination each placed in internal SRAM or PSRAM. The
+// first frames capture the row with the most pixels; a level change back to 0
+// frees the copies (probeReset) so a new capture starts clean.
+uint32_t IRAM_ATTR SleepAnimation::probeBlendRow(uint16_t *drow, const uint8_t *crow, const uint32_t *runs, int nRuns,
+                                                 int level, int w, bool pie) {
+    if (level <= 1) {
+        return 0;
+    }
+    if (level <= 3) {
+        return blendRowProbe(drow, crow, runs, nRuns, level);
+    }
+    if (probeCaptureBands < 720) { // about three frames of bands
+        uint32_t px = 0;
+        int xmax = 0;
+        for (int i = 0; i < nRuns; i++) {
+            const int x0 = static_cast<int>(runs[i] & 0xFFFFu);
+            const int x1 = static_cast<int>(runs[i] >> 16);
+            px += static_cast<uint32_t>(x1 - x0);
+            xmax = x1 > xmax ? x1 : xmax;
+        }
+        if (px > probePx && nRuns <= kProbeRuns && xmax <= w) {
+            if (probeRowSram == nullptr) {
+                probeRowSram = static_cast<uint8_t *>(
+                    heap_caps_malloc(static_cast<size_t>(w) * 3, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+                probeRowPsram = static_cast<uint8_t *>(heap_caps_malloc(static_cast<size_t>(w) * 3, MALLOC_CAP_SPIRAM));
+                probeDstSram = static_cast<uint16_t *>(
+                    heap_caps_aligned_alloc(16, static_cast<size_t>(w) * 2, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+            }
+            if (probeRowSram != nullptr && probeRowPsram != nullptr && probeDstSram != nullptr) {
+                memcpy(probeRowSram, crow, static_cast<size_t>(xmax) * 3);
+                memcpy(probeRowPsram, crow, static_cast<size_t>(xmax) * 3);
+                memcpy(probeRuns, runs, static_cast<size_t>(nRuns) * sizeof(uint32_t));
+                probeNRuns = nRuns;
+                probePx = px;
+                probePxOut.store(px);
+            }
+        }
+        probeCaptureBands++;
+        return 0;
+    }
+    if (probeNRuns == 0) {
+        return 0;
+    }
+    const uint8_t *src = (level == 4 || level == 7) ? probeRowSram : probeRowPsram;
+    uint16_t *dst = (level >= 6) ? probeDstSram : drow;
+    const int reps = probeReps.load();
+    for (int k = 0; k < reps; k++) {
+        if (pie) {
+            blendRowPie<false>(dst, src, probeRuns, probeNRuns, 256);
+        } else {
+            blendRow<false>(dst, src, probeRuns, probeNRuns, 256);
+        }
+    }
+    return static_cast<uint32_t>(reps);
+}
+
+void SleepAnimation::probeReset() {
+    if (probeRowSram != nullptr) {
+        heap_caps_free(probeRowSram);
+    }
+    if (probeRowPsram != nullptr) {
+        heap_caps_free(probeRowPsram);
+    }
+    if (probeDstSram != nullptr) {
+        heap_caps_free(probeDstSram);
+    }
+    probeRowSram = nullptr;
+    probeRowPsram = nullptr;
+    probeDstSram = nullptr;
+    probeNRuns = 0;
+    probePx = 0;
+    probeCaptureBands = 0;
+    probePxOut.store(0);
+}
+#endif // GM_BLEND_PROBE
+
+bool SleepAnimation::bandBufInternal() const { return bandBuf[0] != nullptr && esp_ptr_internal(bandBuf[0]); }
+
+namespace {
 
 #ifdef GM_ANIM_BENCH
 // Bench only: a deterministic value for every panel pixel, so a host can
@@ -4058,16 +4146,21 @@ void IRAM_ATTR SleepAnimation::renderFrame() {
         // stage look ~2x its real cost and sent an earlier round of work at a
         // memory-layout problem the blend did not have.
         uint32_t spanPxLocal = 0;
-        uint32_t probeAcc = 0;
         uint32_t scrimPxLocal = 0;
+#endif
+#ifdef GM_BLEND_PROBE
+        uint32_t probeAcc = 0;
 #endif
         // Text scrim strength, Q8. Zero whenever the user has it off or the
         // grids could not be allocated, and that zero is what makes it free
         // when unused: pass one is skipped outright rather than run with a
         // no-op factor.
         const int scrim = (ov != nullptr && ov->scrim != nullptr) ? scrimQ8.load() : 0;
-#ifdef GM_ANIM_BENCH
+#ifdef GM_BLEND_PROBE
         const int probe = blendProbe.load();
+        if (probe == 0 && probeCaptureBands != 0) {
+            probeReset();
+        }
 #endif
         // A gain below 256 scales the scrim's strength too, so a fading page
         // does not leave its dark halo behind: one scaled cell row, rebuilt
@@ -4172,9 +4265,9 @@ void IRAM_ATTR SleepAnimation::renderFrame() {
             }
 #endif
             const uint8_t *const crow = ov->buf + (static_cast<size_t>(y + ovYoff) * ov->w + ovXoff) * 3;
-#ifdef GM_ANIM_BENCH
-            if (probe >= 2) {
-                probeAcc += blendRowProbe(drow, crow, runs, nRuns, probe);
+#ifdef GM_BLEND_PROBE
+            if (probe >= 1) {
+                probeAcc += probeBlendRow(drow, crow, runs, nRuns, probe, w, pieBlend);
                 continue;
             }
 #endif
@@ -4232,7 +4325,9 @@ void IRAM_ATTR SleepAnimation::renderFrame() {
 #ifdef GM_ANIM_BENCH
         accSpanPx += spanPxLocal;
         accScrimPx += scrimPxLocal;
-        benchProbeSink += probeAcc;
+#endif
+#ifdef GM_BLEND_PROBE
+        probeSink += probeAcc;
 #endif
 
         // Compact the band to just the columns the round panel actually shows.

@@ -1,6 +1,13 @@
 #ifndef SLEEPANIMATION_H
 #define SLEEPANIMATION_H
 
+// Blend-stage probes (benchSetBlendProbe) exist in the bench build and in
+// the touch-probe (loadtest) build, so the bench board can answer where the
+// composite's time goes without a bench flash.
+#if defined(GM_ANIM_BENCH) || defined(GM_TOUCH_PROBE)
+#define GM_BLEND_PROBE 1
+#endif
+
 #include <atomic>
 #include <display/ui/default/TickRingElement.h>
 #include <stdint.h>
@@ -535,6 +542,21 @@ class SleepAnimation {
         bandDma.xferStats(count, sumUs, maxUs, over256, over512);
     }
 
+    // Blend probe state, readable in every build; the knob itself is a bench
+    // or GM_TOUCH_PROBE feature (GM_BLEND_PROBE).
+    void setBlendProbe(int level) { blendProbe.store(level); }
+    int blendProbeLevel() const { return blendProbe.load(); }
+    uint32_t probePixels() const { return probePxOut.load(); }
+    // Times the captured row is blended per band (1 to 8): the difference
+    // between two counts is the per-pixel cost with every fixed cost removed.
+    void setProbeReps(int n) { probeReps.store(n < 1 ? 1 : (n > 8 ? 8 : n)); }
+    int probeRepsValue() const { return probeReps.load(); }
+    // Vector (blendRowPie) or scalar (blendRow) composite, for the A/B.
+    void setBpie(bool on) { bpieOn.store(on); }
+    bool bpie() const { return bpieOn.load(); }
+    // Whether the band buffers landed in internal SRAM (they fall back to PSRAM).
+    bool bandBufInternal() const;
+
 #ifdef GM_ANIM_BENCH
     // Bench build only. The render task walks the whole registry, dwelling on
     // each animation for BENCH_DWELL_MS at its default params, and records
@@ -585,6 +607,13 @@ class SleepAnimation {
     //   3 -- plus the band read-modify-write, so the SRAM traffic does too
     // Which separates the cost of deciding what to touch from the cost of
     // touching it, and that from what waits on memory.
+    //   4 -- the full blend of one captured overlay row from internal SRAM
+    //   5 -- the same row, same runs, from PSRAM (the production source)
+    //   6 -- PSRAM source, internal scratch destination
+    //   7 -- internal source and internal scratch destination
+    // Levels 4 to 7 blend one row's bytes into every band (the picture is
+    // wrong while they run); probe_px on /api/debug/anim is that row's pixel
+    // count, so blend_us / (probe_px * rows) is ns per pixel by memory.
     void benchSetBlendProbe(int level) { blendProbe.store(level); }
     // Replace the animation and the composite with a deterministic pattern the
     // host can recompute, so the render-to-framebuffer path can be checked by
@@ -1406,6 +1435,23 @@ class SleepAnimation {
     // composite, so a plain relaxed load is all it needs.
     std::atomic<int> scrimQ8{0}; // off until setScrim says otherwise; see bgAnimScrim
     std::atomic<int> blendProbe{0};
+#ifdef GM_BLEND_PROBE
+    // One captured overlay row for probe levels 4 to 7 (see benchSetBlendProbe).
+    static constexpr int kProbeRuns = 24; // RUNS_PER_ROW, asserted in the .cpp
+    uint8_t *probeRowSram = nullptr;
+    uint8_t *probeRowPsram = nullptr;
+    uint16_t *probeDstSram = nullptr;
+    uint32_t probeRuns[kProbeRuns] = {};
+    int probeNRuns = 0;
+    uint32_t probePx = 0;
+    int probeCaptureBands = 0;
+    volatile uint32_t probeSink = 0;
+    uint32_t probeBlendRow(uint16_t *drow, const uint8_t *crow, const uint32_t *runs, int nRuns, int level, int w,
+                           bool pie);
+    void probeReset();
+#endif
+    std::atomic<uint32_t> probePxOut{0};
+    std::atomic<int> probeReps{1};
     // Dim the scrim on the PIE vector unit rather than a pixel at a time.
     // Default on; the scalar path stays as the reference /api/pietest checks
     // against, and as the kernel for a run's unaligned edge cells.
