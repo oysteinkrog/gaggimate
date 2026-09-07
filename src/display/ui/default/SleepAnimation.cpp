@@ -4156,7 +4156,12 @@ void SleepAnimation::renderFrame() {
                     display->pushColors(0, y0, w, y0 + rows, band);
                 }
                 xSemaphoreGive(static_cast<SemaphoreHandle_t>(bandFree[renderSlot]));
-            } else if (!nothingOwnedThisBand && bandInterlaced) {
+            } else if (!nothingOwnedThisBand && (bandInterlaced || directInterlacedFrame)) {
+                // Also for a band under regional warm-up inside an interlaced
+                // frame (gm-qo3.5, flagged by the GPT-6 Astra oracle): its
+                // bandInterlaced is false, GDMA wrote it whole, and the frame
+                // still never flips, so nothing else would invalidate it.
+                //
                 // Make these bytes visible to the bounce refill's
                 // cache-mediated reads. A non-interlaced frame gets this for
                 // free, once, for the whole buffer, from presentFrame()'s
@@ -4180,9 +4185,14 @@ void SleepAnimation::renderFrame() {
                 // is the beam-racing exposure this feature accepts (see
                 // presentFrame()), not a new failure mode this invalidate
                 // introduces.
-                for (int i = 0; i < nRowGroups; i++) {
-                    esp_cache_msync(dstRow + static_cast<size_t>(rowGroupRow[i]) * w + dmaX0, rowGroupBytes,
-                                    ESP_CACHE_MSYNC_FLAG_DIR_M2C);
+                if (nRowGroups > 0) {
+                    for (int i = 0; i < nRowGroups; i++) {
+                        esp_cache_msync(dstRow + static_cast<size_t>(rowGroupRow[i]) * w + dmaX0, rowGroupBytes,
+                                        ESP_CACHE_MSYNC_FLAG_DIR_M2C);
+                    }
+                } else {
+                    // The warmed band went out as one transfer.
+                    esp_cache_msync(dstRow, bytes, ESP_CACHE_MSYNC_FLAG_DIR_M2C);
                 }
             }
             BENCH_ACC(accPushUs, tPush);
