@@ -4,6 +4,7 @@
 #include <display/core/Controller.h>
 #include <display/core/PluginManager.h>
 #include <display/core/Settings.h>
+#include <display/drivers/common/LV_Helper.h>
 #include <display/ui/default/DefaultUI.h>
 #include <display/ui/default/eez/images.h>
 #include <display/ui/default/eez/screens.h>
@@ -394,7 +395,10 @@ void SettingsUI::buildTile(lv_obj_t *parent, int index, const SettingsCategoryDe
             const lv_color_t rest = lv_color_hex(theme_colors[eez_flow_get_selected_theme_index()][0]);
             const lv_color_t dim =
                 lv_color_hex(static_cast<uint32_t>(ctx->self->controller().getSettings().getTouchDimColor()));
-            const lv_color_t c = code == LV_EVENT_PRESSED ? settingsPressedColor(rest, dim) : rest;
+            // The compositor's plate is the press feedback while it is active
+            // (g_pressPlateActive); a release always restores the rest colour.
+            const lv_color_t c =
+                (code == LV_EVENT_PRESSED && !g_pressPlateActive) ? settingsPressedColor(rest, dim) : rest;
             if (icon != nullptr) {
                 lv_obj_set_style_img_recolor(icon, c, LV_PART_MAIN);
             }

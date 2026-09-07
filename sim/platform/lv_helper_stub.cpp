@@ -15,6 +15,8 @@
 #include <display/drivers/common/LV_Helper.h>
 
 volatile int64_t g_touchEdgeAtUs = 0;
+TouchHitHook g_touchHitHook = nullptr;
+volatile bool g_pressPlateActive = false;
 volatile int64_t g_overlayMinRefreshUs = 250000; // DefaultUI's constructor sets OVERLAY_MIN_REFRESH_US
 volatile int g_uiAnimTestReq = 0;
 OverlayStats g_overlayStats;

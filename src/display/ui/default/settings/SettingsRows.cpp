@@ -1,4 +1,5 @@
 #include "SettingsRows.h"
+#include <display/drivers/common/LV_Helper.h>
 
 #include <display/core/Controller.h>
 #include <display/core/Settings.h>
@@ -175,7 +176,9 @@ struct PressDim {
 };
 
 void applyPressDim(const PressDim &pd, bool pressed) {
-    const lv_color_t c = pressed ? pd.dim : pd.fg;
+    // A release always restores; a press dims only while the compositor's
+    // plate is not doing the job (g_pressPlateActive).
+    const lv_color_t c = (pressed && !g_pressPlateActive) ? pd.dim : pd.fg;
     if (pd.label != nullptr) {
         lv_obj_set_style_text_color(pd.label, c, LV_PART_MAIN);
     }

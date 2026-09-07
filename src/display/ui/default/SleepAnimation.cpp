@@ -627,6 +627,56 @@ __attribute__((noinline)) static void IRAM_ATTR blendRowPie(uint16_t *__restrict
     }
 }
 
+// Fill dst[x0, x1) with a constant colour at a constant coverage: the
+// element kernel. Coverage is Q5 (32 levels) so both pixels of a word scale
+// in one multiply each, the same packing as scale565x2 above; fgTerm is the
+// colour already scaled by the coverage and packed twice, so per pair this
+// is two multiplies, four masks and an add. Channel sums cannot carry: each
+// channel is a truncated (v * inv) >> 5 plus a truncated (c * a) >> 5 with
+// inv + a == 32, which is at most the channel's own maximum.
+__attribute__((always_inline)) inline void elemFillRow(uint16_t *__restrict dst, int x0, int x1, uint32_t fgTerm,
+                                                       uint32_t invQ5) {
+    const uint16_t fgOne = static_cast<uint16_t>(fgTerm & 0xFFFFu);
+    if ((x0 & 1) != 0 && x0 < x1) {
+        dst[x0] = static_cast<uint16_t>(scale565(dst[x0], invQ5) + fgOne);
+        x0++;
+    }
+    uint32_t *q = reinterpret_cast<uint32_t *>(dst + x0);
+    const int pairs = (x1 - x0) >> 1;
+    for (int i = 0; i < pairs; i++) {
+        q[i] = scale565x2(q[i], invQ5) + fgTerm;
+    }
+    const int xt = x0 + pairs * 2;
+    if (xt < x1) {
+        dst[xt] = static_cast<uint16_t>(scale565(dst[xt], invQ5) + fgOne);
+    }
+}
+
+static inline uint32_t isqrt32(uint32_t v) {
+    if (v == 0) {
+        return 0;
+    }
+    uint32_t s = v;
+    uint32_t t = (s + 1) >> 1;
+    while (t < s) {
+        s = t;
+        t = (s + v / s) >> 1;
+    }
+    return s;
+}
+
+// How far a rounded corner pulls a row's span in: k is the row's index into
+// the corner counted from its outer edge (1 = outermost), r the radius.
+static inline int elemCornerInset(int r, int k) {
+    const int cy2 = 2 * k - 1; // twice the distance from the circle's centre row
+    const int d = 4 * r * r - cy2 * cy2;
+    if (d <= 0) {
+        return r;
+    }
+    const int hw = static_cast<int>((isqrt32(static_cast<uint32_t>(d)) + 1) >> 1);
+    return hw >= r ? 0 : r - hw;
+}
+
 // Dim the band toward black wherever the text scrim reaches, so the glyphs
 // about to go down on top of it stay legible over a bright animation.
 //
@@ -2307,6 +2357,145 @@ void SleepAnimation::compositeLayersRow(uint16_t *drow, int y, int w, bool pieBl
     }
 }
 
+void SleepAnimation::setElement(int id, const ElementDesc &d) {
+    if (id < 0 || id >= MAX_ELEMENTS) {
+        return;
+    }
+    Element &e = elements[id];
+    e.seq.fetch_add(1);
+    e.d = d;
+    e.seq.fetch_add(1);
+}
+
+void SleepAnimation::clearElement(int id) {
+    ElementDesc none;
+    setElement(id, none);
+}
+
+void SleepAnimation::readElement(const Element &e, ElementDesc &out) {
+    for (;;) {
+        const uint32_t s1 = e.seq.load();
+        if (s1 & 1u) {
+            continue;
+        }
+        out = e.d;
+        if (e.seq.load() == s1) {
+            return;
+        }
+    }
+}
+
+void SleepAnimation::evaluateElements(int64_t nowUs) {
+    elementsThisFrame = false;
+    if (display == nullptr) {
+        return;
+    }
+    const int panelH = display->height();
+    const int panelW = display->width();
+    for (int i = 0; i < MAX_ELEMENTS; i++) {
+        Element &e = elements[i];
+        ElementDesc d;
+        readElement(e, d);
+        // Clip to the panel here, once, so the row composite never has to.
+        int x0 = d.x, y0 = d.y, x1 = d.x + d.w, y1 = d.y + d.h;
+        if (x0 < 0) {
+            x0 = 0;
+        }
+        if (y0 < 0) {
+            y0 = 0;
+        }
+        if (x1 > panelW) {
+            x1 = panelW;
+        }
+        if (y1 > panelH) {
+            y1 = panelH;
+        }
+        const bool vis = d.type != ElementType::None && d.alpha != 0 && x1 > x0 && y1 > y0;
+        const bool moved = vis != e.lastVisible || (vis && (y0 != e.lastY0 || y1 != e.lastY1 || d.x != e.f.x ||
+                                                             d.w != e.f.w || d.radius != e.f.radius));
+        if (moved) {
+            int ranges[2][2];
+            int n = 0;
+            if (e.lastVisible) {
+                ranges[n][0] = e.lastY0;
+                ranges[n][1] = e.lastY1;
+                n++;
+            }
+            if (vis) {
+                ranges[n][0] = y0;
+                ranges[n][1] = y1;
+                n++;
+            }
+            if (n > 0) {
+                requestBandWarmup(ranges, n);
+            }
+        }
+#ifdef GM_TOUCH_PROBE
+        if (vis && !e.lastVisible && d.tUs != 0) {
+            ESP_LOGI("TouchProbe", "GM_ELEM: write->frame %lld us (slot %d)", (long long)(nowUs - d.tUs), i);
+        }
+#else
+        (void)nowUs;
+#endif
+        e.f = d;
+        e.fVisible = vis;
+        e.lastVisible = vis;
+        e.lastY0 = y0;
+        e.lastY1 = y1;
+        elementsThisFrame = elementsThisFrame || vis;
+    }
+}
+
+void IRAM_ATTR SleepAnimation::compositeElementsRow(uint16_t *drow, int y, int w) {
+    for (int i = 0; i < MAX_ELEMENTS; i++) {
+        const Element &e = elements[i];
+        if (!e.fVisible) {
+            continue;
+        }
+        const ElementDesc &d = e.f;
+        const int dy = y - d.y;
+        if (dy < 0 || dy >= d.h) {
+            continue;
+        }
+        int r = d.radius;
+        if (r > kElementMaxRadius) {
+            r = kElementMaxRadius;
+        }
+        if (r > d.w / 2) {
+            r = d.w / 2;
+        }
+        if (r > d.h / 2) {
+            r = d.h / 2;
+        }
+        int inset = 0;
+        if (dy < r) {
+            inset = elemCornerInset(r, r - dy);
+        } else if (dy >= d.h - r) {
+            inset = elemCornerInset(r, dy - (d.h - r) + 1);
+        }
+        int x0 = d.x + inset;
+        int x1 = d.x + d.w - inset;
+        if (x0 < 0) {
+            x0 = 0;
+        }
+        if (x1 > w) {
+            x1 = w;
+        }
+        if (x1 <= x0) {
+            continue;
+        }
+        uint32_t a5 = (static_cast<uint32_t>(d.alpha) * 32u + 127u) / 255u;
+        if (a5 == 0) {
+            continue;
+        }
+        if (a5 > 32) {
+            a5 = 32;
+        }
+        const uint32_t cc = static_cast<uint32_t>(d.color) | (static_cast<uint32_t>(d.color) << 16);
+        elemFillRow(drow, x0, x1, scale565x2(cc, a5), 32u - a5);
+    }
+}
+
 // Turns the per-cell coverage in ov.scrimSrc into the halo the composite reads,
 // then widens the span tables to cover it.
 //
@@ -3065,6 +3254,7 @@ void SleepAnimation::renderLoop() {
         lastCopyUs.store(profCopyUs);
         lastBlendUs.store(profBlendUs);
         lastLayerUs.store(profLayerUs);
+        lastElemUs.store(profElemUs);
         lastMsyncUs.store(profMsyncUs);
         lastPushUs.store(profPushUs);
 #endif
@@ -3189,6 +3379,7 @@ void SleepAnimation::renderFrame() {
     profCopyUs = 0;
     profBlendUs = 0;
     profLayerUs = 0;
+    profElemUs = 0;
     profMsyncUs = 0;
     profPushUs = 0;
     // Cropping to the round panel's visible chord trades render-side work
@@ -3292,6 +3483,7 @@ void SleepAnimation::renderFrame() {
     } while (ofi != overlayFront.load());
     const int64_t frameNowUs = esp_timer_get_time();
     evaluateLayers(frameNowUs);
+    evaluateElements(frameNowUs);
     // One gain for the whole frame, like the overlay index above: a ramp
     // step lands between frames, never between bands.
     const uint32_t ovGain = overlayGainAt(frameNowUs, ofi);
@@ -3905,6 +4097,23 @@ void SleepAnimation::renderFrame() {
                     compositeLayersRow(band + static_cast<size_t>(y - y0) * w, y, w, pieBlend);
                 }
                 profLayerUs += static_cast<uint32_t>(esp_timer_get_time() - tLayer);
+            }
+        }
+        // Elements sit above the layers, same parity rule.
+        if (elementsThisFrame && !patternMode) {
+            bool hit = false;
+            for (int i = 0; i < MAX_ELEMENTS && !hit; i++) {
+                hit = elements[i].fVisible && elements[i].f.y < y0 + rows && elements[i].f.y + elements[i].f.h > y0;
+            }
+            if (hit) {
+                const int64_t tElem = esp_timer_get_time();
+                for (int y = y0; y < y0 + rows; y++) {
+                    if (bandInterlaced && ((((pairMode ? (y >> 1) : y) ^ parityNow) & 1) != 0)) {
+                        continue;
+                    }
+                    compositeElementsRow(band + static_cast<size_t>(y - y0) * w, y, w);
+                }
+                profElemUs += static_cast<uint32_t>(esp_timer_get_time() - tElem);
             }
         }
 #ifdef GM_ANIM_BENCH

@@ -304,6 +304,8 @@ static void disp_flush(lv_disp_drv_t *disp_drv, const lv_area_t *area, lv_color_
 }
 
 volatile int64_t g_touchEdgeAtUs = 0;
+TouchHitHook g_touchHitHook = nullptr;
+volatile bool g_pressPlateActive = false;
 OverlayStats g_overlayStats;
 volatile int g_uiAnimTestReq = 0;
 TouchLogEntry g_touchLog[TOUCHLOG_N];
@@ -355,6 +357,9 @@ static void touchpad_read(lv_indev_drv_t *indev_driver, lv_indev_data_t *data) {
                 en.hit = lv_indev_search_obj(lv_scr_act(), &pt);
             }
             g_touchLogCount = g_touchLogCount + 1;
+            if (g_touchHitHook != nullptr) {
+                g_touchHitHook(en.hit, touched != 0, x, y);
+            }
         }
     }
 #ifdef GM_TOUCH_PROBE

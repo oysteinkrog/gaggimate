@@ -193,6 +193,17 @@ class DefaultUI {
     // held until handleScreenChange has swapped, so the old page never
     // gets a refresh mid-fade.
     void beginOverlayTransition(const char *why, bool waitSwap);
+    // Press highlight through the compositor (gm-2cl.3): the touch read
+    // callback hands every edge here; a press writes element 0 over the
+    // target's box, a release clears it. LVGL's pressed styles stand down
+    // while this is the feedback (see g_pressPlateActive).
+    static void touchHitHook(lv_obj_t *hit, bool pressed, int16_t x, int16_t y);
+    void onTouchHit(lv_obj_t *hit, bool pressed);
+    void updatePressPlateMode();
+    bool pressPlateMode = false;
+    static DefaultUI *s_instance;
+    static constexpr int PRESS_PLATE_ELEMENT = 0;
+    static constexpr int PRESS_PLATE_OUTSET = 4;
     void serviceOverlayTransition();
     void finishOverlayTransition();
     bool overlayFadedOut() const;

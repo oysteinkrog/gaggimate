@@ -54,6 +54,19 @@ class SleepAnimation {
     bool layerVisible(int) const { return false; }
     void layerHide(int) {}
     LayerInfo layerInfo(int) const { return LayerInfo{}; }
+    static constexpr int MAX_ELEMENTS = 8;
+    enum class ElementType : uint8_t { None = 0, RoundRect = 1 };
+    struct ElementDesc {
+        ElementType type = ElementType::None;
+        uint8_t alpha = 0;
+        uint8_t radius = 0;
+        uint16_t color = 0;
+        int16_t x = 0, y = 0, w = 0, h = 0;
+        int64_t tUs = 0;
+    };
+    void setElement(int, const ElementDesc &) {}
+    void clearElement(int) {}
+    uint32_t lastElementUsValue() const { return 0; }
 };
 #else
 
@@ -401,6 +414,31 @@ class SleepAnimation {
     void layerHide(int id);
     LayerInfo layerInfo(int id) const;
     uint32_t lastLayerUsValue() const { return lastLayerUs.load(); }
+
+    // Elements (gm-2cl.3): small procedural things the render task draws
+    // above the overlay and the layers every frame, from a descriptor
+    // rather than from pixels. No PSRAM, no snapshot: a change to a
+    // descriptor is on the panel at the next frame. The table is static,
+    // MAX_ELEMENTS records under 64 bytes each, one seqlock per record so
+    // any task can write one. The first type is a rounded rectangle at a
+    // coverage, which is the press highlight: 40 percent toward the touch
+    // dim colour over the pressed target's box, the same rule as the LVGL
+    // pressed styles it replaces while the animation composites. Rows an
+    // element enters or leaves get regional warm-up like a layer.
+    static constexpr int MAX_ELEMENTS = 8;
+    static constexpr int kElementMaxRadius = 24;
+    enum class ElementType : uint8_t { None = 0, RoundRect = 1 };
+    struct ElementDesc {
+        ElementType type = ElementType::None;
+        uint8_t alpha = 0;  // coverage 0..255 (quantised to 32 levels in the blend)
+        uint8_t radius = 0; // corner radius, clamped to kElementMaxRadius and to half the box
+        uint16_t color = 0; // RGB565
+        int16_t x = 0, y = 0, w = 0, h = 0;
+        int64_t tUs = 0;    // when the writer wrote it (probe: write to frame latency)
+    };
+    void setElement(int id, const ElementDesc &d);
+    void clearElement(int id);
+    uint32_t lastElementUsValue() const { return lastElemUs.load(); }
 
     // Framebuffer-ownership controls, deliberately not behind GM_ANIM_BENCH.
     // Each setting produces a different visible defect and neither is visible
@@ -1434,6 +1472,25 @@ class SleepAnimation {
     bool layersThisFrame = false;
     std::atomic<uint32_t> lastLayerUs{0};
     uint32_t profLayerUs = 0; // compositing the layers into the band
+
+    struct Element {
+        std::atomic<uint32_t> seq{0}; // odd while a writer is inside
+        ElementDesc d;                // written under seq
+        ElementDesc f;                // latched for the frame being rendered
+        bool fVisible = false;
+        int lastY0 = 0, lastY1 = 0;
+        bool lastVisible = false;
+    };
+    Element elements[MAX_ELEMENTS];
+    static void readElement(const Element &e, ElementDesc &out);
+    // Once per frame on the render task, after evaluateLayers: latch every
+    // descriptor and warm up the rows an element entered or left.
+    void evaluateElements(int64_t nowUs);
+    // Per panel row, after the layers: every visible element covering y.
+    void compositeElementsRow(uint16_t *drow, int y, int w);
+    bool elementsThisFrame = false;
+    std::atomic<uint32_t> lastElemUs{0};
+    uint32_t profElemUs = 0;
     std::atomic<int> overlayInUse{-1}; // overlay the render task reads this frame
 
 #ifdef GM_ANIM_BENCH

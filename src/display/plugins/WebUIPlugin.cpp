@@ -1396,6 +1396,22 @@ void WebUIPlugin::setupServer() {
                 a->rampOverlayGain(a->overlayGainTarget() > 128 ? 0 : 256, static_cast<uint32_t>(v));
             }
         }
+        // elemtest=1 shows a 120x120 test plate at the centre through element
+        // slot 7 (the press highlight's cost, measured on elem_us); 0 clears.
+        if (request->hasArg("elemtest")) {
+            SleepAnimation::ElementDesc e;
+            if (request->arg("elemtest").toInt() != 0) {
+                e.type = SleepAnimation::ElementType::RoundRect;
+                e.alpha = LV_OPA_40;
+                e.color = 0;
+                e.x = 180;
+                e.y = 180;
+                e.w = 120;
+                e.h = 120;
+                e.radius = 16;
+            }
+            a->setElement(SleepAnimation::MAX_ELEMENTS - 1, e);
+        }
         // fps=N: temporary animation frame cap, 5..60, 0 restores the stored
         // setting. For the contention A/B (how much of a UI pass is the
         // render task's PSRAM traffic); DefaultUI applies it next pass.
@@ -1593,6 +1609,7 @@ void WebUIPlugin::setupServer() {
         doc["ov_min_us"] = static_cast<int64_t>(g_overlayMinRefreshUs);
         doc["fps_override"] = g_animFpsOverride;
         doc["ov_gain"] = a->overlayGain();
+        doc["elem_us"] = a->lastElementUsValue();
         doc["ov_gain_target"] = a->overlayGainTarget();
         doc["tick_cache_bytes"] = meterticks::bytesAllocated();
         doc["uianim"] = g_uiAnimTestReq;

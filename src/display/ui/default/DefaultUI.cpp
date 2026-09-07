@@ -238,7 +238,79 @@ DefaultUI::DefaultUI(Controller *controller, Driver *driver, PluginManager *plug
     xTaskCreatePinnedToCore(loopTask, "DefaultUI::loop", configMINIMAL_STACK_SIZE * 6, this, 1, &taskHandle, 1);
 }
 
+DefaultUI *DefaultUI::s_instance = nullptr;
+
+void DefaultUI::touchHitHook(lv_obj_t *hit, bool pressed, int16_t x, int16_t y) {
+    (void)x;
+    (void)y;
+    if (s_instance != nullptr) {
+        s_instance->onTouchHit(hit, pressed);
+    }
+}
+
+void DefaultUI::onTouchHit(lv_obj_t *hit, bool pressed) {
+#ifndef GAGGIMATE_SIM
+    if (!pressed || !pressPlateMode) {
+        sleepAnimation.clearElement(PRESS_PLATE_ELEMENT);
+        return;
+    }
+    if (hit == nullptr || hit == lv_scr_act() || lv_obj_has_state(hit, LV_STATE_DISABLED) ||
+        !lv_obj_has_flag(hit, LV_OBJ_FLAG_CLICKABLE)) {
+        return;
+    }
+    lv_area_t a;
+    lv_obj_get_coords(hit, &a);
+    const int w = lv_area_get_width(&a);
+    const int h = lv_area_get_height(&a);
+    // A container the size of the screen is not a target, whatever LVGL
+    // says: no plate over a background press.
+    if (w * h > (480 * 480) / 3) {
+        return;
+    }
+    SleepAnimation::ElementDesc e;
+    e.type = SleepAnimation::ElementType::RoundRect;
+    e.alpha = LV_OPA_40;
+    const lv_color_t dim = lv_color_hex(static_cast<uint32_t>(controller->getSettings().getTouchDimColor()));
+    e.color = lv_color_to16(dim);
+    e.x = static_cast<int16_t>(a.x1 - PRESS_PLATE_OUTSET);
+    e.y = static_cast<int16_t>(a.y1 - PRESS_PLATE_OUTSET);
+    e.w = static_cast<int16_t>(w + 2 * PRESS_PLATE_OUTSET);
+    e.h = static_cast<int16_t>(h + 2 * PRESS_PLATE_OUTSET);
+    const int side = e.w < e.h ? e.w : e.h;
+    int r = side / 4;
+    if (r > 16) {
+        r = 16;
+    }
+    e.radius = static_cast<uint8_t>(r);
+    e.tUs = esp_timer_get_time();
+    sleepAnimation.setElement(PRESS_PLATE_ELEMENT, e);
+#else
+    (void)hit;
+    (void)pressed;
+#endif
+}
+
+// The plate is the press feedback whenever the animation composites the
+// screen; LVGL's own pressed styles are cleared from the active screen then,
+// and put back by the next applyPressedFeedback walk when it stops.
+void DefaultUI::updatePressPlateMode() {
+#ifndef GAGGIMATE_SIM
+    const bool plate = sleepAnimation.isActive();
+    if (plate == pressPlateMode) {
+        return;
+    }
+    pressPlateMode = plate;
+    g_pressPlateActive = plate;
+    pressedStyledRoot = nullptr; // force a walk either way
+    if (!plate) {
+        sleepAnimation.clearElement(PRESS_PLATE_ELEMENT);
+    }
+#endif
+}
+
 void DefaultUI::init() {
+    s_instance = this;
+    g_touchHitHook = &DefaultUI::touchHitHook;
     profileManager = controller->getProfileManager();
     g_overlayMinRefreshUs = OVERLAY_MIN_REFRESH_US;
     auto triggerRender = [this](Event const &) { rerender = true; };
@@ -1679,9 +1751,15 @@ void DefaultUI::handleScreenChange() {
 // twice just overwrites it, so the walk is idempotent, and the rest colors
 // are re-read on every walk, which is what makes the theme-change rewalk
 // (applyTheme clears the root) pick up new hues.
-static void applyPressedRecurse(lv_obj_t *obj, lv_color_t dim) {
+static void applyPressedRecurse(lv_obj_t *obj, lv_color_t dim, bool clear = false) {
     const bool isImgBtn = lv_obj_check_type(obj, &lv_imgbtn_class);
-    if (isImgBtn || (lv_obj_check_type(obj, &lv_img_class) && lv_obj_has_flag(obj, LV_OBJ_FLAG_CLICKABLE))) {
+    if (clear) {
+        // The compositor's plate is the feedback: take the local PRESSED
+        // props back so a press does not dim the target twice.
+        lv_obj_remove_local_style_prop(obj, LV_STYLE_IMG_RECOLOR, LV_PART_MAIN | LV_STATE_PRESSED);
+        lv_obj_remove_local_style_prop(obj, LV_STYLE_IMG_RECOLOR_OPA, LV_PART_MAIN | LV_STATE_PRESSED);
+        lv_obj_remove_local_style_prop(obj, LV_STYLE_BG_COLOR, LV_PART_MAIN | LV_STATE_PRESSED);
+    } else if (isImgBtn || (lv_obj_check_type(obj, &lv_img_class) && lv_obj_has_flag(obj, LV_OBJ_FLAG_CLICKABLE))) {
         // Resolved for the unpressed state this walk runs in. Icons the theme
         // fully recolors (opa 255, most of them) shift 40% toward the
         // configured dim color from their own rest color; raw bitmaps get
@@ -1709,23 +1787,24 @@ static void applyPressedRecurse(lv_obj_t *obj, lv_color_t dim) {
     }
     const uint32_t n = lv_obj_get_child_cnt(obj);
     for (uint32_t i = 0; i < n; i++) {
-        applyPressedRecurse(lv_obj_get_child(obj, i), dim);
+        applyPressedRecurse(lv_obj_get_child(obj, i), dim, clear);
     }
 }
 
 void DefaultUI::applyPressedFeedback() {
+    updatePressPlateMode();
     lv_obj_t *scr = lv_scr_act();
     const int dim = controller->getSettings().getTouchDimColor();
     if (scr == nullptr || (scr == pressedStyledRoot && dim == appliedDimColor)) {
         return;
     }
     appliedDimColor = dim;
-    applyPressedRecurse(scr, lv_color_hex(static_cast<uint32_t>(dim)));
+    applyPressedRecurse(scr, lv_color_hex(static_cast<uint32_t>(dim)), pressPlateMode);
     pressedStyledRoot = scr;
 }
 
 void DefaultUI::applyPressedFeedbackTo(lv_obj_t *root) {
-    if (root == nullptr) {
+    if (root == nullptr || pressPlateMode) {
         return;
     }
     const int dim = controller->getSettings().getTouchDimColor();

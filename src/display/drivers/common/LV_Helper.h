@@ -50,6 +50,14 @@ void lvgl_helper_rect_add(lv_area_t *list, int *n, int cap, const lv_area_t &r);
 // probe-gated). DefaultUI::loop compares it against the last telemetry pass
 // start so an interaction bypasses the pass spacing.
 extern volatile int64_t g_touchEdgeAtUs;
+// Called by touchpad_read on every press or release edge, on the UI task,
+// with the deepest clickable object under the point (nullptr on release).
+// DefaultUI installs the press highlight element writer here.
+typedef void (*TouchHitHook)(lv_obj_t *hit, bool pressed, int16_t x, int16_t y);
+extern TouchHitHook g_touchHitHook;
+// True while the compositor's press highlight element is the press feedback:
+// the LVGL pressed styles stand down so a target is not dimmed twice.
+extern volatile bool g_pressPlateActive;
 // How long after a touch edge the interaction fast paths stay open: the
 // telemetry-pass and overlay-refresh gates in DefaultUI stand aside, and the
 // overlay publish wakes the render task early. A window rather than an
