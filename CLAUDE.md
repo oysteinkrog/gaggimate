@@ -104,7 +104,19 @@ telemetry-driven screen from a 650 ms LVGL pass (1.5 Hz widget updates,
   LVGL for an A/B (`elem_rings` counts the owned rings);
   `tools/dial_elem_check.py` is the device check and
   `tools/tickringbench` the host one. The brew progress bar's fill is a
-  RoundRect element on the same terms (`serviceBarElement`).
+  RoundRect element on the same terms (`serviceBarElement`). What the
+  element costs is the pixel work, and the row path had to be trimmed to
+  reach parity (2026-09-07, bench board, divider 8, synthetic brew, cap
+  45): with the two rings owned, 6.7 ms of element a frame against the
+  7.3 ms of overlay blend the ring pixels no longer cost, frame rate
+  within run-to-run noise of LVGL's (13.7 to 15.2 fps against 14.2 to
+  14.3), zero differing stable pixels. The first version, which read
+  every box row and re-derived each tick's colour per row through a
+  flash-resident float call, cost 10.6 ms and lost 2 fps; the span table
+  per tick row, the per-frame colour table (`Element::ringColors`) and
+  the per-row tick bitmask are what brought it down, in that order of
+  effect. The refresh count under the brew stays near 3 a second in both
+  modes because the value text still goes through LVGL (gm-2cl.5).
 
 - **The render loop lives in IRAM** (`renderLoop`, `renderFrame`,
   `presentFrame`, `pushLoop` and the scrim rows, `SleepAnimation.cpp`). The
