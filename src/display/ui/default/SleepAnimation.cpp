@@ -303,7 +303,7 @@ __attribute__((noinline)) static void scale565Oct(uint16_t *__restrict dst, cons
 // expansion is done once per cell row and read back SCRIM_SHIFT times.
 // Expanding the whole row rather than only the cells in runs keeps this
 // branchless; it is 120 cells either way at the widths this panel uses.
-static void expandScrimInv(uint16_t *__restrict out, const uint8_t *__restrict invRow, int cells) {
+static void IRAM_ATTR expandScrimInv(uint16_t *__restrict out, const uint8_t *__restrict invRow, int cells) {
     for (int c = 0; c < cells; c++) {
         const uint16_t v = invRow[c];
         const uint32_t pair = static_cast<uint32_t>(v) | (static_cast<uint32_t>(v) << 16);
@@ -727,7 +727,7 @@ __attribute__((always_inline)) inline void scrimCell(uint16_t *__restrict dst, u
 // halves the per-trip body the same way but still doesn't recover the
 // loop), the randomized bit-exactness proof, and the real-toolchain asm
 // evidence for all three shapes (tools/animbench/kernels-scrimfix/asm.sh).
-__attribute__((noinline)) static void scrimRow(uint16_t *__restrict dst, const uint8_t *__restrict invRow,
+__attribute__((noinline)) static void IRAM_ATTR scrimRow(uint16_t *__restrict dst, const uint8_t *__restrict invRow,
                                                const uint32_t *__restrict runs, int nRuns, int w) {
     for (int i = 0; i < nRuns; i++) {
         const uint32_t r = runs[i];
@@ -765,7 +765,7 @@ __attribute__((noinline)) static void scrimRow(uint16_t *__restrict dst, const u
 // Cells the halo's gap merge swallowed are dimmed by SCRIM_INV_NONE here
 // rather than skipped, because a lane cannot branch. That factor is an exact
 // identity -- 32/32 -- so the group writes those pixels back unchanged.
-__attribute__((noinline)) static void scrimRowPie(uint16_t *__restrict dst, const uint8_t *__restrict invRow,
+__attribute__((noinline)) static void IRAM_ATTR scrimRowPie(uint16_t *__restrict dst, const uint8_t *__restrict invRow,
                                                   const uint16_t *__restrict invPx, const uint32_t *__restrict runs, int nRuns,
                                                   int w) {
     for (int i = 0; i < nRuns; i++) {
@@ -1691,7 +1691,7 @@ bool SleepAnimation::installNativeOnIsrCore() {
 // load and a branch.
 bool SleepAnimation::engineReadyForMode() { return installNativeOnIsrCore(); }
 
-void SleepAnimation::pushLoop() {
+void IRAM_ATTR SleepAnimation::pushLoop() {
     int slot = 0;
     while (running) {
         if (xSemaphoreTake(static_cast<SemaphoreHandle_t>(bandReady[slot]), pdMS_TO_TICKS(200)) != pdTRUE) {
@@ -2777,7 +2777,7 @@ void SleepAnimation::verifyBandPlacement() {
     fbCheckCursor = static_cast<uint16_t>((fbCheckCursor + WINDOW) % nBands);
 }
 
-void SleepAnimation::presentFrame() {
+void IRAM_ATTR SleepAnimation::presentFrame() {
     // directPushOn as well as dmaActive: with the direct path switched off the
     // bands go through pushColors, which writes whichever buffer esp_lcd counts
     // as current, so flipping underneath it would show a buffer nothing wrote.
@@ -3072,7 +3072,7 @@ void SleepAnimation::autoResolution(int id, int fps, int64_t frameUs, int64_t bu
           static_cast<long long>(mean), static_cast<long long>(budgetUs));
 }
 
-void SleepAnimation::renderLoop() {
+void IRAM_ATTR SleepAnimation::renderLoop() {
     uint32_t fpsFrames = 0;
     unsigned long fpsWindowStart = millis();
     while (running) {
@@ -3366,7 +3366,17 @@ void SleepAnimation::benchFinishDwell() {
 }
 #endif
 
-void SleepAnimation::renderFrame() {
+// IRAM, with renderLoop, presentFrame, pushLoop and the scrim rows: the two
+// cores share one 16 KB instruction cache, and every LVGL pass on core 1
+// evicts this loop. Measured 2026-09-07 on the bench board (Starfield, cap
+// 45, status screen refreshing about 3 times a second): with this code in
+// flash every stage doubled (band 7 to 14 ms, push 7 to 15, blend 4 to 17)
+// and the loop ran at 17 fps; in IRAM it ran at 28 fps under the same load.
+// The pins cost about 8 KB of internal RAM (IRAM text past the first 16 KB
+// is taken from DRAM one for one). The animation kernels are not pinned
+// here: all of them would cost another 11 KB, and the loop is the code
+// every animation shares.
+void IRAM_ATTR SleepAnimation::renderFrame() {
     // Per-frame cost breakdown, always on. Half resolution turned out to save
     // only ~13 ms of a ~102 ms frame, which means the per-pixel field work is
     // a minority of the cost and the rest was unaccounted for. Guessing at it
