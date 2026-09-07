@@ -1515,6 +1515,9 @@ class SleepAnimation {
         // TickRing: the eased lit range, render task only.
         float ringLo = 0.0f, ringHi = 0.0f;
         bool ringEased = false;
+        // Tick colours for this frame (tickring::fillColors), so the row
+        // path never re-derives a colour. 128 B per slot.
+        uint16_t ringColors[tickring::kMaxTicks] = {};
     };
     Element elements[MAX_ELEMENTS];
     int64_t lastElemEvalUs = 0;

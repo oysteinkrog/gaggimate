@@ -2532,6 +2532,7 @@ void SleepAnimation::evaluateElements(int64_t nowUs) {
                     e.ringHi = thi;
                 }
             }
+            tickring::fillColors(*d.ring.ring, d.ring.litColor, d.ring.unlitColor, e.ringLo, e.ringHi, e.ringColors);
         } else {
             e.ringEased = false;
         }
@@ -2555,8 +2556,7 @@ void IRAM_ATTR SleepAnimation::compositeElementsRow(uint16_t *drow, int y, int w
             continue;
         }
         if (d.type == ElementType::TickRing) {
-            tickring::compositeRow(drow, y, w, *d.ring.ring, d.ring.litColor, d.ring.unlitColor, e.ringLo, e.ringHi,
-                                   gain);
+            tickring::compositeRowColors(drow, y, w, *d.ring.ring, e.ringColors, gain);
             continue;
         }
         int r = d.radius;

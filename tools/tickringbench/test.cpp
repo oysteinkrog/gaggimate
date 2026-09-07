@@ -42,6 +42,8 @@ struct Ring {
     int cnt, side, W, H;
     std::vector<Box> boxes;
     std::vector<uint8_t> sprites;
+    std::vector<uint8_t> spans;
+    std::vector<uint64_t> rowMask;
     Sprites view;
     Ring(int cnt_, int side_, int W_, int H_, std::mt19937 &rng) : cnt(cnt_), side(side_), W(W_), H(H_) {
         boxes.resize(cnt);
@@ -66,10 +68,20 @@ struct Ring {
                 }
             }
         }
+        spans.assign(static_cast<size_t>(cnt) * side * 2, 0);
+        for (int i = 0; i < cnt; i++) {
+            tickring::buildRowSpans(sprites.data() + static_cast<size_t>(i) * side * side, side,
+                                    spans.data() + static_cast<size_t>(i) * side * 2);
+        }
         view.cnt = static_cast<uint16_t>(cnt);
         view.side = static_cast<uint16_t>(side);
         view.boxes = boxes.data();
         view.sprites = sprites.data();
+        view.spans = spans.data();
+        rowMask.assign(static_cast<size_t>(H), 0);
+        tickring::buildRowMask(view, H, rowMask.data());
+        view.rowMask = rowMask.data();
+        view.maskRows = static_cast<uint16_t>(H);
     }
 };
 
@@ -114,17 +126,24 @@ int main() {
             for (auto &p : bg) {
                 p = static_cast<uint16_t>(rng());
             }
-            std::vector<uint16_t> ref = bg, got = bg;
+            std::vector<uint16_t> ref = bg, got = bg, full = bg;
             refFrame(r, lit, unlit, rg[0], rg[1], ref);
+            Sprites noSpans = r.view; // the fallback path scans every box row
+            noSpans.spans = nullptr;
+            noSpans.rowMask = nullptr;
             for (int y = 0; y < H; y++) {
                 tickring::compositeRow(&got[static_cast<size_t>(y) * W], y, W, r.view, lit, unlit,
                                        static_cast<float>(rg[0]), static_cast<float>(rg[1]));
+                tickring::compositeRow(&full[static_cast<size_t>(y) * W], y, W, noSpans, lit, unlit,
+                                       static_cast<float>(rg[0]), static_cast<float>(rg[1]));
             }
-            size_t diff = 0;
+            size_t diff = 0, diffFull = 0;
             for (size_t k = 0; k < ref.size(); k++) {
                 diff += ref[k] != got[k];
+                diffFull += ref[k] != full[k];
             }
             CHECK(diff == 0, "rest lo=%d hi=%d: %zu pixels differ", rg[0], rg[1], diff);
+            CHECK(diffFull == 0, "rest (no spans) lo=%d hi=%d: %zu pixels differ", rg[0], rg[1], diffFull);
         }
     }
 
@@ -138,6 +157,7 @@ int main() {
             b.y1 = static_cast<int16_t>(b.y1 + 200);
             b.y2 = static_cast<int16_t>(b.y2 + 200);
         }
+        tickring::buildRowMask(r.view, r.H, r.rowMask.data()); // boxes moved: the mask follows
         std::vector<uint16_t> ref(static_cast<size_t>(r.W) * r.H, 0x1234), got = ref;
         refFrame(r, lit, unlit, 5, 17, ref);
         for (int y = 0; y < r.H; y++) {
@@ -207,6 +227,38 @@ int main() {
         }
         CHECK(ref == got, "gain 96 differs from the scaled reference");
         CHECK(zero == bg, "gain 0 painted something");
+    }
+
+    // 4c. The span table brackets exactly the non-zero bytes of each row,
+    //     with a sparse sprite (a diagonal) and an empty row.
+    {
+        const int side = 8;
+        std::vector<uint8_t> sp(side * side, 0), spans(side * 2, 0xEE);
+        for (int y = 0; y < side; y++) {
+            if (y == 3) {
+                continue; // empty row
+            }
+            sp[y * side + y] = 100;
+            if (y + 2 < side) {
+                sp[y * side + y + 2] = 7;
+            }
+        }
+        tickring::buildRowSpans(sp.data(), side, spans.data());
+        for (int y = 0; y < side; y++) {
+            int first = side, last = 0;
+            for (int x = 0; x < side; x++) {
+                if (sp[y * side + x] != 0) {
+                    first = first < x ? first : x;
+                    last = x + 1;
+                }
+            }
+            if (first >= last) {
+                CHECK(spans[y * 2] >= spans[y * 2 + 1], "row %d should be empty", y);
+            } else {
+                CHECK(spans[y * 2] == first && spans[y * 2 + 1] == last, "row %d span %d..%d, got %d..%d", y, first,
+                      last, spans[y * 2], spans[y * 2 + 1]);
+            }
+        }
     }
 
     // 5. bounds is the union of the boxes.

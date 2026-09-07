@@ -40,7 +40,28 @@ struct Sprites {
     uint16_t side = 0;
     const Box *boxes = nullptr;
     const uint8_t *sprites = nullptr;
+    // Per tick, per sprite row: the [first, last + 1) columns holding a
+    // non-zero byte, two bytes per row (cnt * side * 2 in all; a row with
+    // first == last + 1 is empty). A tick is a thin rotated pill, so most of
+    // its box row is zero and the compositor skips it without a read. May
+    // be null: then every box row is scanned.
+    const uint8_t *spans = nullptr;
+    // Per panel row, one bit per tick whose box crosses that row with a
+    // non-empty span (maskRows entries). The compositor visits only those
+    // ticks instead of testing every box, which is cnt reads from PSRAM per
+    // row otherwise. May be null: then every box is tested.
+    const uint64_t *rowMask = nullptr;
+    uint16_t maskRows = 0;
 };
+
+// Most ticks a ring can have (the tick cache's cap, one bit per tick).
+constexpr int kMaxTicks = 64;
+
+// Fills spans (side * 2 bytes) for one sprite of side x side bytes.
+void buildRowSpans(const uint8_t *sprite, int side, uint8_t *spans);
+
+// Fills mask (rows entries) from s.boxes and, when present, s.spans.
+void buildRowMask(const Sprites &s, int rows, uint64_t *mask);
 
 // What the UI task writes. Ticks lo <= i < hi are lit; the render task
 // eases its own lo and hi toward these, and the boundary tick takes the
@@ -79,10 +100,20 @@ uint16_t tickColor(int i, float lo, float hi, uint16_t lit, uint16_t unlit);
 // Union of the tick boxes, for the element's clip box. False when cnt is 0.
 bool bounds(const Sprites &s, Box &out);
 
+// The colour of every tick for boundaries lo and hi, into colors (at least
+// s.cnt entries, s.cnt <= kMaxTicks). Computed once per frame by the render
+// task, so the row path does no float math and makes no call per tick.
+void fillColors(const Sprites &s, uint16_t lit, uint16_t unlit, float lo, float hi, uint16_t *colors);
+
 // Composites row y of the ring into drow (w pixels wide) exactly as the
-// overlay path would have. gain is the frame's overlay gain (Q8, 256 is
-// none): a page fade scales the ring's coverage the way blendRow scales
-// the overlay's, so an owned ring fades with the page it belongs to.
+// overlay path would have, with the tick colours from fillColors. gain is
+// the frame's overlay gain (Q8, 256 is none): a page fade scales the
+// ring's coverage the way blendRow scales the overlay's, so an owned ring
+// fades with the page it belongs to.
+void compositeRowColors(uint16_t *drow, int y, int w, const Sprites &s, const uint16_t *colors, uint32_t gain = 256);
+
+// fillColors then compositeRowColors, for callers without a per-frame
+// colour table (the host test).
 void compositeRow(uint16_t *drow, int y, int w, const Sprites &s, uint16_t lit, uint16_t unlit, float lo, float hi,
                   uint32_t gain = 256);
 

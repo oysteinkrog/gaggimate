@@ -23,12 +23,17 @@ struct Slot {
     bool inUse = false;
     uint16_t side = 0; // sprite stride and height, fixed per meter
     // One PSRAM block per slot: cnt boxes, then cnt sprites of side^2
-    // bytes. Nothing per tick lives in the internal pool (CLAUDE.md, DRAM
-    // section: BSS is the same pool the WiFi TX copies come from).
+    // bytes, then the row spans. Nothing per tick lives in the internal
+    // pool (CLAUDE.md, DRAM section: BSS is the same pool the WiFi TX
+    // copies come from).
     uint8_t *block = nullptr;
     size_t blockBytes = 0;
     lv_area_t *boxes = nullptr;
     uint8_t *sprites = nullptr;
+    uint8_t *spans = nullptr; // cnt * side * 2: per sprite row, the non-zero column span
+    uint64_t *rowMask = nullptr; // maskRows entries, built once every tick is (ring())
+    uint16_t maskRows = 0;
+    bool maskBuilt = false;
     uint64_t built = 0;
     bool pinned = false; // read by the render task through a ring element
 };
@@ -90,7 +95,10 @@ Slot *findOrCreate(const Key &key) {
         return nullptr;
     }
     const size_t boxBytes = static_cast<size_t>(key.cnt) * sizeof(lv_area_t);
-    const size_t bytes = boxBytes + static_cast<size_t>(key.cnt) * side * side;
+    const size_t spriteBytes = static_cast<size_t>(key.cnt) * side * side;
+    const size_t spanBytes = static_cast<size_t>(key.cnt) * side * 2;
+    const int maskRows = lv_disp_get_ver_res(nullptr);
+    const size_t bytes = boxBytes + spriteBytes + spanBytes + static_cast<size_t>(maskRows) * sizeof(uint64_t);
     if (victim->block != nullptr && victim->blockBytes != bytes) {
         free(victim->block);
         g_bytes -= static_cast<uint32_t>(victim->blockBytes);
@@ -108,6 +116,10 @@ Slot *findOrCreate(const Key &key) {
     }
     victim->boxes = reinterpret_cast<lv_area_t *>(victim->block);
     victim->sprites = victim->block + boxBytes;
+    victim->spans = victim->sprites + spriteBytes;
+    victim->rowMask = reinterpret_cast<uint64_t *>(victim->spans + spanBytes);
+    victim->maskRows = static_cast<uint16_t>(maskRows);
+    victim->maskBuilt = false;
     victim->key = key;
     victim->side = static_cast<uint16_t>(side);
     victim->built = 0;
@@ -177,8 +189,10 @@ bool buildSprite(Slot &s, int i, const lv_area_t &box, RenderFn render, void *us
             dst[x] = a == 0 ? 0 : (a == 255 ? 255 : static_cast<uint8_t>(a + 1));
         }
     }
+    tickring::buildRowSpans(sprite, s.side, s.spans + static_cast<size_t>(i) * s.side * 2);
     s.boxes[i] = box;
     s.built |= (1ull << i);
+    s.maskBuilt = false;
     return true;
 }
 
@@ -258,6 +272,13 @@ bool ring(const Key &key, tickring::Sprites &out) {
         out.side = s.side;
         out.boxes = reinterpret_cast<const tickring::Box *>(s.boxes);
         out.sprites = s.sprites;
+        out.spans = s.spans;
+        if (!s.maskBuilt) {
+            tickring::buildRowMask(out, s.maskRows, s.rowMask);
+            s.maskBuilt = true;
+        }
+        out.rowMask = s.rowMask;
+        out.maskRows = s.maskRows;
         return true;
     }
     return false;
