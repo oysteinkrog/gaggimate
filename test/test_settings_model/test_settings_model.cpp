@@ -87,6 +87,20 @@ static void test_format_integer_and_unit() {
     TEST_ASSERT_EQUAL_STRING("800 ms", formatNumeric(800, kBrewDelaySpec).c_str());
     TEST_ASSERT_EQUAL_STRING("30 fps", formatNumeric(30, kBgAnimFpsSpec).c_str());
     TEST_ASSERT_EQUAL_STRING("35 %", formatNumeric(35, kBgAnimPlateOpacitySpec).c_str());
+    TEST_ASSERT_EQUAL_STRING("120 ms", formatNumeric(120, kBgFadeSpec).c_str());
+}
+
+// Screen fade: 20 ms steps, 100 ms fast, clamped at 0 and 1000, and an
+// off-grid web value snaps to the grid on the first press.
+static void test_fade_spec() {
+    TEST_ASSERT_EQUAL(140, stepValue(120, 1, false, kBgFadeSpec));
+    TEST_ASSERT_EQUAL(220, stepValue(120, 1, true, kBgFadeSpec));
+    TEST_ASSERT_EQUAL(0, stepValue(0, -1, false, kBgFadeSpec));
+    TEST_ASSERT_EQUAL(1000, stepValue(1000, 1, true, kBgFadeSpec));
+    TEST_ASSERT_EQUAL(140, stepValue(125, 1, false, kBgFadeSpec));
+    TEST_ASSERT_EQUAL(1000, clampOrWrap(5000, kBgFadeSpec));
+    TEST_ASSERT_EQUAL_STRING("Linear", kFadeCurveLabels[0]);
+    TEST_ASSERT_EQUAL_STRING("Smooth", kFadeCurveLabels[1]);
 }
 
 static void test_format_one_decimal() {
@@ -433,6 +447,7 @@ int main(int argc, char **argv) {
 
     RUN_TEST(test_format_integer_and_unit);
     RUN_TEST(test_format_one_decimal);
+    RUN_TEST(test_fade_spec);
     RUN_TEST(test_format_minutes_seconds);
     RUN_TEST(test_format_standby_minutes);
 

@@ -34,6 +34,7 @@ class SleepAnimation {
     void requestBandWarmup(const int (*)[2], int) {}
     void setOverlayGain(uint16_t) {}
     void rampOverlayGain(uint16_t, uint32_t, int = -1) {}
+    void setOverlayGainSmooth(bool) {}
     int overlayFrontIndex() const { return -1; }
     uint16_t overlayGain() const { return 256; }
     uint16_t overlayGainTarget() const { return 256; }
@@ -366,6 +367,10 @@ class SleepAnimation {
     // for one frame.
     void setOverlayGain(uint16_t g);
     void rampOverlayGain(uint16_t to, uint32_t durMs, int gateFront = -1);
+    // true: every ramp eases in and out (smoothstep on its clock) instead of
+    // running linearly. Read by the render task per frame; a change applies
+    // to the ramp in progress.
+    void setOverlayGainSmooth(bool smooth) { ovGainSmooth.store(smooth); }
     int overlayFrontIndex() const { return overlayFront.load(); }
     uint16_t overlayGain() const { return ovGainFrame.load(); }
     uint16_t overlayGainTarget() const { return ovGainTarget.load(); }
@@ -1441,6 +1446,7 @@ class SleepAnimation {
     std::atomic<uint32_t> ovGainSeq{0};
     std::atomic<uint16_t> ovGainFrame{256};
     std::atomic<uint16_t> ovGainTarget{256};
+    std::atomic<bool> ovGainSmooth{false};
     // Render-task state for the ramp in progress: which record it belongs
     // to and when its clock started (-1 while a gated ramp waits for its
     // overlay to become the composited one).

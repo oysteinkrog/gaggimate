@@ -213,8 +213,14 @@ class DefaultUI {
     bool overlayTransWaitSwap = false;
     bool overlayTransHeld = false; // a rendered page waits in the back buffer for gain 0
     int64_t overlayTransT0Us = 0;
-    static constexpr uint32_t OVERLAY_FADE_OUT_MS = 120;
-    static constexpr uint32_t OVERLAY_FADE_IN_MS = 120;
+    // The fade durations come from the settings (bgFadeOutMs, bgFadeInMs,
+    // web "Screen fade" and the Animation category's Fade rows). The
+    // fade-out length in force when the transition started is kept here so
+    // overlayFadedOut() judges the ramp that actually ran, not a value
+    // changed mid-transition.
+    uint32_t overlayTransOutMs = 0;
+    uint32_t overlayFadeOutMs() const;
+    uint32_t overlayFadeInMs() const;
     // A fade-out whose page never arrives (a cancelled change) is undone
     // after this long, so the screen cannot stay bare.
     static constexpr int64_t OVERLAY_TRANS_ABANDON_US = 1500000;

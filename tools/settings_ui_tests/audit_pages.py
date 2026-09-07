@@ -67,7 +67,7 @@ class PageSpec:
 
 
 # The five real categories plus the Fixture tile, in kCategories order. Row
-# counts: Temps 5 (1 page), Display 6 (2), Animation 11 (3), Machine 3 + the
+# counts: Temps 5 (1 page), Display 6 (2), Animation 15 (3), Machine 3 + the
 # Schedules row gm-flw.11 adds (1 page), Status 8 (2), Fixture 11 (3).
 CATEGORY_PAGES = [
     PageSpec("temps-p0", CAT_TEMPS, 0,
@@ -79,7 +79,8 @@ CATEGORY_PAGES = [
              ["Animation", "Frame rate", "All screens", "Theme", "Gradient"], "animation"),
     PageSpec("animation-p1", CAT_ANIMATION, 1,
              ["Plates", "Plate colour", "Plate opacity", "Element tint", "Tint colour"], "animation"),
-    PageSpec("animation-p2", CAT_ANIMATION, 2, ["Text scrim"], "animation"),
+    PageSpec("animation-p2", CAT_ANIMATION, 2, ["Text scrim", "Fade out", "Fade in", "Fade curve", "Interlace"],
+             "animation"),
     PageSpec("machine-p0", CAT_MACHINE, 0,
              ["Startup mode", "Standby timeout", "Auto wake-up", "Schedules"], "machine"),
     PageSpec("status-p0", CAT_STATUS, 0,

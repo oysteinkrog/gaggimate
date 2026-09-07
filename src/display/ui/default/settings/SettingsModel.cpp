@@ -21,6 +21,7 @@ const NumericSpec kStandbyTimeoutSpec{0, 14400000, 60000, 600000, ClampMode::Cla
 const NumericSpec kBgAnimFpsSpec{5, 60, 5, 10, ClampMode::Clamp, NumericFormat::Integer, " fps"};
 const NumericSpec kBgAnimPlateOpacitySpec{0, 100, 5, 20, ClampMode::Clamp, NumericFormat::Integer, " %"};
 const NumericSpec kBgAnimScrimSpec{0, 100, 5, 20, ClampMode::Clamp, NumericFormat::Integer, " %"};
+const NumericSpec kBgFadeSpec{0, 1000, 20, 100, ClampMode::Clamp, NumericFormat::Integer, " ms"};
 const NumericSpec kScheduleHourSpec{0, 23, 1, 5, ClampMode::Wrap, NumericFormat::Integer, ""};
 const NumericSpec kScheduleMinuteSpec{0, 59, 1, 5, ClampMode::Wrap, NumericFormat::Integer, ""};
 
@@ -114,6 +115,7 @@ int wrapIndex(int index, int count, int direction) {
 const char *const kStartupModeLabels[2] = {"Standby", "Brew"};
 const char *const kThemeModeLabels[2] = {"Dark", "Light"};
 const char *const kPlatesLabels[3] = {"Keep", "Hide", "Custom"};
+const char *const kFadeCurveLabels[2] = {"Linear", "Smooth"};
 
 int startupModeIndexForValue(int value) { return value == MODE_BREW ? 1 : 0; }
 int startupModeValueForIndex(int index) { return index == 1 ? MODE_BREW : MODE_STANDBY; }
