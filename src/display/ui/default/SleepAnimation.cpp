@@ -113,6 +113,9 @@ constexpr int HALO_GAP_MERGE_CELLS = 1;
 // this cell alone". Two smoothing passes leave a wide skirt of cells whose dim
 // rounds away to nothing, and those are dropped from the runs entirely.
 constexpr int SCRIM_INV_NONE = 32;
+// Widest scrim cell row the gain-scaled copy in the composite loop can hold
+// (a 480 px panel has 120 cells); a wider overlay keeps its unscaled scrim.
+constexpr int kScaledInvCells = 128;
 
 // Scrim grid resolution: 1 << 2 = one cell per 4x4 panel pixels.
 constexpr int SCRIM_SHIFT = 2;
@@ -372,8 +375,15 @@ static uint32_t gmRunCount, gmRunPx, gmRunG8Px;
 static uint32_t gmGrpOpq, gmGrpBlnd, gmGrpMix;
 #endif
 
+// kGain selects the overlay-gain variant: coverage is scaled by gain (Q8,
+// below 256) before the blend, so a page fade is the same loop with one
+// multiply and shift more per pixel. The plain variant is untouched code,
+// and the call site picks it whenever the gain is 256, so a settled screen
+// pays nothing for the feature. Under a gain below 256 no pixel reaches
+// 255, so the copy shortcut cannot fire and every pixel takes blend565.
+template <bool kGain>
 __attribute__((noinline)) static void IRAM_ATTR blendRow(uint16_t *__restrict dst, const uint8_t *__restrict colour,
-                                                         const uint32_t *__restrict runs, int nRuns) {
+                                                         const uint32_t *__restrict runs, int nRuns, uint32_t gain) {
     for (int i = 0; i < nRuns; i++) {
         const uint32_t r = runs[i];
         int x = static_cast<int>(r & 0xFFFFu);
@@ -382,9 +392,15 @@ __attribute__((noinline)) static void IRAM_ATTR blendRow(uint16_t *__restrict ds
         for (; x < xEnd; x++, px += 3) {
             // LV_IMG_CF_TRUE_COLOR_ALPHA @16bpp, LV_COLOR_16_SWAP=0:
             // little-endian RGB565 followed by a coverage byte.
-            const uint32_t a = px[2];
+            uint32_t a = px[2];
             if (a == 0) {
                 continue; // only the few pixels a gap merge swallowed
+            }
+            if (kGain) {
+                a = (a * gain) >> 8;
+                if (a == 0) {
+                    continue;
+                }
             }
             const uint16_t c = static_cast<uint16_t>(px[0] | (px[1] << 8));
             // Opaque is most of a glyph's interior and needs no arithmetic at
@@ -515,11 +531,18 @@ __attribute__((noinline)) static void blendGroup8General(uint16_t *__restrict ds
 // fallback all use exactly this code instead of a parallel reimplementation
 // of it (same reasoning as scanRow_pie_asm's scalar fallback elsewhere in
 // this codebase's PIE work).
+template <bool kGain>
 __attribute__((always_inline)) inline void blendPixelScalar(uint16_t *__restrict dst, const uint8_t *__restrict px,
-                                                              int x) {
-    const uint32_t a = px[2];
+                                                              int x, uint32_t gain) {
+    uint32_t a = px[2];
     if (a == 0) {
         return;
+    }
+    if (kGain) {
+        a = (a * gain) >> 8;
+        if (a == 0) {
+            return;
+        }
     }
     const uint16_t c = static_cast<uint16_t>(px[0] | (px[1] << 8));
     dst[x] = a == 255 ? c : blend565(c, dst[x], static_cast<uint8_t>(a));
@@ -530,8 +553,9 @@ __attribute__((always_inline)) inline void blendPixelScalar(uint16_t *__restrict
 // DEVICE-VALIDATED -- see the file header comment on blendGroup8General
 // and the PIE-composite report before switching the call site below from
 // blendRow to this function.
+template <bool kGain>
 __attribute__((noinline)) static void IRAM_ATTR blendRowPie(uint16_t *__restrict dst, const uint8_t *__restrict colour,
-                                                            const uint32_t *__restrict runs, int nRuns) {
+                                                            const uint32_t *__restrict runs, int nRuns, uint32_t gain) {
     for (int i = 0; i < nRuns; i++) {
         const uint32_t r = runs[i];
         int x = static_cast<int>(r & 0xFFFFu);
@@ -546,7 +570,7 @@ __attribute__((noinline)) static void IRAM_ATTR blendRowPie(uint16_t *__restrict
         {
             const uint8_t *px = colour + static_cast<size_t>(x) * 3;
             for (; x < xAlignedStart; x++, px += 3) {
-                blendPixelScalar(dst, px, x);
+                blendPixelScalar<kGain>(dst, px, x, gain);
             }
         }
         for (; x < xAlignedEnd; x += 8) {
@@ -559,8 +583,14 @@ __attribute__((noinline)) static void IRAM_ATTR blendRowPie(uint16_t *__restrict
                 const uint8_t *gp = colour + static_cast<size_t>(x) * 3;
                 for (int k = 0; k < 8; k++, gp += 3) {
                     colStage[k] = static_cast<uint16_t>(gp[0] | (gp[1] << 8));
-                    const uint8_t a = gp[2];
-                    aStage[k] = a;
+                    uint32_t a = gp[2];
+                    if (kGain) {
+                        // Below 256 the scaled coverage never reaches 255, so
+                        // the whole group takes the arithmetic path (a==0
+                        // lanes included, which it handles).
+                        a = (a * gain) >> 8;
+                    }
+                    aStage[k] = static_cast<uint16_t>(a);
                     invStage[k] = static_cast<uint16_t>(256u - a);
                     if (a == 255) {
                         anyOpaque = true;
@@ -569,7 +599,9 @@ __attribute__((noinline)) static void IRAM_ATTR blendRowPie(uint16_t *__restrict
                     }
                 }
             }
-            if (allOpaque) {
+            if (kGain) {
+                blendGroup8General(dst + x, colStage, aStage, invStage);
+            } else if (allOpaque) {
                 const uint16_t *src = colStage;
                 uint16_t *wr = dst + x;
                 asm volatile("ee.vld.128.ip q0, %[src], 16\n"
@@ -582,14 +614,14 @@ __attribute__((noinline)) static void IRAM_ATTR blendRowPie(uint16_t *__restrict
             } else {
                 const uint8_t *px = colour + static_cast<size_t>(x) * 3;
                 for (int k = 0; k < 8; k++, px += 3) {
-                    blendPixelScalar(dst, px, x + k);
+                    blendPixelScalar<kGain>(dst, px, x + k, gain);
                 }
             }
         }
         {
             const uint8_t *px = colour + static_cast<size_t>(x) * 3;
             for (; x < xEnd; x++, px += 3) {
-                blendPixelScalar(dst, px, x);
+                blendPixelScalar<kGain>(dst, px, x, gain);
             }
         }
     }
@@ -2038,6 +2070,47 @@ void SleepAnimation::readLayerMotion(const Layer &L, LayerMotion &m) {
     }
 }
 
+void SleepAnimation::setOverlayGain(uint16_t g) { rampOverlayGain(g, 0); }
+
+void SleepAnimation::rampOverlayGain(uint16_t to, uint32_t durMs) {
+    if (to > 256) {
+        to = 256;
+    }
+    // From the last value a frame actually showed, so a ramp started in the
+    // middle of another one continues from where the panel is.
+    const uint16_t from = ovGainFrame.load();
+    ovGainSeq.fetch_add(1);
+    ovGainRamp.t0Us = esp_timer_get_time();
+    ovGainRamp.durUs = durMs * 1000u;
+    ovGainRamp.from = from;
+    ovGainRamp.to = to;
+    ovGainSeq.fetch_add(1);
+    ovGainTarget.store(to);
+}
+
+uint32_t SleepAnimation::overlayGainAt(int64_t nowUs) {
+    OverlayGainRamp r;
+    for (;;) {
+        const uint32_t s1 = ovGainSeq.load();
+        if (s1 & 1u) {
+            continue;
+        }
+        r = ovGainRamp;
+        if (ovGainSeq.load() == s1) {
+            break;
+        }
+    }
+    if (r.durUs == 0 || nowUs >= r.t0Us + static_cast<int64_t>(r.durUs)) {
+        return r.to;
+    }
+    if (nowUs <= r.t0Us) {
+        return r.from;
+    }
+    const int64_t t = nowUs - r.t0Us;
+    const int64_t v = static_cast<int64_t>(r.from) + (static_cast<int64_t>(r.to) - r.from) * t / r.durUs;
+    return static_cast<uint32_t>(v);
+}
+
 bool SleepAnimation::layerPosAt(const LayerMotion &m, int64_t nowUs, int &x, int &y) {
     if (m.durUs == 0 || nowUs >= m.t0Us + static_cast<int64_t>(m.durUs)) {
         x = m.x1;
@@ -2215,9 +2288,9 @@ void SleepAnimation::compositeLayersRow(uint16_t *drow, int y, int w, bool pieBl
         // row base by -fx pixels.
         const uint8_t *crow = L.buf + (static_cast<ptrdiff_t>(ly) * L.w - L.fx) * 3;
         if (pieBlend) {
-            blendRowPie(drow, crow, shifted, m);
+            blendRowPie<false>(drow, crow, shifted, m, 256);
         } else {
-            blendRow(drow, crow, shifted, m);
+            blendRow<false>(drow, crow, shifted, m, 256);
         }
     }
 }
@@ -3205,7 +3278,12 @@ void SleepAnimation::renderFrame() {
         ofi = overlayFront.load();
         overlayInUse.store(ofi);
     } while (ofi != overlayFront.load());
-    evaluateLayers(esp_timer_get_time());
+    const int64_t frameNowUs = esp_timer_get_time();
+    evaluateLayers(frameNowUs);
+    // One gain for the whole frame, like the overlay index above: a ramp
+    // step lands between frames, never between bands.
+    const uint32_t ovGain = overlayGainAt(frameNowUs);
+    ovGainFrame.store(static_cast<uint16_t>(ovGain));
 #ifdef GM_TOUCH_PROBE
     // This sample is the moment a publish becomes part of a frame; a stamp
     // still pending here means this frame is the first to carry the response.
@@ -3674,9 +3752,16 @@ void SleepAnimation::renderFrame() {
 #ifdef GM_ANIM_BENCH
         const int probe = blendProbe.load();
 #endif
+        // A gain below 256 scales the scrim's strength too, so a fading page
+        // does not leave its dark halo behind: one scaled cell row, rebuilt
+        // when the cell row changes (SCRIM_SHIFT panel rows share one).
+        alignas(4) uint8_t scaledInv[kScaledInvCells];
+        int scaledCy = -1;
+        const bool scaleScrim = ovGain != 256 && ov != nullptr && ov->scrimW <= kScaledInvCells;
         // Rows this frame will not push are thrown away, so compositing
         // widgets into them is wasted. Both rows of a pushed pair still need it.
-        for (int y = y0; y < y0 + rows && ov != nullptr && !patternMode; y++) {
+        // At gain 0 the overlay is invisible and the pass is skipped whole.
+        for (int y = y0; y < y0 + rows && ov != nullptr && !patternMode && ovGain != 0; y++) {
             if (bandInterlaced && ((((pairMode ? (y >> 1) : y) ^ parityNow) & 1) != 0)) {
                 continue;
             }
@@ -3688,7 +3773,17 @@ void SleepAnimation::renderFrame() {
                 const int cy = y >> SCRIM_SHIFT;
                 const int nHalo = ov->haloN[cy];
                 if (nHalo != 0) {
-                    const uint8_t *const invRow = ov->scrim + static_cast<size_t>(cy) * ov->scrimW;
+                    const uint8_t *invRow = ov->scrim + static_cast<size_t>(cy) * ov->scrimW;
+                    if (scaleScrim) {
+                        if (cy != scaledCy) {
+                            for (int c = 0; c < ov->scrimW; c++) {
+                                const uint32_t dim = static_cast<uint32_t>(SCRIM_INV_NONE - invRow[c]);
+                                scaledInv[c] = static_cast<uint8_t>(SCRIM_INV_NONE - ((dim * ovGain) >> 8));
+                            }
+                            scaledCy = cy;
+                        }
+                        invRow = scaledInv;
+                    }
                     const uint32_t *const halo = ov->haloRuns + static_cast<size_t>(cy) * RUNS_PER_ROW;
                     if (pieScrim) {
                         // SCRIM_SHIFT panel rows share a cell row, so the
@@ -3766,10 +3861,16 @@ void SleepAnimation::renderFrame() {
                 continue;
             }
 #endif
-            if (pieBlend) {
-                blendRowPie(drow, crow, runs, nRuns);
+            if (ovGain != 256) {
+                if (pieBlend) {
+                    blendRowPie<true>(drow, crow, runs, nRuns, ovGain);
+                } else {
+                    blendRow<true>(drow, crow, runs, nRuns, ovGain);
+                }
+            } else if (pieBlend) {
+                blendRowPie<false>(drow, crow, runs, nRuns, 256);
             } else {
-                blendRow(drow, crow, runs, nRuns);
+                blendRow<false>(drow, crow, runs, nRuns, 256);
             }
         }
         BENCH_ACC(accBlendUs, tBlend);

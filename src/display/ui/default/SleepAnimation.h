@@ -30,6 +30,11 @@ class SleepAnimation {
     int overlayBackIndex() const { return 0; }
     void requestWholeFrames() {}
     void requestBandWarmup(const int (*)[2], int) {}
+    void setOverlayGain(uint16_t) {}
+    void rampOverlayGain(uint16_t, uint32_t) {}
+    uint16_t overlayGain() const { return 256; }
+    uint16_t overlayGainTarget() const { return 256; }
+    bool overlayGainSettled() const { return true; }
     static constexpr int MAX_LAYERS = 3;
     enum class LayerEase : uint8_t { Linear = 0, EaseOut = 1, EaseInOut = 2 };
     struct LayerInfo {
@@ -314,6 +319,20 @@ class SleepAnimation {
     // UI widgets, which change in discrete steps and are full of them. So the
     // rule is: interlace the animation, never interlace a widget update.
     void requestWholeFrames() { warmupFrames.store(2); }
+    // Global overlay alpha, Q8: 256 composites the overlay as drawn, 0 shows
+    // the bare animation. The composite multiplies every overlay pixel's
+    // coverage and the scrim's strength by it, so a fade costs nothing per
+    // pixel beyond the blend already paid, and a change reaches the panel on
+    // the next frame without a snapshot. setOverlayGain applies at once;
+    // rampOverlayGain runs a linear ramp from the last latched value. The
+    // render task latches one value per frame (overlayGain()), so a caller
+    // that waits for a ramp to end polls overlayGainSettled(). Layers are
+    // not affected: they are the moving elements, not the page.
+    void setOverlayGain(uint16_t g);
+    void rampOverlayGain(uint16_t to, uint32_t durMs);
+    uint16_t overlayGain() const { return ovGainFrame.load(); }
+    uint16_t overlayGainTarget() const { return ovGainTarget.load(); }
+    bool overlayGainSettled() const { return !running.load() || ovGainFrame.load() == ovGainTarget.load(); }
     // Same rule as requestWholeFrames() above, but scoped to just the bands
     // the published ranges cover, for the same 2-frame window: a widget
     // change must not straddle interlace phases across ITS OWN pixels, but
@@ -1335,6 +1354,20 @@ class SleepAnimation {
     Overlay overlays[2];
     uint32_t overlayCap = 0;
     std::atomic<int> overlayFront{-1}; // -1 = nothing published yet
+    // Overlay gain ramp record, written by the UI task under ovGainSeq (odd
+    // while a write is in flight, same discipline as Layer::seq) and copied
+    // by the render task once per frame in overlayGainAt.
+    struct OverlayGainRamp {
+        int64_t t0Us = 0;
+        uint32_t durUs = 0;
+        uint16_t from = 256;
+        uint16_t to = 256;
+    };
+    OverlayGainRamp ovGainRamp;
+    std::atomic<uint32_t> ovGainSeq{0};
+    std::atomic<uint16_t> ovGainFrame{256};
+    std::atomic<uint16_t> ovGainTarget{256};
+    uint32_t overlayGainAt(int64_t nowUs);
 
     struct Layer {
         uint8_t *buf = nullptr;   // PSRAM, w*h*3 (RGB565 + A8)

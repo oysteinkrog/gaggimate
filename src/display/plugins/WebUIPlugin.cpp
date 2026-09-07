@@ -1380,6 +1380,22 @@ void WebUIPlugin::setupServer() {
                 g_overlayMinRefreshUs = v;
             }
         }
+        // ovg=N: overlay gain, Q8, 0..256, applied from the next frame; the
+        // measurement knob for the composite's fade cost (blend_us at 128
+        // against 256). ovramp=ms starts a test ramp to the far end from the
+        // current target (0 if it is above 128, else 256).
+        if (request->hasArg("ovg")) {
+            const long v = request->arg("ovg").toInt();
+            if (v >= 0 && v <= 256) {
+                a->setOverlayGain(static_cast<uint16_t>(v));
+            }
+        }
+        if (request->hasArg("ovramp")) {
+            const long v = request->arg("ovramp").toInt();
+            if (v >= 0 && v <= 10000) {
+                a->rampOverlayGain(a->overlayGainTarget() > 128 ? 0 : 256, static_cast<uint32_t>(v));
+            }
+        }
         // fps=N: temporary animation frame cap, 5..60, 0 restores the stored
         // setting. For the contention A/B (how much of a UI pass is the
         // render task's PSRAM traffic); DefaultUI applies it next pass.
@@ -1576,6 +1592,8 @@ void WebUIPlugin::setupServer() {
         doc["ov_clips"] = g_overlayStats.lastClips;
         doc["ov_min_us"] = static_cast<int64_t>(g_overlayMinRefreshUs);
         doc["fps_override"] = g_animFpsOverride;
+        doc["ov_gain"] = a->overlayGain();
+        doc["ov_gain_target"] = a->overlayGainTarget();
         doc["tick_cache_bytes"] = meterticks::bytesAllocated();
         doc["uianim"] = g_uiAnimTestReq;
         doc["layer_us"] = a->lastLayerUsValue();
