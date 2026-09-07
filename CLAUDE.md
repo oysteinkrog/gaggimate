@@ -89,6 +89,30 @@ telemetry-driven screen from a 650 ms LVGL pass (1.5 Hz widget updates,
   clip precheck in `action_on_meter_draw` (eez/actions.cpp), which skips
   ticks outside `draw_ctx->clip_area` before paying rounded-cap mask setup.
 
+- **The render loop lives in IRAM** (`renderLoop`, `renderFrame`,
+  `presentFrame`, `pushLoop` and the scrim rows, `SleepAnimation.cpp`). The
+  two cores share one 16 KB instruction cache, and every LVGL pass on core 1
+  evicted the loop: with the code in flash, band, push and blend each doubled
+  under a telemetry screen refreshing 3 times a second and the loop ran at
+  17 fps; in IRAM, 28 fps under the same load (2026-09-07, Starfield, cap 45,
+  bench board). The pins cost about 8 KB of internal RAM, since IRAM text
+  past the first 16 KB is taken from DRAM one for one; pinning every kernel
+  would cost 11 KB more and was not done.
+- **What is left of the churn cost is PSRAM bus contention, not pixels.**
+  LVGL's drawing and the snapshot copy contend with the render task for the
+  bus. Compositing only the overlay's non-transparent runs (gm-2cl.11) saved
+  12% of blend with plates on and nothing without them, so it was measured
+  and not shipped. The lever is fewer LVGL passes (gm-2cl.5, .6, .7), not a
+  cheaper blend.
+- **Rendering straight into the bounce ring without a framebuffer does not
+  work on this bus** (gm-2cl.13, killed 2026-09-07). Two rounds, Starfield,
+  standby screen, divider 8 (110 us per 2-row band): 36 to 45% of the 9,200
+  band requests a second underran, even with the producer at priority 22 and
+  its kernel in IRAM, because band plus blend cost 85 to 100 us per band and
+  did not change with priority or placement. The producer is bus-bound. The
+  panel garbles the moment it falls behind, so the framebuffer path stays and
+  the scratch patch (`raster_poc.patch`) is the record.
+
 Measure with `-e display-loadtest` (`GM_TOUCH_PROBE`): `GM_UISTAT` lines give
 pass/snapshot/publish times and snapshot area per 5 s window; `GM_TOUCHLAT`
 lines stamp press→overlay_publish→anim_frame per tap.
@@ -487,6 +511,11 @@ survived, and what the device taught:
   production. `pio run -t compiledb` recreates the env's build tree (ELF
   included) and writes the one project-wide compile_commands.json, so run
   it before the build, not after, and never for another env in between.
+  **Adding or removing an env in platformio.ini also changes the checksum**
+  and wipes every env's build tree (2026-09-07: one POC env cost a 7 minute
+  loadtest rebuild before the board could be restored). Never edit the env
+  list while a runner is on the board; rebuild what you flash next after
+  the edit.
   Three things the first evening on it taught: never reflash the board
   while a round is running (the `band` rows become a snapshot of whatever
   the tree held at build time, and one worker spent an hour comparing
