@@ -23,6 +23,7 @@ class SleepAnimation {
     void setInterlace(bool) {}
     void setScrim(int) {}
     uint8_t *overlayBackBuffer() { return nullptr; }
+    const uint8_t *overlayFrontBuffer() const { return nullptr; }
     uint32_t overlayCapacity() const { return 0; }
     void publishOverlay(int, int, int, int) {}
     void publishOverlayRanges(int, int, const int (*)[2], int) {}
@@ -283,6 +284,14 @@ class SleepAnimation {
     // Returns nullptr when the render task is still reading the back overlay
     // mid-frame (rare, ~20 ms window) — the caller just retries next UI pass.
     uint8_t *overlayBackBuffer();
+    // The published overlay, read-only: the render task blends from it, and
+    // the UI task copies from it the rects the back buffer still owes that
+    // this one already holds (DefaultUI::refreshSleepOverlay). nullptr
+    // before the first publish.
+    const uint8_t *overlayFrontBuffer() const {
+        const int f = overlayFront.load();
+        return f < 0 ? nullptr : overlays[f].buf;
+    }
     uint32_t overlayCapacity() const { return overlayCap; }
     // w/h: the snapshot's actual pixel size (may exceed the panel by the
     // object's ext draw size on each side; the blend centers it).

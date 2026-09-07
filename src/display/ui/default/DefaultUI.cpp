@@ -40,6 +40,7 @@ uint32_t g_ovlN = 0;
 int64_t g_ovlSnapSum = 0, g_ovlSnapMax = 0;
 int64_t g_ovlPubSum = 0, g_ovlPubMax = 0;
 int64_t g_ovlAreaSum = 0, g_ovlAreaMax = 0;
+int64_t g_ovlCopySum = 0, g_ovlCopyArea = 0; // back-buffer repair by copy, per window
 // Snapshot sub-stages: alpha-clear memset vs the lv_obj_redraw itself.
 int64_t g_snapClearSum = 0, g_snapDrawSum = 0;
 int64_t g_uiStatLastLog = 0;
@@ -1961,13 +1962,18 @@ void DefaultUI::refreshSleepOverlay() {
     // snapshot catches them stacked. This is a no-op once the layout is valid.
     lv_obj_update_layout(scr);
     // Collect what LVGL redrew since the last pass FIRST, and owe it to both
-    // buffers. Doing this before any early return is what makes the retry paths
-    // below safe: a refresh that cannot proceed loses nothing.
+    // buffers: as a render to the one that is back now, as a copy to the
+    // other (see overlayCopy in the header). Doing this before any early
+    // return is what makes the retry paths below safe: a refresh that
+    // cannot proceed loses nothing, and the back index only moves on a
+    // publish, so the split stays right across a retry.
+    const int back = sleepAnimation.overlayBackIndex();
+    const int front = back ^ 1;
     lv_area_t fresh[OVERLAY_DIRTY_RECTS];
     const int freshN = lvgl_helper_take_dirty_rects(fresh, OVERLAY_DIRTY_RECTS);
     for (int i = 0; i < freshN; i++) {
-        lvgl_helper_rect_add(overlayDirty[0], &overlayDirtyN[0], OVERLAY_DIRTY_RECTS, fresh[i]);
-        lvgl_helper_rect_add(overlayDirty[1], &overlayDirtyN[1], OVERLAY_DIRTY_RECTS, fresh[i]);
+        lvgl_helper_rect_add(overlayDirty[back], &overlayDirtyN[back], OVERLAY_DIRTY_RECTS, fresh[i]);
+        lvgl_helper_rect_add(overlayCopy[front], &overlayCopyN[front], OVERLAY_DIRTY_RECTS, fresh[i]);
     }
 
     // nullptr means the render task is still reading that buffer; retry next
@@ -1976,12 +1982,11 @@ void DefaultUI::refreshSleepOverlay() {
     if (buf == nullptr) {
         return;
     }
-    const int back = sleepAnimation.overlayBackIndex();
 
     // Nothing moved and this buffer is already complete: the whole refresh
     // costs one comparison. This is the case that gives touch its time back on
     // a screen that is merely sitting there.
-    if (overlayValid[back] && overlayDirtyN[back] == 0) {
+    if (overlayValid[back] && overlayDirtyN[back] == 0 && overlayCopyN[back] == 0) {
         return;
     }
 
@@ -2026,10 +2031,25 @@ void DefaultUI::refreshSleepOverlay() {
     // fresh rect into a clip this pass has already snapshotted.
     lv_area_t clips[2 * OVERLAY_DIRTY_RECTS];
     int clipN = 0;
+    lv_area_t copies[OVERLAY_DIRTY_RECTS];
+    int copyN = 0;
     if (overlayValid[back]) {
         clipN = overlayDirtyN[back];
         for (int i = 0; i < clipN; i++) {
             clips[i] = overlayDirty[back][i];
+        }
+        // Copy debt is settled from the front buffer only while the front
+        // is complete and the same size; otherwise it is rendered like any
+        // other debt. Rendered rects go into the first half of clips[] so
+        // they merge with the render debt, never with the mid-pass extras.
+        const bool canCopy = sleepAnimation.overlayFrontBuffer() != nullptr && overlayValid[front] &&
+                             overlayW[front] == overlayW[back] && overlayH[front] == overlayH[back];
+        for (int i = 0; i < overlayCopyN[back]; i++) {
+            if (canCopy) {
+                copies[copyN++] = overlayCopy[back][i];
+            } else {
+                lvgl_helper_rect_add(clips, &clipN, OVERLAY_DIRTY_RECTS, overlayCopy[back][i]);
+            }
         }
     } else {
         // First use of this buffer: it holds nothing, so a partial draw would
@@ -2045,9 +2065,36 @@ void DefaultUI::refreshSleepOverlay() {
     int w = 0, h = 0;
     const int64_t probeSnap0 = esp_timer_get_time();
     int64_t probeArea = 0;
+    int64_t copyArea = 0;
+    // Copies first, renders after: a rect in both lists holds newer content
+    // in the render debt, and the render overwrites the copy.
+    if (copyN > 0) {
+        const uint8_t *src = sleepAnimation.overlayFrontBuffer();
+        lv_area_t origin;
+        lv_obj_get_coords(scr, &origin);
+        const lv_coord_t ext = _lv_obj_get_ext_draw_size(scr);
+        lv_area_increase(&origin, ext, ext);
+        const int bufW = lv_area_get_width(&origin);
+        for (int i = 0; i < copyN; i++) {
+            lv_area_t r;
+            if (!_lv_area_intersect(&r, &copies[i], &origin)) {
+                continue;
+            }
+            const size_t rowBytes = static_cast<size_t>(lv_area_get_width(&r)) * 3;
+            for (lv_coord_t y = r.y1; y <= r.y2; y++) {
+                const size_t off = (static_cast<size_t>(y - origin.y1) * bufW + (r.x1 - origin.x1)) * 3;
+                memcpy(buf + off, src + off, rowBytes);
+            }
+            copyArea += static_cast<int64_t>(lv_area_get_width(&r)) * lv_area_get_height(&r);
+        }
+        w = bufW;
+        h = lv_area_get_height(&origin);
+    }
+#ifdef GM_TOUCH_PROBE
+    const int64_t probeCopy1 = esp_timer_get_time();
+#endif
     const int baseN = clipN;
     int extraN = 0;
-    const int front = back ^ 1;
     for (int i = 0; i < baseN + extraN; i++) {
         if (!snapshotAreaToOverlay(scr, buf, sleepAnimation.overlayCapacity(), clips[i], &w, &h)) {
             // Leave the debt list intact; the next pass retries every rect.
@@ -2076,7 +2123,7 @@ void DefaultUI::refreshSleepOverlay() {
             lv_area_t more[OVERLAY_DIRTY_RECTS];
             const int moreN = lvgl_helper_take_dirty_rects(more, OVERLAY_DIRTY_RECTS);
             for (int k = 0; k < moreN; k++) {
-                lvgl_helper_rect_add(overlayDirty[front], &overlayDirtyN[front], OVERLAY_DIRTY_RECTS, more[k]);
+                lvgl_helper_rect_add(overlayCopy[front], &overlayCopyN[front], OVERLAY_DIRTY_RECTS, more[k]);
                 lvgl_helper_rect_add(clips + baseN, &extraN, OVERLAY_DIRTY_RECTS, more[k]);
             }
         }
@@ -2094,16 +2141,30 @@ void DefaultUI::refreshSleepOverlay() {
     // Only the rows that changed need their alpha spans recomputed. The clips
     // are in screen coordinates and the host object is the screen, so screen
     // row and panel row are the same number.
-    int ranges[2 * OVERLAY_DIRTY_RECTS][2];
+    int ranges[3 * OVERLAY_DIRTY_RECTS][2];
+    int rangeN = 0;
     for (int i = 0; i < clipN; i++) {
-        ranges[i][0] = clips[i].y1;
-        ranges[i][1] = clips[i].y2 + 1;
+        ranges[rangeN][0] = clips[i].y1;
+        ranges[rangeN][1] = clips[i].y2 + 1;
+        rangeN++;
     }
-    sleepAnimation.publishOverlayRanges(w, h, ranges, clipN);
+    for (int i = 0; i < copyN; i++) {
+        ranges[rangeN][0] = copies[i].y1;
+        ranges[rangeN][1] = copies[i].y2 + 1;
+        rangeN++;
+    }
+    // Warm-up before the publish (an ordering the GPT-6 Astra oracle flagged,
+    // 2026-09-06): the render task runs on the other core, and a frame that
+    // started between the publish and this request would have interlaced
+    // the changed rows once. Requested first, the worst case is one band
+    // rendered whole against the previous overlay, which is harmless. The
+    // list is the same one the publish gets, in the same panel-row space.
+    sleepAnimation.requestBandWarmup(ranges, rangeN);
+    sleepAnimation.publishOverlayRanges(w, h, ranges, rangeN);
     g_overlayStats.lastSnapUs = static_cast<uint32_t>(probeSnap1 - probeSnap0);
     g_overlayStats.lastPubUs = static_cast<uint32_t>(esp_timer_get_time() - probeSnap1);
     g_overlayStats.lastAreaPx = static_cast<uint32_t>(probeArea);
-    g_overlayStats.lastClips = static_cast<uint32_t>(clipN);
+    g_overlayStats.lastClips = static_cast<uint32_t>(clipN + copyN);
     g_overlayStats.refreshes = g_overlayStats.refreshes + 1;
 #ifdef GM_TOUCH_PROBE
     {
@@ -2119,6 +2180,8 @@ void DefaultUI::refreshSleepOverlay() {
         g_ovlAreaSum += probeArea;
         if (probeArea > g_ovlAreaMax)
             g_ovlAreaMax = probeArea;
+        g_ovlCopySum += probeCopy1 - probeSnap0;
+        g_ovlCopyArea += copyArea;
     }
     if (g_probeEdgeUs != 0) {
         const int64_t edge = g_probeEdgeUs;
@@ -2135,17 +2198,7 @@ void DefaultUI::refreshSleepOverlay() {
     overlayW[back] = w;
     overlayH[back] = h;
     overlayDirtyN[back] = 0;
-    // A widget just changed. Do not let interlacing split that change across
-    // two frames; on hard-edged UI content the half-updated frame is plainly
-    // visible, where on the animation it is not. Regional, not global: only
-    // the bands `ranges` actually covers need this, and ranges is the exact
-    // list publishOverlayRanges() just used a few lines up, in the same
-    // panel-row space -- not a fresh read of anything, so there is nothing
-    // to race against that publish. A first-fill or geometry-change pass
-    // above set clips[0] (and so ranges[0]) to the whole screen, which
-    // covers every band the same way the old global call did; only a
-    // partial telemetry update actually narrows this to a handful of bands.
-    sleepAnimation.requestBandWarmup(ranges, clipN);
+    overlayCopyN[back] = 0;
 #endif
 }
 
@@ -2880,7 +2933,8 @@ void DefaultUI::loopTask(void *arg) {
                          "GM_UISTAT: passes=%lu avg=%lld max=%lld us | refreshes=%lu snap avg=%lld max=%lld pub "
                          "avg=%lld max=%lld area avg=%lld max=%lld px | clear=%lld draw=%lld scan=%lld scrim=%lld"
                          " | meter=%lld mcalls=%lu ticks=%lu clip=%lu | ev=%lld/%lu sty=%lld/%lu img=%lld/%lu"
-                         " rect=%lld/%lu rectr=%lld/%lu rmax=%lld lbl=%lld/%lu ln=%lld/%lu arc=%lld/%lu",
+                         " rect=%lld/%lu rectr=%lld/%lu rmax=%lld lbl=%lld/%lu ln=%lld/%lu arc=%lld/%lu"
+                         " | copy=%lld carea=%lld",
                          (unsigned long)g_uiPassN, (long long)(g_uiPassSum / g_uiPassN), (long long)g_uiPassMax,
                          (unsigned long)g_ovlN, (long long)(g_ovlN ? g_ovlSnapSum / g_ovlN : 0), (long long)g_ovlSnapMax,
                          (long long)(g_ovlN ? g_ovlPubSum / g_ovlN : 0), (long long)g_ovlPubMax,
@@ -2899,12 +2953,14 @@ void DefaultUI::loopTask(void *arg) {
                          (long long)gm_ws_rect_max_us,
                          (long long)(g_ovlN ? gm_ws_label_us / g_ovlN : 0), (unsigned long)gm_ws_label_calls,
                          (long long)(g_ovlN ? gm_ws_line_us / g_ovlN : 0), (unsigned long)gm_ws_line_calls,
-                         (long long)(g_ovlN ? gm_ws_arc_us / g_ovlN : 0), (unsigned long)gm_ws_arc_calls);
+                         (long long)(g_ovlN ? gm_ws_arc_us / g_ovlN : 0), (unsigned long)gm_ws_arc_calls,
+                         (long long)(g_ovlN ? g_ovlCopySum / g_ovlN : 0), (long long)(g_ovlN ? g_ovlCopyArea / g_ovlN : 0));
                 g_uiPassN = 0;
                 g_uiPassSum = g_uiPassMax = 0;
                 g_ovlN = 0;
                 g_ovlSnapSum = g_ovlSnapMax = g_ovlPubSum = g_ovlPubMax = 0;
                 g_ovlAreaSum = g_ovlAreaMax = 0;
+                g_ovlCopySum = g_ovlCopyArea = 0;
                 g_snapClearSum = g_snapDrawSum = 0;
                 g_statPubScanUs = g_statPubScrimUs = 0;
                 g_meterDrawUs = 0;

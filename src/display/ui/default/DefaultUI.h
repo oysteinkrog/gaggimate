@@ -282,6 +282,16 @@ class DefaultUI {
     static constexpr int OVERLAY_DIRTY_RECTS = 4;
     lv_area_t overlayDirty[2][OVERLAY_DIRTY_RECTS];
     int overlayDirtyN[2] = {0, 0};
+    // Debt the buffer can settle by copying from the other buffer instead of
+    // rendering (gm-qo3.4). A fresh rect is rendered once, into the buffer
+    // that is back when it arrives, and owed to the other one as a copy:
+    // by the time that buffer is back again, the first holds the rect as of
+    // its render, and everything newer is in its own render debt, which is
+    // drawn after the copy and so wins. A copy of a 3-byte pixel row is a
+    // memcpy in PSRAM; the render it replaces was a clear plus a full LVGL
+    // draw of the same area (10 plus 42 ms per refresh on the board).
+    lv_area_t overlayCopy[2][OVERLAY_DIRTY_RECTS];
+    int overlayCopyN[2] = {0, 0};
     bool overlayValid[2] = {false, false};
     // The snapshot geometry each overlay buffer was built with.
     //
