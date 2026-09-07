@@ -1961,6 +1961,53 @@ void WebUIPlugin::setupServer() {
         response->addHeader("X-FB-Size", disposition);
         request->send(response);
     });
+
+    // /api/debug/ovl?step=1..8: the front overlay snapshot (RGB565 little
+    // endian plus a coverage byte, 3 bytes a pixel), subsampled like the
+    // framebuffer dump. X-OV-Size carries the output size. The instrument
+    // for what the composite is actually asked to blend: coverage, flat
+    // stretches, the plates' real pixel values.
+    server.on("/api/debug/ovl", [](AsyncWebServerRequest *request) {
+        SleepAnimation *a = sleep_animation_bench_instance();
+        int w = 0, h = 0;
+        const uint8_t *buf = a != nullptr ? a->overlayFrontBuffer() : nullptr;
+        if (buf == nullptr || !a->overlayFrontSize(w, h) || w <= 0 || h <= 0) {
+            request->send(404, "application/json", "{\"error\":\"no overlay published\"}");
+            return;
+        }
+        int step = request->hasArg("step") ? request->arg("step").toInt() : 1;
+        if (step < 1 || step > 8)
+            step = 1;
+        const int ow = w / step;
+        const int oh = h / step;
+        // Pixel granular, not row granular like the framebuffer dump: a
+        // 3-byte row of 480 pixels is 1440 bytes, and a later chunk's budget
+        // can be just under that, which would end the response after the
+        // first chunk. state counts output pixels.
+        auto *state = new int(0);
+        AsyncWebServerResponse *response = request->beginChunkedResponse(
+            "application/octet-stream", [buf, w, step, ow, oh, state](uint8_t *out, size_t maxLen, size_t) -> size_t {
+                const int total = ow * oh;
+                size_t written = 0;
+                while (*state < total && written + 3 <= maxLen) {
+                    const int oy = *state / ow;
+                    const int ox = *state - oy * ow;
+                    const uint8_t *p = buf + (static_cast<size_t>(oy) * step * w + static_cast<size_t>(ox) * step) * 3;
+                    out[written] = p[0];
+                    out[written + 1] = p[1];
+                    out[written + 2] = p[2];
+                    written += 3;
+                    (*state)++;
+                }
+                if (written == 0)
+                    delete state;
+                return written;
+            });
+        char disposition[64];
+        snprintf(disposition, sizeof(disposition), "%dx%d", ow, oh);
+        response->addHeader("X-OV-Size", disposition);
+        request->send(response);
+    });
 #endif // !GAGGIMATE_HEADLESS && !GAGGIMATE_SIM
 
 #ifdef GAGGIMATE_SIM

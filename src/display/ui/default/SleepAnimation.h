@@ -24,6 +24,7 @@ class SleepAnimation {
     void setScrim(int) {}
     uint8_t *overlayBackBuffer() { return nullptr; }
     const uint8_t *overlayFrontBuffer() const { return nullptr; }
+    bool overlayFrontSize(int &, int &) const { return false; }
     uint32_t overlayCapacity() const { return 0; }
     void publishOverlay(int, int, int, int) {}
     void publishOverlayRanges(int, int, const int (*)[2], int) {}
@@ -312,6 +313,17 @@ class SleepAnimation {
         return f < 0 ? nullptr : overlays[f].buf;
     }
     uint32_t overlayCapacity() const { return overlayCap; }
+    // The front overlay's snapshot size, for the debug dump; false before
+    // the first publish.
+    bool overlayFrontSize(int &w, int &h) const {
+        const int f = overlayFront.load();
+        if (f < 0) {
+            return false;
+        }
+        w = overlays[f].w;
+        h = overlays[f].h;
+        return true;
+    }
     // w/h: the snapshot's actual pixel size (may exceed the panel by the
     // object's ext draw size on each side; the blend centers it).
     // rowY0/rowY1 bound the PANEL rows whose alpha changed; only those get
