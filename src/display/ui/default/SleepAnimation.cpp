@@ -2072,7 +2072,7 @@ void SleepAnimation::readLayerMotion(const Layer &L, LayerMotion &m) {
 
 void SleepAnimation::setOverlayGain(uint16_t g) { rampOverlayGain(g, 0); }
 
-void SleepAnimation::rampOverlayGain(uint16_t to, uint32_t durMs) {
+void SleepAnimation::rampOverlayGain(uint16_t to, uint32_t durMs, int gateFront) {
     if (to > 256) {
         to = 256;
     }
@@ -2082,13 +2082,15 @@ void SleepAnimation::rampOverlayGain(uint16_t to, uint32_t durMs) {
     ovGainSeq.fetch_add(1);
     ovGainRamp.t0Us = esp_timer_get_time();
     ovGainRamp.durUs = durMs * 1000u;
+    ovGainRamp.id = ovGainRamp.id + 1;
     ovGainRamp.from = from;
     ovGainRamp.to = to;
+    ovGainRamp.gateFront = static_cast<int8_t>(gateFront);
     ovGainSeq.fetch_add(1);
     ovGainTarget.store(to);
 }
 
-uint32_t SleepAnimation::overlayGainAt(int64_t nowUs) {
+uint32_t SleepAnimation::overlayGainAt(int64_t nowUs, int ofi) {
     OverlayGainRamp r;
     for (;;) {
         const uint32_t s1 = ovGainSeq.load();
@@ -2100,13 +2102,23 @@ uint32_t SleepAnimation::overlayGainAt(int64_t nowUs) {
             break;
         }
     }
-    if (r.durUs == 0 || nowUs >= r.t0Us + static_cast<int64_t>(r.durUs)) {
+    if (r.id != ovGainRampId) {
+        ovGainRampId = r.id;
+        ovGainRampStartUs = r.gateFront < 0 ? r.t0Us : -1;
+    }
+    if (ovGainRampStartUs < 0) {
+        if (ofi != r.gateFront) {
+            return r.from; // gated: the overlay this ramp reveals is not composited yet
+        }
+        ovGainRampStartUs = nowUs;
+    }
+    if (r.durUs == 0 || nowUs >= ovGainRampStartUs + static_cast<int64_t>(r.durUs)) {
         return r.to;
     }
-    if (nowUs <= r.t0Us) {
+    if (nowUs <= ovGainRampStartUs) {
         return r.from;
     }
-    const int64_t t = nowUs - r.t0Us;
+    const int64_t t = nowUs - ovGainRampStartUs;
     const int64_t v = static_cast<int64_t>(r.from) + (static_cast<int64_t>(r.to) - r.from) * t / r.durUs;
     return static_cast<uint32_t>(v);
 }
@@ -3282,7 +3294,7 @@ void SleepAnimation::renderFrame() {
     evaluateLayers(frameNowUs);
     // One gain for the whole frame, like the overlay index above: a ramp
     // step lands between frames, never between bands.
-    const uint32_t ovGain = overlayGainAt(frameNowUs);
+    const uint32_t ovGain = overlayGainAt(frameNowUs, ofi);
     ovGainFrame.store(static_cast<uint16_t>(ovGain));
 #ifdef GM_TOUCH_PROBE
     // This sample is the moment a publish becomes part of a frame; a stamp

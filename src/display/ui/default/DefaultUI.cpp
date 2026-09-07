@@ -524,6 +524,71 @@ void DefaultUI::loop() {
     // before, a few lines earlier.
     lv_task_handler();
     maintainSleepAnimation();
+    serviceOverlayTransition();
+}
+
+void DefaultUI::beginOverlayTransition(const char *why, bool waitSwap) {
+#ifndef GAGGIMATE_SIM
+    if (!sleepAnimation.isActive() || animHostScreen == nullptr) {
+        return; // LVGL flushes the panel itself; there is no composite to fade
+    }
+    if (overlayTrans == OverlayTrans::FadeOut) {
+        overlayTransWaitSwap = overlayTransWaitSwap || waitSwap;
+        return;
+    }
+    overlayTrans = OverlayTrans::FadeOut;
+    overlayTransWaitSwap = waitSwap;
+    overlayTransHeld = false;
+    overlayTransT0Us = esp_timer_get_time();
+    // The page must come as soon as it is built, not on the spaced pass.
+    overlayUrgentUntilUs = overlayTransT0Us + OVERLAY_TRANS_ABANDON_US;
+    sleepAnimation.rampOverlayGain(0, OVERLAY_FADE_OUT_MS);
+#ifdef GM_TOUCH_PROBE
+    ESP_LOGI("TouchProbe", "GM_TRANS: fade_out_start %s edge+%lld us", why,
+             (long long)(overlayTransT0Us - g_touchEdgeAtUs));
+#else
+    (void)why;
+#endif
+#else
+    (void)why;
+    (void)waitSwap;
+#endif
+}
+
+void DefaultUI::serviceOverlayTransition() {
+#ifndef GAGGIMATE_SIM
+    if (overlayTrans == OverlayTrans::Idle) {
+        return;
+    }
+    const int64_t nowUs = esp_timer_get_time();
+    if (overlayTrans == OverlayTrans::FadeIn) {
+        if (sleepAnimation.overlayGainSettled()) {
+#ifdef GM_TOUCH_PROBE
+            ESP_LOGI("TouchProbe", "GM_TRANS: fade_in_end t0+%lld us", (long long)(nowUs - overlayTransT0Us));
+#endif
+            overlayTrans = OverlayTrans::Idle;
+        }
+        return;
+    }
+    // FadeOut with no page to show: the animation stopped, or the change was
+    // cancelled before its page was built. Bring the page back.
+    const bool lost = !sleepAnimation.isActive() || animHostScreen == nullptr;
+    if (lost || (!overlayTransHeld && nowUs - overlayTransT0Us > OVERLAY_TRANS_ABANDON_US)) {
+#ifdef GM_TOUCH_PROBE
+        ESP_LOGI("TouchProbe", "GM_TRANS: abandoned %s t0+%lld us", lost ? "lost" : "timeout",
+                 (long long)(nowUs - overlayTransT0Us));
+#endif
+        overlayTransWaitSwap = false;
+        overlayTransHeld = false;
+        if (lost) {
+            sleepAnimation.setOverlayGain(256);
+            overlayTrans = OverlayTrans::Idle;
+        } else {
+            sleepAnimation.rampOverlayGain(256, OVERLAY_FADE_IN_MS);
+            overlayTrans = OverlayTrans::FadeIn;
+        }
+    }
+#endif
 }
 
 // Runs every UI-task pass. Starts/stops the background animation and keeps
@@ -1363,6 +1428,11 @@ void DefaultUI::loopProfiles() {
 }
 
 void DefaultUI::changeScreen(ScreensEnum screen) {
+    if (screen != targetScreen && screen != currentScreen) {
+        // At the request, not at the swap: the swap waits for the next
+        // rerender pass, and the fade is the response the finger sees.
+        beginOverlayTransition("screen", true);
+    }
     targetScreen = screen;
     brewScreenState = BrewScreenState::Brew;
     rerender = true;
@@ -1580,6 +1650,11 @@ void DefaultUI::handleScreenChange() {
         // running anyway, hand it the new host instead of restarting it.
         // maintainSleepAnimation does the adopting, which runs later in this
         // same pass, after ui_tick has actually swapped the screen.
+        // Routes that set targetScreen without changeScreen still fade;
+        // one that came through it only clears the swap hold here. Before
+        // the host is released: with no host there is no composite to fade.
+        beginOverlayTransition("swap", false);
+        overlayTransWaitSwap = false;
         if (bgAnimAllScreens && sleepAnimation.isActive()) {
             releaseAnimHost();
         } else {
@@ -1828,6 +1903,10 @@ void DefaultUI::adoptAnimHost(lv_obj_t *host) {
 void DefaultUI::stopSleepAnimation() {
 #ifndef GAGGIMATE_SIM
     sleepAnimation.stop();
+    sleepAnimation.setOverlayGain(256);
+    overlayTrans = OverlayTrans::Idle;
+    overlayTransWaitSwap = false;
+    overlayTransHeld = false;
     lvgl_helper_suppress_flush(false);
     applyAnimPlates(0);
     for (lv_obj_t *icon : {objects.wifi_icon, objects.bluetooth_icon, objects.update_icon}) {
@@ -1946,6 +2025,34 @@ bool DefaultUI::snapshotAreaToOverlay(lv_obj_t *obj, uint8_t *buf, uint32_t bufS
 #endif
 }
 
+// True once no frame can still show the old page: the render task has
+// latched gain zero, or the fade-out ramp has run its course, so any frame
+// it renders from now on evaluates to zero. The second test matters when
+// frames are stalled (the web task serialising a large dump on the render
+// core, for one): waiting on the latch alone held a page 400 ms.
+bool DefaultUI::overlayFadedOut() const {
+#ifndef GAGGIMATE_SIM
+    if (sleepAnimation.overlayGain() == 0) {
+        return true;
+    }
+    return esp_timer_get_time() >= overlayTransT0Us + static_cast<int64_t>(OVERLAY_FADE_OUT_MS) * 1000 + 2000;
+#else
+    return true;
+#endif
+}
+
+// The transition's page has just been published: fade it in from the first
+// frame that composites it (the gate), and log the hand-over.
+void DefaultUI::finishOverlayTransition() {
+#ifndef GAGGIMATE_SIM
+    sleepAnimation.rampOverlayGain(256, OVERLAY_FADE_IN_MS, sleepAnimation.overlayFrontIndex());
+    overlayTrans = OverlayTrans::FadeIn;
+#ifdef GM_TOUCH_PROBE
+    ESP_LOGI("TouchProbe", "GM_TRANS: fade_in_start t0+%lld us", (long long)(esp_timer_get_time() - overlayTransT0Us));
+#endif
+#endif
+}
+
 void DefaultUI::refreshSleepOverlay() {
 #ifndef GAGGIMATE_SIM
     // The debt lists, LVGL's accumulator and publishOverlayRanges' local range
@@ -1980,6 +2087,28 @@ void DefaultUI::refreshSleepOverlay() {
     // pass without stamping the refresh time.
     uint8_t *buf = sleepAnimation.overlayBackBuffer();
     if (buf == nullptr) {
+        return;
+    }
+
+    // A screen change is fading the old page out and its swap has not run
+    // yet: nothing published now could be anything but the old page, so
+    // hold. The debt harvested above is kept, and adoptAnimHost discards it
+    // with the rest of the old screen.
+    if (overlayTransWaitSwap) {
+        return;
+    }
+    // The transition's page is rendered and waiting for the fade-out to
+    // reach zero. Publish it whole the moment it has; debt harvested since
+    // stays listed against this buffer and is rendered on its next turn.
+    if (overlayTransHeld) {
+        if (!overlayFadedOut()) {
+            return;
+        }
+        overlayTransHeld = false;
+        const int whole[1][2] = {{0, overlayH[back]}};
+        sleepAnimation.requestBandWarmup(whole, 1);
+        sleepAnimation.publishOverlayRanges(overlayW[back], overlayH[back], whole, 1);
+        finishOverlayTransition();
         return;
     }
 
@@ -2159,8 +2288,36 @@ void DefaultUI::refreshSleepOverlay() {
     // the changed rows once. Requested first, the worst case is one band
     // rendered whole against the previous overlay, which is harmless. The
     // list is the same one the publish gets, in the same panel-row space.
+    // A screen change requested from the snapshot's own input slice: what
+    // was just rendered is the old screen. Drop it; adoptAnimHost rebuilds
+    // both buffers for the new one.
+    if (overlayTransWaitSwap) {
+        return;
+    }
+    // The transition's page must not appear until the old one has faded
+    // out entirely: hold it in this buffer and publish on a later pass.
+    if (overlayTrans == OverlayTrans::FadeOut && !overlayFadedOut()) {
+#ifdef GM_TOUCH_PROBE
+        ESP_LOGI("TouchProbe", "GM_TRANS: page_ready held, snap %lld us, t0+%lld us",
+                 (long long)(probeSnap1 - probeSnap0), (long long)(probeSnap1 - overlayTransT0Us));
+#endif
+        overlayTransHeld = true;
+        overlayValid[back] = true;
+        overlayW[back] = w;
+        overlayH[back] = h;
+        overlayDirtyN[back] = 0;
+        overlayCopyN[back] = 0;
+        return;
+    }
     sleepAnimation.requestBandWarmup(ranges, rangeN);
     sleepAnimation.publishOverlayRanges(w, h, ranges, rangeN);
+    if (overlayTrans == OverlayTrans::FadeOut) {
+#ifdef GM_TOUCH_PROBE
+        ESP_LOGI("TouchProbe", "GM_TRANS: page_ready published, snap %lld us, t0+%lld us",
+                 (long long)(probeSnap1 - probeSnap0), (long long)(probeSnap1 - overlayTransT0Us));
+#endif
+        finishOverlayTransition();
+    }
     g_overlayStats.lastSnapUs = static_cast<uint32_t>(probeSnap1 - probeSnap0);
     g_overlayStats.lastPubUs = static_cast<uint32_t>(esp_timer_get_time() - probeSnap1);
     g_overlayStats.lastAreaPx = static_cast<uint32_t>(probeArea);

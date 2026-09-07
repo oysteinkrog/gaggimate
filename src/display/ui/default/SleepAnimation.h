@@ -31,7 +31,8 @@ class SleepAnimation {
     void requestWholeFrames() {}
     void requestBandWarmup(const int (*)[2], int) {}
     void setOverlayGain(uint16_t) {}
-    void rampOverlayGain(uint16_t, uint32_t) {}
+    void rampOverlayGain(uint16_t, uint32_t, int = -1) {}
+    int overlayFrontIndex() const { return -1; }
     uint16_t overlayGain() const { return 256; }
     uint16_t overlayGainTarget() const { return 256; }
     bool overlayGainSettled() const { return true; }
@@ -328,8 +329,15 @@ class SleepAnimation {
     // render task latches one value per frame (overlayGain()), so a caller
     // that waits for a ramp to end polls overlayGainSettled(). Layers are
     // not affected: they are the moving elements, not the page.
+    //
+    // gateFront names an overlay index: the ramp's clock then starts in
+    // the first frame that composites that overlay, not when the call is
+    // made. A fade-in requested right after a publish would otherwise race
+    // the render task's per-frame latch and could brighten the old page
+    // for one frame.
     void setOverlayGain(uint16_t g);
-    void rampOverlayGain(uint16_t to, uint32_t durMs);
+    void rampOverlayGain(uint16_t to, uint32_t durMs, int gateFront = -1);
+    int overlayFrontIndex() const { return overlayFront.load(); }
     uint16_t overlayGain() const { return ovGainFrame.load(); }
     uint16_t overlayGainTarget() const { return ovGainTarget.load(); }
     bool overlayGainSettled() const { return !running.load() || ovGainFrame.load() == ovGainTarget.load(); }
@@ -1360,14 +1368,21 @@ class SleepAnimation {
     struct OverlayGainRamp {
         int64_t t0Us = 0;
         uint32_t durUs = 0;
+        uint32_t id = 0;
         uint16_t from = 256;
         uint16_t to = 256;
+        int8_t gateFront = -1;
     };
     OverlayGainRamp ovGainRamp;
     std::atomic<uint32_t> ovGainSeq{0};
     std::atomic<uint16_t> ovGainFrame{256};
     std::atomic<uint16_t> ovGainTarget{256};
-    uint32_t overlayGainAt(int64_t nowUs);
+    // Render-task state for the ramp in progress: which record it belongs
+    // to and when its clock started (-1 while a gated ramp waits for its
+    // overlay to become the composited one).
+    uint32_t ovGainRampId = 0;
+    int64_t ovGainRampStartUs = -1;
+    uint32_t overlayGainAt(int64_t nowUs, int ofi);
 
     struct Layer {
         uint8_t *buf = nullptr;   // PSRAM, w*h*3 (RGB565 + A8)

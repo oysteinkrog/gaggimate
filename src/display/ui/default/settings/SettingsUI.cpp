@@ -45,6 +45,7 @@ void SettingsUI::open() {
     if (menu == nullptr) {
         return; // menu screen not built yet
     }
+    ui_.beginOverlayTransition("settings_open");
 
     capturedVisible.clear();
     const uint32_t n = lv_obj_get_child_cnt(menu);
@@ -106,6 +107,7 @@ void SettingsUI::close() {
     if (coverObj == nullptr) {
         return;
     }
+    ui_.beginOverlayTransition("settings_close");
     teardownAll();
 }
 
@@ -219,6 +221,7 @@ void SettingsUI::openCategory(int index) {
 }
 
 void SettingsUI::pushPage(const SettingsCategoryDef *def, void *ctx) {
+    ui_.beginOverlayTransition("settings_push");
     if (pageStack.empty()) {
         if (tilePageObj) {
             lv_obj_del(tilePageObj);
@@ -246,6 +249,7 @@ void SettingsUI::popPage() {
     if (pageStack.empty()) {
         return;
     }
+    ui_.beginOverlayTransition("settings_pop");
     const SettingsCategoryDef *def = pageStack.back().def;
     void *ctx = pageStack.back().ctx;
     lv_obj_t *root = pageStack.back().root;
@@ -278,6 +282,7 @@ void SettingsUI::gotoPage(int page) {
     if (pageStack.empty()) {
         return;
     }
+    ui_.beginOverlayTransition("settings_page");
     pageStack.back().page = page; // clamped inside buildCategoryPage
     rebuildPage();
 }

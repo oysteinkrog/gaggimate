@@ -90,6 +90,8 @@ class DefaultUI {
     void openScaleScreen();
 
     void markDirty() { rerender = true; }
+    // For the settings shell: call before a navigation rebuilds the cover.
+    void beginOverlayTransition(const char *why) { beginOverlayTransition(why, false); }
     void markProfileDirty() { profileDirty = true; }
     void markProfileClean() { profileDirty = false; }
 
@@ -182,6 +184,28 @@ class DefaultUI {
 
     void startSleepAnimation();
     void stopSleepAnimation();
+    // Fade transitions (gm-2cl.2). A whole-page overlay rebuild (screen
+    // change, settings navigation) is hidden behind the composite's gain:
+    // the old page fades out from the moment the change is requested, the
+    // rebuilt page is published only once the gain has reached zero, and
+    // fades in from the first frame that composites it. waitSwap marks a
+    // screen change whose EEZ swap is still pending: partial publishes are
+    // held until handleScreenChange has swapped, so the old page never
+    // gets a refresh mid-fade.
+    void beginOverlayTransition(const char *why, bool waitSwap);
+    void serviceOverlayTransition();
+    void finishOverlayTransition();
+    bool overlayFadedOut() const;
+    enum class OverlayTrans : uint8_t { Idle, FadeOut, FadeIn };
+    OverlayTrans overlayTrans = OverlayTrans::Idle;
+    bool overlayTransWaitSwap = false;
+    bool overlayTransHeld = false; // a rendered page waits in the back buffer for gain 0
+    int64_t overlayTransT0Us = 0;
+    static constexpr uint32_t OVERLAY_FADE_OUT_MS = 120;
+    static constexpr uint32_t OVERLAY_FADE_IN_MS = 120;
+    // A fade-out whose page never arrives (a cancelled change) is undone
+    // after this long, so the screen cannot stay bare.
+    static constexpr int64_t OVERLAY_TRANS_ABANDON_US = 1500000;
     // Move the animation's host screen without interrupting it. The only
     // per-screen state the animation holds is the host's transparent
     // background: the plate table and the status icons it also rewrites are
