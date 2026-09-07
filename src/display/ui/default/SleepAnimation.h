@@ -549,6 +549,10 @@ class SleepAnimation {
     // Vector (blendRowPie) or scalar (blendRow) composite, for the A/B.
     void setBpie(bool on) { bpieOn.store(on); }
     bool bpie() const { return bpieOn.load(); }
+    int probeMismatchValue() const { return probeMismatch.load(); }
+    // Front overlay's non-transparent pixel count and row count (gm-2cl.15).
+    uint32_t overlayPixels() const { return overlays[overlayFront.load()].px; }
+    int overlayPixelRows() const { return overlays[overlayFront.load()].pxRows; }
     // Whether the band buffers landed in internal SRAM (they fall back to PSRAM).
     bool bandBufInternal() const;
 
@@ -606,6 +610,9 @@ class SleepAnimation {
     //   5 -- the same row, same runs, from PSRAM (the production source)
     //   6 -- PSRAM source, internal scratch destination
     //   7 -- internal source and internal scratch destination
+    //   8 -- planar copy of the row (RGB565 plane + A16 plane, internal),
+    //        the whole-group vector kernel blendRowPlanar, band destination
+    //   9 -- the same planes through the scalar kernel
     // Levels 4 to 7 blend one row's bytes into every band (the picture is
     // wrong while they run); probe_px on /api/debug/anim is that row's pixel
     // count, so blend_us / (probe_px * rows) is ns per pixel by memory.
@@ -851,6 +858,11 @@ class SleepAnimation {
         // animation and the composite skips it entirely.
         uint32_t *runs = nullptr;
         uint8_t *runN = nullptr;
+        // Non-transparent pixels and rows with any, summed from the run table
+        // at publish: what the blend has to touch per full frame on this page
+        // (gm-2cl.15).
+        uint32_t px = 0;
+        uint16_t pxRows = 0;
 
         // Text scrim, at 1/4 resolution (SCRIM_SHIFT): scrimSrc holds each
         // cell's peak widget alpha, scrim the dilated and smoothed halo the
@@ -1436,6 +1448,13 @@ class SleepAnimation {
     uint8_t *probeRowSram = nullptr;
     uint8_t *probeRowPsram = nullptr;
     uint16_t *probeDstSram = nullptr;
+    // Planar copies of the captured row for levels 8 and 9: RGB565 plane and
+    // a 16-bit alpha plane with 255 stored as 256, so an opaque lane is an
+    // exact copy through the multiply and the vector kernel needs no per-group
+    // opaque rule (see blendRowPlanar in the .cpp).
+    uint16_t *probeColPlane = nullptr;
+    uint16_t *probeA16Plane = nullptr;
+    uint16_t *probeRefRow = nullptr; // blendRow's result on the captured row, for the exactness check
     uint32_t probeRuns[kProbeRuns] = {};
     int probeNRuns = 0;
     uint32_t probePx = 0;
@@ -1447,6 +1466,7 @@ class SleepAnimation {
 #endif
     std::atomic<uint32_t> probePxOut{0};
     std::atomic<int> probeReps{1};
+    std::atomic<int> probeMismatch{-1}; // planar kernel vs blendRow on the captured row; -1 not run
     // Dim the scrim on the PIE vector unit rather than a pixel at a time.
     // Default on; the scalar path stays as the reference /api/pietest checks
     // against, and as the kernel for a run's unaligned edge cells.

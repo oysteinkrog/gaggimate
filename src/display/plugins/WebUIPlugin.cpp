@@ -1626,6 +1626,8 @@ void WebUIPlugin::setupServer() {
         doc["ov_snap_us"] = g_overlayStats.lastSnapUs;
         doc["ov_pub_us"] = g_overlayStats.lastPubUs;
         doc["ov_area_px"] = g_overlayStats.lastAreaPx;
+        doc["ov_px"] = a->overlayPixels();
+        doc["ov_px_rows"] = a->overlayPixelRows();
         doc["ov_clips"] = g_overlayStats.lastClips;
         doc["ov_min_us"] = static_cast<int64_t>(g_overlayMinRefreshUs);
         doc["fps_override"] = g_animFpsOverride;
@@ -1639,6 +1641,7 @@ void WebUIPlugin::setupServer() {
         doc["probe_px"] = a->probePixels();
         doc["probe_reps"] = a->probeRepsValue();
         doc["bpie"] = a->bpie();
+        doc["probe_mismatch"] = a->probeMismatchValue();
 #endif
         doc["ov_gain_target"] = a->overlayGainTarget();
         doc["tick_cache_bytes"] = meterticks::bytesAllocated();

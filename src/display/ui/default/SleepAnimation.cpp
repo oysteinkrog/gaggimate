@@ -861,6 +861,128 @@ __attribute__((noinline)) static uint32_t blendRowProbe(uint16_t *__restrict dst
 
 static_assert(SleepAnimation::kProbeRuns == RUNS_PER_ROW, "probe run capture mirrors the overlay's run table");
 
+// Planar blend: colour plane (RGB565) and alpha plane (16-bit lanes, 0..256,
+// 256 meaning opaque). With the alpha in its own 16-bit lane every 8-pixel
+// group goes through the vector unit whatever its alphas: fg * 256 + bg * 0
+// is an exact copy and fg * 0 + bg * 256 an exact keep, so the a==255 group
+// rule blendRowPie needs (and the scalar staging it pays for) disappears.
+// Arithmetic per channel is the proven raw-magnitude form of blendGroup8General:
+// extract the raw channel (mask, then >> by multiplying by 1 with SAR set),
+// fg_raw * a + bg_raw * inv with SAR 0 (at most 63 * 256, fits a lane),
+// >> 8 by another multiply by 1, then back into position by multiplying by
+// 2^shift. Reads 3 x 16 B, writes 16 B per 8 pixels.
+alignas(16) static const DRAM_ATTR uint16_t kPlanarConsts[7 * 8] = {
+    1,      1,      1,      1,      1,      1,      1,      1,      // ones: the shift multiplier
+    256,    256,    256,    256,    256,    256,    256,    256,    // inv = 256 - a
+    0xF800, 0xF800, 0xF800, 0xF800, 0xF800, 0xF800, 0xF800, 0xF800, // maskR
+    2048,   2048,   2048,   2048,   2048,   2048,   2048,   2048,   // R back into place (<< 11)
+    0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, // maskG
+    32,     32,     32,     32,     32,     32,     32,     32,     // G back into place (<< 5)
+    0x001F, 0x001F, 0x001F, 0x001F, 0x001F, 0x001F, 0x001F, 0x001F, // maskB
+};
+
+// n8 groups of 8 pixels; dst, col and a16 all 16-byte aligned.
+__attribute__((noinline)) static void IRAM_ATTR blendPlanarGroups(uint16_t *__restrict dst, const uint16_t *__restrict col,
+                                                                    const uint16_t *__restrict a16, int n8) {
+    uint16_t *wr = dst;
+    const uint16_t *rd = dst;
+    for (int g = 0; g < n8; g++) {
+        const uint16_t *ct = kPlanarConsts;
+        asm volatile(
+            // q7 ones, q0 fg, q1 bg, q2 a, q3 inv
+            "ee.vld.128.ip q7, %[ct], 16\n"
+            "ee.vld.128.ip q0, %[col], 16\n"
+            "ee.vld.128.ip q1, %[rd], 16\n"
+            "ee.vld.128.ip q2, %[a16], 16\n"
+            "ee.vld.128.ip q3, %[ct], 16\n"
+            "ee.vsubs.s16 q3, q3, q2\n"
+            // R
+            "ee.vld.128.ip q4, %[ct], 16\n"
+            "ee.andq q5, q0, q4\n"
+            "ee.andq q4, q1, q4\n"
+            "ssai 11\n"
+            "ee.vmul.u16 q5, q5, q7\n"
+            "ee.vmul.u16 q4, q4, q7\n"
+            "ssai 0\n"
+            "ee.vmul.u16 q5, q5, q2\n"
+            "ee.vmul.u16 q4, q4, q3\n"
+            "ee.vadds.s16 q5, q5, q4\n"
+            "ssai 8\n"
+            "ee.vmul.u16 q5, q5, q7\n"
+            "ee.vld.128.ip q4, %[ct], 16\n"
+            "ssai 0\n"
+            "ee.vmul.u16 q6, q5, q4\n"
+            // G
+            "ee.vld.128.ip q4, %[ct], 16\n"
+            "ee.andq q5, q0, q4\n"
+            "ee.andq q4, q1, q4\n"
+            "ssai 5\n"
+            "ee.vmul.u16 q5, q5, q7\n"
+            "ee.vmul.u16 q4, q4, q7\n"
+            "ssai 0\n"
+            "ee.vmul.u16 q5, q5, q2\n"
+            "ee.vmul.u16 q4, q4, q3\n"
+            "ee.vadds.s16 q5, q5, q4\n"
+            "ssai 8\n"
+            "ee.vmul.u16 q5, q5, q7\n"
+            "ee.vld.128.ip q4, %[ct], 16\n"
+            "ssai 0\n"
+            "ee.vmul.u16 q5, q5, q4\n"
+            "ee.orq q6, q6, q5\n"
+            // B (already in place)
+            "ee.vld.128.ip q4, %[ct], 16\n"
+            "ee.andq q5, q0, q4\n"
+            "ee.andq q4, q1, q4\n"
+            "ee.vmul.u16 q5, q5, q2\n"
+            "ee.vmul.u16 q4, q4, q3\n"
+            "ee.vadds.s16 q5, q5, q4\n"
+            "ssai 8\n"
+            "ee.vmul.u16 q5, q5, q7\n"
+            "ee.orq q6, q6, q5\n"
+            "ee.vst.128.ip q6, %[wr], 16\n"
+            : [col] "+r"(col), [rd] "+r"(rd), [wr] "+r"(wr), [a16] "+r"(a16), [ct] "+r"(ct)
+            :
+            : "memory");
+    }
+}
+
+__attribute__((always_inline)) inline void blendPixelPlanar(uint16_t *__restrict dst, const uint16_t *__restrict col,
+                                                            const uint16_t *__restrict a16, int x) {
+    const uint32_t a = a16[x];
+    if (a == 0) {
+        return;
+    }
+    dst[x] = a >= 256 ? col[x] : blend565(col[x], dst[x], static_cast<uint8_t>(a));
+}
+
+// The row: scalar to the first 8-aligned pixel, vector groups, scalar tail.
+__attribute__((noinline)) static void IRAM_ATTR blendRowPlanar(uint16_t *__restrict dst, const uint16_t *__restrict col,
+                                                               const uint16_t *__restrict a16,
+                                                               const uint32_t *__restrict runs, int nRuns, bool vector) {
+    for (int i = 0; i < nRuns; i++) {
+        const uint32_t r = runs[i];
+        int x = static_cast<int>(r & 0xFFFFu);
+        const int xEnd = static_cast<int>(r >> 16);
+        if (vector) {
+            int xa = (x + 7) & ~7;
+            if (xa > xEnd) {
+                xa = xEnd;
+            }
+            const int n8 = (xEnd - xa) >> 3;
+            for (; x < xa; x++) {
+                blendPixelPlanar(dst, col, a16, x);
+            }
+            if (n8 > 0) {
+                blendPlanarGroups(dst + x, col + x, a16 + x, n8);
+                x += n8 * 8;
+            }
+        }
+        for (; x < xEnd; x++) {
+            blendPixelPlanar(dst, col, a16, x);
+        }
+    }
+}
+
 // Levels 4 to 7 (benchSetBlendProbe): the production blend kernel over one
 // captured overlay row, the same bytes and the same runs for every band, with
 // the source and the destination each placed in internal SRAM or PSRAM. The
@@ -885,19 +1007,35 @@ uint32_t IRAM_ATTR SleepAnimation::probeBlendRow(uint16_t *drow, const uint8_t *
         }
         if (px > probePx && nRuns <= kProbeRuns && xmax <= w) {
             if (probeRowSram == nullptr) {
+                const size_t rowBytes = static_cast<size_t>(w) * 2;
                 probeRowSram = static_cast<uint8_t *>(
                     heap_caps_malloc(static_cast<size_t>(w) * 3, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
                 probeRowPsram = static_cast<uint8_t *>(heap_caps_malloc(static_cast<size_t>(w) * 3, MALLOC_CAP_SPIRAM));
                 probeDstSram = static_cast<uint16_t *>(
-                    heap_caps_aligned_alloc(16, static_cast<size_t>(w) * 2, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+                    heap_caps_aligned_alloc(16, rowBytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+                probeColPlane = static_cast<uint16_t *>(
+                    heap_caps_aligned_alloc(16, rowBytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+                probeA16Plane = static_cast<uint16_t *>(
+                    heap_caps_aligned_alloc(16, rowBytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+                probeRefRow = static_cast<uint16_t *>(
+                    heap_caps_aligned_alloc(16, rowBytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
             }
-            if (probeRowSram != nullptr && probeRowPsram != nullptr && probeDstSram != nullptr) {
+            if (probeRowSram != nullptr && probeRowPsram != nullptr && probeDstSram != nullptr &&
+                probeColPlane != nullptr && probeA16Plane != nullptr && probeRefRow != nullptr) {
                 memcpy(probeRowSram, crow, static_cast<size_t>(xmax) * 3);
                 memcpy(probeRowPsram, crow, static_cast<size_t>(xmax) * 3);
                 memcpy(probeRuns, runs, static_cast<size_t>(nRuns) * sizeof(uint32_t));
+                memset(probeColPlane, 0, static_cast<size_t>(w) * 2);
+                memset(probeA16Plane, 0, static_cast<size_t>(w) * 2);
+                for (int x = 0; x < xmax; x++) {
+                    const uint8_t *q = crow + static_cast<size_t>(x) * 3;
+                    probeColPlane[x] = static_cast<uint16_t>(q[0] | (q[1] << 8));
+                    probeA16Plane[x] = q[2] == 255 ? 256 : q[2];
+                }
                 probeNRuns = nRuns;
                 probePx = px;
                 probePxOut.store(px);
+                probeMismatch.store(-1);
             }
         }
         probeCaptureBands++;
@@ -906,11 +1044,27 @@ uint32_t IRAM_ATTR SleepAnimation::probeBlendRow(uint16_t *drow, const uint8_t *
     if (probeNRuns == 0) {
         return 0;
     }
+    if (probeMismatch.load() < 0) {
+        // Exactness on the device, once per capture: the planar vector kernel
+        // and the scalar blendRow over the same row and background must agree
+        // on every pixel. The background is this band's row.
+        memcpy(probeRefRow, drow, static_cast<size_t>(w) * 2);
+        memcpy(probeDstSram, drow, static_cast<size_t>(w) * 2);
+        blendRow<false>(probeRefRow, probeRowSram, probeRuns, probeNRuns, 256);
+        blendRowPlanar(probeDstSram, probeColPlane, probeA16Plane, probeRuns, probeNRuns, true);
+        int bad = 0;
+        for (int x = 0; x < w; x++) {
+            bad += probeRefRow[x] != probeDstSram[x];
+        }
+        probeMismatch.store(bad);
+    }
     const uint8_t *src = (level == 4 || level == 7) ? probeRowSram : probeRowPsram;
-    uint16_t *dst = (level >= 6) ? probeDstSram : drow;
+    uint16_t *dst = (level == 6 || level == 7) ? probeDstSram : drow;
     const int reps = probeReps.load();
     for (int k = 0; k < reps; k++) {
-        if (pie) {
+        if (level >= 8) {
+            blendRowPlanar(dst, probeColPlane, probeA16Plane, probeRuns, probeNRuns, level == 8);
+        } else if (pie) {
             blendRowPie<false>(dst, src, probeRuns, probeNRuns, 256);
         } else {
             blendRow<false>(dst, src, probeRuns, probeNRuns, 256);
@@ -929,9 +1083,22 @@ void SleepAnimation::probeReset() {
     if (probeDstSram != nullptr) {
         heap_caps_free(probeDstSram);
     }
+    if (probeColPlane != nullptr) {
+        heap_caps_free(probeColPlane);
+    }
+    if (probeA16Plane != nullptr) {
+        heap_caps_free(probeA16Plane);
+    }
+    if (probeRefRow != nullptr) {
+        heap_caps_free(probeRefRow);
+    }
     probeRowSram = nullptr;
     probeRowPsram = nullptr;
     probeDstSram = nullptr;
+    probeColPlane = nullptr;
+    probeA16Plane = nullptr;
+    probeRefRow = nullptr;
+    probeMismatch.store(-1);
     probeNRuns = 0;
     probePx = 0;
     probeCaptureBands = 0;
@@ -2047,6 +2214,25 @@ void SleepAnimation::publishOverlayRanges(int w, int h, const int (*ranges)[2], 
         if (doScrim) {
             addElementScrim(ov, rowY0, rowY1, sw, panelW);
         }
+    }
+    // Footprint of this page for the blend: every run of every row, so the
+    // count covers rows this publish did not rescan as well (their runs are
+    // carried over). About 11k adds at most, once per publish.
+    {
+        uint32_t px = 0;
+        int rows = 0;
+        for (int y = 0; y < panelH; y++) {
+            const int nr = ov.runN[y];
+            const uint32_t *rowRuns = ov.runs + static_cast<size_t>(y) * RUNS_PER_ROW;
+            uint32_t rowPx = 0;
+            for (int i = 0; i < nr; i++) {
+                rowPx += (rowRuns[i] >> 16) - (rowRuns[i] & 0xFFFFu);
+            }
+            px += rowPx;
+            rows += rowPx != 0;
+        }
+        ov.px = px;
+        ov.pxRows = static_cast<uint16_t>(rows);
     }
 #ifdef GM_TOUCH_PROBE
     const int64_t scrim0 = esp_timer_get_time();
