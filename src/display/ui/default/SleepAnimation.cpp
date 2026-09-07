@@ -2392,10 +2392,26 @@ void SleepAnimation::evaluateElements(int64_t nowUs) {
     }
     const int panelH = display->height();
     const int panelW = display->width();
+    // Easing step for the ring boundaries: dt / (dt + tau) approaches
+    // 1 - exp(-dt / tau) closely enough and costs no exp. The first frame
+    // after a pause is clamped so a long gap does not snap.
+    int64_t dtUs = lastElemEvalUs == 0 ? 0 : nowUs - lastElemEvalUs;
+    if (dtUs < 0) {
+        dtUs = 0;
+    }
+    if (dtUs > 100000) {
+        dtUs = 100000;
+    }
+    lastElemEvalUs = nowUs;
+    const float easeK = static_cast<float>(dtUs) / static_cast<float>(dtUs + kRingEaseTauUs);
+    int rings = 0;
     for (int i = 0; i < MAX_ELEMENTS; i++) {
         Element &e = elements[i];
         ElementDesc d;
         readElement(e, d);
+        if (d.type == ElementType::TickRing && d.ring.ring == nullptr) {
+            d.type = ElementType::None;
+        }
         // Clip to the panel here, once, so the row composite never has to.
         int x0 = d.x, y0 = d.y, x1 = d.x + d.w, y1 = d.y + d.h;
         if (x0 < 0) {
@@ -2443,7 +2459,32 @@ void SleepAnimation::evaluateElements(int64_t nowUs) {
         e.lastY0 = y0;
         e.lastY1 = y1;
         elementsThisFrame = elementsThisFrame || vis;
+        if (vis && d.type == ElementType::TickRing) {
+            rings++;
+            const float tlo = static_cast<float>(d.ring.lo);
+            const float thi = static_cast<float>(d.ring.hi);
+            if (!e.ringEased) {
+                // First frame with a ring: start at the target, no sweep in.
+                e.ringLo = tlo;
+                e.ringHi = thi;
+                e.ringEased = true;
+            } else {
+                e.ringLo += (tlo - e.ringLo) * easeK;
+                e.ringHi += (thi - e.ringHi) * easeK;
+                // Settle exactly: the boundary tick must end on the pure
+                // colour, not a blend one step off it.
+                if ((tlo - e.ringLo) * (tlo - e.ringLo) < 0.0001f) {
+                    e.ringLo = tlo;
+                }
+                if ((thi - e.ringHi) * (thi - e.ringHi) < 0.0001f) {
+                    e.ringHi = thi;
+                }
+            }
+        } else {
+            e.ringEased = false;
+        }
     }
+    ringElems.store(rings);
 }
 
 void IRAM_ATTR SleepAnimation::compositeElementsRow(uint16_t *drow, int y, int w) {
@@ -2455,6 +2496,10 @@ void IRAM_ATTR SleepAnimation::compositeElementsRow(uint16_t *drow, int y, int w
         const ElementDesc &d = e.f;
         const int dy = y - d.y;
         if (dy < 0 || dy >= d.h) {
+            continue;
+        }
+        if (d.type == ElementType::TickRing) {
+            tickring::compositeRow(drow, y, w, *d.ring.ring, d.ring.litColor, d.ring.unlitColor, e.ringLo, e.ringHi);
             continue;
         }
         int r = d.radius;

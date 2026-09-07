@@ -308,6 +308,313 @@ void DefaultUI::updatePressPlateMode() {
 #endif
 }
 
+namespace {
+#ifndef GAGGIMATE_SIM
+// Every lv_meter under obj, in tree order, up to n slots.
+void collectDialMeters(lv_obj_t *obj, lv_obj_t **out, int &count, int n) {
+    const uint32_t children = lv_obj_get_child_cnt(obj);
+    for (uint32_t i = 0; i < children && count < n; i++) {
+        lv_obj_t *child = lv_obj_get_child(obj, i);
+        if (lv_obj_check_type(child, &lv_meter_class)) {
+            out[count++] = child;
+        }
+        collectDialMeters(child, out, count, n);
+    }
+}
+
+// The meter's scale-lines indicator with a single colour, or nullptr when
+// the meter has none or its colour is a gradient (the element paints one
+// colour per tick; LVGL keeps those dials).
+lv_meter_indicator_t *uniformScaleLines(lv_obj_t *obj, lv_meter_scale_t *&scaleOut) {
+    auto *meter = reinterpret_cast<lv_meter_t *>(obj);
+    scaleOut = static_cast<lv_meter_scale_t *>(_lv_ll_get_head(&meter->scale_ll));
+    if (scaleOut == nullptr) {
+        return nullptr;
+    }
+    lv_meter_indicator_t *found = nullptr;
+    for (auto *indic = static_cast<lv_meter_indicator_t *>(_lv_ll_get_head(&meter->indicator_ll)); indic != nullptr;
+         indic = static_cast<lv_meter_indicator_t *>(_lv_ll_get_next(&meter->indicator_ll, indic))) {
+        if (indic->type != LV_METER_INDICATOR_TYPE_SCALE_LINES) {
+            continue;
+        }
+        if (found != nullptr || indic->scale != scaleOut ||
+            indic->type_data.scale_lines.color_start.full != indic->type_data.scale_lines.color_end.full) {
+            return nullptr; // two indicators or a gradient: not this element's shape
+        }
+        found = indic;
+    }
+    return found;
+}
+#endif
+} // namespace
+
+void DefaultUI::serviceDialElements() {
+#ifndef GAGGIMATE_SIM
+    const uint32_t frame = sleepAnimation.animFrameCount();
+    for (DialRetire &r : dialRetire) {
+        if (r.live && frame - r.frame >= 2) {
+            meterticks::pin(r.key, false);
+            r.live = false;
+        }
+    }
+    // The tick-length morph (animateGaugeTicks) rewrites the cache key every
+    // frame; LVGL draws the ring until it has settled and the cache holds
+    // the final geometry.
+    const bool canOwn = g_dialElementsReq != 0 && sleepAnimation.isActive() && currentScreen == targetScreen &&
+                        !panelStopRequested && lv_anim_get(this, gaugeTickAnimCb) == nullptr;
+    serviceBarElement(canOwn);
+    if (!canOwn) {
+        releaseDialElements();
+        return;
+    }
+    lv_obj_t *meters[DIAL_ELEMENTS] = {nullptr};
+    int n = 0;
+    collectDialMeters(lv_scr_act(), meters, n, DIAL_ELEMENTS);
+    for (int i = 0; i < DIAL_ELEMENTS; i++) {
+        DialElement &d = dialElems[i];
+        lv_obj_t *m = i < n ? meters[i] : nullptr;
+        if (d.meter != m) {
+            releaseDialElement(d);
+            d.meter = m;
+        }
+        if (m == nullptr) {
+            continue;
+        }
+        lv_meter_scale_t *scale = nullptr;
+        lv_meter_indicator_t *indic = uniformScaleLines(m, scale);
+        meterticks::Key key;
+        if (!lv_obj_is_visible(m) || indic == nullptr || !meterticks::keyFor(m, key)) {
+            releaseDialElement(d);
+            continue;
+        }
+        if (d.owned && !(d.key == key)) {
+            releaseDialElement(d);
+        }
+        if (!d.owned) {
+            // Re-owning right after a release would rewrite d.ring while
+            // the frame in flight may still read it.
+            if (d.releasedRecently && frame - d.releasedFrame < 2) {
+                continue;
+            }
+            if (!meterticks::ring(key, d.ring)) {
+                continue; // LVGL draws the ring until the cache holds all of it
+            }
+            meterticks::pin(key, true);
+            d.key = key;
+            d.owned = true;
+            d.lo = d.hi = -1;
+            lv_obj_add_flag(m, LV_OBJ_FLAG_USER_1);
+            // LVGL repaints the meter without its ticks; the element covers
+            // the same pixels from this frame on, so the handover is one
+            // unthrottled refresh with no bare ring in between.
+            lv_obj_invalidate(m);
+            overlayUrgentUntilUs = esp_timer_get_time() + GM_TOUCH_GRACE_US;
+        }
+        // The lit range, by LVGL's rule: tick i is lit when its mapped value
+        // lies within [start, end]. Values are monotonic in i (min may be
+        // above max, as on the pressure dial), so the lit ticks are one run.
+        const int cnt = key.cnt;
+        int lo = cnt, hi = 0;
+        for (int t = 0; t < cnt; t++) {
+            const int32_t value = lv_map(t, 0, cnt - 1, scale->min, scale->max);
+            if (value >= indic->start_value && value <= indic->end_value) {
+                if (t < lo) {
+                    lo = t;
+                }
+                hi = t + 1;
+            }
+        }
+        if (hi <= lo) {
+            lo = hi = 0;
+        }
+        const uint16_t lit = lv_color_to16(indic->type_data.scale_lines.color_start);
+        const uint16_t unlit = lv_color_to16(scale->tick_color);
+        if (lo == d.lo && hi == d.hi && lit == d.lit && unlit == d.unlit) {
+            continue;
+        }
+        d.lo = static_cast<int16_t>(lo);
+        d.hi = static_cast<int16_t>(hi);
+        d.lit = lit;
+        d.unlit = unlit;
+        tickring::Box bb;
+        if (!tickring::bounds(d.ring, bb)) {
+            releaseDialElement(d);
+            continue;
+        }
+        SleepAnimation::ElementDesc e;
+        e.type = SleepAnimation::ElementType::TickRing;
+        e.alpha = 255;
+        e.x = bb.x1;
+        e.y = bb.y1;
+        e.w = static_cast<int16_t>(bb.x2 - bb.x1 + 1);
+        e.h = static_cast<int16_t>(bb.y2 - bb.y1 + 1);
+        e.ring.ring = &d.ring;
+        e.ring.litColor = lit;
+        e.ring.unlitColor = unlit;
+        e.ring.lo = d.lo;
+        e.ring.hi = d.hi;
+        e.tUs = esp_timer_get_time();
+        sleepAnimation.setElement(DIAL_ELEMENT_BASE + i, e);
+    }
+#endif
+}
+
+void DefaultUI::releaseDialElement(DialElement &d) {
+#ifndef GAGGIMATE_SIM
+    if (!d.owned) {
+        return;
+    }
+    const int slot = static_cast<int>(&d - dialElems);
+    sleepAnimation.clearElement(DIAL_ELEMENT_BASE + slot);
+    if (d.meter != nullptr) {
+        lv_obj_clear_flag(d.meter, LV_OBJ_FLAG_USER_1);
+        lv_obj_invalidate(d.meter);
+        overlayUrgentUntilUs = esp_timer_get_time() + GM_TOUCH_GRACE_US;
+    }
+    retireDialRing(d.key);
+    d.owned = false;
+    d.lo = d.hi = -1;
+    d.releasedFrame = sleepAnimation.animFrameCount();
+    d.releasedRecently = true;
+#else
+    (void)d;
+#endif
+}
+
+void DefaultUI::retireDialRing(const meterticks::Key &key) {
+#ifndef GAGGIMATE_SIM
+    const uint32_t frame = sleepAnimation.animFrameCount();
+    for (DialRetire &r : dialRetire) {
+        if (!r.live) {
+            r.key = key;
+            r.frame = frame;
+            r.live = true;
+            return;
+        }
+    }
+    // No free entry: the oldest one has certainly been latched past by now.
+    DialRetire *oldest = &dialRetire[0];
+    for (DialRetire &r : dialRetire) {
+        if (r.frame < oldest->frame) {
+            oldest = &r;
+        }
+    }
+    meterticks::pin(oldest->key, false);
+    oldest->key = key;
+    oldest->frame = frame;
+#else
+    (void)key;
+#endif
+}
+
+void DefaultUI::releaseDialElements() {
+    for (DialElement &d : dialElems) {
+        releaseDialElement(d);
+    }
+    releaseBarElement();
+}
+
+void DefaultUI::serviceBarElement(bool canOwn) {
+#ifndef GAGGIMATE_SIM
+    lv_obj_t *bar = objects.brew_bar;
+    if (!canOwn || bar == nullptr || lv_obj_get_screen(bar) != lv_scr_act() || !lv_obj_is_visible(bar)) {
+        releaseBarElement();
+        return;
+    }
+    if (barElem.bar != bar) {
+        releaseBarElement();
+        barElem.bar = bar;
+    }
+    // The fill's geometry, the way lv_bar's draw_indic lays it out for a
+    // horizontal left-to-right bar at rest: the track is the bar's box less
+    // its main-part padding, the fill runs from the track's left edge for
+    // the value's share of the track width.
+    lv_area_t coords;
+    lv_obj_get_coords(bar, &coords);
+    const int x1 = coords.x1 + lv_obj_get_style_pad_left(bar, LV_PART_MAIN);
+    const int x2 = coords.x2 - lv_obj_get_style_pad_right(bar, LV_PART_MAIN);
+    const int y1 = coords.y1 + lv_obj_get_style_pad_top(bar, LV_PART_MAIN);
+    const int y2 = coords.y2 - lv_obj_get_style_pad_bottom(bar, LV_PART_MAIN);
+    const int trackW = x2 - x1 + 1;
+    const int32_t range = lv_bar_get_max_value(bar) - lv_bar_get_min_value(bar);
+    if (trackW <= 0 || y2 < y1 || range <= 0) {
+        releaseBarElement();
+        return;
+    }
+    const int32_t value = lv_bar_get_value(bar) - lv_bar_get_min_value(bar);
+    const float target = static_cast<float>(x1) + static_cast<float>(trackW) * static_cast<float>(value) / range;
+    const int64_t now = esp_timer_get_time();
+    if (!barElem.owned) {
+        barElem.owned = true;
+        barElem.x2 = target; // no slide in from zero on takeover
+        barElem.lastX2 = -1;
+        barElem.opa = lv_obj_get_style_bg_opa(bar, LV_PART_INDICATOR);
+        lv_obj_set_style_bg_opa(bar, LV_OPA_TRANSP, LV_PART_INDICATOR);
+        overlayUrgentUntilUs = now + GM_TOUCH_GRACE_US;
+    } else {
+        int64_t dt = now - barElem.lastUs;
+        if (dt < 0) {
+            dt = 0;
+        }
+        if (dt > 100000) {
+            dt = 100000;
+        }
+        const float k = static_cast<float>(dt) / static_cast<float>(dt + kBarEaseTauUs);
+        barElem.x2 += (target - barElem.x2) * k;
+        if ((target - barElem.x2) * (target - barElem.x2) < 0.01f) {
+            barElem.x2 = target;
+        }
+    }
+    barElem.lastUs = now;
+    const int16_t edge = static_cast<int16_t>(barElem.x2 + 0.5f);
+    if (edge == barElem.lastX2) {
+        return;
+    }
+    barElem.lastX2 = edge;
+    const int w = edge - x1;
+    if (w <= 0) {
+        sleepAnimation.clearElement(BAR_ELEMENT);
+        return;
+    }
+    SleepAnimation::ElementDesc e;
+    e.type = SleepAnimation::ElementType::RoundRect;
+    e.alpha = barElem.opa;
+    e.color = lv_color_to16(lv_obj_get_style_bg_color(bar, LV_PART_INDICATOR));
+    int radius = lv_obj_get_style_radius(bar, LV_PART_INDICATOR);
+    const int h = y2 - y1 + 1;
+    if (radius > h / 2) {
+        radius = h / 2; // LV_RADIUS_CIRCLE and anything larger: a pill
+    }
+    if (radius > SleepAnimation::kElementMaxRadius) {
+        radius = SleepAnimation::kElementMaxRadius;
+    }
+    e.radius = static_cast<uint8_t>(radius < 0 ? 0 : radius);
+    e.x = static_cast<int16_t>(x1);
+    e.y = static_cast<int16_t>(y1);
+    e.w = static_cast<int16_t>(w);
+    e.h = static_cast<int16_t>(h);
+    e.tUs = now;
+    sleepAnimation.setElement(BAR_ELEMENT, e);
+#else
+    (void)canOwn;
+#endif
+}
+
+void DefaultUI::releaseBarElement() {
+#ifndef GAGGIMATE_SIM
+    if (!barElem.owned) {
+        return;
+    }
+    sleepAnimation.clearElement(BAR_ELEMENT);
+    if (barElem.bar != nullptr) {
+        lv_obj_remove_local_style_prop(barElem.bar, LV_STYLE_BG_OPA, LV_PART_INDICATOR);
+        overlayUrgentUntilUs = esp_timer_get_time() + GM_TOUCH_GRACE_US;
+    }
+    barElem.owned = false;
+    barElem.lastX2 = -1;
+#endif
+}
+
 void DefaultUI::init() {
     s_instance = this;
     g_touchHitHook = &DefaultUI::touchHitHook;
@@ -577,6 +884,10 @@ void DefaultUI::loop() {
     // visibly settling a frame late, but only the first time a screen was
     // entered, since after that the flags were already correct.
     ui_tick();
+    // After ui_tick, which is where the flow writes the dials' values, and
+    // before the snapshot below, so an ownership change's invalidation is
+    // published in this pass.
+    serviceDialElements();
     // After ui_tick so a screen eez_flow_set_screen created this pass exists
     // before the walk runs.
     applyPressedFeedback();
@@ -1733,6 +2044,7 @@ void DefaultUI::handleScreenChange() {
             stopSleepAnimation();
         }
         cancelLayerMoves();
+        releaseDialElements();
         eez_flow_set_screen(targetScreen, LV_SCR_LOAD_ANIM_NONE, 0, 0);
         animateGaugeTicks(currentScreen, targetScreen);
         // The flow engine may delete and later recreate the screen this
@@ -1981,6 +2293,7 @@ void DefaultUI::adoptAnimHost(lv_obj_t *host) {
 
 void DefaultUI::stopSleepAnimation() {
 #ifndef GAGGIMATE_SIM
+    releaseDialElements();
     sleepAnimation.stop();
     sleepAnimation.setOverlayGain(256);
     overlayTrans = OverlayTrans::Idle;

@@ -30,7 +30,9 @@ struct Slot {
     lv_area_t *boxes = nullptr;
     uint8_t *sprites = nullptr;
     uint64_t built = 0;
+    bool pinned = false; // read by the render task through a ring element
 };
+static_assert(sizeof(tickring::Box) == sizeof(lv_area_t), "tickring::Box mirrors lv_area_t");
 
 Slot g_slots[kSlots];
 int g_nextEvict = 0;
@@ -55,24 +57,31 @@ Slot *findOrCreate(const Key &key) {
     }
     // A meter that moved or was re-scaled leaves its old slot behind; reuse
     // that slot for the same object first, then a free one, then round-robin.
+    // Never a pinned slot: the render task is reading it.
     Slot *victim = nullptr;
     for (Slot &s : g_slots) {
-        if (s.inUse && s.key.obj == key.obj) {
+        if (s.inUse && !s.pinned && s.key.obj == key.obj) {
             victim = &s;
             break;
         }
     }
     if (victim == nullptr) {
         for (Slot &s : g_slots) {
-            if (!s.inUse) {
+            if (!s.inUse && !s.pinned) {
                 victim = &s;
                 break;
             }
         }
     }
-    if (victim == nullptr) {
-        victim = &g_slots[g_nextEvict];
+    for (int tries = 0; victim == nullptr && tries < kSlots; tries++) {
+        Slot &s = g_slots[g_nextEvict];
         g_nextEvict = (g_nextEvict + 1) % kSlots;
+        if (!s.pinned) {
+            victim = &s;
+        }
+    }
+    if (victim == nullptr) {
+        return nullptr; // every slot pinned; the caller draws directly
     }
     // Pill ticks span tickLength along their axis with 2 px of margin each
     // side and 1 for rounding; dots are never wider than that.
@@ -207,5 +216,59 @@ bool draw(lv_draw_ctx_t *draw_ctx, const Key &key, int i, const lv_area_t &box, 
 }
 
 uint32_t bytesAllocated() { return g_bytes; }
+
+bool keyFor(lv_obj_t *obj, Key &key) {
+    if (obj == nullptr || !lv_obj_check_type(obj, &lv_meter_class)) {
+        return false;
+    }
+    auto *meter = reinterpret_cast<lv_meter_t *>(obj);
+    auto *scale = static_cast<lv_meter_scale_t *>(_lv_ll_get_head(&meter->scale_ll));
+    if (scale == nullptr) {
+        return false;
+    }
+    const uint16_t cnt = scale->tick_major_nth;
+    if (cnt < 2 || scale->tick_length == 0) {
+        return false;
+    }
+    lv_area_t content;
+    lv_obj_get_content_coords(obj, &content);
+    const lv_coord_t r_edge = LV_MIN(lv_area_get_width(&content), lv_area_get_height(&content)) / 2;
+    key = Key{obj,
+              cnt,
+              scale->tick_width,
+              scale->tick_length,
+              static_cast<int16_t>(scale->angle_range),
+              static_cast<int16_t>(scale->rotation),
+              static_cast<lv_coord_t>(content.x1 + r_edge),
+              static_cast<lv_coord_t>(content.y1 + r_edge),
+              r_edge};
+    return true;
+}
+
+bool ring(const Key &key, tickring::Sprites &out) {
+    for (Slot &s : g_slots) {
+        if (!s.inUse || !(s.key == key)) {
+            continue;
+        }
+        const uint64_t all = key.cnt >= 64 ? ~0ull : ((1ull << key.cnt) - 1);
+        if ((s.built & all) != all) {
+            return false;
+        }
+        out.cnt = key.cnt;
+        out.side = s.side;
+        out.boxes = reinterpret_cast<const tickring::Box *>(s.boxes);
+        out.sprites = s.sprites;
+        return true;
+    }
+    return false;
+}
+
+void pin(const Key &key, bool on) {
+    for (Slot &s : g_slots) {
+        if (s.inUse && s.key == key) {
+            s.pinned = on;
+        }
+    }
+}
 
 } // namespace meterticks

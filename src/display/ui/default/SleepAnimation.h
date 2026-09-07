@@ -2,6 +2,7 @@
 #define SLEEPANIMATION_H
 
 #include <atomic>
+#include <display/ui/default/TickRingElement.h>
 #include <stdint.h>
 #ifndef GAGGIMATE_SIM
 #include <display/drivers/common/BandDma.h>
@@ -56,7 +57,7 @@ class SleepAnimation {
     void layerHide(int) {}
     LayerInfo layerInfo(int) const { return LayerInfo{}; }
     static constexpr int MAX_ELEMENTS = 8;
-    enum class ElementType : uint8_t { None = 0, RoundRect = 1 };
+    enum class ElementType : uint8_t { None = 0, RoundRect = 1, TickRing = 2 };
     struct ElementDesc {
         ElementType type = ElementType::None;
         uint8_t alpha = 0;
@@ -64,10 +65,13 @@ class SleepAnimation {
         uint16_t color = 0;
         int16_t x = 0, y = 0, w = 0, h = 0;
         int64_t tUs = 0;
+        tickring::Desc ring{};
     };
     void setElement(int, const ElementDesc &) {}
     void clearElement(int) {}
     uint32_t lastElementUsValue() const { return 0; }
+    int ringElementCount() const { return 0; }
+    uint32_t animFrameCount() const { return 0; }
 };
 #else
 
@@ -439,7 +443,13 @@ class SleepAnimation {
     // element enters or leaves get regional warm-up like a layer.
     static constexpr int MAX_ELEMENTS = 8;
     static constexpr int kElementMaxRadius = 24;
-    enum class ElementType : uint8_t { None = 0, RoundRect = 1 };
+    // TickRing (gm-2cl.6): a dial meter's tick ring painted from the tick
+    // cache's coverage sprites, ticks lo..hi lit; the render task eases
+    // its own boundaries toward the written ones (kRingEaseTauUs), so a
+    // value change slides the lit edge over a few frames instead of
+    // stepping. x/y/w/h is the ring's bounding box (the band hit test and
+    // the warm-up use it); alpha must be non-zero for the element to show.
+    enum class ElementType : uint8_t { None = 0, RoundRect = 1, TickRing = 2 };
     struct ElementDesc {
         ElementType type = ElementType::None;
         uint8_t alpha = 0;  // coverage 0..255 (quantised to 32 levels in the blend)
@@ -447,10 +457,14 @@ class SleepAnimation {
         uint16_t color = 0; // RGB565
         int16_t x = 0, y = 0, w = 0, h = 0;
         int64_t tUs = 0;    // when the writer wrote it (probe: write to frame latency)
+        tickring::Desc ring{}; // TickRing only
     };
     void setElement(int id, const ElementDesc &d);
     void clearElement(int id);
     uint32_t lastElementUsValue() const { return lastElemUs.load(); }
+    // TickRing elements visible in the frame being rendered (debug endpoint).
+    int ringElementCount() const { return ringElems.load(); }
+    static constexpr int64_t kRingEaseTauUs = 90000;
 
     // Framebuffer-ownership controls, deliberately not behind GM_ANIM_BENCH.
     // Each setting produces a different visible defect and neither is visible
@@ -1492,8 +1506,13 @@ class SleepAnimation {
         bool fVisible = false;
         int lastY0 = 0, lastY1 = 0;
         bool lastVisible = false;
+        // TickRing: the eased lit range, render task only.
+        float ringLo = 0.0f, ringHi = 0.0f;
+        bool ringEased = false;
     };
     Element elements[MAX_ELEMENTS];
+    int64_t lastElemEvalUs = 0;
+    std::atomic<int> ringElems{0};
     static void readElement(const Element &e, ElementDesc &out);
     // Once per frame on the render task, after evaluateLayers: latch every
     // descriptor and warm up the rows an element entered or left.

@@ -8,6 +8,7 @@
 #include <display/drivers/Driver.h>
 #include <display/models/profile.h>
 #include <display/ui/default/SleepAnimation.h>
+#include <display/ui/default/eez/MeterTickCache.h>
 #include <display/ui/default/eez/screens.h>
 #include <display/ui/default/eez/structs.h>
 #include <display/ui/default/settings/SettingsUI.h>
@@ -436,6 +437,60 @@ class DefaultUI {
     static void gaugeTickAnimCb(void *var, int32_t v);
     lv_obj_t *gaugeMeters[4] = {nullptr};
     uint8_t gaugeCount = 0;
+
+    // The dial meters' tick rings as compositor elements (gm-2cl.6). While
+    // the animation composites the screen, each visible dial on the active
+    // screen hands its ring to a TickRing element: the meter gets
+    // LV_OBJ_FLAG_USER_1 (its draw handler leaves the ring transparent and
+    // its value setters stop invalidating), its tick cache slot is pinned,
+    // and serviceDialElements writes the lit range the flow has set after
+    // every ui_tick. Released on screen change, when the animation stops,
+    // when the meter hides, and while the tick-length morph is running
+    // (the morph changes the cache key every frame). A released slot stays
+    // pinned until the render task has latched two more frames, because
+    // the frame in flight may still read its sprites.
+    static constexpr int DIAL_ELEMENT_BASE = 5;
+    static constexpr int DIAL_ELEMENTS = 3;
+    struct DialElement {
+        lv_obj_t *meter = nullptr;
+        meterticks::Key key{};
+        tickring::Sprites ring{};
+        bool owned = false;
+        int16_t lo = -1, hi = -1;
+        uint16_t lit = 0, unlit = 0;
+        uint32_t releasedFrame = 0;
+        bool releasedRecently = false;
+    };
+    DialElement dialElems[DIAL_ELEMENTS];
+    struct DialRetire {
+        meterticks::Key key{};
+        uint32_t frame = 0;
+        bool live = false;
+    };
+    DialRetire dialRetire[DIAL_ELEMENTS * 2];
+    void serviceDialElements();
+    void releaseDialElements();
+    void releaseDialElement(DialElement &d);
+    void retireDialRing(const meterticks::Key &key);
+
+    // The brew progress bar's fill as a RoundRect element (gm-2cl.6). LVGL
+    // keeps drawing the track; the fill's right edge eases toward the bar's
+    // value at the UI loop's rate (kBarEaseTauUs) instead of stepping once
+    // per flow update. Owned and released with the dials, and the bar's own
+    // indicator is made transparent through a local style while owned.
+    static constexpr int BAR_ELEMENT = 4;
+    static constexpr int64_t kBarEaseTauUs = 120000;
+    struct BarElement {
+        lv_obj_t *bar = nullptr;
+        bool owned = false;
+        float x2 = 0.0f; // eased right edge, panel x
+        int16_t lastX2 = -1;
+        int64_t lastUs = 0;
+        uint8_t opa = 255; // the indicator's design opacity, read before the override
+    };
+    BarElement barElem;
+    void serviceBarElement(bool canOwn);
+    void releaseBarElement();
     void positionMenuIcon(lv_obj_t *obj, int angle, int radius);
 
     void updateState();

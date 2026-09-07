@@ -132,6 +132,15 @@ static void gm_meter_draw_inner(lv_event_t *e) {
     if (!lv_obj_check_type(obj, &lv_meter_class)) {
         return;
     }
+    // While the animation composites the screen, DefaultUI hands this
+    // meter's ring to a compositor element (gm-2cl.6, TickRingElement.h)
+    // and marks the meter with LV_OBJ_FLAG_USER_1: the render task paints
+    // the ticks from the sprites cached below, and LVGL must leave the ring
+    // transparent so the two never stack. The same flag makes the meter's
+    // value setters skip their invalidation (scripts/patch_lvgl_meter_inv.py).
+    if (lv_obj_has_flag(obj, LV_OBJ_FLAG_USER_1)) {
+        return;
+    }
     auto *meter = reinterpret_cast<lv_meter_t *>(obj);
     auto *scale = static_cast<lv_meter_scale_t *>(_lv_ll_get_head(&meter->scale_ll));
     if (scale == nullptr) {
@@ -175,15 +184,10 @@ static void gm_meter_draw_inner(lv_event_t *e) {
     // Every tick's shape is fixed by this key; only the colour moves with
     // the value. The sprite cache (MeterTickCache.h) renders each shape once
     // and blits it after, byte for byte what the direct draw below writes.
-    const meterticks::Key tickKey = {obj,
-                                     cnt,
-                                     scale->tick_width,
-                                     scale->tick_length,
-                                     (int16_t)scale->angle_range,
-                                     (int16_t)scale->rotation,
-                                     cx,
-                                     cy,
-                                     r_edge};
+    meterticks::Key tickKey;
+    if (!meterticks::keyFor(obj, tickKey)) {
+        return;
+    }
     struct TickDraw {
         bool pill;
         lv_draw_line_dsc_t *line;

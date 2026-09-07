@@ -1430,6 +1430,14 @@ void WebUIPlugin::setupServer() {
                 g_uiAnimTestReq = v;
             }
         }
+        // dials=0|1: the dial tick rings through the TickRing compositor
+        // element (1, production) or through LVGL (0), for the framebuffer
+        // compare and the refresh-count A/B (gm-2cl.6). DefaultUI applies it
+        // on its next pass; elem_rings below reports how many rings the
+        // render task is painting.
+        if (request->hasArg("dials")) {
+            g_dialElementsReq = request->arg("dials").toInt() != 0 ? 1 : 0;
+        }
         // crop=0|1: the direct path's per-row chord crop (SleepAnimation's
         // dmaCrop). Off pushes full-width rows again, for an A/B of what the
         // corners of the square framebuffer cost the push stage.
@@ -1610,6 +1618,8 @@ void WebUIPlugin::setupServer() {
         doc["fps_override"] = g_animFpsOverride;
         doc["ov_gain"] = a->overlayGain();
         doc["elem_us"] = a->lastElementUsValue();
+        doc["elem_rings"] = a->ringElementCount();
+        doc["dials"] = g_dialElementsReq;
         doc["ov_gain_target"] = a->overlayGainTarget();
         doc["tick_cache_bytes"] = meterticks::bytesAllocated();
         doc["uianim"] = g_uiAnimTestReq;

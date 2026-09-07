@@ -103,6 +103,13 @@ extern volatile uint8_t g_animFpsOverride;
 // changes per second) never exercises.
 extern volatile int g_uiAnimTestReq;
 
+// /api/debug/anim?dials=0|1: whether the dial meters' tick rings go through
+// the TickRing compositor element while the animation composites the
+// screen (gm-2cl.6, DefaultUI::serviceDialElements), or stay with LVGL. The
+// A/B for the framebuffer compare and the refresh-count measurement; the
+// production value is 1.
+extern volatile int g_dialElementsReq;
+
 // /api/debug/touchmap: the UI task walks one screen's object tree and writes
 // every object (class, coords, flags, ext click pad, event count, parent) as
 // a JSON array into g_touchMapBuf, so the hit rectangles LVGL will actually

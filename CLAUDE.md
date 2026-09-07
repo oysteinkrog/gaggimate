@@ -88,6 +88,23 @@ telemetry-driven screen from a 650 ms LVGL pass (1.5 Hz widget updates,
 - **Meter updates must stay sector-sized**: the vendored patch above plus the
   clip precheck in `action_on_meter_draw` (eez/actions.cpp), which skips
   ticks outside `draw_ctx->clip_area` before paying rounded-cap mask setup.
+- **While the animation composites, the dial rings are compositor elements,
+  not LVGL draws** (gm-2cl.6, `TickRingElement.h`,
+  `DefaultUI::serviceDialElements`). A dial with `LV_OBJ_FLAG_USER_1` set
+  is owned by the render task: its draw handler paints no ticks, its value
+  setters record the value and skip the invalidation (the second hunk in
+  `scripts/patch_lvgl_meter_inv.py`), and its tick cache slot is pinned
+  because the render task reads the sprites from the other core. The
+  element writes the same bytes the overlay path would have (alpha
+  `(255 * s) >> 8` from the sprite byte, then `blend565`), so the ring is
+  pixel-exact at rest; the lit edge eases over about 90 ms. The flag is set
+  and cleared only on the UI task, released before any screen change,
+  animation stop or tick-length morph, and a released slot stays pinned
+  for two more frames. `/api/debug/anim?dials=0` puts the rings back on
+  LVGL for an A/B (`elem_rings` counts the owned rings);
+  `tools/dial_elem_check.py` is the device check and
+  `tools/tickringbench` the host one. The brew progress bar's fill is a
+  RoundRect element on the same terms (`serviceBarElement`).
 
 - **The render loop lives in IRAM** (`renderLoop`, `renderFrame`,
   `presentFrame`, `pushLoop` and the scrim rows, `SleepAnimation.cpp`). The

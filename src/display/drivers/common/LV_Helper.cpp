@@ -308,6 +308,7 @@ TouchHitHook g_touchHitHook = nullptr;
 volatile bool g_pressPlateActive = false;
 OverlayStats g_overlayStats;
 volatile int g_uiAnimTestReq = 0;
+volatile int g_dialElementsReq = 1;
 TouchLogEntry g_touchLog[TOUCHLOG_N];
 volatile uint32_t g_touchLogCount = 0;
 volatile int g_touchMapReq = 0;

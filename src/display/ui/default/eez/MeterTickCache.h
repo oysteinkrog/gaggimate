@@ -1,5 +1,6 @@
 #pragma once
 
+#include <display/ui/default/TickRingElement.h>
 #include <lvgl.h>
 #include <stdint.h>
 
@@ -63,5 +64,24 @@ bool draw(lv_draw_ctx_t *draw_ctx, const Key &key, int i, const lv_area_t &box, 
 
 // Bytes of PSRAM the caches hold, for the debug endpoints.
 uint32_t bytesAllocated();
+
+// The key action_on_meter_draw would build for this meter right now, from
+// its content box and scale (the tick count is the one suppressMeterTicks
+// stashed in tick_major_nth). False when obj is not a meter with a scale
+// worth drawing. The draw handler and the ring element (gm-2cl.6) both go
+// through here so they can never disagree about which cache slot a meter
+// owns.
+bool keyFor(lv_obj_t *obj, Key &key);
+
+// The complete ring for key: true only when a slot holds it and every one
+// of its cnt ticks has been built (a full draw of the visible meter does
+// that; a sector redraw builds only the ticks it covers). The view points
+// into the slot's PSRAM block, so hold it only while the slot is pinned.
+bool ring(const Key &key, tickring::Sprites &out);
+
+// A pinned slot is never evicted, rebuilt or freed; the render task reads
+// it from another core. Pin before handing the ring to an element, unpin
+// once the element is cleared and the render task has moved past it.
+void pin(const Key &key, bool on);
 
 } // namespace meterticks

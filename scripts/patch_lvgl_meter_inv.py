@@ -158,26 +158,53 @@ HUNKS = [
     (SET_BOUND_OLD, SET_BOUND_NEW, 2),
 ]
 
+# Second, independent patch (gm-2cl.6): while the animation composites the
+# screen, DefaultUI paints a dial's tick ring through a compositor element
+# (src/display/ui/default/TickRingElement.h) and marks the meter with
+# LV_OBJ_FLAG_USER_1. The setters must then still record the value (the
+# element reads start_value and end_value after every ui_tick) but must not
+# invalidate: the invalidation is what turns every telemetry tick into an
+# LVGL draw, a snapshot and an overlay publish. Own marker, so a tree that
+# already carries the sector patch above gets this one added.
+ELEM_MARKER = "GM_METER_ELEM_PATCH"
+ELEM_SKIP = "    if(lv_obj_has_flag(obj, LV_OBJ_FLAG_USER_1)) return; /* " + ELEM_MARKER + ": ring owned by a compositor element */\n"
+ELEM_HUNKS = [
+    ("    indic->start_value = value;\n    indic->end_value = value;\n\n",
+     "    indic->start_value = value;\n    indic->end_value = value;\n" + ELEM_SKIP + "\n", 1),
+    ("    int32_t old_value = indic->start_value;\n    indic->start_value = value;\n\n",
+     "    int32_t old_value = indic->start_value;\n    indic->start_value = value;\n" + ELEM_SKIP + "\n", 1),
+    ("    int32_t old_value = indic->end_value;\n    indic->end_value = value;\n\n",
+     "    int32_t old_value = indic->end_value;\n    indic->end_value = value;\n" + ELEM_SKIP + "\n", 1),
+]
+
+
+def apply_hunks(path, marker, hunks, text):
+    if marker in text:
+        print("patch_lvgl_meter_inv: %s already applied (%s)" % (marker, path))
+        return text, False
+    for old, new, count in hunks:
+        found = text.count(old)
+        if found != count:
+            sys.stderr.write(
+                "patch_lvgl_meter_inv: %s anchor found %d times (want %d) in %s; "
+                "LVGL was updated and this patch needs review. Anchor begins: %r\n"
+                % (marker, found, count, path, old[:80]))
+            sys.exit(1)
+        text = text.replace(old, new)
+    return text, True
+
 
 def apply(path):
     with open(path, encoding="utf-8") as f:
         text = f.read()
-    if MARKER in text:
-        print("patch_lvgl_meter_inv: already patched (%s)" % path)
-        return
     orig = path + ".gm-orig"
     if not os.path.exists(orig):
         with open(orig, "w", encoding="utf-8") as f:
             f.write(text)
-    for old, new, count in HUNKS:
-        found = text.count(old)
-        if found != count:
-            sys.stderr.write(
-                "patch_lvgl_meter_inv: anchor found %d times (want %d) in %s; "
-                "LVGL was updated and this patch needs review. Anchor begins: %r\n"
-                % (found, count, path, old[:80]))
-            sys.exit(1)
-        text = text.replace(old, new)
+    text, a = apply_hunks(path, MARKER, HUNKS, text)
+    text, b = apply_hunks(path, ELEM_MARKER, ELEM_HUNKS, text)
+    if not (a or b):
+        return
     tmp = path + ".gm-tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         f.write(text)
