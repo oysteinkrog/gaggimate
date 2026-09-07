@@ -175,6 +175,40 @@ int main() {
         CHECK(mid == tickring::blend565(lit, unlit, 128), "boundary mix is blend565 at 128");
     }
 
+    // 4b. The page gain scales coverage the way blendRow<true> does:
+    //     a = (a * gain) >> 8 before the blend, and nothing at gain 0.
+    {
+        Ring r(25, 33, W, H, rng);
+        std::vector<uint16_t> bg(static_cast<size_t>(W) * H, 0x2104);
+        std::vector<uint16_t> ref = bg, got = bg, zero = bg;
+        const uint32_t gain = 96;
+        for (int i = 0; i < r.cnt; i++) {
+            const uint16_t c = (i >= 3 && i < 12) ? lit : unlit;
+            const Box &b = r.boxes[i];
+            for (int y = b.y1; y <= b.y2; y++) {
+                for (int x = b.x1; x <= b.x2; x++) {
+                    const uint8_t s = r.sprites[static_cast<size_t>(i) * r.side * r.side +
+                                                static_cast<size_t>(y - b.y1) * r.side + (x - b.x1)];
+                    if (s == 0) {
+                        continue;
+                    }
+                    const uint32_t a = (((255u * s) >> 8) * gain) >> 8;
+                    if (a == 0) {
+                        continue;
+                    }
+                    uint16_t &d = ref[static_cast<size_t>(y) * W + x];
+                    d = a == 255 ? c : refBlend(c, d, static_cast<uint8_t>(a));
+                }
+            }
+        }
+        for (int y = 0; y < H; y++) {
+            tickring::compositeRow(&got[static_cast<size_t>(y) * W], y, W, r.view, lit, unlit, 3.0f, 12.0f, gain);
+            tickring::compositeRow(&zero[static_cast<size_t>(y) * W], y, W, r.view, lit, unlit, 3.0f, 12.0f, 0);
+        }
+        CHECK(ref == got, "gain 96 differs from the scaled reference");
+        CHECK(zero == bg, "gain 0 painted something");
+    }
+
     // 5. bounds is the union of the boxes.
     {
         Ring r(25, 33, W, H, rng);

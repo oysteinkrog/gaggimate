@@ -49,8 +49,9 @@ bool bounds(const Sprites &s, Box &out) {
 // invariants): the two cores share one instruction cache and LVGL passes
 // evict anything of the render task's that lives in flash.
 void TICKRING_IRAM compositeRow(uint16_t *drow, int y, int w, const Sprites &s, uint16_t lit, uint16_t unlit, float lo,
-                                float hi) {
+                                float hi, uint32_t gain) {
     const int side = s.side;
+    const bool scaled = gain < 256;
     const uint8_t *sprites = s.sprites;
     for (int i = 0; i < s.cnt; i++) {
         const Box &b = s.boxes[i];
@@ -73,8 +74,15 @@ void TICKRING_IRAM compositeRow(uint16_t *drow, int y, int w, const Sprites &s, 
                 continue;
             }
             // The alpha LVGL's masked fill would have written to the overlay
-            // for this sprite byte, then the overlay blend's own step.
-            const uint32_t a = (255u * sv) >> 8;
+            // for this sprite byte, then the overlay blend's own step (with
+            // the page gain applied first, as blendRow<true> does).
+            uint32_t a = (255u * sv) >> 8;
+            if (scaled) {
+                a = (a * gain) >> 8;
+                if (a == 0) {
+                    continue;
+                }
+            }
             drow[x] = a == 255 ? c : blend565(c, drow[x], static_cast<uint8_t>(a));
         }
     }

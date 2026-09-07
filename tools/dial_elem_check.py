@@ -7,7 +7,8 @@ two ways the dial ring reaches the panel: through the TickRing element
   python3 tools/dial_elem_check.py [--host 192.168.1.121] [--secs 30]
 
 Part 1, pixels. The brew screen is opened, then the framebuffer is captured
-several times in each mode. Pixels that never change across the captures of
+several times in each mode (at step 2, 240x240: the device delivers
+/api/debug/fb reliably only at that step, see CLAUDE.md). Pixels that never change across the captures of
 one mode are the ring's interior and the rest of the UI (the animation
 underneath moves, so everything it shows through changes). Those stable
 pixels must be identical between the modes; the report prints how many
@@ -34,7 +35,7 @@ from rig import Rig  # noqa: E402
 
 
 def get_fb(host):
-    with urllib.request.urlopen("http://%s/api/debug/fb?step=1" % host, timeout=60) as resp:
+    with urllib.request.urlopen("http://%s/api/debug/fb?step=2" % host, timeout=60) as resp:
         size = resp.headers.get("X-FB-Size", "480x480")
         data = resp.read()
     w, h = (int(v) for v in size.split("x"))

@@ -1513,6 +1513,9 @@ class SleepAnimation {
     Element elements[MAX_ELEMENTS];
     int64_t lastElemEvalUs = 0;
     std::atomic<int> ringElems{0};
+    // At publish: fold the owned rings' coverage into the scrim cells of the
+    // rows just rescanned (they are no longer in the overlay). UI task only.
+    void addElementScrim(Overlay &ov, int rowY0, int rowY1, int sw, int panelW);
     static void readElement(const Element &e, ElementDesc &out);
     // Once per frame on the render task, after evaluateLayers: latch every
     // descriptor and warm up the rows an element entered or left.

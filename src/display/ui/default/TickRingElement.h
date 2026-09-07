@@ -80,7 +80,10 @@ uint16_t tickColor(int i, float lo, float hi, uint16_t lit, uint16_t unlit);
 bool bounds(const Sprites &s, Box &out);
 
 // Composites row y of the ring into drow (w pixels wide) exactly as the
-// overlay path would have.
-void compositeRow(uint16_t *drow, int y, int w, const Sprites &s, uint16_t lit, uint16_t unlit, float lo, float hi);
+// overlay path would have. gain is the frame's overlay gain (Q8, 256 is
+// none): a page fade scales the ring's coverage the way blendRow scales
+// the overlay's, so an owned ring fades with the page it belongs to.
+void compositeRow(uint16_t *drow, int y, int w, const Sprites &s, uint16_t lit, uint16_t unlit, float lo, float hi,
+                  uint32_t gain = 256);
 
 } // namespace tickring

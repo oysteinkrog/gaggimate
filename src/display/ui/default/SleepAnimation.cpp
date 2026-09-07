@@ -1788,6 +1788,49 @@ static int scanOverlayRow(const uint8_t *__restrict a, int panelW, uint32_t *__r
     return nRuns;
 }
 
+// The scrim is built from the overlay's coverage, and an owned ring has
+// left the overlay (its meter draws no ticks), so the halo around it would
+// vanish at the next publish. Put the ring's coverage back into the cells
+// of the rows just rescanned, with the same peak rule and the same alpha
+// LVGL's masked fill would have written: cell content is then identical
+// whichever path owns the ring, and the post-scan compare sees no change.
+// Runs on the UI task, which is the writer of elements[].d.
+void SleepAnimation::addElementScrim(Overlay &ov, int rowY0, int rowY1, int sw, int panelW) {
+    for (int i = 0; i < MAX_ELEMENTS; i++) {
+        const ElementDesc &d = elements[i].d;
+        if (d.type != ElementType::TickRing || d.ring.ring == nullptr || d.alpha == 0) {
+            continue;
+        }
+        const tickring::Sprites &s = *d.ring.ring;
+        const int side = s.side;
+        for (int t = 0; t < s.cnt; t++) {
+            const tickring::Box &b = s.boxes[t];
+            const int yA = b.y1 > rowY0 ? b.y1 : rowY0;
+            const int yB = (b.y2 + 1) < rowY1 ? (b.y2 + 1) : rowY1;
+            if (yB <= yA) {
+                continue;
+            }
+            int x0 = b.x1 < 0 ? 0 : b.x1;
+            int x1 = (b.x2 + 1) > panelW ? panelW : (b.x2 + 1);
+            for (int y = yA; y < yB; y++) {
+                uint8_t *cell = ov.scrimSrc + static_cast<size_t>(y >> SCRIM_SHIFT) * sw;
+                const uint8_t *row = s.sprites + static_cast<size_t>(t) * side * side + static_cast<size_t>(y - b.y1) * side;
+                for (int x = x0; x < x1; x++) {
+                    const uint32_t sv = row[x - b.x1];
+                    if (sv == 0) {
+                        continue;
+                    }
+                    const uint8_t a = static_cast<uint8_t>((255u * sv) >> 8);
+                    uint8_t &c = cell[x >> SCRIM_SHIFT];
+                    if (a > c) {
+                        c = a;
+                    }
+                }
+            }
+        }
+    }
+}
+
 void SleepAnimation::publishOverlayRanges(int w, int h, const int (*ranges)[2], int n) {
     if (overlayCap == 0 || display == nullptr || n <= 0) {
         return;
@@ -1912,6 +1955,9 @@ void SleepAnimation::publishOverlayRanges(int w, int h, const int (*ranges)[2], 
                                         : scanOverlayRow<false>(a, panelW, rowRuns, nullptr);
             }
             ov.runN[y] = static_cast<uint8_t>(nRuns);
+        }
+        if (doScrim) {
+            addElementScrim(ov, rowY0, rowY1, sw, panelW);
         }
     }
 #ifdef GM_TOUCH_PROBE
@@ -2488,6 +2534,10 @@ void SleepAnimation::evaluateElements(int64_t nowUs) {
 }
 
 void IRAM_ATTR SleepAnimation::compositeElementsRow(uint16_t *drow, int y, int w) {
+    // Elements are page content, so a page fade (the overlay gain) scales
+    // their coverage too; otherwise an owned ring or plate would sit at full
+    // strength over a page that is fading out or in around it.
+    const uint32_t gain = ovGainFrame.load();
     for (int i = 0; i < MAX_ELEMENTS; i++) {
         const Element &e = elements[i];
         if (!e.fVisible) {
@@ -2499,7 +2549,8 @@ void IRAM_ATTR SleepAnimation::compositeElementsRow(uint16_t *drow, int y, int w
             continue;
         }
         if (d.type == ElementType::TickRing) {
-            tickring::compositeRow(drow, y, w, *d.ring.ring, d.ring.litColor, d.ring.unlitColor, e.ringLo, e.ringHi);
+            tickring::compositeRow(drow, y, w, *d.ring.ring, d.ring.litColor, d.ring.unlitColor, e.ringLo, e.ringHi,
+                                   gain);
             continue;
         }
         int r = d.radius;
@@ -2529,7 +2580,8 @@ void IRAM_ATTR SleepAnimation::compositeElementsRow(uint16_t *drow, int y, int w
         if (x1 <= x0) {
             continue;
         }
-        uint32_t a5 = (static_cast<uint32_t>(d.alpha) * 32u + 127u) / 255u;
+        const uint32_t alpha = gain < 256 ? (static_cast<uint32_t>(d.alpha) * gain) >> 8 : d.alpha;
+        uint32_t a5 = (alpha * 32u + 127u) / 255u;
         if (a5 == 0) {
             continue;
         }
