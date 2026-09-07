@@ -202,6 +202,12 @@ def open_animation(rig):
     """Opens the shell and jumps straight to the Animation category (index 2:
     Temps, Display, Animation, Machine, Status, Fixture). Returns the
     touchmap dump of the page that lands (page 0)."""
+    # A previous check may have left the shell open at the tile page (the
+    # device path of the precedence check pops but never closes); open=1 on
+    # an open shell is a 409, so close first.
+    if rig.settingsui_state().get("open") is True:
+        rig.settingsui(close=1)
+        rig.wait_until(lambda: rig.settingsui_state().get("open") is False, timeout=5)
     rig.settingsui(open=1)
     rig.wait_until(lambda: rig.settingsui_state().get("open") is True, timeout=5)
     rig.settingsui(cat=2)

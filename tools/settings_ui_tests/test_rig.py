@@ -144,9 +144,15 @@ def check_tap_opens_menu(rig):
     """rig.tap(240, 450) from the brew screen leaves the menu active: that
     point falls inside brew_dials__menu_icon's effective hit rect."""
     rig.touchmap(screen=2, load=True)
-    seq_before = rig.touchmap(screen=0)["seq"]
     rig.tap(240, 450)
-    d_after = rig.wait_dump_change(seq_before, screen=0)
+    # Wait for the menu itself, not for the first dump change: since touch
+    # is polled before the snapshot (gm-qo3.2) the pressed state of the icon
+    # changes the dump before the screen has switched.
+    try:
+        rig.wait_until(lambda: rig.touchmap(screen=0).get("screen_id") == 5, timeout=6)
+    except TimeoutError:
+        pass
+    d_after = rig.touchmap(screen=0)
     check(rig, "tap_opens_menu", d_after.get("screen_id") == 5, "screen_id=%r" % d_after.get("screen_id"))
 
 

@@ -455,7 +455,22 @@ class Rig:
         if bad:
             raise ValueError("unknown settingsui argument(s): %s" % ", ".join(sorted(bad)))
         q = "&".join("%s=%s" % (k, v) for k, v in args.items())
-        return self.get_json("/api/debug/settingsui" + ("?" + q if q else ""))
+        path = "/api/debug/settingsui" + ("?" + q if q else "")
+        if not args:
+            return self.get_json(path)
+        # A command while the previous one is still in flight on the UI task
+        # answers 409. The state can already show the earlier command's
+        # result a pass before the pending flag clears, so the only reliable
+        # rule is to retry the command itself for a while (the device needs
+        # this; the simulator rarely does).
+        deadline = time.time() + 5.0
+        while True:
+            try:
+                return self.get_json(path)
+            except RigHTTPError as e:
+                if "409" not in str(e) or time.time() > deadline:
+                    raise
+                time.sleep(0.1)
 
     def settingsui_state(self):
         """GET /api/debug/settingsui with no arguments: the shell's last
