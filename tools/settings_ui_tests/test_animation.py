@@ -58,13 +58,15 @@ PALETTE = [
     ("Cyan", 0x00FFFF), ("Teal", 0x008080), ("Green", 0x00FF00), ("Black", 0x000000),
 ]
 
-# The eleven fields CatAnimation.cpp writes; the "visit changes nothing
+# The fifteen fields CatAnimation.cpp writes; the "visit changes nothing
 # writes nothing" check compares these, byte for byte, before and after a
 # no-op visit.
 ANIMATION_FIELDS = [
     "bgAnimId", "bgAnimFps", "bgAnimAllScreens", "themeMode", "bgAnimThemeMap", "bgAnimClearPlates",
     "bgAnimPlateColor", "bgAnimPlateOpacity", "elementTintEnabled", "elementTintColor", "bgAnimScrim",
+    "bgFadeOutMs", "bgFadeInMs", "bgFadeCurve", "bgAnimInterlace",
 ]
+FADE_CURVE_LABELS = ["Linear", "Smooth"]
 
 # web/src/pages/Settings/index.jsx's buildSubmitFormData: fields the web
 # form omits entirely when unchecked, so presence (not a "0"/"false" value)
@@ -266,6 +268,14 @@ def check_rows_match_settings(rig):
     d2 = goto_page(rig, 2)
     check(rig, "row_text_scrim", rig.row_value(d2, "Text scrim") == "%d %%" % int(s["bgAnimScrim"]),
           rig.row_value(d2, "Text scrim"))
+    check(rig, "row_fade_out", rig.row_value(d2, "Fade out") == "%d ms" % int(s["bgFadeOutMs"]),
+          rig.row_value(d2, "Fade out"))
+    check(rig, "row_fade_in", rig.row_value(d2, "Fade in") == "%d ms" % int(s["bgFadeInMs"]),
+          rig.row_value(d2, "Fade in"))
+    check(rig, "row_fade_curve", rig.row_value(d2, "Fade curve") == FADE_CURVE_LABELS[int(s["bgFadeCurve"])],
+          rig.row_value(d2, "Fade curve"))
+    check(rig, "row_interlace", rig.row_value(d2, "Interlace") == ("On" if int(s["bgAnimInterlace"]) else "Off"),
+          rig.row_value(d2, "Interlace"))
 
     for page, dump in ((0, d0), (1, d1), (2, d2)):
         a = rig.audit(dump)

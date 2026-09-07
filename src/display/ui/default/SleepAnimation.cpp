@@ -2169,7 +2169,13 @@ uint32_t SleepAnimation::overlayGainAt(int64_t nowUs, int ofi) {
         return r.from;
     }
     const int64_t t = nowUs - ovGainRampStartUs;
-    const int64_t v = static_cast<int64_t>(r.from) + (static_cast<int64_t>(r.to) - r.from) * t / r.durUs;
+    // Progress in Q16. Smooth: s = u * u * (3 - 2u), the smoothstep, so the
+    // ramp starts and ends with zero slope; the mid-point is unchanged.
+    int64_t u = (t << 16) / r.durUs;
+    if (ovGainSmooth.load()) {
+        u = ((u * u) >> 16) * (3 * 65536 - 2 * u) >> 16;
+    }
+    const int64_t v = static_cast<int64_t>(r.from) + (((static_cast<int64_t>(r.to) - r.from) * u) >> 16);
     return static_cast<uint32_t>(v);
 }
 

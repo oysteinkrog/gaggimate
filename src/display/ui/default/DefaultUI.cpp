@@ -612,9 +612,10 @@ void DefaultUI::beginOverlayTransition(const char *why, bool waitSwap) {
     overlayTransWaitSwap = waitSwap;
     overlayTransHeld = false;
     overlayTransT0Us = esp_timer_get_time();
+    overlayTransOutMs = overlayFadeOutMs();
     // The page must come as soon as it is built, not on the spaced pass.
     overlayUrgentUntilUs = overlayTransT0Us + OVERLAY_TRANS_ABANDON_US;
-    sleepAnimation.rampOverlayGain(0, OVERLAY_FADE_OUT_MS);
+    sleepAnimation.rampOverlayGain(0, overlayTransOutMs);
 #ifdef GM_TOUCH_PROBE
     ESP_LOGI("TouchProbe", "GM_TRANS: fade_out_start %s edge+%lld us", why,
              (long long)(overlayTransT0Us - g_touchEdgeAtUs));
@@ -656,7 +657,7 @@ void DefaultUI::serviceOverlayTransition() {
             sleepAnimation.setOverlayGain(256);
             overlayTrans = OverlayTrans::Idle;
         } else {
-            sleepAnimation.rampOverlayGain(256, OVERLAY_FADE_IN_MS);
+            sleepAnimation.rampOverlayGain(256, overlayFadeInMs());
             overlayTrans = OverlayTrans::FadeIn;
         }
     }
@@ -2104,6 +2105,16 @@ bool DefaultUI::snapshotAreaToOverlay(lv_obj_t *obj, uint8_t *buf, uint32_t bufS
 #endif
 }
 
+uint32_t DefaultUI::overlayFadeOutMs() const {
+    const int ms = controller->getSettings().getBgFadeOutMs();
+    return ms < 0 ? 0 : static_cast<uint32_t>(ms);
+}
+
+uint32_t DefaultUI::overlayFadeInMs() const {
+    const int ms = controller->getSettings().getBgFadeInMs();
+    return ms < 0 ? 0 : static_cast<uint32_t>(ms);
+}
+
 // True once no frame can still show the old page: the render task has
 // latched gain zero, or the fade-out ramp has run its course, so any frame
 // it renders from now on evaluates to zero. The second test matters when
@@ -2114,7 +2125,7 @@ bool DefaultUI::overlayFadedOut() const {
     if (sleepAnimation.overlayGain() == 0) {
         return true;
     }
-    return esp_timer_get_time() >= overlayTransT0Us + static_cast<int64_t>(OVERLAY_FADE_OUT_MS) * 1000 + 2000;
+    return esp_timer_get_time() >= overlayTransT0Us + static_cast<int64_t>(overlayTransOutMs) * 1000 + 2000;
 #else
     return true;
 #endif
@@ -2124,7 +2135,7 @@ bool DefaultUI::overlayFadedOut() const {
 // frame that composites it (the gate), and log the hand-over.
 void DefaultUI::finishOverlayTransition() {
 #ifndef GAGGIMATE_SIM
-    sleepAnimation.rampOverlayGain(256, OVERLAY_FADE_IN_MS, sleepAnimation.overlayFrontIndex());
+    sleepAnimation.rampOverlayGain(256, overlayFadeInMs(), sleepAnimation.overlayFrontIndex());
     overlayTrans = OverlayTrans::FadeIn;
 #ifdef GM_TOUCH_PROBE
     ESP_LOGI("TouchProbe", "GM_TRANS: fade_in_start t0+%lld us", (long long)(esp_timer_get_time() - overlayTransT0Us));
@@ -2744,6 +2755,7 @@ void DefaultUI::updateState() {
     sleepAnimation.setMaxFps(static_cast<uint8_t>(g_animFpsOverride != 0 ? g_animFpsOverride : settings.getBgAnimFps()));
     sleepAnimation.setHalfRes(settings.getBgAnimHalfRes() != 0);
     sleepAnimation.setInterlace(settings.getBgAnimInterlace() != 0);
+    sleepAnimation.setOverlayGainSmooth(settings.getBgFadeCurve() != 0);
     // Panel refresh rate: live pclk divider (0 = build default). One register
     // poke, but only touch the peripheral on an actual change. Floored at
     // MIN_USER_DIV: see PanelClock.h for the measurement behind it.

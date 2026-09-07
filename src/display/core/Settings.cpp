@@ -246,6 +246,13 @@ void Settings::setBgAnimHighlightKnee(int bg_anim_highlight_knee) {
 void Settings::setBgAnimScrim(int bg_anim_scrim) {
     bgAnimScrim.set(bg_anim_scrim < 0 ? 0 : (bg_anim_scrim > 100 ? 100 : bg_anim_scrim));
 }
+void Settings::setBgFadeOutMs(int bg_fade_out_ms) {
+    bgFadeOutMs.set(bg_fade_out_ms < 0 ? 0 : (bg_fade_out_ms > 1000 ? 1000 : bg_fade_out_ms));
+}
+void Settings::setBgFadeInMs(int bg_fade_in_ms) {
+    bgFadeInMs.set(bg_fade_in_ms < 0 ? 0 : (bg_fade_in_ms > 1000 ? 1000 : bg_fade_in_ms));
+}
+void Settings::setBgFadeCurve(int bg_fade_curve) { bgFadeCurve.set(bg_fade_curve != 0 ? 1 : 0); }
 void Settings::setPanelClockDiv(int panel_clock_div) { panelClockDiv.set(panel_clock_div); }
 void Settings::setPanelVcom(int panel_vcom) { panelVcom.set(panel_vcom < 0 ? 0 : (panel_vcom > 127 ? 127 : panel_vcom)); }
 void Settings::setBgAnimCustomTheme(const String &bg_anim_custom_theme) { bgAnimCustomTheme.set(bg_anim_custom_theme); }

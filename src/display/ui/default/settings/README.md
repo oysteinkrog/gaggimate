@@ -28,7 +28,8 @@ to run the tests, and what never to do here.
   time zone region and city.
 - `CatAnimation.cpp`: animation, frame rate, all screens, theme, gradient,
   plates and plate colour and opacity, element tint and tint colour, text
-  scrim. Every row here applies live.
+  scrim, screen fade out, fade in and fade curve, interlace. Every row here
+  applies live.
 - `CatMachine.cpp` / `CatMachine.h`: startup mode, standby timeout, auto
   wake-up, and the `MachineDraft` the schedule pages share. The header is the
   whole contract between this file and the schedule editor, including the
