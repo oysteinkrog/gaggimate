@@ -8,6 +8,12 @@
 #include <WiFiClientSecure.h>
 #include <esp_ota_ops.h>
 
+// gm-bzu.8: how long GitHubOTA::update waits for the controller's install
+// report after the image is acknowledged, and what an absent or unreadable
+// report means. See the policy comment at the call site.
+constexpr uint32_t kControllerInstallResultWaitMs = 25000;
+constexpr bool kUnconfirmedControllerInstallIsError = false;
+
 GitHubOTA::GitHubOTA(const String &display_version, const String &controller_version, const String &release_url,
                      const phase_callback_t &phase_callback, const progress_callback_t &progress_callback,
                      const String &firmware_name, const String &filesystem_name, const String &controller_firmware_name) {
@@ -121,13 +127,38 @@ void GitHubOTA::update(bool controller, bool display) {
         ESP_LOGI(TAG, "Controller received the image; waiting for its install result.");
         // update() returns as soon as the controller acks receipt (0xF2), but
         // the controller flashes the image asynchronously afterwards and only
-        // then notifies whether Update.end() actually succeeded. The display
+        // then reports whether Update.end() actually succeeded. The display
         // used to reboot ~1 s later (updateExecuted -> restart below), tearing
-        // down BLE before that result could arrive, so a failed install looked
-        // identical to a good one. Hold a bounded window for the result to land
-        // and be logged. This is diagnostic only: a timeout does not change the
-        // outcome, and the display still reboots to reconnect either way.
-        _controller_ota.waitForInstallResult(25000);
+        // down BLE before that report could arrive, so a failed install looked
+        // identical to a good one. Hold a bounded window for the report.
+        //
+        // Policy (gm-bzu.8):
+        //   Failure: the controller said it did not install the image. Stop
+        //     here with PHASE_ERROR and leave the display image alone, so the
+        //     two boards do not end up on different releases by our doing.
+        //   Success: carry on.
+        //   Unrecognised, LinkDropped, Timeout: the install is unconfirmed.
+        //     Every controller build in this repo sends the report before it
+        //     reboots, but an older controller, or a reboot that beats the
+        //     notification, gives the display nothing to read. Carry on with a
+        //     warning: the controller acknowledged the whole image, and a
+        //     display that refuses to update itself on silence would be stuck
+        //     behind every controller that reboots quickly. Set
+        //     kUnconfirmedControllerInstallIsError to make silence fail too.
+        const ControllerOTA::InstallWait wait = _controller_ota.waitForInstallResult(kControllerInstallResultWaitMs);
+        const bool unconfirmed = wait != ControllerOTA::InstallWait::Success && wait != ControllerOTA::InstallWait::Failure;
+        if (wait == ControllerOTA::InstallWait::Failure || (unconfirmed && kUnconfirmedControllerInstallIsError)) {
+            ESP_LOGE(TAG, "Controller install %s; not touching the display image.", ControllerOTA::installWaitName(wait));
+            this->phase = PHASE_ERROR;
+            this->_phase_callback(PHASE_ERROR);
+            return;
+        }
+        if (unconfirmed) {
+            ESP_LOGW(TAG, "Controller install unconfirmed (%s); continuing on the receipt acknowledgement.",
+                     ControllerOTA::installWaitName(wait));
+        } else {
+            ESP_LOGI(TAG, "Controller reported a successful install.");
+        }
         ESP_LOGI(TAG, "Controller update sequence finished.");
         updateExecuted = true;
     }

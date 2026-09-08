@@ -1,6 +1,7 @@
 #ifndef CONTROLLEROTA_H
 #define CONTROLLEROTA_H
 
+#include "ControllerInstallResult.h"
 #include <Arduino.h>
 #include <NimBLEDevice.h>
 #include <WiFiClientSecure.h>
@@ -30,14 +31,25 @@ class ControllerOTA {
     // fine" is not good enough here.
     bool update(WiFiClientSecure &wifi_client, const String &release_url);
 
+    // What waitForInstallResult() saw. Receipt of the image (0xF2, reported by
+    // update()) and the install are two different events, and only the first
+    // three of these say anything about the install itself.
+    enum class InstallWait : uint8_t {
+        Success,      // the controller reported "OTA Done: Success!"
+        Failure,      // an explicit refusal or Update error, see ControllerInstallResult.h
+        Unrecognised, // a 0x0F report arrived that we cannot read
+        LinkDropped,  // the BLE link went away before any report
+        Timeout,      // no report within timeoutMs
+    };
+
     // After update() returns true the controller keeps running: it flashes the
     // received image asynchronously and then notifies its Update result as a
-    // 0x0F-prefixed ASCII string ("OTA Done: Failed!", "Error #: N", ...). This
-    // blocks up to timeoutMs for that notification (logged by onReceive) so a
-    // failed install is visible on serial instead of being hidden behind the
-    // display's own reboot dropping the BLE link. Returns true if a result
-    // arrived. Purely a diagnostic settle window -- never load-bearing.
-    bool waitForInstallResult(uint32_t timeoutMs);
+    // 0x0F-prefixed ASCII string ("OTA Done: Success!", "Error #: N", ...).
+    // This blocks up to timeoutMs for that notification (logged by onReceive)
+    // and classifies it. Failure is load-bearing: GitHubOTA stops the combined
+    // update on it. The other outcomes are the caller's policy call.
+    InstallWait waitForInstallResult(uint32_t timeoutMs);
+    static const char *installWaitName(InstallWait w);
 
   private:
     bool downloadFile(WiFiClientSecure &wifi_client, const String &release_url);
@@ -62,8 +74,10 @@ class ControllerOTA {
     uint8_t lastSignal = 0x00;
     // Set by onReceive when the controller's async installer reports its result
     // (0x0F prefix). volatile because it is written from the NimBLE callback and
-    // polled from the update task.
-    volatile bool installResultReceived = false;
+    // polled from the update task. kNoResult until a report lands, then one of
+    // the ControllerInstallResult values plus one.
+    static constexpr uint8_t kNoResult = 0;
+    volatile uint8_t installResult = kNoResult;
     uint32_t currentPart = 0;
     uint32_t fileParts = 0;
 };

@@ -47,7 +47,7 @@ bool ControllerOTA::update(WiFiClientSecure &wifi_client, const String &release_
 
     // Clear any result left over from a previous attempt so waitForInstallResult
     // can only observe this run's notification.
-    installResultReceived = false;
+    installResult = kNoResult;
 
     if (LittleFS.exists(UPDATE_FILE)) {
         ESP_LOGI("ControllerOTA", "Removing previous update file");
@@ -388,38 +388,67 @@ void ControllerOTA::onReceive(NimBLERemoteCharacteristic *pRemoteCharacteristic,
     case 0xF2:
         ESP_LOGI("ControllerOTA", "Controller installing firmware");
         break;
-    case 0x0F:
+    case 0x0F: {
         // The controller's async installer reports its Arduino Update result as
-        // a 0x0F-prefixed ASCII string: "Written: x/y [z %]", "OTA Done:
-        // Success!/Failed!", "Error #: N", or "Not enough space...". This used
-        // to fall into the unlogged default case, hiding a failed install
-        // behind the display's "update successful". Log it verbatim; it is the
-        // only window we get into what the controller's flash actually did.
-        ESP_LOGI("ControllerOTA", "Controller install result: %.*s", static_cast<int>(length - 1),
-                 reinterpret_cast<const char *>(pData + 1));
-        installResultReceived = true;
+        // a 0x0F-prefixed ASCII string: "Written: x/y [z %]", then "OTA Done:
+        // Success!/Failed!", "Error #: N", "Not enough space..." or a refusal.
+        // This used to fall into the unlogged default case, hiding a failed
+        // install behind the display's "update successful". Log it verbatim and
+        // classify it; the update task reads the classification.
+        const char *text = reinterpret_cast<const char *>(pData + 1);
+        const size_t textLen = length > 0 ? length - 1 : 0;
+        ESP_LOGI("ControllerOTA", "Controller install result: %.*s", static_cast<int>(textLen), text);
+        const ControllerInstallResult r = classifyControllerInstallResult(text, textLen);
+        installResult = static_cast<uint8_t>(r) + 1;
         break;
+    }
     default:
         ESP_LOGI("ControllerOTA", "Unhandled message (0x%02x, %u bytes)", lastSignal, static_cast<unsigned>(length));
         break;
     }
 }
 
-bool ControllerOTA::waitForInstallResult(uint32_t timeoutMs) {
+ControllerOTA::InstallWait ControllerOTA::waitForInstallResult(uint32_t timeoutMs) {
     const uint32_t start = millis();
     while (millis() - start < timeoutMs) {
-        if (installResultReceived) {
-            return true;
+        const uint8_t r = installResult;
+        if (r != kNoResult) {
+            switch (static_cast<ControllerInstallResult>(r - 1)) {
+            case ControllerInstallResult::Success:
+                return InstallWait::Success;
+            case ControllerInstallResult::Failure:
+                return InstallWait::Failure;
+            case ControllerInstallResult::Unrecognised:
+                break;
+            }
+            ESP_LOGW("ControllerOTA", "Install report not recognised; treating the install as unconfirmed");
+            return InstallWait::Unrecognised;
         }
         // The controller reboots itself a few seconds after flashing, which
         // drops the link. If that happens before a result notification lands we
         // are not going to get one, so stop waiting.
         if (client == nullptr || !client->isConnected()) {
             ESP_LOGW("ControllerOTA", "Controller link dropped before an install result arrived");
-            return false;
+            return InstallWait::LinkDropped;
         }
         delay(100);
     }
     ESP_LOGW("ControllerOTA", "No install result from controller within %u ms", timeoutMs);
-    return false;
+    return InstallWait::Timeout;
+}
+
+const char *ControllerOTA::installWaitName(InstallWait w) {
+    switch (w) {
+    case InstallWait::Success:
+        return "success";
+    case InstallWait::Failure:
+        return "failure";
+    case InstallWait::Unrecognised:
+        return "unrecognised report";
+    case InstallWait::LinkDropped:
+        return "link dropped";
+    case InstallWait::Timeout:
+        return "timeout";
+    }
+    return "?";
 }
