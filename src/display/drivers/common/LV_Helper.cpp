@@ -13,6 +13,9 @@
 #ifdef GM_TOUCH_PROBE
 #include "esp_log.h"
 #include "esp_timer.h"
+#include <display/drivers/common/PanelClock.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
 #endif
 
 #if LV_VERSION_CHECK(9, 0, 0)
@@ -46,6 +49,65 @@ static Display *s_board = nullptr;
 static lv_color_t *s_fb[2] = {nullptr, nullptr};
 static bool s_fbOwned = false;   // the panel framebuffers are LVGL's to render into
 static bool s_fbActive = false;  // ...and LVGL holds them right now
+// A present that the scan-out has not been seen to take yet (gm-bzu.5).
+// presentFrameBuffer() only records the new index in esp_lcd; the bounce
+// refill keeps reading the OLD buffer until its frame wraps, and that wrap is
+// the refill count PanelClock keeps. LVGL's direct mode writes the old buffer
+// at the start of its next refresh (refr_sync_areas copies last frame's
+// areas into it, then renders), before it waits for anything, so the wait
+// has to come before the refresh runs, not after the flush. The refresh timer
+// is paused after every run and resumed by the next invalidation, so a
+// wrapped timer callback is the one place before those writes.
+static volatile bool s_flipPending = false;
+static uint32_t s_flipRefills = 0;
+static lv_timer_cb_t s_refrOrigCb = nullptr;
+LvFlipStats g_lvFlipStats;
+
+// Blocks the UI task until the panel has wrapped a frame since the last
+// present, so the buffer LVGL is about to write is no longer being scanned.
+// Bounded: a panel that stopped refilling must not wedge the UI task.
+static void waitPendingFlip() {
+    if (!s_flipPending) {
+        return;
+    }
+    s_flipPending = false;
+    const int64_t t0 = esp_timer_get_time();
+    constexpr int kMaxMs = 60; // over two panel periods at divider 8
+    for (int waited = 0; waited < kMaxMs; waited++) {
+        uint32_t r = 0;
+        panelclock::scanoutStats(nullptr, &r, nullptr);
+        if (r != s_flipRefills) {
+            const uint32_t us = static_cast<uint32_t>(esp_timer_get_time() - t0);
+            if (waited > 0) {
+                g_lvFlipStats.waits++;
+                g_lvFlipStats.waitUsTotal += us;
+                if (us > g_lvFlipStats.waitUsMax) {
+                    g_lvFlipStats.waitUsMax = us;
+                }
+            } else {
+                g_lvFlipStats.free++;
+            }
+            return;
+        }
+        vTaskDelay(pdMS_TO_TICKS(1));
+    }
+    g_lvFlipStats.timeouts++;
+}
+
+static void refrTimerGuarded(lv_timer_t *t) {
+    if (s_fbActive) {
+        waitPendingFlip();
+    }
+    if (s_refrOrigCb != nullptr) {
+        s_refrOrigCb(t);
+    }
+}
+
+void lvgl_helper_wait_flip() {
+    if (s_fbActive) {
+        waitPendingFlip();
+    }
+}
 static lv_color_t *s_scratch = nullptr;
 static uint32_t s_scratchPx = 0;
 
@@ -153,6 +215,11 @@ void lvgl_helper_suppress_flush(bool suppress) {
         return;
     }
     if (suppress) {
+        // The animation's beginDirectPath settles which buffer the panel scans
+        // before it writes either; a present LVGL left pending is its to wait
+        // for, and a stale one must not make the first pass after the
+        // takeback wait for a wrap that already happened.
+        s_flipPending = false;
         s_fbActive = false;
         lv_disp_draw_buf_init(&draw_buf, s_scratch, NULL, s_scratchPx);
         disp_drv.direct_mode = 0;
@@ -289,6 +356,11 @@ static void disp_flush(lv_disp_drv_t *disp_drv, const lv_area_t *area, lv_color_
             // does not write back at all, because the refill memcpy reads the
             // framebuffer through the same cache the CPU just wrote it with.
             static_cast<Display *>(disp_drv->user_data)->presentFrameBuffer(index, 0, disp_drv->ver_res);
+            // The refill count as of this present; refrTimerGuarded waits for
+            // it to move before LVGL writes the other buffer (gm-bzu.5).
+            panelclock::scanoutStats(nullptr, &s_flipRefills, nullptr);
+            s_flipPending = true;
+            g_lvFlipStats.presents++;
 #ifdef GM_TOUCH_PROBE
             if (g_probeEdgeUs != 0) {
                 const int64_t dt = esp_timer_get_time() - g_probeEdgeUs;
@@ -313,6 +385,7 @@ volatile int g_uiAnimTestReq = 0;
 volatile int g_dialElementsReq = 1;
 volatile int g_textElementsReq = 1;
 volatile int g_iconLayersReq = 1;
+volatile int g_animOffReq = 0;
 volatile int g_marqueeLayersReq = 1;
 volatile int g_clearByRunsReq = 1;
 volatile int g_textEaseReq = 1;
@@ -506,7 +579,16 @@ void beginLvglHelper(Display &board, bool debug) {
     disp_drv.full_refresh = 0;
     disp_drv.direct_mode = s_fbOwned ? 1 : board.supportsDirectMode();
     disp_drv.user_data = &board;
-    lv_disp_drv_register(&disp_drv);
+    lv_disp_t *disp = lv_disp_drv_register(&disp_drv);
+    if (s_fbOwned && disp != nullptr) {
+        // Wrap the refresh so a pending present is waited for before LVGL
+        // writes the buffer the panel may still be scanning (gm-bzu.5).
+        lv_timer_t *refr = _lv_disp_get_refr_timer(disp);
+        if (refr != nullptr && s_refrOrigCb == nullptr) {
+            s_refrOrigCb = refr->timer_cb;
+            lv_timer_set_cb(refr, refrTimerGuarded);
+        }
+    }
 
     lv_indev_drv_init(&indev_drv);
     indev_drv.type = LV_INDEV_TYPE_POINTER;
