@@ -63,6 +63,9 @@ class SleepAnimation {
     bool layerAnimating(int) const { return false; }
     bool layerVisible(int) const { return false; }
     void layerHide(int) {}
+    void layerShowAtGen(int, uint32_t) {}
+    void layerHideAtGen(int, uint32_t) {}
+    uint32_t overlayPublishGen() const { return 0; }
     LayerInfo layerInfo(int) const { return LayerInfo{}; }
     static constexpr int MAX_ELEMENTS = 8;
     enum class ElementType : uint8_t { None = 0, RoundRect = 1, TickRing = 2 };
@@ -462,6 +465,18 @@ class SleepAnimation {
     bool layerAnimating(int id) const;
     bool layerVisible(int id) const;
     void layerHide(int id);
+    // Handover latches (gm-2cl.8). Every overlay publish carries a
+    // generation number (overlayPublishGen is the last one issued), and a
+    // frame composites one overlay, so gating a layer on the generation of
+    // the overlay the frame reads makes "the layer appears" and "the
+    // object leaves the overlay" the same frame, and likewise at landing.
+    // layerShowAtGen: draw the layer only in frames whose overlay is at or
+    // past gen (0 = at once); the motion clock starts at the first frame
+    // that draws it. layerHideAtGen: stop drawing it from that generation
+    // on (0 = never). Both are UI-task calls; the render task reads them.
+    void layerShowAtGen(int id, uint32_t gen);
+    void layerHideAtGen(int id, uint32_t gen);
+    uint32_t overlayPublishGen() const { return overlayPubGen.load(); }
     LayerInfo layerInfo(int id) const;
     uint32_t lastLayerUsValue() const { return lastLayerUs.load(); }
 
@@ -894,6 +909,8 @@ class SleepAnimation {
         // (gm-2cl.15).
         uint32_t px = 0;
         uint16_t pxRows = 0;
+        // Publish generation this slot was last flipped to the front with.
+        uint32_t gen = 0;
 
         // Text scrim, at 1/4 resolution (SCRIM_SHIFT): scrimSrc holds each
         // cell's peak widget alpha, scrim the dilated and smoothed halo the
@@ -1537,6 +1554,7 @@ class SleepAnimation {
     // scalar (set at publish; never expected on the 480 px panel).
     std::atomic<bool> overlayVecOk{true};
     std::atomic<int> overlayFront{-1}; // -1 = nothing published yet
+    std::atomic<uint32_t> overlayPubGen{0}; // last publish generation issued
     // Overlay gain ramp record, written by the UI task under ovGainSeq (odd
     // while a write is in flight, same discipline as Layer::seq) and copied
     // by the render task once per frame in overlayGainAt.
@@ -1578,6 +1596,13 @@ class SleepAnimation {
         int64_t t0Us = 0;
         uint32_t durUs = 0;
         uint8_t ease = 0;
+        // Handover latches, see layerShowAtGen / layerHideAtGen.
+        std::atomic<uint32_t> showGen{0};
+        std::atomic<uint32_t> hideGen{0};
+        // Frame time the layer was first drawn (0 = not yet). The motion
+        // record's clock runs from here rather than from layerAnimate's
+        // call, so a gated start does not lose its first frames.
+        std::atomic<int64_t> shownAtUs{0};
         // Latched by evaluateLayers() for the frame being rendered.
         int fx = 0, fy = 0;
         bool fVisible = false;
@@ -1600,7 +1625,9 @@ class SleepAnimation {
     static bool layerPosAt(const LayerMotion &m, int64_t nowUs, int &x, int &y);
     // Once per frame on the render task: positions for this frame and warmup
     // for the rows any layer entered or left.
-    void evaluateLayers(int64_t nowUs);
+    void evaluateLayers(int64_t nowUs, uint32_t ovGen);
+    // The motion record's time for wall clock nowUs (see Layer::shownAtUs).
+    static int64_t layerClock(const Layer &L, const LayerMotion &m, int64_t nowUs);
     // Per panel row, after the overlay blend: every visible layer whose
     // rows cover y, through the same blend kernels the overlay uses.
     void compositeLayersRow(uint16_t *drow, int y, int w, bool pieBlend);

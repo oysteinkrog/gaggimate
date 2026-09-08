@@ -2340,6 +2340,7 @@ void SleepAnimation::publishOverlayRanges(int w, int h, const int (*ranges)[2], 
 #ifdef GM_TOUCH_PROBE
     g_statPubScrimUs += esp_timer_get_time() - scrim0;
 #endif
+    ov.gen = overlayPubGen.fetch_add(1) + 1;
     overlayFront.store(back);
     // Interaction publishes wake the render task's pacing sleep so the tap's
     // visuals reach glass ~a frame render after publish, not a frame render
@@ -2475,6 +2476,9 @@ void SleepAnimation::layerPublish(int id, int x, int y) {
             scanOverlayRow<false, uint8_t, 3>(a, L.w, L.runs + static_cast<size_t>(r) * RUNS_PER_ROW, nullptr));
     }
     layerSetPos(id, x, y);
+    L.showGen.store(0);
+    L.hideGen.store(0);
+    L.shownAtUs.store(0);
     L.visible.store(true);
 }
 
@@ -2598,7 +2602,12 @@ void SleepAnimation::layerAnimate(int id, int x1, int y1, uint32_t durMs, LayerE
     LayerMotion m;
     readLayerMotion(L, m);
     int cx, cy;
-    layerPosAt(m, now, cx, cy);
+    layerPosAt(m, layerClock(L, m, now), cx, cy);
+    if (L.shownAtUs.load() != 0) {
+        // Already on glass: the new leg's clock starts now. A gated layer
+        // keeps 0 and starts when it is first drawn.
+        L.shownAtUs.store(now);
+    }
     L.seq.fetch_add(1);
     L.x0 = cx;
     L.y0 = cy;
@@ -2617,7 +2626,17 @@ bool SleepAnimation::layerAnimating(int id) const {
     LayerMotion m;
     readLayerMotion(layers[id], m);
     int x, y;
-    return layerPosAt(m, esp_timer_get_time(), x, y);
+    return layerPosAt(m, layerClock(layers[id], m, esp_timer_get_time()), x, y);
+}
+void SleepAnimation::layerShowAtGen(int id, uint32_t gen) {
+    if (id >= 0 && id < MAX_LAYERS) {
+        layers[id].showGen.store(gen);
+    }
+}
+void SleepAnimation::layerHideAtGen(int id, uint32_t gen) {
+    if (id >= 0 && id < MAX_LAYERS) {
+        layers[id].hideGen.store(gen);
+    }
 }
 bool SleepAnimation::layerVisible(int id) const {
     return id >= 0 && id < MAX_LAYERS && layers[id].used.load() && layers[id].visible.load();
@@ -2643,7 +2662,12 @@ SleepAnimation::LayerInfo SleepAnimation::layerInfo(int id) const {
     return info;
 }
 
-void SleepAnimation::evaluateLayers(int64_t nowUs) {
+int64_t SleepAnimation::layerClock(const Layer &L, const LayerMotion &m, int64_t nowUs) {
+    const int64_t shown = L.shownAtUs.load();
+    return shown == 0 ? m.t0Us : m.t0Us + (nowUs - shown);
+}
+
+void SleepAnimation::evaluateLayers(int64_t nowUs, uint32_t ovGen) {
     layersThisFrame = false;
     if (display == nullptr) {
         return;
@@ -2661,14 +2685,23 @@ void SleepAnimation::evaluateLayers(int64_t nowUs) {
             L.w = L.h = 0;
             L.visible.store(false);
             L.releasePending.store(false);
+            L.showGen.store(0);
+            L.hideGen.store(0);
+            L.shownAtUs.store(0);
             L.used.store(false);
         }
-        const bool vis = L.used.load() && L.visible.load() && L.buf != nullptr;
+        const uint32_t showGen = L.showGen.load();
+        const uint32_t hideGen = L.hideGen.load();
+        const bool gated = (showGen != 0 && ovGen < showGen) || (hideGen != 0 && ovGen >= hideGen);
+        const bool vis = L.used.load() && L.visible.load() && L.buf != nullptr && !gated;
         int fx = L.fx, fy = L.fy;
         if (vis) {
+            if (L.shownAtUs.load() == 0) {
+                L.shownAtUs.store(nowUs);
+            }
             LayerMotion m;
             readLayerMotion(L, m);
-            layerPosAt(m, nowUs, fx, fy);
+            layerPosAt(m, layerClock(L, m, nowUs), fx, fy);
         }
         // Rows entered or left since the last frame go out whole this frame
         // and the next (requestBandWarmup's window), same as a widget update.
@@ -3922,7 +3955,7 @@ void IRAM_ATTR SleepAnimation::renderFrame() {
         overlayInUse.store(ofi);
     } while (ofi != overlayFront.load());
     const int64_t frameNowUs = esp_timer_get_time();
-    evaluateLayers(frameNowUs);
+    evaluateLayers(frameNowUs, ofi >= 0 ? overlays[ofi].gen : 0);
     evaluateElements(frameNowUs);
     // One gain for the whole frame, like the overlay index above: a ramp
     // step lands between frames, never between bands.

@@ -374,8 +374,9 @@ class DefaultUI {
         lv_obj_t *obj = nullptr;
         int layer = -1;
         lv_coord_t dx = 0, dy = 0;
-        bool landed = false;         // object moved and shown, layer still up
-        uint32_t landedRefresh = 0;  // g_overlayStats.refreshes at that point
+        bool landed = false;    // object moved and shown, layer still up
+        uint32_t hideGen = 0;   // overlay publish generation that shows the object again
+        int64_t landedAtUs = 0; // fallback clock for a publish that never comes
     };
     LayerMove layerMoves[SleepAnimation::MAX_LAYERS];
     // refreshSleepOverlay's spacing gate is bypassed until this time: set by

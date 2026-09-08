@@ -1701,9 +1701,13 @@ bool DefaultUI::moveObjectViaLayer(lv_obj_t *obj, lv_coord_t dx, lv_coord_t dy, 
         return false;
     }
     sleepAnimation.layerPublish(id, area.x1, area.y1);
-    // Hidden first, then the layer starts: the layer sits exactly over the
-    // object until the next refresh drops the object from the overlay, and
-    // that refresh goes out unthrottled.
+    // Atomic handover (gm-2cl.8): the layer is gated on the next overlay
+    // publish, which is the one that no longer holds the object (the hide
+    // below invalidates it and this task is the only publisher), so the
+    // first frame that draws the layer is the first frame without the
+    // object. Its motion clock starts in that frame. The refresh goes out
+    // unthrottled.
+    sleepAnimation.layerShowAtGen(id, sleepAnimation.overlayPublishGen() + 1);
     lv_obj_add_flag(obj, LV_OBJ_FLAG_HIDDEN);
     overlayUrgentUntilUs = esp_timer_get_time() + GM_TOUCH_GRACE_US;
     sleepAnimation.layerAnimate(id, area.x1 + dx, area.y1 + dy, durMs, ease);
@@ -1712,7 +1716,8 @@ bool DefaultUI::moveObjectViaLayer(lv_obj_t *obj, lv_coord_t dx, lv_coord_t dy, 
     slot->dx = dx;
     slot->dy = dy;
     slot->landed = false;
-    slot->landedRefresh = 0;
+    slot->hideGen = 0;
+    slot->landedAtUs = 0;
     return true;
 #else
     return false;
@@ -1742,15 +1747,20 @@ void DefaultUI::serviceLayerMoves() {
                            static_cast<lv_coord_t>(lv_obj_get_style_y(m.obj, LV_PART_MAIN) + m.dy));
             lv_obj_clear_flag(m.obj, LV_OBJ_FLAG_HIDDEN);
             overlayUrgentUntilUs = esp_timer_get_time() + GM_TOUCH_GRACE_US;
+            // The layer leaves in the frame that first composites the
+            // publish carrying the object again: the same latch as the
+            // start, the other way round, so no frame shows both or neither.
+            m.hideGen = sleepAnimation.overlayPublishGen() + 1;
+            sleepAnimation.layerHideAtGen(m.layer, m.hideGen);
             m.landed = true;
-            m.landedRefresh = g_overlayStats.refreshes;
+            m.landedAtUs = esp_timer_get_time();
             continue;
         }
-        // The object is back in LVGL's picture; once a refresh has published
-        // it there (any refresh after the un-hide includes it: the
-        // invalidation and the snapshot are on this task), the layer is
-        // redundant. Until then it covers the object exactly.
-        if (g_overlayStats.refreshes != m.landedRefresh) {
+        // Once that publish is out, every frame from here on hides the layer
+        // by the latch, so the slot can be freed. The one-second fallback
+        // covers an overlay that stops publishing (animation stopped, screen
+        // gone): the object is visible through LVGL either way.
+        if (sleepAnimation.overlayPublishGen() >= m.hideGen || esp_timer_get_time() - m.landedAtUs > 1000000) {
             sleepAnimation.layerRelease(m.layer);
             m = LayerMove{};
         }
