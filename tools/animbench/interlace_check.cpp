@@ -12,8 +12,8 @@
 // anything), so all shapes must agree, and rendering the reference shape twice
 // is the control that proves that purity.
 //
-// Rendering after a single frame() is what makes this work on all 13
-// animations. The obvious alternative -- give each shape a fresh
+// Rendering after a single frame() is what makes this work on every
+// animation. The obvious alternative -- give each shape a fresh
 // release()+init() -- cannot check starfield, fireflies, steam or nebula at
 // all, because their state is not reproducible across init() (a re-seeded
 // particle field), so two identical renders already differ and the comparison
@@ -30,10 +30,12 @@
 // bandIdx == 0 and ONLY the first bin's path points are drawn -- the
 // whole-frame render is the broken one, and using it as the reference reports
 // every legitimate shape as a mismatch (measured: 1422 px, in the 16-row
-// column, against a correct 16-row render). The reference is production's
-// 8-row band instead, which is a shape the device genuinely uses and which
-// every animation supports. Whole-frame is not tested because nothing calls
-// band() that way.
+// column, against a correct 16-row render). The reference is an 8-row band
+// instead: production's band when this was written, and still a shape every
+// animation supports. The device's BAND_H is 2 now (BgAnim.h), and the
+// interlaced path is the rows==1 and parity shapes below, so the shapes the
+// device actually uses are all in the comparison. Whole-frame is not tested
+// because nothing calls band() that way.
 //
 // Build:
 //   g++ -O2 -std=gnu++17 -Ishim -I. -include mathcount.h interlace_check.cpp
@@ -97,13 +99,13 @@ int main(int argc, char **argv) {
     const uint32_t times[] = {1000, 2000, 5000, 40000, 999999};
     const int nTimes = static_cast<int>(sizeof(times) / sizeof(times[0]));
 
-    // Shape 0 is the reference: SleepAnimation's own 8-row band. Shape 1
+    // Shape 0 is the reference: an 8-row band (see the note above). Shape 1
     // repeats it as the band()-purity control. 4 and 16 also divide 16 (see the
     // note above on why every height must); 1 is the interlaced path's shape,
     // and the parity pair is that path exactly.
     const Shape allShapes[] = {
-        {"8-row", 8, -1},  {"8-row(ctl)", 8, -1}, {"16-row", 16, -1}, {"4-row", 4, -1},
-        {"rows==1", 1, -1}, {"parity0", 1, 0},    {"parity1", 1, 1},
+        {"8-row", 8, -1},   {"8-row(ctl)", 8, -1}, {"16-row", 16, -1}, {"4-row", 4, -1},
+        {"rows==1", 1, -1}, {"parity0", 1, 0},     {"parity1", 1, 1},
     };
     // band()'s alignment precondition (BgAnim.h): rows > 1 needs an even
     // width, because row r of a multi-row destination begins r*w pixels in
@@ -111,7 +113,10 @@ int main(int argc, char **argv) {
     // (233, the 466 px panel at half resolution) only the one-row shapes are
     // within the contract, and the first of them becomes the reference.
     const Shape oddShapes[] = {
-        {"rows==1", 1, -1}, {"rows==1(ctl)", 1, -1}, {"parity0", 1, 0}, {"parity1", 1, 1},
+        {"rows==1", 1, -1},
+        {"rows==1(ctl)", 1, -1},
+        {"parity0", 1, 0},
+        {"parity1", 1, 1},
     };
     const bool oddW = (W & 1) != 0;
     const Shape *shapes = oddW ? oddShapes : allShapes;

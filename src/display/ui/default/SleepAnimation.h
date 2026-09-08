@@ -164,10 +164,15 @@ class SleepAnimation {
     void setMaxFps(uint8_t fps) { maxFps.store(fps); }
 #endif
 
-    // Render at 240x240 and double on the way out. The panel cannot do full
-    // resolution and 40 fps at once: full res clears 40 on 5 of the 13
-    // animations, half res on all 13. Read once per frame, so a live change
-    // never splits a frame between the two.
+    // Render at 240x240 and double on the way out. When this was added the
+    // panel could not do full resolution and 40 fps at once: full res cleared
+    // 40 on 5 of the 13 animations of the time, half res on all 13. Measured
+    // again on 2026-09-05 with interlace on (CLAUDE.md, "Three refresh
+    // rates"): half resolution no longer raises the loop's rate, because the
+    // 2x expansion costs what the smaller render saves; interlace is the
+    // setting that does. Kept as a user option because it is a look, not a
+    // speed. Read once per frame, so a live change never splits a frame
+    // between the two.
     //
     // Interlacing pushes every other row pair and alternates each frame,
     // halving both the bytes and the driver's whole-scanline writeback. Render
@@ -570,7 +575,7 @@ class SleepAnimation {
         uint16_t color = 0;   // RGB565
         uint16_t ver = 0;     // content version: a change warms the rows like a move
         int16_t x = 0, y = 0, w = 0, h = 0;
-        int64_t tUs = 0;    // when the writer wrote it (probe: write to frame latency)
+        int64_t tUs = 0;       // when the writer wrote it (probe: write to frame latency)
         tickring::Desc ring{}; // TickRing only
     };
     void setElement(int id, const ElementDesc &d);
@@ -814,10 +819,10 @@ class SleepAnimation {
         int firstPset = -1;
         int firstX = -1;
         int firstY = -1;
-        uint16_t firstGot = 0;   // band()'s pixel there
-        uint16_t firstWant = 0;  // bandRef()'s pixel there
-        uint32_t bandUs = 0;     // total band() time, all frames and param sets
-        uint32_t refUs = 0;      // same for bandRef()
+        uint16_t firstGot = 0;  // band()'s pixel there
+        uint16_t firstWant = 0; // bandRef()'s pixel there
+        uint32_t bandUs = 0;    // total band() time, all frames and param sets
+        uint32_t refUs = 0;     // same for bandRef()
     };
     void requestAnimTest(int anim, int frames) {
         animTestFrames.store(frames < 1 ? 1 : (frames > 64 ? 64 : frames));
@@ -907,9 +912,9 @@ class SleepAnimation {
         bool ran = false;
         bool initFailed = false;
         uint32_t bands = 0;
-        uint64_t minCyc = 0;   // sum over bands of min-of-n
-        uint64_t firstCyc = 0; // sum over bands of run 0
-        uint64_t sumCyc = 0;   // sum over bands and runs
+        uint64_t minCyc = 0;        // sum over bands of min-of-n
+        uint64_t firstCyc = 0;      // sum over bands of run 0
+        uint64_t sumCyc = 0;        // sum over bands and runs
         uint32_t mismatchBands = 0; // vs the firmware band() (variant 0)
         int firstMismatchFrame = -1;
         int firstMismatchY = -1;
@@ -1369,7 +1374,7 @@ class SleepAnimation {
     // buffers before presenting, and whichever one is really on screen already
     // holds a correct frame. Costs one extra render at animation start.
     bool primePending = false;
-    size_t fbBytes = 0;   // one framebuffer, for the per-frame cache invalidate
+    size_t fbBytes = 0; // one framebuffer, for the per-frame cache invalidate
     bool dmaInstallTried = false;
 #ifndef GAGGIMATE_SIM
     // The native engine. Kept beside the panel's framebuffer pointers
@@ -1455,10 +1460,10 @@ class SleepAnimation {
     uint16_t fbCheckCursor = 0;
     std::atomic<uint32_t> fbChecked{0};
     std::atomic<uint32_t> fbMismatch{0};
-    std::atomic<int32_t> fbLastBand{-1};    // band index that held wrong content
-    std::atomic<int32_t> fbLastSource{-1};  // band whose content was there instead
-    std::atomic<int32_t> fbLastDelta{0};    // source - band, in bands
-    std::atomic<uint32_t> lastInvalUs{0};   // cost of the pre-flip cache invalidate
+    std::atomic<int32_t> fbLastBand{-1};   // band index that held wrong content
+    std::atomic<int32_t> fbLastSource{-1}; // band whose content was there instead
+    std::atomic<int32_t> fbLastDelta{0};   // source - band, in bands
+    std::atomic<uint32_t> lastInvalUs{0};  // cost of the pre-flip cache invalidate
     // Tearing instrument. scanFb is which framebuffer the panel was last
     // CONFIRMED to be scanning, set only after on_frame_buf_complete has fired
     // for a flip, and -1 when that confirmation timed out. liveWrites counts
@@ -1489,9 +1494,9 @@ class SleepAnimation {
     uint32_t profExpandUs = 0; // just the 2x2 expansion inside profBandUs, zero at full resolution
     uint32_t profFillUs = 0;   // the x2 fill of the even output row, inside profExpandUs
     uint32_t profCopyUs = 0;   // duplicating that row into the odd one, inside profExpandUs
-    uint32_t profBlendUs = 0; // compositing the widget overlay into the band
-    uint32_t profMsyncUs = 0; // cache writeback of the GDMA source band
-    uint32_t profPushUs = 0;  // handing the band to the DMA engine
+    uint32_t profBlendUs = 0;  // compositing the widget overlay into the band
+    uint32_t profMsyncUs = 0;  // cache writeback of the GDMA source band
+    uint32_t profPushUs = 0;   // handing the band to the DMA engine
     // Frame time split, for working out what actually caps the frame rate:
     // total wall clock, the part that was work, and the part that was waiting
     // for the panel. Reported rather than reasoned about, because the first
@@ -1593,8 +1598,8 @@ class SleepAnimation {
     uint32_t probePx = 0;
     int probeCaptureBands = 0;
     volatile uint32_t probeSink = 0;
-    uint32_t probeBlendRow(uint16_t *drow, const uint16_t *ccol, const uint16_t *ca16, const uint32_t *runs, int nRuns,
-                           int level, int w, bool pie);
+    uint32_t probeBlendRow(uint16_t *drow, const uint16_t *ccol, const uint16_t *ca16, const uint32_t *runs, int nRuns, int level,
+                           int w, bool pie);
     void probeReset();
 #endif
     std::atomic<uint32_t> probePxOut{0};
@@ -1632,7 +1637,7 @@ class SleepAnimation {
     // the planes' rows are not 16-byte aligned and the blend must stay
     // scalar (set at publish; never expected on the 480 px panel).
     std::atomic<bool> overlayVecOk{true};
-    std::atomic<int> overlayFront{-1}; // -1 = nothing published yet
+    std::atomic<int> overlayFront{-1};      // -1 = nothing published yet
     std::atomic<uint32_t> overlayPubGen{0}; // last publish generation issued
     // Overlay gain ramp record, written by the UI task under ovGainSeq (odd
     // while a write is in flight, same discipline as Layer::seq) and copied

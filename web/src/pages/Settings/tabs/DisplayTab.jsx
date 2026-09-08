@@ -126,7 +126,7 @@ function BackgroundAnimationSettings({ formData, onChange, setField }) {
           helpText={
             formData.panelClockLive === false
               ? 'This build retimes the panel only when it starts up, so restart the display after saving.'
-              : undefined
+              : 'How often the panel scans out. The animation has its own frame rate (the slider) and the widgets refresh when they change.'
           }
         >
           <select
@@ -162,7 +162,12 @@ function BackgroundAnimationSettings({ formData, onChange, setField }) {
             onChange={onChange('panelVcom')}
           />
         </SettingsFormField>
-        <SettingsFormField label='Animation resolution' htmlFor='bgAnimHalfRes' noMargin>
+        <SettingsFormField
+          label='Animation resolution'
+          htmlFor='bgAnimHalfRes'
+          noMargin
+          helpText='Half resolution does not raise the frame rate: doubling the rows costs what the smaller render saves (measured 2026-09-05). Interlace is the setting that does.'
+        >
           <select
             id='bgAnimHalfRes'
             name='bgAnimHalfRes'
@@ -170,8 +175,8 @@ function BackgroundAnimationSettings({ formData, onChange, setField }) {
             value={formData.bgAnimHalfRes === undefined ? 1 : parseInt(formData.bgAnimHalfRes, 10)}
             onChange={onChange('bgAnimHalfRes')}
           >
-            <option value={1}>Half (240x240, doubled), every animation at 40+ fps</option>
-            <option value={0}>Full (480x480), sharper, 15 to 25 fps on the heavy ones</option>
+            <option value={1}>Half (240x240, doubled on the way out)</option>
+            <option value={0}>Full (480x480), sharper</option>
           </select>
         </SettingsFormField>
         <SettingsFormField label='Interlace animation' htmlFor='bgAnimInterlace' noMargin>

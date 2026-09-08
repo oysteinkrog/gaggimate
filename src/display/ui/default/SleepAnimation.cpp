@@ -457,11 +457,11 @@ alignas(16) static const DRAM_ATTR uint16_t kBlendGroupConsts[48] = {
     // extracted from its bit-positioned value, and multiplying by 1 at
     // SAR=8 is the final "divide by 256" -- one constant vector serves
     // every right-shift this kernel needs.
-    1, 1, 1, 1, 1, 1, 1, 1,
+    1,      1,      1,      1,      1,      1,      1,      1,
     0xF800, 0xF800, 0xF800, 0xF800, 0xF800, 0xF800, 0xF800, 0xF800, // maskR
-    2048, 2048, 2048, 2048, 2048, 2048, 2048, 2048,                 // constR2048: raw R (0..31) << 11, as a multiply
+    2048,   2048,   2048,   2048,   2048,   2048,   2048,   2048,   // constR2048: raw R (0..31) << 11, as a multiply
     0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, 0x07E0, // maskG
-    32, 32, 32, 32, 32, 32, 32, 32,                                 // constG32: raw G (0..63) << 5, as a multiply
+    32,     32,     32,     32,     32,     32,     32,     32,     // constG32: raw G (0..63) << 5, as a multiply
     0x001F, 0x001F, 0x001F, 0x001F, 0x001F, 0x001F, 0x001F, 0x001F, // maskB (already raw; blue needs no repositioning)
 };
 
@@ -485,10 +485,9 @@ alignas(16) static const DRAM_ATTR uint16_t kBlendGroupConsts[48] = {
 // PIE-composite report in tools/animbench/kernels-blend/ for the batched
 // alternative that was considered and not used, and for the SAR-threading
 // risk this design still carries into a real device/QEMU validation pass.
-__attribute__((noinline)) static void blendGroup8General(uint16_t *__restrict dst8,
-                                                          const uint16_t *__restrict colStage8,
-                                                          const uint16_t *__restrict aStage8,
-                                                          const uint16_t *__restrict invStage8) {
+__attribute__((noinline)) static void blendGroup8General(uint16_t *__restrict dst8, const uint16_t *__restrict colStage8,
+                                                         const uint16_t *__restrict aStage8,
+                                                         const uint16_t *__restrict invStage8) {
     const uint16_t *rd = dst8;
     uint16_t *wr = dst8;
     const uint16_t *col = colStage8;
@@ -552,8 +551,8 @@ __attribute__((noinline)) static void blendGroup8General(uint16_t *__restrict ds
 // of it (same reasoning as scanRow_pie_asm's scalar fallback elsewhere in
 // this codebase's PIE work).
 template <bool kGain>
-__attribute__((always_inline)) inline void blendPixelScalar(uint16_t *__restrict dst, const uint8_t *__restrict px,
-                                                              int x, uint32_t gain) {
+__attribute__((always_inline)) inline void blendPixelScalar(uint16_t *__restrict dst, const uint8_t *__restrict px, int x,
+                                                            uint32_t gain) {
     uint32_t a = px[2];
     if (a == 0) {
         return;
@@ -748,7 +747,7 @@ __attribute__((always_inline)) inline void scrimCell(uint16_t *__restrict dst, u
 // loop), the randomized bit-exactness proof, and the real-toolchain asm
 // evidence for all three shapes (tools/animbench/kernels-scrimfix/asm.sh).
 __attribute__((noinline)) static void IRAM_ATTR scrimRow(uint16_t *__restrict dst, const uint8_t *__restrict invRow,
-                                               const uint32_t *__restrict runs, int nRuns, int w) {
+                                                         const uint32_t *__restrict runs, int nRuns, int w) {
     for (int i = 0; i < nRuns; i++) {
         const uint32_t r = runs[i];
         const int c0 = static_cast<int>(r & 0xFFFFu);
@@ -786,8 +785,8 @@ __attribute__((noinline)) static void IRAM_ATTR scrimRow(uint16_t *__restrict ds
 // rather than skipped, because a lane cannot branch. That factor is an exact
 // identity -- 32/32 -- so the group writes those pixels back unchanged.
 __attribute__((noinline)) static void IRAM_ATTR scrimRowPie(uint16_t *__restrict dst, const uint8_t *__restrict invRow,
-                                                  const uint16_t *__restrict invPx, const uint32_t *__restrict runs, int nRuns,
-                                                  int w) {
+                                                            const uint16_t *__restrict invPx, const uint32_t *__restrict runs,
+                                                            int nRuns, int w) {
     for (int i = 0; i < nRuns; i++) {
         const uint32_t r = runs[i];
         int c0 = static_cast<int>(r & 0xFFFFu);
@@ -914,8 +913,8 @@ struct alignas(16) PlanarGain {
 // blendRow<true> does per pixel.
 template <bool kGain>
 __attribute__((noinline)) static void IRAM_ATTR blendPlanarGroups(uint16_t *__restrict dst, const uint16_t *__restrict col,
-                                                                    const uint16_t *__restrict a16, int n8,
-                                                                    const PlanarGain *__restrict pg) {
+                                                                  const uint16_t *__restrict a16, int n8,
+                                                                  const PlanarGain *__restrict pg) {
     uint16_t *wr = dst;
     const uint16_t *rd = dst;
     for (int g = 0; g < n8; g++) {
@@ -1014,9 +1013,8 @@ __attribute__((always_inline)) inline void blendPixelPlanar(uint16_t *__restrict
 // snapshot, overlayVecOk).
 template <bool kGain>
 __attribute__((noinline)) static void IRAM_ATTR blendRowPlanar(uint16_t *__restrict dst, const uint16_t *__restrict col,
-                                                               const uint16_t *__restrict a16,
-                                                               const uint32_t *__restrict runs, int nRuns, uint32_t gain,
-                                                               bool vector) {
+                                                               const uint16_t *__restrict a16, const uint32_t *__restrict runs,
+                                                               int nRuns, uint32_t gain, bool vector) {
     PlanarGain pg;
     if (kGain) {
         for (int k = 0; k < 8; k++) {
@@ -1054,8 +1052,8 @@ __attribute__((noinline)) static void IRAM_ATTR blendRowPlanar(uint16_t *__restr
 // the source and the destination each placed in internal SRAM or PSRAM. The
 // first frames capture the row with the most pixels; a level change back to 0
 // frees the copies (probeReset) so a new capture starts clean.
-uint32_t IRAM_ATTR SleepAnimation::probeBlendRow(uint16_t *drow, const uint16_t *ccol, const uint16_t *ca16,
-                                                 const uint32_t *runs, int nRuns, int level, int w, bool pie) {
+uint32_t IRAM_ATTR SleepAnimation::probeBlendRow(uint16_t *drow, const uint16_t *ccol, const uint16_t *ca16, const uint32_t *runs,
+                                                 int nRuns, int level, int w, bool pie) {
     if (level <= 1) {
         return 0;
     }
@@ -1074,20 +1072,20 @@ uint32_t IRAM_ATTR SleepAnimation::probeBlendRow(uint16_t *drow, const uint16_t 
         if (px > probePx && nRuns <= kProbeRuns && xmax <= w) {
             if (probeRowSram == nullptr) {
                 const size_t rowBytes = static_cast<size_t>(w) * 2;
-                probeRowSram = static_cast<uint8_t *>(
-                    heap_caps_malloc(static_cast<size_t>(w) * 3, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+                probeRowSram =
+                    static_cast<uint8_t *>(heap_caps_malloc(static_cast<size_t>(w) * 3, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
                 probeRowPsram = static_cast<uint8_t *>(heap_caps_malloc(static_cast<size_t>(w) * 3, MALLOC_CAP_SPIRAM));
-                probeDstSram = static_cast<uint16_t *>(
-                    heap_caps_aligned_alloc(16, rowBytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
-                probeColPlane = static_cast<uint16_t *>(
-                    heap_caps_aligned_alloc(16, rowBytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
-                probeA16Plane = static_cast<uint16_t *>(
-                    heap_caps_aligned_alloc(16, rowBytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
-                probeRefRow = static_cast<uint16_t *>(
-                    heap_caps_aligned_alloc(16, rowBytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+                probeDstSram =
+                    static_cast<uint16_t *>(heap_caps_aligned_alloc(16, rowBytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+                probeColPlane =
+                    static_cast<uint16_t *>(heap_caps_aligned_alloc(16, rowBytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+                probeA16Plane =
+                    static_cast<uint16_t *>(heap_caps_aligned_alloc(16, rowBytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+                probeRefRow =
+                    static_cast<uint16_t *>(heap_caps_aligned_alloc(16, rowBytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
             }
-            if (probeRowSram != nullptr && probeRowPsram != nullptr && probeDstSram != nullptr &&
-                probeColPlane != nullptr && probeA16Plane != nullptr && probeRefRow != nullptr) {
+            if (probeRowSram != nullptr && probeRowPsram != nullptr && probeDstSram != nullptr && probeColPlane != nullptr &&
+                probeA16Plane != nullptr && probeRefRow != nullptr) {
                 // The interleaved copies for levels 4 to 7 (the old kernel)
                 // are built from the planes: colour, then alpha with 256
                 // back to 255.
@@ -1387,14 +1385,13 @@ void SleepAnimation::start(Display *d) {
             // against a real WPA association before it can ship.
             const size_t bandBytes = static_cast<size_t>(w) * BAND_H * sizeof(uint16_t);
             constexpr size_t BANDBUF_RESERVE = 32 * 1024;
-            if (heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA | MALLOC_CAP_8BIT) >=
-                bandBytes + BANDBUF_RESERVE) {
-                bandBuf[i] = static_cast<uint16_t *>(
-                    heap_caps_aligned_alloc(64, bandBytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA));
+            if (heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA | MALLOC_CAP_8BIT) >= bandBytes + BANDBUF_RESERVE) {
+                bandBuf[i] =
+                    static_cast<uint16_t *>(heap_caps_aligned_alloc(64, bandBytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA));
             }
             if (bandBuf[i] == nullptr && bganim::internalHasRoomFor(bandBytes)) {
-                bandBuf[i] = static_cast<uint16_t *>(
-                    heap_caps_aligned_alloc(64, bandBytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA));
+                bandBuf[i] =
+                    static_cast<uint16_t *>(heap_caps_aligned_alloc(64, bandBytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA));
             }
             if (bandBuf[i] == nullptr) {
                 bandBuf[i] = static_cast<uint16_t *>(heap_caps_aligned_alloc(64, bandBytes, MALLOC_CAP_SPIRAM));
@@ -1874,7 +1871,8 @@ void SleepAnimation::pushTaskEntry(void *arg) {
 // use the WithCaps call so the reap path is one.
 static BaseType_t createAnimTask(TaskFunction_t fn, const char *name, uint32_t stackBytes, void *arg, UBaseType_t prio,
                                  TaskHandle_t *handle) {
-    BaseType_t ok = xTaskCreatePinnedToCoreWithCaps(fn, name, stackBytes, arg, prio, handle, 0, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    BaseType_t ok =
+        xTaskCreatePinnedToCoreWithCaps(fn, name, stackBytes, arg, prio, handle, 0, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (ok != pdPASS) {
         log_w("SleepAnimation: no PSRAM for the %s stack, using internal DRAM", name);
         ok = xTaskCreatePinnedToCoreWithCaps(fn, name, stackBytes, arg, prio, handle, 0, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
@@ -2513,8 +2511,8 @@ void SleepAnimation::publishOverlayRanges(int w, int h, const int (*ranges)[2], 
         for (int g = 0; g < m; g++) {
             cellRowsTouched += ((rr[g][1] + (1 << SCRIM_SHIFT) - 1) >> SCRIM_SHIFT) - (rr[g][0] >> SCRIM_SHIFT);
         }
-        const bool fullNeeded = scrimCmp == nullptr || scrimTmp2 == nullptr || ov.scrimBuiltQ8 != scrimQ8.load() ||
-                                cellRowsTouched * 3 > ov.scrimH;
+        const bool fullNeeded =
+            scrimCmp == nullptr || scrimTmp2 == nullptr || ov.scrimBuiltQ8 != scrimQ8.load() || cellRowsTouched * 3 > ov.scrimH;
         if (fullNeeded) {
             buildScrim(ov, panelW, panelH);
             ov.scrimBuiltQ8 = scrimQ8.load();
@@ -2659,9 +2657,7 @@ void SleepAnimation::layerRelease(int id) {
 uint8_t *SleepAnimation::layerBuffer(int id) {
     return (id >= 0 && id < MAX_LAYERS && layers[id].used.load()) ? layers[id].buf : nullptr;
 }
-int SleepAnimation::layerWidth(int id) const {
-    return (id >= 0 && id < MAX_LAYERS && layers[id].used.load()) ? layers[id].w : 0;
-}
+int SleepAnimation::layerWidth(int id) const { return (id >= 0 && id < MAX_LAYERS && layers[id].used.load()) ? layers[id].w : 0; }
 int SleepAnimation::layerHeight(int id) const {
     return (id >= 0 && id < MAX_LAYERS && layers[id].used.load()) ? layers[id].h : 0;
 }
@@ -3155,9 +3151,8 @@ void SleepAnimation::evaluateElements(int64_t nowUs) {
             y1 = panelH;
         }
         const bool vis = d.type != ElementType::None && d.alpha != 0 && x1 > x0 && y1 > y0;
-        const bool moved = vis != e.lastVisible || (vis && (y0 != e.lastY0 || y1 != e.lastY1 || d.x != e.f.x ||
-                                                             d.w != e.f.w || d.radius != e.f.radius ||
-                                                             d.ver != e.f.ver));
+        const bool moved = vis != e.lastVisible || (vis && (y0 != e.lastY0 || y1 != e.lastY1 || d.x != e.f.x || d.w != e.f.w ||
+                                                            d.radius != e.f.radius || d.ver != e.f.ver));
         if (moved) {
             int ranges[2][2];
             int n = 0;
@@ -3297,8 +3292,8 @@ void IRAM_ATTR SleepAnimation::pickupInteractionElement() {
 // arithmetic. Measured 2026-09-08 against the overlay path on the bench
 // board: zero differing stable pixels once this matched the writer; with a
 // copy at full coverage the interiors were one step brighter.
-static inline void IRAM_ATTR compositeTextRow(uint16_t *drow, int y, int w, const SleepAnimation::TextDesc &t,
-                                              uint16_t color, uint32_t alpha, uint32_t gain) {
+static inline void IRAM_ATTR compositeTextRow(uint16_t *drow, int y, int w, const SleepAnimation::TextDesc &t, uint16_t color,
+                                              uint32_t alpha, uint32_t gain) {
     for (int gi = 0; gi < t.n; gi++) {
         const SleepAnimation::TextGlyph &g = t.g[gi];
         const int dy = y - g.y;
@@ -3413,8 +3408,7 @@ void IRAM_ATTR SleepAnimation::compositeElementsRow(uint16_t *drow, int y, int w
 // transpose would just move the 120-byte stride from the vertical tap onto
 // the transpose's write side. always_inline because GCC has declined to
 // inline same-file helpers in this file at -O2 before (see scale565x2).
-__attribute__((always_inline)) static inline void transposeSquare(const uint8_t *__restrict src, uint8_t *__restrict dst,
-                                                                  int n) {
+__attribute__((always_inline)) static inline void transposeSquare(const uint8_t *__restrict src, uint8_t *__restrict dst, int n) {
     constexpr int kBlock = 16;
     uint8_t tile[kBlock][kBlock];
     for (int by = 0; by < n; by += kBlock) {
@@ -3925,7 +3919,7 @@ void IRAM_ATTR SleepAnimation::presentFrame() {
 // to hide and becomes a texture in its own right, which is what it looks like:
 // a visible weave over what should read as a smooth field.
 //
-// That price used to be paid by all thirteen animations, because the setting
+// That price used to be paid by every animation, because the setting
 // was a single global dial and a dial has to be set for the worst of the
 // fleet. They are nothing like each other -- plasma's band work is a fifth of
 // caustics' -- so the cheap ones were giving up quality to buy headroom they
@@ -4543,8 +4537,8 @@ void IRAM_ATTR SleepAnimation::renderFrame() {
         // load per band, so the ?bpie A/B knob can flip it between frames
         // without a per-row cost.
         const bool pieBlend = bpieOn.load();
-        const bool ovVec = pieBlend && overlayVecOk.load() &&
-                           ((reinterpret_cast<uintptr_t>(band) | (static_cast<uintptr_t>(w) * 2)) & 0xF) == 0;
+        const bool ovVec =
+            pieBlend && overlayVecOk.load() && ((reinterpret_cast<uintptr_t>(band) | (static_cast<uintptr_t>(w) * 2)) & 0xF) == 0;
         const bool pieScrim = pieOn.load() && scrimInvPx != nullptr &&
                               ((reinterpret_cast<uintptr_t>(band) | (static_cast<uintptr_t>(w) * 2)) & 0xF) == 0;
         // Decided once per band and used three times: the render below skips
@@ -4682,8 +4676,9 @@ void IRAM_ATTR SleepAnimation::renderFrame() {
             // contract takes a row count (BgAnim.h) and the last band of the
             // screen already passes a short one, so this is within it; what it
             // relies on is that no animation carries state from one call to the
-            // next, which is true of all thirteen -- each derives its row terms
-            // from the absolute y it is handed.
+            // next, which is true of every animation (BgAnim.h's contract, and
+            // tools/animbench's interlace_check enforces it) -- each derives
+            // its row terms from the absolute y it is handed.
             const bool splitRender = renderSkip && hrows > 0;
             if (lockThisBand) {
                 vTaskSuspendAll();
@@ -5319,8 +5314,8 @@ void IRAM_ATTR SleepAnimation::renderFrame() {
                 esp_err_t msyncErr = ESP_OK;
                 if (nRowGroups > 0) {
                     for (int i = 0; i < nRowGroups; i++) {
-                        msyncErr = esp_cache_msync(band + static_cast<size_t>(rowGroupRow[i]) * w + dmaX0,
-                                                   rowGroupBytes, ESP_CACHE_MSYNC_FLAG_DIR_C2M);
+                        msyncErr = esp_cache_msync(band + static_cast<size_t>(rowGroupRow[i]) * w + dmaX0, rowGroupBytes,
+                                                   ESP_CACHE_MSYNC_FLAG_DIR_C2M);
                         if (msyncErr != ESP_OK) {
                             break;
                         }
@@ -5430,8 +5425,7 @@ void IRAM_ATTR SleepAnimation::renderFrame() {
             } else if (bandDma.ready()) {
                 dmaIssued++;
                 if (nRowGroups > 0) {
-                    err = bandDma.submitRows(renderSlot, dstRow, band, rowGroupOffsets, nRowGroups, rowGroupBytes,
-                                             &done);
+                    err = bandDma.submitRows(renderSlot, dstRow, band, rowGroupOffsets, nRowGroups, rowGroupBytes, &done);
                 } else {
                     err = bandDma.submit(renderSlot, dstRow, band, bytes, &done);
                 }
@@ -5677,8 +5671,7 @@ void SleepAnimation::runAnimTest() {
 
 int SleepAnimation::activeSlot() const {
 #ifdef GM_KBLOB
-    if (useBlob.load(std::memory_order_relaxed) && !blobInstalling.load(std::memory_order_relaxed) &&
-        kblob::anim() != nullptr) {
+    if (useBlob.load(std::memory_order_relaxed) && !blobInstalling.load(std::memory_order_relaxed) && kblob::anim() != nullptr) {
         return KBLOB_SLOT;
     }
 #endif
