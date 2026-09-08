@@ -18,6 +18,16 @@
 //    particle state, rebuild per-row/column terms, rotate palettes.
 //  - band(dst, y0, rows, w, tMs, p): fill rows [y0, y0+rows) into dst
 //    (w * rows RGB565 pixels). Must stay within ~30 cycles/pixel overall.
+//    Alignment precondition (gm-bzu.21): dst is 4-byte aligned, and when
+//    rows > 1, w is even. Kernels store pixel pairs as one 32-bit word and
+//    take row r of dst to begin on a 4-byte boundary, which row r*w pixels in
+//    does only when w is even. An odd w (the 466 px panel at half
+//    resolution, 233) is therefore rendered one row per call into a 4-byte
+//    aligned destination; SleepAnimation's half path does exactly that
+//    (BAND_H = 2, one source row per band) and the host harnesses
+//    (tools/animbench interlace_check, render_one --shapes) keep their
+//    multi-row shapes to even widths. A row's pixels depend only on its
+//    absolute y and the frame state, never on which rows share the call.
 //
 // Params: fixed 4 slots; key == nullptr marks unused slots. The same defs are
 // mirrored in the web UI (web/src/config/bgAnimations.js) — keep in sync.

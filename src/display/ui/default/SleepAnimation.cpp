@@ -4702,6 +4702,13 @@ void IRAM_ATTR SleepAnimation::renderFrame() {
                     bandFn(halfBuf + static_cast<size_t>(sr) * rw, srcBase + sr, 1, rw, tMs, p);
                 }
             } else {
+                // One source row per band (BAND_H is 2), so this call never
+                // hands a kernel more than one row. That is what keeps the
+                // 466 px panel's odd half width (233) inside band()'s
+                // alignment precondition (BgAnim.h): with two rows the second
+                // would begin 466 bytes in, off the 4-byte boundary the
+                // pixel-pair stores assume (gm-bzu.21).
+                static_assert(BAND_H / 2 == 1, "the half path relies on one source row per band; see BgAnim.h");
                 bandFn(halfBuf, srcBase, hrows, rw, tMs, p);
             }
             if (lockThisBand) {

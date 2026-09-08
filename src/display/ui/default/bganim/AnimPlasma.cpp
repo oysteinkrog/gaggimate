@@ -179,10 +179,11 @@ void bandRef(uint16_t *dst, int y0, int rows, int w, uint32_t, const uint8_t *) 
         // unchanged from the undithered version -- zero per-pixel cost.
         const int16_t *ct = colTermPh + static_cast<size_t>(y & 7) * w;
         int x = 0;
-        // Emit pixels in pairs via a single uint32 store where possible —
-        // halves the number of store instructions in the hot loop (device
-        // has no unaligned-16 penalty here since dst is always 32-bit
-        // aligned: bands start at a row boundary and w is even (480)).
+        // Emit pixels in pairs via a single uint32 store where possible;
+        // halves the number of store instructions in the hot loop. Each row
+        // of dst is 32-bit aligned by band()'s contract (BgAnim.h): dst is
+        // 4-byte aligned and a multi-row call has an even w, so row r at
+        // r*w pixels stays aligned. An odd w (233) arrives one row per call.
         for (; x + 1 < w; x += 2) {
             const uint16_t p0 = rotPalette[((ct[x] + rt) >> 4) & 255];
             const uint16_t p1 = rotPalette[((ct[x + 1] + rt) >> 4) & 255];

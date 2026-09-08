@@ -79,16 +79,28 @@ const Shape kShapes[] = {
     {"rows==1", 1, -1}, {"parity0", 1, 0},     {"parity1", 1, 1},
 };
 constexpr int kNumShapes = static_cast<int>(sizeof(kShapes) / sizeof(kShapes[0]));
+// At an odd width only one-row calls are within band()'s alignment
+// precondition (BgAnim.h): row r of a multi-row destination begins r*w
+// pixels in, and the kernels store pixel pairs as 32-bit words. 233 is the
+// 466 px panel at half resolution.
+const Shape kOddShapes[] = {
+    {"rows==1", 1, -1}, {"rows==1(ctl)", 1, -1}, {"parity0", 1, 0}, {"parity1", 1, 1},
+};
+constexpr int kNumOddShapes = static_cast<int>(sizeof(kOddShapes) / sizeof(kOddShapes[0]));
+
+// Even row stride, so every band() call gets the 4-byte aligned destination
+// the contract requires (BgAnim.h) at an odd width as well.
+int rowStride(int w) { return (w + 1) & ~1; }
 
 void renderShape(const BgAnimation &anim, const Shape &s, int w, int h, uint32_t t, const uint8_t p[4], uint16_t *fb) {
     if (s.parity < 0) {
         for (int y = 0; y < h; y += s.bandH) {
             const int rows = (y + s.bandH <= h) ? s.bandH : (h - y);
-            anim.band(fb + static_cast<size_t>(y) * w, y, rows, w, t, p);
+            anim.band(fb + static_cast<size_t>(y) * rowStride(w), y, rows, w, t, p);
         }
     } else {
         for (int y = s.parity; y < h; y += 2) {
-            anim.band(fb + static_cast<size_t>(y) * w, y, 1, w, t, p);
+            anim.band(fb + static_cast<size_t>(y) * rowStride(w), y, 1, w, t, p);
         }
     }
 }
@@ -98,7 +110,7 @@ long compareShape(const uint16_t *ref, const uint16_t *got, const Shape &s, int 
     long bad = 0;
     for (int y = (s.parity < 0) ? 0 : s.parity; y < h; y += step) {
         for (int x = 0; x < w; x++) {
-            const size_t i = static_cast<size_t>(y) * w + x;
+            const size_t i = static_cast<size_t>(y) * rowStride(w) + x;
             bad += ref[i] != got[i];
         }
     }
@@ -120,8 +132,14 @@ int checkShapes(const BgAnimation &anim, const uint8_t p[4], const std::vector<i
     for (int f : frames) {
         last = f > last ? f : last;
     }
-    const size_t frameSz = static_cast<size_t>(w) * h;
-    std::vector<uint16_t> bufs(frameSz * kNumShapes);
+    const size_t frameSz = static_cast<size_t>(rowStride(w)) * h;
+    const bool oddW = (w & 1) != 0;
+    const Shape *shapes = oddW ? kOddShapes : kShapes;
+    const int nShapes = oddW ? kNumOddShapes : kNumShapes;
+    if (oddW) {
+        printf("%dx%d: odd width, one-row shapes only (band() contract, BgAnim.h)\n", w, h);
+    }
+    std::vector<uint16_t> bufs(frameSz * nShapes);
     int failures = 0;
     anim.frame(0, w, h, p);
     for (int i = 0; i <= last; i++) {
@@ -134,14 +152,14 @@ int checkShapes(const BgAnimation &anim, const uint8_t p[4], const std::vector<i
         if (!wanted) {
             continue;
         }
-        for (int s = 0; s < kNumShapes; s++) {
-            renderShape(anim, kShapes[s], w, h, t, p, bufs.data() + frameSz * s);
+        for (int s = 0; s < nShapes; s++) {
+            renderShape(anim, shapes[s], w, h, t, p, bufs.data() + frameSz * s);
         }
         printf("%dx%d frame %03d:", w, h, i);
         bool ok = true;
-        for (int s = 1; s < kNumShapes; s++) {
-            const long bad = compareShape(bufs.data(), bufs.data() + frameSz * s, kShapes[s], w, h);
-            printf(" %s=%ld", kShapes[s].name, bad);
+        for (int s = 1; s < nShapes; s++) {
+            const long bad = compareShape(bufs.data(), bufs.data() + frameSz * s, shapes[s], w, h);
+            printf(" %s=%ld", shapes[s].name, bad);
             ok = ok && bad == 0;
         }
         printf("  %s\n", ok ? "OK" : "MISMATCH");

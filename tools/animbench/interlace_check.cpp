@@ -54,16 +54,21 @@ struct Shape {
 };
 
 // Renders one already-advanced frame in the given shape. Never calls frame().
+// Frame buffers keep an even row stride so every band() call gets a 4-byte
+// aligned destination, which the contract requires (BgAnim.h). Production's
+// half path does the same by handing each call its own aligned row buffer.
+int rowStride(int w) { return (w + 1) & ~1; }
+
 void renderShape(const BgAnimation &anim, const Shape &s, int W, int H, const uint8_t p[4], uint16_t *fb) {
     if (s.parity < 0) {
         const int bandH = (s.bandH > H) ? H : s.bandH;
         for (int y = 0; y < H; y += bandH) {
             const int rows = (y + bandH <= H) ? bandH : (H - y);
-            anim.band(fb + static_cast<size_t>(y) * W, y, rows, W, 0, p);
+            anim.band(fb + static_cast<size_t>(y) * rowStride(W), y, rows, W, 0, p);
         }
     } else {
         for (int y = s.parity; y < H; y += 2) {
-            anim.band(fb + static_cast<size_t>(y) * W, y, 1, W, 0, p);
+            anim.band(fb + static_cast<size_t>(y) * rowStride(W), y, 1, W, 0, p);
         }
     }
 }
@@ -75,7 +80,7 @@ long compare(const uint16_t *ref, const uint16_t *got, const Shape &s, int W, in
     long bad = 0;
     for (int y = first; y < H; y += step) {
         for (int x = 0; x < W; x++) {
-            const size_t i = static_cast<size_t>(y) * W + x;
+            const size_t i = static_cast<size_t>(y) * rowStride(W) + x;
             if (ref[i] != got[i]) {
                 bad++;
             }
@@ -96,12 +101,26 @@ int main(int argc, char **argv) {
     // repeats it as the band()-purity control. 4 and 16 also divide 16 (see the
     // note above on why every height must); 1 is the interlaced path's shape,
     // and the parity pair is that path exactly.
-    const Shape shapes[] = {
+    const Shape allShapes[] = {
         {"8-row", 8, -1},  {"8-row(ctl)", 8, -1}, {"16-row", 16, -1}, {"4-row", 4, -1},
         {"rows==1", 1, -1}, {"parity0", 1, 0},    {"parity1", 1, 1},
     };
-    const int nS = static_cast<int>(sizeof(shapes) / sizeof(shapes[0]));
-    const size_t frameSz = static_cast<size_t>(W) * H;
+    // band()'s alignment precondition (BgAnim.h): rows > 1 needs an even
+    // width, because row r of a multi-row destination begins r*w pixels in
+    // and the kernels store pixel pairs as 32-bit words. At an odd width
+    // (233, the 466 px panel at half resolution) only the one-row shapes are
+    // within the contract, and the first of them becomes the reference.
+    const Shape oddShapes[] = {
+        {"rows==1", 1, -1}, {"rows==1(ctl)", 1, -1}, {"parity0", 1, 0}, {"parity1", 1, 1},
+    };
+    const bool oddW = (W & 1) != 0;
+    const Shape *shapes = oddW ? oddShapes : allShapes;
+    const int nS = oddW ? static_cast<int>(sizeof(oddShapes) / sizeof(oddShapes[0]))
+                        : static_cast<int>(sizeof(allShapes) / sizeof(allShapes[0]));
+    if (oddW) {
+        printf("odd width %d: multi-row shapes are outside band()'s contract (BgAnim.h), one-row shapes only\n", W);
+    }
+    const size_t frameSz = static_cast<size_t>(rowStride(W)) * H;
 
     printf("%dx%d, %d timesteps, %d shapes (reference: %s)\n\n", W, H, nTimes, nS - 1, shapes[0].name);
     int failures = 0;
