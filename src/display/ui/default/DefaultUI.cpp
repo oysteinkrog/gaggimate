@@ -1,5 +1,6 @@
 #include "DefaultUI.h"
 #include <display/ui/default/GlyphAtlas.h>
+#include <display/ui/default/DrawProfile.h>
 #include <ctype.h>
 #include <math.h>
 
@@ -1960,6 +1961,7 @@ void DefaultUI::loop() {
     // After ui_tick so a screen eez_flow_set_screen created this pass exists
     // before the walk runs.
     applyPressedFeedback();
+    tuneGeneratedScreen();
     // Scale overlay before the animation maintenance: maintainSleepAnimation
     // snapshots the LVGL tree into the panel overlay, so the overlay's
     // show/hide state must be final by then, or the pass that enters the
@@ -3259,6 +3261,108 @@ static void applyPressedRecurse(lv_obj_t *obj, lv_color_t dim, bool clear = fals
     for (uint32_t i = 0; i < n; i++) {
         applyPressedRecurse(lv_obj_get_child(obj, i), dim, clear);
     }
+}
+
+// A child's pixels are clipped by a parent's clip_corner only where they lie
+// outside the corner arcs. This reports whether any child of `panel` has a
+// pixel there, with a one pixel margin for the arc's anti-aliased edge, so a
+// panel it returns false for draws the same pixels with the flag off.
+static bool anyChildReachesCorner(lv_obj_t *panel) {
+    lv_area_t pa;
+    lv_obj_get_coords(panel, &pa);
+    lv_coord_t r = lv_obj_get_style_radius(panel, LV_PART_MAIN);
+    const lv_coord_t half = LV_MIN(lv_area_get_width(&pa), lv_area_get_height(&pa)) / 2;
+    if (r > half) {
+        r = half;
+    }
+    if (r <= 1) {
+        return false;
+    }
+    const int32_t limit = static_cast<int32_t>(r - 1) * (r - 1);
+    const lv_coord_t cx[2] = {static_cast<lv_coord_t>(pa.x1 + r), static_cast<lv_coord_t>(pa.x2 - r)};
+    const lv_coord_t cy[2] = {static_cast<lv_coord_t>(pa.y1 + r), static_cast<lv_coord_t>(pa.y2 - r)};
+    const uint32_t n = lv_obj_get_child_cnt(panel);
+    for (uint32_t i = 0; i < n; i++) {
+        lv_obj_t *child = lv_obj_get_child(panel, i);
+        if (lv_obj_has_flag(child, LV_OBJ_FLAG_HIDDEN)) {
+            continue;
+        }
+        lv_area_t ca;
+        lv_obj_get_coords(child, &ca);
+        const lv_coord_t ext = _lv_obj_get_ext_draw_size(child);
+        lv_area_increase(&ca, ext, ext);
+        // Per corner: the child point nearest the panel corner, if it lies
+        // in that corner's r x r square, tested against the arc.
+        for (int k = 0; k < 4; k++) {
+            const bool left = (k & 1) == 0;
+            const bool top = k < 2;
+            const lv_coord_t px = left ? LV_MAX(ca.x1, pa.x1) : LV_MIN(ca.x2, pa.x2);
+            const lv_coord_t py = top ? LV_MAX(ca.y1, pa.y1) : LV_MIN(ca.y2, pa.y2);
+            const bool inSquareX = left ? (px < cx[0] && ca.x2 >= pa.x1) : (px > cx[1] && ca.x1 <= pa.x2);
+            const bool inSquareY = top ? (py < cy[0] && ca.y2 >= pa.y1) : (py > cy[1] && ca.y1 <= pa.y2);
+            if (!inSquareX || !inSquareY) {
+                continue;
+            }
+            const int32_t dx = px - (left ? cx[0] : cx[1]);
+            const int32_t dy = py - (top ? cy[0] : cy[1]);
+            if (dx * dx + dy * dy > limit) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+// Two costs the generated screens carry that their look does not need
+// (gm-2cl.19, measured on the new_profile page change). EEZ Studio writes
+// lv_img_set_zoom(obj, 255) for images it means to show unscaled; LVGL only
+// skips the software transform at exactly 256, so those images were
+// resampled per pixel on every draw. And clip_corner on a container puts a
+// radius mask on every child draw whether or not a child comes near a
+// corner; where none does, the mask changes nothing and is dropped. A panel
+// with scrollable content keeps it, since content can move under a corner
+// later. Only plain lv_obj containers are touched: an lv_img with clip_corner
+// is clipping its own bitmap. Both are debug knobs (zoomfix, clipcorner on
+// /api/debug/anim) so the A/B is one request; the walk re-runs when they
+// change. Setting a knob back does not restore a cleared flag on the screen
+// that is up; the flow engine rebuilds the screen from screens.c on its
+// next visit.
+static void tuneGeneratedRecurse(lv_obj_t *obj, int zoomFix, int clipMode) {
+    if (zoomFix && lv_obj_check_type(obj, &lv_img_class) && lv_img_get_zoom(obj) == LV_IMG_ZOOM_NONE - 1) {
+        lv_img_set_zoom(obj, LV_IMG_ZOOM_NONE);
+    }
+    if (clipMode != 1 && lv_obj_check_type(obj, &lv_obj_class) && lv_obj_get_style_clip_corner(obj, LV_PART_MAIN)) {
+        bool clear = clipMode == 0;
+        if (!clear) {
+            const bool scrolls = lv_obj_has_flag(obj, LV_OBJ_FLAG_SCROLLABLE) &&
+                                 (lv_obj_get_scroll_top(obj) > 0 || lv_obj_get_scroll_bottom(obj) > 0 ||
+                                  lv_obj_get_scroll_left(obj) > 0 || lv_obj_get_scroll_right(obj) > 0);
+            clear = !scrolls && !anyChildReachesCorner(obj);
+        }
+        if (clear) {
+            lv_obj_set_style_clip_corner(obj, false, LV_PART_MAIN | LV_STATE_DEFAULT);
+        }
+    }
+    const uint32_t n = lv_obj_get_child_cnt(obj);
+    for (uint32_t i = 0; i < n; i++) {
+        tuneGeneratedRecurse(lv_obj_get_child(obj, i), zoomFix, clipMode);
+    }
+}
+
+void DefaultUI::tuneGeneratedScreen() {
+    lv_obj_t *scr = lv_scr_act();
+    const int knobs = (g_zoomFixReq ? 1 : 0) | (g_clipCornerReq << 1);
+    if (scr == nullptr || (scr == tunedRoot && knobs == tunedKnobs)) {
+        return;
+    }
+    // The corner test reads final coordinates.
+    lv_obj_update_layout(scr);
+    tuneGeneratedRecurse(scr, g_zoomFixReq, g_clipCornerReq);
+    if (drawprof::g_req && scr != tunedRoot) {
+        drawprof::attach(scr);
+    }
+    tunedRoot = scr;
+    tunedKnobs = knobs;
 }
 
 void DefaultUI::applyPressedFeedback() {

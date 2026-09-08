@@ -1,0 +1,23 @@
+# Flash bus mode for the LilyGo T-RGB envs (gm-2cl.19, 2026-09-08).
+#
+# The board file (boards/LilyGo-T-RGB.json) has said qio at 80 MHz all along,
+# the flash is a Winbond W25Q128 with the quad eFuse set, and every build had
+# been shipping IDF's default of dio because nothing carried the board's
+# setting into the sdkconfig. A per-object LVGL draw profile of the
+# new_profile page put 4 to 6 ms on every small widget while the draw calls
+# themselves were 0.1 to 0.6 ms: the time is code and rodata fetched from
+# flash on cache misses, and the flash bus is what sets it. In QIO the same
+# widgets cost 2.1 ms and every page change drew 30 to 45 percent faster
+# (tools/snapshot_lat.py, bench board, divider 8).
+#
+# The bootloader has to carry this too: it enables the chip's QE bit and sets
+# the cache's SPI mode, while the image headers keep saying dio on purpose
+# (IDF downgrades the header so esptool never programs a chip in a mode it
+# cannot read). So a USB flash of bootloader.bin at 0x0 with the app is what
+# switches a board; an OTA update alone leaves it in dio. /api/debug/flashmode
+# reports the live mode.
+#
+# Chained after sdkconfig.gaggimate.defaults for the T-RGB envs only. The 8 MB
+# headless env runs on a Seeed XIAO ESP32-S3 whose flash was not measured, so
+# it keeps the inherited default.
+CONFIG_ESPTOOLPY_FLASHMODE_QIO=y
