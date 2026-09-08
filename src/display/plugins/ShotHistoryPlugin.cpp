@@ -2,6 +2,7 @@
 
 #include <LittleFS.h>
 #include <SD_MMC.h>
+#include <display/util/SafeReplace.h>
 #include <cmath>
 #include <display/core/Controller.h>
 #include <display/core/ProfileManager.h>
@@ -100,6 +101,9 @@ void ShotHistoryPlugin::setup(Controller *c, PluginManager *pm) {
     if (fs->exists("/h/recent.bin")) {
         fs->remove("/h/recent.bin");
     }
+    // A notes save interrupted between its .tmp and the rename leaves a .bak
+    // or a .tmp under /h; settle them before the history is read.
+    saferep::recoverReplace(*fs, "/h", ".json", "ShotHistoryPlugin");
     // record() samples into a 4 KB buffer and flushes it to the filesystem;
     // the index rebuild has its own, larger task. Measured idle high-water
     // mark was ~500 B used of 9 KB; 6 KB leaves the flush path ample room and
@@ -679,15 +683,9 @@ bool ShotHistoryPlugin::saveNotes(const String &id, const JsonDocument &notes) {
         fs->remove(tmpPath);
         return false;
     }
-    if (fs->exists(target)) {
-        fs->remove(target);
-    }
-    if (!fs->rename(tmpPath, target)) {
-        ESP_LOGE("ShotHistoryPlugin", "Could not move the new notes for shot %s into place", id.c_str());
-        fs->remove(tmpPath);
-        return false;
-    }
-    return true;
+    // Old notes are kept as .json.bak until the new file is in place, and
+    // rolled back if it is not (SafeReplace.h).
+    return saferep::commitReplace(*fs, tmpPath, target, "ShotHistoryPlugin");
 }
 
 void ShotHistoryPlugin::loadNotes(const String &id, JsonDocument &notes) {
