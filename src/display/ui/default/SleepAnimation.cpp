@@ -853,6 +853,8 @@ static uint32_t pieSelfTest(uint32_t *firstBad) {
 
 #endif // GM_ANIM_BENCH
 
+} // namespace
+
 #ifdef GM_BLEND_PROBE
 // Probe builds: the blend walk with its work removed, so the pixel loop can be
 // split into what it computes and what it waits on.
@@ -875,8 +877,6 @@ __attribute__((noinline)) static uint32_t blendRowProbe(uint16_t *__restrict dst
     }
     return acc;
 }
-
-} // namespace
 
 static_assert(SleepAnimation::kProbeRuns == RUNS_PER_ROW, "probe run capture mirrors the overlay's run table");
 
