@@ -19,15 +19,20 @@
 // The generated UI event handlers reference this global (see main.h on device).
 Controller controller;
 
-// Temporary verification harness (not part of the shipped sim story): drives a
-// scripted tap+screenshot sequence for UI-transition testing, since the sim has
-// no other way to inject input non-interactively. One instruction per line in
-// the file passed to --script:
+// Verification harness: drives a scripted tap+screenshot sequence for
+// UI-transition testing, since the sim has no other way to inject input
+// non-interactively. One instruction per line in the file passed to --script
+// (blank lines and lines starting with # are skipped):
 //   WAIT <ms>            sleep, simulated time
 //   TAP <x> <y>          press for 150ms at (x,y), release, same as a real click
 //   SHOT <path.bmp>       write the current frame
 // Lines are executed one at a time, gated on simulated millis(), from the main
-// loop below (see ScriptRunner::pump()).
+// loop below (see ScriptRunner::pump()). Completion: once the last step has
+// run (a TAP counts as run after its release), the loop renders one more
+// frame and the program exits 0. A file that cannot be opened, or a line
+// that is not one of the three forms with its arguments, is reported on
+// stderr with its line number and the program exits 2 before the UI starts
+// (gm-bzu.13).
 struct ScriptStep {
     enum Kind { Wait, Tap, Shot } kind;
     int x = 0, y = 0;
@@ -39,30 +44,48 @@ class ScriptRunner {
   public:
     explicit ScriptRunner(const std::string &path) {
         std::ifstream f(path);
+        if (!f) {
+            fprintf(stderr, "[script] cannot open %s\n", path.c_str());
+            ok_ = false;
+            return;
+        }
         std::string line;
+        int lineNo = 0;
         while (std::getline(f, line)) {
+            lineNo++;
             if (line.empty() || line[0] == '#')
                 continue;
             std::istringstream iss(line);
             std::string op;
             iss >> op;
+            if (op.empty())
+                continue; // whitespace only
             ScriptStep step{};
+            bool parsed = false;
             if (op == "WAIT") {
                 step.kind = ScriptStep::Wait;
-                iss >> step.ms;
+                parsed = static_cast<bool>(iss >> step.ms);
             } else if (op == "TAP") {
                 step.kind = ScriptStep::Tap;
-                iss >> step.x >> step.y;
+                parsed = static_cast<bool>(iss >> step.x >> step.y);
             } else if (op == "SHOT") {
                 step.kind = ScriptStep::Shot;
-                iss >> step.path;
-            } else {
-                continue;
+                parsed = static_cast<bool>(iss >> step.path);
+            }
+            if (!parsed) {
+                fprintf(stderr, "[script] %s:%d: malformed line: %s\n", path.c_str(), lineNo, line.c_str());
+                ok_ = false;
+                return;
             }
             steps_.push_back(step);
         }
+        if (steps_.empty()) {
+            fprintf(stderr, "[script] %s: no steps\n", path.c_str());
+            ok_ = false;
+        }
     }
 
+    bool ok() const { return ok_; }
     bool done() const { return idx_ >= steps_.size(); }
 
     // Called every main-loop iteration. Advances through steps as their gating
@@ -109,6 +132,7 @@ class ScriptRunner {
     size_t idx_ = 0;
     unsigned long waitingUntil_ = 0;
     bool tapPressed_ = false;
+    bool ok_ = true;
 };
 
 int main(int argc, char **argv) {
@@ -126,6 +150,9 @@ int main(int argc, char **argv) {
         }
     }
     ScriptRunner *script = scriptPath ? new ScriptRunner(scriptPath) : nullptr;
+    if (script != nullptr && !script->ok()) {
+        return 2;
+    }
 
     controller.setup(); // builds the UI, installs the SDL driver, marks screen ready
 
@@ -176,6 +203,17 @@ int main(int argc, char **argv) {
         }
 
         drv->pumpAndRender();
+
+        if (script != nullptr) {
+            // After the render, so a SHOT sees the frame the previous steps
+            // produced and a TAP's press lands before the next UI pass.
+            script->pump(drv);
+            if (script->done()) {
+                drv->pumpAndRender(); // deliver the last release to LVGL
+                printf("[script] done @t=%lu\n", millis());
+                break;
+            }
+        }
 
         if (shotPath && !shotTaken && millis() - start >= shotDelayMs) {
             drv->screenshot(shotPath);
