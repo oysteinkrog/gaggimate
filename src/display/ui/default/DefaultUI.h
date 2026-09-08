@@ -612,6 +612,38 @@ class DefaultUI {
     bool takeIconLayer(IconLayer &l, lv_obj_t *img);
     int snapshotIconSprite(IconLayer &l);
     static void iconDeleted(lv_event_t *e);
+
+    // Scrolling labels as looping layers (gm-2cl.18). A
+    // LV_LABEL_LONG_SCROLL_CIRCULAR label whose text overflows its box runs
+    // an lv_anim that invalidates the box on every LVGL tick: the info
+    // screen refreshed 3.75 times a second for its one marquee, and the text
+    // stepped at that rate. The label's text is rendered twice (text, gap,
+    // text) into a layer sprite, the label gets USER_2 (draws no text) and
+    // USER_3 (no invalidations), and the render task loops the sprite across
+    // the box at LVGL's speed with an x clip on the layer, starting at the
+    // label's current offset. Released on text or box change, screen
+    // change, animation stop, delete, or marquees=0.
+    static constexpr int kMarquees = 2;
+    static constexpr int kMarqueeCandCap = 8;
+    static constexpr uint32_t kMarqueeMaxBytes = 256 * 1024;
+    struct Marquee {
+        lv_obj_t *label = nullptr;
+        int layer = -1;
+        uint32_t hash = 0;
+        lv_area_t coords = {};
+        int period = 0;
+    };
+    Marquee marquees[kMarquees];
+    lv_obj_t *marqueeCands[kMarqueeCandCap];
+    int marqueeCandN = 0;
+    lv_obj_t *marqueeScreen = nullptr;
+    void serviceMarquees(bool canOwn);
+    void releaseMarquees();
+    void releaseMarquee(Marquee &m);
+    void scanMarquees(lv_obj_t *obj);
+    // 0: taken, 1: not a marquee right now (text fits), -1: refused.
+    int takeMarquee(Marquee &m, lv_obj_t *label);
+    static void marqueeDeleted(lv_event_t *e);
     void positionMenuIcon(lv_obj_t *obj, int angle, int radius);
 
     void updateState();

@@ -2571,6 +2571,9 @@ int SleepAnimation::layerAcquire(int w, int h) {
         L.t0Us = 0;
         L.durUs = 0;
         L.ease = 0;
+        L.loop = 0;
+        L.clipX0 = 0;
+        L.clipX1 = 0x7fffffff;
         L.seq.fetch_add(1);
         L.visible.store(false);
         L.used.store(true);
@@ -2647,6 +2650,7 @@ void SleepAnimation::readLayerMotion(const Layer &L, LayerMotion &m) {
         m.t0Us = L.t0Us;
         m.durUs = L.durUs;
         m.ease = L.ease;
+        m.loop = L.loop;
         if (L.seq.load() == s1) {
             return;
         }
@@ -2713,6 +2717,15 @@ uint32_t SleepAnimation::overlayGainAt(int64_t nowUs, int ofi) {
 }
 
 bool SleepAnimation::layerPosAt(const LayerMotion &m, int64_t nowUs, int &x, int &y) {
+    if (m.durUs != 0 && m.loop != 0) {
+        // A loop never lands: the clock wraps at the cycle.
+        int64_t el = nowUs < m.t0Us ? 0 : nowUs - m.t0Us;
+        el %= static_cast<int64_t>(m.durUs);
+        const uint32_t t = static_cast<uint32_t>((el << 16) / m.durUs);
+        x = m.x0 + static_cast<int>((static_cast<int64_t>(m.x1 - m.x0) * t) >> 16);
+        y = m.y0 + static_cast<int>((static_cast<int64_t>(m.y1 - m.y0) * t) >> 16);
+        return true;
+    }
     if (m.durUs == 0 || nowUs >= m.t0Us + static_cast<int64_t>(m.durUs)) {
         x = m.x1;
         y = m.y1;
@@ -2761,7 +2774,36 @@ void SleepAnimation::layerAnimate(int id, int x1, int y1, uint32_t durMs, LayerE
     L.t0Us = now;
     L.durUs = durMs * 1000u;
     L.ease = static_cast<uint8_t>(ease);
+    L.loop = 0;
     L.seq.fetch_add(1);
+}
+
+void SleepAnimation::layerLoop(int id, int x0, int y, int x1, uint32_t durMs, uint32_t phaseUs) {
+    if (id < 0 || id >= MAX_LAYERS || !layers[id].used.load() || durMs == 0) {
+        return;
+    }
+    Layer &L = layers[id];
+    const int64_t now = esp_timer_get_time();
+    if (L.shownAtUs.load() != 0) {
+        L.shownAtUs.store(now);
+    }
+    L.seq.fetch_add(1);
+    L.x0 = x0;
+    L.y0 = y;
+    L.x1 = x1;
+    L.y1 = y;
+    L.t0Us = now - static_cast<int64_t>(phaseUs);
+    L.durUs = durMs * 1000u;
+    L.ease = static_cast<uint8_t>(LayerEase::Linear);
+    L.loop = 1;
+    L.seq.fetch_add(1);
+}
+
+void SleepAnimation::layerSetClipX(int id, int x0, int x1) {
+    if (id >= 0 && id < MAX_LAYERS) {
+        layers[id].clipX0 = x0;
+        layers[id].clipX1 = x1;
+    }
 }
 
 bool SleepAnimation::layerAnimating(int id) const {
@@ -2914,6 +2956,13 @@ void SleepAnimation::compositeLayersRow(uint16_t *drow, int y, int w, bool pieBl
             }
             if (x1 > w) {
                 x1 = w;
+            }
+            // The layer's own clip (a marquee shows only its label's box).
+            if (x0 < L.clipX0) {
+                x0 = L.clipX0;
+            }
+            if (x1 > L.clipX1) {
+                x1 = L.clipX1;
             }
             if (x1 > x0) {
                 shifted[m++] = static_cast<uint32_t>(x0) | (static_cast<uint32_t>(x1) << 16);

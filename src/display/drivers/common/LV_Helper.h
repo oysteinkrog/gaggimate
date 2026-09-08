@@ -187,6 +187,9 @@ extern volatile int g_textElementsReq;
 // icons=0|1 on /api/debug/anim: blinking images as layers
 // (DefaultUI::serviceIconLayers, gm-2cl.17).
 extern volatile int g_iconLayersReq;
+// marquees=0|1 on /api/debug/anim: circular-scroll labels as looping
+// layers (DefaultUI::serviceMarquees, gm-2cl.18).
+extern volatile int g_marqueeLayersReq;
 // 1 (default): a whole-page snapshot clears alpha by the back buffer's run
 // table; 0: by a plane memset. /api/debug/anim?clrruns= is the A/B.
 extern volatile int g_clearByRunsReq;
@@ -214,6 +217,14 @@ struct IconLayerDbg {
     volatile uint32_t toggles = 0;
 };
 extern IconLayerDbg g_iconLayerDbg[2];
+// marquee_layers on /api/debug/anim: the scrolling labels owned by layers.
+struct MarqueeDbg {
+    volatile bool owned = false;
+    volatile int16_t x = 0, y = 0, w = 0, h = 0;
+    volatile int16_t period = 0;
+    volatile uint32_t ms = 0;
+};
+extern MarqueeDbg g_marqueeDbg[2];
 // The last DIRTYLOG_N dirty rectangles the overlay refresh harvested from
 // LVGL (dirty_recent on /api/debug/anim): what is still invalidating on a
 // screen once the elements own the live widgets. Ring, newest at

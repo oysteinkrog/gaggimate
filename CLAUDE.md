@@ -276,15 +276,45 @@ telemetry-driven screen from a 650 ms LVGL pass (1.5 Hz widget updates,
   handover in is the same as `moveObjectViaLayer`'s: the image is
   invalidated before the flag is set, so the sprite is gated on the
   publish that no longer holds it. `MAX_LAYERS` is 5 (one move, two icons
-  of two sprites). Bench board, brew screen, synthetic brew on, 20 s
-  windows: refreshes 2.03 a second to 0.00, grind 1.88 to 0.25 (the
+  of two sprites, two marquees). Bench board, synthetic brew on, 20 s
+  windows: brew 2.03 refreshes a second to 0.00, steam 1.88 to 0.25 (the
   takeover pass), and the icon still alternates between the same two
-  colours as on the LVGL path (framebuffer samples through
-  `/api/debug/fb`, bright third of the icon's box). `icons=0` on
+  colours as on the LVGL path (`tools/icon_layer_check.py`: framebuffer
+  samples through `/api/debug/fb`, bright third of the icon's box). `icons=0` on
   `/api/debug/anim` puts the icons back on LVGL and `icon_layers` lists
-  what is owned, with the mirrored toggle count. Internal free sat about
-  1.3 KB lower at rest (28.2 KB against 29.5 KB) with the two extra layer
-  records and the 24-entry candidate table.
+  what is owned, with the mirrored toggle count. Internal free at rest
+  moved within noise (28.2 to 29.9 KB across boots). A sweep of every
+  screen after this (`tools/churn_sweep.py`, 15 s windows) found standby, brew, status, menu, steam,
+  water, profile, grind and new_profile at 0.00 refreshes a second at
+  rest, and only the info screen still refreshing, at 3.75.
+- **A scrolling label is a looping, clipped layer sprite** (gm-2cl.18,
+  2026-09-08, `DefaultUI::serviceMarquees`). Four labels in `screens.c`
+  are `LV_LABEL_LONG_SCROLL_CIRCULAR` (the info screen's obj27 and obj29,
+  `profile_name` on brew, `profile_name_1`), and when the text overflows,
+  LVGL's scroll animation invalidates the box on every tick: the info
+  screen refreshed 3.75 times a second for its 250x21 label and the text
+  stepped at that rate. A circular-scroll label whose text overflows its
+  content box is rendered twice into a layer sprite (text, a gap of three
+  spaces, text; the same `lv_draw_label` descriptor the label draws with,
+  left aligned as lv_label forces for overflowing text) and gets both
+  owner flags: USER_2 so the patched lv_label draws no text, USER_3 so
+  none of its invalidations reach the display, and the LVGL animation
+  runs on underneath at no cost. The layer loops from the box's left edge
+  to one period left of it (`SleepAnimation::layerLoop`, a motion whose
+  clock wraps) over the time LVGL would take (`anim_speed` style, else
+  DPI/3 = 43 px/s, so 9,069 ms for a 390 px period), starting at the
+  label's current `offset.x` so the takeover does not jump, and is drawn
+  only inside the box (`layerSetClipX`). Released on text or box change,
+  hidden, screen change, animation stop, delete, or `marquees=0`;
+  `marquee_layers` on `/api/debug/anim` lists box, period and cycle time.
+  Bench board, info screen (`tools/marquee_check.py`): 3.73 refreshes a
+  second to 0.00; the box's
+  column profile moves 44 to 50 px/s in both modes and 7 of 10 layer-mode
+  framebuffer samples match an LVGL-mode sample to within a mean of 1.3
+  to 4.9 per column against 0.4 to 2.8 for LVGL against itself (the other
+  three had no LVGL sample of a near phase in the set). The text element
+  scan never takes a circular-scroll label (`textLabelEligible`), so the
+  two owners do not meet. `MAX_LAYERS` is 7.
 
 - **The render loop lives in IRAM** (`renderLoop`, `renderFrame`,
   `presentFrame`, `pushLoop` and the scrim rows, `SleepAnimation.cpp`). The
@@ -586,10 +616,10 @@ Instruments, and where each one exists:
   `GM_SYNTH_HANDSHAKE`, which only `display-loadtest` and `display-blestress`
   set.
 - `/api/debug/anim` (frame counters, `anim_id`, `uptime_ms`, `text_elems`,
-  `dirty_recent`, `icon_layers`, the `ov_whole_*` page-change split,
-  `touch_task`, `touch_samples`, `touch_hwm`, `hitmap_n`, `hitmap_gen`, the
-  `texts=`, `textease=`, `dials=`, `icons=`, `clrruns=` and `touchpoll=`
-  knobs) and
+  `dirty_recent`, `icon_layers`, `marquee_layers`, the `ov_whole_*`
+  page-change split, `touch_task`, `touch_samples`, `touch_hwm`, `hitmap_n`,
+  `hitmap_gen`, the `texts=`, `textease=`, `dials=`, `icons=`, `marquees=`,
+  `clrruns=` and `touchpoll=` knobs) and
   `/api/debug/pclk` (the live pixel-clock divider) are device-only: both sit
   inside `WebUIPlugin.cpp`'s real-panel block, which `GAGGIMATE_SIM` and
   `GAGGIMATE_HEADLESS` exclude.
