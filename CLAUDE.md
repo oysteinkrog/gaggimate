@@ -86,7 +86,15 @@ summary; the KB carries the sources and the measurements behind it.
   `/api/debug/scanout`), so it is not where a UI pass goes either. What
   is left per widget is still code volume against a 16 KB instruction
   cache; the 32 KB cache option costs 16 KB of the DRAM the web UI needs
-  and was not tried.
+  and was not tried. **Fetching instructions from PSRAM
+  (`CONFIG_SPIRAM_FETCH_INSTRUCTIONS`) was tried on the bench and not
+  shipped** (2026-09-08, same board and method, on top of QIO): the widget
+  went to 1.3 ms and the page-change draws to standby 36.5, brew 27.7,
+  steam 23.2, water 22.6, status 27.3, grind 28.0, profile 56.6,
+  new_profile 121.1, info 68.8 ms, but `.flash.text` is 3.0 MB, so PSRAM
+  free fell from 4.55 MB to 1.55 MB with the animation resident. Whether
+  3 MB of the 8 MB PSRAM buys that is the owner's call (gm-2cl.20);
+  rodata (2.1 MB) does not fit on top.
 - **A directory on the SD card is listed with `opendir`/`readdir`, never
   with `File::openNextFile()` on the boot path** (`saferep::recoverReplace`,
   2026-09-08). `openNextFile()` opens every entry it returns, and on FAT
