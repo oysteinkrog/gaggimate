@@ -1622,9 +1622,13 @@ void SleepAnimation::start(Display *d) {
     pushStopped = false;
     if (createAnimTask(pushTaskEntry, "SleepPush", 4096, this, 2, &push) != pdPASS) {
         log_e("SleepAnimation: push task creation failed");
+        // The render task is already running and may be inside a frame. Bring
+        // it down the way stop() would, instead of declaring it stopped while
+        // it still writes the framebuffers (gm-bzu.16); the caller reads
+        // stopConfirmed() before handing them back to LVGL.
         pushStopped = true;
         running = false;
-        stopped = true;
+        finishStop();
         return;
     }
     pushHandle = push;
@@ -1650,11 +1654,15 @@ int SleepAnimation::renderPrioValue() const {
     return h != nullptr ? static_cast<int>(uxTaskPriorityGet(h)) : -1;
 }
 
-void SleepAnimation::stop() {
+bool SleepAnimation::stop() {
     if (!running) {
-        return;
+        return stopConfirmed();
     }
     running = false;
+    return finishStop();
+}
+
+bool SleepAnimation::finishStop() {
     const unsigned long deadline = millis() + 500;
     while (!stopped && millis() < deadline) {
         vTaskDelay(pdMS_TO_TICKS(5));
@@ -1670,10 +1678,20 @@ void SleepAnimation::stop() {
     while (!pushStopped && millis() < pushDeadline) {
         vTaskDelay(pdMS_TO_TICKS(5));
     }
-    endDirectPath();
+    const bool drained = endDirectPath();
     // Whichever task has reported done is freed now; one that missed its
     // deadline is still running and gets reaped by the next start().
     reapTasks();
+    const bool confirmed = stopped && pushStopped && drained;
+    if (!confirmed) {
+        log_w("SleepAnimation: stop unconfirmed (render=%d push=%d dma=%d)", stopped ? 1 : 0, pushStopped ? 1 : 0,
+              drained ? 1 : 0);
+    }
+    return confirmed;
+}
+
+bool SleepAnimation::stopConfirmed() const {
+    return !running && stopped && pushStopped && !dmaActive && dmaIssued.load() == g_sleepAnimDmaDone;
 }
 
 // Bring the direct push up. Called only from the render task: the completion
@@ -1740,9 +1758,9 @@ bool SleepAnimation::beginDirectPath() {
 
 // Take the direct push back down, leaving the pipeline on the ordinary push
 // task. Safe to call when it was never up.
-void SleepAnimation::endDirectPath() {
+bool SleepAnimation::endDirectPath() {
     if (!dmaActive) {
-        return;
+        return true;
     }
     // A transfer may still be reading a band buffer, and those buffers are
     // handed straight back to the render task.
@@ -1750,6 +1768,7 @@ void SleepAnimation::endDirectPath() {
     while (dmaIssued.load() != g_sleepAnimDmaDone && millis() < drain) {
         vTaskDelay(pdMS_TO_TICKS(2));
     }
+    const bool drained = dmaIssued.load() == g_sleepAnimDmaDone;
     dmaActive = false;
     if (display != nullptr) {
         for (int i = 0; i < fbCount; i++) {
@@ -1775,6 +1794,7 @@ void SleepAnimation::endDirectPath() {
         g_sleepAnimFbGate = nullptr;
     }
     frameGateHeld = false;
+    return drained;
 }
 
 // Horizontal extent of the inscribed circle for each band. The panel is round:

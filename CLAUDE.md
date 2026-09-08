@@ -205,6 +205,17 @@ telemetry-driven screen from a 650 ms LVGL pass (1.5 Hz widget updates,
   `lv_flip_presents`, `lv_flip_free`, `lv_flip_waits`,
   `lv_flip_wait_us_max` and `lv_flip_timeouts` on `/api/debug/anim`; a
   non-zero timeout count means the panel stopped refilling.
+- **The framebuffers go back to LVGL only when the animation's stop is
+  confirmed** (gm-bzu.16, 2026-09-08). `SleepAnimation::stop()` returns
+  true when both workers have parked and every band transfer has retired;
+  `stopConfirmed()` re-checks the same. On false, `DefaultUI` sets
+  `animStopPending`: LVGL stays on its scratch buffer (touch and widgets
+  keep working, unseen), neither start nor stop runs, and the loop
+  finishes the handoff once confirmed or after a 3 s cap with an error
+  log. A push-task creation failure in `start()` brings the render task
+  down through the same `finishStop()` instead of declaring it stopped.
+  Ten animoff/on cycles on the bench board all confirmed at once; the
+  quarantine path has no device reproduction and is verified by reading.
 - **Touch is read by its own task, and the press plate is written from
   it** (gm-2cl.4, 2026-09-08, `TouchTask.cpp`). `touchtask` polls the
   controller every 5 ms from a core 1 task at priority 2 with a 4 KB

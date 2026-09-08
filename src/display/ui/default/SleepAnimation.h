@@ -23,7 +23,8 @@ struct BgAnimation;
 class SleepAnimation {
   public:
     void start(Display *) {}
-    void stop() {}
+    bool stop() { return true; }
+    bool stopConfirmed() const { return true; }
     bool isActive() const { return false; }
     void configure(uint8_t, const uint8_t *) {}
     void setMaxFps(uint8_t) {}
@@ -131,8 +132,15 @@ class SleepAnimation {
 
     // Starts the render task. No-op if already running or display is null.
     void start(Display *display);
-    // Signals the task to exit and blocks briefly until it has stopped.
-    void stop();
+    // Signals the workers to exit and blocks briefly (500 ms each, 200 ms
+    // for the DMA drain) until they have. Returns true when both workers
+    // have parked and every band transfer has retired, which is what makes
+    // the framebuffers safe to hand back to LVGL. False means a worker or a
+    // transfer outlived the deadlines: the caller must keep LVGL off the
+    // framebuffers and poll stopConfirmed() (gm-bzu.16).
+    bool stop();
+    // True once no worker is running and no band transfer is outstanding.
+    bool stopConfirmed() const;
     bool isActive() const { return running; }
 
     // Selects which registry animation renders and its 4 params (0-100 each).
@@ -1377,7 +1385,13 @@ class SleepAnimation {
     bool beginDirectPath();
     void verifyBandPlacement();
     void presentFrame();
-    void endDirectPath();
+    // Returns false when the DMA drain timed out (a transfer may still be
+    // reading a band buffer or writing the framebuffer).
+    bool endDirectPath();
+    // The body of stop() after running has been cleared; start() uses it
+    // too when the push task could not be created and the render task,
+    // already running, has to be brought down again.
+    bool finishStop();
     std::atomic<uint32_t> dmaIssued{0};
     std::atomic<uint32_t> dmaErrors{0};
     // submitRows() failures, counted separately from dmaErrors above (which
