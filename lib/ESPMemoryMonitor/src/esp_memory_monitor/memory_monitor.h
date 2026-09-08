@@ -13,6 +13,7 @@
 #endif
 
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <deque>
 #include <functional>
@@ -276,6 +277,12 @@ class ESPMemoryMonitor {
     void onSample(SampleCallback callback);
     void onThreshold(ThresholdCallback callback);
     void onFailedAlloc(FailedAllocCallback callback);
+    // Failed allocations recorded by the heap hook since init(), and how many
+    // of them the delivery ring dropped because the sampler had not drained it.
+    // The callback runs on the sampler task, at most sampleIntervalMs after
+    // the failure, never inside the failing allocation.
+    uint32_t failedAllocCount() const { return _allocFailCount.load(std::memory_order_relaxed); }
+    uint32_t failedAllocDropped() const { return _allocDropped.load(std::memory_order_relaxed); }
     void onScope(ScopeCallback callback);
     void onTagThreshold(TagThresholdCallback callback);
     void onTaskStackThreshold(TaskStackThresholdCallback callback);
@@ -403,6 +410,7 @@ class ESPMemoryMonitor {
     MemoryMonitorVector<ThresholdEvent> evaluateThresholdsLocked(const InternalMemorySnapshot &snapshot);
     ThresholdState evaluateState(ThresholdState current, const RegionThreshold &threshold, size_t freeBytes) const;
     void handleAllocEvent(size_t requestedBytes, uint32_t caps, const char *functionName);
+    void drainAllocEvents(const FailedAllocCallback &cb);
 
     void enrichSnapshotLocked(InternalMemorySnapshot &snapshot) const;
     void appendScopeLocked(const InternalScopeStats &stats);
@@ -432,6 +440,20 @@ class ESPMemoryMonitor {
     SampleCallback _sampleCallback;
     ThresholdCallback _thresholdCallback;
     FailedAllocCallback _allocCallback;
+    // Failed-allocation events are recorded here by the heap hook and delivered
+    // by the sampler. The hook runs synchronously inside the failing
+    // heap_caps_malloc, on whatever task made the call, so it must not take
+    // _mutex (the sampler holds it while it grows its own containers, and an
+    // allocation failing there would deadlock the task against itself) and
+    // must not allocate. Multi-producer: a slot is claimed with a CAS on the
+    // head, filled, then published through its sequence word.
+    static constexpr uint32_t kAllocRingSize = 8;
+    FailedAllocEvent _allocRing[kAllocRingSize]{};
+    std::atomic<uint32_t> _allocRingSeq[kAllocRingSize]{};
+    std::atomic<uint32_t> _allocHead{0};
+    std::atomic<uint32_t> _allocTail{0};
+    std::atomic<uint32_t> _allocFailCount{0};
+    std::atomic<uint32_t> _allocDropped{0};
     ScopeCallback _scopeCallback;
     TagThresholdCallback _tagThresholdCallback;
     TaskStackThresholdCallback _taskStackCallback;

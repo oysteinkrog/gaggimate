@@ -588,12 +588,12 @@ void LilyGo_RGBPanel::writeData(const uint8_t *data, int len) {
     }
 }
 
-void LilyGo_RGBPanel::pushColors(uint16_t x, uint16_t y, uint16_t width, uint16_t hight, uint16_t *data) {
+void LilyGo_RGBPanel::pushColors(uint16_t x, uint16_t y, uint16_t xEnd, uint16_t yEnd, uint16_t *data) {
     if (_panelDrv == nullptr) { // panel stopped for display OTA
         return;
     }
     lockFrameBuffer();
-    if (_directWriter && _fbDirect[_fbCurrent] != nullptr && hight > y) {
+    if (_directWriter && _fbDirect[_fbCurrent] != nullptr && yEnd > y) {
         // Drop this framebuffer region from the data cache before letting
         // esp_lcd copy into it.
         //
@@ -619,9 +619,9 @@ void LilyGo_RGBPanel::pushColors(uint16_t x, uint16_t y, uint16_t width, uint16_
         // line, a multiple of the 32-byte cache line.
         const uint32_t stride = static_cast<uint32_t>(this->width()) * 2;
         esp_cache_msync(reinterpret_cast<uint8_t *>(_fbDirect[_fbCurrent]) + static_cast<size_t>(y) * stride,
-                        static_cast<size_t>(hight - y) * stride, ESP_CACHE_MSYNC_FLAG_DIR_M2C);
+                        static_cast<size_t>(yEnd - y) * stride, ESP_CACHE_MSYNC_FLAG_DIR_M2C);
     }
-    esp_lcd_panel_draw_bitmap(_panelDrv, x, y, width, hight, data);
+    esp_lcd_panel_draw_bitmap(_panelDrv, x, y, xEnd, yEnd, data); // exclusive ends, as the contract says
     unlockFrameBuffer();
 }
 

@@ -929,11 +929,11 @@ void WavesharePanel::writeData(uint8_t data) {
     spi_device_transmit(SPI_handle, &spi_tran);
 }
 
-void WavesharePanel::pushColors(uint16_t x, uint16_t y, uint16_t width, uint16_t hight, uint16_t *data) {
+void WavesharePanel::pushColors(uint16_t x, uint16_t y, uint16_t xEnd, uint16_t yEnd, uint16_t *data) {
     if (_panelDrv == nullptr) { // panel stopped for display OTA
         return;
     }
-    esp_lcd_panel_draw_bitmap(_panelDrv, x, y, width, hight, data);
+    esp_lcd_panel_draw_bitmap(_panelDrv, x, y, xEnd, yEnd, data); // exclusive ends, as the contract says
 }
 
 void WavesharePanel::stopPanel() {

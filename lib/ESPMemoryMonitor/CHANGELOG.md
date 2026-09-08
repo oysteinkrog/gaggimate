@@ -11,6 +11,7 @@ All notable changes to this project will be documented in this file.
 - Switched sampler task lifecycle to native FreeRTOS task handling (`xTaskCreatePinnedToCore`/`vTaskDelete`).
 - Added lifecycle teardown tests in `test/test_memory_monitor_lifecycle` covering pre-init `deinit()`, idempotent teardown, re-init, and destructor behavior.
 ### Fixed
+- The failed-allocation hook no longer takes the monitor mutex or calls the user callback inside the failing allocation. It records the event in a fixed lock-free ring (8 slots, overflow counted by `failedAllocDropped()`) and the sampler delivers it on its next pass, at most one sample interval later. Before, an allocation failing on the sampler task while `sampleNow()` held the mutex deadlocked that task against itself. `failedAllocCount()` reports the total.
 - Mark the failed-allocation hook instance pointer as static so Arduino builds compile the callback correctly.
 - `deinit()` now releases monitor-owned container capacity (not just entries), fully clears runtime state, and resets config/runtime flags for deterministic re-init.
 
