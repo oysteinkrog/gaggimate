@@ -398,18 +398,19 @@ class Settings {
     // 1 = render at half resolution and double on the way out. Defaults on:
     // it is the only way every animation clears 40 fps on this panel.
     Property<int> bgAnimHalfRes{registry, "bg_half", 1};
-    // 1 = push every other row pair, alternating each frame. Defaults off:
-    // this flag now also gates the direct-DMA path's beam-racing writes (see
-    // SleepAnimation.h's interlace/renderHalf comments), which is untested
-    // territory to ship silently on. The old CPU-push path's own veto against
-    // it is gone, so a stale 1 here is no longer harmless the way it used to
-    // be. NOTE: this is only the fallback for a key that has never been
-    // written to NVS -- a device that already has bg_ilace=1 persisted (from
-    // before this default changed, or from any earlier explicit settings
-    // write) keeps reading 1 back until it is explicitly set to 0 or the NVS
-    // partition is erased; changing this line does not reach back into
-    // storage that already exists.
-    Property<int> bgAnimInterlace{registry, "bg_ilace", 0};
+    // 1 = push every other row pair, alternating each frame. Defaults on
+    // (gm-2cl.9, 2026-09-08): the interlaced loop is what the whole
+    // smooth-motion work was measured on. At cap 60 nine animations reach
+    // 41 to 52 fps interlaced with zero scan-out slips, and the whole-frame
+    // path cannot exceed 25.3 fps because a frame over one panel period
+    // takes two (CLAUDE.md, "Three refresh rates"). The earlier caution
+    // about the direct-DMA path's beam-racing writes is answered by those
+    // runs. NOTE: this is only the fallback for a key that has never been
+    // written to NVS. A device with bg_ilace persisted (the bench board
+    // stores 0) keeps reading its stored value back until it is set again
+    // or the NVS partition is erased; changing this line does not reach
+    // into storage that already exists.
+    Property<int> bgAnimInterlace{registry, "bg_ilace", 1};
     // What to do with the opaque background plates on the screens that carry
     // one (brew, status, profile, info, and the pill holding the scale weight)
     // while the animation is running: 0 = leave them as the theme drew them,

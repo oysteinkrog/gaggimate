@@ -192,7 +192,10 @@ telemetry-driven screen from a 650 ms LVGL pass (1.5 Hz widget updates,
   fixtures say, so a measurement that assumes the interlaced path must pin
   it (`interlace=1` on the debug endpoint, not stored) and say so. Every
   dial-element number above was taken on the whole-frame path (frame 52 to
-  78 ms). gm-2cl.9 (the default) is still open.
+  78 ms). The build default is 1 since gm-2cl.9 (2026-09-08, `Settings.h`
+  `bg_ilace`, and the web form already fell back to 1); a stored 0 still
+  wins on a device that has one, which is why the bench board needs the
+  pin.
 - **Rendering straight into the bounce ring without a framebuffer does not
   work on this bus** (gm-2cl.13, killed 2026-09-07). Two rounds, Starfield,
   standby screen, divider 8 (110 us per 2-row band): 36 to 45% of the 9,200
