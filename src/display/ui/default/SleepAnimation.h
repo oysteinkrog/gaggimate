@@ -31,6 +31,7 @@ class SleepAnimation {
     void setInterlace(bool) {}
     void setScrim(int) {}
     uint8_t *overlayBackBuffer() { return nullptr; }
+    bool clearBackAlphaByRuns(int, int) { return false; }
     const uint8_t *overlayFrontBuffer() const { return nullptr; }
     bool overlayFrontSize(int &, int &) const { return false; }
     uint32_t overlayCapacity() const { return 0; }
@@ -64,22 +65,40 @@ class SleepAnimation {
     bool layerAnimating(int) const { return false; }
     bool layerVisible(int) const { return false; }
     void layerHide(int) {}
+    void layerShowAtGen(int, uint32_t) {}
+    void layerHideAtGen(int, uint32_t) {}
+    uint32_t overlayPublishGen() const { return 0; }
     LayerInfo layerInfo(int) const { return LayerInfo{}; }
-    static constexpr int MAX_ELEMENTS = 8;
-    enum class ElementType : uint8_t { None = 0, RoundRect = 1, TickRing = 2 };
+    static constexpr int MAX_ELEMENTS = 14;
+    static constexpr int kTextElements = 6;
+    static constexpr int kTextMaxGlyphs = 16;
+    enum class ElementType : uint8_t { None = 0, RoundRect = 1, TickRing = 2, Text = 3 };
+    struct TextGlyph {
+        int16_t x = 0, y = 0;
+        uint8_t w = 0, h = 0;
+        const uint8_t *a8 = nullptr;
+    };
+    struct TextDesc {
+        uint8_t n = 0;
+        TextGlyph g[kTextMaxGlyphs];
+    };
     struct ElementDesc {
         ElementType type = ElementType::None;
         uint8_t alpha = 0;
         uint8_t radius = 0;
+        uint8_t textSlot = 0;
         uint16_t color = 0;
+        uint16_t ver = 0;
         int16_t x = 0, y = 0, w = 0, h = 0;
         int64_t tUs = 0;
         tickring::Desc ring{};
     };
     void setElement(int, const ElementDesc &) {}
+    void setTextElement(int, const ElementDesc &, const TextDesc &) {}
     void clearElement(int) {}
     uint32_t lastElementUsValue() const { return 0; }
     int ringElementCount() const { return 0; }
+    int textElementCount() const { return 0; }
     uint32_t animFrameCount() const { return 0; }
 };
 #else
@@ -373,6 +392,13 @@ class SleepAnimation {
     // is what made every publish cost a near-full-screen span scan when the
     // dirty regions sat at opposite ends of the screen.
     void publishOverlayRanges(int w, int h, const int (*ranges)[2], int n);
+    // Zeroes the back buffer's alpha wherever its last publish found
+    // coverage (its run table), which is the whole of its non-zero alpha as
+    // long as nothing has drawn into it since. False, and nothing touched,
+    // when the buffer was last published at another geometry or never.
+    // A whole-page snapshot's clear then costs the page's coverage (about
+    // 8k to 100k pixels) instead of the 460 KB alpha plane (gm-2cl.7).
+    bool clearBackAlphaByRuns(int w, int h);
     // Which of the two overlay buffers overlayBackBuffer() hands out. The
     // caller needs it to know how much of that particular buffer is stale,
     // since the two are written alternately and a partial update is only valid
@@ -467,6 +493,18 @@ class SleepAnimation {
     bool layerAnimating(int id) const;
     bool layerVisible(int id) const;
     void layerHide(int id);
+    // Handover latches (gm-2cl.8). Every overlay publish carries a
+    // generation number (overlayPublishGen is the last one issued), and a
+    // frame composites one overlay, so gating a layer on the generation of
+    // the overlay the frame reads makes "the layer appears" and "the
+    // object leaves the overlay" the same frame, and likewise at landing.
+    // layerShowAtGen: draw the layer only in frames whose overlay is at or
+    // past gen (0 = at once); the motion clock starts at the first frame
+    // that draws it. layerHideAtGen: stop drawing it from that generation
+    // on (0 = never). Both are UI-task calls; the render task reads them.
+    void layerShowAtGen(int id, uint32_t gen);
+    void layerHideAtGen(int id, uint32_t gen);
+    uint32_t overlayPublishGen() const { return overlayPubGen.load(); }
     LayerInfo layerInfo(int id) const;
     uint32_t lastLayerUsValue() const { return lastLayerUs.load(); }
 
@@ -480,29 +518,55 @@ class SleepAnimation {
     // dim colour over the pressed target's box, the same rule as the LVGL
     // pressed styles it replaces while the animation composites. Rows an
     // element enters or leaves get regional warm-up like a layer.
-    static constexpr int MAX_ELEMENTS = 8;
+    static constexpr int MAX_ELEMENTS = 14;
     static constexpr int kElementMaxRadius = 24;
+    // Text elements (gm-2cl.5): a label the UI task owns is hidden from LVGL
+    // and its glyphs are composited from the glyph atlas (GlyphAtlas.h)
+    // every frame, so a value change costs no LVGL pass. The glyph list is
+    // out of line in a text slot of its own, so the ElementDesc every
+    // element copies per frame stays small. x/y is the glyph bitmap's top
+    // left on the panel; alpha is the label's text opacity; color its text
+    // colour; ver changes whenever the glyph list does, which warms the
+    // rows the way a move does.
+    static constexpr int kTextElements = 6;
+    static constexpr int kTextMaxGlyphs = 16;
+    struct TextGlyph {
+        int16_t x = 0, y = 0;
+        uint8_t w = 0, h = 0;
+        const uint8_t *a8 = nullptr; // w * h coverage bytes, glyph atlas
+    };
+    struct TextDesc {
+        uint8_t n = 0;
+        TextGlyph g[kTextMaxGlyphs];
+    };
     // TickRing (gm-2cl.6): a dial meter's tick ring painted from the tick
     // cache's coverage sprites, ticks lo..hi lit; the render task eases
     // its own boundaries toward the written ones (kRingEaseTauUs), so a
     // value change slides the lit edge over a few frames instead of
     // stepping. x/y/w/h is the ring's bounding box (the band hit test and
     // the warm-up use it); alpha must be non-zero for the element to show.
-    enum class ElementType : uint8_t { None = 0, RoundRect = 1, TickRing = 2 };
+    enum class ElementType : uint8_t { None = 0, RoundRect = 1, TickRing = 2, Text = 3 };
     struct ElementDesc {
         ElementType type = ElementType::None;
-        uint8_t alpha = 0;  // coverage 0..255 (quantised to 32 levels in the blend)
-        uint8_t radius = 0; // corner radius, clamped to kElementMaxRadius and to half the box
-        uint16_t color = 0; // RGB565
+        uint8_t alpha = 0;    // coverage 0..255 (quantised to 32 levels in the RoundRect blend)
+        uint8_t radius = 0;   // corner radius, clamped to kElementMaxRadius and to half the box
+        uint8_t textSlot = 0; // Text only: which text slot holds the glyph list
+        uint16_t color = 0;   // RGB565
+        uint16_t ver = 0;     // content version: a change warms the rows like a move
         int16_t x = 0, y = 0, w = 0, h = 0;
         int64_t tUs = 0;    // when the writer wrote it (probe: write to frame latency)
         tickring::Desc ring{}; // TickRing only
     };
     void setElement(int id, const ElementDesc &d);
+    // Text element: writes the glyph list into text slot d.textSlot, then the
+    // descriptor, each under its own seqlock; the render task latches both
+    // once a frame in evaluateElements.
+    void setTextElement(int id, const ElementDesc &d, const TextDesc &t);
     void clearElement(int id);
     uint32_t lastElementUsValue() const { return lastElemUs.load(); }
     // TickRing elements visible in the frame being rendered (debug endpoint).
     int ringElementCount() const { return ringElems.load(); }
+    int textElementCount() const { return textElems.load(); }
     static constexpr int64_t kRingEaseTauUs = 90000;
 
     // Framebuffer-ownership controls, deliberately not behind GM_ANIM_BENCH.
@@ -899,6 +963,8 @@ class SleepAnimation {
         // (gm-2cl.15).
         uint32_t px = 0;
         uint16_t pxRows = 0;
+        // Publish generation this slot was last flipped to the front with.
+        uint32_t gen = 0;
 
         // Text scrim, at 1/4 resolution (SCRIM_SHIFT): scrimSrc holds each
         // cell's peak widget alpha, scrim the dilated and smoothed halo the
@@ -1542,6 +1608,7 @@ class SleepAnimation {
     // scalar (set at publish; never expected on the 480 px panel).
     std::atomic<bool> overlayVecOk{true};
     std::atomic<int> overlayFront{-1}; // -1 = nothing published yet
+    std::atomic<uint32_t> overlayPubGen{0}; // last publish generation issued
     // Overlay gain ramp record, written by the UI task under ovGainSeq (odd
     // while a write is in flight, same discipline as Layer::seq) and copied
     // by the render task once per frame in overlayGainAt.
@@ -1584,6 +1651,13 @@ class SleepAnimation {
         int64_t t0Us = 0;
         uint32_t durUs = 0;
         uint8_t ease = 0;
+        // Handover latches, see layerShowAtGen / layerHideAtGen.
+        std::atomic<uint32_t> showGen{0};
+        std::atomic<uint32_t> hideGen{0};
+        // Frame time the layer was first drawn (0 = not yet). The motion
+        // record's clock runs from here rather than from layerAnimate's
+        // call, so a gated start does not lose its first frames.
+        std::atomic<int64_t> shownAtUs{0};
         // Latched by evaluateLayers() for the frame being rendered.
         int fx = 0, fy = 0;
         bool fVisible = false;
@@ -1606,7 +1680,9 @@ class SleepAnimation {
     static bool layerPosAt(const LayerMotion &m, int64_t nowUs, int &x, int &y);
     // Once per frame on the render task: positions for this frame and warmup
     // for the rows any layer entered or left.
-    void evaluateLayers(int64_t nowUs);
+    void evaluateLayers(int64_t nowUs, uint32_t ovGen);
+    // The motion record's time for wall clock nowUs (see Layer::shownAtUs).
+    static int64_t layerClock(const Layer &L, const LayerMotion &m, int64_t nowUs);
     // Per panel row, after the overlay blend: every visible layer whose
     // rows cover y, through the same blend kernels the overlay uses.
     void compositeLayersRow(uint16_t *drow, int y, int w, bool pieBlend);
@@ -1631,8 +1707,22 @@ class SleepAnimation {
         uint16_t ringColors[tickring::kMaxTicks] = {};
     };
     Element elements[MAX_ELEMENTS];
+    struct TextSlot {
+        std::atomic<uint32_t> seq{0};
+        TextDesc d; // written under seq
+        TextDesc f; // latched for the frame being rendered
+    };
+    TextSlot textSlots[kTextElements];
+    static void readTextSlot(const TextSlot &s, TextDesc &out);
     int64_t lastElemEvalUs = 0;
+    // The press plate's slot (DefaultUI::PRESS_PLATE_ELEMENT) is picked up
+    // between bands as well as at frame start, so a press lands in the frame
+    // being rendered instead of the next one (gm-2cl.4).
+    static constexpr int kInteractionElement = 0;
+    uint32_t interactionLatchedSeq = 0;
+    void pickupInteractionElement();
     std::atomic<int> ringElems{0};
+    std::atomic<int> textElems{0};
     // At publish: fold the owned rings' coverage into the scrim cells of the
     // rows just rescanned (they are no longer in the overlay). UI task only.
     void addElementScrim(Overlay &ov, int rowY0, int rowY1, int sw, int panelW);

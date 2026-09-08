@@ -49,6 +49,9 @@ LilyGo_RGBPanel::~LilyGo_RGBPanel() {
 }
 
 bool LilyGo_RGBPanel::begin(LilyGo_RGBPanel_Color_Order order) {
+    if (_busLock == nullptr) {
+        _busLock = xSemaphoreCreateRecursiveMutex();
+    }
     if (_panelDrv) {
         return true;
     }
@@ -91,6 +94,7 @@ void LilyGo_RGBPanel::initExtension() {
 }
 
 bool LilyGo_RGBPanel::installSD() {
+    BusGuard busGuard(_busLock);
     initExtension();
     extension.pinMode(sdmmc_cs, OUTPUT);
     extension.digitalWrite(sdmmc_cs, HIGH);
@@ -121,6 +125,7 @@ bool LilyGo_RGBPanel::installSD() {
 }
 
 void LilyGo_RGBPanel::uninstallSD() {
+    BusGuard busGuard(_busLock);
     SD_MMC.end();
     extension.digitalWrite(sdmmc_cs, LOW);
     extension.pinMode(sdmmc_cs, INPUT);
@@ -199,6 +204,7 @@ void LilyGo_RGBPanel::enableTimerWakeup(uint64_t time_in_us) {
 // The sleep method tested CST820 and GT911, and the FTxxxx series should also
 // be usable.
 void LilyGo_RGBPanel::sleep() {
+    BusGuard busGuard(_busLock);
     // turn off blacklight
     for (int i = _brightness; i >= 0; --i) {
         setBrightness(i);
@@ -275,6 +281,7 @@ uint16_t LilyGo_RGBPanel::width() { return BOARD_TFT_WIDTH; }
 uint16_t LilyGo_RGBPanel::height() { return BOARD_TFT_HEIGHT; }
 
 uint8_t LilyGo_RGBPanel::getPoint(int16_t *x_array, int16_t *y_array, uint8_t get_point) {
+    BusGuard busGuard(_busLock);
     if (_touchDrv) {
 
         // The FT3267 type touch reading INT level is to read the coordinates
@@ -292,6 +299,7 @@ uint8_t LilyGo_RGBPanel::getPoint(int16_t *x_array, int16_t *y_array, uint8_t ge
 }
 
 bool LilyGo_RGBPanel::isPressed() {
+    BusGuard busGuard(_busLock);
     if (_touchDrv) {
         return _touchDrv->isPressed();
     }
@@ -562,11 +570,13 @@ bool LilyGo_RGBPanel::initTouch() {
 }
 
 void LilyGo_RGBPanel::writeCommand(const uint8_t cmd) {
+    BusGuard busGuard(_busLock);
     uint16_t data = cmd;
     extension.transfer9(data);
 }
 
 void LilyGo_RGBPanel::writeData(const uint8_t *data, int len) {
+    BusGuard busGuard(_busLock);
     uint32_t i = 0;
     if (len > 0) {
         do {
@@ -639,6 +649,7 @@ constexpr int BANK_LEN = 5;
 } // namespace
 
 void LilyGo_RGBPanel::setVcom(uint8_t vcoms) {
+    BusGuard busGuard(_busLock);
     if (!_has_init) {
         return;
     }
@@ -654,6 +665,7 @@ void LilyGo_RGBPanel::setVcom(uint8_t vcoms) {
 }
 
 void LilyGo_RGBPanel::setInversion(uint8_t invset0) {
+    BusGuard busGuard(_busLock);
     if (!_has_init) {
         return;
     }

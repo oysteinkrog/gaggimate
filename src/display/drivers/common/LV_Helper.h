@@ -26,6 +26,40 @@ extern "C" uint32_t gm_overlay_plane_px;
 void gm_set_px_planar(lv_disp_drv_t *disp_drv, uint8_t *buf, lv_coord_t buf_w, lv_coord_t x, lv_coord_t y,
                       lv_color_t color, lv_opa_t opa);
 extern "C" bool gm_disp_uses_planar_writer(const lv_disp_drv_t *drv);
+// Written extent per overlay buffer row for the snapshot in progress
+// (gm-2cl.7): the first and last x LVGL wrote through the planar writer,
+// or x0 > x1 when it wrote nothing. DefaultUI sets a row to "empty" when it
+// clears the row's whole width before the draw and to "everything"
+// (0, 0x7FFF) otherwise; the writer grows the extent per blend call; the
+// publish scans only the extent, since a full-width-cleared row is zero
+// outside it. A whole-page scan read the 460 KB alpha plane at the ~20 MB/s
+// the bus gives the UI task while the render task runs, 13 to 27 ms; and a
+// fill that lands outside the extent needs no alpha read.
+// Stored in 4-pixel granules, one byte each (a 512 px wide buffer is 128
+// granules), so the table is 1 KB of internal RAM: x0 is the first granule
+// written, x1 the last, x0 > x1 when nothing was. Granules are a superset
+// of the pixels, which is all either reader needs.
+#define GM_SNAP_ROWS 512
+#define GM_SNAP_GRAN_SHIFT 2
+#define GM_SNAP_GRAN_NONE_X0 255
+#define GM_SNAP_GRAN_NONE_X1 0
+extern "C" uint8_t gm_snap_row_x0[GM_SNAP_ROWS];
+extern "C" uint8_t gm_snap_row_x1[GM_SNAP_ROWS];
+static inline void gm_snap_rows_reset_all() {
+    for (int y = 0; y < GM_SNAP_ROWS; y++) {
+        gm_snap_row_x0[y] = 0;
+        gm_snap_row_x1[y] = 254;
+    }
+}
+static inline void gm_snap_rows_mark_cleared(int y0, int y1) {
+    for (int y = y0; y <= y1 && y < GM_SNAP_ROWS; y++) {
+        if (y < 0) {
+            continue;
+        }
+        gm_snap_row_x0[y] = GM_SNAP_GRAN_NONE_X0;
+        gm_snap_row_x1[y] = GM_SNAP_GRAN_NONE_X1;
+    }
+}
 static inline uint16_t gm_planar_alpha_store(lv_opa_t a) { return a == 255 ? 256 : a; }
 static inline lv_opa_t gm_planar_alpha_load(uint16_t a16) { return a16 > 255 ? 255 : static_cast<lv_opa_t>(a16); }
 
@@ -102,6 +136,26 @@ struct OverlayStats {
     volatile uint32_t lastPubUs = 0;
     volatile uint32_t lastAreaPx = 0;
     volatile uint32_t lastClips = 0;
+    // The last whole-buffer snapshot (a page change or a buffer's first use),
+    // split into its stages, so a page's entry cost can be read after the
+    // telemetry refreshes that follow it (gm-2cl.7). clear and draw are
+    // GM_TOUCH_PROBE builds only; the rest is every build.
+    volatile uint32_t lastWholeSnapUs = 0;
+    volatile uint32_t lastWholePubUs = 0;
+    volatile uint32_t lastWholeClearUs = 0;
+    volatile uint32_t lastWholeDrawUs = 0;
+    volatile uint32_t lastWholeScanUs = 0;
+    volatile uint32_t lastWholeScrimUs = 0;
+    volatile uint32_t lastWholeAtMs = 0;
+    // The last publish's span scan and scrim rebuild, every publish.
+    volatile uint32_t lastPubScanUs = 0;
+    volatile uint32_t lastPubScrimUs = 0;
+    // The last whole-grid scrim build: horizontal dilate, vertical dilate
+    // (with its transposes), smooth, halo quantisation and runs.
+    volatile uint32_t scrimStageUs[4] = {0, 0, 0, 0};
+    // How the last whole-page snapshot cleared its alpha: 1 by the back
+    // buffer's run table, 0 by a plane memset.
+    volatile uint32_t lastWholeClearByRuns = 0;
 };
 extern OverlayStats g_overlayStats;
 extern volatile int64_t g_overlayMinRefreshUs;
@@ -127,6 +181,37 @@ extern volatile int g_uiAnimTestReq;
 // A/B for the framebuffer compare and the refresh-count measurement; the
 // production value is 1.
 extern volatile int g_dialElementsReq;
+// texts=0|1 and textease=0|1 on /api/debug/anim: live labels as Text elements
+// (DefaultUI::serviceTextElements) and the numeric easing of their values.
+extern volatile int g_textElementsReq;
+// 1 (default): a whole-page snapshot clears alpha by the back buffer's run
+// table; 0: by a plane memset. /api/debug/anim?clrruns= is the A/B.
+extern volatile int g_clearByRunsReq;
+extern volatile int g_textEaseReq;
+// Text element bookkeeping for /api/debug/anim (text_dbg): 0 labels taken,
+// 2 refused by the glyph build, 3 the last build failure's step, 4 released
+// for eligibility, 5 glyph-list rebuilds.
+extern volatile int g_textDbg[8];
+// What each Text element slot holds this pass (text_elems on /api/debug/anim):
+// the label's text, the glyph box on the panel and the rebuild version.
+struct TextElemDbg {
+    volatile bool owned = false;
+    volatile int16_t x = 0, y = 0, w = 0, h = 0;
+    volatile uint16_t ver = 0;
+    char text[24] = {};
+};
+extern TextElemDbg g_textElemDbg[6];
+// The last DIRTYLOG_N dirty rectangles the overlay refresh harvested from
+// LVGL (dirty_recent on /api/debug/anim): what is still invalidating on a
+// screen once the elements own the live widgets. Ring, newest at
+// (g_dirtyLogCount - 1) % DIRTYLOG_N.
+constexpr int DIRTYLOG_N = 16;
+struct DirtyLogEntry {
+    int16_t x1, y1, x2, y2;
+    uint32_t tMs;
+};
+extern DirtyLogEntry g_dirtyLog[DIRTYLOG_N];
+extern volatile uint32_t g_dirtyLogCount;
 
 // /api/debug/touchmap: the UI task walks one screen's object tree and writes
 // every object (class, coords, flags, ext click pad, event count, parent) as
@@ -169,6 +254,9 @@ extern volatile uint32_t g_touchLogCount;
 // and clears the stamp: disp_flush's direct present, or the animation's
 // renderLoop when the overlay path owns the panel. These two are UI-task-only.
 extern volatile int64_t g_probeEdgeUs;
+// The touch task's press edge when it wrote the press plate; the render task
+// closes it at the present of the next frame (GM_TOUCHLAT press->anim_frame(elem)).
+extern volatile int64_t g_probeElemEdgeUs;
 extern volatile bool g_probeEdgeIsPress;
 // Handoff from the overlay publish to the render task. The publish only makes
 // the snapshot AVAILABLE; the composite samples it at the start of the next

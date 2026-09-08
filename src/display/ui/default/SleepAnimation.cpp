@@ -29,6 +29,7 @@
 // Edge stamp of a publish this frame's composite sampled; renderLoop logs it
 // once the frame is presented. Render-task-private, so no volatile needed.
 static int64_t s_probeFrameEdgeUs = 0;
+static int64_t s_probeFrameElemUs = 0;
 static bool s_probeFramePress = false;
 #endif
 
@@ -137,16 +138,27 @@ constexpr int SCRIM_REACH_CELLS = 3;
 // a line is a row (lineStep = grid width, step = 1), vertically a line is a
 // column (lineStep = 1, step = grid width). Six calls build the whole field, so
 // this is the only place the halo shape is defined.
-void scrimTap3(const uint8_t *src, uint8_t *dst, int lines, int n, int lineStep, int step, bool useMax) {
+template <bool kMax>
+static void IRAM_ATTR scrimTap3T(const uint8_t *__restrict src, uint8_t *__restrict dst, int lines, int n, int lineStep,
+                                 int step) {
+    // The edge taps are peeled so the inner loop is three loads, the max or
+    // the average, and a store, with no clamps. IRAM because the UI task runs
+    // it during a page change while the render task is busy on the other
+    // core, and the two cores share the instruction cache; the seven passes
+    // of a whole-grid build measured 26 to 70 ms from flash (gm-2cl.7).
     for (int l = 0; l < lines; l++) {
         const uint8_t *sp = src + static_cast<size_t>(l) * lineStep;
         uint8_t *dp = dst + static_cast<size_t>(l) * lineStep;
-        for (int i = 0; i < n; i++) {
-            const int a = sp[static_cast<size_t>(i > 0 ? i - 1 : 0) * step];
-            const int b = sp[static_cast<size_t>(i) * step];
-            const int c = sp[static_cast<size_t>(i < n - 1 ? i + 1 : n - 1) * step];
+        if (n == 1) {
+            dp[0] = sp[0];
+            continue;
+        }
+        int a = sp[0];
+        int b = sp[0];
+        int c = sp[step];
+        for (int i = 0;;) {
             int v;
-            if (useMax) {
+            if (kMax) {
                 v = a > b ? a : b;
                 if (c > v) {
                     v = c;
@@ -155,7 +167,21 @@ void scrimTap3(const uint8_t *src, uint8_t *dst, int lines, int n, int lineStep,
                 v = (a + 2 * b + c) >> 2;
             }
             dp[static_cast<size_t>(i) * step] = static_cast<uint8_t>(v);
+            if (++i >= n) {
+                break;
+            }
+            a = b;
+            b = c;
+            c = sp[static_cast<size_t>(i < n - 1 ? i + 1 : n - 1) * step];
         }
+    }
+}
+
+void scrimTap3(const uint8_t *src, uint8_t *dst, int lines, int n, int lineStep, int step, bool useMax) {
+    if (useMax) {
+        scrimTap3T<true>(src, dst, lines, n, lineStep, step);
+    } else {
+        scrimTap3T<false>(src, dst, lines, n, lineStep, step);
     }
 }
 
@@ -2062,6 +2088,41 @@ uint8_t *SleepAnimation::overlayBackBuffer() {
     return overlays[back].buf;
 }
 
+bool SleepAnimation::clearBackAlphaByRuns(int w, int h) {
+    if (overlayCap == 0) {
+        return false;
+    }
+    const int back = (overlayFront.load() + 1) & 1;
+    Overlay &ov = overlays[back];
+    if (ov.buf == nullptr || ov.runs == nullptr || ov.gen == 0 || ov.w != w || ov.h != h) {
+        return false;
+    }
+    const int panelW = display != nullptr ? display->width() : 0;
+    const int panelH = display != nullptr ? display->height() : 0;
+    if (panelW <= 0 || panelH <= 0 || w < panelW || h < panelH) {
+        return false;
+    }
+    const int xoff = (w - panelW) / 2;
+    const int yoff = (h - panelH) / 2;
+    uint16_t *const a16 = ov.a16(overlayPlanePx);
+    for (int y = 0; y < panelH; y++) {
+        const int nr = ov.runN[y];
+        if (nr == 0) {
+            continue;
+        }
+        const uint32_t *rowRuns = ov.runs + static_cast<size_t>(y) * RUNS_PER_ROW;
+        uint16_t *row = a16 + static_cast<size_t>(y + yoff) * w + xoff;
+        for (int i = 0; i < nr; i++) {
+            const int x0 = static_cast<int>(rowRuns[i] & 0xFFFFu);
+            const int x1 = static_cast<int>(rowRuns[i] >> 16);
+            if (x1 > x0) {
+                memset(row + x0, 0, static_cast<size_t>(x1 - x0) * 2);
+            }
+        }
+    }
+    return true;
+}
+
 void SleepAnimation::publishOverlay(int w, int h, int rowY0, int rowY1) {
     const int r[1][2] = {{rowY0, rowY1}};
     publishOverlayRanges(w, h, r, 1);
@@ -2075,11 +2136,33 @@ void SleepAnimation::publishOverlay(int w, int h, int rowY0, int rowY1) {
 // AT and AS are the alpha's type and stride: uint16_t and 1 for the planar
 // overlay (256 counts as 255 for the cell peak), uint8_t and 3 for a layer's
 // interleaved RGB565+A8 sprite.
+// [xFrom, panelW) is the part of the row that can hold coverage; pixels
+// before xFrom are known zero (the snapshot's row extent, LV_Helper.h).
 template <bool HAS_CELL, typename AT, int AS>
-static int scanOverlayRow(const AT *__restrict a, int panelW, uint32_t *__restrict rowRuns, uint8_t *__restrict cell) {
+static int scanOverlayRow(const AT *__restrict a, int panelW, uint32_t *__restrict rowRuns, uint8_t *__restrict cell,
+                          int xFrom = 0) {
     int nRuns = 0;
     int runStart = -1;
-    for (int x = 0; x < panelW; x++, a += AS) {
+    a += static_cast<size_t>(xFrom) * AS;
+    for (int x = xFrom; x < panelW; x++, a += AS) {
+        // Transparent stretches, which are most of every row, go eight
+        // pixels a step: four 32-bit loads and one test instead of eight
+        // loads and eight branches. A whole-page scan is 230k pixels and
+        // took 23 to 28 ms at one pixel a step (gm-2cl.7). Planar rows are
+        // 16-byte aligned at x 0 (overlayVecOk), so x & 7 == 0 is 4-aligned.
+        if (AS == 1 && sizeof(AT) == 2 && runStart < 0 && (x & 7) == 0) {
+            while (x + 8 <= panelW) {
+                const uint32_t *w4 = reinterpret_cast<const uint32_t *>(a);
+                if ((w4[0] | w4[1] | w4[2] | w4[3]) != 0) {
+                    break;
+                }
+                x += 8;
+                a += 8;
+            }
+            if (x >= panelW) {
+                break;
+            }
+        }
         if (*a != 0) {
             if (runStart < 0) {
                 runStart = x;
@@ -2118,7 +2201,37 @@ static int scanOverlayRow(const AT *__restrict a, int panelW, uint32_t *__restri
 void SleepAnimation::addElementScrim(Overlay &ov, int rowY0, int rowY1, int sw, int panelW) {
     for (int i = 0; i < MAX_ELEMENTS; i++) {
         const ElementDesc &d = elements[i].d;
-        if (d.type != ElementType::TickRing || d.ring.ring == nullptr || d.alpha == 0) {
+        if (d.alpha == 0) {
+            continue;
+        }
+        if (d.type == ElementType::Text && d.textSlot < kTextElements) {
+            // Owned text: its glyph coverage, the way the label's pixels
+            // would have counted had they stayed in the overlay.
+            const TextDesc &t = textSlots[d.textSlot].d;
+            for (int gi = 0; gi < t.n; gi++) {
+                const TextGlyph &g = t.g[gi];
+                if (g.a8 == nullptr) {
+                    continue;
+                }
+                const int yA = g.y > rowY0 ? g.y : rowY0;
+                const int yB = (g.y + g.h) < rowY1 ? (g.y + g.h) : rowY1;
+                int x0 = g.x < 0 ? 0 : g.x;
+                int x1 = (g.x + g.w) > panelW ? panelW : (g.x + g.w);
+                for (int y = yA; y < yB; y++) {
+                    uint8_t *cell = ov.scrimSrc + static_cast<size_t>(y >> SCRIM_SHIFT) * sw;
+                    const uint8_t *row = g.a8 + static_cast<size_t>(y - g.y) * g.w;
+                    for (int x = x0; x < x1; x++) {
+                        const uint8_t a = static_cast<uint8_t>((static_cast<uint32_t>(row[x - g.x]) * d.alpha) >> 8);
+                        uint8_t &c = cell[x >> SCRIM_SHIFT];
+                        if (a > c) {
+                            c = a;
+                        }
+                    }
+                }
+            }
+            continue;
+        }
+        if (d.type != ElementType::TickRing || d.ring.ring == nullptr) {
             continue;
         }
         const tickring::Sprites &s = *d.ring.ring;
@@ -2249,9 +2362,7 @@ void SleepAnimation::publishOverlayRanges(int w, int h, const int (*ranges)[2], 
     // Span scan per range, on the UI task. The render task then touches only
     // rows/pixels that matter. Scanning only the changed ranges rather than
     // their bounding row span is the point of taking a list.
-#ifdef GM_TOUCH_PROBE
     const int64_t scan0 = esp_timer_get_time();
-#endif
     for (int g = 0; g < m; g++) {
         const int rowY0 = rr[g][0];
         const int rowY1 = rr[g][1];
@@ -2275,8 +2386,25 @@ void SleepAnimation::publishOverlayRanges(int w, int h, const int (*ranges)[2], 
             if (sy >= 0 && sy < h) {
                 const uint16_t *a = ov.a16(overlayPlanePx) + static_cast<size_t>(sy) * w + xoff;
                 uint8_t *cell = doScrim ? ov.scrimSrc + static_cast<size_t>(y >> SCRIM_SHIFT) * sw : nullptr;
-                nRuns = cell != nullptr ? scanOverlayRow<true, uint16_t, 1>(a, panelW, rowRuns, cell)
-                                        : scanOverlayRow<false, uint16_t, 1>(a, panelW, rowRuns, nullptr);
+                // Only the written extent of the row (LV_Helper.h): a row
+                // cleared whole before the draw is zero outside it, and a row
+                // that was not carries (0, 0x7FFF) and scans whole.
+                int xs = 0;
+                int xe = panelW;
+                if (sy < GM_SNAP_ROWS) {
+                    xs = (gm_snap_row_x0[sy] << GM_SNAP_GRAN_SHIFT) - xoff;
+                    xe = ((gm_snap_row_x1[sy] + 1) << GM_SNAP_GRAN_SHIFT) - xoff;
+                    if (xs < 0) {
+                        xs = 0;
+                    }
+                    if (xe > panelW) {
+                        xe = panelW;
+                    }
+                }
+                if (xs < xe) {
+                    nRuns = cell != nullptr ? scanOverlayRow<true, uint16_t, 1>(a, xe, rowRuns, cell, xs)
+                                            : scanOverlayRow<false, uint16_t, 1>(a, xe, rowRuns, nullptr, xs);
+                }
             }
             ov.runN[y] = static_cast<uint8_t>(nRuns);
         }
@@ -2303,8 +2431,9 @@ void SleepAnimation::publishOverlayRanges(int w, int h, const int (*ranges)[2], 
         ov.px = px;
         ov.pxRows = static_cast<uint16_t>(rows);
     }
-#ifdef GM_TOUCH_PROBE
     const int64_t scrim0 = esp_timer_get_time();
+    g_overlayStats.lastPubScanUs = static_cast<uint32_t>(scrim0 - scan0);
+#ifdef GM_TOUCH_PROBE
     g_statPubScanUs += scrim0 - scan0;
 #endif
     if (doScrim && m > 0) {
@@ -2315,7 +2444,16 @@ void SleepAnimation::publishOverlayRanges(int w, int h, const int (*ranges)[2], 
         // update touches a handful of cell rows out of 120); fall back to the
         // whole grid when the dim strength moved (every row's quantization
         // changes) or the scratch the regional path needs is missing.
-        const bool fullNeeded = scrimCmp == nullptr || scrimTmp2 == nullptr || ov.scrimBuiltQ8 != scrimQ8.load();
+        // A range that reaches most of the grid (a page change) takes the
+        // fused whole build: the regional path walks the vertical taps at
+        // the grid's stride and over the whole grid cost 24 to 59 ms
+        // against the fused build's 4 (gm-2cl.7).
+        int cellRowsTouched = 0;
+        for (int g = 0; g < m; g++) {
+            cellRowsTouched += ((rr[g][1] + (1 << SCRIM_SHIFT) - 1) >> SCRIM_SHIFT) - (rr[g][0] >> SCRIM_SHIFT);
+        }
+        const bool fullNeeded = scrimCmp == nullptr || scrimTmp2 == nullptr || ov.scrimBuiltQ8 != scrimQ8.load() ||
+                                cellRowsTouched * 3 > ov.scrimH;
         if (fullNeeded) {
             buildScrim(ov, panelW, panelH);
             ov.scrimBuiltQ8 = scrimQ8.load();
@@ -2337,9 +2475,11 @@ void SleepAnimation::publishOverlayRanges(int w, int h, const int (*ranges)[2], 
             }
         }
     }
+    g_overlayStats.lastPubScrimUs = static_cast<uint32_t>(esp_timer_get_time() - scrim0);
 #ifdef GM_TOUCH_PROBE
     g_statPubScrimUs += esp_timer_get_time() - scrim0;
 #endif
+    ov.gen = overlayPubGen.fetch_add(1) + 1;
     overlayFront.store(back);
     // Interaction publishes wake the render task's pacing sleep so the tap's
     // visuals reach glass ~a frame render after publish, not a frame render
@@ -2475,6 +2615,9 @@ void SleepAnimation::layerPublish(int id, int x, int y) {
             scanOverlayRow<false, uint8_t, 3>(a, L.w, L.runs + static_cast<size_t>(r) * RUNS_PER_ROW, nullptr));
     }
     layerSetPos(id, x, y);
+    L.showGen.store(0);
+    L.hideGen.store(0);
+    L.shownAtUs.store(0);
     L.visible.store(true);
 }
 
@@ -2604,7 +2747,12 @@ void SleepAnimation::layerAnimate(int id, int x1, int y1, uint32_t durMs, LayerE
     LayerMotion m;
     readLayerMotion(L, m);
     int cx, cy;
-    layerPosAt(m, now, cx, cy);
+    layerPosAt(m, layerClock(L, m, now), cx, cy);
+    if (L.shownAtUs.load() != 0) {
+        // Already on glass: the new leg's clock starts now. A gated layer
+        // keeps 0 and starts when it is first drawn.
+        L.shownAtUs.store(now);
+    }
     L.seq.fetch_add(1);
     L.x0 = cx;
     L.y0 = cy;
@@ -2623,7 +2771,17 @@ bool SleepAnimation::layerAnimating(int id) const {
     LayerMotion m;
     readLayerMotion(layers[id], m);
     int x, y;
-    return layerPosAt(m, esp_timer_get_time(), x, y);
+    return layerPosAt(m, layerClock(layers[id], m, esp_timer_get_time()), x, y);
+}
+void SleepAnimation::layerShowAtGen(int id, uint32_t gen) {
+    if (id >= 0 && id < MAX_LAYERS) {
+        layers[id].showGen.store(gen);
+    }
+}
+void SleepAnimation::layerHideAtGen(int id, uint32_t gen) {
+    if (id >= 0 && id < MAX_LAYERS) {
+        layers[id].hideGen.store(gen);
+    }
 }
 bool SleepAnimation::layerVisible(int id) const {
     return id >= 0 && id < MAX_LAYERS && layers[id].used.load() && layers[id].visible.load();
@@ -2649,7 +2807,12 @@ SleepAnimation::LayerInfo SleepAnimation::layerInfo(int id) const {
     return info;
 }
 
-void SleepAnimation::evaluateLayers(int64_t nowUs) {
+int64_t SleepAnimation::layerClock(const Layer &L, const LayerMotion &m, int64_t nowUs) {
+    const int64_t shown = L.shownAtUs.load();
+    return shown == 0 ? m.t0Us : m.t0Us + (nowUs - shown);
+}
+
+void SleepAnimation::evaluateLayers(int64_t nowUs, uint32_t ovGen) {
     layersThisFrame = false;
     if (display == nullptr) {
         return;
@@ -2667,14 +2830,23 @@ void SleepAnimation::evaluateLayers(int64_t nowUs) {
             L.w = L.h = 0;
             L.visible.store(false);
             L.releasePending.store(false);
+            L.showGen.store(0);
+            L.hideGen.store(0);
+            L.shownAtUs.store(0);
             L.used.store(false);
         }
-        const bool vis = L.used.load() && L.visible.load() && L.buf != nullptr;
+        const uint32_t showGen = L.showGen.load();
+        const uint32_t hideGen = L.hideGen.load();
+        const bool gated = (showGen != 0 && ovGen < showGen) || (hideGen != 0 && ovGen >= hideGen);
+        const bool vis = L.used.load() && L.visible.load() && L.buf != nullptr && !gated;
         int fx = L.fx, fy = L.fy;
         if (vis) {
+            if (L.shownAtUs.load() == 0) {
+                L.shownAtUs.store(nowUs);
+            }
             LayerMotion m;
             readLayerMotion(L, m);
-            layerPosAt(m, nowUs, fx, fy);
+            layerPosAt(m, layerClock(L, m, nowUs), fx, fy);
         }
         // Rows entered or left since the last frame go out whole this frame
         // and the next (requestBandWarmup's window), same as a widget update.
@@ -2753,19 +2925,51 @@ void SleepAnimation::compositeLayersRow(uint16_t *drow, int y, int w, bool pieBl
     }
 }
 
+// Two writers since gm-2cl.4: the UI task and the touch task both write the
+// press plate slot (the task on press and release, the UI task when the
+// animation stops or the screen changes), so the seqlock's write side is a
+// critical section. Readers are unchanged.
+static portMUX_TYPE s_elementWriteMux = portMUX_INITIALIZER_UNLOCKED;
+
 void SleepAnimation::setElement(int id, const ElementDesc &d) {
     if (id < 0 || id >= MAX_ELEMENTS) {
         return;
     }
     Element &e = elements[id];
+    portENTER_CRITICAL(&s_elementWriteMux);
     e.seq.fetch_add(1);
     e.d = d;
     e.seq.fetch_add(1);
+    portEXIT_CRITICAL(&s_elementWriteMux);
+}
+
+void SleepAnimation::setTextElement(int id, const ElementDesc &d, const TextDesc &t) {
+    if (id < 0 || id >= MAX_ELEMENTS || d.textSlot >= kTextElements) {
+        return;
+    }
+    TextSlot &ts = textSlots[d.textSlot];
+    ts.seq.fetch_add(1);
+    ts.d = t;
+    ts.seq.fetch_add(1);
+    setElement(id, d);
 }
 
 void SleepAnimation::clearElement(int id) {
     ElementDesc none;
     setElement(id, none);
+}
+
+void SleepAnimation::readTextSlot(const TextSlot &s, TextDesc &out) {
+    for (;;) {
+        const uint32_t s1 = s.seq.load();
+        if (s1 & 1u) {
+            continue;
+        }
+        out = s.d;
+        if (s.seq.load() == s1) {
+            return;
+        }
+    }
 }
 
 void SleepAnimation::readElement(const Element &e, ElementDesc &out) {
@@ -2801,12 +3005,28 @@ void SleepAnimation::evaluateElements(int64_t nowUs) {
     lastElemEvalUs = nowUs;
     const float easeK = static_cast<float>(dtUs) / static_cast<float>(dtUs + kRingEaseTauUs);
     int rings = 0;
+    int texts = 0;
     for (int i = 0; i < MAX_ELEMENTS; i++) {
         Element &e = elements[i];
         ElementDesc d;
         readElement(e, d);
+        if (i == kInteractionElement) {
+            interactionLatchedSeq = e.seq.load();
+        }
         if (d.type == ElementType::TickRing && d.ring.ring == nullptr) {
             d.type = ElementType::None;
+        }
+        if (d.type == ElementType::Text) {
+            if (d.textSlot >= kTextElements) {
+                d.type = ElementType::None;
+            } else {
+                // Latch the glyph list with the descriptor; the row path
+                // reads only the f copies.
+                readTextSlot(textSlots[d.textSlot], textSlots[d.textSlot].f);
+                if (textSlots[d.textSlot].f.n == 0) {
+                    d.type = ElementType::None;
+                }
+            }
         }
         // Clip to the panel here, once, so the row composite never has to.
         int x0 = d.x, y0 = d.y, x1 = d.x + d.w, y1 = d.y + d.h;
@@ -2824,7 +3044,8 @@ void SleepAnimation::evaluateElements(int64_t nowUs) {
         }
         const bool vis = d.type != ElementType::None && d.alpha != 0 && x1 > x0 && y1 > y0;
         const bool moved = vis != e.lastVisible || (vis && (y0 != e.lastY0 || y1 != e.lastY1 || d.x != e.f.x ||
-                                                             d.w != e.f.w || d.radius != e.f.radius));
+                                                             d.w != e.f.w || d.radius != e.f.radius ||
+                                                             d.ver != e.f.ver));
         if (moved) {
             int ranges[2][2];
             int n = 0;
@@ -2855,6 +3076,9 @@ void SleepAnimation::evaluateElements(int64_t nowUs) {
         e.lastY0 = y0;
         e.lastY1 = y1;
         elementsThisFrame = elementsThisFrame || vis;
+        if (vis && d.type == ElementType::Text) {
+            texts++;
+        }
         if (vis && d.type == ElementType::TickRing) {
             rings++;
             const float tlo = static_cast<float>(d.ring.lo);
@@ -2882,6 +3106,121 @@ void SleepAnimation::evaluateElements(int64_t nowUs) {
         }
     }
     ringElems.store(rings);
+    textElems.store(texts);
+}
+
+// Between bands: a press plate written since the frame started is latched
+// now, so the rows still to be rendered carry it and the frame's present
+// shows it. The rows above the current band get it next frame, which puts
+// the plate on the panel from a band boundary down for one frame; at a 40%
+// dim over 27 ms that is below notice, and it takes a press from about two
+// frame periods to under one (bench board, tools/touch_lat.py, gm-2cl.4).
+// Only the plain rectangle type is picked up here: rings and text latch
+// sprites and glyph lists at frame start and stay there.
+void IRAM_ATTR SleepAnimation::pickupInteractionElement() {
+    Element &e = elements[kInteractionElement];
+    const uint32_t s = e.seq.load();
+    if (s == interactionLatchedSeq || (s & 1u) != 0 || display == nullptr) {
+        return;
+    }
+    ElementDesc d;
+    readElement(e, d);
+    interactionLatchedSeq = e.seq.load();
+    if (d.type != ElementType::None && d.type != ElementType::RoundRect) {
+        return;
+    }
+    const int panelH = display->height();
+    const int panelW = display->width();
+    int x0 = d.x, y0 = d.y, x1 = d.x + d.w, y1 = d.y + d.h;
+    if (x0 < 0) {
+        x0 = 0;
+    }
+    if (y0 < 0) {
+        y0 = 0;
+    }
+    if (x1 > panelW) {
+        x1 = panelW;
+    }
+    if (y1 > panelH) {
+        y1 = panelH;
+    }
+    const bool vis = d.type != ElementType::None && d.alpha != 0 && x1 > x0 && y1 > y0;
+    int ranges[2][2];
+    int n = 0;
+    if (e.lastVisible) {
+        ranges[n][0] = e.lastY0;
+        ranges[n][1] = e.lastY1;
+        n++;
+    }
+    if (vis) {
+        ranges[n][0] = y0;
+        ranges[n][1] = y1;
+        n++;
+    }
+    if (n > 0) {
+        requestBandWarmup(ranges, n);
+    }
+#ifdef GM_TOUCH_PROBE
+    if (vis && g_probeElemEdgeUs != 0) {
+        // This frame's present carries the plate, so the edge closes there.
+        s_probeFrameElemUs = g_probeElemEdgeUs;
+        g_probeElemEdgeUs = 0;
+    }
+#endif
+    e.f = d;
+    e.fVisible = vis;
+    e.lastVisible = vis;
+    e.lastY0 = y0;
+    e.lastY1 = y1;
+    if (vis) {
+        elementsThisFrame = true;
+    }
+}
+
+// One row of a Text element: every glyph whose box covers y, coverage from
+// the atlas times the label's opacity (the overlay writer's rule for a
+// masked fill, (opa * mask) >> 8 in scripts/patch_lvgl_setpx_fast.py, so
+// full coverage at opacity 255 lands at 254 and is blended, never copied),
+// then the page gain, then blend565, which is the planar kernel's
+// arithmetic. Measured 2026-09-08 against the overlay path on the bench
+// board: zero differing stable pixels once this matched the writer; with a
+// copy at full coverage the interiors were one step brighter.
+static inline void IRAM_ATTR compositeTextRow(uint16_t *drow, int y, int w, const SleepAnimation::TextDesc &t,
+                                              uint16_t color, uint32_t alpha, uint32_t gain) {
+    for (int gi = 0; gi < t.n; gi++) {
+        const SleepAnimation::TextGlyph &g = t.g[gi];
+        const int dy = y - g.y;
+        if (dy < 0 || dy >= g.h || g.a8 == nullptr) {
+            continue;
+        }
+        int x0 = 0;
+        int x1 = g.w;
+        if (g.x < 0) {
+            x0 = -g.x;
+        }
+        if (g.x + x1 > w) {
+            x1 = w - g.x;
+        }
+        if (x1 <= x0) {
+            continue;
+        }
+        const uint8_t *row = g.a8 + static_cast<size_t>(dy) * g.w;
+        uint16_t *dst = drow + g.x;
+        for (int x = x0; x < x1; x++) {
+            uint32_t a = row[x];
+            if (a == 0) {
+                continue;
+            }
+            a = (a * alpha) >> 8;
+            if (gain < 256) {
+                a = (a * gain) >> 8;
+            }
+            if (a == 0) {
+                continue;
+            }
+            dst[x] = tickring::blend565(color, dst[x], static_cast<uint8_t>(a));
+        }
+    }
 }
 
 void IRAM_ATTR SleepAnimation::compositeElementsRow(uint16_t *drow, int y, int w) {
@@ -2901,6 +3240,10 @@ void IRAM_ATTR SleepAnimation::compositeElementsRow(uint16_t *drow, int y, int w
         }
         if (d.type == ElementType::TickRing) {
             tickring::compositeRowColors(drow, y, w, *d.ring.ring, e.ringColors, gain);
+            continue;
+        }
+        if (d.type == ElementType::Text) {
+            compositeTextRow(drow, y, w, textSlots[d.textSlot].f, d.color, d.alpha, gain);
             continue;
         }
         int r = d.radius;
@@ -2987,38 +3330,98 @@ __attribute__((always_inline)) static inline void transposeSquare(const uint8_t 
 void SleepAnimation::buildScrim(Overlay &ov, int panelW, int panelH) {
     const int sw = ov.scrimW;
     const int sh = ov.scrimH;
-    // Dilate: two 3-wide max passes per axis, so coverage reaches 2 cells out
-    // in every direction and diagonals get the same reach as the axes.
-    scrimTap3(ov.scrimSrc, scrimTmp, sh, sw, sw, 1, true);
-    scrimTap3(scrimTmp, ov.scrim, sh, sw, sw, 1, true);
-    if (sw == sh) {
-        // The two vertical passes used to walk the grid at a 120-byte PSRAM
-        // stride (lineStep=1, step=sw). Bracketing them in a transpose makes
-        // both taps sequential; the mapping is proven bit-exact in
-        // tools/overlaybench/kernels/scrim_build.cpp (buildScrim_transposed34).
-        // No extra buffers: at each step the source of the previous call is
-        // dead, so the pair ping-pongs scrimTmp and ov.scrim.
-        transposeSquare(ov.scrim, scrimTmp, sw);
-        scrimTap3(scrimTmp, ov.scrim, sw, sh, sw, 1, true);
-        scrimTap3(ov.scrim, scrimTmp, sw, sh, sw, 1, true);
-        transposeSquare(scrimTmp, ov.scrim, sw);
-    } else {
+    const int64_t st0 = esp_timer_get_time();
+    // The six separable passes (two 3-wide max per axis, one 3-tap average
+    // per axis) fused into two sweeps, since the grids live in PSRAM and a
+    // whole-grid build was paying one read and one write of the 14.4 KB grid
+    // per pass, plus five transposes, 16 to 20 ms a page change (gm-2cl.7).
+    // Two clamped 3-wide max passes are one clamped 5-wide max, exactly, so
+    // sweep one writes the horizontal 5-max of every row to scrimTmp, and
+    // sweep two takes each output row from five scrimTmp rows (vertical
+    // 5-max), smooths it horizontally into a three-row ring on the stack and
+    // smooths vertically out of the ring, in the same order and arithmetic
+    // as the passes it replaces, so buildScrimRegional stays bit-exact
+    // against it. Rows wider than the ring fall back to the pass sequence.
+    // Not IRAM: measured the same from flash (gm-2cl.7), and IRAM is DRAM.
+    constexpr int kRing = kScaledInvCells;
+    if (sw > kRing || sh < 1) {
+        scrimTap3(ov.scrimSrc, scrimTmp, sh, sw, sw, 1, true);
+        scrimTap3(scrimTmp, ov.scrim, sh, sw, sw, 1, true);
         scrimTap3(ov.scrim, scrimTmp, sw, sh, 1, sw, true);
         scrimTap3(scrimTmp, ov.scrim, sw, sh, 1, sw, true);
-    }
-    // Smooth, so the scrim's own edge is a gradient rather than a visible
-    // rectangle sitting on the animation.
-    scrimTap3(ov.scrim, scrimTmp, sh, sw, sw, 1, false);
-    if (sw == sh) {
-        // Same bracket for the last vertical pass. A worse trade than the
-        // dilate pair on paper (one strided pass removed for two transposes
-        // instead of two for two), measured separately on the rig.
-        transposeSquare(scrimTmp, ov.scrim, sw);
-        scrimTap3(ov.scrim, scrimTmp, sw, sh, sw, 1, false);
-        transposeSquare(scrimTmp, ov.scrim, sw);
-    } else {
+        scrimTap3(ov.scrim, scrimTmp, sh, sw, sw, 1, false);
         scrimTap3(scrimTmp, ov.scrim, sw, sh, 1, sw, false);
+    } else {
+        // Sweep one: horizontal 5-max, edges clamped.
+        for (int y = 0; y < sh; y++) {
+            const uint8_t *sp = ov.scrimSrc + static_cast<size_t>(y) * sw;
+            uint8_t *dp = scrimTmp + static_cast<size_t>(y) * sw;
+            for (int x = 0; x < sw; x++) {
+                int v = sp[x];
+                for (int k = -2; k <= 2; k++) {
+                    int xi = x + k;
+                    if (xi < 0) {
+                        xi = 0;
+                    } else if (xi >= sw) {
+                        xi = sw - 1;
+                    }
+                    const int c = sp[xi];
+                    if (c > v) {
+                        v = c;
+                    }
+                }
+                dp[x] = static_cast<uint8_t>(v);
+            }
+        }
+        // Sweep two. ring[r % 3] holds the horizontally smoothed, fully
+        // dilated row r; output row y needs rows y-1, y, y+1 (clamped).
+        uint8_t ring[3][kRing];
+        auto makeRow = [&](int r, uint8_t *out) {
+            // Vertical 5-max of scrimTmp rows r-2..r+2, clamped.
+            const uint8_t *rows[5];
+            for (int k = 0; k < 5; k++) {
+                int ri = r - 2 + k;
+                if (ri < 0) {
+                    ri = 0;
+                } else if (ri >= sh) {
+                    ri = sh - 1;
+                }
+                rows[k] = scrimTmp + static_cast<size_t>(ri) * sw;
+            }
+            uint8_t dil[kRing];
+            for (int x = 0; x < sw; x++) {
+                int v = rows[0][x];
+                for (int k = 1; k < 5; k++) {
+                    if (rows[k][x] > v) {
+                        v = rows[k][x];
+                    }
+                }
+                dil[x] = static_cast<uint8_t>(v);
+            }
+            // Horizontal 1-2-1, clamped.
+            for (int x = 0; x < sw; x++) {
+                const int a = dil[x > 0 ? x - 1 : 0];
+                const int b = dil[x];
+                const int c = dil[x < sw - 1 ? x + 1 : sw - 1];
+                out[x] = static_cast<uint8_t>((a + 2 * b + c) >> 2);
+            }
+        };
+        makeRow(0, ring[0]);
+        makeRow(sh > 1 ? 1 : 0, ring[1]);
+        for (int y = 0; y < sh; y++) {
+            const uint8_t *above = ring[(y > 0 ? y - 1 : 0) % 3];
+            const uint8_t *here = ring[y % 3];
+            const uint8_t *below = ring[(y < sh - 1 ? y + 1 : y) % 3];
+            uint8_t *dp = ov.scrim + static_cast<size_t>(y) * sw;
+            for (int x = 0; x < sw; x++) {
+                dp[x] = static_cast<uint8_t>((above[x] + 2 * here[x] + below[x]) >> 2);
+            }
+            if (y + 2 < sh) {
+                makeRow(y + 2, ring[(y + 2) % 3]);
+            }
+        }
     }
+    const int64_t st3 = esp_timer_get_time();
 
     // The halo runs the composite walks, read straight off the grid that was
     // just built. Whole-grid, like the passes above: the dilate spreads
@@ -3057,6 +3460,10 @@ void SleepAnimation::buildScrim(Overlay &ov, int panelW, int panelH) {
         }
         ov.haloN[cy] = static_cast<uint8_t>(n);
     }
+    g_overlayStats.scrimStageUs[0] = static_cast<uint32_t>(st3 - st0);
+    g_overlayStats.scrimStageUs[1] = 0;
+    g_overlayStats.scrimStageUs[2] = 0;
+    g_overlayStats.scrimStageUs[3] = static_cast<uint32_t>(esp_timer_get_time() - st3);
     (void)panelW;
     (void)panelH;
 }
@@ -3625,6 +4032,11 @@ void IRAM_ATTR SleepAnimation::renderLoop() {
                      (long long)(esp_timer_get_time() - s_probeFrameEdgeUs));
             s_probeFrameEdgeUs = 0;
         }
+        if (s_probeFrameElemUs != 0) {
+            ESP_LOGI("TouchProbe", "GM_TOUCHLAT: press->anim_frame(elem) %lld us",
+                     (long long)(esp_timer_get_time() - s_probeFrameElemUs));
+            s_probeFrameElemUs = 0;
+        }
 #endif
         // Once per frame, not once per band: every band of a frame must push
         // the same parity or the two halves of the picture drift apart.
@@ -3928,7 +4340,7 @@ void IRAM_ATTR SleepAnimation::renderFrame() {
         overlayInUse.store(ofi);
     } while (ofi != overlayFront.load());
     const int64_t frameNowUs = esp_timer_get_time();
-    evaluateLayers(frameNowUs);
+    evaluateLayers(frameNowUs, ofi >= 0 ? overlays[ofi].gen : 0);
     evaluateElements(frameNowUs);
     // One gain for the whole frame, like the overlay index above: a ramp
     // step lands between frames, never between bands.
@@ -3941,6 +4353,13 @@ void IRAM_ATTR SleepAnimation::renderFrame() {
         s_probeFrameEdgeUs = g_probePublishUs;
         s_probeFramePress = g_probePublishIsPress;
         g_probePublishUs = 0;
+    }
+    // The touch task's plate write is part of this frame's element
+    // evaluation (evaluateElements above), so the edge it stamped closes at
+    // this frame's present.
+    if (g_probeElemEdgeUs != 0) {
+        s_probeFrameElemUs = g_probeElemEdgeUs;
+        g_probeElemEdgeUs = 0;
     }
 #endif
     const Overlay *ov = ofi >= 0 ? &overlays[ofi] : nullptr;
@@ -4555,7 +4974,11 @@ void IRAM_ATTR SleepAnimation::renderFrame() {
                 PROF_ACC(profLayerUs, tLayer);
             }
         }
-        // Elements sit above the layers, same parity rule.
+        // Elements sit above the layers, same parity rule. The press plate
+        // is re-latched between bands (pickupInteractionElement).
+        if (!patternMode) {
+            pickupInteractionElement();
+        }
         if (elementsThisFrame && !patternMode) {
             bool hit = false;
             for (int i = 0; i < MAX_ELEMENTS && !hit; i++) {

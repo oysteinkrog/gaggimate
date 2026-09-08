@@ -1,0 +1,814 @@
+{
+ "meta": {
+  "host": "192.168.1.121",
+  "date": "2026-09-08",
+  "uptime_ms": 215758,
+  "fps_cap": 45,
+  "interlace": false,
+  "anim_id": 3,
+  "pclk_div": 8
+ },
+ "screens": {
+  "standby": {
+   "rounds": [
+    {
+     "snap_us": 60495,
+     "pub_us": 23030,
+     "clear_us": 4938,
+     "draw_us": 55065,
+     "scan_us": 9003,
+     "scrim_us": 13839,
+     "whole_at_ms": 219130,
+     "clear_by_runs": 1,
+     "scrim_stages_us": [
+      11958,
+      0,
+      0,
+      1799
+     ],
+     "refreshes": 2,
+     "ov_px": 8255,
+     "fps": 45
+    },
+    {
+     "snap_us": 40199,
+     "pub_us": 27573,
+     "clear_us": 4926,
+     "draw_us": 34787,
+     "scan_us": 7369,
+     "scrim_us": 19935,
+     "whole_at_ms": 225149,
+     "clear_by_runs": 1,
+     "scrim_stages_us": [
+      17712,
+      0,
+      0,
+      2143
+     ],
+     "refreshes": 2,
+     "ov_px": 8255,
+     "fps": 45
+    },
+    {
+     "snap_us": 48952,
+     "pub_us": 18525,
+     "clear_us": 4745,
+     "draw_us": 43820,
+     "scan_us": 5924,
+     "scrim_us": 12424,
+     "whole_at_ms": 231166,
+     "clear_by_runs": 1,
+     "scrim_stages_us": [
+      10409,
+      0,
+      0,
+      1958
+     ],
+     "refreshes": 3,
+     "ov_px": 7461,
+     "fps": 45
+    }
+   ],
+   "best": {
+    "snap_us": 48952,
+    "pub_us": 18525,
+    "clear_us": 4745,
+    "draw_us": 43820,
+    "scan_us": 5924,
+    "scrim_us": 12424,
+    "whole_at_ms": 231166,
+    "clear_by_runs": 1,
+    "scrim_stages_us": [
+     10409,
+     0,
+     0,
+     1958
+    ],
+    "refreshes": 3,
+    "ov_px": 7461,
+    "fps": 45
+   }
+  },
+  "menu": {
+   "rounds": [
+    {
+     "snap_us": 76723,
+     "pub_us": 25632,
+     "clear_us": 3549,
+     "draw_us": 72533,
+     "scan_us": 13089,
+     "scrim_us": 12324,
+     "whole_at_ms": 237397,
+     "clear_by_runs": 0,
+     "scrim_stages_us": [
+      10392,
+      0,
+      0,
+      1862
+     ],
+     "refreshes": 4,
+     "ov_px": 12963,
+     "fps": 45
+    },
+    {
+     "snap_us": 82368,
+     "pub_us": 26568,
+     "clear_us": 3035,
+     "draw_us": 78840,
+     "scan_us": 14403,
+     "scrim_us": 11938,
+     "whole_at_ms": 243602,
+     "clear_by_runs": 0,
+     "scrim_stages_us": [
+      9660,
+      0,
+      0,
+      1787
+     ],
+     "refreshes": 4,
+     "ov_px": 12963,
+     "fps": 45
+    },
+    {
+     "snap_us": 102341,
+     "pub_us": 30130,
+     "clear_us": 3138,
+     "draw_us": 98699,
+     "scan_us": 17924,
+     "scrim_us": 11998,
+     "whole_at_ms": 249600,
+     "clear_by_runs": 0,
+     "scrim_stages_us": [
+      9981,
+      0,
+      0,
+      2436
+     ],
+     "refreshes": 5,
+     "ov_px": 12963,
+     "fps": 45
+    }
+   ],
+   "best": {
+    "snap_us": 76723,
+    "pub_us": 25632,
+    "clear_us": 3549,
+    "draw_us": 72533,
+    "scan_us": 13089,
+    "scrim_us": 12324,
+    "whole_at_ms": 237397,
+    "clear_by_runs": 0,
+    "scrim_stages_us": [
+     10392,
+     0,
+     0,
+     1862
+    ],
+    "refreshes": 4,
+    "ov_px": 12963,
+    "fps": 45
+   }
+  },
+  "brew": {
+   "rounds": [
+    {
+     "snap_us": 35984,
+     "pub_us": 22084,
+     "clear_us": 1579,
+     "draw_us": 34056,
+     "scan_us": 9862,
+     "scrim_us": 11906,
+     "whole_at_ms": 255620,
+     "clear_by_runs": 1,
+     "scrim_stages_us": [
+      10351,
+      0,
+      0,
+      1819
+     ],
+     "refreshes": 7,
+     "ov_px": 6897,
+     "fps": 45
+    },
+    {
+     "snap_us": 39455,
+     "pub_us": 19555,
+     "clear_us": 2943,
+     "draw_us": 36117,
+     "scan_us": 7220,
+     "scrim_us": 12149,
+     "whole_at_ms": 261760,
+     "clear_by_runs": 1,
+     "scrim_stages_us": [
+      10220,
+      0,
+      0,
+      1888
+     ],
+     "refreshes": 10,
+     "ov_px": 6897,
+     "fps": 45
+    },
+    {
+     "snap_us": 46038,
+     "pub_us": 19941,
+     "clear_us": 2763,
+     "draw_us": 42850,
+     "scan_us": 7456,
+     "scrim_us": 12298,
+     "whole_at_ms": 267870,
+     "clear_by_runs": 1,
+     "scrim_stages_us": [
+      10436,
+      0,
+      0,
+      1819
+     ],
+     "refreshes": 8,
+     "ov_px": 6897,
+     "fps": 45
+    }
+   ],
+   "best": {
+    "snap_us": 35984,
+    "pub_us": 22084,
+    "clear_us": 1579,
+    "draw_us": 34056,
+    "scan_us": 9862,
+    "scrim_us": 11906,
+    "whole_at_ms": 255620,
+    "clear_by_runs": 1,
+    "scrim_stages_us": [
+     10351,
+     0,
+     0,
+     1819
+    ],
+    "refreshes": 7,
+    "ov_px": 6897,
+    "fps": 45
+   }
+  },
+  "steam": {
+   "rounds": [
+    {
+     "snap_us": 38370,
+     "pub_us": 17923,
+     "clear_us": 2506,
+     "draw_us": 35450,
+     "scan_us": 6044,
+     "scrim_us": 11718,
+     "whole_at_ms": 274072,
+     "clear_by_runs": 1,
+     "scrim_stages_us": [
+      9624,
+      0,
+      0,
+      1631
+     ],
+     "refreshes": 10,
+     "ov_px": 3453,
+     "fps": 45
+    },
+    {
+     "snap_us": 59650,
+     "pub_us": 18667,
+     "clear_us": 4975,
+     "draw_us": 53965,
+     "scan_us": 6314,
+     "scrim_us": 12164,
+     "whole_at_ms": 280106,
+     "clear_by_runs": 1,
+     "scrim_stages_us": [
+      10285,
+      0,
+      0,
+      1821
+     ],
+     "refreshes": 7,
+     "ov_px": 3455,
+     "fps": 45
+    },
+    {
+     "snap_us": 61994,
+     "pub_us": 21542,
+     "clear_us": 2264,
+     "draw_us": 59243,
+     "scan_us": 8919,
+     "scrim_us": 12344,
+     "whole_at_ms": 286227,
+     "clear_by_runs": 1,
+     "scrim_stages_us": [
+      10366,
+      0,
+      0,
+      1920
+     ],
+     "refreshes": 8,
+     "ov_px": 3455,
+     "fps": 45
+    }
+   ],
+   "best": {
+    "snap_us": 38370,
+    "pub_us": 17923,
+    "clear_us": 2506,
+    "draw_us": 35450,
+    "scan_us": 6044,
+    "scrim_us": 11718,
+    "whole_at_ms": 274072,
+    "clear_by_runs": 1,
+    "scrim_stages_us": [
+     9624,
+     0,
+     0,
+     1631
+    ],
+    "refreshes": 10,
+    "ov_px": 3453,
+    "fps": 45
+   }
+  },
+  "water": {
+   "rounds": [
+    {
+     "snap_us": 51097,
+     "pub_us": 21697,
+     "clear_us": 4255,
+     "draw_us": 46279,
+     "scan_us": 9300,
+     "scrim_us": 12246,
+     "whole_at_ms": 292402,
+     "clear_by_runs": 1,
+     "scrim_stages_us": [
+      10099,
+      0,
+      0,
+      1880
+     ],
+     "refreshes": 10,
+     "ov_px": 4443,
+     "fps": 45
+    },
+    {
+     "snap_us": 37501,
+     "pub_us": 22252,
+     "clear_us": 3020,
+     "draw_us": 33989,
+     "scan_us": 9692,
+     "scrim_us": 12375,
+     "whole_at_ms": 298448,
+     "clear_by_runs": 1,
+     "scrim_stages_us": [
+      10427,
+      0,
+      0,
+      1897
+     ],
+     "refreshes": 7,
+     "ov_px": 4441,
+     "fps": 45
+    },
+    {
+     "snap_us": 42228,
+     "pub_us": 19309,
+     "clear_us": 3271,
+     "draw_us": 38496,
+     "scan_us": 6578,
+     "scrim_us": 12544,
+     "whole_at_ms": 304734,
+     "clear_by_runs": 1,
+     "scrim_stages_us": [
+      10653,
+      0,
+      0,
+      1857
+     ],
+     "refreshes": 7,
+     "ov_px": 4441,
+     "fps": 45
+    }
+   ],
+   "best": {
+    "snap_us": 37501,
+    "pub_us": 22252,
+    "clear_us": 3020,
+    "draw_us": 33989,
+    "scan_us": 9692,
+    "scrim_us": 12375,
+    "whole_at_ms": 298448,
+    "clear_by_runs": 1,
+    "scrim_stages_us": [
+     10427,
+     0,
+     0,
+     1897
+    ],
+    "refreshes": 7,
+    "ov_px": 4441,
+    "fps": 45
+   }
+  },
+  "status": {
+   "rounds": [
+    {
+     "snap_us": 39465,
+     "pub_us": 22636,
+     "clear_us": 3144,
+     "draw_us": 35855,
+     "scan_us": 10305,
+     "scrim_us": 12097,
+     "whole_at_ms": 310910,
+     "clear_by_runs": 1,
+     "scrim_stages_us": [
+      10536,
+      0,
+      0,
+      1847
+     ],
+     "refreshes": 8,
+     "ov_px": 9487,
+     "fps": 45
+    },
+    {
+     "snap_us": 45173,
+     "pub_us": 23174,
+     "clear_us": 4860,
+     "draw_us": 39777,
+     "scan_us": 10271,
+     "scrim_us": 12584,
+     "whole_at_ms": 317245,
+     "clear_by_runs": 1,
+     "scrim_stages_us": [
+      10595,
+      0,
+      0,
+      1922
+     ],
+     "refreshes": 8,
+     "ov_px": 9487,
+     "fps": 45
+    },
+    {
+     "snap_us": 37419,
+     "pub_us": 28544,
+     "clear_us": 2593,
+     "draw_us": 34383,
+     "scan_us": 13325,
+     "scrim_us": 14971,
+     "whole_at_ms": 323266,
+     "clear_by_runs": 1,
+     "scrim_stages_us": [
+      12498,
+      0,
+      0,
+      2378
+     ],
+     "refreshes": 10,
+     "ov_px": 9487,
+     "fps": 45
+    }
+   ],
+   "best": {
+    "snap_us": 39465,
+    "pub_us": 22636,
+    "clear_us": 3144,
+    "draw_us": 35855,
+    "scan_us": 10305,
+    "scrim_us": 12097,
+    "whole_at_ms": 310910,
+    "clear_by_runs": 1,
+    "scrim_stages_us": [
+     10536,
+     0,
+     0,
+     1847
+    ],
+    "refreshes": 8,
+    "ov_px": 9487,
+    "fps": 45
+   }
+  },
+  "grind": {
+   "rounds": [
+    {
+     "snap_us": 31212,
+     "pub_us": 21215,
+     "clear_us": 3711,
+     "draw_us": 26916,
+     "scan_us": 7969,
+     "scrim_us": 13047,
+     "whole_at_ms": 329478,
+     "clear_by_runs": 1,
+     "scrim_stages_us": [
+      11049,
+      0,
+      0,
+      3476
+     ],
+     "refreshes": 10,
+     "ov_px": 4209,
+     "fps": 45
+    },
+    {
+     "snap_us": 38773,
+     "pub_us": 20759,
+     "clear_us": 3102,
+     "draw_us": 35195,
+     "scan_us": 7527,
+     "scrim_us": 13020,
+     "whole_at_ms": 335475,
+     "clear_by_runs": 1,
+     "scrim_stages_us": [
+      10791,
+      0,
+      0,
+      2166
+     ],
+     "refreshes": 9,
+     "ov_px": 4209,
+     "fps": 45
+    },
+    {
+     "snap_us": 65427,
+     "pub_us": 18500,
+     "clear_us": 4891,
+     "draw_us": 59672,
+     "scan_us": 6273,
+     "scrim_us": 12074,
+     "whole_at_ms": 341756,
+     "clear_by_runs": 1,
+     "scrim_stages_us": [
+      10206,
+      0,
+      0,
+      1823
+     ],
+     "refreshes": 8,
+     "ov_px": 4209,
+     "fps": 45
+    }
+   ],
+   "best": {
+    "snap_us": 31212,
+    "pub_us": 21215,
+    "clear_us": 3711,
+    "draw_us": 26916,
+    "scan_us": 7969,
+    "scrim_us": 13047,
+    "whole_at_ms": 329478,
+    "clear_by_runs": 1,
+    "scrim_stages_us": [
+     11049,
+     0,
+     0,
+     3476
+    ],
+    "refreshes": 10,
+    "ov_px": 4209,
+    "fps": 45
+   }
+  },
+  "profile": {
+   "rounds": [
+    {
+     "snap_us": 129997,
+     "pub_us": 27968,
+     "clear_us": 2669,
+     "draw_us": 126827,
+     "scan_us": 15736,
+     "scrim_us": 12063,
+     "whole_at_ms": 347958,
+     "clear_by_runs": 0,
+     "scrim_stages_us": [
+      10073,
+      0,
+      0,
+      1919
+     ],
+     "refreshes": 5,
+     "ov_px": 6018,
+     "fps": 45
+    },
+    {
+     "snap_us": 46714,
+     "pub_us": 27133,
+     "clear_us": 2770,
+     "draw_us": 43472,
+     "scan_us": 14518,
+     "scrim_us": 12440,
+     "whole_at_ms": 354189,
+     "clear_by_runs": 0,
+     "scrim_stages_us": [
+      10438,
+      0,
+      0,
+      1852
+     ],
+     "refreshes": 5,
+     "ov_px": 6018,
+     "fps": 45
+    },
+    {
+     "snap_us": 107774,
+     "pub_us": 27753,
+     "clear_us": 3236,
+     "draw_us": 103974,
+     "scan_us": 14478,
+     "scrim_us": 13014,
+     "whole_at_ms": 360179,
+     "clear_by_runs": 0,
+     "scrim_stages_us": [
+      10479,
+      0,
+      0,
+      2808
+     ],
+     "refreshes": 5,
+     "ov_px": 6018,
+     "fps": 45
+    }
+   ],
+   "best": {
+    "snap_us": 46714,
+    "pub_us": 27133,
+    "clear_us": 2770,
+    "draw_us": 43472,
+    "scan_us": 14518,
+    "scrim_us": 12440,
+    "whole_at_ms": 354189,
+    "clear_by_runs": 0,
+    "scrim_stages_us": [
+     10438,
+     0,
+     0,
+     1852
+    ],
+    "refreshes": 5,
+    "ov_px": 6018,
+    "fps": 45
+   }
+  },
+  "new_profile": {
+   "rounds": [
+    {
+     "snap_us": 168493,
+     "pub_us": 31601,
+     "clear_us": 2667,
+     "draw_us": 165414,
+     "scan_us": 19527,
+     "scrim_us": 11842,
+     "whole_at_ms": 366819,
+     "clear_by_runs": 1,
+     "scrim_stages_us": [
+      10115,
+      0,
+      0,
+      1676
+     ],
+     "refreshes": 2,
+     "ov_px": 103562,
+     "fps": 45
+    },
+    {
+     "snap_us": 159366,
+     "pub_us": 33161,
+     "clear_us": 2755,
+     "draw_us": 156041,
+     "scan_us": 18288,
+     "scrim_us": 14638,
+     "whole_at_ms": 372839,
+     "clear_by_runs": 1,
+     "scrim_stages_us": [
+      12614,
+      0,
+      0,
+      1960
+     ],
+     "refreshes": 2,
+     "ov_px": 103562,
+     "fps": 45
+    },
+    {
+     "snap_us": 204978,
+     "pub_us": 27893,
+     "clear_us": 3035,
+     "draw_us": 201537,
+     "scan_us": 15502,
+     "scrim_us": 12198,
+     "whole_at_ms": 379093,
+     "clear_by_runs": 1,
+     "scrim_stages_us": [
+      9782,
+      0,
+      0,
+      2347
+     ],
+     "refreshes": 2,
+     "ov_px": 103562,
+     "fps": 45
+    }
+   ],
+   "best": {
+    "snap_us": 159366,
+    "pub_us": 33161,
+    "clear_us": 2755,
+    "draw_us": 156041,
+    "scan_us": 18288,
+    "scrim_us": 14638,
+    "whole_at_ms": 372839,
+    "clear_by_runs": 1,
+    "scrim_stages_us": [
+     12614,
+     0,
+     0,
+     1960
+    ],
+    "refreshes": 2,
+    "ov_px": 103562,
+    "fps": 45
+   }
+  },
+  "info": {
+   "rounds": [
+    {
+     "snap_us": 79902,
+     "pub_us": 27495,
+     "clear_us": 3035,
+     "draw_us": 76385,
+     "scan_us": 14837,
+     "scrim_us": 12447,
+     "whole_at_ms": 384816,
+     "clear_by_runs": 0,
+     "scrim_stages_us": [
+      10402,
+      0,
+      0,
+      1661
+     ],
+     "refreshes": 13,
+     "ov_px": 40721,
+     "fps": 45
+    },
+    {
+     "snap_us": 74647,
+     "pub_us": 30751,
+     "clear_us": 4893,
+     "draw_us": 69088,
+     "scan_us": 16814,
+     "scrim_us": 13714,
+     "whole_at_ms": 390882,
+     "clear_by_runs": 0,
+     "scrim_stages_us": [
+      10424,
+      0,
+      0,
+      1883
+     ],
+     "refreshes": 13,
+     "ov_px": 40721,
+     "fps": 45
+    },
+    {
+     "snap_us": 83108,
+     "pub_us": 30525,
+     "clear_us": 3610,
+     "draw_us": 78938,
+     "scan_us": 18082,
+     "scrim_us": 12195,
+     "whole_at_ms": 396977,
+     "clear_by_runs": 0,
+     "scrim_stages_us": [
+      10414,
+      0,
+      0,
+      1892
+     ],
+     "refreshes": 15,
+     "ov_px": 40721,
+     "fps": 45
+    }
+   ],
+   "best": {
+    "snap_us": 74647,
+    "pub_us": 30751,
+    "clear_us": 4893,
+    "draw_us": 69088,
+    "scan_us": 16814,
+    "scrim_us": 13714,
+    "whole_at_ms": 390882,
+    "clear_by_runs": 0,
+    "scrim_stages_us": [
+     10424,
+     0,
+     0,
+     1883
+    ],
+    "refreshes": 13,
+    "ov_px": 40721,
+    "fps": 45
+   }
+  }
+ },
+ "settings": {}
+}
