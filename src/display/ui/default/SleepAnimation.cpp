@@ -2791,6 +2791,14 @@ void SleepAnimation::layerHide(int id) {
         layers[id].visible.store(false);
     }
 }
+
+void SleepAnimation::layerShow(int id) {
+    if (id >= 0 && id < MAX_LAYERS && layers[id].used.load() && layers[id].buf != nullptr) {
+        layers[id].showGen.store(0);
+        layers[id].hideGen.store(0);
+        layers[id].visible.store(true);
+    }
+}
 SleepAnimation::LayerInfo SleepAnimation::layerInfo(int id) const {
     LayerInfo info{};
     if (id < 0 || id >= MAX_LAYERS) {

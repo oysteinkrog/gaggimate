@@ -48,7 +48,7 @@ class SleepAnimation {
     uint16_t overlayGain() const { return 256; }
     uint16_t overlayGainTarget() const { return 256; }
     bool overlayGainSettled() const { return true; }
-    static constexpr int MAX_LAYERS = 3;
+    static constexpr int MAX_LAYERS = 5; // one move, two icons of two sprites (gm-2cl.17)
     enum class LayerEase : uint8_t { Linear = 0, EaseOut = 1, EaseInOut = 2 };
     struct LayerInfo {
         bool used, visible, animating;
@@ -65,6 +65,7 @@ class SleepAnimation {
     bool layerAnimating(int) const { return false; }
     bool layerVisible(int) const { return false; }
     void layerHide(int) {}
+    void layerShow(int) {}
     void layerShowAtGen(int, uint32_t) {}
     void layerHideAtGen(int, uint32_t) {}
     uint32_t overlayPublishGen() const { return 0; }
@@ -475,7 +476,7 @@ class SleepAnimation {
     // enters or leaves are pushed whole for that frame (requestBandWarmup):
     // the same rule as widget updates, since a moving hard-edged sprite
     // split across interlace phases combs visibly.
-    static constexpr int MAX_LAYERS = 3;
+    static constexpr int MAX_LAYERS = 5; // one move, two icons of two sprites (gm-2cl.17)
     enum class LayerEase : uint8_t { Linear = 0, EaseOut = 1, EaseInOut = 2 };
     struct LayerInfo {
         bool used, visible, animating;
@@ -493,6 +494,10 @@ class SleepAnimation {
     bool layerAnimating(int id) const;
     bool layerVisible(int id) const;
     void layerHide(int id);
+    // Shows a published layer again at its last position; the runs from
+    // layerPublish still hold. The pair mirrors a blinking object's hidden
+    // flag (DefaultUI::serviceIconLayers).
+    void layerShow(int id);
     // Handover latches (gm-2cl.8). Every overlay publish carries a
     // generation number (overlayPublishGen is the last one issued), and a
     // frame composites one overlay, so gating a layer on the generation of

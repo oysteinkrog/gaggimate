@@ -1461,6 +1461,9 @@ void WebUIPlugin::setupServer() {
         if (request->hasArg("texts")) {
             g_textElementsReq = request->arg("texts").toInt() != 0 ? 1 : 0;
         }
+        if (request->hasArg("icons")) {
+            g_iconLayersReq = request->arg("icons").toInt() != 0 ? 1 : 0;
+        }
         if (request->hasArg("touchpoll")) {
             touchtask::setPollEnabled(request->arg("touchpoll").toInt() != 0);
         }
@@ -1674,6 +1677,7 @@ void WebUIPlugin::setupServer() {
         doc["elem_rings"] = a->ringElementCount();
         doc["dials"] = g_dialElementsReq;
         doc["texts"] = g_textElementsReq;
+        doc["icons"] = g_iconLayersReq;
         doc["clrruns"] = g_clearByRunsReq;
         doc["touch_poll"] = touchtask::pollEnabled();
         doc["touch_task"] = touchtask::running();
@@ -1720,6 +1724,22 @@ void WebUIPlugin::setupServer() {
                 o["w"] = d.w;
                 o["h"] = d.h;
                 o["ver"] = d.ver;
+            }
+        }
+        {
+            JsonArray il = doc["icon_layers"].to<JsonArray>();
+            for (int i = 0; i < 2; i++) {
+                const IconLayerDbg &d = g_iconLayerDbg[i];
+                if (!d.owned) {
+                    continue;
+                }
+                JsonObject o = il.add<JsonObject>();
+                o["x"] = d.x;
+                o["y"] = d.y;
+                o["w"] = d.w;
+                o["h"] = d.h;
+                o["shown"] = d.shown;
+                o["toggles"] = d.toggles;
             }
         }
         doc["atlas_bytes"] = glyphatlas::bytesUsed();
