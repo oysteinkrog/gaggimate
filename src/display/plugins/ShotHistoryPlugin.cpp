@@ -2,15 +2,15 @@
 
 #include <LittleFS.h>
 #include <SD_MMC.h>
-#include <display/util/SafeReplace.h>
 #include <cmath>
 #include <display/core/Controller.h>
 #include <display/core/ProfileManager.h>
 #include <display/core/process/BrewProcess.h>
 #include <display/core/utils.h>
-#include <display/models/shot_log_format.h>
 #include <display/drivers/common/PanelClock.h>
+#include <display/models/shot_log_format.h>
 #include <display/util/PsramAllocator.h>
+#include <display/util/SafeReplace.h>
 
 namespace {
 constexpr float TEMP_SCALE = 10.0f;

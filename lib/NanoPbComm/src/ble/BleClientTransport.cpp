@@ -70,8 +70,8 @@ void BleClientTransport::maintain() {
         _scanner->stop();
         _scanner->setInterval(SCAN_BACKOFF_INTERVAL_MS);
         _scanner->start(0, false, false);
-        ESP_LOGI(LOG_TAG, "No controller in %us, scan backing off to %u ms interval",
-                 (unsigned)(SCAN_BOOST_MS / 1000), (unsigned)SCAN_BACKOFF_INTERVAL_MS);
+        ESP_LOGI(LOG_TAG, "No controller in %us, scan backing off to %u ms interval", (unsigned)(SCAN_BOOST_MS / 1000),
+                 (unsigned)SCAN_BACKOFF_INTERVAL_MS);
     }
 }
 

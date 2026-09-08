@@ -11,8 +11,6 @@ extern uint32_t nebula_lerp_self_test(uint32_t *firstBad);
 #ifndef GAGGIMATE_SIM
 #include <esp_cache.h> // esp_cache_msync, so /api/debug/fb reads past the cache
 #endif
-#include <esp_timer.h>        // esp_timer_dump, for /api/debug/timers
-#include <esp_memory_utils.h> // esp_ptr_external_ram, for the band-buffer placement report
 #include <SD_MMC.h>
 #include <algorithm>
 #include <display/core/Controller.h>
@@ -23,6 +21,8 @@ extern uint32_t nebula_lerp_self_test(uint32_t *firstBad);
 #include <display/models/profile.h>
 #include <display/plugins/BLEScalePlugin.h>
 #include <display/plugins/ShotHistoryPlugin.h>
+#include <esp_memory_utils.h> // esp_ptr_external_ram, for the band-buffer placement report
+#include <esp_timer.h>        // esp_timer_dump, for /api/debug/timers
 #ifdef GM_ANIM_BENCH
 #include <display/ui/default/SleepAnimation.h>
 #include <display/ui/default/bganim/BgAnim.h>
@@ -44,10 +44,10 @@ extern uint32_t nebula_lerp_self_test(uint32_t *firstBad);
 #endif
 #include <display/core/TouchInject.h> // /api/debug/tap
 #ifndef GAGGIMATE_HEADLESS
-#include <display/drivers/common/LV_Helper.h> // g_overlayStats / g_overlayMinRefreshUs for /api/debug/anim
+#include <display/drivers/common/LV_Helper.h>      // g_overlayStats / g_overlayMinRefreshUs for /api/debug/anim
 #include <display/ui/default/eez/MeterTickCache.h> // tick_cache_bytes on /api/debug/anim
-#include <display/ui/default/eez/screens.h>  // objects, for /api/debug/touchlog
-#include <display/ui/default/eez/eez-flow.h> // eez_flow_object_names
+#include <display/ui/default/eez/eez-flow.h>       // eez_flow_object_names
+#include <display/ui/default/eez/screens.h>        // objects, for /api/debug/touchlog
 #endif
 #include <display/drivers/common/PanelClock.h>
 #include <display/ui/default/bganim/BgAnim.h> // bg_library_valid / bg_map_valid for the settings writer; headless too
@@ -637,8 +637,8 @@ void WebUIPlugin::setupServer() {
         // A few spare rows: tasks can be born between the count and the
         // snapshot, and a short array makes uxTaskGetSystemState return 0.
         const UBaseType_t cap = uxTaskGetNumberOfTasks() + 4;
-        TaskStatus_t *st = static_cast<TaskStatus_t *>(
-            heap_caps_malloc(sizeof(TaskStatus_t) * cap, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+        TaskStatus_t *st =
+            static_cast<TaskStatus_t *>(heap_caps_malloc(sizeof(TaskStatus_t) * cap, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
         if (st == nullptr) {
             request->send(500, "application/json", "{\"error\":\"alloc\"}");
             return;
@@ -701,7 +701,8 @@ void WebUIPlugin::setupServer() {
         char buf[512];
         snprintf(buf, sizeof(buf),
                  "{\"int_free\":%u,\"int_largest\":%u,\"int_min\":%u,\"psram_free\":%u,\"psram_largest\":%u,"
-                 "\"anim_sram\":%u,\"anim_psram\":%u,\"hot_used\":%u,\"hot_shared\":%u,\"hot_peak\":%u,\"hot_fail\":%u,\"hot_slab\":%u,"
+                 "\"anim_sram\":%u,\"anim_psram\":%u,\"hot_used\":%u,\"hot_shared\":%u,\"hot_peak\":%u,\"hot_fail\":%u,\"hot_"
+                 "slab\":%u,"
                  "\"sc_frames\":%u,\"sc_refills\":%u,\"sc_slips\":%u,"
                  "\"dma_free\":%u,\"dma_min\":%u,\"asset_streams\":%u,\"asset_queue\":%u,\"uptime_ms\":%lu}",
                  // heap_caps_get_largest_free_block walks every block in the heap,
@@ -766,8 +767,7 @@ void WebUIPlugin::setupServer() {
         // refill headroom fell below N us. Set it one histogram bucket below
         // the healthy mode; 0 turns it off.
         if (request->hasArg("lagthresh")) {
-            panelclock::setLagThresholdUs(
-                static_cast<uint32_t>(request->arg("lagthresh").toInt()));
+            panelclock::setLagThresholdUs(static_cast<uint32_t>(request->arg("lagthresh").toInt()));
         }
         uint32_t frames = 0, refills = 0, slips = 0;
         panelclock::scanoutStats(&frames, &refills, &slips);
@@ -790,8 +790,7 @@ void WebUIPlugin::setupServer() {
         // registers as a slip.
         response->printf("\"margin_us\":%u,\"margin_min_us\":%u,\"margin_max_us\":%u,\"margin_bucket_us\":%u,"
                          "\"margin_hist\":[",
-                         static_cast<unsigned>(marginLast), static_cast<unsigned>(marginMin),
-                         static_cast<unsigned>(marginMax),
+                         static_cast<unsigned>(marginLast), static_cast<unsigned>(marginMin), static_cast<unsigned>(marginMax),
                          static_cast<unsigned>(panelclock::SCANOUT_MARGIN_BUCKET_US));
         for (size_t i = 0; i < panelclock::SCANOUT_MARGIN_BUCKETS; i++) {
             response->printf("%s%u", i ? "," : "", static_cast<unsigned>(marginBucket[i]));
@@ -801,34 +800,28 @@ void WebUIPlugin::setupServer() {
         // it up against the beam instead of restarting the DMA, so it now costs one
         // band of stale pixels rather than a whole shifted frame. dma_restarts should
         // stay at zero: only an explicit panel restart reaches it.
-        response->printf("],\"resyncs\":%u,\"resync_bufs\":%u,\"resync_max\":%u,\"over_count\":%u,\"over_bufs\":%u,\"phy_defer\":%u,"
-                         "\"flash_skips\":%u,"
-                         "\"dma_restarts\":%u,\"dma_catchups\":%u,\"dma_catchup_bufs\":%u,"
-                         "\"dma_catchup_max\":%u,\"eof_expect\":%u,\"eof_min\":%u,\"eof_max\":%u,\"log\":[",
-                         static_cast<unsigned>(gm_rgb_resync_count),
-                         static_cast<unsigned>(gm_rgb_resync_bufs),
-                         static_cast<unsigned>(gm_rgb_resync_max),
-                         static_cast<unsigned>(gm_rgb_over_count), static_cast<unsigned>(gm_rgb_over_bufs),
-                         static_cast<unsigned>(panelclock::phyTrackDeferred()),
-                         static_cast<unsigned>(gm_rgb_flash_skip_bufs),
-                         static_cast<unsigned>(gm_rgb_restart_count),
-                         static_cast<unsigned>(gm_rgb_catchup_count),
-                         static_cast<unsigned>(gm_rgb_catchup_bufs),
-                         static_cast<unsigned>(gm_rgb_catchup_max),
-                         static_cast<unsigned>(gm_rgb_eof_expect),
-                         static_cast<unsigned>(gm_rgb_eof_min),
-                         static_cast<unsigned>(gm_rgb_eof_max));
+        response->printf(
+            "],\"resyncs\":%u,\"resync_bufs\":%u,\"resync_max\":%u,\"over_count\":%u,\"over_bufs\":%u,\"phy_defer\":%u,"
+            "\"flash_skips\":%u,"
+            "\"dma_restarts\":%u,\"dma_catchups\":%u,\"dma_catchup_bufs\":%u,"
+            "\"dma_catchup_max\":%u,\"eof_expect\":%u,\"eof_min\":%u,\"eof_max\":%u,\"log\":[",
+            static_cast<unsigned>(gm_rgb_resync_count), static_cast<unsigned>(gm_rgb_resync_bufs),
+            static_cast<unsigned>(gm_rgb_resync_max), static_cast<unsigned>(gm_rgb_over_count),
+            static_cast<unsigned>(gm_rgb_over_bufs), static_cast<unsigned>(panelclock::phyTrackDeferred()),
+            static_cast<unsigned>(gm_rgb_flash_skip_bufs), static_cast<unsigned>(gm_rgb_restart_count),
+            static_cast<unsigned>(gm_rgb_catchup_count), static_cast<unsigned>(gm_rgb_catchup_bufs),
+            static_cast<unsigned>(gm_rgb_catchup_max), static_cast<unsigned>(gm_rgb_eof_expect),
+            static_cast<unsigned>(gm_rgb_eof_min), static_cast<unsigned>(gm_rgb_eof_max));
         for (size_t i = 0; i < n; i++) {
-            response->printf(
-                "%s{\"frame\":%u,\"t_us\":%u,\"margin_us\":%u,\"overlay_us\":%u,\"flash_us\":%u,\"band_us\":%u,"
-                "\"present_us\":%u,\"phy_us\":%u}",
-                i ? "," : "", static_cast<unsigned>(slipLog[i].frame), static_cast<unsigned>(slipLog[i].tUs),
-                static_cast<unsigned>(slipLog[i].marginUs),
-                static_cast<unsigned>(slipLog[i].sinceUs[panelclock::SCANOUT_ACT_OVERLAY]),
-                static_cast<unsigned>(slipLog[i].sinceUs[panelclock::SCANOUT_ACT_FLASH]),
-                static_cast<unsigned>(slipLog[i].sinceUs[panelclock::SCANOUT_ACT_BANDPUSH]),
-                static_cast<unsigned>(slipLog[i].sinceUs[panelclock::SCANOUT_ACT_PRESENT]),
-                static_cast<unsigned>(slipLog[i].sinceUs[panelclock::SCANOUT_ACT_PHY]));
+            response->printf("%s{\"frame\":%u,\"t_us\":%u,\"margin_us\":%u,\"overlay_us\":%u,\"flash_us\":%u,\"band_us\":%u,"
+                             "\"present_us\":%u,\"phy_us\":%u}",
+                             i ? "," : "", static_cast<unsigned>(slipLog[i].frame), static_cast<unsigned>(slipLog[i].tUs),
+                             static_cast<unsigned>(slipLog[i].marginUs),
+                             static_cast<unsigned>(slipLog[i].sinceUs[panelclock::SCANOUT_ACT_OVERLAY]),
+                             static_cast<unsigned>(slipLog[i].sinceUs[panelclock::SCANOUT_ACT_FLASH]),
+                             static_cast<unsigned>(slipLog[i].sinceUs[panelclock::SCANOUT_ACT_BANDPUSH]),
+                             static_cast<unsigned>(slipLog[i].sinceUs[panelclock::SCANOUT_ACT_PRESENT]),
+                             static_cast<unsigned>(slipLog[i].sinceUs[panelclock::SCANOUT_ACT_PHY]));
         }
         // busy_hist is how long the refill handler spent copying, gap_hist how long it
         // waited between calls, both in 32 us buckets. They separate the two faults that
@@ -847,7 +840,8 @@ void WebUIPlugin::setupServer() {
         // chunk_hist: every 240 B chunk of every refill copy, 16 us buckets. The
         // shape of a slow copy: one 400 us chunk is a bus freeze, many 7 us
         // chunks is a shared bus.
-        response->printf("],\"chunk_bucket_us\":16,\"chunk_max_us\":%u,\"chunk_hist\":[", static_cast<unsigned>(gm_rgb_chunk_max_us));
+        response->printf("],\"chunk_bucket_us\":16,\"chunk_max_us\":%u,\"chunk_hist\":[",
+                         static_cast<unsigned>(gm_rgb_chunk_max_us));
         for (int i = 0; i < 24; i++) {
             response->printf("%s%u", i ? "," : "", static_cast<unsigned>(gm_rgb_chunk_hist[i]));
         }
@@ -867,13 +861,13 @@ void WebUIPlugin::setupServer() {
             const volatile gm_rgb_gap_ev_t &ev = gm_rgb_gaplog[(gapStart + i) % GM_RGB_GAPLOG_N];
             const char *task = ev.task ? ev.task : "?";
             const char *other = ev.other ? ev.other : "?";
-            response->printf("%s{\"t_ms\":%u,\"gap_us\":%u,\"prev_busy_us\":%u,\"busy_us\":%u,\"fills\":%u,\"nest\":%u,\"pos\":%u,"
-                             "\"stall_us\":%u,\"stall_at\":%u,\"pc\":\"0x%08x\",\"ps\":\"0x%08x\",\"task\":\"%s\",\"other\":\"%s\"}",
-                             i ? "," : "", static_cast<unsigned>(ev.t_ms), static_cast<unsigned>(ev.gap_us),
-                             static_cast<unsigned>(ev.prev_busy_us), static_cast<unsigned>(ev.busy_us),
-                             static_cast<unsigned>(ev.fills), static_cast<unsigned>(ev.nest), static_cast<unsigned>(ev.pos),
-                             static_cast<unsigned>(ev.stall_us), static_cast<unsigned>(ev.stall_at),
-                             static_cast<unsigned>(ev.pc), static_cast<unsigned>(ev.ps), task, other);
+            response->printf(
+                "%s{\"t_ms\":%u,\"gap_us\":%u,\"prev_busy_us\":%u,\"busy_us\":%u,\"fills\":%u,\"nest\":%u,\"pos\":%u,"
+                "\"stall_us\":%u,\"stall_at\":%u,\"pc\":\"0x%08x\",\"ps\":\"0x%08x\",\"task\":\"%s\",\"other\":\"%s\"}",
+                i ? "," : "", static_cast<unsigned>(ev.t_ms), static_cast<unsigned>(ev.gap_us),
+                static_cast<unsigned>(ev.prev_busy_us), static_cast<unsigned>(ev.busy_us), static_cast<unsigned>(ev.fills),
+                static_cast<unsigned>(ev.nest), static_cast<unsigned>(ev.pos), static_cast<unsigned>(ev.stall_us),
+                static_cast<unsigned>(ev.stall_at), static_cast<unsigned>(ev.pc), static_cast<unsigned>(ev.ps), task, other);
         }
         response->print("]}");
         request->send(response);
@@ -974,9 +968,9 @@ void WebUIPlugin::setupServer() {
             response->printf("%s{\"start\":\"0x%08x\",\"end\":\"0x%08x\",\"size\":%u,\"used\":%u,\"free\":%u,\"largest_free\":%u,"
                              "\"used_blocks\":%u,\"free_blocks\":%u}",
                              i ? "," : "", static_cast<unsigned>(r.start), static_cast<unsigned>(r.end),
-                             static_cast<unsigned>(r.end - r.start), static_cast<unsigned>(r.used), static_cast<unsigned>(r.free_),
-                             static_cast<unsigned>(r.largestFree), static_cast<unsigned>(r.usedBlocks),
-                             static_cast<unsigned>(r.freeBlocks));
+                             static_cast<unsigned>(r.end - r.start), static_cast<unsigned>(r.used),
+                             static_cast<unsigned>(r.free_), static_cast<unsigned>(r.largestFree),
+                             static_cast<unsigned>(r.usedBlocks), static_cast<unsigned>(r.freeBlocks));
         }
         response->printf("],\"overflow_bytes\":%u,\"overflow_blocks\":%u,\"sizes\":[", static_cast<unsigned>(w->overflowBytes),
                          static_cast<unsigned>(w->overflowBlocks));
@@ -1010,7 +1004,8 @@ void WebUIPlugin::setupServer() {
             uint32_t hwm;
         };
         const UBaseType_t cap = uxTaskGetNumberOfTasks() + 4;
-        auto *st = static_cast<TaskSnapshot_t *>(heap_caps_malloc(sizeof(TaskSnapshot_t) * cap, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+        auto *st =
+            static_cast<TaskSnapshot_t *>(heap_caps_malloc(sizeof(TaskSnapshot_t) * cap, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
         auto *rows = static_cast<TaskRow *>(heap_caps_malloc(sizeof(TaskRow) * cap, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
         if (st != nullptr && rows != nullptr) {
             vTaskSuspendAll();
@@ -1293,7 +1288,8 @@ void WebUIPlugin::setupServer() {
                 if (total == 0 || total > kMaxImage) {
                     return;
                 }
-                auto *stage = static_cast<KBlobStage *>(heap_caps_malloc(sizeof(KBlobStage) + total, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+                auto *stage =
+                    static_cast<KBlobStage *>(heap_caps_malloc(sizeof(KBlobStage) + total, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
                 if (stage == nullptr) {
                     return;
                 }
@@ -2050,9 +2046,8 @@ void WebUIPlugin::setupServer() {
                 }
             }
             len += snprintf(buf + len, CAP - len, "%s{\"t\":%u,\"press\":%d,\"syn\":%d,\"x\":%d,\"y\":%d,\"hit\":%s%s%s}",
-                            i == first ? "" : ",", static_cast<unsigned>(en.tMs), en.press ? 1 : 0, en.syn ? 1 : 0,
-                            en.x, en.y, name != nullptr ? "\"" : "", name != nullptr ? name : "null",
-                            name != nullptr ? "\"" : "");
+                            i == first ? "" : ",", static_cast<unsigned>(en.tMs), en.press ? 1 : 0, en.syn ? 1 : 0, en.x, en.y,
+                            name != nullptr ? "\"" : "", name != nullptr ? name : "null", name != nullptr ? "\"" : "");
         }
         len += snprintf(buf + len, CAP - len, "]}");
         request->send(200, "application/json", buf);
@@ -2169,8 +2164,7 @@ void WebUIPlugin::setupServer() {
         // first chunk. state counts output pixels.
         auto *state = new int(0);
         AsyncWebServerResponse *response = request->beginChunkedResponse(
-            "application/octet-stream",
-            [buf, planePx, w, step, ow, oh, state](uint8_t *out, size_t maxLen, size_t) -> size_t {
+            "application/octet-stream", [buf, planePx, w, step, ow, oh, state](uint8_t *out, size_t maxLen, size_t) -> size_t {
                 const int total = ow * oh;
                 size_t written = 0;
                 while (*state < total && written + 3 <= maxLen) {
@@ -2232,25 +2226,25 @@ void WebUIPlugin::setupServer() {
         // starting row from index rather than a separate row counter keeps this
         // correct either way, and frees frame once index+written reaches total
         // instead of waiting on a since-nonexistent extra all-zero call.
-        AsyncWebServerResponse *response = request->beginResponse(
-            "application/octet-stream", total,
-            [frame, w, step, ow, oh, total](uint8_t *out, size_t maxLen, size_t index) -> size_t {
-                const size_t rowBytes = static_cast<size_t>(ow) * 2;
-                size_t written = 0;
-                int row = static_cast<int>(index / rowBytes);
-                while (row < oh && written + rowBytes <= maxLen) {
-                    const uint16_t *src = frame->data() + static_cast<size_t>(row) * step * w;
-                    uint16_t *dst = reinterpret_cast<uint16_t *>(out + written);
-                    for (int x = 0; x < ow; x++)
-                        dst[x] = src[x * step];
-                    written += rowBytes;
-                    row++;
-                }
-                if (index + written >= total) {
-                    delete frame;
-                }
-                return written;
-            });
+        AsyncWebServerResponse *response =
+            request->beginResponse("application/octet-stream", total,
+                                   [frame, w, step, ow, oh, total](uint8_t *out, size_t maxLen, size_t index) -> size_t {
+                                       const size_t rowBytes = static_cast<size_t>(ow) * 2;
+                                       size_t written = 0;
+                                       int row = static_cast<int>(index / rowBytes);
+                                       while (row < oh && written + rowBytes <= maxLen) {
+                                           const uint16_t *src = frame->data() + static_cast<size_t>(row) * step * w;
+                                           uint16_t *dst = reinterpret_cast<uint16_t *>(out + written);
+                                           for (int x = 0; x < ow; x++)
+                                               dst[x] = src[x * step];
+                                           written += rowBytes;
+                                           row++;
+                                       }
+                                       if (index + written >= total) {
+                                           delete frame;
+                                       }
+                                       return written;
+                                   });
         char disposition[64];
         snprintf(disposition, sizeof(disposition), "%dx%d", ow, oh);
         response->addHeader("X-FB-Size", disposition);
@@ -2307,8 +2301,7 @@ void WebUIPlugin::setupServer() {
             }
             const int x = request->arg("x").toInt();
             const int y = request->arg("y").toInt();
-            const int ms =
-                request->hasArg("ms") ? request->arg("ms").toInt() : static_cast<int>(TOUCH_INJECT_DEFAULT_HOLD_MS);
+            const int ms = request->hasArg("ms") ? request->arg("ms").toInt() : static_cast<int>(TOUCH_INJECT_DEFAULT_HOLD_MS);
             if (x < TOUCH_INJECT_MIN_COORD || x > TOUCH_INJECT_MAX_COORD || y < TOUCH_INJECT_MIN_COORD ||
                 y > TOUCH_INJECT_MAX_COORD || ms < static_cast<int>(TOUCH_INJECT_MIN_HOLD_MS) ||
                 ms > static_cast<int>(TOUCH_INJECT_MAX_HOLD_MS)) {
@@ -2353,8 +2346,8 @@ void WebUIPlugin::setupServer() {
             controller->synthBrewCycleRequest = request->arg("brew").toInt() != 0 ? 1 : 0;
         }
         char buf[64];
-        snprintf(buf, sizeof(buf), "{\"brew_cycle\":%s,\"brewing\":%s}",
-                 controller->synthBrewCycleOn ? "true" : "false", controller->synthBrewingNow ? "true" : "false");
+        snprintf(buf, sizeof(buf), "{\"brew_cycle\":%s,\"brewing\":%s}", controller->synthBrewCycleOn ? "true" : "false",
+                 controller->synthBrewingNow ? "true" : "false");
         request->send(200, "application/json", buf);
     });
 #endif
@@ -2459,8 +2452,8 @@ void WebUIPlugin::setupServer() {
                  "{\"seq\":%u,\"open\":%s,\"depth\":%d,\"category\":%d,\"page\":%d,\"pages\":%d,\"title\":\"%s\","
                  "\"fixture\":{\"enter\":%d,\"commit\":%d,\"draft\":%d,\"action\":%d,\"confirm\":%d,\"locked\":%s,"
                  "\"repeats\":%d,\"fast_repeats\":%d}}",
-                 static_cast<unsigned>(st.seq), st.open ? "true" : "false", st.depth, st.category, st.page, st.pages,
-                 st.title, st.fixtureEnter, st.fixtureCommit, st.fixtureDraft, st.fixtureAction, st.fixtureConfirm,
+                 static_cast<unsigned>(st.seq), st.open ? "true" : "false", st.depth, st.category, st.page, st.pages, st.title,
+                 st.fixtureEnter, st.fixtureCommit, st.fixtureDraft, st.fixtureAction, st.fixtureConfirm,
                  st.fixtureLocked ? "true" : "false", st.fixtureRepeats, st.fixtureFastRepeats);
         request->send(200, "application/json", buf);
     });

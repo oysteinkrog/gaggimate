@@ -2,7 +2,7 @@
 
 #if GM_TOUCH_INJECT
 
-#include <Arduino.h>          // millis()
+#include <Arduino.h>           // millis()
 #include <freertos/FreeRTOS.h> // portMUX_TYPE / portENTER_CRITICAL / portEXIT_CRITICAL
 
 namespace {
@@ -29,8 +29,8 @@ portMUX_TYPE s_mux = portMUX_INITIALIZER_UNLOCKED;
 } // namespace
 
 bool touchInjectRequest(int16_t x, int16_t y, uint32_t holdMs) {
-    if (x < TOUCH_INJECT_MIN_COORD || x > TOUCH_INJECT_MAX_COORD || y < TOUCH_INJECT_MIN_COORD ||
-        y > TOUCH_INJECT_MAX_COORD || holdMs < TOUCH_INJECT_MIN_HOLD_MS || holdMs > TOUCH_INJECT_MAX_HOLD_MS) {
+    if (x < TOUCH_INJECT_MIN_COORD || x > TOUCH_INJECT_MAX_COORD || y < TOUCH_INJECT_MIN_COORD || y > TOUCH_INJECT_MAX_COORD ||
+        holdMs < TOUCH_INJECT_MIN_HOLD_MS || holdMs > TOUCH_INJECT_MAX_HOLD_MS) {
         return false;
     }
     bool queued = false;

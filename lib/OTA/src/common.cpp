@@ -82,8 +82,8 @@ String resolve_redirect_chain(WiFiClientSecure &wifi_client, String url, int max
             https.end();
             return url;
         }
-        if (code == HTTP_CODE_MOVED_PERMANENTLY || code == HTTP_CODE_FOUND ||
-            code == HTTP_CODE_TEMPORARY_REDIRECT || code == HTTP_CODE_PERMANENT_REDIRECT) {
+        if (code == HTTP_CODE_MOVED_PERMANENTLY || code == HTTP_CODE_FOUND || code == HTTP_CODE_TEMPORARY_REDIRECT ||
+            code == HTTP_CODE_PERMANENT_REDIRECT) {
             const String loc = https.getLocation();
             https.end();
             if (loc.length() == 0) {
