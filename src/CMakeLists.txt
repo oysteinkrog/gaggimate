@@ -30,6 +30,12 @@ else()
         # build never does.
         FILE(GLOB_RECURSE panelclock_sources ${CMAKE_SOURCE_DIR}/src/display/drivers/common/PanelClock.cpp)
         list(APPEND app_sources ${panelclock_sources})
+        # ...and the gradient parsers, which the settings writer in WebUIPlugin
+        # validates bgAnimGradients and bgAnimThemeMap with (bg_library_valid,
+        # bg_map_valid) on every board. BgAnimThemes.cpp is parsing and tables
+        # only (BgAnim.h, ctype.h, string.h), no renderer behind it.
+        FILE(GLOB_RECURSE bgthemes_sources ${CMAKE_SOURCE_DIR}/src/display/ui/default/bganim/BgAnimThemes.cpp)
+        list(APPEND app_sources ${bgthemes_sources})
     endif()
 endif()
 
