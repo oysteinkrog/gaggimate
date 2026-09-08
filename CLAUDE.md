@@ -666,8 +666,11 @@ Instruments, and where each one exists:
   `textease=`, `dials=`, `icons=`, `marquees=`, `clrruns=`, `touchpoll=`
   and `animoff=` knobs) and
   `/api/debug/pclk` (the live pixel-clock divider) are device-only: both sit
-  inside `WebUIPlugin.cpp`'s real-panel block, which `GAGGIMATE_SIM` and
-  `GAGGIMATE_HEADLESS` exclude.
+  inside the real-panel block of `WebUIPluginDebug.cpp`, which `GAGGIMATE_SIM`
+  and `GAGGIMATE_HEADLESS` exclude. Every `/api/debug/*` route, the probe
+  routes and the bench routes are registered by
+  `WebUIPlugin::setupDebugEndpoints()` in that file (gm-bzu.19); the
+  production routes stay in `WebUIPlugin.cpp`'s `setupServer()`.
 
 Three test commands, and what each proves:
 
