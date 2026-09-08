@@ -145,6 +145,91 @@ telemetry-driven screen from a 650 ms LVGL pass (1.5 Hz widget updates,
   churn was traced to the size refresh and then to the 40x40 scale icon
   the flow blinks (gm-2cl.7).
 
+- **A page change costs one whole-page snapshot, and it is bus traffic,
+  not pixels** (gm-2cl.7, 2026-09-08, `tools/snapshot_lat.py`, bench board,
+  cap 45, divider 8, Starfield). The UI task gets about 20 to 25 MB/s of
+  PSRAM while the render task and the panel refill run, so every stage of
+  the snapshot cost what it touched: clearing both planes (921 KB) 35 to
+  53 ms, scanning the whole alpha plane (460 KB) 23 to 28 ms, the six
+  scrim passes plus five transposes over the 14 KB grid 16 to 20 ms, and
+  the regional scrim path walking the whole grid at its stride 24 to 59.
+  Five changes took every page but one from 130 to 306 ms to 48 to 100
+  (`ov_whole_*` on `/api/debug/anim` is the split: snap, pub, clear, draw,
+  scan, scrim, and `ov_whole_at_ms` says which page change it was):
+  the clear is alpha only (colour under alpha 0 is never read: the writer
+  copies over a transparent pixel without reading it, the blend gives
+  bg exactly at alpha 0, the scan reads alpha alone) and, for a buffer
+  that was published and not drawn into since, zeroes only what its run
+  table covers (`SleepAnimation::clearBackAlphaByRuns`,
+  `overlayDrawnUnpublished`; `clrruns=0` forces the memset for an A/B,
+  `tools/snapshot_clear_check.py` compares the two modes on stable pixels:
+  zero differing); the planar writer records each buffer row's written
+  extent (`gm_snap_row_x0/x1`, LV_Helper.h, reset per pass, set to
+  "everything" for a row not cleared whole) so the publish scans only the
+  extent and a fill that lands outside it stores without reading the
+  alpha plane; the whole scrim build is two sweeps (a horizontal 5-max,
+  then per row a vertical 5-max, a horizontal 1-2-1 into a three-row
+  stack ring and the vertical 1-2-1 out of it, bit-exact with the six
+  passes and so with `buildScrimRegional`), 12 ms with the halo, and a
+  publish whose ranges reach more than a third of the cell rows takes it
+  instead of the regional path. The snapshot is rendered during the
+  120 ms fade-out and published when the gain reaches zero, so what the
+  eye can see of a page change is the publish (now 17 to 40 ms) plus
+  whatever the snapshot ran past the fade. The page still over the line
+  is new_profile: 165 ms of LVGL draw for a 300 px panel with
+  `clip_corner` (every child drawn through a radius mask) and zoomed
+  images (`lv_img_set_zoom`, a software transform per pixel); that is a
+  screen-design cost, the generated `screens.c` owns it, and the pixel
+  writer is not where it goes. Info (69 ms of draw, the QR code) is the
+  other heavy one. Under the render task the draw stage runs 30 to 60%
+  slower than at 5 fps, which is the shared instruction cache and the
+  bus; pausing the animation for the snapshot would buy that back at the
+  price of a visible hitch on every page change and was not done.
+- **Touch is read by its own task, and the press plate is written from
+  it** (gm-2cl.4, 2026-09-08, `TouchTask.cpp`). `touchtask` polls the
+  controller every 5 ms from a core 1 task at priority 2 with a 4 KB
+  PSRAM stack (about 1.7 KB used) and publishes the latest sample through
+  a seqlock; LVGL's `touchpad_read` takes that sample instead of reading
+  the controller, so clicks, holds, repeats and unlocks stay LVGL events
+  and nothing about their semantics changed, except that a press edge is
+  latched for LVGL's next read: a tap that begins and ends inside one UI
+  pass (every injected tap is 80 ms; a page build on the device is longer)
+  is still delivered as one pressed sample at its point and then the
+  release, where the old poll would have lost it, and the injected tap
+  only ever worked because the queue waited for LVGL. On a press edge the task
+  hit-tests the point against a hit map the UI task publishes at the end
+  of every pass (`DefaultUI::publishTouchHitMap`, at most 96 rects in
+  PSRAM, the same walk as `lv_indev_search_obj`, header packed into one
+  64-bit atomic) and writes the plate element itself; the render task
+  re-latches slot 0 between bands (`pickupInteractionElement`) so the
+  plate lands in the frame being rendered, not the next one. The map's
+  generation moves only when its content changes: the task clears a held
+  plate when the generation moves under the finger (a screen change), and
+  a version that bumped it every pass cleared every plate 25 ms after the
+  press. Measured with `tools/touch_lat.py` (20 injected taps on the
+  Fixture toggle row, bench board, cap 45, divider 8), press to the end
+  of the first frame carrying the plate: interlaced quiet median 33 ms,
+  p90 43; with the 120 px lv_anim plate moving, 35 and 46; on the
+  board's stored whole-frame path 49/69 and 57/74. Before, through
+  LVGL's pressed restyle, the same tap was 84/103 quiet and 153/193
+  busy. What is left is the poll (up to 5 ms) plus the rest of the
+  frame plus the present; the plate is not visible before the flip. The
+  LVGL path itself is unchanged (press to publish 23 ms quiet, 65 busy).
+  **Every user of the panel's I2C bus goes through `LilyGo_RGBPanel`'s
+  recursive bus mutex** (`_busLock`, `BusGuard`): the touch controller
+  read, `setVcom`, `setInversion`, `writeCommand`, `writeData`, `sleep`
+  and the SD mount. Wire serialises one transaction, but a register read
+  is two and its receive buffer is shared, so the touch task's GT911 poll
+  and the UI task's first-pass VCOM write (bit-banged through the XL9555
+  expander) read each other's bytes: the expander's read-modify-write
+  took a GT911 byte as its port state and the controller NACKed every
+  poll until reboot, 30 I2C errors a second, from the animation start
+  onwards. The old design never saw it because the poll and the VCOM
+  write were on the same task. `touchpoll=0` on `/api/debug/anim` parks
+  the task (LVGL reads the controller itself again) and was the A/B that
+  cleared the task itself; `touch_samples` should climb at about 145 a
+  second and a rate near 15 means every transaction is timing out.
+
 - **The render loop lives in IRAM** (`renderLoop`, `renderFrame`,
   `presentFrame`, `pushLoop` and the scrim rows, `SleepAnimation.cpp`). The
   two cores share one 16 KB instruction cache, and every LVGL pass on core 1
@@ -439,7 +524,9 @@ Instruments, and where each one exists:
   `GM_SYNTH_HANDSHAKE`, which only `display-loadtest` and `display-blestress`
   set.
 - `/api/debug/anim` (frame counters, `anim_id`, `uptime_ms`, `text_elems`,
-  `dirty_recent`, the `texts=`, `textease=` and `dials=` element knobs) and
+  `dirty_recent`, the `ov_whole_*` page-change split, `touch_task`,
+  `touch_samples`, `touch_hwm`, `hitmap_n`, `hitmap_gen`, the `texts=`,
+  `textease=`, `dials=`, `clrruns=` and `touchpoll=` knobs) and
   `/api/debug/pclk` (the live pixel-clock divider) are device-only: both sit
   inside `WebUIPlugin.cpp`'s real-panel block, which `GAGGIMATE_SIM` and
   `GAGGIMATE_HEADLESS` exclude.

@@ -1,6 +1,7 @@
 #ifndef DEFAULTUI_H
 #define DEFAULTUI_H
 
+#include <display/ui/default/TouchTask.h>
 #include <atomic>
 #include <display/core/PluginManager.h>
 #include <display/core/ProfileManager.h>
@@ -200,6 +201,10 @@ class DefaultUI {
     // while this is the feedback (see g_pressPlateActive).
     static void touchHitHook(lv_obj_t *hit, bool pressed, int16_t x, int16_t y);
     void onTouchHit(lv_obj_t *hit, bool pressed);
+    // The active screen's clickable rectangles for the touch task
+    // (TouchTask.h), rebuilt once per UI pass and after a screen change.
+    void publishTouchHitMap();
+    static void collectHitRects(lv_obj_t *obj, const lv_area_t &clip, lv_obj_t *scr, touchtask::HitRect *out, int &n);
     void updatePressPlateMode();
     bool pressPlateMode = false;
     static DefaultUI *s_instance;
@@ -293,7 +298,7 @@ class DefaultUI {
     // leaving the rest of the buffer alone, so an overlay refresh costs what
     // actually changed rather than a whole screen.
     bool snapshotAreaToOverlay(lv_obj_t *obj, uint8_t *buf, uint32_t bufSize, const lv_area_t &clip, int *outW,
-                               int *outH);
+                               int *outH, bool clearByRuns = false);
     void maintainScaleScreen();
     void buildScaleScreen();
     void displaceGrindWidgets(bool displaced);
@@ -329,6 +334,10 @@ class DefaultUI {
     lv_area_t overlayCopy[2][OVERLAY_DIRTY_RECTS];
     int overlayCopyN[2] = {0, 0};
     bool overlayValid[2] = {false, false};
+    // Set when a snapshot draws into the buffer, cleared when it is
+    // published: while set, the buffer's run table does not describe its
+    // alpha and a whole-page clear must memset the plane.
+    bool overlayDrawnUnpublished[2] = {true, true};
     // The snapshot geometry each overlay buffer was built with.
     //
     // The snapshot is sized width+ext*2 by height+ext*2, where ext is the

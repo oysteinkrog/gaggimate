@@ -21,6 +21,7 @@ volatile int64_t g_overlayMinRefreshUs = 250000; // DefaultUI's constructor sets
 volatile int g_uiAnimTestReq = 0;
 volatile int g_dialElementsReq = 1;
 volatile int g_textElementsReq = 1;
+volatile int g_clearByRunsReq = 1;
 volatile int g_textEaseReq = 1;
 volatile int g_textDbg[8] = {0};
 TextElemDbg g_textElemDbg[6];
@@ -34,3 +35,8 @@ volatile bool g_touchMapLoad = false;
 volatile bool g_touchMapPending = false;
 char *g_touchMapBuf = nullptr;
 volatile uint32_t g_touchMapLen = 0;
+
+extern "C" {
+uint8_t gm_snap_row_x0[GM_SNAP_ROWS];
+uint8_t gm_snap_row_x1[GM_SNAP_ROWS];
+}

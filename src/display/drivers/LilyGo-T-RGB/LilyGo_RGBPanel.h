@@ -169,6 +169,31 @@ class LilyGo_RGBPanel : public Display {
     uint16_t *_fbDirect[FB_COUNT] = {};
     bool _fbResolved = false;
     SemaphoreHandle_t _fbGate = nullptr;
+    // Serialises every user of the I2C bus behind this driver: the touch
+    // controller reads (the touch task) and the XL9555 expander, through
+    // which the ST7701 register writes are bit-banged (setVcom,
+    // setInversion, on the UI task). Wire serialises single transactions,
+    // but its receive buffer is shared and a register read is two
+    // transactions, so two tasks reading through it at once hand each other
+    // the wrong bytes: a GT911 poll during a VCOM write read the expander's
+    // port byte back into the expander with the touch reset line in the
+    // wrong state, and the controller NACKed every poll until the next
+    // reboot (2026-09-08). Recursive: writeCommand nests under setVcom, and
+    // the touch driver's expander callbacks nest under getPoint.
+    SemaphoreHandle_t _busLock = nullptr;
+    struct BusGuard {
+        SemaphoreHandle_t m;
+        explicit BusGuard(SemaphoreHandle_t mm) : m(mm) {
+            if (m != nullptr) {
+                xSemaphoreTakeRecursive(m, portMAX_DELAY);
+            }
+        }
+        ~BusGuard() {
+            if (m != nullptr) {
+                xSemaphoreGiveRecursive(m);
+            }
+        }
+    };
     int _fbCount = 0;
     // Which buffer the panel is scanning. pushColors invalidates against
     // this one, because that is where esp_lcd's copy path will land.

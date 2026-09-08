@@ -1,0 +1,52 @@
+{
+ "host": "192.168.1.121",
+ "plate_color": "000000",
+ "us_per_px": 0.12,
+ "concepts": [
+  {
+   "name": "disc180-60",
+   "radius": 180,
+   "opacity_pct": 60,
+   "note": "today's Custom plate: the whole dial disc at 60 percent",
+   "blended_px": 101792,
+   "blend_ms_est": 12.2,
+   "png": "/mnt/c/work/gaggimate/.claude/worktrees/gm-2cl-6-dials/tools/overlay_footprint/plate-disc180-60.png"
+  },
+  {
+   "name": "disc140-60",
+   "radius": 140,
+   "opacity_pct": 60,
+   "note": "smaller disc, still behind the dial ring's inner edge",
+   "blended_px": 61520,
+   "blend_ms_est": 7.4,
+   "png": "/mnt/c/work/gaggimate/.claude/worktrees/gm-2cl-6-dials/tools/overlay_footprint/plate-disc140-60.png"
+  },
+  {
+   "name": "disc110-60",
+   "radius": 110,
+   "opacity_pct": 60,
+   "note": "supporting plate behind the numbers only",
+   "blended_px": 38000,
+   "blend_ms_est": 4.6,
+   "png": "/mnt/c/work/gaggimate/.claude/worktrees/gm-2cl-6-dials/tools/overlay_footprint/plate-disc110-60.png"
+  },
+  {
+   "name": "disc180-100",
+   "radius": 180,
+   "opacity_pct": 100,
+   "note": "opaque disc: the copy path, no blend at all",
+   "blended_px": 0,
+   "blend_ms_est": 0.0,
+   "png": "/mnt/c/work/gaggimate/.claude/worktrees/gm-2cl-6-dials/tools/overlay_footprint/plate-disc180-100.png"
+  },
+  {
+   "name": "none",
+   "radius": 0,
+   "opacity_pct": 0,
+   "note": "no plate (the board's stored setting)",
+   "blended_px": 0,
+   "blend_ms_est": 0.0,
+   "png": "/mnt/c/work/gaggimate/.claude/worktrees/gm-2cl-6-dials/tools/overlay_footprint/plate-none.png"
+  }
+ ]
+}

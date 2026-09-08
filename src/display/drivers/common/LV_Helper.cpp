@@ -7,6 +7,7 @@
  * @date      2024-01-22
  *
  */
+#include <display/ui/default/TouchTask.h>
 #include "LV_Helper.h"
 #include <display/core/TouchInject.h>
 #ifdef GM_TOUCH_PROBE
@@ -230,6 +231,7 @@ int lvgl_helper_take_dirty_rects(lv_area_t *out, int maxN) {
 // sits between finger and edge, and the panel scan adds 0-20 ms after the
 // flip. Those bounds are known; this measures the part the firmware owns.
 volatile int64_t g_probeEdgeUs = 0;
+volatile int64_t g_probeElemEdgeUs = 0;
 volatile bool g_probeEdgeIsPress = false;
 std::atomic<int64_t> g_probePublishUs{0};
 std::atomic<bool> g_probePublishIsPress{false};
@@ -310,6 +312,7 @@ OverlayStats g_overlayStats;
 volatile int g_uiAnimTestReq = 0;
 volatile int g_dialElementsReq = 1;
 volatile int g_textElementsReq = 1;
+volatile int g_clearByRunsReq = 1;
 volatile int g_textEaseReq = 1;
 volatile int g_textDbg[8] = {0};
 TextElemDbg g_textElemDbg[6];
@@ -330,10 +333,22 @@ static void touchpad_read(lv_indev_drv_t *indev_driver, lv_indev_data_t *data) {
     static int16_t x, y;
     uint8_t touched;
     bool synthetic;
+    // The controller is read by the touch task (TouchTask.h) when it runs;
+    // this callback then only hands LVGL the latest sample, so a long LVGL
+    // pass delays LVGL's own view of the press but not the press plate. The
+    // direct read stays for panels without the task.
+    int64_t sampleUs = 0;
     {
+        touchtask::Sample s;
         int16_t injX, injY;
         bool injPressed;
-        if (touchInjectPoll(injX, injY, injPressed)) {
+        if (touchtask::latest(s)) {
+            x = s.x;
+            y = s.y;
+            touched = s.pressed;
+            synthetic = s.synthetic != 0;
+            sampleUs = s.tUs;
+        } else if (touchInjectPoll(injX, injY, injPressed)) {
             x = injX;
             y = injY;
             touched = injPressed ? 1 : 0;
@@ -347,11 +362,14 @@ static void touchpad_read(lv_indev_drv_t *indev_driver, lv_indev_data_t *data) {
         // Production-path edge stamp (not probe-gated): DefaultUI::loop uses
         // it to let an interaction bypass the telemetry-pass spacing, so a
         // tap's effect applies on the very next pass instead of waiting out
-        // the spacer.
+        // the spacer. With the touch task the stamp is the sample's own time
+        // (the task already stamped it); without it, now.
         static bool edgeWasTouched = false;
         if (touched != edgeWasTouched) {
             edgeWasTouched = touched;
-            g_touchEdgeAtUs = esp_timer_get_time();
+            if (sampleUs == 0) {
+                g_touchEdgeAtUs = esp_timer_get_time();
+            }
             TouchLogEntry &en = g_touchLog[g_touchLogCount % TOUCHLOG_N];
             en.tMs = static_cast<uint32_t>(::millis());
             en.x = x;
@@ -373,7 +391,7 @@ static void touchpad_read(lv_indev_drv_t *indev_driver, lv_indev_data_t *data) {
     static bool wasTouched = false;
     if (touched != wasTouched) {
         wasTouched = touched;
-        g_probeEdgeUs = esp_timer_get_time();
+        g_probeEdgeUs = sampleUs != 0 ? sampleUs : esp_timer_get_time();
         g_probeEdgeIsPress = touched;
         {
             // See g_statPassStartUs in LV_Helper.h: separates "edge waited in
@@ -498,6 +516,8 @@ void beginLvglHelper(Display &board, bool debug) {
 // set_px_true_color_alpha, so the planes hold what the 3-byte buffer held.
 extern "C" {
 uint32_t gm_overlay_plane_px = 0;
+uint8_t gm_snap_row_x0[GM_SNAP_ROWS];
+uint8_t gm_snap_row_x1[GM_SNAP_ROWS];
 }
 
 void gm_set_px_planar(lv_disp_drv_t *disp_drv, uint8_t *buf, lv_coord_t buf_w, lv_coord_t x, lv_coord_t y,
@@ -505,6 +525,16 @@ void gm_set_px_planar(lv_disp_drv_t *disp_drv, uint8_t *buf, lv_coord_t buf_w, l
     (void)disp_drv;
     uint16_t *col = reinterpret_cast<uint16_t *>(buf) + static_cast<size_t>(buf_w) * y + x;
     uint16_t *a16 = col + gm_overlay_plane_px;
+    if (y >= 0 && y < GM_SNAP_ROWS && x >= 0) {
+        const int g = x >> GM_SNAP_GRAN_SHIFT;
+        const uint8_t gb = g > 254 ? 254 : static_cast<uint8_t>(g);
+        if (gb < gm_snap_row_x0[y]) {
+            gm_snap_row_x0[y] = gb;
+        }
+        if (gb > gm_snap_row_x1[y]) {
+            gm_snap_row_x1[y] = gb;
+        }
+    }
     const lv_opa_t bg_opa = gm_planar_alpha_load(*a16);
     if (opa >= LV_OPA_MAX || bg_opa <= LV_OPA_MIN) {
         *col = color.full;

@@ -1,5 +1,6 @@
 #include "WebUIPlugin.h"
 #include <display/ui/default/GlyphAtlas.h>
+#include <display/ui/default/TouchTask.h>
 
 // Defined in AnimNebula.cpp; see nebulaLerpSelfTest there.
 extern uint32_t nebula_lerp_self_test(uint32_t *firstBad);
@@ -1460,6 +1461,12 @@ void WebUIPlugin::setupServer() {
         if (request->hasArg("texts")) {
             g_textElementsReq = request->arg("texts").toInt() != 0 ? 1 : 0;
         }
+        if (request->hasArg("touchpoll")) {
+            touchtask::setPollEnabled(request->arg("touchpoll").toInt() != 0);
+        }
+        if (request->hasArg("clrruns")) {
+            g_clearByRunsReq = request->arg("clrruns").toInt() != 0 ? 1 : 0;
+        }
         if (request->hasArg("textease")) {
             g_textEaseReq = request->arg("textease").toInt() != 0 ? 1 : 0;
         }
@@ -1639,6 +1646,22 @@ void WebUIPlugin::setupServer() {
         // widgets' refresh rate) and the last pass's snapshot/publish cost.
         doc["ov_refreshes"] = g_overlayStats.refreshes;
         doc["ov_snap_us"] = g_overlayStats.lastSnapUs;
+        doc["ov_whole_snap_us"] = g_overlayStats.lastWholeSnapUs;
+        doc["ov_whole_pub_us"] = g_overlayStats.lastWholePubUs;
+        doc["ov_whole_clear_us"] = g_overlayStats.lastWholeClearUs;
+        doc["ov_whole_draw_us"] = g_overlayStats.lastWholeDrawUs;
+        doc["ov_whole_scan_us"] = g_overlayStats.lastWholeScanUs;
+        doc["ov_whole_scrim_us"] = g_overlayStats.lastWholeScrimUs;
+        doc["ov_whole_at_ms"] = g_overlayStats.lastWholeAtMs;
+        doc["ov_pub_scan_us"] = g_overlayStats.lastPubScanUs;
+        doc["ov_pub_scrim_us"] = g_overlayStats.lastPubScrimUs;
+        doc["ov_whole_clear_by_runs"] = g_overlayStats.lastWholeClearByRuns;
+        {
+            JsonArray st = doc["ov_scrim_stages_us"].to<JsonArray>();
+            for (int i = 0; i < 4; i++) {
+                st.add(g_overlayStats.scrimStageUs[i]);
+            }
+        }
         doc["ov_pub_us"] = g_overlayStats.lastPubUs;
         doc["ov_area_px"] = g_overlayStats.lastAreaPx;
         doc["ov_px"] = a->overlayPixels();
@@ -1651,6 +1674,13 @@ void WebUIPlugin::setupServer() {
         doc["elem_rings"] = a->ringElementCount();
         doc["dials"] = g_dialElementsReq;
         doc["texts"] = g_textElementsReq;
+        doc["clrruns"] = g_clearByRunsReq;
+        doc["touch_poll"] = touchtask::pollEnabled();
+        doc["touch_task"] = touchtask::running();
+        doc["touch_samples"] = touchtask::sampleCount();
+        doc["touch_hwm"] = touchtask::stackHighWaterBytes();
+        doc["hitmap_n"] = touchtask::hitMapCount();
+        doc["hitmap_gen"] = touchtask::hitMapGeneration();
         doc["textease"] = g_textEaseReq;
         doc["elem_text"] = a->textElementCount();
         {

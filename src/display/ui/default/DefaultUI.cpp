@@ -238,6 +238,15 @@ DefaultUI::DefaultUI(Controller *controller, Driver *driver, PluginManager *plug
     : controller(controller), panelDriver(driver), pluginManager(pluginManager),
       settingsUI(*controller, *this, *pluginManager) {
     setupPanel();
+#ifndef GAGGIMATE_SIM
+    // The touch controller read moves off the UI task (gm-2cl.4). The first
+    // hit map is published by the first loop() pass.
+    if (panelDriver != nullptr && panelDriver->getDisplay() != nullptr) {
+        if (!touchtask::start(panelDriver->getDisplay(), &sleepAnimation, PRESS_PLATE_ELEMENT)) {
+            log_w("touch task not started; touch stays on the UI task");
+        }
+    }
+#endif
     xTaskCreatePinnedToCore(loopTask, "DefaultUI::loop", configMINIMAL_STACK_SIZE * 6, this, 1, &taskHandle, 1);
 }
 
@@ -253,6 +262,11 @@ void DefaultUI::touchHitHook(lv_obj_t *hit, bool pressed, int16_t x, int16_t y) 
 
 void DefaultUI::onTouchHit(lv_obj_t *hit, bool pressed) {
 #ifndef GAGGIMATE_SIM
+    if (touchtask::running()) {
+        // The touch task owns the plate: it wrote it at the press edge from
+        // the hit map, before LVGL saw the sample.
+        return;
+    }
     if (!pressed || !pressPlateMode) {
         sleepAnimation.clearElement(PRESS_PLATE_ELEMENT);
         return;
@@ -1392,6 +1406,80 @@ void DefaultUI::loop() {
     lv_task_handler();
     maintainSleepAnimation();
     serviceOverlayTransition();
+    publishTouchHitMap();
+}
+
+// LVGL's own search (lv_indev_search_obj): a hidden object hides its
+// subtree; children are searched when the point is on the object's
+// coordinates or the object has overflow visible; an object is hit when it
+// is clickable, enabled and the point is inside its click area. Flattened
+// here in tree order, so the last containing rectangle is the one LVGL
+// would return; a disabled object is left out and its parent answers, as
+// in LVGL. The screen itself is not a target.
+void DefaultUI::collectHitRects(lv_obj_t *obj, const lv_area_t &clip, lv_obj_t *scr, touchtask::HitRect *out, int &n) {
+    if (lv_obj_has_flag(obj, LV_OBJ_FLAG_HIDDEN)) {
+        return;
+    }
+    lv_area_t coords;
+    lv_obj_get_coords(obj, &coords);
+    if (obj != scr && lv_obj_has_flag(obj, LV_OBJ_FLAG_CLICKABLE) && !lv_obj_has_state(obj, LV_STATE_DISABLED) &&
+        n < touchtask::kMaxHitRects) {
+        lv_area_t click;
+        lv_obj_get_click_area(obj, &click);
+        lv_area_t hit;
+        if (_lv_area_intersect(&hit, &click, &clip)) {
+            touchtask::HitRect &r = out[n++];
+            r.x1 = hit.x1;
+            r.y1 = hit.y1;
+            r.x2 = hit.x2;
+            r.y2 = hit.y2;
+            r.px1 = coords.x1;
+            r.py1 = coords.y1;
+            r.px2 = coords.x2;
+            r.py2 = coords.y2;
+            // A container the size of the screen is not a target, whatever
+            // LVGL says: no plate over a background press (onTouchHit's rule).
+            const int w = lv_area_get_width(&coords);
+            const int h = lv_area_get_height(&coords);
+            r.plate = (w * h > (480 * 480) / 3) ? 0 : 1;
+        }
+    }
+    lv_area_t childClip = clip;
+    if (!lv_obj_has_flag(obj, LV_OBJ_FLAG_OVERFLOW_VISIBLE)) {
+        if (!_lv_area_intersect(&childClip, &coords, &clip)) {
+            return;
+        }
+    }
+    const uint32_t children = lv_obj_get_child_cnt(obj);
+    for (uint32_t i = 0; i < children; i++) {
+        collectHitRects(lv_obj_get_child(obj, i), childClip, scr, out, n);
+    }
+}
+
+void DefaultUI::publishTouchHitMap() {
+#ifndef GAGGIMATE_SIM
+    if (!touchtask::running()) {
+        return;
+    }
+    lv_obj_t *scr = lv_scr_act();
+    if (scr == nullptr) {
+        return;
+    }
+    // PSRAM, not BSS: 96 rectangles are 1.6 KB, and internal RAM is the
+    // WiFi budget.
+    static touchtask::HitRect *rects = nullptr;
+    if (rects == nullptr) {
+        rects = static_cast<touchtask::HitRect *>(ps_malloc(sizeof(touchtask::HitRect) * touchtask::kMaxHitRects));
+        if (rects == nullptr) {
+            return;
+        }
+    }
+    int n = 0;
+    const lv_area_t whole = {-32767, -32767, 32767, 32767};
+    collectHitRects(scr, whole, scr, rects, n);
+    const lv_color_t dim = lv_color_hex(static_cast<uint32_t>(controller->getSettings().getTouchDimColor()));
+    touchtask::publishHitMap(rects, n, pressPlateMode, lv_color_to16(dim), PRESS_PLATE_OUTSET);
+#endif
 }
 
 void DefaultUI::beginOverlayTransition(const char *why, bool waitSwap) {
@@ -2830,7 +2918,7 @@ void DefaultUI::stopSleepAnimation() {
 static lv_coord_t overlayExtX(lv_coord_t ext) { return static_cast<lv_coord_t>((ext + 7) & ~7); }
 
 bool DefaultUI::snapshotAreaToOverlay(lv_obj_t *obj, uint8_t *buf, uint32_t bufSize, const lv_area_t &clip, int *outW,
-                                      int *outH) {
+                                      int *outH, bool clearByRuns) {
 #ifndef GAGGIMATE_SIM
     const lv_coord_t ext = _lv_obj_get_ext_draw_size(obj);
     const lv_coord_t extX = overlayExtX(ext);
@@ -2866,12 +2954,38 @@ bool DefaultUI::snapshotAreaToOverlay(lv_obj_t *obj, uint8_t *buf, uint32_t bufS
 #ifdef GM_TOUCH_PROBE
     const int64_t clear0 = esp_timer_get_time();
 #endif
+    // Alpha only. Colour under alpha 0 is never read: the planar writer
+    // copies over a transparent pixel without reading it, the blend kernels
+    // give (fg * 0 + bg * 256) >> 8 = bg exactly, and the span scan reads
+    // the alpha plane alone. Clearing both planes was half of a whole-page
+    // snapshot's clear (35 to 53 ms of the two planes' 921 KB, gm-2cl.7).
+    // Full-width clips are one contiguous memset instead of one per row.
     const size_t rowBytes = static_cast<size_t>(clipped.x2 - clipped.x1 + 1) * 2;
-    for (int y = clipped.y1; y <= clipped.y2; y++) {
-        const size_t off = static_cast<size_t>(y - snapshotArea.y1) * w + (clipped.x1 - snapshotArea.x1);
-        memset(colPlane + off, 0, rowBytes);
-        memset(a16Plane + off, 0, rowBytes);
+    if (clipped.x1 == snapshotArea.x1 && clipped.x2 == snapshotArea.x2) {
+        // A whole-buffer clip whose buffer was published and not drawn into
+        // since: zero only where its run table says there is coverage. The
+        // margin rows and columns outside the panel are never composited or
+        // scanned, so they can keep whatever they hold.
+        const bool wholeBuf = clipped.y1 == snapshotArea.y1 && clipped.y2 == snapshotArea.y2;
+        bool done = false;
+        if (clearByRuns && wholeBuf) {
+            done = sleepAnimation.clearBackAlphaByRuns(w, h);
+        }
+        if (!done) {
+            const size_t off = static_cast<size_t>(clipped.y1 - snapshotArea.y1) * w;
+            memset(a16Plane + off, 0, static_cast<size_t>(clipped.y2 - clipped.y1 + 1) * w * 2);
+        }
+        if (wholeBuf) {
+            g_overlayStats.lastWholeClearByRuns = done ? 1 : 0;
+        }
+        gm_snap_rows_mark_cleared(clipped.y1 - snapshotArea.y1, clipped.y2 - snapshotArea.y1);
+    } else {
+        for (int y = clipped.y1; y <= clipped.y2; y++) {
+            const size_t off = static_cast<size_t>(y - snapshotArea.y1) * w + (clipped.x1 - snapshotArea.x1);
+            memset(a16Plane + off, 0, rowBytes);
+        }
     }
+    (void)colPlane;
 #ifdef GM_TOUCH_PROBE
     g_snapClearSum += esp_timer_get_time() - clear0;
 #endif
@@ -3014,8 +3128,13 @@ void DefaultUI::refreshSleepOverlay() {
         }
         overlayTransHeld = false;
         const int whole[1][2] = {{0, overlayH[back]}};
+        const int64_t pub0 = esp_timer_get_time();
         sleepAnimation.requestBandWarmup(whole, 1);
         sleepAnimation.publishOverlayRanges(overlayW[back], overlayH[back], whole, 1);
+        overlayDrawnUnpublished[back] = false;
+        g_overlayStats.lastWholePubUs = static_cast<uint32_t>(esp_timer_get_time() - pub0);
+        g_overlayStats.lastWholeScanUs = g_overlayStats.lastPubScanUs;
+        g_overlayStats.lastWholeScrimUs = g_overlayStats.lastPubScrimUs;
         finishOverlayTransition();
         return;
     }
@@ -3070,6 +3189,13 @@ void DefaultUI::refreshSleepOverlay() {
     int clipN = 0;
     lv_area_t copies[OVERLAY_DIRTY_RECTS];
     int copyN = 0;
+    const bool wholeSnap = !overlayValid[back];
+    // Every row scans whole unless a snapshot below clears its full width.
+    gm_snap_rows_reset_all();
+#ifdef GM_TOUCH_PROBE
+    const int64_t wholeClear0 = g_snapClearSum;
+    const int64_t wholeDraw0 = g_snapDrawSum;
+#endif
     if (overlayValid[back]) {
         clipN = overlayDirtyN[back];
         for (int i = 0; i < clipN; i++) {
@@ -3136,7 +3262,9 @@ void DefaultUI::refreshSleepOverlay() {
     const int baseN = clipN;
     int extraN = 0;
     for (int i = 0; i < baseN + extraN; i++) {
-        if (!snapshotAreaToOverlay(scr, buf, sleepAnimation.overlayCapacity(), clips[i], &w, &h)) {
+        const bool byRuns = wholeSnap && !overlayDrawnUnpublished[back] && g_clearByRunsReq != 0;
+        overlayDrawnUnpublished[back] = true;
+        if (!snapshotAreaToOverlay(scr, buf, sleepAnimation.overlayCapacity(), clips[i], &w, &h, byRuns)) {
             // Leave the debt list intact; the next pass retries every rect.
             // Rects already snapshotted this pass just render identically then.
             log_w("Sleep overlay snapshot failed");
@@ -3218,10 +3346,17 @@ void DefaultUI::refreshSleepOverlay() {
         overlayH[back] = h;
         overlayDirtyN[back] = 0;
         overlayCopyN[back] = 0;
+        g_overlayStats.lastWholeSnapUs = static_cast<uint32_t>(probeSnap1 - probeSnap0);
+        g_overlayStats.lastWholeAtMs = static_cast<uint32_t>(::millis());
+#ifdef GM_TOUCH_PROBE
+        g_overlayStats.lastWholeClearUs = static_cast<uint32_t>(g_snapClearSum - wholeClear0);
+        g_overlayStats.lastWholeDrawUs = static_cast<uint32_t>(g_snapDrawSum - wholeDraw0);
+#endif
         return;
     }
     sleepAnimation.requestBandWarmup(ranges, rangeN);
     sleepAnimation.publishOverlayRanges(w, h, ranges, rangeN);
+    overlayDrawnUnpublished[back] = false;
     if (overlayTrans == OverlayTrans::FadeOut) {
 #ifdef GM_TOUCH_PROBE
         ESP_LOGI("TouchProbe", "GM_TRANS: page_ready published, snap %lld us, t0+%lld us",
@@ -3231,6 +3366,17 @@ void DefaultUI::refreshSleepOverlay() {
     }
     g_overlayStats.lastSnapUs = static_cast<uint32_t>(probeSnap1 - probeSnap0);
     g_overlayStats.lastPubUs = static_cast<uint32_t>(esp_timer_get_time() - probeSnap1);
+    if (wholeSnap) {
+        g_overlayStats.lastWholeSnapUs = g_overlayStats.lastSnapUs;
+        g_overlayStats.lastWholePubUs = g_overlayStats.lastPubUs;
+        g_overlayStats.lastWholeScanUs = g_overlayStats.lastPubScanUs;
+        g_overlayStats.lastWholeScrimUs = g_overlayStats.lastPubScrimUs;
+        g_overlayStats.lastWholeAtMs = static_cast<uint32_t>(::millis());
+#ifdef GM_TOUCH_PROBE
+        g_overlayStats.lastWholeClearUs = static_cast<uint32_t>(g_snapClearSum - wholeClear0);
+        g_overlayStats.lastWholeDrawUs = static_cast<uint32_t>(g_snapDrawSum - wholeDraw0);
+#endif
+    }
     g_overlayStats.lastAreaPx = static_cast<uint32_t>(probeArea);
     g_overlayStats.lastClips = static_cast<uint32_t>(clipN + copyN);
     g_overlayStats.refreshes = g_overlayStats.refreshes + 1;

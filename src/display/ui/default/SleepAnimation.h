@@ -31,6 +31,7 @@ class SleepAnimation {
     void setInterlace(bool) {}
     void setScrim(int) {}
     uint8_t *overlayBackBuffer() { return nullptr; }
+    bool clearBackAlphaByRuns(int, int) { return false; }
     const uint8_t *overlayFrontBuffer() const { return nullptr; }
     bool overlayFrontSize(int &, int &) const { return false; }
     uint32_t overlayCapacity() const { return 0; }
@@ -390,6 +391,13 @@ class SleepAnimation {
     // is what made every publish cost a near-full-screen span scan when the
     // dirty regions sat at opposite ends of the screen.
     void publishOverlayRanges(int w, int h, const int (*ranges)[2], int n);
+    // Zeroes the back buffer's alpha wherever its last publish found
+    // coverage (its run table), which is the whole of its non-zero alpha as
+    // long as nothing has drawn into it since. False, and nothing touched,
+    // when the buffer was last published at another geometry or never.
+    // A whole-page snapshot's clear then costs the page's coverage (about
+    // 8k to 100k pixels) instead of the 460 KB alpha plane (gm-2cl.7).
+    bool clearBackAlphaByRuns(int w, int h);
     // Which of the two overlay buffers overlayBackBuffer() hands out. The
     // caller needs it to know how much of that particular buffer is stale,
     // since the two are written alternately and a partial update is only valid
@@ -1701,6 +1709,12 @@ class SleepAnimation {
     TextSlot textSlots[kTextElements];
     static void readTextSlot(const TextSlot &s, TextDesc &out);
     int64_t lastElemEvalUs = 0;
+    // The press plate's slot (DefaultUI::PRESS_PLATE_ELEMENT) is picked up
+    // between bands as well as at frame start, so a press lands in the frame
+    // being rendered instead of the next one (gm-2cl.4).
+    static constexpr int kInteractionElement = 0;
+    uint32_t interactionLatchedSeq = 0;
+    void pickupInteractionElement();
     std::atomic<int> ringElems{0};
     std::atomic<int> textElems{0};
     // At publish: fold the owned rings' coverage into the scrim cells of the
