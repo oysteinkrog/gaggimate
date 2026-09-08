@@ -9,8 +9,11 @@ on:
       - "master"
       - "idf5"
 
+# actions: read is what the gate job needs to list this commit's Checks runs;
+# with an explicit permissions block every scope not named here is none.
 permissions:
   contents: write
+  actions: read
 name: Build Nightly
 
 # Every run of this workflow deletes and recreates the same `nightly` tag and
@@ -28,7 +31,68 @@ concurrency:
   group: nightly-release
   cancel-in-progress: false
 jobs:
+  # Nothing is published for a commit whose Checks run did not pass
+  # (gm-bzu.17). Checks (check.yml) runs on the same push and covers what this
+  # workflow's own builds do not: static analysis, the web lint, the simulator
+  # build and boot, formatting, the unit tests and the animation checks. The
+  # two workflows used to be independent, so a commit that failed any of
+  # those still moved the nightly tag as long as its three firmware builds
+  # compiled.
+  #
+  # The gate polls the Checks runs recorded for this exact commit
+  # (head_sha), so a green run on a neighbouring commit counts for nothing.
+  # It is a polling job rather than a workflow_run trigger because
+  # workflow_run only fires from the workflow file on the default branch,
+  # which is master here, while this fork develops and publishes from idf5.
+  #
+  # Checks cancels its in-progress run when a newer push lands on the same
+  # branch. That run ends "cancelled", the gate fails, and the newer push's
+  # own nightly run publishes instead; with cancel-in-progress off on this
+  # workflow, the runs still publish in push order.
+  gate:
+    name: Wait for Checks on this commit
+    runs-on: ubuntu-latest
+    steps:
+      - name: Wait for the Checks workflow to pass on this commit
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+        run: |
+          # The Checks run is created by the same push event, so it exists
+          # within seconds; ten minutes with no run at all means it is not
+          # coming (workflow disabled, or the push did not trigger it) and
+          # the commit is not published. A run in progress is waited for up
+          # to two hours, well past the longest Checks run seen (about 45
+          # minutes for the full build job).
+          deadline_none=$((SECONDS + 600))
+          deadline_all=$((SECONDS + 7200))
+          while true; do
+            runs=$(gh api "repos/$REPO/actions/workflows/check.yml/runs?head_sha=$SHA&per_page=20" --jq '.workflow_runs[] | "\(.id) \(.status) \(.conclusion)"')
+            if [[ -z "$runs" ]]; then
+              if (( SECONDS > deadline_none )); then
+                echo "::error::No Checks run exists for $SHA after 10 minutes; not publishing."
+                exit 1
+              fi
+              echo "No Checks run for $SHA yet; waiting."
+            elif grep -q ' completed success$' <<<"$runs"; then
+              echo "Checks passed on $SHA:"; echo "$runs"
+              exit 0
+            elif grep -qE ' (queued|in_progress|waiting|pending|requested) ' <<<"$runs"; then
+              if (( SECONDS > deadline_all )); then
+                echo "::error::Checks on $SHA still running after two hours; not publishing."
+                exit 1
+              fi
+              echo "Checks still running on $SHA:"; echo "$runs"
+            else
+              echo "::error::Checks did not pass on $SHA; not publishing."
+              echo "$runs"
+              exit 1
+            fi
+            sleep 60
+          done
   build:
+    needs: gate
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repo
