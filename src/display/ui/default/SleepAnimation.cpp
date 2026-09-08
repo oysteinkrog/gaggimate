@@ -1294,6 +1294,37 @@ static SemaphoreHandle_t g_sleepAnimFbGate = nullptr;
 
 static bool IRAM_ATTR sleepAnimBandRetire(void *arg);
 
+void SleepAnimation::freeOverlayBuffers() {
+    // Only called from start() before the render task exists (or after it has
+    // been stopped), so nothing reads these while they go. Every pointer is
+    // nulled so a later start allocates the whole set again.
+    for (auto &ov : overlays) {
+        heap_caps_free(ov.buf);
+        ov.buf = nullptr;
+        free(ov.runs);
+        ov.runs = nullptr;
+        free(ov.runN);
+        ov.runN = nullptr;
+        free(ov.haloRuns);
+        ov.haloRuns = nullptr;
+        free(ov.haloN);
+        ov.haloN = nullptr;
+        free(ov.scrimSrc);
+        ov.scrimSrc = nullptr;
+        free(ov.scrim);
+        ov.scrim = nullptr;
+    }
+    free(scrimTmp);
+    scrimTmp = nullptr;
+    free(scrimTmp2);
+    scrimTmp2 = nullptr;
+    free(scrimCmp);
+    scrimCmp = nullptr;
+    overlayCap = 0;
+    overlayPlanePx = 0;
+    gm_overlay_plane_px = 0;
+}
+
 void SleepAnimation::start(Display *d) {
     // !stopped: a previous task timed out its stop() and hasn't exited yet —
     // refuse to start rather than run two renderers against the same buffers.
@@ -1505,6 +1536,14 @@ void SleepAnimation::start(Display *d) {
     if (!pipelineOk || !overlayOk) {
         log_e("SleepAnimation: buffer allocation failed (bandBuf=%p/%p halfBuf=%p overlayOk=%d)", bandBuf[0], bandBuf[1], halfBuf,
               overlayOk);
+        if (!overlayOk) {
+            // Roll the partial overlay construction back so the next start
+            // allocates again. overlayCap is the sentinel the block above is
+            // guarded by; leaving it set with a buffer missing made one
+            // transient PSRAM shortage disable the animation until reboot
+            // (gm-bzu.12).
+            freeOverlayBuffers();
+        }
         return;
     }
     // Reset the pipeline: both cursors to slot 0, any signal left over from a
@@ -5394,7 +5433,12 @@ void IRAM_ATTR SleepAnimation::renderFrame() {
                 // release arg, so no interrupt is coming for it, and
                 // pushColors takes the same gate.
                 dmaErrors++;
-                dmaIssued--;
+                // dmaIssued is not touched here: the submit branch already
+                // rolled its own reservation back, and the not-ready branch
+                // never made one. A second decrement here left issued one
+                // below completed for good after the first failure, so the
+                // drain loops below compared the wrong pair from then on
+                // (gm-bzu.4).
                 // Earlier bands may still be in flight, reading their slot
                 // and writing the framebuffer. Let them retire before the CPU
                 // fallback touches either, or the fallback races a transfer.

@@ -1614,6 +1614,9 @@ class SleepAnimation {
     uint8_t *scrimCmp = nullptr;
 
     Overlay overlays[2];
+    // Frees every overlay buffer and clears overlayCap, the sentinel start()
+    // allocates behind; start() calls it when a required allocation failed.
+    void freeOverlayBuffers();
     uint32_t overlayCap = 0;
     uint32_t overlayPlanePx = 0;
     // False when a snapshot's stride or x offset is not a multiple of 8, so
