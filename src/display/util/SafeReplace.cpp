@@ -3,6 +3,8 @@
 #include <ArduinoJson.h>
 #include <esp_log.h>
 
+#include <cerrno>
+#include <dirent.h>
 #include <vector>
 
 namespace saferep {
@@ -105,44 +107,91 @@ bool commitReplace(fs::FS &fs, const String &tmpPath, const String &target, cons
     return true;
 }
 
-void recoverReplace(fs::FS &fs, const String &dir, const char *suffix, const char *tag) {
-    File root = fs.open(dir);
-    if (!root || !root.isDirectory()) {
-        if (root) {
-            root.close();
-        }
+namespace {
+
+// Adds `name` to targets when it is a leftover .bak or .tmp for `suffix`.
+void noteLeftover(String name, const String &sfxBak, const String &sfxTmp, std::vector<String> &targets) {
+    const int slash = name.lastIndexOf('/');
+    if (slash >= 0) {
+        name = name.substring(slash + 1);
+    }
+    if (!name.endsWith(sfxBak) && !name.endsWith(sfxTmp)) {
         return;
     }
+    const String base = name.substring(0, name.length() - 4);
+    if (base.length() == 0) {
+        return;
+    }
+    for (const String &t : targets) {
+        if (t == base) {
+            return;
+        }
+    }
+    targets.push_back(base);
+}
+
+// Lists dir without opening its entries. File::openNextFile() opens every
+// entry it returns, and on FAT each open is a linear scan of the directory,
+// so walking /h on the SD card that way is quadratic in the shot count: with
+// the bench card's history the boot sat in this walk for over eight minutes
+// with WiFi and BLE never started (2026-09-08). readdir() reads the names
+// straight out of the directory clusters. Returns false when the filesystem
+// has no VFS mount point to read through.
+bool listDirNames(fs::FS &fs, const String &dir, const String &sfxBak, const String &sfxTmp, std::vector<String> &targets) {
+#ifdef GAGGIMATE_SIM
+    (void)fs;
+    (void)dir;
+    (void)sfxBak;
+    (void)sfxTmp;
+    (void)targets;
+    return false;
+#else
+    const char *mount = fs.mountpoint();
+    if (mount == nullptr) {
+        return false;
+    }
+    const String path = String(mount) + dir;
+    DIR *d = opendir(path.c_str());
+    if (d == nullptr) {
+        // ENOENT is the normal first boot; report anything else.
+        if (errno != ENOENT) {
+            ESP_LOGW("SafeReplace", "opendir %s: %d", path.c_str(), errno);
+        }
+        return true;
+    }
+    while (const dirent *e = readdir(d)) {
+        noteLeftover(String(e->d_name), sfxBak, sfxTmp, targets);
+    }
+    closedir(d);
+    return true;
+#endif
+}
+
+} // namespace
+
+void recoverReplace(fs::FS &fs, const String &dir, const char *suffix, const char *tag) {
+    const String sfxBak = String(suffix) + ".bak";
+    const String sfxTmp = String(suffix) + ".tmp";
     // Collect first, act after the directory handle is closed: renaming and
     // removing entries under an open directory iterator is not something
     // every filesystem here handles.
     std::vector<String> targets;
-    const String sfxBak = String(suffix) + ".bak";
-    const String sfxTmp = String(suffix) + ".tmp";
-    File file = root.openNextFile();
-    while (file) {
-        String name = file.name();
-        file.close();
-        const int slash = name.lastIndexOf('/');
-        if (slash >= 0) {
-            name = name.substring(slash + 1);
-        }
-        String base;
-        if (name.endsWith(sfxBak) || name.endsWith(sfxTmp)) {
-            base = name.substring(0, name.length() - 4);
-        }
-        if (base.length() > 0) {
-            bool seen = false;
-            for (const String &t : targets) {
-                seen = seen || t == base;
+    if (!listDirNames(fs, dir, sfxBak, sfxTmp, targets)) {
+        File root = fs.open(dir);
+        if (!root || !root.isDirectory()) {
+            if (root) {
+                root.close();
             }
-            if (!seen) {
-                targets.push_back(base);
-            }
+            return;
         }
-        file = root.openNextFile();
+        File file = root.openNextFile();
+        while (file) {
+            noteLeftover(String(file.name()), sfxBak, sfxTmp, targets);
+            file.close();
+            file = root.openNextFile();
+        }
+        root.close();
     }
-    root.close();
     for (const String &base : targets) {
         recoverOne(fs, dir + "/" + base, tag);
     }
