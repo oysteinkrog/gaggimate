@@ -879,6 +879,7 @@ __attribute__((noinline)) static uint32_t blendRowProbe(uint16_t *__restrict dst
 }
 
 static_assert(SleepAnimation::kProbeRuns == RUNS_PER_ROW, "probe run capture mirrors the overlay's run table");
+#endif // GM_BLEND_PROBE
 
 // Planar blend: colour plane (RGB565) and alpha plane (16-bit lanes, 0..256,
 // 256 meaning opaque). With the alpha in its own 16-bit lane every 8-pixel
@@ -1047,6 +1048,7 @@ __attribute__((noinline)) static void IRAM_ATTR blendRowPlanar(uint16_t *__restr
     }
 }
 
+#ifdef GM_BLEND_PROBE
 // Levels 4 to 7 (benchSetBlendProbe): the production blend kernel over one
 // captured overlay row, the same bytes and the same runs for every band, with
 // the source and the destination each placed in internal SRAM or PSRAM. The
