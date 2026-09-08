@@ -10,12 +10,17 @@
 #include <display/ui/default/TouchTask.h>
 #include "LV_Helper.h"
 #include <display/core/TouchInject.h>
-#ifdef GM_TOUCH_PROBE
-#include "esp_log.h"
+// The flip wait (waitPendingFlip, gm-bzu.5) is production code: it reads the
+// refill count from PanelClock and polls with vTaskDelay, so these three stay
+// outside the probe guard. They were inside it once and only the loadtest
+// build compiled; -e display failed on 'panelclock' has not been declared
+// (found by the gm-bzu.22 matrix, 2026-09-08).
 #include "esp_timer.h"
 #include <display/drivers/common/PanelClock.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
+#ifdef GM_TOUCH_PROBE
+#include "esp_log.h"
 #endif
 
 #if LV_VERSION_CHECK(9, 0, 0)
