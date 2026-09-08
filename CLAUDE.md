@@ -254,6 +254,37 @@ telemetry-driven screen from a 650 ms LVGL pass (1.5 Hz widget updates,
   family of reason: the owned Text element eases the digits at the
   animation's rate while the flex row around it is laid out only on an
   LVGL refresh, so a content-sized number left the "g" trailing.
+- **A blinking icon is two layer sprites, not an LVGL redraw** (gm-2cl.17,
+  2026-09-08, `DefaultUI::serviceIconLayers`). The dial screens' 40x40
+  temperature icon blinks because the flow toggles its CHECKED state about
+  twice a second and the theme recolours it on that state (`screens.c`,
+  the dials widget tick); not the hidden flag, which the touchmap showed
+  constant while `dirty_recent` filled with 130,415,179,464. Each toggle
+  was an invalidation, a snapshot and a publish, and that pass was what
+  was left of the brew and grind screens' churn (2.0 and 1.9 refreshes a
+  second at rest). An lv_img on the active screen whose state or hidden
+  flag has changed twice since the screen was entered gets
+  `LV_OBJ_FLAG_USER_3`: the patched lv_img draws nothing for it and the
+  patched `lv_obj_invalidate_area` drops its invalidations (both in
+  `scripts/patch_lvgl_label_elem.py`, which now applies per hunk so a hunk
+  added later still lands in a file the marker is already in). Each state
+  the image shows is rendered once into a layer sprite, keyed by
+  `lv_obj_get_state`, two per icon, and every UI pass shows the sprite for
+  the current state and hides the other, or both while the image or an
+  ancestor is hidden; a third state, a src or box change, a screen change,
+  an animation stop or a delete hands the image back to LVGL. The
+  handover in is the same as `moveObjectViaLayer`'s: the image is
+  invalidated before the flag is set, so the sprite is gated on the
+  publish that no longer holds it. `MAX_LAYERS` is 5 (one move, two icons
+  of two sprites). Bench board, brew screen, synthetic brew on, 20 s
+  windows: refreshes 2.03 a second to 0.00, grind 1.88 to 0.25 (the
+  takeover pass), and the icon still alternates between the same two
+  colours as on the LVGL path (framebuffer samples through
+  `/api/debug/fb`, bright third of the icon's box). `icons=0` on
+  `/api/debug/anim` puts the icons back on LVGL and `icon_layers` lists
+  what is owned, with the mirrored toggle count. Internal free sat about
+  1.3 KB lower at rest (28.2 KB against 29.5 KB) with the two extra layer
+  records and the 24-entry candidate table.
 
 - **The render loop lives in IRAM** (`renderLoop`, `renderFrame`,
   `presentFrame`, `pushLoop` and the scrim rows, `SleepAnimation.cpp`). The
@@ -549,9 +580,10 @@ Instruments, and where each one exists:
   `GM_SYNTH_HANDSHAKE`, which only `display-loadtest` and `display-blestress`
   set.
 - `/api/debug/anim` (frame counters, `anim_id`, `uptime_ms`, `text_elems`,
-  `dirty_recent`, the `ov_whole_*` page-change split, `touch_task`,
-  `touch_samples`, `touch_hwm`, `hitmap_n`, `hitmap_gen`, the `texts=`,
-  `textease=`, `dials=`, `clrruns=` and `touchpoll=` knobs) and
+  `dirty_recent`, `icon_layers`, the `ov_whole_*` page-change split,
+  `touch_task`, `touch_samples`, `touch_hwm`, `hitmap_n`, `hitmap_gen`, the
+  `texts=`, `textease=`, `dials=`, `icons=`, `clrruns=` and `touchpoll=`
+  knobs) and
   `/api/debug/pclk` (the live pixel-clock divider) are device-only: both sit
   inside `WebUIPlugin.cpp`'s real-panel block, which `GAGGIMATE_SIM` and
   `GAGGIMATE_HEADLESS` exclude.

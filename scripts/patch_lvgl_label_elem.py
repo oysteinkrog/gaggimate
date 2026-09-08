@@ -35,6 +35,11 @@ rather than silently drawing owned labels twice. Same mechanics as
 scripts/patch_lvgl_meter_inv.py: the library lives in
 .pio/libdeps/<env>/lvgl, resolved through the SCons env, and a pristine
 copy is kept at lv_label.c.gm-orig beside the patched file.
+
+Since gm-2cl.17 LV_OBJ_FLAG_USER_3 on an lv_img means "owned by a layer":
+the image draws nothing (lv_img.c) and none of its invalidations reach the
+display (lv_obj_pos.c); DefaultUI::serviceIconLayers mirrors its state and
+hidden flag into layer sprites instead.
 """
 
 import os
@@ -127,18 +132,58 @@ POS_HUNKS = [
     (POS_NEW_OLD, POS_NEW_NEW, 2),
 ]
 
+# LV_OBJ_FLAG_USER_3 on an lv_img means "owned by a layer" (gm-2cl.17,
+# DefaultUI::serviceIconLayers): the image draws nothing (lv_img.c) and
+# none of its invalidations reach the display (lv_obj_pos.c), so the flow
+# can toggle its CHECKED state (the dial screens' icons blink by a recolor
+# on that state) or its hidden flag without costing an LVGL pass. The UI
+# task invalidates the image before setting the flag and after clearing
+# it, so the handover to and from the layer still redraws the area.
+GUARD3 = "lv_obj_has_flag(obj, LV_OBJ_FLAG_USER_3)"
+INV_OLD = (
+    "void lv_obj_invalidate_area(const lv_obj_t * obj, const lv_area_t * area)\n"
+    "{\n"
+    "    LV_ASSERT_OBJ(obj, MY_CLASS);\n"
+    "\n"
+)
+INV_NEW = (
+    "void lv_obj_invalidate_area(const lv_obj_t * obj, const lv_area_t * area)\n"
+    "{\n"
+    "    LV_ASSERT_OBJ(obj, MY_CLASS);\n"
+    "    if(" + GUARD3 + ") return; /* " + MARKER + ": owned by a layer */\n"
+    "\n"
+)
+POS_HUNKS.append((INV_OLD, INV_NEW, 1))
+
+IMG_OLD = (
+    "    else if(code == LV_EVENT_DRAW_MAIN || code == LV_EVENT_DRAW_POST) {\n"
+    "\n"
+    "        lv_coord_t obj_w = lv_obj_get_width(obj);\n"
+)
+IMG_NEW = (
+    "    else if(code == LV_EVENT_DRAW_MAIN || code == LV_EVENT_DRAW_POST) {\n"
+    "        if(" + GUARD3 + ") return; /* " + MARKER + ": a layer paints it */\n"
+    "\n"
+    "        lv_coord_t obj_w = lv_obj_get_width(obj);\n"
+)
+IMG_HUNKS = [
+    (IMG_OLD, IMG_NEW, 1),
+]
+
 
 def apply(path, hunks):
     with open(path, encoding="utf-8") as f:
         text = f.read()
-    if MARKER in text:
-        print("patch_lvgl_label_elem: already applied (%s)" % path)
-        return
     orig = path + ".gm-orig"
     if not os.path.exists(orig):
         with open(orig, "w", encoding="utf-8") as f:
             f.write(text)
+    # Per hunk, so a hunk added later still lands in a file the marker is
+    # already in.
+    changed = 0
     for old, new, count in hunks:
+        if new in text:
+            continue
         found = text.count(old)
         if found != count:
             sys.stderr.write(
@@ -147,16 +192,21 @@ def apply(path, hunks):
                 % (found, count, path, old[:80]))
             sys.exit(1)
         text = text.replace(old, new)
+        changed += 1
+    if changed == 0:
+        print("patch_lvgl_label_elem: already applied (%s)" % path)
+        return
     tmp = path + ".gm-tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         f.write(text)
     os.replace(tmp, path)
-    print("patch_lvgl_label_elem: patched %s" % path)
+    print("patch_lvgl_label_elem: patched %s (%d hunks)" % (path, changed))
 
 
 def main():
     root = os.path.join(env.subst("$PROJECT_LIBDEPS_DIR"), env.subst("$PIOENV"), "lvgl", "src")  # noqa: F821
-    for rel, hunks in ((("widgets", "lv_label.c"), HUNKS), (("core", "lv_obj_pos.c"), POS_HUNKS)):
+    for rel, hunks in ((("widgets", "lv_label.c"), HUNKS), (("core", "lv_obj_pos.c"), POS_HUNKS),
+                       (("widgets", "lv_img.c"), IMG_HUNKS)):
         path = os.path.join(root, *rel)
         if not os.path.isfile(path):
             print("patch_lvgl_label_elem: %s not found for this env; skipping" % rel[-1])

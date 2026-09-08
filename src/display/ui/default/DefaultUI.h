@@ -559,6 +559,53 @@ class DefaultUI {
                          int &by1) const;
     void easeTextValue(TextElement &t, const char *target, int64_t now);
     static void textLabelDeleted(lv_event_t *e);
+
+    // Blinking icons as layers (gm-2cl.17). The dial screens' 40x40 icons
+    // blink because the flow toggles their CHECKED state about twice a
+    // second and the theme recolors them on it; every toggle was an LVGL
+    // invalidation, a snapshot and a publish, and the pass it cost stalled
+    // the eased text elements. An lv_img on the active screen whose state
+    // or hidden flag has changed twice since the screen was entered gets
+    // LV_OBJ_FLAG_USER_3: the patched lv_img draws nothing for it and the
+    // patched lv_obj_invalidate_area drops its invalidations. Each state
+    // the image shows is rendered once into a layer sprite (two per icon,
+    // keyed by lv_obj_get_state), and every pass shows the sprite for the
+    // current state and hides the other, or hides both while the image or
+    // an ancestor is hidden. Released on screen change, animation stop, a
+    // third state, a src or box change, delete, or icons=0.
+    static constexpr int kIconLayers = 2;
+    static constexpr int kIconSprites = 2;
+    static constexpr int kIconCandCap = 24;
+    static constexpr int kIconMaxPx = 96 * 96;
+    struct IconCand {
+        lv_obj_t *obj = nullptr;
+        uint32_t seen = 0;
+        uint16_t state = 0;
+        uint8_t toggles = 0;
+        bool hidden = false;
+        bool refused = false;
+    };
+    struct IconLayer {
+        lv_obj_t *obj = nullptr;
+        int layer[kIconSprites] = {-1, -1};
+        uint16_t state[kIconSprites] = {0, 0};
+        int sprites = 0;
+        int shown = -1; // sprite index drawn, or -1 for none
+        const void *src = nullptr;
+        lv_area_t coords = {};
+    };
+    IconCand iconCands[kIconCandCap];
+    int iconCandN = 0;
+    uint32_t iconPass = 0;
+    lv_obj_t *iconScreen = nullptr;
+    IconLayer iconLayers[kIconLayers];
+    void serviceIconLayers(bool canOwn);
+    void releaseIconLayers();
+    void releaseIconLayer(IconLayer &l);
+    void scanIcons(lv_obj_t *obj);
+    bool takeIconLayer(IconLayer &l, lv_obj_t *img);
+    int snapshotIconSprite(IconLayer &l);
+    static void iconDeleted(lv_event_t *e);
     void positionMenuIcon(lv_obj_t *obj, int angle, int radius);
 
     void updateState();

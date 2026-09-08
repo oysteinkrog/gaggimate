@@ -184,6 +184,9 @@ extern volatile int g_dialElementsReq;
 // texts=0|1 and textease=0|1 on /api/debug/anim: live labels as Text elements
 // (DefaultUI::serviceTextElements) and the numeric easing of their values.
 extern volatile int g_textElementsReq;
+// icons=0|1 on /api/debug/anim: blinking images as layers
+// (DefaultUI::serviceIconLayers, gm-2cl.17).
+extern volatile int g_iconLayersReq;
 // 1 (default): a whole-page snapshot clears alpha by the back buffer's run
 // table; 0: by a plane memset. /api/debug/anim?clrruns= is the A/B.
 extern volatile int g_clearByRunsReq;
@@ -201,6 +204,16 @@ struct TextElemDbg {
     char text[24] = {};
 };
 extern TextElemDbg g_textElemDbg[6];
+// icon_layers on /api/debug/anim: the images owned by layers, their box,
+// whether a sprite is shown, and how many state or hidden changes were
+// mirrored into the layers instead of costing an LVGL pass.
+struct IconLayerDbg {
+    volatile bool owned = false;
+    volatile bool shown = false;
+    volatile int16_t x = 0, y = 0, w = 0, h = 0;
+    volatile uint32_t toggles = 0;
+};
+extern IconLayerDbg g_iconLayerDbg[2];
 // The last DIRTYLOG_N dirty rectangles the overlay refresh harvested from
 // LVGL (dirty_recent on /api/debug/anim): what is still invalidating on a
 // screen once the elements own the live widgets. Ring, newest at

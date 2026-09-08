@@ -381,6 +381,7 @@ void DefaultUI::serviceDialElements() {
                         !panelStopRequested && lv_anim_get(this, gaugeTickAnimCb) == nullptr;
     serviceBarElement(canOwn);
     serviceTextElements(canOwn);
+    serviceIconLayers(canOwn);
     if (!canOwn) {
         releaseDialElements();
         return;
@@ -1111,6 +1112,301 @@ void DefaultUI::releaseTextElements() {
     for (TextElement &t : textElems) {
         releaseTextElement(t);
     }
+}
+
+void DefaultUI::iconDeleted(lv_event_t *e) {
+    DefaultUI *ui = static_cast<DefaultUI *>(lv_event_get_user_data(e));
+    lv_obj_t *obj = lv_event_get_target(e);
+    if (ui == nullptr) {
+        return;
+    }
+    for (IconLayer &l : ui->iconLayers) {
+        if (l.obj == obj) {
+            // The object is going away under us: free the layers without
+            // touching the image.
+            l.obj = nullptr;
+            ui->releaseIconLayer(l);
+        }
+    }
+    for (int i = 0; i < ui->iconCandN; i++) {
+        if (ui->iconCands[i].obj == obj) {
+            ui->iconCands[i] = ui->iconCands[ui->iconCandN - 1];
+            ui->iconCandN--;
+            break;
+        }
+    }
+}
+
+void DefaultUI::scanIcons(lv_obj_t *obj) {
+    if (lv_obj_check_type(obj, &lv_img_class)) {
+        const bool hidden = lv_obj_has_flag(obj, LV_OBJ_FLAG_HIDDEN);
+        const uint16_t state = lv_obj_get_state(obj);
+        IconCand *c = nullptr;
+        for (int i = 0; i < iconCandN; i++) {
+            if (iconCands[i].obj == obj) {
+                c = &iconCands[i];
+                break;
+            }
+        }
+        if (c == nullptr) {
+            if (iconCandN < kIconCandCap && lv_obj_get_width(obj) * lv_obj_get_height(obj) <= kIconMaxPx) {
+                c = &iconCands[iconCandN++];
+                c->obj = obj;
+                c->hidden = hidden;
+                c->state = state;
+                c->toggles = 0;
+                c->refused = false;
+                lv_obj_add_event_cb(obj, iconDeleted, LV_EVENT_DELETE, this);
+            }
+        } else if (c->hidden != hidden || c->state != state) {
+            c->hidden = hidden;
+            c->state = state;
+            if (c->toggles < 255) {
+                c->toggles++;
+            }
+        }
+        if (c != nullptr) {
+            c->seen = iconPass;
+        }
+        return;
+    }
+    const uint32_t n = lv_obj_get_child_cnt(obj);
+    for (uint32_t i = 0; i < n; i++) {
+        scanIcons(lv_obj_get_child(obj, i));
+    }
+}
+
+void DefaultUI::releaseIconLayer(IconLayer &l) {
+#ifndef GAGGIMATE_SIM
+    for (int i = 0; i < kIconSprites; i++) {
+        if (l.layer[i] >= 0) {
+            sleepAnimation.layerRelease(l.layer[i]);
+            l.layer[i] = -1;
+        }
+    }
+    g_iconLayerDbg[&l - iconLayers].owned = false;
+    if (l.obj != nullptr) {
+        // Clear the flag first: the invalidation has to reach the display.
+        // A no-op while the image is hidden, which is right.
+        lv_obj_clear_flag(l.obj, LV_OBJ_FLAG_USER_3);
+        lv_obj_invalidate(l.obj);
+        overlayUrgentUntilUs = esp_timer_get_time() + GM_TOUCH_GRACE_US;
+    }
+    l.obj = nullptr;
+    l.src = nullptr;
+    l.sprites = 0;
+    l.shown = -1;
+#else
+    (void)l;
+#endif
+}
+
+void DefaultUI::releaseIconLayers() {
+    for (IconLayer &l : iconLayers) {
+        releaseIconLayer(l);
+    }
+}
+
+// Renders the image in its current state into a new sprite and returns its
+// index, or -1 when there is no room or the render failed. The owner flag
+// is lifted for the render because the patched lv_img draws nothing under
+// it; lifting and restoring it invalidates nothing.
+int DefaultUI::snapshotIconSprite(IconLayer &l) {
+#ifndef GAGGIMATE_SIM
+    if (l.sprites >= kIconSprites || l.obj == nullptr) {
+        return -1;
+    }
+    lv_obj_t *img = l.obj;
+    const lv_coord_t ext = _lv_obj_get_ext_draw_size(img);
+    const int lw = lv_obj_get_width(img) + ext * 2;
+    const int lh = lv_obj_get_height(img) + ext * 2;
+    if (lw <= 0 || lh <= 0 || lw * lh > kIconMaxPx * 2) {
+        return -1;
+    }
+    const int id = sleepAnimation.layerAcquire(lw, lh);
+    if (id < 0) {
+        return -1;
+    }
+    const bool owned = lv_obj_has_flag(img, LV_OBJ_FLAG_USER_3);
+    if (owned) {
+        lv_obj_clear_flag(img, LV_OBJ_FLAG_USER_3);
+    }
+    lv_area_t area;
+    const bool ok = snapshotObjectToBuffer(img, sleepAnimation.layerBuffer(id), static_cast<uint32_t>(lw) * lh * 3, &area);
+    if (owned) {
+        lv_obj_add_flag(img, LV_OBJ_FLAG_USER_3);
+    }
+    if (!ok) {
+        sleepAnimation.layerRelease(id);
+        return -1;
+    }
+    sleepAnimation.layerPublish(id, area.x1, area.y1);
+    sleepAnimation.layerHide(id);
+    const int idx = l.sprites++;
+    l.layer[idx] = id;
+    l.state[idx] = lv_obj_get_state(img);
+    IconLayerDbg &d = g_iconLayerDbg[&l - iconLayers];
+    d.x = static_cast<int16_t>(area.x1);
+    d.y = static_cast<int16_t>(area.y1);
+    d.w = static_cast<int16_t>(lw);
+    d.h = static_cast<int16_t>(lh);
+    return idx;
+#else
+    (void)l;
+    return -1;
+#endif
+}
+
+bool DefaultUI::takeIconLayer(IconLayer &l, lv_obj_t *img) {
+#ifndef GAGGIMATE_SIM
+    lv_obj_update_layout(img);
+    l.obj = img;
+    l.sprites = 0;
+    l.shown = -1;
+    const int idx = snapshotIconSprite(l);
+    if (idx < 0) {
+        l.obj = nullptr;
+        return false;
+    }
+    // Same handover as moveObjectViaLayer: the sprite is drawn from the
+    // first overlay publish that no longer holds the image. That publish
+    // comes from this invalidation, recorded before the flag blocks them.
+    lv_obj_invalidate(img);
+    lv_obj_add_flag(img, LV_OBJ_FLAG_USER_3);
+    sleepAnimation.layerShowAtGen(l.layer[idx], sleepAnimation.overlayPublishGen() + 1);
+    overlayUrgentUntilUs = esp_timer_get_time() + GM_TOUCH_GRACE_US;
+    l.shown = idx;
+    l.src = lv_img_get_src(img);
+    lv_obj_get_coords(img, &l.coords);
+    IconLayerDbg &d = g_iconLayerDbg[&l - iconLayers];
+    d.toggles = 0;
+    d.shown = true;
+    d.owned = true;
+    return true;
+#else
+    (void)l;
+    (void)img;
+    return false;
+#endif
+}
+
+void DefaultUI::serviceIconLayers(bool canOwn) {
+#ifndef GAGGIMATE_SIM
+    if (!canOwn || g_iconLayersReq == 0) {
+        releaseIconLayers();
+        return;
+    }
+    lv_obj_t *scr = lv_scr_act();
+    if (scr != iconScreen) {
+        releaseIconLayers();
+        for (int i = 0; i < iconCandN; i++) {
+            if (iconCands[i].obj != nullptr) {
+                lv_obj_remove_event_cb_with_user_data(iconCands[i].obj, iconDeleted, this);
+            }
+        }
+        iconCandN = 0;
+        iconScreen = scr;
+    }
+    iconPass++;
+    scanIcons(scr);
+    // Images that left the tree without a DELETE event drop out.
+    for (int i = 0; i < iconCandN;) {
+        if (iconCands[i].seen != iconPass) {
+            for (IconLayer &l : iconLayers) {
+                if (l.obj == iconCands[i].obj) {
+                    l.obj = nullptr; // never touch it again
+                    releaseIconLayer(l);
+                }
+            }
+            iconCands[i] = iconCands[iconCandN - 1];
+            iconCandN--;
+        } else {
+            i++;
+        }
+    }
+    // Owned images: same picture in the same place, and the sprite shown
+    // follows the state and the hidden flags (an ancestor's counts too).
+    for (IconLayer &l : iconLayers) {
+        if (l.obj == nullptr) {
+            continue;
+        }
+        lv_area_t coords;
+        lv_obj_get_coords(l.obj, &coords);
+        if (lv_img_get_src(l.obj) != l.src || !_lv_area_is_equal(&coords, &l.coords)) {
+            releaseIconLayer(l);
+            continue;
+        }
+        bool hidden = false;
+        for (lv_obj_t *p = l.obj; p != nullptr; p = lv_obj_get_parent(p)) {
+            if (lv_obj_has_flag(p, LV_OBJ_FLAG_HIDDEN)) {
+                hidden = true;
+                break;
+            }
+        }
+        int want = -1;
+        if (!hidden) {
+            const uint16_t st = lv_obj_get_state(l.obj);
+            for (int i = 0; i < l.sprites; i++) {
+                if (l.state[i] == st) {
+                    want = i;
+                    break;
+                }
+            }
+            if (want < 0) {
+                want = snapshotIconSprite(l);
+                if (want < 0) {
+                    // A third state, or no room: LVGL takes it back.
+                    releaseIconLayer(l);
+                    continue;
+                }
+            }
+        }
+        if (want != l.shown) {
+            if (l.shown >= 0) {
+                sleepAnimation.layerHide(l.layer[l.shown]);
+            }
+            if (want >= 0) {
+                sleepAnimation.layerShow(l.layer[want]);
+            }
+            l.shown = want;
+            IconLayerDbg &d = g_iconLayerDbg[&l - iconLayers];
+            d.shown = want >= 0;
+            d.toggles = d.toggles + 1;
+        }
+    }
+    // Take blinking, visible images into free slots.
+    for (int i = 0; i < iconCandN; i++) {
+        IconCand &c = iconCands[i];
+        if (c.toggles < 2 || c.refused || c.hidden || c.obj == nullptr) {
+            continue;
+        }
+        bool have = false;
+        for (IconLayer &l : iconLayers) {
+            if (l.obj == c.obj) {
+                have = true;
+                break;
+            }
+        }
+        if (have) {
+            continue;
+        }
+        IconLayer *slot = nullptr;
+        for (IconLayer &l : iconLayers) {
+            if (l.obj == nullptr) {
+                slot = &l;
+                break;
+            }
+        }
+        if (slot == nullptr) {
+            break;
+        }
+        if (!takeIconLayer(*slot, c.obj)) {
+            c.refused = true;
+        }
+    }
+#else
+    (void)canOwn;
+#endif
 }
 
 void DefaultUI::init() {
