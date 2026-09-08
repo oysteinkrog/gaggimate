@@ -1,6 +1,7 @@
 #include "ProfileManager.h"
 #include <ArduinoJson.h>
 #include <display/util/PsramAllocator.h>
+#include <display/util/SafeReplace.h>
 
 #include <utility>
 
@@ -9,6 +10,9 @@ ProfileManager::ProfileManager(fs::FS *fs, String dir, Settings &settings, Plugi
 
 void ProfileManager::setup() {
     ensureDirectory();
+    // A save interrupted between its .tmp and the rename leaves a .bak or a
+    // .tmp behind; settle them before anything lists the directory.
+    saferep::recoverReplace(*_fs, _dir, ".json", "ProfileManager");
     // Call listProfiles once; each call scans the filesystem and (historically)
     // burned a file handle. Reuse this snapshot for both the entry guard and
     // the migrate() call so we hit the FS as little as possible at boot.
@@ -215,15 +219,10 @@ bool ProfileManager::saveProfile(Profile &profile) {
         return false;
     }
     // FAT (SD_MMC) refuses to rename onto a name that already exists, so the
-    // target has to go first. If power is lost between the two, the complete
-    // document is still sitting in the .tmp file, which is recoverable; a
-    // truncated target is not.
-    if (_fs->exists(target)) {
-        _fs->remove(target);
-    }
-    if (!_fs->rename(tmpPath, target)) {
-        ESP_LOGE("ProfileManager", "Could not move profile %s into place", profile.id.c_str());
-        _fs->remove(tmpPath);
+    // old file is set aside as .bak, the new one moved in, and the .bak
+    // dropped; a failure rolls the old one back, and whatever an interruption
+    // leaves is settled by recoverReplace at the next setup() (SafeReplace.h).
+    if (!saferep::commitReplace(*_fs, tmpPath, target, "ProfileManager")) {
         return false;
     }
 
