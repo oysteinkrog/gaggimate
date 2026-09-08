@@ -70,6 +70,11 @@ class BLEScalePlugin : public Plugin {
     void pollScaleMetadata();
 
     void establishConnection();
+    // Start or stop the scale library's scan and keep the shared-scanner owner
+    // token in step (gm-bzu.6). Every scan start and stop in this plugin goes
+    // through these two.
+    void startScaleScan() const;
+    void stopScaleScan() const;
 
     // mutable because scan() is const and must be able to arm discovery: it
     // is the one entry point the web UI's scan button shares with the

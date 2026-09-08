@@ -1,6 +1,7 @@
 #include "BLEScalePlugin.h"
 #include "remote_scales.h"
 #include "remote_scales_plugin_registry.h"
+#include <ble/BleScanOwner.h>
 #include <cmath> // For isfinite()
 #include <display/core/Controller.h>
 #include <scales/acaia.h>
@@ -57,6 +58,41 @@ void on_ble_measurement(float value) {
 
 BLEScalePlugin BLEScales;
 
+// The scale library and the controller transport share one NimBLE scanner
+// and one callback slot (lib/NanoPbComm/src/ble/BleScanOwner.h). These two
+// wrappers are the only way this plugin touches the library's scan so the
+// owner token follows it: the transport reads the token to leave a scale scan
+// alone and to know when it has to re-install its own callbacks.
+void BLEScalePlugin::startScaleScan() const {
+    if (scanner == nullptr) {
+        return;
+    }
+    if (!scanner->isScanRunning()) {
+        const BleScanOwner previous = bleScanOwner();
+        if (previous == BleScanOwner::Controller && NimBLEDevice::getScan()->isScanning()) {
+            // Taking the slot from a controller scan that has not found its
+            // peer yet. The transport gets it back when this scan stops
+            // (BleClientTransport::maintain restarts with its own callbacks).
+            ESP_LOGI("BLEScalePlugin", "Scale scan taking the scanner over from the controller scan");
+        }
+    }
+    scanner->initializeAsyncScan();
+    if (scanner->isScanRunning()) {
+        bleScanSetOwner(BleScanOwner::Scale);
+    }
+}
+
+void BLEScalePlugin::stopScaleScan() const {
+    if (scanner == nullptr) {
+        return;
+    }
+    const bool wasRunning = scanner->isScanRunning();
+    scanner->stopAsyncScan();
+    if (wasRunning) {
+        bleScanRelease(BleScanOwner::Scale);
+    }
+}
+
 BLEScalePlugin::BLEScalePlugin() = default;
 
 BLEScalePlugin::~BLEScalePlugin() noexcept {
@@ -72,7 +108,7 @@ BLEScalePlugin::~BLEScalePlugin() noexcept {
 
         if (scanner != nullptr) {
             // Stop scanning first
-            scanner->stopAsyncScan();
+            stopScaleScan();
             // Give it time to actually stop
             delay(50);
             delete scanner;
@@ -169,7 +205,7 @@ void BLEScalePlugin::loop() {
             disconnect();
         }
         if (scanner->isScanRunning()) {
-            scanner->stopAsyncScan();
+            stopScaleScan();
         }
     }
     const unsigned long now = millis();
@@ -238,14 +274,14 @@ void BLEScalePlugin::update() {
                 // schedule the first burst a period out. The boost minute
                 // itself was continuous discovery, so there is nothing to
                 // gain from a burst right away.
-                scanner->stopAsyncScan();
+                stopScaleScan();
                 scanNextBurstAt = now + SCAN_BURST_PERIOD_MS;
             } else if (static_cast<long>(now - scanBurstStopAt) >= 0) {
-                scanner->stopAsyncScan();
+                stopScaleScan();
                 scanBurstStopAt = 0;
             }
         } else if (static_cast<long>(now - scanNextBurstAt) >= 0) {
-            scanner->initializeAsyncScan();
+            startScaleScan();
             scanBurstStopAt = now + SCAN_BURST_LEN_MS;
             scanNextBurstAt = now + SCAN_BURST_PERIOD_MS;
         }
@@ -306,7 +342,7 @@ void BLEScalePlugin::scan() const {
     if (controller != nullptr && controller->getMode() != MODE_STANDBY) {
         active = true;
     }
-    scanner->initializeAsyncScan();
+    startScaleScan();
 }
 
 void BLEScalePlugin::disconnect() {
@@ -375,7 +411,7 @@ void BLEScalePlugin::establishConnection() {
         return;
     }
 
-    scanner->stopAsyncScan();
+    stopScaleScan();
 
     auto discoveredScales = scanner->getDiscoveredScales();
     bool deviceFound = false;

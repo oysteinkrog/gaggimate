@@ -20,6 +20,10 @@ void BleClientTransport::init(const String &deviceName) {
 
 void BleClientTransport::scan() {
     _readyForConnection = false;
+    takeScan(true);
+}
+
+void BleClientTransport::takeScan(bool resetBoost) {
     _scanner->clearResults(); // esp-nimble-cpp 2.x has no clearDuplicateCache(); results vector is unused (setMaxResults(0))
     // 1.x setAdvertisedDeviceCallbacks(cb, wantDuplicates=true) -> 2.x
     // setScanCallbacks(cb, wantDuplicates). wantDuplicates=true keeps duplicate
@@ -34,14 +38,25 @@ void BleClientTransport::scan() {
     // boot or a fresh disconnect -- then maintain() backs off to 5000 ms.
     // Passive scan with a 50 ms window catches typical 100-200 ms adverts
     // within a few windows, so backed-off discovery still lands in seconds.
-    _scanStartedMs = millis();
-    _scanBackedOff = false;
-    _scanner->setInterval(SCAN_BOOST_INTERVAL_MS);
+    if (resetBoost) {
+        _scanStartedMs = millis();
+        _scanBackedOff = false;
+    }
+    _scanner->setInterval(_scanBackedOff ? SCAN_BACKOFF_INTERVAL_MS : SCAN_BOOST_INTERVAL_MS);
     _scanner->setWindow(SCAN_WINDOW_MS);
     _scanner->setMaxResults(0);
     _scanner->setDuplicateFilter(false);
     _scanner->setActiveScan(false);
-    _scanner->start(0, false, false); // 2.x: start(duration=0 continuous, isContinue, restart)
+    // If the scale library's scan is still running, restart so our parameters
+    // apply; NimBLE's start() with restart=false would otherwise return
+    // BLE_HS_EALREADY and leave the radio on the scale's active-scan cadence.
+    const bool running = _scanner->isScanning();
+    const BleScanOwner previous = bleScanOwner();
+    if (running && previous == BleScanOwner::Scale) {
+        ESP_LOGI(LOG_TAG, "Taking the scanner over from the scale scan");
+    }
+    bleScanSetOwner(BleScanOwner::Controller);
+    _scanner->start(0, false, running); // 2.x: start(duration=0 continuous, isContinue, restart)
 }
 
 void BleClientTransport::maintain() {
@@ -53,19 +68,23 @@ void BleClientTransport::maintain() {
         // about whether a controller is near, and going through scan() here
         // re-entered boost each time, which held the radio at the boost duty
         // (and its display cost) nearly continuously on a bench with no
-        // controller. Parameters survive in the scanner object, so start()
-        // alone resumes; fall back to a full scan() only if it refuses.
+        // controller. This also covers a scan the scale library started and
+        // stopped while we were disconnected: the singleton then holds the
+        // scale's callbacks, and a bare start() resumed with them installed,
+        // so our onResult() never saw the controller again (gm-bzu.6).
+        // takeScan(false) re-installs ours without touching the boost clock.
         ESP_LOGI(LOG_TAG, "Scan stalled, restarting");
-        if (!_scanner->start(0, false, false)) {
-            scan();
-        }
+        takeScan(false);
         return;
     }
-    // Back off a long-running fruitless scan (rationale at scan()). Inline
+    // Back off a long-running fruitless scan (rationale at takeScan()). Inline
     // stop/start rather than scan(), which would reset the boost clock; the
     // early return above keeps the stall-restart path from seeing the brief
-    // not-scanning gap this creates.
-    if (!_scanBackedOff && _scanner->isScanning() && millis() - _scanStartedMs >= SCAN_BOOST_MS) {
+    // not-scanning gap this creates. Only a scan we own: after we have
+    // connected (the scan stopped in onResult) the running scan, if any, is
+    // the scale's, and its cadence is the scale plugin's business.
+    if (!_scanBackedOff && bleScanOwner() == BleScanOwner::Controller && _scanner->isScanning() &&
+        millis() - _scanStartedMs >= SCAN_BOOST_MS) {
         _scanBackedOff = true;
         _scanner->stop();
         _scanner->setInterval(SCAN_BACKOFF_INTERVAL_MS);
@@ -198,6 +217,7 @@ void BleClientTransport::onResult(const NimBLEAdvertisedDevice *advertisedDevice
         ESP_LOGI(LOG_TAG, "Found controller at address %s with name %s, ready to connect", _serverAddress.toString().c_str(),
                  advertisedDevice->getName().c_str());
         _scanner->stop();
+        bleScanRelease(BleScanOwner::Controller);
         _readyForConnection = true;
     }
 }
