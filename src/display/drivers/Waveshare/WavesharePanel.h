@@ -82,7 +82,7 @@ class WavesharePanel : public Display {
 
     uint16_t getBattVoltage();
 
-    void pushColors(uint16_t x, uint16_t y, uint16_t width, uint16_t hight, uint16_t *data) override;
+    void pushColors(uint16_t x, uint16_t y, uint16_t xEnd, uint16_t yEnd, uint16_t *data) override;
     // Stops RGB scan-out until reboot (frees the esp_lcd panel). Used during
     // display OTA to keep the shared flash/PSRAM bus free for flash writes.
     void stopPanel();

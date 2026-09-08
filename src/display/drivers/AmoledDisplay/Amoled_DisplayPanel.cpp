@@ -211,10 +211,14 @@ uint16_t Amoled_DisplayPanel::getBattVoltage(void) {
     return (sum / number_of_samples) * 2;
 }
 
-void Amoled_DisplayPanel::pushColors(uint16_t x, uint16_t y, uint16_t width, uint16_t height, uint16_t *data) {
-    if (displayBus && display) {
-        display->draw16bitRGBBitmap(x, y, data, width, height);
+void Amoled_DisplayPanel::pushColors(uint16_t x, uint16_t y, uint16_t xEnd, uint16_t yEnd, uint16_t *data) {
+    // Display::pushColors hands over exclusive end coordinates (see Display.h);
+    // Arduino_GFX wants a width and a height. Passing the ends through as
+    // dimensions read past the source buffer by x and y pixels (gm-bzu.2).
+    if (!displayBus || !display || data == nullptr || xEnd <= x || yEnd <= y) {
+        return;
     }
+    display->draw16bitRGBBitmap(x, y, data, static_cast<int16_t>(xEnd - x), static_cast<int16_t>(yEnd - y));
 }
 
 void Amoled_DisplayPanel::setRotation(uint8_t rotation) {

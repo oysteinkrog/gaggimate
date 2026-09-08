@@ -7,7 +7,14 @@ class Display {
     virtual ~Display() = default;
 
     Display() : _rotation(0) {};
-    virtual void pushColors(uint16_t x, uint16_t y, uint16_t width, uint16_t height, uint16_t *data) = 0;
+    // Copies a rectangle of pixels to the panel. xEnd and yEnd are EXCLUSIVE
+    // end coordinates, the same contract as esp_lcd_panel_draw_bitmap: the
+    // LVGL flush passes area->x2 + 1 and area->y2 + 1, the animation's push
+    // loop passes the row after its last, and `data` holds exactly
+    // (xEnd - x) * (yEnd - y) pixels. An adapter whose backend wants a width
+    // and a height converts here (Amoled_DisplayPanel); before it did, a
+    // two-row band at y = 100 was drawn 102 rows tall from a two-row buffer.
+    virtual void pushColors(uint16_t x, uint16_t y, uint16_t xEnd, uint16_t yEnd, uint16_t *data) = 0;
     virtual uint16_t width() = 0;
     virtual uint16_t height() = 0;
     virtual uint8_t getPoint(int16_t *x, int16_t *y, uint8_t get_point) = 0;
