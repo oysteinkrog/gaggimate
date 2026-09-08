@@ -142,14 +142,15 @@ constexpr int RLUT_N = 256 + RPAD;
 
 uint16_t *paletteExt = nullptr; // [PAL_EXT_N]; real ramp lives at paletteExt+PAD
 uint16_t *palette = nullptr;    // = paletteExt + PAD, 256 entries, reversed theme ramp
-int8_t *radiusLUT = nullptr;   // [RLUT_N]; r^2>>RSHIFT -> FIELD_BIAS-centered radius byte (see FIELD_BIAS)
+int8_t *radiusLUT = nullptr;    // [RLUT_N]; r^2>>RSHIFT -> FIELD_BIAS-centered radius byte (see FIELD_BIAS)
 int16_t *flickerLUT = nullptr;  // [256]; noise byte -> signed flicker contribution
 const uint8_t *noise = nullptr;
-int8_t *fieldRow = nullptr;    // [allocW]; radiusLUT[ridx] for the current row pair, shared by both rows, still FIELD_BIAS-centered
-int8_t *flickerRow = nullptr;  // [allocW]; flickerLUT[noise] truncated to a byte (proven to fit, see file header), current row pair
+int8_t *fieldRow = nullptr; // [allocW]; radiusLUT[ridx] for the current row pair, shared by both rows, still FIELD_BIAS-centered
+int8_t *flickerRow =
+    nullptr; // [allocW]; flickerLUT[noise] truncated to a byte (proven to fit, see file header), current row pair
 int8_t *zeroFlickerRow = nullptr; // [allocW]; all zero, stands in for flickerRow when flicker is off (see band())
-int8_t *perColTile = nullptr;  // [16]; this row's 8 dither/breathe values replicated twice for the PIE stage
-uint8_t *idxRow = nullptr;     // [allocW]; emberIdxRowPie's output: the unsigned, ready-to-gather palette offset
+int8_t *perColTile = nullptr;     // [16]; this row's 8 dither/breathe values replicated twice for the PIE stage
+uint8_t *idxRow = nullptr;        // [allocW]; emberIdxRowPie's output: the unsigned, ready-to-gather palette offset
 int allocW = 0;
 uint32_t lastThemeGen = 0xFFFFFFFF;
 uint8_t lastGlow = 255;
@@ -217,7 +218,7 @@ constexpr int INDEX_UNBIAS = 35; // FIELD_BIAS - 128; added to palOff to read th
 // directly into the unsigned offset palOffBiased indexes with no scalar
 // work.
 alignas(16) constexpr uint8_t kIdxUnsignBias[16] = {0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80,
-                                                     0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80};
+                                                    0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80};
 
 void buildRadiusLut(uint8_t glow) {
     const float glowGain = 0.55f + 0.014f * glow;
@@ -256,6 +257,8 @@ void *allocHotOrPsram(size_t size) {
     return p;
 }
 
+void release();
+
 bool init(int w, int h) {
     if (paletteExt == nullptr) {
         // Nine tables total: the four kept from before (paletteExt,
@@ -278,9 +281,12 @@ bool init(int w, int h) {
         perColTile = static_cast<int8_t *>(allocHotOrPsram(16));
         idxRow = static_cast<uint8_t *>(allocHotOrPsram(static_cast<size_t>(w)));
         allocW = w;
-        if (paletteExt == nullptr || radiusLUT == nullptr || flickerLUT == nullptr || noise == nullptr ||
-            fieldRow == nullptr || flickerRow == nullptr || zeroFlickerRow == nullptr || perColTile == nullptr ||
-            idxRow == nullptr) {
+        if (paletteExt == nullptr || radiusLUT == nullptr || flickerLUT == nullptr || noise == nullptr || fieldRow == nullptr ||
+            flickerRow == nullptr || zeroFlickerRow == nullptr || perColTile == nullptr || idxRow == nullptr) {
+            // Give the partial set back. The block is keyed on paletteExt, so
+            // a retry would otherwise skip it and run with the rest null
+            // (gm-bzu.15, tools/animbench/lifecycle_check).
+            release();
             return false;
         }
         palette = paletteExt + PAD;
@@ -469,9 +475,8 @@ void bandRef(uint16_t *dst, int y0, int rows, int w, uint32_t, const uint8_t *) 
 // long as the allocator itself returns an aligned pointer, the same
 // assumption every other kernel in this file already makes for its own
 // output buffer.
-__attribute__((noinline)) static void GM_ANIM_IRAM emberFieldRow(int8_t *__restrict out,
-                                                                   const int8_t *__restrict radiusLUTIn, int r2_0,
-                                                                   int ddx_0, int wPairs) {
+__attribute__((noinline)) static void GM_ANIM_IRAM emberFieldRow(int8_t *__restrict out, const int8_t *__restrict radiusLUTIn,
+                                                                 int r2_0, int ddx_0, int wPairs) {
     int r2 = r2_0;
     int ddx = ddx_0;
     int8_t *wr = out;
@@ -528,9 +533,9 @@ __attribute__((noinline)) static void GM_ANIM_IRAM emberFieldRow(int8_t *__restr
 // original comment above for why it, not an extra filler, supplies idx1's
 // load-to-use gap.
 __attribute__((noinline)) static void GM_ANIM_IRAM emberFlickerFieldRow(int8_t *__restrict flickerRowOut,
-                                                                          const uint8_t *__restrict noiseRowIn,
-                                                                          const int16_t *__restrict flickerLUTIn,
-                                                                          int gsxIn, int wPairs) {
+                                                                        const uint8_t *__restrict noiseRowIn,
+                                                                        const int16_t *__restrict flickerLUTIn, int gsxIn,
+                                                                        int wPairs) {
     int ni = gsxIn;
     int8_t *cr = flickerRowOut;
     int idx0, idx1;
@@ -602,12 +607,10 @@ __attribute__((noinline)) static void GM_ANIM_IRAM emberFlickerFieldRow(int8_t *
 // checks this once per call, the same defensive pattern AnimNebula.cpp
 // uses for its own hot tables. perColTileIn and biasTileIn are always
 // allocHot/static-const and 16-byte aligned by construction.
-__attribute__((noinline)) static void GM_ANIM_IRAM emberIdxRowPie(uint8_t *__restrict idxOut,
-                                                                     const int8_t *__restrict fieldIn,
-                                                                     const int8_t *__restrict flickerSrcIn,
-                                                                     const int8_t *__restrict perColTileIn,
-                                                                     const uint8_t *__restrict biasTileIn,
-                                                                     int wSixteens) {
+__attribute__((noinline)) static void GM_ANIM_IRAM emberIdxRowPie(uint8_t *__restrict idxOut, const int8_t *__restrict fieldIn,
+                                                                  const int8_t *__restrict flickerSrcIn,
+                                                                  const int8_t *__restrict perColTileIn,
+                                                                  const uint8_t *__restrict biasTileIn, int wSixteens) {
     const int8_t *fr = fieldIn;
     const int8_t *lr = flickerSrcIn;
     uint8_t *wr = idxOut;
@@ -623,8 +626,7 @@ __attribute__((noinline)) static void GM_ANIM_IRAM emberIdxRowPie(uint8_t *__res
                  "ee.vst.128.ip q0, %[wr], 16\n"
                  "addi %[n], %[n], -1\n"
                  "bnez %[n], 1b\n"
-                 : [fr] "+r"(fr), [lr] "+r"(lr), [wr] "+r"(wr), [n] "+r"(n), [bias] "+r"(biasTileIn),
-                   [pct] "+r"(perColTileIn)
+                 : [fr] "+r"(fr), [lr] "+r"(lr), [wr] "+r"(wr), [n] "+r"(n), [bias] "+r"(biasTileIn), [pct] "+r"(perColTileIn)
                  :
                  : "memory");
 }
@@ -656,9 +658,8 @@ __attribute__((noinline)) static void GM_ANIM_IRAM emberIdxRowPie(uint8_t *__res
 // 16 here (band()'s own guard below, tighter than round 3's %8 since the
 // PIE stage needs full 16-lane groups), so wPairs has no remainder.
 __attribute__((noinline)) static void GM_ANIM_IRAM emberFinalizeRow(uint16_t *__restrict row,
-                                                                      const uint16_t *__restrict palOffBiased,
-                                                                      const uint8_t *__restrict idxRowIn,
-                                                                      int wPairs) {
+                                                                    const uint16_t *__restrict palOffBiased,
+                                                                    const uint8_t *__restrict idxRowIn, int wPairs) {
     const uint8_t *ir = idxRowIn;
     uint16_t *wr = row;
     int i0, i1, a0, a1;
@@ -709,11 +710,10 @@ GM_ANIM_IRAM void band(uint16_t *dst, int y0, int rows, int w, uint32_t tMs, con
     // misaligned address, so a silent fallback would corrupt output rather
     // than crash. Checked once per band() call, same pattern
     // AnimNebula.cpp uses for its own hot tables.
-    const bool hotAligned = (reinterpret_cast<uintptr_t>(fieldRow) & 15) == 0 &&
-                             (reinterpret_cast<uintptr_t>(flickerRow) & 15) == 0 &&
-                             (reinterpret_cast<uintptr_t>(zeroFlickerRow) & 15) == 0 &&
-                             (reinterpret_cast<uintptr_t>(perColTile) & 15) == 0 &&
-                             (reinterpret_cast<uintptr_t>(idxRow) & 15) == 0;
+    const bool hotAligned =
+        (reinterpret_cast<uintptr_t>(fieldRow) & 15) == 0 && (reinterpret_cast<uintptr_t>(flickerRow) & 15) == 0 &&
+        (reinterpret_cast<uintptr_t>(zeroFlickerRow) & 15) == 0 && (reinterpret_cast<uintptr_t>(perColTile) & 15) == 0 &&
+        (reinterpret_cast<uintptr_t>(idxRow) & 15) == 0;
     if (!hotAligned) {
         bandRef(dst, y0, rows, w, tMs, p);
         return;
@@ -758,8 +758,7 @@ GM_ANIM_IRAM void band(uint16_t *dst, int y0, int rows, int w, uint32_t tMs, con
         // emberIdxRowPie's own header for the bias/order derivation. Picks
         // flickerRow when flicker is on, zeroFlickerRow (all zero, exact)
         // when it is off, so the kernel itself needs no flicker-off branch.
-        emberIdxRowPie(idxRow, fieldRow, doFlicker ? flickerRow : zeroFlickerRow, perColTile, kIdxUnsignBias,
-                       wSixteens);
+        emberIdxRowPie(idxRow, fieldRow, doFlicker ? flickerRow : zeroFlickerRow, perColTile, kIdxUnsignBias, wSixteens);
         emberFinalizeRow(row, palOffBiased, idxRow, wPairs);
     }
 #else
@@ -787,14 +786,9 @@ void release() {
 
 extern const BgAnimation bg_anim_ember;
 const BgAnimation bg_anim_ember = {
-    "ember",
-    "Ember",
-    {{"speed", "Speed", 50}, {"glow", "Glow size", 45}, {"flicker", "Flicker", 20}, {"pulse", "Pulse", 50}},
-    init,
-    frame,
-    band,
-    release,
-    bandRef,
+    "ember", "Ember", {{"speed", "Speed", 50}, {"glow", "Glow size", 45}, {"flicker", "Flicker", 20}, {"pulse", "Pulse", 50}},
+    init,    frame,   band,
+    release, bandRef,
 };
 
 #endif // GAGGIMATE_SIM

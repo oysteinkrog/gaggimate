@@ -128,6 +128,8 @@ void spawnAll(int count, int w, int h) {
     builtCount = count;
 }
 
+void release();
+
 bool init(int w, int h) {
     if (ff == nullptr) {
         // Placement split by reads per frame (BgAnimCommon.h's hot-slab
@@ -147,6 +149,9 @@ bool init(int w, int h) {
         expLUT = static_cast<float *>(alloc(EXP_LUT_N * sizeof(float)));
         if (ff == nullptr || draws == nullptr || alphaLUT == nullptr || bgLUT == nullptr || ffCol == nullptr ||
             expLUT == nullptr) {
+            // Same rule as AnimStarfield: the block is keyed on `ff`, so a
+            // partial set must not survive a failed init (gm-bzu.15).
+            release();
             return false;
         }
         g_h = h;
@@ -252,8 +257,8 @@ inline void fillBgRowScalar(uint16_t *row, uint16_t c, int w) {
 // more device work than the branchy version ever did. Restored both
 // `continue`s verbatim; see drawGlowSpanAsm below for the same fix in asm
 // (a real BGEI/BEQZ branch, not a clamp).
-inline void drawGlowSpanScalar(uint16_t *row, int32_t dxQ8_0, int32_t dy2Q4, int32_t invR2Fixed, uint8_t r, uint8_t g,
-                                uint8_t b, uint8_t a8, int count) {
+inline void drawGlowSpanScalar(uint16_t *row, int32_t dxQ8_0, int32_t dy2Q4, int32_t invR2Fixed, uint8_t r, uint8_t g, uint8_t b,
+                               uint8_t a8, int count) {
     int32_t dxQ8 = dxQ8_0;
     for (int i = 0; i < count; i++, dxQ8 += 256) {
         const int32_t dx2Q4 = (dxQ8 * dxQ8) >> 12;
@@ -382,8 +387,8 @@ __attribute__((noinline)) static void fillRowPie(uint16_t *__restrict dstIn, uin
 // base2 (4, "=&r" scratch) = 14. Confirmed no spill in xtensa-asm14 again
 // this round (report).
 __attribute__((noinline)) static void drawGlowSpanAsm(uint16_t *__restrict rowIn, int32_t dxQ8_0, int32_t dy2Q4,
-                                                       int32_t invR2Fixed, uint8_t rCol, uint8_t gCol, uint8_t bCol,
-                                                       uint8_t a8v, int count) {
+                                                      int32_t invR2Fixed, uint8_t rCol, uint8_t gCol, uint8_t bCol, uint8_t a8v,
+                                                      int count) {
     uint16_t *row = rowIn;
     int32_t dxQ8 = dxQ8_0;
     const uint8_t *alut = alphaLUT;
@@ -399,7 +404,7 @@ __attribute__((noinline)) static void drawGlowSpanAsm(uint16_t *__restrict rowIn
         "bgei  %[a], 64, 4f\n"           // outside the circle: skip gather+blend+store, matches `if (idx>=64) continue`
         // a = alphaLUT[idx] * a8v >> 8  (uint8-range result, no mask needed)
         "add   %[a], %[alut], %[a]\n"
-        "l8ui  %[a], %[a], 0\n"  // alphaLUT[idx]
+        "l8ui  %[a], %[a], 0\n" // alphaLUT[idx]
         "mull  %[a], %[a], %[a8v]\n"
         "srli  %[a], %[a], 8\n" // a
         "beqz  %[a], 4f\n"      // fully transparent: skip blend+store, matches `if (a==0) continue`
@@ -412,7 +417,7 @@ __attribute__((noinline)) static void drawGlowSpanAsm(uint16_t *__restrict rowIn
         "add   %[res], %[res], %[n]\n"
         "movi  %[n], 31\n"
         "min   %[res], %[res], %[n]\n"
-        "slli  %[res], %[res], 11\n" // res = R contribution, now the output accumulator
+        "slli  %[res], %[res], 11\n"     // res = R contribution, now the output accumulator
         "extui %[base2], %[dst], 5, 6\n" // G base
         "mull  %[n], %[gc], %[a]\n"
         "srai  %[n], %[n], 10\n"
@@ -434,9 +439,8 @@ __attribute__((noinline)) static void drawGlowSpanAsm(uint16_t *__restrict rowIn
         "addi  %[dxQ8], %[dxQ8], 256\n"
         "3:\n"
         : [row] "+r"(row), [dxQ8] "+r"(dxQ8), [a] "=&r"(a), [dst] "=&r"(dst), [res] "=&r"(res), [base2] "=&r"(base2)
-        : [dy2Q4] "r"(dy2Q4), [invR2] "r"(invR2Fixed), [rc] "r"(static_cast<int32_t>(rCol)),
-          [gc] "r"(static_cast<int32_t>(gCol)), [bc] "r"(static_cast<int32_t>(bCol)),
-          [a8v] "r"(static_cast<int32_t>(a8v)), [alut] "r"(alut), [n] "r"(count)
+        : [dy2Q4] "r"(dy2Q4), [invR2] "r"(invR2Fixed), [rc] "r"(static_cast<int32_t>(rCol)), [gc] "r"(static_cast<int32_t>(gCol)),
+          [bc] "r"(static_cast<int32_t>(bCol)), [a8v] "r"(static_cast<int32_t>(a8v)), [alut] "r"(alut), [n] "r"(count)
         : "memory");
 }
 #endif
@@ -486,14 +490,9 @@ void release() {
 
 extern const BgAnimation bg_anim_fireflies;
 const BgAnimation bg_anim_fireflies = {
-    "fireflies",
-    "Fireflies",
-    {{"speed", "Speed", 50}, {"count", "Count", 60}, {"glow", "Glow", 55}, {"shimmer", "Shimmer", 40}},
-    init,
-    frame,
-    band,
-    release,
-    bandRef,
+    "fireflies", "Fireflies", {{"speed", "Speed", 50}, {"count", "Count", 60}, {"glow", "Glow", 55}, {"shimmer", "Shimmer", 40}},
+    init,        frame,       band,
+    release,     bandRef,
 };
 
 #endif // GAGGIMATE_SIM

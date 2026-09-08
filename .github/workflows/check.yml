@@ -244,3 +244,12 @@ jobs:
       # no reason for them to be a thing someone remembers to run.
       - name: Golden frames and band call-shape invariance
         run: make -C tools/animbench check
+      # Lifecycle under the sanitizers (gm-bzu.15): every animation through
+      # init, render and release at 480, 240, 466 and 233, with the heap made
+      # to run out at each allocation in turn. The goldens above init once
+      # and never release, so a table sized from a stale width, a hot table
+      # leaked across a size switch, or an init() that returns true with a
+      # null table after a partial failure only shows here. halt_on_error
+      # turns the first sanitizer report into a failing step.
+      - name: Animation lifecycle and allocation faults
+        run: make -C tools/animbench -f Makefile.lifecycle check

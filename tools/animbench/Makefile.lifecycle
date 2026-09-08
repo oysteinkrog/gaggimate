@@ -1,0 +1,32 @@
+# Animation lifecycle check (gm-bzu.15): init, render, release and size
+# switches for every animation, with allocation faults injected, under
+# AddressSanitizer and UndefinedBehaviorSanitizer. See lifecycle_check.cpp.
+#
+#   make -f Makefile.lifecycle check      build and run (what CI runs)
+#   make -f Makefile.lifecycle            build only (-> build/lifecycle_check)
+#
+# The sanitizers are the point: without them a stale-width overrun reads a
+# neighbouring byte and passes. halt_on_error turns the first UBSan report
+# into a failing exit code. On WSL1 run with
+# ASAN_OPTIONS=verify_asan_link_order=0:detect_leaks=0 (libasan is not first
+# in the initial library list there, and LeakSanitizer cannot ptrace); the
+# harness counts heap blocks itself, so leak coverage does not depend on
+# LeakSanitizer.
+BIN ?= build/lifecycle_check
+ANIM_DIR := ../../src/display/ui/default/bganim
+SRCS := lifecycle_check.cpp mathcount.cpp $(wildcard $(ANIM_DIR)/*.cpp)
+CXXFLAGS := -O1 -g -std=gnu++17 -fsanitize=address,undefined -fno-omit-frame-pointer -Ishim -I. -include mathcount.h -Wall -Wno-unused-function
+PASSES ?= 3
+ASAN_OPTIONS ?= detect_leaks=1
+UBSAN_OPTIONS ?= halt_on_error=1:print_stacktrace=1
+
+$(BIN): $(SRCS) mathcount.h shim/Arduino.h shim/esp_heap_caps.h shim/esp_memory_utils.h
+	@mkdir -p $(dir $(BIN))
+	g++ $(CXXFLAGS) $(SRCS) -o $(BIN) -lm
+
+check: $(BIN)
+	ASAN_OPTIONS=$(ASAN_OPTIONS) UBSAN_OPTIONS=$(UBSAN_OPTIONS) ./$(BIN) $(PASSES)
+
+clean:
+	rm -rf build
+.PHONY: check clean
