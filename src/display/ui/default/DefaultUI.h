@@ -186,6 +186,14 @@ class DefaultUI {
 
     void startSleepAnimation();
     void stopSleepAnimation();
+    // The half of stopSleepAnimation that hands the framebuffers back to
+    // LVGL; runs at once when stop() confirmed, otherwise from the loop once
+    // stopConfirmed() says so or the 3 s cap expires (gm-bzu.16).
+    void finishStopSleepAnimation(bool forced);
+    void serviceAnimStopPending();
+    // Blocks (up to maxMs) until a pending stop is confirmed; for the panel
+    // stop path, which is about to delete the panel under any transfer.
+    void waitAnimStopPending(unsigned long maxMs);
     // Fade transitions (gm-2cl.2). A whole-page overlay rebuild (screen
     // change, settings navigation) is hidden behind the composite's gain:
     // the old page fades out from the moment the change is requested, the
@@ -316,6 +324,11 @@ class DefaultUI {
     float lastShownScaleWeight = -1000.0f;
     SleepAnimation sleepAnimation;
     unsigned long lastSleepAnimAttempt = 0;
+    // A stop() that could not confirm its workers and transfers had retired.
+    // While set, LVGL stays on its scratch buffer and neither start nor stop
+    // runs; the panel keeps showing the last frame.
+    bool animStopPending = false;
+    unsigned long animStopPendingSince = 0;
     unsigned long lastSleepOverlayRefresh = 0;
     // Dirty regions still owed to each of the two overlay buffers, in screen
     // coordinates, and whether that buffer has ever held a full render. They

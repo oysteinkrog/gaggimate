@@ -1858,6 +1858,7 @@ void DefaultUI::loop() {
     if (panelStopRequested && !panelStopped) {
         panelStopped = true;
         stopSleepAnimation();
+        waitAnimStopPending(3000);
         if (panelDriver != nullptr) {
             panelDriver->stopPanel();
         }
@@ -2156,6 +2157,11 @@ void DefaultUI::maintainSleepAnimation() {
     }
 #endif
 
+    if (animStopPending) {
+        // Neither start nor stop until the last stop has been confirmed.
+        serviceAnimStopPending();
+        return;
+    }
     if (wantAnimation) {
         if (!sleepAnimation.isActive()) {
             const unsigned long now = ::millis();
@@ -3290,6 +3296,14 @@ void DefaultUI::startSleepAnimation() {
     lvgl_helper_suppress_flush(true);
     sleepAnimation.start(display);
     if (!sleepAnimation.isActive()) {
+        if (!sleepAnimation.stopConfirmed()) {
+            // start() created the render task and then failed (the push task),
+            // and its shutdown of the render task did not confirm. Same
+            // quarantine as an unconfirmed stop.
+            animStopPending = true;
+            animStopPendingSince = ::millis();
+            return;
+        }
         lvgl_helper_suppress_flush(false);
         return;
     }
@@ -3447,7 +3461,59 @@ void DefaultUI::adoptAnimHost(lv_obj_t *host) {
 void DefaultUI::stopSleepAnimation() {
 #ifndef GAGGIMATE_SIM
     releaseDialElements();
-    sleepAnimation.stop();
+    if (!sleepAnimation.stop()) {
+        // A worker or a band transfer outlived stop()'s deadlines. Handing the
+        // framebuffers to LVGL now would put its rendering under a writer that
+        // is still going, so LVGL stays on the scratch buffer (touch and
+        // widgets keep working, unseen) until stopConfirmed() or the cap.
+        if (!animStopPending) {
+            animStopPending = true;
+            animStopPendingSince = ::millis();
+        }
+        return;
+    }
+    // A stop that was pending (a screen change can call this again) is
+    // confirmed now; the flag has to clear or the loop would stay parked.
+    animStopPending = false;
+    finishStopSleepAnimation(false);
+#endif
+}
+
+void DefaultUI::serviceAnimStopPending() {
+#ifndef GAGGIMATE_SIM
+    if (!animStopPending) {
+        return;
+    }
+    constexpr unsigned long kStopPendingCapMs = 3000;
+    const bool confirmed = sleepAnimation.stopConfirmed();
+    const bool expired = ::millis() - animStopPendingSince > kStopPendingCapMs;
+    if (!confirmed && !expired) {
+        return;
+    }
+    if (!confirmed) {
+        log_e("DefaultUI: animation stop unconfirmed after %lu ms, handing the panel to LVGL anyway", kStopPendingCapMs);
+    }
+    animStopPending = false;
+    finishStopSleepAnimation(!confirmed);
+#endif
+}
+
+void DefaultUI::waitAnimStopPending(unsigned long maxMs) {
+#ifndef GAGGIMATE_SIM
+    const unsigned long deadline = ::millis() + maxMs;
+    while (animStopPending && !sleepAnimation.stopConfirmed() && ::millis() < deadline) {
+        vTaskDelay(pdMS_TO_TICKS(5));
+    }
+    if (animStopPending) {
+        animStopPending = false;
+        finishStopSleepAnimation(!sleepAnimation.stopConfirmed());
+    }
+#endif
+}
+
+void DefaultUI::finishStopSleepAnimation(bool forced) {
+#ifndef GAGGIMATE_SIM
+    (void)forced;
     sleepAnimation.setOverlayGain(256);
     overlayTrans = OverlayTrans::Idle;
     overlayTransWaitSwap = false;
