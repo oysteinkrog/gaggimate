@@ -3,6 +3,7 @@
 
 #include "../Protocol.h"
 #include "../Transport.h"
+#include "BleScanOwner.h"
 #include <NimBLEDevice.h>
 
 /**
@@ -20,7 +21,9 @@ class BleClientTransport : public Transport, public NimBLEScanCallbacks, public 
 
     void init(const String &deviceName);
     void scan();
-    void maintain();        // restart scan if it stalled; call from loop()
+    void maintain(); // restart scan if it stalled; call from loop()
+    // Which side last started the shared scanner (see BleScanOwner.h).
+    static BleScanOwner scanOwner() { return bleScanOwner(); }
     bool connectToServer(); // returns true once connected + subscribed
     bool isReadyForConnection() const { return _readyForConnection; }
     void disconnect();
@@ -105,6 +108,13 @@ class BleClientTransport : public Transport, public NimBLEScanCallbacks, public 
     static constexpr uint32_t SCAN_BOOST_MS = 45000;
     unsigned long _scanStartedMs = 0;
     bool _scanBackedOff = false;
+    // Install this transport's callbacks and parameters on the shared scanner
+    // and start it. resetBoost=true is a fresh discovery (boot, disconnect):
+    // the boost clock restarts. false keeps the current phase, for restarting
+    // a stalled scan. Either way the callbacks are ours afterwards, which is
+    // the point (gm-bzu.6): a bare start() kept whatever callbacks the scale
+    // library had left in the singleton.
+    void takeScan(bool resetBoost);
 
     static constexpr const char *LOG_TAG = "BleClientTransport";
     static constexpr size_t MAX_CONNECT_RETRIES = 3;
