@@ -9,6 +9,16 @@
 // unchanged; only the file moved. setupServer() calls setupDebugEndpoints()
 // where the block used to be.
 #include "WebUIPlugin.h"
+
+#ifndef GAGGIMATE_HEADLESS
+#include <display/ui/default/DrawProfile.h> // /api/debug/drawprof; the header pulls in lvgl.h
+#endif
+#ifndef GAGGIMATE_SIM
+#include <esp_flash.h> // /api/debug/flashmode
+#include <esp_image_format.h>
+#include <esp_ota_ops.h>
+#include <soc/spi_mem_reg.h>
+#endif
 #ifndef GAGGIMATE_HEADLESS // the headless build has no LVGL and no UI tree (src/CMakeLists.txt)
 #include <display/ui/default/GlyphAtlas.h>
 #include <display/ui/default/TouchTask.h>
@@ -1030,6 +1040,16 @@ void WebUIPlugin::setupDebugEndpoints() {
         if (request->hasArg("marquees")) {
             g_marqueeLayersReq = request->arg("marquees").toInt() != 0 ? 1 : 0;
         }
+        if (request->hasArg("drawprof")) {
+            drawprof::g_req = request->arg("drawprof").toInt() != 0 ? 1 : 0;
+        }
+        if (request->hasArg("zoomfix")) {
+            g_zoomFixReq = request->arg("zoomfix").toInt() != 0 ? 1 : 0;
+        }
+        if (request->hasArg("clipcorner")) {
+            const int v = request->arg("clipcorner").toInt();
+            g_clipCornerReq = v < 0 ? 0 : (v > 2 ? 2 : v);
+        }
         if (request->hasArg("touchpoll")) {
             touchtask::setPollEnabled(request->arg("touchpoll").toInt() != 0);
         }
@@ -1252,6 +1272,10 @@ void WebUIPlugin::setupDebugEndpoints() {
         doc["icons"] = g_iconLayersReq;
         doc["anim_off"] = g_animOffReq;
         doc["marquees"] = g_marqueeLayersReq;
+        doc["zoomfix"] = g_zoomFixReq;
+        doc["drawprof_req"] = drawprof::g_req;
+        drawprof::report(doc, "drawprof");
+        doc["clipcorner"] = g_clipCornerReq;
         doc["clrruns"] = g_clearByRunsReq;
         doc["touch_poll"] = touchtask::pollEnabled();
         doc["touch_task"] = touchtask::running();
@@ -1910,6 +1934,58 @@ void WebUIPlugin::setupDebugEndpoints() {
     });
 #endif
 
+#ifndef GAGGIMATE_SIM
+    // The flash bus mode the chip is running, against what the two image
+    // headers ask for. The board file says qio at 80 MHz; the IDF sdkconfig
+    // said dio and nothing had checked which one the bootloader applied. An
+    // instruction-cache miss is a flash line read, and the LVGL draw path
+    // per object is longer than the 16 KB cache, so this bus is what every
+    // widget draw waits on (gm-2cl.19 profile, 2026-09-08).
+    server.on("/api/debug/flashmode", [](AsyncWebServerRequest *request) {
+        AsyncResponseStream *response = request->beginResponseStream("application/json");
+        JsonDocument doc(&psramAllocator);
+        const uint32_t ctrl = REG_READ(SPI_MEM_CTRL_REG(0));
+        const char *live = (ctrl & SPI_MEM_FREAD_QIO)    ? "qio"
+                           : (ctrl & SPI_MEM_FREAD_QUAD) ? "qout"
+                           : (ctrl & SPI_MEM_FREAD_DIO)  ? "dio"
+                           : (ctrl & SPI_MEM_FREAD_DUAL) ? "dout"
+                                                         : "slow";
+        doc["live_mode"] = live;
+        doc["spi0_ctrl"] = ctrl;
+        // clk register: 0 with the sysclk bit means the full source clock.
+        doc["spi0_clock_reg"] = REG_READ(SPI_MEM_CLOCK_REG(0));
+        static const char *const modes[] = {"qio", "qout", "dio", "dout", "fast", "slow"};
+        esp_image_header_t hdr;
+        if (esp_flash_read(nullptr, &hdr, 0x0, sizeof(hdr)) == ESP_OK && hdr.magic == ESP_IMAGE_HEADER_MAGIC) {
+            doc["bootloader_mode"] = hdr.spi_mode < 6 ? modes[hdr.spi_mode] : "?";
+            doc["bootloader_speed"] = hdr.spi_speed;
+        }
+        const esp_partition_t *run = esp_ota_get_running_partition();
+        if (run != nullptr && esp_partition_read(run, 0, &hdr, sizeof(hdr)) == ESP_OK && hdr.magic == ESP_IMAGE_HEADER_MAGIC) {
+            doc["app_mode"] = hdr.spi_mode < 6 ? modes[hdr.spi_mode] : "?";
+            doc["app_speed"] = hdr.spi_speed;
+            doc["app_partition"] = run->label;
+        }
+        serializeJson(doc, *response);
+        request->send(response);
+    });
+#endif
+#ifdef GM_DRAW_PROFILE
+    // Per-object draw profile of the active screen (DrawProfile.h). arm=1
+    // attaches to the next screen DefaultUI tunes, arm=0 stops attaching;
+    // the report is whatever the last attached screen has drawn since.
+    server.on("/api/debug/drawprof", [](AsyncWebServerRequest *request) {
+        if (request->hasArg("arm")) {
+            drawprof::g_req = request->arg("arm").toInt() != 0 ? 1 : 0;
+        }
+        AsyncResponseStream *response = request->beginResponseStream("application/json");
+        JsonDocument doc(&psramAllocator);
+        doc["armed"] = drawprof::g_req;
+        drawprof::report(doc, "drawprof", 64);
+        serializeJson(doc, *response);
+        request->send(response);
+    });
+#endif
 #if defined(GM_TOUCH_PROBE) || defined(GAGGIMATE_SIM)
     // /api/debug/settingsui[?open=1|close=1|cat=N|page=N|pop=1]: opens,
     // closes and navigates the on-display settings shell from a script and

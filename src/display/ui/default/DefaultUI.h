@@ -454,6 +454,11 @@ class DefaultUI {
     // root so recreated screens and re-themed rest colors get rewalked.
     void applyPressedFeedback();
     lv_obj_t *pressedStyledRoot = nullptr;
+    // tuneGeneratedScreen's walk runs once per screen root and again when
+    // its knobs change (gm-2cl.19).
+    lv_obj_t *tunedRoot = nullptr;
+    int tunedKnobs = -1;
+    void tuneGeneratedScreen();
     // Last-applied web-configurable colors, sentinel-initialized so the first
     // pass applies. appliedTintKey packs enabled+color (see applyTheme).
     int appliedDimColor = -1;

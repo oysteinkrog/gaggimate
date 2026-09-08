@@ -62,6 +62,31 @@ summary; the KB carries the sources and the measurements behind it.
   (per-env, into `.pio/libdeps/<env>/lvgl`) gives lv_meter scale-lines
   indicators sector invalidation. If dial updates ever get slow again, check
   it applied for that env.
+- **The flash runs in QIO, and the LVGL draw cost per widget is the flash
+  bus, not pixels** (gm-2cl.19, 2026-09-08). `boards/LilyGo-T-RGB.json` has
+  said qio at 80 MHz all along, the flash is a Winbond W25Q128 with the
+  quad eFuse set, and every build shipped IDF's default of dio because the
+  board setting never reached the sdkconfig. `sdkconfig.qio.defaults` sets
+  QIO for the T-RGB envs (not the 8 MB XIAO headless env); the bootloader
+  carries it, the image headers keep saying dio on purpose, so a board
+  switches on a USB flash of `bootloader.bin` with the app and an OTA alone
+  leaves it in dio. `/api/debug/flashmode` reports the live SPI0 mode. Why
+  it matters: the per-object draw profile (`DrawProfile.h`,
+  `/api/debug/drawprof?arm=1`, loadtest and sim builds) put 4 to 6 ms on
+  every small widget of the new_profile page while its draw calls
+  (DRAW_PART) were 0.1 to 0.6 ms and the host draws the same widget in 25
+  us: code and rodata fetched from flash on cache misses, doubled by the
+  render task's PSRAM traffic on the same bus. QIO took the widget to
+  2.1 ms and every page-change draw down 30 to 45% (standby 50.5 to 40.7
+  ms, brew 61.8 to 35.4, status 80.6 to 43.4, new_profile 251.9 to
+  170.4). Zoom 255 on the generated images and clip_corner on the panels
+  cost nothing measurable (`tuneGeneratedScreen`, `zoomfix=`,
+  `clipcorner=` on `/api/debug/anim`; `tools/screen_tune_check.py`). The
+  refill ISR is about 18% of core 1 (busy histogram on
+  `/api/debug/scanout`), so it is not where a UI pass goes either. What
+  is left per widget is still code volume against a 16 KB instruction
+  cache; the 32 KB cache option costs 16 KB of the DRAM the web UI needs
+  and was not tried.
 - **A directory on the SD card is listed with `opendir`/`readdir`, never
   with `File::openNextFile()` on the boot path** (`saferep::recoverReplace`,
   2026-09-08). `openNextFile()` opens every entry it returns, and on FAT

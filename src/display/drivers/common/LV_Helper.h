@@ -204,6 +204,16 @@ extern volatile int g_textElementsReq;
 // icons=0|1 on /api/debug/anim: blinking images as layers
 // (DefaultUI::serviceIconLayers, gm-2cl.17).
 extern volatile int g_iconLayersReq;
+// Generated-screen tuning (DefaultUI::tuneGeneratedScreen, gm-2cl.19).
+// zoomfix=0|1 on /api/debug/anim: an lv_img whose zoom is 255 (EEZ Studio
+// writes that for "no zoom") is set to 256, which is the value LVGL treats
+// as untransformed; at 255 every pixel goes through the software transform.
+extern volatile int g_zoomFixReq;
+// clipcorner=0|1|2 on /api/debug/anim: 1 leaves clip_corner as generated,
+// 0 clears it on every plain container of the active screen (an A/B bound,
+// not pixel-exact), 2 clears it only where no child reaches the rounded
+// corner, which draws the same pixels without the per-child radius mask.
+extern volatile int g_clipCornerReq;
 // Debug knob (`animoff=1` on /api/debug/anim, not stored): keeps the
 // background animation off so LVGL owns the panel's framebuffers on every
 // screen, which is the path gm-bzu.5's flip wait guards. 0 restores the
