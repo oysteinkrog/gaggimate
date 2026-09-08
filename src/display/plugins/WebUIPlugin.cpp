@@ -1464,6 +1464,9 @@ void WebUIPlugin::setupServer() {
         if (request->hasArg("icons")) {
             g_iconLayersReq = request->arg("icons").toInt() != 0 ? 1 : 0;
         }
+        if (request->hasArg("marquees")) {
+            g_marqueeLayersReq = request->arg("marquees").toInt() != 0 ? 1 : 0;
+        }
         if (request->hasArg("touchpoll")) {
             touchtask::setPollEnabled(request->arg("touchpoll").toInt() != 0);
         }
@@ -1678,6 +1681,7 @@ void WebUIPlugin::setupServer() {
         doc["dials"] = g_dialElementsReq;
         doc["texts"] = g_textElementsReq;
         doc["icons"] = g_iconLayersReq;
+        doc["marquees"] = g_marqueeLayersReq;
         doc["clrruns"] = g_clearByRunsReq;
         doc["touch_poll"] = touchtask::pollEnabled();
         doc["touch_task"] = touchtask::running();
@@ -1740,6 +1744,22 @@ void WebUIPlugin::setupServer() {
                 o["h"] = d.h;
                 o["shown"] = d.shown;
                 o["toggles"] = d.toggles;
+            }
+        }
+        {
+            JsonArray ml = doc["marquee_layers"].to<JsonArray>();
+            for (int i = 0; i < 2; i++) {
+                const MarqueeDbg &d = g_marqueeDbg[i];
+                if (!d.owned) {
+                    continue;
+                }
+                JsonObject o = ml.add<JsonObject>();
+                o["x"] = d.x;
+                o["y"] = d.y;
+                o["w"] = d.w;
+                o["h"] = d.h;
+                o["period"] = d.period;
+                o["ms"] = d.ms;
             }
         }
         doc["atlas_bytes"] = glyphatlas::bytesUsed();

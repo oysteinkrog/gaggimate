@@ -382,6 +382,7 @@ void DefaultUI::serviceDialElements() {
     serviceBarElement(canOwn);
     serviceTextElements(canOwn);
     serviceIconLayers(canOwn);
+    serviceMarquees(canOwn);
     if (!canOwn) {
         releaseDialElements();
         return;
@@ -663,6 +664,11 @@ void DefaultUI::textLabelDeleted(lv_event_t *e) {
             if (t.owned) {
                 ui->sleepAnimation.clearElement(TEXT_ELEMENT_BASE + static_cast<int>(&t - ui->textElems));
                 t.owned = false;
+#ifndef GAGGIMATE_SIM
+                // Without this the debug list kept showing labels of a torn
+                // down settings page on every later screen (2026-09-08).
+                g_textElemDbg[&t - ui->textElems].owned = false;
+#endif
             }
         }
     }
@@ -1403,6 +1409,274 @@ void DefaultUI::serviceIconLayers(bool canOwn) {
         if (!takeIconLayer(*slot, c.obj)) {
             c.refused = true;
         }
+    }
+#else
+    (void)canOwn;
+#endif
+}
+
+void DefaultUI::marqueeDeleted(lv_event_t *e) {
+    DefaultUI *ui = static_cast<DefaultUI *>(lv_event_get_user_data(e));
+    lv_obj_t *obj = lv_event_get_target(e);
+    if (ui == nullptr) {
+        return;
+    }
+    for (Marquee &m : ui->marquees) {
+        if (m.label == obj) {
+            m.label = nullptr; // going away: free the layer, never touch it
+            ui->releaseMarquee(m);
+        }
+    }
+    for (int i = 0; i < ui->marqueeCandN; i++) {
+        if (ui->marqueeCands[i] == obj) {
+            ui->marqueeCands[i] = ui->marqueeCands[ui->marqueeCandN - 1];
+            ui->marqueeCandN--;
+            break;
+        }
+    }
+}
+
+void DefaultUI::scanMarquees(lv_obj_t *obj) {
+    if (lv_obj_check_type(obj, &lv_label_class)) {
+        if (lv_label_get_long_mode(obj) == LV_LABEL_LONG_SCROLL_CIRCULAR && !lv_label_get_recolor(obj)) {
+            for (int i = 0; i < marqueeCandN; i++) {
+                if (marqueeCands[i] == obj) {
+                    return;
+                }
+            }
+            if (marqueeCandN < kMarqueeCandCap) {
+                marqueeCands[marqueeCandN++] = obj;
+                lv_obj_add_event_cb(obj, marqueeDeleted, LV_EVENT_DELETE, this);
+            }
+        }
+        return;
+    }
+    const uint32_t n = lv_obj_get_child_cnt(obj);
+    for (uint32_t i = 0; i < n; i++) {
+        scanMarquees(lv_obj_get_child(obj, i));
+    }
+}
+
+void DefaultUI::releaseMarquee(Marquee &m) {
+#ifndef GAGGIMATE_SIM
+    if (m.layer >= 0) {
+        sleepAnimation.layerRelease(m.layer);
+        m.layer = -1;
+    }
+    g_marqueeDbg[&m - marquees].owned = false;
+    if (m.label != nullptr) {
+        // Flags first: the invalidation has to reach the display. LVGL's own
+        // scroll animation kept running underneath, so the text comes back
+        // at LVGL's phase.
+        lv_obj_clear_flag(m.label, LV_OBJ_FLAG_USER_2);
+        lv_obj_clear_flag(m.label, LV_OBJ_FLAG_USER_3);
+        lv_obj_invalidate(m.label);
+        overlayUrgentUntilUs = esp_timer_get_time() + GM_TOUCH_GRACE_US;
+    }
+    m.label = nullptr;
+    m.hash = 0;
+    m.period = 0;
+#else
+    (void)m;
+#endif
+}
+
+void DefaultUI::releaseMarquees() {
+    for (Marquee &m : marquees) {
+        releaseMarquee(m);
+    }
+}
+
+int DefaultUI::takeMarquee(Marquee &m, lv_obj_t *label) {
+#ifndef GAGGIMATE_SIM
+    const char *text = lv_label_get_text(label);
+    if (text == nullptr || text[0] == '\0') {
+        return 1;
+    }
+    lv_area_t box;
+    lv_obj_get_content_coords(label, &box);
+    const int boxW = lv_area_get_width(&box);
+    const int boxH = lv_area_get_height(&box);
+    if (boxW <= 0 || boxH <= 0) {
+        return 1;
+    }
+    // The same measurement lv_label makes to decide whether to scroll.
+    lv_draw_label_dsc_t dsc;
+    lv_draw_label_dsc_init(&dsc);
+    lv_obj_init_draw_label_dsc(label, LV_PART_MAIN, &dsc);
+    dsc.flag = LV_TEXT_FLAG_EXPAND;
+    dsc.align = LV_TEXT_ALIGN_LEFT; // what lv_label uses once the text overflows
+    lv_point_t size;
+    lv_txt_get_size(&size, text, dsc.font, dsc.letter_space, dsc.line_space, LV_COORD_MAX, dsc.flag);
+    if (size.x <= boxW) {
+        return 1; // fits: LVGL draws it still and there is nothing to loop
+    }
+    const int gap = lv_font_get_glyph_width(dsc.font, ' ', ' ') * LV_LABEL_WAIT_CHAR_COUNT;
+    const int period = size.x + gap;
+    const int lw = period + boxW;
+    const int lh = boxH;
+    if (static_cast<uint32_t>(lw) * lh * 3 > kMarqueeMaxBytes) {
+        return -1;
+    }
+    const int id = sleepAnimation.layerAcquire(lw, lh);
+    if (id < 0) {
+        return -1;
+    }
+    uint8_t *buf = sleepAnimation.layerBuffer(id);
+    memset(buf, 0, static_cast<size_t>(lw) * lh * 3);
+    // Draw the text twice into the sprite through a fake display, the way
+    // snapshotObjectToBuffer renders an object: the second copy sits one
+    // period to the right, so any window of boxW pixels holds the circular
+    // picture LVGL would have drawn at that offset.
+    lv_disp_t *objDisp = lv_obj_get_disp(label);
+    lv_disp_drv_t driver;
+    lv_disp_drv_init(&driver);
+    driver.hor_res = static_cast<lv_coord_t>(lw);
+    driver.ver_res = static_cast<lv_coord_t>(lh);
+    lv_disp_drv_use_generic_set_px_cb(&driver, LV_IMG_CF_TRUE_COLOR_ALPHA);
+    lv_disp_t fakeDisp;
+    lv_memset_00(&fakeDisp, sizeof(lv_disp_t));
+    fakeDisp.driver = &driver;
+    lv_draw_ctx_t *drawCtx = static_cast<lv_draw_ctx_t *>(lv_mem_alloc(objDisp->driver->draw_ctx_size));
+    if (drawCtx == nullptr) {
+        sleepAnimation.layerRelease(id);
+        return -1;
+    }
+    objDisp->driver->draw_ctx_init(fakeDisp.driver, drawCtx);
+    fakeDisp.driver->draw_ctx = drawCtx;
+    lv_area_t area = {0, 0, static_cast<lv_coord_t>(lw - 1), static_cast<lv_coord_t>(lh - 1)};
+    drawCtx->clip_area = &area;
+    drawCtx->buf_area = &area;
+    drawCtx->buf = static_cast<void *>(buf);
+    driver.draw_ctx = drawCtx;
+    lv_disp_t *refrOri = _lv_refr_get_disp_refreshing();
+    _lv_refr_set_disp_refreshing(&fakeDisp);
+    lv_area_t txt = {0, 0, static_cast<lv_coord_t>(size.x - 1), static_cast<lv_coord_t>(lh - 1)};
+    dsc.ofs_x = 0;
+    dsc.ofs_y = 0;
+    lv_draw_label(drawCtx, &dsc, &txt, text, nullptr);
+    lv_area_t txt2 = {static_cast<lv_coord_t>(period), 0, static_cast<lv_coord_t>(period + size.x - 1),
+                      static_cast<lv_coord_t>(lh - 1)};
+    lv_draw_label(drawCtx, &dsc, &txt2, text, nullptr);
+    _lv_refr_set_disp_refreshing(refrOri);
+    objDisp->driver->draw_ctx_deinit(fakeDisp.driver, drawCtx);
+    lv_mem_free(drawCtx);
+
+    // LVGL's speed and phase, so the takeover does not jump.
+    uint32_t speed = lv_obj_get_style_anim_speed(label, LV_PART_MAIN);
+    if (speed == 0) {
+        speed = static_cast<uint32_t>(lv_disp_get_dpi(objDisp) / 3);
+    }
+    const uint32_t durMs = lv_anim_speed_to_time(speed, 0, -period);
+    int ofs = -static_cast<int>(reinterpret_cast<lv_label_t *>(label)->offset.x); // 0 .. period
+    if (ofs < 0) {
+        ofs = 0;
+    }
+    if (ofs >= period) {
+        ofs = period - 1;
+    }
+    const uint32_t phaseUs = static_cast<uint32_t>((static_cast<uint64_t>(ofs) * durMs * 1000u) / period);
+    sleepAnimation.layerSetClipX(id, box.x1, box.x2 + 1);
+    sleepAnimation.layerPublish(id, box.x1 - ofs, box.y1);
+    sleepAnimation.layerLoop(id, box.x1, box.y1, box.x1 - period, durMs, phaseUs);
+    // Handover as in moveObjectViaLayer: the sprite is drawn from the first
+    // publish without the text, which the invalidation below produces
+    // before USER_3 starts dropping them.
+    sleepAnimation.layerShowAtGen(id, sleepAnimation.overlayPublishGen() + 1);
+    lv_obj_add_flag(label, LV_OBJ_FLAG_USER_2);
+    lv_obj_invalidate(label);
+    lv_obj_add_flag(label, LV_OBJ_FLAG_USER_3);
+    overlayUrgentUntilUs = esp_timer_get_time() + GM_TOUCH_GRACE_US;
+    m.label = label;
+    m.layer = id;
+    m.hash = textHash(text);
+    lv_obj_get_coords(label, &m.coords);
+    m.period = period;
+    MarqueeDbg &d = g_marqueeDbg[&m - marquees];
+    d.x = static_cast<int16_t>(box.x1);
+    d.y = static_cast<int16_t>(box.y1);
+    d.w = static_cast<int16_t>(boxW);
+    d.h = static_cast<int16_t>(boxH);
+    d.period = static_cast<int16_t>(period);
+    d.ms = durMs;
+    d.owned = true;
+    return 0;
+#else
+    (void)m;
+    (void)label;
+    return -1;
+#endif
+}
+
+void DefaultUI::serviceMarquees(bool canOwn) {
+#ifndef GAGGIMATE_SIM
+    if (!canOwn || g_marqueeLayersReq == 0) {
+        releaseMarquees();
+        return;
+    }
+    lv_obj_t *scr = lv_scr_act();
+    if (scr != marqueeScreen) {
+        releaseMarquees();
+        for (int i = 0; i < marqueeCandN; i++) {
+            lv_obj_remove_event_cb_with_user_data(marqueeCands[i], marqueeDeleted, this);
+        }
+        marqueeCandN = 0;
+        marqueeScreen = scr;
+    }
+    scanMarquees(scr);
+    // Owned labels: same text in the same place and still visible.
+    for (Marquee &m : marquees) {
+        if (m.label == nullptr) {
+            continue;
+        }
+        const char *text = lv_label_get_text(m.label);
+        lv_area_t coords;
+        lv_obj_get_coords(m.label, &coords);
+        bool hidden = false;
+        for (lv_obj_t *p = m.label; p != nullptr; p = lv_obj_get_parent(p)) {
+            if (lv_obj_has_flag(p, LV_OBJ_FLAG_HIDDEN)) {
+                hidden = true;
+                break;
+            }
+        }
+        if (hidden || text == nullptr || textHash(text) != m.hash || !_lv_area_is_equal(&coords, &m.coords)) {
+            releaseMarquee(m);
+        }
+    }
+    // Take visible, overflowing candidates into free slots.
+    for (int i = 0; i < marqueeCandN; i++) {
+        lv_obj_t *label = marqueeCands[i];
+        bool have = false;
+        for (Marquee &m : marquees) {
+            if (m.label == label) {
+                have = true;
+                break;
+            }
+        }
+        if (have) {
+            continue;
+        }
+        bool hidden = false;
+        for (lv_obj_t *p = label; p != nullptr; p = lv_obj_get_parent(p)) {
+            if (lv_obj_has_flag(p, LV_OBJ_FLAG_HIDDEN)) {
+                hidden = true;
+                break;
+            }
+        }
+        if (hidden) {
+            continue;
+        }
+        Marquee *slot = nullptr;
+        for (Marquee &m : marquees) {
+            if (m.label == nullptr) {
+                slot = &m;
+                break;
+            }
+        }
+        if (slot == nullptr) {
+            break;
+        }
+        takeMarquee(*slot, label); // a refusal is retried on the next pass; nothing else to do
     }
 #else
     (void)canOwn;

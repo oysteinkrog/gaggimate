@@ -47,7 +47,7 @@ class SleepAnimation {
     uint16_t overlayGain() const { return 256; }
     uint16_t overlayGainTarget() const { return 256; }
     bool overlayGainSettled() const { return true; }
-    static constexpr int MAX_LAYERS = 5; // one move, two icons of two sprites (gm-2cl.17)
+    static constexpr int MAX_LAYERS = 7; // one move, two icons of two sprites (gm-2cl.17), two marquees (gm-2cl.18)
     enum class LayerEase : uint8_t { Linear = 0, EaseOut = 1, EaseInOut = 2 };
     struct LayerInfo {
         bool used, visible, animating;
@@ -65,6 +65,8 @@ class SleepAnimation {
     bool layerVisible(int) const { return false; }
     void layerHide(int) {}
     void layerShow(int) {}
+    void layerLoop(int, int, int, int, uint32_t, uint32_t) {}
+    void layerSetClipX(int, int, int) {}
     void layerShowAtGen(int, uint32_t) {}
     void layerHideAtGen(int, uint32_t) {}
     uint32_t overlayPublishGen() const { return 0; }
@@ -471,7 +473,7 @@ class SleepAnimation {
     // enters or leaves are pushed whole for that frame (requestBandWarmup):
     // the same rule as widget updates, since a moving hard-edged sprite
     // split across interlace phases combs visibly.
-    static constexpr int MAX_LAYERS = 5; // one move, two icons of two sprites (gm-2cl.17)
+    static constexpr int MAX_LAYERS = 7; // one move, two icons of two sprites (gm-2cl.17), two marquees (gm-2cl.18)
     enum class LayerEase : uint8_t { Linear = 0, EaseOut = 1, EaseInOut = 2 };
     struct LayerInfo {
         bool used, visible, animating;
@@ -493,6 +495,12 @@ class SleepAnimation {
     // layerPublish still hold. The pair mirrors a blinking object's hidden
     // flag (DefaultUI::serviceIconLayers).
     void layerShow(int id);
+    // Loops the layer from (x0, y) to (x1, y) and back to the start over
+    // durMs, linear, forever, starting phaseUs into the cycle. A marquee
+    // (DefaultUI::serviceMarquees) is a text sprite looping across its box.
+    void layerLoop(int id, int x0, int y, int x1, uint32_t durMs, uint32_t phaseUs);
+    // Panel x range [x0, x1) the layer is drawn in; set while hidden.
+    void layerSetClipX(int id, int x0, int x1);
     // Handover latches (gm-2cl.8). Every overlay publish carries a
     // generation number (overlayPublishGen is the last one issued), and a
     // frame composites one overlay, so gating a layer on the generation of
@@ -1650,6 +1658,9 @@ class SleepAnimation {
         int64_t t0Us = 0;
         uint32_t durUs = 0;
         uint8_t ease = 0;
+        uint8_t loop = 0; // layerLoop: the clock wraps at durUs
+        // Panel x range the layer is drawn in (layerSetClipX).
+        int32_t clipX0 = 0, clipX1 = 0x7fffffff;
         // Handover latches, see layerShowAtGen / layerHideAtGen.
         std::atomic<uint32_t> showGen{0};
         std::atomic<uint32_t> hideGen{0};
@@ -1671,6 +1682,7 @@ class SleepAnimation {
         int64_t t0Us;
         uint32_t durUs;
         uint8_t ease;
+        uint8_t loop;
     };
     // Seqlock read of a layer's motion record; either task may call it.
     static void readLayerMotion(const Layer &L, LayerMotion &m);
