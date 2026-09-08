@@ -30,13 +30,13 @@ extern volatile uint32_t gm_rgb_catchup_max;
 #include "esp_intr_alloc.h" // esp_intr_dump, the one-shot ISR-core map below
 #endif
 #include "esp_timer.h"
-#include <esp_heap_caps.h>
 #include <LittleFS.h>
 #include <SD_MMC.h>
 #include <cmath>
 #include <ctime>
 #include <display/config.h>
 #include <display/core/MemoryMonitor.h>
+#include <esp_heap_caps.h>
 #ifdef GM_SYNTH_HANDSHAKE
 #include <display/drivers/common/LV_Helper.h> // g_touchEdgeAtUs: the synth brew hold defers to manual touches
 #endif
@@ -215,8 +215,8 @@ void Controller::setup() {
     static constexpr uint32_t LOGIC_TASK_STACK_BYTES = configMINIMAL_STACK_SIZE * 6;
     auto *logicTaskStack = static_cast<StackType_t *>(heap_caps_malloc(LOGIC_TASK_STACK_BYTES, MALLOC_CAP_SPIRAM));
     if (logicTaskStack != nullptr) {
-        logicTaskHandle = xTaskCreateStaticPinnedToCore(loopLogicTask, "Controller::loopLogic", LOGIC_TASK_STACK_BYTES, this,
-                                                         3, logicTaskStack, &logicTaskBuffer, 0);
+        logicTaskHandle = xTaskCreateStaticPinnedToCore(loopLogicTask, "Controller::loopLogic", LOGIC_TASK_STACK_BYTES, this, 3,
+                                                        logicTaskStack, &logicTaskBuffer, 0);
     } else {
         // PSRAM exhausted: fall back to an internal-heap stack rather than
         // leaving the machine without a control task.
@@ -874,8 +874,7 @@ void Controller::loop() {
                 // /api/debug/synth?brew=0 quiets both so a rig soak can sit on
                 // the menu or settings screens without either dragging it
                 // away.
-                if (synthBrewCycleOn && getMode() != MODE_BREW &&
-                    esp_timer_get_time() - g_touchEdgeAtUs >= 60LL * 1000 * 1000) {
+                if (synthBrewCycleOn && getMode() != MODE_BREW && esp_timer_get_time() - g_touchEdgeAtUs >= 60LL * 1000 * 1000) {
                     setMode(MODE_BREW);
                 }
                 const float cycle = fmodf(static_cast<float>(telNow) / 1000.0f, 48.0f);
@@ -948,13 +947,11 @@ void Controller::loop() {
                                  "busy_max=%u gap_max=%u busy_hi=%u gap_hi=%u busy_top=%u gap_top=%u "
                                  "catchups=%u catchup_bufs=%u catchup_max=%u",
                                  static_cast<unsigned long long>(esp_timer_get_time()), frames, slips,
-                                 static_cast<unsigned>(gm_rgb_resync_count),
-                                 panelclock::phyTrackDeferred(), static_cast<unsigned>(gm_rgb_busy_max),
-                                 static_cast<unsigned>(gm_rgb_gap_max), static_cast<unsigned>(busyHi),
-                                 static_cast<unsigned>(gapHi), static_cast<unsigned>(gm_rgb_busy_hist[23]),
-                                 static_cast<unsigned>(gm_rgb_gap_hist[23]),
-                                 static_cast<unsigned>(gm_rgb_catchup_count),
-                                 static_cast<unsigned>(gm_rgb_catchup_bufs),
+                                 static_cast<unsigned>(gm_rgb_resync_count), panelclock::phyTrackDeferred(),
+                                 static_cast<unsigned>(gm_rgb_busy_max), static_cast<unsigned>(gm_rgb_gap_max),
+                                 static_cast<unsigned>(busyHi), static_cast<unsigned>(gapHi),
+                                 static_cast<unsigned>(gm_rgb_busy_hist[23]), static_cast<unsigned>(gm_rgb_gap_hist[23]),
+                                 static_cast<unsigned>(gm_rgb_catchup_count), static_cast<unsigned>(gm_rgb_catchup_bufs),
                                  static_cast<unsigned>(gm_rgb_catchup_max));
                         // The slip log carries per-event phase against each
                         // instrumented activity; print entries not yet shown so
@@ -970,8 +967,7 @@ void Controller::loop() {
                             ESP_LOGI(LOG_TAG,
                                      "GM_SLIP: t_us=%u short=%u overlay_us=%u flash_us=%u band_us=%u "
                                      "present_us=%u phy_us=%u",
-                                     slipBuf[i].tUs, slipBuf[i].marginUs,
-                                     slipBuf[i].sinceUs[panelclock::SCANOUT_ACT_OVERLAY],
+                                     slipBuf[i].tUs, slipBuf[i].marginUs, slipBuf[i].sinceUs[panelclock::SCANOUT_ACT_OVERLAY],
                                      slipBuf[i].sinceUs[panelclock::SCANOUT_ACT_FLASH],
                                      slipBuf[i].sinceUs[panelclock::SCANOUT_ACT_BANDPUSH],
                                      slipBuf[i].sinceUs[panelclock::SCANOUT_ACT_PRESENT],
@@ -1042,8 +1038,7 @@ void Controller::loop() {
     // exactly what happened: the rig ran with the panel parked on "Waiting for
     // controller", a screen that repaints almost nothing, while the telemetry
     // it was built to churn had nowhere to draw.
-    if (!waitingForController && initialized && !isLinkUp() &&
-        (now - connectStartTime) > CONTROLLER_WAITING_TIMEOUT_MS) {
+    if (!waitingForController && initialized && !isLinkUp() && (now - connectStartTime) > CONTROLLER_WAITING_TIMEOUT_MS) {
         waitingForController = true;
         pluginManager->trigger("controller:bluetooth:waiting");
     }

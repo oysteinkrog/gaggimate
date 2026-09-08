@@ -108,12 +108,14 @@ bool ESPMemoryMonitor::init(const MemoryMonitorConfig &config) {
     if (_running) {
         // A WithCaps task has to be deleted with vTaskDeleteWithCaps, so both
         // placements go through the WithCaps call and the exit path is one.
-        const uint32_t caps = _config.stackInPSRAM ? (MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) : (MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-        BaseType_t created = xTaskCreatePinnedToCoreWithCaps(&ESPMemoryMonitor::samplerTaskThunk, kSamplerTaskName, _config.stackSize,
-                                                             this, _config.priority, &_samplerTask, _config.coreId, caps);
+        const uint32_t caps =
+            _config.stackInPSRAM ? (MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) : (MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+        BaseType_t created =
+            xTaskCreatePinnedToCoreWithCaps(&ESPMemoryMonitor::samplerTaskThunk, kSamplerTaskName, _config.stackSize, this,
+                                            _config.priority, &_samplerTask, _config.coreId, caps);
         if (created != pdPASS && _config.stackInPSRAM) {
-            created = xTaskCreatePinnedToCoreWithCaps(&ESPMemoryMonitor::samplerTaskThunk, kSamplerTaskName, _config.stackSize, this,
-                                                      _config.priority, &_samplerTask, _config.coreId,
+            created = xTaskCreatePinnedToCoreWithCaps(&ESPMemoryMonitor::samplerTaskThunk, kSamplerTaskName, _config.stackSize,
+                                                      this, _config.priority, &_samplerTask, _config.coreId,
                                                       MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
         }
 

@@ -38,9 +38,9 @@ typedef struct {
     unsigned char _unused;
 } StaticTask_t;
 
-static inline TaskHandle_t xTaskCreateStaticPinnedToCore(TaskFunction_t fn, const char *name, const uint32_t stack,
-                                                          void *param, UBaseType_t prio, StackType_t *stackBuffer,
-                                                          StaticTask_t *taskBuffer, BaseType_t core) {
+static inline TaskHandle_t xTaskCreateStaticPinnedToCore(TaskFunction_t fn, const char *name, const uint32_t stack, void *param,
+                                                         UBaseType_t prio, StackType_t *stackBuffer, StaticTask_t *taskBuffer,
+                                                         BaseType_t core) {
     (void)stack;
     (void)stackBuffer;
     (void)taskBuffer;

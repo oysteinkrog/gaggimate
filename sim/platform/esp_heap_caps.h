@@ -1,9 +1,9 @@
 // Host shim for esp_heap_caps.h: heap-cap allocs map onto the libc heap.
 #pragma once
 
+#include <malloc.h> // malloc_usable_size, for heap_caps_get_allocated_size
 #include <stdint.h>
 #include <stdlib.h>
-#include <malloc.h> // malloc_usable_size, for heap_caps_get_allocated_size
 
 #define MALLOC_CAP_8BIT 0
 #define MALLOC_CAP_32BIT 0

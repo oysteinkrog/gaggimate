@@ -30,7 +30,7 @@ typedef uint8_t StackType_t;
 typedef struct {
     int _unused;
 } portMUX_TYPE;
-#define portMUX_INITIALIZER_UNLOCKED \
+#define portMUX_INITIALIZER_UNLOCKED                                                                                             \
     {}
 static inline void portENTER_CRITICAL(portMUX_TYPE *mux) { (void)mux; }
 static inline void portEXIT_CRITICAL(portMUX_TYPE *mux) { (void)mux; }
