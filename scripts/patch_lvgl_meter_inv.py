@@ -23,6 +23,17 @@ inv_arc: values above 360 are normalized and a start>end sector takes the
 wrapped-quarter path, so gauges whose scale crosses 360 (rotation 300 +
 range 120) stay covered.
 
+Needle images take the same route (2026-09-08). Upstream sends a NEEDLE_IMG
+indicator through inv_line(), which reads needle_line.r_mod out of the
+type_data union; for an image that word is part of the src pointer, so the
+"line" is thousands of pixels long and the area clamps to the whole meter:
+every telemetry tick that moved a temperature needle repainted the screen
+(dirty_recent on /api/debug/anim showed 0,0,479,479 four times a second on
+the grind screen). gm_inv_needle_img() invalidates the rotated image's own
+bounding box at the old and the new angle, computed the way lv_draw_img
+computes it (_lv_img_buf_get_transformed_area about the pivot placed on the
+scale centre), plus one pixel of margin.
+
 Idempotent: guarded by a marker string. Anchored on exact upstream text so an
 LVGL bump that rewrites these functions fails the build loudly here rather
 than silently shipping full-screen invalidation again.
@@ -38,6 +49,7 @@ import sys
 Import("env")  # noqa: F821 -- provided by SCons
 
 MARKER = "GM_METER_INV_PATCH"
+ELEM_MARKER = "GM_METER_ELEM_PATCH"
 
 HELPER = (
     "/* " + MARKER + ": partial invalidation for scale-lines indicators. The\n"
@@ -91,6 +103,44 @@ HELPER = (
     "}\n"
     "\n"
 )
+HELPER_NEEDLE = (
+    "/* " + MARKER + ": partial invalidation for needle images. Upstream routes\n"
+    " * NEEDLE_IMG through inv_line(), which reads needle_line.r_mod from the\n"
+    " * type_data union (part of the image pointer for a needle image), so the\n"
+    " * area came out as the whole meter. This is the rotated image's bounding\n"
+    " * box, as lv_draw_img places it: pivot on the scale centre, one pixel of\n"
+    " * margin. See scripts/patch_lvgl_meter_inv.py. */\n"
+    "static void gm_inv_needle_img(lv_obj_t * obj, lv_meter_indicator_t * indic, int32_t value)\n"
+    "{\n"
+    "    const void * src = indic->type_data.needle_img.src;\n"
+    "    if(src == NULL) return;\n"
+    "    lv_img_header_t info;\n"
+    "    if(lv_img_decoder_get_info(src, &info) != LV_RES_OK) {\n"
+    "        lv_obj_invalidate(obj);\n"
+    "        return;\n"
+    "    }\n"
+    "    lv_area_t scale_area;\n"
+    "    lv_obj_get_content_coords(obj, &scale_area);\n"
+    "    lv_coord_t r_out = lv_area_get_width(&scale_area) / 2;\n"
+    "    lv_point_t c;\n"
+    "    c.x = scale_area.x1 + r_out;\n"
+    "    c.y = scale_area.y1 + r_out;\n"
+    "    lv_meter_scale_t * scale = indic->scale;\n"
+    "    int32_t angle = lv_map(value, scale->min, scale->max, scale->rotation, scale->rotation + scale->angle_range);\n"
+    "    angle = angle * 10;\n"
+    "    if(angle > 3600) angle -= 3600;\n"
+    "    lv_point_t pivot = indic->type_data.needle_img.pivot;\n"
+    "    lv_area_t t;\n"
+    "    _lv_img_buf_get_transformed_area(&t, info.w, info.h, (int16_t)angle, LV_IMG_ZOOM_NONE, &pivot);\n"
+    "    lv_area_t a;\n"
+    "    a.x1 = c.x - pivot.x + t.x1 - 1;\n"
+    "    a.y1 = c.y - pivot.y + t.y1 - 1;\n"
+    "    a.x2 = c.x - pivot.x + t.x2 + 1;\n"
+    "    a.y2 = c.y - pivot.y + t.y2 + 1;\n"
+    "    lv_obj_invalidate_area(obj, &a);\n"
+    "}\n"
+    "\n"
+)
 
 SET_VALUE_BANNER = (
     "/*=====================\n"
@@ -112,14 +162,21 @@ SET_VALUE_OLD = (
     "    }\n"
 )
 SET_VALUE_NEW = (
-    "    else if(indic->type == LV_METER_INDICATOR_TYPE_NEEDLE_IMG || indic->type == LV_METER_INDICATOR_TYPE_NEEDLE_LINE) {\n"
+    "    else if(indic->type == LV_METER_INDICATOR_TYPE_NEEDLE_LINE) {\n"
     "        inv_line(obj, indic, old_start);\n"
     "        inv_line(obj, indic, old_end);\n"
     "        inv_line(obj, indic, value);\n"
     "    }\n"
+    "    else if(indic->type == LV_METER_INDICATOR_TYPE_NEEDLE_IMG) { /* " + MARKER + " */\n"
+    "        gm_inv_needle_img(obj, indic, old_start);\n"
+    "        gm_inv_needle_img(obj, indic, old_end);\n"
+    "        gm_inv_needle_img(obj, indic, value);\n"
+    "    }\n"
     "    else if(indic->type == LV_METER_INDICATOR_TYPE_SCALE_LINES) { /* " + MARKER + " */\n"
-    "        gm_inv_scale_lines(obj, indic, old_start, value);\n"
-    "        gm_inv_scale_lines(obj, indic, old_end, value);\n"
+    "        if(!lv_obj_has_flag(obj, LV_OBJ_FLAG_USER_1)) { /* " + ELEM_MARKER + ": ring owned by a compositor element */\n"
+    "            gm_inv_scale_lines(obj, indic, old_start, value);\n"
+    "            gm_inv_scale_lines(obj, indic, old_end, value);\n"
+    "        }\n"
     "    }\n"
     "    else {\n"
     "        lv_obj_invalidate(obj);\n"
@@ -139,12 +196,18 @@ SET_BOUND_OLD = (
     "    }\n"
 )
 SET_BOUND_NEW = (
-    "    else if(indic->type == LV_METER_INDICATOR_TYPE_NEEDLE_IMG || indic->type == LV_METER_INDICATOR_TYPE_NEEDLE_LINE) {\n"
+    "    else if(indic->type == LV_METER_INDICATOR_TYPE_NEEDLE_LINE) {\n"
     "        inv_line(obj, indic, old_value);\n"
     "        inv_line(obj, indic, value);\n"
     "    }\n"
+    "    else if(indic->type == LV_METER_INDICATOR_TYPE_NEEDLE_IMG) { /* " + MARKER + " */\n"
+    "        gm_inv_needle_img(obj, indic, old_value);\n"
+    "        gm_inv_needle_img(obj, indic, value);\n"
+    "    }\n"
     "    else if(indic->type == LV_METER_INDICATOR_TYPE_SCALE_LINES) { /* " + MARKER + " */\n"
-    "        gm_inv_scale_lines(obj, indic, old_value, value);\n"
+    "        if(!lv_obj_has_flag(obj, LV_OBJ_FLAG_USER_1)) { /* " + ELEM_MARKER + ": ring owned by a compositor element */\n"
+    "            gm_inv_scale_lines(obj, indic, old_value, value);\n"
+    "        }\n"
     "    }\n"
     "    else {\n"
     "        lv_obj_invalidate(obj);\n"
@@ -153,29 +216,23 @@ SET_BOUND_NEW = (
 
 # (anchor, replacement, expected occurrence count)
 HUNKS = [
-    (SET_VALUE_BANNER, HELPER + SET_VALUE_BANNER, 1),
+    (SET_VALUE_BANNER, HELPER + HELPER_NEEDLE + SET_VALUE_BANNER, 1),
     (SET_VALUE_OLD, SET_VALUE_NEW, 1),
     (SET_BOUND_OLD, SET_BOUND_NEW, 2),
 ]
 
-# Second, independent patch (gm-2cl.6): while the animation composites the
-# screen, DefaultUI paints a dial's tick ring through a compositor element
-# (src/display/ui/default/TickRingElement.h) and marks the meter with
-# LV_OBJ_FLAG_USER_1. The setters must then still record the value (the
-# element reads start_value and end_value after every ui_tick) but must not
-# invalidate: the invalidation is what turns every telemetry tick into an
-# LVGL draw, a snapshot and an overlay publish. Own marker, so a tree that
-# already carries the sector patch above gets this one added.
-ELEM_MARKER = "GM_METER_ELEM_PATCH"
-ELEM_SKIP = "    if(lv_obj_has_flag(obj, LV_OBJ_FLAG_USER_1)) return; /* " + ELEM_MARKER + ": ring owned by a compositor element */\n"
-ELEM_HUNKS = [
-    ("    indic->start_value = value;\n    indic->end_value = value;\n\n",
-     "    indic->start_value = value;\n    indic->end_value = value;\n" + ELEM_SKIP + "\n", 1),
-    ("    int32_t old_value = indic->start_value;\n    indic->start_value = value;\n\n",
-     "    int32_t old_value = indic->start_value;\n    indic->start_value = value;\n" + ELEM_SKIP + "\n", 1),
-    ("    int32_t old_value = indic->end_value;\n    indic->end_value = value;\n\n",
-     "    int32_t old_value = indic->end_value;\n    indic->end_value = value;\n" + ELEM_SKIP + "\n", 1),
-]
+# Second concern (gm-2cl.6), folded into the hunks above: while the animation
+# composites the screen, DefaultUI paints a dial's tick ring through a
+# compositor element (src/display/ui/default/TickRingElement.h) and marks the
+# meter with LV_OBJ_FLAG_USER_1. The setters still record the value (the
+# element reads start_value and end_value after every ui_tick) but skip the
+# scale-lines invalidation, which is what turned every telemetry tick into an
+# LVGL draw, a snapshot and an overlay publish. Only the ring is owned: the
+# needle image on the same meter is still LVGL's, so its invalidation must
+# still happen (a first version returned from the setter before any branch
+# and the owned dials' needles froze, 2026-09-08). ELEM_MARKER is what an
+# already-patched tree is recognised by.
+ELEM_HUNKS = []
 
 
 def apply_hunks(path, marker, hunks, text):

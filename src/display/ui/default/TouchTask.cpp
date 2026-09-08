@@ -17,6 +17,7 @@ namespace touchtask {
 namespace {
 
 constexpr uint32_t kPeriodMs = 5;
+constexpr int kReleaseSamples = 3;
 constexpr uint32_t kStackBytes = 4096;
 
 Display *s_display = nullptr;
@@ -115,6 +116,7 @@ void writePlate(const HitRect &r, const Header &hdr, int64_t tUs) {
 
 void taskMain(void *) {
     bool wasPressed = false;
+    int emptyRun = 0;
     bool plateUp = false;
     uint32_t pressGen = 0;
     uint32_t seq = 0;
@@ -147,6 +149,20 @@ void taskMain(void *) {
             }
         }
         const int64_t now = esp_timer_get_time();
+        // The GT911 rewrites its status register every 10 ms and the driver
+        // clears it after every read, so a 5 ms poll reads "no touch" on
+        // every other sample of a steady press. A release counts only when
+        // the controller has reported no touch kReleaseSamples times in a
+        // row (15 ms); a single empty sample keeps the last point.
+        if (!pressed && wasPressed && !synthetic) {
+            if (++emptyRun < kReleaseSamples) {
+                pressed = true;
+                x = s_sample.x;
+                y = s_sample.y;
+            }
+        } else {
+            emptyRun = 0;
+        }
         if (!pressed && wasPressed) {
             // Keep the release at the last pressed point, as touchpad_read
             // did with its static x/y.

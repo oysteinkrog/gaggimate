@@ -3546,6 +3546,14 @@ void DefaultUI::buildScaleScreen() {
     lv_label_set_text(scaleWeightLabel, "0.0");
     lv_obj_set_style_text_font(scaleWeightLabel, &lv_font_montserrat_48, LV_PART_MAIN);
     lv_obj_set_style_text_color(scaleWeightLabel, fg, LV_PART_MAIN);
+    // Fixed width, right-aligned: the number is painted by a Text element
+    // once it is live (serviceTextElements), which eases the digits at the
+    // animation's rate, while the flex row above is laid out only when LVGL
+    // refreshes. A content-sized number would move the unit only on those
+    // refreshes, so the "g" trailed the digits (2026-09-08). "-999.9" in the
+    // 48 pt face is under 170 px.
+    lv_obj_set_width(scaleWeightLabel, 170);
+    lv_obj_set_style_text_align(scaleWeightLabel, LV_TEXT_ALIGN_RIGHT, LV_PART_MAIN);
     lastShownScaleWeight = -1000.0f;
 
     lv_obj_t *unit = lv_label_create(readout);

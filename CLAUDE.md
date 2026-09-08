@@ -229,6 +229,31 @@ telemetry-driven screen from a 650 ms LVGL pass (1.5 Hz widget updates,
   the task (LVGL reads the controller itself again) and was the A/B that
   cleared the task itself; `touch_samples` should climb at about 145 a
   second and a rate near 15 means every transaction is timing out.
+  **A release counts only after three empty samples.** The GT911 rewrites
+  its status register every 10 ms and the driver clears it after every
+  read, so a 5 ms poll reads "no touch" on every other sample of a steady
+  press; without the debounce every hold was a stream of press and
+  release edges, the press plate and LVGL's pressed restyle flickered, and
+  a hold could click several times (owner's report, 2026-09-08).
+- **A needle image invalidates its own rotated box, never the meter**
+  (`scripts/patch_lvgl_meter_inv.py`, 2026-09-08). Upstream LVGL 8.4 sends
+  a NEEDLE_IMG indicator through `inv_line`, which reads `needle_line.r_mod`
+  out of the type_data union; for an image that word is part of the src
+  pointer, so the "line" is thousands of pixels long and the area clamps to
+  the whole 480x480 meter. Every telemetry tick that moved a side
+  temperature needle was a whole-screen snapshot (126 ms) throttled to four
+  a second on the grind screen and two on brew (`dirty_recent` full of
+  0,0,479,479), and the UI task spent half its time in them: that was the
+  stalling the owner saw in the scale readout. With `gm_inv_needle_img`
+  the grind screen refreshes 1.8 times a second, all of it the blinking
+  scale icon. The same patch no longer returns early for an owned dial:
+  only the scale-lines invalidation is skipped, because the needle image
+  on the same meter is still LVGL's and a first version froze the owned
+  dials' needles until some other refresh covered them. The scale
+  readout's number label is 170 px wide and right-aligned for the same
+  family of reason: the owned Text element eases the digits at the
+  animation's rate while the flex row around it is laid out only on an
+  LVGL refresh, so a content-sized number left the "g" trailing.
 
 - **The render loop lives in IRAM** (`renderLoop`, `renderFrame`,
   `presentFrame`, `pushLoop` and the scrim rows, `SleepAnimation.cpp`). The
