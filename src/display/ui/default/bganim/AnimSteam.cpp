@@ -311,10 +311,11 @@ void bandPortable(uint16_t *dst, int y0, int rows, int w, uint32_t, const uint8_
     for (int r = 0; r < rows; r++) {
         const uint16_t c = bgLUT[y0 + r];
         uint16_t *row = dst + static_cast<size_t>(r) * w;
-        // Fill two pixels per store: the band buffer is 4-byte aligned and
-        // w is even (480), so pairing halves store traffic vs. one s16i/px.
-        // Odd-width tail (defensive; never hit at w=480) falls back to a
-        // single 16-bit store.
+        // Fill two pixels per store: the band buffer is 4-byte aligned and a
+        // multi-row call has an even w (band()'s contract, BgAnim.h), so
+        // every row start is 4-byte aligned and pairing halves store traffic
+        // vs. one s16i/px. The odd-width tail is the one-row-per-call case
+        // (233): a single 16-bit store for the last pixel.
         const uint32_t c2 = (static_cast<uint32_t>(c) << 16) | c;
         uint32_t *row32 = reinterpret_cast<uint32_t *>(row);
         const int pairs = w >> 1;
