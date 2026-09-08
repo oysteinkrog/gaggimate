@@ -11,6 +11,24 @@
 #include <Arduino.h>
 #include <lvgl.h>
 
+// Planar overlay pixel format (gm-2cl.16). The animation's overlay is two
+// planes, not RGB565+A8 interleaved: an RGB565 plane and a 16-bit alpha
+// plane with 255 stored as 256, both gm_overlay_plane_px pixels long, the
+// alpha plane starting right after the colour plane. With the alpha in a
+// 16-bit lane of its own every 8-pixel group blends on the vector unit
+// (fg * 256 + bg * 0 is an exact copy), which is 5x the interleaved
+// kernel's speed per pixel (tools/blend_probe.py, 2026-09-07). LVGL writes
+// the overlay through gm_set_px_planar; scripts/patch_lvgl_setpx_fast.py
+// recognises that writer by pointer identity and inlines it in
+// lv_draw_sw_blend.c, so the render task and LVGL agree on the layout
+// through this one declaration.
+extern "C" uint32_t gm_overlay_plane_px;
+void gm_set_px_planar(lv_disp_drv_t *disp_drv, uint8_t *buf, lv_coord_t buf_w, lv_coord_t x, lv_coord_t y,
+                      lv_color_t color, lv_opa_t opa);
+extern "C" bool gm_disp_uses_planar_writer(const lv_disp_drv_t *drv);
+static inline uint16_t gm_planar_alpha_store(lv_opa_t a) { return a == 255 ? 256 : a; }
+static inline lv_opa_t gm_planar_alpha_load(uint16_t a16) { return a16 > 255 ? 255 : static_cast<lv_opa_t>(a16); }
+
 void enable_amoled_black_theme_override(lv_disp_t *disp);
 void beginLvglHelper(Display &board, bool debug = false);
 // While true, LVGL flushes are dropped (rendered to the draw buffer but never

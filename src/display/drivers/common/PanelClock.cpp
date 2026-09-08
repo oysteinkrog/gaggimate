@@ -375,7 +375,7 @@ uint32_t bootPclkHz() {
 
 bool hasLiveControl() { return PANELCLOCK_HAS_SET_PCLK != 0; }
 
-void scanoutMark(int which) {
+void IRAM_ATTR scanoutMark(int which) {
     if (which >= 0 && which < SCANOUT_ACT_COUNT) {
         // esp_timer_get_time is IRAM-safe, so this stays callable from the
         // paths that run with the cache disabled -- which are exactly the ones

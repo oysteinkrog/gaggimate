@@ -177,7 +177,10 @@ void BandDma::uninstall() {
     _onDone = nullptr;
 }
 
-esp_err_t BandDma::submit(int slot, void *dst, const void *src, size_t bytes, void *arg) {
+// The per-band submit path is IRAM: the render loop calls it 240 times a
+// frame from IRAM, and a flash-resident callee pays an instruction-cache
+// miss per band whenever the UI task has churned the shared cache.
+esp_err_t IRAM_ATTR BandDma::submit(int slot, void *dst, const void *src, size_t bytes, void *arg) {
     if (_rxChan == nullptr || slot < 0 || slot >= SLOTS) {
         return ESP_ERR_INVALID_STATE;
     }
@@ -223,7 +226,7 @@ esp_err_t BandDma::submit(int slot, void *dst, const void *src, size_t bytes, vo
     return queueSlot(slot, arg);
 }
 
-esp_err_t BandDma::submitRows(int slot, void *dstBase, const void *srcBase, const uint32_t *rowOffsets, int n,
+esp_err_t IRAM_ATTR BandDma::submitRows(int slot, void *dstBase, const void *srcBase, const uint32_t *rowOffsets, int n,
                               size_t groupBytes, void *arg) {
     if (_rxChan == nullptr || slot < 0 || slot >= SLOTS) {
         return ESP_ERR_INVALID_STATE;
@@ -260,7 +263,7 @@ esp_err_t BandDma::submitRows(int slot, void *dstBase, const void *srcBase, cons
     return queueSlot(slot, arg);
 }
 
-esp_err_t BandDma::queueSlot(int slot, void *arg) {
+esp_err_t IRAM_ATTR BandDma::queueSlot(int slot, void *arg) {
     bool startNow = false;
     portENTER_CRITICAL(&_mux);
     const uint8_t next = static_cast<uint8_t>((_tail + 1) % SLOTS);
@@ -284,7 +287,7 @@ esp_err_t BandDma::queueSlot(int slot, void *arg) {
     return ESP_OK;
 }
 
-void BandDma::startSlot(int slot) {
+void IRAM_ATTR BandDma::startSlot(int slot) {
     _xferStartUs = esp_timer_get_time();
     // RX first: the receiver has to be armed before the sender pushes, or the
     // first bytes have nowhere to land.

@@ -2329,20 +2329,32 @@ void DefaultUI::stopSleepAnimation() {
 // rectangle is cleared, because everything outside it is still valid from an
 // earlier pass. Clearing it at all matters: alpha has to go back to zero where
 // a widget shrank or moved away, or it would leave a trail.
+// The overlay's x margin: the screen's ext draw size rounded up to a
+// multiple of 8, so the snapshot's stride and the panel's x offset into it
+// are multiples of 8 and every 8-aligned group of a row is one 16-byte
+// aligned vector load for the planar blend (SleepAnimation::overlayVecOk).
+// The y margin stays the ext draw size.
+static lv_coord_t overlayExtX(lv_coord_t ext) { return static_cast<lv_coord_t>((ext + 7) & ~7); }
+
 bool DefaultUI::snapshotAreaToOverlay(lv_obj_t *obj, uint8_t *buf, uint32_t bufSize, const lv_area_t &clip, int *outW,
                                       int *outH) {
 #ifndef GAGGIMATE_SIM
-    const uint32_t needed = lv_snapshot_buf_size_needed(obj, LV_IMG_CF_TRUE_COLOR_ALPHA);
-    if (needed == 0 || needed > bufSize) {
-        return false;
-    }
     const lv_coord_t ext = _lv_obj_get_ext_draw_size(obj);
+    const lv_coord_t extX = overlayExtX(ext);
     lv_area_t snapshotArea;
     lv_obj_get_coords(obj, &snapshotArea);
-    lv_area_increase(&snapshotArea, ext, ext);
+    lv_area_increase(&snapshotArea, extX, ext);
 
-    const int w = lv_obj_get_width(obj) + ext * 2;
+    const int w = lv_obj_get_width(obj) + extX * 2;
     const int h = lv_obj_get_height(obj) + ext * 2;
+    // Two planes of w * h uint16_t, the alpha plane planePx pixels in
+    // (SleepAnimation::overlayPlanePixels; bufSize is both planes).
+    const uint32_t planePx = bufSize / 4;
+    if (w <= 0 || h <= 0 || static_cast<uint32_t>(w) * h > planePx) {
+        return false;
+    }
+    uint16_t *const colPlane = reinterpret_cast<uint16_t *>(buf);
+    uint16_t *const a16Plane = colPlane + planePx;
 
     lv_area_t clipped = clip;
     if (clipped.x1 < snapshotArea.x1)
@@ -2361,10 +2373,11 @@ bool DefaultUI::snapshotAreaToOverlay(lv_obj_t *obj, uint8_t *buf, uint32_t bufS
 #ifdef GM_TOUCH_PROBE
     const int64_t clear0 = esp_timer_get_time();
 #endif
-    const int rowBytes = (clipped.x2 - clipped.x1 + 1) * 3;
+    const size_t rowBytes = static_cast<size_t>(clipped.x2 - clipped.x1 + 1) * 2;
     for (int y = clipped.y1; y <= clipped.y2; y++) {
-        uint8_t *row = buf + (static_cast<size_t>(y - snapshotArea.y1) * w + (clipped.x1 - snapshotArea.x1)) * 3;
-        memset(row, 0, rowBytes);
+        const size_t off = static_cast<size_t>(y - snapshotArea.y1) * w + (clipped.x1 - snapshotArea.x1);
+        memset(colPlane + off, 0, rowBytes);
+        memset(a16Plane + off, 0, rowBytes);
     }
 #ifdef GM_TOUCH_PROBE
     g_snapClearSum += esp_timer_get_time() - clear0;
@@ -2375,7 +2388,9 @@ bool DefaultUI::snapshotAreaToOverlay(lv_obj_t *obj, uint8_t *buf, uint32_t bufS
     lv_disp_drv_init(&driver);
     driver.hor_res = lv_disp_get_hor_res(objDisp);
     driver.ver_res = lv_disp_get_hor_res(objDisp);
-    lv_disp_drv_use_generic_set_px_cb(&driver, LV_IMG_CF_TRUE_COLOR_ALPHA);
+    // The planar writer (LV_Helper.h); the patched lv_draw_sw_blend.c
+    // recognises it by pointer identity and inlines it.
+    driver.set_px_cb = gm_set_px_planar;
 
     lv_disp_t fakeDisp;
     lv_memset_00(&fakeDisp, sizeof(lv_disp_t));
@@ -2546,7 +2561,7 @@ void DefaultUI::refreshSleepOverlay() {
         lv_area_t geom;
         lv_obj_get_coords(scr, &geom);
         const lv_coord_t extNow = _lv_obj_get_ext_draw_size(scr);
-        const int wNow = lv_area_get_width(&geom) + extNow * 2;
+        const int wNow = lv_area_get_width(&geom) + overlayExtX(extNow) * 2;
         const int hNow = lv_area_get_height(&geom) + extNow * 2;
         if (overlayValid[back] && (overlayW[back] != wNow || overlayH[back] != hNow)) {
             log_i("sleep overlay: snapshot geometry %dx%d -> %dx%d, redrawing buffer %d whole", overlayW[back],
@@ -2588,7 +2603,7 @@ void DefaultUI::refreshSleepOverlay() {
         // composite against garbage. Take the whole screen once.
         lv_obj_get_coords(scr, &clips[0]);
         const lv_coord_t ext = _lv_obj_get_ext_draw_size(scr);
-        lv_area_increase(&clips[0], ext, ext);
+        lv_area_increase(&clips[0], overlayExtX(ext), ext);
         clipN = 1;
     }
 
@@ -2601,21 +2616,24 @@ void DefaultUI::refreshSleepOverlay() {
     // Copies first, renders after: a rect in both lists holds newer content
     // in the render debt, and the render overwrites the copy.
     if (copyN > 0) {
-        const uint8_t *src = sleepAnimation.overlayFrontBuffer();
+        const uint16_t *src = reinterpret_cast<const uint16_t *>(sleepAnimation.overlayFrontBuffer());
+        uint16_t *dst = reinterpret_cast<uint16_t *>(buf);
+        const uint32_t planePx = sleepAnimation.overlayPlanePixels();
         lv_area_t origin;
         lv_obj_get_coords(scr, &origin);
         const lv_coord_t ext = _lv_obj_get_ext_draw_size(scr);
-        lv_area_increase(&origin, ext, ext);
+        lv_area_increase(&origin, overlayExtX(ext), ext);
         const int bufW = lv_area_get_width(&origin);
         for (int i = 0; i < copyN; i++) {
             lv_area_t r;
             if (!_lv_area_intersect(&r, &copies[i], &origin)) {
                 continue;
             }
-            const size_t rowBytes = static_cast<size_t>(lv_area_get_width(&r)) * 3;
+            const size_t rowBytes = static_cast<size_t>(lv_area_get_width(&r)) * 2;
             for (lv_coord_t y = r.y1; y <= r.y2; y++) {
-                const size_t off = (static_cast<size_t>(y - origin.y1) * bufW + (r.x1 - origin.x1)) * 3;
-                memcpy(buf + off, src + off, rowBytes);
+                const size_t off = static_cast<size_t>(y - origin.y1) * bufW + (r.x1 - origin.x1);
+                memcpy(dst + off, src + off, rowBytes);                     // colour plane
+                memcpy(dst + planePx + off, src + planePx + off, rowBytes); // alpha plane
             }
             copyArea += static_cast<int64_t>(lv_area_get_width(&r)) * lv_area_get_height(&r);
         }

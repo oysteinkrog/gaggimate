@@ -1409,6 +1409,12 @@ void WebUIPlugin::setupServer() {
             a->setBpie(request->arg("bpie").toInt() != 0);
         }
 #endif
+        // scrim=0..100 overrides the text scrim strength until scrim=-1 or
+        // a reboot; the stored setting is untouched. Measures the scrim pass
+        // on blend_scrim_us.
+        if (request->hasArg("scrim")) {
+            a->setScrimOverride(request->arg("scrim").toInt());
+        }
         // elemtest=1 shows a 120x120 test plate at the centre through element
         // slot 7 (the press highlight's cost, measured on elem_us); 0 clears.
         if (request->hasArg("elemtest")) {
@@ -1626,6 +1632,8 @@ void WebUIPlugin::setupServer() {
         doc["ov_snap_us"] = g_overlayStats.lastSnapUs;
         doc["ov_pub_us"] = g_overlayStats.lastPubUs;
         doc["ov_area_px"] = g_overlayStats.lastAreaPx;
+        doc["ov_px"] = a->overlayPixels();
+        doc["ov_px_rows"] = a->overlayPixelRows();
         doc["ov_clips"] = g_overlayStats.lastClips;
         doc["ov_min_us"] = static_cast<int64_t>(g_overlayMinRefreshUs);
         doc["fps_override"] = g_animFpsOverride;
@@ -1639,6 +1647,7 @@ void WebUIPlugin::setupServer() {
         doc["probe_px"] = a->probePixels();
         doc["probe_reps"] = a->probeRepsValue();
         doc["bpie"] = a->bpie();
+        doc["probe_mismatch"] = a->probeMismatchValue();
 #endif
         doc["ov_gain_target"] = a->overlayGainTarget();
         doc["tick_cache_bytes"] = meterticks::bytesAllocated();
@@ -1667,6 +1676,9 @@ void WebUIPlugin::setupServer() {
         doc["copy_us"] = a->lastCopyUsValue();
         doc["half_psram"] = esp_ptr_external_ram(const_cast<void *>(a->halfBufAddr()));
         doc["blend_us"] = a->lastBlendUsValue();
+        doc["blend_scrim_us"] = a->lastBlendScrimUsValue();
+        doc["scrim_override"] = a->scrimOverrideValue();
+        doc["anim_internal"] = a->objectInternal();
         doc["msync_us"] = a->lastMsyncUsValue();
         doc["push_us"] = a->lastPushUsValue();
         for (int i = 0; i < 2; i++) {
@@ -1992,15 +2004,17 @@ void WebUIPlugin::setupServer() {
         request->send(response);
     });
 
-    // /api/debug/ovl?step=1..8: the front overlay snapshot (RGB565 little
-    // endian plus a coverage byte, 3 bytes a pixel), subsampled like the
-    // framebuffer dump. X-OV-Size carries the output size. The instrument
-    // for what the composite is actually asked to blend: coverage, flat
-    // stretches, the plates' real pixel values.
+    // /api/debug/ovl?step=1..8: the front overlay snapshot as RGB565 little
+    // endian plus a coverage byte, 3 bytes a pixel (converted from the
+    // planar buffer, so readers see the format they always did), subsampled
+    // like the framebuffer dump. X-OV-Size carries the output size. The
+    // instrument for what the composite is actually asked to blend:
+    // coverage, flat stretches, the plates' real pixel values.
     server.on("/api/debug/ovl", [](AsyncWebServerRequest *request) {
         SleepAnimation *a = sleep_animation_bench_instance();
         int w = 0, h = 0;
-        const uint8_t *buf = a != nullptr ? a->overlayFrontBuffer() : nullptr;
+        const uint16_t *buf = a != nullptr ? reinterpret_cast<const uint16_t *>(a->overlayFrontBuffer()) : nullptr;
+        const uint32_t planePx = a != nullptr ? a->overlayPlanePixels() : 0;
         if (buf == nullptr || !a->overlayFrontSize(w, h) || w <= 0 || h <= 0) {
             request->send(404, "application/json", "{\"error\":\"no overlay published\"}");
             return;
@@ -2016,16 +2030,19 @@ void WebUIPlugin::setupServer() {
         // first chunk. state counts output pixels.
         auto *state = new int(0);
         AsyncWebServerResponse *response = request->beginChunkedResponse(
-            "application/octet-stream", [buf, w, step, ow, oh, state](uint8_t *out, size_t maxLen, size_t) -> size_t {
+            "application/octet-stream",
+            [buf, planePx, w, step, ow, oh, state](uint8_t *out, size_t maxLen, size_t) -> size_t {
                 const int total = ow * oh;
                 size_t written = 0;
                 while (*state < total && written + 3 <= maxLen) {
                     const int oy = *state / ow;
                     const int ox = *state - oy * ow;
-                    const uint8_t *p = buf + (static_cast<size_t>(oy) * step * w + static_cast<size_t>(ox) * step) * 3;
-                    out[written] = p[0];
-                    out[written + 1] = p[1];
-                    out[written + 2] = p[2];
+                    const size_t at = static_cast<size_t>(oy) * step * w + static_cast<size_t>(ox) * step;
+                    const uint16_t c = buf[at];
+                    const uint16_t a16 = buf[planePx + at];
+                    out[written] = static_cast<uint8_t>(c);
+                    out[written + 1] = static_cast<uint8_t>(c >> 8);
+                    out[written + 2] = a16 > 255 ? 255 : static_cast<uint8_t>(a16);
                     written += 3;
                     (*state)++;
                 }

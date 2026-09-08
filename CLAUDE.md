@@ -148,6 +148,31 @@ telemetry-driven screen from a 650 ms LVGL pass (1.5 Hz widget updates,
   breakdown at rest on the brew screen: band 9.5 ms, push 8.3, blend 5.7,
   element 3.4, frame 32; under an LVGL pass band and blend nearly double
   with the same pixels, which is the contention above.
+- **The overlay is planar and the blend stage's fixed cost was the scrim
+  pass** (gm-2cl.16, 2026-09-08). The overlay is an RGB565 plane and a
+  16-bit alpha plane (255 stored as 256, `gm_overlay_plane_px` pixels each,
+  16-byte aligned PSRAM); LVGL writes it through `gm_set_px_planar` and the
+  second hunk of `scripts/patch_lvgl_setpx_fast.py`. The snapshot's x
+  margin is rounded to a multiple of 8 (`DefaultUI::overlayExtX`) so every
+  aligned group is one vector load (`blendPlanarGroups`, exact against the
+  old kernel: probe 4 mismatch 0). The kernel changed nothing at 9.5k
+  pixels: the pixel work is about 3 ms either way and it is PSRAM line
+  fetches, about 1.3 us per 64-byte line, not compute. The fixed cost was
+  the text-halo scrim pass at 2.7 ms a frame: its per-cell-row expansion
+  was reset per band and so ran on every interlaced row. Per frame now
+  (`expandedCy`), the pass is about 2.0 ms, half of it the kernel. The
+  scrim=0 A/B that had said "no change" was void: the UI pass re-applies
+  the stored scrim through `setScrim` every tick, so the knob lasted one
+  pass. `scrim=N` is now an override that holds until `scrim=-1`, and the
+  JSON reports `scrim_override`. Probe levels 5 to 9 leave the blend row
+  at fixed points (loop header, row head, after the scrim, without the
+  expansion, without the scrim kernel) so a slice reads off `blend_us`;
+  `blend_scrim_us` reports the scrim pass. `tools/blend_ab.py` is the
+  production A/B. Ruled out, one build each: render stack placement,
+  object placement, render priority, DMA completion ISR core, CPU push
+  instead of DMA, panel refill duty (divider 8 to 16). `scale565Oct`, the
+  BandDma submit path and `scanoutMark` were flash-resident and called per
+  band from IRAM; pinned now, about 660 B, push 5.7 to about 4.5 ms.
 - **The bench board stores `bgAnimInterlace` 0**, whatever the runner
   fixtures say, so a measurement that assumes the interlaced path must pin
   it (`interlace=1` on the debug endpoint, not stored) and say so. Every
@@ -649,6 +674,15 @@ Debugging methodology that this codebase has already paid for:
 - Include the device's stored settings in "static configuration". The stored
   pixel-clock divider silently replaced the build's; enumerate what NVS can
   override before trusting a compile-time constant.
+- Read a debug knob back after a UI pass before trusting an A/B on it. The
+  scrim knob was overwritten by the settings refresh every tick, and a
+  whole evening went into stack, object, priority, ISR-core and DMA
+  experiments against a "fixed cost" the knob would have named at once.
+  A knob that a periodic path also writes needs an override, not a set.
+- Bisect a stage by exit point, not by theory. Probe levels that leave the
+  loop at fixed points (`probe=5..9`) named the scrim block in one build
+  after five builds of in-place cycle probes had cleared every instruction
+  around it.
 
 ## Bench facts
 
