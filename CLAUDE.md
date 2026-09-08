@@ -884,6 +884,23 @@ survived, and what the device taught:
   ditherAmp() caps at 16, reading past its LUT at the default parameters.
   Any animation with an unclamped, padded gather sizes its pad from that
   cap, and a change to a table's layout re-runs the fuzz for the fleet.
+- **An init() that fails halfway releases everything it allocated before
+  returning false** (gm-bzu.15, 2026-09-08). Five animations allocated
+  every table inside one block keyed on the first pointer; when one
+  allocation failed they returned false with the rest in place, and the
+  retry that BgAnim.h promises either skipped the block and ran with null
+  tables (starfield and ember wrote through null in frame()) or allocated
+  the hot tables again and leaked the first set in the slab, which never
+  resets while a table is live. `tools/animbench/lifecycle_check.cpp`
+  (`make -f Makefile.lifecycle check`, ASan and UBSan, CI runs it after
+  the goldens) is what finds this: every animation through 480, 240, 466
+  and 233 and back with a release between, the heap made to run out at
+  each allocation in turn, and a non-zero exit on an init failure, a
+  slab or heap leak, or a sanitizer report. The goldens and the
+  call-shape check init once and never release, so none of it showed
+  there. On WSL1 run it with
+  `ASAN_OPTIONS=verify_asan_link_order=0:detect_leaks=0`; the harness
+  counts heap blocks itself.
 - **A row's pixels depend on its absolute y and the frame state, never on
   which other rows share the band() call.** Production's interlaced path
   (SleepAnimation.cpp, `splitRender`/`renderSkip`) calls band() with

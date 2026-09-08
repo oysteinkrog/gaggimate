@@ -31,14 +31,14 @@ struct StarDraw {
 };
 
 Star *stars = nullptr;
-StarDraw *draws = nullptr;      // per star, this frame
-int16_t *starY = nullptr;       // fixed row per star
-int16_t *bandHead = nullptr;    // NUM_BANDS heads
-int16_t *bandNext = nullptr;    // linked list per star
-int32_t *driftQ = nullptr;      // per-star drift phase, Q16.16 px, integer-wrapped mod w
+StarDraw *draws = nullptr;   // per star, this frame
+int16_t *starY = nullptr;    // fixed row per star
+int16_t *bandHead = nullptr; // NUM_BANDS heads
+int16_t *bandNext = nullptr; // linked list per star
+int32_t *driftQ = nullptr;   // per-star drift phase, Q16.16 px, integer-wrapped mod w
 int32_t *dx2 = nullptr, *dy2 = nullptr;
-uint8_t *vigLUT = nullptr;    // 128 entries
-uint8_t *starCol = nullptr;   // MAX_STARS * 3, per-star base color from the theme
+uint8_t *vigLUT = nullptr;  // 128 entries
+uint8_t *starCol = nullptr; // MAX_STARS * 3, per-star base color from the theme
 // 128 radial steps x 16 Bayer phases of theme-tinted RGB565 background.
 //
 // The vignette has to be dithered in COLOUR space, not index space like the
@@ -71,7 +71,7 @@ struct Shoot {
     bool active = false;
     float x, y, vx, vy, life, maxLife;
     float invMaxLife; // 1/maxLife, precomputed once at trigger time so band()'s
-                       // per-band progress calc is a multiply, not a divide.
+                      // per-band progress calc is a multiply, not a divide.
 };
 Shoot shoot;
 uint32_t nextShootMs = 6000;
@@ -121,6 +121,8 @@ int allocW = 0, allocH = 0;        // dimensions dx2/dy2 were sized for
 // the file at 12,800 B), driftQ, starCol (frame()-only) and vigLUT
 // (theme-rebuild only) are all far colder and stay in PSRAM; nothing here
 // needed shrinking to fit.
+void release();
+
 bool init(int w, int h) {
     if (stars == nullptr) {
         dx2 = static_cast<int32_t *>(allocHot(w * sizeof(int32_t)));
@@ -139,6 +141,12 @@ bool init(int w, int h) {
         if (stars == nullptr || draws == nullptr || starY == nullptr || bandHead == nullptr || bandNext == nullptr ||
             driftQ == nullptr || dx2 == nullptr || dy2 == nullptr || vigLUT == nullptr || starCol == nullptr ||
             vigColor == nullptr) {
+            // Give everything back before failing. The block is keyed on
+            // `stars`, so a retry with a partial set left in place would
+            // either reallocate the hot tables (leaking slab bytes) or, if
+            // `stars` had succeeded, skip the block and run with the rest
+            // null (gm-bzu.15, found by tools/animbench/lifecycle_check).
+            release();
             return false;
         }
         const float cx = w * 0.5f, cy = h * 0.5f;
@@ -163,7 +171,7 @@ bool init(int w, int h) {
             stars[i].y = nextRandf(rng) * h;
             stars[i].phase = nextRandf(rng) * 6.2831853f;
             stars[i].rate = 0.3f + nextRandf(rng) * 1.1f;
-            stars[i].baseBrightness = layer == 0 ? (0.25f + nextRandf(rng) * 0.25f)
+            stars[i].baseBrightness = layer == 0   ? (0.25f + nextRandf(rng) * 0.25f)
                                       : layer == 1 ? (0.45f + nextRandf(rng) * 0.25f)
                                                    : (0.7f + nextRandf(rng) * 0.3f);
             stars[i].sizeClass = layer;
@@ -195,8 +203,7 @@ void rebuildThemeAssets() {
         themeRGB((vigLUT[idx] * 36) >> 8, c);
         for (int ph = 0; ph < VIG_PHASES; ph++) {
             const float d = (static_cast<float>(BAYER4[ph]) - 7.5f) * (0.75f / 7.5f);
-            vigColor[ph * 128 + idx] = rgb565(clamp8f(c[0] + d * 8.226f), clamp8f(c[1] + d * 4.048f),
-                                              clamp8f(c[2] + d * 8.226f));
+            vigColor[ph * 128 + idx] = rgb565(clamp8f(c[0] + d * 8.226f), clamp8f(c[1] + d * 4.048f), clamp8f(c[2] + d * 8.226f));
         }
     }
     themeRGB(255, shootCol);
@@ -211,7 +218,7 @@ void frame(uint32_t tMs, int w, int h, const uint8_t p[4]) {
     g_nStars = 40 + (p[1] * (MAX_STARS - 40)) / 100;
     const float t = tMs * 0.001f;
     const float twinkleAmt = p[2] * (1.0f / 100.0f); // reciprocal multiply: dividend isn't a compile-time
-                                                      // constant, so the compiler can't fold /100.0f itself
+                                                     // constant, so the compiler can't fold /100.0f itself
     // Old formula was `scale = 1 - twinkleAmt*(1-twinkle)`, i.e. a depth
     // coefficient equal to twinkleAmt itself (identity). twinkle in [0.4,1.0],
     // so at p[2]=100 (twinkleAmt=1) the dip only ever reached scale=0.4 -- not
@@ -495,52 +502,51 @@ void bandRef(uint16_t *dst, int y0, int rows, int w, uint32_t, const uint8_t *) 
 // documents for inline asm inside a windowed-ABI function. Checked in
 // xtensa-asm14/AnimStarfield.S: no spill around this block (report in this
 // pass's final message).
-__attribute__((noinline)) static void starfieldVigRowAsm(uint16_t *__restrict row, const int32_t *__restrict dx2Row,
-                                                          int32_t dyv, const uint16_t *__restrict p0,
-                                                          const uint16_t *__restrict p1, const uint16_t *__restrict p2,
-                                                          const uint16_t *__restrict p3, int n4) {
+__attribute__((noinline)) static void starfieldVigRowAsm(uint16_t *__restrict row, const int32_t *__restrict dx2Row, int32_t dyv,
+                                                         const uint16_t *__restrict p0, const uint16_t *__restrict p1,
+                                                         const uint16_t *__restrict p2, const uint16_t *__restrict p3, int n4) {
     const int32_t *dxp = dx2Row;
     uint16_t *rowp = row;
     int32_t t1, t2, t3, t4, c127; // scratch; values unused after the block
-    asm volatile("movi %[c127], 127\n"
-                 "loopnez %[n], 2f\n"
-                 "l32i    %[t1], %[dxp], 0\n"  // dx2[x+0]
-                 "l32i    %[t2], %[dxp], 4\n"  // dx2[x+1]
-                 "add     %[t1], %[t1], %[dyv]\n"
-                 "add     %[t2], %[t2], %[dyv]\n"
-                 "l32i    %[t3], %[dxp], 8\n"  // dx2[x+2]
-                 "l32i    %[t4], %[dxp], 12\n" // dx2[x+3]
-                 "srai    %[t1], %[t1], 10\n"
-                 "srai    %[t2], %[t2], 10\n"
-                 "add     %[t3], %[t3], %[dyv]\n"
-                 "add     %[t4], %[t4], %[dyv]\n"
-                 "min     %[t1], %[t1], %[c127]\n"
-                 "min     %[t2], %[t2], %[c127]\n"
-                 "srai    %[t3], %[t3], 10\n"
-                 "srai    %[t4], %[t4], 10\n"
-                 "min     %[t3], %[t3], %[c127]\n"
-                 "min     %[t4], %[t4], %[c127]\n"
-                 "addx2   %[t1], %[t1], %[p0]\n" // t1 = &p0[idx0]
-                 "addx2   %[t2], %[t2], %[p1]\n" // t2 = &p1[idx1]
-                 "l16ui   %[t1], %[t1], 0\n"     // t1 = p0[idx0]
-                 "l16ui   %[t2], %[t2], 0\n"     // t2 = p1[idx1]
-                 "addx2   %[t3], %[t3], %[p2]\n" // t3 = &p2[idx2]
-                 "addx2   %[t4], %[t4], %[p3]\n" // t4 = &p3[idx3]
-                 "l16ui   %[t3], %[t3], 0\n"     // t3 = p2[idx2]
-                 "l16ui   %[t4], %[t4], 0\n"     // t4 = p3[idx3]
-                 "slli    %[t2], %[t2], 16\n"
-                 "slli    %[t4], %[t4], 16\n"
-                 "or      %[t1], %[t1], %[t2]\n" // pixels x+0,x+1 packed
-                 "or      %[t3], %[t3], %[t4]\n" // pixels x+2,x+3 packed
-                 "s32i    %[t1], %[rowp], 0\n"
-                 "s32i    %[t3], %[rowp], 4\n"
-                 "addi    %[dxp], %[dxp], 16\n" // four int32_t
-                 "addi    %[rowp], %[rowp], 8\n" // four uint16_t
-                 "2:\n"
-                 : [dxp] "+r"(dxp), [rowp] "+r"(rowp), [t1] "=&r"(t1), [t2] "=&r"(t2), [t3] "=&r"(t3),
-                   [t4] "=&r"(t4), [c127] "=&r"(c127)
-                 : [dyv] "r"(dyv), [p0] "r"(p0), [p1] "r"(p1), [p2] "r"(p2), [p3] "r"(p3), [n] "r"(n4)
-                 : "memory");
+    asm volatile(
+        "movi %[c127], 127\n"
+        "loopnez %[n], 2f\n"
+        "l32i    %[t1], %[dxp], 0\n" // dx2[x+0]
+        "l32i    %[t2], %[dxp], 4\n" // dx2[x+1]
+        "add     %[t1], %[t1], %[dyv]\n"
+        "add     %[t2], %[t2], %[dyv]\n"
+        "l32i    %[t3], %[dxp], 8\n"  // dx2[x+2]
+        "l32i    %[t4], %[dxp], 12\n" // dx2[x+3]
+        "srai    %[t1], %[t1], 10\n"
+        "srai    %[t2], %[t2], 10\n"
+        "add     %[t3], %[t3], %[dyv]\n"
+        "add     %[t4], %[t4], %[dyv]\n"
+        "min     %[t1], %[t1], %[c127]\n"
+        "min     %[t2], %[t2], %[c127]\n"
+        "srai    %[t3], %[t3], 10\n"
+        "srai    %[t4], %[t4], 10\n"
+        "min     %[t3], %[t3], %[c127]\n"
+        "min     %[t4], %[t4], %[c127]\n"
+        "addx2   %[t1], %[t1], %[p0]\n" // t1 = &p0[idx0]
+        "addx2   %[t2], %[t2], %[p1]\n" // t2 = &p1[idx1]
+        "l16ui   %[t1], %[t1], 0\n"     // t1 = p0[idx0]
+        "l16ui   %[t2], %[t2], 0\n"     // t2 = p1[idx1]
+        "addx2   %[t3], %[t3], %[p2]\n" // t3 = &p2[idx2]
+        "addx2   %[t4], %[t4], %[p3]\n" // t4 = &p3[idx3]
+        "l16ui   %[t3], %[t3], 0\n"     // t3 = p2[idx2]
+        "l16ui   %[t4], %[t4], 0\n"     // t4 = p3[idx3]
+        "slli    %[t2], %[t2], 16\n"
+        "slli    %[t4], %[t4], 16\n"
+        "or      %[t1], %[t1], %[t2]\n" // pixels x+0,x+1 packed
+        "or      %[t3], %[t3], %[t4]\n" // pixels x+2,x+3 packed
+        "s32i    %[t1], %[rowp], 0\n"
+        "s32i    %[t3], %[rowp], 4\n"
+        "addi    %[dxp], %[dxp], 16\n"  // four int32_t
+        "addi    %[rowp], %[rowp], 8\n" // four uint16_t
+        "2:\n"
+        : [dxp] "+r"(dxp), [rowp] "+r"(rowp), [t1] "=&r"(t1), [t2] "=&r"(t2), [t3] "=&r"(t3), [t4] "=&r"(t4), [c127] "=&r"(c127)
+        : [dyv] "r"(dyv), [p0] "r"(p0), [p1] "r"(p1), [p2] "r"(p2), [p3] "r"(p3), [n] "r"(n4)
+        : "memory");
 }
 #endif
 

@@ -39,7 +39,7 @@ struct PathPt {
 
 OrbitDef orbits[MAX_ORBITS];
 int orbitCount = 0;
-PathPt *pathBins = nullptr;   // [orbit][band][pt]
+PathPt *pathBins = nullptr;      // [orbit][band][pt]
 uint8_t *pathBinCount = nullptr; // [orbit][band]
 int lastCountP = -1, lastEccP = -1;
 uint32_t lastThemeGen = 0xFFFFFFFF;
@@ -62,9 +62,9 @@ uint16_t g_bg = 0;
 // touching them), and frame()-time libm is explicitly fine per OPTIMIZE.md).
 struct Sample {
     float x, y, radius, alpha;
-    float r2;  // radius*radius, was recomputed per (sample, band-call)
+    float r2;   // radius*radius, was recomputed per (sample, band-call)
     float invR; // 1/radius, ditto -- one __divsf3 call each, now paid once
-    int rr;    // ceilf(radius), ditto -- one libcall each, now paid once
+    int rr;     // ceilf(radius), ditto -- one libcall each, now paid once
     uint8_t orbit;
 };
 constexpr int MAX_SAMPLES = MAX_ORBITS * 18;
@@ -77,8 +77,8 @@ int sampleCount = 0;
 // 240 times a frame. A sample can straddle a bin edge (bin height 16,
 // max reach 2.6px), so it is registered into every bin its [y-radius,
 // y+radius] span touches -- almost always one bin, occasionally two.
-uint8_t *sampleBinCount = nullptr;           // [NUM_BANDS]
-uint8_t *sampleBinIdx = nullptr;             // [NUM_BANDS][SAMPLE_BIN_CAP], indices into samples[]
+uint8_t *sampleBinCount = nullptr; // [NUM_BANDS]
+uint8_t *sampleBinIdx = nullptr;   // [NUM_BANDS][SAMPLE_BIN_CAP], indices into samples[]
 
 void rebuildGeometry(int countP, int eccP, int w, int h) {
     geomW = w;
@@ -126,6 +126,8 @@ void rebuildGeometry(int countP, int eccP, int w, int h) {
     }
 }
 
+void release();
+
 bool init(int w, int h) {
     g_w = w;
     // samples[] is read per candidate pixel inside every touched stamp's
@@ -138,6 +140,7 @@ bool init(int w, int h) {
     if (samples == nullptr) {
         samples = static_cast<Sample *>(allocHot(MAX_SAMPLES * sizeof(Sample)));
         if (samples == nullptr) {
+            release(); // a partial set must not survive a failed init (gm-bzu.15)
             return false;
         }
     }
@@ -152,6 +155,7 @@ bool init(int w, int h) {
         pathBins = static_cast<PathPt *>(alloc(MAX_ORBITS * NUM_BANDS * PTS_PER_BAND * sizeof(PathPt)));
         pathBinCount = static_cast<uint8_t *>(allocHot(MAX_ORBITS * NUM_BANDS));
         if (pathBins == nullptr || pathBinCount == nullptr) {
+            release(); // a partial set must not survive a failed init (gm-bzu.15)
             return false;
         }
         rebuildGeometry(55, 55, w, h);
@@ -166,6 +170,7 @@ bool init(int w, int h) {
         sampleBinCount = static_cast<uint8_t *>(allocHot(NUM_BANDS));
         sampleBinIdx = static_cast<uint8_t *>(allocHot(NUM_BANDS * SAMPLE_BIN_CAP));
         if (sampleBinCount == nullptr || sampleBinIdx == nullptr) {
+            release(); // a partial set must not survive a failed init (gm-bzu.15)
             return false;
         }
         memset(sampleBinCount, 0, NUM_BANDS);

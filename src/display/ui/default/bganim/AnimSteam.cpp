@@ -130,6 +130,8 @@ void buildWisps(int count, int w, int h, uint32_t tMs) {
     builtCount = count;
 }
 
+void release();
+
 bool init(int, int h) {
     if (blobs == nullptr) {
         blobs = static_cast<Blob *>(alloc(BLOBS_MAX * sizeof(Blob))); // frame()-only: cold, PSRAM
@@ -141,6 +143,11 @@ bool init(int, int h) {
         builtCount = -1;
     }
     if (blobs == nullptr || draws == nullptr) {
+        // A partial set must not survive a failed init: the blocks here are
+        // keyed on `blobs` and `alphaLUT`, so a retry would otherwise skip a
+        // block whose other tables are null, or reallocate hot tables it
+        // already holds (gm-bzu.15, tools/animbench/lifecycle_check).
+        release();
         return false;
     }
     if (alphaLUT == nullptr) {
@@ -163,10 +170,12 @@ bool init(int, int h) {
         // ever exercised.
         fillBcast = static_cast<uint16_t *>(allocPreferHot(8 * sizeof(uint16_t)));
         if (alphaLUT == nullptr || bgLUT == nullptr || fillBcast == nullptr) {
+            release();
             return false;
         }
 #else
         if (alphaLUT == nullptr || bgLUT == nullptr) {
+            release();
             return false;
         }
 #endif
@@ -399,9 +408,7 @@ void band(uint16_t *dst, int y0, int rows, int w, uint32_t, const uint8_t *) {
 
 #else
 
-void band(uint16_t *dst, int y0, int rows, int w, uint32_t tMs, const uint8_t *p) {
-    bandPortable(dst, y0, rows, w, tMs, p);
-}
+void band(uint16_t *dst, int y0, int rows, int w, uint32_t tMs, const uint8_t *p) { bandPortable(dst, y0, rows, w, tMs, p); }
 
 #endif
 
