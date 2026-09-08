@@ -371,6 +371,13 @@ telemetry-driven screen from a 650 ms LVGL pass (1.5 Hz widget updates,
   instead of DMA, panel refill duty (divider 8 to 16). `scale565Oct`, the
   BandDma submit path and `scanoutMark` were flash-resident and called per
   band from IRAM; pinned now, about 660 B, push 5.7 to about 4.5 ms.
+  **Build `-e display` after touching anything near a `GM_BLEND_PROBE`
+  block.** Only the bench and loadtest builds define it, and twice the
+  production env stopped building without anyone noticing for a day: the
+  anonymous namespace was closed inside the block, and the planar kernel
+  itself was inside it (fixed 2026-09-08, d0781460 and 45367098). The
+  worktree's `display` libdeps do not install on WSL1 (a permission
+  error unpacking Nanopb), so that build runs in the main checkout.
 - **The overlay footprint per page is measured, not guessed** (gm-2cl.15,
   `tools/overlay_footprint.py`, report under `tools/overlay_footprint/`).
   `ov_px` on `/api/debug/anim` is the overlay pixels inside the composite's
