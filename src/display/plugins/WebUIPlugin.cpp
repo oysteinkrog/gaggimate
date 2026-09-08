@@ -1,6 +1,8 @@
 #include "WebUIPlugin.h"
+#ifndef GAGGIMATE_HEADLESS // the headless build has no LVGL and no UI tree (src/CMakeLists.txt)
 #include <display/ui/default/GlyphAtlas.h>
 #include <display/ui/default/TouchTask.h>
+#endif
 
 // Defined in AnimNebula.cpp; see nebulaLerpSelfTest there.
 extern uint32_t nebula_lerp_self_test(uint32_t *firstBad);
@@ -41,13 +43,17 @@ extern uint32_t nebula_lerp_self_test(uint32_t *firstBad);
 #include <SdlDriver.h> // /api/debug/fb's sim frame source
 #endif
 #include <display/core/TouchInject.h> // /api/debug/tap
+#ifndef GAGGIMATE_HEADLESS
 #include <display/drivers/common/LV_Helper.h> // g_overlayStats / g_overlayMinRefreshUs for /api/debug/anim
 #include <display/ui/default/eez/MeterTickCache.h> // tick_cache_bytes on /api/debug/anim
 #include <display/ui/default/eez/screens.h>  // objects, for /api/debug/touchlog
 #include <display/ui/default/eez/eez-flow.h> // eez_flow_object_names
+#endif
 #include <display/drivers/common/PanelClock.h>
-#include <display/ui/default/bganim/BgAnim.h> // bg_library_valid / bg_map_valid for the settings writer
+#include <display/ui/default/bganim/BgAnim.h> // bg_library_valid / bg_map_valid for the settings writer; headless too
+#ifndef GAGGIMATE_HEADLESS
 #include <display/ui/default/bganim/BgAnimCommon.h>
+#endif
 #ifdef GM_KBLOB
 #include <display/ui/default/bganim/KBlob.h>
 #endif
