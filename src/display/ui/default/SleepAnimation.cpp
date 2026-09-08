@@ -5388,7 +5388,12 @@ void IRAM_ATTR SleepAnimation::renderFrame() {
                 // release arg, so no interrupt is coming for it, and
                 // pushColors takes the same gate.
                 dmaErrors++;
-                dmaIssued--;
+                // dmaIssued is not touched here: the submit branch already
+                // rolled its own reservation back, and the not-ready branch
+                // never made one. A second decrement here left issued one
+                // below completed for good after the first failure, so the
+                // drain loops below compared the wrong pair from then on
+                // (gm-bzu.4).
                 // Earlier bands may still be in flight, reading their slot
                 // and writing the framebuffer. Let them retire before the CPU
                 // fallback touches either, or the fallback races a transfer.
