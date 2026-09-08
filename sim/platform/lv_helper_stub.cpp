@@ -19,6 +19,13 @@ TouchHitHook g_touchHitHook = nullptr;
 volatile bool g_pressPlateActive = false;
 volatile int64_t g_overlayMinRefreshUs = 250000; // DefaultUI's constructor sets OVERLAY_MIN_REFRESH_US
 volatile int g_uiAnimTestReq = 0;
+volatile int g_dialElementsReq = 1;
+volatile int g_textElementsReq = 1;
+volatile int g_textEaseReq = 1;
+volatile int g_textDbg[8] = {0};
+TextElemDbg g_textElemDbg[6];
+DirtyLogEntry g_dirtyLog[DIRTYLOG_N];
+volatile uint32_t g_dirtyLogCount = 0;
 OverlayStats g_overlayStats;
 TouchLogEntry g_touchLog[TOUCHLOG_N];
 volatile uint32_t g_touchLogCount = 0;

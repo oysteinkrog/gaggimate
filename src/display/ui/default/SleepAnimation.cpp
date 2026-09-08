@@ -2118,7 +2118,37 @@ static int scanOverlayRow(const AT *__restrict a, int panelW, uint32_t *__restri
 void SleepAnimation::addElementScrim(Overlay &ov, int rowY0, int rowY1, int sw, int panelW) {
     for (int i = 0; i < MAX_ELEMENTS; i++) {
         const ElementDesc &d = elements[i].d;
-        if (d.type != ElementType::TickRing || d.ring.ring == nullptr || d.alpha == 0) {
+        if (d.alpha == 0) {
+            continue;
+        }
+        if (d.type == ElementType::Text && d.textSlot < kTextElements) {
+            // Owned text: its glyph coverage, the way the label's pixels
+            // would have counted had they stayed in the overlay.
+            const TextDesc &t = textSlots[d.textSlot].d;
+            for (int gi = 0; gi < t.n; gi++) {
+                const TextGlyph &g = t.g[gi];
+                if (g.a8 == nullptr) {
+                    continue;
+                }
+                const int yA = g.y > rowY0 ? g.y : rowY0;
+                const int yB = (g.y + g.h) < rowY1 ? (g.y + g.h) : rowY1;
+                int x0 = g.x < 0 ? 0 : g.x;
+                int x1 = (g.x + g.w) > panelW ? panelW : (g.x + g.w);
+                for (int y = yA; y < yB; y++) {
+                    uint8_t *cell = ov.scrimSrc + static_cast<size_t>(y >> SCRIM_SHIFT) * sw;
+                    const uint8_t *row = g.a8 + static_cast<size_t>(y - g.y) * g.w;
+                    for (int x = x0; x < x1; x++) {
+                        const uint8_t a = static_cast<uint8_t>((static_cast<uint32_t>(row[x - g.x]) * d.alpha) >> 8);
+                        uint8_t &c = cell[x >> SCRIM_SHIFT];
+                        if (a > c) {
+                            c = a;
+                        }
+                    }
+                }
+            }
+            continue;
+        }
+        if (d.type != ElementType::TickRing || d.ring.ring == nullptr) {
             continue;
         }
         const tickring::Sprites &s = *d.ring.ring;
@@ -2790,9 +2820,33 @@ void SleepAnimation::setElement(int id, const ElementDesc &d) {
     e.seq.fetch_add(1);
 }
 
+void SleepAnimation::setTextElement(int id, const ElementDesc &d, const TextDesc &t) {
+    if (id < 0 || id >= MAX_ELEMENTS || d.textSlot >= kTextElements) {
+        return;
+    }
+    TextSlot &ts = textSlots[d.textSlot];
+    ts.seq.fetch_add(1);
+    ts.d = t;
+    ts.seq.fetch_add(1);
+    setElement(id, d);
+}
+
 void SleepAnimation::clearElement(int id) {
     ElementDesc none;
     setElement(id, none);
+}
+
+void SleepAnimation::readTextSlot(const TextSlot &s, TextDesc &out) {
+    for (;;) {
+        const uint32_t s1 = s.seq.load();
+        if (s1 & 1u) {
+            continue;
+        }
+        out = s.d;
+        if (s.seq.load() == s1) {
+            return;
+        }
+    }
 }
 
 void SleepAnimation::readElement(const Element &e, ElementDesc &out) {
@@ -2828,12 +2882,25 @@ void SleepAnimation::evaluateElements(int64_t nowUs) {
     lastElemEvalUs = nowUs;
     const float easeK = static_cast<float>(dtUs) / static_cast<float>(dtUs + kRingEaseTauUs);
     int rings = 0;
+    int texts = 0;
     for (int i = 0; i < MAX_ELEMENTS; i++) {
         Element &e = elements[i];
         ElementDesc d;
         readElement(e, d);
         if (d.type == ElementType::TickRing && d.ring.ring == nullptr) {
             d.type = ElementType::None;
+        }
+        if (d.type == ElementType::Text) {
+            if (d.textSlot >= kTextElements) {
+                d.type = ElementType::None;
+            } else {
+                // Latch the glyph list with the descriptor; the row path
+                // reads only the f copies.
+                readTextSlot(textSlots[d.textSlot], textSlots[d.textSlot].f);
+                if (textSlots[d.textSlot].f.n == 0) {
+                    d.type = ElementType::None;
+                }
+            }
         }
         // Clip to the panel here, once, so the row composite never has to.
         int x0 = d.x, y0 = d.y, x1 = d.x + d.w, y1 = d.y + d.h;
@@ -2851,7 +2918,8 @@ void SleepAnimation::evaluateElements(int64_t nowUs) {
         }
         const bool vis = d.type != ElementType::None && d.alpha != 0 && x1 > x0 && y1 > y0;
         const bool moved = vis != e.lastVisible || (vis && (y0 != e.lastY0 || y1 != e.lastY1 || d.x != e.f.x ||
-                                                             d.w != e.f.w || d.radius != e.f.radius));
+                                                             d.w != e.f.w || d.radius != e.f.radius ||
+                                                             d.ver != e.f.ver));
         if (moved) {
             int ranges[2][2];
             int n = 0;
@@ -2882,6 +2950,9 @@ void SleepAnimation::evaluateElements(int64_t nowUs) {
         e.lastY0 = y0;
         e.lastY1 = y1;
         elementsThisFrame = elementsThisFrame || vis;
+        if (vis && d.type == ElementType::Text) {
+            texts++;
+        }
         if (vis && d.type == ElementType::TickRing) {
             rings++;
             const float tlo = static_cast<float>(d.ring.lo);
@@ -2909,6 +2980,53 @@ void SleepAnimation::evaluateElements(int64_t nowUs) {
         }
     }
     ringElems.store(rings);
+    textElems.store(texts);
+}
+
+// One row of a Text element: every glyph whose box covers y, coverage from
+// the atlas times the label's opacity (the overlay writer's rule for a
+// masked fill, (opa * mask) >> 8 in scripts/patch_lvgl_setpx_fast.py, so
+// full coverage at opacity 255 lands at 254 and is blended, never copied),
+// then the page gain, then blend565, which is the planar kernel's
+// arithmetic. Measured 2026-09-08 against the overlay path on the bench
+// board: zero differing stable pixels once this matched the writer; with a
+// copy at full coverage the interiors were one step brighter.
+static inline void IRAM_ATTR compositeTextRow(uint16_t *drow, int y, int w, const SleepAnimation::TextDesc &t,
+                                              uint16_t color, uint32_t alpha, uint32_t gain) {
+    for (int gi = 0; gi < t.n; gi++) {
+        const SleepAnimation::TextGlyph &g = t.g[gi];
+        const int dy = y - g.y;
+        if (dy < 0 || dy >= g.h || g.a8 == nullptr) {
+            continue;
+        }
+        int x0 = 0;
+        int x1 = g.w;
+        if (g.x < 0) {
+            x0 = -g.x;
+        }
+        if (g.x + x1 > w) {
+            x1 = w - g.x;
+        }
+        if (x1 <= x0) {
+            continue;
+        }
+        const uint8_t *row = g.a8 + static_cast<size_t>(dy) * g.w;
+        uint16_t *dst = drow + g.x;
+        for (int x = x0; x < x1; x++) {
+            uint32_t a = row[x];
+            if (a == 0) {
+                continue;
+            }
+            a = (a * alpha) >> 8;
+            if (gain < 256) {
+                a = (a * gain) >> 8;
+            }
+            if (a == 0) {
+                continue;
+            }
+            dst[x] = tickring::blend565(color, dst[x], static_cast<uint8_t>(a));
+        }
+    }
 }
 
 void IRAM_ATTR SleepAnimation::compositeElementsRow(uint16_t *drow, int y, int w) {
@@ -2928,6 +3046,10 @@ void IRAM_ATTR SleepAnimation::compositeElementsRow(uint16_t *drow, int y, int w
         }
         if (d.type == ElementType::TickRing) {
             tickring::compositeRowColors(drow, y, w, *d.ring.ring, e.ringColors, gain);
+            continue;
+        }
+        if (d.type == ElementType::Text) {
+            compositeTextRow(drow, y, w, textSlots[d.textSlot].f, d.color, d.alpha, gain);
             continue;
         }
         int r = d.radius;

@@ -1,4 +1,5 @@
 #include "WebUIPlugin.h"
+#include <display/ui/default/GlyphAtlas.h>
 
 // Defined in AnimNebula.cpp; see nebulaLerpSelfTest there.
 extern uint32_t nebula_lerp_self_test(uint32_t *firstBad);
@@ -1449,11 +1450,19 @@ void WebUIPlugin::setupServer() {
                 g_uiAnimTestReq = v;
             }
         }
+        // texts=0|1: live labels as Text elements (gm-2cl.5); textease=0|1:
+        // the numeric easing of their values.
         // dials=0|1: the dial tick rings through the TickRing compositor
         // element (1, production) or through LVGL (0), for the framebuffer
         // compare and the refresh-count A/B (gm-2cl.6). DefaultUI applies it
         // on its next pass; elem_rings below reports how many rings the
         // render task is painting.
+        if (request->hasArg("texts")) {
+            g_textElementsReq = request->arg("texts").toInt() != 0 ? 1 : 0;
+        }
+        if (request->hasArg("textease")) {
+            g_textEaseReq = request->arg("textease").toInt() != 0 ? 1 : 0;
+        }
         if (request->hasArg("dials")) {
             g_dialElementsReq = request->arg("dials").toInt() != 0 ? 1 : 0;
         }
@@ -1641,6 +1650,50 @@ void WebUIPlugin::setupServer() {
         doc["elem_us"] = a->lastElementUsValue();
         doc["elem_rings"] = a->ringElementCount();
         doc["dials"] = g_dialElementsReq;
+        doc["texts"] = g_textElementsReq;
+        doc["textease"] = g_textEaseReq;
+        doc["elem_text"] = a->textElementCount();
+        {
+            JsonArray td = doc["text_dbg"].to<JsonArray>();
+            for (int i = 0; i < 8; i++) {
+                td.add(g_textDbg[i]);
+            }
+        }
+        {
+            // Newest last; age_ms is how long ago the rect was harvested.
+            JsonArray dr = doc["dirty_recent"].to<JsonArray>();
+            const uint32_t n = g_dirtyLogCount;
+            const uint32_t nowMs = static_cast<uint32_t>(esp_timer_get_time() / 1000);
+            const uint32_t from = n > static_cast<uint32_t>(DIRTYLOG_N) ? n - DIRTYLOG_N : 0;
+            for (uint32_t i = from; i < n; i++) {
+                const DirtyLogEntry &e = g_dirtyLog[i % DIRTYLOG_N];
+                JsonArray r = dr.add<JsonArray>();
+                r.add(e.x1);
+                r.add(e.y1);
+                r.add(e.x2);
+                r.add(e.y2);
+                r.add(nowMs - e.tMs);
+            }
+            doc["dirty_total"] = n;
+        }
+        {
+            JsonArray te = doc["text_elems"].to<JsonArray>();
+            for (int i = 0; i < 6; i++) {
+                const TextElemDbg &d = g_textElemDbg[i];
+                if (!d.owned) {
+                    continue;
+                }
+                JsonObject o = te.add<JsonObject>();
+                o["text"] = d.text;
+                o["x"] = d.x;
+                o["y"] = d.y;
+                o["w"] = d.w;
+                o["h"] = d.h;
+                o["ver"] = d.ver;
+            }
+        }
+        doc["atlas_bytes"] = glyphatlas::bytesUsed();
+        doc["atlas_glyphs"] = glyphatlas::glyphCount();
         doc["band_internal"] = a->bandBufInternal();
 #ifdef GM_BLEND_PROBE
         doc["probe"] = a->blendProbeLevel();

@@ -1,4 +1,7 @@
 #include "DefaultUI.h"
+#include <display/ui/default/GlyphAtlas.h>
+#include <ctype.h>
+#include <math.h>
 
 #include <WiFi.h>
 // Unconditional (unlike the GM_TOUCH_PROBE-guarded include below): setBrightness
@@ -363,6 +366,7 @@ void DefaultUI::serviceDialElements() {
     const bool canOwn = g_dialElementsReq != 0 && sleepAnimation.isActive() && currentScreen == targetScreen &&
                         !panelStopRequested && lv_anim_get(this, gaugeTickAnimCb) == nullptr;
     serviceBarElement(canOwn);
+    serviceTextElements(canOwn);
     if (!canOwn) {
         releaseDialElements();
         return;
@@ -613,6 +617,486 @@ void DefaultUI::releaseBarElement() {
     barElem.owned = false;
     barElem.lastX2 = -1;
 #endif
+}
+
+// ---- Text elements (gm-2cl.5) ----
+
+namespace {
+uint32_t fnv1a(uint32_t h, const void *data, size_t n) {
+    const uint8_t *p = static_cast<const uint8_t *>(data);
+    for (size_t i = 0; i < n; i++) {
+        h ^= p[i];
+        h *= 16777619u;
+    }
+    return h;
+}
+uint32_t textHash(const char *s) { return fnv1a(2166136261u, s, strlen(s)); }
+void copyStr(char *dst, size_t cap, const char *src) { snprintf(dst, cap, "%s", src); }
+} // namespace
+
+void DefaultUI::textLabelDeleted(lv_event_t *e) {
+    DefaultUI *ui = static_cast<DefaultUI *>(lv_event_get_user_data(e));
+    lv_obj_t *obj = lv_event_get_target(e);
+    if (ui == nullptr) {
+        return;
+    }
+    for (TextElement &t : ui->textElems) {
+        if (t.label == obj) {
+            // The object is going away under us: drop the element without
+            // touching the label.
+            t.label = nullptr;
+            if (t.owned) {
+                ui->sleepAnimation.clearElement(TEXT_ELEMENT_BASE + static_cast<int>(&t - ui->textElems));
+                t.owned = false;
+            }
+        }
+    }
+    for (int i = 0; i < ui->liveLabelN; i++) {
+        if (ui->liveLabels[i].obj == obj) {
+            ui->liveLabels[i] = ui->liveLabels[ui->liveLabelN - 1];
+            ui->liveLabelN--;
+            break;
+        }
+    }
+}
+
+DefaultUI::LiveLabel *DefaultUI::liveLabelFor(lv_obj_t *obj) {
+    for (int i = 0; i < liveLabelN; i++) {
+        if (liveLabels[i].obj == obj) {
+            return &liveLabels[i];
+        }
+    }
+    return nullptr;
+}
+
+void DefaultUI::scanLiveLabels(lv_obj_t *obj) {
+    if (lv_obj_check_type(obj, &lv_label_class)) {
+        const char *txt = lv_label_get_text(obj);
+        const uint32_t h = txt != nullptr ? textHash(txt) : 0;
+        LiveLabel *l = liveLabelFor(obj);
+        if (l == nullptr) {
+            if (liveLabelN < kLiveLabelCap) {
+                l = &liveLabels[liveLabelN++];
+                l->obj = obj;
+                l->hash = h;
+                l->live = false;
+                l->refused = false;
+                lv_obj_add_event_cb(obj, textLabelDeleted, LV_EVENT_DELETE, this);
+            }
+        } else if (l->hash != h) {
+            l->hash = h;
+            l->live = true;
+        }
+        if (l != nullptr) {
+            l->seen = liveLabelPass;
+        }
+        return; // labels have no children of interest
+    }
+    const uint32_t n = lv_obj_get_child_cnt(obj);
+    for (uint32_t i = 0; i < n; i++) {
+        scanLiveLabels(lv_obj_get_child(obj, i));
+    }
+}
+
+bool DefaultUI::textLabelEligible(lv_obj_t *label, bool owned) const {
+    // The label and its ancestors visible: the flow drives the hidden flag
+    // and an owned label keeps it, so a label the flow hides is released.
+    (void)owned;
+    for (lv_obj_t *p = label; p != nullptr; p = lv_obj_get_parent(p)) {
+        if (lv_obj_has_flag(p, LV_OBJ_FLAG_HIDDEN)) {
+            return false;
+        }
+    }
+    if (lv_label_get_recolor(label)) {
+        return false;
+    }
+    const lv_label_long_mode_t lm = lv_label_get_long_mode(label);
+    if (lm == LV_LABEL_LONG_SCROLL || lm == LV_LABEL_LONG_SCROLL_CIRCULAR) {
+        return false;
+    }
+    if (lv_obj_get_style_text_opa(label, LV_PART_MAIN) == LV_OPA_TRANSP) {
+        return false;
+    }
+    if (lv_obj_get_style_text_decor(label, LV_PART_MAIN) != LV_TEXT_DECOR_NONE) {
+        return false;
+    }
+    const lv_label_t *lbl = reinterpret_cast<const lv_label_t *>(label);
+    if (lbl->offset.x != 0 || lbl->offset.y != 0) {
+        return false;
+    }
+    const char *txt = lv_label_get_text(label);
+    return txt != nullptr && txt[0] != '\0' && strlen(txt) < static_cast<size_t>(kTextMaxLen) &&
+           strchr(txt, '\n') == nullptr;
+}
+
+// Places txt's glyphs the way lv_draw_label does for a single line inside
+// the label's content box (lv_label.c draw_main, lv_draw_label.c,
+// lv_draw_sw_letter.c): pen from the content box's top left, moved for
+// CENTER and RIGHT by the line width, each glyph at pen + ofs_x and
+// pen.y + (line_height - base_line) - box_h - ofs_y, the pen advancing by
+// the kerned advance plus letter_space. False when the text would wrap,
+// a glyph is not in the atlas or the list is full.
+bool DefaultUI::buildTextGlyphs(lv_obj_t *label, const char *txt, SleepAnimation::TextDesc &t, int &bx0, int &by0,
+                                int &bx1, int &by1) const {
+    t.n = 0;
+    lv_obj_update_layout(label);
+    lv_area_t coords;
+    lv_obj_get_content_coords(label, &coords);
+    const lv_font_t *font = lv_obj_get_style_text_font(label, LV_PART_MAIN);
+    if (font == nullptr) {
+        g_textDbg[3] = 5;
+        return false;
+    }
+    const lv_coord_t letterSpace = lv_obj_get_style_text_letter_space(label, LV_PART_MAIN);
+    const lv_coord_t lineSpace = lv_obj_get_style_text_line_space(label, LV_PART_MAIN);
+    const lv_label_t *lbl = reinterpret_cast<const lv_label_t *>(label);
+    lv_text_flag_t flag = LV_TEXT_FLAG_NONE;
+    if (lbl->expand != 0) {
+        flag = static_cast<lv_text_flag_t>(flag | LV_TEXT_FLAG_EXPAND);
+    }
+    if (lv_obj_get_style_width(label, LV_PART_MAIN) == LV_SIZE_CONTENT && !label->w_layout) {
+        flag = static_cast<lv_text_flag_t>(flag | LV_TEXT_FLAG_FIT);
+    }
+    const lv_coord_t boxW = lv_area_get_width(&coords);
+    const lv_coord_t wrapW = (flag & LV_TEXT_FLAG_EXPAND) ? LV_COORD_MAX : boxW;
+    const int32_t lineHeight = lv_font_get_line_height(font);
+    lv_point_t size;
+    lv_txt_get_size(&size, txt, font, letterSpace, lineSpace, wrapW, flag);
+    if (size.y > lineHeight) {
+        g_textDbg[3] = 1;
+        return false; // more than one line
+    }
+    lv_text_align_t align = lv_obj_calculate_style_text_align(label, LV_PART_MAIN, txt);
+    const lv_coord_t lineWidth = lv_txt_get_width(txt, static_cast<uint32_t>(strlen(txt)), font, letterSpace, flag);
+    int32_t penX = coords.x1;
+    const int32_t penY = coords.y1;
+    if (align == LV_TEXT_ALIGN_CENTER) {
+        penX += (boxW - lineWidth) / 2;
+    } else if (align == LV_TEXT_ALIGN_RIGHT) {
+        penX += boxW - lineWidth;
+    }
+    const int32_t baseY = penY + (font->line_height - font->base_line);
+    bx0 = by0 = 0x7fff;
+    bx1 = by1 = -0x7fff;
+    uint32_t i = 0;
+    while (txt[i] != '\0') {
+        uint32_t letter = 0, letterNext = 0;
+        _lv_txt_encoded_letter_next_2(txt, &letter, &letterNext, &i);
+        if (letter == 0) {
+            break;
+        }
+        const lv_coord_t letterW = lv_font_get_glyph_width(font, letter, letterNext);
+        glyphatlas::Glyph g;
+        if (!glyphatlas::get(font, letter, g)) {
+            g_textDbg[3] = 2;
+            return false;
+        }
+        if (g.w > 0 && g.h > 0 && g.a8 != nullptr) {
+            if (t.n >= SleepAnimation::kTextMaxGlyphs) {
+                g_textDbg[3] = 3;
+                return false;
+            }
+            SleepAnimation::TextGlyph &tg = t.g[t.n++];
+            tg.x = static_cast<int16_t>(penX + g.ofsX);
+            tg.y = static_cast<int16_t>(baseY - g.h - g.ofsY);
+            tg.w = g.w;
+            tg.h = g.h;
+            tg.a8 = g.a8;
+            if (tg.x < bx0) {
+                bx0 = tg.x;
+            }
+            if (tg.y < by0) {
+                by0 = tg.y;
+            }
+            if (tg.x + tg.w > bx1) {
+                bx1 = tg.x + tg.w;
+            }
+            if (tg.y + tg.h > by1) {
+                by1 = tg.y + tg.h;
+            }
+        }
+        if (letterW > 0) {
+            penX += letterW + letterSpace;
+        }
+    }
+    if (t.n == 0) {
+        g_textDbg[3] = 4;
+    }
+    return t.n > 0;
+}
+
+// The first number in target (optional sign, digits, optional fraction) is
+// eased toward from the value shown so far when the text around it and its
+// format have not changed; anything else snaps. shownText is what the
+// element renders.
+void DefaultUI::easeTextValue(TextElement &t, const char *target, int64_t now) {
+    const char *p = target;
+    while (*p != '\0' && !(isdigit(static_cast<unsigned char>(*p)) ||
+                           (*p == '-' && isdigit(static_cast<unsigned char>(p[1]))))) {
+        p++;
+    }
+    if (*p == '\0') {
+        t.numeric = false;
+        copyStr(t.shownText, sizeof(t.shownText), target);
+        return;
+    }
+    const char *numStart = p;
+    if (*p == '-') {
+        p++;
+    }
+    const char *intStart = p;
+    while (isdigit(static_cast<unsigned char>(*p))) {
+        p++;
+    }
+    const int intDigits = static_cast<int>(p - intStart);
+    int decimals = 0;
+    if (*p == '.' && isdigit(static_cast<unsigned char>(p[1]))) {
+        p++;
+        while (isdigit(static_cast<unsigned char>(*p))) {
+            p++;
+            decimals++;
+        }
+    }
+    const char *numEnd = p;
+    char prefix[kTextMaxLen];
+    const size_t preLen = static_cast<size_t>(numStart - target);
+    memcpy(prefix, target, preLen);
+    prefix[preLen] = '\0';
+    const bool padded = intDigits > 1 && intStart[0] == '0';
+    const float value = strtof(numStart, nullptr);
+    const bool sameShape = t.numeric && strcmp(prefix, t.prefix) == 0 && strcmp(numEnd, t.suffix) == 0 &&
+                           decimals == t.decimals && padded == t.padded && g_textEaseReq != 0;
+    if (!sameShape) {
+        t.numeric = true;
+        t.shown = value;
+        t.target = value;
+        t.decimals = decimals;
+        t.intDigits = intDigits;
+        t.padded = padded;
+        copyStr(t.prefix, sizeof(t.prefix), prefix);
+        copyStr(t.suffix, sizeof(t.suffix), numEnd);
+        t.lastUs = now;
+        copyStr(t.shownText, sizeof(t.shownText), target);
+        return;
+    }
+    t.target = value;
+    t.intDigits = intDigits;
+    int64_t dt = now - t.lastUs;
+    t.lastUs = now;
+    if (dt < 0) {
+        dt = 0;
+    }
+    if (dt > 100000) {
+        dt = 100000;
+    }
+    const float k = static_cast<float>(dt) / static_cast<float>(dt + kTextEaseTauUs);
+    t.shown += (t.target - t.shown) * k;
+    float unit = 1.0f;
+    for (int d = 0; d < decimals; d++) {
+        unit *= 0.1f;
+    }
+    if (fabsf(t.target - t.shown) < unit * 0.5f) {
+        t.shown = t.target;
+    }
+    if (t.shown == t.target) {
+        copyStr(t.shownText, sizeof(t.shownText), target);
+        return;
+    }
+    char num[24];
+    if (padded) {
+        const int width = intDigits + (decimals > 0 ? decimals + 1 : 0) + (t.shown < 0 ? 1 : 0);
+        snprintf(num, sizeof(num), "%0*.*f", width, decimals, static_cast<double>(t.shown));
+    } else {
+        snprintf(num, sizeof(num), "%.*f", decimals, static_cast<double>(t.shown));
+    }
+    snprintf(t.shownText, sizeof(t.shownText), "%s%s%s", t.prefix, num, t.suffix);
+}
+
+void DefaultUI::serviceTextElements(bool canOwn) {
+#ifndef GAGGIMATE_SIM
+    if (!canOwn || g_textElementsReq == 0) {
+        releaseTextElements();
+        return;
+    }
+    lv_obj_t *scr = lv_scr_act();
+    if (scr != liveScreen) {
+        releaseTextElements();
+        for (int i = 0; i < liveLabelN; i++) {
+            if (liveLabels[i].obj != nullptr) {
+                lv_obj_remove_event_cb_with_user_data(liveLabels[i].obj, textLabelDeleted, this);
+            }
+        }
+        liveLabelN = 0;
+        liveScreen = scr;
+    }
+    liveLabelPass++;
+    scanLiveLabels(scr);
+    // Labels that left the tree without a DELETE event (reparented) drop out.
+    for (int i = 0; i < liveLabelN;) {
+        if (liveLabels[i].seen != liveLabelPass) {
+            for (TextElement &t : textElems) {
+                if (t.label == liveLabels[i].obj) {
+                    releaseTextElement(t);
+                    t.label = nullptr;
+                }
+            }
+            liveLabels[i] = liveLabels[liveLabelN - 1];
+            liveLabelN--;
+        } else {
+            i++;
+        }
+    }
+    const int64_t now = esp_timer_get_time();
+    // Owned labels: still eligible, and still hidden by us.
+    for (TextElement &t : textElems) {
+        if (!t.owned) {
+            continue;
+        }
+        if (t.label == nullptr) {
+            t.owned = false;
+            continue;
+        }
+        if (!textLabelEligible(t.label, true)) {
+            g_textDbg[4]++;
+            releaseTextElement(t);
+        }
+    }
+    // Take live, eligible labels into free slots.
+    for (int i = 0; i < liveLabelN; i++) {
+        LiveLabel &l = liveLabels[i];
+        if (!l.live || l.refused || l.obj == nullptr) {
+            continue;
+        }
+        bool have = false;
+        for (TextElement &t : textElems) {
+            if (t.owned && t.label == l.obj) {
+                have = true;
+                break;
+            }
+        }
+        if (have) {
+            continue;
+        }
+        TextElement *slot = nullptr;
+        for (TextElement &t : textElems) {
+            if (!t.owned) {
+                slot = &t;
+                break;
+            }
+        }
+        if (slot == nullptr) {
+            break;
+        }
+        if (!textLabelEligible(l.obj, false)) {
+            continue;
+        }
+        SleepAnimation::TextDesc td;
+        int bx0, by0, bx1, by1;
+        if (!buildTextGlyphs(l.obj, lv_label_get_text(l.obj), td, bx0, by0, bx1, by1)) {
+            l.refused = true; // a font or shape the atlas cannot carry
+            g_textDbg[2]++;
+            continue;
+        }
+        g_textDbg[0]++;
+        slot->label = l.obj;
+        slot->owned = true;
+        slot->hash = 0;
+        slot->numeric = false;
+        slot->shownText[0] = '\0';
+        // With USER_2 set the patched lv_label draws nothing and stops
+        // invalidating on set_text (scripts/patch_lvgl_label_elem.py). LVGL
+        // repaints the label's area without it; the element covers the same
+        // pixels from this frame on, one unthrottled refresh, as the dial
+        // rings do.
+        lv_obj_add_flag(l.obj, LV_OBJ_FLAG_USER_2);
+        lv_obj_invalidate(l.obj);
+        overlayUrgentUntilUs = now + GM_TOUCH_GRACE_US;
+    }
+    // Rebuild what changed.
+    for (TextElement &t : textElems) {
+        if (!t.owned || t.label == nullptr) {
+            continue;
+        }
+        easeTextValue(t, lv_label_get_text(t.label), now);
+        lv_obj_update_layout(t.label);
+        lv_area_t coords;
+        lv_obj_get_content_coords(t.label, &coords);
+        const lv_color_t color = lv_obj_get_style_text_color_filtered(t.label, LV_PART_MAIN);
+        const lv_opa_t opa = lv_obj_get_style_text_opa(t.label, LV_PART_MAIN);
+        const lv_font_t *font = lv_obj_get_style_text_font(t.label, LV_PART_MAIN);
+        uint32_t h = textHash(t.shownText);
+        h = fnv1a(h, &coords, sizeof(coords));
+        h = fnv1a(h, &color, sizeof(color));
+        h = fnv1a(h, &opa, sizeof(opa));
+        h = fnv1a(h, &font, sizeof(font));
+        if (h == t.hash) {
+            continue;
+        }
+        SleepAnimation::TextDesc td;
+        int bx0, by0, bx1, by1;
+        if (!buildTextGlyphs(t.label, t.shownText, td, bx0, by0, bx1, by1)) {
+            LiveLabel *l = liveLabelFor(t.label);
+            if (l != nullptr) {
+                l->refused = true;
+            }
+            releaseTextElement(t);
+            continue;
+        }
+        t.hash = h;
+        t.ver++;
+        g_textDbg[5]++;
+        {
+            TextElemDbg &dbg = g_textElemDbg[&t - textElems];
+            dbg.owned = true;
+            dbg.x = static_cast<int16_t>(bx0);
+            dbg.y = static_cast<int16_t>(by0);
+            dbg.w = static_cast<int16_t>(bx1 - bx0);
+            dbg.h = static_cast<int16_t>(by1 - by0);
+            dbg.ver = t.ver;
+            copyStr(dbg.text, sizeof(dbg.text), t.shownText);
+        }
+        SleepAnimation::ElementDesc e;
+        e.type = SleepAnimation::ElementType::Text;
+        e.alpha = opa;
+        e.color = lv_color_to16(color);
+        e.textSlot = static_cast<uint8_t>(&t - textElems);
+        e.ver = t.ver;
+        e.x = static_cast<int16_t>(bx0);
+        e.y = static_cast<int16_t>(by0);
+        e.w = static_cast<int16_t>(bx1 - bx0);
+        e.h = static_cast<int16_t>(by1 - by0);
+        e.tUs = now;
+        sleepAnimation.setTextElement(TEXT_ELEMENT_BASE + e.textSlot, e, td);
+    }
+#else
+    (void)canOwn;
+#endif
+}
+
+void DefaultUI::releaseTextElement(TextElement &t) {
+#ifndef GAGGIMATE_SIM
+    if (!t.owned) {
+        return;
+    }
+    sleepAnimation.clearElement(TEXT_ELEMENT_BASE + static_cast<int>(&t - textElems));
+    g_textElemDbg[&t - textElems].owned = false;
+    if (t.label != nullptr) {
+        lv_obj_clear_flag(t.label, LV_OBJ_FLAG_USER_2);
+        lv_obj_invalidate(t.label);
+        overlayUrgentUntilUs = esp_timer_get_time() + GM_TOUCH_GRACE_US;
+    }
+    t.owned = false;
+    t.hash = 0;
+    t.numeric = false;
+#else
+    (void)t;
+#endif
+}
+
+void DefaultUI::releaseTextElements() {
+    for (TextElement &t : textElems) {
+        releaseTextElement(t);
+    }
 }
 
 void DefaultUI::init() {
@@ -2498,6 +2982,13 @@ void DefaultUI::refreshSleepOverlay() {
     for (int i = 0; i < freshN; i++) {
         lvgl_helper_rect_add(overlayDirty[back], &overlayDirtyN[back], OVERLAY_DIRTY_RECTS, fresh[i]);
         lvgl_helper_rect_add(overlayCopy[front], &overlayCopyN[front], OVERLAY_DIRTY_RECTS, fresh[i]);
+        DirtyLogEntry &e = g_dirtyLog[g_dirtyLogCount % DIRTYLOG_N];
+        e.x1 = static_cast<int16_t>(fresh[i].x1);
+        e.y1 = static_cast<int16_t>(fresh[i].y1);
+        e.x2 = static_cast<int16_t>(fresh[i].x2);
+        e.y2 = static_cast<int16_t>(fresh[i].y2);
+        e.tMs = static_cast<uint32_t>(esp_timer_get_time() / 1000);
+        g_dirtyLogCount = g_dirtyLogCount + 1;
     }
 
     // nullptr means the render task is still reading that buffer; retry next

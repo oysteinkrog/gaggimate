@@ -117,6 +117,33 @@ telemetry-driven screen from a 650 ms LVGL pass (1.5 Hz widget updates,
   the per-row tick bitmask are what brought it down, in that order of
   effect. The refresh count under the brew stays near 3 a second in both
   modes because the value text still goes through LVGL (gm-2cl.5).
+- **Live labels are Text elements, and an owned label keeps its hidden
+  flag** (gm-2cl.5, `GlyphAtlas.h`, `DefaultUI::serviceTextElements`,
+  `scripts/patch_lvgl_label_elem.py`). A label on the active screen whose
+  text has changed once since the screen was entered is live; up to six
+  live labels get `LV_OBJ_FLAG_USER_2`, which the patched lv_label reads
+  as "draw nothing, do not invalidate on set_text", and the patched
+  lv_obj_pos skips the size and move invalidations for it too (a
+  content-sized label resizes on every width change, and that was the
+  rectangle still refreshing after the first version). The UI task
+  rebuilds the glyph list after every ui_tick from an A8 atlas in PSRAM
+  (one 32 KB arena per font, glyphs copied once from the flash font
+  through the 4bpp opa table) and places each glyph the way lv_draw_label
+  would. Hiding the label instead does not work: the generated flow code
+  reads and writes the hidden flag of the status bar labels every tick
+  and un-hid them within one pass (2026-09-08, `text_dbg` counters). The
+  element reproduces the overlay writer's alpha rule, `(opa * mask) >> 8`
+  (`patch_lvgl_setpx_fast.py`), so full coverage lands at 254 and is
+  blended, never copied: with a copy at 255 the interiors were one step
+  brighter and 69 stable pixels differed; with the rule, zero
+  (`tools/text_elem_check.py`, bench board, brew screen, whole-frame
+  path). A numeric value eases toward the flow's value (150 ms time
+  constant) so a reading counts instead of stepping; `textease=0` turns
+  that off and `texts=0` puts the labels back on LVGL. `text_elems` on
+  `/api/debug/anim` lists what is owned and `dirty_recent` the last 16
+  rectangles LVGL invalidated, which is how the remaining brew-screen
+  churn was traced to the size refresh and then to the 40x40 scale icon
+  the flow blinks (gm-2cl.7).
 
 - **The render loop lives in IRAM** (`renderLoop`, `renderFrame`,
   `presentFrame`, `pushLoop` and the scrim rows, `SleepAnimation.cpp`). The
@@ -411,7 +438,8 @@ Instruments, and where each one exists:
   lifecycle so a measurement is not dragged back to the status screen;
   `GM_SYNTH_HANDSHAKE`, which only `display-loadtest` and `display-blestress`
   set.
-- `/api/debug/anim` (frame counters, `anim_id`, `uptime_ms`) and
+- `/api/debug/anim` (frame counters, `anim_id`, `uptime_ms`, `text_elems`,
+  `dirty_recent`, the `texts=`, `textease=` and `dials=` element knobs) and
   `/api/debug/pclk` (the live pixel-clock divider) are device-only: both sit
   inside `WebUIPlugin.cpp`'s real-panel block, which `GAGGIMATE_SIM` and
   `GAGGIMATE_HEADLESS` exclude.

@@ -127,6 +127,34 @@ extern volatile int g_uiAnimTestReq;
 // A/B for the framebuffer compare and the refresh-count measurement; the
 // production value is 1.
 extern volatile int g_dialElementsReq;
+// texts=0|1 and textease=0|1 on /api/debug/anim: live labels as Text elements
+// (DefaultUI::serviceTextElements) and the numeric easing of their values.
+extern volatile int g_textElementsReq;
+extern volatile int g_textEaseReq;
+// Text element bookkeeping for /api/debug/anim (text_dbg): 0 labels taken,
+// 2 refused by the glyph build, 3 the last build failure's step, 4 released
+// for eligibility, 5 glyph-list rebuilds.
+extern volatile int g_textDbg[8];
+// What each Text element slot holds this pass (text_elems on /api/debug/anim):
+// the label's text, the glyph box on the panel and the rebuild version.
+struct TextElemDbg {
+    volatile bool owned = false;
+    volatile int16_t x = 0, y = 0, w = 0, h = 0;
+    volatile uint16_t ver = 0;
+    char text[24] = {};
+};
+extern TextElemDbg g_textElemDbg[6];
+// The last DIRTYLOG_N dirty rectangles the overlay refresh harvested from
+// LVGL (dirty_recent on /api/debug/anim): what is still invalidating on a
+// screen once the elements own the live widgets. Ring, newest at
+// (g_dirtyLogCount - 1) % DIRTYLOG_N.
+constexpr int DIRTYLOG_N = 16;
+struct DirtyLogEntry {
+    int16_t x1, y1, x2, y2;
+    uint32_t tMs;
+};
+extern DirtyLogEntry g_dirtyLog[DIRTYLOG_N];
+extern volatile uint32_t g_dirtyLogCount;
 
 // /api/debug/touchmap: the UI task walks one screen's object tree and writes
 // every object (class, coords, flags, ext click pad, event count, parent) as

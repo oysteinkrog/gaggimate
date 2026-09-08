@@ -492,6 +492,64 @@ class DefaultUI {
     BarElement barElem;
     void serviceBarElement(bool canOwn);
     void releaseBarElement();
+
+    // Live labels as Text elements (gm-2cl.5). A label on the active screen
+    // whose text has changed once since the screen was entered is "live";
+    // while the animation composites, up to kTextElements live labels are
+    // owned: the label gets LV_OBJ_FLAG_USER_2, which the patched lv_label
+    // (scripts/patch_lvgl_label_elem.py) reads as "draw nothing and do not
+    // invalidate on set_text", and the UI task rebuilds its glyph list from
+    // the glyph atlas after every ui_tick, placing each glyph the way
+    // lv_draw_label would have. The hidden flag is left to the flow, which
+    // reads and writes it every tick on the dial value labels. A numeric
+    // value eases toward the flow's value at the UI loop's rate
+    // (kTextEaseTauUs) so a reading counts up instead of stepping. Released
+    // on screen change, when the animation stops and when the label or an
+    // ancestor hides.
+    static constexpr int TEXT_ELEMENT_BASE = 8;
+    static constexpr int TEXT_ELEMENTS = SleepAnimation::kTextElements;
+    static constexpr int64_t kTextEaseTauUs = 150000;
+    static constexpr int kTextMaxLen = 40;
+    struct TextElement {
+        lv_obj_t *label = nullptr;
+        bool owned = false;
+        uint16_t ver = 0;
+        uint32_t hash = 0; // of the glyph list's inputs; unchanged means no rewrite
+        // Easing state: the number in the label's text, if it has one.
+        bool numeric = false;
+        float shown = 0.0f;
+        float target = 0.0f;
+        int decimals = 0;
+        int intDigits = 0;
+        bool padded = false;
+        int64_t lastUs = 0;
+        char prefix[kTextMaxLen] = {};
+        char suffix[kTextMaxLen] = {};
+        char shownText[kTextMaxLen] = {};
+    };
+    TextElement textElems[TEXT_ELEMENTS];
+    static constexpr int kLiveLabelCap = 24;
+    struct LiveLabel {
+        lv_obj_t *obj = nullptr;
+        uint32_t hash = 0;
+        uint32_t seen = 0;
+        bool live = false;
+        bool refused = false;
+    };
+    LiveLabel liveLabels[kLiveLabelCap];
+    int liveLabelN = 0;
+    uint32_t liveLabelPass = 0;
+    lv_obj_t *liveScreen = nullptr;
+    void serviceTextElements(bool canOwn);
+    void releaseTextElements();
+    void releaseTextElement(TextElement &t);
+    void scanLiveLabels(lv_obj_t *obj);
+    LiveLabel *liveLabelFor(lv_obj_t *obj);
+    bool textLabelEligible(lv_obj_t *label, bool owned) const;
+    bool buildTextGlyphs(lv_obj_t *label, const char *txt, SleepAnimation::TextDesc &t, int &bx0, int &by0, int &bx1,
+                         int &by1) const;
+    void easeTextValue(TextElement &t, const char *target, int64_t now);
+    static void textLabelDeleted(lv_event_t *e);
     void positionMenuIcon(lv_obj_t *obj, int angle, int radius);
 
     void updateState();

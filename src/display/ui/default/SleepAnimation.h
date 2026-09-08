@@ -67,21 +67,36 @@ class SleepAnimation {
     void layerHideAtGen(int, uint32_t) {}
     uint32_t overlayPublishGen() const { return 0; }
     LayerInfo layerInfo(int) const { return LayerInfo{}; }
-    static constexpr int MAX_ELEMENTS = 8;
-    enum class ElementType : uint8_t { None = 0, RoundRect = 1, TickRing = 2 };
+    static constexpr int MAX_ELEMENTS = 14;
+    static constexpr int kTextElements = 6;
+    static constexpr int kTextMaxGlyphs = 16;
+    enum class ElementType : uint8_t { None = 0, RoundRect = 1, TickRing = 2, Text = 3 };
+    struct TextGlyph {
+        int16_t x = 0, y = 0;
+        uint8_t w = 0, h = 0;
+        const uint8_t *a8 = nullptr;
+    };
+    struct TextDesc {
+        uint8_t n = 0;
+        TextGlyph g[kTextMaxGlyphs];
+    };
     struct ElementDesc {
         ElementType type = ElementType::None;
         uint8_t alpha = 0;
         uint8_t radius = 0;
+        uint8_t textSlot = 0;
         uint16_t color = 0;
+        uint16_t ver = 0;
         int16_t x = 0, y = 0, w = 0, h = 0;
         int64_t tUs = 0;
         tickring::Desc ring{};
     };
     void setElement(int, const ElementDesc &) {}
+    void setTextElement(int, const ElementDesc &, const TextDesc &) {}
     void clearElement(int) {}
     uint32_t lastElementUsValue() const { return 0; }
     int ringElementCount() const { return 0; }
+    int textElementCount() const { return 0; }
     uint32_t animFrameCount() const { return 0; }
 };
 #else
@@ -490,29 +505,55 @@ class SleepAnimation {
     // dim colour over the pressed target's box, the same rule as the LVGL
     // pressed styles it replaces while the animation composites. Rows an
     // element enters or leaves get regional warm-up like a layer.
-    static constexpr int MAX_ELEMENTS = 8;
+    static constexpr int MAX_ELEMENTS = 14;
     static constexpr int kElementMaxRadius = 24;
+    // Text elements (gm-2cl.5): a label the UI task owns is hidden from LVGL
+    // and its glyphs are composited from the glyph atlas (GlyphAtlas.h)
+    // every frame, so a value change costs no LVGL pass. The glyph list is
+    // out of line in a text slot of its own, so the ElementDesc every
+    // element copies per frame stays small. x/y is the glyph bitmap's top
+    // left on the panel; alpha is the label's text opacity; color its text
+    // colour; ver changes whenever the glyph list does, which warms the
+    // rows the way a move does.
+    static constexpr int kTextElements = 6;
+    static constexpr int kTextMaxGlyphs = 16;
+    struct TextGlyph {
+        int16_t x = 0, y = 0;
+        uint8_t w = 0, h = 0;
+        const uint8_t *a8 = nullptr; // w * h coverage bytes, glyph atlas
+    };
+    struct TextDesc {
+        uint8_t n = 0;
+        TextGlyph g[kTextMaxGlyphs];
+    };
     // TickRing (gm-2cl.6): a dial meter's tick ring painted from the tick
     // cache's coverage sprites, ticks lo..hi lit; the render task eases
     // its own boundaries toward the written ones (kRingEaseTauUs), so a
     // value change slides the lit edge over a few frames instead of
     // stepping. x/y/w/h is the ring's bounding box (the band hit test and
     // the warm-up use it); alpha must be non-zero for the element to show.
-    enum class ElementType : uint8_t { None = 0, RoundRect = 1, TickRing = 2 };
+    enum class ElementType : uint8_t { None = 0, RoundRect = 1, TickRing = 2, Text = 3 };
     struct ElementDesc {
         ElementType type = ElementType::None;
-        uint8_t alpha = 0;  // coverage 0..255 (quantised to 32 levels in the blend)
-        uint8_t radius = 0; // corner radius, clamped to kElementMaxRadius and to half the box
-        uint16_t color = 0; // RGB565
+        uint8_t alpha = 0;    // coverage 0..255 (quantised to 32 levels in the RoundRect blend)
+        uint8_t radius = 0;   // corner radius, clamped to kElementMaxRadius and to half the box
+        uint8_t textSlot = 0; // Text only: which text slot holds the glyph list
+        uint16_t color = 0;   // RGB565
+        uint16_t ver = 0;     // content version: a change warms the rows like a move
         int16_t x = 0, y = 0, w = 0, h = 0;
         int64_t tUs = 0;    // when the writer wrote it (probe: write to frame latency)
         tickring::Desc ring{}; // TickRing only
     };
     void setElement(int id, const ElementDesc &d);
+    // Text element: writes the glyph list into text slot d.textSlot, then the
+    // descriptor, each under its own seqlock; the render task latches both
+    // once a frame in evaluateElements.
+    void setTextElement(int id, const ElementDesc &d, const TextDesc &t);
     void clearElement(int id);
     uint32_t lastElementUsValue() const { return lastElemUs.load(); }
     // TickRing elements visible in the frame being rendered (debug endpoint).
     int ringElementCount() const { return ringElems.load(); }
+    int textElementCount() const { return textElems.load(); }
     static constexpr int64_t kRingEaseTauUs = 90000;
 
     // Framebuffer-ownership controls, deliberately not behind GM_ANIM_BENCH.
@@ -1652,8 +1693,16 @@ class SleepAnimation {
         uint16_t ringColors[tickring::kMaxTicks] = {};
     };
     Element elements[MAX_ELEMENTS];
+    struct TextSlot {
+        std::atomic<uint32_t> seq{0};
+        TextDesc d; // written under seq
+        TextDesc f; // latched for the frame being rendered
+    };
+    TextSlot textSlots[kTextElements];
+    static void readTextSlot(const TextSlot &s, TextDesc &out);
     int64_t lastElemEvalUs = 0;
     std::atomic<int> ringElems{0};
+    std::atomic<int> textElems{0};
     // At publish: fold the owned rings' coverage into the scrim cells of the
     // rows just rescanned (they are no longer in the overlay). UI task only.
     void addElementScrim(Overlay &ov, int rowY0, int rowY1, int sw, int panelW);
