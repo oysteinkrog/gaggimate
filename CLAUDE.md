@@ -62,6 +62,18 @@ summary; the KB carries the sources and the measurements behind it.
   (per-env, into `.pio/libdeps/<env>/lvgl`) gives lv_meter scale-lines
   indicators sector invalidation. If dial updates ever get slow again, check
   it applied for that env.
+- **A directory on the SD card is listed with `opendir`/`readdir`, never
+  with `File::openNextFile()` on the boot path** (`saferep::recoverReplace`,
+  2026-09-08). `openNextFile()` opens every entry it returns, and on FAT
+  each open is a linear scan of the directory, so the walk is quadratic in
+  the file count. The first version of the gm-bzu.7 startup recovery walked
+  `/h` that way, and on the bench card (333 MB of shot history) the setup
+  task sat in it for over eight minutes on two boots in a row: everything
+  registered after ShotHistoryPlugin never ran, so there was no WiFi, no
+  BLE and no web server, while the panel and the animation looked healthy.
+  The tell in the serial log is `Logging shot history to SD card` with no
+  `STA got IP` after it. The simulator's FS shim has no mount point and
+  keeps the File walk, so only the board can show this.
 
 ## UI-pipeline invariants (violate these and touch latency regresses)
 
