@@ -31,6 +31,8 @@ class WebUIPlugin : public Plugin {
 
   private:
     void setupServer();
+    // The debug, probe and bench routes, in WebUIPluginDebug.cpp (gm-bzu.19).
+    void setupDebugEndpoints();
     void start();
     void stop();
 
