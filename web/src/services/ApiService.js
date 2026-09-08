@@ -229,6 +229,10 @@ export default class ApiService {
         hardwareScaleCell2Weight: message.c2 ?? 0,
         hardwareScaleCell1Valid: !!message.c1v,
         hardwareScaleCell2Valid: !!message.c2v,
+        // Scale factors the readings above were produced with (the device's
+        // stored values, as sent to the controller). Absent on older firmware.
+        hardwareScaleFactor1: Number.isFinite(message.sf1) ? message.sf1 : null,
+        hardwareScaleFactor2: Number.isFinite(message.sf2) ? message.sf2 : null,
       },
     };
   }

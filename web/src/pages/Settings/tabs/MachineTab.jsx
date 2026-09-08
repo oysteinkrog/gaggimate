@@ -81,6 +81,36 @@ export function MachineTab({ formData, onChange, setField }) {
     [setField],
   );
 
+  // The factor the device is measuring with. Newer firmware reports it with
+  // every hardware-scale event; without that, the value the form was loaded
+  // with stands in, since Save is the only way it changes.
+  const appliedScaleFactor = useCallback(
+    cellNumber => {
+      const reported =
+        cellNumber === 1 ? status.value?.hardwareScaleFactor1 : status.value?.hardwareScaleFactor2;
+      if (Number.isFinite(reported) && reported !== null) {
+        return reported;
+      }
+      const loaded = cellNumber === 1 ? formData.scaleFactor1Loaded : formData.scaleFactor2Loaded;
+      return Number.parseFloat(loaded);
+    },
+    [formData.scaleFactor1Loaded, formData.scaleFactor2Loaded],
+  );
+
+  // True while the draft differs from the factor the device measures with:
+  // a calibration, sign flip or edit that has not been saved and applied. The
+  // calibrate buttons wait for Save so two presses cannot compound.
+  const calibrationPending = cellNumber => {
+    const applied = appliedScaleFactor(cellNumber);
+    const draft = Number.parseFloat(
+      cellNumber === 1 ? formData.scaleFactor1 : formData.scaleFactor2,
+    );
+    if (!Number.isFinite(applied) || !Number.isFinite(draft)) {
+      return false;
+    }
+    return Math.abs(applied - draft) > 0.005;
+  };
+
   const calibrateLoadCell = useCallback(
     cellNumber => {
       const measuredWeight =
@@ -105,15 +135,26 @@ export function MachineTab({ formData, onChange, setField }) {
         return;
       }
 
-      const currentFactor =
-        cellNumber === 1
-          ? Number.parseFloat(formData.scaleFactor1) || 1
-          : Number.parseFloat(formData.scaleFactor2) || 1;
-      const newFactor = (measuredWeight * currentFactor) / actualWeight;
+      // The reading was produced with the factor the device holds, so that is
+      // the one to scale from. The editable field is a draft: after one
+      // calibration, a sign flip or a manual edit it differs from the applied
+      // factor, and multiplying the unchanged reading by the draft compounded
+      // the error (applied 2500, 80 g read against 100 g gives 2000; a second
+      // press gave 1600). Older firmware does not report the factor; then the
+      // draft is used only while it still equals the value loaded from the
+      // device, which is the same number.
+      const appliedFactor = appliedScaleFactor(cellNumber);
+      if (!Number.isFinite(appliedFactor) || Math.abs(appliedFactor) < 0.001) {
+        window.alert(
+          'The device has not reported the scale factor in use yet. Wait a moment and try again.',
+        );
+        return;
+      }
+      const newFactor = (measuredWeight * appliedFactor) / actualWeight;
       setField(`scaleFactor${cellNumber}`, newFactor.toFixed(2));
       setCalibrationWeight('');
     },
-    [calibrationWeight, formData.scaleFactor1, formData.scaleFactor2, setField],
+    [calibrationWeight, appliedScaleFactor, setField],
   );
 
   return (
@@ -480,7 +521,11 @@ export function MachineTab({ formData, onChange, setField }) {
                 type='button'
                 className='btn btn-primary btn-sm'
                 onClick={() => calibrateLoadCell(1)}
-                disabled={!status.value?.hardwareScaleCell1Valid || !calibrationWeight}
+                disabled={
+                  !status.value?.hardwareScaleCell1Valid ||
+                  !calibrationWeight ||
+                  calibrationPending(1)
+                }
               >
                 Calibrate Load Cell 1
               </button>
@@ -488,11 +533,21 @@ export function MachineTab({ formData, onChange, setField }) {
                 type='button'
                 className='btn btn-primary btn-sm'
                 onClick={() => calibrateLoadCell(2)}
-                disabled={!status.value?.hardwareScaleCell2Valid || !calibrationWeight}
+                disabled={
+                  !status.value?.hardwareScaleCell2Valid ||
+                  !calibrationWeight ||
+                  calibrationPending(2)
+                }
               >
                 Calibrate Load Cell 2
               </button>
             </div>
+            {(calibrationPending(1) || calibrationPending(2)) && (
+              <p className='text-base-content/60 text-xs'>
+                A scale factor has changed but is not saved yet. Save, wait for a fresh reading,
+                then calibrate again if needed.
+              </p>
+            )}
 
             <div className='grid grid-cols-1 gap-4 md:grid-cols-2'>
               <div>

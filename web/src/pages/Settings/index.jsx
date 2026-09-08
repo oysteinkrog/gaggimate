@@ -121,6 +121,11 @@ function transformFetchedSettings(fetchedSettings) {
     Number.isFinite(sf1) && Math.abs(sf1) > 0.001 ? sf1 : DEFAULT_SCALE_FACTOR_1;
   settingsWithToggle.scaleFactor2 =
     Number.isFinite(sf2) && Math.abs(sf2) > 0.001 ? sf2 : DEFAULT_SCALE_FACTOR_2;
+  // The factors as loaded from the device, kept beside the editable drafts so
+  // the load-cell calibration can tell a pending draft from the value the
+  // device measures with (MachineTab). Not submitted: see buildSubmitFormData.
+  settingsWithToggle.scaleFactor1Loaded = settingsWithToggle.scaleFactor1;
+  settingsWithToggle.scaleFactor2Loaded = settingsWithToggle.scaleFactor2;
   const sampleRate = Number(fetchedSettings.hardwareScaleSampleRateSps);
   settingsWithToggle.hardwareScaleSampleRateSps =
     sampleRate === 80 ? 80 : DEFAULT_HARDWARE_SCALE_SAMPLE_RATE_SPS;
@@ -162,6 +167,8 @@ function buildSubmitFormData(formData, autowakeupSchedules, restart) {
 
   for (const [key, value] of Object.entries(formData)) {
     if (value === undefined || value === null) continue;
+    // Form-only bookkeeping, not a device setting.
+    if (key === 'scaleFactor1Loaded' || key === 'scaleFactor2Loaded') continue;
 
     if (checkboxKeys.includes(key)) {
       if (value) {

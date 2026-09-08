@@ -261,6 +261,15 @@ void WebUIPlugin::loop() {
         hardwareScaleDiagnosticDoc["c2"] = controller->getHardwareScaleCell2Weight();
         hardwareScaleDiagnosticDoc["c1v"] = controller->isHardwareScaleCell1Valid();
         hardwareScaleDiagnosticDoc["c2v"] = controller->isHardwareScaleCell2Valid();
+        // The factors these readings were produced with: the stored values are
+        // what setScaleFactors() sent the controller. The web calibration
+        // divides the reading by this pair, never by its unsaved draft
+        // (gm-bzu.10).
+        {
+            const Settings &s = controller->getSettings();
+            hardwareScaleDiagnosticDoc["sf1"] = s.getScaleFactor1();
+            hardwareScaleDiagnosticDoc["sf2"] = s.getScaleFactor2();
+        }
         broadcastJson(hardwareScaleDiagnosticDoc);
     }
     if (now > lastStatus + STATUS_PERIOD && !ws.getClients().empty()) {
