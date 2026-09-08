@@ -173,6 +173,21 @@ telemetry-driven screen from a 650 ms LVGL pass (1.5 Hz widget updates,
   instead of DMA, panel refill duty (divider 8 to 16). `scale565Oct`, the
   BandDma submit path and `scanoutMark` were flash-resident and called per
   band from IRAM; pinned now, about 660 B, push 5.7 to about 4.5 ms.
+- **The overlay footprint per page is measured, not guessed** (gm-2cl.15,
+  `tools/overlay_footprint.py`, report under `tools/overlay_footprint/`).
+  `ov_px` on `/api/debug/anim` is the overlay pixels inside the composite's
+  run spans, counted at publish; it matched an offline count of the
+  `/api/debug/ovl` dump exactly (7,962 both, brew screen). Bench board,
+  2026-09-08, interlace pinned, cap 45, divider 8, Starfield, per frame:
+  standby 8.4k px and 2.7 ms of blend; menu 13k and 4.9; brew 8.0k and 4.7
+  (plus 3.4 ms of dial elements); steam 4.6k and 3.0; water 5.5k and 3.7;
+  status 10.6k and 5.6 (plus 5.0 of elements); grind 5.3k and 3.9; profile
+  6.0k and 3.9; the settings pages 7.7k to 13.3k and 2.9 to 4.0 with no
+  elements. Two pages are the outliers: new_profile at 104k px and 9.2 ms,
+  and info at 41k and 6.9, both because of large translucent panels. The
+  brew screen's 106k figure quoted above was taken with the plates on; the
+  bench board has them off, and the scrim (about 1.6 to 2.6 ms on every
+  page) is now the larger of the two fixed costs.
 - **The bench board stores `bgAnimInterlace` 0**, whatever the runner
   fixtures say, so a measurement that assumes the interlaced path must pin
   it (`interlace=1` on the debug endpoint, not stored) and say so. Every
