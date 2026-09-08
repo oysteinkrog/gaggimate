@@ -784,7 +784,8 @@ too dark to classify.
 
 ## Animation kernels (violate these and band time regresses silently)
 
-The 13 background animations' band() hot paths went through a hand-written
+The background animations' band() hot paths (13 at the time; Silk 2 made it
+14 on 2026-09-05) went through a hand-written
 Xtensa pass (2026-09-04, 13 Fable workers in parallel, four rounds). What
 survived, and what the device taught:
 
