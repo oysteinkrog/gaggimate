@@ -151,6 +151,15 @@ void ESPMemoryMonitor::deinit() {
     unregisterFailedAllocCallback();
     unregisterPanicHandler();
 
+    // The hook is unregistered, so nobody writes the ring now; reset it.
+    for (auto &seq : _allocRingSeq) {
+        seq.store(0, std::memory_order_relaxed);
+    }
+    _allocHead.store(0, std::memory_order_relaxed);
+    _allocTail.store(0, std::memory_order_relaxed);
+    _allocFailCount.store(0, std::memory_order_relaxed);
+    _allocDropped.store(0, std::memory_order_relaxed);
+
     {
         LockGuard guard(_mutex);
         // Recreate monitor-owned containers so reserved capacity is released.
@@ -187,6 +196,7 @@ MemorySnapshot ESPMemoryMonitor::sampleNow() {
     SampleCallback sampleCb;
     ThresholdCallback thresholdCb;
     TaskStackThresholdCallback stackCb;
+    FailedAllocCallback allocCb;
     MemoryMonitorVector<ThresholdEvent> events{MemoryMonitorAllocator<ThresholdEvent>(_usePSRAMBuffers)};
     MemoryMonitorVector<TaskStackEvent> stackEvents{MemoryMonitorAllocator<TaskStackEvent>(_usePSRAMBuffers)};
 
@@ -199,8 +209,13 @@ MemorySnapshot ESPMemoryMonitor::sampleNow() {
         sampleCb = _sampleCallback;
         thresholdCb = _thresholdCallback;
         stackCb = _taskStackCallback;
+        allocCb = _allocCallback;
         publicSnapshot = toPublicSnapshot(snapshot);
     }
+
+    // Deliver the failed-allocation events the heap hook recorded since the
+    // last pass, outside the lock (the callback may take its own).
+    drainAllocEvents(allocCb);
 
     for (const auto &evt : events) {
         if (thresholdCb) {
@@ -655,23 +670,52 @@ ThresholdState ESPMemoryMonitor::evaluateState(ThresholdState current, const Reg
 }
 
 void ESPMemoryMonitor::handleAllocEvent(size_t requestedBytes, uint32_t caps, const char *functionName) {
-    FailedAllocCallback cb;
-    {
-        LockGuard guard(_mutex);
-        cb = _allocCallback;
+    // Runs inside the failing heap_caps_malloc on the caller's task. No mutex,
+    // no allocation, no callback: the sampler delivers the event later
+    // (drainAllocEvents). Before this, the hook took _mutex to copy the
+    // std::function, and an allocation failing on the sampler task while it
+    // held the mutex deadlocked that task against itself.
+    _allocFailCount.fetch_add(1, std::memory_order_relaxed);
+
+    uint32_t ticket;
+    for (;;) {
+        ticket = _allocHead.load(std::memory_order_relaxed);
+        uint32_t tail = _allocTail.load(std::memory_order_acquire);
+        if (ticket - tail >= kAllocRingSize) {
+            _allocDropped.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+        if (_allocHead.compare_exchange_weak(ticket, ticket + 1, std::memory_order_acq_rel, std::memory_order_relaxed)) {
+            break;
+        }
     }
 
-    if (!cb) {
-        return;
+    FailedAllocEvent &slot = _allocRing[ticket % kAllocRingSize];
+    slot.requestedBytes = requestedBytes;
+    slot.caps = caps;
+    slot.functionName = functionName;
+    slot.timestampUs = esp_timer_get_time();
+    // Publish: the consumer accepts the slot once its sequence equals ticket + 1.
+    _allocRingSeq[ticket % kAllocRingSize].store(ticket + 1, std::memory_order_release);
+}
+
+void ESPMemoryMonitor::drainAllocEvents(const FailedAllocCallback &cb) {
+    // Single consumer (the sampler, or whoever calls sampleNow). Slots are
+    // consumed in ticket order; a claimed slot that is not yet published
+    // stops the drain until the next pass.
+    for (;;) {
+        uint32_t tail = _allocTail.load(std::memory_order_relaxed);
+        uint32_t idx = tail % kAllocRingSize;
+        if (_allocRingSeq[idx].load(std::memory_order_acquire) != tail + 1) {
+            return;
+        }
+        FailedAllocEvent event = _allocRing[idx];
+        _allocRingSeq[idx].store(0, std::memory_order_relaxed);
+        _allocTail.store(tail + 1, std::memory_order_release);
+        if (cb) {
+            cb(event);
+        }
     }
-
-    FailedAllocEvent event{};
-    event.requestedBytes = requestedBytes;
-    event.caps = caps;
-    event.functionName = functionName;
-    event.timestampUs = esp_timer_get_time();
-
-    cb(event);
 }
 
 void ESPMemoryMonitor::allocFailedHook(size_t requestedBytes, uint32_t caps, const char *functionName) {
