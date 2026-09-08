@@ -486,3 +486,38 @@ void beginLvglHelper(Display &board, bool debug) {
     indev_drv.user_data = &board;
     lv_indev_drv_register(&indev_drv);
 }
+
+// ---- Planar overlay writer (gm-2cl.16); see LV_Helper.h. -------------------
+// Same branch order and the same lv_color_mix_with_alpha as LVGL's generic
+// set_px_true_color_alpha, so the planes hold what the 3-byte buffer held.
+extern "C" {
+uint32_t gm_overlay_plane_px = 0;
+}
+
+void gm_set_px_planar(lv_disp_drv_t *disp_drv, uint8_t *buf, lv_coord_t buf_w, lv_coord_t x, lv_coord_t y,
+                      lv_color_t color, lv_opa_t opa) {
+    (void)disp_drv;
+    uint16_t *col = reinterpret_cast<uint16_t *>(buf) + static_cast<size_t>(buf_w) * y + x;
+    uint16_t *a16 = col + gm_overlay_plane_px;
+    const lv_opa_t bg_opa = gm_planar_alpha_load(*a16);
+    if (opa >= LV_OPA_MAX || bg_opa <= LV_OPA_MIN) {
+        *col = color.full;
+        *a16 = gm_planar_alpha_store(opa);
+        return;
+    }
+    if (opa <= LV_OPA_MIN) {
+        return;
+    }
+    lv_color_t bg_color;
+    bg_color.full = *col;
+    lv_color_t res;
+    lv_opa_t res_a;
+    lv_color_mix_with_alpha(bg_color, bg_opa, color, opa, &res, &res_a);
+    *a16 = gm_planar_alpha_store(res_a);
+    if (res_a <= LV_OPA_MIN) {
+        return;
+    }
+    *col = res.full;
+}
+
+extern "C" bool gm_disp_uses_planar_writer(const lv_disp_drv_t *drv) { return drv->set_px_cb == gm_set_px_planar; }

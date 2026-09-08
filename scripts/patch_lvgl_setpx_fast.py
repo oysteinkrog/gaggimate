@@ -201,11 +201,134 @@ BLEND_IMPL = (
 )
 
 
-def apply_one(path, hunks, append=None):
+# --- GM_SETPX_PLANAR: the animation overlay's planar layout ------------------
+# The overlay is an RGB565 plane followed by a 16-bit alpha plane (255 stored
+# as 256), gm_overlay_plane_px pixels each; see src/display/drivers/common/
+# LV_Helper.h. LVGL renders into it through gm_set_px_planar, and this hunk
+# inlines that writer the way the one above inlines the generic one: same
+# branch order, same lv_color_mix_with_alpha, recognised by pointer identity.
+MARKER2 = "GM_SETPX_PLANAR"
+PLANAR_PROTO_ANCHOR = """extern bool gm_disp_uses_generic_true_color_alpha(const lv_disp_drv_t * drv);
+"""
+PLANAR_PROTO_ADD = PLANAR_PROTO_ANCHOR + (
+    "/* " + MARKER2 + " (see scripts/patch_lvgl_setpx_fast.py) */\n"
+    "extern bool gm_disp_uses_planar_writer(const lv_disp_drv_t * drv);\n"
+    "extern uint32_t gm_overlay_plane_px;\n"
+    "#if LV_COLOR_DEPTH == 16\n"
+    "static void gm_fill_set_px_planar(lv_color_t * dest_buf, const lv_area_t * blend_area, lv_coord_t dest_stride,\n"
+    "                                  lv_color_t color, lv_opa_t opa, const lv_opa_t * mask, lv_coord_t mask_stide);\n"
+    "static void gm_map_set_px_planar(lv_color_t * dest_buf, const lv_area_t * dest_area, lv_coord_t dest_stride,\n"
+    "                                 const lv_color_t * src_buf, lv_coord_t src_stride, lv_opa_t opa,\n"
+    "                                 const lv_opa_t * mask, lv_coord_t mask_stride);\n"
+    "#endif\n"
+)
+PLANAR_DISPATCH_OLD = """        if(gm_disp_uses_generic_true_color_alpha(disp->driver)) {
+"""
+PLANAR_DISPATCH_NEW = """        if(gm_disp_uses_planar_writer(disp->driver)) { /* """ + MARKER2 + """ */
+            if(dsc->src_buf == NULL) {
+                gm_fill_set_px_planar(dest_buf, &blend_area, dest_stride, dsc->color, dsc->opa, mask, mask_stride);
+            }
+            else {
+                gm_map_set_px_planar(dest_buf, &blend_area, dest_stride, src_buf, src_stride, dsc->opa, mask,
+                                     mask_stride);
+            }
+        }
+        else if(gm_disp_uses_generic_true_color_alpha(disp->driver)) {
+"""
+PLANAR_IMPL = (
+    "\n/* " + MARKER2 + ": inline writers for the planar overlay (RGB565 plane, then a\n"
+    " * 16-bit alpha plane with 255 stored as 256, gm_overlay_plane_px pixels each).\n"
+    " * Same branch order and mix as gm_write_px_rgb565a8 above. */\n"
+    "#if LV_COLOR_DEPTH == 16\n"
+    "static inline void gm_write_px_planar(uint16_t * col, uint16_t * a16, lv_color_t color, lv_opa_t opa)\n"
+    "{\n"
+    "    uint16_t bg16 = *a16;\n"
+    "    lv_opa_t bg_opa = bg16 > 255 ? 255 : (lv_opa_t)bg16;\n"
+    "    if(opa >= LV_OPA_MAX || bg_opa <= LV_OPA_MIN) {\n"
+    "        *col = color.full;\n"
+    "        *a16 = opa == 255 ? 256 : opa;\n"
+    "        return;\n"
+    "    }\n"
+    "    if(opa <= LV_OPA_MIN) return;\n"
+    "    lv_color_t bg_color;\n"
+    "    lv_color_t res_color;\n"
+    "    lv_opa_t res_a;\n"
+    "    bg_color.full = *col;\n"
+    "    lv_color_mix_with_alpha(bg_color, bg_opa, color, opa, &res_color, &res_a);\n"
+    "    *a16 = res_a == 255 ? 256 : res_a;\n"
+    "    if(res_a <= LV_OPA_MIN) return;\n"
+    "    *col = res_color.full;\n"
+    "}\n"
+    "\n"
+    "static void gm_fill_set_px_planar(lv_color_t * dest_buf, const lv_area_t * blend_area, lv_coord_t dest_stride,\n"
+    "                                  lv_color_t color, lv_opa_t opa, const lv_opa_t * mask, lv_coord_t mask_stide)\n"
+    "{\n"
+    "    uint16_t * colp = (uint16_t *)dest_buf;\n"
+    "    uint16_t * a16p = colp + gm_overlay_plane_px;\n"
+    "    int32_t x;\n"
+    "    int32_t y;\n"
+    "    if(mask == NULL) {\n"
+    "        for(y = blend_area->y1; y <= blend_area->y2; y++) {\n"
+    "            size_t i = (size_t)y * dest_stride + blend_area->x1;\n"
+    "            for(x = blend_area->x1; x <= blend_area->x2; x++, i++) {\n"
+    "                gm_write_px_planar(colp + i, a16p + i, color, opa);\n"
+    "            }\n"
+    "        }\n"
+    "    }\n"
+    "    else {\n"
+    "        int32_t w = lv_area_get_width(blend_area);\n"
+    "        int32_t h = lv_area_get_height(blend_area);\n"
+    "        for(y = 0; y < h; y++) {\n"
+    "            size_t i = (size_t)(blend_area->y1 + y) * dest_stride + blend_area->x1;\n"
+    "            for(x = 0; x < w; x++, i++) {\n"
+    "                if(mask[x]) {\n"
+    "                    gm_write_px_planar(colp + i, a16p + i, color, (lv_opa_t)((uint32_t)((uint32_t)opa * mask[x]) >> 8));\n"
+    "                }\n"
+    "            }\n"
+    "            mask += mask_stide;\n"
+    "        }\n"
+    "    }\n"
+    "}\n"
+    "\n"
+    "static void gm_map_set_px_planar(lv_color_t * dest_buf, const lv_area_t * dest_area, lv_coord_t dest_stride,\n"
+    "                                 const lv_color_t * src_buf, lv_coord_t src_stride, lv_opa_t opa,\n"
+    "                                 const lv_opa_t * mask, lv_coord_t mask_stride)\n"
+    "{\n"
+    "    uint16_t * colp = (uint16_t *)dest_buf;\n"
+    "    uint16_t * a16p = colp + gm_overlay_plane_px;\n"
+    "    int32_t w = lv_area_get_width(dest_area);\n"
+    "    int32_t h = lv_area_get_height(dest_area);\n"
+    "    int32_t x;\n"
+    "    int32_t y;\n"
+    "    if(mask == NULL) {\n"
+    "        for(y = 0; y < h; y++) {\n"
+    "            size_t i = (size_t)(dest_area->y1 + y) * dest_stride + dest_area->x1;\n"
+    "            for(x = 0; x < w; x++, i++) {\n"
+    "                gm_write_px_planar(colp + i, a16p + i, src_buf[x], opa);\n"
+    "            }\n"
+    "            src_buf += src_stride;\n"
+    "        }\n"
+    "    }\n"
+    "    else {\n"
+    "        for(y = 0; y < h; y++) {\n"
+    "            size_t i = (size_t)(dest_area->y1 + y) * dest_stride + dest_area->x1;\n"
+    "            for(x = 0; x < w; x++, i++) {\n"
+    "                if(mask[x]) {\n"
+    "                    gm_write_px_planar(colp + i, a16p + i, src_buf[x], (lv_opa_t)((uint32_t)((uint32_t)opa * mask[x]) >> 8));\n"
+    "                }\n"
+    "            }\n"
+    "            mask += mask_stride;\n"
+    "            src_buf += src_stride;\n"
+    "        }\n"
+    "    }\n"
+    "}\n"
+    "#endif /*LV_COLOR_DEPTH == 16*/\n"
+)
+def apply_one(path, hunks, append=None, marker=MARKER):
     with open(path, encoding="utf-8") as f:
         text = f.read()
-    if MARKER in text:
-        print("patch_lvgl_setpx_fast: already patched (%s)" % path)
+    if marker in text:
+        print("patch_lvgl_setpx_fast: already patched (%s, %s)" % (path, marker))
         return
     orig = path + ".gm-orig"
     if not os.path.exists(orig):
@@ -239,6 +362,8 @@ def main():
     apply_one(hal, [(HAL_ANCHOR, HAL_ADD)])
     apply_one(blend, [(BLEND_PROTO_ANCHOR, BLEND_PROTO_ADD),
                       (BLEND_DISPATCH_OLD, BLEND_DISPATCH_NEW)], append=BLEND_IMPL)
+    apply_one(blend, [(PLANAR_PROTO_ANCHOR, PLANAR_PROTO_ADD),
+                      (PLANAR_DISPATCH_OLD, PLANAR_DISPATCH_NEW)], append=PLANAR_IMPL, marker=MARKER2)
 
 
 main()

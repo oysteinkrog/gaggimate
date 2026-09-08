@@ -34,6 +34,7 @@ class SleepAnimation {
     const uint8_t *overlayFrontBuffer() const { return nullptr; }
     bool overlayFrontSize(int &, int &) const { return false; }
     uint32_t overlayCapacity() const { return 0; }
+    uint32_t overlayPlanePixels() const { return 0; }
     void publishOverlay(int, int, int, int) {}
     void publishOverlayRanges(int, int, const int (*)[2], int) {}
     int overlayBackIndex() const { return 0; }
@@ -287,6 +288,8 @@ class SleepAnimation {
     uint32_t lastCopyUsValue() const { return lastCopyUs.load(); }
     const void *halfBufAddr() const { return halfBuf; }
     uint32_t lastBlendUsValue() const { return lastBlendUs.load(); }
+    uint32_t lastBlendScrimUsValue() const { return lastBlendScrimUs.load(); }
+    bool objectInternal() const;
     uint32_t lastMsyncUsValue() const { return lastMsyncUs.load(); }
     uint32_t lastPushUsValue() const { return lastPushUs.load(); }
 
@@ -305,13 +308,34 @@ class SleepAnimation {
         // Stored in Q8 so the per-pixel path multiplies and shifts rather than
         // dividing by 100. 100 percent maps to 256, which takes a fully covered
         // cell to black.
+        if (scrimOverride.load() >= 0) {
+            pct = scrimOverride.load();
+        }
         scrimQ8.store(pct * 256 / 100);
     }
+    // Debug override for the scrim strength, in percent; -1 follows the
+    // stored setting again. The UI pass re-applies the setting through
+    // setScrim on every tick, so a plain setScrim from a debug knob lasts
+    // only until the next pass (2026-09-08: that is how a scrim=0 A/B read
+    // as "no change" for a whole evening).
+    void setScrimOverride(int pct) {
+        scrimOverride.store(pct);
+        if (pct >= 0) {
+            setScrim(pct);
+        }
+    }
+    int scrimOverrideValue() const { return scrimOverride.load(); }
 
-    // Overlay: an LV_IMG_CF_TRUE_COLOR_ALPHA (RGB565 + A8, 3 B/px) snapshot of
-    // the standby widgets. Double-buffered: the UI task renders a snapshot
-    // into overlayBackBuffer(), then publishOverlay() computes per-row alpha
-    // spans and atomically flips which overlay the render task blends from.
+    // Overlay: a snapshot of the standby widgets in the planar format of
+    // LV_Helper.h (an RGB565 plane, then a 16-bit alpha plane with 255
+    // stored as 256, overlayPlanePixels() pixels each; the snapshot's w x h
+    // pixels are indexed y * w + x into both). Planar because the blend then
+    // runs whole 8-pixel groups on the vector unit whatever their alphas:
+    // 16 ns a pixel against 75 to 95 for the interleaved RGB565+A8 kernel
+    // (gm-2cl.16, tools/blend_probe.py, 2026-09-07). Double-buffered: the UI
+    // task renders a snapshot into overlayBackBuffer(), then
+    // publishOverlay() computes per-row alpha spans and atomically flips
+    // which overlay the render task blends from.
     // Returns nullptr when the render task is still reading the back overlay
     // mid-frame (rare, ~20 ms window) — the caller just retries next UI pass.
     uint8_t *overlayBackBuffer();
@@ -324,6 +348,9 @@ class SleepAnimation {
         return f < 0 ? nullptr : overlays[f].buf;
     }
     uint32_t overlayCapacity() const { return overlayCap; }
+    // Pixels per plane (the alpha plane starts this many uint16_t after the
+    // colour plane); a multiple of 8 so both planes stay 16-byte aligned.
+    uint32_t overlayPlanePixels() const { return overlayPlanePx; }
     // The front overlay's snapshot size, for the debug dump; false before
     // the first publish.
     bool overlayFrontSize(int &w, int &h) const {
@@ -836,9 +863,13 @@ class SleepAnimation {
   private:
   public:
     struct Overlay {
+        // Base of the two planes (16-byte aligned PSRAM); col() and a16()
+        // index them.
         uint8_t *buf = nullptr;
         int w = 0;
         int h = 0;
+        uint16_t *col(uint32_t planePx) const { return reinterpret_cast<uint16_t *>(buf); }
+        uint16_t *a16(uint32_t planePx) const { return reinterpret_cast<uint16_t *>(buf) + planePx; }
         // What each pass has to touch, as exact per-row runs of consecutive
         // pixels rather than a bounding span or a block mask.
         //
@@ -1358,6 +1389,9 @@ class SleepAnimation {
     uint32_t lastFlipWaitUs = 0;
     // Per-frame stage costs, render-task only so plain members. Published at
     // the end of each frame into the atomics below.
+    // Per-frame stage accumulators. Despite the names they hold CPU cycles
+    // (PROF_ACC in the .cpp) and are converted to microseconds once per
+    // frame where the last*Us atomics are stored.
     uint32_t profBandUs = 0;   // the animation's own per-pixel field work, plus the half-res expansion
     uint32_t profExpandUs = 0; // just the 2x2 expansion inside profBandUs, zero at full resolution
     uint32_t profFillUs = 0;   // the x2 fill of the even output row, inside profExpandUs
@@ -1379,6 +1413,11 @@ class SleepAnimation {
     std::atomic<uint32_t> lastFillUs{0};
     std::atomic<uint32_t> lastCopyUs{0};
     std::atomic<uint32_t> lastBlendUs{0};
+    // The scrim (text halo) pass of the blend loop, per frame
+    // (GM_TOUCH_PROBE, blend_scrim_us). It was the blend's "fixed cost":
+    // 2.7 ms a frame on the brew screen before the expansion went per frame.
+    std::atomic<uint32_t> lastBlendScrimUs{0};
+    uint32_t profBlendScrimCyc = 0;
     std::atomic<uint32_t> lastMsyncUs{0};
     std::atomic<uint32_t> lastPushUs{0};
     // Core the async-memcpy completion interrupt is bound to. Deliberately not
@@ -1441,6 +1480,7 @@ class SleepAnimation {
     // Scrim strength in Q8 (0 = off, 256 = black). Read once per band by the
     // composite, so a plain relaxed load is all it needs.
     std::atomic<int> scrimQ8{0}; // off until setScrim says otherwise; see bgAnimScrim
+    std::atomic<int> scrimOverride{-1};
     std::atomic<int> blendProbe{0};
 #ifdef GM_BLEND_PROBE
     // One captured overlay row for probe levels 4 to 7 (see benchSetBlendProbe).
@@ -1460,8 +1500,8 @@ class SleepAnimation {
     uint32_t probePx = 0;
     int probeCaptureBands = 0;
     volatile uint32_t probeSink = 0;
-    uint32_t probeBlendRow(uint16_t *drow, const uint8_t *crow, const uint32_t *runs, int nRuns, int level, int w,
-                           bool pie);
+    uint32_t probeBlendRow(uint16_t *drow, const uint16_t *ccol, const uint16_t *ca16, const uint32_t *runs, int nRuns,
+                           int level, int w, bool pie);
     void probeReset();
 #endif
     std::atomic<uint32_t> probePxOut{0};
@@ -1491,6 +1531,11 @@ class SleepAnimation {
 
     Overlay overlays[2];
     uint32_t overlayCap = 0;
+    uint32_t overlayPlanePx = 0;
+    // False when a snapshot's stride or x offset is not a multiple of 8, so
+    // the planes' rows are not 16-byte aligned and the blend must stay
+    // scalar (set at publish; never expected on the 480 px panel).
+    std::atomic<bool> overlayVecOk{true};
     std::atomic<int> overlayFront{-1}; // -1 = nothing published yet
     // Overlay gain ramp record, written by the UI task under ovGainSeq (odd
     // while a write is in flight, same discipline as Layer::seq) and copied
