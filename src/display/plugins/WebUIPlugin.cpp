@@ -1470,6 +1470,9 @@ void WebUIPlugin::setupServer() {
         if (request->hasArg("icons")) {
             g_iconLayersReq = request->arg("icons").toInt() != 0 ? 1 : 0;
         }
+        if (request->hasArg("animoff")) {
+            g_animOffReq = request->arg("animoff").toInt() != 0 ? 1 : 0;
+        }
         if (request->hasArg("marquees")) {
             g_marqueeLayersReq = request->arg("marquees").toInt() != 0 ? 1 : 0;
         }
@@ -1657,6 +1660,12 @@ void WebUIPlugin::setupServer() {
         // Foreground: overlay refreshes (two reads over a window are the
         // widgets' refresh rate) and the last pass's snapshot/publish cost.
         doc["ov_refreshes"] = g_overlayStats.refreshes;
+        doc["lv_flip_presents"] = g_lvFlipStats.presents;
+        doc["lv_flip_free"] = g_lvFlipStats.free;
+        doc["lv_flip_waits"] = g_lvFlipStats.waits;
+        doc["lv_flip_wait_us_max"] = g_lvFlipStats.waitUsMax;
+        doc["lv_flip_wait_us_total"] = g_lvFlipStats.waitUsTotal;
+        doc["lv_flip_timeouts"] = g_lvFlipStats.timeouts;
         doc["ov_snap_us"] = g_overlayStats.lastSnapUs;
         doc["ov_whole_snap_us"] = g_overlayStats.lastWholeSnapUs;
         doc["ov_whole_pub_us"] = g_overlayStats.lastWholePubUs;
@@ -1687,6 +1696,7 @@ void WebUIPlugin::setupServer() {
         doc["dials"] = g_dialElementsReq;
         doc["texts"] = g_textElementsReq;
         doc["icons"] = g_iconLayersReq;
+        doc["anim_off"] = g_animOffReq;
         doc["marquees"] = g_marqueeLayersReq;
         doc["clrruns"] = g_clearByRunsReq;
         doc["touch_poll"] = touchtask::pollEnabled();

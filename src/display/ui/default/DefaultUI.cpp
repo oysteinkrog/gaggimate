@@ -2141,7 +2141,7 @@ void DefaultUI::maintainSleepAnimation() {
     // suppresses the LVGL flushes the fade is made of.
     const bool uiReady = uiBuiltAt != 0 && ::millis() - uiBuiltAt >= STARTUP_FADE_MS;
     const bool sleepWant = uiReady && currentScreen == SCREEN_ID_STANDBY_SCREEN && standbyMode && !blocked;
-    const bool wantAnimation = bgAnimAllScreens ? (uiReady && !blocked) : sleepWant;
+    const bool wantAnimation = g_animOffReq == 0 && (bgAnimAllScreens ? (uiReady && !blocked) : sleepWant);
 
 #ifdef GM_ANIM_BENCH
     {

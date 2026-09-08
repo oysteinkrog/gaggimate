@@ -158,6 +158,23 @@ struct OverlayStats {
     volatile uint32_t lastWholeClearByRuns = 0;
 };
 extern OverlayStats g_overlayStats;
+
+// LVGL's own framebuffer flips (direct mode, animation off): presents made,
+// refreshes that found the flip already taken (free), refreshes that had to
+// wait for the scan-out to leave the other buffer, and waits that gave up
+// after 60 ms (gm-bzu.5). Read on /api/debug/anim as lv_flip_*.
+struct LvFlipStats {
+    uint32_t presents = 0;
+    uint32_t free = 0;
+    uint32_t waits = 0;
+    uint32_t waitUsTotal = 0;
+    uint32_t waitUsMax = 0;
+    uint32_t timeouts = 0;
+};
+extern LvFlipStats g_lvFlipStats;
+// Waits for a pending present before code outside the refresh timer writes
+// LVGL's framebuffer (lv_refr_now callers); the timer path waits on its own.
+void lvgl_helper_wait_flip();
 extern volatile int64_t g_overlayMinRefreshUs;
 // fps= on /api/debug/anim: a temporary animation frame cap for A/B runs
 // (0 = the stored setting). DefaultUI applies it where it re-applies the
@@ -187,6 +204,11 @@ extern volatile int g_textElementsReq;
 // icons=0|1 on /api/debug/anim: blinking images as layers
 // (DefaultUI::serviceIconLayers, gm-2cl.17).
 extern volatile int g_iconLayersReq;
+// Debug knob (`animoff=1` on /api/debug/anim, not stored): keeps the
+// background animation off so LVGL owns the panel's framebuffers on every
+// screen, which is the path gm-bzu.5's flip wait guards. 0 restores the
+// settings-driven behaviour.
+extern volatile int g_animOffReq;
 // marquees=0|1 on /api/debug/anim: circular-scroll labels as looping
 // layers (DefaultUI::serviceMarquees, gm-2cl.18).
 extern volatile int g_marqueeLayersReq;

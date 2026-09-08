@@ -185,6 +185,26 @@ telemetry-driven screen from a 650 ms LVGL pass (1.5 Hz widget updates,
   slower than at 5 fps, which is the shared instruction cache and the
   bus; pausing the animation for the snapshot would buy that back at the
   price of a visible hitch on every page change and was not done.
+- **When LVGL owns the framebuffers, its refresh waits for the panel to
+  leave the buffer it is about to write** (gm-bzu.5, 2026-09-08,
+  `LV_Helper.cpp`, `refrTimerGuarded`). `presentFrameBuffer` only records
+  the new index in esp_lcd; the bounce refill reads the old buffer until
+  its frame wraps, and LVGL's direct mode writes that old buffer at the
+  start of its next refresh (`refr_sync_areas` copies last frame's areas
+  into it, then renders), before it waits for anything. So the last flush
+  records the refill count at the present, the refresh timer's callback
+  is wrapped, and the wrapper waits (1 ms polls, 60 ms bound) for the
+  count to move before the refresh runs. The timer is paused after every
+  run and resumed by the next invalidation, so the wait overlaps the gap
+  between passes and is paid only when a refresh follows a present within
+  one panel period. Measured with the animation off (`animoff=1`, bench
+  board, divider 8, screens cycled and a synthetic brew): 235 presents,
+  57 refreshes that would have written the scanned buffer, mean wait
+  5.2 ms, max 12.8 ms, no timeouts. With the animation on this path is
+  not taken (the animation's own `presentFrame` does the same wait).
+  `lv_flip_presents`, `lv_flip_free`, `lv_flip_waits`,
+  `lv_flip_wait_us_max` and `lv_flip_timeouts` on `/api/debug/anim`; a
+  non-zero timeout count means the panel stopped refilling.
 - **Touch is read by its own task, and the press plate is written from
   it** (gm-2cl.4, 2026-09-08, `TouchTask.cpp`). `touchtask` polls the
   controller every 5 ms from a core 1 task at priority 2 with a 4 KB
@@ -618,9 +638,10 @@ Instruments, and where each one exists:
   set.
 - `/api/debug/anim` (frame counters, `anim_id`, `uptime_ms`, `text_elems`,
   `dirty_recent`, `icon_layers`, `marquee_layers`, the `ov_whole_*`
-  page-change split, `touch_task`, `touch_samples`, `touch_hwm`, `hitmap_n`,
-  `hitmap_gen`, the `texts=`, `textease=`, `dials=`, `icons=`, `marquees=`,
-  `clrruns=` and `touchpoll=` knobs) and
+  page-change split, the `lv_flip_*` counters, `touch_task`,
+  `touch_samples`, `touch_hwm`, `hitmap_n`, `hitmap_gen`, the `texts=`,
+  `textease=`, `dials=`, `icons=`, `marquees=`, `clrruns=`, `touchpoll=`
+  and `animoff=` knobs) and
   `/api/debug/pclk` (the live pixel-clock divider) are device-only: both sit
   inside `WebUIPlugin.cpp`'s real-panel block, which `GAGGIMATE_SIM` and
   `GAGGIMATE_HEADLESS` exclude.
