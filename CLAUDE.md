@@ -793,8 +793,12 @@ Known limits, recorded rather than fixed:
   editor and as the raw string in the list (`CatSchedules.cpp`, through
   `settingsui::scheduleTimeParts`).
 - `buildRegions` rebuilds the whole region span list, one `std::string` per
-  zone entry, on every region or city arrow press (`SettingsModel.cpp`). The
-  churn is unmeasured.
+  zone entry, on every region or city arrow press (`SettingsModel.cpp`): three
+  builds for a region press, two for a city press. Measured on the host
+  (2026-09-09, x86 at -Os, 461 entries): 11 us per build, 34 us per region
+  press, 14 us per `locate`. The device has not been timed; at the 20 to 50x
+  the S3 runs string-heavy flash code slower than the host this is about
+  1 to 2 ms per press, under one UI pass, so it is left as it is.
 
 ## Internal DRAM budget (violate these and the web UI dies)
 
