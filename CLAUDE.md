@@ -793,8 +793,12 @@ Known limits, recorded rather than fixed:
   editor and as the raw string in the list (`CatSchedules.cpp`, through
   `settingsui::scheduleTimeParts`).
 - `buildRegions` rebuilds the whole region span list, one `std::string` per
-  zone entry, on every region or city arrow press (`SettingsModel.cpp`). The
-  churn is unmeasured.
+  zone entry, on every region or city arrow press (`SettingsModel.cpp`): three
+  builds for a region press, two for a city press. Measured on the host
+  (2026-09-09, x86 at -Os, 461 entries): 11 us per build, 34 us per region
+  press, 14 us per `locate`. The device has not been timed; at the 20 to 50x
+  the S3 runs string-heavy flash code slower than the host this is about
+  1 to 2 ms per press, under one UI pass, so it is left as it is.
 
 ## Internal DRAM budget (violate these and the web UI dies)
 
@@ -1059,11 +1063,25 @@ Debugging methodology that this codebase has already paid for:
 ## Open cleanups
 
 - The PHY PLL-track deferral (`scripts/patch_phy_track_defer.py`,
-  PanelClock.cpp) predates the core-1 interrupt fix and is probably vestigial
-  now: with the panel's interrupts off core 0, the tick cannot touch the
-  refill. Candidate for a measured revert-test; it costs a framework patch to
-  maintain across IDF updates. The BLE scan backoff and the 5s PLL-track
-  period stay regardless (less coex churn for free).
+  PanelClock.cpp) predates the core-1 interrupt fix and the revert test
+  says it is vestigial now (2026-09-09, bench board, loadtest build, WiFi
+  and the BLE controller link up, standby screen with the animation on).
+  `/api/debug/scanout?phydefer=0|1` switches the deferral at run time (0 is
+  the stock inline tick, not stored; `phy_defer_on` reports it and
+  `phy_defer` keeps counting only while it is on), and the A/B toggled it
+  within one boot, four phases each: at the stored divider 8, 5 minute
+  phases, 0 resyncs and 0 slips in every phase, catchups 0.03 to 0.05 a
+  second either way, busy_max 61 to 72 us; at divider 6 (set live through
+  `/api/debug/pclk`, the production clock, 50.67 frames a second), 4
+  minute phases, again 0 resyncs and 0 slips in every phase, catchups 0.2
+  a second either way with depth max 2 of 8, busy_max 72 to 79 us. The
+  fault the patch was written for was one displaced band a second, so
+  four minutes at zero is a clean result. Removing the patch is gm-bzu.24:
+  it takes the framework patch, the deferral task and the VSYNC release
+  with it, and the BLE scan backoff and the 5 s PLL-track period stay
+  regardless (less coex churn for free). `tools/phydefer_ab.py` is the
+  A/B (a serial capture with host timestamps plus the HTTP counters, and
+  the two channels agreed).
 - `tools/animbench/OPTIMIZE.md`: do NOT modify golden/, BASELINE.md, or bench
   sources.
 - The DMA footprint of a live BLE controller link is unmeasured; the rig's

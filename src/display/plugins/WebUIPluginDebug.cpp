@@ -314,6 +314,11 @@ void WebUIPlugin::setupDebugEndpoints() {
     server.on("/api/debug/scanout", [](AsyncWebServerRequest *request) {
         // reset=1 zeroes the counters so two configurations can be compared as
         // rates rather than as totals accumulated since boot.
+        // phydefer=0 runs the PHY PLL-track tick inline (stock behaviour);
+        // phydefer=1 defers it into vertical blanking again. Not stored.
+        if (request->hasArg("phydefer")) {
+            panelclock::setPhyTrackDefer(request->arg("phydefer") != "0");
+        }
         if (request->hasArg("reset")) {
             panelclock::scanoutReset();
             gm_rgb_restart_count = 0;
@@ -375,18 +380,19 @@ void WebUIPlugin::setupDebugEndpoints() {
         // it up against the beam instead of restarting the DMA, so it now costs one
         // band of stale pixels rather than a whole shifted frame. dma_restarts should
         // stay at zero: only an explicit panel restart reaches it.
-        response->printf(
-            "],\"resyncs\":%u,\"resync_bufs\":%u,\"resync_max\":%u,\"over_count\":%u,\"over_bufs\":%u,\"phy_defer\":%u,"
-            "\"flash_skips\":%u,"
-            "\"dma_restarts\":%u,\"dma_catchups\":%u,\"dma_catchup_bufs\":%u,"
-            "\"dma_catchup_max\":%u,\"eof_expect\":%u,\"eof_min\":%u,\"eof_max\":%u,\"log\":[",
-            static_cast<unsigned>(gm_rgb_resync_count), static_cast<unsigned>(gm_rgb_resync_bufs),
-            static_cast<unsigned>(gm_rgb_resync_max), static_cast<unsigned>(gm_rgb_over_count),
-            static_cast<unsigned>(gm_rgb_over_bufs), static_cast<unsigned>(panelclock::phyTrackDeferred()),
-            static_cast<unsigned>(gm_rgb_flash_skip_bufs), static_cast<unsigned>(gm_rgb_restart_count),
-            static_cast<unsigned>(gm_rgb_catchup_count), static_cast<unsigned>(gm_rgb_catchup_bufs),
-            static_cast<unsigned>(gm_rgb_catchup_max), static_cast<unsigned>(gm_rgb_eof_expect),
-            static_cast<unsigned>(gm_rgb_eof_min), static_cast<unsigned>(gm_rgb_eof_max));
+        response->printf("],\"resyncs\":%u,\"resync_bufs\":%u,\"resync_max\":%u,\"over_count\":%u,\"over_bufs\":%u,\"phy_defer\":"
+                         "%u,\"phy_defer_on\":%u,"
+                         "\"flash_skips\":%u,"
+                         "\"dma_restarts\":%u,\"dma_catchups\":%u,\"dma_catchup_bufs\":%u,"
+                         "\"dma_catchup_max\":%u,\"eof_expect\":%u,\"eof_min\":%u,\"eof_max\":%u,\"log\":[",
+                         static_cast<unsigned>(gm_rgb_resync_count), static_cast<unsigned>(gm_rgb_resync_bufs),
+                         static_cast<unsigned>(gm_rgb_resync_max), static_cast<unsigned>(gm_rgb_over_count),
+                         static_cast<unsigned>(gm_rgb_over_bufs), static_cast<unsigned>(panelclock::phyTrackDeferred()),
+                         static_cast<unsigned>(panelclock::phyTrackDefer() ? 1 : 0),
+                         static_cast<unsigned>(gm_rgb_flash_skip_bufs), static_cast<unsigned>(gm_rgb_restart_count),
+                         static_cast<unsigned>(gm_rgb_catchup_count), static_cast<unsigned>(gm_rgb_catchup_bufs),
+                         static_cast<unsigned>(gm_rgb_catchup_max), static_cast<unsigned>(gm_rgb_eof_expect),
+                         static_cast<unsigned>(gm_rgb_eof_min), static_cast<unsigned>(gm_rgb_eof_max));
         for (size_t i = 0; i < n; i++) {
             response->printf("%s{\"frame\":%u,\"t_us\":%u,\"margin_us\":%u,\"overlay_us\":%u,\"flash_us\":%u,\"band_us\":%u,"
                              "\"present_us\":%u,\"phy_us\":%u}",
