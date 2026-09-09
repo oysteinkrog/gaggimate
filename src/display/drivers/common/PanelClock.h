@@ -105,17 +105,6 @@ bool hasLiveControl();
 // Any argument may be null. All three are zero before attach().
 void scanoutStats(uint32_t *frames, uint32_t *refills, uint32_t *slips);
 
-// PHY PLL-track ticks run in the vertical blanking window instead of at the
-// timer's own moment (see PanelClock.cpp). Zero on a live radio means the
-// deferral is not engaging and the once-a-second displaced band is back.
-uint32_t phyTrackDeferred();
-// Runtime switch for the deferral, for A/B soaks that compare the stock
-// inline tick against the deferred one within a single boot
-// (`/api/debug/scanout?phydefer=0|1`). Off means gm_phy_track_defer returns
-// false and the PHY timer runs its tick inline, as an unpatched build would.
-void setPhyTrackDefer(bool on);
-bool phyTrackDefer();
-
 // Refill headroom, which is the measurement `slips` cannot make.
 //
 // There is no public per-EOF callback to replicate esp_lcd's own condition with
@@ -178,8 +167,7 @@ enum ScanoutActivity {
     SCANOUT_ACT_FLASH = 1,    // NVS / LittleFS write, which masks the LCD ISR
     SCANOUT_ACT_BANDPUSH = 2, // animation band pushed into the framebuffer
     SCANOUT_ACT_PRESENT = 3,  // whole-framebuffer cache invalidate before a flip
-    SCANOUT_ACT_PHY = 4,      // deferred RF PLL-track tick run at VSYNC (PanelClock.cpp)
-    SCANOUT_ACT_COUNT = 5,
+    SCANOUT_ACT_COUNT = 4,
 };
 
 void scanoutMark(int which);

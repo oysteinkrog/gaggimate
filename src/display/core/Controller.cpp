@@ -943,11 +943,11 @@ void Controller::loop() {
                             gapHi += gm_rgb_gap_hist[i];
                         }
                         ESP_LOGI(LOG_TAG,
-                                 "GM_SCANOUT: t_us=%llu frames=%u slips=%u resyncs=%u phy_defer=%u "
+                                 "GM_SCANOUT: t_us=%llu frames=%u slips=%u resyncs=%u "
                                  "busy_max=%u gap_max=%u busy_hi=%u gap_hi=%u busy_top=%u gap_top=%u "
                                  "catchups=%u catchup_bufs=%u catchup_max=%u",
                                  static_cast<unsigned long long>(esp_timer_get_time()), frames, slips,
-                                 static_cast<unsigned>(gm_rgb_resync_count), panelclock::phyTrackDeferred(),
+                                 static_cast<unsigned>(gm_rgb_resync_count),
                                  static_cast<unsigned>(gm_rgb_busy_max), static_cast<unsigned>(gm_rgb_gap_max),
                                  static_cast<unsigned>(busyHi), static_cast<unsigned>(gapHi),
                                  static_cast<unsigned>(gm_rgb_busy_hist[23]), static_cast<unsigned>(gm_rgb_gap_hist[23]),
@@ -966,12 +966,11 @@ void Controller::loop() {
                             lastSlipTUs = slipBuf[i].tUs;
                             ESP_LOGI(LOG_TAG,
                                      "GM_SLIP: t_us=%u short=%u overlay_us=%u flash_us=%u band_us=%u "
-                                     "present_us=%u phy_us=%u",
+                                     "present_us=%u",
                                      slipBuf[i].tUs, slipBuf[i].marginUs, slipBuf[i].sinceUs[panelclock::SCANOUT_ACT_OVERLAY],
                                      slipBuf[i].sinceUs[panelclock::SCANOUT_ACT_FLASH],
                                      slipBuf[i].sinceUs[panelclock::SCANOUT_ACT_BANDPUSH],
-                                     slipBuf[i].sinceUs[panelclock::SCANOUT_ACT_PRESENT],
-                                     slipBuf[i].sinceUs[panelclock::SCANOUT_ACT_PHY]);
+                                     slipBuf[i].sinceUs[panelclock::SCANOUT_ACT_PRESENT]);
                         }
                     }
                 }
