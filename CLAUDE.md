@@ -92,9 +92,10 @@ summary; the KB carries the sources and the measurements behind it.
   went to 1.3 ms and the page-change draws to standby 36.5, brew 27.7,
   steam 23.2, water 22.6, status 27.3, grind 28.0, profile 56.6,
   new_profile 121.1, info 68.8 ms, but `.flash.text` is 3.0 MB, so PSRAM
-  free fell from 4.55 MB to 1.55 MB with the animation resident. Whether
-  3 MB of the 8 MB PSRAM buys that is the owner's call (gm-2cl.20);
-  rodata (2.1 MB) does not fit on top. For that call: `psram_min` on
+  free fell from 4.55 MB to 1.55 MB with the animation resident. The owner
+  decided on 2026-09-09 to keep production off and measure on
+  `display-loadtest-xip` (`sdkconfig.xip.defaults`, gm-2cl.20), the
+  loadtest build with the fetch on; rodata (2.1 MB) does not fit on top. For that call: `psram_min` on
   `/api/debug/heap` is the PSRAM low-water mark since boot, and after the
   device runner, three cold web loads and a screen cycle it read 4.47 MB
   against 4.63 to 4.70 MB idle, so peak use above idle is about 230 KB.

@@ -1,0 +1,12 @@
+# Instruction fetch from PSRAM, bench env only (gm-2cl.20).
+#
+# Copies .flash.text (3.0 MB) into PSRAM at boot so instruction cache misses
+# are served by octal PSRAM instead of quad flash. Measured 2026-09-08 on the
+# bench board on top of QIO: the small-widget draw went from 2.1 to 1.3 ms and
+# every page-change draw 20 to 45 percent faster (standby 36.5, brew 27.7,
+# new_profile 121.1, info 68.8 ms), with PSRAM free falling from 4.55 MB to
+# 1.55 MB with the animation resident. The owner decided on 2026-09-09 to
+# leave production off and keep this behind the display-loadtest-xip env so
+# it can be measured further. rodata (2.1 MB) does not fit on top, so
+# SPIRAM_RODATA stays off. Chained last for that env only.
+CONFIG_SPIRAM_FETCH_INSTRUCTIONS=y
