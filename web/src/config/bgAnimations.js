@@ -153,6 +153,17 @@ export const BG_ANIMATIONS = [
       { key: 'glow', label: 'Sheen', def: 55 },
     ],
   },
+  {
+    id: 'brushed',
+    name: 'Brushed Metal',
+    description: 'Fine horizontal grain with one broad reflection sliding across it.',
+    params: [
+      { key: 'speed', label: 'Speed', def: 20 },
+      { key: 'grain', label: 'Grain', def: 35 },
+      { key: 'reflection', label: 'Reflection', def: 45 },
+      { key: 'contrast', label: 'Contrast', def: 30 },
+    ],
+  },
 ];
 
 // Shared color themes — MUST mirror BgAnimThemes.cpp (append only, the theme
