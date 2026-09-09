@@ -458,6 +458,40 @@ void SettingsUI::buildCategoryPage(PageEntry &entry) {
     lv_obj_add_flag(root, LV_OBJ_FLAG_EVENT_BUBBLE);
     lv_obj_set_style_bg_opa(root, LV_OPA_TRANSP, LV_PART_MAIN);
 
+    // Swipe between pages: a horizontal gesture anywhere on the page, the
+    // finger moving left for the next page. LVGL delivers a gesture to the
+    // first ancestor of the pressed object that does not bubble gestures,
+    // so the root clears the flag and everything under it keeps it. The
+    // rest of the press is dropped (lv_indev_wait_release) so the row the
+    // swipe started on gets no CLICKED at the release: LVGL 8.4 gates
+    // CLICKED on scrolling, not on a gesture, and a swipe across a toggle
+    // row would otherwise flip it. A stepper still steps once on the
+    // PRESSED it already had if the swipe began on its 40 px button.
+    lv_obj_clear_flag(root, LV_OBJ_FLAG_GESTURE_BUBBLE);
+    lv_obj_add_event_cb(
+        root,
+        [](lv_event_t *e) {
+            auto *self = static_cast<SettingsUI *>(lv_event_get_user_data(e));
+            lv_indev_t *indev = lv_indev_get_act();
+            if (indev == nullptr || self->pageStack.empty()) {
+                return;
+            }
+            const lv_dir_t dir = lv_indev_get_gesture_dir(indev);
+            if (dir != LV_DIR_LEFT && dir != LV_DIR_RIGHT) {
+                return;
+            }
+            PageEntry &top = self->pageStack.back();
+            const int rows = top.def->rowCount ? top.def->rowCount(top.ctx) : 0;
+            const int pages = rows > 0 ? (rows + kRowsPerPage - 1) / kRowsPerPage : 1;
+            const int target = top.page + (dir == LV_DIR_LEFT ? 1 : -1);
+            if (target < 0 || target >= pages) {
+                return; // at an edge: nothing to show, keep the press alive
+            }
+            lv_indev_wait_release(indev);
+            self->gotoPage(target);
+        },
+        LV_EVENT_GESTURE, this);
+
     const int totalRows = entry.def->rowCount ? entry.def->rowCount(entry.ctx) : 0;
     const int totalPages = totalRows > 0 ? (totalRows + kRowsPerPage - 1) / kRowsPerPage : 1;
     if (entry.page >= totalPages) {
@@ -467,11 +501,15 @@ void SettingsUI::buildCategoryPage(PageEntry &entry) {
         entry.page = 0;
     }
 
-    // Header: up arrow, title+indicator column, down arrow, all centred on
-    // one row so the up/down arrows' 56x56 hit pad never has to compete with
-    // a stacked title band for the ~68 px available between the status icons
-    // and the row block (hand-verified against the 12 px edge rule and the
-    // row block's own chevron clearance; see the epic's shared contract).
+    // Header: previous-page arrow, title+indicator column, next-page arrow,
+    // all centred on one row so the arrows' 56x56 hit pad never has to
+    // compete with a stacked title band for the ~68 px available between the
+    // status icons and the row block (hand-verified against the 12 px edge
+    // rule and the row block's own chevron clearance; see the epic's shared
+    // contract). The pages sit side by side in the reader's mind, so the
+    // arrows point left and right (owner's request, 2026-09-09; they were
+    // up and down chevrons before) and a horizontal swipe on the page does
+    // the same, see the GESTURE handler on the root below.
     lv_obj_t *header = lv_obj_create(root);
     lv_obj_remove_style_all(header);
     lv_obj_set_size(header, 200, 56);
@@ -482,7 +520,7 @@ void SettingsUI::buildCategoryPage(PageEntry &entry) {
     // activity) never sees the arrow presses.
     lv_obj_add_flag(header, LV_OBJ_FLAG_EVENT_BUBBLE);
     // Same clipping the row slots below need the flag for (see the loop
-    // building kRowY): the up/down arrows' 8 px ext click pad has to reach
+    // building kRowY): the arrows' 8 px ext click pad has to reach
     // past this container's own 200 px width to make their 56x56 hit box,
     // and with no spare margin between them and the title column there was
     // nowhere for that pad to go (measured: both arrows audited at 48x56).
@@ -493,7 +531,7 @@ void SettingsUI::buildCategoryPage(PageEntry &entry) {
     lv_obj_set_style_pad_column(header, 12, LV_PART_MAIN);
 
     lv_obj_t *upArrow = lv_img_create(header);
-    lv_img_set_src(upArrow, &img_angle_up_40x40);
+    lv_img_set_src(upArrow, &img_angle_left_40x40);
     lv_obj_set_style_img_recolor(upArrow, fg, LV_PART_MAIN);
     lv_obj_set_style_img_recolor_opa(upArrow, LV_OPA_COVER, LV_PART_MAIN);
     lv_obj_add_flag(upArrow, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_EVENT_BUBBLE);
@@ -510,7 +548,7 @@ void SettingsUI::buildCategoryPage(PageEntry &entry) {
     if (entry.page == 0) {
         lv_obj_add_flag(upArrow, LV_OBJ_FLAG_HIDDEN);
     }
-    tag(upArrow, "page_up", "page_up");
+    tag(upArrow, "page_prev", "page_prev");
 
     lv_obj_t *mid = lv_obj_create(header);
     lv_obj_remove_style_all(mid);
@@ -536,7 +574,7 @@ void SettingsUI::buildCategoryPage(PageEntry &entry) {
     lv_obj_set_style_text_color(indicator, fg, LV_PART_MAIN);
 
     lv_obj_t *downArrow = lv_img_create(header);
-    lv_img_set_src(downArrow, &img_angle_down_40x40);
+    lv_img_set_src(downArrow, &img_angle_right_40x40);
     lv_obj_set_style_img_recolor(downArrow, fg, LV_PART_MAIN);
     lv_obj_set_style_img_recolor_opa(downArrow, LV_OPA_COVER, LV_PART_MAIN);
     lv_obj_add_flag(downArrow, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_EVENT_BUBBLE);
@@ -553,7 +591,7 @@ void SettingsUI::buildCategoryPage(PageEntry &entry) {
     if (entry.page >= totalPages - 1) {
         lv_obj_add_flag(downArrow, LV_OBJ_FLAG_HIDDEN);
     }
-    tag(downArrow, "page_down", "page_down");
+    tag(downArrow, "page_next", "page_next");
 
     // Five 320x56 row slots, contiguous and centred (matches the epic's
     // shared contract); positions hand-verified to keep every corner inside

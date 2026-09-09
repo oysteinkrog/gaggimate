@@ -14,9 +14,10 @@ to run the tests, and what never to do here.
   with no LVGL, Arduino or ESP-IDF dependency, so `pio test -e
   native_settingsui` runs it on the host.
 - `SettingsUI.h` / `.cpp`: the shell. The cover object, the tile page, the
-  paged list page, the page stack, `Settings::Guard` ordering, the debug
-  tags, web-save reconciliation and the 1 s refresh tick. The header is the
-  contract every category codes against.
+  paged list page (left and right arrows in the header, or a horizontal
+  swipe, turn the pages), the page stack, `Settings::Guard` ordering, the
+  debug tags, web-save reconciliation and the 1 s refresh tick. The header
+  is the contract every category codes against.
 - `SettingsRows.h` / `.cpp`: the seven row widgets (stepper, choice, toggle,
   action, locked, confirm, info). Each fits the shell's 320x56 slot and owns
   its own hold state.

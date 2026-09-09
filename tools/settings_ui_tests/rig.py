@@ -381,6 +381,23 @@ class Rig:
         time.sleep(0.15)
         return state
 
+    def swipe(self, x, y, x2, y2, ms=200):
+        """Queues one synthetic drag from (x, y) to (x2, y2) over ms
+        (/api/debug/tap with x2/y2) and waits for its release the way tap()
+        does."""
+        self.get_json("/api/debug/tap?x=%d&y=%d&x2=%d&y2=%d&ms=%d" % (x, y, x2, y2, ms))
+        deadline = time.time() + ms / 1000.0 + 10
+        state = None
+        while time.time() < deadline:
+            state = self.get_json("/api/debug/tap")
+            if state.get("released_at_ms"):
+                break
+            time.sleep(0.02)
+        else:
+            raise TimeoutError("swipe from (%d,%d) did not release within timeout" % (x, y))
+        time.sleep(0.15)
+        return state
+
     def tap_target(self, target, ms=80):
         """Taps the centre of target's effective hit rect (a dict from
         touchmap()/targets()/find_tag(), carrying "hit")."""
