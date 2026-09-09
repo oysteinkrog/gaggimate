@@ -208,6 +208,17 @@ export const BG_ANIMATIONS = [
       { key: 'variation', label: 'Variation', def: 55 },
     ],
   },
+  {
+    id: 'saddle',
+    name: 'Saddle',
+    description: 'Two broad regions brightening toward opposite edges, with curved boundaries drifting through a quiet centre.',
+    params: [
+      { key: 'speed', label: 'Speed', def: 12 },
+      { key: 'curvature', label: 'Curvature', def: 35 },
+      { key: 'drift', label: 'Drift', def: 25 },
+      { key: 'contrast', label: 'Contrast', def: 30 },
+    ],
+  },
 ];
 
 // Shared color themes — MUST mirror BgAnimThemes.cpp (append only, the theme
