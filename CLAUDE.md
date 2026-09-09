@@ -94,7 +94,10 @@ summary; the KB carries the sources and the measurements behind it.
   new_profile 121.1, info 68.8 ms, but `.flash.text` is 3.0 MB, so PSRAM
   free fell from 4.55 MB to 1.55 MB with the animation resident. Whether
   3 MB of the 8 MB PSRAM buys that is the owner's call (gm-2cl.20);
-  rodata (2.1 MB) does not fit on top.
+  rodata (2.1 MB) does not fit on top. For that call: `psram_min` on
+  `/api/debug/heap` is the PSRAM low-water mark since boot, and after the
+  device runner, three cold web loads and a screen cycle it read 4.47 MB
+  against 4.63 to 4.70 MB idle, so peak use above idle is about 230 KB.
 - **A directory on the SD card is listed with `opendir`/`readdir`, never
   with `File::openNextFile()` on the boot path** (`saferep::recoverReplace`,
   2026-09-08). `openNextFile()` opens every entry it returns, and on FAT
@@ -107,6 +110,25 @@ summary; the KB carries the sources and the measurements behind it.
   The tell in the serial log is `Logging shot history to SD card` with no
   `STA got IP` after it. The simulator's FS shim has no mount point and
   keeps the File walk, so only the board can show this.
+- **Every open of a shot-history file runs on the history worker, never on
+  the web server's task, and the response is sent from the client's poll**
+  (`WebUIPlugin::handleHistoryRequest`, 2026-09-09). A FAT lookup in `/h`
+  walks the directory one sector at a time: about 2 s per walk on the
+  bench card (3,000 shots), 4.8 s for `FS::open` of a shot file (stat,
+  then open), 5 s for a missing id. The static handler that served
+  `/api/history/` probed for `<name>.gz` and `<name>` first, so
+  `recent.bin`, which is computed and never stored, cost two full walks
+  on async_tcp and the 5 s task watchdog rebooted the board on the web
+  UI's Home page load. The worker task does the filesystem work and marks
+  the job done; AsyncTCP polls the parked client every 500 ms on the
+  async_tcp task and that poll sends the response. Do not send from the
+  worker: the library's RequestContinuation example does, and under a
+  burst of five requests the ack path finished the response under the
+  worker, deleted the client and faulted in `write_send_buffs`. One file
+  at a time, a queue of eight, 503 past that; `hist_served`,
+  `hist_dropped`, `hist_queue_max` and `hist_open_us_max` on
+  `/api/debug/heap`. The walk itself is a layout cost (one flat FAT
+  directory with long-name entries) and is gm-bzu.23.
 
 ## UI-pipeline invariants (violate these and touch latency regresses)
 
