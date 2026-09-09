@@ -252,6 +252,17 @@ export const BG_ANIMATIONS = [
       { key: 'contrast', label: 'Contrast', def: 40 },
     ],
   },
+  {
+    id: 'glint',
+    name: 'Glint',
+    description: 'A nearly black face with one soft curved highlight sweeping slowly across it.',
+    params: [
+      { key: 'speed', label: 'Speed', def: 10 },
+      { key: 'length', label: 'Length', def: 35 },
+      { key: 'width', label: 'Width', def: 45 },
+      { key: 'brightness', label: 'Brightness', def: 55 },
+    ],
+  },
 ];
 
 // Shared color themes — MUST mirror BgAnimThemes.cpp (append only, the theme

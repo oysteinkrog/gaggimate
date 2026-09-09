@@ -48,7 +48,7 @@ constexpr const char *kSimAnimNames[] = {
     "Orbits", "Fireflies", "Steam", "Ember", "Nebula", "Silk 2", "Brushed Metal",
     "Quiet Horizon", "Soft Oculus", "Folded Chevron",
     "Quiet Mosaic", "Saddle", "Refraction",
-    "Silent Sundial", "Matte Crescent",
+    "Silent Sundial", "Matte Crescent", "Glint",
 };
 constexpr const char *kSimThemeNames[] = {
     "Espresso", "Ocean", "Violet Dusk", "Forest", "Sunset", "Fire", "Ice", "Mono", "Rose", "Gold", "Aurora", "Cyber",
