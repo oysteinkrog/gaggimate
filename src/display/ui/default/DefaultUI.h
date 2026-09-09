@@ -431,6 +431,14 @@ class DefaultUI {
     bool animPlateHas[ANIM_PLATE_COUNT] = {};
     lv_opa_t animPlateOpa[ANIM_PLATE_COUNT] = {};
     lv_color_t animPlateBg[ANIM_PLATE_COUNT] = {};
+    // Mode 2 does not tint the four dial panels themselves (360 and 400 px
+    // discs, about 102k blended pixels a frame at 60 percent). It paints a
+    // smaller disc behind their children instead (gm-2cl.10, owner's choice
+    // 2026-09-09: radius 140, 61k pixels): one child object per panel,
+    // created on first use, shown in mode 2 and hidden otherwise.
+    static constexpr int ANIM_PLATE_DISC_COUNT = 4;
+    static constexpr int ANIM_PLATE_DISC_RADIUS = 140;
+    lv_obj_t *animPlateDisc[ANIM_PLATE_DISC_COUNT] = {};
     std::atomic<bool> panelStopRequested{false};
     std::atomic<bool> panelStopped{false};
     std::atomic<bool> otaEnded{false};
