@@ -175,6 +175,17 @@ export const BG_ANIMATIONS = [
       { key: 'softness', label: 'Softness', def: 60 },
     ],
   },
+  {
+    id: 'oculus',
+    name: 'Soft Oculus',
+    description: 'A broad circular opening with a softly lit inner edge, breathing slowly.',
+    params: [
+      { key: 'speed', label: 'Speed', def: 15 },
+      { key: 'diameter', label: 'Diameter', def: 65 },
+      { key: 'breath', label: 'Breath', def: 20 },
+      { key: 'edge', label: 'Edge softness', def: 55 },
+    ],
+  },
 ];
 
 // Shared color themes — MUST mirror BgAnimThemes.cpp (append only, the theme
