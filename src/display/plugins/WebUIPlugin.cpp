@@ -14,6 +14,7 @@ extern uint32_t nebula_lerp_self_test(uint32_t *firstBad);
 #include <SD_MMC.h>
 #include <algorithm>
 #include <atomic>
+#include <cstdio>
 #include <display/core/Controller.h>
 #include <display/core/MemoryMonitor.h>
 #include <display/core/ProfileManager.h>
@@ -24,6 +25,7 @@ extern uint32_t nebula_lerp_self_test(uint32_t *firstBad);
 #include <display/plugins/ShotHistoryPlugin.h>
 #include <esp_memory_utils.h> // esp_ptr_external_ram, for the band-buffer placement report
 #include <esp_timer.h>        // esp_timer_dump, for /api/debug/timers
+#include <sys/stat.h>
 #ifdef GM_ANIM_BENCH
 #include <display/ui/default/SleepAnimation.h>
 #include <display/ui/default/bganim/BgAnim.h>
@@ -608,12 +610,18 @@ struct WebUIPlugin::HistoryJob {
     // Set by the worker when the result below is complete; read on async_tcp.
     std::atomic<bool> done{false};
     bool sent = false;
-    File file;                         // kHistFile: the opened file, or none
+    File file;                         // kHistFile on the simulator: the opened file, or none
+    FILE *fp = nullptr;                // kHistFile on the device: the opened file, or null
+    size_t size = 0;                   // its length
+    size_t pos = 0;                    // read position, for the response filler
     ShotIndexEntry *entries = nullptr; // kHistRecent: ps_malloc'd, `count` valid
     size_t count = 0;
     ~HistoryJob() {
         if (file) {
             file.close();
+        }
+        if (fp != nullptr) {
+            fclose(fp);
         }
         if (entries != nullptr) {
             free(entries);
@@ -680,9 +688,29 @@ void WebUIPlugin::serviceHistoryQueue() {
                     job->count = ShotHistory.readRecentEntries(job->entries, job->limit);
                 }
             } else {
-                // The slow part: one directory walk for the stat inside
-                // FS::open and one for the open itself.
+#ifdef GAGGIMATE_SIM
                 job->file = historyFs->open("/h/" + job->name, "r");
+#else
+                // The slow part: the directory walk inside the open. Through
+                // the POSIX layer it is one walk; FS::open does a stat first
+                // and so walks twice (4.8 s against 2.5 s for a shot file on
+                // the bench card, 2026-09-09). The size comes from the open
+                // handle, not from a stat.
+                const char *mount = historyFs->mountpoint();
+                if (mount != nullptr) {
+                    const String full = String(mount) + "/h/" + job->name;
+                    job->fp = fopen(full.c_str(), "r");
+                    if (job->fp != nullptr) {
+                        struct stat st {};
+                        if (fstat(fileno(job->fp), &st) == 0 && S_ISREG(st.st_mode)) {
+                            job->size = static_cast<size_t>(st.st_size);
+                        } else {
+                            fclose(job->fp);
+                            job->fp = nullptr;
+                        }
+                    }
+                }
+#endif
             }
         }
         const unsigned long us = micros() - t0;
@@ -728,6 +756,7 @@ void WebUIPlugin::completeHistoryJob(HistoryJob &job, AsyncWebServerRequest *req
         histServed++;
         return;
     }
+#ifdef GAGGIMATE_SIM
     if (!job.file || job.file.isDirectory()) {
         request->send(404, "text/plain", "Not found");
         return;
@@ -738,6 +767,34 @@ void WebUIPlugin::completeHistoryJob(HistoryJob &job, AsyncWebServerRequest *req
     // The response holds the file now; drop this handle without closing it
     // (File is shared, close() would close it for the response too).
     job.file = File();
+#else
+    if (job.fp == nullptr) {
+        request->send(404, "text/plain", "Not found");
+        return;
+    }
+    // The filler runs on async_tcp as the client acks, reading the open
+    // handle in order (sector reads, no directory walk). The job outlives the
+    // response: the request's disconnect closure holds it, and its destructor
+    // closes the handle whether the transfer finished or the browser left.
+    HistoryJob *jobp = &job;
+    AsyncWebServerResponse *response = request->beginResponse(
+        historyContentType(job.name), job.size, [jobp](uint8_t *buffer, size_t maxLen, size_t index) -> size_t {
+            if (jobp->fp == nullptr || index >= jobp->size) {
+                return 0;
+            }
+            if (index != jobp->pos) {
+                if (fseek(jobp->fp, static_cast<long>(index), SEEK_SET) != 0) {
+                    return 0;
+                }
+                jobp->pos = index;
+            }
+            const size_t want = std::min(maxLen, jobp->size - index);
+            const size_t got = fread(buffer, 1, want, jobp->fp);
+            jobp->pos += got;
+            return got;
+        });
+    response->addHeader("Cache-Control", "no-store");
+#endif
     request->send(response);
     histServed++;
 }

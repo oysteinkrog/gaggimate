@@ -114,8 +114,10 @@ summary; the KB carries the sources and the measurements behind it.
   the web server's task, and the response is sent from the client's poll**
   (`WebUIPlugin::handleHistoryRequest`, 2026-09-09). A FAT lookup in `/h`
   walks the directory one sector at a time: about 2 s per walk on the
-  bench card (3,000 shots), 4.8 s for `FS::open` of a shot file (stat,
-  then open), 5 s for a missing id. The static handler that served
+  bench card (3,000 shots). `FS::open` walks twice (a stat, then the
+  open), 4.8 s for a shot file, so the worker opens through `fopen` on
+  the mount path and reads the size with `fstat`: 2.3 s, a missing id
+  the same, and the response is a filler over the handle. The static handler that served
   `/api/history/` probed for `<name>.gz` and `<name>` first, so
   `recent.bin`, which is computed and never stored, cost two full walks
   on async_tcp and the 5 s task watchdog rebooted the board on the web
