@@ -5,6 +5,8 @@
 
 #include <DNSServer.h>
 #include <deque>
+#include <memory>
+#include <mutex>
 
 #include "GitHubOTA.h"
 #include <ArduinoJson.h>
@@ -28,6 +30,8 @@ class WebUIPlugin : public Plugin {
     WebUIPlugin();
     void setup(Controller *controller, PluginManager *pluginManager) override;
     void loop() override;
+    // Called by the /api/history/ handler on the async_tcp task.
+    void handleHistoryRequest(AsyncWebServerRequest *request);
 
   private:
     void setupServer();
@@ -81,6 +85,27 @@ class WebUIPlugin : public Plugin {
     // from the async_tcp task (handlers and disconnect callbacks).
     uint8_t assetStreams = 0;
     std::deque<AsyncWebServerRequestPtr> assetQueue;
+
+    // Shot-history files (/api/history/*) are opened by a worker task, never
+    // by the web server's own task: a FAT lookup in /h is a linear scan of
+    // the directory, seconds on a card with thousands of shots, and the
+    // 5 s task watchdog aborted async_tcp on a miss (see handleHistoryRequest
+    // in WebUIPlugin.cpp). The queue is pushed from async_tcp and popped by
+    // the worker, under the lock; the counters are read by /api/debug/heap.
+    struct HistoryJob;
+    std::deque<std::shared_ptr<HistoryJob>> historyQueue;
+    std::mutex historyLock;
+    fs::FS *historyFs = nullptr;
+    uint32_t histServed = 0;
+    uint32_t histDropped = 0;
+    uint32_t histQueueMax = 0;
+    uint32_t histOpenUsMax = 0;
+    void serviceHistoryQueue();
+    void completeHistoryJob(HistoryJob &job, AsyncWebServerRequest *request);
+    static void historyTaskFn(void *param);
+#ifndef GAGGIMATE_SIM
+    static void historyPollCb(void *arg, AsyncClient *client);
+#endif
 
     long lastUpdateCheck = 0;
     long lastStatus = 0;

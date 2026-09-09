@@ -13,6 +13,7 @@ extern uint32_t nebula_lerp_self_test(uint32_t *firstBad);
 #endif
 #include <SD_MMC.h>
 #include <algorithm>
+#include <atomic>
 #include <display/core/Controller.h>
 #include <display/core/MemoryMonitor.h>
 #include <display/core/ProfileManager.h>
@@ -236,6 +237,9 @@ void WebUIPlugin::loop() {
     if (!serverRunning) {
         return;
     }
+#ifdef GAGGIMATE_SIM
+    serviceHistoryQueue(); // the simulator spawns no tasks
+#endif
     const unsigned long now = millis();
     // Skip the (blocking, TLS) update check while a process is active: a brew/steam/grind
     // must not have the control loop stalled for the duration of the handshake, nor compete
@@ -520,6 +524,256 @@ void WebUIPlugin::drainAssetQueue() {
     }
 }
 
+// ---- /api/history/* -------------------------------------------------------
+//
+// The shot history lives as one file per shot in /h on the SD card (LittleFS
+// without a card). FAT has no directory index: every open, stat or exists()
+// walks /h entry by entry, one 512 B sector read per step, and with about
+// 3,000 shots on the bench card a walk is about 2 s and FS::open (a stat,
+// then the open) 4 to 5 s. The AsyncStaticWebHandler that used to serve this
+// prefix probed for "<name>.gz", then "<name>", then opened the file, on the
+// web server's own task, so a request for a name that does not exist
+// (recent.bin, which is computed, not stored) was two full walks and the 5 s
+// task watchdog aborted async_tcp: the board rebooted on the first Home page
+// load of the web UI with a big history (2026-09-09).
+//
+// Here the handler validates the name, parks the request and queues a job.
+// The worker task does the filesystem work and marks the job done; it never
+// touches the request. AsyncTCP polls the parked client every 500 ms on the
+// async_tcp task, and that poll is where the result is picked up and the
+// response sent, so the response runs on the one task the library expects.
+// A first version sent from the worker, the way the library's
+// RequestContinuation example does, and under a burst of five requests the
+// ack path finished the response underneath the worker, deleted the client
+// and faulted in write_send_buffs (LoadProhibited, 2026-09-09). One file at
+// a time, so a burst queues rather than piling walks on the card.
+
+namespace {
+
+enum HistoryKind : uint8_t { kHistFile = 0, kHistRecent = 1 };
+constexpr size_t kHistoryQueueCap = 8;
+constexpr long kRecentLimitMax = 50;
+
+// index.bin, recent.bin, or up to 12 digits followed by .slog or .json.
+bool historyName(const String &name, HistoryKind &kind) {
+    if (name == "index.bin") {
+        kind = kHistFile;
+        return true;
+    }
+    if (name == "recent.bin") {
+        kind = kHistRecent;
+        return true;
+    }
+    int dot = name.indexOf('.');
+    if (dot < 1 || dot > 12) {
+        return false;
+    }
+    for (int i = 0; i < dot; i++) {
+        if (name[i] < '0' || name[i] > '9') {
+            return false;
+        }
+    }
+    const String ext = name.substring(dot);
+    if (ext != ".slog" && ext != ".json") {
+        return false;
+    }
+    kind = kHistFile;
+    return true;
+}
+
+const char *historyContentType(const String &name) {
+    return name.endsWith(".json") ? "application/json" : "application/octet-stream";
+}
+
+class HistoryHandler : public AsyncWebHandler {
+  public:
+    explicit HistoryHandler(WebUIPlugin *plugin) : plugin(plugin) {}
+    bool canHandle(AsyncWebServerRequest *request) const override {
+        return request->method() == HTTP_GET && request->url().startsWith("/api/history/");
+    }
+    void handleRequest(AsyncWebServerRequest *request) override { plugin->handleHistoryRequest(request); }
+
+  private:
+    WebUIPlugin *plugin;
+};
+
+} // namespace
+
+struct WebUIPlugin::HistoryJob {
+    WebUIPlugin *plugin = nullptr;
+    AsyncWebServerRequestPtr request;
+    String name;
+    uint8_t kind = kHistFile;
+    uint8_t limit = 0;
+    // Set by the worker when the result below is complete; read on async_tcp.
+    std::atomic<bool> done{false};
+    bool sent = false;
+    File file;                         // kHistFile: the opened file, or none
+    ShotIndexEntry *entries = nullptr; // kHistRecent: ps_malloc'd, `count` valid
+    size_t count = 0;
+    ~HistoryJob() {
+        if (file) {
+            file.close();
+        }
+        if (entries != nullptr) {
+            free(entries);
+        }
+    }
+};
+
+void WebUIPlugin::handleHistoryRequest(AsyncWebServerRequest *request) {
+    const String name = request->url().substring(strlen("/api/history/"));
+    HistoryKind kind = kHistFile;
+    if (!historyName(name, kind)) {
+        request->send(404, "text/plain", "Not found");
+        return;
+    }
+    long limit = 8;
+    if (kind == kHistRecent && request->hasArg("limit")) {
+        limit = constrain(request->arg("limit").toInt(), 1L, kRecentLimitMax);
+    }
+    std::lock_guard<std::mutex> guard(historyLock);
+    if (historyQueue.size() >= kHistoryQueueCap) {
+        histDropped++;
+        request->send(503, "text/plain", "History busy, retry");
+        return;
+    }
+    auto job = std::make_shared<HistoryJob>();
+    job->plugin = this;
+    job->name = name;
+    job->kind = kind;
+    job->limit = static_cast<uint8_t>(limit);
+    job->request = request->pause();
+#ifndef GAGGIMATE_SIM
+    // Replaces the request's own poll handler for this client, which does
+    // nothing while the request is paused; historyPollCb stands in for it
+    // once the response is on its way. The closure keeps the job alive for
+    // as long as the request; the queue holds the other reference.
+    request->client()->onPoll(historyPollCb, job.get());
+    request->onDisconnect([job]() {});
+#endif
+    historyQueue.push_back(std::move(job));
+    if (historyQueue.size() > histQueueMax) {
+        histQueueMax = historyQueue.size();
+    }
+}
+
+// Worker side: the filesystem work, and nothing that touches the request.
+// On the simulator this runs from the plugin loop (it has no tasks) and the
+// same thread also serves the web, so the response is sent right here.
+void WebUIPlugin::serviceHistoryQueue() {
+    for (;;) {
+        std::shared_ptr<HistoryJob> job;
+        {
+            std::lock_guard<std::mutex> guard(historyLock);
+            if (historyQueue.empty()) {
+                return;
+            }
+            job = std::move(historyQueue.front());
+            historyQueue.pop_front();
+        }
+        const unsigned long t0 = micros();
+        if (historyFs != nullptr && job->request.lock()) {
+            if (job->kind == kHistRecent) {
+                job->entries = static_cast<ShotIndexEntry *>(ps_malloc(job->limit * sizeof(ShotIndexEntry)));
+                if (job->entries != nullptr) {
+                    job->count = ShotHistory.readRecentEntries(job->entries, job->limit);
+                }
+            } else {
+                // The slow part: one directory walk for the stat inside
+                // FS::open and one for the open itself.
+                job->file = historyFs->open("/h/" + job->name, "r");
+            }
+        }
+        const unsigned long us = micros() - t0;
+        if (us > histOpenUsMax) {
+            histOpenUsMax = us;
+        }
+        job->done.store(true, std::memory_order_release);
+#ifdef GAGGIMATE_SIM
+        if (auto req = job->request.lock()) {
+            job->sent = true;
+            completeHistoryJob(*job, req.get());
+        }
+#endif
+    }
+}
+
+// Sends the finished job's response. Runs on the web server's task (the
+// client poll on the device, the plugin loop on the simulator).
+void WebUIPlugin::completeHistoryJob(HistoryJob &job, AsyncWebServerRequest *request) {
+    if (historyFs == nullptr) {
+        request->send(503, "text/plain", "History unavailable");
+        return;
+    }
+    if (job.kind == kHistRecent) {
+        if (job.entries == nullptr) {
+            request->send(500, "text/plain", "Out of memory");
+            return;
+        }
+        // The most recent non-deleted shots, newest first, as a regular shot
+        // index (SIDX header + entries): the same binary format as index.bin,
+        // truncated, so clients reuse the index.bin parser.
+        ShotIndexHeader header{};
+        header.magic = SHOT_INDEX_MAGIC;
+        header.version = SHOT_INDEX_VERSION;
+        header.entrySize = SHOT_INDEX_ENTRY_SIZE;
+        header.entryCount = job.count;
+        header.nextId = 0; // meaningless for a partial view
+        AsyncResponseStream *response = request->beginResponseStream("application/octet-stream");
+        response->addHeader("Cache-Control", "no-store");
+        response->write(reinterpret_cast<const uint8_t *>(&header), sizeof(header));
+        response->write(reinterpret_cast<const uint8_t *>(job.entries), job.count * sizeof(ShotIndexEntry));
+        request->send(response);
+        histServed++;
+        return;
+    }
+    if (!job.file || job.file.isDirectory()) {
+        request->send(404, "text/plain", "Not found");
+        return;
+    }
+    const String path = "/h/" + job.name;
+    AsyncWebServerResponse *response = request->beginResponse(job.file, path, historyContentType(job.name));
+    response->addHeader("Cache-Control", "no-store");
+    // The response holds the file now; drop this handle without closing it
+    // (File is shared, close() would close it for the response too).
+    job.file = File();
+    request->send(response);
+    histServed++;
+}
+
+#ifndef GAGGIMATE_SIM
+void WebUIPlugin::historyPollCb(void *arg, AsyncClient *client) {
+    auto *job = static_cast<HistoryJob *>(arg);
+    if (!job->done.load(std::memory_order_acquire)) {
+        return;
+    }
+    auto request = job->request.lock();
+    if (!request) {
+        return;
+    }
+    if (!job->sent) {
+        job->sent = true;
+        job->plugin->completeHistoryJob(*job, request.get());
+        return;
+    }
+    // What AsyncWebServerRequest::_onPoll does: nudge a response whose acks
+    // have stopped while the client can take more.
+    AsyncWebServerResponse *response = request->getResponse();
+    if (response != nullptr && client->canSend()) {
+        response->_ack(request.get(), 0, 0);
+    }
+}
+#endif
+
+void WebUIPlugin::historyTaskFn(void *param) {
+    auto *self = static_cast<WebUIPlugin *>(param);
+    for (;;) {
+        self->serviceHistoryQueue();
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+}
+
 void WebUIPlugin::setupServer() {
     server.on("/connecttest.txt", [](AsyncWebServerRequest *request) {
         request->redirect("http://logout.net");
@@ -557,46 +811,33 @@ void WebUIPlugin::setupServer() {
     if (controller->isSDCard()) {
         fs = &SD_MMC;
     }
-    server.serveStatic("/api/history/", *fs, "/h/").setCacheControl("no-store");
-    server.on("/api/history/index.bin", HTTP_GET, [this, fs](AsyncWebServerRequest *request) {
-        // Serve the binary index file directly
-        if (fs->exists("/h/index.bin")) {
-            request->send(*fs, "/h/index.bin", "application/octet-stream");
-        } else {
-            request->send(404, "text/plain", "Index not found");
+    // /api/history/index.bin, recent.bin and <id>.slog/.json. Every open of a
+    // file in /h is queued for the history worker (handleHistoryRequest); the
+    // static handler this replaces probed the directory up to four times per
+    // request on the async_tcp task and tripped the task watchdog.
+    historyFs = fs;
+    server.addHandler(new HistoryHandler(this));
+#ifndef GAGGIMATE_SIM
+    {
+        // The worker only reads through the filesystem. On an SD card that
+        // never disables the flash cache, so its stack can live in PSRAM (the
+        // internal pool is what the web UI dies of, see CLAUDE.md); on
+        // LittleFS a read is a flash operation, which runs with the cache
+        // off and needs an internal stack. The task never deletes itself.
+        constexpr uint32_t kHistoryStack = 4096;
+        TaskHandle_t handle = nullptr;
+        if (controller->isSDCard()) {
+            xTaskCreatePinnedToCoreWithCaps(historyTaskFn, "HistServe", kHistoryStack, this, 1, &handle, 0,
+                                            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
         }
-    });
-    server.on("/api/history/recent.bin", HTTP_GET, [this](AsyncWebServerRequest *request) {
-        // The most recent non-deleted shots, newest first, as a regular shot
-        // index (SIDX header + entries) — same binary format as index.bin,
-        // just truncated, so clients reuse the index.bin parser.
-        constexpr long MAX_RECENT_LIMIT = 50;
-        long limit = 8;
-        if (request->hasArg("limit")) {
-            limit = constrain(request->arg("limit").toInt(), 1L, MAX_RECENT_LIMIT);
+        if (handle == nullptr) {
+            xTaskCreatePinnedToCore(historyTaskFn, "HistServe", kHistoryStack, this, 1, &handle, 0);
         }
-
-        auto *entries = static_cast<ShotIndexEntry *>(ps_malloc(limit * sizeof(ShotIndexEntry)));
-        if (entries == nullptr) {
-            request->send(500, "text/plain", "Out of memory");
-            return;
+        if (handle == nullptr) {
+            ESP_LOGE("WebUIPlugin", "history worker not created; /api/history/* will answer 503");
         }
-        size_t count = ShotHistory.readRecentEntries(entries, limit);
-
-        ShotIndexHeader header{};
-        header.magic = SHOT_INDEX_MAGIC;
-        header.version = SHOT_INDEX_VERSION;
-        header.entrySize = SHOT_INDEX_ENTRY_SIZE;
-        header.entryCount = count;
-        header.nextId = 0; // meaningless for a partial view
-
-        AsyncResponseStream *response = request->beginResponseStream("application/octet-stream");
-        response->addHeader("Cache-Control", "no-store");
-        response->write(reinterpret_cast<const uint8_t *>(&header), sizeof(header));
-        response->write(reinterpret_cast<const uint8_t *>(entries), count * sizeof(ShotIndexEntry));
-        free(entries);
-        request->send(response);
-    });
+    }
+#endif
     server.on("/api/core-dump", HTTP_GET, [this](AsyncWebServerRequest *request) { handleCoreDumpDownload(request); });
     // The web UI is embedded in firmware flash and served from the memory-mapped blob (see serveWebAsset). It is no
     // longer in LittleFS, so OTA never touches the partition holding profiles/shots. The catch-all onNotFound handles
