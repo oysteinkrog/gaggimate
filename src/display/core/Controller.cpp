@@ -947,12 +947,11 @@ void Controller::loop() {
                                  "busy_max=%u gap_max=%u busy_hi=%u gap_hi=%u busy_top=%u gap_top=%u "
                                  "catchups=%u catchup_bufs=%u catchup_max=%u",
                                  static_cast<unsigned long long>(esp_timer_get_time()), frames, slips,
-                                 static_cast<unsigned>(gm_rgb_resync_count),
-                                 static_cast<unsigned>(gm_rgb_busy_max), static_cast<unsigned>(gm_rgb_gap_max),
-                                 static_cast<unsigned>(busyHi), static_cast<unsigned>(gapHi),
-                                 static_cast<unsigned>(gm_rgb_busy_hist[23]), static_cast<unsigned>(gm_rgb_gap_hist[23]),
-                                 static_cast<unsigned>(gm_rgb_catchup_count), static_cast<unsigned>(gm_rgb_catchup_bufs),
-                                 static_cast<unsigned>(gm_rgb_catchup_max));
+                                 static_cast<unsigned>(gm_rgb_resync_count), static_cast<unsigned>(gm_rgb_busy_max),
+                                 static_cast<unsigned>(gm_rgb_gap_max), static_cast<unsigned>(busyHi),
+                                 static_cast<unsigned>(gapHi), static_cast<unsigned>(gm_rgb_busy_hist[23]),
+                                 static_cast<unsigned>(gm_rgb_gap_hist[23]), static_cast<unsigned>(gm_rgb_catchup_count),
+                                 static_cast<unsigned>(gm_rgb_catchup_bufs), static_cast<unsigned>(gm_rgb_catchup_max));
                         // The slip log carries per-event phase against each
                         // instrumented activity; print entries not yet shown so
                         // attribution works when HTTP cannot.

@@ -381,11 +381,11 @@ void WebUIPlugin::setupDebugEndpoints() {
                          "\"dma_catchup_max\":%u,\"eof_expect\":%u,\"eof_min\":%u,\"eof_max\":%u,\"log\":[",
                          static_cast<unsigned>(gm_rgb_resync_count), static_cast<unsigned>(gm_rgb_resync_bufs),
                          static_cast<unsigned>(gm_rgb_resync_max), static_cast<unsigned>(gm_rgb_over_count),
-                         static_cast<unsigned>(gm_rgb_over_bufs),
-                         static_cast<unsigned>(gm_rgb_flash_skip_bufs), static_cast<unsigned>(gm_rgb_restart_count),
-                         static_cast<unsigned>(gm_rgb_catchup_count), static_cast<unsigned>(gm_rgb_catchup_bufs),
-                         static_cast<unsigned>(gm_rgb_catchup_max), static_cast<unsigned>(gm_rgb_eof_expect),
-                         static_cast<unsigned>(gm_rgb_eof_min), static_cast<unsigned>(gm_rgb_eof_max));
+                         static_cast<unsigned>(gm_rgb_over_bufs), static_cast<unsigned>(gm_rgb_flash_skip_bufs),
+                         static_cast<unsigned>(gm_rgb_restart_count), static_cast<unsigned>(gm_rgb_catchup_count),
+                         static_cast<unsigned>(gm_rgb_catchup_bufs), static_cast<unsigned>(gm_rgb_catchup_max),
+                         static_cast<unsigned>(gm_rgb_eof_expect), static_cast<unsigned>(gm_rgb_eof_min),
+                         static_cast<unsigned>(gm_rgb_eof_max));
         for (size_t i = 0; i < n; i++) {
             response->printf("%s{\"frame\":%u,\"t_us\":%u,\"margin_us\":%u,\"overlay_us\":%u,\"flash_us\":%u,\"band_us\":%u,"
                              "\"present_us\":%u}",
