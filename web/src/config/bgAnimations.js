@@ -164,6 +164,17 @@ export const BG_ANIMATIONS = [
       { key: 'contrast', label: 'Contrast', def: 30 },
     ],
   },
+  {
+    id: 'horizon',
+    name: 'Quiet Horizon',
+    description: 'One gently curved horizon between two broad theme tones, rising and falling slowly.',
+    params: [
+      { key: 'speed', label: 'Speed', def: 10 },
+      { key: 'height', label: 'Height', def: 45 },
+      { key: 'curvature', label: 'Curvature', def: 35 },
+      { key: 'softness', label: 'Softness', def: 60 },
+    ],
+  },
 ];
 
 // Shared color themes — MUST mirror BgAnimThemes.cpp (append only, the theme
