@@ -241,6 +241,17 @@ export const BG_ANIMATIONS = [
       { key: 'shading', label: 'Surface shading', def: 30 },
     ],
   },
+  {
+    id: 'crescent',
+    name: 'Matte Crescent',
+    description: 'A pale crescent on a dark face, turning slowly and swelling and thinning as it turns.',
+    params: [
+      { key: 'speed', label: 'Speed', def: 15 },
+      { key: 'size', label: 'Size', def: 70 },
+      { key: 'phase', label: 'Phase range', def: 40 },
+      { key: 'contrast', label: 'Contrast', def: 40 },
+    ],
+  },
 ];
 
 // Shared color themes — MUST mirror BgAnimThemes.cpp (append only, the theme
