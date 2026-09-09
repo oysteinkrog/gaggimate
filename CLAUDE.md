@@ -1082,26 +1082,27 @@ Debugging methodology that this codebase has already paid for:
 
 ## Open cleanups
 
-- The PHY PLL-track deferral (`scripts/patch_phy_track_defer.py`,
-  PanelClock.cpp) predates the core-1 interrupt fix and the revert test
-  says it is vestigial now (2026-09-09, bench board, loadtest build, WiFi
-  and the BLE controller link up, standby screen with the animation on).
-  `/api/debug/scanout?phydefer=0|1` switches the deferral at run time (0 is
-  the stock inline tick, not stored; `phy_defer_on` reports it and
-  `phy_defer` keeps counting only while it is on), and the A/B toggled it
+- The PHY PLL-track deferral is gone (gm-bzu.24, removed 2026-09-09,
+  kept on branch `keep/phy-track-defer` at 48dcf8a6). It was a framework
+  patch (`patch_phy_track_defer.py`) plus a task and a VSYNC release in
+  PanelClock.cpp that ran the RF PHY's once-a-second PLL-track tick in
+  vertical blanking, written when the panel's interrupts shared core 0
+  with the radio and the tick's flash fetches displaced one band a second.
+  The revert test (bench board, loadtest build, WiFi and the BLE controller
+  link up, standby screen with the animation on) toggled it at run time
   within one boot, four phases each: at the stored divider 8, 5 minute
   phases, 0 resyncs and 0 slips in every phase, catchups 0.03 to 0.05 a
-  second either way, busy_max 61 to 72 us; at divider 6 (set live through
-  `/api/debug/pclk`, the production clock, 50.67 frames a second), 4
-  minute phases, again 0 resyncs and 0 slips in every phase, catchups 0.2
-  a second either way with depth max 2 of 8, busy_max 72 to 79 us. The
-  fault the patch was written for was one displaced band a second, so
-  four minutes at zero is a clean result. Removing the patch is gm-bzu.24:
-  it takes the framework patch, the deferral task and the VSYNC release
-  with it, and the BLE scan backoff and the 5 s PLL-track period stay
-  regardless (less coex churn for free). `tools/phydefer_ab.py` is the
-  A/B (a serial capture with host timestamps plus the HTTP counters, and
-  the two channels agreed).
+  second either way; at divider 6 (set live, the production clock), 4
+  minute phases, again 0 and 0, catchups 0.2 a second either way with
+  depth max 2 of 8. With the panel's interrupts on core 1 the tick fits.
+  The build without it soaked 10 minutes at divider 6 (`tools/rig_soak.py`,
+  585 s settled): 0 resyncs, 0 slips, catchups 0.6 a second at depth max
+  2 of 8, busy_max 83 us.
+  `GM_SCANOUT` and `/api/debug/scanout` no longer carry `phy_defer`, the
+  slip log no longer carries `phy_us`, and `tools/rig_soak.py` parses the
+  shorter line. The BLE scan backoff and the 5 s PLL-track period stay
+  (less coex churn for free). The A/B script `tools/phydefer_ab.py` lives
+  on the branch with the code it drives.
 - `tools/animbench/OPTIMIZE.md`: do NOT modify golden/, BASELINE.md, or bench
   sources.
 - The DMA footprint of a live BLE controller link is unmeasured; the rig's

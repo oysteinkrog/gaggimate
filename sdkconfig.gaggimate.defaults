@@ -407,10 +407,12 @@ CONFIG_LCD_RGB_ISR_IRAM_SAFE=y
 # --- RF PLL temperature tracking at 5 s instead of 1 s ---
 # Every PLL-track tick is followed ~100-180 ms later by radio-side work that
 # stalls the scan-out refill for ~770 us, just over the bounce pool's 672 us
-# of slack, displacing a band of the picture. The tick body itself already
-# runs in the vertical blanking window (scripts/patch_phy_track_defer.py +
-# PanelClock.cpp), but that follow-on work fires on the radio's own schedule
-# and cannot be deferred from here, so the remaining lever is the tick rate.
+# of slack, displacing a band of the picture. The tick body itself used to be
+# deferred into the vertical blanking window (branch keep/phy-track-defer;
+# removed 2026-09-09 after an A/B found no difference with the panel's
+# interrupts on core 1), but that follow-on work fires on the radio's own
+# schedule and cannot be deferred from here, so the remaining lever is the
+# tick rate.
 # Slips in /api/debug/scanout's log sat phase-locked 5-8 frames after each
 # tick (phy_us 115/138/161/184 ms at 23.04 ms per frame) with flash and
 # overlay acquitted, so the rate should scale down with the period.

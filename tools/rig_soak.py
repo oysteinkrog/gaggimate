@@ -45,7 +45,7 @@ WIN_PY = os.environ.get(
 PORT = os.environ.get("GM_RIG_PORT", "COM3")
 
 SCANOUT = re.compile(
-    r"GM_SCANOUT: t_us=(\d+) frames=(\d+) slips=(\d+) resyncs=(\d+) phy_defer=(\d+) "
+    r"GM_SCANOUT: t_us=(\d+) frames=(\d+) slips=(\d+) resyncs=(\d+) "
     r"busy_max=(\d+) gap_max=(\d+) busy_hi=(\d+) gap_hi=(\d+) busy_top=(\d+) gap_top=(\d+) "
     r"catchups=(\d+) catchup_bufs=(\d+) catchup_max=(\d+)"
 )
@@ -105,9 +105,8 @@ def analyze(path):
     print(f"window t={a[0] / 1e6:.0f}..{b[0] / 1e6:.0f}s ({el:.0f}s), boot churn excluded")
     print(f"frames    {rate(1):8.2f}/s   (43.4 = pclk div 7, 50.7 = div 6)")
     print(f"resyncs   {rate(3):8.4f}/s   total this boot: {b[3]}  <- the visible-band counter")
-    print(f"catchups  {rate(11):8.3f}/s   depth max {b[13]} of 8  <- absorbed latency events")
-    print(f"slips     {b[2] - a[2]:8d}     busy_max={b[5]}us gap_max={b[6]}us")
-    print(f"phy_defer {rate(4):8.3f}/s")
+    print(f"catchups  {rate(10):8.3f}/s   depth max {b[12]} of 8  <- absorbed latency events")
+    print(f"slips     {b[2] - a[2]:8d}     busy_max={b[4]}us gap_max={b[5]}us")
     if slips:
         print(f"\n{len(slips)} GM_SLIP attribution line(s):")
         for s in slips[-10:]:
