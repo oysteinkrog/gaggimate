@@ -98,6 +98,11 @@ summary; the KB carries the sources and the measurements behind it.
   `/api/debug/heap` is the PSRAM low-water mark since boot, and after the
   device runner, three cold web loads and a screen cycle it read 4.47 MB
   against 4.63 to 4.70 MB idle, so peak use above idle is about 230 KB.
+  After QIO and the history worker the rest of the pipeline measured the
+  same (2026-09-09, bench board, whole-frame path): `tools/churn_sweep.py`
+  0.00 refreshes a second on every screen but standby at 0.13, and
+  `tools/touch_lat.py` on the brew screen's icon press to the first frame
+  carrying the plate median 56 ms, p90 68.
 - **A directory on the SD card is listed with `opendir`/`readdir`, never
   with `File::openNextFile()` on the boot path** (`saferep::recoverReplace`,
   2026-09-08). `openNextFile()` opens every entry it returns, and on FAT
