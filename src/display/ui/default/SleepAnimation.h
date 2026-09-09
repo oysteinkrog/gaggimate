@@ -854,14 +854,15 @@ class SleepAnimation {
         return r;
     }
 
-#ifdef GM_KBLOB
-    // ---- hot-loaded kernel blob (bganim/KBlob.h, tools/kblob) -------------
-    // The blob is addressed as one more animation slot: renderFrame() and the
-    // benches resolve slots through animBySlot(), and the resident/initialised
+    // The hot-loaded kernel blob (GM_KBLOB, bganim/KBlob.h, tools/kblob) is
+    // addressed as one more animation slot: renderFrame() and the benches
+    // resolve slots through animBySlot(), and the resident/initialised
     // bookkeeping treats KBLOB_SLOT like any registry id, so switching to or
     // away from the blob releases and re-inits tables the same way switching
-    // animations does.
+    // animations does. Outside GM_KBLOB no slot ever carries it.
     static constexpr int KBLOB_SLOT = 1000;
+#ifdef GM_KBLOB
+    // ---- hot-loaded kernel blob (bganim/KBlob.h, tools/kblob) -------------
     // Routes the live render loop into the blob's descriptor (when one is
     // installed) instead of the stored animation: the production-conditions
     // A/B and the visual check for a kernel that has not been flashed.
@@ -1155,6 +1156,31 @@ class SleepAnimation {
     std::atomic<uint32_t> animTestSeq{0};
     AnimTestResult animTest;
     void runAnimTest();
+
+    // ---- Hooks for the bench and probe builds (SleepAnimationProbe.h) -----
+    // The render path calls these where a build flag used to open a block.
+    // Outside its flag each one is an empty inline, so a production build
+    // carries no call and no branch for it (checked against a baseline ELF
+    // with tools/elf_func_diff.py); inside the flag its own translation unit
+    // defines it. A hook that runs per band or per row stays a macro or an
+    // inline in that header, never an out-of-line call.
+    void probeFrameBoundary();                        // GM_KBLOB: detach handshake, kbench
+    void probeResidentSet(int id);                    // GM_KBLOB: mirrors residency for the loader
+    bool probeBlobActive() const;                     // GM_KBLOB: the render loop dispatches into the blob
+    const BgAnimation *probeBlobAnim(int slot) const; // GM_KBLOB: the blob's descriptor for KBLOB_SLOT
+    bool probeReleaseBlobResident();                  // GM_KBLOB: true when it released the blob's tables
+    void probeFrameSampled(int ofi);                  // GM_TOUCH_PROBE: the publish edge this frame carries
+    void probeFramePresented();                       // GM_TOUCH_PROBE: GM_TOUCHLAT lines after the present
+    void probeElemEdgeClose(bool vis);                // GM_TOUCH_PROBE: the plate write edge closes this frame
+    void probeElemShown(int slot, int64_t sinceUs);   // GM_TOUCH_PROBE: GM_ELEM line on an element's first frame
+    int probeLevel();                                 // GM_BLEND_PROBE: the level, 0 elsewhere
+    uint32_t probeBlendRow(uint16_t *drow, const uint16_t *ccol, const uint16_t *ca16, const uint32_t *runs, int nRuns, int level,
+                           int w, bool pie);          // GM_BLEND_PROBE: levels 1 to 9 over one row
+    void probeReset();                                // GM_BLEND_PROBE: frees the captured row
+    bool benchFillBand(uint16_t *band, int y0, int rows, int w, int h); // GM_ANIM_BENCH: flash and pattern fills
+    void benchFrameBegin(int h);                      // GM_ANIM_BENCH: rotates the locked band
+    void benchFrameDone(int64_t frameStart);          // GM_ANIM_BENCH: frame accounting and the dwell
+    bool benchLockThisBand(int y0) const;             // GM_ANIM_BENCH: render this band with the scheduler off
 #ifdef GM_KBLOB
     std::atomic<bool> useBlob{false};
     std::atomic<bool> blobInstalling{false};
@@ -1603,9 +1629,6 @@ class SleepAnimation {
     uint32_t probePx = 0;
     int probeCaptureBands = 0;
     volatile uint32_t probeSink = 0;
-    uint32_t probeBlendRow(uint16_t *drow, const uint16_t *ccol, const uint16_t *ca16, const uint32_t *runs, int nRuns, int level,
-                           int w, bool pie);
-    void probeReset();
 #endif
     std::atomic<uint32_t> probePxOut{0};
     std::atomic<int> probeReps{1};
@@ -1802,6 +1825,8 @@ class SleepAnimation {
 
     void benchTick();        // called once per frame from renderLoop
     void benchFinishDwell(); // records the current animation and advances
+    void benchBandDone(int rows, bool locked, int64_t tBand); // per band, after the animation's rows
+    bool benchFillBandDiag(uint16_t *band, int y0, int rows, int w, int h); // the flash and pattern fills, mode on
 #endif
 };
 
