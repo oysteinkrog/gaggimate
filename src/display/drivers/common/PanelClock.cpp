@@ -130,6 +130,7 @@ TaskHandle_t g_phyTrackTask = nullptr;
 volatile bool g_phyTrackPending = false;
 volatile uint32_t g_phyTrackHeartbeatUs = 0;
 volatile uint32_t g_phyTrackDeferred = 0; // ticks run in the blanking window
+volatile bool g_phyTrackDeferOn = true;   // the runtime switch (setPhyTrackDefer)
 constexpr uint32_t PHY_TRACK_HEARTBEAT_STALE_US = 100000;
 
 extern "C" void gm_phy_track_pll_run(void);
@@ -151,7 +152,7 @@ extern "C" bool gm_phy_track_defer(void) {
     // Runs on the esp_timer task, once a second. Volatile reads only; the
     // pending flag is consumed in the VSYNC ISR.
     const uint32_t now = static_cast<uint32_t>(esp_timer_get_time());
-    if (g_phyTrackTask == nullptr || now - g_phyTrackHeartbeatUs > PHY_TRACK_HEARTBEAT_STALE_US) {
+    if (!g_phyTrackDeferOn || g_phyTrackTask == nullptr || now - g_phyTrackHeartbeatUs > PHY_TRACK_HEARTBEAT_STALE_US) {
         // A tick deferred just before the panel stopped has no VSYNC left to
         // release it. Drop it here rather than let it replay out of cadence
         // when the panel comes back; the inline run below covers this period.
@@ -165,6 +166,8 @@ extern "C" bool gm_phy_track_defer(void) {
 namespace panelclock {
 
 uint32_t phyTrackDeferred() { return g_phyTrackDeferred; }
+void setPhyTrackDefer(bool on) { g_phyTrackDeferOn = on; }
+bool phyTrackDefer() { return g_phyTrackDeferOn; }
 
 namespace {
 

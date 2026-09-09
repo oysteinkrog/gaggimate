@@ -109,6 +109,12 @@ void scanoutStats(uint32_t *frames, uint32_t *refills, uint32_t *slips);
 // timer's own moment (see PanelClock.cpp). Zero on a live radio means the
 // deferral is not engaging and the once-a-second displaced band is back.
 uint32_t phyTrackDeferred();
+// Runtime switch for the deferral, for A/B soaks that compare the stock
+// inline tick against the deferred one within a single boot
+// (`/api/debug/scanout?phydefer=0|1`). Off means gm_phy_track_defer returns
+// false and the PHY timer runs its tick inline, as an unpatched build would.
+void setPhyTrackDefer(bool on);
+bool phyTrackDefer();
 
 // Refill headroom, which is the measurement `slips` cannot make.
 //
