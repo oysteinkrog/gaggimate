@@ -247,6 +247,17 @@ AsyncWebServerResponse *AsyncWebServerRequest::beginResponse(const String &conte
     }
     return r;
 }
+AsyncWebServerResponse *AsyncWebServerRequest::beginResponse(File content, const String &path, const char *contentType) {
+    (void)path;
+    auto *r = new AsyncWebServerResponse();
+    r->_contentType = contentType;
+    uint8_t chunk[4096];
+    size_t n;
+    while ((n = content.read(chunk, sizeof(chunk))) > 0)
+        r->_body.append((const char *)chunk, n);
+    content.close();
+    return r;
+}
 AsyncResponseStream *AsyncWebServerRequest::beginResponseStream(const String &contentType) {
     auto *r = new AsyncResponseStream();
     r->_contentType = contentType;
@@ -571,6 +582,12 @@ void AsyncWebServer::dispatch(Conn &c, const std::shared_ptr<AsyncWebServerReque
     for (auto &r : _routes) {
         if ((r.method == HTTP_ANY || (r.method & req->_method)) && r.uri == path) {
             r.handler(req.get());
+            return;
+        }
+    }
+    for (auto *h : _handlers) {
+        if (h->canHandle(req.get())) {
+            h->handleRequest(req.get());
             return;
         }
     }

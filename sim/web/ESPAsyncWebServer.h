@@ -91,6 +91,8 @@ class AsyncWebServerRequest : public std::enable_shared_from_this<AsyncWebServer
     AsyncWebServerResponse *beginResponse(int code, const String &contentType, const uint8_t *content, size_t len);
     AsyncWebServerResponse *beginResponse(const String &contentType, size_t len, AwsResponseFiller callback);
     AsyncResponseStream *beginResponseStream(const String &contentType);
+    // Reads the whole file into the response body (the sim has no streaming).
+    AsyncWebServerResponse *beginResponse(File content, const String &path, const char *contentType);
 
     void send(AsyncWebServerResponse *response);
     void send(int code, const String &contentType = "text/plain", const String &body = String());
@@ -176,6 +178,15 @@ class AsyncWebSocket {
     String _url;
 };
 
+// Custom handler base, as in the real library: the server asks canHandle()
+// for every request no route matched, and the first taker handles it.
+class AsyncWebHandler {
+  public:
+    virtual ~AsyncWebHandler() = default;
+    virtual bool canHandle(AsyncWebServerRequest *) const { return false; }
+    virtual void handleRequest(AsyncWebServerRequest *) {}
+};
+
 // Returned by serveStatic(); only setCacheControl() is used.
 class AsyncStaticWebHandler {
   public:
@@ -193,6 +204,7 @@ class AsyncWebServer {
     }
     void onNotFound(ArRequestHandlerFunction handler) { _notFound = std::move(handler); }
     void addHandler(AsyncWebSocket *ws) { _ws = ws; }
+    void addHandler(AsyncWebHandler *handler) { _handlers.push_back(handler); }
     AsyncStaticWebHandler &serveStatic(const char *uri, FS &fs, const char *path);
 
     void begin();
@@ -217,6 +229,7 @@ class AsyncWebServer {
     std::vector<Route> _routes;
     std::vector<StaticRoute> _static;
     std::vector<AsyncStaticWebHandler> _staticHandlers;
+    std::vector<AsyncWebHandler *> _handlers;
     ArRequestHandlerFunction _notFound;
     AsyncWebSocket *_ws = nullptr;
 

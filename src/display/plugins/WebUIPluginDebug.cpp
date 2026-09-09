@@ -266,13 +266,15 @@ void WebUIPlugin::setupDebugEndpoints() {
         // the fault is far too rare to catch by looking at it.
         uint32_t scFrames = 0, scRefills = 0, scSlips = 0;
         panelclock::scanoutStats(&scFrames, &scRefills, &scSlips);
-        char buf[512];
+        char buf[640];
         snprintf(buf, sizeof(buf),
-                 "{\"int_free\":%u,\"int_largest\":%u,\"int_min\":%u,\"psram_free\":%u,\"psram_largest\":%u,"
+                 "{\"int_free\":%u,\"int_largest\":%u,\"int_min\":%u,\"psram_free\":%u,\"psram_largest\":%u,\"psram_min\":%u,"
                  "\"anim_sram\":%u,\"anim_psram\":%u,\"hot_used\":%u,\"hot_shared\":%u,\"hot_peak\":%u,\"hot_fail\":%u,\"hot_"
                  "slab\":%u,"
                  "\"sc_frames\":%u,\"sc_refills\":%u,\"sc_slips\":%u,"
-                 "\"dma_free\":%u,\"dma_min\":%u,\"asset_streams\":%u,\"asset_queue\":%u,\"uptime_ms\":%lu}",
+                 "\"dma_free\":%u,\"dma_min\":%u,\"asset_streams\":%u,\"asset_queue\":%u,"
+                 "\"hist_served\":%u,\"hist_dropped\":%u,\"hist_queue_max\":%u,\"hist_open_us_max\":%u,"
+                 "\"uptime_ms\":%lu}",
                  // heap_caps_get_largest_free_block walks every block in the heap,
                  // which costs about 1.3 ms across both regions and starves the
                  // RGB panel's bounce refill for the duration -- one displaced
@@ -285,13 +287,18 @@ void WebUIPlugin::setupDebugEndpoints() {
                  static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL)),
                  static_cast<unsigned>(heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL)),
                  static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_SPIRAM)),
-                 static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM)), static_cast<unsigned>(animSram),
+                 static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM)),
+                 // psram_min is the PSRAM low-water mark since boot: the number a
+                 // proposal that spends PSRAM (gm-2cl.20, code fetched from PSRAM)
+                 // is measured against.
+                 static_cast<unsigned>(heap_caps_get_minimum_free_size(MALLOC_CAP_SPIRAM)), static_cast<unsigned>(animSram),
                  static_cast<unsigned>(animPsram), static_cast<unsigned>(hotUsed), static_cast<unsigned>(hotShared),
                  static_cast<unsigned>(hotPeak), static_cast<unsigned>(hotFail), static_cast<unsigned>(hotSlab),
                  static_cast<unsigned>(scFrames), static_cast<unsigned>(scRefills), static_cast<unsigned>(scSlips),
                  static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_DMA)),
                  static_cast<unsigned>(heap_caps_get_minimum_free_size(MALLOC_CAP_DMA)), static_cast<unsigned>(assetStreams),
-                 static_cast<unsigned>(assetQueue.size()), static_cast<unsigned long>(millis()));
+                 static_cast<unsigned>(assetQueue.size()), static_cast<unsigned>(histServed), static_cast<unsigned>(histDropped),
+                 static_cast<unsigned>(histQueueMax), static_cast<unsigned>(histOpenUsMax), static_cast<unsigned long>(millis()));
         request->send(200, "application/json", buf);
     });
     // Which slips happened, and how long before each one the suspects last ran.
