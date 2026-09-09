@@ -503,16 +503,19 @@ void SettingsUI::buildCategoryPage(PageEntry &entry) {
 
     // Header: previous-page arrow, title+indicator column, next-page arrow,
     // all centred on one row so the arrows' 56x56 hit pad never has to
-    // compete with a stacked title band for the ~68 px available between the
-    // status icons and the row block (hand-verified against the 12 px edge
-    // rule and the row block's own chevron clearance; see the epic's shared
-    // contract). The pages sit side by side in the reader's mind, so the
-    // arrows point left and right (owner's request, 2026-09-09; they were
-    // up and down chevrons before) and a horizontal swipe on the page does
-    // the same, see the GESTURE handler on the root below.
+    // compete with a stacked title band for the ~68 px available between
+    // the status icons and the row block. 240 px wide: the arrows' hit
+    // boxes then span x 82..138 at y -188..-132, and the far corner sits
+    // 227.4 px from the centre, inside the 228 px edge rule; the title gets
+    // the 144 px between them on one line ("Animation" in montserrat 24 is
+    // about 125 px; the old 96 px column broke it as "Animatio" / "n").
+    // The pages sit side by side in the reader's mind, so the arrows point
+    // left and right (owner's request, 2026-09-09; they were up and down
+    // chevrons before) and a horizontal swipe on the page does the same,
+    // see the GESTURE handler on the root above.
     lv_obj_t *header = lv_obj_create(root);
     lv_obj_remove_style_all(header);
-    lv_obj_set_size(header, 200, 56);
+    lv_obj_set_size(header, 240, 56);
     lv_obj_align(header, LV_ALIGN_CENTER, 0, -160);
     lv_obj_clear_flag(header, LV_OBJ_FLAG_SCROLLABLE);
     // Every container between a clickable and the cover must bubble, or the
@@ -528,7 +531,7 @@ void SettingsUI::buildCategoryPage(PageEntry &entry) {
     lv_obj_set_style_bg_opa(header, LV_OPA_TRANSP, LV_PART_MAIN);
     lv_obj_set_flex_flow(header, LV_FLEX_FLOW_ROW);
     lv_obj_set_flex_align(header, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    lv_obj_set_style_pad_column(header, 12, LV_PART_MAIN);
+    lv_obj_set_style_pad_column(header, 8, LV_PART_MAIN);
 
     lv_obj_t *upArrow = lv_img_create(header);
     lv_img_set_src(upArrow, &img_angle_left_40x40);
@@ -552,7 +555,7 @@ void SettingsUI::buildCategoryPage(PageEntry &entry) {
 
     lv_obj_t *mid = lv_obj_create(header);
     lv_obj_remove_style_all(mid);
-    lv_obj_set_size(mid, 96, LV_SIZE_CONTENT);
+    lv_obj_set_size(mid, 144, LV_SIZE_CONTENT);
     lv_obj_clear_flag(mid, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_set_style_bg_opa(mid, LV_OPA_TRANSP, LV_PART_MAIN);
     lv_obj_set_flex_flow(mid, LV_FLEX_FLOW_COLUMN);
@@ -560,7 +563,9 @@ void SettingsUI::buildCategoryPage(PageEntry &entry) {
 
     lv_obj_t *title = lv_label_create(mid);
     lv_label_set_text(title, entry.def->title);
-    lv_obj_set_width(title, 96);
+    // One line: LONG_DOT only truncates once the height is fixed too, and
+    // with LV_SIZE_CONTENT height it wrapped the text instead.
+    lv_obj_set_size(title, 144, lv_font_get_line_height(&lv_font_montserrat_24));
     lv_label_set_long_mode(title, LV_LABEL_LONG_DOT);
     lv_obj_set_style_text_align(title, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
     lv_obj_set_style_text_font(title, &lv_font_montserrat_24, LV_PART_MAIN);

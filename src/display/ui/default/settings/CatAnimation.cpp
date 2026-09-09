@@ -1,6 +1,7 @@
 // Animation category: background animation, frame rate, all-screens, the UI
-// theme, the current animation's gradient, plate handling, element tint and
-// the text scrim. Every row is live (SettingsUI.h): a row writes Settings
+// theme, the current animation's gradient, plate handling, element tint, the
+// text scrim, the screen fade (out, in, curve) and interlacing. Every row is
+// live (SettingsUI.h): a row writes Settings
 // and calls markDirty() the moment it changes, rather than waiting for
 // commit, so DefaultUI::updateState applies it on the next rerender pass
 // (CLAUDE.md, UI-pipeline invariants). commit()'s only remaining job is the
@@ -73,6 +74,7 @@ const settingsui::ThemeNameProvider kThemeProvider{themeCountFn, themeNameFn};
 
 constexpr int kThemeModeCount = sizeof(settingsui::kThemeModeLabels) / sizeof(settingsui::kThemeModeLabels[0]);
 constexpr int kPlatesCount = sizeof(settingsui::kPlatesLabels) / sizeof(settingsui::kPlatesLabels[0]);
+constexpr int kFadeCurveCount = sizeof(settingsui::kFadeCurveLabels) / sizeof(settingsui::kFadeCurveLabels[0]);
 
 std::vector<settingsui::GradientChoice> currentGradientChoices() {
     return settingsui::gradientChoices(kThemeProvider, std::string(controller.getSettings().getBgAnimGradients().c_str()));
@@ -157,6 +159,11 @@ struct CatAnimationCtx {
 
     long scrim = 0;
 
+    long fadeOut = 120; // ms, kBgFadeSpec grid
+    long fadeIn = 120;
+    int fadeCurve = 0; // 0 Linear, 1 Smooth
+    bool interlace = false;
+
     bool animIdTouched = false;
     bool fpsTouched = false;
     bool allScreensTouched = false;
@@ -167,6 +174,10 @@ struct CatAnimationCtx {
     bool tintEnabledTouched = false;
     bool tintColorTouched = false;
     bool scrimTouched = false;
+    bool fadeOutTouched = false;
+    bool fadeInTouched = false;
+    bool fadeCurveTouched = false;
+    bool interlaceTouched = false;
 
     lv_obj_t *animRow = nullptr;
     lv_obj_t *frameRateRow = nullptr;
@@ -177,10 +188,13 @@ struct CatAnimationCtx {
     lv_obj_t *plateOpacityRow = nullptr;
     lv_obj_t *tintColorRow = nullptr;
     lv_obj_t *scrimRow = nullptr;
+    lv_obj_t *fadeOutRow = nullptr;
+    lv_obj_t *fadeInRow = nullptr;
+    lv_obj_t *fadeCurveRow = nullptr;
 
     // Cached from the first buildRow call (enter/commit/reconcile receive
     // only ctx, never SettingsUI&; see CatTemps.cpp's identical comment).
-    // All eleven rows here are live, unlike Temps, so this is also how every
+    // All fifteen rows here are live, unlike Temps, so this is also how every
     // onChange callback reaches markDirty()/plugins().trigger(), not just
     // commit(). Every row on the current page runs buildRow before any of
     // these other callbacks can fire (enter -> rebuildPage -> buildRow,
@@ -390,9 +404,61 @@ void scrimOnStep(void *user, int dir, bool fast) {
     }
 }
 
+// ---- Fade out / Fade in / Fade curve ----------------------------------------
+//
+// The next screen change uses the new value: DefaultUI reads the settings
+// when it starts a transition, so there is nothing to apply here beyond the
+// write. The page arrows on this very page are a screen change too, so the
+// fade can be tried without leaving the category.
+
+void fadeOutOnStep(void *user, int dir, bool fast) {
+    auto *ctx = static_cast<CatAnimationCtx *>(user);
+    ctx->fadeOut = settingsui::stepValue(ctx->fadeOut, dir, fast, settingsui::kBgFadeSpec);
+    ctx->fadeOutTouched = true;
+    controller.getSettings().setBgFadeOutMs(static_cast<int>(ctx->fadeOut));
+    if (ctx->fadeOutRow != nullptr) {
+        settingsRowSetValue(ctx->fadeOutRow, settingsui::formatNumeric(ctx->fadeOut, settingsui::kBgFadeSpec).c_str());
+    }
+}
+
+void fadeInOnStep(void *user, int dir, bool fast) {
+    auto *ctx = static_cast<CatAnimationCtx *>(user);
+    ctx->fadeIn = settingsui::stepValue(ctx->fadeIn, dir, fast, settingsui::kBgFadeSpec);
+    ctx->fadeInTouched = true;
+    controller.getSettings().setBgFadeInMs(static_cast<int>(ctx->fadeIn));
+    if (ctx->fadeInRow != nullptr) {
+        settingsRowSetValue(ctx->fadeInRow, settingsui::formatNumeric(ctx->fadeIn, settingsui::kBgFadeSpec).c_str());
+    }
+}
+
+void fadeCurveOnCycle(void *user, int dir) {
+    auto *ctx = static_cast<CatAnimationCtx *>(user);
+    ctx->fadeCurve = settingsui::wrapIndex(ctx->fadeCurve, kFadeCurveCount, dir);
+    ctx->fadeCurveTouched = true;
+    controller.getSettings().setBgFadeCurve(ctx->fadeCurve);
+    if (ctx->fadeCurveRow != nullptr) {
+        settingsRowSetValue(ctx->fadeCurveRow, settingsui::kFadeCurveLabels[ctx->fadeCurve]);
+    }
+    if (ctx->ui != nullptr) {
+        ctx->ui->ui().markDirty(); // updateState hands the curve to the render task
+    }
+}
+
+// ---- Interlace ------------------------------------------------------------------
+
+void interlaceOnToggle(void *user, bool value) {
+    auto *ctx = static_cast<CatAnimationCtx *>(user);
+    ctx->interlace = value;
+    ctx->interlaceTouched = true;
+    controller.getSettings().setBgAnimInterlace(value ? 1 : 0);
+    if (ctx->ui != nullptr) {
+        ctx->ui->ui().markDirty();
+    }
+}
+
 // ---- shell plumbing ---------------------------------------------------------
 
-int animRowCount(void * /*ctx*/) { return 11; }
+int animRowCount(void * /*ctx*/) { return 15; }
 
 void animBuildRow(void *ctx0, int index, lv_obj_t *parent, SettingsUI &ui) {
     auto *ctx = static_cast<CatAnimationCtx *>(ctx0);
@@ -496,6 +562,37 @@ void animBuildRow(void *ctx0, int index, lv_obj_t *parent, SettingsUI &ui) {
         settingsRowSetValue(row, settingsui::formatNumeric(ctx->scrim, settingsui::kBgAnimScrimSpec).c_str());
         break;
     }
+    case 11: { // Fade out
+        lv_obj_t *row = settingsRowStepperCreate(ui, parent, "Fade out", "Fade out", fadeOutOnStep, ctx);
+        ctx->fadeOutRow = row;
+        lv_obj_add_event_cb(
+            row, [](lv_event_t *e) { static_cast<CatAnimationCtx *>(lv_event_get_user_data(e))->fadeOutRow = nullptr; },
+            LV_EVENT_DELETE, ctx);
+        settingsRowSetValue(row, settingsui::formatNumeric(ctx->fadeOut, settingsui::kBgFadeSpec).c_str());
+        break;
+    }
+    case 12: { // Fade in
+        lv_obj_t *row = settingsRowStepperCreate(ui, parent, "Fade in", "Fade in", fadeInOnStep, ctx);
+        ctx->fadeInRow = row;
+        lv_obj_add_event_cb(
+            row, [](lv_event_t *e) { static_cast<CatAnimationCtx *>(lv_event_get_user_data(e))->fadeInRow = nullptr; },
+            LV_EVENT_DELETE, ctx);
+        settingsRowSetValue(row, settingsui::formatNumeric(ctx->fadeIn, settingsui::kBgFadeSpec).c_str());
+        break;
+    }
+    case 13: { // Fade curve
+        lv_obj_t *row = settingsRowChoiceCreate(ui, parent, "Fade curve", "Fade curve", fadeCurveOnCycle, ctx);
+        ctx->fadeCurveRow = row;
+        lv_obj_add_event_cb(
+            row,
+            [](lv_event_t *e) { static_cast<CatAnimationCtx *>(lv_event_get_user_data(e))->fadeCurveRow = nullptr; },
+            LV_EVENT_DELETE, ctx);
+        settingsRowSetValue(row, settingsui::kFadeCurveLabels[ctx->fadeCurve]);
+        break;
+    }
+    case 14: // Interlace
+        settingsRowToggleCreate(ui, parent, "Interlace", "Interlace", ctx->interlace, interlaceOnToggle, ctx);
+        break;
     default:
         break;
     }
@@ -521,6 +618,10 @@ void animEnter(void *ctx0) {
     ctx->tintColorIndex = settingsui::paletteCurrentIndex(ctx->tintColorAnchor);
     ctx->tintColor = ctx->tintColorAnchor;
     ctx->scrim = settings.getBgAnimScrim();
+    ctx->fadeOut = settingsui::clampOrWrap(settings.getBgFadeOutMs(), settingsui::kBgFadeSpec);
+    ctx->fadeIn = settingsui::clampOrWrap(settings.getBgFadeInMs(), settingsui::kBgFadeSpec);
+    ctx->fadeCurve = settings.getBgFadeCurve() != 0 ? 1 : 0;
+    ctx->interlace = settings.getBgAnimInterlace() != 0;
 
     const auto choices = currentGradientChoices();
     ctx->gradientIndex = gradientIndexForAnim(ctx->animId, choices);
@@ -538,6 +639,10 @@ void animEnter(void *ctx0) {
     ctx->tintEnabledTouched = false;
     ctx->tintColorTouched = false;
     ctx->scrimTouched = false;
+    ctx->fadeOutTouched = false;
+    ctx->fadeInTouched = false;
+    ctx->fadeCurveTouched = false;
+    ctx->interlaceTouched = false;
 }
 
 // After a settings:changed event: refreshes only the fields this visit has
@@ -581,6 +686,18 @@ void animReconcile(void *ctx0) {
     }
     if (!ctx->scrimTouched) {
         ctx->scrim = settings.getBgAnimScrim();
+    }
+    if (!ctx->fadeOutTouched) {
+        ctx->fadeOut = settingsui::clampOrWrap(settings.getBgFadeOutMs(), settingsui::kBgFadeSpec);
+    }
+    if (!ctx->fadeInTouched) {
+        ctx->fadeIn = settingsui::clampOrWrap(settings.getBgFadeInMs(), settingsui::kBgFadeSpec);
+    }
+    if (!ctx->fadeCurveTouched) {
+        ctx->fadeCurve = settings.getBgFadeCurve() != 0 ? 1 : 0;
+    }
+    if (!ctx->interlaceTouched) {
+        ctx->interlace = settings.getBgAnimInterlace() != 0;
     }
 
     // Gradient row on screen: shows this visit's touched choice for
@@ -682,6 +799,26 @@ void animCommit(void *ctx0) {
     if (ctx->scrimTouched && settings.getBgAnimScrim() != static_cast<int>(ctx->scrim)) {
         settings.setBgAnimScrim(static_cast<int>(ctx->scrim));
         settingsLogAppend(log, sizeof(log), used, " scrim=%ld", ctx->scrim);
+        wrote = true;
+    }
+    if (ctx->fadeOutTouched && settings.getBgFadeOutMs() != static_cast<int>(ctx->fadeOut)) {
+        settings.setBgFadeOutMs(static_cast<int>(ctx->fadeOut));
+        settingsLogAppend(log, sizeof(log), used, " fadeOut=%ld", ctx->fadeOut);
+        wrote = true;
+    }
+    if (ctx->fadeInTouched && settings.getBgFadeInMs() != static_cast<int>(ctx->fadeIn)) {
+        settings.setBgFadeInMs(static_cast<int>(ctx->fadeIn));
+        settingsLogAppend(log, sizeof(log), used, " fadeIn=%ld", ctx->fadeIn);
+        wrote = true;
+    }
+    if (ctx->fadeCurveTouched && settings.getBgFadeCurve() != ctx->fadeCurve) {
+        settings.setBgFadeCurve(ctx->fadeCurve);
+        settingsLogAppend(log, sizeof(log), used, " fadeCurve=%d", ctx->fadeCurve);
+        wrote = true;
+    }
+    if (ctx->interlaceTouched && (settings.getBgAnimInterlace() != 0) != ctx->interlace) {
+        settings.setBgAnimInterlace(ctx->interlace ? 1 : 0);
+        settingsLogAppend(log, sizeof(log), used, " interlace=%d", ctx->interlace ? 1 : 0);
         wrote = true;
     }
     (void)used;

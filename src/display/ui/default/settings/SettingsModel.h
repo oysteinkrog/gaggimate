@@ -66,6 +66,7 @@ extern const NumericSpec kStandbyTimeoutSpec;            // ms, 0 = never
 extern const NumericSpec kBgAnimFpsSpec;
 extern const NumericSpec kBgAnimPlateOpacitySpec;
 extern const NumericSpec kBgAnimScrimSpec;
+extern const NumericSpec kBgFadeSpec; // screen fade out and in, ms, 0 = cut
 extern const NumericSpec kScheduleHourSpec;
 extern const NumericSpec kScheduleMinuteSpec;
 
@@ -92,6 +93,7 @@ int startupModeValueForIndex(int index);        // 0/1 -> MODE_STANDBY/MODE_BREW
 // Index equals the stored value for both of these; no mapping needed.
 extern const char *const kThemeModeLabels[2]; // {"Dark", "Light"}
 extern const char *const kPlatesLabels[3];    // {"Keep", "Hide", "Custom"}
+extern const char *const kFadeCurveLabels[2]; // {"Linear", "Smooth"}
 
 // ---- animation names (firmware table, provider-supplied) ------------------
 

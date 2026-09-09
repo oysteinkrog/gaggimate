@@ -1307,6 +1307,12 @@ void WebUIPlugin::handleSettings(AsyncWebServerRequest *request) const {
                 settings->setBgAnimHighlightKnee(request->arg("bgAnimHighlightKnee").toInt());
             if (request->hasArg("bgAnimScrim"))
                 settings->setBgAnimScrim(request->arg("bgAnimScrim").toInt());
+            if (request->hasArg("bgFadeOutMs"))
+                settings->setBgFadeOutMs(request->arg("bgFadeOutMs").toInt());
+            if (request->hasArg("bgFadeInMs"))
+                settings->setBgFadeInMs(request->arg("bgFadeInMs").toInt());
+            if (request->hasArg("bgFadeCurve"))
+                settings->setBgFadeCurve(request->arg("bgFadeCurve").toInt());
             if (request->hasArg("panelClockDiv")) {
                 // 0 = firmware default; explicit dividers outside the sane
                 // window (MIN_USER_DIV..12, 6.7-13.3 MHz pclk) could leave the
@@ -1529,6 +1535,9 @@ void WebUIPlugin::handleSettings(AsyncWebServerRequest *request) const {
     doc["bgAnimBrightness"] = settings.getBgAnimBrightness();
     doc["bgAnimHighlightKnee"] = settings.getBgAnimHighlightKnee();
     doc["bgAnimScrim"] = settings.getBgAnimScrim();
+    doc["bgFadeOutMs"] = settings.getBgFadeOutMs();
+    doc["bgFadeInMs"] = settings.getBgFadeInMs();
+    doc["bgFadeCurve"] = settings.getBgFadeCurve();
     doc["panelClockDiv"] = settings.getPanelClockDiv();
     doc["panelVcom"] = settings.getPanelVcom();
     // Read-only capability flag, not a setting: on ESP-IDF 4.4 there is no

@@ -26,6 +26,7 @@ linked from each leaf.
 | `pie-and-scalar-idioms-in-this-firmware.md` | Thirteen kernel idioms with file:line | scale565Oct as the model kernel; zip/unzip widen and narrow; the unaligned usar/src.q stream; multiply as the only shift in the blend kernels; the four-way interleaved gather; the bandRef twin and the flag gate |
 | `band-contract-interlace-and-row-independence.md` | What a band() must satisfy | BAND_H is 2 on the device (240 calls per frame); rows==1 parity-skipping and 240-wide calls exist; a row depends only on its y and the frame state; derive from y & ~1 and memcpy only within a call |
 | `fuzzing-the-fleet-and-the-silk-palette-pad.md` | The fuzzer and the defect that made the rule | fuzz.cpp sweeps parameters, themes and time under ASan and UBSan; silk's pad of 4 against a dither cap of 16 read past its LUT; size a pad from the producer's cap and re-fuzz the fleet on any table change |
+| `render-loop-icache-eviction-and-bus-contention.md` | Shared icache eviction fixed, two bus-bound attempts killed | Render loop in IRAM: 17 to 28 fps under LVGL churn for about 8 KB DRAM (`1fc09db7`, gm-2cl.12); flat-run overlay compositing cut blend only 12%, capped by PSRAM/cache contention with LVGL, not pixel count (gm-2cl.11); no-framebuffer raster POC missed zero-underrun by about 3,000x because the producer is bus-bound, not preempted (gm-2cl.13) |
 
 ## Not yet covered
 

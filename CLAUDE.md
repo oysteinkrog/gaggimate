@@ -674,16 +674,22 @@ the design cannot show and what the runs measured.
   chevron is exempt from the size and edge rules and its ext click pad is
   34 px on settings pages, not the 45 px the generated screens use: at 45 px
   it reached 10x6 px into the two lower tiles (measured by the runner's
-  audit, 91cb0ed5). `Rig.audit()` in `tools/settings_ui_tests/rig.py` is the
-  check, and the runner audits every page on every run. The arrows point
-  left and right (owner's request, 2026-09-09; they were up and down
-  chevrons on the same spots) and a horizontal swipe on a category page
-  turns it too: the page root clears `LV_OBJ_FLAG_GESTURE_BUBBLE`, since
-  LVGL hands a gesture to the first ancestor that does not bubble, and the
-  handler calls `lv_indev_wait_release` before `gotoPage`, because LVGL
-  8.4 gates CLICKED on scrolling and not on a gesture, so a swipe across a
-  toggle row would otherwise flip it on release. `/api/debug/tap` takes
-  `x2=` and `y2=` for a scripted drag and `Rig.swipe()` wraps it.
+  audit, 91cb0ed5). The page header is 240 px wide at y -160: previous and
+  next arrows at x -100 and +100 (hit boxes 82 to 138 px from the centre,
+  far corner 227.4 px out, under the 228 px edge rule) with the title on
+  one line in the 144 px between them, its height fixed to the font's line
+  height because LONG_DOT wraps instead of truncating when the height is
+  left to the content (the old 96 px column showed "Animatio" / "n").
+  `Rig.audit()` in `tools/settings_ui_tests/rig.py` is the check, and the
+  runner audits every page on every run. The arrows point left and right
+  (owner's request, 2026-09-09; they were up and down chevrons on the same
+  spots) and a horizontal swipe on a category page turns it too: the page
+  root clears `LV_OBJ_FLAG_GESTURE_BUBBLE`, since LVGL hands a gesture to
+  the first ancestor that does not bubble, and the handler calls
+  `lv_indev_wait_release` before `gotoPage`, because LVGL 8.4 gates
+  CLICKED on scrolling and not on a gesture, so a swipe across a toggle
+  row would otherwise flip it on release. `/api/debug/tap` takes `x2=`
+  and `y2=` for a scripted drag and `Rig.swipe()` wraps it.
 - **Ranges live in three places that must agree.** `SettingsModel.h` owns the
   display's editing ranges, steps, wrap rules and formats. `Settings` clamps
   a few fields on store (`setBrewDelay` and `setGrindDelay` to 0 to 4000,

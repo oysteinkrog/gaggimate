@@ -269,6 +269,58 @@ function BackgroundAnimationSettings({ formData, onChange, setField }) {
           />
         </SettingsFormField>
         <SettingsFormField
+          label={`Screen fade out (${
+            formData.bgFadeOutMs === undefined ? 120 : parseInt(formData.bgFadeOutMs, 10)
+          } ms)`}
+          htmlFor='bgFadeOutMs'
+          noMargin
+          helpText='How long the old screen takes to fade away on a screen change. 0 cuts.'
+        >
+          <input
+            id='bgFadeOutMs'
+            name='bgFadeOutMs'
+            type='range'
+            min='0'
+            max='1000'
+            step='10'
+            className='range w-full'
+            value={formData.bgFadeOutMs === undefined ? 120 : parseInt(formData.bgFadeOutMs, 10)}
+            onChange={onChange('bgFadeOutMs')}
+          />
+        </SettingsFormField>
+        <SettingsFormField
+          label={`Screen fade in (${
+            formData.bgFadeInMs === undefined ? 120 : parseInt(formData.bgFadeInMs, 10)
+          } ms)`}
+          htmlFor='bgFadeInMs'
+          noMargin
+          helpText='How long the new screen takes to appear once it is ready. 0 cuts.'
+        >
+          <input
+            id='bgFadeInMs'
+            name='bgFadeInMs'
+            type='range'
+            min='0'
+            max='1000'
+            step='10'
+            className='range w-full'
+            value={formData.bgFadeInMs === undefined ? 120 : parseInt(formData.bgFadeInMs, 10)}
+            onChange={onChange('bgFadeInMs')}
+          />
+        </SettingsFormField>
+        <SettingsFormField label='Screen fade curve' htmlFor='bgFadeCurve' noMargin>
+          <select
+            id='bgFadeCurve'
+            name='bgFadeCurve'
+            className='select select-bordered w-full'
+            value={formData.bgFadeCurve === undefined ? 0 : parseInt(formData.bgFadeCurve, 10)}
+            onChange={onChange('bgFadeCurve')}
+          >
+            <option value={0}>Linear, constant speed</option>
+            <option value={1}>Smooth, eases in and out</option>
+          </select>
+        </SettingsFormField>
+        <SettingsFormField
           label={`Animation brightness (${
             formData.bgAnimBrightness === undefined ? 100 : parseInt(formData.bgAnimBrightness, 10)
           }%)`}

@@ -189,6 +189,9 @@ class Settings {
     int getBgAnimBrightness() const { return bgAnimBrightness.get(); }
     int getBgAnimHighlightKnee() const { return bgAnimHighlightKnee.get(); }
     int getBgAnimScrim() const { return bgAnimScrim.get(); }
+    int getBgFadeOutMs() const { return bgFadeOutMs.get(); }
+    int getBgFadeInMs() const { return bgFadeInMs.get(); }
+    int getBgFadeCurve() const { return bgFadeCurve.get(); }
     int getPanelClockDiv() const { return panelClockDiv.get(); }
     int getPanelVcom() const { return panelVcom.get(); }
     int getSmartGrindMode() const { return smartGrindMode.get(); }
@@ -289,6 +292,9 @@ class Settings {
     void setBgAnimBrightness(int bg_anim_brightness);
     void setBgAnimHighlightKnee(int bg_anim_highlight_knee);
     void setBgAnimScrim(int bg_anim_scrim);
+    void setBgFadeOutMs(int bg_fade_out_ms);
+    void setBgFadeInMs(int bg_fade_in_ms);
+    void setBgFadeCurve(int bg_fade_curve);
     void setPanelClockDiv(int panel_clock_div);
     void setPanelVcom(int panel_vcom);
     void setSmartGrindIp(String smart_grind_ip);
@@ -473,6 +479,16 @@ class Settings {
     // the number suggests: 55 percent of the encoded value is roughly 25 percent
     // of the luminance.
     Property<int> bgAnimScrim{registry, "bg_scrim", 0};
+    // Screen change fade, in ms: the old page's overlay gain ramps to 0
+    // (bg_fade_out), the new page is published, then its gain ramps to 256
+    // (bg_fade_in). The ramp runs in the render task at the animation's
+    // frame rate (DefaultUI::beginOverlayTransition). 0 = cut. Clamped to
+    // 0..1000 on store.
+    Property<int> bgFadeOutMs{registry, "bg_fade_out", 120};
+    Property<int> bgFadeInMs{registry, "bg_fade_in", 120};
+    // 0 = linear ramp, 1 = smooth (ease in and out, a smoothstep on the
+    // ramp's clock). Applied to both directions.
+    Property<int> bgFadeCurve{registry, "bg_fade_crv", 0};
     // RGB pixel-clock divider off the 80 MHz LCD group clock; 0 = keep the
     // build-flag boot value. The IDF 4.4 driver only does integer division,
     // so real choices are 80/n: 5=16 MHz (~61 Hz), 6=13.3 MHz (~51 Hz),
