@@ -477,13 +477,56 @@ telemetry-driven screen from a 650 ms LVGL pass (1.5 Hz widget updates,
   instead of DMA, panel refill duty (divider 8 to 16). `scale565Oct`, the
   BandDma submit path and `scanoutMark` were flash-resident and called per
   band from IRAM; pinned now, about 660 B, push 5.7 to about 4.5 ms.
-  **Build `-e display` after touching anything near a `GM_BLEND_PROBE`
-  block.** Only the bench and loadtest builds define it, and twice the
+  **Build `-e display` after touching anything near a probe hook.** Only
+  the bench and loadtest builds define `GM_BLEND_PROBE`, and twice the
   production env stopped building without anyone noticing for a day: the
   anonymous namespace was closed inside the block, and the planar kernel
-  itself was inside it (fixed 2026-09-08, d0781460 and 45367098). The
+  itself was inside it (fixed 2026-09-08, d0781460 and 45367098). A
   worktree's `display` libdeps do not install on WSL1 (a permission
-  error unpacking Nanopb), so that build runs in the main checkout.
+  error unpacking Nanopb), and neither does a new env's in any checkout;
+  a symlink from `.pio/libdeps/<env>` to an installed env's directory
+  with the same library list (the main checkout's `display`, or
+  `display-loadtest` for `display-loadtest-xip`) is what makes that
+  build run (2026-09-09).
+- **The bench and probe code is out of the render unit, behind a hook
+  interface** (gm-bzu.19, 2026-09-09). `SleepAnimation.cpp` holds the
+  render loop, the kernels and the production paths; `GM_ANIM_BENCH`
+  lives in `SleepAnimationBench.cpp`, `GM_KBLOB` in
+  `SleepAnimationKBlob.cpp`, `GM_BLEND_PROBE` in
+  `SleepAnimationBlendProbe.cpp` and `GM_TOUCH_PROBE` in
+  `SleepAnimationTouchProbe.cpp`. `SleepAnimationProbe.h` is the
+  interface: the hooks are declared in the class whatever the flags,
+  defined as empty inlines outside their flag and out of line inside it;
+  the per-band and per-row ones are macros that expand to `((void)0)`
+  without the flag (`BENCH_T0`, `BENCH_ACC`, `BENCH_BAND_DONE`,
+  `PROBE_SCRIM_T0` and the rest); `kAnimBench` is a constexpr for the
+  `if constexpr` branches; and `probeLevel()` returns 0 in production so
+  every `probe == N` test folds away. The kernels stay static in the
+  render unit and the probe units reach them through the `probeKernel*`
+  IRAM wrappers; `scale565` is in `SleepAnimationInternal.h` so probe
+  level 3 runs the inline body per pixel and not a call. No member is
+  added outside a flag, so the class layout in production is unchanged,
+  and `g_sleepAnimDmaDone` stays static there. Proof, the production
+  `display` ELF against the one built before the move
+  (`tools/elf_func_diff.py` compares every function's instruction stream
+  with addresses and literal-pool slots stripped; `--loose` also drops
+  the pool objdump decodes after a function's last return): every
+  kernel, `renderLoop`, `presentFrame`, `pushLoop`, the scrim rows and
+  the composite rows have the same instructions; `renderFrame` has the
+  same instruction mix with the register choices moved (8 fewer stack
+  spills, 3 fewer instructions, 68 bytes larger with its literals) and
+  `start()` swaps one add for one branch; IRAM placement, `.dram0.data`
+  and `.dram0.bss` are byte for byte the same. Bench board, loadtest
+  build, cap 45, divider 8, interlace pinned, Starfield, 20 s medians,
+  before and then two runs after: standby band 6352 to 6456 and 6269 us,
+  blend 2487 to 2427 and 2329, scrim 779 to 750 and 741, push 3704 to
+  3695 and 3569, frame 16991 to 16643 and 16426, 42.3 fps in all three.
+  The brew screen is not a like-for-like pair (its overlay held 2,785 px
+  before and 6,306 after, a different screen state), and the after
+  numbers there are lower on every stage. A Codex review of the move
+  found the guard order that broke the flag builds' link, a per-pixel
+  wrapper call, a per-band call that had left the IRAM path and the
+  counter's linkage; all four are fixed.
 - **The overlay footprint per page is measured, not guessed** (gm-2cl.15,
   `tools/overlay_footprint.py`, report under `tools/overlay_footprint/`).
   `ov_px` on `/api/debug/anim` is the overlay pixels inside the composite's

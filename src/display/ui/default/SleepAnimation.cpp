@@ -1,15 +1,14 @@
 #ifndef GAGGIMATE_SIM
 
 #include "SleepAnimation.h"
+#include "SleepAnimationInternal.h"
+#include "SleepAnimationProbe.h"
 #include <Arduino.h>
 #include <display/drivers/common/Display.h>
 #include <display/drivers/common/PanelClock.h>
 #include <display/ui/default/bganim/BgAnim.h>
 #include <display/ui/default/bganim/BgAnimCommon.h>
-#ifdef GM_KBLOB
-#include <display/ui/default/bganim/KBlob.h>
-#include <esp_cpu.h> // esp_cpu_get_cycle_count, for the kbench
-#endif
+#include <esp_cpu.h> // esp_cpu_get_cycle_count, for the stage profile (PROF_T0)
 #include <esp_cache.h> // esp_cache_msync, around the direct push
 #include <esp_heap_caps.h>
 #include <esp_memory_utils.h>
@@ -24,38 +23,11 @@
 // GM_TOUCH_PROBE-gated inside the header).
 #include <display/drivers/common/LV_Helper.h>
 
-#ifdef GM_TOUCH_PROBE
-#include "esp_log.h"
-// Edge stamp of a publish this frame's composite sampled; renderLoop logs it
-// once the frame is presented. Render-task-private, so no volatile needed.
-static int64_t s_probeFrameEdgeUs = 0;
-static int64_t s_probeFrameElemUs = 0;
-static bool s_probeFramePress = false;
-#endif
 
 static BaseType_t createAnimTask(TaskFunction_t fn, const char *name, uint32_t stackBytes, void *arg, UBaseType_t prio,
                                  TaskHandle_t *handle);
 static void parkForReap();
 
-// Stage timers for the bench build. These compile to nothing in a normal
-// build, so the shipping render path carries no measurement overhead.
-#ifdef GM_ANIM_BENCH
-#define BENCH_T0(v) const int64_t v = esp_timer_get_time()
-#define BENCH_ACC(acc, t0) (acc) += static_cast<uint64_t>(esp_timer_get_time() - (t0))
-// How long to sit on each animation before recording it. Long enough that the
-// mean is not dominated by the first frames, where the lazy LUT init runs.
-constexpr unsigned long BENCH_DWELL_MS = 6000;
-#define GM_BENCH_LOCK_ONE_BAND 1
-#else
-// Outside the bench build the marks compile to nothing. The per-band stage
-// profiling on /api/debug/anim used to ride on these (a systimer read per
-// mark, four marks a band); it reads the cycle counter through PROF_T0 now.
-#define BENCH_T0(v) ((void)0)
-#define BENCH_ACC(acc, t0) ((void)0)
-// Constant-false, so the suspend branch in renderFrame folds away entirely in
-// shipping builds rather than being compiled and never taken.
-#define GM_BENCH_LOCK_ONE_BAND 0
-#endif
 
 // Per-band stage accounting (prof*Us, published as band_us, blend_us, elem_us
 // and the rest) reads the core's cycle counter, one instruction, not
@@ -67,33 +39,6 @@ constexpr unsigned long BENCH_DWELL_MS = 6000;
 #define PROF_ACC(acc, t0) (acc) += (esp_cpu_get_cycle_count() - (t0))
 
 namespace {
-// Rows rendered/pushed per chunk, and how many of those chunks are in flight.
-// Push cost is per byte rather than per call, so band height does not change
-// what a frame costs to push -- but it does set the handoff count, and 8 rows
-// (60 cross-core semaphore round trips per frame instead of 30) cost ~1.3 ms
-// and dropped plasma 43.0 -> 40.6 fps.
-//
-// 8 rows across two slots is chosen against internal SRAM, which is the
-// binding constraint: internal SRAM is what WiFi/BLE/TLS draw from at runtime,
-// and the web server needs a contiguous 2,872 B of it per send round. 8 x 2 is
-// 15,360 B; the handoff cost above is the price of the row count, and the slot
-// count is argued separately at NUM_SLOTS in the header.
-//
-// Note on the fps figure quoted above: it comes from a 16-vs-8 bench, which is
-// where the 30-vs-60 handoff counts come from. The 12-vs-8 step this constant
-// actually took has never been benched directly; scaling the measured number
-// linearly puts it nearer 0.9 ms than 1.3 ms, so 40.6 fps is a conservative
-// floor rather than a measurement of the current configuration.
-// BAND_H=4 was tried on-device 2026-08-30 and reverted the same day, on two
-// measurements. bdma_mean scaled exactly with the transfer (91 us at 1,920 B,
-// 179 us at 3,840 B): the band DMA is bandwidth-bound at ~21.5 MB/s, so a
-// bigger band buys no per-transfer overhead back. And the doubled internal
-// slots (2 x 3,840 B, +3,840 B over BAND_H=2) tipped the DMA-capable pool
-// with BLE up: NetWatchdog showed dma free 1.5-5 KB with min=256 B and the
-// web server started timing out, which is the same WiFi-pool cliff the
-// bounce-depth and 15,360 B experiments hit. The ~6.5 ms/frame of per-band
-// loop overhead at 240 bands/frame is real but not worth that pool.
-constexpr int BAND_H = 2;
 
 // Longest the render task will wait for the scan-out to leave the buffer it is
 // about to overwrite, in milliseconds. One panel frame is ~23 ms at the shipped
@@ -104,10 +49,6 @@ constexpr int FLIP_WAIT_MAX_MS = 60;
 // Headroom for the snapshot's ext draw size (shadows etc. extend the render
 // area past the object on every side).
 constexpr int OVERLAY_EXT_MARGIN = 16;
-// How many runs a single row's list can hold before emitRun starts merging.
-// 24 is well past what the standby widgets produce; a row through the clock and
-// both icons emits about eight.
-constexpr int RUNS_PER_ROW = 24;
 // Runs closer together than this are emitted as one. A run record costs a load,
 // two extracts and a loop setup, which is more than the handful of transparent
 // pixels the blend will skip, and antialiased text puts one- and two-pixel gaps
@@ -117,16 +58,10 @@ constexpr int RUN_GAP_MERGE = 4;
 // as wide in pixels. One cell, because a merged gap here is not a few skipped
 // pixels: every cell in it gets read, scaled and written back.
 constexpr int HALO_GAP_MERGE_CELLS = 1;
-// The scrim factor is stored as 32nds of full brightness, so 32 means "leave
-// this cell alone". Two smoothing passes leave a wide skirt of cells whose dim
-// rounds away to nothing, and those are dropped from the runs entirely.
-constexpr int SCRIM_INV_NONE = 32;
 // Widest scrim cell row the gain-scaled copy in the composite loop can hold
 // (a 480 px panel has 120 cells); a wider overlay keeps its unscaled scrim.
 constexpr int kScaledInvCells = 128;
 
-// Scrim grid resolution: 1 << 2 = one cell per 4x4 panel pixels.
-constexpr int SCRIM_SHIFT = 2;
 // How far the halo reaches past the outermost widget pixel, in cells: two
 // 3-wide max passes carry coverage two cells out, and the 3-tap smoothing pass
 // carries a fraction of it one further. 3 cells is 12 pixels.
@@ -227,33 +162,9 @@ __attribute__((always_inline)) inline uint16_t blend565(uint16_t fg, uint16_t bg
     return static_cast<uint16_t>((r & 0xF800u) | (g & 0x07E0u) | (b & 0x001Fu));
 }
 
-// Scale an RGB565 toward black. inv is 0..32, i.e. 32 keeps the pixel and 0
-// blacks it out.
-//
-// Two multiplies rather than blend565's six, because red and blue share one
-// lane. That packing is what the comment above blend565 warns is broken -- and
-// it is, for an 8-bit alpha. With five bits it is exact: blue's product tops
-// out at 31 * 32 = 992, ten bits, while red's starts at bit 11, so the two
-// never touch. The scrim is a blurred halo, so the step from 256 levels to 32
-// is not visible in it; the antialiasing on the glyph edges, where it would be,
-// still goes through blend565.
-__attribute__((always_inline)) inline uint16_t scale565(uint16_t c, uint32_t inv) {
-    // The two products are left where the multiply puts them and the masks do
-    // the shifting, so one shift serves both lanes instead of one each.
-    // (c & 0xF81F) * inv leaves blue in bits 0..9 and red in bits 11..20 -- inv
-    // is five bits, so they cannot reach each other -- and 0x1F03E0 picks the
-    // top five of each. Green, five bits further up, comes out under 0xFC00.
-    const uint32_t rb = (c & 0xF81Fu) * inv;
-    const uint32_t g = (c & 0x07E0u) * inv;
-    return static_cast<uint16_t>(((rb & 0x1F03E0u) | (g & 0xFC00u)) >> 5);
-}
-
-// Two neighbouring pixels at once. The band is 4-byte aligned and a scrim cell
-// starts on an even pixel, so the pair is one aligned load and one aligned
-// store where four half-word accesses stood before.
-__attribute__((always_inline)) inline uint32_t scale565x2(uint32_t w, uint32_t inv) {
-    return scale565(static_cast<uint16_t>(w), inv) | (static_cast<uint32_t>(scale565(w >> 16, inv)) << 16);
-}
+// scale565 and scale565x2 live in SleepAnimationInternal.h: the blend probe
+// unit runs the same inline body per pixel (a call through a wrapper would be
+// what probe level 3 measured).
 
 // The same arithmetic as scale565, eight pixels per instruction group, on the
 // ESP32-S3's PIE vector unit.
@@ -809,76 +720,8 @@ __attribute__((noinline)) static void IRAM_ATTR scrimRowPie(uint16_t *__restrict
     }
 }
 
-#ifdef GM_ANIM_BENCH
-// Bench only: every input the vector kernel can ever see, checked against the
-// scalar one on the silicon that will run it.
-//
-// The host can only confirm the algebra. What it cannot confirm is that this
-// core's EE.VMUL.U16 really keeps a 32-bit product before the shift, that the
-// assembler encoded what was meant, or that the 128-bit accesses land where
-// they were pointed -- and all three fail silently, as wrong colours rather
-// than as a fault. 65,536 colours by 33 factors is the whole input space, so a
-// pass here is exhaustive rather than a sample.
-//
-// ~135 ms of solid compute, so it blocks whichever task calls it. Diagnostic
-// only, never on a frame path.
-static uint32_t pieSelfTest(uint32_t *firstBad) {
-    alignas(16) uint16_t px[8];
-    alignas(16) uint16_t iv[8];
-    uint32_t bad = 0;
-    for (uint32_t inv = 0; inv <= SCRIM_INV_NONE; inv++) {
-        for (int i = 0; i < 8; i++) {
-            iv[i] = static_cast<uint16_t>(inv);
-        }
-        for (uint32_t c = 0; c < 65536; c += 8) {
-            for (int i = 0; i < 8; i++) {
-                px[i] = static_cast<uint16_t>(c + i);
-            }
-            scale565Oct(px, iv, 1);
-            for (int i = 0; i < 8; i++) {
-                const uint16_t want = scale565(static_cast<uint16_t>(c + i), inv);
-                if (px[i] != want) {
-                    if (bad == 0 && firstBad != nullptr) {
-                        // colour, factor, what came back, what was wanted
-                        *firstBad = (c + i) | (inv << 16);
-                    }
-                    bad++;
-                }
-            }
-        }
-    }
-    return bad;
-}
-
-#endif // GM_ANIM_BENCH
-
 } // namespace
 
-#ifdef GM_BLEND_PROBE
-// Probe builds: the blend walk with its work removed, so the pixel loop can be
-// split into what it computes and what it waits on.
-//   2 -- read the coverage byte and nothing else (the PSRAM load on its own)
-//   3 -- coverage plus the band read-modify-write (adds the SRAM traffic)
-// Returns the accumulator so the loads cannot be optimised away.
-__attribute__((noinline)) static uint32_t blendRowProbe(uint16_t *__restrict dst, const uint16_t *__restrict a16,
-                                                        const uint32_t *__restrict runs, int nRuns, int level) {
-    uint32_t acc = 0;
-    for (int i = 0; i < nRuns; i++) {
-        const uint32_t r = runs[i];
-        int x = static_cast<int>(r & 0xFFFFu);
-        const int xEnd = static_cast<int>(r >> 16);
-        for (; x < xEnd; x++) {
-            acc += a16[x];
-            if (level >= 3) {
-                dst[x] = scale565(dst[x], 24);
-            }
-        }
-    }
-    return acc;
-}
-
-static_assert(SleepAnimation::kProbeRuns == RUNS_PER_ROW, "probe run capture mirrors the overlay's run table");
-#endif // GM_BLEND_PROBE
 
 // Planar blend: colour plane (RGB565) and alpha plane (16-bit lanes, 0..256,
 // 256 meaning opaque). With the alpha in its own 16-bit lane every 8-pixel
@@ -1046,130 +889,22 @@ __attribute__((noinline)) static void IRAM_ATTR blendRowPlanar(uint16_t *__restr
     }
 }
 
-#ifdef GM_BLEND_PROBE
-// Levels 4 to 7 (benchSetBlendProbe): the production blend kernel over one
-// captured overlay row, the same bytes and the same runs for every band, with
-// the source and the destination each placed in internal SRAM or PSRAM. The
-// first frames capture the row with the most pixels; a level change back to 0
-// frees the copies (probeReset) so a new capture starts clean.
-uint32_t IRAM_ATTR SleepAnimation::probeBlendRow(uint16_t *drow, const uint16_t *ccol, const uint16_t *ca16, const uint32_t *runs,
-                                                 int nRuns, int level, int w, bool pie) {
-    if (level <= 1) {
-        return 0;
-    }
-    if (level <= 3) {
-        return blendRowProbe(drow, ca16, runs, nRuns, level);
-    }
-    if (probeCaptureBands < 720) { // about three frames of bands
-        uint32_t px = 0;
-        int xmax = 0;
-        for (int i = 0; i < nRuns; i++) {
-            const int x0 = static_cast<int>(runs[i] & 0xFFFFu);
-            const int x1 = static_cast<int>(runs[i] >> 16);
-            px += static_cast<uint32_t>(x1 - x0);
-            xmax = x1 > xmax ? x1 : xmax;
-        }
-        if (px > probePx && nRuns <= kProbeRuns && xmax <= w) {
-            if (probeRowSram == nullptr) {
-                const size_t rowBytes = static_cast<size_t>(w) * 2;
-                probeRowSram =
-                    static_cast<uint8_t *>(heap_caps_malloc(static_cast<size_t>(w) * 3, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
-                probeRowPsram = static_cast<uint8_t *>(heap_caps_malloc(static_cast<size_t>(w) * 3, MALLOC_CAP_SPIRAM));
-                probeDstSram =
-                    static_cast<uint16_t *>(heap_caps_aligned_alloc(16, rowBytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
-                probeColPlane =
-                    static_cast<uint16_t *>(heap_caps_aligned_alloc(16, rowBytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
-                probeA16Plane =
-                    static_cast<uint16_t *>(heap_caps_aligned_alloc(16, rowBytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
-                probeRefRow =
-                    static_cast<uint16_t *>(heap_caps_aligned_alloc(16, rowBytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
-            }
-            if (probeRowSram != nullptr && probeRowPsram != nullptr && probeDstSram != nullptr && probeColPlane != nullptr &&
-                probeA16Plane != nullptr && probeRefRow != nullptr) {
-                // The interleaved copies for levels 4 to 7 (the old kernel)
-                // are built from the planes: colour, then alpha with 256
-                // back to 255.
-                memcpy(probeRuns, runs, static_cast<size_t>(nRuns) * sizeof(uint32_t));
-                memcpy(probeColPlane, ccol, static_cast<size_t>(xmax) * 2);
-                memcpy(probeA16Plane, ca16, static_cast<size_t>(xmax) * 2);
-                for (int x = 0; x < xmax; x++) {
-                    uint8_t *q = probeRowSram + static_cast<size_t>(x) * 3;
-                    q[0] = static_cast<uint8_t>(ccol[x]);
-                    q[1] = static_cast<uint8_t>(ccol[x] >> 8);
-                    q[2] = ca16[x] > 255 ? 255 : static_cast<uint8_t>(ca16[x]);
-                }
-                memcpy(probeRowPsram, probeRowSram, static_cast<size_t>(xmax) * 3);
-                probeNRuns = nRuns;
-                probePx = px;
-                probePxOut.store(px);
-                probeMismatch.store(-1);
-            }
-        }
-        probeCaptureBands++;
-        return 0;
-    }
-    if (probeNRuns == 0) {
-        return 0;
-    }
-    if (probeMismatch.load() < 0) {
-        // Exactness on the device, once per capture: the planar vector kernel
-        // and the scalar blendRow over the same row and background must agree
-        // on every pixel. The background is this band's row.
-        memcpy(probeRefRow, drow, static_cast<size_t>(w) * 2);
-        memcpy(probeDstSram, drow, static_cast<size_t>(w) * 2);
-        blendRow<false>(probeRefRow, probeRowSram, probeRuns, probeNRuns, 256);
-        blendRowPlanar<false>(probeDstSram, probeColPlane, probeA16Plane, probeRuns, probeNRuns, 256, true);
-        int bad = 0;
-        for (int x = 0; x < w; x++) {
-            bad += probeRefRow[x] != probeDstSram[x];
-        }
-        probeMismatch.store(bad);
-    }
-    const uint8_t *src = (level == 4 || level == 7) ? probeRowSram : probeRowPsram;
-    uint16_t *dst = (level == 6 || level == 7) ? probeDstSram : drow;
-    const int reps = probeReps.load();
-    for (int k = 0; k < reps; k++) {
-        if (level >= 8) {
-            blendRowPlanar<false>(dst, probeColPlane, probeA16Plane, probeRuns, probeNRuns, 256, level == 8);
-        } else if (pie) {
-            blendRowPie<false>(dst, src, probeRuns, probeNRuns, 256);
-        } else {
-            blendRow<false>(dst, src, probeRuns, probeNRuns, 256);
-        }
-    }
-    return static_cast<uint32_t>(reps);
-}
 
-void SleepAnimation::probeReset() {
-    if (probeRowSram != nullptr) {
-        heap_caps_free(probeRowSram);
-    }
-    if (probeRowPsram != nullptr) {
-        heap_caps_free(probeRowPsram);
-    }
-    if (probeDstSram != nullptr) {
-        heap_caps_free(probeDstSram);
-    }
-    if (probeColPlane != nullptr) {
-        heap_caps_free(probeColPlane);
-    }
-    if (probeA16Plane != nullptr) {
-        heap_caps_free(probeA16Plane);
-    }
-    if (probeRefRow != nullptr) {
-        heap_caps_free(probeRefRow);
-    }
-    probeRowSram = nullptr;
-    probeRowPsram = nullptr;
-    probeDstSram = nullptr;
-    probeColPlane = nullptr;
-    probeA16Plane = nullptr;
-    probeRefRow = nullptr;
-    probeMismatch.store(-1);
-    probeNRuns = 0;
-    probePx = 0;
-    probeCaptureBands = 0;
-    probePxOut.store(0);
+#ifdef GM_BLEND_PROBE
+// The kernels above stay static, so the production translation unit is what
+// it was; the probe units (SleepAnimationBench.cpp, SleepAnimationBlendProbe.cpp)
+// reach them through these. IRAM like the kernels, so a probe row does not
+// add a flash fetch to what it measures.
+void IRAM_ATTR probeKernelScale565Oct(uint16_t *dst, const uint16_t *inv, int nOct) { scale565Oct(dst, inv, nOct); }
+void IRAM_ATTR probeKernelBlendRow(uint16_t *dst, const uint8_t *colour, const uint32_t *runs, int nRuns) {
+    blendRow<false>(dst, colour, runs, nRuns, 256);
+}
+void IRAM_ATTR probeKernelBlendRowPie(uint16_t *dst, const uint8_t *colour, const uint32_t *runs, int nRuns) {
+    blendRowPie<false>(dst, colour, runs, nRuns, 256);
+}
+void IRAM_ATTR probeKernelBlendRowPlanar(uint16_t *dst, const uint16_t *col, const uint16_t *a16, const uint32_t *runs, int nRuns,
+                                        bool vector) {
+    blendRowPlanar<false>(dst, col, a16, runs, nRuns, 256, vector);
 }
 #endif // GM_BLEND_PROBE
 
@@ -1183,30 +918,6 @@ bool SleepAnimation::bandBufInternal() const { return bandBuf[0] != nullptr && e
 bool SleepAnimation::objectInternal() const { return esp_ptr_internal(this); }
 
 namespace {
-
-#ifdef GM_ANIM_BENCH
-// Bench only: a deterministic value for every panel pixel, so a host can
-// compute the entire framebuffer independently and compare it byte for byte.
-//
-// The point is to take visual judgement out of the loop. A photograph of this
-// panel cannot settle whether the pipeline corrupts anything -- a webcam in a
-// dark room auto-exposes to tens of milliseconds and integrates ten panel
-// frames, which fabricates shear and duplication that are not on the screen.
-// This is the same path the animations use, up to and including the GDMA
-// transfer into the framebuffer, with the content replaced by something the
-// far end already knows the answer to. Any misplaced band, dropped descriptor,
-// wrong destination offset or flipped bit shows up as an exact mismatch count
-// and coordinate rather than an opinion about a JPEG.
-//
-// Multiplied by primes and folded so neighbouring pixels and neighbouring rows
-// differ in the high bits: an offset error has to change the value, which a
-// smooth ramp would let slide for small displacements.
-__attribute__((always_inline)) inline uint16_t benchPatternPx(int x, int y) {
-    const uint32_t v = static_cast<uint32_t>(x) * 2654435761u + static_cast<uint32_t>(y) * 40503u;
-    return static_cast<uint16_t>((v >> 11) ^ (v >> 27));
-}
-#endif
-
 // Internal SRAM is deliberately scarce in this firmware (WiFi/BLE/TLS all
 // compete for it) — always fall back to PSRAM rather than failing.
 //
@@ -1243,25 +954,18 @@ void *allocPreferInternal(size_t size) {
 }
 } // namespace
 
-#ifdef GM_ANIM_BENCH
-uint32_t SleepAnimation::benchPieSelfTest(uint32_t *firstBad) { return pieSelfTest(firstBad); }
-#endif
-
 SleepAnimation::~SleepAnimation() { stop(); }
 
 void SleepAnimation::configure(uint8_t id, const uint8_t p[4]) {
-#ifdef GM_ANIM_BENCH
-    // The bench owns the selection: DefaultUI re-applies the stored animation
-    // on every UI pass, which would otherwise yank the sweep back to whatever
-    // is saved in settings after each frame.
-    (void)id;
-    (void)p;
-    return;
-#else
+    if constexpr (kAnimBench) {
+        // The bench owns the selection: DefaultUI re-applies the stored
+        // animation on every UI pass, which would otherwise yank the sweep
+        // back to whatever is saved in settings after each frame.
+        return;
+    }
     animId.store(id);
     animParams.store(static_cast<uint32_t>(p[0]) | (static_cast<uint32_t>(p[1]) << 8) | (static_cast<uint32_t>(p[2]) << 16) |
                      (static_cast<uint32_t>(p[3]) << 24));
-#endif
 }
 
 // Not bench-gated. The two framebuffer-ownership settings this exposes each
@@ -1283,8 +987,13 @@ SleepAnimation *sleep_animation_bench_instance() { return g_benchInstance; }
 // The counter is a plain volatile rather than the std::atomic the other
 // counters use: a fetch_add on this target can land in a libatomic helper that
 // is not in IRAM. There is one animation instance, and the only readers are the
-// bench endpoint and the drain loop in stop().
-static volatile uint32_t g_sleepAnimDmaDone = 0;
+// drain loop in stop() and the bench build's benchDmaCompleted()
+// (SleepAnimationBench.cpp, hence the external linkage under GM_ANIM_BENCH and
+// the declaration in SleepAnimationInternal.h; production keeps it static).
+#ifndef GM_ANIM_BENCH
+static
+#endif
+    volatile uint32_t g_sleepAnimDmaDone = 0;
 // The panel's framebuffer gate, cached as a raw handle at start(). The ISR
 // releases it on the last chunk of a band; calling a virtual accessor from
 // there would be a jump into flash.
@@ -1962,83 +1671,6 @@ static bool sleepAnimBandRetire(void *arg) {
     return woken == pdTRUE;
 }
 
-#ifdef GM_ANIM_BENCH
-uint32_t SleepAnimation::benchDmaCompleted() const { return g_sleepAnimDmaDone; }
-
-size_t SleepAnimation::benchCopyFrameBuffer(uint8_t *out, size_t cap, int *outW, int *outH) {
-    if (out == nullptr || display == nullptr) {
-        return 0;
-    }
-    // The buffer currently on screen, which with double buffering is the one
-    // the render task is NOT composing into. Dumping the back buffer would show
-    // a half-written frame and invite exactly the wrong conclusion.
-    uint16_t *const fb = (dmaActive && fbCount > 1) ? fbDirect[fbBack ^ 1] : display->directFrameBuffer(0);
-    if (fb == nullptr) {
-        return 0;
-    }
-    const int w = display->width();
-    const int h = display->height();
-    const size_t bytes = static_cast<size_t>(w) * h * 2;
-    if (bytes > cap) {
-        return 0;
-    }
-    display->lockFrameBuffer();
-    // The DMA path writes this buffer without going through the cache, so a
-    // plain read can return whatever the CPU happens to still hold.
-    esp_cache_msync(fb, bytes, ESP_CACHE_MSYNC_FLAG_DIR_M2C);
-    memcpy(out, fb, bytes);
-    display->unlockFrameBuffer();
-    if (outW != nullptr) {
-        *outW = w;
-    }
-    if (outH != nullptr) {
-        *outH = h;
-    }
-    return bytes;
-}
-
-size_t SleepAnimation::benchCopyOverlay(uint8_t *out, size_t cap, int *outW, int *outH) {
-    const int front = overlayFront.load();
-    if (out == nullptr || front < 0) {
-        return 0;
-    }
-    const Overlay &ov = overlays[front & 1];
-    if (ov.buf == nullptr || ov.w <= 0 || ov.h <= 0) {
-        return 0;
-    }
-    const size_t bytes = static_cast<size_t>(ov.w) * ov.h * 3;
-    if (bytes > cap) {
-        return 0;
-    }
-    // Interleaved RGB565 plus a coverage byte for the dump's readers.
-    const uint16_t *col = ov.col(overlayPlanePx);
-    const uint16_t *a16 = ov.a16(overlayPlanePx);
-    const size_t n = static_cast<size_t>(ov.w) * ov.h;
-    for (size_t i = 0; i < n; i++) {
-        out[i * 3] = static_cast<uint8_t>(col[i]);
-        out[i * 3 + 1] = static_cast<uint8_t>(col[i] >> 8);
-        out[i * 3 + 2] = a16[i] > 255 ? 255 : static_cast<uint8_t>(a16[i]);
-    }
-    if (outW != nullptr) {
-        *outW = ov.w;
-    }
-    if (outH != nullptr) {
-        *outH = ov.h;
-    }
-    return bytes;
-}
-
-bool SleepAnimation::benchBandsInternal() const {
-    for (int i = 0; i < NUM_SLOTS; i++) {
-        const uintptr_t a = reinterpret_cast<uintptr_t>(bandBuf[i]);
-        if (a == 0 || (a >= 0x3C000000u && a < 0x3E000000u)) {
-            return false;
-        }
-    }
-    return true;
-}
-#endif // GM_ANIM_BENCH
-
 namespace {
 // esp_intr_alloc binds the handler to whichever core calls it, and there is no
 // argument to say otherwise -- so the only way to choose is to call from a task
@@ -2103,9 +1735,7 @@ void IRAM_ATTR SleepAnimation::pushLoop() {
             break;
         }
         const PushJob job = pushJob[slot];
-#ifdef GM_ANIM_BENCH
-        const int64_t t0 = esp_timer_get_time();
-#endif
+        BENCH_T0(tPush);
         if (job.mode != 0) {
             // esp_lcd takes a rectangle and no stride, so the rows that go out
             // cannot be one call. Mode 2 sends them two at a time -- at half
@@ -2124,9 +1754,7 @@ void IRAM_ATTR SleepAnimation::pushLoop() {
         } else {
             display->pushColors(job.x0, job.y0, job.x1, job.y1, bandBuf[slot]);
         }
-#ifdef GM_ANIM_BENCH
-        accPushUs += static_cast<uint64_t>(esp_timer_get_time() - t0);
-#endif
+        BENCH_ACC(accPushUs, tPush);
         xSemaphoreGive(static_cast<SemaphoreHandle_t>(bandFree[slot]));
         slot = (slot + 1) % NUM_SLOTS;
     }
@@ -2492,9 +2120,7 @@ void SleepAnimation::publishOverlayRanges(int w, int h, const int (*ranges)[2], 
     }
     const int64_t scrim0 = esp_timer_get_time();
     g_overlayStats.lastPubScanUs = static_cast<uint32_t>(scrim0 - scan0);
-#ifdef GM_TOUCH_PROBE
-    g_statPubScanUs += scrim0 - scan0;
-#endif
+    PROBE_STAT_ADD(g_statPubScanUs, scrim0 - scan0);
     if (doScrim && m > 0) {
         // The full rebuild is seven whole-grid passes over PSRAM (~34 ms
         // measured), and most publishes are recolors that leave the coverage
@@ -2535,9 +2161,7 @@ void SleepAnimation::publishOverlayRanges(int w, int h, const int (*ranges)[2], 
         }
     }
     g_overlayStats.lastPubScrimUs = static_cast<uint32_t>(esp_timer_get_time() - scrim0);
-#ifdef GM_TOUCH_PROBE
-    g_statPubScrimUs += esp_timer_get_time() - scrim0;
-#endif
+    PROBE_STAT_ADD(g_statPubScrimUs, esp_timer_get_time() - scrim0);
     ov.gen = overlayPubGen.fetch_add(1) + 1;
     overlayFront.store(back);
     // Interaction publishes wake the render task's pacing sleep so the tap's
@@ -3176,13 +2800,9 @@ void SleepAnimation::evaluateElements(int64_t nowUs) {
                 requestBandWarmup(ranges, n);
             }
         }
-#ifdef GM_TOUCH_PROBE
         if (vis && !e.lastVisible && d.tUs != 0) {
-            ESP_LOGI("TouchProbe", "GM_ELEM: write->frame %lld us (slot %d)", (long long)(nowUs - d.tUs), i);
+            probeElemShown(i, nowUs - d.tUs);
         }
-#else
-        (void)nowUs;
-#endif
         e.f = d;
         e.fVisible = vis;
         e.lastVisible = vis;
@@ -3273,13 +2893,7 @@ void IRAM_ATTR SleepAnimation::pickupInteractionElement() {
     if (n > 0) {
         requestBandWarmup(ranges, n);
     }
-#ifdef GM_TOUCH_PROBE
-    if (vis && g_probeElemEdgeUs != 0) {
-        // This frame's present carries the plate, so the edge closes there.
-        s_probeFrameElemUs = g_probeElemEdgeUs;
-        g_probeElemEdgeUs = 0;
-    }
-#endif
+    probeElemEdgeClose(vis);
     e.f = d;
     e.fVisible = vis;
     e.lastVisible = vis;
@@ -4118,14 +3732,7 @@ void IRAM_ATTR SleepAnimation::renderLoop() {
         if (animTestReq.load() >= 0) {
             runAnimTest();
         }
-#ifdef GM_KBLOB
-        // Same frame-boundary slot: the blob loader's detach handshake and the
-        // cycle-count bench both need the animation statics to themselves.
-        serviceBlobDetach();
-        if (kbenchReq.load() >= 0) {
-            runKBench();
-        }
-#endif
+        probeFrameBoundary();
         const int64_t frameStart = esp_timer_get_time();
         renderFrame();
         // First frame of the direct path: fill the other buffer too, so the
@@ -4138,18 +3745,7 @@ void IRAM_ATTR SleepAnimation::renderLoop() {
             renderFrame();
         }
         presentFrame();
-#ifdef GM_TOUCH_PROBE
-        if (s_probeFrameEdgeUs != 0) {
-            ESP_LOGI("TouchProbe", "GM_TOUCHLAT: %s->anim_frame %lld us", s_probeFramePress ? "press" : "release",
-                     (long long)(esp_timer_get_time() - s_probeFrameEdgeUs));
-            s_probeFrameEdgeUs = 0;
-        }
-        if (s_probeFrameElemUs != 0) {
-            ESP_LOGI("TouchProbe", "GM_TOUCHLAT: press->anim_frame(elem) %lld us",
-                     (long long)(esp_timer_get_time() - s_probeFrameElemUs));
-            s_probeFrameElemUs = 0;
-        }
-#endif
+        probeFramePresented();
         // Once per frame, not once per band: every band of a frame must push
         // the same parity or the two halves of the picture drift apart.
         frameParity++;
@@ -4159,15 +3755,7 @@ void IRAM_ATTR SleepAnimation::renderLoop() {
         }
         fpsFrames++;
         animFrames.fetch_add(1);
-#ifdef GM_ANIM_BENCH
-        const uint32_t frameUs = static_cast<uint32_t>(esp_timer_get_time() - frameStart);
-        accTotalUs += frameUs;
-        accFrames++;
-        if (frameUs > accMaxTotalUs) {
-            accMaxTotalUs = frameUs;
-        }
-        benchTick();
-#endif
+        benchFrameDone(frameStart);
 
         const unsigned long now = millis();
         if (now - fpsWindowStart >= 10000) {
@@ -4183,41 +3771,41 @@ void IRAM_ATTR SleepAnimation::renderLoop() {
         fps = fps < 1 ? 1 : (fps > 60 ? 60 : fps);
         const int64_t targetFrameUs = 1000000 / fps;
         const int64_t elapsed = esp_timer_get_time() - frameStart;
-#ifndef GM_ANIM_BENCH
-        // Bench builds drive the resolution explicitly, and a probe moving it
-        // underneath a sweep would average two configurations into one number.
-        //
-        // autoResolution is asked how long the frame's WORK took, not how long
-        // the frame took. presentFrame() ends by waiting for the scan-out to
-        // leave the buffer the next frame will overwrite, which is up to one
-        // panel frame (~23 ms) of vTaskDelay and is idle, not compute. Charging
-        // it to the budget makes a frame that comfortably fits look like an
-        // overrun, and the animation then drops to half resolution to pay back
-        // time it never spent. Half resolution has a real quality cost, so this
-        // has to be judged on the work.
-        //
-        // The pacing sleep below deliberately still uses the full wall clock:
-        // the wait is real elapsed time whatever its cause, and double-counting
-        // it there would run the loop fast.
-        const int64_t workUs = elapsed - static_cast<int64_t>(lastFlipWaitUs);
-        autoResolution(animId.load(), fps, workUs > 0 ? workUs : elapsed, targetFrameUs);
-        lastWorkUs.store(static_cast<uint32_t>(workUs > 0 ? workUs : elapsed));
-        lastFrameUs.store(static_cast<uint32_t>(elapsed));
-        lastWaitUs.store(lastFlipWaitUs);
-        // prof*Us hold cycles (PROF_ACC); one divide each per frame.
-        const uint32_t cpuMhz = getCpuFrequencyMhz();
-        lastBandUs.store(profBandUs / cpuMhz);
-        lastExpandUs.store(profExpandUs / cpuMhz);
-        lastFillUs.store(profFillUs / cpuMhz);
-        lastCopyUs.store(profCopyUs / cpuMhz);
-        lastBlendUs.store(profBlendUs / cpuMhz);
-        lastBlendScrimUs.store(profBlendScrimCyc / cpuMhz);
-        profBlendScrimCyc = 0;
-        lastLayerUs.store(profLayerUs / cpuMhz);
-        lastElemUs.store(profElemUs / cpuMhz);
-        lastMsyncUs.store(profMsyncUs / cpuMhz);
-        lastPushUs.store(profPushUs / cpuMhz);
-#endif
+        if constexpr (!kAnimBench) {
+            // Bench builds drive the resolution explicitly, and a probe moving it
+            // underneath a sweep would average two configurations into one number.
+            //
+            // autoResolution is asked how long the frame's WORK took, not how long
+            // the frame took. presentFrame() ends by waiting for the scan-out to
+            // leave the buffer the next frame will overwrite, which is up to one
+            // panel frame (~23 ms) of vTaskDelay and is idle, not compute. Charging
+            // it to the budget makes a frame that comfortably fits look like an
+            // overrun, and the animation then drops to half resolution to pay back
+            // time it never spent. Half resolution has a real quality cost, so this
+            // has to be judged on the work.
+            //
+            // The pacing sleep below deliberately still uses the full wall clock:
+            // the wait is real elapsed time whatever its cause, and double-counting
+            // it there would run the loop fast.
+            const int64_t workUs = elapsed - static_cast<int64_t>(lastFlipWaitUs);
+            autoResolution(animId.load(), fps, workUs > 0 ? workUs : elapsed, targetFrameUs);
+            lastWorkUs.store(static_cast<uint32_t>(workUs > 0 ? workUs : elapsed));
+            lastFrameUs.store(static_cast<uint32_t>(elapsed));
+            lastWaitUs.store(lastFlipWaitUs);
+            // prof*Us hold cycles (PROF_ACC); one divide each per frame.
+            const uint32_t cpuMhz = getCpuFrequencyMhz();
+            lastBandUs.store(profBandUs / cpuMhz);
+            lastExpandUs.store(profExpandUs / cpuMhz);
+            lastFillUs.store(profFillUs / cpuMhz);
+            lastCopyUs.store(profCopyUs / cpuMhz);
+            lastBlendUs.store(profBlendUs / cpuMhz);
+            lastBlendScrimUs.store(profBlendScrimCyc / cpuMhz);
+            profBlendScrimCyc = 0;
+            lastLayerUs.store(profLayerUs / cpuMhz);
+            lastElemUs.store(profElemUs / cpuMhz);
+            lastMsyncUs.store(profMsyncUs / cpuMhz);
+            lastPushUs.store(profPushUs / cpuMhz);
+        }
         const int64_t remaining = targetFrameUs - elapsed;
         // Always yield at least one full tick so the UI task keeps polling
         // touch even when a frame overruns its budget.
@@ -4234,97 +3822,6 @@ void IRAM_ATTR SleepAnimation::renderLoop() {
         }
     }
 }
-
-#ifdef GM_ANIM_BENCH
-void SleepAnimation::benchTick() {
-    const unsigned long now = millis();
-    if (benchResetPending.exchange(false)) {
-        // Applied here, on the render task, so no dwell is half-recorded and
-        // the reader never sees a torn benchDone[].
-        for (int i = 0; i < BENCH_MAX_ANIMS; i++) {
-            benchDone[i] = BenchResult{};
-        }
-        accBandUs = accBlendUs = accPushUs = accTotalUs = accWaitUs = accPackUs = 0;
-        accSpanPx = accScrimPx = 0;
-        accSpanPx = accScrimPx = 0;
-        accFrames = 0;
-        accMaxTotalUs = 0;
-        accBandLockedUs = 0;
-        accBandLockedRows = accBandRows = 0;
-        benchPasses = 0;
-        benchDwellStart = now;
-        uint8_t p[4];
-        bg_parse_params(nullptr, 0, p);
-        animParams.store(static_cast<uint32_t>(p[0]) | (static_cast<uint32_t>(p[1]) << 8) | (static_cast<uint32_t>(p[2]) << 16) |
-                         (static_cast<uint32_t>(p[3]) << 24));
-        animId.store(0);
-        log_i("animbench: results cleared, sweep restarted");
-        return;
-    }
-    if (benchDwellStart == 0) {
-        benchDwellStart = now;
-        return;
-    }
-    if (now - benchDwellStart >= BENCH_DWELL_MS) {
-        benchFinishDwell();
-    }
-}
-
-void SleepAnimation::benchFinishDwell() {
-    const int id = animId.load();
-    const unsigned long elapsedMs = millis() - benchDwellStart;
-    if (id >= 0 && id < BENCH_MAX_ANIMS && accFrames > 0) {
-        BenchResult &r = benchDone[id];
-        r.frames = accFrames;
-        r.bandUs = static_cast<uint32_t>(accBandUs / accFrames);
-        r.blendUs = static_cast<uint32_t>(accBlendUs / accFrames);
-        r.pushUs = static_cast<uint32_t>(accPushUs / accFrames);
-        r.totalUs = static_cast<uint32_t>(accTotalUs / accFrames);
-        r.maxTotalUs = accMaxTotalUs;
-        r.waitUs = static_cast<uint32_t>(accWaitUs / accFrames);
-        r.packUs = static_cast<uint32_t>(accPackUs / accFrames);
-        r.spanPx = static_cast<uint32_t>(accSpanPx / accFrames);
-        r.scrimPx = static_cast<uint32_t>(accScrimPx / accFrames);
-        r.achievedFps = elapsedMs > 0 ? static_cast<uint32_t>(accFrames * 100000ULL / elapsedMs) : 0;
-        // Both normalised per row so the locked sample (one band per frame)
-        // is directly comparable to the unlocked one (all 30 bands).
-        const uint64_t unlockedUs = accBandUs > accBandLockedUs ? accBandUs - accBandLockedUs : 0;
-        const uint32_t unlockedRows = accBandRows > accBandLockedRows ? accBandRows - accBandLockedRows : 0;
-        r.bandNsPerRow = unlockedRows > 0 ? static_cast<uint32_t>(unlockedUs * 1000ULL / unlockedRows) : 0;
-        r.bandLockedNsPerRow = accBandLockedRows > 0 ? static_cast<uint32_t>(accBandLockedUs * 1000ULL / accBandLockedRows) : 0;
-        r.valid = true; // publish last: readers on other tasks gate on this
-        log_i("animbench: %-10s band=%u us blend=%u us push=%u us total=%u us max=%u us fps=%u.%02u", bg_animation(id).id,
-              r.bandUs, r.blendUs, r.pushUs, r.totalUs, r.maxTotalUs, r.achievedFps / 100, r.achievedFps % 100);
-    }
-
-    accBandUs = accBlendUs = accPushUs = accTotalUs = accWaitUs = accPackUs = 0;
-    accSpanPx = accScrimPx = 0;
-    accFrames = 0;
-    accMaxTotalUs = 0;
-    accBandLockedUs = 0;
-    accBandLockedRows = accBandRows = 0;
-    benchDwellStart = millis();
-
-    const int count = bg_animation_count();
-    // benchOnly pins the sweep to a single animation. A full pass is 13 dwells
-    // of 6 s, so iterating on one animation's inner loop otherwise costs about
-    // 90 s of waiting per measurement, nearly all of it spent measuring the
-    // twelve animations that did not change.
-    const int pin = benchOnly.load();
-    const int next = (pin >= 0 && pin < count) ? pin : (id + 1) % count;
-    if (next == 0 || pin >= 0) {
-        benchPasses++;
-        log_i("animbench: completed sweep %u of all %d animations", benchPasses, count);
-    }
-    // Each animation is measured at its own documented defaults, so a run is
-    // reproducible and comparable against the host harness numbers.
-    uint8_t p[4];
-    bg_parse_params(nullptr, next, p);
-    animParams.store(static_cast<uint32_t>(p[0]) | (static_cast<uint32_t>(p[1]) << 8) | (static_cast<uint32_t>(p[2]) << 16) |
-                     (static_cast<uint32_t>(p[3]) << 24));
-    animId.store(static_cast<uint8_t>(next));
-}
-#endif
 
 // IRAM, with renderLoop, presentFrame, pushLoop and the scrim rows: the two
 // cores share one 16 KB instruction cache, and every LVGL pass on core 1
@@ -4427,9 +3924,7 @@ void IRAM_ATTR SleepAnimation::renderFrame() {
         // succeeds and makes the failure recoverable.
         if (anim.release != nullptr) {
             residentAnimId = id;
-#ifdef GM_KBLOB
-            blobResident.store(id == KBLOB_SLOT);
-#endif
+            probeResidentSet(id);
         }
         if (!anim.init(rw, rh)) {
             log_e("SleepAnimation: init failed for animation %d (%s)", id, anim.id);
@@ -4458,31 +3953,12 @@ void IRAM_ATTR SleepAnimation::renderFrame() {
     // step lands between frames, never between bands.
     const uint32_t ovGain = overlayGainAt(frameNowUs, ofi);
     ovGainFrame.store(static_cast<uint16_t>(ovGain));
-#ifdef GM_TOUCH_PROBE
-    // This sample is the moment a publish becomes part of a frame; a stamp
-    // still pending here means this frame is the first to carry the response.
-    if (g_probePublishUs != 0 && ofi >= 0) {
-        s_probeFrameEdgeUs = g_probePublishUs;
-        s_probeFramePress = g_probePublishIsPress;
-        g_probePublishUs = 0;
-    }
-    // The touch task's plate write is part of this frame's element
-    // evaluation (evaluateElements above), so the edge it stamped closes at
-    // this frame's present.
-    if (g_probeElemEdgeUs != 0) {
-        s_probeFrameElemUs = g_probeElemEdgeUs;
-        g_probeElemEdgeUs = 0;
-    }
-#endif
+    probeFrameSampled(ofi);
     const Overlay *ov = ofi >= 0 ? &overlays[ofi] : nullptr;
     const int ovXoff = ov != nullptr ? (ov->w - w) / 2 : 0;
     const int ovYoff = ov != nullptr ? (ov->h - h) / 2 : 0;
 
-#ifdef GM_ANIM_BENCH
-    // Advance which band gets the suspended render (see the note by
-    // lockThisBand). h/BAND_H rounded up, so the last short band is included.
-    benchLockBand = (benchLockBand + 1) % static_cast<uint32_t>((h + BAND_H - 1) / BAND_H);
-#endif
+    benchFrameBegin(h);
     // Which scrim cell row scrimInvPx holds. Per frame, not per band: the
     // overlay slot is fixed for the frame (overlayInUse above), and a reset
     // per band re-expanded the same 120 cells on every interlaced row,
@@ -4499,9 +3975,7 @@ void IRAM_ATTR SleepAnimation::renderFrame() {
         const bool gotSlot = xSemaphoreTake(static_cast<SemaphoreHandle_t>(bandFree[renderSlot]), pdMS_TO_TICKS(1000)) == pdTRUE;
         const uint32_t waitUs = static_cast<uint32_t>(esp_timer_get_time() - tWait);
         frameWaitUs += waitUs;
-#ifdef GM_ANIM_BENCH
-        accWaitUs += waitUs;
-#endif
+        BENCH_ADD(accWaitUs, waitUs);
         if (!gotSlot) {
             log_w("SleepAnimation: push task stalled, dropping frame");
             // Hand the framebuffer gate back before bailing, or the render task
@@ -4666,11 +4140,7 @@ void IRAM_ATTR SleepAnimation::renderFrame() {
         // band 0 and reported steam at "+191% preemption" purely from that.
         // Rotating means every band is locked equally often across a dwell, so
         // both populations cover the same pixels.
-#if GM_BENCH_LOCK_ONE_BAND
-        const bool lockThisBand = (y0 / BAND_H) == static_cast<int>(benchLockBand);
-#else
-        constexpr bool lockThisBand = false;
-#endif
+        const bool lockThisBand = benchLockThisBand(y0);
         BENCH_T0(tBand);
         PROF_T0(cBand);
         if (half) {
@@ -4782,130 +4252,13 @@ void IRAM_ATTR SleepAnimation::renderFrame() {
         }
         BENCH_ACC(accBandUs, tBand);
         PROF_ACC(profBandUs, cBand);
-#ifdef GM_ANIM_BENCH
-        accBandRows += static_cast<uint32_t>(rows);
-        if (lockThisBand) {
-            accBandLockedUs += static_cast<uint64_t>(esp_timer_get_time() - tBand);
-            accBandLockedRows += static_cast<uint32_t>(rows);
-        }
-#endif
-#ifdef GM_ANIM_BENCH
-        // Overwrite whatever the animation produced, after any half-resolution
-        // expansion, so what lands in the framebuffer is exactly the pattern
-        // regardless of how the band was generated. The composite is skipped
-        // too: the widgets are the one thing the host cannot predict.
-        // A tearing test a bad camera can still answer.
-        //
-        // The reason the webcam kept reporting corruption that was not in
-        // memory is that a dark room drives its exposure to tens of
-        // milliseconds, so one photo integrates ten panel frames. Integration
-        // blends, though -- it cannot invent an edge. So drive the whole
-        // screen to one of two maximally distinct colours on alternating
-        // frames and the signature becomes spatial instead of temporal: a
-        // correct flip can only ever photograph as uniform red, uniform blue,
-        // or a uniform mix of the two, at any exposure. A horizontal boundary
-        // between the two colours means part of the panel was scanning one
-        // frame while part scanned the next, which is exactly tearing, and no
-        // exposure time can fake it.
-        //
-        // frameParity advances once per frame, so every band of a frame picks
-        // the same colour. The fill covers all rows of the band whatever the
-        // interlace is doing, or the untouched rows would themselves read as
-        // a tear.
-        //   1 -- alternate per frame, the actual test
-        //   3 -- alternate every 32 frames instead of every frame. Mode 1 came
-        //        back uniformly red in every photo, which has two possible
-        //        causes: the flip never reaches the panel and one buffer is
-        //        stuck on screen, or the render rate and the panel's 61 Hz
-        //        scan are close enough to a harmonic that the shutter keeps
-        //        landing on the same parity. Half a second per colour is far
-        //        longer than any exposure and beats any harmonic, so if the
-        //        panel still never goes blue, the flip is the problem. Both
-        //        the pattern test and mode 1 render identical content every
-        //        frame, so neither can see a stuck flip on its own.
-        //   2 -- a fixed red-over-blue split at mid-screen, which is what a
-        //        tear looks like, as the negative control. Without it a clean
-        //        result proves nothing: at these exposures the two colours
-        //        partly blend, and a test whose contrast has been washed out
-        //        reports no tear because it can no longer see one. Mode 2
-        //        holds the edge still so the same measurement has to find it.
-        //   4 -- a static fiducial for horizontal scanout displacement, which
-        //        modes 1-3 cannot see at all: they fill whole rows with one
-        //        colour, so every pixel in a row is identical and shifting the
-        //        row sideways changes nothing a camera could record. The RGB
-        //        peripheral clocks HSYNC and VSYNC off its own counters
-        //        regardless of whether the DMA kept up, so a PSRAM underrun
-        //        desynchronises the pixel stream against the sync signals and
-        //        the picture shifts horizontally without the framebuffer ever
-        //        being wrong. /api/fbdump is therefore blind to it by
-        //        construction and only the panel's own output can show it.
-        //
-        //        Three vertical bars at deliberately unequal spacing, plus one
-        //        horizontal bar. Unequal spacing is the point: a periodic
-        //        grating shifted by a whole period is indistinguishable from
-        //        one not shifted at all, so a regular pattern can report clean
-        //        while displaced. The scene is static, which removes the other
-        //        confound -- with nothing moving, any displacement a photograph
-        //        records belongs to the panel and not to the animation.
-        //
-        //        Reading the result: a bar that is ragged or stepped means the
-        //        displacement varies line to line, while several clean copies
-        //        of the same bar mean the scanout phase was stable within a
-        //        frame but moved between frames during the exposure. The
-        //        horizontal bar catches the vertical component, since a shift
-        //        large enough to wrap carries pixels onto the next line.
-        const int flashMode = flashOn.load();
-        if (flashMode == 4) {
-            // Dark grey rather than black: the camera's auto-exposure hunts on
-            // a near-black field and returns unusable frames (measured at
-            // roughly one in seven), and a bar blooming out of pure black is
-            // harder to locate than one on a ground the sensor can meter.
-            const int bw = w >= 400 ? 6 : 4;
-            const int bx0 = w / 8, bx1 = (w * 2) / 5, bx2 = (w * 5) / 6;
-            const int by = h / 4, bh = bw;
-            for (int r = 0; r < rows; r++) {
-                const int py = y0 + r;
-                uint16_t *const prow = band + static_cast<size_t>(r) * w;
-                const bool hbar = py >= by && py < by + bh;
-                for (int x = 0; x < w; x++) {
-                    const bool vbar = (x >= bx0 && x < bx0 + bw) || (x >= bx1 && x < bx1 + bw) || (x >= bx2 && x < bx2 + bw);
-                    prow[x] = (hbar || vbar) ? 0xFFFF : 0x2124;
-                }
-            }
-        } else if (flashMode != 0) {
-            const uint32_t phase = flashMode == 3 ? (frameParity >> 5) : frameParity;
-            const uint16_t alt = (phase & 1u) != 0 ? 0xF800 : 0x001F;
-            for (int r = 0; r < rows; r++) {
-                const uint16_t c = flashMode == 2 ? ((y0 + r) < (h / 2) ? 0xF800 : 0x001F) : alt;
-                const uint32_t pair = static_cast<uint32_t>(c) | (static_cast<uint32_t>(c) << 16);
-                uint32_t *const prow = reinterpret_cast<uint32_t *>(band + static_cast<size_t>(r) * w);
-                for (int x = 0; x < w / 2; x++) {
-                    prow[x] = pair;
-                }
-            }
-        }
-        // pattern 1 replaces the animation and skips the composite, so the
-        // host can predict every pixel. pattern 2 keeps the composite, which
-        // the host cannot predict -- but it makes the background static, and a
-        // static scene is what lets the vector scrim be compared against the
-        // scalar one end to end: same scene, two kernels, the dumps must match
-        // byte for byte. The exhaustive kernel test covers the arithmetic;
-        // this covers the plumbing around it.
-        const int patternLevel = patternOn.load();
-        const bool patternMode = patternLevel == 1 || flashMode != 0;
-        if (patternLevel != 0) {
-            for (int r = 0; r < rows; r++) {
-                uint16_t *const prow = band + static_cast<size_t>(r) * w;
-                const int py = y0 + r;
-                for (int x = 0; x < w; x++) {
-                    prow[x] = benchPatternPx(x, py);
-                }
-            }
-        }
-#else
-        // Row-encoded test pattern, debug builds included, because the bench
-        // pattern above is compiled out of the load rig and the load rig is
-        // the only build that reproduces the fault.
+        BENCH_BAND_DONE(rows, lockThisBand, tBand);
+        // The bench replaces the band with a flash colour or a pattern the
+        // host can recompute (benchFillBand, SleepAnimationBench.cpp) and
+        // skips the composite while it does. Every other build keeps the
+        // row-encoded test pattern below, the load rig included, because the
+        // load rig is the only build that reproduces the fault it was
+        // written for.
         //
         // Every pixel of source row py carries py * 137, so a framebuffer dump
         // says which row each row's bytes actually CAME FROM. That separates
@@ -4916,8 +4269,8 @@ void IRAM_ATTR SleepAnimation::renderFrame() {
         // the duplicate is coming from the overlay composite or from a second
         // writer. The composite is skipped while this is on so every pixel is
         // predictable from its row alone.
-        const bool patternMode = debugPattern.load() != 0;
-        if (patternMode) {
+        const bool patternMode = kAnimBench ? benchFillBand(band, y0, rows, w, h) : debugPattern.load() != 0;
+        if (!kAnimBench && patternMode) {
             for (int r = 0; r < rows; r++) {
                 uint16_t *const prow = band + static_cast<size_t>(r) * w;
                 const uint16_t v = static_cast<uint16_t>((y0 + r) * 137u);
@@ -4926,32 +4279,27 @@ void IRAM_ATTR SleepAnimation::renderFrame() {
                 }
             }
         }
-#endif
         BENCH_T0(tBlend);
         PROF_T0(cBlend);
-#ifdef GM_ANIM_BENCH
-        // Locals, not the uint64_t members: a member increment in the innermost
-        // per-pixel loop is two loads, an add-with-carry and two stores, and it
-        // pins `this` for the whole loop. Charging that to the blend made the
-        // stage look ~2x its real cost and sent an earlier round of work at a
-        // memory-layout problem the blend did not have.
-        uint32_t spanPxLocal = 0;
-        uint32_t scrimPxLocal = 0;
-#endif
-#ifdef GM_BLEND_PROBE
-        uint32_t probeAcc = 0;
-#endif
+        // Bench and probe tallies for this band. Locals, not the uint64_t
+        // members: a member increment in the innermost per-pixel loop is two
+        // loads, an add-with-carry and two stores, and it pins `this` for the
+        // whole loop; charging that to the blend made the stage look ~2x its
+        // real cost and sent an earlier round of work at a memory-layout
+        // problem the blend did not have. Outside their builds nothing
+        // touches them and they fold away.
+        [[maybe_unused]] uint32_t spanPxLocal = 0;
+        [[maybe_unused]] uint32_t scrimPxLocal = 0;
+        [[maybe_unused]] uint32_t probeAcc = 0;
         // Text scrim strength, Q8. Zero whenever the user has it off or the
         // grids could not be allocated, and that zero is what makes it free
         // when unused: pass one is skipped outright rather than run with a
         // no-op factor.
         const int scrim = (ov != nullptr && ov->scrim != nullptr) ? scrimQ8.load() : 0;
-#ifdef GM_BLEND_PROBE
-        const int probe = blendProbe.load();
-        if (probe == 0 && probeCaptureBands != 0) {
-            probeReset();
-        }
-#endif
+        // Blend probe level, 0 outside GM_BLEND_PROBE so every test on it
+        // below folds away. Levels 5 to 9 leave the row at fixed points; 1 to
+        // 4 and 8 to 9 swap the kernel (probeBlendRow, SleepAnimationBlendProbe.cpp).
+        const int probe = probeLevel();
         // A gain below 256 scales the scrim's strength too, so a fading page
         // does not leave its dark halo behind: one scaled cell row, rebuilt
         // when the cell row changes (SCRIM_SHIFT panel rows share one).
@@ -4966,7 +4314,6 @@ void IRAM_ATTR SleepAnimation::renderFrame() {
                 continue;
             }
             uint16_t *const drow = band + static_cast<size_t>(y - y0) * w;
-#ifdef GM_BLEND_PROBE
             // Probe 5: the loop header alone. Probe 6: header plus the row
             // head asm. Probe 7: everything up to and including the scrim
             // block. Each leaves the row here so the stage cost can be
@@ -4974,16 +4321,11 @@ void IRAM_ATTR SleepAnimation::renderFrame() {
             if (probe == 5) {
                 continue;
             }
-#endif
-#ifdef GM_TOUCH_PROBE
             // Scrim slice: the halo block alone, per frame (blend_scrim_us).
-            PROF_T0(cScrimStart);
-#endif
-#ifdef GM_BLEND_PROBE
+            PROBE_SCRIM_T0(cScrimStart);
             if (probe == 6) {
                 continue;
             }
-#endif
             // Pass one: dim the halo. Its own runs, at cell resolution, because
             // the halo reaches 12 pixels past the glyphs and into rows that
             // hold no glyph at all.
@@ -5006,66 +4348,42 @@ void IRAM_ATTR SleepAnimation::renderFrame() {
                     if (pieScrim) {
                         // SCRIM_SHIFT panel rows share a cell row, so the
                         // expansion is amortised over all of them.
-#ifdef GM_BLEND_PROBE
                         // Probe 8 skips the expansion (stale factors, timing
                         // only); probe 9 skips the kernel.
                         if (cy != expandedCy && probe != 8) {
-#else
-                        if (cy != expandedCy) {
-#endif
                             expandScrimInv(scrimInvPx, invRow, ov->scrimW);
                             expandedCy = cy;
                         }
-#ifdef GM_BLEND_PROBE
                         if (probe != 9) {
                             scrimRowPie(drow, invRow, scrimInvPx, halo, nHalo, w);
                         }
-#else
-                        scrimRowPie(drow, invRow, scrimInvPx, halo, nHalo, w);
-#endif
                     } else {
                         scrimRow(drow, invRow, halo, nHalo, w);
                     }
-#ifdef GM_ANIM_BENCH
-                    for (int i = 0; i < nHalo; i++) {
-                        const uint32_t r = ov->haloRuns[static_cast<size_t>(cy) * RUNS_PER_ROW + i];
-                        scrimPxLocal += ((r >> 16) - (r & 0xFFFFu)) << SCRIM_SHIFT;
-                    }
-#endif
+                    BENCH_SCRIM_PX(scrimPxLocal, ov, cy, nHalo);
                 }
             }
             // Pass two: composite the widgets, over the glyph runs only.
-#ifdef GM_TOUCH_PROBE
-            PROF_T0(cScrimEnd);
-            profBlendScrimCyc += cScrimEnd - cScrimStart;
-#endif
-#ifdef GM_BLEND_PROBE
+            PROBE_SCRIM_END(cScrimStart);
             if (probe == 7) {
                 continue;
             }
-#endif
             const int nRuns = ov->runN[y];
             if (nRuns == 0) {
                 continue;
             }
             const uint32_t *const runs = ov->runs + static_cast<size_t>(y) * RUNS_PER_ROW;
-#ifdef GM_ANIM_BENCH
-            for (int i = 0; i < nRuns; i++) {
-                spanPxLocal += (runs[i] >> 16) - (runs[i] & 0xFFFFu);
-            }
-            if (probe == 1) {
+            BENCH_SPAN_PX(spanPxLocal, runs, nRuns);
+            if (kAnimBench && probe == 1) {
                 continue; // row and run walk only, no pixels touched
             }
-#endif
             const size_t ovAt = static_cast<size_t>(y + ovYoff) * ov->w + ovXoff;
             const uint16_t *const ccol = ov->col(overlayPlanePx) + ovAt;
             const uint16_t *const ca16 = ov->a16(overlayPlanePx) + ovAt;
-#ifdef GM_BLEND_PROBE
             if (probe >= 1) {
                 probeAcc += probeBlendRow(drow, ccol, ca16, runs, nRuns, probe, w, pieBlend);
                 continue;
             }
-#endif
             if (ovGain != 256) {
                 blendRowPlanar<true>(drow, ccol, ca16, runs, nRuns, ovGain, ovVec);
             } else {
@@ -5115,13 +4433,9 @@ void IRAM_ATTR SleepAnimation::renderFrame() {
                 PROF_ACC(profElemUs, tElem);
             }
         }
-#ifdef GM_ANIM_BENCH
-        accSpanPx += spanPxLocal;
-        accScrimPx += scrimPxLocal;
-#endif
-#ifdef GM_BLEND_PROBE
-        probeSink += probeAcc;
-#endif
+        BENCH_ADD(accSpanPx, spanPxLocal);
+        BENCH_ADD(accScrimPx, scrimPxLocal);
+        PROBE_SINK(probeAcc);
 
         // Compact the band to just the columns the round panel actually shows.
         // Rows are written full-width by the animations; here each row's
@@ -5676,23 +4990,16 @@ void SleepAnimation::runAnimTest() {
 }
 
 int SleepAnimation::activeSlot() const {
-#ifdef GM_KBLOB
-    if (useBlob.load(std::memory_order_relaxed) && !blobInstalling.load(std::memory_order_relaxed) && kblob::anim() != nullptr) {
+    if (probeBlobActive()) {
         return KBLOB_SLOT;
     }
-#endif
     return animId.load();
 }
 
 const BgAnimation &SleepAnimation::animBySlot(int slot) const {
-#ifdef GM_KBLOB
-    if (slot == KBLOB_SLOT) {
-        const BgAnimation *b = kblob::anim();
-        if (b != nullptr) {
-            return *b;
-        }
+    if (const BgAnimation *b = probeBlobAnim(slot)) {
+        return *b;
     }
-#endif
     return bg_animation(slot);
 }
 
@@ -5700,261 +5007,14 @@ void SleepAnimation::releaseResident() {
     if (residentAnimId < 0) {
         return;
     }
-#ifdef GM_KBLOB
-    if (residentAnimId == KBLOB_SLOT) {
-        // Never through bg_animation(): a slot with no blob behind it clamps
-        // to Plasma there, and Plasma's release() is not what holds these.
-        const BgAnimation *b = kblob::anim();
-        if (b != nullptr && b->release != nullptr) {
-            b->release();
-        }
-        residentAnimId = -1;
-        blobResident.store(false);
+    if (probeReleaseBlobResident()) {
         return;
     }
-#endif
     const BgAnimation &prev = bg_animation(residentAnimId);
     if (prev.release != nullptr) {
         prev.release();
     }
     residentAnimId = -1;
 }
-
-#ifdef GM_KBLOB
-
-bool SleepAnimation::kblobBeginInstall(uint32_t timeoutMs) {
-    // Order matters: the guard first, so a useblob=1 arriving from here on is
-    // dropped, then the switch off, then the handshake.
-    blobInstalling.store(true);
-    useBlob.store(false);
-    if (!running) {
-        if (blobResident.load()) {
-            blobInstalling.store(false);
-            return false;
-        }
-        return true;
-    }
-    blobDetachReq.store(true);
-    const int64_t deadline = esp_timer_get_time() + static_cast<int64_t>(timeoutMs) * 1000;
-    while (blobDetachReq.load()) {
-        if (esp_timer_get_time() > deadline) {
-            blobInstalling.store(false);
-            return false;
-        }
-        vTaskDelay(pdMS_TO_TICKS(5));
-    }
-    if (blobResident.load()) {
-        blobInstalling.store(false);
-        return false;
-    }
-    return true;
-}
-
-void SleepAnimation::serviceBlobDetach() {
-    if (!blobDetachReq.load()) {
-        return;
-    }
-    if (residentAnimId == KBLOB_SLOT) {
-        releaseResident();
-    }
-    if (initializedAnimId == KBLOB_SLOT) {
-        initializedAnimId = -1;
-    }
-    blobDetachReq.store(false);
-}
-
-namespace {
-uint32_t fnv1a(const void *p, size_t n) {
-    const uint8_t *b = static_cast<const uint8_t *>(p);
-    uint32_t h = 2166136261u;
-    for (size_t i = 0; i < n; i++) {
-        h = (h ^ b[i]) * 16777619u;
-    }
-    return h;
-}
-} // namespace
-
-void SleepAnimation::runKBench() {
-    const int id = kbenchReq.exchange(-1);
-    const int n = kbenchN.load();
-    const int frames = kbenchFrames.load();
-    const uint32_t which = kbenchWhich.load();
-    const int w = display->width();
-    const int h = display->height();
-    KBenchResult r;
-    r.anim = id;
-    r.frames = frames;
-    r.n = n;
-    r.which = which;
-    const uint32_t seq = kbenchSeq.load() + 2;
-    r.seq = seq;
-    auto publish = [&]() {
-        kbenchSeq.store(seq - 1, std::memory_order_release);
-        kbench = r;
-        kbenchSeq.store(seq, std::memory_order_release);
-    };
-    const BgAnimation &fw = bg_animation(id);
-    const BgAnimation *blob = kblob::anim();
-    const size_t bandBytes = static_cast<size_t>(w) * BAND_H * sizeof(uint16_t);
-    // Internal like the production band buffers; PSRAM only if that fails,
-    // which the log then says.
-    uint16_t *buf = static_cast<uint16_t *>(heap_caps_aligned_alloc(64, bandBytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
-    if (buf == nullptr) {
-        buf = static_cast<uint16_t *>(heap_caps_aligned_alloc(64, bandBytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
-        log_w("SleepAnimation: kbench band buffer fell back to PSRAM");
-    }
-    const int bandsPerFrame = (h + BAND_H - 1) / BAND_H;
-    // Per-band output hashes of the firmware band(): the firmware bandRef()
-    // and both blob kernels are compared against them. The blob's own
-    // bandRef() is compared with the blob band() of the same band directly.
-    uint32_t *hashes = nullptr;
-    if ((which & KB_BAND) != 0 && (which & ~KB_BAND) != 0) {
-        const size_t hashBytes = sizeof(uint32_t) * static_cast<size_t>(frames) * bandsPerFrame;
-        hashes = static_cast<uint32_t *>(heap_caps_malloc(hashBytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
-    }
-    if (buf == nullptr) {
-        publish();
-        return;
-    }
-    uint8_t pFw[4];
-    bg_parse_params(nullptr, id, pFw);
-    releaseResident();
-    initializedAnimId = -1;
-    // Nothing is resident now, so anything still in the slab was leaked by
-    // an earlier init()/release() pair. Report it and start clean.
-    r.hotLeakBefore = static_cast<uint32_t>(bganim::hotUsed());
-    if (r.hotLeakBefore != 0) {
-        log_w("SleepAnimation: kbench found %u B of hot slab allocated with nothing resident, resetting",
-              static_cast<unsigned>(bganim::hotReset()));
-    }
-    bool haveHashes = false; // the firmware band() ran and filled hashes[]
-    // obj 0 is the firmware descriptor (variants 0 and 1), obj 1 the blob
-    // (variants 2 and 3). Each object inits once and both of its kernels
-    // are timed on the same frame() state (see the header).
-    for (int obj = 0; obj < 2; obj++) {
-        const BgAnimation *a = obj == 0 ? &fw : blob;
-        const int vBand = obj * 2;
-        const int vRef = obj * 2 + 1;
-        const bool doBand = (which & (1u << vBand)) != 0 && a != nullptr;
-        const bool doRef = (which & (1u << vRef)) != 0 && a != nullptr && a->bandRef != nullptr;
-        if (!doBand && !doRef) {
-            continue;
-        }
-        // Each descriptor's own parameter defaults: for a blob that is a
-        // variant of animation `id` they are the same values, and for a blob
-        // that is a new animation they are the only ones that make sense.
-        uint8_t p[4];
-        for (int i = 0; i < 4; i++) {
-            p[i] = obj == 0 ? pFw[i] : (a->params[i].key != nullptr ? a->params[i].def : 0);
-        }
-        if (a->release != nullptr) {
-            residentAnimId = obj == 0 ? id : KBLOB_SLOT;
-            blobResident.store(obj == 1);
-        }
-        r.v[vBand].ran = doBand;
-        r.v[vRef].ran = doRef;
-        if (!a->init(w, h)) {
-            r.v[vBand].initFailed = doBand;
-            r.v[vRef].initFailed = doRef;
-            releaseResident();
-            continue;
-        }
-        for (int f = 0; f < frames; f++) {
-            const uint32_t tMs = 123456u + static_cast<uint32_t>(f) * 33u;
-            a->frame(tMs, w, h, p);
-            int bi = 0;
-            for (int y0 = 0; y0 < h; y0 += BAND_H, bi++) {
-                const int rows = (y0 + BAND_H <= h) ? BAND_H : (h - y0);
-                const int idx = f * bandsPerFrame + bi;
-                uint32_t hsh[2] = {0, 0}; // [0] band(), [1] bandRef()
-                // Alternate which kernel meets the band cold, as animtest
-                // does, so neither one's first run always follows the
-                // other's warm-up of the same tables.
-                for (int k2 = 0; k2 < 2; k2++) {
-                    const bool isRef = ((bi & 1) == 0) ? (k2 == 1) : (k2 == 0);
-                    if (isRef ? !doRef : !doBand) {
-                        continue;
-                    }
-                    const auto fn = isRef ? a->bandRef : a->band;
-                    KBenchVariant &v = r.v[isRef ? vRef : vBand];
-                    uint32_t best = ~0u;
-                    uint32_t first = 0;
-                    for (int k = 0; k < n; k++) {
-                        const uint32_t c0 = esp_cpu_get_cycle_count();
-                        fn(buf, y0, rows, w, tMs, p);
-                        const uint32_t dc = esp_cpu_get_cycle_count() - c0;
-                        if (k == 0) {
-                            first = dc;
-                        }
-                        if (dc < best) {
-                            best = dc;
-                        }
-                        v.sumCyc += dc;
-                    }
-                    v.minCyc += best;
-                    v.firstCyc += first;
-                    v.bands++;
-                    if (hashes != nullptr) {
-                        hsh[isRef ? 1 : 0] = fnv1a(buf, static_cast<size_t>(w) * rows * sizeof(uint16_t));
-                    }
-                }
-                if (hashes == nullptr) {
-                    continue;
-                }
-                auto note = [&](KBenchVariant &v, uint32_t expect, uint32_t got) {
-                    if (expect == got) {
-                        return;
-                    }
-                    if (v.mismatchBands == 0) {
-                        v.firstMismatchFrame = f;
-                        v.firstMismatchY = y0;
-                    }
-                    v.mismatchBands++;
-                };
-                if (obj == 0) {
-                    if (doBand) {
-                        hashes[idx] = hsh[0];
-                        if (doRef) {
-                            note(r.v[1], hsh[0], hsh[1]);
-                        }
-                    }
-                } else {
-                    if (haveHashes && doBand) {
-                        note(r.v[2], hashes[idx], hsh[0]);
-                    }
-                    if (haveHashes && doRef) {
-                        note(r.v[3], hashes[idx], hsh[1]);
-                    }
-                    if (doBand && doRef && hsh[0] != hsh[1]) {
-                        r.v[3].mismatchVsBlob++;
-                    }
-                }
-            }
-        }
-        releaseResident();
-        const uint32_t leaked = static_cast<uint32_t>(bganim::hotUsed());
-        if (obj == 0) {
-            r.hotLeakFw = leaked;
-        } else {
-            r.hotLeakBlob = leaked;
-        }
-        if (leaked != 0) {
-            log_w("SleepAnimation: kbench %s %s left %u B in the hot slab after release(), resetting",
-                  obj == 0 ? "firmware" : "blob", a->id, static_cast<unsigned>(leaked));
-            bganim::hotReset();
-        }
-        if (obj == 0 && doBand) {
-            haveHashes = hashes != nullptr;
-        }
-    }
-    heap_caps_free(buf);
-    heap_caps_free(hashes);
-    publish();
-    log_i("SleepAnimation: kbench %s n=%d frames=%d band=%llu ref=%llu blob=%llu blobref=%llu min cycles", fw.id, n, frames,
-          static_cast<unsigned long long>(r.v[0].minCyc), static_cast<unsigned long long>(r.v[1].minCyc),
-          static_cast<unsigned long long>(r.v[2].minCyc), static_cast<unsigned long long>(r.v[3].minCyc));
-}
-
-#endif // GM_KBLOB
 
 #endif // GAGGIMATE_SIM
