@@ -3480,6 +3480,37 @@ void DefaultUI::applyAnimPlates(int mode, uint32_t color, int opaPct) {
             animPlateBg[i] = lv_obj_get_style_bg_color(plates[i], LV_PART_MAIN);
             animPlateHas[i] = true;
         }
+        // The first four entries are the dial panels. In mode 2 the panel
+        // stays transparent and a radius-140 disc child carries the colour
+        // (see ANIM_PLATE_DISC_RADIUS): the dial ring and the value column
+        // sit inside it, the profile row stays inside it, and the blend a
+        // frame drops from about 12 ms to about 7 (gm-2cl.10). The disc is
+        // the panel's bottom child so every widget draws over it, it takes
+        // no clicks, and the panel's own hit area is unchanged.
+        if (i < ANIM_PLATE_DISC_COUNT) {
+            lv_obj_t *&disc = animPlateDisc[i];
+            if (mode == 2) {
+                if (disc == nullptr) {
+                    disc = lv_obj_create(plates[i]);
+                    lv_obj_remove_style_all(disc);
+                    lv_obj_set_size(disc, 2 * ANIM_PLATE_DISC_RADIUS, 2 * ANIM_PLATE_DISC_RADIUS);
+                    lv_obj_set_align(disc, LV_ALIGN_CENTER);
+                    lv_obj_set_style_radius(disc, LV_RADIUS_CIRCLE, LV_PART_MAIN);
+                    lv_obj_clear_flag(disc, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+                    lv_obj_clear_flag(disc, LV_OBJ_FLAG_CLICK_FOCUSABLE);
+                    lv_obj_add_flag(disc, LV_OBJ_FLAG_IGNORE_LAYOUT);
+                    lv_obj_move_background(disc);
+                }
+                lv_obj_set_style_bg_color(disc, lv_color_hex(color), LV_PART_MAIN);
+                lv_obj_set_style_bg_opa(disc, static_cast<lv_opa_t>((opaPct * 255 + 50) / 100), LV_PART_MAIN);
+                lv_obj_clear_flag(disc, LV_OBJ_FLAG_HIDDEN);
+                lv_obj_set_style_bg_opa(plates[i], LV_OPA_TRANSP, LV_PART_MAIN);
+                continue;
+            }
+            if (disc != nullptr) {
+                lv_obj_add_flag(disc, LV_OBJ_FLAG_HIDDEN);
+            }
+        }
         switch (mode) {
         case 0:
             lv_obj_set_style_bg_opa(plates[i], animPlateOpa[i], LV_PART_MAIN);

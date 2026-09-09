@@ -561,9 +561,26 @@ and `frames` is the scan-out's counter, so neither is a rate):
   moving elements should stay around 150 px, and a full-screen slide
   through a layer (230k px, 40 ms a frame) is not a 30 fps transition.
   The same rate applies to the overlay itself: the brew screen with 60%
-  plates is ~106k non-transparent pixels and 12 to 13 ms of blend a frame
+  plates was ~106k non-transparent pixels and 12 to 13 ms of blend a frame
   at any render priority, so how much of the screen is translucent over
   the animation is the budget knob for everything above.
+- **A Custom plate is a radius-140 disc behind the dial, not the dial
+  panel itself** (gm-2cl.10, owner's choice 2026-09-09,
+  `DefaultUI::applyAnimPlates`, `ANIM_PLATE_DISC_RADIUS`). The four dial
+  panels (brew, steam, water and status; 360 and 400 px discs in
+  `screens.c`) stay transparent in mode 2 and a 280 px child disc, the
+  panel's bottom child, carries the colour and opacity; modes 0 and 1 hide
+  it. The generated screens are untouched, so the children keep their
+  positions and nothing is clipped. Bench board, brew screen, interlace
+  pinned, cap 45, divider 8, black plate at the stored opacity, two runs:
+  blend 9.6 ms over 103k overlay pixels before, 6.9 and 7.1 ms over 65k
+  after, frame rate 27.5 to 30.2 fps. The bead asked for 3 ms; the 2.6
+  measured is what 38k fewer pixels buy at the 0.07 us a pixel the
+  planar kernel now costs, not the 0.12 the estimate used. The profile
+  row and the centre controls sit inside the disc (framebuffer capture
+  through `/api/debug/fb`); the status bar readouts above the dial were
+  outside the old plate too. Measured with the mode switched through the
+  Animation category and switched back, so the stored mode ends as found.
 
 ## On-display settings (violate these and an edit is lost or a target is unreachable)
 
@@ -601,8 +618,9 @@ the design cannot show and what the runs measured.
 - **No translucent plate on a settings page.** The cover sets `bg_opa` to
   `LV_OPA_TRANSP` and every row is text and icons on the screen background
   (`SettingsUI.cpp`). Translucent pixels are the render task's budget knob:
-  the brew screen's plates are about 106k non-transparent pixels and 12 to
-  13 ms of blend a frame (UI-pipeline invariants above). The bench board
+  the brew screen's plates were about 106k non-transparent pixels and 12 to
+  13 ms of blend a frame before the radius-140 disc, 65k and 7 ms after
+  (UI-pipeline invariants above). The bench board
   measured 29.7 to 30.6 fps on all nine settings pages against a 27.9 fps
   menu-screen baseline at cap 30, so the cover costs the animation nothing
   (device runner report, `report.json` pages and the `baseline` step,
