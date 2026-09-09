@@ -230,6 +230,17 @@ export const BG_ANIMATIONS = [
       { key: 'contrast', label: 'Contrast', def: 30 },
     ],
   },
+  {
+    id: 'sundial',
+    name: 'Silent Sundial',
+    description: 'One broad wedge of shade turning slowly around the centre of the panel.',
+    params: [
+      { key: 'speed', label: 'Speed', def: 10 },
+      { key: 'width', label: 'Wedge width', def: 40 },
+      { key: 'contrast', label: 'Contrast', def: 25 },
+      { key: 'shading', label: 'Surface shading', def: 30 },
+    ],
+  },
 ];
 
 // Shared color themes — MUST mirror BgAnimThemes.cpp (append only, the theme
