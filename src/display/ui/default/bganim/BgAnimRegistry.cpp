@@ -25,13 +25,14 @@ extern const BgAnimation bg_anim_brushed;
 extern const BgAnimation bg_anim_horizon;
 extern const BgAnimation bg_anim_oculus;
 extern const BgAnimation bg_anim_chevrons;
+extern const BgAnimation bg_anim_mosaic;
 
 namespace {
 const BgAnimation *const REGISTRY[] = {
     &bg_anim_plasma,  &bg_anim_lava,    &bg_anim_silk,    &bg_anim_starfield, &bg_anim_aurora, &bg_anim_ripples,
     &bg_anim_caustics, &bg_anim_mandala, &bg_anim_orbits, &bg_anim_fireflies, &bg_anim_steam, &bg_anim_ember,
     &bg_anim_nebula,  &bg_anim_silk2,   &bg_anim_brushed, &bg_anim_horizon, &bg_anim_oculus,
-    &bg_anim_chevrons,
+    &bg_anim_chevrons, &bg_anim_mosaic,
 };
 } // namespace
 

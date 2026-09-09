@@ -197,6 +197,17 @@ export const BG_ANIMATIONS = [
       { key: 'contrast', label: 'Contrast', def: 35 },
     ],
   },
+  {
+    id: 'mosaic',
+    name: 'Quiet Mosaic',
+    description: 'Uneven tiles with a darker grout line, each changing brightness on its own clock.',
+    params: [
+      { key: 'speed', label: 'Speed', def: 15 },
+      { key: 'size', label: 'Tile size', def: 45 },
+      { key: 'contrast', label: 'Contrast', def: 30 },
+      { key: 'variation', label: 'Variation', def: 55 },
+    ],
+  },
 ];
 
 // Shared color themes — MUST mirror BgAnimThemes.cpp (append only, the theme
