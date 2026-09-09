@@ -552,6 +552,22 @@ void WebUIPlugin::drainAssetQueue() {
 
 namespace {
 
+// True for "HH:MM" with a 24-hour hour and a two-digit minute in range,
+// the only form the schedule editor and the wakeup tick understand.
+bool isScheduleTime(const String &t) {
+    if (t.length() != 5 || t.charAt(2) != ':') {
+        return false;
+    }
+    for (int i : {0, 1, 3, 4}) {
+        if (t.charAt(i) < '0' || t.charAt(i) > '9') {
+            return false;
+        }
+    }
+    const int hour = (t.charAt(0) - '0') * 10 + (t.charAt(1) - '0');
+    const int minute = (t.charAt(3) - '0') * 10 + (t.charAt(4) - '0');
+    return hour <= 23 && minute <= 59;
+}
+
 enum HistoryKind : uint8_t { kHistFile = 0, kHistRecent = 1 };
 constexpr size_t kHistoryQueueCap = 8;
 constexpr long kRecentLimitMax = 50;
@@ -1422,7 +1438,11 @@ void WebUIPlugin::handleSettings(AsyncWebServerRequest *request) const {
                         String scheduleStr = (end != -1) ? schedulesStr.substring(start, end) : schedulesStr.substring(start);
 
                         int pipePos = scheduleStr.indexOf('|');
-                        if (pipePos != -1) {
+                        // A time that is not HH:MM in range is dropped here rather
+                        // than stored: the on-display editor parses the stored
+                        // string and showed 00:00 for anything else, and the
+                        // wakeup tick would never match it.
+                        if (pipePos != -1 && isScheduleTime(scheduleStr.substring(0, pipePos))) {
                             String timeStr = scheduleStr.substring(0, pipePos);
                             String daysStr = scheduleStr.substring(pipePos + 1);
 
