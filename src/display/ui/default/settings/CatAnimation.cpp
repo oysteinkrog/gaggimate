@@ -46,7 +46,7 @@ namespace {
 constexpr const char *kSimAnimNames[] = {
     "Plasma", "Lava", "Silk", "Starfield", "Aurora", "Ripples", "Caustics", "Mandala",
     "Orbits", "Fireflies", "Steam", "Ember", "Nebula", "Silk 2", "Brushed Metal",
-    "Quiet Horizon", "Soft Oculus",
+    "Quiet Horizon", "Soft Oculus", "Folded Chevron",
 };
 constexpr const char *kSimThemeNames[] = {
     "Espresso", "Ocean", "Violet Dusk", "Forest", "Sunset", "Fire", "Ice", "Mono", "Rose", "Gold", "Aurora", "Cyber",

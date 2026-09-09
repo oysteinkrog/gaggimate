@@ -186,6 +186,17 @@ export const BG_ANIMATIONS = [
       { key: 'edge', label: 'Edge softness', def: 55 },
     ],
   },
+  {
+    id: 'chevrons',
+    name: 'Folded Chevron',
+    description: 'Broad angular folds like a paper relief, lit on one face and shaded on the other.',
+    params: [
+      { key: 'speed', label: 'Speed', def: 15 },
+      { key: 'spacing', label: 'Spacing', def: 65 },
+      { key: 'angle', label: 'Angle', def: 50 },
+      { key: 'contrast', label: 'Contrast', def: 35 },
+    ],
+  },
 ];
 
 // Shared color themes — MUST mirror BgAnimThemes.cpp (append only, the theme
