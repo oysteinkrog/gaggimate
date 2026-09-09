@@ -788,10 +788,12 @@ What the device runs taught, beyond the numbers:
 
 Known limits, recorded rather than fixed:
 
-- A malformed stored schedule time, which the web UI can write because its
-  handler stores whatever string the browser sent, shows as 00:00 in the
-  editor and as the raw string in the list (`CatSchedules.cpp`, through
-  `settingsui::scheduleTimeParts`).
+- A malformed stored schedule time shows as 00:00 in the editor and as the
+  raw string in the list (`CatSchedules.cpp`, through
+  `settingsui::scheduleTimeParts`). The web handler no longer writes one
+  (2026-09-09, `isScheduleTime` in `WebUIPlugin.cpp` drops an entry whose
+  time is not HH:MM in range), so only a value stored before that or
+  written by hand can still show this way.
 - `buildRegions` rebuilds the whole region span list, one `std::string` per
   zone entry, on every region or city arrow press (`SettingsModel.cpp`): three
   builds for a region press, two for a city press. Measured on the host
