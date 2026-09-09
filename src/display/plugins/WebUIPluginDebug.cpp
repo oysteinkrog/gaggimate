@@ -1874,8 +1874,9 @@ void WebUIPlugin::setupDebugEndpoints() {
 #endif // !GAGGIMATE_HEADLESS
 
 #if GM_TOUCH_INJECT
-    // /api/debug/tap?x=<0..479>&y=<0..479>[&ms=<hold, default 80>]: queues one
-    // synthetic tap (TouchInject.h). touchpad_read (LV_Helper.cpp) and, on the
+    // /api/debug/tap?x=<0..479>&y=<0..479>[&ms=<hold, default 80>][&x2=&y2=]:
+    // queues one synthetic tap (TouchInject.h), or a drag from x,y to x2,y2
+    // over the hold when both are given. touchpad_read (LV_Helper.cpp) and, on the
     // simulator, mouse_read (SdlDriver.cpp) poll it ahead of their own reads,
     // so a scripted request drives the same screen-change code a finger does.
     // Without x/y, returns the in-flight request's observed timing so a
@@ -1897,7 +1898,22 @@ void WebUIPlugin::setupDebugEndpoints() {
                 request->send(400, "application/json", "{\"error\":\"x,y 0..479, ms 20..10000\"}");
                 return;
             }
-            if (!touchInjectRequest(static_cast<int16_t>(x), static_cast<int16_t>(y), static_cast<uint32_t>(ms))) {
+            int x2 = x, y2 = y;
+            if (request->hasArg("x2") || request->hasArg("y2")) {
+                if (!request->hasArg("x2") || !request->hasArg("y2")) {
+                    request->send(400, "application/json", "{\"error\":\"x2 and y2 both required\"}");
+                    return;
+                }
+                x2 = request->arg("x2").toInt();
+                y2 = request->arg("y2").toInt();
+                if (x2 < TOUCH_INJECT_MIN_COORD || x2 > TOUCH_INJECT_MAX_COORD || y2 < TOUCH_INJECT_MIN_COORD ||
+                    y2 > TOUCH_INJECT_MAX_COORD) {
+                    request->send(400, "application/json", "{\"error\":\"x2,y2 0..479\"}");
+                    return;
+                }
+            }
+            if (!touchInjectRequest(static_cast<int16_t>(x), static_cast<int16_t>(y), static_cast<int16_t>(x2),
+                                    static_cast<int16_t>(y2), static_cast<uint32_t>(ms))) {
                 bool active;
                 uint32_t remainingMs, pressedAtMs, releasedAtMs;
                 touchInjectState(active, remainingMs, pressedAtMs, releasedAtMs);

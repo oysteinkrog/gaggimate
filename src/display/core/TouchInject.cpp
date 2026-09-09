@@ -18,6 +18,8 @@ struct State {
     Stage stage = Stage::Idle;
     int16_t x = 0;
     int16_t y = 0;
+    int16_t x2 = 0; // where the press ends; equal to x, y for a tap
+    int16_t y2 = 0;
     uint32_t holdMs = 0;
     uint32_t pressedAtMs = 0;
     uint32_t releasedAtMs = 0;
@@ -28,9 +30,12 @@ portMUX_TYPE s_mux = portMUX_INITIALIZER_UNLOCKED;
 
 } // namespace
 
-bool touchInjectRequest(int16_t x, int16_t y, uint32_t holdMs) {
+bool touchInjectRequest(int16_t x, int16_t y, uint32_t holdMs) { return touchInjectRequest(x, y, x, y, holdMs); }
+
+bool touchInjectRequest(int16_t x, int16_t y, int16_t x2, int16_t y2, uint32_t holdMs) {
     if (x < TOUCH_INJECT_MIN_COORD || x > TOUCH_INJECT_MAX_COORD || y < TOUCH_INJECT_MIN_COORD || y > TOUCH_INJECT_MAX_COORD ||
-        holdMs < TOUCH_INJECT_MIN_HOLD_MS || holdMs > TOUCH_INJECT_MAX_HOLD_MS) {
+        x2 < TOUCH_INJECT_MIN_COORD || x2 > TOUCH_INJECT_MAX_COORD || y2 < TOUCH_INJECT_MIN_COORD ||
+        y2 > TOUCH_INJECT_MAX_COORD || holdMs < TOUCH_INJECT_MIN_HOLD_MS || holdMs > TOUCH_INJECT_MAX_HOLD_MS) {
         return false;
     }
     bool queued = false;
@@ -39,6 +44,8 @@ bool touchInjectRequest(int16_t x, int16_t y, uint32_t holdMs) {
         s_state.stage = Stage::Queued;
         s_state.x = x;
         s_state.y = y;
+        s_state.x2 = x2;
+        s_state.y2 = y2;
         s_state.holdMs = holdMs;
         s_state.pressedAtMs = 0;
         s_state.releasedAtMs = 0;
@@ -63,20 +70,25 @@ bool touchInjectPoll(int16_t &x, int16_t &y, bool &pressed) {
         pressed = true;
         active = true;
         break;
-    case Stage::Pressed:
-        if (now - s_state.pressedAtMs >= s_state.holdMs) {
+    case Stage::Pressed: {
+        const uint32_t elapsed = now - s_state.pressedAtMs;
+        if (elapsed >= s_state.holdMs) {
             s_state.stage = Stage::Released;
             s_state.releasedAtMs = now;
-            x = s_state.x;
-            y = s_state.y;
+            x = s_state.x2;
+            y = s_state.y2;
             pressed = false;
         } else {
-            x = s_state.x;
-            y = s_state.y;
+            // Linear from (x, y) to (x2, y2) over the hold; a tap has both the same.
+            x = static_cast<int16_t>(s_state.x + (static_cast<int32_t>(s_state.x2 - s_state.x) * static_cast<int32_t>(elapsed)) /
+                                                     static_cast<int32_t>(s_state.holdMs));
+            y = static_cast<int16_t>(s_state.y + (static_cast<int32_t>(s_state.y2 - s_state.y) * static_cast<int32_t>(elapsed)) /
+                                                     static_cast<int32_t>(s_state.holdMs));
             pressed = true;
         }
         active = true;
         break;
+    }
     case Stage::Released:
         // The release sample already went out on the previous poll; this is
         // the poll after that, so hand real input back from here on.

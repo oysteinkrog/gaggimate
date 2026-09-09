@@ -32,6 +32,10 @@ constexpr uint32_t TOUCH_INJECT_DEFAULT_HOLD_MS = 80;
 // so it can tell the two rejection reasons apart (400 vs 409); this also
 // re-checks range so no other caller can queue an out-of-bounds tap.
 bool touchInjectRequest(int16_t x, int16_t y, uint32_t holdMs);
+// The same, ending at (x2, y2): the pressed samples move from (x, y) to
+// (x2, y2) linearly over holdMs and the release lands at (x2, y2), which is
+// how a swipe is scripted (/api/debug/tap?x=&y=&x2=&y2=&ms=).
+bool touchInjectRequest(int16_t x, int16_t y, int16_t x2, int16_t y2, uint32_t holdMs);
 
 // Polled first by touchpad_read (device) and mouse_read (sim), ahead of
 // either's own read of real hardware/SDL state. While a tap is in flight
@@ -52,6 +56,7 @@ void touchInjectState(bool &active, uint32_t &remainingMs, uint32_t &pressedAtMs
 #else
 
 inline bool touchInjectRequest(int16_t, int16_t, uint32_t) { return false; }
+inline bool touchInjectRequest(int16_t, int16_t, int16_t, int16_t, uint32_t) { return false; }
 inline bool touchInjectPoll(int16_t &, int16_t &, bool &) { return false; }
 inline void touchInjectState(bool &active, uint32_t &remainingMs, uint32_t &pressedAtMs, uint32_t &releasedAtMs) {
     active = false;

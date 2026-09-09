@@ -458,6 +458,40 @@ void SettingsUI::buildCategoryPage(PageEntry &entry) {
     lv_obj_add_flag(root, LV_OBJ_FLAG_EVENT_BUBBLE);
     lv_obj_set_style_bg_opa(root, LV_OPA_TRANSP, LV_PART_MAIN);
 
+    // Swipe between pages: a horizontal gesture anywhere on the page, the
+    // finger moving left for the next page. LVGL delivers a gesture to the
+    // first ancestor of the pressed object that does not bubble gestures,
+    // so the root clears the flag and everything under it keeps it. The
+    // rest of the press is dropped (lv_indev_wait_release) so the row the
+    // swipe started on gets no CLICKED at the release: LVGL 8.4 gates
+    // CLICKED on scrolling, not on a gesture, and a swipe across a toggle
+    // row would otherwise flip it. A stepper still steps once on the
+    // PRESSED it already had if the swipe began on its 40 px button.
+    lv_obj_clear_flag(root, LV_OBJ_FLAG_GESTURE_BUBBLE);
+    lv_obj_add_event_cb(
+        root,
+        [](lv_event_t *e) {
+            auto *self = static_cast<SettingsUI *>(lv_event_get_user_data(e));
+            lv_indev_t *indev = lv_indev_get_act();
+            if (indev == nullptr || self->pageStack.empty()) {
+                return;
+            }
+            const lv_dir_t dir = lv_indev_get_gesture_dir(indev);
+            if (dir != LV_DIR_LEFT && dir != LV_DIR_RIGHT) {
+                return;
+            }
+            PageEntry &top = self->pageStack.back();
+            const int rows = top.def->rowCount ? top.def->rowCount(top.ctx) : 0;
+            const int pages = rows > 0 ? (rows + kRowsPerPage - 1) / kRowsPerPage : 1;
+            const int target = top.page + (dir == LV_DIR_LEFT ? 1 : -1);
+            if (target < 0 || target >= pages) {
+                return; // at an edge: nothing to show, keep the press alive
+            }
+            lv_indev_wait_release(indev);
+            self->gotoPage(target);
+        },
+        LV_EVENT_GESTURE, this);
+
     const int totalRows = entry.def->rowCount ? entry.def->rowCount(entry.ctx) : 0;
     const int totalPages = totalRows > 0 ? (totalRows + kRowsPerPage - 1) / kRowsPerPage : 1;
     if (entry.page >= totalPages) {
@@ -475,6 +509,10 @@ void SettingsUI::buildCategoryPage(PageEntry &entry) {
     // 227.4 px from the centre, inside the 228 px edge rule; the title gets
     // the 144 px between them on one line ("Animation" in montserrat 24 is
     // about 125 px; the old 96 px column broke it as "Animatio" / "n").
+    // The pages sit side by side in the reader's mind, so the arrows point
+    // left and right (owner's request, 2026-09-09; they were up and down
+    // chevrons before) and a horizontal swipe on the page does the same,
+    // see the GESTURE handler on the root above.
     lv_obj_t *header = lv_obj_create(root);
     lv_obj_remove_style_all(header);
     lv_obj_set_size(header, 240, 56);
@@ -485,7 +523,7 @@ void SettingsUI::buildCategoryPage(PageEntry &entry) {
     // activity) never sees the arrow presses.
     lv_obj_add_flag(header, LV_OBJ_FLAG_EVENT_BUBBLE);
     // Same clipping the row slots below need the flag for (see the loop
-    // building kRowY): the up/down arrows' 8 px ext click pad has to reach
+    // building kRowY): the arrows' 8 px ext click pad has to reach
     // past this container's own 200 px width to make their 56x56 hit box,
     // and with no spare margin between them and the title column there was
     // nowhere for that pad to go (measured: both arrows audited at 48x56).

@@ -681,7 +681,15 @@ the design cannot show and what the runs measured.
   height because LONG_DOT wraps instead of truncating when the height is
   left to the content (the old 96 px column showed "Animatio" / "n").
   `Rig.audit()` in `tools/settings_ui_tests/rig.py` is the check, and the
-  runner audits every page on every run.
+  runner audits every page on every run. The arrows point left and right
+  (owner's request, 2026-09-09; they were up and down chevrons on the same
+  spots) and a horizontal swipe on a category page turns it too: the page
+  root clears `LV_OBJ_FLAG_GESTURE_BUBBLE`, since LVGL hands a gesture to
+  the first ancestor that does not bubble, and the handler calls
+  `lv_indev_wait_release` before `gotoPage`, because LVGL 8.4 gates
+  CLICKED on scrolling and not on a gesture, so a swipe across a toggle
+  row would otherwise flip it on release. `/api/debug/tap` takes `x2=`
+  and `y2=` for a scripted drag and `Rig.swipe()` wraps it.
 - **Ranges live in three places that must agree.** `SettingsModel.h` owns the
   display's editing ranges, steps, wrap rules and formats. `Settings` clamps
   a few fields on store (`setBrewDelay` and `setGrindDelay` to 0 to 4000,
