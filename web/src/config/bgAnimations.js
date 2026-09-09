@@ -219,6 +219,17 @@ export const BG_ANIMATIONS = [
       { key: 'contrast', label: 'Contrast', def: 30 },
     ],
   },
+  {
+    id: 'refraction',
+    name: 'Refraction',
+    description: 'Broad tonal channels bending across the face, as if seen through uneven glass.',
+    params: [
+      { key: 'speed', label: 'Speed', def: 18 },
+      { key: 'bend', label: 'Bend', def: 35 },
+      { key: 'width', label: 'Channel width', def: 65 },
+      { key: 'contrast', label: 'Contrast', def: 30 },
+    ],
+  },
 ];
 
 // Shared color themes — MUST mirror BgAnimThemes.cpp (append only, the theme
