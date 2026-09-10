@@ -149,6 +149,10 @@ export const BG_ANIMATIONS = [
       { key: 'count', label: 'Wisps', def: 55 },
       { key: 'swirl', label: 'Swirl', def: 45 },
       { key: 'density', label: 'Density', def: 50 },
+      { key: 'size', label: 'Puff size', def: 50 },
+      { key: 'spread', label: 'Base spread', def: 50 },
+      { key: 'tint', label: 'Steam tint', def: 50 },
+      { key: 'taper', label: 'Top fade', def: 50 },
     ],
   },
   {

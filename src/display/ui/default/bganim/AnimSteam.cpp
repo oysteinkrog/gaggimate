@@ -204,6 +204,27 @@ void frame(uint32_t tMs, int w, int h, const uint8_t p[BG_ANIM_PARAMS]) {
     const float riseSpeed = 0.034f * speedMul(p[0]);
     const float swirl = 0.5f + (p[2] / 100.0f) * 1.7f;
     const float density = 0.5f + (p[3] / 100.0f) * 0.8f;
+    // The four sliders added on 2026-09-10 (gm-3vj.13) all share this shape:
+    // t is exactly 0.0f at the default of 50, and each term below is written
+    // so that t == 0 leaves the arithmetic the animation had before them --
+    // multiplying by a float 1.0f and adding a float 0.0f are both exact in
+    // IEEE 754, so the default output is unchanged bit for bit rather than
+    // nearly unchanged. Every one of them acts here in frame(), on values
+    // BlobDraw carries into the band loop, so neither the portable pixel
+    // loop nor the fill kernel below sees a parameter at all.
+    const float sizeT = (static_cast<int>(p[4]) - 50) / 50.0f;
+    const float sizeMul = 1.0f + sizeT * (sizeT < 0.0f ? 0.5f : 0.8f); // 0.5x .. 1.8x puff radius
+    const float spreadT = (static_cast<int>(p[5]) - 50) / 50.0f;
+    const float spreadMul = 1.0f + spreadT * (spreadT < 0.0f ? 0.85f : 0.5f); // 0.15x .. 1.5x base spacing
+    // Theme position the wisp colour is sampled from. The +heightFrac*55 rise
+    // term stays; themeRGB clamps, so the top of the slider simply parks every
+    // blob on the theme's brightest accent.
+    const int tintBase = 200 + ((static_cast<int>(p[6]) - 50) * 11) / 5; // 90 .. 310
+    const float taperT = (static_cast<int>(p[7]) - 50) / 50.0f;
+    // Never above 1.0f: heightFrac is clamped to 1, so (1 - heightFrac*taper)
+    // cannot go negative and alpha cannot reach the undefined float-to-uint8
+    // conversion a negative value would ask for.
+    const float taper = 0.3f + taperT * (taperT < 0.0f ? 0.3f : 0.7f); // 0.0 (no top fade) .. 1.0
     const float maxHeight = h * 0.62f;
     // Blob radii and sway amplitudes below were written as absolute pixel
     // counts, which silently assumed the render target is always 480 wide.
@@ -213,6 +234,7 @@ void frame(uint32_t tMs, int w, int h, const uint8_t p[BG_ANIM_PARAMS]) {
     // while everything else quarters. Scaling them to the render width keeps
     // the picture identical at any resolution and makes the cost scale with it.
     const float rscale = w * (1.0f / 480.0f);
+    const float cx = w * 0.5f;
 
     g_active = wispCount * BLOBS_PER_WISP;
     for (int i = 0; i < g_active; i++) {
@@ -228,11 +250,19 @@ void frame(uint32_t tMs, int w, int h, const uint8_t p[BG_ANIM_PARAMS]) {
         const float rise = riseSpeed * age;
         const float heightFrac = fminf(1.0f, rise / maxHeight);
         const float y = wp.y0 - rise;
-        const float R = (10.0f + 26.0f * heightFrac) * (0.85f + 0.3f * fastSinRad(b.seed)) * rscale;
+        const float R = (10.0f + 26.0f * heightFrac) * (0.85f + 0.3f * fastSinRad(b.seed)) * rscale * sizeMul;
         const float swayAmp = (5.0f + 22.0f * heightFrac) * swirl * rscale;
-        const float x = wp.x0 + swayAmp * fastSinRad(wp.swayFreq1 * tMs + wp.swayPhase1 + b.seed) +
+        // Base spread scales the wisp's launch point about the panel centre.
+        // The == 1.0f branch is what keeps the default bit-exact: a round trip
+        // through (wp.x0 - cx) and back is exact for every x0 this animation
+        // actually builds, but that rests on both operands staying within a
+        // factor of two of cx, which is a property of halfSpan rather than
+        // anything this line controls. Taking the branch costs nothing and
+        // owes the reader no such argument.
+        const float wx0 = spreadMul == 1.0f ? wp.x0 : cx + (wp.x0 - cx) * spreadMul;
+        const float x = wx0 + swayAmp * fastSinRad(wp.swayFreq1 * tMs + wp.swayPhase1 + b.seed) +
                         swayAmp * 0.35f * fastSinRad(wp.swayFreq2 * tMs + wp.swayPhase2 + b.seed * 1.7f);
-        float alpha = density * 0.44f * 4.0f * L * (1.0f - L) * (1.0f - heightFrac * 0.3f);
+        float alpha = density * 0.44f * 4.0f * L * (1.0f - L) * (1.0f - heightFrac * taper);
         if (alpha > 0.4f) {
             alpha = 0.4f; // hard cap: steam stays vapor, never opaque
         }
@@ -245,7 +275,7 @@ void frame(uint32_t tMs, int w, int h, const uint8_t p[BG_ANIM_PARAMS]) {
         d.scaleQ = static_cast<int32_t>(63.0f * 65536.0f / (R * R) + 0.5f);
         // Wisps ride the theme's bright end, shifting slightly as they rise.
         uint8_t c[3];
-        themeRGB(200 + static_cast<int>(heightFrac * 55.0f), c);
+        themeRGB(tintBase + static_cast<int>(heightFrac * 55.0f), c);
         d.r = c[0];
         d.g = c[1];
         d.b = c[2];
@@ -431,7 +461,14 @@ extern const BgAnimation bg_anim_steam;
 const BgAnimation bg_anim_steam = {
     "steam",
     "Steam",
-    {{"speed", "Rise speed", 50}, {"count", "Wisps", 55}, {"swirl", "Swirl", 45}, {"density", "Density", 50}},
+    {{"speed", "Rise speed", 50},
+     {"count", "Wisps", 55},
+     {"swirl", "Swirl", 45},
+     {"density", "Density", 50},
+     {"size", "Puff size", 50},
+     {"spread", "Base spread", 50},
+     {"tint", "Steam tint", 50},
+     {"taper", "Top fade", 50}},
     init,
     frame,
     band,
