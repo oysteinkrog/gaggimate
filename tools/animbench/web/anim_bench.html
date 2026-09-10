@@ -5247,8 +5247,9 @@ function pcDither(dst, amp) {
 /* ---- D1: Barrel Roll (astra_brainstorm.txt candidate 5) ----
    Wide diagonal bands wrapped around a shaded vertical cylinder, climbing
    at 16 px/s with a 32 s period, exactly as the candidate specifies.
-   Column table is baked once: the arcsine angle phase and the cosine shade
-   with a smooth 24 px edge fade, packed side by side (the firmware packs
+   Column table is baked on the first frame and again whenever one of the
+   four geometry sliders moves: the arcsine angle phase and the cosine
+   shade with a smooth edge fade, packed side by side (the firmware packs
    them into one uint32; two typed arrays read the same way here).
    Pixel kernel is the candidate's: one column gather, a 17-bit fold, one
    multiply and one palette gather.
@@ -5259,15 +5260,25 @@ function pcDither(dst, amp) {
    well short of the palette top so white UI text keeps its contrast. Bayer dither on
    the index kills the RGB565 banding the wide gradients would otherwise
    show, and the triangle fold gives the band edges a linear ramp rather
-   than a step, so there is nothing for the panel to alias on. */
+   than a step, so there is nothing for the panel to alias on.
+   Eight parameters since gm-3vj.42. Band tilt is the phase step per row,
+   Barrel width the cylinder radius against the panel's half width, Edge
+   fade the smoothstep width, Light angle where the highlight sits, and
+   Band depth the base of the height ramp. Each is the constant this entry
+   used to hard-code when its slider is at 50, so the default preview is
+   the one the firmware port was written from. */
 (() => {
   const PERIOD = 131072;        // 17-bit fold, as the candidate specifies
   const HALF = PERIOD >> 1;
-  const H_BASE = 8738;          // fold 0    -> index 22 + 34 at full shade
   const IDX_LO = 22;            // darkest edge of the cylinder
   const CLIMB_PX_S = 16;        // candidate: climbs at about 16 px/s
-  const ROW_STEP = 256;         // (y<<8): 512 rows per band, 32 s period
-  const EDGE_PX = 24;           // candidate: fade to zero over 24 px
+  const ROW_STEP_DEF = 256;     // Band tilt 50: 512 rows per band, 32 s period
+  const FOLD_SPAN = 24576;      // the fold's whole contribution to the height
+  const CREST = 8738 + FOLD_SPAN; // the height Band depth pins the crest to
+  // Band depth: the height ramp's base, where fold 0 lands. 17476 at slider
+  // 0 (a shallow ripple), 8738 at 50 (index 22 + 34 at full shade, the
+  // original), 0 at 100, where the troughs reach the palette floor.
+  const hBaseOf = v => 17476 - Math.round(v * 17476 / 100);
 
   ANIMS.push({
     id: 'barrel', name: 'Barrel', proto: true,
@@ -5275,28 +5286,18 @@ function pcDither(dst, amp) {
       { key: 'speed', label: 'Speed', def: 50 },
       { key: 'bands', label: 'Bands', def: 14 },
       { key: 'shade', label: 'Cylinder shade', def: 62 },
+      { key: 'tilt', label: 'Band tilt', def: 50 },
+      { key: 'width', label: 'Barrel width', def: 50 },
+      { key: 'edge', label: 'Edge fade', def: 50 },
+      { key: 'light', label: 'Light angle', def: 50 },
+      { key: 'depth', label: 'Band depth', def: 50 },
     ],
     init(w, h, state) {
       state.colAng = new Int32Array(w);   // 256 * asin-mapped angle, 0..65536
-      state.colShade = new Uint8Array(w); // 0..255, cosine body times edge fade
+      state.colShade = new Uint16Array(w); // 0..346, cosine body times edge fade times the depth scale
       state.colPhase = new Int32Array(w);
-      const half = (w - 1) / 2;
-      for (let x = 0; x < w; x++) {
-        let z = (x - half) / (w / 2);
-        if (z < -1) z = -1; else if (z > 1) z = 1;
-        // angle phase: 128 + 256*asin(z)/pi, scaled by 256 -> 0..65536
-        const a = 128 + 256 * Math.asin(z) / Math.PI;
-        state.colAng[x] = Math.round(a * 256);
-        // body shading is the cylinder cosine; the edge fade is a smoothstep
-        // over the outermost EDGE_PX so the compressed silhouette samples
-        // never reach the screen.
-        const body = Math.sqrt(Math.max(0, 1 - z * z));
-        const e = Math.min(x, w - 1 - x) / EDGE_PX;
-        const fade = e >= 1 ? 1 : e * e * (3 - 2 * e);
-        state.colShade[x] = Math.round(255 * body * fade);
-      }
       state.dith = new Int16Array(64);
-      state.pal = null; state.key = null;
+      state.pal = null; state.key = null; state.geom = null;
     },
     render(data, w, h, tMs, p, state) {
       const key = p[2] + '|' + THEME.gen;
@@ -5305,24 +5306,63 @@ function pcDither(dst, amp) {
         state.pal = themeRamp(180 + Math.round(p[2] * 76 / 100));
         bayerOffsets(state.dith, 1.6, 1);
       }
+      // Barrel width, Edge fade, Light angle and Band depth rebuild the
+      // column table. At 50 each map is the constant this entry used to
+      // hard-code: radius scale 1, fade width 24 px, light angle 0 (where
+      // the shading term is the plain cosine again) and depth scale 1.
+      const geom = p[4] + '|' + p[5] + '|' + p[6] + '|' + p[7];
+      if (state.geom !== geom) {
+        state.geom = geom;
+        const half = (w - 1) / 2;
+        const invRadius = 2 / (w * (0.5 + p[4] / 100));
+        const edgePx = 2 + p[5] * 44 / 100;
+        const lightA = (p[6] - 50) * (0.6 / 50);
+        const cosA = Math.cos(lightA), sinA = Math.sin(lightA);
+        // Band depth pins the crest: the shade column is scaled so that
+        // hBase + FOLD_SPAN always lands on the same palette index, and only
+        // the trough moves. See the firmware file for the swept bounds.
+        const shadeScale = CREST / (hBaseOf(p[7]) + FOLD_SPAN);
+        for (let x = 0; x < w; x++) {
+          let z = (x - half) * invRadius;
+          if (z < -1) z = -1; else if (z > 1) z = 1;
+          // angle phase: 128 + 256*asin(z)/pi, scaled by 256 -> 0..65536
+          const a = 128 + 256 * Math.asin(z) / Math.PI;
+          state.colAng[x] = Math.round(a * 256);
+          // body shading is cos(theta - lightA) with theta = asin(z), which
+          // is the cylinder cosine turned toward the light; the edge fade is
+          // a smoothstep over the outermost edgePx so the compressed
+          // silhouette samples never reach the screen.
+          let body = cosA * Math.sqrt(Math.max(0, 1 - z * z)) + sinA * z;
+          if (body < 0) body = 0;
+          const e = Math.min(x, w - 1 - x) / edgePx;
+          const fade = e >= 1 ? 1 : e * e * (3 - 2 * e);
+          state.colShade[x] = Math.round(255 * body * fade * shadeScale);
+        }
+      }
       const te = tMs * speedMulJS(p[0]);
       // 3..10 band cycles across the cylinder; the default 4 is the
       // candidate's own, and it is also where the bands sit at 45 degrees:
-      // the x phase rate at the centre then matches the row step.
+      // the x phase rate at the centre then matches the default row step.
       const bandK = 3 + Math.round(p[1] * 7 / 100);
-      const phase = Math.round(CLIMB_PX_S * ROW_STEP * te / 1000) % PERIOD;
-      // fold -> h ramp: h = H_BASE + 3*fold/8, so a full-shade column runs
-      // index 56 at the band trough to 151 at its crest.
+      // Band tilt: 0 phase units a row at slider 0, where the bands stand
+      // vertical and slide sideways, 256 at 50, 512 at 100. The phase rate
+      // stays the default tilt's so the pattern moves at every tilt.
+      const rowStep = Math.round(p[3] * 512 / 100);
+      const hBase = hBaseOf(p[7]);
+      const phase = Math.round(CLIMB_PX_S * ROW_STEP_DEF * te / 1000) % PERIOD;
+      // fold -> h ramp: h = hBase + 3*fold/8, so at the default depth a
+      // full-shade column runs index 56 at the band trough to 151 at its
+      // crest.
       const { colAng, colShade, colPhase, dith, pal } = state;
       for (let x = 0; x < w; x++) colPhase[x] = colAng[x] * bandK;
       let o = 0;
       for (let y = 0; y < h; y++) {
-        const r = y * ROW_STEP + phase;
+        const r = y * rowStep + phase;
         const dRow = (y & 7) << 3;
         for (let x = 0; x < w; x++) {
           const v = (colPhase[x] + r) & (PERIOD - 1);
           const f = v <= HALF ? v : PERIOD - v;
-          const hh = H_BASE + ((f * 3) >> 3);
+          const hh = hBase + ((f * 3) >> 3);
           let i = IDX_LO + ((colShade[x] * hh) >> 16) + dith[dRow + (x & 7)];
           if (i < 0) i = 0; else if (i > 255) i = 255;
           i *= 3;

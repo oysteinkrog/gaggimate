@@ -560,6 +560,11 @@ export const BG_ANIMATIONS = [
       { key: 'speed', label: 'Speed', def: 50 },
       { key: 'bands', label: 'Bands', def: 14 },
       { key: 'shade', label: 'Cylinder shade', def: 62 },
+      { key: 'tilt', label: 'Band tilt', def: 50 },
+      { key: 'width', label: 'Barrel width', def: 50 },
+      { key: 'edge', label: 'Edge fade', def: 50 },
+      { key: 'light', label: 'Light angle', def: 50 },
+      { key: 'depth', label: 'Band depth', def: 50 },
     ],
   },
   {
