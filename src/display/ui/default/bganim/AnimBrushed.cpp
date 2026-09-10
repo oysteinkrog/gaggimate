@@ -227,7 +227,7 @@ void release() {
 extern const BgAnimation bg_anim_brushed;
 const BgAnimation bg_anim_brushed = {
     "brushed",
-    "Brushed Metal",
+    "Brushed",
     {{"speed", "Speed", 20}, {"grain", "Grain", 35}, {"reflection", "Reflection", 45}, {"contrast", "Contrast", 30}},
     init,
     frame,

@@ -359,7 +359,7 @@ void release() {
 extern const BgAnimation bg_anim_crescent;
 const BgAnimation bg_anim_crescent = {
     "crescent",
-    "Matte Crescent",
+    "Crescent",
     {{"speed", "Speed", 15},
      {"size", "Size", 70},
      {"phase", "Phase range", 40},

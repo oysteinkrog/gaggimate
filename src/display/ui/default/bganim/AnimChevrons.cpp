@@ -223,7 +223,7 @@ void release() {
 extern const BgAnimation bg_anim_chevrons;
 const BgAnimation bg_anim_chevrons = {
     "chevrons",
-    "Folded Chevron",
+    "Chevrons",
     {{"speed", "Speed", 15}, {"spacing", "Spacing", 65}, {"angle", "Angle", 50}, {"contrast", "Contrast", 35}},
     init,
     frame,

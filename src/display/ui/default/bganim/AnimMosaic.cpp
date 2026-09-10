@@ -295,7 +295,7 @@ void release() {
 extern const BgAnimation bg_anim_mosaic;
 const BgAnimation bg_anim_mosaic = {
     "mosaic",
-    "Quiet Mosaic",
+    "Mosaic",
     {{"speed", "Speed", 15}, {"size", "Tile size", 45}, {"contrast", "Contrast", 30}, {"variation", "Variation", 55}},
     init,
     frame,

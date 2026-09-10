@@ -361,7 +361,7 @@ void release() {
 extern const BgAnimation bg_anim_sundial;
 const BgAnimation bg_anim_sundial = {
     "sundial",
-    "Silent Sundial",
+    "Sundial",
     {{"speed", "Speed", 10},
      {"width", "Wedge width", 40},
      {"contrast", "Contrast", 25},

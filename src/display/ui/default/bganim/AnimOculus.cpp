@@ -254,7 +254,7 @@ void release() {
 extern const BgAnimation bg_anim_oculus;
 const BgAnimation bg_anim_oculus = {
     "oculus",
-    "Soft Oculus",
+    "Oculus",
     {{"speed", "Speed", 15}, {"diameter", "Diameter", 65}, {"breath", "Breath", 20}, {"edge", "Edge softness", 55}},
     init,
     frame,

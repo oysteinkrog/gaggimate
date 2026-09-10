@@ -155,8 +155,8 @@ export const BG_ANIMATIONS = [
   },
   {
     id: 'brushed',
-    name: 'Brushed Metal',
-    description: 'Fine horizontal grain with one broad reflection sliding across it.',
+    name: 'Brushed',
+    description: 'A dark brushed surface with a wide sheen sliding across it.',
     params: [
       { key: 'speed', label: 'Speed', def: 20 },
       { key: 'grain', label: 'Grain', def: 35 },
@@ -166,8 +166,8 @@ export const BG_ANIMATIONS = [
   },
   {
     id: 'horizon',
-    name: 'Quiet Horizon',
-    description: 'One gently curved horizon between two broad theme tones, rising and falling slowly.',
+    name: 'Horizon',
+    description: 'A glowing horizon line between ground and sky, drifting slowly.',
     params: [
       { key: 'speed', label: 'Speed', def: 10 },
       { key: 'height', label: 'Height', def: 45 },
@@ -177,8 +177,8 @@ export const BG_ANIMATIONS = [
   },
   {
     id: 'oculus',
-    name: 'Soft Oculus',
-    description: 'A broad circular opening with a softly lit inner edge, breathing slowly.',
+    name: 'Oculus',
+    description: 'A dark pupil inside a softly lit ring that breathes.',
     params: [
       { key: 'speed', label: 'Speed', def: 15 },
       { key: 'diameter', label: 'Diameter', def: 65 },
@@ -188,8 +188,8 @@ export const BG_ANIMATIONS = [
   },
   {
     id: 'chevrons',
-    name: 'Folded Chevron',
-    description: 'Broad angular folds like a paper relief, lit on one face and shaded on the other.',
+    name: 'Chevrons',
+    description: 'Wide soft folds travelling down the face.',
     params: [
       { key: 'speed', label: 'Speed', def: 15 },
       { key: 'spacing', label: 'Spacing', def: 65 },
@@ -199,8 +199,8 @@ export const BG_ANIMATIONS = [
   },
   {
     id: 'mosaic',
-    name: 'Quiet Mosaic',
-    description: 'Uneven tiles with a darker grout line, each changing brightness on its own clock.',
+    name: 'Mosaic',
+    description: 'Large soft tiles, each fading on its own clock.',
     params: [
       { key: 'speed', label: 'Speed', def: 15 },
       { key: 'size', label: 'Tile size', def: 45 },
@@ -211,7 +211,7 @@ export const BG_ANIMATIONS = [
   {
     id: 'saddle',
     name: 'Saddle',
-    description: 'Two broad regions brightening toward opposite edges, with curved boundaries drifting through a quiet centre.',
+    description: 'Tonal contours flowing along a drifting saddle surface.',
     params: [
       { key: 'speed', label: 'Speed', def: 12 },
       { key: 'curvature', label: 'Curvature', def: 35 },
@@ -222,7 +222,7 @@ export const BG_ANIMATIONS = [
   {
     id: 'refraction',
     name: 'Refraction',
-    description: 'Broad tonal channels bending across the face, as if seen through uneven glass.',
+    description: 'Broad tonal channels bending as if seen through uneven glass.',
     params: [
       { key: 'speed', label: 'Speed', def: 18 },
       { key: 'bend', label: 'Bend', def: 35 },
@@ -232,8 +232,8 @@ export const BG_ANIMATIONS = [
   },
   {
     id: 'sundial',
-    name: 'Silent Sundial',
-    description: 'One broad wedge of shade turning slowly around the centre of the panel.',
+    name: 'Sundial',
+    description: 'A soft wedge of light turning slowly around the centre.',
     params: [
       { key: 'speed', label: 'Speed', def: 10 },
       { key: 'width', label: 'Wedge width', def: 40 },
@@ -243,8 +243,8 @@ export const BG_ANIMATIONS = [
   },
   {
     id: 'crescent',
-    name: 'Matte Crescent',
-    description: 'A pale crescent on a dark face, turning slowly and swelling and thinning as it turns.',
+    name: 'Crescent',
+    description: 'A pale crescent turning, swelling and thinning.',
     params: [
       { key: 'speed', label: 'Speed', def: 15 },
       { key: 'size', label: 'Size', def: 70 },
@@ -255,12 +255,217 @@ export const BG_ANIMATIONS = [
   {
     id: 'glint',
     name: 'Glint',
-    description: 'A nearly black face with one soft curved highlight sweeping slowly across it.',
+    description: 'A soft curved highlight sweeping across a dark face.',
     params: [
       { key: 'speed', label: 'Speed', def: 10 },
       { key: 'length', label: 'Length', def: 35 },
       { key: 'width', label: 'Width', def: 45 },
       { key: 'brightness', label: 'Brightness', def: 55 },
+    ],
+  },
+  {
+    id: 'tunnel',
+    name: 'Tunnel',
+    description: 'A soft walled tunnel with bands gliding toward the viewer.',
+    params: [
+      { key: 'speed', label: 'Speed', def: 50 },
+      { key: 'pitch', label: 'Band pitch', def: 50 },
+      { key: 'brightness', label: 'Brightness', def: 74 },
+    ],
+  },
+  {
+    id: 'kaleido',
+    name: 'Kaleido',
+    description: 'A six fold flower of soft blotches that keeps reforming.',
+    params: [
+      { key: 'speed', label: 'Speed', def: 50 },
+      { key: 'scale', label: 'Blotch scale', def: 50 },
+      { key: 'brightness', label: 'Brightness', def: 62 },
+    ],
+  },
+  {
+    id: 'shafts',
+    name: 'Shafts',
+    description: 'Soft shafts of light fanning from above and swaying.',
+    params: [
+      { key: 'speed', label: 'Speed', def: 50 },
+      { key: 'density', label: 'Shaft count', def: 50 },
+      { key: 'brightness', label: 'Brightness', def: 66 },
+    ],
+  },
+  {
+    id: 'weave',
+    name: 'Weave',
+    description: 'A large soft honeycomb cloth turning and breathing.',
+    params: [
+      { key: 'speed', label: 'Speed', def: 50 },
+      { key: 'scale', label: 'Weave scale', def: 50 },
+      { key: 'brightness', label: 'Brightness', def: 62 },
+    ],
+  },
+  {
+    id: 'lens',
+    name: 'Lens',
+    description: 'A magnifying lens wandering over a dim mottled ground.',
+    params: [
+      { key: 'speed', label: 'Speed', def: 50 },
+      { key: 'size', label: 'Lens size', def: 55 },
+      { key: 'brightness', label: 'Brightness', def: 62 },
+    ],
+  },
+  {
+    id: 'tide',
+    name: 'Tide',
+    description: 'Broad soft bars gliding through each other and brightening where they cross.',
+    params: [
+      { key: 'speed', label: 'Speed', def: 50 },
+      { key: 'width', label: 'Band width', def: 50 },
+      { key: 'glow', label: 'Glow', def: 55 },
+    ],
+  },
+  {
+    id: 'truchet',
+    name: 'Truchet',
+    description: 'Soft quarter circle arcs linking into meandering loops.',
+    params: [
+      { key: 'speed', label: 'Speed', def: 50 },
+      { key: 'arc', label: 'Arc width', def: 50 },
+      { key: 'glow', label: 'Glow', def: 55 },
+    ],
+  },
+  {
+    id: 'quilt',
+    name: 'Quilt',
+    description: 'A grid of soft pillows with the light walking around them.',
+    params: [
+      { key: 'speed', label: 'Speed', def: 50 },
+      { key: 'pitch', label: 'Pillow size', def: 75 },
+      { key: 'relief', label: 'Relief', def: 55 },
+    ],
+  },
+  {
+    id: 'rain',
+    name: 'Rain',
+    description: 'Sparse soft streaks falling down a dark face.',
+    params: [
+      { key: 'speed', label: 'Speed', def: 50 },
+      { key: 'tail', label: 'Tail length', def: 50 },
+      { key: 'glow', label: 'Head glow', def: 55 },
+    ],
+  },
+  {
+    id: 'stripes',
+    name: 'Stripes',
+    description: 'Broad soft stripes sliding and turning while two gratings beat.',
+    params: [
+      { key: 'speed', label: 'Speed', def: 50 },
+      { key: 'pitch', label: 'Stripe pitch', def: 50 },
+      { key: 'depth', label: 'Depth', def: 55 },
+    ],
+  },
+  {
+    id: 'ribbon',
+    name: 'Ribbon',
+    description: 'One wide ribbon twisting about its axis down the face.',
+    params: [
+      { key: 'speed', label: 'Speed', def: 50 },
+      { key: 'width', label: 'Ribbon width', def: 50 },
+      { key: 'twist', label: 'Twist', def: 50 },
+      { key: 'bright', label: 'Brightness', def: 62 },
+    ],
+  },
+  {
+    id: 'harmonograph',
+    name: 'Harmonograph',
+    description: 'A luminous Lissajous thread drawing slow loops over a glow.',
+    params: [
+      { key: 'speed', label: 'Speed', def: 50 },
+      { key: 'size', label: 'Figure size', def: 68 },
+      { key: 'glow', label: 'Thread glow', def: 60 },
+      { key: 'bright', label: 'Brightness', def: 60 },
+    ],
+  },
+  {
+    id: 'floor',
+    name: 'Floor',
+    description: 'A soft plaid floor running back to a glowing horizon.',
+    params: [
+      { key: 'speed', label: 'Speed', def: 50 },
+      { key: 'yaw', label: 'Yaw sway', def: 50 },
+      { key: 'scale', label: 'Plaid scale', def: 50 },
+      { key: 'bright', label: 'Brightness', def: 60 },
+    ],
+  },
+  {
+    id: 'hills',
+    name: 'Hills',
+    description: 'Three hill layers scrolling at different speeds under drifting stars.',
+    params: [
+      { key: 'speed', label: 'Speed', def: 50 },
+      { key: 'relief', label: 'Ridge relief', def: 50 },
+      { key: 'depth', label: 'Layer contrast', def: 55 },
+      { key: 'bright', label: 'Brightness', def: 60 },
+    ],
+  },
+  {
+    id: 'gyroid',
+    name: 'Gyroid',
+    description: 'Broad luminous passages through a gyroid section, opening and reconnecting.',
+    params: [
+      { key: 'speed', label: 'Speed', def: 50 },
+      { key: 'scale', label: 'Passage size', def: 50 },
+      { key: 'glow', label: 'Passage width', def: 55 },
+      { key: 'bright', label: 'Brightness', def: 60 },
+    ],
+  },
+  {
+    id: 'barrel',
+    name: 'Barrel',
+    description: 'Satin bands climbing a shaded cylinder.',
+    params: [
+      { key: 'speed', label: 'Speed', def: 50 },
+      { key: 'bands', label: 'Bands', def: 14 },
+      { key: 'shade', label: 'Cylinder shade', def: 62 },
+    ],
+  },
+  {
+    id: 'grid',
+    name: 'Grid',
+    description: 'A soft wire floor receding into the distance, crossings sliding forward.',
+    params: [
+      { key: 'speed', label: 'Speed', def: 50 },
+      { key: 'density', label: 'Grid density', def: 50 },
+      { key: 'lines', label: 'Line strength', def: 58 },
+    ],
+  },
+  {
+    id: 'cells',
+    name: 'Cells',
+    description: 'Glowing channels dividing quiet dark cells, drifting slowly.',
+    params: [
+      { key: 'speed', label: 'Speed', def: 50 },
+      { key: 'width', label: 'Channel width', def: 55 },
+      { key: 'depth', label: 'Contrast', def: 60 },
+    ],
+  },
+  {
+    id: 'dimples',
+    name: 'Dimples',
+    description: 'A hammered relief with the highlight sweeping around it.',
+    params: [
+      { key: 'speed', label: 'Speed', def: 50 },
+      { key: 'relief', label: 'Relief', def: 58 },
+      { key: 'bright', label: 'Brightness', def: 62 },
+    ],
+  },
+  {
+    id: 'cube',
+    name: 'Cube',
+    description: 'A translucent cube with feathered edges turning in a graded field.',
+    params: [
+      { key: 'speed', label: 'Speed', def: 50 },
+      { key: 'size', label: 'Cube size', def: 50 },
+      { key: 'glow', label: 'Face glow', def: 55 },
     ],
   },
 ];

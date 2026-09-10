@@ -275,7 +275,7 @@ void release() {
 extern const BgAnimation bg_anim_horizon;
 const BgAnimation bg_anim_horizon = {
     "horizon",
-    "Quiet Horizon",
+    "Horizon",
     {{"speed", "Speed", 10}, {"height", "Height", 45}, {"curvature", "Curvature", 35}, {"softness", "Softness", 60}},
     init,
     frame,
