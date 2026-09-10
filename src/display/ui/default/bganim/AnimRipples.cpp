@@ -148,6 +148,17 @@
 // (a per-pixel branch-and-load memset-alike, and a per-pixel-per-band range
 // check); left as a candidate for a future pass, not attempted here.
 
+// Parameter pass (2026-09-10, gm-3vj.8): four more sliders, taking this
+// animation from 4 to 8. Every one of them acts in frame() or in a table
+// frame() rebuilds -- drop spread moves the landing point, ring width
+// rewrites envLUT, water tone scales two per-row constants, trough dip
+// scales a colour factor blendPackSpan reads -- so neither pixel loop
+// changed and the two hand-written Xtensa kernels below are untouched.
+// Each new slider defaults to 50, and at 50 the arithmetic collapses to the
+// constant this file hard-coded before: paramScale returns a literal 1.0f,
+// the spread term is 1.0f + 0.0f, and rebuildEnvLUT takes a branch that
+// writes the original expression. So the default output is the old output
+// bit for bit, which is what the golden frames check.
 #include "BgAnim.h"
 #include "BgAnimCommon.h"
 #include <math.h>
@@ -166,25 +177,43 @@ constexpr float RAD_TO_TABLE = 256.0f / 6.2831853f;
 constexpr float WIN_MARGIN = 2.0f; // px slack on every crossing window (see file header)
 
 // Padded clamp-to-uint8 LUT sizing. Worst case for cr/cg/cb (see clamp8f
-// call sites below): baseR/baseG/baseB in [0,255] (themeRGB output); ring
+// call sites below): baseR/baseG/baseB in [0,255] (themeRGB output, whatever
+// the water tone parameter does to the position it asks for); ring
 // term g*crestF/troughF where |g| = |hAcc * g_glow| and hAcc sums up to
 // MAX_RIPPLES per-ring contributions, each bounded by amp*cos*env <=
-// amp_max ~= 0.975 (rise in [0,1], expf(-ageS/life) < 1 with its peak at
-// ageS=0.18s -> ~0.975 for the largest tunable life of 7s), so
-// |hAcc| <= 4*0.975 = 3.9; g_glow in [0.35, 1.5] (p[3] 0..100) so
-// |g| <= 5.85. crestF[ch] <= 255*0.65 = 165.75 (crest branch, g>0):
-// cr_max ~= 255 + 5.85*165.75 + dith(4.125) ~= 1228.7. troughF[ch] <=
-// crestF*0.12 <= 19.89 (trough branch, g<0): cr_min ~= 0 - 5.85*19.89 -
-// 4.125 ~= -120.5. So the true range is about [-121, 1229]; CLAMP_PAD/SIZE
-// below add a comfortable margin on both ends.
-constexpr int CLAMP_PAD = 200;
-constexpr int CLAMP_SIZE = 1600; // covers b = (int)v in [-200, 1399]
+// amp_max * env_max ~= 0.975 * 1.6 = 1.56 (rise in [0,1], expf(-ageS/life)
+// < 1 with its peak at ageS=0.18s -> ~0.975 for the largest tunable life of
+// 7s; envLUT holds a*(1-n*n)^e with the base in [0,1] and a <= 1.6 at the
+// fattest ring width, p[5]=0), so |hAcc| <= 4*1.56 = 6.24; g_glow in
+// [0.35, 1.5] (p[3] 0..100) so |g| <= 9.36. crestF[ch] <= 255*0.65 = 165.75
+// (crest branch, g>0): cr_max ~= 255 + 9.36*165.75 + dith(4.125) ~= 1810.8.
+// troughF[ch] <= crestF*0.72 <= 119.34 (trough branch, g<0, at the deepest
+// trough dip p[7]=100): cr_min ~= 0 - 9.36*119.34 - 4.125 ~= -1121.2. So the
+// true range is about [-1122, 1811]; CLAMP_PAD/SIZE below add a comfortable
+// margin on both ends. Both grew for the two new parameters that widen this
+// bound (p[5] lifts env above 1, p[7] takes the trough factor to 6x its old
+// fixed 0.12), which costs 1,600 B more of the hot slab: 4,544 B of 9,216
+// before, 6,144 after, so nothing here had to be shrunk to fit either.
+constexpr int CLAMP_PAD = 1200;
+constexpr int CLAMP_SIZE = 3200; // covers b = (int)v in [-1200, 1999]
 
 // Local equivalents of bganim::fastCosRad/fastSinRad that take an already-
 // fetched table pointer, so callers don't pay a cosTableF() call8 per use
 // (see file header). Same indexing formula as BgAnimCommon.h.
 inline float cosRadLocal(const float *ct, float rad) { return ct[static_cast<int>(rad * RAD_TO_TABLE) & 255]; }
 inline float sinRadLocal(const float *ct, float rad) { return cosRadLocal(ct, rad - 1.5707963f); }
+
+// A 0-100 parameter as a multiplier on a tuned constant: exactly 1.0 at 50,
+// 1/base at 0, base at 100, geometric in between. Every parameter this file
+// gained on 2026-09-10 defaults to 50 and scales a constant that was
+// hard-coded before, so the default multiplies by a literal 1.0f and
+// reproduces the old constant bit for bit -- the `d == 0` branch is what
+// makes that a guarantee rather than a hope about powf's rounding. Called
+// from frame() and the table rebuilds, never per row and never per pixel.
+inline float paramScale(uint8_t v, float base) {
+    const int d = static_cast<int>(v) - 50;
+    return d == 0 ? 1.0f : powf(base, d / 50.0f);
+}
 
 // Quake-style fast approximate sqrt: rsqrt via the bit-hack magic constant,
 // refined by two Newton iterations, then sqrt(x) = x * rsqrt(x). Device has
@@ -254,6 +283,16 @@ const float *g_cosTable = nullptr; // cached once so band()/frame() never call c
 bool inited = false;
 uint32_t lastThemeGen = 0xFFFFFFFF;
 float crestF[3] = {62, 98, 127}, troughF[3] = {7, 12, 15};
+// Parameter values the two rebuilt tables were last built for, so frame()
+// rebuilds only when the user moves that slider (envLUT is 256 powf calls,
+// the crest/trough colours three multiplies).
+uint8_t lastWidthP = 50;
+uint8_t lastTroughP = 50;
+// Water tone (p[6]): the vertical span and the offset of the background's
+// gradient position. 20.0f/3.0f are the values every build before
+// 2026-09-10 hard-coded, and paramScale(50, ...) puts them back exactly.
+float g_toneSpan = 20.0f;
+float g_toneOff = 3.0f;
 
 int g_n = 0;
 float g_cx[MAX_RIPPLES], g_cy[MAX_RIPPLES], g_r[MAX_RIPPLES], g_amp[MAX_RIPPLES];
@@ -261,12 +300,69 @@ int g_icx[MAX_RIPPLES], g_icy[MAX_RIPPLES]; // centers rounded to nearest pixel,
 float g_glow = 1.0f;
 uint32_t g_tMs = 0;
 
+// Ring width (p[5]): the radial envelope is a gather table, so the whole
+// parameter lives in this rebuild and neither pixel loop -- the portable one
+// or the hand-written Xtensa kernel, which reads envLUT by index and knows
+// nothing about its contents -- changes at all. n = ad/HALFW, and the
+// envelope is 1 - n*n at the default, written as the original expression on
+// purpose (powf(x, 1.0f) is very probably x, but "very probably" is not the
+// golden-frame contract).
+//
+// The two directions are shaped differently, and the reason is the fixed
+// cosine the envelope multiplies. cos(ad*WAVEFREQ) crosses zero at
+// ad = 6.75 px, so the annulus is a lit crest inside that radius and a
+// shadow outside it, and the envelope is already near 1 across the crest.
+// Bending the curve alone therefore moves only the shadow, which is a few
+// levels on near-black water: the first version of this parameter measured
+// 11 of 255 at one end and 5 at the other, which is not a parameter a
+// person would notice. So:
+//   thinner (above 50): squeeze the envelope's support, n' = min(1, n*c)
+//     with c up to 4, which takes it to zero at ad = 3.25 px instead of 13
+//     and narrows the lit band itself.
+//   fatter (below 50): flatten the curve AND lift it, a * (1 - n*n)^e with
+//     a up to 1.6 and e down to 0.2, so the crest reaches further out
+//     before it falls away and the shadow behind it deepens.
+// Both meet the default at 1 - n*n exactly (a and e are 1.0f there, and
+// multiplying by 1.0f is exact). The base stays in [0, 1] so there is no
+// negative base and no NaN, but the lift means the table now reaches 1.6
+// rather than 1, which the clamp table above is sized for.
+void rebuildEnvLUT(uint8_t widthP) {
+    if (envLUT == nullptr) {
+        return;
+    }
+    const int d = static_cast<int>(widthP) - 50;
+    if (d == 0) {
+        for (int i = 0; i < 256; i++) {
+            const float n = i / 255.0f;
+            envLUT[i] = 1.0f - n * n;
+        }
+        return;
+    }
+    if (d > 0) {
+        const float c = 1.0f + (d / 50.0f) * 3.0f; // 1 .. 4
+        for (int i = 0; i < 256; i++) {
+            float n = (i / 255.0f) * c;
+            if (n > 1.0f) {
+                n = 1.0f;
+            }
+            envLUT[i] = 1.0f - n * n;
+        }
+        return;
+    }
+    const float e = 1.0f + (d / 50.0f) * 0.8f;  // 1 .. 0.2
+    const float a = 1.0f - (d / 50.0f) * 0.6f;  // 1 .. 1.6
+    for (int i = 0; i < 256; i++) {
+        const float n = i / 255.0f;
+        envLUT[i] = a * powf(1.0f - n * n, e);
+    }
+}
+
 bool init(int, int) {
     // envLUT, clampU8 and g_hAccBuf are all read (and, for g_hAccBuf,
     // written) once or more per pixel -- allocHot() puts them in the fixed
     // internal-SRAM slab instead of PSRAM (BgAnimCommon.h's GM_BGANIM_HOT_SLAB
     // comment: placement decides more of band() time than the kernel does).
-    // Total ask is 1,024 + 1,600 + 1,920 = 4,544 B, comfortably inside the
+    // Total ask is 1,024 + 3,200 + 1,920 = 6,144 B, comfortably inside the
     // 9,216 B this animation gets after the shared sinLut/cosTableF term, so
     // nothing here was shrunk to fit. allocHot() falls back to alloc()
     // (PSRAM) on its own if the slab is ever full when this runs -- same
@@ -276,10 +372,13 @@ bool init(int, int) {
         if (envLUT == nullptr) {
             return false;
         }
-        for (int i = 0; i < 256; i++) {
-            const float n = i / 255.0f;
-            envLUT[i] = 1.0f - n * n;
-        }
+        // init() gets no parameters, so the table starts at the default
+        // width and frame() rebuilds it on the first pass that sees a
+        // different p[5]. lastWidthP is set here, next to the build it
+        // describes, so a release()/init() cycle can never leave the
+        // sentinel claiming a width the fresh table does not have.
+        lastWidthP = 50;
+        rebuildEnvLUT(lastWidthP);
     }
     if (clampU8 == nullptr) {
         clampU8 = static_cast<uint8_t *>(allocHot(CLAMP_SIZE));
@@ -318,27 +417,60 @@ bool init(int, int) {
 }
 
 // Water surface sits in the theme's darkest ~10%; ring crests borrow the
-// brightest stop, troughs a dimmed version of it.
-void rebuildThemeAssets() {
+// brightest stop, troughs a dimmed version of it. The trough dip (p[7])
+// scales that dimming: 0.12 of the crest colour at the default, a sixth of
+// that at 0 (a bright arc on flat water, no dark ring beside it at all) and
+// six times it at 100 (a dark ring that reaches black where the wave is
+// strongest). The water itself is only 10 to 25 levels above black, so this
+// is a small number of levels either way; it is what makes the shadow
+// beside a crest read as a trough rather than as nothing. Both factors are
+// read only by blendPackSpan, which is portable C++ shared by band() and
+// bandRef(), so this parameter does not reach the Xtensa kernel either.
+void rebuildThemeAssets(uint8_t troughP) {
     uint8_t c[3];
     themeRGB(255, c);
+    const float troughMul = 0.12f * paramScale(troughP, 6.0f);
     for (int ch = 0; ch < 3; ch++) {
         crestF[ch] = c[ch] * 0.65f;
-        troughF[ch] = crestF[ch] * 0.12f;
+        troughF[ch] = crestF[ch] * troughMul;
     }
 }
 
 void frame(uint32_t tMs, int w, int h, const uint8_t p[BG_ANIM_PARAMS]) {
     g_tMs = tMs;
-    if (themeGen() != lastThemeGen) {
-        rebuildThemeAssets();
+    if (themeGen() != lastThemeGen || p[7] != lastTroughP) {
+        lastTroughP = p[7];
+        rebuildThemeAssets(lastTroughP);
         lastThemeGen = themeGen();
     }
+    if (p[5] != lastWidthP) {
+        lastWidthP = p[5];
+        rebuildEnvLUT(lastWidthP);
+    }
+    // Water tone (p[6]): scales both terms of the background gradient
+    // position, so the water goes from near-flat black at 0 to a clearly
+    // graded, lighter surface at 100.
+    {
+        const float toneMul = paramScale(p[6], 3.0f);
+        g_toneSpan = 20.0f * toneMul;
+        g_toneOff = 3.0f * toneMul;
+    }
+    // Drop spread (p[4]): the random landing point pulled toward the centre
+    // (0.30 at slider 0, so every drop lands inside the middle 30 percent of
+    // the panel) or pushed out past the rim (1.70 at slider 100, so some
+    // drops land off-panel and their rings sweep in as arcs). Written as rand*s + centre*(1-s)
+    // because at s == 1.0f exactly that is rand + 0.0f, the old expression
+    // bit for bit, and the random stream is untouched at every setting: the
+    // same drops at the same times, moved.
+    const float spread = 1.0f + static_cast<float>(static_cast<int>(p[4]) - 50) * 0.014f;
     const float interval = lerpf(14000.0f, 1500.0f, p[1] / 100.0f);
     if (tMs >= nextDropMs) {
         for (auto &r : ripples) {
             if (!r.active) {
-                r = {nextRandf(rng) * w, nextRandf(rng) * h, tMs, true};
+                const float rx = nextRandf(rng) * w;
+                const float ry = nextRandf(rng) * h;
+                const float invS = 1.0f - spread;
+                r = {rx * spread + (w * 0.5f) * invS, ry * spread + (h * 0.5f) * invS, tMs, true};
                 break;
             }
         }
@@ -366,10 +498,17 @@ void frame(uint32_t tMs, int w, int h, const uint8_t p[BG_ANIM_PARAMS]) {
         }
         g_cx[g_n] = r.cx;
         g_cy[g_n] = r.cy;
-        // Round once per frame (not per row/pixel) for the integer tracker;
-        // cx/cy are always >= 0 so truncation-after-offset is a valid round.
-        g_icx[g_n] = static_cast<int>(r.cx + 0.5f);
-        g_icy[g_n] = static_cast<int>(r.cy + 0.5f);
+        // Round once per frame (not per row/pixel) for the integer tracker.
+        // Truncation-after-offset is a valid round for cx/cy >= 0, which is
+        // every drop the spread parameter has not pushed off the panel; for
+        // a negative centre the extra decrement makes it a floor instead of
+        // a round toward zero. It lands one pixel low at an exact negative
+        // integer, which is the same ~1 px of phase error the rounding
+        // itself already costs and which WIN_MARGIN already budgets.
+        const float rcx = r.cx + 0.5f;
+        const float rcy = r.cy + 0.5f;
+        g_icx[g_n] = static_cast<int>(rcx) - (rcx < 0.0f ? 1 : 0);
+        g_icy[g_n] = static_cast<int>(rcy) - (rcy < 0.0f ? 1 : 0);
         g_r[g_n] = radius;
         g_amp[g_n] = amp;
         g_n++;
@@ -386,11 +525,17 @@ void buildRowState(int y, int w, RowState &rs) {
     {
         const float vt = y * INV_ROWMAX;
         const float swell = sinRadLocal(g_cosTable, g_tMs * 0.00014f + y * 0.014f) * 2.5f;
-        int basePos = static_cast<int>(vt * 20.0f + swell + 3.0f);
+        // g_toneSpan/g_toneOff are 20.0f/3.0f at the default water tone, so
+        // this is the original expression there. The upper clamp is 127
+        // rather than 31 because the highest tone (span 60, offset 9) asks
+        // for positions up to about 72; the old 31 was never reached at the
+        // default (max 25.5), so raising it changes nothing there, and
+        // themeRGB clamps to 255 on its own anyway.
+        int basePos = static_cast<int>(vt * g_toneSpan + swell + g_toneOff);
         if (basePos < 0) {
             basePos = 0;
-        } else if (basePos > 31) {
-            basePos = 31;
+        } else if (basePos > 127) {
+            basePos = 127;
         }
         uint8_t baseC[3];
         themeRGB(basePos, baseC);
@@ -887,7 +1032,14 @@ extern const BgAnimation bg_anim_ripples;
 const BgAnimation bg_anim_ripples = {
     "ripples",
     "Ripples",
-    {{"speed", "Ring speed", 50}, {"rate", "Drop rate", 40}, {"decay", "Fade", 50}, {"glow", "Glow", 50}},
+    {{"speed", "Ring speed", 50},
+     {"rate", "Drop rate", 40},
+     {"decay", "Fade", 50},
+     {"glow", "Glow", 50},
+     {"spread", "Drop spread", 50},
+     {"width", "Ring width", 50},
+     {"tone", "Water tone", 50},
+     {"trough", "Trough dip", 50}},
     init,
     frame,
     band,

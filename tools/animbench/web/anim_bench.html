@@ -719,7 +719,9 @@ ANIMS.push({
   id: 'ripples', name: 'Ripples',
   params: [
     {key:'speed',label:'Ring speed',def:50},{key:'rate',label:'Drop rate',def:40},
-    {key:'decay',label:'Fade',def:50},{key:'glow',label:'Glow',def:50}],
+    {key:'decay',label:'Fade',def:50},{key:'glow',label:'Glow',def:50},
+    {key:'spread',label:'Drop spread',def:50},{key:'width',label:'Ring width',def:50},
+    {key:'tone',label:'Water tone',def:50},{key:'trough',label:'Trough dip',def:50}],
   init(w, h, state) {
     state.ripples = [];
     state.rand = mulberry32(0xC0FFEE ^ (w*31+h));
@@ -732,11 +734,23 @@ ANIMS.push({
       state._gen = THEME.gen;
       const c = themeRGB(255);
       state.crest = [c[0]*0.65, c[1]*0.65, c[2]*0.65];
-      state.trough = state.crest.map(v => v*0.12);
     }
+    // Multiplier on a tuned constant: exactly 1 at 50, which is how each of
+    // the four sliders added on 2026-09-10 reproduces the value this
+    // animation hard-coded before them.
+    const pscale = (v, base) => (v === 50 ? 1 : Math.pow(base, (v-50)/50));
+    const trough = state.crest.map(v => v*0.12*pscale(p[7], 6));
+    const spread = 1 + (p[4]-50)*0.014;   // 0.30 (all drops mid-panel) .. 1.70 (out past the rim)
+    // Ring width: above 50 squeeze the envelope's support (thin, hard ring),
+    // below 50 flatten the curve (fat, soft one). Same two shapes as
+    // rebuildEnvLUT in AnimRipples.cpp.
+    const envC = p[5] > 50 ? 1 + ((p[5]-50)/50)*3 : 1;
+    const envE = p[5] < 50 ? 1 + ((p[5]-50)/50)*0.8 : 1;
+    const envA = p[5] < 50 ? 1 - ((p[5]-50)/50)*0.6 : 1;
+    const tone = pscale(p[6], 3);          // water gradient span and offset
     const interval = lerp(14000, 1500, p[1]/100);
     if (tMs >= state.nextDrop && state.ripples.length < 4) {
-      state.ripples.push({ cx: rand()*w, cy: rand()*h, birth: tMs });
+      state.ripples.push({ cx: rand()*w*spread + w*0.5*(1-spread), cy: rand()*h*spread + h*0.5*(1-spread), birth: tMs });
       state.nextDrop = tMs + interval*(0.55+0.9*rand());
     }
     const speed = lerp(25, 220, p[0]/100);
@@ -752,7 +766,7 @@ ANIMS.push({
     for (let y = 0; y < h; y++) {
       const vt = y/(h-1);
       const swell = Math.sin(tMs*0.00014 + y*0.014)*2.5;
-      const baseC = themeRGB(Math.max(0, Math.min(31, (vt*20+swell+3)|0)));
+      const baseC = themeRGB(Math.max(0, Math.min(127, (vt*20*tone+swell+3*tone)|0)));
       const baseR = baseC[0], baseG = baseC[1], baseB = baseC[2];
       const rows = [];
       for (const r of R) {
@@ -772,13 +786,15 @@ ANIMS.push({
           const delta = d-row.r.radius, ad = Math.abs(delta);
           if (ad > HALFW) continue;
           const n = ad/HALFW;
-          hAcc += row.r.amp * Math.cos(delta*WAVEFREQ) * (1-n*n);
+          const nc = Math.min(1, n*envC);
+          const e0 = 1-nc*nc;
+          hAcc += row.r.amp * Math.cos(delta*WAVEFREQ) * (envE === 1 ? e0 : envA*Math.pow(e0, envE));
         }
         let cr = baseR, cg = baseG, cb = baseB;
         if (hAcc !== 0) {
           const g = hAcc*glow;
           if (g > 0) { cr += g*state.crest[0]; cg += g*state.crest[1]; cb += g*state.crest[2]; }
-          else { cr += g*state.trough[0]; cg += g*state.trough[1]; cb += g*state.trough[2]; }
+          else { cr += g*trough[0]; cg += g*trough[1]; cb += g*trough[2]; }
         }
         const dith = (BAYER4[(y&3)*4+(x&3)]-7.5)*0.55;
         const idx = rowOff + x*4;

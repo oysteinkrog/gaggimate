@@ -88,6 +88,10 @@ export const BG_ANIMATIONS = [
       { key: 'rate', label: 'Drop rate', def: 40 },
       { key: 'decay', label: 'Fade', def: 50 },
       { key: 'glow', label: 'Glow', def: 50 },
+      { key: 'spread', label: 'Drop spread', def: 50 },
+      { key: 'width', label: 'Ring width', def: 50 },
+      { key: 'tone', label: 'Water tone', def: 50 },
+      { key: 'trough', label: 'Trough dip', def: 50 },
     ],
   },
   {
