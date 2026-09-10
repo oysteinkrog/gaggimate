@@ -138,6 +138,10 @@ export const BG_ANIMATIONS = [
       { key: 'count', label: 'Count', def: 60 },
       { key: 'glow', label: 'Glow', def: 55 },
       { key: 'shimmer', label: 'Shimmer', def: 40 },
+      { key: 'spread', label: 'Spread', def: 50 },
+      { key: 'drift', label: 'Drift', def: 50 },
+      { key: 'pulse', label: 'Pulse depth', def: 50 },
+      { key: 'halo', label: 'Halo', def: 50 },
     ],
   },
   {

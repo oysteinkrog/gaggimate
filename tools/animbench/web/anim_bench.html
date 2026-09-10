@@ -1023,7 +1023,9 @@ ANIMS.push({
     id: 'fireflies', name: 'Fireflies',
     params: [
       {key:'speed',label:'Speed',def:50},{key:'count',label:'Count',def:60},
-      {key:'glow',label:'Glow',def:55},{key:'shimmer',label:'Shimmer',def:40}],
+      {key:'glow',label:'Glow',def:55},{key:'shimmer',label:'Shimmer',def:40},
+      {key:'spread',label:'Spread',def:50},{key:'drift',label:'Drift',def:50},
+      {key:'pulse',label:'Pulse depth',def:50},{key:'halo',label:'Halo',def:50}],
     init(w, h, state) {
       state.cx = w/2; state.cy = h/2;
       state.rMax = Math.min(w,h)*0.46;
@@ -1050,6 +1052,18 @@ ANIMS.push({
       const speed = speedMulJS(p[0]);
       const glow = 0.7 + (p[2]/100)*0.8;
       const shimAmt = p[3]/100;
+      // Multiplier on a constant this animation used to hard-code: lo at 0,
+      // exactly 1 at 50, hi at 100. Same shape as paramMul in
+      // AnimFireflies.cpp, added with the four sliders on 2026-09-10.
+      const pmul = (v, lo, hi) => v === 50 ? 1 : 1 + ((v-50)/50)*(v < 50 ? (1-lo) : (hi-1));
+      const spread = pmul(p[4], 0.35, 1.35);   // swarm radius about the centre
+      const drift = pmul(p[5], 0, 2);          // wander amplitude
+      const halo = 2*pmul(p[7], 0.3, 2.3);     // glow falloff exponent
+      let pulseDepth = 0.72, pulseBase = 0.28;
+      if (p[6] !== 50) {
+        pulseDepth = p[6] < 50 ? 0.72*(p[6]/50) : 0.72 + ((p[6]-50)/50)*0.28;
+        pulseBase = 1 - pulseDepth;
+      }
       const shimPeriod = 14000 - shimAmt*8000;
       const t = tMs*speed;
       const ringPos = (t % shimPeriod)/shimPeriod;
@@ -1058,10 +1072,12 @@ ANIMS.push({
       for (let pi = 0; pi < state.particles.length; pi++) {
         const pt = state.particles[pi];
         const glowC = state.pCol[pi];
-        const x = pt.homeX + pt.ax1*Math.sin(pt.wx1*t+pt.px1) + pt.ax2*Math.sin(pt.wx2*t+pt.px2);
-        const y = pt.homeY + pt.ay1*Math.sin(pt.wy1*t+pt.py1) + pt.ay2*Math.sin(pt.wy2*t+pt.py2);
+        const hx = state.cx + (pt.homeX-state.cx)*spread;
+        const hy = state.cy + (pt.homeY-state.cy)*spread;
+        const x = hx + pt.ax1*drift*Math.sin(pt.wx1*t+pt.px1) + pt.ax2*drift*Math.sin(pt.wx2*t+pt.px2);
+        const y = hy + pt.ay1*drift*Math.sin(pt.wy1*t+pt.py1) + pt.ay2*drift*Math.sin(pt.wy2*t+pt.py2);
         const pulse = Math.pow(Math.max(0, Math.sin(pt.pulseFreq*t+pt.pulsePhase)), 2.2);
-        let brightness = 0.28 + 0.72*pulse;
+        let brightness = pulseBase + pulseDepth*pulse;
         if (shimAmt > 0) {
           const dr = pt.radialNorm - ringPos;
           brightness += shimAmt*Math.exp(-(dr*dr)/(2*0.09*0.09));
@@ -1077,7 +1093,7 @@ ANIMS.push({
             const d = Math.sqrt(dx*dx+dy*dy);
             if (d > R) continue;
             const norm = d/R;
-            const falloff = (1-norm)*(1-norm);
+            const falloff = halo === 2 ? (1-norm)*(1-norm) : Math.pow(1-norm, halo);
             const core = Math.max(0, 1-norm*2.6);
             const a = falloff*brightness;
             if (a <= 0.004) continue;

@@ -69,6 +69,11 @@ float *expLUT = nullptr;     // EXP_LUT_N entries, expf(-(dr*dr)*61.7f) over |dr
 int ffCount = 0;
 int builtCount = -1;
 int allocH = 0; // height bgLUT was sized for
+// Glow falloff exponent, the shape alphaLUT is built with; exactly 2.0f at
+// the default, which is the a*a this animation hard-coded before the "Halo"
+// slider existed. builtHalo is the p[7] the table was built for.
+float haloExp = 2.0f;
+int builtHalo = -1;
 uint32_t rng = 0x9e3779b9;
 uint32_t lastThemeGen = 0xFFFFFFFF;
 int g_h = 480;
@@ -83,6 +88,19 @@ inline float expLutLookup(float dr) {
     return expLUT[idx];
 }
 
+// Slider (0-100) to a multiplier on a constant this file used to hard-code:
+// lo at 0, exactly 1.0f at 50, hi at 100. The 50 case returns the literal
+// rather than computing it, because the arithmetic does not land on 1.0f
+// exactly for every (lo, hi) pair and the default output has to be the old
+// output bit for bit.
+inline float paramMul(uint8_t v, float lo, float hi) {
+    if (v == 50) {
+        return 1.0f;
+    }
+    const float f = (static_cast<int>(v) - 50) * (1.0f / 50.0f); // -1 .. 1
+    return v < 50 ? 1.0f + f * (1.0f - lo) : 1.0f + f * (hi - 1.0f);
+}
+
 // Particles glow in the theme's bright range (per-particle hueMix spreads
 // them); the dusk background sits in the darkest few percent.
 void rebuildThemeAssets() {
@@ -94,6 +112,20 @@ void rebuildThemeAssets() {
         uint8_t c[3];
         themeRGB(static_cast<int>(8.0f - n * 5.0f), c);
         bgLUT[y] = rgb565(c[0], c[1], c[2]);
+    }
+}
+
+// Radial falloff, 64 entries indexed by normalized d^2. exp 2 is what this
+// animation always used, and that case keeps the literal a*a so the default
+// table is byte for byte the old one; a powf here would be a different
+// rounding and a math call the bench would count. Below 2 the halo reaches
+// most of the sprite's radius (a soft, wide bloom), above it the light
+// collapses toward the centre (small hard points).
+void buildAlphaLUT(float e) {
+    for (int i = 0; i < 64; i++) {
+        float a = 1.0f - sqrtf(i / 63.0f);
+        a = a < 0 ? 0 : (e == 2.0f ? a * a : powf(a, e));
+        alphaLUT[i] = static_cast<uint8_t>(a * 255.0f);
     }
 }
 
@@ -155,11 +187,7 @@ bool init(int w, int h) {
             return false;
         }
         g_h = h;
-        for (int i = 0; i < 64; i++) {
-            float a = 1.0f - sqrtf(i / 63.0f);
-            a = a < 0 ? 0 : a * a;
-            alphaLUT[i] = static_cast<uint8_t>(a * 255.0f);
-        }
+        buildAlphaLUT(haloExp);
         for (int i = 0; i < EXP_LUT_N; i++) {
             const float dr = i * (EXP_LUT_DR_MAX / (EXP_LUT_N - 1));
             expLUT[i] = expf(-(dr * dr) * 61.7f);
@@ -170,6 +198,11 @@ bool init(int w, int h) {
 
 void frame(uint32_t tMs, int w, int h, const uint8_t p[BG_ANIM_PARAMS]) {
     const int count = 15 + (p[1] * 25) / 100;
+    if (static_cast<int>(p[7]) != builtHalo) {
+        haloExp = 2.0f * paramMul(p[7], 0.3f, 2.3f); // 0.6 .. 2.0 .. 4.6
+        buildAlphaLUT(haloExp);
+        builtHalo = p[7];
+    }
     if (count != builtCount) {
         spawnAll(count, w, h);
         rebuildThemeAssets();
@@ -183,6 +216,19 @@ void frame(uint32_t tMs, int w, int h, const uint8_t p[BG_ANIM_PARAMS]) {
     const float speed = speedMul(p[0]);
     const float glow = 0.7f + (p[2] / 100.0f) * 0.8f;
     const float shimAmt = p[3] / 100.0f;
+    // Swarm radius about the panel centre: 0.35 (a tight knot in the middle)
+    // to 1.35 (out to the rim, the widest ones clipped by the bezel).
+    const float cx = w * 0.5f, cy = h * 0.5f;
+    const float spread = paramMul(p[4], 0.35f, 1.35f);
+    // Wander amplitude: 0 (each mote hovers on its home point) to 2x.
+    const float drift = paramMul(p[5], 0.0f, 2.0f);
+    // Pulse depth: 0 is a steady lamp at full brightness, 0.72 is what this
+    // animation always did, 1.0 blinks all the way to black.
+    float pulseDepth = 0.72f, pulseBase = 0.28f;
+    if (p[6] != 50) {
+        pulseDepth = p[6] < 50 ? 0.72f * (p[6] / 50.0f) : 0.72f + ((p[6] - 50) / 50.0f) * 0.28f;
+        pulseBase = 1.0f - pulseDepth;
+    }
     const float shimPeriod = 14000.0f - shimAmt * 8000.0f;
     const float t = tMs * speed;
     const float ringPos = fmodf(t, shimPeriod) / shimPeriod;
@@ -190,8 +236,16 @@ void frame(uint32_t tMs, int w, int h, const uint8_t p[BG_ANIM_PARAMS]) {
     for (int i = 0; i < ffCount; i++) {
         const Firefly &f = ff[i];
         FfDraw &d = draws[i];
-        d.x = f.homeX + f.ax1 * fastSinRad(f.wx1 * t + f.px1) + f.ax2 * fastSinRad(f.wx2 * t + f.px2);
-        d.y = f.homeY + f.ay1 * fastSinRad(f.wy1 * t + f.py1) + f.ay2 * fastSinRad(f.wy2 * t + f.py2);
+        // Both guards keep the default bit exact: scaling a home coordinate
+        // about the centre and back is not the identity in float, and
+        // multiplying an amplitude by exactly 1.0f is.
+        float hx = f.homeX, hy = f.homeY;
+        if (spread != 1.0f) {
+            hx = cx + (hx - cx) * spread;
+            hy = cy + (hy - cy) * spread;
+        }
+        d.x = hx + (f.ax1 * drift) * fastSinRad(f.wx1 * t + f.px1) + (f.ax2 * drift) * fastSinRad(f.wx2 * t + f.px2);
+        d.y = hy + (f.ay1 * drift) * fastSinRad(f.wy1 * t + f.py1) + (f.ay2 * drift) * fastSinRad(f.wy2 * t + f.py2);
         d.R = (6.0f + f.size * 8.0f) * glow;
         d.cxQ8 = static_cast<int32_t>(d.x * 256.0f + 0.5f);
         d.cyQ8 = static_cast<int32_t>(d.y * 256.0f + 0.5f);
@@ -203,7 +257,7 @@ void frame(uint32_t tMs, int w, int h, const uint8_t p[BG_ANIM_PARAMS]) {
         d.invR2Fixed = static_cast<int32_t>((63.0f * 65536.0f) / (d.R * d.R) + 0.5f);
         float pulse = fastSinRad(f.pulseFreq * t + f.pulsePhase);
         pulse = pulse < 0 ? 0 : pulse * pulse;
-        float brightness = 0.28f + 0.72f * pulse;
+        float brightness = pulseBase + pulseDepth * pulse;
         if (shimAmt > 0) {
             const float dr = f.radialNorm - ringPos;
             brightness += shimAmt * expLutLookup(dr); // sigma 0.09
@@ -483,6 +537,8 @@ void release() {
     releaseTable(expLUT, static_cast<size_t>(EXP_LUT_N) * sizeof(float));
     allocH = 0;
     builtCount = -1;
+    builtHalo = -1;
+    haloExp = 2.0f;
     lastThemeGen = 0xFFFFFFFF;
 }
 
@@ -490,9 +546,21 @@ void release() {
 
 extern const BgAnimation bg_anim_fireflies;
 const BgAnimation bg_anim_fireflies = {
-    "fireflies", "Fireflies", {{"speed", "Speed", 50}, {"count", "Count", 60}, {"glow", "Glow", 55}, {"shimmer", "Shimmer", 40}},
-    init,        frame,       band,
-    release,     bandRef,
+    "fireflies",
+    "Fireflies",
+    {{"speed", "Speed", 50},
+     {"count", "Count", 60},
+     {"glow", "Glow", 55},
+     {"shimmer", "Shimmer", 40},
+     {"spread", "Spread", 50},
+     {"drift", "Drift", 50},
+     {"pulse", "Pulse depth", 50},
+     {"halo", "Halo", 50}},
+    init,
+    frame,
+    band,
+    release,
+    bandRef,
 };
 
 #endif // GAGGIMATE_SIM
