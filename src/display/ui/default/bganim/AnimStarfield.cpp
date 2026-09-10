@@ -65,7 +65,30 @@ uint8_t shootCol[3] = {220, 225, 255};
 uint32_t lastThemeGen = 0xFFFFFFFF;
 int g_nStars = 0;
 
+// ---- state the four later parameters derive (gm-3vj.6) ------------------
+// p4 glow, p5 sky glow, p6 sky falloff and p7 star tint all act through the
+// tables below or through a per-star constant in frame(), never inside the
+// vignette pixel loop, so starfieldVigRowAsm and vigRowScalar are untouched
+// by this pass and stay bit-for-bit equal to each other.
+//
+// Every default reproduces the constant it replaced exactly: the spill
+// numerators are over 40, so 16/40 is 2/5 and 12/40 is 3/10 with the same
+// integer truncation; skySpan 36, tintBase 180 with tintSpanF 75 and gamma
+// exactly 1 are the old literals.
+int haloNum0 = 0;          // spill given to a single-pixel star, over 40
+int haloNum1 = 16;         // sizeClass >= 1 spill brightness, over 40
+int haloNum2 = 12;         // sizeClass >= 2 spill brightness, over 40
+int skySpan = 36;          // theme positions the vignette climbs through
+int tintBase = 180;        // lowest theme position a star colour comes from
+float tintSpanF = 75.0f;   // width of that window, in theme positions
+float falloffGamma = 1.0f; // shape of the radial fade; 1 is the linear fade
+float maxR2f = 0.0f;       // set in init(); buildVigLUT keeps init()'s own
+                           // float expression, which reads maxR2 twice and so
+                           // is not simply sqrtf(i / 127.0f) in float
+uint8_t lastSkyP = 50, lastFallP = 50, lastTintP = 50;
+
 void rebuildThemeAssets();
+void buildVigLUT();
 
 struct Shoot {
     bool active = false;
@@ -158,12 +181,8 @@ bool init(int w, int h) {
             const float d = y - cy;
             dy2[y] = static_cast<int32_t>(d * d);
         }
-        const float maxR2 = cx * cx + cy * cy;
-        for (int i = 0; i < 128; i++) {
-            // index maps r2 linearly; shade = 1 - r/maxR
-            const float rn = sqrtf(i / 127.0f * maxR2) / sqrtf(maxR2);
-            vigLUT[i] = static_cast<uint8_t>(fmaxf(0.0f, 1.0f - rn) * 255.0f);
-        }
+        maxR2f = cx * cx + cy * cy;
+        buildVigLUT();
         for (int i = 0; i < MAX_STARS; i++) {
             const float roll = nextRandf(rng);
             const uint8_t layer = roll < 0.7f ? 0 : (roll < 0.92f ? 1 : 2);
@@ -188,11 +207,31 @@ bool init(int w, int h) {
     return true;
 }
 
+// The radial fade the vignette reads, 128 steps of squared distance. At
+// falloffGamma 1 this is the linear fade init() built before this pass, down
+// to the two sqrtf calls; p6 away from 50 bends it with one powf per step,
+// which is a theme-rebuild cost and never a per-pixel one.
+void buildVigLUT() {
+    const float maxR2 = maxR2f;
+    if (maxR2 <= 0.0f) {
+        return; // no geometry yet; init() sets maxR2f before the first call
+    }
+    for (int i = 0; i < 128; i++) {
+        // index maps r2 linearly; shade = 1 - r/maxR
+        const float rn = sqrtf(i / 127.0f * maxR2) / sqrtf(maxR2);
+        float shade = fmaxf(0.0f, 1.0f - rn);
+        if (falloffGamma != 1.0f) {
+            shade = powf(shade, falloffGamma);
+        }
+        vigLUT[i] = static_cast<uint8_t>(shade * 255.0f);
+    }
+}
+
 // Stars sample the theme's bright end (per-star hue picks the exact spot);
 // the vignette background sits in the theme's darkest ~14%.
 void rebuildThemeAssets() {
     for (int i = 0; i < MAX_STARS; i++) {
-        themeRGB(180 + static_cast<int>(stars[i].hue * 75.0f), &starCol[i * 3]);
+        themeRGB(tintBase + static_cast<int>(stars[i].hue * tintSpanF), &starCol[i * 3]);
     }
     // One RGB565 step is 8.226 of 0..255 in red and blue, 4.048 in green. A
     // 0.75-step peak swing clears the contours (44.0% -> 0.0%) while moving
@@ -200,7 +239,7 @@ void rebuildThemeAssets() {
     // stays below the noise floor of a 0.13 mm pixel pitch.
     for (int idx = 0; idx < 128; idx++) {
         uint8_t c[3];
-        themeRGB((vigLUT[idx] * 36) >> 8, c);
+        themeRGB((vigLUT[idx] * skySpan) >> 8, c);
         for (int ph = 0; ph < VIG_PHASES; ph++) {
             const float d = (static_cast<float>(BAYER4[ph]) - 7.5f) * (0.75f / 7.5f);
             vigColor[ph * 128 + idx] = rgb565(clamp8f(c[0] + d * 8.226f), clamp8f(c[1] + d * 4.048f), clamp8f(c[2] + d * 8.226f));
@@ -211,7 +250,44 @@ void rebuildThemeAssets() {
 
 void frame(uint32_t tMs, int w, int h, const uint8_t p[BG_ANIM_PARAMS]) {
     (void)h;
-    if (themeGen() != lastThemeGen) {
+    // p4 glow: how far a star spreads past its own pixel. Integer numerators
+    // over 40, so 50 gives back 2/5 and 3/10 with the same truncation the
+    // fixed fractions had. At 0 every star is a bare pixel. Above 50 the
+    // single-pixel stars start to spill as well, which is what makes the top
+    // of the range reach most of the field: seven stars in ten are that
+    // smallest class. haloNum0 grows from 0 at 50, so the default plots
+    // nothing extra and the branch below is not taken.
+    haloNum1 = (p[4] * 32) / 100;
+    haloNum2 = (p[4] * 24) / 100;
+    haloNum0 = p[4] > 50 ? ((p[4] - 50) * 32) / 50 : 0;
+
+    bool rebuild = themeGen() != lastThemeGen;
+    // p6 sky falloff: how quickly the sky glow fades toward the rim. Low
+    // spreads it out to a wide wash, high pulls it into the middle.
+    if (p[6] != lastFallP) {
+        lastFallP = p[6];
+        falloffGamma = p[6] == 50 ? 1.0f : (0.25f + p[6] * (1.5f / 100.0f));
+        buildVigLUT();
+        rebuild = true;
+    }
+    // p5 sky glow: how far up the theme the vignette climbs. 0 is a flat sky
+    // in the theme's darkest tone, 100 doubles the old reach.
+    if (p[5] != lastSkyP) {
+        lastSkyP = p[5];
+        skySpan = (p[5] * 36) / 50;
+        rebuild = true;
+    }
+    // p7 star tint: the window of theme positions star colours come from,
+    // anchored at the bright end. 0 gives every star the theme's accent, 100
+    // spreads them over the top 150 positions, so colour varies star to star.
+    if (p[7] != lastTintP) {
+        lastTintP = p[7];
+        const int span = (p[7] * 150) / 100;
+        tintSpanF = static_cast<float>(span);
+        tintBase = 255 - span;
+        rebuild = true;
+    }
+    if (rebuild) {
         rebuildThemeAssets();
         lastThemeGen = themeGen();
     }
@@ -373,12 +449,15 @@ void plotStarsAndShoot(uint16_t *dst, int y0, int rows, int w) {
             const StarDraw &d = draws[i];
             const int x = d.x;
             plotMax(dst, rows, w, x, y, d.r, d.g, d.b);
+            if (d.sizeClass == 0 && haloNum0 > 0) {
+                plotMax(dst, rows, w, x + 1, y, d.r * haloNum0 / 40, d.g * haloNum0 / 40, d.b * haloNum0 / 40);
+            }
             if (d.sizeClass >= 1) {
-                plotMax(dst, rows, w, x + 1, y, d.r * 2 / 5, d.g * 2 / 5, d.b * 2 / 5);
+                plotMax(dst, rows, w, x + 1, y, d.r * haloNum1 / 40, d.g * haloNum1 / 40, d.b * haloNum1 / 40);
             }
             if (d.sizeClass >= 2) {
-                plotMax(dst, rows, w, x, y + 1, d.r * 2 / 5, d.g * 2 / 5, d.b * 2 / 5);
-                plotMax(dst, rows, w, x - 1, y, d.r * 3 / 10, d.g * 3 / 10, d.b * 3 / 10);
+                plotMax(dst, rows, w, x, y + 1, d.r * haloNum1 / 40, d.g * haloNum1 / 40, d.b * haloNum1 / 40);
+                plotMax(dst, rows, w, x - 1, y, d.r * haloNum2 / 40, d.g * haloNum2 / 40, d.b * haloNum2 / 40);
             }
         }
     }
@@ -585,6 +664,18 @@ void release() {
     lastThemeGen = 0xFFFFFFFF;
     lastTMs = 0;
     lastDriftMs = 0xFFFFFFFF;
+    // Back to the defaults, so the next init() builds the tables the default
+    // parameters describe and frame()'s first pass rebuilds only what the
+    // stored parameters actually move.
+    haloNum0 = 0;
+    haloNum1 = 16;
+    haloNum2 = 12;
+    skySpan = 36;
+    tintBase = 180;
+    tintSpanF = 75.0f;
+    falloffGamma = 1.0f;
+    maxR2f = 0.0f;
+    lastSkyP = lastFallP = lastTintP = 50;
 }
 
 } // namespace
@@ -593,7 +684,14 @@ extern const BgAnimation bg_anim_starfield;
 const BgAnimation bg_anim_starfield = {
     "starfield",
     "Starfield",
-    {{"speed", "Drift speed", 50}, {"density", "Stars", 45}, {"twinkle", "Twinkle", 50}, {"shooting", "Shooting stars", 30}},
+    {{"speed", "Drift speed", 50},
+     {"density", "Stars", 45},
+     {"twinkle", "Twinkle", 50},
+     {"shooting", "Shooting stars", 30},
+     {"glow", "Star glow", 50},
+     {"skyglow", "Sky glow", 50},
+     {"falloff", "Sky falloff", 50},
+     {"tint", "Star tint", 50}},
     init,
     frame,
     band,

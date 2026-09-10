@@ -546,7 +546,9 @@ function gradLUT(stops) { // stops: [[t0..255, r, g, b], ...] -> Uint8Array 256*
     id: 'starfield', name: 'Starfield',
     params: [
       {key:'speed',label:'Drift speed',def:50},{key:'density',label:'Stars',def:45},
-      {key:'twinkle',label:'Twinkle',def:50},{key:'shooting',label:'Shooting stars',def:30}],
+      {key:'twinkle',label:'Twinkle',def:50},{key:'shooting',label:'Shooting stars',def:30},
+      {key:'glow',label:'Star glow',def:50},{key:'skyglow',label:'Sky glow',def:50},
+      {key:'falloff',label:'Sky falloff',def:50},{key:'tint',label:'Star tint',def:50}],
     init(w, h, state) {
       const rand = mulberry32(0xC0FFEE);
       state.rand = rand;
@@ -566,29 +568,41 @@ function gradLUT(stops) { // stops: [[t0..255, r, g, b], ...] -> Uint8Array 256*
       state.nextShootTime = 2000 + rand()*4000;
       state.lastT = null;
       state._gen = -1;
+      state._sky = 50; state._fall = 50; state._tint = 50;
     },
     // Theme-tinted assets: vignette from the darkest ~14%, stars from the
     // bright end (per-star hue picks the exact spot), shooting star = stop 5.
-    rebuildTheme(w, h, state) {
+    rebuildTheme(w, h, state, p) {
+      const skySpan = (p[5]*36/50)|0;
+      const gamma = p[6] === 50 ? 1 : 0.25 + p[6]*0.015;
+      const tintSpan = (p[7]*150/100)|0, tintBase = 255-tintSpan;
       state.bg = new Uint8ClampedArray(w*h*4);
       const cx = w/2, cy = h/2, maxR = Math.sqrt(cx*cx+cy*cy);
       for (let y = 0; y < h; y++) {
         const dy = y-cy;
         for (let x = 0; x < w; x++) {
           const dx = x-cx;
-          const shade = Math.max(0, 1 - Math.sqrt(dx*dx+dy*dy)/maxR);
-          const c = themeRGB((shade*255*36/256)|0);
+          let shade = Math.max(0, 1 - Math.sqrt(dx*dx+dy*dy)/maxR);
+          if (gamma !== 1) shade = Math.pow(shade, gamma);
+          const c = themeRGB((shade*255*skySpan/256)|0);
           const idx = (y*w+x)*4;
           state.bg[idx] = c[0]; state.bg[idx+1] = c[1]; state.bg[idx+2] = c[2]; state.bg[idx+3] = 255;
         }
       }
-      state.starCol = state.stars.map(st => themeRGB(180 + (st.hue*75)|0));
+      state.starCol = state.stars.map(st => themeRGB(tintBase + (st.hue*tintSpan)|0));
       state.shootCol = themeRGB(255);
     },
     render(data, w, h, tMs, p, state) {
-      if (state._gen !== THEME.gen) { this.rebuildTheme(w, h, state); state._gen = THEME.gen; }
+      if (state._gen !== THEME.gen || state._sky !== p[5] || state._fall !== p[6] || state._tint !== p[7]) {
+        this.rebuildTheme(w, h, state, p);
+        state._gen = THEME.gen; state._sky = p[5]; state._fall = p[6]; state._tint = p[7];
+      }
       const nStars = Math.round(40 + (p[1]/100)*360);
       const twinkleAmt = p[2]/100, shootFreq = p[3];
+      // Star glow, mirroring the firmware's integer numerators over 40:
+      // 50 gives 0.4 and 0.3, the constants that were fixed before.
+      const h1 = ((p[4]*32/100)|0)/40, h2 = ((p[4]*24/100)|0)/40;
+      const h0 = p[4] > 50 ? (((p[4]-50)*32/50)|0)/40 : 0;
       const t = tMs/1000;
       const dt = state.lastT != null ? Math.max(0, (tMs-state.lastT)/1000) : 1/30;
       state.lastT = tMs;
@@ -606,10 +620,11 @@ function gradLUT(stops) { // stops: [[t0..255, r, g, b], ...] -> Uint8Array 256*
         const r = sc[0]*b, g = sc[1]*b, bl = sc[2]*b;
         const xi = Math.round(x), yi = Math.round(s.y);
         plot(data, w, h, xi, yi, r, g, bl);
-        if (s.size >= 1) plot(data, w, h, xi+1, yi, r*0.4, g*0.4, bl*0.4);
+        if (s.size === 0 && h0 > 0) plot(data, w, h, xi+1, yi, r*h0, g*h0, bl*h0);
+        if (s.size >= 1) plot(data, w, h, xi+1, yi, r*h1, g*h1, bl*h1);
         if (s.size >= 2) {
-          plot(data, w, h, xi, yi+1, r*0.4, g*0.4, bl*0.4);
-          plot(data, w, h, xi-1, yi, r*0.3, g*0.3, bl*0.3);
+          plot(data, w, h, xi, yi+1, r*h1, g*h1, bl*h1);
+          plot(data, w, h, xi-1, yi, r*h2, g*h2, bl*h2);
         }
       }
       if (!state.shootingStar && shootFreq > 0 && tMs > state.nextShootTime) {

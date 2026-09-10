@@ -63,6 +63,10 @@ export const BG_ANIMATIONS = [
       { key: 'density', label: 'Stars', def: 45 },
       { key: 'twinkle', label: 'Twinkle', def: 50 },
       { key: 'shooting', label: 'Shooting stars', def: 30 },
+      { key: 'glow', label: 'Star glow', def: 50 },
+      { key: 'skyglow', label: 'Sky glow', def: 50 },
+      { key: 'falloff', label: 'Sky falloff', def: 50 },
+      { key: 'tint', label: 'Star tint', def: 50 },
     ],
   },
   {
