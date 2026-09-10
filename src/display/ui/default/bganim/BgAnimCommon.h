@@ -5,6 +5,23 @@
 #include <stdint.h>
 #include <stdlib.h>
 
+// Where a kernel's code lives. The animations mark their band() and row
+// kernels GM_ANIM_IRAM, and by default that is nothing: the kernels run from
+// flash. Only the render loop itself is pinned in IRAM (SleepAnimation.cpp),
+// because IRAM text past the first 16 KB is taken from internal DRAM byte
+// for byte, and internal DRAM is what the web UI dies of (CLAUDE.md,
+// "Internal DRAM budget"). The 21 ported animations each pinned their own
+// kernels in 2026-09 and together took 21.5 KB: the loadtest build idled at
+// 9 KB internal instead of 30 and WiFi lost every outgoing frame. Build with
+// -DGM_BGANIM_IRAM_KERNELS=1 to pin them again for a bench A/B; never ship
+// that.
+#if defined(ESP_PLATFORM) && defined(GM_BGANIM_IRAM_KERNELS) && GM_BGANIM_IRAM_KERNELS
+#include <esp_attr.h>
+#define GM_ANIM_IRAM IRAM_ATTR
+#else
+#define GM_ANIM_IRAM
+#endif
+
 // Shared helpers for background animations. Everything here is safe to call
 // from the render task (core 1); allocations prefer internal SRAM and fall
 // back to PSRAM (never fail hard — the caller checks for nullptr).

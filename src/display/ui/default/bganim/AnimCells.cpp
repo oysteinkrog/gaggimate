@@ -29,13 +29,6 @@
 #include <math.h>
 #include <string.h>
 
-#if defined(ESP_PLATFORM)
-#include <esp_attr.h>
-#define GM_ANIM_IRAM IRAM_ATTR
-#else
-#define GM_ANIM_IRAM
-#endif
-
 // On by default; the portable reference stays available for a device A/B.
 #ifndef GM_BGANIM_CELLS_ASM
 #define GM_BGANIM_CELLS_ASM 1

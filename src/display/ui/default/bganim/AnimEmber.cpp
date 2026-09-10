@@ -145,13 +145,6 @@
 #include <math.h>
 #include <string.h>
 
-#if defined(ESP_PLATFORM)
-#include <esp_attr.h>
-#define GM_ANIM_IRAM IRAM_ATTR
-#else
-#define GM_ANIM_IRAM
-#endif
-
 namespace {
 using namespace bganim;
 

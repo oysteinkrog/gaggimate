@@ -83,16 +83,6 @@
 #include "BgAnimCommon.h"
 #include <math.h>
 
-// Same reasoning as AnimSilk.cpp/AnimEmber.cpp: keep the hot loop out of
-// flash so LVGL's icache churn on the other core can't stall it behind an
-// MSPI refill. No-op on the host bench.
-#if defined(ESP_PLATFORM)
-#include <esp_attr.h>
-#define GM_ANIM_IRAM IRAM_ATTR
-#else
-#define GM_ANIM_IRAM
-#endif
-
 // Master switch for the hand-written Xtensa kernel below (silk2PairRowAsm
 // and band()'s dispatch to it). ON by default: this is Silk 2's first
 // hand-written kernel, transcribed from GCC 14's own compile of bandRef()'s

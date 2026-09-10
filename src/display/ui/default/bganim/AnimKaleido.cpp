@@ -32,13 +32,6 @@
 #include "BgAnimCommon.h"
 #include <math.h>
 
-#if defined(ESP_PLATFORM)
-#include <esp_attr.h>
-#define GM_ANIM_IRAM IRAM_ATTR
-#else
-#define GM_ANIM_IRAM
-#endif
-
 // Default on after assembly and QEMU parity checks. Device parity and an
 // A/B timing against bandRef remain the release gate for a speed claim.
 #ifndef GM_BGANIM_KALEIDO_ASM

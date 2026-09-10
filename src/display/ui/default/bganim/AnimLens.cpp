@@ -34,13 +34,6 @@
 #include "BgAnimCommon.h"
 #include <math.h>
 
-#if defined(ESP_PLATFORM)
-#include <esp_attr.h>
-#define GM_ANIM_IRAM IRAM_ATTR
-#else
-#define GM_ANIM_IRAM
-#endif
-
 // On by default, with a portable reference for the device parity/timing A/B.
 // Host and QEMU checks establish correctness; speed still needs the device.
 #ifndef GM_BGANIM_LENS_ASM

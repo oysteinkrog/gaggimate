@@ -24,13 +24,6 @@
 #include "BgAnimCommon.h"
 #include <math.h>
 
-#if defined(ESP_PLATFORM)
-#include <esp_attr.h>
-#define GM_ANIM_IRAM IRAM_ATTR
-#else
-#define GM_ANIM_IRAM
-#endif
-
 #ifndef GM_BGANIM_RAIN_ASM
 #define GM_BGANIM_RAIN_ASM 1
 #endif

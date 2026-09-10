@@ -38,13 +38,6 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#if defined(ESP_PLATFORM)
-#include <esp_attr.h>
-#define GM_ANIM_IRAM IRAM_ATTR
-#else
-#define GM_ANIM_IRAM
-#endif
-
 // Master switch for the hand-written Xtensa kernel below. -DGM_BGANIM_GRID_ASM=0
 // makes band() bandRef() byte for byte.
 #ifndef GM_BGANIM_GRID_ASM

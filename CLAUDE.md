@@ -843,6 +843,19 @@ DMA-capable, largest block 7.7 kB) and two browser tabs killed it. After the
   histogram, and every task's stack size and high-water mark. Size stacks
   from the measured `hwm`, not from guesses. `/api/debug/heap` carries
   `dma_free`/`dma_min` and the asset gate counters.
+- **Animation kernels run from flash; only the render loop is pinned in
+  IRAM** (2026-09-10). IRAM text past the first 16 KB is taken from
+  internal DRAM byte for byte. The 21 ported animations each carried a
+  private `#define GM_ANIM_IRAM IRAM_ATTR` and together pinned 21.5 KB of
+  kernels (linker map, `.iram0.text` by object): the boot heap pool shrank
+  from 196 KiB to 170 KiB, the loadtest build idled at 9 KB internal
+  instead of 24 to 35, DMA-capable free sat at 1.4 KB, and WiFi lost every
+  outgoing frame within a minute of connecting (`FAILED ALLOC size=1630`,
+  the NetWatchdog reconnect loop, no web UI). `GM_ANIM_IRAM` is defined
+  once in `BgAnimCommon.h` and is empty unless the build sets
+  `GM_BGANIM_IRAM_KERNELS=1`, which is a bench A/B knob and never ships.
+  The tripwire is the `heap_init: At 3FC... (N KiB): RAM` line at boot:
+  under 190 KiB means something new is static in DRAM or IRAM.
 - **Animation tables come from a fixed 12 KB slab, never from the heap
   pool** (`bganim::allocHot`, BgAnimCommon.h; `bganim::alloc` is PSRAM,
   always). Before the slab, placement was decided at init() against the free

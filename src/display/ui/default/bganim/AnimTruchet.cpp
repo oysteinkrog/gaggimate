@@ -27,13 +27,6 @@
 #include <math.h>
 #include <string.h>
 
-#if defined(ESP_PLATFORM)
-#include <esp_attr.h>
-#define GM_ANIM_IRAM IRAM_ATTR
-#else
-#define GM_ANIM_IRAM
-#endif
-
 #ifndef GM_BGANIM_TRUCHET_ASM
 // Device timing is still required. The portable reference remains available
 // to /api/debug/animtest and useref=1 for the production parity/timing rung.

@@ -223,16 +223,6 @@
 #include "BgAnimCommon.h"
 #include <math.h>
 
-// Same pattern as AnimEmber.cpp: keep band() out of flash so LVGL's icache
-// churn on the other core can't stall it behind MSPI refills (see file
-// header). No-op on the host bench.
-#if defined(ESP_PLATFORM)
-#include <esp_attr.h>
-#define GM_ANIM_IRAM IRAM_ATTR
-#else
-#define GM_ANIM_IRAM
-#endif
-
 // Master switch for the hand-written Xtensa kernels below (silkFastCell16Asm,
 // silkExactCell16Asm, and band()'s dispatch to them). OFF by default: the
 // sixth pass's port of these kernels to the 16-pixel grid is bit-exact

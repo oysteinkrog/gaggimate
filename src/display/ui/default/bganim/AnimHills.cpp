@@ -93,13 +93,6 @@
 #include <math.h>
 #include <stdint.h>
 
-#if defined(ESP_PLATFORM)
-#include <esp_attr.h>
-#define GM_ANIM_IRAM IRAM_ATTR
-#else
-#define GM_ANIM_IRAM
-#endif
-
 // -DGM_BGANIM_HILLS_ASM=0 drops the Xtensa kernels and renders through
 // bandRef() verbatim, which is the A/B for the kernels on the device.
 #ifndef GM_BGANIM_HILLS_ASM
