@@ -11,11 +11,19 @@
 // the real 256-entry ramp, so the per-pixel combined index (radius plus
 // dither/breathe plus flicker) can be used to index paletteExt directly with
 // no clamp branch; the pad entries already hold the clamped edge colors.
-// Range proof (worst-case params, p[1..3]=100): breathe in [-35,+35], dither
-// in [-6,+6], flicker term in [-10,+9], radius in [72,255] (CORE_FLOOR=72 is
-// a true floor: clamp8f(72 + r*scale) with r*scale always non-negative, for
-// every glow/w/h this animation targets), so the combined index lands in
-// [21,305], 285 distinct values. PAD=64 covers that with margin.
+// Range proof (worst-case params, every slider at whichever end widens the
+// term): breathe in [-35,+35], dither in [-18,+19] (the Grain slider scales
+// the old +-6 by up to 3x), flicker term in [-10,+9], radius in [45,255]
+// (coreFloor is a true floor: clamp8f(coreFloor + t) with t always
+// non-negative, and the Core heat slider moves coreFloor over [45,99] around
+// its old fixed 72, for every glow/falloff/w/h this animation targets), so
+// the combined index lands in [-18,318], 337 distinct values. The gather
+// itself always reads paletteExt[99..354] of 384, since the index it takes
+// is a byte; PAD=64 is what makes the values outside [35,290] land on a
+// clamp entry rather than off the end.
+// The Falloff slider does not appear here on purpose. It bends the radius
+// ramp between the same two ends and so cannot widen anything; see
+// buildRadiusLut.
 //
 // radiusLUT is padded the same way on the high side (RPAD entries repeating
 // radiusLUT[255]) so radiusLUT[ridx] needs no >255 clamp either; safe for
@@ -30,6 +38,28 @@
 // the multiply into a lookup. Whether flicker is on at all is decided once
 // per band() call rather than once per pixel: the caller picks which source
 // buffer feeds the combine stage instead of branching inside the loop.
+//
+// Eight sliders, four of them added 2026-09-10 (gm-3vj.14). Each new one is
+// an offset from 50, so at 50 it contributes exactly the constant it
+// replaced and the picture at the defaults is unchanged:
+//
+//   speed    Speed       50  how fast the breathing runs (frame)
+//   glow     Glow size   45  how far the glow reaches (radiusLUT)
+//   flicker  Flicker     20  how much the noise texture stirs it (flickerLUT)
+//   pulse    Pulse       50  how deep the breathing swings (frame)
+//   height   Height      50  where up or down the panel the glow sits
+//                            (applyCenter, then radiusLUT)
+//   falloff  Falloff     50  broad wash or tight core: the shape of the ramp
+//                            between the same two ends (radiusLUT)
+//   core     Core heat   50  which palette entry the very centre reads
+//                            (coreFloor in radiusLUT)
+//   grain    Grain       50  how strong the ordered dither reads
+//                            (g_ditherMul, the per-row dither build)
+//
+// None of the four new ones reaches the pixel loop or any of the four hand
+// written Xtensa kernels. Three feed the 256-entry radiusLUT, rebuilt only
+// when one of them moves; the fourth scales an eight-value term band() and
+// bandRef() already built once per row.
 //
 // Design: anim-atmosphere (Fable), 2026-08-15. Optimized: opt-ember,
 // 2026-08-15; row-precomputed flicker/dither term, 2026-08-30; hand-written
@@ -70,10 +100,10 @@
 // breathe/dither in that order (the order that keeps the one real clamp
 // identical to clamping the true three-way sum once, proven at
 // FIELD_BIAS's own comment), and XORs the sign bit to recover an unsigned
-// palette offset. This costs 29 of the 285 true values (14 at the coolest
-// corner, 15 at the hottest core, reachable only when glow, flicker and
-// pulse are all near their limits at once); full derivation is at
-// FIELD_BIAS and satAddS8, below.
+// palette offset. This costs 81 of the 337 true values (53 at the coolest
+// corner, 28 at the hottest core, reachable only when several sliders sit
+// near their limits at once); full derivation is at FIELD_BIAS and
+// satAddS8, below.
 //
 // The negative floor is the textbook -128 on silicon, but this QEMU fork's
 // model of ee.vadds.s8 floors at -127 (tools/qemubench/tests/probe_vadds_s8
@@ -155,25 +185,44 @@ int allocW = 0;
 uint32_t lastThemeGen = 0xFFFFFFFF;
 uint8_t lastGlow = 255;
 uint8_t lastFlickerParam = 255;
+// Sentinels for the three sliders that feed radiusLUT and the one that moves
+// the centre. 255 is unreachable for a parameter (0-100), so the first frame
+// after init() always rebuilds.
+uint8_t lastHeight = 255;
+uint8_t lastFalloff = 255;
+uint8_t lastCore = 255;
 int g_cx = 240, g_cy = 260;
 float g_maxR = 353.7f;
 int g_breathe = 0, g_flickerAmp = 0, g_sx = 0, g_sy = 0;
+// Grain: the ordered dither's numerator, 32 at the default slider. The dither
+// term is ((BAYER8[..] - 31) * g_ditherMul) / 160, and (x * 32) / 160 is the
+// same integer for every x that the old x / 5 gave (both truncate the same
+// rational), so a default grain reproduces the old dither exactly.
+int g_ditherMul = 32;
 
 // Ramp is reversed so index 0 (brightest) lands at the glow's core, which
 // sits at screen center where the UI puts its readouts; starting the ramp
 // part way in (CORE_FLOOR) takes the peak off the text without changing the
 // falloff shape.
 constexpr int CORE_FLOOR = 72;
+// How far the Core heat slider moves that floor either way. 27 keeps the
+// floor at or above 45, which is what makes the first of the two saturating
+// adds below provably clip-free: radiusLUT's biased minimum is
+// coreFloor - FIELD_BIAS >= -118, and the flicker term never falls below
+// -10, so their sum never leaves [-128,127]. A wider span would break that
+// proof, not just widen the picture.
+constexpr int CORE_SPAN = 27;
 
 // Round 4's bias scheme. The true combined palette index (radiusLUT gather
-// + perCol dither/breathe + flicker) lands in [21,305], 285 distinct
+// + perCol dither/breathe + flicker) lands in [-18,318], 337 distinct
 // values (see the file header's range proof), and ee.vadds.s8 has 256
 // representable outputs, [-128,127]. A single byte-wide vector add of all
 // three terms in one shot would wrap for the outermost values, so
-// FIELD_BIAS re-centers radiusLUT's own [72,255] range on zero (163 is
-// [21,305]'s own midpoint, which is what keeps the clamp region nearly
-// symmetric too, see below) so it fits with room to spare ([-91,92]); the
-// vector stage then adds the two small per-row/per-pair terms (flicker,
+// FIELD_BIAS re-centers radiusLUT's own [45,255] range on zero (163 was
+// picked as the midpoint of the original [21,305], and the Core heat
+// slider is bounded so that the same 163 still works) so it fits with
+// room to spare ([-118,92]); the vector stage then adds the two small
+// per-row/per-pair terms (flicker,
 // then perCol) on top via ee.vadds.s8, which saturates instead of
 // wrapping, and INDEX_UNBIAS undoes the same 163-centering (minus the 128
 // that XORing the sign bit adds back, so 163-128=35) at the scalar
@@ -185,10 +234,11 @@ constexpr int CORE_FLOOR = 72;
 //
 // Order matters and is NOT swappable: the vector stage adds flicker first,
 // then perCol, specifically because flicker is small enough that
-// radiusLUT_biased + flicker spans [-101,101], strictly inside [-128,127]
-// (checked, not assumed, same standard as the range proof itself), so
-// that first add never saturates. Adding perCol first instead
-// (radiusLUT_biased + perCol spans [-132,133], which DOES exceed that
+// radiusLUT_biased + flicker spans [-128,101], inside [-128,127] (checked,
+// not assumed, same standard as the range proof itself; the lower end is
+// exactly the representable floor, which is why CORE_SPAN is 27 and not
+// more), so that first add never saturates. Adding perCol first instead
+// (radiusLUT_biased + perCol spans [-171,146], which DOES exceed that
 // range) would let that first add clip some values the true three-way sum
 // does not actually need clipped, and a second add afterward cannot undo a
 // clip the first one already made: e.g. radiusLUT_biased=-91, perCol=-41,
@@ -198,17 +248,18 @@ constexpr int CORE_FLOOR = 72;
 // representable range. Flicker-first avoids this because its own
 // intermediate step provably never saturates, so the single saturating
 // clip that remains (on the second add) is applied to the exact true sum,
-// identical to clamping the sum once. That is what keeps the 29-value
-// clamp region (14 values at the coolest corner where trueIndex <= 34, 15
+// identical to clamping the sum once. That is what keeps the 81-value
+// clamp region (53 values at the coolest corner where trueIndex <= 34, 28
 // at the hottest core where trueIndex >= 291) the ONLY approximation in
 // this scheme, not an additional, order-dependent one stacked on top of
-// it: 285 true values minus 29 clamped is exactly 256, the vector stage's
+// it: 337 true values minus 81 clamped is exactly 256, the vector stage's
 // actual capacity, which is what makes this accounting self-checking
-// rather than assumed. Those 29 values are only reachable when glow,
-// flicker and pulse are all simultaneously at or near their extremes (the
-// range proof's own worst case), and even there each clamp is a one-step
-// ramp flattening, not a color jump.
-constexpr int FIELD_BIAS = 163;  // subtracted from radiusLUT's raw [72,255] at build time
+// rather than assumed. Those 81 values are only reachable when several
+// sliders sit at or near their extremes at the same time (the range
+// proof's own worst case; nothing clamps at the defaults, where the true
+// index still lands in the old [21,305]), and even there each clamp is a
+// one-step ramp flattening, not a color jump.
+constexpr int FIELD_BIAS = 163;  // subtracted from radiusLUT's raw [45,255] at build time
 constexpr int INDEX_UNBIAS = 35; // FIELD_BIAS - 128; added to palOff to read the biased index back
 
 // Sixteen copies of 0x80 for the PIE stage's sign<->unsigned conversion:
@@ -220,12 +271,38 @@ constexpr int INDEX_UNBIAS = 35; // FIELD_BIAS - 128; added to palOff to read th
 alignas(16) constexpr uint8_t kIdxUnsignBias[16] = {0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80,
                                                     0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80};
 
-void buildRadiusLut(uint8_t glow) {
+// Three sliders shape this table and none of them reaches the pixel loop or
+// the hand written kernels: glow scales the radius, falloff bends the ramp
+// between the same two ends, core sets the palette index the very centre
+// reads. All of it is build-time float work over 256 entries, rebuilt only
+// when one of the three moves, the same terms a theme change rebuilds on.
+//
+// Every slider is an offset from 50, so at 50 the added term is exactly zero
+// and this is the plain linear ramp the animation always had, bit for bit.
+// Falloff maps t through t + k*t*(255-t)/255 with k in [-0.8,+0.8]: a
+// monotone map of [0,255] onto itself that fixes both ends, so the field's
+// own range does not move with the slider and the range proof at the top of
+// the file stays a statement about coreFloor alone. Positive k pulls the ramp
+// out early and the core reads tight and hard-edged; negative k holds the
+// bright end and the glow reads as a broad wash. The pre-clamp of t at 255 is
+// what makes the monotonicity true and is itself a no-op at the default: the
+// old code let t run past 255 and clamp8f flattened it at the same place.
+// Without the pre-clamp a large t drives the quadratic term far negative and
+// the far corners would read bright again, which is the one way this slider
+// could have produced garbage.
+void buildRadiusLut(uint8_t glow, uint8_t falloffP, uint8_t coreP) {
     const float glowGain = 0.55f + 0.014f * glow;
     const float scale = 255.0f / (g_maxR * glowGain);
+    const float shape = static_cast<float>(static_cast<int>(falloffP) - 50) * 0.016f;
+    const int coreFloor = CORE_FLOOR + ((static_cast<int>(coreP) - 50) * CORE_SPAN) / 50;
     for (int i = 0; i < 256; i++) {
         const float r = sqrtf(static_cast<float>(i << RSHIFT));
-        radiusLUT[i] = static_cast<int8_t>(clamp8f(CORE_FLOOR + r * scale) - FIELD_BIAS);
+        float t = r * scale;
+        if (t > 255.0f) {
+            t = 255.0f;
+        }
+        t += shape * t * (255.0f - t) * (1.0f / 255.0f);
+        radiusLUT[i] = static_cast<int8_t>(clamp8f(static_cast<float>(coreFloor) + t) - FIELD_BIAS);
     }
     for (int i = 256; i < RLUT_N; i++) {
         radiusLUT[i] = radiusLUT[255];
@@ -247,6 +324,22 @@ void buildFlickerLut(int flickerAmp) {
         // extending 16-bit load; see emberFlickerFieldRow's own header.
         flickerLUT[i] = static_cast<int16_t>(((i - 128) * flickerAmp) >> 7);
     }
+}
+
+// Height moves the glow up or down the panel, and with it the farthest
+// corner, so the caller rebuilds radiusLUT whenever this runs. At slider 50
+// the offset is the (20 * h) / 480 this animation always used, in the same
+// integer arithmetic, so neither the centre nor the radius scale moves at the
+// default. The slider is worth +-50 rows on a 480 px panel, and that bound is
+// what keeps every pixel inside radiusLUT's padded tail: the worst case is
+// height 100 on 480x480, centre row 310, farthest r^2 >> RSHIFT of 300
+// against the table's 320 entries.
+void applyCenter(int w, int h, uint8_t height) {
+    g_cx = w / 2;
+    g_cy = h / 2 + ((20 + (static_cast<int>(height) - 50)) * h) / 480;
+    const float dx = static_cast<float>(g_cx);
+    const float dy = static_cast<float>(g_cy > h - g_cy ? g_cy : h - g_cy);
+    g_maxR = sqrtf(dx * dx + dy * dy);
 }
 
 void *allocHotOrPsram(size_t size) {
@@ -295,26 +388,39 @@ bool init(int w, int h) {
         // stage needs no flicker-off branch (see band()'s own comment).
         memset(zeroFlickerRow, 0, static_cast<size_t>(w));
     }
-    g_cx = w / 2;
-    g_cy = h / 2 + (20 * h) / 480;
-    const float dx = static_cast<float>(g_cx);
-    const float dy = static_cast<float>(g_cy > h - g_cy ? g_cy : h - g_cy);
-    g_maxR = sqrtf(dx * dx + dy * dy);
+    // A sane centre before the first frame; frame() re-applies it from the
+    // Height slider, and the sentinels below make that first frame rebuild
+    // both the centre and the radius table whatever the slider says.
+    applyCenter(w, h, 50);
     lastThemeGen = 0xFFFFFFFF;
     lastGlow = 255;
     lastFlickerParam = 255;
+    lastHeight = 255;
+    lastFalloff = 255;
+    lastCore = 255;
     return true;
 }
 
-void frame(uint32_t tMs, int, int, const uint8_t p[BG_ANIM_PARAMS]) {
+void frame(uint32_t tMs, int w, int h, const uint8_t p[BG_ANIM_PARAMS]) {
     if (themeGen() != lastThemeGen) {
         buildThemeRamp(palette, 256, /*reversed=*/true);
         extendPalette();
         lastThemeGen = themeGen();
     }
-    if (p[1] != lastGlow) {
-        buildRadiusLut(p[1]);
+    // Four sliders share one 256-entry table. Glow, falloff and core change
+    // what the table holds; height changes the centre the table is scaled
+    // from, so it rebuilds the table too.
+    bool radiusStale = p[1] != lastGlow || p[5] != lastFalloff || p[6] != lastCore;
+    if (p[4] != lastHeight) {
+        applyCenter(w, h, p[4]);
+        lastHeight = p[4];
+        radiusStale = true;
+    }
+    if (radiusStale) {
+        buildRadiusLut(p[1], p[5], p[6]);
         lastGlow = p[1];
+        lastFalloff = p[5];
+        lastCore = p[6];
     }
     const float spd = speedMul(p[0]);
     const uint32_t vt = static_cast<uint32_t>(static_cast<int64_t>(static_cast<double>(tMs) * spd));
@@ -330,6 +436,21 @@ void frame(uint32_t tMs, int, int, const uint8_t p[BG_ANIM_PARAMS]) {
     }
     g_sx = static_cast<int>((vt * 6u) >> 10) & 255;
     g_sy = static_cast<int>((vt * 4u) >> 10) & 255;
+    // Grain: no dither at all at 0, the old fixed dither at 50, three times
+    // it at 100. 32 at slider 50, and (x * 32) / 160 truncates to the same
+    // integer x / 5 did for every x in BAYER8's range, so the default is the
+    // old term exactly.
+    //
+    // The map is two straight segments rather than one because one line
+    // through both 0 at slider 0 and 32 at slider 50 can only reach 64 at
+    // 100, and 64 was not enough: at 2x a second model reading the renders
+    // called the difference from the default "slightly more pronounced" and
+    // would not call it coarser, while at 0 it named the banding at once. Two
+    // segments keep both ends useful and still land on exactly 32 at 50.
+    // Frame-constant, so it costs the per-row dither build one multiply and
+    // nothing per pixel.
+    const int grainP = static_cast<int>(p[7]);
+    g_ditherMul = grainP <= 50 ? (32 * grainP) / 50 : 32 + ((grainP - 50) * 64) / 50;
 }
 
 // Portable reference for the field/finalize design: the spec this file's own
@@ -411,7 +532,7 @@ void bandRef(uint16_t *dst, int y0, int rows, int w, uint32_t, const uint8_t *) 
         const uint8_t *bayerRow = &BAYER8[(y & 7) * 8];
         int8_t perCol[8];
         for (int j = 0; j < 8; j++) {
-            perCol[j] = static_cast<int8_t>((static_cast<int>(bayerRow[j]) - 31) / 5 - g_breathe);
+            perCol[j] = static_cast<int8_t>(((static_cast<int>(bayerRow[j]) - 31) * g_ditherMul) / 160 - g_breathe);
         }
         const int8_t *flickerSrc = doFlicker ? flickerRow : zeroFlickerRow;
         // Same two-step saturating order the PIE kernel uses (flicker
@@ -750,7 +871,7 @@ GM_ANIM_IRAM void band(uint16_t *dst, int y0, int rows, int w, uint32_t tMs, con
         uint16_t *row = dst + static_cast<size_t>(r) * w;
         const uint8_t *bayerRow = &BAYER8[(y & 7) * 8];
         for (int j = 0; j < 8; j++) {
-            const int8_t v = static_cast<int8_t>((static_cast<int>(bayerRow[j]) - 31) / 5 - g_breathe);
+            const int8_t v = static_cast<int8_t>(((static_cast<int>(bayerRow[j]) - 31) * g_ditherMul) / 160 - g_breathe);
             perColTile[j] = v;
             perColTile[j + 8] = v;
         }
@@ -780,15 +901,30 @@ void release() {
     lastThemeGen = 0xFFFFFFFF;
     lastGlow = 255;
     lastFlickerParam = 255;
+    lastHeight = 255;
+    lastFalloff = 255;
+    lastCore = 255;
 }
 
 } // namespace
 
 extern const BgAnimation bg_anim_ember;
 const BgAnimation bg_anim_ember = {
-    "ember", "Ember", {{"speed", "Speed", 50}, {"glow", "Glow size", 45}, {"flicker", "Flicker", 20}, {"pulse", "Pulse", 50}},
-    init,    frame,   band,
-    release, bandRef,
+    "ember",
+    "Ember",
+    {{"speed", "Speed", 50},
+     {"glow", "Glow size", 45},
+     {"flicker", "Flicker", 20},
+     {"pulse", "Pulse", 50},
+     {"height", "Height", 50},
+     {"falloff", "Falloff", 50},
+     {"core", "Core heat", 50},
+     {"grain", "Grain", 50}},
+    init,
+    frame,
+    band,
+    release,
+    bandRef,
 };
 
 #endif // GAGGIMATE_SIM

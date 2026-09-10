@@ -1331,13 +1331,12 @@ function buildRamp(stopsA, stopsB, blend) {
     id: 'ember', name: 'Ember',
     params: [
       {key:'speed',label:'Speed',def:50},{key:'glow',label:'Glow size',def:45},
-      {key:'flicker',label:'Flicker',def:20},{key:'pulse',label:'Pulse',def:50}],
+      {key:'flicker',label:'Flicker',def:20},{key:'pulse',label:'Pulse',def:50},
+      {key:'height',label:'Height',def:50},{key:'falloff',label:'Falloff',def:50},
+      {key:'core',label:'Core heat',def:50},{key:'grain',label:'Grain',def:50}],
     init(w, h, state) {
       state.noise = buildTileableNoise(256, 1337);
       state.cx = w*0.5;
-      state.cy = h*0.5 + 20*(h/480);
-      const corners = [[0,0],[w,0],[0,h],[w,h]];
-      state.maxR = Math.max(...corners.map(([x,y]) => Math.hypot(x-state.cx, y-state.cy)));
       state._gen = -1; state._pal = null;
     },
     render(data, w, h, tMs, p, state) {
@@ -1354,15 +1353,32 @@ function buildRamp(stopsA, stopsB, blend) {
       const flickerAmp = 10*flickerGain;
       const vtMs = tMs*speedMulJS(p[0]);
       const scrollX = (vtMs*0.006)%256, scrollY = (vtMs*0.004)%256;
-      const cx = state.cx, cy = state.cy, maxR = state.maxR*glowGain;
+      // Height, Falloff, Core heat and Grain map as an offset from the
+      // midpoint, the same way AnimEmber.cpp maps them, so 50 lands on the old
+      // constant and the picture at the defaults does not move.
+      const cx = state.cx;
+      const cy = h*0.5 + (20 + (p[4]-50))*(h/480);
+      const corners = [[0,0],[w,0],[0,h],[w,h]];
+      const maxR = Math.max(...corners.map(([x,y]) => Math.hypot(x-cx, y-cy)))*glowGain;
+      const shape = (p[5]-50)*0.016;
+      const coreOff = (p[6]-50)*(27/50);
+      // Two segments, mirroring AnimEmber.cpp's g_ditherMul: no dither at 0,
+      // exactly the old term at 50, three times it at 100.
+      const grain = p[7] <= 50 ? p[7]/50 : 1 + (p[7]-50)*(2/50);
       for (let y = 0; y < h; y++) {
         const dy = y-cy;
         const noiseY = Math.floor(y+scrollY);
         for (let x = 0; x < w; x++) {
           const dx = x-cx;
           const r = Math.sqrt(dx*dx+dy*dy);
-          let rn = (r/maxR)*255 - breatheOffset;
-          rn += (BAYER8[(y&7)*8+(x&7)]-31.5)/63 * 6;
+          let rn = (r/maxR)*255;
+          // Falloff bends the ramp between the same two ends. The clamped copy
+          // is what keeps the bend monotone; at slider 50 the term is 0 and rn
+          // is untouched.
+          const rc = rn > 255 ? 255 : rn;
+          rn += shape*rc*(255-rc)/255;
+          rn += coreOff - breatheOffset;
+          rn += (BAYER8[(y&7)*8+(x&7)]-31.5)/63 * 6 * grain;
           if (flickerGain > 0) {
             const nv = sampleNoise(state.noise, 256, Math.floor(x+scrollX), noiseY);
             rn += (nv-128)*flickerAmp/128;

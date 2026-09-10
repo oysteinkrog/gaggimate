@@ -182,6 +182,10 @@ export const BG_ANIMATIONS = [
       { key: 'glow', label: 'Glow size', def: 45 },
       { key: 'flicker', label: 'Flicker', def: 20 },
       { key: 'pulse', label: 'Pulse', def: 50 },
+      { key: 'height', label: 'Height', def: 50 },
+      { key: 'falloff', label: 'Falloff', def: 50 },
+      { key: 'core', label: 'Core heat', def: 50 },
+      { key: 'grain', label: 'Grain', def: 50 },
     ],
   },
   {
