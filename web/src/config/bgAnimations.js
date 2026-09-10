@@ -575,6 +575,11 @@ export const BG_ANIMATIONS = [
       { key: 'speed', label: 'Speed', def: 50 },
       { key: 'density', label: 'Grid density', def: 50 },
       { key: 'lines', label: 'Line strength', def: 58 },
+      { key: 'width', label: 'Line width', def: 50 },
+      { key: 'cross', label: 'Cross lines', def: 50 },
+      { key: 'reach', label: 'Grid reach', def: 50 },
+      { key: 'shade', label: 'Floor shade', def: 50 },
+      { key: 'drift', label: 'Side drift', def: 50 },
     ],
   },
   {

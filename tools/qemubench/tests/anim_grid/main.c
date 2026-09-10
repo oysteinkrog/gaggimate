@@ -266,6 +266,7 @@ static void note_bad(int idx, uint32_t got, uint32_t want) {
 static uint8_t g_prof[256];
 static uint16_t g_pal[PAL_N];
 
+#define NLW 11
 #define MAXPIX 512
 /* The row starts 8 halfwords in, so it is 16-byte aligned the way the
  * panel's band buffers are, which is what EE.VST.128.IP requires (it masks
@@ -448,13 +449,15 @@ int main(void) {
     checkFill(60, 1000); /* 480 px */
     checkFill(30, 2000); /* 240 px */
 
-    /* Production's own operand ranges. lw is 2611..4301 over the panel's
-     * rows, kv = round(255*65536/lw) is 3885..6400, du = (A[y]*dens)>>8 is
-     * 32802..196608 at dens 128..384, g and amp are bytes, bg+dither is
-     * 59..85. */
-    static const int lws[] = {2611, 2612, 3072, 3456, 4300, 4301};
+    /* Production's own operand ranges. The line width slider (gm-3vj.43,
+     * 0.40x to 1.80x of the half-width this file used to fix) takes lw over
+     * the panel's rows from 2611..4301 to 1044..7741, so kv =
+     * round(255*65536/lw) is 2159..16008; du = (A[y]*dens)>>8 is
+     * 32802..196608 at dens 128..384; g and amp are bytes; and the floor
+     * shade slider takes bg+dither from 59..85 to 59..109. */
+    static const int lws[] = {1044, 1045, 2611, 2612, 3072, 3456, 4300, 4301, 5800, 7740, 7741};
     static const int dus[] = {32802, 65604, 131072, 196608};
-    for (int li = 0; li < 6; li++) {
+    for (int li = 0; li < NLW; li++) {
         const int lw = lws[li];
         const int kv = (255 * 65536 + lw / 2) / lw;
         for (int di = 0; di < 4; di++) {
@@ -502,11 +505,12 @@ int main(void) {
     };
     for (int ci = 0; ci < (int)(sizeof(corners) / sizeof(corners[0])); ci++) {
         for (int di = 0; di < 4; di++) {
-            for (int li = 0; li < 6; li++) {
+            for (int li = 0; li < NLW; li++) {
                 const int lw = lws[li];
                 const int kv = (255 * 65536 + lw / 2) / lw;
                 check(corners[ci], (uint32_t)dus[di], lw, kv, 0, 119, 60, 59, 700);
                 check(corners[ci], (uint32_t)dus[di], lw, kv, 255, 119, 60, 59, 700);
+                check(corners[ci], (uint32_t)dus[di], lw, kv, 255, 119, 60, 88, 700);
             }
         }
     }
@@ -514,7 +518,7 @@ int main(void) {
     /* hv exactly 0 (fold == lw), and hv at its most negative (fold at the
      * triangle's peak), which is the case the kernel handles by letting MULL
      * and SRAI go negative and relying on MAX against g. */
-    for (int li = 0; li < 6; li++) {
+    for (int li = 0; li < NLW; li++) {
         const int lw = lws[li];
         const int kv = (255 * 65536 + lw / 2) / lw;
         for (int gi = 0; gi <= 255; gi += 5) {
@@ -548,7 +552,7 @@ int main(void) {
      * floor in production. */
     static const int blockCounts[] = {1, 2, 3, 4, 5, 7, 8, 15, 16, 30, 60, 64};
     for (int bi = 0; bi < 12; bi++) {
-        for (int li = 0; li < 6; li++) {
+        for (int li = 0; li < NLW; li++) {
             const int lw = lws[li];
             const int kv = (255 * 65536 + lw / 2) / lw;
             check(rng(), (uint32_t)dus[li & 3], lw, kv, (int)(rng() & 255), (int)(rng() % 120),
@@ -559,10 +563,12 @@ int main(void) {
     /* Bulk random sweep over the production ranges, so nothing above is
      * load-bearing on its own. */
     for (long i = 0; i < 20000; i++) {
-        const int lw = 2611 + (int)(rng() % 1691);
+        const int lw = 1044 + (int)(rng() % 6698);
         const int kv = (255 * 65536 + lw / 2) / lw;
         const uint32_t du = 32802u + (rng() % (196608u - 32802u + 1u));
-        check(rng(), du, lw, kv, (int)(rng() & 255), (int)(rng() % 120), 60, 59, 700);
+        /* bgdBase spreads the eight background indices over base..base+21,
+         * so 59..88 as a base covers the widened 59..109. */
+        check(rng(), du, lw, kv, (int)(rng() & 255), (int)(rng() % 120), 60, 59 + (int)(rng() % 30), 700);
     }
 
     uart_puts("grid: calls=");

@@ -5419,6 +5419,11 @@ function pcDither(dst, amp) {
       { key: 'speed', label: 'Speed', def: 50 },
       { key: 'density', label: 'Grid density', def: 50 },
       { key: 'lines', label: 'Line strength', def: 58 },
+      { key: 'width', label: 'Line width', def: 50 },
+      { key: 'cross', label: 'Cross lines', def: 50 },
+      { key: 'reach', label: 'Grid reach', def: 50 },
+      { key: 'shade', label: 'Floor shade', def: 50 },
+      { key: 'drift', label: 'Side drift', def: 50 },
     ],
     init(w, h, state) {
       state.A = new Int32Array(h);
@@ -5434,48 +5439,73 @@ function pcDither(dst, amp) {
       for (let y = 0; y < h; y++) {
         state.A[y] = Math.round(GRID_NUM * 65536 / (y + h));
         state.Vq8[y] = Math.round(FLOW_NUM * 256 / (y + h));
-        // near-to-far ramp: the far grid sits on a slightly darker floor.
-        state.bgRow[y] = 60 + Math.round(24 * y / (h - 1));
-        // near lines are wider in phase units as well as in pixels, so the
-        // width grows faster than perspective alone would make it.
-        const d = y / (h - 1);
-        const lw = Math.round(LINE_W * (0.85 + 0.55 * d));
-        state.lw[y] = lw;
-        state.kv[y] = Math.round(255 * 65536 / lw);
-        // the extra third only pays for itself where the rows compress; at
-        // the near edge it would turn the line into a broad bar.
-        const lwH = Math.round(lw * (1.35 - 0.35 * d));
-        state.lwH[y] = lwH;
-        state.kh[y] = Math.round(255 * 65536 / lwH);
       }
       state.dith = new Int16Array(64);
-      state.pal = null; state.key = null;
+      state.pal = null; state.key = null; state.wkey = null;
     },
     render(data, w, h, tMs, p, state) {
-      const key = p[2] + '|' + THEME.gen;
+      // Line width: 0.40x at slider 0, exactly 1x at 50, 1.80x at 100. The
+      // multiplier is a factor of exactly 1 at the default, so the widths
+      // are the ones this entry used to fix in init().
+      const wmul = p[3] <= 50 ? 40 + ((p[3] * 60 / 50) | 0) : 100 + (((p[3] - 50) * 80 / 50) | 0);
+      if (state.wkey !== wmul) {
+        state.wkey = wmul;
+        for (let y = 0; y < h; y++) {
+          // near lines are wider in phase units as well as in pixels, so the
+          // width grows faster than perspective alone would make it.
+          const d = y / (h - 1);
+          const lw = Math.round(LINE_W * (0.85 + 0.55 * d) * (wmul / 100));
+          state.lw[y] = lw;
+          state.kv[y] = Math.round(255 * 65536 / lw);
+          // the extra third only pays for itself where the rows compress; at
+          // the near edge it would turn the line into a broad bar.
+          const lwH = Math.round(lw * (1.35 - 0.35 * d));
+          state.lwH[y] = lwH;
+          state.kh[y] = Math.round(255 * 65536 / lwH);
+        }
+      }
+      const key = p[2] + '|' + p[5] + '|' + p[6] + '|' + THEME.gen;
       if (state.key !== key) {
         state.key = key;
         state.pal = themeRamp(190 + Math.round(p[2] * 66 / 100));
         bayerOffsets(state.dith, 1.4, 1);
         const amp = Math.round(LINE_AMP * (0.55 + p[2] * 0.9 / 100));
+        // Grid reach sets the ease length: 0.95 at slider 0, exactly 0.55 at
+        // 50, 0.15 at 100, so a higher slider brings the grid to full
+        // strength further up the panel.
+        const lenq = p[5] <= 50 ? 95 - ((p[5] * 40 / 50) | 0) : 55 - (((p[5] - 50) * 40 / 50) | 0);
+        const lenf = lenq / 100;
+        // Floor shade is the lift the floor gains from the far edge to the
+        // near one: flat at 0, the original 24 palette indices at 50, 48 at
+        // 100.
+        const span = Math.round(48 * p[6] / 100);
         for (let y = 0; y < h; y++) {
           // Depth gain: exactly zero over the top 5% of rows, easing in to
-          // full by 60% of the way down. The grid has to end, not thin out:
-          // the rows above the ease-in are where the feather would be a
-          // couple of rows wide and the crossings would bunch.
+          // full over the next lenf of the panel. The grid has to end, not
+          // thin out: the rows above the ease-in are where the feather would
+          // be a couple of rows wide and the crossings would bunch.
           const d = y / (h - 1);
-          let f = (d - 0.05) / 0.55;
+          let f = (d - 0.05) / lenf;
           if (f < 0) f = 0; else if (f > 1) f = 1;
           state.ampRow[y] = Math.round(amp * f * f * (3 - 2 * f));
+          // near-to-far ramp: the far grid sits on a slightly darker floor.
+          state.bgRow[y] = 60 + Math.round(span * y / (h - 1));
         }
       }
       const te = tMs * speedMulJS(p[0]);
       const ts = te / 1000;
       const dens = 128 + Math.round(p[1] * 256 / 100);   // 128..384, /256
-      const drift = Math.round(DRIFT_Q16_PER_S * ts) % U_PERIOD;
+      // Side drift scales the lateral rate: held still at slider 0, exactly
+      // the old 2 Q16 units per second at 50, twice that at 100. The factor
+      // is exactly 1 at the default, so the default phase is unchanged.
+      const drift = Math.round(DRIFT_Q16_PER_S * ((2 * p[7]) / 100) * ts) % U_PERIOD;
       const flow = Math.round(FLOW_Q8_PER_S * ts) % 32768;
       const { A, Vq8, ampRow, bgRow, U0, G, lw, kv, lwH, kh, dith, pal } = state;
       const halfW = w >> 1;
+      // Cross lines scales the horizontal term: gone at slider 0, exactly
+      // the old value at 50, doubled at 100. The cap is what keeps the
+      // doubled value a legal PROF index.
+      const cmul = 2 * p[4];
       for (let y = 0; y < h; y++) {
         const a = (A[y] * dens) >> 8;
         U0[y] = -halfW * a + drift;
@@ -5484,7 +5514,9 @@ function pcDither(dst, amp) {
         // the horizontal line arrives already normalized onto 0..255, so
         // the pixel loop takes one max and one profile gather for both.
         const g = lwH[y] - fold;
-        G[y] = g > 0 ? (g * kh[y]) >> 16 : 0;
+        let gn = g > 0 ? (g * kh[y]) >> 16 : 0;
+        gn = (gn * cmul / 100) | 0;
+        G[y] = gn > 255 ? 255 : gn;
       }
       let o = 0;
       for (let y = 0; y < h; y++) {

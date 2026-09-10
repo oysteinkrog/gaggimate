@@ -22,6 +22,15 @@
 // the same call AnimKaleido.cpp already makes: the scale is part of the
 // look that was signed off, not a user-facing brightness control, and the
 // user-facing one is still setThemeTone().
+//
+// Five more parameters landed on 2026-09-10 (gm-3vj.43): line width, cross
+// lines, grid reach, floor shade and side drift. Each one is exactly the
+// constant this file used to hard-code when its slider sits at 50, so the
+// default picture is the old picture bit for bit. None of them reaches the
+// pixel loop. Line width and floor shade rebuild per-row table entries,
+// cross lines scales the horizontal term frame() already writes each frame,
+// grid reach reshapes the depth gain, and side drift scales the lateral
+// phase rate. band(), bandRef() and both kernels are unchanged code.
 
 #include "BgAnim.h"
 #include "BgAnimCommon.h"
@@ -87,7 +96,11 @@ uint8_t *profile = nullptr; // the page's PROF, 0..255 in one byte each
 uint16_t *palette = nullptr;
 int16_t *dither = nullptr;
 int allocW = 0, allocH = 0;
-int lastLines = -1;
+// The tone tables cover line strength, grid reach and floor shade, so one
+// key gates all three; line width has its own, because its rebuild is the
+// heavier one and the two move independently.
+int lastToneKey = -1;
+int lastWidth = -1;
 uint32_t lastThemeGen = 0;
 
 // At 480 rows every table read per pixel or per row fits the 9,216 B hot
@@ -129,42 +142,98 @@ bool init(int w, int h) {
         const int n = 2 * BAYER8[k] - 63;
         dither[k] = static_cast<int16_t>(n < 0 ? -((-n + 22) / 45) : (n + 22) / 45);
     }
-    const int dh = h > 1 ? h - 1 : 1; // define the one-row degenerate panel
+    // Only the perspective terms are fixed at this size. Everything else a
+    // row needs depends on a parameter, so frame() owns it: both sentinels
+    // are -1 here (release() ran above, or this is the first init), which
+    // makes the first frame() build them before any band() reads them.
     for (int y = 0; y < h; y++) {
-        CursorRow &c = cursor[y];
         DepthRow &d = depth[y];
         const int den = y + h;
         d.a = (GRID_NUM * 65536 + den / 2) / den;
         d.vq8 = (FLOW_NUM * 256 + den / 2) / den;
-        tone[y].bg = static_cast<uint8_t>(60 + (24 * y + dh / 2) / dh);
-        // lw = round(3072*(0.85+0.55*y/(h-1))). Keeping the exact
-        // hundredths avoids a float half-tie changing the width by one.
-        const int dw = 100 * dh;
-        c.lw = static_cast<uint16_t>((LINE_W * (85 * dh + 55 * y) + dw / 2) / dw);
-        c.kv = static_cast<uint16_t>((255 * 65536 + c.lw / 2) / c.lw);
-        // Horizontal width is 1.35x at the far edge, tapering to 1x near.
-        d.lwH = static_cast<uint16_t>((c.lw * (135 * dh - 35 * y) + dw / 2) / dw);
-        d.kh = static_cast<uint16_t>((255 * 65536 + d.lwH / 2) / d.lwH);
     }
     return true;
+}
+
+// Line width. wmul is the half-width multiplier in hundredths: 40 at slider
+// 0, exactly 100 at 50, 180 at 100. At 100 this is the same rational the
+// original init() evaluated, numerator and denominator both scaled by 100,
+// and dw = 100*(h-1) is always even, so the default table comes out entry
+// for entry the table it used to be.
+void buildWidth(int h, int wmul) {
+    const int dh = h > 1 ? h - 1 : 1; // define the one-row degenerate panel
+    const int dw = 100 * dh;
+    for (int y = 0; y < h; y++) {
+        CursorRow &c = cursor[y];
+        DepthRow &d = depth[y];
+        // lw = round(3072*(0.85+0.55*y/(h-1))*wmul/100). Keeping the exact
+        // hundredths avoids a float half-tie changing the width by one.
+        const int64_t num = static_cast<int64_t>(LINE_W) * (85 * dh + 55 * y) * wmul;
+        c.lw = static_cast<uint16_t>((num + dw * 50) / (static_cast<int64_t>(dw) * 100));
+        c.kv = static_cast<uint16_t>((255 * 65536 + c.lw / 2) / c.lw);
+        // Horizontal width is 1.35x at the far edge, tapering to 1x near.
+        const int64_t numH = static_cast<int64_t>(c.lw) * (135 * dh - 35 * y);
+        d.lwH = static_cast<uint16_t>((numH + dw / 2) / dw);
+        d.kh = static_cast<uint16_t>((255 * 65536 + d.lwH / 2) / d.lwH);
+    }
+}
+
+// The palette and both per-row tone terms. lenq is the depth fade's ease
+// length in hundredths (95 at grid reach 0, exactly 55 at 50, 15 at 100) and
+// span is how many palette indices the floor gains from the far edge to the
+// near one (0 at floor shade 0, exactly 24 at 50, 48 at 100).
+void buildTone(int h, int lines, int lenq, int span) {
+    // The page scales RGB channels by this Q8 brightness before 565
+    // quantization. Scaling an already-quantized ramp would differ.
+    buildThemeRamp(palette, static_cast<uint16_t>(190 + (lines * 66 + 50) / 100));
+    const int amp = (LINE_AMP * (550 + 9 * lines) + 500) / 1000;
+    const int dh = h > 1 ? h - 1 : 1;
+    const float invH = 1.0f / dh;
+    // 55.0f/100.0f is the same float the literal 0.55f was, both being the
+    // correctly rounded value of 0.55, and the divide below is the same
+    // operation on the same operands, so grid reach 50 is bit exact.
+    const float lenf = static_cast<float>(lenq) / 100.0f;
+    for (int y = 0; y < h; y++) {
+        // Depth gain: exactly zero over the top 5% of rows, easing in to
+        // full over the next lenf of the panel. The grid has to end, not
+        // thin out: the rows above the ease-in are where the feather would
+        // be a couple of rows wide and the crossings would bunch.
+        float f = (y * invH - 0.05f) / lenf;
+        f = f < 0 ? 0 : (f > 1 ? 1 : f);
+        tone[y].amp = static_cast<uint8_t>(lroundf(amp * f * f * (3.0f - 2.0f * f)));
+        // near-to-far ramp: the far grid sits on a slightly darker floor.
+        tone[y].bg = static_cast<uint8_t>(60 + (span * y + dh / 2) / dh);
+    }
 }
 
 void frame(uint32_t tMs, int w, int h, const uint8_t p[BG_ANIM_PARAMS]) {
     const int lines = p[2] > PARAM_MAX ? PARAM_MAX : p[2];
     const int density = p[1] > PARAM_MAX ? PARAM_MAX : p[1];
+    const int width = p[3] > PARAM_MAX ? PARAM_MAX : p[3];
+    const int cross = p[4] > PARAM_MAX ? PARAM_MAX : p[4];
+    const int reach = p[5] > PARAM_MAX ? PARAM_MAX : p[5];
+    const int shade = p[6] > PARAM_MAX ? PARAM_MAX : p[6];
+    const int driftAmt = p[7] > PARAM_MAX ? PARAM_MAX : p[7];
+    // Line width: 0.40x at slider 0, exactly 1x at 50, 1.80x at 100. Keyed
+    // on the multiplier, not the slider, so neighbouring slider values that
+    // land on the same hundredths skip the rebuild.
+    const int wmul = width <= 50 ? 40 + (width * 60) / 50 : 100 + ((width - 50) * 80) / 50;
+    if (lastWidth != wmul) {
+        buildWidth(h, wmul);
+        lastWidth = wmul;
+    }
+    // Grid reach: the ease length, 0.95 at 0, exactly 0.55 at 50, 0.15 at
+    // 100, so a higher slider brings the grid to full strength further up
+    // the panel and a lower one keeps it near the viewer.
+    const int lenq = reach <= 50 ? 95 - (reach * 40) / 50 : 55 - ((reach - 50) * 40) / 50;
+    // Floor shade: the near-to-far lift, flat at 0, exactly 24 at 50, 48 at
+    // 100. bg therefore spans 60..108 rather than the old fixed 60..84.
+    const int span = (48 * shade + 50) / 100;
     const uint32_t gen = themeGen();
-    if (lastLines != lines || lastThemeGen != gen) {
-        // The page scales RGB channels by this Q8 brightness before 565
-        // quantization. Scaling an already-quantized ramp would differ.
-        buildThemeRamp(palette, static_cast<uint16_t>(190 + (lines * 66 + 50) / 100));
-        const int amp = (LINE_AMP * (550 + 9 * lines) + 500) / 1000;
-        const float invH = 1.0f / (h > 1 ? h - 1 : 1);
-        for (int y = 0; y < h; y++) {
-            float f = (y * invH - 0.05f) / 0.55f;
-            f = f < 0 ? 0 : (f > 1 ? 1 : f);
-            tone[y].amp = static_cast<uint8_t>(lroundf(amp * f * f * (3.0f - 2.0f * f)));
-        }
-        lastLines = lines;
+    const int toneKey = lines | (lenq << 8) | (span << 16);
+    if (lastToneKey != toneKey || lastThemeGen != gen) {
+        buildTone(h, lines, lenq, span);
+        lastToneKey = toneKey;
         lastThemeGen = gen;
     }
     // Derive phases from tMs, as the page does, never from call history.
@@ -175,8 +244,20 @@ void frame(uint32_t tMs, int w, int h, const uint8_t p[BG_ANIM_PARAMS]) {
     const uint32_t speedQ24 = static_cast<uint32_t>(lroundf(speedMul(p[0]) * 16777216.0f));
     const uint64_t scaledMs = static_cast<uint64_t>(tMs) * speedQ24;
     constexpr uint64_t TIME_DEN = 1000ull * 16777216ull;
+    // Side drift scales the 2 Q16 units per second lateral rate: held still
+    // at slider 0, exactly the old rate at 50, twice it at 100. dmul carries
+    // that in hundredths, so 100 divides back to the original constant with
+    // no rounding of its own. Reducing the time modulo U_PERIOD*DRIFT_DEN100
+    // first removes whole multiples of dmul*U_PERIOD from the quotient,
+    // which the mask drops, and it keeps the product inside uint64: the
+    // reduced time is under 1.08e14 and dmul is at most 200.
     constexpr uint64_t DRIFT_DEN = TIME_DEN / DRIFT_Q16_PER_S; // 128000
-    const uint32_t drift = static_cast<uint32_t>((scaledMs + DRIFT_DEN / 2) / DRIFT_DEN) & (U_PERIOD - 1);
+    constexpr uint64_t DRIFT_DEN100 = DRIFT_DEN * 100;         // 12,800,000
+    constexpr uint64_t DRIFT_WRAP = static_cast<uint64_t>(U_PERIOD) * DRIFT_DEN100;
+    const uint64_t dmul = static_cast<uint64_t>(2 * driftAmt);
+    const uint32_t drift =
+        static_cast<uint32_t>(((scaledMs % DRIFT_WRAP) * dmul + DRIFT_DEN100 / 2) / DRIFT_DEN100) &
+        (U_PERIOD - 1);
     // Reduce before multiplying by 4914. Removing a whole number of line
     // periods from the time cannot change round(4914*ts) mod 32768, and the
     // largest intermediate is (32768*TIME_DEN-1)*4914 < 2.71e18, safely
@@ -184,6 +265,11 @@ void frame(uint32_t tMs, int w, int h, const uint8_t p[BG_ANIM_PARAMS]) {
     const uint32_t flow = static_cast<uint32_t>(((scaledMs % (32768ull * TIME_DEN)) * FLOW_Q8_PER_S +
                                                 TIME_DEN / 2) / TIME_DEN) & 32767u;
     const uint32_t dens = 128 + (density * 256 + 50) / 100;
+    // Cross lines scales the horizontal term: gone at slider 0, exactly the
+    // old value at 50, doubled at 100. The clamp is what keeps the doubled
+    // value a legal profile index; without it the gather would read past the
+    // 256-entry table.
+    const int cmul = 2 * cross;
     for (int y = 0; y < h; y++) {
         CursorRow &c = cursor[y];
         const DepthRow &d = depth[y];
@@ -192,15 +278,22 @@ void frame(uint32_t tMs, int w, int h, const uint8_t p[BG_ANIM_PARAMS]) {
         const int wv = (d.vq8 + flow) & 32767;
         const int fold = wv <= 16384 ? wv : 32768 - wv;
         const int g = d.lwH - fold;
-        tone[y].g = static_cast<uint8_t>(g > 0 ? (g * d.kh) >> 16 : 0);
+        int gn = g > 0 ? (g * d.kh) >> 16 : 0;
+        gn = (gn * cmul) / 100;
+        tone[y].g = static_cast<uint8_t>(gn > 255 ? 255 : gn);
     }
 }
 
 // Portable spec: precisely the page's integer pixel loop. Its clamp of the
-// palette index is redundant for legal params: bg=60..84, amp=0..119,
-// PROF=0..255 and dither=-1..1 put i in 59..203, so it is left out rather
+// palette index is redundant for legal params, and still is with the five
+// parameters gm-3vj.43 added: floor shade widens bg to 60..108, amp is
+// unchanged at 0..119, PROF=0..255 and dither=-1..1, which puts i in
+// 59..228, inside the 256-entry palette, so the clamp is left out rather
 // than paid for per pixel. Both normalized profiles stay inside 0..255:
-// round(255*65536/lw)*lw differs from 255*65536 by at most lw/2 < 2151.
+// round(255*65536/lw)*lw differs from 255*65536 by at most lw/2, and line
+// width caps lw at 7,741 and lwH at 10,450, both far below the 131,072 at
+// which that slack would reach a whole index. Cross lines is the one term
+// that can exceed 255 on its own, and frame() clamps it there.
 GM_ANIM_IRAM void bandRef(uint16_t *__restrict dst, int y0, int rows, int w, uint32_t, const uint8_t *) {
     for (int y = y0; y < y0 + rows; y++) {
         const CursorRow &c = cursor[y];
@@ -276,7 +369,10 @@ static_assert(offsetof(GridRowAsm, lwPlus) == 16 && offsetof(GridRowAsm, nBlocks
 // therefore exact, never optimistic: a block that fails it falls through to
 // the full chain for all eight pixels, so the kernel is pixel-identical to
 // bandRef() by construction rather than by tuning. lw is 16% to 26% of the
-// half period, so 74% to 84% of blocks take the store.
+// half period at the default line width, so 74% to 84% of blocks take the
+// store; the width slider moves that band to 6% to 11% at 0 and 29% to 47%
+// at 100, which changes how often the fast path wins and nothing about
+// whether it is right.
 //
 // Cost, at the panel's 480 px row: about 0.9 instructions per pixel on the
 // fast path against bandRef()'s compiled 15 plus its load-use stalls, and
@@ -480,7 +576,8 @@ void release() {
     releaseTable(dither, 64 * sizeof(int16_t));
     releaseTable(depth, static_cast<size_t>(allocH) * sizeof(DepthRow));
     allocW = allocH = 0;
-    lastLines = -1;
+    lastToneKey = -1;
+    lastWidth = -1;
     lastThemeGen = 0;
 }
 
@@ -493,7 +590,11 @@ const BgAnimation bg_anim_grid = {
     {{"speed", "Speed", 50},
      {"density", "Grid density", 50},
      {"lines", "Line strength", 58},
-     {nullptr, nullptr, 0}},
+     {"width", "Line width", 50},
+     {"cross", "Cross lines", 50},
+     {"reach", "Grid reach", 50},
+     {"shade", "Floor shade", 50},
+     {"drift", "Side drift", 50}},
     init,
     frame,
     band,
