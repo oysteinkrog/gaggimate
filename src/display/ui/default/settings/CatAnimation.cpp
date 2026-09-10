@@ -62,12 +62,12 @@ struct SimAnim {
 };
 
 constexpr SimAnim kSimAnims[] = {
-    {"Plasma", {{"speed", "Speed", 50}, {"scale", "Scale", 50}, {"brightness", "Brightness", 70}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}}},
-    {"Lava", {{"speed", "Speed", 50}, {"scale", "Blob size", 50}, {"glow", "Glow", 60}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}}},
-    {"Silk", {{"speed", "Speed", 50}, {"scale", "Fringe density", 45}, {"glow", "Sheen", 55}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}}},
-    {"Starfield", {{"speed", "Drift speed", 50}, {"density", "Stars", 45}, {"twinkle", "Twinkle", 50}, {"shooting", "Shooting stars", 30}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}}},
-    {"Aurora", {{"speed", "Speed", 50}, {"intensity", "Intensity", 55}, {"waviness", "Waviness", 50}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}}},
-    {"Ripples", {{"speed", "Ring speed", 50}, {"rate", "Drop rate", 40}, {"decay", "Fade", 50}, {"glow", "Glow", 50}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}}},
+    {"Plasma", {{"speed", "Speed", 50}, {"scale", "Scale", 50}, {"brightness", "Brightness", 70}, {"contrast", "Contrast", 50}, {"cycle", "Colour cycle", 50}, {"stretch", "Stretch", 50}, {"grain", "Grain", 50}, {"shift", "Palette shift", 50}}},
+    {"Lava", {{"speed", "Speed", 50}, {"scale", "Blob size", 50}, {"glow", "Glow", 60}, {"count", "Blob count", 67}, {"core", "Hot core", 50}, {"falloff", "Falloff", 40}, {"contrast", "Contrast", 50}, {"wander", "Wander", 50}}},
+    {"Silk", {{"speed", "Speed", 50}, {"scale", "Fringe density", 45}, {"glow", "Sheen", 55}, {"spread", "Wave spread", 50}, {"twist", "Twist", 50}, {"wobble", "Breathe", 50}, {"vignette", "Edge fade", 80}, {"grain", "Grain", 50}}},
+    {"Starfield", {{"speed", "Drift speed", 50}, {"density", "Stars", 45}, {"twinkle", "Twinkle", 50}, {"shooting", "Shooting stars", 30}, {"glow", "Star glow", 50}, {"skyglow", "Sky glow", 50}, {"falloff", "Sky falloff", 50}, {"tint", "Star tint", 50}}},
+    {"Aurora", {{"speed", "Speed", 50}, {"intensity", "Intensity", 55}, {"waviness", "Waviness", 50}, {"height", "Height", 50}, {"spread", "Spread", 50}, {"glow", "Glow", 50}, {"drift", "Drift", 50}, {nullptr, nullptr, 0}}},
+    {"Ripples", {{"speed", "Ring speed", 50}, {"rate", "Drop rate", 40}, {"decay", "Fade", 50}, {"glow", "Glow", 50}, {"spread", "Drop spread", 50}, {"width", "Ring width", 50}, {"tone", "Water tone", 50}, {"trough", "Trough dip", 50}}},
     {"Caustics", {{"speed", "Drift speed", 50}, {"scale", "Cell scale", 45}, {"contrast", "Contrast", 55}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}}},
     {"Mandala", {{"speed", "Speed", 50}, {"symmetry", "Symmetry", 50}, {"complexity", "Complexity", 45}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}}},
     {"Orbits", {{"speed", "Speed", 50}, {"orbitCount", "Orbits", 55}, {"eccentricity", "Eccentricity", 55}, {"trail", "Trail", 50}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}}},
