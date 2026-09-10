@@ -486,6 +486,10 @@ export const BG_ANIMATIONS = [
       { key: 'width', label: 'Ribbon width', def: 50 },
       { key: 'twist', label: 'Twist', def: 50 },
       { key: 'bright', label: 'Brightness', def: 62 },
+      { key: 'waist', label: 'Waist', def: 50 },
+      { key: 'glow', label: 'Edge glow', def: 50 },
+      { key: 'shade', label: 'Face shading', def: 50 },
+      { key: 'wash', label: 'Backdrop', def: 50 },
     ],
   },
   {

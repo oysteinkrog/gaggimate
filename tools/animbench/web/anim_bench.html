@@ -4395,11 +4395,21 @@ function pcDither(dst, amp) {
      36 of the 600 rows in a twist and still looked pointed.
    - The face indices sit in the 60..130 band rather than running to the top of
      the ramp, which keeps white UI text readable over the ribbon.
+
+   Four of the eight sliders name numbers this design fixed. Waist is the half
+   width left at the joins, 4..26..52 px, so the joins can be a point or nearly
+   no pinch at all. Edge glow scales the halo profile and clips it, so the edge
+   runs from hard through the 18 px design halo to a doubled bloom. Face shading
+   scales the front and back lighting swings, from a flat strip to twice the
+   design's contrast, with the face index window held so the ramp stays inside
+   itself. Backdrop scales the wash swing behind the strip, from flat to double.
+   Each sits at its design value at 50.
    --------------------------------------------------------------------------- */
 (() => {
   const GLOW = 18;                 // px of halo either side of the face
   const GT_N = GLOW * 16 + 1;      // halo profile sampled at 1/16 px
-  const WAIST = 26;                // px of half width left at the twist joins
+  const WAIST = 26;                // px of half width at the joins, Waist at 50
+  const LO_MIN = 8, LO_MAX = 150;  // the face index window Face shading works in
 
   ANIMS.push({
     id: 'ribbon', name: 'Ribbon', proto: true,
@@ -4408,16 +4418,14 @@ function pcDither(dst, amp) {
       { key: 'width', label: 'Ribbon width', def: 50 },
       { key: 'twist', label: 'Twist', def: 50 },
       { key: 'bright', label: 'Brightness', def: 62 },
+      { key: 'waist', label: 'Waist', def: 50 },
+      { key: 'glow', label: 'Edge glow', def: 50 },
+      { key: 'shade', label: 'Face shading', def: 50 },
+      { key: 'wash', label: 'Backdrop', def: 50 },
     ],
     init(w, h, state) {
       state.key = null; state.pal32 = null;
       state.gt = new Uint8Array(GT_N);
-      for (let k = 0; k < GT_N; k++) {
-        const u = k / 16;
-        const near = 0.5 * (1 + Math.cos(Math.PI * Math.min(1, u / 3.5)));
-        const far = 0.5 * (1 + Math.cos(Math.PI * u / GLOW));
-        state.gt[k] = Math.round(255 * (0.42 * near + 0.58 * far));
-      }
       state.dith = new Int16Array(64);
       state.bgIdx = new Int16Array(h);
     },
@@ -4428,6 +4436,15 @@ function pcDither(dst, amp) {
         state.key = key;
         state.pal32 = pcPal32(themeRamp(176 + Math.round(p[3] * 0.8)));
         pcDither(state.dith, 2.2);
+        // The halo profile, scaled by Edge glow and clipped. At 50 the gain is
+        // exactly 1 and this is the mixture the design shipped with.
+        const gain = p[5] / 50;
+        for (let k = 0; k < GT_N; k++) {
+          const u = k / 16;
+          const near = 0.5 * (1 + Math.cos(Math.PI * Math.min(1, u / 3.5)));
+          const far = 0.5 * (1 + Math.cos(Math.PI * u / GLOW));
+          state.gt[k] = Math.min(255, Math.round(255 * (0.42 * near + 0.58 * far) * gain));
+        }
       }
       const pal32 = state.pal32, gt = state.gt, dith = state.dith, bgIdx = state.bgIdx;
       const sm = speedMulJS(p[0]);
@@ -4436,11 +4453,20 @@ function pcDither(dst, amp) {
       const ky = (1024 / 600) * (0.45 + p[2] * 0.011); // turns along y
       const halfMax = 58 + p[1] * 1.15;                // px, 115 at the default
       const bgPh = (tt / 21000) * 1024;
+      // Waist in px, two integer segments so slider 50 is exactly WAIST. The
+      // floor of 4 keeps the face wide enough for the per-row division below.
+      const wp = p[4];
+      const waistPx = wp <= 50 ? 4 + (((WAIST - 4) * wp + 25) / 50 | 0)
+                               : WAIST + ((WAIST * (wp - 50) + 25) / 50 | 0);
+      const waistSq = waistPx * waistPx;
+      const fwd = ((56 * p[6] + 25) / 50) | 0;         // front lighting swing, 56 at 50
+      const back = ((40 * p[6] + 25) / 50) | 0;        // back lighting swing, 40 at 50
+      const washAmp = ((9 * p[7] + 25) / 50) | 0;      // wash swing, 9 at 50
 
       // Background: a faint vertical wash so the face around the ribbon is not
       // a flat black plate.
       for (let y = 0; y < h; y++) {
-        bgIdx[y] = 23 + ((SIN[((y * 2 + bgPh) | 0) & 1023] * 9) >> 9);
+        bgIdx[y] = 23 + ((SIN[((y * 2 + bgPh) | 0) & 1023] * washAmp) >> 9);
       }
 
       const cxq = 240 * 256;
@@ -4450,9 +4476,11 @@ function pcDither(dst, amp) {
         const s = SIN[th & 1023];
         const c = SIN[(th + 256) & 1023];
         const sw = ((s < 0 ? -s : s) * halfMax) / 512;          // px
-        const hw = (Math.sqrt(sw * sw + WAIST * WAIST) * 256) | 0;  // Q8, rounded waist
-        const base = 100 + ((c > 0 ? c * 56 : c * 40) >> 9);
-        const lo = base - 30, hi = base + 34;
+        const hw = (Math.sqrt(sw * sw + waistSq) * 256) | 0;   // Q8, rounded waist
+        const base = 100 + ((c > 0 ? c * fwd : c * back) >> 9);
+        let lo = base - 30;
+        if (lo < LO_MIN) lo = LO_MIN; else if (lo > LO_MAX) lo = LO_MAX;
+        const hi = lo + 64;
         const bg = bgIdx[y];
         const bgCol = pal32[bg];
         let x0i = ((cxq - hw) >> 8) - GLOW; if (x0i < 0) x0i = 0;

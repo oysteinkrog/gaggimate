@@ -5,6 +5,15 @@
 // entry 34, 'ribbon', in tools/animbench/web/anim_bench.html, including its
 // softened design: 26 px half waist, 18 px halo, and restrained face shading.
 //
+// Eight sliders. Speed, Ribbon width, Twist and Brightness are the original
+// four. Waist sets the half width left where the twist crosses (4, 26 or 52
+// design px), Edge glow scales the halo profile (none, the design, or twice
+// and clipped), Face shading scales the front and back lighting swings, and
+// Backdrop scales the vertical wash behind the strip. All four of the new
+// ones act in frame() or on the halo table, so bandRef and the three Xtensa
+// kernels are exactly what they were. At slider 50 each one reproduces the
+// constant it replaced by construction, so the goldens do not move.
+//
 // Coordinates and half widths are Q8 in the preview's 480 px design space.
 // At 480 wide each output pixel advances 256 units; at 240 it advances 512,
 // so the half-resolution path samples the same picture. Other widths truncate
@@ -42,8 +51,18 @@ constexpr int DESIGN = 480;
 constexpr int CX_Q8 = 240 * 256;
 constexpr int GLOW = 18;
 constexpr int GT_N = GLOW * 16 + 1; // distance buckets 0..288, inclusive
-constexpr int WAIST = 26;
+constexpr int WAIST = 26;      // half width at the joins with Waist at 50
 constexpr int FACE_RANGE = 64; // hi - lo = (base + 34) - (base - 30)
+constexpr int GLOW_DEF = 50; // Edge glow default; equals the slider default in
+                             // the table below, so a device left at the default
+                             // never rebuilds the halo table at all
+// The face index window. Face shading at 100 doubles the lighting swing, which
+// would drive lo to -10 on the darkest row and 181 on the brightest; the face
+// runs lo..lo+64 and the kernels gather the palette without a clamp, so lo is
+// held inside this window. At slider 50 lo is 30..125 and neither bound binds,
+// which is why the goldens do not move.
+constexpr int LO_MIN = 8;
+constexpr int LO_MAX = 150;
 
 struct Row {
     uint16_t hw, x0, x1;
@@ -61,6 +80,7 @@ const int16_t *sine = nullptr; // borrowed shared table, never released here
 int allocH = 0;
 int pixelQ8 = 256;
 int lastBright = -1;
+int lastGlow = -1;
 uint32_t lastThemeGen = 0xFFFFFFFFu;
 
 // At h=480: rowRec 7,680 B, palette 512 B, gt 289 B (304 B aligned),
@@ -68,6 +88,28 @@ uint32_t lastThemeGen = 0xFFFFFFFFu;
 // allocHot: 8,640 B of 9,216 B including alignment, no PSRAM tables.
 // sinLut's 2,048 B belong to the separate 3,072 B shared reservation.
 void release();
+
+// The halo profile, sampled at 1/16 px out to the full 18 px. gp is the Edge
+// glow slider and gp/50 scales the whole profile: at 50 the divisor makes the
+// gain exactly 1.0f and a multiply by 1.0f cannot change a float, so this is
+// the page's own mixture bit for bit. At 0 the table is all zeroes and the
+// face has a hard edge with no halo; at 100 the profile is doubled and clipped
+// at 255, which widens the part that is full face colour and leaves the outer
+// falloff smooth. 289 cosf pairs, paid on a change and never per frame: init()
+// builds the default and frame() rebuilds only when the slider differs from it.
+void buildHalo(int gp) {
+    const float gain = static_cast<float>(gp) / 50.0f;
+    for (int k = 0; k < GT_N; k++) {
+        // The page mixes a 42% raised-cosine shoulder ending at 3.5 px
+        // with a 58% raised-cosine skirt ending at the full 18 px halo.
+        const float u = k * (1.0f / 16.0f);
+        const float nearU = u < 3.5f ? u * (1.0f / 3.5f) : 1.0f;
+        const float near = 0.5f * (1.0f + cosf(static_cast<float>(M_PI) * nearU));
+        const float far = 0.5f * (1.0f + cosf(static_cast<float>(M_PI) * u * (1.0f / GLOW)));
+        const long v = lroundf(255.0f * (0.42f * near + 0.58f * far) * gain);
+        gt[k] = static_cast<uint8_t>(v > 255 ? 255 : v);
+    }
+}
 
 bool init(int w, int h) {
     // 960 B is the aligned total of the four fixed-size hot tables below.
@@ -93,15 +135,8 @@ bool init(int w, int h) {
         release();
         return false;
     }
-    for (int k = 0; k < GT_N; k++) {
-        // The page mixes a 42% raised-cosine shoulder ending at 3.5 px
-        // with a 58% raised-cosine skirt ending at the full 18 px halo.
-        const float u = k * (1.0f / 16.0f);
-        const float nearU = u < 3.5f ? u * (1.0f / 3.5f) : 1.0f;
-        const float near = 0.5f * (1.0f + cosf(static_cast<float>(M_PI) * nearU));
-        const float far = 0.5f * (1.0f + cosf(static_cast<float>(M_PI) * u * (1.0f / GLOW)));
-        gt[k] = static_cast<uint8_t>(lroundf(255.0f * (0.42f * near + 0.58f * far)));
-    }
+    buildHalo(GLOW_DEF);
+    lastGlow = GLOW_DEF;
     for (int k = 0; k < 64; k++) {
         // No half ties occur here, so lroundf and JS Math.round agree even
         // for negative offsets. The result is -2..2, independent of theme.
@@ -119,6 +154,10 @@ void frame(uint32_t tMs, int w, int h, const uint8_t p[BG_ANIM_PARAMS]) {
         lastBright = p[3];
         lastThemeGen = gen;
     }
+    if (lastGlow != static_cast<int>(p[5])) {
+        buildHalo(p[5]);
+        lastGlow = p[5];
+    }
     // Time remains a pure function of tMs, including speed changes. Q24
     // carries the float speed multiplier over the 0..100 range; the 64-bit
     // product stays below 2^59 even at millis() wrap. Reduce each cycle
@@ -135,6 +174,23 @@ void frame(uint32_t tMs, int w, int h, const uint8_t p[BG_ANIM_PARAMS]) {
     // this is one sine turn per 600 rows, or 0.8 turns over the panel.
     const float ky = (1024.0f / 600.0f) * (0.45f + p[2] * 0.011f);
     const float halfMax = 58.0f + p[1] * 1.15f; // 58..173 px; 115.5 at width=50
+    // Waist: the half width left where the twist crosses, in design px. Two
+    // integer segments, 4..26..52, so slider 50 lands on the page's own WAIST
+    // and the squared term below is the same int 676 the constant produced.
+    // The floor of 4 keeps the face at least 8 px wide, which is what stops
+    // the per-row division by the span from seeing zero and holds the face
+    // index step small enough for the kernels' int16 accumulators.
+    const int wp = p[4];
+    const int waistPx = wp <= 50 ? 4 + ((WAIST - 4) * wp + 25) / 50 : WAIST + (WAIST * (wp - 50) + 25) / 50;
+    const int waistSq = waistPx * waistPx;
+    // Face shading: the front and back lighting swings, the page's 56 and 40 at
+    // slider 50 (both integer divisions land on them exactly), 0 at 0 for a
+    // flat strip with no light and dark faces, and double at 100.
+    const int fwd = (56 * static_cast<int>(p[6]) + 25) / 50;
+    const int back = (40 * static_cast<int>(p[6]) + 25) / 50;
+    // Backdrop: the swing of the vertical wash in palette indices, the page's
+    // 9 at slider 50, 0 at 0 for a flat ground and 18 at 100.
+    const int washAmp = (9 * static_cast<int>(p[7]) + 25) / 50;
     const float yScale = static_cast<float>(DESIGN) / h;
     pixelQ8 = DESIGN * 256 / w;
 
@@ -144,13 +200,19 @@ void frame(uint32_t tMs, int w, int h, const uint8_t p[BG_ANIM_PARAMS]) {
         const int s = sine[th & 1023];
         const int c = sine[(th + 256) & 1023]; // quarter-turn offset gives cosine
         const float sw = (s < 0 ? -s : s) * halfMax * (1.0f / 512.0f);
-        const int hw = static_cast<int>(sqrtf(sw * sw + WAIST * WAIST) * 256.0f);
-        // Asymmetric lighting: the front adds up to 56 indices to 100,
-        // the back subtracts up to 40. Face edges are base-30 and base+34.
-        const int base = 100 + ((c > 0 ? c * 56 : c * 40) >> 9);
-        const int lo = base - 30;
-        // Background indices 23 +/-9, two sine slots per design row.
-        const int bg = 23 + ((sine[static_cast<int>(yy * 2.0f + bgPh) & 1023] * 9) >> 9);
+        const int hw = static_cast<int>(sqrtf(sw * sw + waistSq) * 256.0f);
+        // Asymmetric lighting: at Face shading 50 the front adds up to 56
+        // indices to 100 and the back subtracts up to 40. Face edges are
+        // lo and lo + 64, which is base-30 and base+34 while lo is unclamped.
+        const int base = 100 + ((c > 0 ? c * fwd : c * back) >> 9);
+        int lo = base - 30;
+        if (lo < LO_MIN) {
+            lo = LO_MIN;
+        } else if (lo > LO_MAX) {
+            lo = LO_MAX;
+        }
+        // Background indices 23 +/-9 at Backdrop 50, two sine slots per design row.
+        const int bg = 23 + ((sine[static_cast<int>(yy * 2.0f + bgPh) & 1023] * washAmp) >> 9);
         int x0 = (CX_Q8 - hw - GLOW * 256) / pixelQ8;
         int x1 = (CX_Q8 + hw + GLOW * 256) / pixelQ8;
         if (x0 < 0) x0 = 0;
@@ -457,6 +519,7 @@ void release() {
     allocH = 0;
     pixelQ8 = 256;
     lastBright = -1;
+    lastGlow = -1;
     lastThemeGen = 0xFFFFFFFFu;
 }
 
@@ -469,7 +532,11 @@ const BgAnimation bg_anim_ribbon = {
     {{"speed", "Speed", 50},
      {"width", "Ribbon width", 50},
      {"twist", "Twist", 50},
-     {"bright", "Brightness", 62}},
+     {"bright", "Brightness", 62},
+     {"waist", "Waist", 50},
+     {"glow", "Edge glow", 50},
+     {"shade", "Face shading", 50},
+     {"wash", "Backdrop", 50}},
     init,
     frame,
     band,
