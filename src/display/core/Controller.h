@@ -173,8 +173,17 @@ class Controller {
     // (-1 once consumed), so the toggle and a synthetic brew's own start/end
     // decision never race each other. synthBrewCycleOn/synthBrewingNow mirror
     // the loop-local state so the GET response can read it from any task.
+    // Off at boot since 2026-09-10: the owner uses the loadtest build on the
+    // bench board by hand, and the forced brew every 60 s idle pulled the
+    // screen away from whatever was being looked at. A soak that wants the
+    // brew load turns it on with /api/debug/synth?brew=1 (or builds with
+    // -DGM_SYNTH_BREW_CYCLE=1); the handshake and the telemetry ramp run
+    // either way.
+#ifndef GM_SYNTH_BREW_CYCLE
+#define GM_SYNTH_BREW_CYCLE 0
+#endif
     volatile int synthBrewCycleRequest = -1;
-    volatile bool synthBrewCycleOn = true;
+    volatile bool synthBrewCycleOn = GM_SYNTH_BREW_CYCLE != 0;
     volatile bool synthBrewingNow = false;
 #endif
 

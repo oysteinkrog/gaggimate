@@ -1146,6 +1146,19 @@ void DefaultUI::iconDeleted(lv_event_t *e) {
 
 void DefaultUI::scanIcons(lv_obj_t *obj) {
     if (lv_obj_check_type(obj, &lv_img_class)) {
+        // A clickable image is a button, and its PRESSED state changes are
+        // the user's taps, not a blink. The settings rows' arrows (clickable
+        // lv_img, SettingsRows.cpp) were taken over after their first tap
+        // and then sometimes vanished until the next redraw (owner's report,
+        // 2026-09-10); the likely reason is that the sprite waits for the
+        // publish after the handover invalidation and a settings page at
+        // rest has none, but the fix is the same either way. The blinking
+        // dial icons are not clickable, so nothing this path exists for is
+        // lost. A candidate that has become clickable falls out through the
+        // unseen sweep in serviceIconLayers, releasing its layer.
+        if (lv_obj_has_flag(obj, LV_OBJ_FLAG_CLICKABLE)) {
+            return;
+        }
         const bool hidden = lv_obj_has_flag(obj, LV_OBJ_FLAG_HIDDEN);
         const uint16_t state = lv_obj_get_state(obj);
         IconCand *c = nullptr;
