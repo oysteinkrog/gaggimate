@@ -1,141 +1,25 @@
-#ifndef GAGGIMATE_SIM
-
-// "Stripes": broad, soft parallel stripes with a slowly travelling beat,
-// turning once per 150 seconds. This is entry 33 of anim_bench.html,
-// including its softened 4/5 harmonics, 5:3 weights and raised base of 34.
-// The unequal weights leave one quarter of the amplitude at a beat node.
-//
-// A 32-bit unsigned DDS cursor covers one complete 4096-entry table cycle.
-// Its top 12 bits select a Q4 palette index; the bottom 20 retain sub-entry
-// motion. Each pixel adds the screen-anchored 8x8 Bayer offset before the
-// four-bit shift and the ordinary 256-entry theme-ramp gather. No wheel,
-// row duplication, per-pixel float, or phase carried between band calls.
-
-#include "BgAnim.h"
-#include "BgAnimCommon.h"
-#include <math.h>
-
-#if defined(ESP_PLATFORM)
-#include <esp_attr.h>
-#define GM_ANIM_IRAM IRAM_ATTR
-#else
+/* Freestanding execution check for the literal production kernel. The C
+ * reference independently implements the page/bandRef inner loop, including
+ * its clamp, so a packed lane carry, wrong dither sign, phase wrap or store
+ * overrun is visible. The test enables CP3 once; the kernel never does.
+ */
+#include <stdint.h>
 #define GM_ANIM_IRAM
-#endif
+#define UART0_FIFO (*(volatile uint32_t *)0x60000000u)
 
-#ifndef GM_BGANIM_STRIPES_ASM
-#define GM_BGANIM_STRIPES_ASM 1
-#endif
-
-namespace {
-using namespace bganim;
-
-constexpr int TAB = 4096;
-constexpr int TURN_BITS = 20; // 32 - log2(TAB), not the size of a whole turn
-constexpr int BASE = 34;     // keeps the beat node above near-black
-constexpr float TURN = 4294967296.0f;
-
-// Every owned table is hot, with no width-dependent allocations:
-//   tabQ4    4096 uint16_t  8192 B  per-pixel field gather, slab
-//   palette   256 uint16_t   512 B  per-pixel colour gather, slab
-//   dith       64 int16_t    128 B  per-pixel Bayer offsets, slab
-// Total 8832 B of the 9216 B animation allowance, including alignment.
-// The shared 2048 B sine LUT is borrowed from the separate 3072 B reserve.
-uint16_t *tabQ4 = nullptr;
-uint16_t *palette = nullptr;
-int16_t *dith = nullptr;
-const int16_t *sl = nullptr;
-uint32_t lastThemeGen = 0;
-bool paletteValid = false;
-uint32_t phase0 = 0, stepX = 0, stepY = 0;
-
-void release();
-
-bool init(int, int) {
-    sl = sinLut();
-    if (sl != nullptr && tabQ4 == nullptr) {
-        tabQ4 = static_cast<uint16_t *>(allocHot(TAB * sizeof(uint16_t)));
-    }
-    if (sl != nullptr && palette == nullptr) {
-        palette = static_cast<uint16_t *>(allocHot(256 * sizeof(uint16_t)));
-    }
-    if (sl != nullptr && dith == nullptr) {
-        dith = static_cast<int16_t *>(allocHot(64 * sizeof(int16_t)));
-    }
-    if (sl == nullptr || tabQ4 == nullptr || palette == nullptr || dith == nullptr) {
-        // Roll back the entire partial set so a retry starts with no live
-        // slab allocations and no stale palette-generation sentinel.
-        release();
-        return false;
-    }
-    return true;
-}
-
-void frame(uint32_t tMs, int, int, const uint8_t p[4]) {
-    const uint32_t gen = themeGen();
-    if (!paletteValid || lastThemeGen != gen) {
-        buildThemeRamp(palette, 256);
-        // Full ditherAmp, in sixteenths of an index. bayerOffsets on the
-        // page uses the same symmetric lround rule, including negatives.
-        const float scale = ditherAmp(palette, 256) * 16.0f / 31.5f;
-        for (int k = 0; k < 64; ++k) {
-            dith[k] = static_cast<int16_t>(lroundf((BAYER8[k] - 31.5f) * scale));
-        }
-        lastThemeGen = gen;
-        paletteValid = true;
-    }
-    // Integer forms of the page's positive Math.round: 70..135 indices,
-    // 590..430 pixels per table cycle, or about 131..96 px per stripe.
-    const int span = 70 + (static_cast<int>(p[2]) * 65 + 50) / 100;
-    const int cyclePx = 590 - (static_cast<int>(p[1]) * 16 + 5) / 10;
-    const float K = TURN / static_cast<float>(cyclePx);
-    const float tsec = (static_cast<float>(tMs) * speedMul(p[0])) * 0.001f;
-    // 21 sine entries/s is the page's nominal 10 px/s envelope drift.
-    // Wide conversions keep days of uptime defined before the phase masks.
-    const unsigned beatPhase = static_cast<uint64_t>(tsec * 21.0f) & 1023u;
-    for (int i = 0; i < TAB; ++i) {
-        const int s = sl[i & 1023] * 5 + sl[(((i * 5) >> 2) + beatPhase) & 1023] * 3 + 4096;
-        // s is 0..8192. /512 converts s/8192 * span to Q4 exactly as
-        // the page does, retaining its truncation before adding dither.
-        tabQ4[i] = static_cast<uint16_t>((BASE << 4) + ((s * span) >> 9));
-    }
-    // Q8 interpolation between sine entries removes whole-entry angular
-    // twitches. Arithmetic shifts round negative interpolation deltas down,
-    // as JavaScript >> does on the page and both supported GCC targets do.
-    const uint64_t aQ8 = static_cast<uint64_t>(tsec * (1024.0f * 256.0f / 150.0f));
-    const unsigned ai = (aQ8 >> 8) & 1023u;
-    const int af = aQ8 & 255u;
-    const int cosA = sl[(ai + 256) & 1023] +
-                     (((sl[(ai + 257) & 1023] - sl[(ai + 256) & 1023]) * af) >> 8);
-    const int sinA = sl[ai] + (((sl[(ai + 1) & 1023] - sl[ai]) * af) >> 8);
-    stepX = static_cast<uint32_t>(static_cast<int32_t>(cosA * K * (1.0f / 512.0f)));
-    stepY = static_cast<uint32_t>(static_cast<int32_t>(sinA * K * (1.0f / 512.0f)));
-    // Reduce the 15 px/s slide in pixels before scaling to a whole turn.
-    // This is the page's modulo-2^32 p0, without a huge float product that
-    // loses an entire turn at long uptimes. Frame setup uses float on both
-    // host and device; the page uses double, so very late timestamps can
-    // differ in phase rounding. All per-pixel operations are bit-exact.
-    phase0 = static_cast<uint32_t>(static_cast<uint64_t>(fmodf(tsec * 15.0f, cyclePx) * K));
-}
-
-GM_ANIM_IRAM void bandRef(uint16_t *__restrict dst, int y0, int rows, int w, uint32_t, const uint8_t *) {
-    const uint16_t *__restrict tab = tabQ4;
-    const uint16_t *__restrict pal = palette;
-    for (int row = 0; row < rows; ++row) {
-        const int y = y0 + row;
-        uint32_t ph = phase0 + stepY * static_cast<uint32_t>(y);
-        const int16_t *off = dith + (y & 7) * 8;
-        for (int x = 0; x < w; ++x) {
-            const int idx = (tab[ph >> TURN_BITS] + off[x & 7]) >> 4;
-            // The page clamps to 0..255. Here tab is 544..2704 and dither
-            // is at most +-256 (ditherAmp's cap of 16), so idx is 18..185
-            // for every legal parameter/theme. The clamp is an identity.
-            *dst++ = pal[idx];
-            ph += stepX;
-        }
+static void puts_uart(const char *s) {
+    while (*s) {
+        if (*s == '\n') UART0_FIFO = '\r';
+        UART0_FIFO = (uint8_t)*s++;
     }
 }
+static void put_dec(uint32_t v) {
+    char b[12];
+    int n = 0;
+    do { b[n++] = '0' + v % 10; v /= 10; } while (v);
+    while (n) UART0_FIFO = b[--n];
+}
 
-#if GM_BGANIM_STRIPES_ASM && defined(__XTENSA__) && !defined(GM_BGANIM_NO_ASM)
 // BEGIN VERBATIM PRODUCTION KERNELS
 // GCC 14.2, xtensa-asm14.sh with the firmware flags, emits a 14-instruction
 // hardware loop for bandRef. This scalar body transcribes its order: all
@@ -182,10 +66,8 @@ GM_ANIM_IRAM __attribute__((noinline)) uint32_t stripesScalarAsm(uint16_t *out, 
 //
 // tab entries 544..2704 and offsets -256..256 sum to 288..2960: signed
 // saturation is inactive and extracting bits 4..11 is the exact >>4.
-// off must address eight readable offsets at a 16-byte-aligned address.
-// band() checks dith's alignment before calling this kernel because
-// allocHot can fall back to PSRAM without guaranteeing that alignment.
-// Each Bayer row is 16 bytes, so the check covers every row's VLD span.
+// off is one complete 16-byte row in allocHot's aligned Bayer table, so
+// the only VLD span is aligned by construction and never crosses its end.
 // out needs only the contract's four-byte alignment, including widths 233
 // and 466. S32I stores full pairs only; the scalar tail touches no padding.
 //
@@ -300,50 +182,150 @@ GM_ANIM_IRAM __attribute__((noinline)) uint32_t stripesRowAsm(uint16_t *out, con
 }
 // END VERBATIM PRODUCTION KERNELS
 
-GM_ANIM_IRAM void band(uint16_t *dst, int y0, int rows, int w, uint32_t tMs, const uint8_t *p) {
-    if ((reinterpret_cast<uintptr_t>(dith) & 15u) != 0) {
-        bandRef(dst, y0, rows, w, tMs, p);
-        return;
+static uint32_t stripesRowRef(uint16_t *out, const uint16_t *tab,
+                              const int16_t *off, const uint16_t *pal,
+                              uint32_t ph, uint32_t step, int n) {
+    for (int x = 0; x < n; ++x) {
+        int idx = ((int)tab[ph >> 20] + off[x & 7]) >> 4;
+        if (idx < 0) idx = 0;
+        if (idx > 255) idx = 255;
+        out[x] = pal[idx];
+        ph += step;
     }
-    for (int row = 0; row < rows; ++row) {
-        const int y = y0 + row;
-        const uint32_t ph = phase0 + stepY * static_cast<uint32_t>(y);
-        stripesRowAsm(dst, tabQ4, dith + (y & 7) * 8, palette, ph, stepX, w);
-        dst += w;
+    return ph;
+}
+
+#define STORAGE 544
+static uint16_t tab[4096] __attribute__((aligned(16)));
+static uint16_t pal[256] __attribute__((aligned(16)));
+static int16_t dith[64] __attribute__((aligned(16)));
+static uint16_t got[STORAGE] __attribute__((aligned(16)));
+static uint16_t want[STORAGE] __attribute__((aligned(16)));
+static uint32_t calls, pixels, mismatches, firstCall, firstLane, firstGot, firstWant;
+static uint32_t rng = 0x73547269u;
+
+static uint32_t next_rand(void) {
+    rng ^= rng << 13; rng ^= rng >> 17; rng ^= rng << 5;
+    return rng;
+}
+static void mismatch(int lane, uint32_t g, uint32_t w) {
+    if (!mismatches) {
+        firstCall = calls; firstLane = lane; firstGot = g; firstWant = w;
     }
-}
-#else
-// The portable reference is also the flag-off and GM_BGANIM_NO_ASM path.
-void band(uint16_t *dst, int y0, int rows, int w, uint32_t tMs, const uint8_t *p) {
-    bandRef(dst, y0, rows, w, tMs, p);
-}
-#endif
-
-void release() {
-    releaseTable(tabQ4, TAB * sizeof(uint16_t));
-    releaseTable(palette, 256 * sizeof(uint16_t));
-    releaseTable(dith, 64 * sizeof(int16_t));
-    sl = nullptr; // borrowed, never freed by this animation
-    paletteValid = false;
-    lastThemeGen = 0;
-    phase0 = stepX = stepY = 0;
+    ++mismatches;
 }
 
-} // namespace
+/* Compare the entire guarded buffers, not just the live pixels. All four
+ * possible four-byte alignments modulo 16 are passed directly to the row
+ * kernel. No vector stores are allowed to touch the guards or tail. */
+static void run_case(int n, int alignment, int rowPhase, uint32_t ph, uint32_t step, int scalar) {
+    ++calls;
+    const int at = 8 + 2 * alignment;
+    for (int i = 0; i < STORAGE; ++i) got[i] = want[i] = 0x5aa5;
+    const int16_t *off = dith + rowPhase * 8;
+    uint32_t g = scalar ? stripesScalarAsm(got + at, tab, off, pal, ph, step, n)
+                        : stripesRowAsm(got + at, tab, off, pal, ph, step, n);
+    const uint32_t w = stripesRowRef(want + at, tab, off, pal, ph, step, n);
+    if (g != w) mismatch(STORAGE, g, w);
+    for (int i = 0; i < STORAGE; ++i) {
+        if (got[i] != want[i]) mismatch(i, got[i], want[i]);
+    }
+    if (n > 0) pixels += n;
+}
 
-extern const BgAnimation bg_anim_stripes;
-const BgAnimation bg_anim_stripes = {
-    "stripes",
-    "Stripes",
-    {{"speed", "Speed", 50},
-     {"pitch", "Stripe pitch", 50},
-     {"depth", "Depth", 55},
-     {nullptr, nullptr, 0}},
-    init,
-    frame,
-    band,
-    release,
-    bandRef,
-};
+static void fill_tables(void) {
+    for (int i = 0; i < 4096; ++i) tab[i] = 544 + next_rand() % 2161;
+    // One-to-one palette, with both all-zero and all-one words, so wrong
+    // indices cannot hide behind a quantized theme's repeated colours.
+    for (int i = 0; i < 256; ++i) pal[i] = (uint16_t)(i * 257);
+    for (int i = 0; i < 64; ++i) dith[i] = (int)(next_rand() % 513) - 256;
+}
 
-#endif // GAGGIMATE_SIM
+int main(void) {
+    uint32_t enable = 8;
+    asm volatile("wsr %0, cpenable\nisync\n" : : "r"(enable));
+    fill_tables();
+
+    // Every table index, in both phase directions, including UINT32 wrap.
+    for (int batch = 0; batch < 8; ++batch) {
+        run_case(512, batch & 3, batch, (uint32_t)batch << 29, 1u << 20, 0);
+        run_case(512, batch & 3, batch, ((uint32_t)batch << 29) - 1, 0u - (1u << 20), 0);
+    }
+    // Every table value and signed dither endpoint, with one full vector.
+    for (int v = 544; v <= 2704; ++v) {
+        tab[0] = v;
+        for (int i = 0; i < 8; ++i) {
+            static const int16_t edge[] = {-256, -255, -1, 0, 1, 255, 256, -128};
+            dith[i] = edge[(i + v) & 7];
+        }
+        run_case(8, v & 3, 0, 0, 0, 0);
+    }
+    // Every offset in the full ditherAmp cap, including negative values.
+    for (int d = -256; d <= 256; ++d) {
+        for (int i = 0; i < 8; ++i) dith[i] = d;
+        tab[0] = (d & 1) ? 544 : 2704;
+        run_case(9, d & 3, 0, 0xfffffu, 0, 0);
+    }
+    fill_tables();
+    // Widths around every vector/pair boundary plus actual device widths.
+    // Full 32-bit step extremes cover every sign, not just the production
+    // maximum of floor(2^32 / 430) = 9988296 units per pixel.
+    static const int widths[] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 15, 16, 17, 31, 32, 33, 233, 240, 466, 480, 511, 512};
+    static const uint32_t steps[] = {0, 1, 0xffffffffu, 0xfffffu, 0x100000u, 0x100001u,
+                                    0x7fffffffu, 0x80000000u, 0x80000001u,
+                                    7279605u, 0u - 7279605u, 9988296u, 0u - 9988296u};
+    static const uint32_t phases[] = {0, 1, 0xfffffu, 0x100000u, 0x7fffffffu, 0x80000000u, 0xffffffffu};
+    for (unsigned n = 0; n < sizeof(widths) / sizeof(widths[0]); ++n) {
+        for (unsigned s = 0; s < sizeof(steps) / sizeof(steps[0]); ++s) {
+            for (unsigned ph = 0; ph < sizeof(phases) / sizeof(phases[0]); ++ph) {
+                run_case(widths[n], (n + s + ph) & 3, (n + s + ph) & 7, phases[ph], steps[s], 0);
+            }
+        }
+    }
+    // Independent direct checks of the verbatim scalar transcription,
+    // including zero trip and all possible scalar tails.
+    for (int n = 0; n <= 17; ++n) {
+        run_case(n, n & 3, n & 7, next_rand(), next_rand(), 1);
+    }
+    // Parameter endpoints as they reach the kernel: span 70/135 and cycle
+    // 590/430. All waveform values are bounded by those spans; synthetic s
+    // traverses 0..8192, including both extremes. Exercise both rotation
+    // directions, row phases and phase wrap at each combination.
+    for (int pitch = 0; pitch <= 100; pitch += 100) {
+        const uint32_t cycle = 590 - (pitch * 16 + 5) / 10;
+        const uint32_t step = 0xffffffffu / cycle + ((0xffffffffu % cycle) == cycle - 1);
+        for (int depth = 0; depth <= 100; depth += 100) {
+            const int span = 70 + (depth * 65 + 50) / 100;
+            for (int i = 0; i < 4096; ++i) {
+                const int s = (i == 4095) ? 8192 : i * 2;
+                tab[i] = 544 + ((s * span) >> 9);
+            }
+            for (int r = 0; r < 8; ++r) {
+                run_case(480, r & 3, r, next_rand(), step, 0);
+                run_case(240, r & 3, r, next_rand(), 0u - step, 0);
+            }
+        }
+    }
+    // Deterministic random phases/steps cover interior bit patterns and
+    // varying palettes exercise the complete RGB565 word operand range.
+    for (int i = 0; i < 512; ++i) {
+        if ((i & 31) == 0) {
+            fill_tables();
+            for (int c = 0; c < 256; ++c) pal[c] = (uint16_t)next_rand();
+        }
+        run_case(next_rand() % 513, i & 3, i & 7, next_rand(), next_rand(), 0);
+    }
+    if (mismatches) {
+        puts_uart("GM_QEMUBENCH_PIE: FAIL stripes call="); put_dec(firstCall);
+        puts_uart(" lane="); put_dec(firstLane);
+        puts_uart(" got="); put_dec(firstGot);
+        puts_uart(" want="); put_dec(firstWant);
+        puts_uart(" mismatches="); put_dec(mismatches); puts_uart("\n");
+    } else {
+        puts_uart("GM_QEMUBENCH_PIE: PASS stripes calls="); put_dec(calls);
+        puts_uart(" pixels="); put_dec(pixels);
+        puts_uart(" mismatches=0 (Q4, signed dither, DDS wraps, tails, alignment, parameter extremes)\n");
+    }
+    puts_uart("GM_QEMUBENCH_PIE_DONE\n");
+    for (;;) {}
+}
