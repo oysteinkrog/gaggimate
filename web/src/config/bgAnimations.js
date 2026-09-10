@@ -455,6 +455,11 @@ export const BG_ANIMATIONS = [
       { key: 'speed', label: 'Speed', def: 50 },
       { key: 'tail', label: 'Tail length', def: 50 },
       { key: 'glow', label: 'Head glow', def: 55 },
+      { key: 'width', label: 'Drop width', def: 50 },
+      { key: 'fade', label: 'Tail fade', def: 50 },
+      { key: 'spread', label: 'Speed spread', def: 50 },
+      { key: 'base', label: 'Base light', def: 50 },
+      { key: 'grain', label: 'Grain', def: 50 },
     ],
   },
   {

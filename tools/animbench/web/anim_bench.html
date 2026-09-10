@@ -4095,10 +4095,14 @@ const pa_dith = (x, y) => (BAYER8[(y & 7) * 8 + (x & 7)] - 31.5) * (1 / 64);
    keeps the mean luma above the readability floor on the darker themes.
 -------------------------------------------------------------------- */
 (() => {
-  const CYC = 2048, TAIL = 160, LANE = 8, SPD = [5, 6, 7];  // ~19.5, 23.4, 27.3 px/s
+  const CYC = 2048, TAIL = 160, LANE = 8;  // middle rate 6 => ~23.4 px/s
   // Lane cross-section: one class index per column of the 8 px lane.
   const XCLASS = [0, 1, 2, 3, 3, 2, 1, 0];
+  // Drop width mixes the middle set toward the narrow or the wide one. The
+  // mix factor is zero at 50, so the middle set is what the default renders.
   const XGAIN = [0.18, 0.45, 0.80, 1.00];
+  const XGAIN_NARROW = [0.00, 0.06, 0.55, 1.00];
+  const XGAIN_WIDE = [0.62, 0.82, 0.94, 1.00];
   const NCLASS = 4;
 
   ANIMS.push({
@@ -4107,6 +4111,11 @@ const pa_dith = (x, y) => (BAYER8[(y & 7) * 8 + (x & 7)] - 31.5) * (1 / 64);
       { key: 'speed', label: 'Speed', def: 50 },
       { key: 'tail', label: 'Tail length', def: 50 },
       { key: 'glow', label: 'Head glow', def: 55 },
+      { key: 'width', label: 'Drop width', def: 50 },
+      { key: 'fade', label: 'Tail fade', def: 50 },
+      { key: 'spread', label: 'Speed spread', def: 50 },
+      { key: 'base', label: 'Base light', def: 50 },
+      { key: 'grain', label: 'Grain', def: 50 },
     ],
     init(w, h, state) {
       state.tabQ4 = new Uint16Array(NCLASS * CYC);
@@ -4124,21 +4133,33 @@ const pa_dith = (x, y) => (BAYER8[(y & 7) * 8 + (x & 7)] - 31.5) * (1 / 64);
         state.key = key;
         state.pal = themeRamp();
         // Most of the face is the flat floor, where a full-amplitude
-        // ordered dither is visible as a cross-hatch and buys nothing.
-        bayerOffsets(state.dith, ditherAmpJS(state.pal, 256) * 0.7, 16);
-        const tail = Math.round(TAIL * (0.55 + p[1] * 0.009));   // 88..250 units
+        // ordered dither is visible as a cross-hatch and buys nothing, so
+        // Grain attenuates it to 0.7 at the default and reaches 1.4 at 100.
+        bayerOffsets(state.dith, ditherAmpJS(state.pal, 256) * (p[7] * 7 / 500), 16);
+        const tail = Math.round(TAIL * (0.55 + p[1] * 0.009));   // 88..232 units
         const head = 148 + Math.round(p[2] * 0.8);               // 148..228
-        const floor = 66;                                        // the dark face
+        // Base light: the palette index of the dark face, 66 at the default.
+        // The floor cannot go below 24, because the dither offset is taken
+        // off it and the firmware kernel reads the sum unclamped.
+        const floor = p[6] <= 50 ? 24 + Math.floor(p[6] * 42 / 50)
+                                 : 66 + Math.floor((p[6] - 50) * 60 / 50);
         const BELOW = 14;                                        // rounds the head off
+        const gTo = p[3] <= 50 ? XGAIN_NARROW : XGAIN_WIDE;
+        const gMix = (p[3] <= 50 ? 50 - p[3] : p[3] - 50) / 50;
+        // Tail fade: how much of the tail's brightness sits right under the
+        // head. The two weights sum to 1 at every setting, so the sample at
+        // the head is the head; 45 and 55 is the front-loaded default.
+        const fadeN = 5 + Math.floor(p[4] * 8 / 10);
+        const front = fadeN / 100, slope = (100 - fadeN) / 100;
         const tab = state.tabQ4;
         for (let cls = 0; cls < NCLASS; cls++) {
-          const gain = XGAIN[cls];
+          const gain = XGAIN[cls] + (gTo[cls] - XGAIN[cls]) * gMix;
           for (let u = 0; u < CYC; u++) {
             const d = (CYC - u) & (CYC - 1);                     // 0 at the head
             let v = 0;
             if (d <= tail) {
               const f = 1 - d / tail;
-              v = (head - floor) * f * f * (0.45 + 0.55 * f);    // soft, front loaded
+              v = (head - floor) * f * f * (front + slope * f);
             } else if (u > 0 && u <= BELOW) {
               // A short glow under the head, so the streak ends in a
               // rounded point instead of the spec's hard cut.
@@ -4151,6 +4172,11 @@ const pa_dith = (x, y) => (BAYER8[(y & 7) * 8 + (x & 7)] - 31.5) * (1 / 64);
       }
       const { tabQ4, colPhase, seed, dith, pal } = state;
       const t = tMs * speedMulJS(p[0]);
+      // Speed spread pulls the three lane rates apart about the middle one
+      // of 6. 1 at the default gives back the original 5, 6 and 7 per 256
+      // units of the clock; 0 puts every lane on 6 and 100 gives 3, 6 and 9.
+      const sk = p[5] <= 50 ? p[5] / 50 : 1 + (p[5] - 50) * 2 / 50;
+      const SPD = [6 - sk, 6, 6 + sk];
       for (let x = 0; x < w; x++) {
         const lane = x >> 3;
         const ph = (seed[lane] - (((t * SPD[lane % 3]) >> 8) | 0)) & (CYC - 1);

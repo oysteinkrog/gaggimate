@@ -7,9 +7,10 @@
 // a short quadratic glow rounds its lower tip.
 //
 // This is entry 'rain' in tools/animbench/web/anim_bench.html. Its executable
-// values govern: floor 66, Q4 uint16 samples, tail 88..232, eight pixel lanes.
-// The page's older header still says floor 44, uint8 and four pixel lanes,
-// and its tail-range comment says 250. Those are not what the page renders.
+// values govern: floor 66 at the default, Q4 uint16 samples, tail 88..232,
+// eight pixel lanes. The page's older header still says floor 44, uint8 and
+// four pixel lanes, and its tail-range comment says 250. Those are not what
+// the page renders.
 //
 // The logical table is four classes times a 2048 pixel cycle. Q4 would make
 // that 16,384 B, before palette and lane phases, exceeding the hot slab.
@@ -42,7 +43,6 @@ constexpr int LANE = 8;         // cross-section and Bayer row both repeat here
 constexpr int TAIL = 160;       // default tail: 160 * (0.55 + 50 * 0.009)
 constexpr int MAX_TAIL = 232;   // round(160 * (0.55 + 100 * 0.009))
 constexpr int BELOW = 14;       // quadratic glow below the head
-constexpr int FLOOR = 66;       // palette index of the unlit face
 constexpr int FLOOR_SLOT = MAX_TAIL + BELOW + 1;
 constexpr int PROFILE_N = FLOOR_SLOT + 1;
 constexpr size_t PROFILE_BYTES = PROFILE_N * LANE * sizeof(uint16_t);
@@ -57,8 +57,23 @@ int allocW = 0;
 int seedN = 0;
 int lastTail = -1;
 int lastGlow = -1;
+int lastWidth = -1;
+int lastFade = -1;
+int lastBase = -1;
+int lastGrain = -1;
 uint32_t lastThemeGen = 0xFFFFFFFFu;
 bool tablesValid = false;
+
+// Lane cross-section, mirrored about the centre, as a gain on the streak's
+// brightness above the floor. The middle set is the approved preview's
+// 0.18/0.45/0.80/1.00, which "Drop width" 50 reproduces exactly: the mix
+// factor is zero there and a float plus zero is the float. Narrow leaves a
+// two pixel core with almost nothing beside it, wide spreads the streak
+// across the whole eight pixel lane. Every entry is inside 0..1, so a Q4
+// sample stays between floor * 16 and head * 16 at any width.
+constexpr float GAIN_MID[4] = {0.18f, 0.45f, 0.80f, 1.00f};
+constexpr float GAIN_NARROW[4] = {0.00f, 0.06f, 0.55f, 1.00f};
+constexpr float GAIN_WIDE[4] = {0.62f, 0.82f, 0.94f, 1.00f};
 
 // At 480 wide: tabQ4 3,968 B + lanePhase 120 B (128 B slab reservation)
 // + dith 128 B + pal 512 B + background 128 B = 4,856 B payload,
@@ -113,69 +128,124 @@ bool init(int w, int h) {
 
 void frame(uint32_t tMs, int w, int, const uint8_t p[BG_ANIM_PARAMS]) {
     const uint32_t gen = themeGen();
-    if (!tablesValid || gen != lastThemeGen) {
+    const bool themeDirty = !tablesValid || gen != lastThemeGen;
+    if (themeDirty) {
         buildThemeRamp(pal, 256);
-        // The page attenuates dither to 0.7 because most pixels are on a
-        // flat floor. Units are sixteenths of a palette index, not pixels.
-        const float amp = ditherAmp(pal, 256) * 0.7f;
-        for (int k = 0; k < 64; k++) {
-            dith[k] = static_cast<int16_t>(lroundf((BAYER8[k] - 31.5f) * (amp * 16.0f / 31.5f)));
-            // Every class outside the streak is exactly FLOOR in Q4.
-            // Cache its final RGB565 once per theme, including Bayer.
-            background[k] = pal[(FLOOR * 16 + dith[k]) >> 4];
-        }
         lastThemeGen = gen;
     }
-    if (!tablesValid || lastTail != p[1] || lastGlow != p[2]) {
+    // "Grain": a scale on the ordered dither, 0 to 1.4, and exactly the
+    // page's 0.7 attenuation at 50 because 350/500 rounds to the same float
+    // as the literal 0.7f. The attenuation is there because most pixels are
+    // on the flat floor, where full amplitude reads as a cross-hatch. Units
+    // are sixteenths of a palette index, not pixels. ditherAmp caps at 16,
+    // so the offset is at most round(16 * 1.4 * 16) = 358 either way.
+    const bool ditherDirty = themeDirty || lastGrain != p[7];
+    if (ditherDirty) {
+        const float amp = ditherAmp(pal, 256) * (static_cast<float>(p[7] * 7) / 500.0f);
+        for (int k = 0; k < 64; k++) {
+            dith[k] = static_cast<int16_t>(lroundf((BAYER8[k] - 31.5f) * (amp * 16.0f / 31.5f)));
+        }
+        lastGrain = p[7];
+    }
+    // "Base light": the palette index of the unlit face, 24 to 126, and 66
+    // at 50, which is the approved preview's floor. Integer arithmetic, so
+    // the default is the same 66 the table was built from. The low end is
+    // 24 and not 0 because the dither offset is subtracted from it and the
+    // kernel's bit field takes the sum unclamped: 24 * 16 - 358 = 26 >= 0.
+    const int floorIdx = p[6] <= 50 ? 24 + p[6] * 42 / 50 : 66 + (p[6] - 50) * 60 / 50;
+    if (ditherDirty || lastTail != p[1] || lastGlow != p[2] || lastWidth != p[3] || lastFade != p[4] ||
+        lastBase != p[6]) {
         // Single precision on host and device; the page's double arithmetic
         // can round a boundary sample one Q4 unit differently. The profile
         // shape and its final integer dither/shift are otherwise identical.
         const int tail = static_cast<int>(lroundf(TAIL * (0.55f + p[1] * 0.009f)));
         const int head = 148 + static_cast<int>(lroundf(p[2] * 0.8f));
         const float invTail = 1.0f / tail;
+        // "Drop width": mix the middle cross-section toward the narrow or
+        // the wide set. The factor is zero at 50, so each gain is the
+        // middle value plus zero, which is the middle value.
+        const float *gTo = p[3] <= 50 ? GAIN_NARROW : GAIN_WIDE;
+        const float gMix = static_cast<float>(p[3] <= 50 ? 50 - p[3] : p[3] - 50) * (1.0f / 50.0f);
+        float gain[4];
+        for (int cls = 0; cls < 4; cls++) gain[cls] = GAIN_MID[cls] + (gTo[cls] - GAIN_MID[cls]) * gMix;
+        // "Tail fade": how much of the tail's brightness sits right under
+        // the head. The two weights are n/100 and (100 - n)/100, so at
+        // n = 45 they are the float values of the literals 0.45f and 0.55f
+        // the profile was written with. Their sum is 1 at every n, so the
+        // sample at the head is the head whatever the fade is. n = 5 is a
+        // short bright dash, n = 85 an evenly lit streak.
+        const int fadeN = 5 + p[4] * 8 / 10;
+        const float front = static_cast<float>(fadeN) / 100.0f;
+        const float slope = static_cast<float>(100 - fadeN) / 100.0f;
+        // Every class outside the streak is exactly the floor in Q4. Cache
+        // its final RGB565 here, including Bayer, once per rebuild.
+        for (int k = 0; k < 64; k++) {
+            int idx = (floorIdx * 16 + dith[k]) >> 4;
+            if (idx < 0) idx = 0;
+            else if (idx > 255) idx = 255;
+            background[k] = pal[idx];
+        }
         for (int i = 0; i < PROFILE_N; i++) {
             const int u = (i - MAX_TAIL) & (CYC - 1);
             const int d = (CYC - u) & (CYC - 1);
             float v = 0.0f;
             if (i != FLOOR_SLOT && d <= tail) {
                 const float f = 1.0f - d * invTail;
-                v = (head - FLOOR) * f * f * (0.45f + 0.55f * f);
+                v = (head - floorIdx) * f * f * (front + slope * f);
             } else if (i != FLOOR_SLOT && u > 0 && u <= BELOW) {
                 const float f = 1.0f - u * (1.0f / BELOW);
-                v = (head - FLOOR) * f * f;
+                v = (head - floorIdx) * f * f;
             }
             for (int cls = 0; cls < 4; cls++) {
-                const float gain = cls == 0 ? 0.18f : (cls == 1 ? 0.45f : (cls == 2 ? 0.80f : 1.00f));
-                const uint16_t q4 = static_cast<uint16_t>(lroundf((FLOOR + v * gain) * 16.0f));
+                const uint16_t q4 = static_cast<uint16_t>(lroundf((floorIdx + v * gain[cls]) * 16.0f));
                 tabQ4[i * LANE + cls] = q4;
                 tabQ4[i * LANE + 7 - cls] = q4;
             }
         }
         lastTail = p[1];
         lastGlow = p[2];
+        lastWidth = p[3];
+        lastFade = p[4];
+        lastBase = p[6];
     }
     tablesValid = true;
 
-    // Page: (tMs * speedMul(p[0]) * SPD[lane % 3]) >> 8. Rates at
+    // Page: (tMs * speedMul(p[0]) * spd[lane % 3]) >> 8. Rates at
     // speed 50 are 5000/256, 6000/256, 7000/256 px/s; a cycle is 2048 px.
     // uint64 conversion preserves the bits needed after JavaScript's
     // ToInt32 wrap even at the uint32 millis limit, without an overflowing
     // float-to-int32 cast. Float rounding can move a late-uptime phase
     // relative to the browser's double, but host and device use this same
     // single-precision clock. No per-band state or accumulated time drift.
+    //
+    // "Speed spread" pulls the three rates apart about the middle one of 6.
+    // 50.0f / 50.0f is exactly 1, so at the default the rates are the same
+    // 5, 6 and 7 as before. 0 puts every lane on the middle rate, 100 gives
+    // 3, 6 and 9. Every rate stays positive, so the cast stays in range.
     const float t = static_cast<float>(tMs) * speedMul(p[0]);
+    const float sk = p[5] <= 50 ? static_cast<float>(p[5]) / 50.0f
+                                : 1.0f + static_cast<float>(p[5] - 50) * (2.0f / 50.0f);
     uint32_t fall[3];
-    for (int i = 0; i < 3; i++) fall[i] = static_cast<uint32_t>(static_cast<uint64_t>(t * (5 + i)) >> 8);
+    for (int i = 0; i < 3; i++) {
+        const float rate = 6.0f + (i - 1) * sk;
+        fall[i] = static_cast<uint32_t>(static_cast<uint64_t>(t * rate) >> 8);
+    }
     for (int lane = 0; lane < seedN; lane++) {
         const uint32_t ph = lane < w / LANE ? (seed[lane] - fall[lane % 3]) & (CYC - 1) : 0;
         lanePhase[lane] = static_cast<uint16_t>(ph);
     }
 }
 
-// A Q4 sample is 1056..3648 (66..228). ditherAmp caps at 16, so the
-// attenuated Q4 offset is at most round(16 * 0.7 * 16) = 179. The sum
-// is therefore 877..3827, strictly inside 0..4095; the page's clamp never
-// changes it. Keep the clamp explicit in the portable specification.
+// A Q4 sample is floor * 16 at its lowest and head * 16 at its highest,
+// because every cross-section gain is inside 0..1 and the profile term v
+// is inside 0..(head - floor). "Base light" holds floor in 24..126 and
+// "Head glow" holds head in 148..228, so a sample is 384..3648. ditherAmp
+// caps at 16 and "Grain" scales it by at most 1.4, so the Q4 offset is at
+// most round(16 * 1.4 * 16) = 358 either way. The sum is therefore
+// 26..4006, strictly inside 0..4095 at every parameter setting; the page's
+// clamp never changes it, which is what lets the kernel read the palette
+// index straight out of bits 4..11. Keep the clamp explicit in the
+// portable specification.
 // GCC's may_alias permits packed stores into the uint16_t band buffer.
 // BgAnim.h guarantees four-byte row alignment for normal calls. The
 // halfword fallback also permits single odd-width rows at any alignment.
@@ -384,7 +454,7 @@ void release() {
     releaseTable(background, 64 * sizeof(uint16_t));
     releaseTable(seed, static_cast<size_t>(seedN) * sizeof(uint16_t));
     allocW = seedN = 0;
-    lastTail = lastGlow = -1;
+    lastTail = lastGlow = lastWidth = lastFade = lastBase = lastGrain = -1;
     lastThemeGen = 0xFFFFFFFFu;
     tablesValid = false;
 }
@@ -398,7 +468,11 @@ const BgAnimation bg_anim_rain = {
     {{"speed", "Speed", 50},
      {"tail", "Tail length", 50},
      {"glow", "Head glow", 55},
-     {nullptr, nullptr, 0}},
+     {"width", "Drop width", 50},
+     {"fade", "Tail fade", 50},
+     {"spread", "Speed spread", 50},
+     {"base", "Base light", 50},
+     {"grain", "Grain", 50}},
     init,
     frame,
     band,
