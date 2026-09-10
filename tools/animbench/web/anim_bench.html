@@ -3656,17 +3656,23 @@ const pa_dith = (x, y) => (BAYER8[(y & 7) * 8 + (x & 7)] - 31.5) * (1 / 64);
    and the per-pixel work is one add, one shift and the palette gather.
    The firmware would pay the same by expanding the eight y-phases into
    an 8-entry colour pattern per row, which is what the inner loop does.
+
+   Eight parameters (gm-3vj.32). Every one acts in the per-frame setup:
+   the bell profile, the dither table, the band count and paths, and the
+   per-row sum. The pixel loop is untouched, so the firmware's Xtensa
+   kernel needs no change. Band count 50, Sway 50, Edge shape 50, Floor 30
+   and Grain 50 reproduce the original four-band picture exactly.
 -------------------------------------------------------------------- */
 (() => {
-  const NBAND = 4;
-  const PERIOD = [23000, 31000, 41000, 53000];
-  // Start phases, so the four bands are not stacked on the centre row at
+  const NBAND_MAX = 6;
+  // The first four periods and start phases are the original ones, so the
+  // default Band count of four is unchanged; the last two only appear
+  // above Band count 50. Start phases keep the bands off the centre row at
   // t = 0. The spec left them all at phase 0 and the first frame was one
   // saturated slab.
-  const PHASE0 = [0, 296, 611, 858];
-  const AMP = 180;            // px, band excursion about the centre row
+  const PERIOD = [23000, 31000, 41000, 53000, 67000, 83000];
+  const PHASE0 = [0, 296, 611, 858, 412, 175];
   const BELL_N = 64;
-  const BASE_IDX = 12;        // near-black floor between the bands
   const SUM_CAP = 214;        // below 255, so a crossing brightens instead
                               // of clipping to a flat white slab
 
@@ -3676,6 +3682,11 @@ const pa_dith = (x, y) => (BAYER8[(y & 7) * 8 + (x & 7)] - 31.5) * (1 / 64);
       { key: 'speed', label: 'Speed', def: 50 },
       { key: 'width', label: 'Band width', def: 50 },
       { key: 'glow', label: 'Glow', def: 55 },
+      { key: 'bands', label: 'Band count', def: 50 },
+      { key: 'sway', label: 'Sway', def: 50 },
+      { key: 'edge', label: 'Edge shape', def: 50 },
+      { key: 'floor', label: 'Floor', def: 30 },
+      { key: 'grain', label: 'Grain', def: 50 },
     ],
     init(w, h, state) {
       state.bell = new Uint8Array(BELL_N);
@@ -3690,27 +3701,44 @@ const pa_dith = (x, y) => (BAYER8[(y & 7) * 8 + (x & 7)] - 31.5) * (1 / 64);
       if (state.key !== key) {
         state.key = key;
         state.pal = themeRamp();
-        bayerOffsets(state.dith, ditherAmpJS(state.pal, 256), 16);
+        // Grain scales the ordered-dither swing: 0 leaves the ramp steps
+        // as horizontal contours, 100 doubles the swing into visible
+        // grain. 50 is exactly 1, so the default table is unchanged.
+        bayerOffsets(state.dith, ditherAmpJS(state.pal, 256) * (p[7] / 50), 16);
         // Raised cosine, peak set by Glow. Two bands crossing at their
         // peaks reach about 2x peak, and the sum is capped at 255.
         const peak = 44 + Math.round(p[2] * 0.62);   // 44..106
+        // Edge shape bends that cosine without moving its ends, through
+        // s + k*(s*s - s). k is 0 at the default, which is the plain
+        // cosine; -1 gives 2s - s*s, a flat-topped slab with a hard edge;
+        // +1 gives s*s, a tight core with a long soft tail.
+        const kShape = (p[5] - 50) / 50;             // -1 .. +1
         for (let i = 0; i < BELL_N; i++) {
-          state.bell[i] = Math.round(peak * 0.5 * (1 + Math.cos(Math.PI * i / BELL_N)));
+          const s = 0.5 * (1 + Math.cos(Math.PI * i / BELL_N));
+          state.bell[i] = Math.round(peak * (s + kShape * (s * s - s)));
         }
         state.halfW = 60 + Math.round(p[1] * 0.70);  // 60..130 px
         state.invW = Math.floor(BELL_N * 256 / state.halfW);
+        // One band is a single slow sweep with no crossings; six fill the
+        // face with overlaps.
+        state.nBand = 1 + Math.floor((p[3] * 5 + 50) / 100);      // 1..6
+        // Sway is how far a band travels either side of the centre row.
+        state.amp = 60 + Math.floor((p[4] * 240 + 50) / 100);     // 60..300 px
+        // Floor is the palette index of the face between the bands: 0 is
+        // the darkest theme stop, 40 a lifted tint over the whole screen.
+        state.baseIdx = Math.floor((p[6] * 40 + 50) / 100);       // 0..40
       }
-      const { bell, rowQ4, dith, pat, pal, invW } = state;
+      const { bell, rowQ4, dith, pat, pal, invW, nBand, amp, baseIdx } = state;
       const t = tMs * speedMulJS(p[0]);
       // Band centres: one sine table read each, Q0 pixels.
-      const cy = [0, 0, 0, 0];
-      for (let k = 0; k < NBAND; k++) {
+      const cy = new Array(NBAND_MAX).fill(0);
+      for (let k = 0; k < nBand; k++) {
         const ph = (Math.floor(t * 1024 / PERIOD[k]) + PHASE0[k]) & 1023;
-        cy[k] = 240 + ((sin1024(ph) * AMP) >> 9);
+        cy[k] = 240 + ((sin1024(ph) * amp) >> 9);
       }
       for (let y = 0; y < h; y++) {
-        let s = BASE_IDX;
-        for (let k = 0; k < NBAND; k++) {
+        let s = baseIdx;
+        for (let k = 0; k < nBand; k++) {
           let d = y - cy[k]; if (d < 0) d = -d;
           const q = (d * invW) >> 8;
           if (q < BELL_N) s += bell[q];

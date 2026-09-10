@@ -1,17 +1,22 @@
 #ifndef GAGGIMATE_SIM
 
-// "Tide": four broad, soft horizontal bands of theme colour rising and
-// falling through each other over a near-black floor. A crossing adds the
-// bands' raised-cosine profiles, capped below the top of the theme ramp so
-// the overlap keeps its colour. This ports entry 29, id 'tide', including
-// the Copper Tide header, in tools/animbench/web/anim_bench.html.
+// "Tide": broad, soft horizontal bands of theme colour rising and falling
+// through each other over a near-black floor. A crossing adds the bands'
+// raised-cosine profiles, capped below the top of the theme ramp so the
+// overlap keeps its colour. This ports entry 29, id 'tide', including the
+// Copper Tide header, in tools/animbench/web/anim_bench.html.
 //
-// The page's 64-entry bell and four sine paths build one Q4 value per row
+// The page's 64-entry bell and the sine paths build one Q4 value per row
 // in frame(). bandRef() adds the eight signed Q4 Bayer offsets for the
 // absolute y phase, shifts by four, clamps, and gathers eight RGB565 theme
 // colours. That pattern repeats across the row. No row pairing, cached
 // predecessor, or call-local phase: a single interlaced row is identical
 // to that row in a full-frame call.
+//
+// All eight user parameters act in frame(), through the bell profile, the
+// dither table, the band count and paths, and the per-row sum. The pixel
+// loop and the Xtensa kernel read the same three tables they always did
+// and are untouched by this file's parameter work (gm-3vj.32).
 
 #include "BgAnim.h"
 #include "BgAnimCommon.h"
@@ -33,10 +38,19 @@ namespace {
 using namespace bganim;
 
 constexpr int BELL_N = 64;
-constexpr int BASE_IDX = 12; // near-black floor between bands
 constexpr int SUM_CAP = 214; // overlap headroom below the ramp's 255 endpoint
 constexpr int CENTRE = 240;  // page coordinates, deliberately independent of h
-constexpr int AMP = 180;     // vertical excursion in pixels, independent of w/h
+constexpr int BAND_MAX = 6;  // slots in the path tables below
+
+// Band paths. The first four periods and start phases are the page's, so
+// the default count of four reproduces the original picture exactly; the
+// last two are only reached above Band count 50. The reciprocals are the
+// same compile-time float constants the four unrolled phases used.
+constexpr int PHASE0[BAND_MAX] = {0, 296, 611, 858, 412, 175};
+constexpr float RATE[BAND_MAX] = {
+    1024.0f / 23000.0f, 1024.0f / 31000.0f, 1024.0f / 41000.0f,
+    1024.0f / 53000.0f, 1024.0f / 67000.0f, 1024.0f / 83000.0f,
+};
 constexpr size_t DITH_BYTES = 64 * sizeof(int16_t);
 constexpr size_t PAT_BYTES = 8 * sizeof(uint16_t);
 constexpr size_t ALIGN_PAD = 15; // room to align even an allocHot PSRAM fallback
@@ -51,9 +65,10 @@ uint16_t *pattern = nullptr;
 const int16_t *sine = nullptr; // borrowed shared sine, never release here
 int allocH = 0;
 int invW = 0;
-int lastWidth = -1, lastGlow = -1;
+int lastWidth = -1, lastGlow = -1, lastEdge = -1, lastGrain = -1;
 uint32_t lastThemeGen = 0xFFFFFFFF;
 bool paletteValid = false;
+bool dithValid = false;
 
 // At h=480: rowQ4 1,920 + palette 512 + dith 143 + pattern 31 =
 // 2,606 requested bytes, 2,608 after the slab's 16-byte allocation rounding.
@@ -104,27 +119,48 @@ void frame(uint32_t tMs, int, int h, const uint8_t p[BG_ANIM_PARAMS]) {
     const uint32_t gen = themeGen();
     if (!paletteValid || gen != lastThemeGen) {
         buildThemeRamp(palette, 256);
-        const float ampQ4 = ditherAmp(palette, 256) * 16.0f / 31.5f;
+        lastThemeGen = gen;
+        paletteValid = true;
+        dithValid = false;
+    }
+    if (!dithValid || lastGrain != p[7]) {
+        // Grain scales the ordered-dither swing. 50 is exactly 1.0f, so the
+        // default multiply is the identity and the table is bit-identical to
+        // the version without this knob. 0 removes the dither and the ramp
+        // steps show as horizontal contours; 100 doubles it into visible
+        // grain. The page multiplies the same amplitude before bayerOffsets.
+        const float grain = static_cast<float>(p[7]) / 50.0f; // 0.0 .. 2.0
+        const float ampQ4 = ditherAmp(palette, 256) * grain * 16.0f / 31.5f;
         for (int k = 0; k < 64; k++) {
             // bayerOffsets(..., unit=16): signed rounding away from zero,
             // exactly the page's lround helper, including negative ties.
             dith[k] = static_cast<int16_t>(lroundf((BAYER8[k] - 31.5f) * ampQ4));
         }
-        lastThemeGen = gen;
-        paletteValid = true;
+        lastGrain = p[7];
+        dithValid = true;
     }
-    if (lastGlow != p[2]) {
+    if (lastGlow != p[2] || lastEdge != p[5]) {
         // Positive Math.round in the page. Integer hundredths avoid a
         // float rounding boundary at a half-integer knob value.
         const int peak = 44 + (static_cast<int>(p[2]) * 62 + 50) / 100; // 44..106
+        // Edge shape bends the raised cosine without moving its ends. The
+        // blend is s + k*(s*s - s): k is 0 at the default, which is the plain
+        // cosine to the last bit; k = -1 gives 2s - s*s, a flat-topped slab
+        // with a hard edge; k = +1 gives s*s, a tight core and a long tail.
+        const float kShape = (static_cast<int>(p[5]) - 50) / 50.0f; // -1 .. +1
         for (int i = 0; i < BELL_N; i++) {
-            bell[i] = static_cast<uint8_t>(lroundf(peak * 0.5f * (1.0f + cosf(static_cast<float>(M_PI) * i / BELL_N))));
+            const float s = 0.5f * (1.0f + cosf(static_cast<float>(M_PI) * i / BELL_N));
+            bell[i] = static_cast<uint8_t>(lroundf(peak * (s + kShape * (s * s - s))));
         }
-        // cosf(pi/2) is a tiny negative float, while JavaScript's double
-        // cosine is a tiny positive value. Keep Math.round(peak/2) exact
-        // for odd peaks instead of rounding that midpoint down on device.
-        bell[BELL_N / 2] = static_cast<uint8_t>((peak + 1) / 2);
+        if (kShape == 0.0f) {
+            // cosf(pi/2) is a tiny negative float, while JavaScript's double
+            // cosine is a tiny positive value. Keep Math.round(peak/2) exact
+            // for odd peaks instead of rounding that midpoint down on device.
+            // Off the default the blend already moves this entry off 0.5.
+            bell[BELL_N / 2] = static_cast<uint8_t>((peak + 1) / 2);
+        }
         lastGlow = p[2];
+        lastEdge = p[5];
     }
     if (lastWidth != p[1]) {
         // JavaScript's binary64 0.70 lands just below the tie at width
@@ -136,28 +172,34 @@ void frame(uint32_t tMs, int, int h, const uint8_t p[BG_ANIM_PARAMS]) {
         lastWidth = p[1];
     }
 
+    // Band count 50 is four bands, the page's number. One band is a single
+    // slow sweep with no crossings; six fill the face with overlaps.
+    const int nBand = 1 + (static_cast<int>(p[3]) * 5 + 50) / 100; // 1..6
+    // Sway is how far a band travels either side of the centre row. At 60 px
+    // the bands hover near the middle; at 300 px they run off both edges.
+    const int amp = 60 + (static_cast<int>(p[4]) * 240 + 50) / 100; // 60..300 px
+    // Floor is the palette index of the face between the bands: 0 is the
+    // darkest theme stop, 40 a clearly lifted tint over the whole screen.
+    const int baseIdx = (static_cast<int>(p[6]) * 40 + 50) / 100; // 0..40
+
     // Milliseconds times the same exponential speed curve as the page.
     // These are absolute-time phases, not accumulated deltas. Float is
     // intentional in frame(); no double libm on the device. At long uptime
     // float rounding can move a phase bucket relative to JavaScript double,
-    // but the four periods and speeds are unchanged. uint64 conversion
-    // before masking stays defined even at UINT32_MAX milliseconds.
+    // but the periods and speeds are unchanged. uint64 conversion before
+    // masking stays defined even at UINT32_MAX milliseconds.
     const float t = static_cast<float>(tMs) * speedMul(p[0]);
-    const int ph0 = static_cast<int>(static_cast<uint64_t>(t * (1024.0f / 23000.0f)) & 1023u);
-    const int ph1 = static_cast<int>((static_cast<uint64_t>(t * (1024.0f / 31000.0f)) + 296u) & 1023u);
-    const int ph2 = static_cast<int>((static_cast<uint64_t>(t * (1024.0f / 41000.0f)) + 611u) & 1023u);
-    const int ph3 = static_cast<int>((static_cast<uint64_t>(t * (1024.0f / 53000.0f)) + 858u) & 1023u);
-    // The page uses an arithmetic >>9 on signed sine*180. Explicit floor
+    // The page uses an arithmetic >>9 on signed sine*amp. Explicit floor
     // division preserves that rule on a portable C++17 implementation too.
-    const int cy[4] = {
-        CENTRE + (sine[ph0] * AMP + 512 * AMP) / 512 - AMP,
-        CENTRE + (sine[ph1] * AMP + 512 * AMP) / 512 - AMP,
-        CENTRE + (sine[ph2] * AMP + 512 * AMP) / 512 - AMP,
-        CENTRE + (sine[ph3] * AMP + 512 * AMP) / 512 - AMP,
-    };
+    int cy[BAND_MAX];
+    for (int k = 0; k < nBand; k++) {
+        const uint64_t ticks = static_cast<uint64_t>(t * RATE[k]) + static_cast<uint32_t>(PHASE0[k]);
+        const int ph = static_cast<int>(ticks & 1023u);
+        cy[k] = CENTRE + (sine[ph] * amp + 512 * amp) / 512 - amp;
+    }
     for (int y = 0; y < h; y++) {
-        int sum = BASE_IDX;
-        for (int k = 0; k < 4; k++) {
+        int sum = baseIdx;
+        for (int k = 0; k < nBand; k++) {
             const int delta = y - cy[k];
             const int d = delta < 0 ? -delta : delta;
             const int q = (d * invW) >> 8;
@@ -313,9 +355,10 @@ void release() {
     pattern = nullptr;
     sine = nullptr;
     allocH = invW = 0;
-    lastWidth = lastGlow = -1;
+    lastWidth = lastGlow = lastEdge = lastGrain = -1;
     lastThemeGen = 0xFFFFFFFF;
     paletteValid = false;
+    dithValid = false;
 }
 
 } // namespace
@@ -327,7 +370,11 @@ const BgAnimation bg_anim_tide = {
     {{"speed", "Speed", 50},
      {"width", "Band width", 50},
      {"glow", "Glow", 55},
-     {nullptr, nullptr, 0}},
+     {"bands", "Band count", 50},
+     {"sway", "Sway", 50},
+     {"edge", "Edge shape", 50},
+     {"floor", "Floor", 30},
+     {"grain", "Grain", 50}},
     init,
     frame,
     band,

@@ -410,6 +410,11 @@ export const BG_ANIMATIONS = [
       { key: 'speed', label: 'Speed', def: 50 },
       { key: 'width', label: 'Band width', def: 50 },
       { key: 'glow', label: 'Glow', def: 55 },
+      { key: 'bands', label: 'Band count', def: 50 },
+      { key: 'sway', label: 'Sway', def: 50 },
+      { key: 'edge', label: 'Edge shape', def: 50 },
+      { key: 'floor', label: 'Floor', def: 30 },
+      { key: 'grain', label: 'Grain', def: 50 },
     ],
   },
   {
