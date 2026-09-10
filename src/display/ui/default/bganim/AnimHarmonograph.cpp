@@ -127,7 +127,7 @@ BGANIM_INLINE int sineQ6(uint32_t q) {
     return sl[k] + (((sl[(k + 1) & 1023] - sl[k]) * static_cast<int>(q & 63)) >> 6);
 }
 
-void frame(uint32_t tMs, int w, int h, const uint8_t p[4]) {
+void frame(uint32_t tMs, int w, int h, const uint8_t p[BG_ANIM_PARAMS]) {
     const uint32_t gen = themeGen();
     if (lastBright != p[3] || lastThemeGen != gen) {
         // The page applies 176..256 Q8 brightness after themeRGB, using

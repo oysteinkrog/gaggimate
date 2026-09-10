@@ -21,7 +21,7 @@
 // Frames are numbered as bench.cpp numbers them (t = 1000 + i*33 ms after one
 // warm-up frame at t=0), so frame 120 here is frame 120 of the goldens, and a
 // candidate can be laid beside golden/<orig>-120.ppm. Parameters default to
-// the descriptor's own; GM_RENDER_P0/P1/P2 override them (0..100), and
+// the descriptor's own; GM_RENDER_P0..P7 override them (0..100), and
 // GM_RENDER_THEME selects a theme index (the default theme otherwise, as the
 // goldens use). The same W, H, BAND_H and PPM conversion as bench.cpp.
 #include "../../src/display/ui/default/bganim/BgAnim.h"
@@ -92,7 +92,7 @@ constexpr int kNumOddShapes = static_cast<int>(sizeof(kOddShapes) / sizeof(kOddS
 // the contract requires (BgAnim.h) at an odd width as well.
 int rowStride(int w) { return (w + 1) & ~1; }
 
-void renderShape(const BgAnimation &anim, const Shape &s, int w, int h, uint32_t t, const uint8_t p[4], uint16_t *fb) {
+void renderShape(const BgAnimation &anim, const Shape &s, int w, int h, uint32_t t, const uint8_t p[BG_ANIM_PARAMS], uint16_t *fb) {
     if (s.parity < 0) {
         for (int y = 0; y < h; y += s.bandH) {
             const int rows = (y + s.bandH <= h) ? s.bandH : (h - y);
@@ -120,7 +120,7 @@ long compareShape(const uint16_t *ref, const uint16_t *got, const Shape &s, int 
 // One init() per size, frame() advanced through every timestep up to the
 // requested frame index, then that one state rendered in every shape. Reports
 // the worst shape per size and frame; returns the number of failing renders.
-int checkShapes(const BgAnimation &anim, const uint8_t p[4], const std::vector<int> &frames, int w, int h) {
+int checkShapes(const BgAnimation &anim, const uint8_t p[BG_ANIM_PARAMS], const std::vector<int> &frames, int w, int h) {
     if (anim.release != nullptr) {
         anim.release();
     }
@@ -198,10 +198,15 @@ int main(int argc, char **argv) {
     }
 
     const BgAnimation &anim = GM_RENDER_CANDIDATE;
-    uint8_t p[4] = {anim.params[0].def, anim.params[1].def, anim.params[2].def, anim.params[3].def};
-    p[0] = static_cast<uint8_t>(envInt("GM_RENDER_P0", p[0]));
-    p[1] = static_cast<uint8_t>(envInt("GM_RENDER_P1", p[1]));
-    p[2] = static_cast<uint8_t>(envInt("GM_RENDER_P2", p[2]));
+    uint8_t p[BG_ANIM_PARAMS];
+    for (int i = 0; i < BG_ANIM_PARAMS; i++) {
+        p[i] = anim.params[i].key != nullptr ? anim.params[i].def : 0;
+    }
+    for (int i = 0; i < BG_ANIM_PARAMS; i++) {
+        char name[16];
+        snprintf(name, sizeof(name), "GM_RENDER_P%d", i);
+        p[i] = static_cast<uint8_t>(envInt(name, p[i]));
+    }
 
     if (shapes) {
         const int failures = checkShapes(anim, p, frames, W, H) + checkShapes(anim, p, frames, W / 2, H / 2);

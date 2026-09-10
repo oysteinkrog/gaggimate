@@ -70,7 +70,7 @@ bool init(int, int) {
     return true;
 }
 
-void frame(uint32_t tMs, int, int, const uint8_t p[4]) {
+void frame(uint32_t tMs, int, int, const uint8_t p[BG_ANIM_PARAMS]) {
     const uint32_t gen = themeGen();
     if (!paletteValid || lastThemeGen != gen) {
         buildThemeRamp(palette, 256);

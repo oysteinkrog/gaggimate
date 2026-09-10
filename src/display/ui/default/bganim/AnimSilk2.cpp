@@ -431,7 +431,7 @@ bool init(int w, int h) {
     return true;
 }
 
-void frame(uint32_t tMs, int w, int h, const uint8_t p[4]) {
+void frame(uint32_t tMs, int w, int h, const uint8_t p[BG_ANIM_PARAMS]) {
     if (p[2] != lastGlow || themeGen() != lastThemeGen) {
         buildSilk2Lut(p[2]);
         lastGlow = p[2];

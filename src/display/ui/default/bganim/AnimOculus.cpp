@@ -141,7 +141,7 @@ void buildPalette(int a, int edge) {
     }
 }
 
-void frame(uint32_t tMs, int w, int h, const uint8_t p[4]) {
+void frame(uint32_t tMs, int w, int h, const uint8_t p[BG_ANIM_PARAMS]) {
     const bool paramsChanged = memcmp(p, lastP, 4) != 0;
     const bool themeChanged = themeGen() != lastThemeGen;
     if (paramsChanged || themeChanged) {

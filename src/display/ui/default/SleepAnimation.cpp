@@ -1249,7 +1249,7 @@ uint32_t SleepAnimation::benchPieSelfTest(uint32_t *firstBad) { return pieSelfTe
 
 SleepAnimation::~SleepAnimation() { stop(); }
 
-void SleepAnimation::configure(uint8_t id, const uint8_t p[4]) {
+void SleepAnimation::configure(uint8_t id, const uint8_t p[BG_ANIM_PARAMS]) {
 #ifdef GM_ANIM_BENCH
     // The bench owns the selection: DefaultUI re-applies the stored animation
     // on every UI pass, which would otherwise yank the sweep back to whatever
@@ -1259,8 +1259,7 @@ void SleepAnimation::configure(uint8_t id, const uint8_t p[4]) {
     return;
 #else
     animId.store(id);
-    animParams.store(static_cast<uint32_t>(p[0]) | (static_cast<uint32_t>(p[1]) << 8) | (static_cast<uint32_t>(p[2]) << 16) |
-                     (static_cast<uint32_t>(p[3]) << 24));
+    storeParams(p);
 #endif
 }
 
@@ -4253,10 +4252,9 @@ void SleepAnimation::benchTick() {
         accBandLockedRows = accBandRows = 0;
         benchPasses = 0;
         benchDwellStart = now;
-        uint8_t p[4];
+        uint8_t p[BG_ANIM_PARAMS];
         bg_parse_params(nullptr, 0, p);
-        animParams.store(static_cast<uint32_t>(p[0]) | (static_cast<uint32_t>(p[1]) << 8) | (static_cast<uint32_t>(p[2]) << 16) |
-                         (static_cast<uint32_t>(p[3]) << 24));
+        storeParams(p);
         animId.store(0);
         log_i("animbench: results cleared, sweep restarted");
         return;
@@ -4318,10 +4316,9 @@ void SleepAnimation::benchFinishDwell() {
     }
     // Each animation is measured at its own documented defaults, so a run is
     // reproducible and comparable against the host harness numbers.
-    uint8_t p[4];
+    uint8_t p[BG_ANIM_PARAMS];
     bg_parse_params(nullptr, next, p);
-    animParams.store(static_cast<uint32_t>(p[0]) | (static_cast<uint32_t>(p[1]) << 8) | (static_cast<uint32_t>(p[2]) << 16) |
-                     (static_cast<uint32_t>(p[3]) << 24));
+    storeParams(p);
     animId.store(static_cast<uint8_t>(next));
 }
 #endif
@@ -4376,9 +4373,8 @@ void IRAM_ATTR SleepAnimation::renderFrame() {
     // The slot, not the stored id: with GM_KBLOB and useBlob set this is the
     // hot-loaded blob, which renders with the stored animation's parameters.
     const int id = activeSlot();
-    const uint32_t packed = animParams.load();
-    const uint8_t p[4] = {static_cast<uint8_t>(packed & 0xFF), static_cast<uint8_t>((packed >> 8) & 0xFF),
-                          static_cast<uint8_t>((packed >> 16) & 0xFF), static_cast<uint8_t>((packed >> 24) & 0xFF)};
+    uint8_t p[BG_ANIM_PARAMS];
+    loadParams(p);
     // Half-resolution mode: the animation renders a 240x240 image and each
     // pixel is doubled on the way into the band buffer. Every animation here
     // is a smooth procedural field -- gradients, glows, warped curtains -- with
@@ -5604,9 +5600,9 @@ void SleepAnimation::runAnimTest() {
         publish();
         return;
     }
-    uint8_t psets[3][4];
+    uint8_t psets[3][BG_ANIM_PARAMS];
     bg_parse_params(nullptr, id, psets[0]);
-    for (int i = 0; i < 4; i++) {
+    for (int i = 0; i < BG_ANIM_PARAMS; i++) {
         psets[1][i] = 0;
         psets[2][i] = 100;
     }
@@ -5816,7 +5812,7 @@ void SleepAnimation::runKBench() {
         publish();
         return;
     }
-    uint8_t pFw[4];
+    uint8_t pFw[BG_ANIM_PARAMS];
     bg_parse_params(nullptr, id, pFw);
     releaseResident();
     initializedAnimId = -1;
@@ -5843,8 +5839,8 @@ void SleepAnimation::runKBench() {
         // Each descriptor's own parameter defaults: for a blob that is a
         // variant of animation `id` they are the same values, and for a blob
         // that is a new animation they are the only ones that make sense.
-        uint8_t p[4];
-        for (int i = 0; i < 4; i++) {
+        uint8_t p[BG_ANIM_PARAMS];
+        for (int i = 0; i < BG_ANIM_PARAMS; i++) {
             p[i] = obj == 0 ? pFw[i] : (a->params[i].key != nullptr ? a->params[i].def : 0);
         }
         if (a->release != nullptr) {

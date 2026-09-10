@@ -11,6 +11,7 @@
 #include <atomic>
 #include <display/ui/default/TickRingElement.h>
 #include <stdint.h>
+#include <display/ui/default/bganim/BgAnim.h> // BG_ANIM_PARAMS
 #ifndef GAGGIMATE_SIM
 #include <display/drivers/common/BandDma.h>
 #endif
@@ -144,10 +145,10 @@ class SleepAnimation {
     bool stopConfirmed() const;
     bool isActive() const { return running; }
 
-    // Selects which registry animation renders and its 4 params (0-100 each).
+    // Selects which registry animation renders and its BG_ANIM_PARAMS params (0-100 each).
     // Safe to call while running — params apply on the next frame, an id
     // change triggers the new animation's lazy init on the render task.
-    void configure(uint8_t animId, const uint8_t p[4]);
+    void configure(uint8_t animId, const uint8_t p[BG_ANIM_PARAMS]);
     // The id currently configured (not gated behind GM_ANIM_BENCH like
     // benchCurrentAnim() below, so /api/debug/anim can report it in every
     // build): the same value GET /api/settings reports as bgAnimId once the
@@ -1555,7 +1556,27 @@ class SleepAnimation {
     // Animation selection; id and params may tear against each other for one
     // frame, which is harmless. Packed params: p[i] = (word >> 8*i) & 0xFF.
     std::atomic<uint8_t> animId{0};
-    std::atomic<uint32_t> animParams{0};
+    // Eight bytes in two words (the S3 has no 64-bit atomic store, and a
+    // libatomic lock has no place in the IRAM render loop); the two may tear
+    // against each other for one frame like id against params, harmless.
+    std::atomic<uint32_t> animParamsLo{0};
+    std::atomic<uint32_t> animParamsHi{0};
+    void storeParams(const uint8_t p[BG_ANIM_PARAMS]) {
+        uint32_t lo = 0, hi = 0;
+        for (int i = 0; i < 4; i++) {
+            lo |= static_cast<uint32_t>(p[i]) << (8 * i);
+            hi |= static_cast<uint32_t>(p[4 + i]) << (8 * i);
+        }
+        animParamsLo.store(lo);
+        animParamsHi.store(hi);
+    }
+    void loadParams(uint8_t p[BG_ANIM_PARAMS]) const {
+        const uint32_t lo = animParamsLo.load(), hi = animParamsHi.load();
+        for (int i = 0; i < 4; i++) {
+            p[i] = static_cast<uint8_t>((lo >> (8 * i)) & 0xFF);
+            p[4 + i] = static_cast<uint8_t>((hi >> (8 * i)) & 0xFF);
+        }
+    }
 #ifdef GM_ANIM_BENCH
     // The bench measures what the pipeline can do, so it must not sit against
     // the shipping frame cap -- a throttled frame reports the cap, not the cost.

@@ -569,7 +569,7 @@ bool init(int w, int h) {
     return true;
 }
 
-void frame(uint32_t tMs, int w, int, const uint8_t p[4]) {
+void frame(uint32_t tMs, int w, int, const uint8_t p[BG_ANIM_PARAMS]) {
     const float omega0 = 6.2831853f / 45000.0f * speedMul(p[0]); // 45s base cycle at speed 50
     const float sizeMul = 0.6f + (p[1] / 100.0f);
     const float intensity = 0.5f + (p[2] / 100.0f) * 1.3f;

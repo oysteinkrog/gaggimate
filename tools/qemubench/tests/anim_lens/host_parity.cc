@@ -12,7 +12,7 @@ static int check_alignment_fallback() {
     alignas(16) uint16_t scratch[56], constants[80], got[976], want[976];
     unsigned calls = 0, fallbacks = 0;
     for (int size : {0,55,100}) {
-        const uint8_t p[4] = {50,static_cast<uint8_t>(size),62,0};
+        const uint8_t p[BG_ANIM_PARAMS] = {50,static_cast<uint8_t>(size),62,0};
         bg_anim_lens.frame(1990,480,480,p);
         // These two rows include long feathers at the inner circle's top.
         const int y = lensY - innerRadius;
@@ -61,7 +61,7 @@ int main() {
         if (!bg_anim_lens.init(w,w)) return 2;
         if (bganim::hotUsed() != 9216) return 3;
         for (int setting = 0; setting < 16; setting++) {
-            uint8_t p[4] = {50,55,62,0};
+            uint8_t p[BG_ANIM_PARAMS] = {50,55,62,0};
             if (setting < 8) for (int k = 0; k < 3; k++) p[k] = (setting & (1<<k)) ? 100 : 0;
             else for (int k = 0; k < 3; k++) p[k] = (setting * 37 + k * 19) % 101;
             const uint8_t theme[3][3] = {{0,0,0},{uint8_t(setting*17),uint8_t(255-setting*17),123},{255,255,255}};

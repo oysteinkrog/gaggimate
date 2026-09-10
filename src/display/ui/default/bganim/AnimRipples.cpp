@@ -328,7 +328,7 @@ void rebuildThemeAssets() {
     }
 }
 
-void frame(uint32_t tMs, int w, int h, const uint8_t p[4]) {
+void frame(uint32_t tMs, int w, int h, const uint8_t p[BG_ANIM_PARAMS]) {
     g_tMs = tMs;
     if (themeGen() != lastThemeGen) {
         rebuildThemeAssets();

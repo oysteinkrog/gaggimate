@@ -178,7 +178,7 @@ int layoutAxis(uint8_t *tile, int8_t *shade, int n, int base, int jitter, uint32
     return idx > 0 ? idx : 1;
 }
 
-void frame(uint32_t tMs, int w, int h, const uint8_t p[4]) {
+void frame(uint32_t tMs, int w, int h, const uint8_t p[BG_ANIM_PARAMS]) {
     if (memcmp(p, lastP, 4) != 0 || themeGen() != lastThemeGen) {
         buildThemeRamp(palette, 256);
         lastThemeGen = themeGen();

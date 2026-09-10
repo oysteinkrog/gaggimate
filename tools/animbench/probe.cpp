@@ -16,7 +16,8 @@ int main(int argc, char **argv) {
     const BgAnimation &a = bg_animation(id);
     setvbuf(stderr, nullptr, _IONBF, 0);
     fprintf(stderr, "anim %d (%s)\n", id, a.id);
-    uint8_t p[4] = {a.params[0].def, a.params[1].def, a.params[2].def, a.params[3].def};
+    uint8_t p[BG_ANIM_PARAMS];
+    bg_parse_params(nullptr, id, p);
     std::vector<uint16_t> band(480 * 16);
     double t0 = now();
     fprintf(stderr, "init...\n");

@@ -615,7 +615,7 @@ bool init(int w, int h) {
 inline int16_t sinFromTurn(uint32_t turn) { return g_sinLut[turn >> 22]; }
 constexpr float TURN = 4294967296.0f / 6.2831853f;
 
-void frame(uint32_t tMs, int, int, const uint8_t p[4]) {
+void frame(uint32_t tMs, int, int, const uint8_t p[BG_ANIM_PARAMS]) {
     const float omega0 = 6.2831853f / 55000.0f * speedMul(p[0]); // 55s base drift at speed 50
     const float k0 = 0.008f + 0.022f * (p[1] / 100.0f);
     if (themeGen() != lastThemeGen) {

@@ -209,7 +209,7 @@ void rebuildThemeAssets() {
     themeRGB(255, shootCol);
 }
 
-void frame(uint32_t tMs, int w, int h, const uint8_t p[4]) {
+void frame(uint32_t tMs, int w, int h, const uint8_t p[BG_ANIM_PARAMS]) {
     (void)h;
     if (themeGen() != lastThemeGen) {
         rebuildThemeAssets();

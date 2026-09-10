@@ -61,7 +61,7 @@ struct Shape {
 // half path does the same by handing each call its own aligned row buffer.
 int rowStride(int w) { return (w + 1) & ~1; }
 
-void renderShape(const BgAnimation &anim, const Shape &s, int W, int H, const uint8_t p[4], uint16_t *fb) {
+void renderShape(const BgAnimation &anim, const Shape &s, int W, int H, const uint8_t p[BG_ANIM_PARAMS], uint16_t *fb) {
     if (s.parity < 0) {
         const int bandH = (s.bandH > H) ? H : s.bandH;
         for (int y = 0; y < H; y += bandH) {
@@ -131,7 +131,7 @@ int main(int argc, char **argv) {
     int failures = 0;
     for (int id = 0; id < bg_animation_count(); id++) {
         const BgAnimation &anim = bg_animation(id);
-        uint8_t p[4];
+        uint8_t p[BG_ANIM_PARAMS];
         bg_parse_params(nullptr, id, p);
         if (anim.release != nullptr) {
             anim.release();

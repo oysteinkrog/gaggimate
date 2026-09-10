@@ -96,7 +96,7 @@ bool init(int w, int h) {
            rotPalette != nullptr;
 }
 
-void frame(uint32_t tMs, int w, int h, const uint8_t p[4]) {
+void frame(uint32_t tMs, int w, int h, const uint8_t p[BG_ANIM_PARAMS]) {
     if (memcmp(p, lastP, 4) != 0 || themeGen() != lastThemeGen) {
         memcpy(lastP, p, 4);
         lastThemeGen = themeGen();

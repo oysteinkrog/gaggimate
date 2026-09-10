@@ -168,7 +168,7 @@ bool init(int w, int h) {
     return true;
 }
 
-void frame(uint32_t tMs, int w, int h, const uint8_t p[4]) {
+void frame(uint32_t tMs, int w, int h, const uint8_t p[BG_ANIM_PARAMS]) {
     const int count = 15 + (p[1] * 25) / 100;
     if (count != builtCount) {
         spawnAll(count, w, h);

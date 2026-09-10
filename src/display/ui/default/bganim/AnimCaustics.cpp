@@ -315,7 +315,7 @@ bool init(int, int) {
 // integer-to-unsigned conversion perform the modular wrap the design wants.
 inline uint32_t ddsQ(double v) { return static_cast<uint32_t>(static_cast<int64_t>(fmod(v, 4294967296.0))); }
 
-void frame(uint32_t tMs, int, int, const uint8_t p[4]) {
+void frame(uint32_t tMs, int, int, const uint8_t p[BG_ANIM_PARAMS]) {
     if (themeGen() != lastThemeGen) {
         buildThemePalette();
         lastThemeGen = themeGen();

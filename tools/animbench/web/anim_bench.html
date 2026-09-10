@@ -237,7 +237,7 @@ const speedMulJS = sp => Math.pow(2, (sp - 50) / 18.2);
 /* ================= animation registry =================
    Same contract the firmware registry mirrors:
    { id, name, params:[{key,label,def,options?}], init(w,h,state), render(data,w,h,tMs,p,state) }
-   p = [0-100 x4]. Registration order = persisted animation id. Append only. */
+   p = [0-100 x up to 8, BG_ANIM_PARAMS in BgAnim.h]. Registration order = persisted animation id. Append only. */
 const ANIMS = [];
 
 /* ---- 0: Plasma (firmware AnimPlasma.cpp bandRef, ported) ---- */

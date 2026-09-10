@@ -145,7 +145,7 @@ bool init(int w, int) {
     return true;
 }
 
-void frame(uint32_t tMs, int w, int, const uint8_t p[4]) {
+void frame(uint32_t tMs, int w, int, const uint8_t p[BG_ANIM_PARAMS]) {
     const uint32_t gen = themeGen();
     if (lastShade != p[2] || lastThemeGen != gen) {
         // This brightness belongs to the page's Cylinder shade parameter:

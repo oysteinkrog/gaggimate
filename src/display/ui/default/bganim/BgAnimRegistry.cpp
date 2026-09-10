@@ -89,9 +89,9 @@ const BgAnimation &bg_animation(int id) {
     return *REGISTRY[(id >= 0 && id < n) ? id : 0];
 }
 
-void bg_parse_params(const char *packed, int animId, uint8_t out[4]) {
+void bg_parse_params(const char *packed, int animId, uint8_t out[BG_ANIM_PARAMS]) {
     const BgAnimation &anim = bg_animation(animId);
-    for (int i = 0; i < 4; i++) {
+    for (int i = 0; i < BG_ANIM_PARAMS; i++) {
         out[i] = anim.params[i].key != nullptr ? anim.params[i].def : 0;
     }
     if (packed == nullptr) {
@@ -108,7 +108,7 @@ void bg_parse_params(const char *packed, int animId, uint8_t out[4]) {
     if (s == nullptr || *s == '\0' || *s == ';') {
         return;
     }
-    for (int i = 0; i < 4 && *s != '\0' && *s != ';'; i++) {
+    for (int i = 0; i < BG_ANIM_PARAMS && *s != '\0' && *s != ';'; i++) {
         char *end = nullptr;
         const long v = strtol(s, &end, 10);
         if (end == s) {

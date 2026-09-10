@@ -137,7 +137,7 @@ bool init(int, int h) {
     return true;
 }
 
-void frame(uint32_t tMs, int, int h, const uint8_t p[4]) {
+void frame(uint32_t tMs, int, int h, const uint8_t p[BG_ANIM_PARAMS]) {
     if (lastScale != p[2]) {
         // Integer positive rounding matches Math.round, without float ties.
         const int wide = 30 + (p[2] * 22 + 50) / 100;

@@ -306,7 +306,7 @@ bool init(int w, int h) {
     return true;
 }
 
-void frame(uint32_t tMs, int, int, const uint8_t p[4]) {
+void frame(uint32_t tMs, int, int, const uint8_t p[BG_ANIM_PARAMS]) {
     if (themeGen() != lastThemeGen) {
         buildThemeRamp(palette, 256, /*reversed=*/true);
         extendPalette();

@@ -240,7 +240,7 @@ bool init(int, int) {
     return true;
 }
 
-void frame(uint32_t, int, int, const uint8_t p[4]) {
+void frame(uint32_t, int, int, const uint8_t p[BG_ANIM_PARAMS]) {
     if (themeGen() != lastThemeGen) {
         buildThemeRamp(palette, 256);
         extendPalette();
@@ -1286,7 +1286,7 @@ void bandRef(uint16_t *dst, int y0, int rows, int w, uint32_t, const uint8_t *) 
 // way neither has been measured against. Kept as two independent, verified
 // copies instead, the same choice the file already makes for the r==0
 // ixCur/ixNext pass (see that comment).
-void band(uint16_t *dst, int y0, int rows, int w, uint32_t tMs, const uint8_t p[4]) {
+void band(uint16_t *dst, int y0, int rows, int w, uint32_t tMs, const uint8_t p[BG_ANIM_PARAMS]) {
 #if defined(__XTENSA__) && !defined(GM_BGANIM_NO_ASM)
     // Fast-path precondition: w a multiple of 16. True for both of the
     // panel's real widths (480 full-res, 240 half-res/interlaced -- see the

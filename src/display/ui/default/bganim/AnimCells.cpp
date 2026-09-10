@@ -181,7 +181,7 @@ void buildBase(uint8_t width) {
     }
 }
 
-void frame(uint32_t tMs, int, int, const uint8_t p[4]) {
+void frame(uint32_t tMs, int, int, const uint8_t p[BG_ANIM_PARAMS]) {
     if (p[1] != lastWidth) {
         buildBase(p[1]);
         lastWidth = p[1];

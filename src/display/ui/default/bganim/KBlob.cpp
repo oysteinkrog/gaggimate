@@ -39,7 +39,9 @@ struct __attribute__((packed)) Header {
 };
 static_assert(sizeof(Header) == 64, "kblob header layout");
 
-constexpr uint32_t kVersion = 1;
+// 2 since 2026-09-10: BgAnimation::params grew from 4 to 8 slots (gm-3vj.1), so a
+// blob built against the old descriptor layout is refused instead of misread.
+constexpr uint32_t kVersion = 2;
 
 Info g_info;
 const BgAnimation *g_anim = nullptr;

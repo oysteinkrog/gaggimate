@@ -2,8 +2,10 @@
 // src/display/ui/default/bganim/BgAnimRegistry.cpp (same order: the array
 // index is the persisted animation id; append only, never reorder).
 //
-// Params are up to 4 sliders, each 0-100, persisted per animation in the
-// `bgAnimParams` setting as "p0,p1,p2,p3;p0,p1,p2,p3;..." indexed by id.
+// Params are up to 8 sliders (BG_ANIM_PARAMS in BgAnim.h), each 0-100,
+// persisted per animation in the `bgAnimParams` setting as
+// "p0,p1,...;p0,p1,...;..." indexed by id; a shorter stored group keeps the
+// defaults for the slots it does not name.
 // By convention p0 is always Speed.
 
 export const BG_ANIMATIONS = [
@@ -708,7 +710,7 @@ export function parseBgAnimParams(packed) {
   const groups = String(packed ?? '').split(';');
   return BG_ANIMATIONS.map((anim, i) => {
     const defs = anim.params.map(p => p.def ?? 0);
-    while (defs.length < 4) defs.push(0);
+    while (defs.length < 8) defs.push(0);
     const parts = (groups[i] ?? '').split(',');
     return defs.map((def, j) => {
       const v = parseInt(parts[j], 10);

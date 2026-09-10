@@ -178,7 +178,7 @@ bool init(int w, int h) {
     return true;
 }
 
-void frame(uint32_t tMs, int w, int h, const uint8_t p[4]) {
+void frame(uint32_t tMs, int w, int h, const uint8_t p[BG_ANIM_PARAMS]) {
     if (p[1] != lastCountP || p[2] != lastEccP || themeGen() != lastThemeGen || w != geomW || h != geomH) {
         rebuildGeometry(p[1], p[2], w, h);
         lastCountP = p[1];

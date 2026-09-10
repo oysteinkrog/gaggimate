@@ -258,7 +258,7 @@ GM_ANIM_IRAM __attribute__((noinline)) void tunnelLevelsAsm(uint16_t *out, const
 }
 #endif
 
-void frame(uint32_t tMs, int, int, const uint8_t p[4]) {
+void frame(uint32_t tMs, int, int, const uint8_t p[BG_ANIM_PARAMS]) {
     const uint32_t gen = themeGen();
     if (lastBrightness != p[2] || lastThemeGen != gen) {
         // pa_bright: 80+round(p[2]*176/100), 80..256. This is the page's

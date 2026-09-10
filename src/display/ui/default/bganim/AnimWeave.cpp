@@ -61,7 +61,7 @@ bool init(int, int) {
     return true;
 }
 
-void frame(uint32_t tMs, int, int, const uint8_t p[4]) {
+void frame(uint32_t tMs, int, int, const uint8_t p[BG_ANIM_PARAMS]) {
     const uint32_t gen = themeGen();
     if (lastBrightness != p[2] || lastThemeGen != gen) {
         // pa_bright: 80 + Math.round(p[2] * 176 / 100), Q8 brightness.

@@ -4516,7 +4516,7 @@ void DefaultUI::updateState() {
             }
         }
     }
-    uint8_t animP[4];
+    uint8_t animP[BG_ANIM_PARAMS];
     bg_parse_params(settings.getBgAnimParams().c_str(), animId, animP);
     sleepAnimation.configure(static_cast<uint8_t>(animId), animP);
     // fps= on /api/debug/anim overrides the stored cap for a measurement

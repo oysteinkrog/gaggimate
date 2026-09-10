@@ -6,9 +6,10 @@
 // Procedural background animation registry. Each animation renders directly
 // into RGB565 horizontal bands (the SleepAnimation task owns the band buffer
 // and the panel push; see SleepAnimation.cpp for the pipeline). Animations are
-// pure functions of wall-clock time plus up to 4 user parameters (0-100 each,
-// configured from the web UI and persisted in Settings as "p0,p1,p2,p3;..."
-// indexed by animation id).
+// pure functions of wall-clock time plus up to BG_ANIM_PARAMS (8) user
+// parameters (0-100 each, configured from the web UI and the display's
+// Parameters page, persisted in Settings as "p0,p1,...,p7;..." indexed by
+// animation id; a stored group may be shorter, the rest keep their defaults).
 //
 // Contract:
 //  - init(w, h): lazy, idempotent buffer/LUT allocation; false on OOM. Called
@@ -29,8 +30,11 @@
 //    multi-row shapes to even widths. A row's pixels depend only on its
 //    absolute y and the frame state, never on which rows share the call.
 //
-// Params: fixed 4 slots; key == nullptr marks unused slots. The same defs are
-// mirrored in the web UI (web/src/config/bgAnimations.js) — keep in sync.
+// Params: fixed BG_ANIM_PARAMS slots; key == nullptr marks unused slots. The
+// same defs are mirrored in the web UI (web/src/config/bgAnimations.js) and
+// the page (tools/animbench/web/anim_bench.html); check-params.py checks the
+// mirrors. The cap was 4 until 2026-09-10 (gm-3vj.1).
+#define BG_ANIM_PARAMS 8
 
 struct BgAnimParamDef {
     const char *key;   // short identifier, e.g. "speed"
@@ -41,10 +45,10 @@ struct BgAnimParamDef {
 struct BgAnimation {
     const char *id;   // stable short id, e.g. "plasma"
     const char *name; // display name
-    BgAnimParamDef params[4];
+    BgAnimParamDef params[BG_ANIM_PARAMS];
     bool (*init)(int w, int h);
-    void (*frame)(uint32_t tMs, int w, int h, const uint8_t p[4]);
-    void (*band)(uint16_t *dst, int y0, int rows, int w, uint32_t tMs, const uint8_t p[4]);
+    void (*frame)(uint32_t tMs, int w, int h, const uint8_t p[BG_ANIM_PARAMS]);
+    void (*band)(uint16_t *dst, int y0, int rows, int w, uint32_t tMs, const uint8_t p[BG_ANIM_PARAMS]);
     // Optional. Frees everything init() allocated and resets whatever staleness
     // sentinel gates the rebuild, so the next init() reallocates from scratch.
     // Called on the render task when the animation is switched away from, or
@@ -61,16 +65,17 @@ struct BgAnimation {
     // differs, which is the only way an assembly kernel gets validated, since
     // the host bench compiles the C++ path only. nullptr when band() is
     // portable code and there is nothing to compare it against.
-    void (*bandRef)(uint16_t *dst, int y0, int rows, int w, uint32_t tMs, const uint8_t p[4]);
+    void (*bandRef)(uint16_t *dst, int y0, int rows, int w, uint32_t tMs, const uint8_t p[BG_ANIM_PARAMS]);
 };
 
 int bg_animation_count();
 // Clamps out-of-range ids to 0 (Plasma).
 const BgAnimation &bg_animation(int id);
 
-// Fills out[4] with the defaults for animId, then overrides from the packed
-// settings string ("p0,p1,p2,p3;p0,p1,p2,p3;..." indexed by animation id).
-void bg_parse_params(const char *packed, int animId, uint8_t out[4]);
+// Fills out[BG_ANIM_PARAMS] with the defaults for animId, then overrides from
+// the packed settings string ("p0,p1,...;p0,p1,...;..." indexed by animation
+// id; a group shorter than BG_ANIM_PARAMS leaves the remaining defaults).
+void bg_parse_params(const char *packed, int animId, uint8_t out[BG_ANIM_PARAMS]);
 
 // ---- shared color themes -------------------------------------------------
 // Every animation draws its colors from one gradient: 2-16 RGB stops ordered

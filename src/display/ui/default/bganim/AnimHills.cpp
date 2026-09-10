@@ -267,7 +267,7 @@ bool init(int w, int h) {
 // soft handover.
 BGANIM_INLINE int ditherY(int y) { return ((y & 1) << 7) | ((y & 2) << 5); }
 
-void frame(uint32_t tMs, int w, int h, const uint8_t p[4]) {
+void frame(uint32_t tMs, int w, int h, const uint8_t p[BG_ANIM_PARAMS]) {
     if (lastBright != p[3] || lastThemeGen != themeGen()) {
         // The page's own brightness, 176 + round(p[3] * 0.8), on top of the
         // shared theme tone. round(x) is floor(x + 1/2), which for p in

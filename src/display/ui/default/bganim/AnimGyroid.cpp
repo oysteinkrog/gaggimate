@@ -95,7 +95,7 @@ bool init(int w, int h) {
     return true;
 }
 
-void frame(uint32_t tMs, int w, int h, const uint8_t p[4]) {
+void frame(uint32_t tMs, int w, int h, const uint8_t p[BG_ANIM_PARAMS]) {
     const uint32_t gen = themeGen();
     if (lastBright != p[3] || lastThemeGen != gen) {
         // Exactly themeRamp(176 + round(p[3]*0.8)) from the page. Scaling

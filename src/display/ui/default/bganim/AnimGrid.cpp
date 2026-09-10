@@ -149,7 +149,7 @@ bool init(int w, int h) {
     return true;
 }
 
-void frame(uint32_t tMs, int w, int h, const uint8_t p[4]) {
+void frame(uint32_t tMs, int w, int h, const uint8_t p[BG_ANIM_PARAMS]) {
     const int lines = p[2] > PARAM_MAX ? PARAM_MAX : p[2];
     const int density = p[1] > PARAM_MAX ? PARAM_MAX : p[1];
     const uint32_t gen = themeGen();

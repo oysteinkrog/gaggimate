@@ -550,7 +550,7 @@ int g_sxOffset = 0; // (g_N & 1) ? 128 : 0, see the pass-2 comment at the top
 constexpr int WRAP_GUARD = 24;
 bool g_fineDetail = false;
 
-void frame(uint32_t tMs, int, int, const uint8_t p[4]) {
+void frame(uint32_t tMs, int, int, const uint8_t p[BG_ANIM_PARAMS]) {
     if (themeGen() != lastThemeGen) {
         buildThemePalette();
         lastThemeGen = themeGen();
