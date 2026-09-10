@@ -3477,49 +3477,76 @@ const pa_dith = (x, y) => (BAYER8[(y & 7) * 8 + (x & 7)] - 31.5) * (1 / 64);
     params: [
       { key: 'speed', label: 'Speed', def: 50 },
       { key: 'size', label: 'Lens size', def: 55 },
-      { key: 'brightness', label: 'Brightness', def: 62 }],
+      { key: 'brightness', label: 'Brightness', def: 62 },
+      { key: 'contrast', label: 'Contrast', def: 50 },
+      { key: 'edge', label: 'Edge width', def: 50 },
+      { key: 'rim', label: 'Rim darkness', def: 50 },
+      { key: 'travel', label: 'Lens travel', def: 50 },
+      { key: 'drift', label: 'Ground drift', def: 50 }],
     init(w, h, state) {
       state.lvl = new Uint8Array(T_N * T_N);
-      for (let j = 0, c = 0; j < T_N; j++) {
-        for (let i = 0; i < T_N; i++, c++) {
-          // Two scales on purpose: a broad swell one cycle per tile, and a
-          // grain three cycles per tile at a quarter weight, crossed rather
-          // than parallel so the two do not beat into stripes. On the ground
-          // the grain is about 40 px and reads as texture; under the lens it
-          // is 80 px and is what makes the magnification legible.
-          const v = SIN[(i * 16) & (SIN_N - 1)] +
-            SIN[(j * 16 + 180) & (SIN_N - 1)] +
-            (SIN[(i * 48 + j * 16 + 300) & (SIN_N - 1)] >> 2) +
-            (SIN[(i * 16 - j * 48 + 700) & (SIN_N - 1)] >> 2);
-          const idx = 84 + Math.round(v * 0.0410);        // ramp 32..136
-          state.lvl[c] = idx < 0 ? 0 : idx > 255 ? 255 : idx;
-        }
-      }
       state.tex = new Uint32Array(T_N * T_N);
-      // The rim, as a darkening across the feather rather than a run of one
-      // dark colour. A 3 px run of a fixed colour was a drawn circle: it sat
-      // on top of the picture and the eye read the outline before the lens.
       state.rimMul = new Uint16Array(257);
-      for (let k = 0; k <= 256; k++) {
-        const g = (k - 128) / 128, b = 1 - g * g;
-        state.rimMul[k] = 256 - Math.round(70 * b * b);
-      }
       state.chordO = new Uint16Array(160);
       state.chordI = new Uint16Array(160);
-      state.key = null; state.rKey = -1;
+      state.key = null; state.rKey = -1; state.cKey = -1; state.mKey = -1;
       state.R = 0; state.RI = 0; state.ri2 = 0; state.span = 1; state.invSpan = 0;
+      // Mirror of AnimLens.cpp's paramSpan: lo at 0, mid at 50, hi at 100,
+      // and the mid literal itself at 50 so the defaults are the old picture.
+      state.pspan = (v, lo, mid, hi) => {
+        const d = v - 50;
+        if (d === 0) return mid;
+        const f = d / 50;
+        return d < 0 ? mid + (mid - lo) * f : mid + (hi - mid) * f;
+      };
+      state.pspanI = (v, lo, mid, hi) => v === 50 ? mid : Math.round(state.pspan(v, lo, mid, hi));
     },
     render(data, w, h, tMs, p, state) {
+      const pspan = state.pspan, pspanI = state.pspanI;
+      // Contrast is a gain on the summed waves, so at 50 it is a multiply by
+      // 1 and the tile is the tile this entry built in init() before.
+      if (state.cKey !== p[3]) {
+        state.cKey = p[3]; state.key = null;
+        const contrast = pspan(p[3], 0.25, 1.0, 2.4);
+        for (let j = 0, c = 0; j < T_N; j++) {
+          for (let i = 0; i < T_N; i++, c++) {
+            // Two scales on purpose: a broad swell one cycle per tile, and a
+            // grain three cycles per tile at a quarter weight, crossed rather
+            // than parallel so the two do not beat into stripes. On the ground
+            // the grain is about 40 px and reads as texture; under the lens it
+            // is 80 px and is what makes the magnification legible.
+            const v = SIN[(i * 16) & (SIN_N - 1)] +
+              SIN[(j * 16 + 180) & (SIN_N - 1)] +
+              (SIN[(i * 48 + j * 16 + 300) & (SIN_N - 1)] >> 2) +
+              (SIN[(i * 16 - j * 48 + 700) & (SIN_N - 1)] >> 2);
+            const idx = 84 + Math.round(v * 0.0410 * contrast);  // ramp 32..136 at 50
+            state.lvl[c] = idx < 0 ? 0 : idx > 255 ? 255 : idx;
+          }
+        }
+      }
       const key = p[2] + '|' + THEME.gen;
       if (state.key !== key) {
         state.key = key;
         const pal = pa_ramp32(pa_bright(p[2]));
         for (let c = 0; c < T_N * T_N; c++) state.tex[c] = pal[state.lvl[c]];
       }
-      if (state.rKey !== p[1]) {
-        state.rKey = p[1];
+      // The rim, as a darkening across the feather rather than a run of one
+      // dark colour. A 3 px run of a fixed colour was a drawn circle: it sat
+      // on top of the picture and the eye read the outline before the lens.
+      // The slider is how deep that darkening goes, 70 at 50.
+      if (state.mKey !== p[5]) {
+        state.mKey = p[5];
+        const depth = pspanI(p[5], 0, 70, 180);
+        for (let k = 0; k <= 256; k++) {
+          const g = (k - 128) / 128, b = 1 - g * g;
+          state.rimMul[k] = 256 - Math.round(depth * b * b);
+        }
+      }
+      const rKey = p[1] + '|' + p[4];
+      if (state.rKey !== rKey) {
+        state.rKey = rKey;
         const R = 80 + Math.round(p[1] * 50 / 100);       // 80..130
-        const RI = R - FEATHER;
+        const RI = R - pspanI(p[4], 3, FEATHER, 30);      // feather 3..30 px
         state.R = R; state.RI = RI;
         state.ri2 = RI * RI;
         state.span = R * R - RI * RI;
@@ -3530,10 +3557,13 @@ const pa_dith = (x, y) => (BAYER8[(y & 7) * 8 + (x & 7)] - 31.5) * (1 / 64);
       const spd = speedMulJS(p[0]);
       const t = tMs * spd;
       const { R, RI, chordO, chordI, tex, rimMul, ri2, span, invSpan } = state;
-      const lx = Math.round(240 + 70 * Math.sin(t * (2 * Math.PI / 37000) + 0.7)) | 0;
-      const ly = Math.round(240 + 90 * Math.sin(t * (2 * Math.PI / 53000) + 2.3)) | 0;
-      const bu = Math.round(-t * 0.006) | 0;              // mottle scrolls at 6 px/s
-      const bv = Math.round(-t * 0.0034) | 0;
+      // Travel scales how far the lens roams about the centre, drift the rate
+      // the ground scrolls under it. Both are 1 at 50.
+      const travel = pspan(p[6], 0.0, 1.0, 2.0), drift = pspan(p[7], 0.0, 1.0, 3.0);
+      const lx = Math.round(240 + 70 * travel * Math.sin(t * (2 * Math.PI / 37000) + 0.7)) | 0;
+      const ly = Math.round(240 + 90 * travel * Math.sin(t * (2 * Math.PI / 53000) + 2.3)) | 0;
+      const bu = Math.round(-t * 0.006 * drift) | 0;      // mottle scrolls at 6 px/s at 50
+      const bv = Math.round(-t * 0.0034 * drift) | 0;
       const out = pa_view(data, state);
       const cl = v => (v < 0 ? 0 : v > w ? w : v);
       for (let y = 0, o = 0; y < h; y++) {

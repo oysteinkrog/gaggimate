@@ -19,6 +19,16 @@
 // levels and the theme ramp are only swept at init/theme/brightness changes,
 // in PSRAM. Byte chords retain the page's full 160 entries: radii never
 // exceed 130, so narrowing loses no precision and fits the slab budget.
+//
+// Parameter pass (2026-09-10, gm-3vj.31): five more sliders, taking this
+// animation from 3 to 8. None of them touches a pixel loop. Contrast and rim
+// darkness change the bytes in two tables that were built once and are now
+// rebuilt when their slider moves; edge width joins lens size in the block
+// that rebuilds the chords; lens travel and ground drift are per-frame
+// constants. So bandRef and the hand-written Xtensa kernel below are byte for
+// byte what they were, and paramSpan() returns its middle argument as a
+// literal at 50, which is what makes the default picture the old picture
+// rather than a hope about float rounding.
 
 #include "BgAnim.h"
 #include "BgAnimCommon.h"
@@ -43,7 +53,7 @@ using namespace bganim;
 constexpr int TILE_N = 64;
 constexpr int TILE_PIXELS = TILE_N * TILE_N;
 constexpr int CHORD_N = 160;
-constexpr int FEATHER = 12;
+constexpr int FEATHER = 12; // the edge-width slider's midpoint, in pixels
 constexpr uint32_t GROUND_STEP = 32768;
 constexpr uint32_t LENS_STEP = 16384;
 
@@ -65,8 +75,14 @@ static_assert(8192 + 528 + 160 + 160 + 112 + 64 <= HOT_SLAB_BYTES - HOT_SHARED_R
               "Lens tables must fit the resident animation's hot slab");
 
 int lastBrightness = -1;
+// lastSize keys the chord block on lens size and edge width together.
 int lastSize = -1;
+// The two table sliders start where init() builds their table, so a device
+// left at the defaults never pays for a rebuild.
+int lastContrast = 50;
+int lastRim = 50;
 uint32_t lastThemeGen = 0xFFFFFFFF;
+int feather = FEATHER;
 int radius = 0, innerRadius = 0, inner2 = 0, span = 1, invSpan = 0;
 int lensX = 240, lensY = 240, scrollX = 0, scrollY = 0;
 
@@ -76,12 +92,73 @@ void release();
 // from zero. No per-pixel float operations use this helper.
 int roundJS(float v) { return static_cast<int>(floorf(v + 0.5f)); }
 
+// A 0-100 slider as a piecewise linear value with an exact midpoint: lo at
+// 0, mid at 50, hi at 100. At 50 it returns the mid literal itself rather
+// than an expression that happens to round to it, so a default slider folds
+// away to the constant this file hard-coded before. Called a few times per
+// frame at most, never per row and never per pixel.
+inline float paramSpan(uint8_t v, float lo, float mid, float hi) {
+    const int d = static_cast<int>(v) - 50;
+    if (d == 0) {
+        return mid;
+    }
+    const float f = d / 50.0f;
+    return d < 0 ? mid + (mid - lo) * f : mid + (hi - mid) * f;
+}
+
+// The same curve as a whole number, for the sliders that set a pixel count
+// or a Q8 amount. Rounded the way the page rounds, through roundJS.
+inline int paramSpanI(uint8_t v, int lo, int mid, int hi) {
+    if (static_cast<int>(v) == 50) {
+        return mid;
+    }
+    return roundJS(paramSpan(v, static_cast<float>(lo), static_cast<float>(mid), static_cast<float>(hi)));
+}
+
+// The mottle tile. Contrast is a gain on the summed waves before the level
+// offset, so at slider 50 it is a multiply by a literal 1.0f and the bytes
+// are the bytes this loop wrote before. Levels feed the texture, so a
+// rebuild here has to invalidate the texture as well; frame() does that.
+void buildLevels(uint8_t contrastParam) {
+    const int16_t *sl = sinLut();
+    if (sl == nullptr || levels == nullptr) {
+        return;
+    }
+    const float contrast = paramSpan(contrastParam, 0.25f, 1.0f, 2.4f);
+    for (int j = 0; j < TILE_N; j++) {
+        for (int i = 0; i < TILE_N; i++) {
+            // 16 LUT entries is one cycle per tile, 48 is three. The phase
+            // offsets 180, 300 and 700 keep the crossed waves asymmetric.
+            const int v = sl[(i * 16) & 1023] + sl[(j * 16 + 180) & 1023] +
+                          (sl[(i * 48 + j * 16 + 300) & 1023] >> 2) +
+                          (sl[(i * 16 - j * 48 + 700) & 1023] >> 2);
+            const int idx = 84 + roundJS(static_cast<float>(v) * 0.0410f * contrast);
+            levels[j * TILE_N + i] = static_cast<uint8_t>(idx < 0 ? 0 : (idx > 255 ? 255 : idx));
+        }
+    }
+}
+
+// The rim, as a darkening across the feather rather than a run of one dark
+// colour. Depth is the Q8 amount taken off at the middle of the feather: 70
+// at slider 50, which is the number this loop hard-coded. Nothing reads
+// rimMul but the blend, so this table stands alone.
+void buildRim(uint8_t rimParam) {
+    if (rimMul == nullptr) {
+        return;
+    }
+    const float depth = static_cast<float>(paramSpanI(rimParam, 0, 70, 180));
+    for (int k = 0; k <= 256; k++) {
+        const float g = (k - 128) * (1.0f / 128.0f);
+        const float b = 1.0f - g * g;
+        rimMul[k] = static_cast<uint16_t>(256 - roundJS(depth * b * b));
+    }
+}
+
 bool init(int, int) {
     if (texture != nullptr) {
         return true;
     }
-    const int16_t *sl = sinLut();
-    if (sl == nullptr) {
+    if (sinLut() == nullptr) {
         release();
         return false;
     }
@@ -99,22 +176,13 @@ bool init(int, int) {
         release();
         return false;
     }
-    for (int j = 0; j < TILE_N; j++) {
-        for (int i = 0; i < TILE_N; i++) {
-            // 16 LUT entries is one cycle per tile, 48 is three. The phase
-            // offsets 180, 300 and 700 keep the crossed waves asymmetric.
-            const int v = sl[(i * 16) & 1023] + sl[(j * 16 + 180) & 1023] +
-                          (sl[(i * 48 + j * 16 + 300) & 1023] >> 2) +
-                          (sl[(i * 16 - j * 48 + 700) & 1023] >> 2);
-            const int idx = 84 + roundJS(v * 0.0410f);
-            levels[j * TILE_N + i] = static_cast<uint8_t>(idx < 0 ? 0 : (idx > 255 ? 255 : idx));
-        }
-    }
-    for (int k = 0; k <= 256; k++) {
-        const float g = (k - 128) * (1.0f / 128.0f);
-        const float b = 1.0f - g * g;
-        rimMul[k] = static_cast<uint16_t>(256 - roundJS(70.0f * b * b));
-    }
+    // Built at the two sliders' defaults. frame() rebuilds either one the
+    // moment its slider reads anything else, so init() is complete on its
+    // own and a band call cannot meet a half-built table.
+    buildLevels(50);
+    buildRim(50);
+    lastContrast = 50;
+    lastRim = 50;
     for (int lane = 0; lane < 8; lane++) {
         // Mask, expand factor, repack factor for R and G; B needs no
         // repack. floor(r5*33/4) and floor(g6*65/16) replicate the low
@@ -131,6 +199,15 @@ bool init(int, int) {
 }
 
 void frame(uint32_t tMs, int, int, const uint8_t p[BG_ANIM_PARAMS]) {
+    if (lastContrast != p[3]) {
+        buildLevels(p[3]);
+        lastContrast = p[3];
+        lastBrightness = -1; // texture is the ramp read through levels
+    }
+    if (lastRim != p[5]) {
+        buildRim(p[5]);
+        lastRim = p[5];
+    }
     const uint32_t gen = themeGen();
     if (lastBrightness != p[2] || gen != lastThemeGen) {
         // pa_bright(): Q8 80..256, rounding before the channel scale. This
@@ -144,9 +221,12 @@ void frame(uint32_t tMs, int, int, const uint8_t p[BG_ANIM_PARAMS]) {
         lastBrightness = p[2];
         lastThemeGen = gen;
     }
-    if (lastSize != p[1]) {
+    // Lens size and edge width share the chord block: both move the radii.
+    const int sizeKey = static_cast<int>(p[1]) | (static_cast<int>(p[4]) << 8);
+    if (lastSize != sizeKey) {
         radius = 80 + (static_cast<int>(p[1]) * 50 + 50) / 100;
-        innerRadius = radius - FEATHER;
+        feather = paramSpanI(p[4], 3, FEATHER, 30);
+        innerRadius = radius - feather;
         inner2 = innerRadius * innerRadius;
         span = radius * radius - inner2;
         invSpan = 16777216 / span; // floor(2^24/span), exactly the page
@@ -156,7 +236,7 @@ void frame(uint32_t tMs, int, int, const uint8_t p[BG_ANIM_PARAMS]) {
         for (int k = 0; k < innerRadius; k++) {
             chordI[k] = static_cast<uint8_t>(roundJS(sqrtf(static_cast<float>(inner2 - k * k))));
         }
-        lastSize = p[1];
+        lastSize = sizeKey;
     }
     // Derived from wall time, not from which frames or bands were requested.
     // True sinf calls once per frame avoid the coarse fastSinRad table's
@@ -166,10 +246,18 @@ void frame(uint32_t tMs, int, int, const uint8_t p[BG_ANIM_PARAMS]) {
     // cursors deliberately wrap uint32, avoiding signed left-shift overflow.
     const float t = static_cast<float>(tMs) * speedMul(p[0]);
     constexpr float TAU = 6.2831853071795864769f;
-    lensX = roundJS(240.0f + 70.0f * sinf(t * (TAU / 37000.0f) + 0.7f));
-    lensY = roundJS(240.0f + 90.0f * sinf(t * (TAU / 53000.0f) + 2.3f));
-    scrollX = roundJS(-t * 0.006f);  // -6 ground pixels/s at speed 50
-    scrollY = roundJS(-t * 0.0034f); // -3.4 ground pixels/s at speed 50
+    // Travel scales how far the lens roams about the centre; at 0 it parks
+    // at (240, 240) and only the ground moves under it. Drift scales the
+    // ground's scroll on both axes together, so its direction is fixed and
+    // only its rate changes. Both are a literal 1.0f at slider 50.
+    const float travel = paramSpan(p[6], 0.0f, 1.0f, 2.0f);
+    const float drift = paramSpan(p[7], 0.0f, 1.0f, 3.0f);
+    const float ampX = 70.0f * travel;
+    const float ampY = 90.0f * travel;
+    lensX = roundJS(240.0f + ampX * sinf(t * (TAU / 37000.0f) + 0.7f));
+    lensY = roundJS(240.0f + ampY * sinf(t * (TAU / 53000.0f) + 2.3f));
+    scrollX = roundJS(-t * 0.006f * drift);  // -6 ground pixels/s at the defaults
+    scrollY = roundJS(-t * 0.0034f * drift); // -3.4 ground pixels/s at the defaults
 }
 
 // The preview blends expanded RGB888 samples of an RGB565 palette, then dims
@@ -327,7 +415,8 @@ GM_ANIM_IRAM __attribute__((noinline)) uint32_t lensRunPairsAsm(uint16_t *out, c
 // this 14-register block retains them, schedules every load-use gap, and
 // closes 24 instructions/pixel with LOOP. e is rr2-inner2, de is 2*dx+1.
 // Both are fresh at each block. Clamping precedes the Q24 reciprocal multiply
-// so its product is at most 2^24 for radii 80..130 (span 1776..2976).
+// so its product is at most 2^24 for radii 80..130 and edge widths 3..30
+// (span f*(2R-f), 471..6900); invSpan is floor(2^24/span) for any of them.
 // The temp holding LOOP's count is free to reuse after the instruction has
 // copied it to LCOUNT. There are no nested hardware loops or calls here.
 GM_ANIM_IRAM __attribute__((noinline)) void lensStage8Asm(uint16_t *stage, const uint16_t *bg,
@@ -588,6 +677,9 @@ void release() {
     releaseTable(pieConst, 112);
     releaseTable(stage8, 64);
     lastBrightness = lastSize = -1;
+    lastContrast = 50;
+    lastRim = 50;
+    feather = FEATHER;
     lastThemeGen = 0xFFFFFFFF;
     radius = innerRadius = inner2 = invSpan = 0;
     span = 1;
@@ -604,7 +696,11 @@ const BgAnimation bg_anim_lens = {
     {{"speed", "Speed", 50},
      {"size", "Lens size", 55},
      {"brightness", "Brightness", 62},
-     {nullptr, nullptr, 0}},
+     {"contrast", "Contrast", 50},
+     {"edge", "Edge width", 50},
+     {"rim", "Rim darkness", 50},
+     {"travel", "Lens travel", 50},
+     {"drift", "Ground drift", 50}},
     init,
     frame,
     band,

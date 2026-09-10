@@ -395,6 +395,11 @@ export const BG_ANIMATIONS = [
       { key: 'speed', label: 'Speed', def: 50 },
       { key: 'size', label: 'Lens size', def: 55 },
       { key: 'brightness', label: 'Brightness', def: 62 },
+      { key: 'contrast', label: 'Contrast', def: 50 },
+      { key: 'edge', label: 'Edge width', def: 50 },
+      { key: 'rim', label: 'Rim darkness', def: 50 },
+      { key: 'travel', label: 'Lens travel', def: 50 },
+      { key: 'drift', label: 'Ground drift', def: 50 },
     ],
   },
   {
