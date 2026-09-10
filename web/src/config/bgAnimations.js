@@ -210,7 +210,12 @@ export const BG_ANIMATIONS = [
     params: [
       { key: 'speed', label: 'Speed', def: 50 },
       { key: 'scale', label: 'Fringe density', def: 45 },
-      { key: 'glow', label: 'Sheen', def: 55 },
+      { key: 'glow', label: 'Contrast', def: 55 },
+      { key: 'mix', label: 'Wave balance', def: 50 },
+      { key: 'cross', label: 'Cross detail', def: 50 },
+      { key: 'sheenw', label: 'Sheen width', def: 55 },
+      { key: 'rim', label: 'Rim spread', def: 50 },
+      { key: 'drift', label: 'Drift', def: 50 },
     ],
   },
   {

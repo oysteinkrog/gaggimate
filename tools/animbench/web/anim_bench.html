@@ -1581,7 +1581,12 @@ function bayerOffsets(dithOff, amp, unit) {
     params: [
       { key: 'speed', label: 'Speed', def: 50 },
       { key: 'scale', label: 'Fringe density', def: 45 },
-      { key: 'glow', label: 'Sheen', def: 55 }],
+      { key: 'glow', label: 'Contrast', def: 55 },
+      { key: 'mix', label: 'Wave balance', def: 50 },
+      { key: 'cross', label: 'Cross detail', def: 50 },
+      { key: 'sheenw', label: 'Sheen width', def: 55 },
+      { key: 'rim', label: 'Rim spread', def: 50 },
+      { key: 'drift', label: 'Drift', def: 50 }],
     init(w, h, state) {
       state.sheenLut = new Int16Array(SIN_N);
       const sheenScale = AMP_SHEEN / SIN_AMP;
@@ -1612,10 +1617,21 @@ function bayerOffsets(dithOff, amp, unit) {
       }
       const tF = F(t);
       const speedF = speedMulF(p[0]);
+      // Drift (p[7]): 0x..2x on the slow terms only (both angle wobbles, the
+      // sheen's rotation and the sheen's temporal phase), exactly 1x at 50.
+      const driftF = F(F(p[7]) / 50);
+      // Wave balance (p[3]): moves amplitude between the two oblique waves
+      // and always keeps ampA + ampB at AMP_A + AMP_B, so SUM_N is unchanged.
+      const mixD = (p[3] - 50) * 3;
+      const ampA = AMP_A + mixD, ampB = AMP_B - mixD;
+      // Rim spread (p[6]): blends the vignette falloff from a fourth power
+      // through the square to a straight line. Exactly the square at 50.
+      const rimS = F(F(p[6] - 50) * F(1 / 50));
+      const rimWide = rimS >= 0, rimMix = rimWide ? rimS : -rimS;
       const angleA = F(ANGLE_A_BASE + F(ANGLE_A_WOBBLE *
-        fastSinRad(F(F(F(ANGLE_A_DRIFT_RATE * tF) * speedF) + ANGLE_A_PHASE))));
+        fastSinRad(F(F(F(F(ANGLE_A_DRIFT_RATE * tF) * speedF) * driftF) + ANGLE_A_PHASE))));
       const angleB = F(ANGLE_B_BASE + F(ANGLE_B_WOBBLE *
-        fastSinRad(F(F(F(ANGLE_B_DRIFT_RATE * tF) * speedF) + ANGLE_B_PHASE))));
+        fastSinRad(F(F(F(F(ANGLE_B_DRIFT_RATE * tF) * speedF) * driftF) + ANGLE_B_PHASE))));
       const slopeA = F(fastSinRad(angleA) / fastCosRad(angleA));
       const slopeB = F(fastSinRad(angleB) / fastCosRad(angleB));
 
@@ -1625,8 +1641,12 @@ function bayerOffsets(dithOff, amp, unit) {
       const phaseB0 = ((foldBase * 7) >>> 0) >>> 8, phaseB1 = ((foldBase * 6) >>> 0) >>> 8;
       const sxScale = 128 + Math.floor(p[1] * 384 / 100);
       const freqA0 = (2 * sxScale) >> 8, freqA1 = (3 * sxScale) >> 8;
-      const freqB0 = (4 * sxScale) >> 8, freqB1 = (5 * sxScale) >> 8;
-      const ampScaleA = F(F(F(0.5) * AMP_A) / SIN_AMP), ampScaleB = F(F(F(0.5) * AMP_B) / SIN_AMP);
+      // Cross detail (p[4]): wave B's frequency as a percentage of wave A's,
+      // 80 at slider 0, exactly 100 at 50, 200 at 100.
+      const crossPct = p[4] < 50 ? (80 + Math.floor(p[4] * 20 / 50)) : (100 + (p[4] - 50) * 2);
+      const freqB0 = Math.floor(4 * sxScale * crossPct / 100) >> 8;
+      const freqB1 = Math.floor(5 * sxScale * crossPct / 100) >> 8;
+      const ampScaleA = F(F(F(0.5) * ampA) / SIN_AMP), ampScaleB = F(F(F(0.5) * ampB) / SIN_AMP);
       const wHalf = F(F(w) * F(0.5)), hHalf = F(F(h) * F(0.5));
 
       const { colFoldA, colFoldB, shiftA, shiftB, rowVign, padA, padB, lut2, sheenLut } = state;
@@ -1636,7 +1656,9 @@ function bayerOffsets(dithOff, amp, unit) {
         const base = lround(F(F(raw) * ampScaleA));
         const cx = spatialX < 0 ? 0 : (spatialX >= w ? w - 1 : spatialX);
         const dxN = F(F(cx - wHalf) / wHalf);
-        colFoldA[tx] = base - lround(F(F(VIGN_COL_MAX * dxN) * dxN));
+        const colBase = F(F(VIGN_COL_MAX * dxN) * dxN);
+        const colAlt = rimWide ? F(VIGN_COL_MAX * Math.abs(dxN)) : F(F(colBase * dxN) * dxN);
+        colFoldA[tx] = base - lround(F(colBase + F(rimMix * F(colAlt - colBase))));
       }
       for (let tx = 0; tx < state.tableWB; tx++) {
         const ux = (tx - padB) >>> 0;
@@ -1647,16 +1669,22 @@ function bayerOffsets(dithOff, amp, unit) {
         shiftA[y] = lround(F(slopeA * F(y - hHalf)));
         shiftB[y] = lround(F(slopeB * F(y - hHalf)));
         const dyN = F(F(y - hHalf) / hHalf);
-        rowVign[y] = -lround(F(F(VIGN_ROW_MAX * dyN) * dyN));
+        const rowBase = F(F(VIGN_ROW_MAX * dyN) * dyN);
+        const rowAlt = rimWide ? F(VIGN_ROW_MAX * Math.abs(dyN)) : F(F(rowBase * dyN) * dyN);
+        rowVign[y] = -lround(F(rowBase + F(rimMix * F(rowAlt - rowBase))));
       }
 
       const omega0 = F(OMEGA_BASE * speedF);
-      const A = F(SHEEN_A0 + F(F(F(omega0 * F(0.15)) * SHEEN_ROT_MULT) * tF));
-      const k0 = F(F(0.0015) + F(F(0.0025) * F(F(p[1]) / 100)));
+      const A = F(SHEEN_A0 + F(F(F(F(omega0 * F(0.15)) * SHEEN_ROT_MULT) * driftF) * tF));
+      // Sheen width (p[5]): its own slider now. k0 is a spatial frequency, so
+      // the slider is subtracted to make turning it up widen the highlight.
+      // The default 55 leaves 100 - 55 = 45, the number this term used to
+      // read out of Fringe density.
+      const k0 = F(F(0.0015) + F(F(0.0025) * F(F(100 - p[5]) / 100)));
       const k = F(k0 * F(1.0 + F(F(0.15) * fastSinRad(F(F(SHEEN_WK * tF) + SHEEN_PHK)))));
       const sheenStep = Math.trunc(F(F(k * fastCosRad(A)) * TURN)) | 0;
       const sheenRowStep = Math.trunc(F(F(k * fastSinRad(A)) * TURN)) | 0;
-      const wRateQ = Math.trunc(F(F(omega0 * SHEEN_W_MULT) * TURN)) | 0;
+      const wRateQ = Math.trunc(F(F(F(omega0 * SHEEN_W_MULT) * driftF) * TURN)) | 0;
       const sheenWt = Math.imul(wRateQ, t) >>> 0;
       const sheenStep2 = (sheenStep * 2) | 0;
 
