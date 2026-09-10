@@ -3786,9 +3786,20 @@ const pa_dith = (x, y) => (BAYER8[(y & 7) * 8 + (x & 7)] - 31.5) * (1 / 64);
    firmware would keep uint8 tiles and fold the dither into the row's
    8-entry phase table. The scroll is 18 and 12 px/s rather than 12 and 8:
    see the note at the scroll accumulators.
+
+   Eight parameters (gm-3vj.33). Speed and Drift angle set the scroll
+   vector, Arc width, Glow and Sharpness shape the two tiles, Tile bias
+   decides how much of the field keeps the seeded orientation mix, Contrast
+   reads the theme ramp through a gain about the picture's midpoint, and
+   Grain scales the Bayer amplitude. Every one of them is a constant fold at
+   its default, so the entry renders exactly what it rendered with three.
 -------------------------------------------------------------------- */
 (() => {
   const TILE = 128, HALF = TILE >> 1, CELLS = 5, SCAN = CELLS * TILE;
+  // A multiple of 256 * TILE, of TILE and of 8, so it moves neither the
+  // orientation hash nor subX nor the dither phase. It is what lets a
+  // rotated drift vector run backwards without a negative cell index.
+  const SCROLL_BIAS = 0x40000000;
 
   ANIMS.push({
     id: 'truchet', name: 'Truchet', proto: true,
@@ -3796,12 +3807,18 @@ const pa_dith = (x, y) => (BAYER8[(y & 7) * 8 + (x & 7)] - 31.5) * (1 / 64);
       { key: 'speed', label: 'Speed', def: 50 },
       { key: 'arc', label: 'Arc width', def: 50 },
       { key: 'glow', label: 'Glow', def: 55 },
+      { key: 'drift', label: 'Drift angle', def: 50 },
+      { key: 'bias', label: 'Tile bias', def: 50 },
+      { key: 'sharp', label: 'Sharpness', def: 50 },
+      { key: 'contrast', label: 'Contrast', def: 50 },
+      { key: 'grain', label: 'Grain', def: 50 },
     ],
     init(w, h, state) {
       state.tile = [new Uint16Array(TILE * TILE), new Uint16Array(TILE * TILE)];
       state.orient = new Uint8Array(256);
       const rnd = mulberry32(0x7ce1);
       for (let i = 0; i < 256; i++) state.orient[i] = (rnd() * 256) | 0;
+      state.obit = new Uint8Array(256);
       state.scan = new Uint16Array(SCAN);
       state.dith = new Int16Array(64);
       state.pal = null;
@@ -3811,14 +3828,50 @@ const pa_dith = (x, y) => (BAYER8[(y & 7) * 8 + (x & 7)] - 31.5) * (1 / 64);
       const key = p.join(',') + '|' + THEME.gen;
       if (state.key !== key) {
         state.key = key;
-        state.pal = themeRamp();
-        bayerOffsets(state.dith, ditherAmpJS(state.pal, 256), 16);
-        // Arc profile: a raised cosine across the ring, so both tiles
-        // carry identical coverage at the four edge midpoints and the
-        // paths join without a kink.
         const hw = 16 + p[1] * 0.18;               // 16..34 px half width
         const peak = 64 + Math.round(p[2] * 0.9);  // 64..154 over the ground
         const ground = 26;
+        // Contrast: index i reads the colour that sat at mid + (i - mid) *
+        // gain, mid being the picture's own midpoint, so the gain spreads or
+        // squeezes the arc tones about their middle instead of dragging the
+        // whole image brighter. 256 in Q8 at the default, where this loop
+        // writes what themeRamp() writes, entry for entry.
+        const gQ8 = p[6] < 50 ? 64 + Math.trunc(p[6] * 192 / 50)
+                              : 256 + Math.trunc((p[6] - 50) * 384 / 50);
+        const mid = ground + (peak >> 1);
+        const pal = new Uint8Array(256 * 3);
+        for (let i = 0; i < 256; i++) {
+          const c = themeRGB(mid + Math.trunc((i - mid) * gQ8 / 256));
+          pal[i * 3] = q565r(c[0]); pal[i * 3 + 1] = q565g(c[1]); pal[i * 3 + 2] = q565r(c[2]);
+        }
+        state.pal = pal;
+        // Grain: a gain on the Bayer amplitude, exactly 1 at the default.
+        // The top of the range is 1.6x, which is the room the firmware
+        // kernel's palette index proof leaves for it.
+        const grain = p[7] < 50 ? p[7] / 50 : 1 + (p[7] - 50) * 0.6 / 50;
+        bayerOffsets(state.dith, ditherAmpJS(state.pal, 256) * grain, 16);
+        // Tile bias: at the default every cell keeps the low bit of its
+        // seeded byte, which is the maze. Away from the default a growing
+        // share of the cells is forced to one orientation, until at either
+        // end the whole field carries one tile and the arcs line up into a
+        // regular diagonal weave. Bits 1..7 of the same byte pick which
+        // cells are forced, so the mix is a hash and not a stripe.
+        const kb = p[4] - 50;
+        const thr = Math.trunc(Math.abs(kb) * 128 / 50), forced = kb > 0 ? 1 : 0;
+        for (let i = 0; i < 256; i++) {
+          const r = state.orient[i];
+          state.obit[i] = (r >> 1) < thr ? forced : (r & 1);
+        }
+        // Sharpness bends the raised-cosine ring profile toward smoothstep
+        // (100), which darkens the outer rim and brightens the core, or as
+        // far the other way (0), which flattens the ribbon into a broad even
+        // wash. Both ends of the profile are fixed points, so the arc keeps
+        // its peak and its width in pixels and the tile's Q4 range does not
+        // move.
+        const ks = (p[5] - 50) / 50;
+        // Arc profile: a raised cosine across the ring, so both tiles
+        // carry identical coverage at the four edge midpoints and the
+        // paths join without a kink.
         for (let o = 0; o < 2; o++) {
           const cx = [o === 0 ? 0 : TILE, o === 0 ? TILE : 0];
           const cy = [0, TILE];
@@ -3831,7 +3884,9 @@ const pa_dith = (x, y) => (BAYER8[(y & 7) * 8 + (x & 7)] - 31.5) * (1 / 64);
                 let d = Math.sqrt(dx * dx + dy * dy) - HALF;
                 d = d < 0 ? -d : d;
                 if (d < hw) {
-                  const c = peak * 0.5 * (1 + Math.cos(Math.PI * d / hw));
+                  let s = 0.5 * (1 + Math.cos(Math.PI * d / hw));
+                  if (ks !== 0) s += ks * (s * s * (3 - 2 * s) - s);
+                  const c = peak * s;
                   if (c > v) v = c;
                 }
               }
@@ -3846,20 +3901,29 @@ const pa_dith = (x, y) => (BAYER8[(y & 7) * 8 + (x & 7)] - 31.5) * (1 / 64);
           for (let ty = 0; ty < TILE; ty++) state.rowView[o].push(state.tile[o].subarray(ty * TILE, ty * TILE + TILE));
         }
       }
-      const { rowView, orient, scan, dith, pal } = state;
+      const { rowView, obit, scan, dith, pal } = state;
       const t = tMs * speedMulJS(p[0]);
       // 18 and 12 px/s, not the spec's 12 and 8. A tile blit scrolls in
       // whole pixels, so at 12 px/s and 30 fps half the frames repeat and
       // the field creeps in visible steps. At 18 px/s two frames in three
       // move, and the speed is still far under the 60 px/s crawl ceiling.
-      const ox = Math.floor(t * 18 / 1000);
-      const oy = Math.floor(t * 12 / 1000);
+      //
+      // Drift angle turns that vector by up to 2.8 radians either way, so
+      // the field can slide in any direction and the two ends of the slider
+      // are 160 degrees apart rather than the same direction twice. At the
+      // default the angle is 0, the cosine 1 and the sine 0, so the two
+      // components are 18 and 12 and the accumulators are the old ones.
+      const ang = (p[3] - 50) * (2.8 / 50);
+      const vx = 18 * Math.cos(ang) - 12 * Math.sin(ang);
+      const vy = 18 * Math.sin(ang) + 12 * Math.cos(ang);
+      const ox = Math.floor(t * vx / 1000) + SCROLL_BIAS;
+      const oy = Math.floor(t * vy / 1000) + SCROLL_BIAS;
       const cellX0 = ox / TILE | 0, subX = ox % TILE;
       let o = 0;
       for (let y = 0; y < h; y++) {
         const yy = y + oy, ty = yy % TILE, cellY = yy / TILE | 0;
         for (let c = 0; c < CELLS; c++) {
-          const which = orient[(((cellX0 + c) * 7 + cellY * 13) & 255)] & 1;
+          const which = obit[(((cellX0 + c) * 7 + cellY * 13) & 255)] & 1;
           scan.set(rowView[which][ty], c * TILE);
         }
         const off = (y & 7) * 8;

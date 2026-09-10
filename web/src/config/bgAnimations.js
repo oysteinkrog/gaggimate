@@ -425,6 +425,11 @@ export const BG_ANIMATIONS = [
       { key: 'speed', label: 'Speed', def: 50 },
       { key: 'arc', label: 'Arc width', def: 50 },
       { key: 'glow', label: 'Glow', def: 55 },
+      { key: 'drift', label: 'Drift angle', def: 50 },
+      { key: 'bias', label: 'Tile bias', def: 50 },
+      { key: 'sharp', label: 'Sharpness', def: 50 },
+      { key: 'contrast', label: 'Contrast', def: 50 },
+      { key: 'grain', label: 'Grain', def: 50 },
     ],
   },
   {
