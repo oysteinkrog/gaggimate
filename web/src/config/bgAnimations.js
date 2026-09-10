@@ -375,6 +375,11 @@ export const BG_ANIMATIONS = [
       { key: 'speed', label: 'Speed', def: 50 },
       { key: 'scale', label: 'Weave scale', def: 50 },
       { key: 'brightness', label: 'Brightness', def: 62 },
+      { key: 'contrast', label: 'Contrast', def: 50 },
+      { key: 'cross', label: 'Cross weave', def: 50 },
+      { key: 'turn', label: 'Turn rate', def: 50 },
+      { key: 'drift', label: 'Drift', def: 50 },
+      { key: 'breath', label: 'Breath rate', def: 50 },
     ],
   },
   {

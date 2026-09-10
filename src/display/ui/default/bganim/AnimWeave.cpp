@@ -5,6 +5,14 @@
 // texture from three sine waves, rotated, breathed and translated by two
 // Q16.16 cursors. The texture already contains theme RGB565 pixels, so the
 // hot loop has one gather per pixel. The approved page adds no dither here.
+//
+// Eight parameters, all of them handled in frame() (gm-3vj.30). Three build
+// the cell table: brightness, contrast and cross weave. Three set the
+// motion: turn rate, drift and breath rate, alongside speed and scale. Each
+// one is exactly its old hard-coded constant at 50, so the defaults render
+// what this file rendered before them, and none of them reaches the pixel
+// loop: band(), bandRef() and the Xtensa kernel read the same table and the
+// same two cursors they always did.
 
 #include "BgAnim.h"
 #include "BgAnimCommon.h"
@@ -32,7 +40,7 @@ uint16_t *ramp = nullptr; // 512 B, PSRAM: only read when rebuilding tex
 int32_t *phaseData = nullptr; // 96 B, slab: six aligned PIE vectors read per row
 const int16_t *sine = nullptr; // borrowed shared 1,024-entry, +/-512 LUT
 uint32_t lastThemeGen = 0;
-int lastBrightness = -1;
+int lastTexKey = -1; // brightness, contrast and cross weave, packed
 uint32_t u0 = 0, v0 = 0;
 int du = 0, dv = 0;
 
@@ -63,31 +71,55 @@ bool init(int, int) {
 
 void frame(uint32_t tMs, int, int, const uint8_t p[BG_ANIM_PARAMS]) {
     const uint32_t gen = themeGen();
-    if (lastBrightness != p[2] || lastThemeGen != gen) {
+    // Contrast: how far the cell table swings either side of the ramp's
+    // middle, in thousandths of a palette step per sine unit. 8 at slider 0,
+    // so the cloth is a faint mottle; the original 33 at 50; 66 at 100, where
+    // the crossings print as a hard waffle.
+    const int contrast = static_cast<int>(p[3]);
+    const int amp = contrast <= 50 ? 8 + contrast * 25 / 50 : 33 + (contrast - 50) * 33 / 50;
+    // Cross weave: the Q8 weight of the diagonal sine that turns a square
+    // grid of bars into cloth. 128 at slider 50 is the >> 1 the table was
+    // written with, and (s * 128) >> 8 is that shift for negative s too.
+    const int crossW = static_cast<int>(p[4]) * 256 / 100;
+    const int texKey = static_cast<int>(p[2]) | (amp << 8) | (crossW << 16);
+    if (lastTexKey != texKey || lastThemeGen != gen) {
         // pa_bright: 80 + Math.round(p[2] * 176 / 100), Q8 brightness.
         // Scale RGB888 before packing, exactly as the page's themeRamp does.
         buildThemeRamp(ramp, 80 + (static_cast<int>(p[2]) * 176 + 50) / 100);
         for (int j = 0; j < TILE_N; j++) {
             for (int i = 0; i < TILE_N; i++) {
-                const int value = sine[i * 16] + sine[j * 16] + (sine[((i + j) * 16) & 1023] >> 1);
-                // 104 + Math.round(value * 0.0330). Exact rational arithmetic
-                // also preserves JS's ties toward +infinity for negative v.
-                const int scaled = value * 33 + 500;
+                const int value = sine[i * 16] + sine[j * 16] + ((sine[((i + j) * 16) & 1023] * crossW) >> 8);
+                // 104 + Math.round(value * amp / 1000). Exact rational
+                // arithmetic also preserves JS's ties toward +infinity for
+                // negative v. amp is 33 at the default contrast.
+                const int scaled = value * amp + 500;
                 int idx = 104 + (scaled >= 0 ? scaled / 1000 : (scaled - 999) / 1000);
                 idx = idx < 0 ? 0 : (idx > 255 ? 255 : idx);
                 tex[j * TILE_N + i] = ramp[idx];
             }
         }
-        lastBrightness = p[2];
+        lastTexKey = texKey;
         lastThemeGen = gen;
     }
 
     const float t = static_cast<float>(tMs) * speedMul(p[0]);
+    // Turn rate, drift and breath rate are all 1.0f at slider 50, so each one
+    // multiplies its constant by exactly one and the default frame is the old
+    // frame. Below 50 they run down to a standstill; above, up to three times
+    // the old rate for the two clocks and twice the old speed for the drift.
+    const auto rateMul = [](uint8_t v) {
+        return v <= 50 ? static_cast<float>(v) / 50.0f : 1.0f + static_cast<float>(v - 50) * (2.0f / 50.0f);
+    };
+    const float turnMul = rateMul(p[5]);
+    const float breathMul = rateMul(p[7]);
+    const float driftMul = static_cast<float>(p[6]) / 50.0f;
     // One turn in 120 seconds, using the same 1,024-step sine and cosine.
-    const int angle = static_cast<int>(t * (1024.0f / 120000.0f) + 0.5f) & 1023;
+    const int angle = static_cast<int>(t * (1024.0f / 120000.0f) * turnMul + 0.5f) & 1023;
     // One 40-second breath of +/-22.5 percent. The unbreathed scale is
     // 0.20..0.50 texels/pixel, hence even the largest breath stays below 1.
-    const float breath = 1.0f + 0.225f * sinf(t * (6.283185307179586f / 40000.0f));
+    // Breath rate changes how often it breathes and never how far, which is
+    // what keeps |du| and |dv| inside the kernel's bound below.
+    const float breath = 1.0f + 0.225f * sinf(t * (6.283185307179586f / 40000.0f) * breathMul);
     const float sBase = 0.20f + p[1] * (0.30f / 100.0f);
     const int scale = static_cast<int>(65536.0f * sBase * breath + 0.5f);
     du = (sine[(angle + 256) & 1023] * scale) >> 9;
@@ -95,8 +127,8 @@ void frame(uint32_t tMs, int, int, const uint8_t p[BG_ANIM_PARAMS]) {
     // Translation is 5 and 3.2 px/s measured at the unbreathed scale.
     // Wrap before conversion so every uint32 timestamp stays in range.
     const float nom = 65536.0f * sBase;
-    const uint32_t cu = static_cast<uint32_t>(fmodf(t * 0.005f * nom, static_cast<float>(SPAN)) + 0.5f);
-    const uint32_t cv = static_cast<uint32_t>(fmodf(t * 0.0032f * nom, static_cast<float>(SPAN)) + 0.5f);
+    const uint32_t cu = static_cast<uint32_t>(fmodf(t * 0.005f * nom * driftMul, static_cast<float>(SPAN)) + 0.5f);
+    const uint32_t cv = static_cast<uint32_t>(fmodf(t * 0.0032f * nom * driftMul, static_cast<float>(SPAN)) + 0.5f);
     // The page anchors at (240,240), including when w/h differ. Retain that
     // fixed panel origin, rather than silently changing the crop at 240 wide.
     // Unsigned phases define the page's |0 wrap without signed C++ overflow.
@@ -242,7 +274,7 @@ void release() {
     releaseTable(phaseData, 24 * sizeof(int32_t));
     sine = nullptr; // shared table, never owned here
     lastThemeGen = 0;
-    lastBrightness = -1;
+    lastTexKey = -1;
     u0 = v0 = 0;
     du = dv = 0;
 }
@@ -256,7 +288,11 @@ const BgAnimation bg_anim_weave = {
     {{"speed", "Speed", 50},
      {"scale", "Weave scale", 50},
      {"brightness", "Brightness", 62},
-     {nullptr, nullptr, 0}},
+     {"contrast", "Contrast", 50},
+     {"cross", "Cross weave", 50},
+     {"turn", "Turn rate", 50},
+     {"drift", "Drift", 50},
+     {"breath", "Breath rate", 50}},
     init,
     frame,
     band,

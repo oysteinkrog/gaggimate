@@ -3341,21 +3341,34 @@ const pa_dith = (x, y) => (BAYER8[(y & 7) * 8 + (x & 7)] - 31.5) * (1 / 64);
     params: [
       { key: 'speed', label: 'Speed', def: 50 },
       { key: 'scale', label: 'Weave scale', def: 50 },
-      { key: 'brightness', label: 'Brightness', def: 62 }],
+      { key: 'brightness', label: 'Brightness', def: 62 },
+      { key: 'contrast', label: 'Contrast', def: 50 },
+      { key: 'cross', label: 'Cross weave', def: 50 },
+      { key: 'turn', label: 'Turn rate', def: 50 },
+      { key: 'drift', label: 'Drift', def: 50 },
+      { key: 'breath', label: 'Breath rate', def: 50 }],
     init(w, h, state) {
       state.tex = new Uint32Array(T_N * T_N);
       state.key = null;
     },
     render(data, w, h, tMs, p, state) {
-      const key = p[2] + '|' + THEME.gen;
+      // The five sliders added on 2026-09-10 (gm-3vj.30). Every map is
+      // exactly its old constant at 50, so the defaults draw what this
+      // preview drew before them. amp is thousandths of a palette step per
+      // sine unit (8 .. 33 .. 66) and crossW the Q8 weight of the diagonal
+      // sine, where 128 is the >> 1 this table was written with.
+      const amp = (p[3] <= 50 ? 8 + ((p[3] * 25 / 50) | 0)
+                              : 33 + (((p[3] - 50) * 33 / 50) | 0)) / 1000;
+      const crossW = (p[4] * 256 / 100) | 0;
+      const key = p[2] + '|' + p[3] + '|' + p[4] + '|' + THEME.gen;
       if (state.key !== key) {
         state.key = key;
         const pal = pa_ramp32(pa_bright(p[2])), tex = state.tex;
         for (let j = 0, c = 0; j < T_N; j++) {
           for (let i = 0; i < T_N; i++, c++) {
             const v = SIN[(i * 16) & (SIN_N - 1)] + SIN[(j * 16) & (SIN_N - 1)] +
-              (SIN[(i * 16 + j * 16) & (SIN_N - 1)] >> 1);
-            let idx = 104 + Math.round(v * 0.0330);       // ramp 62..146
+              ((SIN[(i * 16 + j * 16) & (SIN_N - 1)] * crossW) >> 8);
+            let idx = 104 + Math.round(v * amp);          // ramp 62..146
             idx = idx < 0 ? 0 : idx > 255 ? 255 : idx;
             tex[c] = pal[idx];
           }
@@ -3363,8 +3376,15 @@ const pa_dith = (x, y) => (BAYER8[(y & 7) * 8 + (x & 7)] - 31.5) * (1 / 64);
       }
       const spd = speedMulJS(p[0]);
       const t = tMs * spd;
-      const A = Math.round(t * (TURN / 120000)) | 0;                 // one turn per 120 s
-      const breath = 1 + 0.225 * Math.sin(t * (2 * Math.PI / 40000));
+      // Turn rate and breath rate run each clock from a standstill to three
+      // times its old rate; drift from anchored to twice its old speed.
+      // Breath rate never changes how far the scale swings, which is what
+      // keeps the firmware kernel's cursor bound where it was.
+      const turnMul = p[5] <= 50 ? p[5] / 50 : 1 + (p[5] - 50) * (2 / 50);
+      const breathMul = p[7] <= 50 ? p[7] / 50 : 1 + (p[7] - 50) * (2 / 50);
+      const driftMul = p[6] / 50;
+      const A = Math.round(t * (TURN / 120000) * turnMul) | 0;       // one turn per 120 s
+      const breath = 1 + 0.225 * Math.sin(t * (2 * Math.PI / 40000) * breathMul);
       // 0.20 to 0.50 texels per pixel before the breath, so one tile is 128 to
       // 320 px and the panel holds two to four of them. At the spec's one texel
       // per pixel the tile repeated seven and a half times and the weave read
@@ -3378,8 +3398,8 @@ const pa_dith = (x, y) => (BAYER8[(y & 7) * 8 + (x & 7)] - 31.5) * (1 / 64);
       // Translation at 5 px/s and 3.2 px/s, taken against the unbreathed scale
       // and wrapped into one tile so the Q16.16 accumulators never overflow.
       const nom = 65536 * sBase;
-      const cu = Math.round((t * 0.005 * nom) % SPAN) | 0;
-      const cv = Math.round((t * 0.0032 * nom) % SPAN) | 0;
+      const cu = Math.round((t * 0.005 * nom * driftMul) % SPAN) | 0;
+      const cv = Math.round((t * 0.0032 * nom * driftMul) % SPAN) | 0;
       let u = (cu - 240 * du - 240 * duY) | 0;
       let v = (cv - 240 * dv - 240 * dvY) | 0;
       const { tex } = state;
