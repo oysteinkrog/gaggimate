@@ -4909,17 +4909,20 @@ function pcDither(dst, amp) {
    --------------------------------------------------------------------------- */
 (() => {
   const CAP = 40;                  // crossings per row per layer
-  const GLOWN = 22;
-  const NSTAR = 90;
+  const GLOWN = 22;                // far layer haze height at Ridge haze 50
+  const GLOW_MAX = GLOWN * 2;      // and at Ridge haze 100, which sizes the profile
+  const NSTAR = 90;                // stars at Star density 50
+  const NSTAR_MAX = NSTAR * 2;     // and at Star density 100, which sizes the tables
+  const SPREAD_ANCHOR = 424;       // Ridge spacing slides the far layers toward the near one
   const GLOW_PEAK = 185;           // haze weight at the ridge, both sides
   // Ordered dither down the y axis, in Q8. Everything here is a row fill, so a
   // one index step in a slow vertical ramp lands as a hard line across the
   // whole panel; interleaving four rows turns each step into a soft handover.
   const BY = [0, 128, 64, 192];
   const LAY = [
-    { base: 268, a1: 26, a2: 9, k1: 1024 / 380, k2: 1024 / 168, sp: 4, idx: 126, fade: 14, r1: 0.000041, r2: 0.000027 },
-    { base: 346, a1: 31, a2: 11, k1: 1024 / 320, k2: 1024 / 141, sp: 8, idx: 98, fade: 12, r1: 0.000033, r2: 0.000051 },
-    { base: 424, a1: 35, a2: 12, k1: 1024 / 265, k2: 1024 / 116, sp: 16, idx: 64, fade: 10, r1: 0.000059, r2: 0.000037 },
+    { base: 268, a1: 26, a2: 9, k1: 1024 / 380, k2: 1024 / 168, sp: 4, idx: 126, fade: 14, gn: GLOWN, r1: 0.000041, r2: 0.000027 },
+    { base: 346, a1: 31, a2: 11, k1: 1024 / 320, k2: 1024 / 141, sp: 8, idx: 98, fade: 12, gn: 16, r1: 0.000033, r2: 0.000051 },
+    { base: 424, a1: 35, a2: 12, k1: 1024 / 265, k2: 1024 / 116, sp: 16, idx: 64, fade: 10, gn: 11, r1: 0.000059, r2: 0.000037 },
   ];
 
   ANIMS.push({
@@ -4929,6 +4932,10 @@ function pcDither(dst, amp) {
       { key: 'relief', label: 'Ridge relief', def: 50 },
       { key: 'depth', label: 'Layer contrast', def: 55 },
       { key: 'bright', label: 'Brightness', def: 60 },
+      { key: 'spread', label: 'Ridge spacing', def: 50 },
+      { key: 'haze', label: 'Ridge haze', def: 50 },
+      { key: 'sky', label: 'Sky tone', def: 50 },
+      { key: 'stars', label: 'Star density', def: 50 },
     ],
     init(w, h, state) {
       state.key = null; state.pal32 = null;
@@ -4940,12 +4947,10 @@ function pcDither(dst, amp) {
       state.sky = new Uint32Array(h);
       // Haze profile at quarter pixel steps. Sampled per whole row it steps
       // wherever the ridge crosses a row boundary, which shows as vertical
-      // stripes through the band.
-      state.glowTab = new Uint8Array(GLOWN * 4 + 8);
-      for (let k = 0; k < state.glowTab.length; k++) {
-        const u = Math.min(1, k / (GLOWN * 4));
-        state.glowTab[k] = Math.round(GLOW_PEAK * (1 - u) * (1 - u));
-      }
+      // stripes through the band. Ridge haze scales its length, so it is
+      // sized for the top of that range and rebuilt when the slider moves.
+      state.glowTab = new Uint8Array(GLOW_MAX * 4 + 8);
+      state.hazeKey = -1;
       // Smoothstep, 0..256 in and out, for the fade-in below a ridge.
       state.ss = new Uint16Array(257);
       for (let k = 0; k <= 256; k++) {
@@ -4953,12 +4958,14 @@ function pcDither(dst, amp) {
         state.ss[k] = Math.round(256 * t * t * (3 - 2 * t));
       }
       // Star field: fixed positions, a phase and a brightness class each.
+      // Drawn in order, so the first n of them are the same stars whatever
+      // Star density is.
       const rnd = mulberry32(0x5eed51);
-      state.stx = new Float32Array(NSTAR);
-      state.sty = new Int16Array(NSTAR);
-      state.stp = new Int16Array(NSTAR);
-      state.stb = new Uint8Array(NSTAR);
-      for (let i = 0; i < NSTAR; i++) {
+      state.stx = new Float32Array(NSTAR_MAX);
+      state.sty = new Int16Array(NSTAR_MAX);
+      state.stp = new Int16Array(NSTAR_MAX);
+      state.stb = new Uint8Array(NSTAR_MAX);
+      for (let i = 0; i < NSTAR_MAX; i++) {
         state.stx[i] = rnd() * w;
         state.sty[i] = 8 + ((rnd() * 214) | 0);
         state.stp[i] = (rnd() * 1024) | 0;
@@ -4979,11 +4986,29 @@ function pcDither(dst, amp) {
       const tt = tMs * sm;
       const relief = 0.5 + p[1] * 0.012;
       const contrast = 0.6 + p[2] * 0.008;
+      // Ridge haze: none at 0, the heights below at 50, twice them at 100.
+      // The profile is built at the far layer's height, the longest, and the
+      // two nearer layers truncate it.
+      if (state.hazeKey !== p[5]) {
+        state.hazeKey = p[5];
+        const gf = Math.max(1, Math.min(GLOW_MAX, (GLOWN * p[5] / 50) | 0));
+        for (let k = 0; k < state.glowTab.length; k++) {
+          const u = Math.min(1, k / (gf * 4));
+          state.glowTab[k] = Math.round(GLOW_PEAK * (1 - u) * (1 - u));
+        }
+      }
+      // Star density: none at 0, 90 at 50, 180 at 100.
+      const nStar = Math.min(NSTAR_MAX, (p[7] * 9 / 5) | 0);
+      // Sky tone: the palette index the sky starts from, black at 0, the
+      // page's own 22 at 50, 44 at 100. The lift toward the ridge line stays
+      // at 44, because a steeper ramp bands: the sky is a flat row fill
+      // dithered over four rows and cannot carry a palette step every five.
+      const skyBase = (22 * p[6] / 50) | 0;
 
       // Sky: a gradient that lifts toward the far ridge line.
       for (let y = 0; y < h; y++) {
         const f = y / h;
-        let idx = ((22 << 8) + ((44 * f * f * 256) | 0) + BY[y & 3]) >> 8;
+        let idx = ((skyBase << 8) + ((44 * f * f * 256) | 0) + BY[y & 3]) >> 8;
         if (idx > 255) idx = 255;
         sky[y] = pal32[idx];
         u32.fill(sky[y], y * w, y * w + w);
@@ -4992,7 +5017,7 @@ function pcDither(dst, amp) {
       // Stars, under everything the hills draw.
       const drift = (tt * 0.0006) % w;
       const tw = (tt * 0.0009) | 0;
-      for (let i = 0; i < NSTAR; i++) {
+      for (let i = 0; i < nStar; i++) {
         const xf = state.stx[i] + drift;
         const xi = xf | 0, fr = ((xf - xi) * 256) | 0;
         const x0 = xi >= w ? xi - w : xi, x1 = x0 + 1 >= w ? 0 : x0 + 1;
@@ -5014,7 +5039,11 @@ function pcDither(dst, amp) {
         const a1 = la.a1 * relief, a2 = la.a2 * relief;
         const s = tt * la.sp / 1000;
         const q1 = tt * la.r1 * 1024, q2 = tt * la.r2 * 1024;
-        const topRow = la.base - (a1 + a2);
+        // Ridge spacing: the near layer stays put and the two behind it slide
+        // toward it, so 0 stacks all three ridges on the near line and 100
+        // lifts the far one to row 112. Integer, so 50 is 268, 346 and 424.
+        const lbase = SPREAD_ANCHOR + (((la.base - SPREAD_ANCHOR) * p[4] / 50) | 0);
+        const topRow = lbase - (a1 + a2);
         const idx0 = Math.round(30 + (la.idx - 30) * contrast);
         const fade = la.fade;                        // rows the layer takes to appear
         const fadeInv = (65536 / (fade * 256)) | 0;  // Q8 reciprocal of the band
@@ -5027,7 +5056,7 @@ function pcDither(dst, amp) {
         for (let x = 0; x < w; x++) {
           const i1 = (((x + s) * la.k1 + q1) | 0) & 1023;
           const i2 = (((x + s) * la.k2 + q2) | 0) & 1023;
-          const v = (la.base * 256 + ((SIN[i1] * a1 + SIN[i2] * a2) >> 1)) | 0;
+          const v = (lbase * 256 + ((SIN[i1] * a1 + SIN[i2] * a2) >> 1)) | 0;
           hQ[x] = v;
           let r = (v >> 8) + 1 + fade;      // the fill starts below the fade band
           if (r < 0) r = 0; else if (r > h) r = h;
@@ -5068,7 +5097,7 @@ function pcDither(dst, amp) {
         // Anti-aliased ridge line, then the haze band above it. The haze is
         // the layer's own colour lifted toward the ramp, so each ridge reads as
         // distance rather than a cut edge.
-        const gn = L === 0 ? GLOWN : L === 1 ? 16 : 11;
+        const gn = (la.gn * p[5] / 50) | 0;
         const glowCol = pal32[Math.min(255, idx0 + 26)];
         for (let x = 0; x < w; x++) {
           const v = hQ[x], r = v >> 8;

@@ -12,6 +12,18 @@
 // ramp and the layers sit in the 40..120 index band, so mean luma stays
 // readable.
 //
+// Eight parameters, and every one of them is read in frame(): speed, ridge
+// relief and layer contrast as they always were, brightness through the
+// palette, and four added in gm-3vj.40. Ridge spacing (p[4]) moves the two
+// far bases toward the near one. Ridge haze (p[5]) scales every haze band's
+// height and the quarter-pixel profile with it. Sky tone (p[6]) lifts the
+// palette index the sky starts from. Star density (p[7]) sets how many of one
+// fixed star field are drawn. At 50 each of the four is exactly the constant
+// this file used to hard-code, so the default picture is unchanged pixel for
+// pixel. band(), bandRef() and the two Xtensa
+// kernels are untouched: what the four parameters change is the tables and
+// the per-layer constants frame() writes.
+//
 // The page scales the shared theme ramp by its own Brightness parameter,
 // themeRamp(176 + round(p[3] * 0.8)), and frame() keeps that: the parameter
 // is the page's, not the global animation brightness, and the look the owner
@@ -98,11 +110,16 @@ namespace {
 using namespace bganim;
 
 constexpr int LAYERS = 3;
-constexpr int CAP = 40;                  // the page's crossings per row per layer
-constexpr int GLOWN = 22;                // far layer haze height in pixels
-constexpr int GLOW_SIZE = GLOWN * 4 + 8; // quarter-pixel profile plus zero pad
-constexpr int GLOW_PEAK = 185;           // Q8 haze weight where haze meets fade
-constexpr int NSTAR = 90;
+constexpr int CAP = 40;                     // the page's crossings per row per layer
+constexpr int GLOWN = 22;                   // far layer haze height at Ridge haze 50
+constexpr int GLOW_MAX = GLOWN * 2;         // and at Ridge haze 100, which sizes the profile
+constexpr int GLOW_SIZE = GLOW_MAX * 4 + 8; // quarter-pixel profile plus zero pad
+constexpr int GLOW_PEAK = 185;              // Q8 haze weight where haze meets fade
+constexpr int NSTAR = 90;                   // stars at Star density 50
+constexpr int NSTAR_MAX = NSTAR * 2;        // and at Star density 100, which sizes the tables
+// Ridge spacing holds the near layer where it is and slides the other two
+// toward it, so the anchor is the near layer's own base.
+constexpr int SPREAD_ANCHOR = 424;
 constexpr int TILE = 16;                          // columns per skip tile
 constexpr int MAX_W = 480;                        // panel width, the largest render width
 constexpr int MAX_TILES = (MAX_W + TILE - 1) / TILE;
@@ -150,27 +167,33 @@ int16_t *tileBound = nullptr;  // [LAYERS * MAX_TILES * 2] per-tile {min, max} o
 uint8_t *glowTab = nullptr;    // [GLOW_SIZE]            quarter-pixel haze weight
 uint16_t *smooth = nullptr;    // [SS_N]                 smoothstep, 0..256
 uint16_t *palette = nullptr;   // [256]                  theme ramp at this brightness
-Star *stars = nullptr;         // [NSTAR]                projected stars
-uint8_t *starRow = nullptr;    // [NSTAR]                star rows alone, for the row scan
+Star *stars = nullptr;         // [NSTAR_MAX]            projected stars
+uint8_t *starRow = nullptr;    // [NSTAR_MAX]            star rows alone, for the row scan
 Layer *layers = nullptr;       // [LAYERS]
 uint16_t *work = nullptr;      // [WORK_N]               tile scratch plus PIE constants
-StarDef *starDef = nullptr;    // [NSTAR]                fixed star field, frame() only, PSRAM
+uint16_t *skyCol = nullptr;    // [allocH]               sky colour per row, dither included
+StarDef *starDef = nullptr;    // [NSTAR_MAX]            fixed star field, frame() only, PSRAM
 const int16_t *sine = nullptr; // borrowed shared sine LUT
 
 int allocW = 0, allocH = 0;
 int starTop = 0, starBot = 0; // rows a star can touch, inclusive
+int starN = NSTAR;            // stars actually drawn, from the density parameter
 int lastBright = -1;
+int lastHaze = -1;
+int lastSky = -1;
 uint32_t lastThemeGen = 0xFFFFFFFFu;
 
-// Hot slab at w = 480, each table's own size and then what allocHot rounds
-// it to: heightQ 2,880, tileBound 360 (368), glowTab 96 (96), smooth 514
-// (528), palette 512 (512), stars 540 (544), starRow 90 (96), layers 120
-// (128), work 272 (272). Measured total 5,424 B of the 9,216 B an animation
-// may take, 3,984 B at w = 240 and 3,952 B at w = 233, with no fallback to
-// PSRAM and the slab back to empty after release(). PSRAM holds starDef,
-// 1,080 B, which frame() reads and band() never does. Every table read per
-// pixel or per row comes from allocHot, and nothing is allocated in frame()
-// or band().
+// Hot slab at w = 480, h = 480, each table's own size and then what allocHot
+// rounds it to: heightQ 2,880, tileBound 360 (368), glowTab 184 (192), smooth
+// 514 (528), palette 512 (512), stars 1,080 (1,088), starRow 180 (192),
+// layers 120 (128), work 272 (272), skyCol 960 (960). The star and haze
+// tables are sized for the top of their parameter ranges, not for the
+// defaults. Measured total 7,120 B of the 9,216 B an animation may take,
+// 5,200 B at w = 240 and 5,168 B at w = 233, with no fallback to PSRAM and
+// the slab back to empty after release(). PSRAM holds starDef, 2,160 B,
+// which frame() reads and band() never does. Every table read per pixel or
+// per row comes from allocHot, and nothing is allocated in frame() or
+// band().
 void release();
 
 // The page's mulberry32, in uint32 arithmetic. JS does the same work on
@@ -199,26 +222,20 @@ bool init(int w, int h) {
     glowTab = static_cast<uint8_t *>(allocHot(GLOW_SIZE));
     smooth = static_cast<uint16_t *>(allocHot(SS_N * sizeof(uint16_t)));
     palette = static_cast<uint16_t *>(allocHot(256 * sizeof(uint16_t)));
-    stars = static_cast<Star *>(allocHot(NSTAR * sizeof(Star)));
-    starRow = static_cast<uint8_t *>(allocHot(NSTAR));
+    stars = static_cast<Star *>(allocHot(NSTAR_MAX * sizeof(Star)));
+    starRow = static_cast<uint8_t *>(allocHot(NSTAR_MAX));
     layers = static_cast<Layer *>(allocHot(LAYERS * sizeof(Layer)));
     work = static_cast<uint16_t *>(allocHot(WORK_N * sizeof(uint16_t)));
-    starDef = static_cast<StarDef *>(alloc(NSTAR * sizeof(StarDef)));
+    skyCol = static_cast<uint16_t *>(allocHot(static_cast<size_t>(h) * sizeof(uint16_t)));
+    starDef = static_cast<StarDef *>(alloc(NSTAR_MAX * sizeof(StarDef)));
     // One test over every pointer, and release() on any failure, so a half
     // finished init() leaves the slab exactly as it found it and the retry
     // BgAnim.h promises starts from scratch.
     if (heightQ == nullptr || tileBound == nullptr || glowTab == nullptr || smooth == nullptr || palette == nullptr ||
-        stars == nullptr || starRow == nullptr || layers == nullptr || work == nullptr || starDef == nullptr) {
+        stars == nullptr || starRow == nullptr || layers == nullptr || work == nullptr || skyCol == nullptr ||
+        starDef == nullptr) {
         release();
         return false;
-    }
-    // Haze profile at quarter-pixel steps. Sampled per whole row it steps
-    // wherever the ridge crosses a row boundary, which shows as vertical
-    // stripes through the band. The pad past GLOWN * 4 holds zero so a
-    // clamped index reads a weight of nothing.
-    for (int k = 0; k < GLOW_SIZE; k++) {
-        const float u = k < GLOWN * 4 ? k * (1.0f / (GLOWN * 4)) : 1.0f;
-        glowTab[k] = static_cast<uint8_t>(GLOW_PEAK * (1.0f - u) * (1.0f - u) + 0.5f);
     }
     for (int k = 0; k < SS_N; k++) {
         const float t = k * (1.0f / 256.0f);
@@ -240,10 +257,14 @@ bool init(int w, int h) {
     }
     // Star field: fixed positions, a twinkle phase and a brightness class
     // each, drawn from the page's seed in the page's call order.
+    // Drawn in order, so the first starN of them are the same stars whatever
+    // the density parameter is, and the row extremes below cover the whole
+    // field rather than the drawn part: a wider row scan finds nothing extra,
+    // a narrower one would drop a star.
     uint32_t rng = 0x5eed51u;
     starTop = 480;
     starBot = 0;
-    for (int i = 0; i < NSTAR; i++) {
+    for (int i = 0; i < NSTAR_MAX; i++) {
         StarDef &s = starDef[i];
         // Multiply before the conversion so the PRNG fraction is not rounded
         // first; the page holds this in a Float32Array too.
@@ -267,7 +288,21 @@ bool init(int w, int h) {
 // soft handover.
 BGANIM_INLINE int ditherY(int y) { return ((y & 1) << 7) | ((y & 2) << 5); }
 
+// Haze profile at quarter-pixel steps, over gn rows. Sampled per whole row it
+// steps wherever the ridge crosses a row boundary, which shows as vertical
+// stripes through the band. The pad past gn * 4 holds zero so a clamped index
+// reads a weight of nothing, which is also what lets a layer whose own haze
+// is shorter than gn truncate the profile instead of rescaling it, the way
+// the page does by running its haze loop from its own height down to 1.
+void buildGlow(int gn) {
+    for (int k = 0; k < GLOW_SIZE; k++) {
+        const float u = k < gn * 4 ? k * (1.0f / (gn * 4)) : 1.0f;
+        glowTab[k] = static_cast<uint8_t>(GLOW_PEAK * (1.0f - u) * (1.0f - u) + 0.5f);
+    }
+}
+
 void frame(uint32_t tMs, int w, int h, const uint8_t p[BG_ANIM_PARAMS]) {
+    bool palNew = false;
     if (lastBright != p[3] || lastThemeGen != themeGen()) {
         // The page's own brightness, 176 + round(p[3] * 0.8), on top of the
         // shared theme tone. round(x) is floor(x + 1/2), which for p in
@@ -275,14 +310,55 @@ void frame(uint32_t tMs, int w, int h, const uint8_t p[BG_ANIM_PARAMS]) {
         buildThemeRamp(palette, static_cast<uint16_t>(176 + (static_cast<int>(p[3]) * 4 + 2) / 5));
         lastBright = p[3];
         lastThemeGen = themeGen();
+        palNew = true;
+    }
+    // Ridge haze, p[5]: the height of every haze band as a fraction of the
+    // page's, none at 0, the page's own 22, 16 and 11 rows at 50, twice that
+    // at 100. The profile is built at the far layer's height, which is the
+    // longest, and the two nearer layers truncate it. Rebuilt only when the
+    // slider moves, so a frame pays nothing for it.
+    if (lastHaze != p[5]) {
+        int gnFull = GLOWN * static_cast<int>(p[5]) / 50;
+        if (gnFull < 1) gnFull = 1; // the sub-pixel row above a ridge still reads the profile
+        if (gnFull > GLOW_MAX) gnFull = GLOW_MAX;
+        buildGlow(gnFull);
+        lastHaze = p[5];
+    }
+    // Sky tone, p[6]: how light the night sky is. The page starts the sky at
+    // palette index 22 and lifts it 44 more toward the far ridge line; this
+    // moves the starting index, black at slider 0, the page's 22 at 50 and 44
+    // at 100, and leaves the lift alone. Moving the lift instead was tried
+    // and dropped: the sky is a flat row fill dithered over four rows, so a
+    // steeper ramp puts a palette step every five or six rows and the sky
+    // reads as horizontal bands. Shifting the whole ramp adds no step at all.
+    // The row colours go in a table because it is rebuilt only when the
+    // slider or the palette moves, never per frame, which also takes a
+    // division out of the row path.
+    if (palNew || lastSky != p[6]) {
+        const int skyBase = 22 * static_cast<int>(p[6]) / 50;
+        for (int y = 0; y < allocH; y++) {
+            // The numerator is under 2^32 for any height up to 480 and the
+            // height is never zero.
+            const uint32_t skyQ = 44u * static_cast<uint32_t>(y) * static_cast<uint32_t>(y) * 256u /
+                                  (static_cast<uint32_t>(allocH) * static_cast<uint32_t>(allocH));
+            int skyIdx = (skyBase * 256 + static_cast<int>(skyQ) + ditherY(y)) >> 8;
+            if (skyIdx > 255) skyIdx = 255;
+            skyCol[y] = palette[skyIdx];
+        }
+        lastSky = p[6];
     }
     const float tt = static_cast<float>(tMs) * speedMul(p[0]);
     const float relief = 0.5f + p[1] * 0.012f;
     const float contrast = 0.6f + p[2] * 0.008f;
+    // Star density, p[7]: none at 0, the page's 90 at 50, 180 at 100. The
+    // stars drawn are always the first starN of one fixed field, so raising
+    // the slider adds stars and never moves the ones already there.
+    starN = static_cast<int>(p[7]) * 9 / 5;
+    if (starN > NSTAR_MAX) starN = NSTAR_MAX;
 
     const float drift = fmodf(tt * 0.0006f, static_cast<float>(w)); // 0.6 px/s at speed 50
     const uint32_t tw = static_cast<uint32_t>(tt * 0.0009f);        // twinkle phase, ~19 min per turn
-    for (int i = 0; i < NSTAR; i++) {
+    for (int i = 0; i < starN; i++) {
         const StarDef &s = starDef[i];
         const float xf = s.x + drift; // below 2w: s.x < w and drift < w
         const int xi = static_cast<int>(xf);
@@ -299,16 +375,21 @@ void frame(uint32_t tMs, int w, int h, const uint8_t p[BG_ANIM_PARAMS]) {
     for (int l = 0; l < LAYERS; l++) {
         const LayerDef d = definition(l);
         Layer &s = layers[l];
-        s.base = d.base;
+        // Ridge spacing, p[4]: the near layer stays where it is and the two
+        // behind it slide toward it, so 0 stacks all three ridges on the near
+        // line and 100 lifts the far one to row 112. Integer, so 50 is the
+        // page's own 268, 346 and 424 exactly.
+        const int base = SPREAD_ANCHOR + (d.base - SPREAD_ANCHOR) * static_cast<int>(p[4]) / 50;
+        s.base = base;
         s.fade = d.fade;
-        s.gn = d.glow;
+        s.gn = d.glow * static_cast<int>(p[5]) / 50;
         s.fadeInv = 256 / d.fade; // 18, 21, 25: the page's truncated Q8 reciprocal
         s.idx0 = static_cast<int>(30.0f + (d.index - 30) * contrast + 0.5f);
         s.glow = palette[s.idx0 + 26 > 255 ? 255 : s.idx0 + 26];
         const float a1 = d.a1 * relief, a2 = d.a2 * relief;
         // The page truncates y - topRow toward zero before scaling it, so
         // both brackets of the float top row are needed, not one rounding.
-        const float top = d.base - (a1 + a2);
+        const float top = base - (a1 + a2);
         s.topFloor = static_cast<int>(floorf(top));
         s.topCeil = static_cast<int>(ceilf(top));
         const float scroll = tt * d.speed * 0.001f;
@@ -666,19 +747,14 @@ template <bool Asm> GM_ANIM_IRAM void renderRow(uint16_t *out, int y, int w, int
     }
 
     if (first == 0) {
-        // Sky: a quadratic ramp that lifts toward the far ridge line. The
-        // numerator is under 2^32 for any height up to 480 and the height is
-        // never zero.
-        const uint32_t skyQ = 44u * static_cast<uint32_t>(y) * static_cast<uint32_t>(y) * 256u /
-                              (static_cast<uint32_t>(allocH) * static_cast<uint32_t>(allocH));
-        int skyIdx = (22 * 256 + static_cast<int>(skyQ) + ditherY(y)) >> 8;
-        if (skyIdx > 255) skyIdx = 255;
-        const uint16_t sky = palette[skyIdx];
+        // Sky: a quadratic ramp that lifts toward the far ridge line, built
+        // per row in frame() with the dither already in it.
+        const uint16_t sky = skyCol[y];
         for (int i = 0; i < TILE; i++) colV[i] = sky;
         fillRun<Asm>(out, colV, sky, w);
 
         if (y >= starTop && y <= starBot) {
-            for (int i = 0; i < NSTAR; i++) {
+            for (int i = 0; i < starN; i++) {
                 const int dy = y - starRow[i];
                 if (dy < -1 || dy > 1) continue;
                 const Star &s = stars[i];
@@ -794,15 +870,19 @@ void release() {
     releaseTable(glowTab, static_cast<size_t>(GLOW_SIZE));
     releaseTable(smooth, SS_N * sizeof(uint16_t));
     releaseTable(palette, 256 * sizeof(uint16_t));
-    releaseTable(stars, NSTAR * sizeof(Star));
-    releaseTable(starRow, static_cast<size_t>(NSTAR));
+    releaseTable(stars, NSTAR_MAX * sizeof(Star));
+    releaseTable(starRow, static_cast<size_t>(NSTAR_MAX));
     releaseTable(layers, LAYERS * sizeof(Layer));
     releaseTable(work, WORK_N * sizeof(uint16_t));
-    releaseTable(starDef, NSTAR * sizeof(StarDef));
+    releaseTable(skyCol, static_cast<size_t>(allocH) * sizeof(uint16_t));
+    releaseTable(starDef, NSTAR_MAX * sizeof(StarDef));
     sine = nullptr;
     allocW = allocH = 0;
     starTop = starBot = 0;
+    starN = NSTAR;
     lastBright = -1;
+    lastHaze = -1;
+    lastSky = -1;
     lastThemeGen = 0xFFFFFFFFu;
 }
 
@@ -815,7 +895,11 @@ const BgAnimation bg_anim_hills = {
     {{"speed", "Speed", 50},
      {"relief", "Ridge relief", 50},
      {"depth", "Layer contrast", 55},
-     {"bright", "Brightness", 60}},
+     {"bright", "Brightness", 60},
+     {"spread", "Ridge spacing", 50},
+     {"haze", "Ridge haze", 50},
+     {"sky", "Sky tone", 50},
+     {"stars", "Star density", 50}},
     init,
     frame,
     band,

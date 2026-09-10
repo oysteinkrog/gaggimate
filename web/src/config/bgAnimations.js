@@ -531,6 +531,10 @@ export const BG_ANIMATIONS = [
       { key: 'relief', label: 'Ridge relief', def: 50 },
       { key: 'depth', label: 'Layer contrast', def: 55 },
       { key: 'bright', label: 'Brightness', def: 60 },
+      { key: 'spread', label: 'Ridge spacing', def: 50 },
+      { key: 'haze', label: 'Ridge haze', def: 50 },
+      { key: 'sky', label: 'Sky tone', def: 50 },
+      { key: 'stars', label: 'Star density', def: 50 },
     ],
   },
   {
