@@ -41,7 +41,7 @@ OrbitDef orbits[MAX_ORBITS];
 int orbitCount = 0;
 PathPt *pathBins = nullptr;      // [orbit][band][pt]
 uint8_t *pathBinCount = nullptr; // [orbit][band]
-int lastCountP = -1, lastEccP = -1;
+int lastCountP = -1, lastEccP = -1, lastSizeP = -1, lastPathP = -1, lastTiltP = -1;
 uint32_t lastThemeGen = 0xFFFFFFFF;
 // Resolution the path points were baked at. pathBins holds literal pixel
 // coordinates, and unlike the other animations' tables its SIZE is independent
@@ -80,12 +80,41 @@ int sampleCount = 0;
 uint8_t *sampleBinCount = nullptr; // [NUM_BANDS]
 uint8_t *sampleBinIdx = nullptr;   // [NUM_BANDS][SAMPLE_BIN_CAP], indices into samples[]
 
-void rebuildGeometry(int countP, int eccP, int w, int h) {
+// Slider maps for the four parameters added on 2026-09-10 (gm-3vj.11). Each
+// one returns exactly 1.0f at 50, and the call sites multiply a constant this
+// file used to hard-code, so every default reproduces the old pixel exactly:
+// a float times 1.0f is the same float. The 50 point is reached by a division
+// where the shape allows one, because 50/50.0f is exactly 1 while 50 times a
+// rounded 1/50 is only nearly so.
+inline float sizeMulOf(int v) { return v < 50 ? 0.40f + v * (0.60f / 50.0f) : 1.0f + (v - 50) * (0.35f / 50.0f); } // 0.40 .. 1.35
+inline float pathMulOf(int v) { return v < 50 ? v / 50.0f : 1.0f + (v - 50) * (3.0f / 50.0f); }                    // 0 .. 4
+inline float glowMulOf(int v) { return v < 50 ? 0.30f + v * (0.70f / 50.0f) : 1.0f + (v - 50) * (1.6f / 50.0f); }  // 0.30 .. 2.60
+inline float tiltMulOf(int v) { return v / 50.0f; }                                                                // 0 .. 2
+
+void rebuildGeometry(int countP, int eccP, int sizeP, int pathP, int tiltP, int w, int h) {
     geomW = w;
     geomH = h;
     orbitCount = 3 + (countP * 3) / 100;
     const float bRatio = 0.95f - (eccP / 100.0f) * 0.4f;
-    const float maxR = (w < h ? w : h) * 0.46f;
+    // Orbit size scales the whole ring set about the panel centre, 0.40 at
+    // slider 0 to 1.35 at 100. The top is not symmetric with the bottom on
+    // purpose: at 1.35 the outer ellipse crosses the rim and its path is
+    // clipped away by the bounds checks below and in drawOverlays, while the
+    // inner rings still fill the frame. Much past that the panel empties.
+    const float maxR = (w < h ? w : h) * 0.46f * sizeMulOf(sizeP);
+    // Angle between one orbit's major axis and the next. 0 stacks every
+    // ellipse on the same axis (a nested, aligned orrery), 4.8 rad fans them
+    // out differently from the default 2.4.
+    const float phiStep = 2.4f * tiltMulOf(tiltP);
+    // Path glow: how strongly the traced ellipse stands off the background.
+    // 0 blends nothing, so the paths disappear and only the bodies remain.
+    int pathQ8 = static_cast<int>(0.11f * 256 * pathMulOf(pathP));
+    if (pathQ8 < 0) {
+        pathQ8 = 0;
+    }
+    if (pathQ8 > 256) {
+        pathQ8 = 256;
+    }
     const float cx = w * 0.5f, cy = h * 0.5f;
     memset(pathBinCount, 0, MAX_ORBITS * NUM_BANDS);
     uint8_t bgC[3];
@@ -96,7 +125,7 @@ void rebuildGeometry(int countP, int eccP, int w, int h) {
         OrbitDef &o = orbits[i];
         o.a = maxR * (0.30f + i * (0.62f / (orbitCount - 1)));
         o.b = o.a * bRatio;
-        o.phi = i * 2.4f;
+        o.phi = i * phiStep;
         o.cosPhi = cosf(o.phi);
         o.sinPhi = sinf(o.phi);
         o.T = 6.0f * powf(1.0f + GOLDEN, static_cast<float>(i));
@@ -107,7 +136,7 @@ void rebuildGeometry(int countP, int eccP, int w, int h) {
         o.colR = col[0];
         o.colG = col[1];
         o.colB = col[2];
-        o.pathColor565 = blendQ8(bg, rgb565(o.colR, o.colG, o.colB), static_cast<int>(0.11f * 256));
+        o.pathColor565 = blendQ8(bg, rgb565(o.colR, o.colG, o.colB), pathQ8);
         for (int s = 0; s < 480; s++) {
             const float u = s / 480.0f * 6.2831853f;
             const float cu = cosf(u), su = sinf(u);
@@ -158,9 +187,12 @@ bool init(int w, int h) {
             release(); // a partial set must not survive a failed init (gm-bzu.15)
             return false;
         }
-        rebuildGeometry(55, 55, w, h);
+        rebuildGeometry(55, 55, 50, 50, 50, w, h);
         lastCountP = 55;
         lastEccP = 55;
+        lastSizeP = 50;
+        lastPathP = 50;
+        lastTiltP = 50;
     }
     // sampleBinCount (30 B) and sampleBinIdx (1,440 B) are read once and
     // nS times respectively per band call (240 calls/frame) to find which
@@ -179,14 +211,28 @@ bool init(int w, int h) {
 }
 
 void frame(uint32_t tMs, int w, int h, const uint8_t p[BG_ANIM_PARAMS]) {
-    if (p[1] != lastCountP || p[2] != lastEccP || themeGen() != lastThemeGen || w != geomW || h != geomH) {
-        rebuildGeometry(p[1], p[2], w, h);
+    if (p[1] != lastCountP || p[2] != lastEccP || p[4] != lastSizeP || p[5] != lastPathP || p[7] != lastTiltP ||
+        themeGen() != lastThemeGen || w != geomW || h != geomH) {
+        rebuildGeometry(p[1], p[2], p[4], p[5], p[7], w, h);
         lastCountP = p[1];
         lastEccP = p[2];
+        lastSizeP = p[4];
+        lastPathP = p[5];
+        lastTiltP = p[7];
         lastThemeGen = themeGen();
     }
     const float spd = speedMul(p[0]);
     const float trailAmt = p[3] / 100.0f;
+    // Body glow scales both the radius and the opacity of every stamp, the
+    // body and each trail dot alike, which is what makes the slider read as
+    // brightness and not only as size. The floor of 0.30 keeps the smallest
+    // trail radius at 0.14 px, so 1/radius stays finite and rr stays at
+    // least 1. The ceiling of 2.6 takes the body to 6.8 px, a 16x16
+    // candidate box and about 11k stamp pixels a frame against the 230k
+    // background writes, and its opacity past 1, where the existing
+    // aQ8 > 256 clamp holds it: the core saturates and the falloff widens,
+    // which is what a bigger glow looks like.
+    const float glowMul = glowMulOf(p[6]);
     const int K = 6 + static_cast<int>(trailAmt * 10.0f);
     const float t = tMs * 0.001f;
     const float cx = w * 0.5f, cy = h * 0.5f;
@@ -203,8 +249,8 @@ void frame(uint32_t tMs, int w, int h, const uint8_t p[BG_ANIM_PARAMS]) {
             const float ex = cx + o.a * cu * o.cosPhi - o.b * su * o.sinPhi;
             const float ey = cy + o.a * cu * o.sinPhi + o.b * su * o.cosPhi;
             const float f = 1.0f - static_cast<float>(k) / (K + 1);
-            const float radius = (k == 0) ? 2.6f : 1.2f * f + 0.4f;
-            float alpha = (k == 0) ? 0.95f : 0.55f * f * f * (0.4f + 0.8f * trailAmt); // f^2 ~ f^1.6, no powf
+            const float radius = ((k == 0) ? 2.6f : 1.2f * f + 0.4f) * glowMul;
+            float alpha = ((k == 0) ? 0.95f : 0.55f * f * f * (0.4f + 0.8f * trailAmt)) * glowMul; // f^2 ~ f^1.6, no powf
             if (sampleCount < MAX_SAMPLES) {
                 // r2/invR/rr computed once here (frame() runs once per frame,
                 // not once per band() call) -- see the Sample comment above.
@@ -420,7 +466,7 @@ void release() {
     releaseTable(sampleBinIdx, static_cast<size_t>(NUM_BANDS) * SAMPLE_BIN_CAP);
     // Every sentinel that gates a rebuild, or init() would hand back
     // reallocated tables that nothing refills.
-    lastCountP = lastEccP = -1;
+    lastCountP = lastEccP = lastSizeP = lastPathP = lastTiltP = -1;
     lastThemeGen = 0xFFFFFFFF;
     geomW = geomH = 0;
     orbitCount = 0;
@@ -433,7 +479,14 @@ extern const BgAnimation bg_anim_orbits;
 const BgAnimation bg_anim_orbits = {
     "orbits",
     "Orbits",
-    {{"speed", "Speed", 50}, {"orbitCount", "Orbits", 55}, {"eccentricity", "Eccentricity", 55}, {"trail", "Trail", 50}},
+    {{"speed", "Speed", 50},
+     {"orbitCount", "Orbits", 55},
+     {"eccentricity", "Eccentricity", 55},
+     {"trail", "Trail", 50},
+     {"size", "Orbit size", 50},
+     {"path", "Path glow", 50},
+     {"glow", "Body glow", 50},
+     {"tilt", "Tilt spread", 50}},
     init,
     frame,
     band,

@@ -127,6 +127,10 @@ export const BG_ANIMATIONS = [
       { key: 'orbitCount', label: 'Orbits', def: 55 },
       { key: 'eccentricity', label: 'Eccentricity', def: 55 },
       { key: 'trail', label: 'Trail', def: 50 },
+      { key: 'size', label: 'Orbit size', def: 50 },
+      { key: 'path', label: 'Path glow', def: 50 },
+      { key: 'glow', label: 'Body glow', def: 50 },
+      { key: 'tilt', label: 'Tilt spread', def: 50 },
     ],
   },
   {

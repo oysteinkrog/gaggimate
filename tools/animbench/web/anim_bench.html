@@ -950,7 +950,9 @@ ANIMS.push({
     id: 'orbits', name: 'Orbits',
     params: [
       {key:'speed',label:'Speed',def:50},{key:'orbitCount',label:'Orbits',def:55},
-      {key:'eccentricity',label:'Eccentricity',def:55},{key:'trail',label:'Trail',def:50}],
+      {key:'eccentricity',label:'Eccentricity',def:55},{key:'trail',label:'Trail',def:50},
+      {key:'size',label:'Orbit size',def:50},{key:'path',label:'Path glow',def:50},
+      {key:'glow',label:'Body glow',def:50},{key:'tilt',label:'Tilt spread',def:50}],
     init(w, h, state) {
       state._gen = -1;
     },
@@ -961,7 +963,13 @@ ANIMS.push({
         state.bgC = themeRGB(3);
         state._gen = THEME.gen;
       }
-      const cx = w/2, cy = h/2, maxR = Math.min(w,h)*0.46;
+      // The four sliders added on 2026-09-10 (gm-3vj.11). Each map is exactly
+      // 1 at 50, so the defaults draw what this preview drew before them.
+      const sizeMul = p[4] < 50 ? 0.40 + p[4]*(0.60/50) : 1 + (p[4]-50)*(0.35/50); // 0.40 .. 1.35
+      const pathMul = p[5] < 50 ? p[5]/50 : 1 + (p[5]-50)*(3/50);             // 0 .. 4
+      const glowMul = p[6] < 50 ? 0.30 + p[6]*(0.70/50) : 1 + (p[6]-50)*(1.6/50); // 0.30 .. 2.6
+      const phiStep = 2.4*(p[7]/50);                                          // 0 .. 4.8
+      const cx = w/2, cy = h/2, maxR = Math.min(w,h)*0.46*sizeMul;
       const count = Math.max(3, Math.min(6, Math.round(3 + (p[1]/100)*3)));
       const spd = speedMulJS(p[0]);
       const bRatio = 0.95 - (p[2]/100)*0.4;
@@ -973,13 +981,13 @@ ANIMS.push({
       for (let i = 0; i < count; i++) {
         const a = maxR*(0.30 + i*(0.62/(count-1)));
         const b = a*bRatio;
-        const phi = i*2.4, cphi = Math.cos(phi), sphi = Math.sin(phi);
+        const phi = i*phiStep, cphi = Math.cos(phi), sphi = Math.sin(phi);
         const T = 6.0*Math.pow(1+golden, i)/spd;
         const col = state.hues[i%6];
         for (let s = 0; s < 480; s++) {
           const u = s/480*Math.PI*2;
           blendPx(data, w, h, cx + a*Math.cos(u)*cphi - b*Math.sin(u)*sphi,
-                  cy + a*Math.cos(u)*sphi + b*Math.sin(u)*cphi, col, 0.11);
+                  cy + a*Math.cos(u)*sphi + b*Math.sin(u)*cphi, col, 0.11*pathMul);
         }
         const K = Math.round(6 + trailAmt*10);
         const dt = T/90;
@@ -988,8 +996,8 @@ ANIMS.push({
           const ex = cx + a*Math.cos(u)*cphi - b*Math.sin(u)*sphi;
           const ey = cy + a*Math.cos(u)*sphi + b*Math.sin(u)*cphi;
           const f = 1 - k/(K+1);
-          const rad = k===0 ? 2.6 : 1.2*f+0.4;
-          const alpha = k===0 ? 0.95 : 0.55*Math.pow(f,1.6)*(0.4+trailAmt*0.8);
+          const rad = (k===0 ? 2.6 : 1.2*f+0.4)*glowMul;
+          const alpha = (k===0 ? 0.95 : 0.55*Math.pow(f,1.6)*(0.4+trailAmt*0.8))*glowMul;
           drawGlow(data, w, h, ex, ey, rad, col, alpha);
         }
       }
