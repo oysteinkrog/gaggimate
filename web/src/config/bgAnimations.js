@@ -77,6 +77,10 @@ export const BG_ANIMATIONS = [
       { key: 'speed', label: 'Speed', def: 50 },
       { key: 'intensity', label: 'Intensity', def: 55 },
       { key: 'waviness', label: 'Waviness', def: 50 },
+      { key: 'height', label: 'Height', def: 50 },
+      { key: 'spread', label: 'Spread', def: 50 },
+      { key: 'glow', label: 'Glow', def: 50 },
+      { key: 'drift', label: 'Drift', def: 50 },
     ],
   },
   {

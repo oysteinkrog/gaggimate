@@ -664,19 +664,29 @@ function gradLUT(stops) { // stops: [[t0..255, r, g, b], ...] -> Uint8Array 256*
     id: 'aurora', name: 'Aurora',
     params: [
       {key:'speed',label:'Speed',def:50},{key:'intensity',label:'Intensity',def:55},
-      {key:'waviness',label:'Waviness',def:50}],
+      {key:'waviness',label:'Waviness',def:50},{key:'height',label:'Height',def:50},
+      {key:'spread',label:'Spread',def:50},{key:'glow',label:'Glow',def:50},
+      {key:'drift',label:'Drift',def:50}],
     init(w, h, state) {
       state._gen = -1;
+      state._glowP = -1;
       state.lut = new Uint8Array(256*3);
     },
     render(data, w, h, tMs, p, state) {
       const intensityP = p[1]/100, wavinessP = p[2]/100;
-      if (state._gen !== THEME.gen) {
+      // Height, Spread, Glow and Drift map as an offset from the midpoint, the
+      // same way AnimAurora.cpp maps them, so 50 lands on the old constant.
+      const center = 0.32 + (p[3]-50)*0.006;
+      const spread = 0.85 + (p[4]-50)*0.011;
+      const glowGain = 2.2 + (p[5]-50)*0.032;
+      const drift = 1 + (p[6]-50)*0.08;
+      if (state._gen !== THEME.gen || state._glowP !== p[5]) {
         state._gen = THEME.gen;
+        state._glowP = p[5];
         // Curtain rides the theme's mid-to-bright range; low intensity fades to black.
         for (let i = 0; i < 256; i++) {
           const c = themeRGB(40 + ((i*215)>>8));
-          const scale = Math.min(1, (i/255)*2.2);
+          const scale = Math.min(1, (i/255)*glowGain);
           state.lut[i*3] = c[0]*scale; state.lut[i*3+1] = c[1]*scale; state.lut[i*3+2] = c[2]*scale;
         }
       }
@@ -688,11 +698,11 @@ function gradLUT(stops) { // stops: [[t0..255, r, g, b], ...] -> Uint8Array 256*
         const warp1 = Math.sin(y*0.021 + t*0.5)*A1;
         const warp2 = Math.sin(y*0.013 - t*0.44 + 1.7)*A2;
         const yn = y/h;
-        let env = 1 - Math.abs(yn-0.32)/0.85;
+        let env = 1 - Math.abs(yn-center)/spread;
         env = env < 0 ? 0 : env*env;
         const bgC = themeRGB((yn*10)|0);
         const bgR = bgC[0], bgG = bgC[1], bgB = bgC[2];
-        let ph1 = warp1 + t*0.12, ph2 = warp2 + t*0.07;
+        let ph1 = warp1 + t*0.12*drift, ph2 = warp2 + t*0.07*drift;
         const rowOff = (y&7)*8;
         for (let x = 0; x < w; x++) {
           const v1 = Math.sin(ph1), v2 = Math.sin(ph2);

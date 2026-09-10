@@ -153,6 +153,15 @@
 // descriptor, added for the aurora2/lava2 redesign passes) before this
 // touched src/, and again here with tools/animbench/interlace_check.cpp
 // across the whole fleet.
+//
+// Parameters, 2026-09-10 (gm-3vj.7): three sliders became seven. Height,
+// Spread, Glow and Drift were fixed constants in frame(), computeRowState and
+// buildGlowLUT; they are now sliders that reach exactly those constants at
+// the default 50, so the goldens are unchanged (mean 0.000, max 0 on all
+// three frames). None of them touches the pixel loop or auroraPixelsAsm: two
+// feed the row envelope, one feeds the phase bases, one feeds the glow
+// colours. See the g_envCenter block below for why each maps as an offset
+// from the midpoint rather than as a span from a low end.
 #include "BgAnim.h"
 #include "BgAnimCommon.h"
 #include <math.h>
@@ -239,6 +248,24 @@ constexpr int32_t ROWLUT_SIZE = ((SQ_MAX * INTEN14_MAX) >> 12) + 7 + ROWLUT_PAD 
 float g_t = 0, g_A1 = 0, g_A2 = 0;
 int32_t g_inten14 = 0; // intensity * 1.4 in Q8
 
+// Params 3 to 6, added 2026-09-10 (gm-3vj.7). Every one of them acts on a
+// frame-constant or a row-constant term: three feed computeRowState and the
+// phase bases, one feeds the glow table. Nothing here reaches the pixel loop,
+// so auroraPixelsAsm below is untouched and bandRef stays its exact spec.
+//
+// Each slider maps to the constant it replaced as an OFFSET from the
+// midpoint, so at the default 50 the added term is exactly 0.0f in float and
+// the picture is bit for bit what it was before the params existed. Writing
+// them as "lo + (p/100)*span" instead would land a rounding error on the
+// default and move every golden frame by a least significant bit.
+float g_envCenter = 0.32f;     // p3 Height: where down the panel the band sits
+float g_envInv = 1.0f / 0.85f; // p4 Spread: reciprocal of the band's height
+float g_glowGain = 2.2f;       // p5 Glow: how fast the ramp reaches full colour
+float g_drift = 1.0f;          // p6 Drift: rate and direction of sideways travel
+// The p5 value glowLUT currently holds. 0xFF is not a reachable parameter
+// value (0 to 100), so it forces the first frame after init() to rebuild.
+uint8_t g_glowP = 0xFF;
+
 // Per-row phase = TICKS*(warp(y) + t*coeff). t*coeff is frame-constant (same
 // for all 480 rows), but t itself is proportional to uptime and unbounded, so
 // TICKS*t*coeff can exceed int32 range after long enough uptime. The old code
@@ -255,12 +282,16 @@ int32_t g_inten14 = 0; // intensity * 1.4 in Q8
 uint32_t g_phBase1 = 0, g_phBase2 = 0;
 
 // Curtain color rides the theme's mid-to-bright range; the fade ramp keeps
-// low intensities near-black so the additive blend stays subtle.
+// low intensities near-black so the additive blend stays subtle. g_glowGain
+// (p5) is how steep that ramp is: below the default the brightest curtain
+// never reaches the full theme colour and the whole curtain reads soft and
+// dim, above it the ramp saturates part way up and the curtain reads as a
+// hard bright sheet with a thin fade at its edge.
 void buildGlowLUT() {
     for (int i = 0; i < 256; i++) {
         uint8_t c[3];
         themeRGB(40 + ((i * 215) >> 8), c);
-        const float scale = fminf(1.0f, (i / 255.0f) * 2.2f);
+        const float scale = fminf(1.0f, (i / 255.0f) * g_glowGain);
         glowLUT[i] = rgb565(clamp8f(c[0] * scale), clamp8f(c[1] * scale), clamp8f(c[2] * scale));
     }
 }
@@ -308,20 +339,43 @@ bool init(int, int) {
 }
 
 void frame(uint32_t tMs, int, int, const uint8_t p[BG_ANIM_PARAMS]) {
-    if (themeGen() != lastThemeGen) {
+    // p5 changes the colours in glowLUT, so the table is rebuilt on the same
+    // terms a theme change rebuilds it: only when the value it was built for
+    // has moved. 256 entries with a themeRGB() sample each is too much to
+    // spend on every frame, and it buys nothing while the slider sits still.
+    g_glowGain = 2.2f + (static_cast<int>(p[5]) - 50) * 0.032f; // 0.6 .. 3.8
+    if (themeGen() != lastThemeGen || p[5] != g_glowP) {
         buildGlowLUT();
         lastThemeGen = themeGen();
+        g_glowP = p[5];
     }
     // One real rebuild per frame at most per background segment: see g_rowLUT.
+    // This also republishes the new glow colours through every row table.
     g_lastBgIdx = -1;
     g_t = (tMs * 0.001f) * 0.45f * speedMul(p[0]);
     g_A1 = 0.6f + (p[2] / 100.0f) * 2.4f;
     g_A2 = 0.4f + (p[2] / 100.0f) * 1.6f;
     g_inten14 = static_cast<int32_t>((p[1] / 100.0f) * 1.4f * 256.0f);
+    // p3 moves the band up and down the panel, p4 makes it shorter or taller.
+    // Both are read once per row by computeRowState. The spread never reaches
+    // zero, so the reciprocal is always finite; env is clamped at 0 below it,
+    // and it still peaks at exactly 1, so rowScale keeps the bound ROWLUT_SIZE
+    // was derived from.
+    g_envCenter = 0.32f + (static_cast<int>(p[3]) - 50) * 0.006f;         // 0.02 .. 0.62
+    g_envInv = 1.0f / (0.85f + (static_cast<int>(p[4]) - 50) * 0.011f);   // band 0.30 .. 1.40 tall
+    // p6 scales how far the curtains travel sideways per second. Below about
+    // 38 it goes negative and they drift the other way; the warp terms in
+    // computeRowState keep waving either way, so nothing freezes at 0. The
+    // range is wide because the travel it scales is slow: the default is
+    // about 2 px a second, so a 2x end is a difference nobody notices in a
+    // glance. At 5x it is 10 px a second, and Speed multiplies on top.
+    g_drift = 1.0f + (static_cast<int>(p[6]) - 50) * 0.08f; // -3.0 .. 5.0
     // Wraparound-safe once/frame (see note by g_phBase1/2 above); replaces the
-    // 960x/frame int64 conversion that used to run per-row inside band().
-    g_phBase1 = static_cast<uint32_t>(static_cast<int64_t>(g_t * 0.12f * TICKS));
-    g_phBase2 = static_cast<uint32_t>(static_cast<int64_t>(g_t * 0.07f * TICKS));
+    // 960x/frame int64 conversion that used to run per-row inside band(). The
+    // int64 cast also covers a negative drift, whose uint32 wraparound is the
+    // same defined conversion a long uptime relies on.
+    g_phBase1 = static_cast<uint32_t>(static_cast<int64_t>(g_t * 0.12f * g_drift * TICKS));
+    g_phBase2 = static_cast<uint32_t>(static_cast<int64_t>(g_t * 0.07f * g_drift * TICKS));
 }
 
 // Pure helpers shared by both bandRef and the asm dispatch path below (both
@@ -394,7 +448,9 @@ RowState computeRowState(int y, float t, const float *ct, uint16_t rowLUT[ROWLUT
     const float warp1 = rowSin(y * 0.021f + t * 0.5f) * g_A1;
     const float warp2 = rowSin(y * 0.013f - t * 0.44f + 1.7f) * g_A2;
     const float yn = y * (1.0f / 480.0f); // was a divide (__divsf3 libcall on device)
-    float env = 1.0f - fabsf(yn - 0.32f) * (1.0f / 0.85f);
+    // Height (p3) and Spread (p4). At their defaults these two are exactly
+    // 0.32f and 1.0f/0.85f, the constants that used to be written here.
+    float env = 1.0f - fabsf(yn - g_envCenter) * g_envInv;
     env = env < 0 ? 0 : env * env;
     const int32_t envQ12 = static_cast<int32_t>(env * 4096.0f);
     RowState st;
@@ -722,6 +778,11 @@ void release() {
     releaseTable(g_rowLUT, static_cast<size_t>(ROWLUT_SIZE) * sizeof(uint16_t));
     g_lastBgIdx = -1;
     lastThemeGen = 0xFFFFFFFF;
+    // Same reason as lastThemeGen: the next init() builds glowLUT with
+    // whatever gain the last run left behind, so the first frame after it
+    // has to see a value it cannot match and rebuild.
+    g_glowGain = 2.2f;
+    g_glowP = 0xFF;
 }
 
 } // namespace
@@ -730,7 +791,14 @@ extern const BgAnimation bg_anim_aurora;
 const BgAnimation bg_anim_aurora = {
     "aurora",
     "Aurora",
-    {{"speed", "Speed", 50}, {"intensity", "Intensity", 55}, {"waviness", "Waviness", 50}, {nullptr, nullptr, 0}},
+    {{"speed", "Speed", 50},
+     {"intensity", "Intensity", 55},
+     {"waviness", "Waviness", 50},
+     {"height", "Height", 50},
+     {"spread", "Spread", 50},
+     {"glow", "Glow", 50},
+     {"drift", "Drift", 50},
+     {nullptr, nullptr, 0}},
     init,
     frame,
     band,
