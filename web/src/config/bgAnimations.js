@@ -501,6 +501,10 @@ export const BG_ANIMATIONS = [
       { key: 'size', label: 'Figure size', def: 68 },
       { key: 'glow', label: 'Thread glow', def: 60 },
       { key: 'bright', label: 'Brightness', def: 60 },
+      { key: 'lobes', label: 'Lobe count', def: 50 },
+      { key: 'turn', label: 'Turn rate', def: 50 },
+      { key: 'trail', label: 'Trail length', def: 50 },
+      { key: 'vign', label: 'Vignette', def: 50 },
     ],
   },
   {

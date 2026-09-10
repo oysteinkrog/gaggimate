@@ -4554,6 +4554,10 @@ function pcDither(dst, amp) {
       { key: 'size', label: 'Figure size', def: 68 },
       { key: 'glow', label: 'Thread glow', def: 60 },
       { key: 'bright', label: 'Brightness', def: 60 },
+      { key: 'lobes', label: 'Lobe count', def: 50 },
+      { key: 'turn', label: 'Turn rate', def: 50 },
+      { key: 'trail', label: 'Trail length', def: 50 },
+      { key: 'vign', label: 'Vignette', def: 50 },
     ],
     init(w, h, state) {
       state.key = null; state.pal32 = null;
@@ -4592,10 +4596,16 @@ function pcDither(dst, amp) {
         // The comet is a smooth periodic bump, not an exponential decay: a
         // decay leaves a step where the tail meets the head again, and that
         // step shows as a blunt bright tip sitting on the thread.
+        // Trail length (added 2026-09-10, gm-3vj.38) reshapes that bump: the
+        // exponent is 9.0 at slider 0, where the thread sits at its floor
+        // except for a short bright head, exactly 2.6 at 50, and 0.4 at 100,
+        // where the whole thread glows. The table's range, floorLvl to 255,
+        // never moves with it.
         const floorLvl = 78 + p[2] * 0.35;
+        const texp = (p[6] <= 50 ? 2600 + (50 - p[6]) * 128 : 2600 - (p[6] - 50) * 44) / 1000;
         for (let k = 0; k < NS; k++) {
           const u = 0.5 * (1 + Math.cos(2 * Math.PI * k / NS));
-          state.tail[k] = Math.round(floorLvl + (255 - floorLvl) * Math.pow(u, 2.6));
+          state.tail[k] = Math.round(floorLvl + (255 - floorLvl) * Math.pow(u, texp));
         }
       }
       const pal32 = state.pal32, buf = state.buf, tail = state.tail;
@@ -4610,15 +4620,22 @@ function pcDither(dst, amp) {
       // Two sines per axis for the wash, plus half a quadratic vignette per
       // axis: the two halves sum to a radial falloff, so the ground is warm in
       // the middle and drops away at the rim without a second gather.
+      // Vignette scales the half quadratic each axis subtracts: 0 at slider
+      // 0, where the ground is a flat drifting wash out to the panel edge,
+      // the original 1560 at 50, and 2340 at 100, where the frame closes down
+      // to a small bright centre. It is the one added parameter that widens
+      // an operand domain the firmware kernel is proved against, so both the
+      // proof and the QEMU sweep quote the wider range.
+      const vign = p[7] <= 50 ? ((1560 * p[7] / 50) | 0) : 1560 + (((p[7] - 50) * 780 / 50) | 0);
       for (let x = 0; x < w; x++) {
         const q = (x - 240) / 240;
         colTerm[x] = ((SIN[(x * 3 + g1) & 1023] * 135) >> 9) + ((SIN[(x * 7 - g2) & 1023] * 75) >> 9)
-          - ((1560 * q * q) | 0);
+          - ((vign * q * q) | 0);
       }
       for (let y = 0; y < h; y++) {
         const q = (y - 240) / 240;
         rowTerm[y] = ((SIN[(y * 4 + g3) & 1023] * 135) >> 9) + ((SIN[(y * 5 - g4) & 1023] * 75) >> 9)
-          - ((1560 * q * q) | 0);
+          - ((vign * q * q) | 0);
       }
       for (let ph = 0; ph < 8; ph++) {
         const dst = ph * w, off = ph * 8;
@@ -4631,7 +4648,16 @@ function pcDither(dst, amp) {
       const a1 = (at * 0.69) | 0, a2 = (at * 0.31) | 0;
       const q1 = (tt * 0.704) | 0, q2 = (tt * 0.4544) | 0;   // Q6 sub-index phases
       const q3 = (tt * 0.3136) | 0, q4 = (tt * 0.5952) | 0;
-      const rot = (tt * 0.18176) | 0;                 // about 1 degree per second, Q6
+      // Lobe count shifts both secondary strides by whole steps of 32 in Q6,
+      // half a sine table entry: 0 at slider 50, so 320 and 256 there, 128
+      // and 64 at 0 and 512 and 448 at 100. Every stride stays a multiple of
+      // 32, so 2048 samples is still a whole number of table laps and the
+      // thread closes on itself. Turn rate scales the rotation from held
+      // still through the original rate at 50 to three times it at 100.
+      const lobeOff = (((p[4] - 50) * 6 / 50) | 0) * 32;
+      const sx2 = 320 + lobeOff, sy2 = 256 + lobeOff;
+      const turnMul = (p[5] <= 50 ? p[5] * 2 : 100 + (p[5] - 50) * 4) / 100;
+      const rot = (tt * (0.18176 * turnMul)) | 0;     // about 1 degree per second at 50, Q6
       const ri = (rot >> 6) & 1023, rf = rot & 63;
       const ca = SIN[(ri + 256) & 1023] + (((SIN[(ri + 257) & 1023] - SIN[(ri + 256) & 1023]) * rf) >> 6);
       const sa = SIN[ri] + (((SIN[(ri + 1) & 1023] - SIN[ri]) * rf) >> 6);
@@ -4639,11 +4665,11 @@ function pcDither(dst, amp) {
       for (let s = 0; s < NS; s++) {
         let k = ((s * 192 + q1) >> 6) & 1023, f = (s * 192 + q1) & 63;
         const s1 = SIN[k] + (((SIN[(k + 1) & 1023] - SIN[k]) * f) >> 6);
-        k = ((s * 320 + q2) >> 6) & 1023; f = (s * 320 + q2) & 63;
+        k = ((s * sx2 + q2) >> 6) & 1023; f = (s * sx2 + q2) & 63;
         const s2 = SIN[k] + (((SIN[(k + 1) & 1023] - SIN[k]) * f) >> 6);
         k = ((s * 128 + q3) >> 6) & 1023; f = (s * 128 + q3) & 63;
         const s3 = SIN[k] + (((SIN[(k + 1) & 1023] - SIN[k]) * f) >> 6);
-        k = ((s * 256 + q4) >> 6) & 1023; f = (s * 256 + q4) & 63;
+        k = ((s * sy2 + q4) >> 6) & 1023; f = (s * sy2 + q4) & 63;
         const s4 = SIN[k] + (((SIN[(k + 1) & 1023] - SIN[k]) * f) >> 6);
         const ux = ((a1 * s1) + (a2 * s2)) >> 9;
         const uy = ((a1 * s3) + (a2 * s4)) >> 9;

@@ -8,6 +8,18 @@
 // raised to 1.5. Max coverage preserves every crossing. A smooth, nonzero
 // comet envelope completes one lap per 8 seconds at speed 50.
 //
+// Eight parameters, all read in frame(): speed, figure size, thread glow and
+// brightness, then lobe count (the two secondary curve frequencies), turn
+// rate (the whole figure's rotation), trail length (the comet envelope's
+// exponent) and vignette (the ground's quadratic rim falloff). Each of the
+// four added on 2026-09-10 (gm-3vj.38) is exactly the constant this file used
+// to hard-code at its default, so the default frame is unchanged. None of
+// them reaches the pixel loop: they act on the curve samples, the comet table
+// and the row and column terms, and band(), bandRef() and harmonographRowAsm
+// read the same tables they always did. Vignette does widen how far down
+// rowTerm and ct can reach, so the saturation proof below and the sweep in
+// tools/qemubench/tests/anim_harmonograph quote the wider domain.
+//
 // The page's wash is deliberately asymmetric here: rowTerm is multiplied
 // by 32, colTerm is not. Bayer offsets are multiplied by 32 before the sum
 // is shifted by 10. Making the axes symmetric changes the approved look.
@@ -51,7 +63,7 @@ int16_t *dith = nullptr;
 const int16_t *sl = nullptr; // borrowed shared slab table, never released here
 int allocW = 0, allocH = 0, ctStride = 0, bufStride = 0;
 uint32_t lastThemeGen = 0xFFFFFFFF;
-int lastGlow = -1, lastBright = -1, top = 0;
+int lastTailKey = -1, lastBright = -1, top = 0;
 
 void release();
 
@@ -136,27 +148,46 @@ void frame(uint32_t tMs, int w, int h, const uint8_t p[BG_ANIM_PARAMS]) {
         lastBright = p[3];
         lastThemeGen = gen;
     }
-    if (lastGlow != p[2]) {
+    // The comet table depends on thread glow and on trail length, so both
+    // gate its rebuild. Trail length reshapes the envelope: the exponent is
+    // 9.0 at slider 0, where the thread sits at its floor except for a short
+    // bright head, exactly 2.6 at 50, and 0.4 at 100, where the whole thread
+    // glows. It is carried in thousandths so 50 divides to the old literal
+    // exactly. The table's own range, floorLvl to 255, never moves with it.
+    const int tailKey = static_cast<int>(p[2]) | (static_cast<int>(p[6]) << 8);
+    if (lastTailKey != tailKey) {
         const float floorLvl = 78.0f + p[2] * 0.35f;
+        const int texpM = p[6] <= 50 ? 2600 + (50 - static_cast<int>(p[6])) * 128 : 2600 - (static_cast<int>(p[6]) - 50) * 44;
+        const float texp = static_cast<float>(texpM) / 1000.0f;
         for (int k = 0; k < NS; ++k) {
             const float u = 0.5f * (1.0f + cosf(2.0f * PI * k / NS));
-            tail[k] = static_cast<uint8_t>(lroundf(floorLvl + (255.0f - floorLvl) * powf(u, 2.6f)));
+            tail[k] = static_cast<uint8_t>(lroundf(floorLvl + (255.0f - floorLvl) * powf(u, texp)));
         }
         top = 196 + (static_cast<int>(p[2]) * 55 + 50) / 100;
-        lastGlow = p[2];
+        lastTailKey = tailKey;
     }
     const float tt = static_cast<float>(tMs) * speedMul(p[0]);
     const uint32_t g1 = phase(tt, 0.0170f), g2 = phase(tt, 0.0119f);
     const uint32_t g3 = phase(tt, 0.0098f), g4 = phase(tt, 0.0145f);
+    // Vignette scales the half quadratic each axis subtracts, which is what
+    // darkens the rim: 0 at slider 0, so the ground is a flat drifting wash
+    // out to the panel edge, the original 1560 at 50, and 2340 at 100, where
+    // the frame closes down to a small bright centre. The scale is a whole
+    // number and is 1560 at 50, so the subtracted term is the old float
+    // product there. This is the
+    // one added parameter that widens an operand domain: rowTerm and colTerm
+    // reach -2550 rather than -1770, and ct -2646 rather than -1866. The
+    // proof under the kernel and the QEMU sweep both quote the wider range.
+    const int vign = p[7] <= 50 ? (1560 * static_cast<int>(p[7])) / 50 : 1560 + ((static_cast<int>(p[7]) - 50) * 780) / 50;
     for (int x = 0; x < w; ++x) {
         const float q = (x - 240) / 240.0f;
         colTerm[x] = ((sl[(x * 3 + g1) & 1023] * 135) >> 9) +
-                     ((sl[(x * 7 - g2) & 1023] * 75) >> 9) - static_cast<int>(1560.0f * q * q);
+                     ((sl[(x * 7 - g2) & 1023] * 75) >> 9) - static_cast<int>(vign * q * q);
     }
     for (int y = 0; y < h; ++y) {
         const float q = (y - 240) / 240.0f;
         rowTerm[y] = ((sl[(y * 4 + g3) & 1023] * 135) >> 9) +
-                     ((sl[(y * 5 - g4) & 1023] * 75) >> 9) - static_cast<int>(1560.0f * q * q);
+                     ((sl[(y * 5 - g4) & 1023] * 75) >> 9) - static_cast<int>(vign * q * q);
     }
     for (int ph = 0; ph < 8; ++ph) {
         for (int x = 0; x < w; ++x)
@@ -167,14 +198,37 @@ void frame(uint32_t tMs, int w, int h, const uint8_t p[BG_ANIM_PARAMS]) {
     const int a1 = static_cast<int>(at * 0.69f), a2 = static_cast<int>(at * 0.31f);
     const uint32_t q1 = phase(tt, 0.704f), q2 = phase(tt, 0.4544f);
     const uint32_t q3 = phase(tt, 0.3136f), q4 = phase(tt, 0.5952f);
-    const uint32_t rot = phase(tt, 0.18176f); // Q6, 360 degrees per ~360.56 s
+    // Lobe count shifts both secondary sample strides by whole steps of 32 in
+    // Q6, which is half a sine table entry. The shift is 0 at slider 50, so
+    // the strides are the original 320 and 256 there; at 0 they are 128 and
+    // 64 and at 100 they are 512 and 448. A stride is 32 per cycle over the
+    // 2048 samples, so the second frequency runs 4 to 16 cycles on the x axis
+    // and 2 to 14 on the y, against the first pair's fixed 6 and 4, and the
+    // figure gains or loses lobes with it. Every stride stays a multiple of 32,
+    // so 2048 samples is a whole number of table laps and the thread still
+    // closes on itself rather than leaving a gap.
+    const int lobeOff = ((static_cast<int>(p[4]) - 50) * 6) / 50 * 32;
+    const uint32_t sx2 = static_cast<uint32_t>(320 + lobeOff);
+    const uint32_t sy2 = static_cast<uint32_t>(256 + lobeOff);
+    // Turn rate scales the whole figure's rotation, from held still at slider
+    // 0 through the original rate at 50 to three times it at 100. The
+    // multiplier is carried as a percentage, so 50 divides to exactly 1.0f
+    // and the phase is the old one there. ca and sa stay within +/-512
+    // whatever the rate.
+    const int turnPct = p[5] <= 50 ? static_cast<int>(p[5]) * 2 : 100 + (static_cast<int>(p[5]) - 50) * 4;
+    const float turnMul = static_cast<float>(turnPct) / 100.0f;
+    const uint32_t rot = phase(tt, 0.18176f * turnMul); // Q6, 360 degrees per ~360.56 s at 50
     const int ca = sineQ6(rot + 256 * 64), sa = sineQ6(rot);
     const int head = phase(tt, NS / 8000.0f) & (NS - 1);
     for (int s = 0; s < NS; ++s) {
-        // Q6 strides 192/320/128/256 are exactly 3/5/2/4 table entries.
-        // The weighted coordinates use Q9 sine, rotation shifts by 7 to Q2.
-        const int ux = (a1 * sineQ6(s * 192u + q1) + a2 * sineQ6(s * 320u + q2)) >> 9;
-        const int uy = (a1 * sineQ6(s * 128u + q3) + a2 * sineQ6(s * 256u + q4)) >> 9;
+        // Q6 strides 192 and 128 are exactly 3 and 2 table entries; the two
+        // secondary strides are 320 and 256 at lobe count 50 and any other
+        // multiple of 32 otherwise, where the sine table's own interpolation
+        // carries the half entry. The weighted coordinates use Q9 sine, and
+        // the rotation shifts by 7 to Q2. Neither the strides nor the turn
+        // rate change how far a sample can land from the centre.
+        const int ux = (a1 * sineQ6(s * 192u + q1) + a2 * sineQ6(s * sx2 + q2)) >> 9;
+        const int uy = (a1 * sineQ6(s * 128u + q3) + a2 * sineQ6(s * sy2 + q4)) >> 9;
         const int pxq = 240 * 4 + ((ux * ca - uy * sa) >> 7);
         const int pyq = 240 * 4 + ((ux * sa + uy * ca) >> 7);
         const int x0 = (pxq >> 2) - 5, y0 = (pyq >> 2) - 5;
@@ -221,10 +275,11 @@ GM_ANIM_IRAM void bandRef(uint16_t *__restrict dst, int y0, int rows, int w, uin
 //
 // Split rt=32*rowTerm into 1024*(rowTerm>>5) + 32*(rowTerm&31).
 // Thus i=(90+(rowTerm>>5)) + ((ct+32*(rowTerm&31))>>10), exactly,
-// including negative rows. rowTerm is -1770..210; ct is -1866..306.
-// The lane sum is -1866..1298, i is 32..96, top is 196..251, and
+// including negative rows. rowTerm is -2550..210 and ct is -2646..306,
+// both at vignette 100; at the default they are -1770..210 and -1866..306.
+// The lane sum is -2646..1298, i is 7..97, top is 196..251, and
 // coverage is 0..254 (QEMU additionally tests 255). The composite lies
-// in 32..250, so signed lane adds/subtracts never saturate and the palette
+// in 7..250, so signed lane adds/subtracts never saturate and the palette
 // clamp cannot fire. Unsigned coverage widened against zero stays positive.
 //
 // Row constants are broadcast from scalars, without a stack table. one is
@@ -357,7 +412,7 @@ void release() {
     sl = nullptr;
     allocW = allocH = ctStride = bufStride = 0;
     lastThemeGen = 0xFFFFFFFF;
-    lastGlow = lastBright = -1;
+    lastTailKey = lastBright = -1;
     top = 0;
 }
 
@@ -370,7 +425,11 @@ const BgAnimation bg_anim_harmonograph = {
     {{"speed", "Speed", 50},
      {"size", "Figure size", 68},
      {"glow", "Thread glow", 60},
-     {"bright", "Brightness", 60}},
+     {"bright", "Brightness", 60},
+     {"lobes", "Lobe count", 50},
+     {"turn", "Turn rate", 50},
+     {"trail", "Trail length", 50},
+     {"vign", "Vignette", 50}},
     init,
     frame,
     band,

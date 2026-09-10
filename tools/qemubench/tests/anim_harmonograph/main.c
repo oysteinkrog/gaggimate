@@ -1,6 +1,8 @@
 /* Harness mode, no libc. The production kernel below is copied verbatim
  * from AnimHarmonograph.cpp. Synthetic rows cover the full proven operand
- * domains: ct -1866..306, rowTerm -1770..210, top 196..251, coverage 0..255.
+ * domains: ct -2646..306, rowTerm -2550..210, top 196..251, coverage 0..255.
+ * Those two floors are the vignette parameter at 100 (gm-3vj.38); at its
+ * default they are -1866 and -1770, which the sweep still passes through.
  * The last coverage value extends production's 0..254 bound. Param 0/100
  * affects phases, geometry, top and palette; those reach this kernel only
  * through these bounded tables. Every valid output alignment modulo 16 and
@@ -128,8 +130,8 @@ static void fail(int lane, uint32_t g, uint32_t w) {
 static void check(int w, int align, int rt, int top, uint32_t seed, int fixedCt) {
     int offset = 8 + 2 * align; // 16,20,24,28 bytes, every legal word alignment
     for (int x = 0; x < CAP; ++x) {
-        ct[x] = fixedCt < -1866 ? (int16_t)((seed + x * 73u) % 2173u - 1866) : fixedCt;
-        coverage[x] = fixedCt < -1866 ? (uint8_t)(seed * 7u + x * 37u) : (uint8_t)x;
+        ct[x] = fixedCt < -2646 ? (int16_t)((seed + x * 73u) % 2953u - 2646) : fixedCt;
+        coverage[x] = fixedCt < -2646 ? (uint8_t)(seed * 7u + x * 37u) : (uint8_t)x;
     }
     for (int k = 0; k < 256; ++k) pal[k] = (uint16_t)(seed * 257u + k * 4051u);
     for (int k = 0; k < 8; ++k) ones[k] = 1;
@@ -158,24 +160,29 @@ int main(void) {
     uint32_t cp = 8; // CP3, exclusively owned by this freestanding harness
     asm volatile("wsr %0, cpenable\nrsync\n" :: "r"(cp) : "memory");
     static const int widths[] = {0,1,2,7,8,15,16,17,31,32,33,233,240,466,480};
-    static const int rowEdges[] = {-1770,-1761,-1025,-1024,-1023,-33,-32,-31,-1,0,1,31,32,33,210};
+    // Both vignette extremes' floors, the shift boundaries either side of
+    // them, and every multiple-of-32 crossing the split arithmetic turns on.
+    static const int rowEdges[] = {-2550,-2541,-2049,-2048,-2047,-1793,-1770,-1761,
+                                   -1025,-1024,-1023,-33,-32,-31,-1,0,1,31,32,33,210};
+    static const int nW = (int)(sizeof(widths) / sizeof(widths[0]));
+    static const int nR = (int)(sizeof(rowEdges) / sizeof(rowEdges[0]));
     // All alignments, zero and minimum vector trips, every scalar tail,
     // and parameter extremes as they reach the top and colour operands.
     for (int a = 0; a < 4; ++a)
-        for (int wi = 0; wi < 15; ++wi)
-            for (int ri = 0; ri < 15; ++ri)
+        for (int wi = 0; wi < nW; ++wi)
+            for (int ri = 0; ri < nR; ++ri)
                 for (int t = 0; t < 3; ++t)
                     check(widths[wi], a, rowEdges[ri], t == 0 ? 196 : t == 1 ? 229 : 251,
-                          (uint32_t)(a * 123 + wi * 937 + ri * 17 + t), -2000);
+                          (uint32_t)(a * 123 + wi * 937 + ri * 17 + t), -3000);
     // Every rowTerm value, all 56 top values, full-width varying lanes.
-    for (int rt = -1770; rt <= 210; ++rt)
-        check(480, rt & 3, rt, 196 + (rt + 1770) % 56, (uint32_t)(rt + 1770), -2000);
+    for (int rt = -2550; rt <= 210; ++rt)
+        check(480, rt & 3, rt, 196 + (rt + 2550) % 56, (uint32_t)(rt + 2550), -3000);
     // Every ct x coverage combination at four row extremes/shift boundaries.
-    for (int c = -1866; c <= 306; ++c) {
-        check(256, c & 3, -1770, 196, (uint32_t)(c + 1866), c);
-        check(256, c & 3, -1, 251, (uint32_t)(c + 2981), c);
-        check(256, c & 3, 0, 196, (uint32_t)(c + 4321), c);
-        check(256, c & 3, 210, 251, (uint32_t)(c + 5987), c);
+    for (int c = -2646; c <= 306; ++c) {
+        check(256, c & 3, -2550, 196, (uint32_t)(c + 2646), c);
+        check(256, c & 3, -1, 251, (uint32_t)(c + 3761), c);
+        check(256, c & 3, 0, 196, (uint32_t)(c + 5101), c);
+        check(256, c & 3, 210, 251, (uint32_t)(c + 6767), c);
     }
     if (!failures) {
         uart_puts("GM_QEMUBENCH_PIE: PASS harmonographRowAsm calls="); uart_dec(calls);
