@@ -329,6 +329,30 @@
 // its own comment by the #define) on exactly that evidence: correctness is
 // covered on both bodies, speed is not measured on either.
 
+// Parameter pass (gm-3vj.4, 2026-09-10): three params became eight. The five
+// new ones all act in frame() or on the palette, so bandRef(), renderRow(),
+// finalizeSpan() and both hand-written Xtensa kernels are byte for byte what
+// round 7 left; the only edits below band() are the two blob loops reading
+// activeBlobs instead of the constant NUM_BLOBS.
+//
+//   count    (p[3], def 67) how many blobs are live, 2 to 8, 6 at the
+//            default. NUM_BLOBS went 6 -> 8 and the blob loops now run to
+//            activeBlobs, which frame() sets.
+//   core     (p[4], def 50) weight of the t^6 hot-core term, 0 to 1.2, and
+//            exactly the old hard-coded 0.6f at 50. Acts in the LUT build.
+//   falloff  (p[5], def 40) exponent of the radial profile, 1 to 6 in six
+//            steps, 3 at the default. Acts in the LUT build.
+//   contrast (p[6], def 50) palette remap gain, 0.5 to 1.5, identity at 50.
+//            Acts on paletteLUT once per slider move, never per pixel.
+//   wander   (p[7], def 50) scale on the orbit amplitudes, 0 to 2, identity
+//            at 50. Acts on the per-frame blob positions.
+//
+// Every default is bit-exact against the pre-parameter output, checked
+// against this file's three goldens (mean 0.000, max 0). The exactness is not
+// an accident of rounding: each mapping either multiplies by exactly 1.0f,
+// halves 1.2f, or associates its multiplies the way the replaced expression
+// did.
+
 #include "BgAnim.h"
 #include "BgAnimCommon.h"
 #include <math.h>
@@ -358,7 +382,14 @@
 namespace {
 using namespace bganim;
 
-constexpr int NUM_BLOBS = 6;
+// Upper bound on the blob count. The "count" param (p[3]) picks how many of
+// these are live this frame (activeBlobs below, 2 to 8, 6 at the default), so
+// the table has to hold the largest choice. It was a flat 6 before the
+// parameter pass (gm-3vj.4, 2026-09-10); the two extra slots cost 200 B of
+// BSS (BlobDef 72 B + BlobState 28 B each) and nothing per pixel, since the
+// blob loops run to activeBlobs, not to this.
+constexpr int NUM_BLOBS = 8;
+constexpr int DEFAULT_BLOBS = 6; // what every frame rendered before p[3] existed
 // 1/1.6 exactly (1.6 = 8/5, so 1/1.6 = 0.625 = 5/8, exact in binary), folded
 // with the *255 index scale. Used only once per frame now (building
 // lavaLUT in frame()). band() never multiplies by it per pixel.
@@ -440,6 +471,16 @@ int16_t *lavaBase = nullptr; // lavaLUT + LUT_OFFSET, so band() indexes it direc
 uint32_t lastThemeGen = 0xFFFFFFFF;
 bool inited = false;
 int allocW = 0; // width fieldRow was sized for
+// How many blobs this frame renders (p[3], 2 to 8). frame() writes it and
+// every blob loop reads it, so a blob past this count is never touched: its
+// blob[] entry keeps whatever the last frame that did use it left there, and
+// no reader looks. Starts at the pre-parameter count so a band() that somehow
+// runs before the first frame() sees the shipped picture rather than zero
+// blobs.
+int activeBlobs = DEFAULT_BLOBS;
+// Last contrast param the palette was built for, so the ramp is remapped only
+// when the user moves the slider. -1 forces the first frame() to rebuild.
+int lastContrastP = -1;
 
 // Precomputed "no blob touched this pixel" row, one per Bayer row phase
 // 0..3, rebuilt only when paletteLUT changes (theme change). A pixel no
@@ -475,6 +516,33 @@ void buildDitherLUT() {
     }
 }
 
+// Contrast (p[6]): rewrites the 256-entry palette in place so index i reads
+// the colour that used to sit at 128 + (i - 128) * gain, clamped to the ends.
+// gain > 1 pushes the ramp's dark end darker and its bright end brighter
+// sooner, gain < 1 pulls both toward the middle tone, which lifts the
+// background off the darkest stop. This is the whole of the parameter: the
+// field arithmetic, the LUT, the dither and both band() paths are untouched,
+// and the cost is one 256-entry pass when the slider moves, never per pixel.
+// gain == 1 is a bit-exact no-op and returns without touching anything, so
+// the default palette is the bytes buildThemeRamp() wrote.
+void applyPaletteContrast(float gain) {
+    if (gain == 1.0f) {
+        return;
+    }
+    uint16_t src[256];
+    memcpy(src, paletteLUT, sizeof(src));
+    for (int i = 0; i < 256; i++) {
+        const float f = 128.0f + (static_cast<float>(i) - 128.0f) * gain;
+        int j = static_cast<int>(f + 0.5f);
+        if (j < 0) {
+            j = 0;
+        } else if (j > 255) {
+            j = 255;
+        }
+        paletteLUT[i] = src[j];
+    }
+}
+
 void buildBgRows(int w) {
     for (int py = 0; py < 4; py++) {
         uint16_t *row = bgRowAll + static_cast<size_t>(py) * w;
@@ -489,6 +557,18 @@ void buildBgRows(int w) {
             row[x] = paletteLUT[idx];
         }
     }
+}
+
+// The whole palette chain, in the one order that is valid: the theme ramp
+// first, then the contrast remap on top of it, then the dither amplitude
+// (derived from the remapped ramp's step spacing) and the four background
+// rows (built from both). Called from frame() when the theme generation moves
+// or the contrast slider does.
+void rebuildPalette(float gain) {
+    buildThemeRamp(paletteLUT, 256);
+    applyPaletteContrast(gain);
+    buildDitherLUT();
+    buildBgRows(bgRowAllW);
 }
 
 bool init(int w, int h) {
@@ -563,6 +643,11 @@ bool init(int w, int h) {
         }
         buildThemeRamp(paletteLUT, 256);
         lastThemeGen = themeGen();
+        // init() takes no params, so the contrast is not knowable here: the
+        // ramp is built unmapped and lastContrastP stays -1, which makes the
+        // first frame() rebuild it through rebuildPalette(). At the default
+        // contrast that rebuild writes exactly these bytes again.
+        lastContrastP = -1;
         buildDitherLUT();       // amplitude follows the ramp just built
         buildBgRows(bgRowAllW); // needs both of the above
     }
@@ -573,11 +658,30 @@ void frame(uint32_t tMs, int w, int, const uint8_t p[BG_ANIM_PARAMS]) {
     const float omega0 = 6.2831853f / 45000.0f * speedMul(p[0]); // 45s base cycle at speed 50
     const float sizeMul = 0.6f + (p[1] / 100.0f);
     const float intensity = 0.5f + (p[2] / 100.0f) * 1.3f;
-    if (themeGen() != lastThemeGen) {
-        buildThemeRamp(paletteLUT, 256);
+    // Blob count (p[3]): 2 at 0, 8 at 100, 6 (the shipped picture) at the
+    // default 67. Only the loop bound changes; blobs 6 and 7 continue the
+    // same golden-angle pattern init() lays down for 0 to 5.
+    activeBlobs = 2 + (static_cast<int>(p[3]) * 6 + 50) / 100;
+    // Hot core (p[4]): weight of the t^6 term that brightens a blob's middle.
+    // 0 at 0, 1.2 at 100, and exactly 0.6f at the default 50 (50/100 is 0.5
+    // exactly and halving 1.2f is exact), which is the constant this file
+    // hard-coded before.
+    const float coreW = p[4] / 100.0f * 1.2f;
+    // Falloff (p[5]): the exponent of the blob's radial profile, 1 at 0 up to
+    // 6 at 100, in six steps, and 3 at the default 40. A low exponent is a
+    // wide soft glow that fills the panel, a high one a tight bright core.
+    const int falloffExp = 1 + (static_cast<int>(p[5]) * 5) / 100;
+    // Contrast (p[6]): palette remap gain, 0.5 at 0 through 1.5 at 100, and
+    // exactly 1.0f at the default 50, where applyPaletteContrast() is a no-op.
+    const float contrastGain = 0.5f + (p[6] / 100.0f);
+    // Wander (p[7]): scale on the orbit amplitudes, 0 at 0 (blobs hold their
+    // centres and only pulse) through 2 at 100, exactly 1.0f at the default
+    // 50, where every multiply below is the identity.
+    const float wander = p[7] / 50.0f;
+    if (themeGen() != lastThemeGen || static_cast<int>(p[6]) != lastContrastP) {
         lastThemeGen = themeGen();
-        buildDitherLUT();
-        buildBgRows(bgRowAllW);
+        lastContrastP = p[6];
+        rebuildPalette(contrastGain);
     }
 
     // Rebuild the tt -> field-contribution LUT for this frame's intensity.
@@ -599,21 +703,37 @@ void frame(uint32_t tMs, int w, int, const uint8_t p[BG_ANIM_PARAMS]) {
         if (tt > 1.0f) {
             tt = 1.0f; // padding entries clamp to the tt=1 (blob-center) value
         }
-        const float t3 = tt * tt * tt;
-        const float contribution = (t3 * intensity + (tt > 0.7f ? t3 * t3 * intensity * 0.6f : 0.0f)) * kFieldScale;
-        // contribution is always >= 0 and its max (tt=1, intensity=1.8,
-        // hot core included) is 459.0: well inside int16_t's range, so
-        // the round-5 narrowing (see file-top comment) loses no precision
-        // versus the old int32_t storage, only bucket resolution (LUT_BITS).
+        // Repeated multiplication, not powf: falloffExp is small, this runs
+        // once per bucket per frame, and at falloffExp == 3 the product
+        // associates exactly as the tt*tt*tt this replaces, so the default
+        // stays bit-exact.
+        float t3 = tt;
+        for (int k = 1; k < falloffExp; k++) {
+            t3 *= tt;
+        }
+        const float contribution = (t3 * intensity + (tt > 0.7f ? t3 * t3 * intensity * coreW : 0.0f)) * kFieldScale;
+        // contribution is always >= 0. Its max is at tt=1 with intensity 1.8
+        // and coreW 1.2: (1.8 + 1.8*1.2) * 159.375 = 631.1, well inside
+        // int16_t's range, so the round-5 narrowing (see file-top comment)
+        // loses no precision versus the old int32_t storage, only bucket
+        // resolution (LUT_BITS). It was 459.0 before the hot-core weight
+        // became a parameter (gm-3vj.4).
         lavaLUT[p2] = static_cast<int16_t>(contribution + 0.5f);
     }
 
     const float t = tMs * omega0;
-    for (int i = 0; i < NUM_BLOBS; i++) {
+    for (int i = 0; i < activeBlobs; i++) {
         const BlobDef &d = blobDef[i];
         BlobState &b = blob[i];
-        b.bx = d.cx + d.ax1 * fastSinRad(t * d.fx1 + d.px1) + d.ax2 * fastSinRad(t * d.fx2 * 1.7f + d.px2);
-        b.by = d.cy + d.ay1 * fastCosRad(t * d.fy1 * 1.13f + d.py1) + d.ay2 * fastSinRad(t * d.fy2 * 0.9f + d.py2);
+        // The four orbit amplitudes carry the wander scale. At wander == 1
+        // each product is the identity on the value init() stored, so the
+        // default path is bit-exact.
+        const float ax1 = d.ax1 * wander;
+        const float ax2 = d.ax2 * wander;
+        const float ay1 = d.ay1 * wander;
+        const float ay2 = d.ay2 * wander;
+        b.bx = d.cx + ax1 * fastSinRad(t * d.fx1 + d.px1) + ax2 * fastSinRad(t * d.fx2 * 1.7f + d.px2);
+        b.by = d.cy + ay1 * fastCosRad(t * d.fy1 * 1.13f + d.py1) + ay2 * fastSinRad(t * d.fy2 * 0.9f + d.py2);
         const float R = (d.R0 + d.Rpulse * fastSinRad(tMs * d.wR + d.phR)) * sizeMul;
         b.R2 = R * R;
         b.invR2 = 1.0f / b.R2;
@@ -730,6 +850,11 @@ void finalizeSpan(uint16_t *out, int lo, int hi, int yPhase) {
 // comment for why.
 void renderRow(uint16_t *out, int y, int w, int yPhase) {
     memset(fieldRow, 0, static_cast<size_t>(w) * sizeof(int32_t));
+    // The loop below runs to activeBlobs, the count p[3] chose this frame,
+    // not to NUM_BLOBS: an unused slot is not visited at all, so the count
+    // costs nothing when it is low and the pixel work is the only thing that
+    // grows when it is high.
+    //
     // Spans of blobs that actually reach this row (dy2 < R2), collected
     // in the same pass that accumulates the field: no extra iteration
     // over blobs. Everywhere outside their union, fieldRow is provably
@@ -739,7 +864,7 @@ void renderRow(uint16_t *out, int y, int w, int yPhase) {
     int spanLo[NUM_BLOBS];
     int spanHi[NUM_BLOBS];
     int nSpans = 0;
-    for (int i = 0; i < NUM_BLOBS; i++) {
+    for (int i = 0; i < activeBlobs; i++) {
         const BlobState &b = blob[i];
         const float dy = y - b.by;
         const float dy2 = dy * dy;
@@ -1128,7 +1253,7 @@ void renderRowAsm(uint16_t *out, int y, int w, int yPhase) {
     int spanLo[NUM_BLOBS];
     int spanHi[NUM_BLOBS];
     int nSpans = 0;
-    for (int i = 0; i < NUM_BLOBS; i++) {
+    for (int i = 0; i < activeBlobs; i++) {
         const BlobState &b = blob[i];
         const float dy = y - b.by;
         const float dy2 = dy * dy;
@@ -1237,6 +1362,10 @@ void release() {
     allocW = 0;
     bgRowAllW = 0;
     lastThemeGen = 0xFFFFFFFF;
+    // Back to the shipped count and to "palette not built for any contrast",
+    // so a re-init starts from the same state a cold boot does.
+    activeBlobs = DEFAULT_BLOBS;
+    lastContrastP = -1;
     inited = false;
 }
 
@@ -1246,7 +1375,14 @@ extern const BgAnimation bg_anim_lava;
 const BgAnimation bg_anim_lava = {
     "lava",
     "Lava",
-    {{"speed", "Speed", 50}, {"scale", "Blob size", 50}, {"glow", "Glow", 60}, {nullptr, nullptr, 0}},
+    {{"speed", "Speed", 50},
+     {"scale", "Blob size", 50},
+     {"glow", "Glow", 60},
+     {"count", "Blob count", 67},
+     {"core", "Hot core", 50},
+     {"falloff", "Falloff", 40},
+     {"contrast", "Contrast", 50},
+     {"wander", "Wander", 50}},
     init,
     frame,
     band,

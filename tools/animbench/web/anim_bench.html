@@ -362,14 +362,30 @@ function gradLUT(stops) { // stops: [[t0..255, r, g, b], ...] -> Uint8Array 256*
 
 /* ---- 1: Lava (anim-fluid) ---- */
 (() => {
+  // Contrast: index i reads the colour that sat at 128 + (i-128)*gain, the
+  // same remap AnimLava.cpp applies to its palette LUT. gain 1 is identity.
+  function palContrast(pal, gain) {
+    if (gain === 1) return pal;
+    const out = new Uint8Array(256 * 3);
+    for (let i = 0; i < 256; i++) {
+      let j = Math.round(128 + (i - 128) * gain);
+      if (j < 0) j = 0; else if (j > 255) j = 255;
+      out[i*3] = pal[j*3]; out[i*3+1] = pal[j*3+1]; out[i*3+2] = pal[j*3+2];
+    }
+    return out;
+  }
   ANIMS.push({
     id: 'lava', name: 'Lava',
     params: [
       {key:'speed',label:'Speed',def:50},{key:'scale',label:'Blob size',def:50},
-      {key:'glow',label:'Glow',def:60}],
+      {key:'glow',label:'Glow',def:60},{key:'count',label:'Blob count',def:67},
+      {key:'core',label:'Hot core',def:50},{key:'falloff',label:'Falloff',def:40},
+      {key:'contrast',label:'Contrast',def:50},{key:'wander',label:'Wander',def:50}],
     init(w, h, state) {
       state.blobs = [];
-      for (let i = 0; i < 6; i++) {
+      // Eight definitions, of which the count param picks the first 2 to 8
+      // (six at the default), matching NUM_BLOBS in AnimLava.cpp.
+      for (let i = 0; i < 8; i++) {
         const ga = i * 2.39996323;
         state.blobs.push({
           cx: w*0.5 + w*0.28*Math.cos(ga), cy: h*0.5 + h*0.28*Math.sin(ga*1.3),
@@ -383,24 +399,36 @@ function gradLUT(stops) { // stops: [[t0..255, r, g, b], ...] -> Uint8Array 256*
       }
       state.field = new Float32Array(w * h);
       state._gen = -1;
+      state._gain = -1;
     },
     render(data, w, h, tMs, p, state) {
-      const [speed, scale, glow] = p;
+      const [speed, scale, glow, count, core, falloff, contrast, wander] = p;
       const omega0 = 2*Math.PI / 45000 * speedMulJS(speed); // 45s base cycle at 50
       const sizeMul = 0.6 + (scale/100);
       const intensity = 0.5 + (glow/100)*1.3;
-      if (state._gen !== THEME.gen) { state.pal = themeRamp(); state._gen = THEME.gen; }
+      const nBlobs = 2 + Math.floor((count*6 + 50)/100);   // 2..8, 6 at def 67
+      const coreW = core/100*1.2;                          // 0..1.2, 0.6 at def 50
+      const falloffExp = 1 + Math.floor(falloff*5/100);    // 1..6, 3 at def 40
+      const gain = 0.5 + contrast/100;                     // 0.5..1.5, 1 at def 50
+      const wanderMul = wander/50;                         // 0..2, 1 at def 50
+      if (state._gen !== THEME.gen || state._gain !== gain) {
+        state.pal = palContrast(themeRamp(), gain);
+        state._gen = THEME.gen; state._gain = gain;
+      }
       const pal = state.pal;
       const t = tMs * omega0;
-      for (const b of state.blobs) {
-        b.bx = b.cx + b.ax1*Math.sin(t*b.fx1+b.px1) + b.ax2*Math.sin(t*b.fx2*1.7+b.px2);
-        b.by = b.cy + b.ay1*Math.cos(t*b.fy1*1.13+b.py1) + b.ay2*Math.sin(t*b.fy2*0.9+b.py2);
+      const live = state.blobs.slice(0, nBlobs);
+      for (const b of live) {
+        const ax1 = b.ax1*wanderMul, ax2 = b.ax2*wanderMul;
+        const ay1 = b.ay1*wanderMul, ay2 = b.ay2*wanderMul;
+        b.bx = b.cx + ax1*Math.sin(t*b.fx1+b.px1) + ax2*Math.sin(t*b.fx2*1.7+b.px2);
+        b.by = b.cy + ay1*Math.cos(t*b.fy1*1.13+b.py1) + ay2*Math.sin(t*b.fy2*0.9+b.py2);
         const R = (b.R0 + b.Rpulse*Math.sin(tMs*b.wR + b.phR)) * sizeMul;
         b.R2 = R*R; b.invR2 = 1/b.R2;
       }
       const field = state.field;
       field.fill(0);
-      for (const b of state.blobs) {
+      for (const b of live) {
         const half0 = Math.sqrt(b.R2);
         const ylo = Math.max(0, Math.floor(b.by-half0)), yhi = Math.min(h-1, Math.ceil(b.by+half0));
         for (let y = ylo; y <= yhi; y++) {
@@ -412,8 +440,9 @@ function gradLUT(stops) { // stops: [[t0..255, r, g, b], ...] -> Uint8Array 256*
           for (let x = xlo; x <= xhi; x++) {
             const dx = x-b.bx, tt = 1 - (dx*dx+dy2)*b.invR2;
             if (tt <= 0) continue;
-            const t3 = tt*tt*tt;
-            field[rowOff+x] += t3*intensity + (tt > 0.7 ? t3*t3*intensity*0.6 : 0);
+            let t3 = tt;
+            for (let k = 1; k < falloffExp; k++) t3 *= tt;
+            field[rowOff+x] += t3*intensity + (tt > 0.7 ? t3*t3*intensity*coreW : 0);
           }
         }
       }

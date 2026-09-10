@@ -32,6 +32,11 @@ export const BG_ANIMATIONS = [
       { key: 'speed', label: 'Speed', def: 50 },
       { key: 'scale', label: 'Blob size', def: 50 },
       { key: 'glow', label: 'Glow', def: 60 },
+      { key: 'count', label: 'Blob count', def: 67 },
+      { key: 'core', label: 'Hot core', def: 50 },
+      { key: 'falloff', label: 'Falloff', def: 40 },
+      { key: 'contrast', label: 'Contrast', def: 50 },
+      { key: 'wander', label: 'Wander', def: 50 },
     ],
   },
   {
