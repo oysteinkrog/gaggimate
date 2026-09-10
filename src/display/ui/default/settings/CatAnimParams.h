@@ -2,7 +2,7 @@
 #define GM_CAT_ANIM_PARAMS_H
 
 // The animation Parameters page (gm-3vj.2), pushed from the Animation
-// category's second row. This header is the whole contract between the two
+// category's Parameters row. This header is the whole contract between the two
 // files: CatAnimation.cpp owns the animation roster (and, on the simulator,
 // the mirror of it) and exports the three accessors below; CatAnimParams.cpp
 // owns the page and exports the one call that pushes it. The page's own

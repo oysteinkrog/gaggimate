@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Scenario for the Animation settings category (gm-flw.9): animation, frame
-rate, all-screens, theme, gradient, plates, plate colour/opacity, element
-tint/colour and text scrim, every value row live, plus the Parameters child
-page the Animation row's neighbour pushes (gm-3vj.2). Built on
+"""Scenario for the Animation settings category (gm-flw.9): animation, the
+standby screen's own animation (gm-3vj.49), frame rate, all-screens, theme,
+gradient, plates, plate colour/opacity, element tint/colour and text scrim,
+every value row live, plus the Parameters child page the Parameters row
+pushes (gm-3vj.2). Built on
 tools/settings_ui_tests/rig.py (gm-flw.16); runs against the desktop
 simulator by default (pio run -e display-sim) and against a loadtest device
 with --host.
@@ -68,11 +69,12 @@ PALETTE = [
     ("Cyan", 0x00FFFF), ("Teal", 0x008080), ("Green", 0x00FF00), ("Black", 0x000000),
 ]
 
-# The fifteen fields CatAnimation.cpp writes; the "visit changes nothing
+# The sixteen fields CatAnimation.cpp writes; the "visit changes nothing
 # writes nothing" check compares these, byte for byte, before and after a
 # no-op visit.
 ANIMATION_FIELDS = [
-    "bgAnimId", "bgAnimFps", "bgAnimAllScreens", "themeMode", "bgAnimThemeMap", "bgAnimClearPlates",
+    "bgAnimId", "bgAnimStandbyId", "bgAnimFps", "bgAnimAllScreens", "themeMode", "bgAnimThemeMap",
+    "bgAnimClearPlates",
     "bgAnimPlateColor", "bgAnimPlateOpacity", "elementTintEnabled", "elementTintColor", "bgAnimScrim",
     "bgFadeOutMs", "bgFadeInMs", "bgFadeCurve", "bgAnimInterlace",
 ]
@@ -154,6 +156,16 @@ def expected_gradient_text(settings, anim_id=None):
     theme_idx = int(settings["bgAnimTheme"])
     name = THEME_NAMES[theme_idx] if 0 <= theme_idx < len(THEME_NAMES) else THEME_NAMES[0]
     return "Default (%s)" % name
+
+
+def expected_standby_text(settings):
+    """Python mirror of CatAnimation.cpp's clampStandbyAnimId plus
+    standbyChoiceLabel: the Standby anim row shows "Same" for -1 and for any
+    id outside the roster, and the animation's name otherwise."""
+    stored = int(settings["bgAnimStandbyId"])
+    if stored < 0 or stored >= len(ANIM_NAMES):
+        return "Same"
+    return ANIM_NAMES[stored]
 
 
 def expected_palette_text(color_int):
@@ -300,6 +312,10 @@ def check_rows_match_settings(rig):
     # tracks the row above it (CatAnimation.cpp).
     check(rig, "row_parameters", v["Parameters"] == ANIM_NAMES[int(s["bgAnimId"])],
           "%r vs bgAnimId=%s" % (v["Parameters"], s["bgAnimId"]))
+    # "Same" for -1 or for an id past the end of this build's roster, the
+    # animation's name otherwise (CatAnimation.cpp, clampStandbyAnimId).
+    check(rig, "row_standby_anim", v["Standby anim"] == expected_standby_text(s),
+          "%r vs bgAnimStandbyId=%s" % (v["Standby anim"], s["bgAnimStandbyId"]))
     check(rig, "row_frame_rate", v["Frame rate"] == "%d fps" % int(s["bgAnimFps"]), v["Frame rate"])
     check(rig, "row_all_screens", v["All screens"] == ("On" if s["bgAnimAllScreens"] else "Off"), v["All screens"])
     check(rig, "row_theme", v["Theme"] == THEME_MODE_LABELS[int(s["themeMode"])], v["Theme"])
@@ -340,6 +356,92 @@ def check_no_op_visit(rig):
     close_animation(rig)
     after = {k: rig.settings()[k] for k in ANIMATION_FIELDS}
     check(rig, "no_op_visit_writes_nothing", before == after, "before=%r after=%r" % (before, after))
+
+
+def standby_choice(anim_id):
+    """The row's cycle position for a stored id: 0 is "Same", n is animation
+    n - 1 (CatAnimation.cpp, standbyChoiceIndex)."""
+    return 0 if anim_id < 0 else anim_id + 1
+
+
+def standby_id_for_choice(choice):
+    return -1 if choice <= 0 else choice - 1
+
+
+def standby_step(anim_id, direction):
+    """One tap of the row's next/prev arrow, over "Same" plus the roster."""
+    count = len(ANIM_NAMES) + 1
+    return standby_id_for_choice((standby_choice(anim_id) + direction) % count)
+
+
+def standby_label(anim_id):
+    return "Same" if anim_id < 0 else ANIM_NAMES[anim_id]
+
+
+def check_standby_anim(rig):
+    """Acceptance (gm-3vj.49): the Standby anim row cycles through "Same" and
+    then every animation, writes bgAnimStandbyId live, leaves bgAnimId alone,
+    and its value survives closing and reopening the category. The rule the
+    value drives (the standby screen playing that animation instead of the
+    main one) is a render-path effect and is not observable here: the
+    simulator has no renderer and no /api/debug/anim route (see "Not
+    verified" at the bottom of this file)."""
+    s0 = rig.settings()
+    stored0 = int(s0["bgAnimStandbyId"])
+    anim_id0 = int(s0["bgAnimId"])
+    # The row shows "Same" for a stored id outside the roster, so the value
+    # the arrows step from is the clamped one, not the raw stored one.
+    start = stored0 if 0 <= stored0 < len(ANIM_NAMES) else -1
+
+    open_animation(rig)
+    d = page_with_row(rig, "Standby anim")
+    check(rig, "standby_row_initial_text", rig.row_value(d, "Standby anim") == standby_label(start),
+          "%r vs stored %d" % (rig.row_value(d, "Standby anim"), stored0))
+
+    # Two taps forward: one crosses the "Same"/first-animation boundary from
+    # wherever the fixture starts, the second lands on a name either way.
+    expect = start
+    for step in (1, 2):
+        expect = standby_step(expect, +1)
+        btn = rig.find_tag(page_with_row(rig, "Standby anim"), "Standby anim", "next")
+        if btn is None:
+            check(rig, "standby_next_found", False, "no next arrow on the Standby anim row")
+            close_animation(rig)
+            return
+        rig.tap_target(btn)
+        got = int(rig.settings()["bgAnimStandbyId"])
+        check(rig, "standby_live_write_%d" % step, got == expect, "got %d want %d" % (got, expect))
+        d = page_with_row(rig, "Standby anim")
+        check(rig, "standby_row_value_%d" % step, rig.row_value(d, "Standby anim") == standby_label(expect),
+              "%r want %r" % (rig.row_value(d, "Standby anim"), standby_label(expect)))
+
+    check(rig, "standby_leaves_main_anim_alone", int(rig.settings()["bgAnimId"]) == anim_id0,
+          "bgAnimId %r want %d" % (rig.settings()["bgAnimId"], anim_id0))
+
+    for page, dump in all_row_values(rig)[1]:
+        a = rig.audit(dump)
+        check(rig, "standby_audit_page_%d_clean" % page, len(a["violations"]) == 0, repr(a["violations"]))
+
+    # Persistence: close the category, reopen it, and the row reads back the
+    # value the taps wrote rather than the one the visit opened on.
+    close_animation(rig)
+    persisted = int(rig.settings()["bgAnimStandbyId"])
+    check(rig, "standby_persists_after_close", persisted == expect, "got %d want %d" % (persisted, expect))
+    open_animation(rig)
+    d = page_with_row(rig, "Standby anim")
+    check(rig, "standby_row_after_reopen", rig.row_value(d, "Standby anim") == standby_label(expect),
+          "%r want %r" % (rig.row_value(d, "Standby anim"), standby_label(expect)))
+
+    # Restore, through the UI: two taps back the way they came. A stored id
+    # outside the roster cannot be put back this way (the row cannot show
+    # it), so that case is reported rather than forced.
+    for _ in range(2):
+        tap_row(rig, "Standby anim", "prev")
+    close_animation(rig)
+    final = int(rig.settings()["bgAnimStandbyId"])
+    check(rig, "standby_restored", final == start, "got %d want %d" % (final, start))
+    if final != stored0:
+        rig.log("could_not_restore", bgAnimStandbyId=final, was=stored0)
 
 
 def check_frame_rate_live_and_precedence(rig):
@@ -403,7 +505,10 @@ def check_theme_recolor(rig):
     proves."""
     s0 = rig.settings()
     mode0 = int(s0["themeMode"])
-    d = open_animation(rig)
+    open_animation(rig)
+    # Theme moved off page 0 when the Standby anim row was added (gm-3vj.49),
+    # so the row is reached by name, like every other row this file touches.
+    d = page_with_row(rig, "Theme")
     row = rig.find_tag(d, "Theme", "row")
     if row is None:
         check(rig, "theme_row_found", False)
@@ -915,6 +1020,7 @@ def check_parameters_web_precedence(rig):
 CHECKS = [
     ("rows_match_settings", check_rows_match_settings),
     ("no_op_visit", check_no_op_visit),
+    ("standby_anim", check_standby_anim),
     ("frame_rate_live_and_precedence", check_frame_rate_live_and_precedence),
     ("theme_recolor", check_theme_recolor),
     ("gradient_default_and_builtin", check_gradient_default_and_builtin),
@@ -992,6 +1098,16 @@ if __name__ == "__main__":
 #   loop `rig.tap_target(find_tag(dump, "Animation", "next"))` once a
 #   second across all 14 animations against Rig("192.168.1.121"), reading
 #   rig.anim() and rig.heap() between taps.
+# - The Standby anim row's own effect (gm-3vj.49): the standby screen
+#   playing the chosen animation and the other screens keeping the main one,
+#   and the switch on a standby entry or exit costing no more than a live
+#   change of the main id does. Neither is observable here (no renderer, no
+#   /api/debug/anim route on the simulator). Command for the leader against
+#   the device: set Standby anim to an animation that differs from
+#   Animation, read rig.anim()["anim_id"] on an active screen, let the
+#   standby timeout land or force the standby screen, and read anim_id
+#   again; then walk in and out of standby a few times watching
+#   /api/debug/anim frames and /api/debug/heap int_free and hot_fail.
 # - Frame rate's device assertion: /api/debug/anim cap reaching 60 within
 #   500 ms, and the passive frame-counter rate check (orbits, all-screens
 #   on, interlace confirmed active). Command: rig.anim() before/after the

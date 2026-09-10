@@ -4498,9 +4498,29 @@ void DefaultUI::updateState() {
 #else
     bgAnimAllScreens = settings.isBgAnimAllScreens();
 #endif
+    // The standby screen can carry its own animation. bgAnimStandbyId is -1
+    // when it should play the same one as everywhere else, and an id past the
+    // end of the registry reads the same way, so a build rolled back to a
+    // shorter roster falls back instead of indexing off the end (nothing
+    // range-checks the value on its way in from the web form; CLAUDE.md,
+    // "Nothing range-checks a stored value on the web path"). Read every pass
+    // like the main id, so a change from either editor lands on the next
+    // frame, and so a standby entry or exit switches the animation over the
+    // same path a live edit of the main id already takes: renderFrame sees a
+    // new id, releases the outgoing animation's tables and inits the incoming
+    // one on that frame. The params are parsed for whichever id wins, and
+    // bgAnimParams is indexed per animation, so the standby animation brings
+    // its own parameters and its own gradient with it (the theme key below
+    // takes animId too).
+    int animId = settings.getBgAnimId();
+    if (currentScreen == SCREEN_ID_STANDBY_SCREEN) {
+        const int standbyId = settings.getBgAnimStandbyId();
+        if (standbyId >= 0 && standbyId < bg_animation_count()) {
+            animId = standbyId;
+        }
+    }
     // A live gradient preview overrides both the animation shown and its
     // gradient until it lapses; the saved selection is re-resolved after.
-    int animId = settings.getBgAnimId();
     bool previewActive = false;
     bool previewApply = false;
     String previewGradient;

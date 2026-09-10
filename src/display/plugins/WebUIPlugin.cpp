@@ -1263,6 +1263,12 @@ void WebUIPlugin::handleSettings(AsyncWebServerRequest *request) const {
             settings->setScaleMenuButton(request->hasArg("scaleMenuButton"));
             if (request->hasArg("bgAnimId"))
                 settings->setBgAnimId(request->arg("bgAnimId").toInt());
+            // -1 means "the standby screen plays the main animation". The
+            // form sends that value like any other, so nothing here has to
+            // special-case it; DefaultUI reads a negative or out of range id
+            // as "same as the main one".
+            if (request->hasArg("bgAnimStandbyId"))
+                settings->setBgAnimStandbyId(request->arg("bgAnimStandbyId").toInt());
             if (request->hasArg("bgAnimParams"))
                 settings->setBgAnimParams(request->arg("bgAnimParams"));
             if (request->hasArg("bgAnimTheme"))
@@ -1530,6 +1536,7 @@ void WebUIPlugin::handleSettings(AsyncWebServerRequest *request) const {
     doc["smartGrindActive"] = settings.isSmartGrindActive();
     doc["scaleMenuButton"] = settings.isScaleMenuButton();
     doc["bgAnimId"] = settings.getBgAnimId();
+    doc["bgAnimStandbyId"] = settings.getBgAnimStandbyId();
     doc["bgAnimParams"] = settings.getBgAnimParams();
     doc["bgAnimAllScreens"] = settings.isBgAnimAllScreens();
     doc["bgAnimTheme"] = settings.getBgAnimTheme();

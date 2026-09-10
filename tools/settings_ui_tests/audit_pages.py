@@ -67,8 +67,9 @@ class PageSpec:
 
 
 # The five real categories plus the Fixture tile, in kCategories order. Row
-# counts: Temps 5 (1 page), Display 6 (2), Animation 16 (4, the Parameters
-# row gm-3vj.2 adds included), Machine 3 + the Schedules row gm-flw.11 adds
+# counts: Temps 5 (1 page), Display 6 (2), Animation 17 (4, the Parameters
+# row gm-3vj.2 adds and the Standby anim row gm-3vj.49 adds included),
+# Machine 3 + the Schedules row gm-flw.11 adds
 # (1 page), Status 8 (2), Fixture 11 (3).
 #
 # The Parameters page itself is not in this table. Its row list is one
@@ -83,12 +84,12 @@ CATEGORY_PAGES = [
              ["Main brightness", "Standby brightness", "Dim after", "24-hour clock", "Time zone region"], "display"),
     PageSpec("display-p1", CAT_DISPLAY, 1, ["City"], "display"),
     PageSpec("animation-p0", CAT_ANIMATION, 0,
-             ["Animation", "Parameters", "Frame rate", "All screens", "Theme"], "animation"),
+             ["Animation", "Standby anim", "Parameters", "Frame rate", "All screens"], "animation"),
     PageSpec("animation-p1", CAT_ANIMATION, 1,
-             ["Gradient", "Plates", "Plate colour", "Plate opacity", "Element tint"], "animation"),
+             ["Theme", "Gradient", "Plates", "Plate colour", "Plate opacity"], "animation"),
     PageSpec("animation-p2", CAT_ANIMATION, 2,
-             ["Tint colour", "Text scrim", "Fade out", "Fade in", "Fade curve"], "animation"),
-    PageSpec("animation-p3", CAT_ANIMATION, 3, ["Interlace"], "animation"),
+             ["Element tint", "Tint colour", "Text scrim", "Fade out", "Fade in"], "animation"),
+    PageSpec("animation-p3", CAT_ANIMATION, 3, ["Fade curve", "Interlace"], "animation"),
     PageSpec("machine-p0", CAT_MACHINE, 0,
              ["Startup mode", "Standby timeout", "Auto wake-up", "Schedules"], "machine"),
     PageSpec("status-p0", CAT_STATUS, 0,

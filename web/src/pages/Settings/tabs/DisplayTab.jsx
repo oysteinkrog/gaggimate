@@ -7,6 +7,16 @@ import {
   ToggleField,
 } from '../../../components/SettingsFormField.jsx';
 
+// The standby animation selector's value. -1 is "same as main", which is
+// also what an id past the end of this build's roster means: the firmware
+// falls back to the main animation for one of those rather than indexing off
+// the end of the registry, so the form shows the same thing it does.
+function standbyAnimValue(stored) {
+  const id = parseInt(stored, 10);
+  if (!Number.isFinite(id) || id < 0 || id >= BG_ANIMATIONS.length) return -1;
+  return id;
+}
+
 // Animation picker + parameter sliders for the selected animation only.
 // Params live in formData.bgAnimParams as the same packed string the firmware
 // stores ("p0,p1,p2,p3;..." indexed by animation id) — edited via setField.
@@ -406,6 +416,29 @@ function BackgroundAnimationSettings({ formData, onChange, setField }) {
           checked={!!formData.bgAnimAllScreens}
           onChange={onChange('bgAnimAllScreens')}
         />
+      </div>
+      <div className='mt-4'>
+        <SettingsFormField
+          label='Standby screen animation'
+          htmlFor='bgAnimStandbyId'
+          noMargin
+          helpText='The standby screen can play a different animation from the rest of the display. It keeps its own parameters and its own gradient. With the animation shown behind all screens turned off, only this one is ever seen.'
+        >
+          <select
+            id='bgAnimStandbyId'
+            name='bgAnimStandbyId'
+            className='select select-bordered w-full'
+            value={standbyAnimValue(formData.bgAnimStandbyId)}
+            onChange={onChange('bgAnimStandbyId')}
+          >
+            <option value={-1}>Same as main</option>
+            {BG_ANIMATIONS.map((a, i) => (
+              <option key={`standby-${a.id}`} value={i}>
+                {a.name}
+              </option>
+            ))}
+          </select>
+        </SettingsFormField>
       </div>
       <div className='mt-4'>
         <ToggleField

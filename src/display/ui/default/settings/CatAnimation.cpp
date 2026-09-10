@@ -1,11 +1,12 @@
-// Animation category: background animation, its parameters (one row that
-// pushes CatAnimParams.cpp's page), frame rate, all-screens, the UI theme,
-// the current animation's gradient, plate handling, element tint, the text
-// scrim, the screen fade (out, in, curve) and interlacing. Every value row is
-// live (SettingsUI.h): a row writes Settings
-// and calls markDirty() the moment it changes, rather than waiting for
-// commit, so DefaultUI::updateState applies it on the next rerender pass
-// (CLAUDE.md, UI-pipeline invariants). commit()'s only remaining job is the
+// Animation category: background animation, the standby screen's own
+// animation, the parameters of the chosen one (a row that pushes
+// CatAnimParams.cpp's page), frame rate, all-screens, the UI theme, the
+// current animation's gradient, plate handling, element tint, the text
+// scrim, the screen fade (out, in, curve) and interlacing. Every value row
+// is live (SettingsUI.h): a row writes Settings and calls markDirty() the
+// moment it changes, rather than waiting for commit, so
+// DefaultUI::updateState applies it on the next rerender pass (CLAUDE.md,
+// UI-pipeline invariants). commit()'s only remaining job is the
 // touched-field precedence rule: if a web save landed on a touched field
 // while this page was open, re-assert this visit's value (gm-flw.9).
 #include "CatAnimParams.h"
@@ -162,6 +163,25 @@ int clampAnimId(int id) {
     return id >= count ? count - 1 : id;
 }
 
+// The Standby anim row's own clamp. Its stored value is -1 for "play the
+// main animation on the standby screen too", which is the default, and an id
+// past the end of the live registry means the same thing: DefaultUI falls
+// back to the main id there rather than indexing off the end, so the row has
+// to show "Same" for that value instead of a name it cannot look up.
+int clampStandbyAnimId(int id) {
+    const int count = animCountFn();
+    if (id < 0 || count <= 0 || id >= count) {
+        return -1;
+    }
+    return id;
+}
+
+// The row cycles through "Same" and then every animation, so choice 0 is
+// "Same" (stored -1) and choice n is animation n - 1.
+int standbyChoiceIndex(int id) { return id < 0 ? 0 : id + 1; }
+int standbyIdForChoice(int choice) { return choice <= 0 ? -1 : choice - 1; }
+const char *standbyChoiceLabel(int id) { return id < 0 ? "Same" : animNameFn(id); }
+
 // The choice index bgAnimThemeMap's stored ref resolves to for animId, 0
 // (Default) when the map has no entry there or the entry names a library
 // gradient that has since been deleted (SettingsModel.h,
@@ -184,6 +204,8 @@ std::string gradientDisplayText(int index, const std::vector<settingsui::Gradien
 
 struct CatAnimationCtx {
     int animId = 0;
+    // -1 = "Same", i.e. the standby screen plays the main animation.
+    int standbyAnimId = -1;
     long fps = 30; // kBgAnimFpsSpec grid (settingsui::stepValue works in long)
     bool allScreens = false;
     int themeMode = 0; // 0 Dark, 1 Light
@@ -229,6 +251,7 @@ struct CatAnimationCtx {
     bool interlace = false;
 
     bool animIdTouched = false;
+    bool standbyAnimIdTouched = false;
     bool fpsTouched = false;
     bool allScreensTouched = false;
     bool themeModeTouched = false;
@@ -244,6 +267,7 @@ struct CatAnimationCtx {
     bool interlaceTouched = false;
 
     lv_obj_t *animRow = nullptr;
+    lv_obj_t *standbyRow = nullptr;
     lv_obj_t *paramsRow = nullptr;
     lv_obj_t *frameRateRow = nullptr;
     lv_obj_t *themeRow = nullptr;
@@ -301,6 +325,29 @@ void animIdOnCycle(void *user, int dir) {
     if (ctx->ui != nullptr) {
         ctx->ui->ui().markDirty();
         ctx->ui->plugins().trigger("bganim:preview-end");
+    }
+}
+
+// ---- Standby anim -----------------------------------------------------------
+
+// The animation the standby screen plays. "Same" (stored -1) means it plays
+// whatever the Animation row above selects; anything else names one
+// animation of its own, with its own stored parameters and its own gradient,
+// because both are indexed by animation id. No preview-end trigger here,
+// unlike the Animation row: this value changes nothing on the screen the
+// settings cover sits on, so it cannot be what a live gradient preview is
+// showing.
+void standbyAnimOnCycle(void *user, int dir) {
+    auto *ctx = static_cast<CatAnimationCtx *>(user);
+    const int choice = settingsui::wrapIndex(standbyChoiceIndex(ctx->standbyAnimId), animCountFn() + 1, dir);
+    ctx->standbyAnimId = standbyIdForChoice(choice);
+    ctx->standbyAnimIdTouched = true;
+    controller.getSettings().setBgAnimStandbyId(ctx->standbyAnimId);
+    if (ctx->standbyRow != nullptr) {
+        settingsRowSetValue(ctx->standbyRow, standbyChoiceLabel(ctx->standbyAnimId));
+    }
+    if (ctx->ui != nullptr) {
+        ctx->ui->ui().markDirty();
     }
 }
 
@@ -543,7 +590,7 @@ void interlaceOnToggle(void *user, bool value) {
 
 // ---- shell plumbing ---------------------------------------------------------
 
-int animRowCount(void * /*ctx*/) { return 16; }
+int animRowCount(void * /*ctx*/) { return 17; }
 
 void animBuildRow(void *ctx0, int index, lv_obj_t *parent, SettingsUI &ui) {
     auto *ctx = static_cast<CatAnimationCtx *>(ctx0);
@@ -560,7 +607,16 @@ void animBuildRow(void *ctx0, int index, lv_obj_t *parent, SettingsUI &ui) {
         settingsRowSetValue(row, animNameFn(ctx->animId));
         break;
     }
-    case 1: { // Parameters (pushes CatAnimParams.cpp's page)
+    case 1: { // Standby anim
+        lv_obj_t *row = settingsRowChoiceCreate(ui, parent, "Standby anim", "Standby anim", standbyAnimOnCycle, ctx);
+        ctx->standbyRow = row;
+        lv_obj_add_event_cb(
+            row, [](lv_event_t *e) { static_cast<CatAnimationCtx *>(lv_event_get_user_data(e))->standbyRow = nullptr; },
+            LV_EVENT_DELETE, ctx);
+        settingsRowSetValue(row, standbyChoiceLabel(ctx->standbyAnimId));
+        break;
+    }
+    case 2: { // Parameters (pushes CatAnimParams.cpp's page)
         lv_obj_t *row = settingsRowActionCreate(ui, parent, "Parameters", "Parameters", paramsOnActivate, ctx);
         ctx->paramsRow = row;
         lv_obj_add_event_cb(
@@ -571,7 +627,7 @@ void animBuildRow(void *ctx0, int index, lv_obj_t *parent, SettingsUI &ui) {
         settingsRowSetValue(row, animNameFn(ctx->animId));
         break;
     }
-    case 2: { // Frame rate
+    case 3: { // Frame rate
         lv_obj_t *row = settingsRowStepperCreate(ui, parent, "Frame rate", "Frame rate", frameRateOnStep, ctx);
         ctx->frameRateRow = row;
         lv_obj_add_event_cb(
@@ -581,10 +637,10 @@ void animBuildRow(void *ctx0, int index, lv_obj_t *parent, SettingsUI &ui) {
         settingsRowSetValue(row, settingsui::formatNumeric(ctx->fps, settingsui::kBgAnimFpsSpec).c_str());
         break;
     }
-    case 3: // All screens
+    case 4: // All screens
         settingsRowToggleCreate(ui, parent, "All screens", "All screens", ctx->allScreens, allScreensOnToggle, ctx);
         break;
-    case 4: { // Theme
+    case 5: { // Theme
         lv_obj_t *row = settingsRowChoiceCreate(ui, parent, "Theme", "Theme", themeOnCycle, ctx);
         ctx->themeRow = row;
         lv_obj_add_event_cb(
@@ -593,7 +649,7 @@ void animBuildRow(void *ctx0, int index, lv_obj_t *parent, SettingsUI &ui) {
         settingsRowSetValue(row, settingsui::kThemeModeLabels[ctx->themeMode]);
         break;
     }
-    case 5: { // Gradient
+    case 6: { // Gradient
         lv_obj_t *row = settingsRowChoiceCreate(ui, parent, "Gradient", "Gradient", gradientOnCycle, ctx);
         ctx->gradientRow = row;
         lv_obj_add_event_cb(
@@ -604,7 +660,7 @@ void animBuildRow(void *ctx0, int index, lv_obj_t *parent, SettingsUI &ui) {
         settingsRowSetValue(row, gradientDisplayText(ctx->gradientIndex, choices).c_str());
         break;
     }
-    case 6: { // Plates
+    case 7: { // Plates
         lv_obj_t *row = settingsRowChoiceCreate(ui, parent, "Plates", "Plates", platesOnCycle, ctx);
         ctx->platesRow = row;
         lv_obj_add_event_cb(
@@ -613,7 +669,7 @@ void animBuildRow(void *ctx0, int index, lv_obj_t *parent, SettingsUI &ui) {
         settingsRowSetValue(row, settingsui::kPlatesLabels[ctx->plates]);
         break;
     }
-    case 7: { // Plate colour
+    case 8: { // Plate colour
         lv_obj_t *row = settingsRowChoiceCreate(ui, parent, "Plate colour", "Plate colour", plateColorOnCycle, ctx);
         ctx->plateColorRow = row;
         lv_obj_add_event_cb(
@@ -624,7 +680,7 @@ void animBuildRow(void *ctx0, int index, lv_obj_t *parent, SettingsUI &ui) {
         settingsRowSetEnabled(row, ctx->plates == 2);
         break;
     }
-    case 8: { // Plate opacity
+    case 9: { // Plate opacity
         lv_obj_t *row = settingsRowStepperCreate(ui, parent, "Plate opacity", "Plate opacity", plateOpacityOnStep, ctx);
         ctx->plateOpacityRow = row;
         lv_obj_add_event_cb(
@@ -635,10 +691,10 @@ void animBuildRow(void *ctx0, int index, lv_obj_t *parent, SettingsUI &ui) {
         settingsRowSetEnabled(row, ctx->plates == 2);
         break;
     }
-    case 9: // Element tint
+    case 10: // Element tint
         settingsRowToggleCreate(ui, parent, "Element tint", "Element tint", ctx->tintEnabled, tintEnabledOnToggle, ctx);
         break;
-    case 10: { // Tint colour
+    case 11: { // Tint colour
         lv_obj_t *row = settingsRowChoiceCreate(ui, parent, "Tint colour", "Tint colour", tintColorOnCycle, ctx);
         ctx->tintColorRow = row;
         lv_obj_add_event_cb(
@@ -649,7 +705,7 @@ void animBuildRow(void *ctx0, int index, lv_obj_t *parent, SettingsUI &ui) {
         settingsRowSetEnabled(row, ctx->tintEnabled);
         break;
     }
-    case 11: { // Text scrim
+    case 12: { // Text scrim
         lv_obj_t *row = settingsRowStepperCreate(ui, parent, "Text scrim", "Text scrim", scrimOnStep, ctx);
         ctx->scrimRow = row;
         lv_obj_add_event_cb(
@@ -658,7 +714,7 @@ void animBuildRow(void *ctx0, int index, lv_obj_t *parent, SettingsUI &ui) {
         settingsRowSetValue(row, settingsui::formatNumeric(ctx->scrim, settingsui::kBgAnimScrimSpec).c_str());
         break;
     }
-    case 12: { // Fade out
+    case 13: { // Fade out
         lv_obj_t *row = settingsRowStepperCreate(ui, parent, "Fade out", "Fade out", fadeOutOnStep, ctx);
         ctx->fadeOutRow = row;
         lv_obj_add_event_cb(
@@ -667,7 +723,7 @@ void animBuildRow(void *ctx0, int index, lv_obj_t *parent, SettingsUI &ui) {
         settingsRowSetValue(row, settingsui::formatNumeric(ctx->fadeOut, settingsui::kBgFadeSpec).c_str());
         break;
     }
-    case 13: { // Fade in
+    case 14: { // Fade in
         lv_obj_t *row = settingsRowStepperCreate(ui, parent, "Fade in", "Fade in", fadeInOnStep, ctx);
         ctx->fadeInRow = row;
         lv_obj_add_event_cb(
@@ -676,7 +732,7 @@ void animBuildRow(void *ctx0, int index, lv_obj_t *parent, SettingsUI &ui) {
         settingsRowSetValue(row, settingsui::formatNumeric(ctx->fadeIn, settingsui::kBgFadeSpec).c_str());
         break;
     }
-    case 14: { // Fade curve
+    case 15: { // Fade curve
         lv_obj_t *row = settingsRowChoiceCreate(ui, parent, "Fade curve", "Fade curve", fadeCurveOnCycle, ctx);
         ctx->fadeCurveRow = row;
         lv_obj_add_event_cb(
@@ -686,7 +742,7 @@ void animBuildRow(void *ctx0, int index, lv_obj_t *parent, SettingsUI &ui) {
         settingsRowSetValue(row, settingsui::kFadeCurveLabels[ctx->fadeCurve]);
         break;
     }
-    case 15: // Interlace
+    case 16: // Interlace
         settingsRowToggleCreate(ui, parent, "Interlace", "Interlace", ctx->interlace, interlaceOnToggle, ctx);
         break;
     default:
@@ -701,6 +757,7 @@ void animEnter(void *ctx0) {
     auto *ctx = static_cast<CatAnimationCtx *>(ctx0);
     Settings &settings = controller.getSettings();
     ctx->animId = clampAnimId(settings.getBgAnimId());
+    ctx->standbyAnimId = clampStandbyAnimId(settings.getBgAnimStandbyId());
     ctx->fps = settings.getBgAnimFps();
     ctx->allScreens = settings.isBgAnimAllScreens();
     ctx->themeMode = settings.getThemeMode();
@@ -724,6 +781,7 @@ void animEnter(void *ctx0) {
     ctx->gradientRef = choices[static_cast<size_t>(ctx->gradientIndex)].ref;
 
     ctx->animIdTouched = false;
+    ctx->standbyAnimIdTouched = false;
     ctx->fpsTouched = false;
     ctx->allScreensTouched = false;
     ctx->themeModeTouched = false;
@@ -751,6 +809,9 @@ void animReconcile(void *ctx0) {
     Settings &settings = controller.getSettings();
     if (!ctx->animIdTouched) {
         ctx->animId = clampAnimId(settings.getBgAnimId());
+    }
+    if (!ctx->standbyAnimIdTouched) {
+        ctx->standbyAnimId = clampStandbyAnimId(settings.getBgAnimStandbyId());
     }
     if (!ctx->fpsTouched) {
         ctx->fps = settings.getBgAnimFps();
@@ -821,6 +882,11 @@ void animCommit(void *ctx0) {
     if (ctx->animIdTouched && settings.getBgAnimId() != ctx->animId) {
         settings.setBgAnimId(ctx->animId);
         settingsLogAppend(log, sizeof(log), used, " anim=%d", ctx->animId);
+        wrote = true;
+    }
+    if (ctx->standbyAnimIdTouched && settings.getBgAnimStandbyId() != ctx->standbyAnimId) {
+        settings.setBgAnimStandbyId(ctx->standbyAnimId);
+        settingsLogAppend(log, sizeof(log), used, " standbyAnim=%d", ctx->standbyAnimId);
         wrote = true;
     }
     if (ctx->fpsTouched && settings.getBgAnimFps() != static_cast<int>(ctx->fps)) {

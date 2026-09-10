@@ -28,7 +28,8 @@ to run the tests, and what never to do here.
   delay, delay auto-adjust.
 - `CatDisplay.cpp`: main and standby brightness, dim timeout, 24-hour clock,
   time zone region and city.
-- `CatAnimation.cpp`: animation, its Parameters row, frame rate, all
+- `CatAnimation.cpp`: animation, the standby screen's own animation, the
+  Parameters row, frame rate, all
   screens, theme, gradient, plates and plate colour and opacity, element
   tint and tint colour, text scrim, screen fade out, fade in and fade
   curve, interlace. Every value row here applies live. It also owns the
@@ -36,7 +37,7 @@ to run the tests, and what never to do here.
   mirror of it, and exports that as the three accessors `CatAnimParams.h`
   declares.
 - `CatAnimParams.cpp` / `.h`: the Parameters page, pushed from the
-  Animation category's second row. One stepper per parameter the chosen
+  Animation category's third row. One stepper per parameter the chosen
   animation defines (0 to 100, step 5, fast step 10), labelled from the
   animation's own `BgAnimParamDef`, plus a "Reset to defaults" confirm
   row. Every step writes the whole `bgAnimParams` string back and calls
@@ -59,6 +60,35 @@ to run the tests, and what never to do here.
 - `SettingsFixture.cpp`: the sixth tile. One of each row widget, and the
   counters the Fixture scenario asserts on. Compiled only under
   `GM_TOUCH_PROBE` or `GAGGIMATE_SIM`.
+
+### The Standby anim row
+
+The Animation category's second row picks a background animation for the
+standby screen on its own. It cycles through "Same" and then every animation
+in the roster, and stores `bgAnimStandbyId`: -1 for "Same", otherwise the
+animation's id. -1 is the default, so a device that has never touched this
+plays one animation everywhere, the way it always did.
+
+The rule lives in one place, `DefaultUI::updateState`. On every UI pass it
+reads `bgAnimId`, and when the current screen is the standby screen and
+`bgAnimStandbyId` names an animation in the live registry it pushes that id
+instead. Everything downstream keys off the id it pushed, so the standby
+animation brings its own stored parameters and its own gradient with it.
+Nothing extra happens on a standby entry or exit: the render task sees a new
+id, hands back the outgoing animation's tables and inits the incoming one on
+that frame, which is the same path a live edit of the main animation already
+takes.
+
+A stored id past the end of the registry reads as "Same" rather than as an
+error, in the row, in the web form and in the selection rule. Nothing
+range-checks the value on its way in, and a build rolled back to a shorter
+roster would otherwise index off the end.
+
+One consequence worth knowing before reading a bug report: with "All
+screens" off the animation only ever plays on the standby screen, so a
+Standby anim other than "Same" is then the only animation anyone sees, and
+the Animation row picks the one nothing shows. The web form says as much in
+its help text.
 
 The tests are one directory tree away: the shared rig and the scenarios in
 `tools/settings_ui_tests/` (its own `README.md` documents `Rig` and `Sim`

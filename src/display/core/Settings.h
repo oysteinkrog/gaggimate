@@ -170,6 +170,7 @@ class Settings {
     bool isSmartGrindActive() const { return smartGrindActive.get(); }
     bool isScaleMenuButton() const { return scaleMenuButton.get(); }
     int getBgAnimId() const { return bgAnimId.get(); }
+    int getBgAnimStandbyId() const { return bgAnimStandbyId.get(); }
     String getBgAnimParams() const { return bgAnimParams.get(); }
     bool isBgAnimAllScreens() const { return bgAnimAllScreens.get(); }
     int getBgAnimTheme() const { return bgAnimTheme.get(); }
@@ -274,6 +275,7 @@ class Settings {
     void setSmartGrindActive(bool smart_grind_active);
     void setScaleMenuButton(bool scale_menu_button);
     void setBgAnimId(int bg_anim_id);
+    void setBgAnimStandbyId(int bg_anim_standby_id);
     void setBgAnimParams(const String &bg_anim_params);
     void setBgAnimAllScreens(bool bg_anim_all_screens);
     void setBgAnimTheme(int bg_anim_theme);
@@ -387,6 +389,13 @@ class Settings {
     // (index into BG_ANIMATIONS), its per-animation parameters, and whether it
     // runs behind every screen or only during standby sleep.
     Property<int> bgAnimId{registry, "bg_an", 0};
+    // The standby screen can play a different animation from the rest of
+    // the UI. -1 means "the same one as everywhere else", which is the
+    // default and what every device that has never set this stores.
+    // An id past the end of the registry reads as -1 too, so a build
+    // rolled back to a shorter roster falls back instead of indexing off
+    // the end (DefaultUI::updateState, CatAnimation.cpp).
+    Property<int> bgAnimStandbyId{registry, "bg_ans", -1};
     // Per-animation params, "p0,p1,p2,p3;p0,p1,p2,p3;..." indexed by anim id,
     // each 0-100; missing/short entries fall back to the animation's defaults.
     Property<String> bgAnimParams{registry, "bg_anp", ""};

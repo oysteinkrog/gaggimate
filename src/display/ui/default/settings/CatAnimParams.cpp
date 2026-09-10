@@ -1,6 +1,6 @@
 // The animation Parameters page (gm-3vj.2): one stepper row per parameter
 // the current background animation defines, plus a "Reset to defaults"
-// confirm row. Pushed from the Animation category's second row
+// confirm row. Pushed from the Animation category's Parameters row
 // (CatAnimation.cpp, through settingsAnimParamsPush below); its
 // SettingsCategoryDef lives in this file's anonymous namespace, like
 // CatSchedules.cpp's two pushed pages, because it is never in SettingsUI.h's
