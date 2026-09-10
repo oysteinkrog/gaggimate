@@ -47,6 +47,11 @@ export const BG_ANIMATIONS = [
       { key: 'speed', label: 'Speed', def: 50 },
       { key: 'scale', label: 'Fringe density', def: 45 },
       { key: 'glow', label: 'Sheen', def: 55 },
+      { key: 'spread', label: 'Wave spread', def: 50 },
+      { key: 'twist', label: 'Twist', def: 50 },
+      { key: 'wobble', label: 'Breathe', def: 50 },
+      { key: 'vignette', label: 'Edge fade', def: 80 },
+      { key: 'grain', label: 'Grain', def: 50 },
     ],
   },
   {

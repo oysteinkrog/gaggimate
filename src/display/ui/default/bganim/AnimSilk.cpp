@@ -54,15 +54,21 @@
 //
 // Non-negative env proof (why the clamp branch is gone): for ANY square
 // panel (w==h — true of every display driver in this tree: 480x480 and
-// 466x466), R = w/2 and vignK = 0.32/R^2, so vignK*dx^2 and vignK*dy^2 are
-// each in [0, 0.32] regardless of resolution (dx,dy max out at R, so
-// vignK*R^2 == 0.32 exactly). envRowBase = 1 - vignK*dy^2 is therefore in
-// [0.68, 1.0], and env = envRowBase - vignK*dx^2 is in [0.68-0.32, 1.0] =
-// [0.36, 1.0] — always positive. In Q8 that's env_q8 in [~92, 256], with
-// zero real-world path to negative. (If a non-square panel is ever added,
-// this bound breaks; the fix would be to reinstate a one-instruction
-// `if (env_q8 < 0) env_q8 = 0;` guard, matching AnimEmber.cpp's precedent
-// of trusting an analytic proof scoped to the supported panel shapes.)
+// 466x466), R = w/2 and vignK = V/R^2, so vignK*dx^2 and vignK*dy^2 are
+// each in [0, V] regardless of resolution (dx,dy max out at R, so
+// vignK*R^2 == V exactly). V is the "vignette" param's factor: 0 at 0,
+// 0.32 at its default of 80, 0.4 at 100 (frame() maps it). envRowBase =
+// 1 - vignK*dy^2 is therefore in [1-V, 1.0] and env = envRowBase -
+// vignK*dx^2 is in [1-2V, 1.0], so [0.36, 1.0] at the default and
+// [0.2, 1.0] at the widest the param reaches — always positive. In Q8
+// that's env_q8 >= ~51, with zero real-world path to negative. The 0.4
+// ceiling is what keeps this proof alive, and it is why the param maps
+// through 80 rather than 50: past V = 0.5 the disc's corners go negative and
+// the unclamped palette gather below would read outside the pad. (If a
+// non-square panel is ever added, this bound breaks too; the fix would be
+// to reinstate a one-instruction `if (env_q8 < 0) env_q8 = 0;` guard,
+// matching AnimEmber.cpp's precedent of trusting an analytic proof scoped
+// to the supported panel shapes.)
 //
 // Final index range and the padded-palette trick (same pattern as
 // AnimEmber.cpp's paletteExt): nc_q8 in [0, 65280] (nc in [0,255] exactly,
@@ -71,12 +77,14 @@
 // >= 0 as the compile-time-safe floor). Their product is therefore in
 // [0, 255<<16] exactly (65280*256 == 255*65536). The dither amplitude comes
 // from ditherAmp(): half the palette's RGB565 step spacing, capped at 16.0
-// index units for a palette flat enough to have only 8 distinct steps, so
-// dith_q16 is in [-16, +16] << 16 at the widest (the old fixed 255/160
-// amplitude that gave the [-1, 255] bound quoted in earlier revisions of
-// this comment is gone since the dither was derived from the palette).
-// Summing and shifting right 16 (floor) gives idxq>>16 in [-16, 271], so
-// PAD below is 16: with PAD=4 the fuzz harness under ASan read one entry
+// index units for a palette flat enough to have only 8 distinct steps, then
+// scaled by the "grain" param's gain, which is 1.0 at its default of 50 and
+// 2.0 at 100 — so dith_q16 is in [-32, +32] << 16 at the widest (the old
+// fixed 255/160 amplitude that gave the [-1, 255] bound quoted in earlier
+// revisions of this comment is gone since the dither was derived from the
+// palette). Summing and shifting right 16 (floor) gives idxq>>16 in
+// [-32, 287], so PAD below is 40, eight index units of margin over the
+// widest the params can produce: with PAD=4 the fuzz harness under ASan read one entry
 // past g_lut at a parameter set that produced a coarse palette (2026-09-04),
 // which on the device is a wrong colour from whatever follows the table in
 // the slab. band()'s final lookup stays a single unclamped, unbranched
@@ -274,6 +282,12 @@ SilkWave wave[3] = {
     {2.15f, -1.0f, 1.37f, 6.2831853f / 95000.0f, 2.1f, 0, 0},
     {4.35f, 1.4f, 0.71f, 6.2831853f / 123000.0f, 4.0f, 0, 0},
 };
+// The heading the three waves collapse onto when the "spread" param is 0:
+// the mean of the A0 values above, (0.20 + 2.15 + 4.35) / 3. Only its value
+// at spread 0 matters visually; at the default the term it feeds is
+// multiplied by exactly zero (see frame()), so no precision claim rides on
+// this constant.
+constexpr float SPREAD_MID = 2.2333333f;
 
 // contrastLUT is indexed DIRECTLY by (s + 1536), s being the raw 3-wave sine
 // sum (range -1536..1536, 3073 values) — no more scaling s down to a 0..255
@@ -286,9 +300,14 @@ constexpr int CONTRAST_N = 3073; // 2*1536 + 1
 // Palette is stored "padded" like AnimEmber.cpp's paletteExt: PAD clamp
 // entries on each side of the real 256-entry ramp so an out-of-range
 // fixed-point index lands on a valid clamped entry with no branch. The
-// dither reaches +-16 index units at its ditherAmp() cap, so PAD is 16 (see
-// the file-header bound; 4 was one short of the cap and overran under ASan).
-constexpr int PAD = 16;
+// dither reaches +-16 index units at its ditherAmp() cap and the "grain"
+// param doubles that at 100, so the index reaches [-32, 287] and PAD is 40
+// (see the file-header bound; 4 was one short of the old cap and overran
+// under ASan). Widening the pad does not move PALETTE_REAL_OFF — any PAD up
+// to 255 still rounds to the same 3328 — so the pixel loops' palette base
+// pointer, the asm kernels' arguments and every golden are untouched by it;
+// the whole cost is 48 more bytes of hot table.
+constexpr int PAD = 40;
 constexpr int PAL_EXT_N = 256 + 2 * PAD;
 // contrastLUT and the padded palette are ONE allocation (contrast curve
 // first, palette immediately after) so band()'s hot loop only ever needs a
@@ -336,10 +355,11 @@ float ditherLUT[16];
 // (dx2) that never varied by phase in the first place, against a slab that
 // now only has 9,216 B total. Split back into what each term actually is:
 //   - g_dx2Row[x]: ONE copy, not four. dx2 depends only on x, so there is
-//     nothing to duplicate. Q8, range [0, ~82] for any x on a panel this
-//     size (see the file header's env proof: vignK*dx^2 <= 0.32*256 ==
-//     81.92 for |dx| up to the panel radius), so uint8_t holds it exactly -
-//     not a precision cut, a range fit. ~480 B at w=480, versus 4*480*4 =
+//     nothing to duplicate. Q8, range [0, ~103] for any x on a panel this
+//     size (see the file header's env proof: vignK*dx^2 <= V*256, which is
+//     81.92 at the vignette param's default and 102.4 at its ceiling of
+//     V = 0.4, for |dx| up to the panel radius), so uint8_t holds it
+//     exactly - not a precision cut, a range fit. ~480 B at w=480, versus 4*480*4 =
 //     7,680 B for the dx2 half of the old table alone.
 //   - g_ditherQ[16]: the dither term only ever takes 16 distinct values
 //     (4 y-phases x 4 x-phases, from BAYER4), so storing it once per pixel
@@ -374,6 +394,13 @@ int g_dx2RowW = 0; // width g_dx2Row was sized for
 int32_t *g_ditherQ = nullptr;
 uint32_t lastThemeGen = 0xFFFFFFFF;
 int lastGlow = -1;
+// "grain": scales the dither amplitude ditherAmp() derives from the palette.
+// 1.0 at the param's default of 50, 0 at 0 (hard contours, the banding the
+// dither exists to hide), 2.0 at 100 (grain spanning two palette steps, which
+// is what PAD above is sized for). Read by buildDitherLUT(), so it reaches
+// band() only through g_ditherQ and never touches a pixel loop.
+float g_ditherGain = 1.0f;
+int lastGrain = -1;
 // Vignette column term (same value and quantization as g_dx2Row[]) at the
 // GRID-NODE columns only: x = 0, SILK_GRID, ..., cellsFull*SILK_GRID — note
 // the last entry can be x == w, one past what g_dx2Row holds, because it is
@@ -385,7 +412,15 @@ int lastGlow = -1;
 uint8_t *g_dx2Node = nullptr;
 int g_dx2NodeN = 0;
 float g_invR2 = 1.0f;
-float g_vignK = 0.32f; // 0.32f * g_invR2, folded so band() does one multiply instead of two
+// "vignette": the vignette factor V. 0.32 at the param's default of 80 (the
+// value this animation shipped with), 0 at 0 (flat brightness out to the
+// panel edge), 0.4 at 100, capped there by the file header's non-negative
+// env proof. Like g_ditherGain it reaches band() only through tables —
+// g_dx2Row, g_dx2Node and the per-row envRowBase — so no pixel loop
+// changes with it.
+float g_vignBase = 0.32f;
+int lastVign = -1;
+float g_vignK = 0.32f; // g_vignBase * g_invR2, folded so band() does one multiply instead of two
 int32_t g_step[3];    // per-pixel x-phase step, Q32 turns/px
 int32_t g_bigStep[3]; // = g_step * SILK_GRID: per-cell x-phase step for the
                        // coarse-grid interpolation in band() (see there);
@@ -478,8 +513,12 @@ void extendPalette() {
 // <=1 LSB staircase at brightness 100. Deriving it drops that to 3.4%.
 void buildDitherLUT() {
     const float amp = ditherAmp(palette, 256);
+    // g_ditherGain is exactly 1.0f at the "grain" param's default, and
+    // `amp / 7.5f * 1.0f` is bit-identical to `amp / 7.5f`, so the default
+    // reproduces the pre-param table entry for entry.
+    const float scale = amp / 7.5f * g_ditherGain;
     for (int k = 0; k < 16; k++) {
-        ditherLUT[k] = (static_cast<float>(BAYER4[k]) - 7.5f) * (amp / 7.5f);
+        ditherLUT[k] = (static_cast<float>(BAYER4[k]) - 7.5f) * scale;
     }
 }
 
@@ -498,6 +537,44 @@ void refreshDither() {
     buildDitherLUT();
     for (int k = 0; k < 16; k++) {
         g_ditherQ[k] = static_cast<int32_t>(lroundf(ditherLUT[k] * 65536.0f));
+    }
+}
+
+// Fills both vignette tables from the current g_vignK. Called from init()
+// after the allocations and from frame() when the "vignette" param moves, so
+// the two paths write byte-identical tables: the fast path's node columns
+// only stay bit-identical to the slow path's pixels while g_dx2Node and
+// g_dx2Row round the same expression the same way (see g_dx2Node's
+// declaration), and one shared function is the cheapest way to guarantee
+// that. In place, never a free and a realloc: releasing anything but the
+// most-recently-allocated hot table does not reclaim the slab (see
+// BgAnimCommon.h), the same reason refreshDither() rebuilds where it stands.
+// The centre comes from g_dx2RowW, which is the w of the init() that
+// allocated the tables; a resolution change releases them first (BgAnim.h),
+// so it can never be a stale width.
+void buildVignetteTables() {
+    if (g_dx2RowW <= 0) {
+        return;
+    }
+    const float cx = g_dx2RowW * 0.5f;
+    if (g_dx2Row != nullptr) {
+        for (int x = 0; x < g_dx2RowW; x++) {
+            const float dx = x - cx;
+            // Pre-scaled by g_vignK and quantized to Q8 so band()'s
+            // per-pixel vignette work is a single integer subtract -
+            // env_q8 = envRowBase_q8 - g_dx2Row[x], instead of a load +
+            // add(dy2) + multiply(vignK) + subtract, all in float. Range
+            // [0, ~103] (see g_dx2Row's declaration) fits uint8_t exactly.
+            g_dx2Row[x] = static_cast<uint8_t>(lroundf(g_vignK * dx * dx * 256.0f));
+        }
+    }
+    if (g_dx2Node != nullptr) {
+        for (int j = 0; j < g_dx2NodeN; j++) {
+            const float dx = j * SILK_GRID - cx;
+            // Identical rounding to g_dx2Row[] above, required for the
+            // node-column bit-exactness argument in the file header.
+            g_dx2Node[j] = static_cast<uint8_t>(lroundf(g_vignK * dx * dx * 256.0f));
+        }
     }
 }
 
@@ -529,7 +606,11 @@ bool init(int w, int h) {
     }
     const float R = (w < h ? w : h) * 0.5f;
     g_invR2 = 1.0f / (R * R);
-    g_vignK = 0.32f * g_invR2;
+    // g_vignBase is 0.32f until the first frame() reads the "vignette" param,
+    // and release() puts it back, so a fresh activation builds the tables at
+    // the shipped factor and the first frame() rebuilds them only if the
+    // stored param differs from it.
+    g_vignK = g_vignBase * g_invR2;
     if (lastGlow < 0) {
         buildThemeRamp(palette, 256);
         extendPalette();
@@ -543,7 +624,6 @@ bool init(int w, int h) {
     // old per-phase retry loop (and its four independent null checks) is
     // gone along with RowAux.
     if (g_dx2Row == nullptr) {
-        const float cx = w * 0.5f;
         g_dx2Row = static_cast<uint8_t *>(allocHot(static_cast<size_t>(w) * sizeof(uint8_t)));
         if (g_dx2Row == nullptr) {
             g_dx2Row = static_cast<uint8_t *>(alloc(static_cast<size_t>(w) * sizeof(uint8_t)));
@@ -552,15 +632,6 @@ bool init(int w, int h) {
             return false;
         }
         g_dx2RowW = w;
-        for (int x = 0; x < w; x++) {
-            const float dx = x - cx;
-            // Pre-scaled by g_vignK and quantized to Q8 so band()'s
-            // per-pixel vignette work is a single integer subtract -
-            // env_q8 = envRowBase_q8 - g_dx2Row[x], instead of a load +
-            // add(dy2) + multiply(vignK) + subtract, all in float. Range
-            // [0, ~82] (see g_dx2Row's declaration) fits uint8_t exactly.
-            g_dx2Row[x] = static_cast<uint8_t>(lroundf(g_vignK * dx * dx * 256.0f));
-        }
     }
     // g_ditherQ: independent allocation and null check from g_dx2Row above
     // (not bundled into that guard), a transient allocHot()/alloc() failure
@@ -589,7 +660,6 @@ bool init(int w, int h) {
     // declaration). Null-checked like g_dx2Row so a transient allocation
     // failure is retried on the next init() rather than latched.
     if (g_dx2Node == nullptr) {
-        const float cx = w * 0.5f;
         const int n = (w >> SILK_GRID_SHIFT) + 1;
         g_dx2Node = static_cast<uint8_t *>(allocHot(static_cast<size_t>(n) * sizeof(uint8_t)));
         if (g_dx2Node == nullptr) {
@@ -599,13 +669,13 @@ bool init(int w, int h) {
             return false;
         }
         g_dx2NodeN = n;
-        for (int j = 0; j < n; j++) {
-            const float dx = j * SILK_GRID - cx;
-            // Identical rounding to g_dx2Row[] above, required for the
-            // node-column bit-exactness argument in the file header.
-            g_dx2Node[j] = static_cast<uint8_t>(lroundf(g_vignK * dx * dx * 256.0f));
-        }
     }
+    // Filled here rather than inside the allocation guards above so that the
+    // param rebuild in frame() runs exactly the same code (see
+    // buildVignetteTables). init() runs once per activation, not per frame
+    // (SleepAnimation::renderFrame calls it only when the animation or the
+    // resolution changes), so the 511 stores are not a per-frame cost.
+    buildVignetteTables();
     return true;
 }
 
@@ -615,23 +685,66 @@ bool init(int w, int h) {
 inline int16_t sinFromTurn(uint32_t turn) { return g_sinLut[turn >> 22]; }
 constexpr float TURN = 4294967296.0f / 6.2831853f;
 
+// Every param this animation takes is applied here or in a table this
+// function rebuilds, so band(), bandRef() and the two Xtensa kernels are
+// untouched by all eight of them. Three of the five added in gm-3vj.5 fold
+// into constants the wave loop below already multiplied by, and the other
+// two (vignette, grain) rebuild a table. Each default is the value the
+// animation shipped with, reproduced bit for bit: p/50.0f is exactly 1.0f at
+// 50 and p/80.0f exactly 1.0f at 80, `0.15f * 1.0f` is 0.15f, and adding a
+// term multiplied by (1.0f - 1.0f) leaves the operand alone.
 void frame(uint32_t tMs, int, int, const uint8_t p[BG_ANIM_PARAMS]) {
     const float omega0 = 6.2831853f / 55000.0f * speedMul(p[0]); // 55s base drift at speed 50
     const float k0 = 0.008f + 0.022f * (p[1] / 100.0f);
+    // "spread": how far apart the three waves point. 1.0 leaves each wave's
+    // tuned heading alone; 0 collapses all three onto SPREAD_MID, which
+    // turns the moire into beating parallel stripes (the three waves still
+    // differ in temporal phase and in their wobble, so the field does not
+    // degenerate); 2.0 fans the headings to twice their spacing.
+    const float sprK = p[3] / 50.0f;
+    // "twist": the rate the headings rotate at, as a multiple of the drift
+    // rate. 0 freezes the fringe orientation and leaves only the drift.
+    const float rotK = 0.15f * (p[4] / 50.0f);
+    // "wobble": depth of the slow breathing of each wave's fringe spacing.
+    // 0 holds the spacing constant, 0.3 doubles the swing.
+    const float wobK = 0.15f * (p[5] / 50.0f);
+    // One dither rebuild even when the theme and the grain both moved.
+    bool ditherStale = false;
     if (themeGen() != lastThemeGen) {
         buildThemeRamp(palette, 256);
         extendPalette();
         lastThemeGen = themeGen();
-        refreshDither(); // step spacing moved with the new palette
+        ditherStale = true; // step spacing moved with the new palette
     }
     if (p[2] != lastGlow) {
         buildContrastLUT(p[2]);
         lastGlow = p[2];
     }
+    if (p[7] != lastGrain) {
+        g_ditherGain = p[7] / 50.0f;
+        lastGrain = p[7];
+        ditherStale = true;
+    }
+    if (ditherStale) {
+        refreshDither();
+    }
+    if (p[6] != lastVign) {
+        // 0.32f * 1.0f at the default of 80, so the tables come out exactly
+        // as they did before this param existed. The ceiling of 0.4 at 100
+        // is load-bearing, see the file header's non-negative env proof.
+        g_vignBase = 0.32f * (p[6] / 80.0f);
+        g_vignK = g_vignBase * g_invR2;
+        lastVign = p[6];
+        buildVignetteTables();
+    }
     for (int i = 0; i < 3; i++) {
         SilkWave &wv = wave[i];
-        const float A = wv.A0 + (omega0 * 0.15f * wv.rotMult) * tMs;
-        const float k = k0 * (1.0f + 0.15f * fastSinRad(wv.wk * tMs + wv.phk));
+        // At sprK == 1.0f the (1.0f - sprK) factor is exactly 0.0f, so this
+        // is wv.A0 plus a signed zero, which IEEE addition leaves as wv.A0
+        // (every A0 here is non-zero).
+        const float A0i = wv.A0 + (SPREAD_MID - wv.A0) * (1.0f - sprK);
+        const float A = A0i + (omega0 * rotK * wv.rotMult) * tMs;
+        const float k = k0 * (1.0f + wobK * fastSinRad(wv.wk * tMs + wv.phk));
         wv.kx = k * fastCosRad(A);
         wv.ky = k * fastSinRad(A);
         g_step[i] = static_cast<int32_t>(wv.kx * TURN);
@@ -1378,6 +1491,15 @@ void release() {
     g_sinLut = nullptr;
     lastThemeGen = 0xFFFFFFFF;
     lastGlow = -1;
+    // Back to the shipped values, not to the last param seen: the next
+    // init() builds its tables before any frame() has read a param, so it
+    // has to start from a known factor and gain, and the first frame() then
+    // rebuilds whatever the stored params actually ask for.
+    g_vignBase = 0.32f;
+    g_vignK = 0.32f;
+    lastVign = -1;
+    g_ditherGain = 1.0f;
+    lastGrain = -1;
 }
 
 } // namespace
@@ -1386,7 +1508,21 @@ extern const BgAnimation bg_anim_silk;
 const BgAnimation bg_anim_silk = {
     "silk",
     "Silk",
-    {{"speed", "Speed", 50}, {"scale", "Fringe density", 45}, {"glow", "Sheen", 55}, {nullptr, nullptr, 0}},
+    // All eight slots, all applied in frame() or in a table it rebuilds.
+    // Effects: speed drift rate; scale fringe spacing; glow the contrast
+    // curve's exponent; spread how far apart the three waves point; twist
+    // how fast those headings rotate; wobble the depth of the fringe
+    // spacing's slow breathing; vignette how dark the panel edge goes;
+    // grain the ordered-dither amplitude. Every default reproduces the
+    // pre-parameter output bit for bit.
+    {{"speed", "Speed", 50},
+     {"scale", "Fringe density", 45},
+     {"glow", "Sheen", 55},
+     {"spread", "Wave spread", 50},
+     {"twist", "Twist", 50},
+     {"wobble", "Breathe", 50},
+     {"vignette", "Edge fade", 80},
+     {"grain", "Grain", 50}},
     init,
     frame,
     band,

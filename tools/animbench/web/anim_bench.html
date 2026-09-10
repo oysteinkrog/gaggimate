@@ -468,29 +468,40 @@ function gradLUT(stops) { // stops: [[t0..255, r, g, b], ...] -> Uint8Array 256*
     id: 'silk', name: 'Silk',
     params: [
       {key:'speed',label:'Speed',def:50},{key:'scale',label:'Fringe density',def:45},
-      {key:'glow',label:'Sheen',def:55}],
+      {key:'glow',label:'Sheen',def:55},{key:'spread',label:'Wave spread',def:50},
+      {key:'twist',label:'Twist',def:50},{key:'wobble',label:'Breathe',def:50},
+      {key:'vignette',label:'Edge fade',def:80},{key:'grain',label:'Grain',def:50}],
     init(w, h, state) {
       state.waves = [
         {A0:0.20, rotMult:0.6,  wMult:1.00, wk:2*Math.PI/71000,  phk:0.4},
         {A0:2.15, rotMult:-1.0, wMult:1.37, wk:2*Math.PI/95000,  phk:2.1},
         {A0:4.35, rotMult:1.4,  wMult:0.71, wk:2*Math.PI/123000, phk:4.0},
       ];
+      // Mean of the three A0 above: the heading all three collapse onto at
+      // spread 0. Matches SPREAD_MID in AnimSilk.cpp.
+      state.spreadMid = 2.2333333;
       state.cx = w/2; state.cy = h/2;
       state.Rscreen = Math.min(w,h)/2;
       state._gen = -1;
     },
     render(data, w, h, tMs, p, state) {
-      const [speed, scale, glow] = p;
+      const [speed, scale, glow, spread, twist, wobble, vignette, grain] = p;
       const omega0 = 2*Math.PI / 55000 * speedMulJS(speed); // 55s base drift at 50
       const k0 = 0.008 + 0.022*(scale/100);
       const contrastExp = 0.6 + 2.0*(glow/100);
+      // Same mappings as AnimSilk.cpp's frame(): every default is a factor of
+      // exactly 1, so the picture at the defaults is the one this entry drew
+      // before the params existed.
+      const sprK = spread/50, rotK = 0.15*(twist/50), wobK = 0.15*(wobble/50);
+      const vignK = 0.32*(vignette/80), grainK = grain/50;
       if (state._gen !== THEME.gen) { state.pal = themeRamp(); state._gen = THEME.gen; }
       const pal = state.pal;
       const W = state.waves;
       for (let i = 0; i < 3; i++) {
         const wv = W[i];
-        const A = wv.A0 + (omega0*0.15*wv.rotMult)*tMs;
-        const k = k0*(1+0.15*Math.sin(wv.wk*tMs+wv.phk));
+        const A0i = wv.A0 + (state.spreadMid - wv.A0)*(1-sprK);
+        const A = A0i + (omega0*rotK*wv.rotMult)*tMs;
+        const k = k0*(1+wobK*Math.sin(wv.wk*tMs+wv.phk));
         wv.kx = k*Math.cos(A); wv.ky = k*Math.sin(A);
         wv.wt = (omega0*wv.wMult)*tMs;
       }
@@ -508,9 +519,9 @@ function gradLUT(stops) { // stops: [[t0..255, r, g, b], ...] -> Uint8Array 256*
           if (n < 0) n = 0; else if (n > 1) n = 1;
           n = Math.pow(n, contrastExp);
           const dx = x-cx;
-          let env = 1-0.32*(dx*dx+dy2)*invR2;
+          let env = 1-vignK*(dx*dx+dy2)*invR2;
           if (env < 0) env = 0;
-          const dith = (BAYER4[(y&3)*4+(x&3)]/16-0.5)*(1/160);
+          const dith = (BAYER4[(y&3)*4+(x&3)]/16-0.5)*(1/160)*grainK;
           let idx = Math.round((n*env+dith)*255);
           if (idx < 0) idx = 0; else if (idx > 255) idx = 255;
           const o = (rowOff+x)*4;
