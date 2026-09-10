@@ -869,6 +869,16 @@ DMA-capable, largest block 7.7 kB) and two browser tabs killed it. After the
   animation's static tables are not a way around it: BSS is the same pool.
   With the slab a normal boot idles at ~53 kB internal (45 kB DMA-capable)
   with the boot animation resident.
+- **The web UI reaches the firmware only through `scripts/build_webui.sh`**
+  (2026-09-10). `npm run build` alone writes `web/dist` and nothing reads
+  it: the script gzips the bundle and runs `embed_webui.py`, which writes
+  the git-ignored `src/display/webassets/` (blob, manifest, `.S`). A fresh
+  worktree has a 1-byte `web_ui.bin` stub there, `embed_webui_pre.py` keeps
+  it so a bare build links, and the firmware then answers 404 "Not found"
+  on `/` and every page while `/api/*` works. Three flashes from this
+  worktree shipped that stub before anyone opened the web UI. The tell is
+  `.pio/build/<env>/webassets/web_ui_blob.o` at 864 bytes (the real one is
+  about 500 KB), or `web_ui.bin` at 1 byte.
 - **Big embedded assets stream at most three at a time, and a second or
   third only while `dma_free` is above 20 KB** (`kMaxAssetStreams`,
   `kAssetGateDmaFloor`, `WebUIPlugin::assetSlotFree`). In-flight WiFi copies
