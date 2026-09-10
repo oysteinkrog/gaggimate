@@ -121,6 +121,11 @@ export const BG_ANIMATIONS = [
       { key: 'speed', label: 'Speed', def: 50 },
       { key: 'symmetry', label: 'Symmetry', def: 50 },
       { key: 'complexity', label: 'Complexity', def: 45 },
+      { key: 'drift', label: 'Ring drift', def: 50 },
+      { key: 'vignette', label: 'Vignette', def: 50 },
+      { key: 'breathe', label: 'Breathe', def: 50 },
+      { key: 'contrast', label: 'Contrast', def: 50 },
+      { key: 'rings', label: 'Ring pitch', def: 50 },
     ],
   },
   {

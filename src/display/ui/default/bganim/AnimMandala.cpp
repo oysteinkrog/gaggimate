@@ -219,6 +219,18 @@
 // horizontal-only probe kept that same vertical stepping on one axis. The
 // user picked the interpolated design's picture over the faster options'
 // streaking.
+//
+// Five more sliders, 2026-09-10 (gm-3vj.10): rotation, vignette, breathe,
+// contrast and ring pitch, taking this animation from three parameters to
+// eight. Each one defaults to 50 and at 50 reproduces a constant this file
+// used to hard-code, so the default picture is unchanged bit for bit. None
+// of them reaches the pixel loop or interpPairKernel: rotation and breathe
+// are per-frame constants, vignette and ring pitch are fields of the
+// rParams table frame() already rebuilds every frame, and contrast is a
+// rebuild of rescaleLUT on the slider move. The one classification that
+// moved is the moire guard, which now also watches the B harmonic's radial
+// step because the ring-pitch slider can push it past the A harmonic's;
+// see frame() for why that leaves the default frame classified as before.
 #include "BgAnim.h"
 #include "BgAnimCommon.h"
 #include <esp_heap_caps.h>
@@ -312,6 +324,41 @@ int g_sampleCacheW = 0;
 constexpr uint8_t OUTSIDE_R = 0xFF;
 
 void buildThemePalette() { buildThemeRamp(paletteLUT, 256); }
+
+// The contrast slider's expansion factor, Q8. 256 is 1x, and p[6] == 50
+// gives exactly 256, which is why the default table below is the one this
+// file built before the slider existed, entry for entry. Namespace scope so
+// release() can reset the staleness sentinel.
+int g_contrastK = 256;
+int lastContrastK = -1;
+
+// (v+190) -> 0..255, with the contrast expansion folded in. Rebuilt only
+// when kQ8 changes (init(), and frame() on a slider move), never per frame
+// and never per pixel: this table is where a magnitude curve costs nothing
+// at render time, since mandalaIndex already reads it once per sample.
+//
+// The expansion is about the midpoint, so 128 stays put and the ends bend:
+// below 1x the rings flatten toward one mid tone, above 1x they clip to the
+// palette's two ends and the pattern reads as hard bands. Written through
+// the padded base so the leading and trailing pad entries repeat the
+// clamped end values (see RESCALE_PAD above).
+void buildRescale(int kQ8) {
+    for (int j = 0; j < RESCALE_N; j++) {
+        int i = j - RESCALE_PAD;
+        if (i < 0) {
+            i = 0;
+        } else if (i > RESCALE_SPAN - 1) {
+            i = RESCALE_SPAN - 1;
+        }
+        int v = 128 + (((static_cast<int>((i * 255) / 380) - 128) * kQ8) >> 8);
+        if (v < 0) {
+            v = 0;
+        } else if (v > 255) {
+            v = 255;
+        }
+        rescaleLUT[j - RESCALE_PAD] = static_cast<uint8_t>(v);
+    }
+}
 
 // Octant-folded angle (0..64) for a point in the first quadrant (ax,ay >= 0).
 // Same reciprocal-LUT + minimax-poly approximation the old per-pixel path
@@ -478,17 +525,8 @@ bool init(int w, int) {
         for (int r = 0; r < mapDim; r++) {
             vigByR[r] = static_cast<uint8_t>(lroundf(255.0f * powf(1.0f - static_cast<float>(r) / g_cx, 0.55f)));
         }
-        // Build through the padded base so the leading and trailing pad
-        // entries repeat the clamped end values (see RESCALE_PAD above).
-        for (int j = 0; j < RESCALE_N; j++) {
-            int i = j - RESCALE_PAD;
-            if (i < 0) {
-                i = 0;
-            } else if (i > RESCALE_SPAN - 1) {
-                i = RESCALE_SPAN - 1;
-            }
-            rescaleLUT[j - RESCALE_PAD] = static_cast<uint8_t>((i * 255) / 380);
-        }
+        buildRescale(256);
+        lastContrastK = 256;
         const int maxR2 = g_cx * g_cx;
         for (int ay = 0; ay < mapDim; ay++) {
             for (int ax = 0; ax < mapDim; ax++) {
@@ -516,6 +554,41 @@ bool init(int w, int) {
 int g_N = 8, g_tOffA = 0, g_tOffB = 0, g_rOffsetScale = 0;
 int g_breatheQ8 = 256;
 int g_sxOffset = 0; // (g_N & 1) ? 128 : 0, see the pass-2 comment at the top
+
+// The `halfOffset` argument every sampling run is called with: the left
+// half's is g_sxOffset, the right half's is 0, and the drift slider adds
+// the same constant to both. That is the whole cost of the slider: one
+// constant per row half, nothing per pixel, and nothing for the
+// hand-written kernel to know about, since the kernel only interpolates
+// and gathers and the polar chain that reads these lives in mandalaIndex.
+// At the default (p[3] == 50) the added constant is 0 and these are
+// g_sxOffset and 0, the two values the file passed before.
+//
+// What the constant does to the picture depends on the angle term, and on
+// this animation as it stands the angle term is nearly absent: octantAngle
+// above only ever returns 0 or 64 (its `>> 16` drops the ratio's fraction
+// before the polynomial sees it, so `ratio` is 0 for every point off the
+// 45 degree diagonal), so `oct * gN_eff` is one of at most four values per
+// quadrant and, for a symmetry setting where g_N is a multiple of 4, is 0
+// everywhere. base is then the constant halfOffset, and adding to it
+// shifts the A harmonic's phase by the constant and the B harmonic's by
+// twice it, which reads as the two ring families sliding across each other
+// at a rate the slider sets. That is why the slider is called Ring drift
+// and not Rotation: on a picture with a working angle term the same
+// constant would be exactly a rotation by (constant / g_N) 256ths of a
+// turn, because base = angleQ8 * g_N. The angle defect is older than this
+// slider and is baked into the goldens, so it is reported, not fixed here.
+int g_halfOffL = 0;
+int g_halfOffR = 0;
+// The B harmonic's radial phase step as a percentage of the A harmonic's.
+// 60 is (rOffset * 3) / 5, the ratio this file hard-coded, and is what
+// p[7] == 50 gives; the two agree for every rOffset because 60/100 and 3/5
+// floor identically.
+int g_ringNum = 60;
+// Q8 scale on the vignette's fall from the centre. 256 leaves vigByR
+// alone, 0 flattens it to full brightness everywhere, 512 doubles the fall
+// and takes the outer disc to black.
+int g_vigStrengthQ8 = 256;
 
 // g_rOffsetScale is the per-unit-radius phase step (256ths of a turn) the
 // A/B harmonics advance by, so 256/g_rOffsetScale is roughly the radial
@@ -555,16 +628,58 @@ void frame(uint32_t tMs, int, int, const uint8_t p[BG_ANIM_PARAMS]) {
         buildThemePalette();
         lastThemeGen = themeGen();
     }
+    // Contrast, folded into rescaleLUT (buildRescale above). p[6] == 50 is
+    // 256 exactly, so the default table and the default picture are the old
+    // ones; anything else costs one 389-entry rebuild on the slider move.
+    g_contrastK = p[6] <= 50 ? 64 + (p[6] * 192) / 50 : 256 + ((p[6] - 50) * 768) / 50;
+    if (g_contrastK != lastContrastK) {
+        buildRescale(g_contrastK);
+        lastContrastK = g_contrastK;
+    }
     g_N = 4 + (p[1] * 8) / 100;
     g_sxOffset = (g_N & 1) ? 128 : 0;
     const float t = tMs * 0.001f * 0.35f * speedMul(p[0]);
     const float turb = 0.25f + (p[2] / 100.0f) * 1.1f;
     g_rOffsetScale = static_cast<int>(turb * 18.0f);
-    g_fineDetail = g_rOffsetScale >= WRAP_GUARD;
+    g_ringNum = p[7] <= 50 ? (p[7] * 60) / 50 : 60 + ((p[7] - 50) * 120) / 50;
+    // The moire guard now covers the B harmonic too. WRAP_GUARD is a bound
+    // on radial phase step against the halved scheme's 2-pixel column
+    // pitch, and until the ring-pitch slider existed the B step was always
+    // 3/5 of the A step, so watching A alone was enough. At the top of the
+    // slider B runs at 1.8x A instead, which can reach the guard first.
+    // g_ringNum == 60 makes this term (g_rOffsetScale * 3) / 5, always
+    // below g_rOffsetScale, so the default frame classifies exactly as
+    // before; the top of the slider stays under the guard at the default
+    // complexity (13 * 180 / 100 = 23) and trips it above that, trading
+    // band time for the exact picture the same way complexity 99 does.
+    const int bStep = (g_rOffsetScale * g_ringNum) / 100;
+    g_fineDetail = g_rOffsetScale >= WRAP_GUARD || bStep >= WRAP_GUARD;
     // 40.74 = 256 ticks per 2*pi radians
     g_tOffA = static_cast<int>(t * 1.4f * 40.74f) & 0xFF;
     g_tOffB = static_cast<int>(t * 0.8f * 40.74f) & 0xFF;
-    g_breatheQ8 = static_cast<int>((0.82f + 0.18f * fastSinRad(t * 0.45f)) * 256.0f);
+    // Ring drift, the constant added to both row halves' base (see
+    // g_halfOffL's comment for what it does to this picture and what it
+    // would do to one with a working angle term). p[3] == 50 is a rate of
+    // exactly 0.0f, so the offset is 0 and both halves keep the constants
+    // they had. Signed: below 50 the rings slide the other way, which is
+    // why the rest position is the middle of the slider and not one end.
+    // The angle is masked to 256ths of a turn before the multiply by g_N so
+    // a long uptime cannot overflow the product.
+    const float driftRate = (static_cast<int>(p[3]) - 50) / 50.0f;
+    const int driftQ8 = static_cast<int>(t * 0.35f * driftRate * 256.0f) & 0xFF;
+    const int driftOffset = (driftQ8 * g_N) & 0xFF;
+    g_halfOffL = (g_sxOffset + driftOffset) & 0xFF;
+    g_halfOffR = driftOffset;
+    // Breathe depth. p[5] == 50 gives an amplitude of exactly 0.18f and a
+    // base of exactly 0.82f (1.0f - 0.18f is 0.82f in single precision), so
+    // this is the old expression at the default. At 0 the pulse is gone and
+    // the disc sits at full weight; at 100 it swings from 0.28 to 1.00.
+    const float breatheAmp = 0.18f * (p[5] / 50.0f);
+    g_breatheQ8 = static_cast<int>((1.0f - breatheAmp + breatheAmp * fastSinRad(t * 0.45f)) * 256.0f);
+    // Vignette depth, applied to vigByR's fall rather than rebuilt from
+    // powf per frame. 256 is the identity (255 - (255 - v) is v), so the
+    // default vig field is the old one for every radius.
+    g_vigStrengthQ8 = (p[4] * 512) / 100;
     // rParams (below) is about to change, which is everything
     // sampleRowIndices reads that varies frame to frame; drop any cached
     // row so the next fetchRow call for it recomputes rather than reusing
@@ -581,8 +696,12 @@ void frame(uint32_t tMs, int, int, const uint8_t p[BG_ANIM_PARAMS]) {
     for (int r = 0; r < mapDim; r++) {
         const int rOffset = (r * g_rOffsetScale) & 0xFF;
         const auto a = static_cast<uint8_t>(rOffset + g_tOffA);
-        const auto b = static_cast<uint8_t>(g_tOffB - (rOffset * 3) / 5);
-        const auto vig = static_cast<uint8_t>((vigByR[r] * g_breatheQ8) >> 8);
+        const auto b = static_cast<uint8_t>(g_tOffB - (rOffset * g_ringNum) / 100);
+        int vb = 255 - (((255 - vigByR[r]) * g_vigStrengthQ8) >> 8);
+        if (vb < 0) {
+            vb = 0;
+        }
+        const auto vig = static_cast<uint8_t>((vb * g_breatheQ8) >> 8);
         rParams[r] = static_cast<uint32_t>(a) | (static_cast<uint32_t>(b) << 8) | (static_cast<uint32_t>(vig) << 16);
     }
 }
@@ -686,9 +805,9 @@ void sampleRowIndices(uint8_t *idxOut, int y, int w) {
     const int gN_eff_right = sy ? -g_N : g_N;
 
     const int nBlocksL = cx / 2;
-    mandalaIndexRun<-1>(idxOut, mapRow + g_cx / 2, nBlocksL, gN_eff_left, g_sxOffset);
+    mandalaIndexRun<-1>(idxOut, mapRow + g_cx / 2, nBlocksL, gN_eff_left, g_halfOffL);
     const int nBlocksR = (w - cx) / 2;
-    mandalaIndexRun<+1>(idxOut + nBlocksL, mapRow, nBlocksR, gN_eff_right, 0);
+    mandalaIndexRun<+1>(idxOut + nBlocksL, mapRow, nBlocksR, gN_eff_right, g_halfOffR);
 }
 
 // Returns nBlocks valid magnitudes for absolute row y, from the cache when
@@ -901,8 +1020,8 @@ void computeRowFull(uint16_t *row, int y, int w) {
     const uint16_t *mapRow = polarMap + static_cast<size_t>(ay) * mapDim;
     const int gN_eff_left = sy ? g_N : -g_N;
     const int gN_eff_right = sy ? -g_N : g_N;
-    mandalaRunSingle<-1>(row, mapRow + g_cx, cx, gN_eff_left, g_sxOffset);
-    mandalaRunSingle<+1>(row + cx, mapRow, w - cx, gN_eff_right, 0);
+    mandalaRunSingle<-1>(row, mapRow + g_cx, cx, gN_eff_left, g_halfOffL);
+    mandalaRunSingle<+1>(row + cx, mapRow, w - cx, gN_eff_right, g_halfOffR);
 }
 
 // Pixels within INNER_BAND rows and INNER_HALF_W columns of the center
@@ -948,8 +1067,8 @@ void patchCentre(uint16_t *row, int y, int w) {
     const uint16_t *mapRow = polarMap + static_cast<size_t>(ay) * mapDim;
     const int gN_eff_left = sy ? g_N : -g_N;
     const int gN_eff_right = sy ? -g_N : g_N;
-    mandalaRunSingle<-1>(row + cx - k, mapRow + (g_cx - cx + k), k, gN_eff_left, g_sxOffset);
-    mandalaRunSingle<+1>(row + cx, mapRow, k, gN_eff_right, 0);
+    mandalaRunSingle<-1>(row + cx - k, mapRow + (g_cx - cx + k), k, gN_eff_left, g_halfOffL);
+    mandalaRunSingle<+1>(row + cx, mapRow, k, gN_eff_right, g_halfOffR);
 }
 
 // bandRef is the portable spec for this design and the one place
@@ -1113,6 +1232,11 @@ void release() {
     // reallocated (and unfilled) g_sampleCache.
     tablesBuilt = false;
     lastThemeGen = 0xFFFFFFFF;
+    // rescaleLUT is gone with its allocation, so the contrast table the
+    // next frame() sees is whatever init() rebuilds; a surviving sentinel
+    // would tell frame() the table already matches the slider and skip
+    // that rebuild.
+    lastContrastK = -1;
     g_sampleCacheY = NO_CACHED_ROW;
 }
 
@@ -1122,7 +1246,14 @@ extern const BgAnimation bg_anim_mandala;
 const BgAnimation bg_anim_mandala = {
     "mandala",
     "Mandala",
-    {{"speed", "Speed", 50}, {"symmetry", "Symmetry", 50}, {"complexity", "Complexity", 45}, {nullptr, nullptr, 0}},
+    {{"speed", "Speed", 50},
+     {"symmetry", "Symmetry", 50},
+     {"complexity", "Complexity", 45},
+     {"drift", "Ring drift", 50},
+     {"vignette", "Vignette", 50},
+     {"breathe", "Breathe", 50},
+     {"contrast", "Contrast", 50},
+     {"rings", "Ring pitch", 50}},
     init,
     frame,
     band,

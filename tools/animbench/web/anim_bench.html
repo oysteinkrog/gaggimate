@@ -888,7 +888,9 @@ ANIMS.push({
   id: 'mandala', name: 'Mandala',
   params: [
     {key:'speed',label:'Speed',def:50},{key:'symmetry',label:'Symmetry',def:50},
-    {key:'complexity',label:'Complexity',def:45}],
+    {key:'complexity',label:'Complexity',def:45},{key:'drift',label:'Ring drift',def:50},
+    {key:'vignette',label:'Vignette',def:50},{key:'breathe',label:'Breathe',def:50},
+    {key:'contrast',label:'Contrast',def:50},{key:'rings',label:'Ring pitch',def:50}],
   init(w, h, state) {
     state._gen = -1;
   },
@@ -904,7 +906,15 @@ ANIMS.push({
     const threeLayers = p[2] > 60;
     const cx = w/2, cy = h/2, maxR = Math.min(w,h)*0.5;
     const pal = state.pal, outside = state.outside;
-    const breathe = 0.82 + 0.18*Math.sin(t*0.45);
+    // The five sliders added on 2026-09-10 (gm-3vj.10). Each is 1x, or 0,
+    // at 50, so the default picture here is the one this entry drew before
+    // them, the same way AnimMandala.cpp's defaults reproduce its own.
+    const spinTurns = t*0.35*((p[3]-50)/50);
+    const bAmp = 0.18*(p[5]/50);
+    const vigStr = p[4]/50;
+    const kC = p[6] <= 50 ? (64 + (p[6]*192)/50)/256 : (256 + ((p[6]-50)*768)/50)/256;
+    const ringScale = (p[7] <= 50 ? (p[7]*60)/50 : 60 + ((p[7]-50)*120)/50)/60;
+    const breathe = (1-bAmp) + bAmp*Math.sin(t*0.45);
     const norm = 1 + 0.55 + (threeLayers ? 0.3 : 0) + 0.4;
     let idx = 0;
     for (let y = 0; y < h; y++) {
@@ -913,13 +923,14 @@ ANIMS.push({
         const dx = x-cx;
         const rn = Math.sqrt(dx*dx+dy*dy)/maxR;
         if (rn > 1) { data[idx]=outside[0]; data[idx+1]=outside[1]; data[idx+2]=outside[2]; data[idx+3]=255; idx += 4; continue; }
-        const theta = Math.atan2(dy, dx);
+        const theta = Math.atan2(dy, dx) + spinTurns*2*Math.PI;
         let v = Math.sin(N*theta + rn*7.0*turb - t*1.4);
-        v += 0.55*Math.cos(N*2*theta - rn*4.5*turb + t*0.8);
+        v += 0.55*Math.cos(N*2*theta - rn*4.5*turb*ringScale + t*0.8);
         if (threeLayers) v += 0.3*Math.sin(N*3*theta + rn*3.0*turb + t*0.5);
         v += 0.4*Math.sin(rn*9.0 - t*1.0);
         v = (v/norm)*0.5 + 0.5;
-        const vig = Math.pow(1-rn, 0.55);
+        v = Math.min(1, Math.max(0, 0.5 + (v-0.5)*kC));
+        const vig = Math.max(0, 1 - (1-Math.pow(1-rn, 0.55))*vigStr);
         v *= breathe*(0.30 + 0.70*vig);
         const li = (Math.min(1, Math.max(0, v))*255)|0;
         data[idx]   = pal[li*3];
