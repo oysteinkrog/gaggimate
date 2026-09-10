@@ -28,9 +28,16 @@
 // before indexing with it.
 
 #include <cstddef>
+#include <cstdint>
 #include <functional>
 #include <string>
 #include <vector>
+
+// For BG_ANIM_PARAMS alone, so the parameter-slot count below cannot drift
+// from the one the renderer uses. BgAnim.h is a declarations-only header
+// over <stdint.h>: including it pulls in no animation code and adds nothing
+// for the host test to link.
+#include <display/ui/default/bganim/BgAnim.h>
 
 namespace settingsui {
 
@@ -130,6 +137,52 @@ int gradientChoiceIndexForRef(const std::vector<GradientChoice> &choices, const 
 // every other slot's text untouched; a map shorter than animId reads as "".
 std::string gradientMapReadRef(const std::string &map, int animId);
 std::string gradientMapWriteRef(const std::string &map, int animId, const std::string &newRef);
+
+// ---- background animation parameters ---------------------------------------
+//
+// bgAnimParams is one string for the whole roster: "p0,p1,...;p0,p1,...;...",
+// one ';'-separated group per animation id, up to kBgAnimParamSlots values of
+// 0 to 100 in each. A missing or short group means "the rest keep the
+// animation's own defaults", so a device that never edited a parameter stores
+// "". The defaults themselves live in the animation registry, which carries
+// the render kernels and so is out of this file's reach; every function below
+// therefore takes them from the caller (BgAnimation::params[i].def on the
+// device, the generated mirror on the simulator).
+//
+// Both the display's Parameters page and the web UI's sliders write this
+// string. They differ on purpose in what they leave behind: the web form
+// repacks every group of every animation (web/src/config/bgAnimations.js,
+// setBgAnimParam), while the writers here touch one group and leave every
+// other group's text exactly as it was, so an edit on the display cannot
+// bake one build's defaults into another animation's slot.
+
+constexpr int kBgAnimParamSlots = BG_ANIM_PARAMS;
+
+// 0 to 100, step 5, fast step 10 after a 2 s hold, no wrap and no unit. A
+// stored value off the step grid (the web UI's slider writes any integer) is
+// what stepValue's grid-snap rule exists for.
+extern const NumericSpec kBgAnimParamSpec;
+
+// Reads animId's group into out[kBgAnimParamSlots], starting from
+// defaults[kBgAnimParamSlots] and overriding from the string, by exactly the
+// rules bg_parse_params() applies on the device. A null `defaults` reads as
+// all zeroes.
+void bgParamsRead(const std::string &packed, int animId, const uint8_t *defaults, uint8_t *out);
+
+// The string with animId's whole group replaced by all kBgAnimParamSlots of
+// `values` (each clamped to 0..100). Groups between the stored end and animId
+// are appended empty; every other group keeps its own text.
+std::string bgParamsWriteGroup(const std::string &packed, int animId, const uint8_t *values);
+
+// The string with one slot of animId's group set to `value`. The group is
+// read through bgParamsRead first, so slots the string did not carry are
+// written at their defaults rather than at zero.
+std::string bgParamsWriteSlot(const std::string &packed, int animId, const uint8_t *defaults, int slot, long value);
+
+// The string with animId's group emptied, which reads back as the defaults.
+// Trailing empty groups are trimmed, so clearing the last group that carried
+// anything returns the whole string to "".
+std::string bgParamsClearGroup(const std::string &packed, int animId);
 
 // ---- palette ----------------------------------------------------------------
 

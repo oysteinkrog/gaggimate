@@ -1,12 +1,14 @@
-// Animation category: background animation, frame rate, all-screens, the UI
-// theme, the current animation's gradient, plate handling, element tint, the
-// text scrim, the screen fade (out, in, curve) and interlacing. Every row is
+// Animation category: background animation, its parameters (one row that
+// pushes CatAnimParams.cpp's page), frame rate, all-screens, the UI theme,
+// the current animation's gradient, plate handling, element tint, the text
+// scrim, the screen fade (out, in, curve) and interlacing. Every value row is
 // live (SettingsUI.h): a row writes Settings
 // and calls markDirty() the moment it changes, rather than waiting for
 // commit, so DefaultUI::updateState applies it on the next rerender pass
 // (CLAUDE.md, UI-pipeline invariants). commit()'s only remaining job is the
 // touched-field precedence rule: if a web save landed on a touched field
 // while this page was open, re-assert this visit's value (gm-flw.9).
+#include "CatAnimParams.h"
 #include "SettingsModel.h"
 #include "SettingsLog.h"
 #include "SettingsRows.h"
@@ -36,30 +38,88 @@ namespace {
 // symbol exists to link against on the host. This category still has to show
 // real names on the sim (the bead's own acceptance criteria: "the model's
 // animation names and gradient parsing are host code, so the sim shows them
-// without a renderer"), so it keeps a names-only mirror of both tables here
-// rather than touching BgAnimRegistry.cpp/BgAnimThemes.cpp, which this bead
-// does not own and which the asm-* workers are editing concurrently this
-// wave. Append-only, same order as the real tables; verified against every
-// AnimX.cpp's `.name` field and BgAnimThemes.cpp's THEMES array at HEAD
-// 2b87cb88. A change to either real table needs the same edit made here.
+// without a renderer"), so it keeps a mirror of both tables here rather than
+// touching BgAnimRegistry.cpp/BgAnimThemes.cpp, which carry the kernels the
+// animation workers are editing. The animation half of the mirror now
+// carries each animation's parameter table too, because the Parameters page
+// (gm-3vj.2, CatAnimParams.cpp) shows one row per parameter and needs the
+// labels and defaults, not just the names.
 #ifdef GAGGIMATE_SIM
-constexpr const char *kSimAnimNames[] = {
-    "Plasma", "Lava", "Silk", "Starfield", "Aurora", "Ripples", "Caustics", "Mandala",
-    "Orbits", "Fireflies", "Steam", "Ember", "Nebula", "Silk 2", "Brushed Metal",
-    "Quiet Horizon", "Soft Oculus", "Folded Chevron",
-    "Quiet Mosaic", "Saddle", "Refraction",
-    "Silent Sundial", "Matte Crescent", "Glint",
+// One entry per registry slot, in REGISTRY order (BgAnimRegistry.cpp), each
+// carrying the animation's display name and its whole eight-slot parameter
+// table. Generated from the real tables at HEAD 096292af (the `.name` field
+// and the params brace of every Anim*.cpp BgAnimation struct, read with the
+// regexes tools/animbench/check-params.py already uses), which is also how
+// the eight names this mirror had wrong when it was hand-written were found
+// ("Brushed Metal" for "Brushed", "Quiet Horizon" for "Horizon", and six
+// more). Append-only, same order as the real table: the index is the
+// persisted setting. A change to the real roster still needs the same edit
+// made here and in test_animation.py's ANIM_NAMES; regenerating both from
+// the source is a few lines of Python and is flagged to the epic lead.
+struct SimAnim {
+    const char *name;
+    BgAnimParamDef params[BG_ANIM_PARAMS];
 };
+
+constexpr SimAnim kSimAnims[] = {
+    {"Plasma", {{"speed", "Speed", 50}, {"scale", "Scale", 50}, {"brightness", "Brightness", 70}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}}},
+    {"Lava", {{"speed", "Speed", 50}, {"scale", "Blob size", 50}, {"glow", "Glow", 60}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}}},
+    {"Silk", {{"speed", "Speed", 50}, {"scale", "Fringe density", 45}, {"glow", "Sheen", 55}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}}},
+    {"Starfield", {{"speed", "Drift speed", 50}, {"density", "Stars", 45}, {"twinkle", "Twinkle", 50}, {"shooting", "Shooting stars", 30}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}}},
+    {"Aurora", {{"speed", "Speed", 50}, {"intensity", "Intensity", 55}, {"waviness", "Waviness", 50}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}}},
+    {"Ripples", {{"speed", "Ring speed", 50}, {"rate", "Drop rate", 40}, {"decay", "Fade", 50}, {"glow", "Glow", 50}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}}},
+    {"Caustics", {{"speed", "Drift speed", 50}, {"scale", "Cell scale", 45}, {"contrast", "Contrast", 55}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}}},
+    {"Mandala", {{"speed", "Speed", 50}, {"symmetry", "Symmetry", 50}, {"complexity", "Complexity", 45}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}}},
+    {"Orbits", {{"speed", "Speed", 50}, {"orbitCount", "Orbits", 55}, {"eccentricity", "Eccentricity", 55}, {"trail", "Trail", 50}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}}},
+    {"Fireflies", {{"speed", "Speed", 50}, {"count", "Count", 60}, {"glow", "Glow", 55}, {"shimmer", "Shimmer", 40}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}}},
+    {"Steam", {{"speed", "Rise speed", 50}, {"count", "Wisps", 55}, {"swirl", "Swirl", 45}, {"density", "Density", 50}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}}},
+    {"Ember", {{"speed", "Speed", 50}, {"glow", "Glow size", 45}, {"flicker", "Flicker", 20}, {"pulse", "Pulse", 50}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}}},
+    {"Nebula", {{"speed", "Drift speed", 50}, {"density", "Density", 50}, {"turbulence", "Turbulence", 40}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}}},
+    {"Silk 2", {{"speed", "Speed", 50}, {"scale", "Fringe density", 45}, {"glow", "Sheen", 55}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}}},
+    {"Brushed", {{"speed", "Speed", 20}, {"grain", "Grain", 35}, {"reflection", "Reflection", 45}, {"contrast", "Contrast", 30}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}}},
+    {"Horizon", {{"speed", "Speed", 10}, {"height", "Height", 45}, {"curvature", "Curvature", 35}, {"softness", "Softness", 60}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}}},
+    {"Oculus", {{"speed", "Speed", 15}, {"diameter", "Diameter", 65}, {"breath", "Breath", 20}, {"edge", "Edge softness", 55}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}}},
+    {"Chevrons", {{"speed", "Speed", 15}, {"spacing", "Spacing", 65}, {"angle", "Angle", 50}, {"contrast", "Contrast", 35}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}}},
+    {"Mosaic", {{"speed", "Speed", 15}, {"size", "Tile size", 45}, {"contrast", "Contrast", 30}, {"variation", "Variation", 55}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}}},
+    {"Saddle", {{"speed", "Speed", 12}, {"curvature", "Curvature", 35}, {"drift", "Drift", 25}, {"contrast", "Contrast", 30}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}}},
+    {"Refraction", {{"speed", "Speed", 18}, {"bend", "Bend", 35}, {"width", "Channel width", 65}, {"contrast", "Contrast", 30}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}}},
+    {"Sundial", {{"speed", "Speed", 10}, {"width", "Wedge width", 40}, {"contrast", "Contrast", 25}, {"shading", "Surface shading", 30}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}}},
+    {"Crescent", {{"speed", "Speed", 15}, {"size", "Size", 70}, {"phase", "Phase range", 40}, {"contrast", "Contrast", 40}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}}},
+    {"Glint", {{"speed", "Speed", 10}, {"length", "Length", 35}, {"width", "Width", 45}, {"brightness", "Brightness", 55}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}}},
+    {"Tunnel", {{"speed", "Speed", 50}, {"pitch", "Band pitch", 50}, {"brightness", "Brightness", 74}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}}},
+    {"Kaleido", {{"speed", "Speed", 50}, {"scale", "Blotch scale", 50}, {"brightness", "Brightness", 62}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}}},
+    {"Shafts", {{"speed", "Speed", 50}, {"density", "Shaft count", 50}, {"brightness", "Brightness", 66}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}}},
+    {"Weave", {{"speed", "Speed", 50}, {"scale", "Weave scale", 50}, {"brightness", "Brightness", 62}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}}},
+    {"Lens", {{"speed", "Speed", 50}, {"size", "Lens size", 55}, {"brightness", "Brightness", 62}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}}},
+    {"Tide", {{"speed", "Speed", 50}, {"width", "Band width", 50}, {"glow", "Glow", 55}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}}},
+    {"Truchet", {{"speed", "Speed", 50}, {"arc", "Arc width", 50}, {"glow", "Glow", 55}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}}},
+    {"Quilt", {{"speed", "Speed", 50}, {"pitch", "Pillow size", 75}, {"relief", "Relief", 55}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}}},
+    {"Rain", {{"speed", "Speed", 50}, {"tail", "Tail length", 50}, {"glow", "Head glow", 55}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}}},
+    {"Stripes", {{"speed", "Speed", 50}, {"pitch", "Stripe pitch", 50}, {"depth", "Depth", 55}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}}},
+    {"Ribbon", {{"speed", "Speed", 50}, {"width", "Ribbon width", 50}, {"twist", "Twist", 50}, {"bright", "Brightness", 62}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}}},
+    {"Harmonograph", {{"speed", "Speed", 50}, {"size", "Figure size", 68}, {"glow", "Thread glow", 60}, {"bright", "Brightness", 60}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}}},
+    {"Floor", {{"speed", "Speed", 50}, {"yaw", "Yaw sway", 50}, {"scale", "Plaid scale", 50}, {"bright", "Brightness", 60}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}}},
+    {"Hills", {{"speed", "Speed", 50}, {"relief", "Ridge relief", 50}, {"depth", "Layer contrast", 55}, {"bright", "Brightness", 60}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}}},
+    {"Gyroid", {{"speed", "Speed", 50}, {"scale", "Passage size", 50}, {"glow", "Passage width", 55}, {"bright", "Brightness", 60}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}}},
+    {"Barrel", {{"speed", "Speed", 50}, {"bands", "Bands", 14}, {"shade", "Cylinder shade", 62}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}}},
+    {"Grid", {{"speed", "Speed", 50}, {"density", "Grid density", 50}, {"lines", "Line strength", 58}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}}},
+    {"Cells", {{"speed", "Speed", 50}, {"width", "Channel width", 55}, {"depth", "Contrast", 60}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}}},
+    {"Dimples", {{"speed", "Speed", 50}, {"relief", "Relief", 58}, {"bright", "Brightness", 62}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}}},
+    {"Cube", {{"speed", "Speed", 50}, {"size", "Cube size", 50}, {"glow", "Face glow", 55}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}}},
+};
+
 constexpr const char *kSimThemeNames[] = {
     "Espresso", "Ocean", "Violet Dusk", "Forest", "Sunset", "Fire", "Ice", "Mono", "Rose", "Gold", "Aurora", "Cyber",
     "Ember Coal", "Deep Space", "Teal Reef", "Sakura", "Lime", "Arctic Night",
 };
 
-int animCountFn() { return static_cast<int>(sizeof(kSimAnimNames) / sizeof(kSimAnimNames[0])); }
-const char *animNameFn(int i) {
+int animCountFn() { return static_cast<int>(sizeof(kSimAnims) / sizeof(kSimAnims[0])); }
+const SimAnim &simAnim(int i) {
     const int n = animCountFn();
-    return kSimAnimNames[(i >= 0 && i < n) ? i : 0];
+    return kSimAnims[(i >= 0 && i < n) ? i : 0];
 }
+const char *animNameFn(int i) { return simAnim(i).name; }
+const BgAnimParamDef *animParamsFn(int i) { return simAnim(i).params; }
 int themeCountFn() { return static_cast<int>(sizeof(kSimThemeNames) / sizeof(kSimThemeNames[0])); }
 const char *themeNameFn(int i) {
     const int n = themeCountFn();
@@ -68,6 +128,7 @@ const char *themeNameFn(int i) {
 #else
 int animCountFn() { return bg_animation_count(); }
 const char *animNameFn(int i) { return bg_animation(i).name; }
+const BgAnimParamDef *animParamsFn(int i) { return bg_animation(i).params; }
 int themeCountFn() { return bg_theme_count(); }
 const char *themeNameFn(int i) { return bg_theme_name(i); }
 #endif
@@ -183,6 +244,7 @@ struct CatAnimationCtx {
     bool interlaceTouched = false;
 
     lv_obj_t *animRow = nullptr;
+    lv_obj_t *paramsRow = nullptr;
     lv_obj_t *frameRateRow = nullptr;
     lv_obj_t *themeRow = nullptr;
     lv_obj_t *gradientRow = nullptr;
@@ -197,11 +259,12 @@ struct CatAnimationCtx {
 
     // Cached from the first buildRow call (enter/commit/reconcile receive
     // only ctx, never SettingsUI&; see CatTemps.cpp's identical comment).
-    // All fifteen rows here are live, unlike Temps, so this is also how every
+    // Every value row here is live, unlike Temps, so this is also how every
     // onChange callback reaches markDirty()/plugins().trigger(), not just
-    // commit(). Every row on the current page runs buildRow before any of
-    // these other callbacks can fire (enter -> rebuildPage -> buildRow,
-    // always page 0 first), so this is set before any of them ever run.
+    // commit(); the Parameters row needs it to push its page. Every row on
+    // the current page runs buildRow before any of these other callbacks can
+    // fire (enter -> rebuildPage -> buildRow, always page 0 first), so this
+    // is set before any of them ever run.
     SettingsUI *ui = nullptr;
 };
 
@@ -230,9 +293,28 @@ void animIdOnCycle(void *user, int dir) {
     if (ctx->gradientRow != nullptr) {
         settingsRowSetValue(ctx->gradientRow, gradientDisplayText(ctx->gradientIndex, choices).c_str());
     }
+    // The Parameters row names the animation whose parameters it opens, so
+    // it follows this row.
+    if (ctx->paramsRow != nullptr) {
+        settingsRowSetValue(ctx->paramsRow, animNameFn(ctx->animId));
+    }
     if (ctx->ui != nullptr) {
         ctx->ui->ui().markDirty();
         ctx->ui->plugins().trigger("bganim:preview-end");
+    }
+}
+
+// ---- Parameters ---------------------------------------------------------------
+
+// Pushes the Parameters page for the animation the draft is on. The page
+// writes Settings live and has no draft of its own to hand back, so nothing
+// here needs to survive the push; ctx->animId is read now rather than
+// captured, so cycling Animation and then tapping this opens the animation
+// on screen.
+void paramsOnActivate(void *user) {
+    auto *ctx = static_cast<CatAnimationCtx *>(user);
+    if (ctx->ui != nullptr) {
+        settingsAnimParamsPush(*ctx->ui, ctx->animId);
     }
 }
 
@@ -461,7 +543,7 @@ void interlaceOnToggle(void *user, bool value) {
 
 // ---- shell plumbing ---------------------------------------------------------
 
-int animRowCount(void * /*ctx*/) { return 15; }
+int animRowCount(void * /*ctx*/) { return 16; }
 
 void animBuildRow(void *ctx0, int index, lv_obj_t *parent, SettingsUI &ui) {
     auto *ctx = static_cast<CatAnimationCtx *>(ctx0);
@@ -478,7 +560,18 @@ void animBuildRow(void *ctx0, int index, lv_obj_t *parent, SettingsUI &ui) {
         settingsRowSetValue(row, animNameFn(ctx->animId));
         break;
     }
-    case 1: { // Frame rate
+    case 1: { // Parameters (pushes CatAnimParams.cpp's page)
+        lv_obj_t *row = settingsRowActionCreate(ui, parent, "Parameters", "Parameters", paramsOnActivate, ctx);
+        ctx->paramsRow = row;
+        lv_obj_add_event_cb(
+            row, [](lv_event_t *e) { static_cast<CatAnimationCtx *>(lv_event_get_user_data(e))->paramsRow = nullptr; },
+            LV_EVENT_DELETE, ctx);
+        // The animation's name, not a count: the page edits one animation's
+        // parameters and this row sits under the one that chooses which.
+        settingsRowSetValue(row, animNameFn(ctx->animId));
+        break;
+    }
+    case 2: { // Frame rate
         lv_obj_t *row = settingsRowStepperCreate(ui, parent, "Frame rate", "Frame rate", frameRateOnStep, ctx);
         ctx->frameRateRow = row;
         lv_obj_add_event_cb(
@@ -488,10 +581,10 @@ void animBuildRow(void *ctx0, int index, lv_obj_t *parent, SettingsUI &ui) {
         settingsRowSetValue(row, settingsui::formatNumeric(ctx->fps, settingsui::kBgAnimFpsSpec).c_str());
         break;
     }
-    case 2: // All screens
+    case 3: // All screens
         settingsRowToggleCreate(ui, parent, "All screens", "All screens", ctx->allScreens, allScreensOnToggle, ctx);
         break;
-    case 3: { // Theme
+    case 4: { // Theme
         lv_obj_t *row = settingsRowChoiceCreate(ui, parent, "Theme", "Theme", themeOnCycle, ctx);
         ctx->themeRow = row;
         lv_obj_add_event_cb(
@@ -500,7 +593,7 @@ void animBuildRow(void *ctx0, int index, lv_obj_t *parent, SettingsUI &ui) {
         settingsRowSetValue(row, settingsui::kThemeModeLabels[ctx->themeMode]);
         break;
     }
-    case 4: { // Gradient
+    case 5: { // Gradient
         lv_obj_t *row = settingsRowChoiceCreate(ui, parent, "Gradient", "Gradient", gradientOnCycle, ctx);
         ctx->gradientRow = row;
         lv_obj_add_event_cb(
@@ -511,7 +604,7 @@ void animBuildRow(void *ctx0, int index, lv_obj_t *parent, SettingsUI &ui) {
         settingsRowSetValue(row, gradientDisplayText(ctx->gradientIndex, choices).c_str());
         break;
     }
-    case 5: { // Plates
+    case 6: { // Plates
         lv_obj_t *row = settingsRowChoiceCreate(ui, parent, "Plates", "Plates", platesOnCycle, ctx);
         ctx->platesRow = row;
         lv_obj_add_event_cb(
@@ -520,7 +613,7 @@ void animBuildRow(void *ctx0, int index, lv_obj_t *parent, SettingsUI &ui) {
         settingsRowSetValue(row, settingsui::kPlatesLabels[ctx->plates]);
         break;
     }
-    case 6: { // Plate colour
+    case 7: { // Plate colour
         lv_obj_t *row = settingsRowChoiceCreate(ui, parent, "Plate colour", "Plate colour", plateColorOnCycle, ctx);
         ctx->plateColorRow = row;
         lv_obj_add_event_cb(
@@ -531,7 +624,7 @@ void animBuildRow(void *ctx0, int index, lv_obj_t *parent, SettingsUI &ui) {
         settingsRowSetEnabled(row, ctx->plates == 2);
         break;
     }
-    case 7: { // Plate opacity
+    case 8: { // Plate opacity
         lv_obj_t *row = settingsRowStepperCreate(ui, parent, "Plate opacity", "Plate opacity", plateOpacityOnStep, ctx);
         ctx->plateOpacityRow = row;
         lv_obj_add_event_cb(
@@ -542,10 +635,10 @@ void animBuildRow(void *ctx0, int index, lv_obj_t *parent, SettingsUI &ui) {
         settingsRowSetEnabled(row, ctx->plates == 2);
         break;
     }
-    case 8: // Element tint
+    case 9: // Element tint
         settingsRowToggleCreate(ui, parent, "Element tint", "Element tint", ctx->tintEnabled, tintEnabledOnToggle, ctx);
         break;
-    case 9: { // Tint colour
+    case 10: { // Tint colour
         lv_obj_t *row = settingsRowChoiceCreate(ui, parent, "Tint colour", "Tint colour", tintColorOnCycle, ctx);
         ctx->tintColorRow = row;
         lv_obj_add_event_cb(
@@ -556,7 +649,7 @@ void animBuildRow(void *ctx0, int index, lv_obj_t *parent, SettingsUI &ui) {
         settingsRowSetEnabled(row, ctx->tintEnabled);
         break;
     }
-    case 10: { // Text scrim
+    case 11: { // Text scrim
         lv_obj_t *row = settingsRowStepperCreate(ui, parent, "Text scrim", "Text scrim", scrimOnStep, ctx);
         ctx->scrimRow = row;
         lv_obj_add_event_cb(
@@ -565,7 +658,7 @@ void animBuildRow(void *ctx0, int index, lv_obj_t *parent, SettingsUI &ui) {
         settingsRowSetValue(row, settingsui::formatNumeric(ctx->scrim, settingsui::kBgAnimScrimSpec).c_str());
         break;
     }
-    case 11: { // Fade out
+    case 12: { // Fade out
         lv_obj_t *row = settingsRowStepperCreate(ui, parent, "Fade out", "Fade out", fadeOutOnStep, ctx);
         ctx->fadeOutRow = row;
         lv_obj_add_event_cb(
@@ -574,7 +667,7 @@ void animBuildRow(void *ctx0, int index, lv_obj_t *parent, SettingsUI &ui) {
         settingsRowSetValue(row, settingsui::formatNumeric(ctx->fadeOut, settingsui::kBgFadeSpec).c_str());
         break;
     }
-    case 12: { // Fade in
+    case 13: { // Fade in
         lv_obj_t *row = settingsRowStepperCreate(ui, parent, "Fade in", "Fade in", fadeInOnStep, ctx);
         ctx->fadeInRow = row;
         lv_obj_add_event_cb(
@@ -583,7 +676,7 @@ void animBuildRow(void *ctx0, int index, lv_obj_t *parent, SettingsUI &ui) {
         settingsRowSetValue(row, settingsui::formatNumeric(ctx->fadeIn, settingsui::kBgFadeSpec).c_str());
         break;
     }
-    case 13: { // Fade curve
+    case 14: { // Fade curve
         lv_obj_t *row = settingsRowChoiceCreate(ui, parent, "Fade curve", "Fade curve", fadeCurveOnCycle, ctx);
         ctx->fadeCurveRow = row;
         lv_obj_add_event_cb(
@@ -593,7 +686,7 @@ void animBuildRow(void *ctx0, int index, lv_obj_t *parent, SettingsUI &ui) {
         settingsRowSetValue(row, settingsui::kFadeCurveLabels[ctx->fadeCurve]);
         break;
     }
-    case 14: // Interlace
+    case 15: // Interlace
         settingsRowToggleCreate(ui, parent, "Interlace", "Interlace", ctx->interlace, interlaceOnToggle, ctx);
         break;
     default:
@@ -841,6 +934,13 @@ void *animCreateCtx() { return new CatAnimationCtx(); }
 void animDestroyCtx(void *ctx) { delete static_cast<CatAnimationCtx *>(ctx); }
 
 } // namespace
+
+// The roster, for the Parameters page (CatAnimParams.h). Exported from here
+// rather than duplicated there because this file already owns the split
+// between the real registry and the simulator's mirror.
+int settingsAnimCount() { return animCountFn(); }
+const char *settingsAnimName(int animId) { return animNameFn(clampAnimId(animId)); }
+const BgAnimParamDef *settingsAnimParams(int animId) { return animParamsFn(clampAnimId(animId)); }
 
 const SettingsCategoryDef kCatAnimation = {
     "Animation", &img_settings_40x40, animRowCount, animBuildRow, animEnter, nullptr, animCommit, animReconcile,

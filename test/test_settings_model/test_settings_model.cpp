@@ -19,10 +19,13 @@
 //   E -- palette
 //   F -- time zones (real 461-entry table)
 //   G -- wake-up schedules
+//   H -- background animation parameters (the packed bgAnimParams string)
 
 #include <unity.h>
 
 #include <cstddef>
+#include <cstdint>
+#include <cstdio>
 #include <string>
 #include <vector>
 
@@ -431,6 +434,135 @@ static void test_schedule_serialize_parse_round_trip_and_malformed_dropped() {
 }
 
 // ---------------------------------------------------------------------------
+// Group H -- background animation parameters (packed bgAnimParams string)
+// ---------------------------------------------------------------------------
+
+// Stand-in for one animation's BgAnimParamDef defaults: four defined
+// parameters and four unused slots, which the registry reports as 0. The
+// real table is unreachable from the host (it carries the render kernels),
+// and every function under test takes the defaults from its caller for
+// exactly that reason, so a literal here is the whole fixture.
+static const uint8_t kDefs4[kBgAnimParamSlots] = {50, 45, 60, 20, 0, 0, 0, 0};
+
+static void assert_slots(const uint8_t *got, const uint8_t *want) {
+    for (int i = 0; i < kBgAnimParamSlots; i++) {
+        char msg[24];
+        std::snprintf(msg, sizeof(msg), "slot %d", i);
+        TEST_ASSERT_EQUAL_UINT8_MESSAGE(want[i], got[i], msg);
+    }
+}
+
+static void test_bgparams_read_defaults_when_unset() {
+    uint8_t got[kBgAnimParamSlots];
+    // Nothing stored at all.
+    bgParamsRead("", 3, kDefs4, got);
+    assert_slots(got, kDefs4);
+    // Stored, but not this far: three groups, animation 3 asked for.
+    bgParamsRead("1,2;3,4;5,6", 3, kDefs4, got);
+    assert_slots(got, kDefs4);
+    // An explicitly empty group is "keep the defaults" too.
+    bgParamsRead("1,2;;5,6", 1, kDefs4, got);
+    assert_slots(got, kDefs4);
+    // A null defaults pointer reads as all zeroes.
+    static const uint8_t zeroes[kBgAnimParamSlots] = {0, 0, 0, 0, 0, 0, 0, 0};
+    bgParamsRead("", 0, nullptr, got);
+    assert_slots(got, zeroes);
+}
+
+static void test_bgparams_read_overrides_and_short_group() {
+    uint8_t got[kBgAnimParamSlots];
+    // Whole group present: every slot comes from the string.
+    bgParamsRead("0,0;7,8,9,10,11,12,13,14", 1, kDefs4, got);
+    static const uint8_t all8[kBgAnimParamSlots] = {7, 8, 9, 10, 11, 12, 13, 14};
+    assert_slots(got, all8);
+    // Two values stored: the other six keep their defaults. This is the
+    // compatibility rule that let a stored group of four survive
+    // BG_ANIM_PARAMS going from 4 to 8 (gm-3vj.1).
+    bgParamsRead("35,40", 0, kDefs4, got);
+    static const uint8_t shortGroup[kBgAnimParamSlots] = {35, 40, 60, 20, 0, 0, 0, 0};
+    assert_slots(got, shortGroup);
+}
+
+static void test_bgparams_read_clamps_and_stops_at_garbage() {
+    uint8_t got[kBgAnimParamSlots];
+    // Out of range in both directions, clamped to 0..100.
+    bgParamsRead("250,-8", 0, kDefs4, got);
+    static const uint8_t clamped[kBgAnimParamSlots] = {100, 0, 60, 20, 0, 0, 0, 0};
+    assert_slots(got, clamped);
+    // A value that is not a number ends the group there; every slot from it
+    // on keeps its default, rather than reading as 0.
+    bgParamsRead("30,oops,70", 0, kDefs4, got);
+    static const uint8_t stopped[kBgAnimParamSlots] = {30, 45, 60, 20, 0, 0, 0, 0};
+    assert_slots(got, stopped);
+    // A group that is garbage from its first character keeps every default.
+    bgParamsRead("nonsense", 0, kDefs4, got);
+    assert_slots(got, kDefs4);
+}
+
+static void test_bgparams_write_group_repacks_at_eight() {
+    static const uint8_t values[kBgAnimParamSlots] = {5, 10, 15, 20, 0, 0, 0, 0};
+    // Written at eight values even though the animation defines four, so a
+    // later build that gives it more parameters shows what was stored here
+    // rather than that build's defaults.
+    TEST_ASSERT_EQUAL_STRING("5,10,15,20,0,0,0,0", bgParamsWriteGroup("", 0, values).c_str());
+    // Values out of range clamp on the way in.
+    static const uint8_t wild[kBgAnimParamSlots] = {200, 0, 0, 0, 0, 0, 0, 101};
+    TEST_ASSERT_EQUAL_STRING("100,0,0,0,0,0,0,100", bgParamsWriteGroup("", 0, wild).c_str());
+}
+
+static void test_bgparams_write_group_leaves_neighbours_alone() {
+    static const uint8_t values[kBgAnimParamSlots] = {1, 2, 3, 4, 5, 6, 7, 8};
+    // The neighbours keep their own text, short groups included: this writer
+    // never expands a group it was not asked to change.
+    TEST_ASSERT_EQUAL_STRING("9,9;1,2,3,4,5,6,7,8;7", bgParamsWriteGroup("9,9;50;7", 1, values).c_str());
+    // Animations between the stored end and animId are appended empty.
+    TEST_ASSERT_EQUAL_STRING("9,9;;;1,2,3,4,5,6,7,8", bgParamsWriteGroup("9,9", 3, values).c_str());
+}
+
+static void test_bgparams_write_slot_fills_the_rest_from_defaults() {
+    // Slot 2 of animation 1, whose group is not stored: the other seven
+    // slots are written at the animation's defaults, not at zero.
+    TEST_ASSERT_EQUAL_STRING("4,4;50,45,80,20,0,0,0,0", bgParamsWriteSlot("4,4", 1, kDefs4, 2, 80).c_str());
+    // Slot 0 over a stored short group: the stored second value survives.
+    TEST_ASSERT_EQUAL_STRING("25,40,60,20,0,0,0,0", bgParamsWriteSlot("35,40", 0, kDefs4, 0, 25).c_str());
+    // Out of range clamps; a slot index off the end changes nothing.
+    TEST_ASSERT_EQUAL_STRING("100,45,60,20,0,0,0,0", bgParamsWriteSlot("", 0, kDefs4, 0, 999).c_str());
+    TEST_ASSERT_EQUAL_STRING("35,40", bgParamsWriteSlot("35,40", 0, kDefs4, kBgAnimParamSlots, 10).c_str());
+}
+
+static void test_bgparams_clear_group_restores_defaults() {
+    const std::string cleared = bgParamsClearGroup("1,2;3,4;5,6", 1);
+    TEST_ASSERT_EQUAL_STRING("1,2;;5,6", cleared.c_str());
+    uint8_t got[kBgAnimParamSlots];
+    bgParamsRead(cleared, 1, kDefs4, got);
+    assert_slots(got, kDefs4);
+    // The neighbours are untouched by the clear.
+    bgParamsRead(cleared, 0, kDefs4, got);
+    static const uint8_t first[kBgAnimParamSlots] = {1, 2, 60, 20, 0, 0, 0, 0};
+    assert_slots(got, first);
+    // Clearing the last group that carried anything trims back to "", the
+    // state a device that never edited a parameter stores.
+    TEST_ASSERT_EQUAL_STRING("1,2", bgParamsClearGroup("1,2;3,4", 1).c_str());
+    TEST_ASSERT_EQUAL_STRING("", bgParamsClearGroup("3,4", 0).c_str());
+    // Clearing past the stored end is a no-op, not a string full of ';'.
+    TEST_ASSERT_EQUAL_STRING("1,2", bgParamsClearGroup("1,2", 5).c_str());
+}
+
+static void test_bgparams_spec_steps_and_clamps() {
+    TEST_ASSERT_EQUAL(0, kBgAnimParamSpec.minValue);
+    TEST_ASSERT_EQUAL(100, kBgAnimParamSpec.maxValue);
+    TEST_ASSERT_EQUAL(5, stepValue(0, 1, false, kBgAnimParamSpec));
+    TEST_ASSERT_EQUAL(10, stepValue(0, 1, true, kBgAnimParamSpec));
+    TEST_ASSERT_EQUAL(0, stepValue(0, -1, false, kBgAnimParamSpec));
+    TEST_ASSERT_EQUAL(100, stepValue(100, 1, false, kBgAnimParamSpec));
+    // A slider-written value off the step-5 grid moves to the nearest grid
+    // line in the direction pressed, not a full step past it.
+    TEST_ASSERT_EQUAL(45, stepValue(43, 1, false, kBgAnimParamSpec));
+    TEST_ASSERT_EQUAL(40, stepValue(43, -1, false, kBgAnimParamSpec));
+    TEST_ASSERT_EQUAL_STRING("55", formatNumeric(55, kBgAnimParamSpec).c_str());
+}
+
+// ---------------------------------------------------------------------------
 // Unity entrypoint
 // ---------------------------------------------------------------------------
 
@@ -474,5 +606,14 @@ int main(int argc, char **argv) {
     RUN_TEST(test_schedule_time_parts_reads_malformed_as_midnight);
     RUN_TEST(test_schedule_summary_strings);
     RUN_TEST(test_schedule_serialize_parse_round_trip_and_malformed_dropped);
+
+    RUN_TEST(test_bgparams_read_defaults_when_unset);
+    RUN_TEST(test_bgparams_read_overrides_and_short_group);
+    RUN_TEST(test_bgparams_read_clamps_and_stops_at_garbage);
+    RUN_TEST(test_bgparams_write_group_repacks_at_eight);
+    RUN_TEST(test_bgparams_write_group_leaves_neighbours_alone);
+    RUN_TEST(test_bgparams_write_slot_fills_the_rest_from_defaults);
+    RUN_TEST(test_bgparams_clear_group_restores_defaults);
+    RUN_TEST(test_bgparams_spec_steps_and_clamps);
     return UNITY_END();
 }

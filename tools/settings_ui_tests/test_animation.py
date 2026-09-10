@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Scenario for the Animation settings category (gm-flw.9): animation, frame
 rate, all-screens, theme, gradient, plates, plate colour/opacity, element
-tint/colour and text scrim, all eleven rows live. Built on
+tint/colour and text scrim, every value row live, plus the Parameters child
+page the Animation row's neighbour pushes (gm-3vj.2). Built on
 tools/settings_ui_tests/rig.py (gm-flw.16); runs against the desktop
 simulator by default (pio run -e display-sim) and against a loadtest device
 with --host.
@@ -37,13 +38,22 @@ DEFAULT_PROGRAM = os.path.join(REPO_ROOT, ".pio", "build", "display-sim", "progr
 # of (see that file's comment): BgAnimRegistry.cpp's REGISTRY order
 # (animation display names) and BgAnimThemes.cpp's THEMES order (built-in
 # gradient names). Both compile only outside GAGGIMATE_SIM, so there is no
-# device route this script could read them from instead; verified against
-# the same source at HEAD 2b87cb88. A change to either real table needs the
-# same edit made in three places now (BgAnimRegistry.cpp/BgAnimThemes.cpp,
-# CatAnimation.cpp's sim mirror, and this list) -- flagged to the epic lead.
+# device route this script could read them from instead.
+#
+# ANIM_NAMES was regenerated from the real structs at HEAD 096292af
+# (gm-3vj.2), along with CatAnimation.cpp's own mirror. It had drifted twice
+# over: 14 names against a roster of 44, and eight of the names it did carry
+# were the pre-rename ones ("Brushed Metal" for "Brushed", and so on). A
+# change to the real roster still needs the same edit made in three places
+# (the Anim*.cpp structs, CatAnimation.cpp's mirror and this list) --
+# flagged to the epic lead, with the note that generating the last two from
+# the first is a few lines of Python.
 ANIM_NAMES = [
-    "Plasma", "Lava", "Silk", "Starfield", "Aurora", "Ripples", "Caustics", "Mandala",
-    "Orbits", "Fireflies", "Steam", "Ember", "Nebula", "Silk 2",
+    "Plasma", "Lava", "Silk", "Starfield", "Aurora", "Ripples", "Caustics", "Mandala", "Orbits",
+    "Fireflies", "Steam", "Ember", "Nebula", "Silk 2", "Brushed", "Horizon", "Oculus", "Chevrons",
+    "Mosaic", "Saddle", "Refraction", "Sundial", "Crescent", "Glint", "Tunnel", "Kaleido", "Shafts",
+    "Weave", "Lens", "Tide", "Truchet", "Quilt", "Rain", "Stripes", "Ribbon", "Harmonograph",
+    "Floor", "Hills", "Gyroid", "Barrel", "Grid", "Cells", "Dimples", "Cube",
 ]
 THEME_NAMES = [
     "Espresso", "Ocean", "Violet Dusk", "Forest", "Sunset", "Fire", "Ice", "Mono", "Rose", "Gold", "Aurora", "Cyber",
@@ -223,6 +233,34 @@ def goto_page(rig, page):
     return rig.touchmap(screen=0)
 
 
+def page_with_row(rig, name):
+    """Turns to the page carrying the row called `name` and returns its dump.
+    Addressed by name rather than by page number because this category's rows
+    move across page boundaries whenever one is added: gm-3vj.2's Parameters
+    row pushed five of them onto the next page and made a fourth page. The
+    audit table (audit_pages.py) still pins the exact per-page row lists, so
+    nothing here has to."""
+    state = rig.settingsui_state()
+    pages = int(state.get("pages", 1))
+    for page in range(pages):
+        dump = goto_page(rig, page)
+        if rig.find_tag(dump, name, "value") is not None:
+            return dump
+    raise AssertionError("no row %r on any of the %d pages" % (name, pages))
+
+
+def tap_row(rig, name, role):
+    """Turns to the page carrying the row called `name` and taps its `role`
+    control ("next", "prev", "plus", "minus", "toggle", "action"). Two rows
+    this scenario alternates between, Animation and Gradient, are on
+    different pages since gm-3vj.2."""
+    dump = page_with_row(rig, name)
+    target = rig.find_tag(dump, name, role)
+    if target is None:
+        raise AssertionError("row %r has no %r control on its page" % (name, role))
+    rig.tap_target(target)
+
+
 def close_animation(rig):
     rig.settingsui(close=1)
     rig.wait_until(lambda: rig.settingsui_state().get("open") is False, timeout=5)
@@ -232,52 +270,61 @@ def close_animation(rig):
 # Checks
 
 
+def all_row_values(rig):
+    """Every row value on every page of the open category, keyed by row name,
+    plus the per-page dumps. One sweep, so no check has to know which page a
+    row landed on (they move whenever a row is added)."""
+    pages = int(rig.settingsui_state().get("pages", 1))
+    values, dumps = {}, []
+    for page in range(pages):
+        dump = goto_page(rig, page)
+        dumps.append((page, dump))
+        for o in dump["objects"]:
+            tag = o.get("tag") or ""
+            if tag.endswith("/value"):
+                val = o.get("val")
+                values[tag[: -len("/value")]] = val if val is not None else o.get("t")
+    return values, dumps
+
+
 def check_rows_match_settings(rig):
-    """Acceptance: the eleven rows show the stored values as GET
-    /api/settings reports them, across all three pages, without a
-    renderer (the model's animation/gradient/palette logic is host code)."""
+    """Acceptance: every row shows the stored value as GET /api/settings
+    reports it, across all four pages, without a renderer (the model's
+    animation/gradient/palette logic is host code)."""
     s = rig.settings()
-    d0 = open_animation(rig)
-    check(rig, "row_animation", rig.row_value(d0, "Animation") == ANIM_NAMES[int(s["bgAnimId"])],
-          "%r vs bgAnimId=%s" % (rig.row_value(d0, "Animation"), s["bgAnimId"]))
-    check(rig, "row_frame_rate", rig.row_value(d0, "Frame rate") == "%d fps" % int(s["bgAnimFps"]),
-          rig.row_value(d0, "Frame rate"))
-    check(rig, "row_all_screens", rig.row_value(d0, "All screens") == ("On" if s["bgAnimAllScreens"] else "Off"),
-          rig.row_value(d0, "All screens"))
-    check(rig, "row_theme", rig.row_value(d0, "Theme") == THEME_MODE_LABELS[int(s["themeMode"])],
-          rig.row_value(d0, "Theme"))
+    open_animation(rig)
+    v, dumps = all_row_values(rig)
+    check(rig, "row_animation", v["Animation"] == ANIM_NAMES[int(s["bgAnimId"])],
+          "%r vs bgAnimId=%s" % (v["Animation"], s["bgAnimId"]))
+    # The Parameters row names the animation whose parameters it opens, so it
+    # tracks the row above it (CatAnimation.cpp).
+    check(rig, "row_parameters", v["Parameters"] == ANIM_NAMES[int(s["bgAnimId"])],
+          "%r vs bgAnimId=%s" % (v["Parameters"], s["bgAnimId"]))
+    check(rig, "row_frame_rate", v["Frame rate"] == "%d fps" % int(s["bgAnimFps"]), v["Frame rate"])
+    check(rig, "row_all_screens", v["All screens"] == ("On" if s["bgAnimAllScreens"] else "Off"), v["All screens"])
+    check(rig, "row_theme", v["Theme"] == THEME_MODE_LABELS[int(s["themeMode"])], v["Theme"])
     exp_grad = expected_gradient_text(s)
     if exp_grad is not None:
-        check(rig, "row_gradient", rig.row_value(d0, "Gradient") == exp_grad,
-              "%r vs %r" % (rig.row_value(d0, "Gradient"), exp_grad))
+        check(rig, "row_gradient", v["Gradient"] == exp_grad, "%r vs %r" % (v["Gradient"], exp_grad))
     else:
         rig.log("row_gradient_skipped", reason="library ref not reachable on the simulator")
 
-    d1 = goto_page(rig, 1)
-    check(rig, "row_plates", rig.row_value(d1, "Plates") == PLATES_LABELS[int(s["bgAnimClearPlates"])],
-          rig.row_value(d1, "Plates"))
-    check(rig, "row_plate_colour", rig.row_value(d1, "Plate colour") == expected_palette_text(hex_to_int(s["bgAnimPlateColor"])),
-          rig.row_value(d1, "Plate colour"))
-    check(rig, "row_plate_opacity", rig.row_value(d1, "Plate opacity") == "%d %%" % int(s["bgAnimPlateOpacity"]),
-          rig.row_value(d1, "Plate opacity"))
-    check(rig, "row_element_tint", rig.row_value(d1, "Element tint") == ("On" if s["elementTintEnabled"] else "Off"),
-          rig.row_value(d1, "Element tint"))
-    check(rig, "row_tint_colour", rig.row_value(d1, "Tint colour") == expected_palette_text(hex_to_int(s["elementTintColor"])),
-          rig.row_value(d1, "Tint colour"))
+    check(rig, "row_plates", v["Plates"] == PLATES_LABELS[int(s["bgAnimClearPlates"])], v["Plates"])
+    check(rig, "row_plate_colour", v["Plate colour"] == expected_palette_text(hex_to_int(s["bgAnimPlateColor"])),
+          v["Plate colour"])
+    check(rig, "row_plate_opacity", v["Plate opacity"] == "%d %%" % int(s["bgAnimPlateOpacity"]), v["Plate opacity"])
+    check(rig, "row_element_tint", v["Element tint"] == ("On" if s["elementTintEnabled"] else "Off"),
+          v["Element tint"])
+    check(rig, "row_tint_colour", v["Tint colour"] == expected_palette_text(hex_to_int(s["elementTintColor"])),
+          v["Tint colour"])
 
-    d2 = goto_page(rig, 2)
-    check(rig, "row_text_scrim", rig.row_value(d2, "Text scrim") == "%d %%" % int(s["bgAnimScrim"]),
-          rig.row_value(d2, "Text scrim"))
-    check(rig, "row_fade_out", rig.row_value(d2, "Fade out") == "%d ms" % int(s["bgFadeOutMs"]),
-          rig.row_value(d2, "Fade out"))
-    check(rig, "row_fade_in", rig.row_value(d2, "Fade in") == "%d ms" % int(s["bgFadeInMs"]),
-          rig.row_value(d2, "Fade in"))
-    check(rig, "row_fade_curve", rig.row_value(d2, "Fade curve") == FADE_CURVE_LABELS[int(s["bgFadeCurve"])],
-          rig.row_value(d2, "Fade curve"))
-    check(rig, "row_interlace", rig.row_value(d2, "Interlace") == ("On" if int(s["bgAnimInterlace"]) else "Off"),
-          rig.row_value(d2, "Interlace"))
+    check(rig, "row_text_scrim", v["Text scrim"] == "%d %%" % int(s["bgAnimScrim"]), v["Text scrim"])
+    check(rig, "row_fade_out", v["Fade out"] == "%d ms" % int(s["bgFadeOutMs"]), v["Fade out"])
+    check(rig, "row_fade_in", v["Fade in"] == "%d ms" % int(s["bgFadeInMs"]), v["Fade in"])
+    check(rig, "row_fade_curve", v["Fade curve"] == FADE_CURVE_LABELS[int(s["bgFadeCurve"])], v["Fade curve"])
+    check(rig, "row_interlace", v["Interlace"] == ("On" if int(s["bgAnimInterlace"]) else "Off"), v["Interlace"])
 
-    for page, dump in ((0, d0), (1, d1), (2, d2)):
+    for page, dump in dumps:
         a = rig.audit(dump)
         check(rig, "audit_page_%d_clean" % page, len(a["violations"]) == 0, repr(a["violations"]))
 
@@ -288,8 +335,8 @@ def check_no_op_visit(rig):
     """Acceptance: a visit that changes nothing writes nothing."""
     before = {k: rig.settings()[k] for k in ANIMATION_FIELDS}
     open_animation(rig)
-    goto_page(rig, 1)
-    goto_page(rig, 2)
+    for page in range(1, int(rig.settingsui_state().get("pages", 1))):
+        goto_page(rig, page)
     close_animation(rig)
     after = {k: rig.settings()[k] for k in ANIMATION_FIELDS}
     check(rig, "no_op_visit_writes_nothing", before == after, "before=%r after=%r" % (before, after))
@@ -399,7 +446,8 @@ def check_gradient_default_and_builtin(rig):
     anim0 = int(s0["bgAnimId"])
     map0 = s0["bgAnimThemeMap"]
 
-    d = open_animation(rig)
+    open_animation(rig)
+    d = page_with_row(rig, "Gradient")
     grad0_text = rig.row_value(d, "Gradient")
     next_btn = rig.find_tag(d, "Gradient", "next")
     if next_btn is None:
@@ -454,20 +502,15 @@ def check_gradient_precedence_across_animations(rig):
     anim_a = int(s0["bgAnimId"])
     anim_b = (anim_a + 1) % len(ANIM_NAMES)
 
-    d = open_animation(rig)
-    grad_a_btn = rig.find_tag(d, "Gradient", "next")
-    if grad_a_btn is None:
-        check(rig, "precedence_gradient_next_found", False)
-        close_animation(rig)
-        return
-    rig.tap_target(grad_a_btn)
+    open_animation(rig)
+    tap_row(rig, "Gradient", "next")
     ref_a = map_ref(rig.settings()["bgAnimThemeMap"], anim_a)
     check(rig, "precedence_setup_touch_a", ref_a != "", "anim %d ref=%r" % (anim_a, ref_a))
 
-    rig.tap_target(rig.find_tag(rig.touchmap(screen=0), "Animation", "next"))
+    tap_row(rig, "Animation", "next")
     check(rig, "precedence_moved_to_b", int(rig.settings()["bgAnimId"]) == anim_b, rig.settings()["bgAnimId"])
 
-    rig.tap_target(rig.find_tag(rig.touchmap(screen=0), "Gradient", "next"))
+    tap_row(rig, "Gradient", "next")
     map_after_b = rig.settings()["bgAnimThemeMap"]
     ref_b = map_ref(map_after_b, anim_b)
     check(rig, "precedence_setup_touch_b", ref_b != "", "anim %d ref=%r" % (anim_b, ref_b))
@@ -508,10 +551,10 @@ def check_gradient_precedence_across_animations(rig):
     # "Animation next" tap above), Gradient showing ref_b one step from
     # Default; undo it, step Animation back to A, undo A's edit the same
     # way.
-    d = open_animation(rig)
-    rig.tap_target(rig.find_tag(d, "Gradient", "prev"))
-    rig.tap_target(rig.find_tag(rig.touchmap(screen=0), "Animation", "prev"))
-    rig.tap_target(rig.find_tag(rig.touchmap(screen=0), "Gradient", "prev"))
+    open_animation(rig)
+    tap_row(rig, "Gradient", "prev")
+    tap_row(rig, "Animation", "prev")
+    tap_row(rig, "Gradient", "prev")
     close_animation(rig)
 
     restored_map = rig.settings()["bgAnimThemeMap"]
@@ -534,7 +577,7 @@ def check_plates_and_tint_coupling(rig):
     tint0 = bool(s0["elementTintEnabled"])
 
     open_animation(rig)
-    d1 = goto_page(rig, 1)
+    d1 = page_with_row(rig, "Plates")
 
     steps_to_keep = (0 - plates0) % 3
     for _ in range(steps_to_keep):
@@ -568,37 +611,38 @@ def check_plates_and_tint_coupling(rig):
     after_opacity = int(rig.settings()["bgAnimPlateOpacity"])
     check(rig, "plate_opacity_enabled_changes", after_opacity != before_opacity, "%r -> %r" % (before_opacity, after_opacity))
 
-    d1 = rig.touchmap(screen=0)
-    if rig.row_value(d1, "Element tint") == "On":
-        rig.tap_target(rig.find_tag(d1, "Element tint", "toggle"))
-    d1 = rig.touchmap(screen=0)
-    check(rig, "tint_off_for_test", rig.row_value(d1, "Element tint") == "Off", rig.row_value(d1, "Element tint"))
+    # Element tint and Tint colour are on different pages since gm-3vj.2, so
+    # the two rows are reached by name from here on.
+    dt = page_with_row(rig, "Element tint")
+    if rig.row_value(dt, "Element tint") == "On":
+        rig.tap_target(rig.find_tag(dt, "Element tint", "toggle"))
+    dt = rig.touchmap(screen=0)
+    check(rig, "tint_off_for_test", rig.row_value(dt, "Element tint") == "Off", rig.row_value(dt, "Element tint"))
     before_tc = rig.settings()["elementTintColor"]
-    rig.tap_target(rig.find_tag(d1, "Tint colour", "next"))
+    tap_row(rig, "Tint colour", "next")
     check(rig, "tint_color_disabled_ignored", rig.settings()["elementTintColor"] == before_tc)
 
-    rig.tap_target(rig.find_tag(rig.touchmap(screen=0), "Element tint", "toggle"))
-    d1 = rig.touchmap(screen=0)
-    check(rig, "tint_on_for_test", rig.row_value(d1, "Element tint") == "On", rig.row_value(d1, "Element tint"))
+    tap_row(rig, "Element tint", "toggle")
+    dt = page_with_row(rig, "Element tint")
+    check(rig, "tint_on_for_test", rig.row_value(dt, "Element tint") == "On", rig.row_value(dt, "Element tint"))
     before_tc = rig.settings()["elementTintColor"]
-    rig.tap_target(rig.find_tag(d1, "Tint colour", "next"))
+    tap_row(rig, "Tint colour", "next")
     after_tc = rig.settings()["elementTintColor"]
     check(rig, "tint_color_enabled_changes", after_tc != before_tc, "%r -> %r" % (before_tc, after_tc))
 
     # Restore, through the UI, in reverse.
-    rig.tap_target(rig.find_tag(rig.touchmap(screen=0), "Tint colour", "prev"))  # undo the one "next" above
+    tap_row(rig, "Tint colour", "prev")  # undo the one "next" above
     if not tint0:
-        rig.tap_target(rig.find_tag(rig.touchmap(screen=0), "Element tint", "toggle"))
-    d1 = rig.touchmap(screen=0)
-    check(rig, "tint_enabled_restored", bool(rig.row_value(d1, "Element tint") == "On") == tint0)
+        tap_row(rig, "Element tint", "toggle")
+    dt = page_with_row(rig, "Element tint")
+    check(rig, "tint_enabled_restored", bool(rig.row_value(dt, "Element tint") == "On") == tint0)
 
-    rig.tap_target(rig.find_tag(d1, "Plate colour", "prev"))  # undo the one "next" above
+    tap_row(rig, "Plate colour", "prev")  # undo the one "next" above
     restore_opacity_dir = "plus" if opacity_dir == "minus" else "minus"
-    rig.tap_target(rig.find_tag(rig.touchmap(screen=0), "Plate opacity", restore_opacity_dir))
+    tap_row(rig, "Plate opacity", restore_opacity_dir)
     steps_from_custom = (plates0 - 2) % 3
     for _ in range(steps_from_custom):
-        d1 = rig.touchmap(screen=0)
-        rig.tap_target(rig.find_tag(d1, "Plates", "next"))
+        tap_row(rig, "Plates", "next")
 
     final = rig.settings()
     check(rig, "plates_restored", int(final["bgAnimClearPlates"]) == plates0,
@@ -608,6 +652,262 @@ def check_plates_and_tint_coupling(rig):
     if int(final["bgAnimClearPlates"]) != plates0 or int(final["bgAnimPlateOpacity"]) != opacity0:
         rig.log("could_not_restore", plates=final["bgAnimClearPlates"], plateOpacity=final["bgAnimPlateOpacity"])
     close_animation(rig)
+
+
+def params_group(packed, anim_id):
+    """One animation's ';'-separated group of the bgAnimParams string, "" when
+    the string does not reach that far (which reads as "every parameter at its
+    default"; SettingsModel.h)."""
+    parts = str(packed or "").split(";")
+    return parts[anim_id] if 0 <= anim_id < len(parts) else ""
+
+
+def other_groups(packed, skip_id, count):
+    """Every group but `skip_id`, as text, for a "nothing else moved" check."""
+    return {i: params_group(packed, i) for i in range(count) if i != skip_id}
+
+
+def params_set_group(packed, anim_id, group):
+    """`packed` with one animation's group replaced, for the web-save half of
+    the Parameters check. The display's own writer does the same thing in C++
+    (SettingsModel.cpp, bgParamsWriteGroup)."""
+    parts = str(packed or "").split(";")
+    while len(parts) <= anim_id:
+        parts.append("")
+    parts[anim_id] = group
+    return ";".join(parts)
+
+
+def wait_depth(rig, depth, timeout=5):
+    def at():
+        state = rig.settingsui_state()
+        return state if int(state.get("depth", -1)) == depth else None
+
+    return rig.wait_until(at, timeout)
+
+
+def check_parameters_page(rig):
+    """Acceptance (gm-3vj.2): the Parameters row opens a page of one stepper
+    per parameter the current animation defines plus a Reset row; a step
+    writes that animation's group of bgAnimParams and no other group; Reset
+    puts the group back to the defaults; the chevron returns to the Animation
+    page.
+
+    The step and Reset halves are only exercised when the animation's group
+    is unset to begin with, which is what a fresh device and the simulator
+    fixture both store: Reset empties the group, so a run that started from
+    stored parameter values could not put them back through the UI
+    afterwards. The device runner hits that case if the bench board has
+    edited parameters, and logs it rather than moving a stored value it
+    cannot restore."""
+    s0 = rig.settings()
+    anim0 = int(s0["bgAnimId"])
+    packed0 = s0.get("bgAnimParams", "")
+    group0 = params_group(packed0, anim0)
+    others0 = other_groups(packed0, anim0, len(ANIM_NAMES))
+
+    d0 = open_animation(rig)
+    row = rig.find_tag(d0, "Parameters", "action")
+    if row is None:
+        check(rig, "params_row_found", False, "no Parameters action row on the Animation page")
+        close_animation(rig)
+        return
+    rig.tap_target(row)
+    state = wait_depth(rig, 2)
+    if state is None:
+        check(rig, "params_page_pushed", False, repr(rig.settingsui_state()))
+        close_animation(rig)
+        return
+    check(rig, "params_page_pushed", True)
+
+    # The title is the animation's name, with " params" behind it when the
+    # shell's 144 px title box can hold both (CatAnimParams.cpp).
+    name = ANIM_NAMES[anim0]
+    check(rig, "params_title", state.get("title") in (name, name + " params"),
+          "%r for animation %r" % (state.get("title"), name))
+
+    # Every page of the pushed page: audited, and its row list read.
+    pages = int(state.get("pages", 1))
+    names, dumps = [], []
+    for page in range(pages):
+        dump = goto_page(rig, page)
+        dumps.append((page, dump))
+        names += rig.rows_on_page(dump)
+    for page, dump in dumps:
+        a = rig.audit(dump)
+        check(rig, "params_audit_page_%d_clean" % page, len(a["violations"]) == 0, repr(a["violations"]))
+    check(rig, "params_has_reset_row", names and names[-1] == "Reset to defaults", repr(names))
+    param_names = names[:-1]
+    check(rig, "params_row_count", 1 <= len(param_names) <= 8, repr(names))
+    if not param_names:
+        rig.settingsui(pop=1)
+        close_animation(rig)
+        return
+
+    # Step the first parameter twice. Its row is the animation's slot 0: the
+    # page lists the slots the animation defines in slot order, and no
+    # animation in the roster leaves an undefined slot before a defined one.
+    first = param_names[0]
+    d = page_with_row(rig, first)
+    at_open = int(rig.row_value(d, first))
+    direction, delta = ("plus", 5) if at_open <= 90 else ("minus", -5)
+    expected = max(0, min(100, at_open + 2 * delta))
+    for _ in range(2):
+        tap_row(rig, first, direction)
+    d = page_with_row(rig, first)
+    shown = int(rig.row_value(d, first))
+    check(rig, "params_row_stepped", shown == expected, "got %d want %d (from %d)" % (shown, expected, at_open))
+
+    packed1 = rig.settings().get("bgAnimParams", "")
+    group1 = params_group(packed1, anim0)
+    slots1 = group1.split(",")
+    check(rig, "params_group_written", len(slots1) == 8, "%r" % group1)
+    check(rig, "params_group_first_slot", slots1 and slots1[0] == str(expected), "%r" % group1)
+    others1 = other_groups(packed1, anim0, len(ANIM_NAMES))
+    check(rig, "params_other_groups_untouched", others1 == others0,
+          "changed: %r" % {k: (others0[k], others1[k]) for k in others0 if others0[k] != others1[k]})
+
+    if group0 == "":
+        # Reset: the group goes back to being unset, and every row shows the
+        # animation's own default again.
+        d = page_with_row(rig, "Reset to defaults")
+        target = rig.find_tag(d, "Reset to defaults", "confirm")
+        if target is None:
+            check(rig, "params_reset_target_found", False, repr(rig.rows_on_page(d)))
+        else:
+            rig.tap_target(target, ms=2500)
+            packed2 = rig.settings().get("bgAnimParams", "")
+            check(rig, "params_reset_clears_group", params_group(packed2, anim0) == "",
+                  "%r" % params_group(packed2, anim0))
+            d = page_with_row(rig, first)
+            back = int(rig.row_value(d, first))
+            check(rig, "params_reset_restores_row", back == at_open, "got %d want %d" % (back, at_open))
+            others2 = other_groups(packed2, anim0, len(ANIM_NAMES))
+            check(rig, "params_reset_leaves_others", others2 == others0)
+    else:
+        # Started from stored values: undo the two steps instead of resetting.
+        undo = "minus" if direction == "plus" else "plus"
+        for _ in range(2):
+            tap_row(rig, first, undo)
+        rig.log("params_reset_skipped", reason="animation %d has stored parameters (%r)" % (anim0, group0))
+
+    # Out through the chevron: back on the Animation page, not closed.
+    d = page_with_row(rig, "Reset to defaults") if "Reset to defaults" in names else rig.touchmap(screen=0)
+    chevron = rig.find_tag(d, "exit", "exit")
+    if chevron is None:
+        check(rig, "params_chevron_found", False)
+    else:
+        rig.tap_target(chevron)
+        back = wait_depth(rig, 1)
+        check(rig, "params_chevron_returns_to_parent", back is not None, repr(rig.settingsui_state()))
+        if back is not None:
+            check(rig, "params_parent_page_rebuilt",
+                  rig.find_tag(rig.touchmap(screen=0), "Animation", "value") is not None,
+                  repr(rig.rows_on_page(rig.touchmap(screen=0))))
+    close_animation(rig)
+
+    final = rig.settings().get("bgAnimParams", "")
+    check(rig, "params_visit_restored", params_group(final, anim0) == group0,
+          "got %r want %r" % (params_group(final, anim0), group0))
+    if params_group(final, anim0) != group0:
+        rig.log("could_not_restore", bgAnimParams=final)
+
+
+def check_parameters_web_precedence(rig):
+    """Acceptance: a web save while the Parameters page is open is per-field
+    last writer wins, per parameter. A slot this visit stepped keeps the
+    visit's value and is re-asserted at pop; a slot it did not touch takes
+    the web value on the next pass.
+
+    Unlike bgAnimThemeMap, bgAnimParams is not gated behind a validity check
+    in WebUIPlugin.cpp, so the simulator can run this whole criterion: the
+    POST lands. Simulator only all the same, because web_save refuses any
+    host but loopback."""
+    s0 = rig.settings()
+    anim0 = int(s0["bgAnimId"])
+    packed0 = s0.get("bgAnimParams", "")
+    if params_group(packed0, anim0) != "":
+        rig.log("params_web_precedence_skipped", reason="animation %d has stored parameters" % anim0)
+        return
+
+    d0 = open_animation(rig)
+    row = rig.find_tag(d0, "Parameters", "action")
+    if row is None:
+        check(rig, "params_web_row_found", False)
+        close_animation(rig)
+        return
+    rig.tap_target(row)
+    if wait_depth(rig, 2) is None:
+        check(rig, "params_web_page_pushed", False, repr(rig.settingsui_state()))
+        close_animation(rig)
+        return
+
+    names = rig.rows_on_page(rig.touchmap(screen=0))
+    param_names = [n for n in names if n != "Reset to defaults"]
+    if len(param_names) < 2:
+        rig.log("params_web_precedence_skipped", reason="animation %d defines fewer than two parameters" % anim0)
+        rig.settingsui(pop=1)
+        close_animation(rig)
+        return
+    touched_row, untouched_row = param_names[0], param_names[1]
+
+    d = page_with_row(rig, touched_row)
+    at_open = int(rig.row_value(d, touched_row))
+    direction, delta = ("plus", 5) if at_open <= 95 else ("minus", -5)
+    expected = max(0, min(100, at_open + delta))
+    tap_row(rig, touched_row, direction)
+
+    # A web save that moves both slots: the touched one to a third value,
+    # the untouched one to something the page has never shown.
+    packed1 = rig.settings().get("bgAnimParams", "")
+    slots = params_group(packed1, anim0).split(",")
+    web_touched = "5" if expected != 5 else "10"
+    web_untouched = "15" if slots[1] != "15" else "20"
+    slots[0], slots[1] = web_touched, web_untouched
+    try:
+        web_save(rig, {"bgAnimParams": params_set_group(packed1, anim0, ",".join(slots))})
+    except RuntimeError as e:
+        rig.log("params_web_precedence_unavailable", reason=str(e))
+        rig.settingsui(pop=1)
+        close_animation(rig)
+        return
+
+    def untouched_shows_web():
+        dump = page_with_row(rig, untouched_row)
+        return dump if rig.row_value(dump, untouched_row) == web_untouched else None
+
+    ok = rig.wait_until(untouched_shows_web, timeout=6)
+    check(rig, "params_untouched_slot_takes_web_value", ok is not None,
+          "row %r shows %r, want %r" % (untouched_row, rig.row_value(page_with_row(rig, untouched_row), untouched_row),
+                                        web_untouched))
+    d = page_with_row(rig, touched_row)
+    check(rig, "params_touched_slot_keeps_draft", int(rig.row_value(d, touched_row)) == expected,
+          "row %r shows %r, want %d" % (touched_row, rig.row_value(d, touched_row), expected))
+
+    rig.settingsui(pop=1)
+    wait_depth(rig, 1)
+    final = params_group(rig.settings().get("bgAnimParams", ""), anim0).split(",")
+    check(rig, "params_commit_reasserts_touched_slot", final and final[0] == str(expected),
+          "slot 0 is %r, want %r" % (final[0] if final else None, str(expected)))
+    check(rig, "params_commit_keeps_web_slot", len(final) > 1 and final[1] == web_untouched,
+          "slot 1 is %r, want %r" % (final[1] if len(final) > 1 else None, web_untouched))
+
+    # Put the animation's group back to unset, through the UI.
+    rig.tap_target(rig.find_tag(rig.touchmap(screen=0), "Parameters", "action"))
+    if wait_depth(rig, 2) is not None:
+        d = page_with_row(rig, "Reset to defaults")
+        target = rig.find_tag(d, "Reset to defaults", "confirm")
+        if target is not None:
+            rig.tap_target(target, ms=2500)
+        rig.settingsui(pop=1)
+        wait_depth(rig, 1)
+    close_animation(rig)
+
+    restored = rig.settings().get("bgAnimParams", "")
+    check(rig, "params_web_precedence_restored", params_group(restored, anim0) == "",
+          "%r" % params_group(restored, anim0))
+    if params_group(restored, anim0) != "":
+        rig.log("could_not_restore", bgAnimParams=restored)
 
 
 # Every check, in order. One list, read by main() and by run() below, so a
@@ -620,6 +920,8 @@ CHECKS = [
     ("gradient_default_and_builtin", check_gradient_default_and_builtin),
     ("gradient_precedence_across_animations", check_gradient_precedence_across_animations),
     ("plates_and_tint_coupling", check_plates_and_tint_coupling),
+    ("parameters_page", check_parameters_page),
+    ("parameters_web_precedence", check_parameters_web_precedence),
 ]
 
 

@@ -10,7 +10,8 @@ to run the tests, and what never to do here.
 
 - `SettingsModel.h` / `.cpp`: the value model. Ranges, steps, wrap rules,
   display formats, choice lists, the time zone region and city split,
-  gradient map slots, the palette, wake-up schedule editing. Plain C++17
+  gradient map slots, the animation parameter string, the palette, wake-up
+  schedule editing. Plain C++17
   with no LVGL, Arduino or ESP-IDF dependency, so `pio test -e
   native_settingsui` runs it on the host.
 - `SettingsUI.h` / `.cpp`: the shell. The cover object, the tile page, the
@@ -27,10 +28,24 @@ to run the tests, and what never to do here.
   delay, delay auto-adjust.
 - `CatDisplay.cpp`: main and standby brightness, dim timeout, 24-hour clock,
   time zone region and city.
-- `CatAnimation.cpp`: animation, frame rate, all screens, theme, gradient,
-  plates and plate colour and opacity, element tint and tint colour, text
-  scrim, screen fade out, fade in and fade curve, interlace. Every row here
-  applies live.
+- `CatAnimation.cpp`: animation, its Parameters row, frame rate, all
+  screens, theme, gradient, plates and plate colour and opacity, element
+  tint and tint colour, text scrim, screen fade out, fade in and fade
+  curve, interlace. Every value row here applies live. It also owns the
+  animation roster the settings screens read, including the simulator's
+  mirror of it, and exports that as the three accessors `CatAnimParams.h`
+  declares.
+- `CatAnimParams.cpp` / `.h`: the Parameters page, pushed from the
+  Animation category's second row. One stepper per parameter the chosen
+  animation defines (0 to 100, step 5, fast step 10), labelled from the
+  animation's own `BgAnimParamDef`, plus a "Reset to defaults" confirm
+  row. Every step writes the whole `bgAnimParams` string back and calls
+  `markDirty()`, so the animation behind the settings cover changes under
+  the finger. The page is fixed to the animation it was opened for, the
+  way the schedule editor is fixed to its position. The string arithmetic
+  (read one group with the defaults behind it, write one group back, clear
+  one group) is in `SettingsModel`, host-tested; the page itself holds no
+  parsing.
 - `CatMachine.cpp` / `CatMachine.h`: startup mode, standby timeout, auto
   wake-up, and the `MachineDraft` the schedule pages share. The header is the
   whole contract between this file and the schedule editor, including the
@@ -73,6 +88,18 @@ host model tests in `test/test_settings_model/`.
    `tools/settings_ui_test.py` and its pages to `CATEGORY_PAGES` in
    `tools/settings_ui_tests/audit_pages.py`. The scenario puts back every
    value it changes.
+
+   Adding a row to a category that already has one is the same edit plus
+   one more: `CATEGORY_PAGES` pins the exact row list of every page, and
+   five rows to a page means one new row shifts every row below it onto
+   the next page and can add a page. Address rows by name in a scenario
+   rather than by page number (`page_with_row` and `tap_row` in
+   `test_animation.py`); the audit table is where the per-page lists
+   belong.
+
+   A pushed page whose row list depends on stored data (the schedule list,
+   the Parameters page) has no fixed entry in `CATEGORY_PAGES`. Audit it
+   from the scenario at visit time with `rig.audit` instead.
 6. A new source file under `src/` needs `touch src/CMakeLists.txt` before the
    ESP-IDF builds pick it up; the glob has no `CONFIGURE_DEPENDS`.
 
@@ -80,7 +107,7 @@ host model tests in `test/test_settings_model/`.
 
 Use the `pio` on PATH, one PlatformIO install per checkout (`CLAUDE.md`).
 
-The value model, on the host, 28 cases, a few seconds:
+The value model, on the host, 37 cases, about 20 seconds:
 
 ```
 pio test -e native_settingsui
