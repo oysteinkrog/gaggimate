@@ -18,6 +18,36 @@
 // executable depthDim formula is 26+192*pow(u,1.15), ending at 218, used here.
 // bandRef() then only streams the map and gathers colors. No row is copied
 // from a neighbour or cached across calls: y0 selects the absolute map row.
+//
+// Every user parameter acts in frame(), on the tables the two kernels read.
+// Neither kernel and neither pixel loop changed for any of them, and at the
+// defaults each one reduces to the constant it replaced, so the output is the
+// same word for word:
+//   p3 "Band share"  splits the fixed 1024 unit level swing between the
+//                    outward bands and the wall's own shading. Two Q9 gains
+//                    that always sum to 1024, so s stays inside 0..2048
+//                    whatever the split; 512 and 512 is the original pair,
+//                    where both gains are the identity.
+//   p4 "Contrast"    the level window, which lives in the kernel's `factors`
+//                    table. span = (180 * g) >> 8 and floor = 130 - span/2,
+//                    so the window keeps its midpoint; g = 256 gives back
+//                    180 and 40. span stays under 255, so the widest s * span
+//                    product is 522,240, inside what the existing 368,640
+//                    already asks of ee.vmul.u16.
+//   p5 "Depth curve" the depthDim exponent, (550 + p*12)/1000. Both operands
+//                    are exact, so the division is exactly 1.15f at 50 and
+//                    the 32 rounded table entries are unchanged. The ends
+//                    of the table, 26 and 218, do not move with it.
+//   p6 "Spiral"      how far the depth phase advances per angle cell, which
+//                    turns the concentric bands into a corkscrew. Multiples
+//                    of 8 units only: 128 angle cells then cover a whole
+//                    number of 1024 unit sine periods and the left horizontal
+//                    radius keeps no seam, the same reason ANG_K is 16. Zero
+//                    at the default, and only then is the depth wave built
+//                    once for the whole frame instead of once per angle.
+//   p7 "Turn rate"   a second speed curve on the wall's rotation alone, so
+//                    the turn and the outward bands can be paced apart.
+//                    speedMul(50) is exactly 1, so the rate is untouched.
 
 #include "BgAnim.h"
 #include "BgAnimCommon.h"
@@ -77,6 +107,8 @@ const int16_t *sine = nullptr; // borrowed shared sine, outside our slab share
 int allocW = 0;
 int allocH = 0;
 int lastBrightness = -1;
+int lastCurve = -1;
+int lastContrast = -1;
 uint32_t lastThemeGen = 0xFFFFFFFFu;
 
 void release();
@@ -104,13 +136,9 @@ bool init(int w, int h) {
         return false;
     }
     ft = reinterpret_cast<FrameTables *>((reinterpret_cast<uintptr_t>(frameStorage) + 15u) & ~uintptr_t(15));
-    for (int d = 0; d < D_N; d++) {
-        ft->depthDim[d] = static_cast<uint16_t>(lroundf(26.0f + 192.0f * powf(d / 31.0f, 1.15f)));
-    }
-    for (int i = 0; i < 8; i++) {
-        ft->factors[i] = 180;
-        ft->factors[i + 8] = 40;
-    }
+    // depthDim and factors now carry parameters, so frame() builds them on its
+    // first call and whenever the parameter moves. Like the palette and tex,
+    // they are meaningless until frame() has run, which every caller does.
 
     const float cx = w * 0.5f - 0.5f;
     const float cy = h * 0.5f - 0.5f;
@@ -269,24 +297,72 @@ void frame(uint32_t tMs, int, int, const uint8_t p[BG_ANIM_PARAMS]) {
         lastBrightness = p[2];
         lastThemeGen = gen;
     }
+    if (lastCurve != p[5]) {
+        // Exact operands, so the division is exactly 1.15f at the default and
+        // the table below is the one init() used to bake. 0.55 to 1.75: a low
+        // exponent brightens the wall right out of the throat, a high one
+        // holds it dark until the rim. Both ends of the table stay put.
+        const float curve = (550 + static_cast<int>(p[5]) * 12) / 1000.0f;
+        for (int d = 0; d < D_N; d++) {
+            ft->depthDim[d] = static_cast<uint16_t>(lroundf(26.0f + 192.0f * powf(d / 31.0f, curve)));
+        }
+        lastCurve = p[5];
+    }
+    if (lastContrast != p[4]) {
+        // Q8 gain on the page's 180 unit window, about the window's midpoint
+        // of 130. 256 is the identity and gives back 180 and 40; the ends are
+        // 35 (a flat mid-tone wall) and 254 (near black to near white).
+        const int gain = p[4] <= 50 ? 51 + (static_cast<int>(p[4]) * 205 + 25) / 50
+                                    : 256 + ((static_cast<int>(p[4]) - 50) * 106 + 25) / 50;
+        const int span = (180 * gain) >> 8;
+        const int base = 130 - span / 2;
+        for (int i = 0; i < 8; i++) {
+            ft->factors[i] = static_cast<uint16_t>(span);
+            ft->factors[i + 8] = static_cast<uint16_t>(base);
+        }
+        lastContrast = p[4];
+    }
     const float speed = speedMul(p[0]);
     // Page rates: outward bands at 90 sine units/s (1024/90 = 11.377... s
     // per cycle), angular phase at 11.38 units/s (89.982... s per cycle).
+    // The wall's rotation takes a second speed curve of its own, exactly 1x
+    // at 50, so the turn can be paced apart from the outward bands.
     const uint32_t dPhase = 0u - phaseAt(tMs, 0.090f, speed);
-    const uint32_t aPhase = phaseAt(tMs, 0.01138f, speed);
+    const uint32_t aPhase = phaseAt(tMs, 0.01138f, speed * speedMul(p[7]));
     const int bandK = 14 + (static_cast<int>(p[1]) * 20 + 50) / 100; // 14..34, default 24
-    for (int d = 0; d < D_N; d++) {
-        ft->depthWave[d] = sine[(static_cast<uint32_t>(d * bandK) + dPhase) & (SIN_N - 1)];
+    // Q9 gains that always sum to 1024, so s keeps its 0..2048 range at every
+    // split and neither the saturating add nor the u16 multiply can overflow.
+    // 512 is the identity: (v * 512) >> 9 is v for both signs.
+    const int gainD = (static_cast<int>(p[3]) * 1024 + 50) / 100;
+    const int gainA = 1024 - gainD;
+    // Depth phase carried per angle cell, in multiples of 8 units so 128 cells
+    // span whole 1024 unit sine periods and the angle wrap keeps no seam.
+    // -24..24, which is three turns of corkscrew either way.
+    const int twistK = 8 * ((static_cast<int>(p[6]) - 50) * 3 / 50);
+    const auto buildWave = [&](int aIdx) {
+        const uint32_t phase = dPhase + static_cast<uint32_t>(aIdx * twistK);
+        for (int d = 0; d < D_N; d++) {
+            const int v = sine[(static_cast<uint32_t>(d * bandK) + phase) & (SIN_N - 1)];
+            ft->depthWave[d] = static_cast<int16_t>((v * gainD) >> 9);
+        }
+    };
+    if (twistK == 0) {
+        buildWave(0); // one build for the frame, exactly the original loop
     }
     for (int a = 0; a < A_N; a++) {
-        const int aTerm = sine[(a * ANG_K + aPhase) & (SIN_N - 1)] + 1024;
+        if (twistK != 0) {
+            buildWave(a);
+        }
+        const int aTerm = ((sine[(a * ANG_K + aPhase) & (SIN_N - 1)] * gainA) >> 9) + 1024;
 #if GM_BGANIM_TUNNEL_ASM && defined(__XTENSA__) && !defined(GM_BGANIM_NO_ASM)
         tunnelLevelsAsm(ft->levels, ft->depthWave, ft->depthDim, ft->factors, aTerm, D_N / 8);
         tunnelGatherAsm(tex + a * D_N, ft->levels, ft->palette, D_N);
 #else
+        const int span = ft->factors[0];
+        const int base = ft->factors[8];
         for (int d = 0; d < D_N; d++) {
             const int s = ft->depthWave[d] + aTerm;
-            const int idx = ((40 + ((s * 180) >> 11)) * ft->depthDim[d]) >> 8;
+            const int idx = ((base + ((s * span) >> 11)) * ft->depthDim[d]) >> 8;
             tex[a * D_N + d] = ft->palette[idx];
         }
 #endif
@@ -324,6 +400,8 @@ void release() {
     allocW = 0;
     allocH = 0;
     lastBrightness = -1;
+    lastCurve = -1;
+    lastContrast = -1;
     lastThemeGen = 0xFFFFFFFFu;
 }
 
@@ -336,7 +414,11 @@ const BgAnimation bg_anim_tunnel = {
     {{"speed", "Speed", 50},
      {"pitch", "Band pitch", 50},
      {"brightness", "Brightness", 74},
-     {nullptr, nullptr, 0}},
+     {"mix", "Band share", 50},
+     {"contrast", "Contrast", 50},
+     {"curve", "Depth curve", 50},
+     {"spiral", "Spiral", 50},
+     {"turn", "Turn rate", 50}},
     init,
     frame,
     band,

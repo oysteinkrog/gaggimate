@@ -2946,14 +2946,19 @@ const pa_dith = (x, y) => (BAYER8[(y & 7) * 8 + (x & 7)] - 31.5) * (1 / 64);
     params: [
       { key: 'speed', label: 'Speed', def: 50 },
       { key: 'pitch', label: 'Band pitch', def: 50 },
-      { key: 'brightness', label: 'Brightness', def: 74 }],
+      { key: 'brightness', label: 'Brightness', def: 74 },
+      { key: 'mix', label: 'Band share', def: 50 },
+      { key: 'contrast', label: 'Contrast', def: 50 },
+      { key: 'curve', label: 'Depth curve', def: 50 },
+      { key: 'spiral', label: 'Spiral', def: 50 },
+      { key: 'turn', label: 'Turn rate', def: 50 }],
     init(w, h, state) {
       state.map = new Uint16Array(w * h);
       state.tex = new Uint32Array(A_N * D_N);
+      // depthDim and the level window carry parameters now, so render() builds
+      // them on its first call and whenever the parameter moves.
       state.depthDim = new Uint8Array(D_N);
-      for (let d = 0; d < D_N; d++) {
-        state.depthDim[d] = Math.round(26 + 192 * Math.pow(d / (D_N - 1), 1.15));
-      }
+      state.curveKey = -1; state.contrastKey = -1;
       const cx = w * 0.5 - 0.5, cy = h * 0.5 - 0.5;
       const depthK = (D_N - 1) / Math.pow(R_OUT, DEPTH_P);
       const angK = A_N / (2 * Math.PI);
@@ -2982,27 +2987,60 @@ const pa_dith = (x, y) => (BAYER8[(y & 7) * 8 + (x & 7)] - 31.5) * (1 / 64);
     render(data, w, h, tMs, p, state) {
       const key = p[2] + '|' + THEME.gen;
       if (state.key !== key) { state.key = key; state.pal = pa_ramp32(pa_bright(p[2])); }
+      if (state.curveKey !== p[5]) {
+        // 0.55 to 1.75, exactly 1.15 at the default. A low exponent brightens
+        // the wall right out of the throat, a high one holds it dark until the
+        // rim. Both ends of the table, 26 and 218, stay where they were.
+        const curve = (550 + p[5] * 12) / 1000;
+        for (let d = 0; d < D_N; d++) {
+          state.depthDim[d] = Math.round(26 + 192 * Math.pow(d / (D_N - 1), curve));
+        }
+        state.curveKey = p[5];
+      }
+      if (state.contrastKey !== p[4]) {
+        // Q8 gain on the 180 unit level window, about its midpoint of 130.
+        // 256 is the identity and gives back the window's own 180 and 40; the
+        // ends are 35 (a flat mid-tone wall) and 254 (near black to near white).
+        const gain = p[4] <= 50 ? 51 + ((p[4] * 205 + 25) / 50 | 0)
+                                : 256 + (((p[4] - 50) * 106 + 25) / 50 | 0);
+        state.span = (180 * gain) >> 8;
+        state.base = 130 - (state.span / 2 | 0);
+        state.contrastKey = p[4];
+      }
       const spd = speedMulJS(p[0]);
       // Bands out at one cycle per 11.4 s, the wall around at 1024 units per 90 s.
       // aTerm carries the +1024 bias, so s stays in 0..2048 and never wraps.
+      // The wall's rotation takes a second speed curve of its own, exactly 1x
+      // at 50, so the turn can be paced apart from the outward bands.
       const dPhase = -Math.round(tMs * 0.090 * spd) | 0;
-      const aPhase = Math.round(tMs * 0.01138 * spd) | 0;
+      const aPhase = Math.round(tMs * 0.01138 * spd * speedMulJS(p[7])) | 0;
       // 14 to 34, 24 at the default. The ceiling is the ring budget: the band
       // gradient is 0.24 palette steps per unit of pitch at the rim, where the
       // depth gain is highest, and past about 8 steps per cell the cell edges
       // print as rings. One broad band sweeping out is what 32 cells can carry.
       const bandK = 14 + Math.round(p[1] * 20 / 100);
-      const { tex, pal, depthDim, map } = state;
+      // Q9 gains that always sum to 1024, so s keeps its 0..2048 range at every
+      // split between the outward bands and the wall's own shading. 512 is the
+      // identity: (v * 512) >> 9 is v for both signs.
+      const gainD = (p[3] * 1024 + 50) / 100 | 0;
+      const gainA = 1024 - gainD;
+      // Depth phase carried per angle cell, which turns the concentric bands
+      // into a corkscrew. Multiples of 8 units only, so 128 angle cells span
+      // whole 1024 unit sine periods and the angle wrap keeps no seam, the same
+      // reason ANG_K is 16. -24 to 24, three turns of corkscrew either way.
+      const twistK = 8 * ((p[6] - 50) * 3 / 50 | 0);
+      const { tex, pal, depthDim, map, span, base } = state;
       for (let a = 0, c = 0; a < A_N; a++) {
-        const aTerm = SIN[(a * ANG_K + aPhase) & (SIN_N - 1)] + 1024;
+        const aTerm = ((SIN[(a * ANG_K + aPhase) & (SIN_N - 1)] * gainA) >> 9) + 1024;
+        const dBase = dPhase + a * twistK;
         for (let d = 0; d < D_N; d++, c++) {
-          // s runs 0..2048; the level it maps to runs 40..220, not 0..255.
-          // The floor keeps the darkest part of the wall off the bottom of the
-          // ramp, and the compression is also what pays for the band pitch:
-          // the band gradient is 0.28 palette steps per unit of pitch here
-          // against 0.39 at full range.
-          const s = SIN[(d * bandK + dPhase) & (SIN_N - 1)] + aTerm;
-          const idx = ((40 + ((s * 180) >> 11)) * depthDim[d]) >> 8;
+          // s runs 0..2048; the level it maps to runs 40..220 at the default,
+          // not 0..255. The floor keeps the darkest part of the wall off the
+          // bottom of the ramp, and the compression is also what pays for the
+          // band pitch: the band gradient is 0.28 palette steps per unit of
+          // pitch here against 0.39 at full range.
+          const s = ((SIN[(d * bandK + dBase) & (SIN_N - 1)] * gainD) >> 9) + aTerm;
+          const idx = ((base + ((s * span) >> 11)) * depthDim[d]) >> 8;
           tex[c] = pal[idx];
         }
       }

@@ -327,6 +327,11 @@ export const BG_ANIMATIONS = [
       { key: 'speed', label: 'Speed', def: 50 },
       { key: 'pitch', label: 'Band pitch', def: 50 },
       { key: 'brightness', label: 'Brightness', def: 74 },
+      { key: 'mix', label: 'Band share', def: 50 },
+      { key: 'contrast', label: 'Contrast', def: 50 },
+      { key: 'curve', label: 'Depth curve', def: 50 },
+      { key: 'spiral', label: 'Spiral', def: 50 },
+      { key: 'turn', label: 'Turn rate', def: 50 },
     ],
   },
   {
