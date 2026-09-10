@@ -3,15 +3,20 @@
 // "Quilt": soft square pillows with highlights and shadows walking around
 // them as the light turns. The grid drifts upward. This is the approved
 // id 'quilt' entry, including its deviations, in anim_bench.html: a 36 s
-// light revolution, 8 px/s drift, and ambient 1560 in Q4 palette units.
+// light revolution, 8 px/s drift, and ambient 1560 in Q4 palette units,
+// which are now the defaults of the turn, drift and bright parameters.
 //
 // A cosine height and its negative-sine slope on each axis make a separable
 // pillow. Keeping the height terms at 35% of the slope amplitude preserves
-// the pillows when the light crosses an axis. frame() multiplies the slopes
-// by the Q9 light direction, adds the heights, and folds Q4 Bayer dither
-// into eight column phases. bandRef() is the page's sepBand verbatim in
-// integer arithmetic: pal[((colTermPh[(y&7)*w+x] + rowTerm[y]) >> 4) & 255].
+// the pillows when the light crosses an axis; that share is what puffiness
+// scales. frame() multiplies the slopes by the Q9 light direction, adds the
+// heights, and folds Q4 Bayer dither into eight column phases. bandRef() is
+// the page's sepBand verbatim in integer arithmetic:
+// pal[((colTermPh[(y&7)*w+x] + rowTerm[y]) >> 4) & 255].
 // No row depends on a preceding call or on which rows share its band.
+//
+// All eight parameters act in frame(), on those three tables. The pixel
+// loop and both Xtensa kernels below are untouched by every one of them.
 
 #include "BgAnim.h"
 #include "BgAnimCommon.h"
@@ -32,7 +37,7 @@
 namespace {
 using namespace bganim;
 
-constexpr int AMBIENT = 1560; // Q4 palette units, the page's readability adjustment
+constexpr int AMBIENT = 1560; // Q4 palette units at bright 50, the page's readability adjustment
 constexpr int PHASES = 8;     // absolute y's Bayer8 phase, never the band-local row
 constexpr int PALETTE_N = 256;
 
@@ -46,7 +51,10 @@ int16_t *dith = nullptr;
 uint16_t *pal = nullptr;
 const int16_t *sl = nullptr; // borrowed boot-lifetime shared sine table
 int allocW = 0, allocH = 0;
-int lastPitch = -1, lastRelief = -1;
+int lastPitch = -1, lastRelief = -1, lastDome = -1, lastStretch = -1, lastBright = -1;
+int lastDithCap = -1;
+int dithCap = 0;   // max |dith[k]|, set with the palette
+int curAmbient = AMBIENT;
 uint32_t lastThemeGen = 0;
 bool paletteValid = false;
 
@@ -94,35 +102,77 @@ void frame(uint32_t tMs, int w, int h, const uint8_t p[BG_ANIM_PARAMS]) {
     if (!paletteValid || gen != lastThemeGen) {
         buildThemeRamp(pal, 256);
         const float amp = ditherAmp(pal, 256);
+        int cap = 0;
         for (int k = 0; k < 64; k++) {
             // Page bayerOffsets(..., amp, 16): whole Q4 units, rounded
             // half away from zero. ditherAmp caps at 16, so |dith| <= 256.
             dith[k] = static_cast<int16_t>(lroundf((BAYER8[k] - 31.5f) * (amp * 16.0f / 31.5f)));
+            const int a = dith[k] < 0 ? -dith[k] : dith[k];
+            if (a > cap) cap = a;
         }
+        dithCap = cap;
         lastThemeGen = gen;
         paletteValid = true;
     }
-    if (lastPitch != p[1] || lastRelief != p[2]) {
+    // One gate for everything that is not time: the four shape parameters,
+    // brightness, and the dither cap the palette sets. Brightness on its own
+    // does not need the sine tables, but a parameter press is rare and
+    // rebuilding them keeps this to a single branch.
+    if (lastPitch != p[1] || lastRelief != p[2] || lastDome != p[5] || lastStretch != p[6] ||
+        lastBright != p[7] || lastDithCap != dithCap) {
         // All six pitches divide 480. Keep the page's pixel units even
         // at other sizes: rescaling here would change its design. At a
         // height not divisible by the chosen pitch, its modulo-h drift
         // has the same wrap seam as rendering the page at that height.
         const int pitches[] = {48, 60, 80, 96, 120, 160};
-        const int bucket = static_cast<int>(p[1]) * 6 / 100;
-        const int pitch = pitches[bucket < 6 ? bucket : 5];
+        int bx = static_cast<int>(p[1]) * 6 / 100;
+        if (bx > 5) bx = 5;
+        // Stretch moves the row pitch to another entry of the same table,
+        // never off it, so both axes keep a pitch that divides 480 and the
+        // upward drift still wraps without a seam. No shift at 50.
+        int by = bx + static_cast<int>(p[6]) * 7 / 100 - 3;
+        if (by < 0) by = 0;
+        if (by > 5) by = 5;
         const int amp = 200 + static_cast<int>(lroundf(p[2] * 3.4f));
-        const int hAmp = static_cast<int>(lroundf(amp * 0.35f));
-        const float angleStep = 2.0f * static_cast<float>(M_PI) / pitch;
+        // Puffiness is a Q8 gain on the page's 0.35 height share, so 256 is
+        // that share unchanged and the default height table is the old one.
+        const int domeQ8 = static_cast<int>(p[5]) * 512 / 100;
+        const int hAmp = (static_cast<int>(lroundf(amp * 0.35f)) * domeQ8) >> 8;
+        const float stepX = 2.0f * static_cast<float>(M_PI) / pitches[bx];
+        const float stepY = 2.0f * static_cast<float>(M_PI) / pitches[by];
         for (int x = 0; x < w; x++) {
-            dHx[x] = static_cast<int16_t>(lroundf(-sinf(angleStep * x) * amp));
-            hX[x] = static_cast<int16_t>(lroundf(cosf(angleStep * x) * hAmp));
+            dHx[x] = static_cast<int16_t>(lroundf(-sinf(stepX * x) * amp));
+            hX[x] = static_cast<int16_t>(lroundf(cosf(stepX * x) * hAmp));
         }
         for (int y = 0; y < h; y++) {
-            dHy[y] = static_cast<int16_t>(lroundf(-sinf(angleStep * y) * amp));
-            hY[y] = static_cast<int16_t>(lroundf(cosf(angleStep * y) * hAmp));
+            dHy[y] = static_cast<int16_t>(lroundf(-sinf(stepY * y) * amp));
+            hY[y] = static_cast<int16_t>(lroundf(cosf(stepY * y) * hAmp));
         }
+        // The palette index is (ct + rt) >> 4 masked to eight bits, so a
+        // field that swings past either end of the ramp wraps from black to
+        // white. The column and row swings are the two axes of one light
+        // direction of length at most one, so the most the pair can reach
+        // together is sqrt(2*amp^2 + 4*hAmp^2), and a few units cover the
+        // roundings. Brightness moves the ambient inside what is left of
+        // the ramp and is held off both ends. The widest swing any pitch,
+        // relief and puffiness can make is 1074 plus the dither, so at
+        // brightness 50 the hold never bites and the ambient is exactly the
+        // page's 1560. Integer square root, so the page gets the same number.
+        const int devSq = 2 * amp * amp + 4 * hAmp * hAmp;
+        int dev = static_cast<int>(sqrtf(static_cast<float>(devSq)));
+        while ((dev + 1) * (dev + 1) <= devSq) dev++;
+        while (dev > 0 && dev * dev > devSq) dev--;
+        const int devMax = dev + dithCap + 24;
+        int ambient = AMBIENT + (static_cast<int>(p[7]) - 50) * 24;
+        if (ambient < devMax) ambient = devMax;
+        if (ambient > 255 * 16 - devMax) ambient = 255 * 16 - devMax;
+        curAmbient = ambient;
         lastPitch = p[1];
         lastRelief = p[2];
+        lastDome = p[5];
+        lastStretch = p[6];
+        lastBright = p[7];
+        lastDithCap = dithCap;
     }
 
     // Absolute time, as on the page, so parameter changes immediately
@@ -131,7 +181,11 @@ void frame(uint32_t tMs, int w, int h, const uint8_t p[BG_ANIM_PARAMS]) {
     // math can round a cursor/drift boundary differently from JS doubles;
     // it never changes the periods, Q8 interpolation, or integer pixel math.
     const float t = static_cast<float>(tMs) * speedMul(p[0]);
-    const uint64_t lQ8 = static_cast<uint64_t>(t * (1024.0f * 256.0f / 36000.0f)) + (128u << 8);
+    // The light turn carries its own speed curve on top of the master one,
+    // so the highlight can walk faster or slower than the grid drifts.
+    // speedMul(50) is exactly 1, so the default cursor is untouched.
+    const float tl = t * speedMul(p[3]);
+    const uint64_t lQ8 = static_cast<uint64_t>(tl * (1024.0f * 256.0f / 36000.0f)) + (128u << 8);
     const int li = static_cast<int>((lQ8 >> 8) & 1023);
     const int lf = static_cast<int>(lQ8 & 255);
     const int lx0 = sl[(li + 256) & 1023];
@@ -140,7 +194,11 @@ void frame(uint32_t tMs, int w, int h, const uint8_t p[BG_ANIM_PARAMS]) {
     // Q8 with arithmetic right shifts, matching JS >> on negative deltas.
     const int lx = lx0 + (((sl[(li + 257) & 1023] - lx0) * lf) >> 8);
     const int ly = ly0 + (((sl[(li + 1) & 1023] - ly0) * lf) >> 8);
-    const int drift = static_cast<int>(static_cast<uint64_t>(t * 8.0f / 1000.0f) % static_cast<unsigned>(h));
+    // Drift in whole pixels a second, 8 at the default, both operands exact
+    // so the division gives back the page's own 8 there. At 0 the grid
+    // stands still and only the light moves.
+    const float driftPx = static_cast<float>(p[4]) * 16.0f / 100.0f;
+    const int drift = static_cast<int>(static_cast<uint64_t>(t * driftPx / 1000.0f) % static_cast<unsigned>(h));
     for (int ph = 0; ph < PHASES; ph++) {
         int16_t *ct = colTermPh + static_cast<size_t>(ph) * w;
         for (int x = 0; x < w; x++) {
@@ -150,7 +208,7 @@ void frame(uint32_t tMs, int w, int h, const uint8_t p[BG_ANIM_PARAMS]) {
     for (int y = 0; y < h; y++) {
         int yy = y + drift;
         if (yy >= h) yy -= h;
-        rowTerm[y] = static_cast<int16_t>(((ly * dHy[yy]) >> 9) + hY[yy] + AMBIENT);
+        rowTerm[y] = static_cast<int16_t>(((ly * dHy[yy]) >> 9) + hY[yy] + curAmbient);
     }
 }
 
@@ -201,9 +259,10 @@ GM_ANIM_IRAM __attribute__((noinline)) void quiltScalarAsm(uint16_t *dst, const 
 // genuine gathers and remain scalar. Load the high pixel first, low second,
 // then shift high and OR low: neither load has an immediate consumer.
 //
-// Bounds at relief 0..100: |dH| <= 540, |h| <= 189, |light| <= 512,
-// |dith| <= 256. Thus ct is in [-985,985], rt in [831,2289], and their
-// sum in [-154,3274]. VADDS.S16 cannot saturate anywhere in that superset.
+// Bounds over every parameter: |dH| <= 541, |h| <= 379 (relief 100 with
+// puffiness 100), |light| <= 512, |dith| <= 256, and the ambient hold in
+// frame() keeps ct + rt inside [0, 4080]. Both terms are int16 with room to
+// spare, so VADDS.S16 cannot saturate anywhere in that superset.
 //
 // Main body: 43 instructions per eight pixels (5.375/pixel), 129 bytes
 // before density relaxation, with no exposed load-use interlocks under the
@@ -332,7 +391,10 @@ void release() {
     releaseTable(dith, 64 * sizeof(int16_t));
     sl = nullptr;
     allocW = allocH = 0;
-    lastPitch = lastRelief = -1;
+    lastPitch = lastRelief = lastDome = lastStretch = lastBright = -1;
+    lastDithCap = -1;
+    dithCap = 0;
+    curAmbient = AMBIENT;
     lastThemeGen = 0;
     paletteValid = false;
 }
@@ -346,7 +408,11 @@ const BgAnimation bg_anim_quilt = {
     {{"speed", "Speed", 50},
      {"pitch", "Pillow size", 75},
      {"relief", "Relief", 55},
-     {nullptr, nullptr, 0}},
+     {"turn", "Light turn", 50},
+     {"drift", "Drift", 50},
+     {"dome", "Puffiness", 50},
+     {"stretch", "Stretch", 50},
+     {"bright", "Brightness", 50}},
     init,
     frame,
     band,

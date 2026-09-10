@@ -3956,7 +3956,16 @@ const pa_dith = (x, y) => (BAYER8[(y & 7) * 8 + (x & 7)] - 31.5) * (1 / 64);
    index 128 and the mean luma came out over the readability ceiling on
    the warm themes. The light turns once per 36 s and the grid drifts at
    8 px/s, not 45 s and 4 px/s: at the spec's rates the mean frame-to-frame
+   The light turns once per 36 s and the grid drifts at
+   8 px/s, not 45 s and 4 px/s: at the spec's rates the mean frame-to-frame
    change was under a palette step and the field read as still.
+
+   Eight parameters (gm-3vj.34). speed, pitch and relief as before; turn is
+   a second speed curve on the light alone, drift is the upward rate in
+   whole pixels a second, dome scales the height share the pillows get,
+   stretch moves the row pitch by up to three table entries so the pillows
+   can be oblong, and bright moves the ambient. Each one is 50 at the value
+   this entry already had, so the defaults render what they always did.
 -------------------------------------------------------------------- */
 (() => {
   const PITCHES = [48, 60, 80, 96, 120, 160];
@@ -3968,6 +3977,11 @@ const pa_dith = (x, y) => (BAYER8[(y & 7) * 8 + (x & 7)] - 31.5) * (1 / 64);
       { key: 'speed', label: 'Speed', def: 50 },
       { key: 'pitch', label: 'Pillow size', def: 75 },
       { key: 'relief', label: 'Relief', def: 55 },
+      { key: 'turn', label: 'Light turn', def: 50 },
+      { key: 'drift', label: 'Drift', def: 50 },
+      { key: 'dome', label: 'Puffiness', def: 50 },
+      { key: 'stretch', label: 'Stretch', def: 50 },
+      { key: 'bright', label: 'Brightness', def: 50 },
     ],
     init(w, h, state) {
       state.dHx = new Int16Array(w);
@@ -3986,7 +4000,13 @@ const pa_dith = (x, y) => (BAYER8[(y & 7) * 8 + (x & 7)] - 31.5) * (1 / 64);
         state.key = key;
         state.pal = themeRamp();
         bayerOffsets(state.dith, ditherAmpJS(state.pal, 256), 16);
-        const pitch = PITCHES[Math.min(PITCHES.length - 1, Math.floor(p[1] * PITCHES.length / 100))];
+        let dithCap = 0;
+        for (let k = 0; k < 64; k++) dithCap = Math.max(dithCap, Math.abs(state.dith[k]));
+        const bx = Math.min(PITCHES.length - 1, Math.floor(p[1] * PITCHES.length / 100));
+        // Stretch moves the row pitch to another entry of the same table,
+        // never off it, so both axes keep a pitch that divides 480 and the
+        // upward drift still wraps without a seam. No shift at 50.
+        const by = Math.min(PITCHES.length - 1, Math.max(0, bx + Math.floor(p[6] * 7 / 100) - 3));
         // Derivative of a raised-cosine bump of the given pitch. Two of
         // these, one per axis, are what makes a separable pillow field.
         const amp = 200 + Math.round(p[2] * 3.4);   // 200..540
@@ -3994,35 +4014,58 @@ const pa_dith = (x, y) => (BAYER8[(y & 7) * 8 + (x & 7)] - 31.5) * (1 / 64);
         // amplitude. Without it the field is flat on whichever axis the
         // circling light is crossing and the quilt reads as corduroy twice
         // per quarter turn; with it the pillows hold their shape all the
-        // way round and the light only walks the highlight.
-        const hAmp = Math.round(amp * 0.35);
+        // way round and the light only walks the highlight. Puffiness is a
+        // Q8 gain on that third, so 256 is the original share.
+        const domeQ8 = Math.floor(p[5] * 512 / 100);
+        const hAmp = (Math.round(amp * 0.35) * domeQ8) >> 8;
         for (let x = 0; x < w; x++) {
-          state.dHx[x] = lround(-Math.sin(2 * Math.PI * x / pitch) * amp);
-          state.hX[x] = lround(Math.cos(2 * Math.PI * x / pitch) * hAmp);
+          state.dHx[x] = lround(-Math.sin(2 * Math.PI * x / PITCHES[bx]) * amp);
+          state.hX[x] = lround(Math.cos(2 * Math.PI * x / PITCHES[bx]) * hAmp);
         }
         for (let y = 0; y < h; y++) {
-          state.dHy[y] = lround(-Math.sin(2 * Math.PI * y / pitch) * amp);
-          state.hY[y] = lround(Math.cos(2 * Math.PI * y / pitch) * hAmp);
+          state.dHy[y] = lround(-Math.sin(2 * Math.PI * y / PITCHES[by]) * amp);
+          state.hY[y] = lround(Math.cos(2 * Math.PI * y / PITCHES[by]) * hAmp);
         }
+        // The index is (ct + rt) >> 4 masked to eight bits, so a field that
+        // swings past either end of the ramp wraps from black to white. The
+        // column and row swings are the two axes of one light direction of
+        // length at most one, so the most the pair can reach together is
+        // sqrt(2*amp^2 + 4*hAmp^2), and a few units cover the roundings.
+        // Brightness moves the ambient inside what is left and is held off
+        // both ends; at 50 the hold never bites and the ambient is AMBIENT.
+        // Integer square root, so the firmware gets the same number.
+        const devSq = 2 * amp * amp + 4 * hAmp * hAmp;
+        let dev = Math.floor(Math.sqrt(devSq));
+        while ((dev + 1) * (dev + 1) <= devSq) dev++;
+        while (dev > 0 && dev * dev > devSq) dev--;
+        const devMax = dev + dithCap + 24;
+        state.ambient = Math.min(255 * 16 - devMax, Math.max(devMax, AMBIENT + (p[7] - 50) * 24));
       }
       const { dHx, dHy, hX, hY, colTermPh, rowTerm, dith, pal } = state;
       const t = tMs * speedMulJS(p[0]);
-      // One turn per 36 s, the sine table read at Q8 between entries so the
-      // light sweeps instead of stepping between table entries.
+      // One turn per 36 s at light turn 50, the sine table read at Q8
+      // between entries so the light sweeps instead of stepping between
+      // table entries. The turn carries its own speed curve on top of the
+      // master one, so the highlight can walk faster or slower than the
+      // grid drifts; speedMulJS(50) is exactly 1.
       // The +128 start offset puts the light on the diagonal at t = 0. On
       // an axis the field is pure corduroy and the pillows do not read.
-      const lQ8 = Math.floor(t * 1024 * 256 / 36000) + (128 << 8);
+      const tl = t * speedMulJS(p[3]);
+      const lQ8 = Math.floor(tl * 1024 * 256 / 36000) + (128 << 8);
       const li = (lQ8 >> 8) & 1023, lf = lQ8 & 255;
       const lx = sin1024(li + 256) + (((sin1024(li + 257) - sin1024(li + 256)) * lf) >> 8);
       const ly = sin1024(li) + (((sin1024(li + 1) - sin1024(li)) * lf) >> 8);
-      const drift = Math.floor(t * 8 / 1000) % h;       // 8 px/s upward
+      // Whole pixels a second, 8 at the default. At 0 the grid stands
+      // still and only the light moves.
+      const driftPx = p[4] * 16 / 100;
+      const drift = Math.floor(t * driftPx / 1000) % h;
       for (let ph = 0; ph < 8; ph++) {
         const dst = ph * w, off = ph * 8;
         for (let x = 0; x < w; x++) colTermPh[dst + x] = ((lx * dHx[x]) >> 9) + hX[x] + dith[off + (x & 7)];
       }
       for (let y = 0; y < h; y++) {
         let yy = y + drift; if (yy >= h) yy -= h;
-        rowTerm[y] = ((ly * dHy[yy]) >> 9) + hY[yy] + AMBIENT;
+        rowTerm[y] = ((ly * dHy[yy]) >> 9) + hY[yy] + state.ambient;
       }
       sepBand(data, w, h, colTermPh, rowTerm, pal);
     },

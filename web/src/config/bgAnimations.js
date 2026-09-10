@@ -440,6 +440,11 @@ export const BG_ANIMATIONS = [
       { key: 'speed', label: 'Speed', def: 50 },
       { key: 'pitch', label: 'Pillow size', def: 75 },
       { key: 'relief', label: 'Relief', def: 55 },
+      { key: 'turn', label: 'Light turn', def: 50 },
+      { key: 'drift', label: 'Drift', def: 50 },
+      { key: 'dome', label: 'Puffiness', def: 50 },
+      { key: 'stretch', label: 'Stretch', def: 50 },
+      { key: 'bright', label: 'Brightness', def: 50 },
     ],
   },
   {
