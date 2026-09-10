@@ -645,7 +645,11 @@ def run(args):
     sim = None
     try:
         if args.host:
-            rig = Rig(args.host)
+            # GM_RIG_TIMEOUT: per-request HTTP timeout in seconds (default 15).
+            # The bench board's link is round trip bound under BLE coex and on a
+            # bad radio evening a touchmap dump takes 20 to 30 s (2026-09-11,
+            # 37 percent ping loss, 200 ms average round trip).
+            rig = Rig(args.host, timeout=float(os.environ.get("GM_RIG_TIMEOUT", "15")))
             venue = Venue(sim=None, program=None, workdir=report_dir, port=None, host=args.host,
                           log_path=None, is_device=True, skip_restart=args.skip_restart)
             report.step("venue", kind="device", host=args.host)
