@@ -590,6 +590,11 @@ export const BG_ANIMATIONS = [
       { key: 'speed', label: 'Speed', def: 50 },
       { key: 'width', label: 'Channel width', def: 55 },
       { key: 'depth', label: 'Contrast', def: 60 },
+      { key: 'count', label: 'Cell count', def: 42 },
+      { key: 'halo', label: 'Halo width', def: 40 },
+      { key: 'tilt', label: 'Drift tilt', def: 50 },
+      { key: 'grain', label: 'Grain', def: 50 },
+      { key: 'glow', label: 'Glow', def: 50 },
     ],
   },
   {

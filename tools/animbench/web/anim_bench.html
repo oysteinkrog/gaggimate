@@ -5585,10 +5585,16 @@ function pcDither(dst, amp) {
   const TPX = 2;                // texel footprint, 1 << TPX screen pixels
   const CH_W = 9;               // channel half-width in texels
   const IDX_LO = 50, IDX_AMP = 70, HALO_AMP = 30, HALO_MUL = 3.2;
-  const VX_TEX_S = 1, VY_TEX_S = 3;   // right 1 texel/s, up 3 texel/s
-  // Nine fixed, well-spaced seeds on a jittered lattice.
-  const SEEDS = [[12, 10], [45, 20], [78, 8], [20, 44], [52, 50],
-                 [84, 40], [8, 76], [38, 84], [70, 72]];
+  const VX_TEX_S = 1;           // right 1 texel/s; upward is the Drift tilt knob
+  const SEED_MIN = 4;           // fewest seeds Cell count can select
+  // Sixteen fixed, well-spaced seeds on the torus. The first nine are the
+  // original set, ordered farthest-point first so every shorter prefix stays
+  // spread over the tile instead of crowding one corner; the seven after them
+  // continue the same greedy walk. Cell count takes a prefix of this table and
+  // its default of 42 takes exactly those nine, so the picture is unchanged.
+  const SEEDS = [[45, 20], [8, 76], [84, 40], [70, 72], [78, 8], [20, 44],
+                 [38, 84], [12, 10], [52, 50], [57, 0], [33, 62], [66, 27],
+                 [89, 61], [5, 29], [86, 85], [25, 25]];
 
   ANIMS.push({
     id: 'cells', name: 'Cells', proto: true,
@@ -5596,6 +5602,11 @@ function pcDither(dst, amp) {
       { key: 'speed', label: 'Speed', def: 50 },
       { key: 'width', label: 'Channel width', def: 55 },
       { key: 'depth', label: 'Contrast', def: 60 },
+      { key: 'count', label: 'Cell count', def: 42 },
+      { key: 'halo', label: 'Halo width', def: 40 },
+      { key: 'tilt', label: 'Drift tilt', def: 50 },
+      { key: 'grain', label: 'Grain', def: 50 },
+      { key: 'glow', label: 'Glow', def: 50 },
     ],
     init(w, h, state) {
       state.B = new Uint8Array(TS * TS);
@@ -5603,18 +5614,23 @@ function pcDither(dst, amp) {
       state.xt = new Uint8Array(w);
       for (let x = 0; x < w; x++) state.xt[x] = (x >> TPX) % TS;
       state.dith = new Int16Array(64);
-      state.pal = null; state.key = null; state.bkey = null;
+      state.pal = null; state.key = null; state.bkey = null; state.gkey = null;
     },
     render(data, w, h, tMs, p, state) {
-      const bkey = p[1] + '';
+      const bkey = p[1] + '|' + p[3] + '|' + p[4];
       if (state.bkey !== bkey) {
         state.bkey = bkey;
+        // Cell count 42 gives the original nine seeds, 0 gives four broad
+        // cells and 100 sixteen small ones. Halo width 40 leaves the halo at
+        // the original 3.2x of the channel; its lowest scale is 0.2, never 0.
+        const nSeeds = SEED_MIN + (((p[3] * (SEEDS.length - SEED_MIN) + 50) / 100) | 0);
         const chw = CH_W * (0.6 + p[1] * 0.9 / 100);
+        const haloScale = (20 + p[4] * 2) / 100;
         const B = state.B;
         for (let ty = 0; ty < TS; ty++) {
           for (let tx = 0; tx < TS; tx++) {
             let d1 = 1e9, d2 = 1e9;
-            for (let s = 0; s < SEEDS.length; s++) {
+            for (let s = 0; s < nSeeds; s++) {
               let dx = Math.abs(tx - SEEDS[s][0]); if (dx > TS / 2) dx = TS - dx;
               let dy = Math.abs(ty - SEEDS[s][1]); if (dy > TS / 2) dy = TS - dy;
               const d = Math.sqrt(dx * dx + dy * dy);
@@ -5623,7 +5639,7 @@ function pcDither(dst, amp) {
             // z = 0 on a cell boundary, 1 well inside a cell. The raised
             // cosine gives the channel a soft shoulder on both sides.
             const z = Math.min(1, (d2 - d1) / chw);
-            const zh = Math.min(1, (d2 - d1) / (chw * HALO_MUL));
+            const zh = Math.min(1, (d2 - d1) / (chw * HALO_MUL * haloScale));
             // channel core plus a much wider halo of the same shape: the halo
             // is what keeps the cell interiors shaded instead of dead flat,
             // and it drops the core-to-interior contrast that made the first
@@ -5634,18 +5650,50 @@ function pcDither(dst, amp) {
           }
         }
       }
-      const key = p[2] + '|' + THEME.gen;
+      const key = p[2] + '|' + p[7] + '|' + THEME.gen;
       if (state.key !== key) {
         state.key = key;
         state.pal = themeRamp(176 + Math.round(p[2] * 80 / 100));
-        bayerOffsets(state.dith, 1.5, 1);
+        // Glow tilts the ramp by index: channel cores sit at the top of it and
+        // cell interiors near the bottom, so this changes how hard the channels
+        // read without moving the floor, where Contrast scales the whole ramp.
+        // Glow 50 is no lift and leaves every entry exactly as themeRamp wrote
+        // it. Scaling is on the 5/6/5 levels, the same arithmetic the firmware
+        // does on its RGB565 palette.
+        const lift = p[7] - 50;
+        if (lift !== 0) {
+          const pal = state.pal;
+          for (let i = 0; i < 256; i++) {
+            const f = 256 + (((lift * i * 128) / (50 * 255)) | 0);
+            let r = ((pal[i * 3] >> 3) * f) >> 8;
+            let g = ((pal[i * 3 + 1] >> 2) * f) >> 8;
+            let b = ((pal[i * 3 + 2] >> 3) * f) >> 8;
+            if (r > 31) r = 31;
+            if (g > 63) g = 63;
+            if (b > 31) b = 31;
+            pal[i * 3] = q565r(r << 3);
+            pal[i * 3 + 1] = q565g(g << 2);
+            pal[i * 3 + 2] = q565r(b << 3);
+          }
+        }
+      }
+      const gkey = p[6] + '';
+      if (state.gkey !== gkey) {
+        // Grain 50 keeps the original amplitude of 1.5; 0 removes the dither
+        // and leaves the palette's own steps visible, 100 doubles it.
+        state.gkey = gkey;
+        bayerOffsets(state.dith, 1.5 * (p[6] * 2) / 100, 1);
       }
       const te = tMs * speedMulJS(p[0]);
       const ts = te / 1000;
+      // Drift tilt sets the upward speed in sixteenths of a texel per second.
+      // 50 gives the original 3 texels/s, 0 a purely sideways drift and 100
+      // six texels/s. Sideways stays at 1 texel/s.
+      const vy = (((p[5] * 96 + 50) / 100) | 0) / 16;
       // Q8 source offset; moving the sample point backwards moves the
       // network forwards. Wrapped into the tile so it never leaves int32.
       const oxq = ((-Math.round(VX_TEX_S * 256 * ts) % (TS * 256)) + TS * 256) % (TS * 256);
-      const oyq = ((Math.round(VY_TEX_S * 256 * ts) % (TS * 256)) + TS * 256) % (TS * 256);
+      const oyq = ((Math.round(vy * 256 * ts) % (TS * 256)) + TS * 256) % (TS * 256);
       const ix = oxq >> 8, fx = oxq & 255, iy = oyq >> 8, fy = oyq & 255;
       const { B, T, dith, pal } = state;
       for (let ty = 0; ty < TS; ty++) {

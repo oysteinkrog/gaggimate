@@ -1,8 +1,10 @@
 #ifndef GAGGIMATE_SIM
 
 // "Cells": broad, softly lit Voronoi channels drifting right and upward.
-// This is entry 41 of tools/animbench/web/anim_bench.html: nine toroidal
-// seeds, a raised-cosine channel and a wider halo over shaded interiors.
+// This is entry 41 of tools/animbench/web/anim_bench.html: a prefix of a
+// sixteen entry toroidal seed table, a raised-cosine channel and a wider
+// halo over shaded interiors. Cell count picks the prefix; its default of
+// 42 selects the nine seeds the page has always used.
 // B is the stationary 96x96 byte tile. frame() translates it into T with
 // the page's Q8 bilinear arithmetic, including its two rounding stages.
 // A texel covers 4x4 screen pixels, with independent 8x8 Bayer dither at
@@ -49,7 +51,10 @@ constexpr int IDX_LO = 50;
 constexpr int IDX_AMP = 70;
 constexpr int HALO_AMP = 30;
 constexpr float HALO_MUL = 3.2f;
-constexpr int SEED_N = 9;
+constexpr int SEED_MAX = 16;    // seed table entries; Cell count takes a prefix
+constexpr int SEED_MIN = 4;     // fewest seeds Cell count can select
+constexpr int SEED_DEF = 9;     // what the default Cell count resolves to
+constexpr int CELL_COUNT_DEF = 42;
 constexpr int PACK_BITS = 7;    // T-50 is 0..100, exactly representable
 constexpr int PACK_ROW = TS * PACK_BITS / 8; // 84 B, also word aligned
 // One guard byte would do: the packer's second store for the last texel of
@@ -59,8 +64,13 @@ constexpr int PACK_ROW = TS * PACK_BITS / 8; // 84 B, also word aligned
 constexpr int TILE_BYTES = TS * PACK_ROW + 4;
 constexpr int PACK_MAX = (1 << PACK_BITS) - 1; // 127, what the mask can yield
 
+// The Cell count default has to land on the page's nine seeds exactly, or
+// the animation stops rendering what it rendered before this knob.
+static_assert(SEED_MIN + (CELL_COUNT_DEF * (SEED_MAX - SEED_MIN) + 50) / 100 == SEED_DEF,
+              "Cell count default must resolve to nine seeds");
+
 uint8_t *baseTile = nullptr;   // B, frame-only source -> PSRAM, 9,216 B
-uint8_t *seeds = nullptr;      // fixed coordinate pairs -> PSRAM, 18 B
+uint8_t *seeds = nullptr;      // fixed coordinate pairs -> PSRAM, 32 B
 uint8_t *tile = nullptr;       // packed T -> slab, 8,068 B (8,080 aligned)
 uint8_t *rowTex = nullptr;     // one tile row unpacked -> slab, texCap B
 uint16_t *palette = nullptr;   // 256-entry theme ramp -> slab, 512 B
@@ -71,7 +81,7 @@ const uint16_t **slotTab = nullptr; // eight palette bases -> slab, 32 B
 // At 240 wide: 8,816 B. A host build stores 64 B of pointers rather than
 // 32 and reaches 8,912 B, still inside the slab. No per-row table is
 // needed: absolute y gives both the tile row and the Bayer phase.
-// PSRAM owns 9,234 B at either width.
+// PSRAM owns 9,248 B at either width.
 //
 // rowTex holds the current tile row with T-50 already unpacked, and it is
 // long enough to run past the 96 texel wrap so the pixel loop never tests
@@ -82,11 +92,40 @@ int allocW = 0;
 int texCap = 0;
 int lastWidth = -1;
 int lastDepth = -1;
+int lastCount = -1;
+int lastHalo = -1;
+int lastGrain = -1;
+int lastGlow = -1;
 int rowTexIdx = -1;    // tile row currently unpacked into rowTex, -1 if none
 bool kernelSafe = false;
 uint32_t lastThemeGen = 0xFFFFFFFF;
 
 void release();
+
+// The page's bayerOffsets(dith, 1.5 * grainScale, 1), with lround's ties
+// away from zero. Grain 50 makes the scale exactly 1, so the table is the
+// one the page has always built. Grain 0 removes the dither and leaves the
+// palette's own steps visible; Grain 100 doubles the amplitude to +-3.
+void buildDither(uint8_t grain) {
+    const float amp = 1.5f * (static_cast<float>(grain * 2) / 100.0f);
+    int lo = 0, hi = 0;
+    for (int k = 0; k < 64; k++) {
+        const int d = static_cast<int>(lroundf((BAYER8[k] - 31.5f) * (amp / 31.5f)));
+        dither[k] = static_cast<int16_t>(d);
+        if (d < lo) lo = d;
+        if (d > hi) hi = d;
+    }
+    // bandRef() clamps the palette index the way the page does. The kernel
+    // folds the dither into a palette base instead, which is only the same
+    // arithmetic while no clamp can fire. The packed value is masked to
+    // seven bits, so the widest index the kernel can form is
+    // IDX_LO + 127 + hi and the narrowest IDX_LO + lo. Grain 100 gives
+    // 47..180, so the clamp is dead and the kernel runs; the check is
+    // re-run on every Grain change rather than assumed, because a wider
+    // amplitude would break it silently.
+    kernelSafe = (IDX_LO + lo) >= 0 && (IDX_LO + PACK_MAX + hi) <= 255;
+    lastGrain = grain;
+}
 
 bool init(int w, int) {
     // Idempotent at a fixed size; also safe if a caller resizes directly.
@@ -108,54 +147,49 @@ bool init(int w, int) {
     dither = static_cast<int16_t *>(allocHot(64 * sizeof(int16_t)));
     slotTab = static_cast<const uint16_t **>(allocHot(8 * sizeof(const uint16_t *)));
     baseTile = static_cast<uint8_t *>(alloc(TS * TS));
-    seeds = static_cast<uint8_t *>(alloc(SEED_N * 2));
+    seeds = static_cast<uint8_t *>(alloc(SEED_MAX * 2));
     if (tile == nullptr || rowTex == nullptr || palette == nullptr || dither == nullptr ||
         slotTab == nullptr || baseTile == nullptr || seeds == nullptr) {
         release();
         return false;
     }
-    // The page's nine seeds, in its original order. These constants are
+    // The first nine are the page's own seeds, so the default Cell count
+    // renders exactly what it always did. Their order within those nine does
+    // not reach the picture, because buildBase() takes the two smallest
+    // distances over the whole prefix and those two values do not depend on
+    // the order they were seen in. It does decide which seeds a shorter
+    // prefix keeps, so they are written farthest-point first: every prefix
+    // from four up stays spread over the tile instead of crowding one
+    // corner. The seven after them are the greedy farthest-point
+    // continuation, so sixteen seeds are still evenly spaced (smallest
+    // toroidal gap 19.7 texels against 28.4 at nine). These constants are
     // written into the allocated table, never kept in an internal BSS LUT.
-    seeds[0] = 12; seeds[1] = 10;
-    seeds[2] = 45; seeds[3] = 20;
-    seeds[4] = 78; seeds[5] = 8;
-    seeds[6] = 20; seeds[7] = 44;
-    seeds[8] = 52; seeds[9] = 50;
-    seeds[10] = 84; seeds[11] = 40;
-    seeds[12] = 8; seeds[13] = 76;
-    seeds[14] = 38; seeds[15] = 84;
-    seeds[16] = 70; seeds[17] = 72;
-    int lo = 0, hi = 0;
-    for (int k = 0; k < 64; k++) {
-        // bayerOffsets(..., 1.5, 1) uses lround, ties away from zero.
-        // Its endpoints are -2 and +2, not theme-derived ditherAmp().
-        const int d = static_cast<int>(lroundf((BAYER8[k] - 31.5f) * (1.5f / 31.5f)));
-        dither[k] = static_cast<int16_t>(d);
-        if (d < lo) lo = d;
-        if (d > hi) hi = d;
-    }
-    // bandRef() clamps the palette index the way the page does. The kernel
-    // folds the dither into a palette base instead, which is only the same
-    // arithmetic while no clamp can fire. The packed value is masked to
-    // seven bits, so the widest index the kernel can form is
-    // IDX_LO + 127 + hi and the narrowest IDX_LO + lo. With this Bayer
-    // table that is 48..179, so the clamp is dead and the kernel runs.
-    // The check is here rather than assumed because a future dither
-    // amplitude could break it silently.
-    kernelSafe = (IDX_LO + lo) >= 0 && (IDX_LO + PACK_MAX + hi) <= 255;
+    static const uint8_t kSeeds[SEED_MAX * 2] = {
+        45, 20, 8,  76, 84, 40, 70, 72, 78, 8,  20, 44, 38, 84, 12, 10,
+        52, 50, 57, 0,  33, 62, 66, 27, 89, 61, 5,  29, 86, 85, 25, 25,
+    };
+    memcpy(seeds, kSeeds, sizeof(kSeeds));
+    buildDither(50);
     rowTexIdx = -1;
     return true;
 }
 
-void buildBase(uint8_t width) {
+void buildBase(uint8_t width, uint8_t count, uint8_t halo) {
+    // Cell count 42 resolves to the page's nine seeds; 0 gives four broad
+    // cells and 100 sixteen small ones.
+    const int nSeeds = SEED_MIN + (count * (SEED_MAX - SEED_MIN) + 50) / 100;
     const float chw = CH_W * (0.6f + width * 0.9f / 100.0f);
+    // Halo width 40 makes this scale exactly 1.0f, so the halo keeps the
+    // page's 3.2x spread and the tile is bit for bit the one it built. The
+    // smallest scale is 0.2, never 0, so the reciprocal below is finite.
+    const float haloScale = static_cast<float>(20 + halo * 2) / 100.0f;
     const float invChw = 1.0f / chw;
-    const float invHalo = 1.0f / (chw * HALO_MUL);
+    const float invHalo = 1.0f / (chw * HALO_MUL * haloScale);
     constexpr float PI = 3.14159265358979323846f;
     for (int ty = 0; ty < TS; ty++) {
         for (int tx = 0; tx < TS; tx++) {
             float d1 = 1.0e9f, d2 = 1.0e9f;
-            for (int s = 0; s < SEED_N; s++) {
+            for (int s = 0; s < nSeeds; s++) {
                 int dx = abs(tx - seeds[s * 2]);
                 int dy = abs(ty - seeds[s * 2 + 1]);
                 if (dx > TS / 2) dx = TS - dx;
@@ -181,17 +215,50 @@ void buildBase(uint8_t width) {
     }
 }
 
+// Glow tilts the ramp by palette index. Channel cores sit near the top of
+// the ramp and cell interiors near the bottom, so a lift here changes how
+// hard the channels read against the interiors without moving the floor,
+// where Contrast scales the whole ramp evenly. Glow 50 is no lift and
+// returns before touching an entry, so the ramp is exactly what
+// buildThemeRamp() wrote. Applied in place: a second 256-entry ramp would
+// not fit the slab, and 512 B of stack on the render task is not worth it.
+void applyGlow(uint8_t glow) {
+    const int lift = static_cast<int>(glow) - 50;
+    if (lift == 0) {
+        return;
+    }
+    for (int i = 0; i < 256; i++) {
+        // 1.5x at the brightest entry with Glow 100, 0.5x with Glow 0, and
+        // nothing at all at index 0 whatever the setting.
+        const int f = 256 + (lift * i * 128) / (50 * 255);
+        int r = (((palette[i] >> 11) & 0x1F) * f) >> 8;
+        int g = (((palette[i] >> 5) & 0x3F) * f) >> 8;
+        int b = ((palette[i] & 0x1F) * f) >> 8;
+        if (r > 31) r = 31;
+        if (g > 63) g = 63;
+        if (b > 31) b = 31;
+        palette[i] = static_cast<uint16_t>((r << 11) | (g << 5) | b);
+    }
+}
+
 void frame(uint32_t tMs, int, int, const uint8_t p[BG_ANIM_PARAMS]) {
-    if (p[1] != lastWidth) {
-        buildBase(p[1]);
+    if (p[1] != lastWidth || p[3] != lastCount || p[4] != lastHalo) {
+        buildBase(p[1], p[3], p[4]);
         lastWidth = p[1];
+        lastCount = p[3];
+        lastHalo = p[4];
+    }
+    if (p[6] != lastGrain) {
+        buildDither(p[6]);
     }
     const uint32_t gen = themeGen();
-    if (p[2] != lastDepth || gen != lastThemeGen) {
+    if (p[2] != lastDepth || p[7] != lastGlow || gen != lastThemeGen) {
         // This is the page's Contrast control, including its brightness
         // scale: 176 + round(depth*80/100), 224 at the default 60.
         buildThemeRamp(palette, static_cast<uint16_t>(176 + (p[2] * 80 + 50) / 100));
+        applyGlow(p[7]);
         lastDepth = p[2];
+        lastGlow = p[7];
         lastThemeGen = gen;
     }
 
@@ -203,11 +270,22 @@ void frame(uint32_t tMs, int, int, const uint8_t p[BG_ANIM_PARAMS]) {
     // The only difference from JS double is speedMul's normal float
     // rounding (and sqrtf/cosf at a profile rounding boundary).
     const uint32_t speedQ27 = static_cast<uint32_t>(speedMul(p[0]) * 134217728.0f);
-    const uint64_t clockQ27 = static_cast<uint64_t>(tMs) * speedQ27;
     constexpr uint64_t Q8_DIV = 1000u * (1u << 19);
+    constexpr uint64_t VEL_DEN = 16; // velocities are sixteenths of a texel/s
+    constexpr uint64_t Q8_DIV_V = Q8_DIV * VEL_DEN;
     constexpr int WRAP_Q8 = TS * 256;
-    const int xq = static_cast<int>(((clockQ27 + Q8_DIV / 2) / Q8_DIV) % WRAP_Q8);
-    const int oyq = static_cast<int>(((clockQ27 * 3u + Q8_DIV / 2) / Q8_DIV) % WRAP_Q8);
+    // Drift tilt sets the upward speed. 50 gives the page's 3 texels/s, 0 a
+    // purely sideways drift and 100 six texels/s. Sideways stays at 1.
+    const uint64_t vyN = static_cast<uint64_t>((p[5] * 96 + 50) / 100);
+    // Wrapping the clock into one whole spatial period first is what lets
+    // the numerator carry a velocity at all: at the old scale, times three
+    // was already within a factor of two of overflowing uint64. Subtracting
+    // a multiple of this period moves the sample point by whole tiles, so
+    // both offsets below are the ones the unwrapped clock would have given.
+    constexpr uint64_t CLOCK_WRAP = static_cast<uint64_t>(WRAP_Q8) * Q8_DIV_V;
+    const uint64_t clockQ27 = (static_cast<uint64_t>(tMs) * speedQ27) % CLOCK_WRAP;
+    const int xq = static_cast<int>(((clockQ27 * VEL_DEN + Q8_DIV_V / 2) / Q8_DIV_V) % WRAP_Q8);
+    const int oyq = static_cast<int>(((clockQ27 * vyN + Q8_DIV_V / 2) / Q8_DIV_V) % WRAP_Q8);
     const int oxq = xq == 0 ? 0 : WRAP_Q8 - xq; // sample left to move right
     const int ix = oxq >> 8, fx = oxq & 255;
     const int iy = oyq >> 8, fy = oyq & 255;
@@ -433,7 +511,7 @@ void band(uint16_t *dst, int y0, int rows, int w, uint32_t tMs, const uint8_t *p
 #endif
 
 void release() {
-    releaseTable(seeds, SEED_N * 2);
+    releaseTable(seeds, SEED_MAX * 2);
     releaseTable(baseTile, TS * TS);
     releaseTable(slotTab, 8 * sizeof(const uint16_t *));
     releaseTable(dither, 64 * sizeof(int16_t));
@@ -444,7 +522,7 @@ void release() {
     texCap = 0;
     rowTexIdx = -1;
     kernelSafe = false;
-    lastWidth = lastDepth = -1;
+    lastWidth = lastDepth = lastCount = lastHalo = lastGrain = lastGlow = -1;
     lastThemeGen = 0xFFFFFFFF;
 }
 
@@ -457,7 +535,11 @@ const BgAnimation bg_anim_cells = {
     {{"speed", "Speed", 50},
      {"width", "Channel width", 55},
      {"depth", "Contrast", 60},
-     {nullptr, nullptr, 0}},
+     {"count", "Cell count", 42},
+     {"halo", "Halo width", 40},
+     {"tilt", "Drift tilt", 50},
+     {"grain", "Grain", 50},
+     {"glow", "Glow", 50}},
     init,
     frame,
     band,
