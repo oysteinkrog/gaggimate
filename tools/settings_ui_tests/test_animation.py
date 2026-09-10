@@ -517,15 +517,16 @@ def check_theme_recolor(rig):
     x1, y1, x2, y2 = row["hit"]
     points = [(x1 + int((x2 - x1) * f), (y1 + y2) // 2) for f in (0.3, 0.5, 0.7)]
 
-    fb_before = rig.get_bytes("/api/debug/fb?step=1")
-    colors_before = [rgb565_pixel(fb_before, x, y) for x, y in points]
+    # step=2 (240x240): the device delivers the framebuffer only at step 2.
+    fb_before = rig.get_bytes("/api/debug/fb?step=2")
+    colors_before = [rgb565_pixel(fb_before, x // 2, y // 2, w=240) for x, y in points]
 
     next_btn = rig.find_tag(d, "Theme", "next")
     rig.tap_target(next_btn)
     rig.wait_until(lambda: int(rig.settings()["themeMode"]) != mode0, timeout=2)
     time.sleep(0.5)  # one more rerender pass for applyTheme()'s change_color_theme + the page's own rebuildPage
-    fb_after = rig.get_bytes("/api/debug/fb?step=1")
-    colors_after = [rgb565_pixel(fb_after, x, y) for x, y in points]
+    fb_after = rig.get_bytes("/api/debug/fb?step=2")
+    colors_after = [rgb565_pixel(fb_after, x // 2, y // 2, w=240) for x, y in points]
 
     check(rig, "theme_mode_flipped", int(rig.settings()["themeMode"]) == (1 - mode0))
     check(rig, "theme_recolor_pixels_changed", any(a != b for a, b in zip(colors_before, colors_after)),
