@@ -247,6 +247,11 @@ ANIMS.push({
     { key: 'speed', label: 'Speed', def: 50 },
     { key: 'scale', label: 'Scale', def: 50 },
     { key: 'brightness', label: 'Brightness', def: 70 },
+    { key: 'contrast', label: 'Contrast', def: 50 },
+    { key: 'cycle', label: 'Colour cycle', def: 50 },
+    { key: 'stretch', label: 'Stretch', def: 50 },
+    { key: 'grain', label: 'Grain', def: 50 },
+    { key: 'shift', label: 'Palette shift', def: 50 },
   ],
   init(w, h, state) {
     state.colTerm = new Int16Array(w);
@@ -273,30 +278,49 @@ ANIMS.push({
       // Three quarters of the mean step: a wheel's gradient is not uniform,
       // and at the full amplitude its steep arcs over-dither into visible
       // texture. Offsets are in sixteenths of a palette index, so a
-      // sub-index amplitude survives the shift in the pixel loop.
-      bayerOffsets(state.dith, ditherAmpJS(state.pal, 256) * 0.75, 16);
+      // sub-index amplitude survives the shift in the pixel loop. Grain
+      // scales that 0.75: none at 0, 0.75 at 50, four times it at 100.
+      const grain = p[6] <= 50 ? p[6] * 0.75 / 50 : 0.75 + (p[6] - 50) * 2.25 / 50;
+      bayerOffsets(state.dith, ditherAmpJS(state.pal, 256) * grain, 16);
     }
     const speedMul = 4 + Math.floor(p[0] * 44 / 100); // 4 to 48, /16 = 0.25x to 3x
     const base = ((t * speedMul) >>> 0) >>> 4;
     const phase1 = ((base * 30) >>> 0) >>> 9; // ratios from the frame-based original
     const phase2 = ((base * 23) >>> 0) >>> 9;
     const phase3 = ((base * 26) >>> 0) >>> 9;
-    const cycle = ((base * 11) >>> 0) >>> 9;
+    // Colour cycle: 0 freezes the palette, 11/512 of the drift at 50, four
+    // times that at 100. The two segments meet at exactly 11.
+    const cycNum = p[4] <= 50 ? Math.floor(p[4] * 11 / 50) : 11 + Math.floor((p[4] - 50) * 33 / 50);
+    const cycle = ((base * cycNum) >>> 0) >>> 9;
     const sx = 128 + Math.floor(p[1] * 384 / 100); // 128 to 512, /256
-    const f5 = (5 * sx) >> 8, f2 = (2 * sx) >> 8, f4 = (4 * sx) >> 8, f3 = (3 * sx) >> 8;
+    // Stretch tips the scale between the axes: both gains 256 at 50, sideways
+    // at 0, upright at 100. Frequencies floor at 1 so no term goes flat.
+    const tilt = Math.trunc((p[5] - 50) * 256 / 100); // -128 to +128
+    const sxx = (sx * (256 + tilt)) >>> 8, sxy = (sx * (256 - tilt)) >>> 8;
+    const fq = v => Math.max(1, v >> 8);
+    const f5 = fq(5 * sxx), f2 = fq(2 * sxx), f4 = fq(4 * sxy), f3 = fq(3 * sxy);
+    // Contrast scales both sine sums, so a pixel sweeps a narrower or wider arc
+    // of the wheel: half at 0, one and a half times at 100. 256 at 50 is the
+    // identity, so the default output is unchanged.
+    const cgain = 128 + Math.floor(p[3] * 256 / 100); // 128 to 384, /256
     const { colTerm, colTermPh, rowTerm, rotPal, dith, pal } = state;
     for (let x = 0; x < w; x++) {
-      colTerm[x] = SIN[(x * f5 + phase1) & (SIN_N - 1)] +
+      const s = SIN[(x * f5 + phase1) & (SIN_N - 1)] +
         SIN[(x * f2 + SIN_N - (phase2 & (SIN_N - 1))) & (SIN_N - 1)];
+      colTerm[x] = (s * cgain) >> 8;
     }
     for (let y = 0; y < h; y++) {
-      rowTerm[y] = SIN[(y * f4 + phase2) & (SIN_N - 1)] + SIN[(y * f3 + phase3) & (SIN_N - 1)];
+      const s = SIN[(y * f4 + phase2) & (SIN_N - 1)] + SIN[(y * f3 + phase3) & (SIN_N - 1)];
+      rowTerm[y] = (s * cgain) >> 8;
     }
     for (let ph = 0; ph < 8; ph++) {
       const dst = ph * w, off = ph * 8;
       for (let x = 0; x < w; x++) colTermPh[dst + x] = colTerm[x] + dith[off + (x & 7)];
     }
-    const rot = cycle & 255;
+    // Palette shift slides the wheel without rotating it over time: nothing at
+    // 50, about 40 percent of the wheel back at 0 and forward at 100.
+    const shift = (p[7] - 50) * 2; // -100 to +100 of 256
+    const rot = ((cycle & 255) + shift) & 255;
     for (let i = 0; i < 256; i++) {
       const s = ((i + rot) & 255) * 3, d = i * 3;
       rotPal[d] = pal[s]; rotPal[d + 1] = pal[s + 1]; rotPal[d + 2] = pal[s + 2];

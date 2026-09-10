@@ -17,6 +17,11 @@ export const BG_ANIMATIONS = [
       { key: 'speed', label: 'Speed', def: 50 },
       { key: 'scale', label: 'Scale', def: 50 },
       { key: 'brightness', label: 'Brightness', def: 70 },
+      { key: 'contrast', label: 'Contrast', def: 50 },
+      { key: 'cycle', label: 'Colour cycle', def: 50 },
+      { key: 'stretch', label: 'Stretch', def: 50 },
+      { key: 'grain', label: 'Grain', def: 50 },
+      { key: 'shift', label: 'Palette shift', def: 50 },
     ],
   },
   {
