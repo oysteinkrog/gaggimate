@@ -1388,29 +1388,56 @@ function buildRamp(stopsA, stopsB, blend) {
     id: 'nebula', name: 'Nebula',
     params: [
       {key:'speed',label:'Drift speed',def:50},{key:'density',label:'Density',def:50},
-      {key:'turbulence',label:'Turbulence',def:40}],
+      {key:'turbulence',label:'Turbulence',def:40},{key:'contrast',label:'Contrast',def:50},
+      {key:'drift',label:'Drift angle',def:50},{key:'grain',label:'Grain',def:50},
+      {key:'detail',label:'Fine detail',def:50},{key:'lspeed',label:'Layer speed',def:50}],
     init(w, h, state) {
       state.noise = buildTileableNoise(256, 4242);
-      state._gen = -1; state._pal = null;
+      state._gen = -1; state._pal = null; state._contrast = -1;
     },
     render(data, w, h, tMs, p, state) {
-      if (state._gen !== THEME.gen) { state._pal = themeRampBytes(false); state._gen = THEME.gen; }
+      // Contrast reads the theme ramp through a gain about its midpoint, the
+      // same remap AnimNebula.cpp's buildContrastRamp does. A gain of 1 reads
+      // entry i at i, so the default palette is the plain ramp.
+      if (state._gen !== THEME.gen || state._contrast !== p[3]) {
+        const raw = themeRampBytes(false);
+        const gain = 1 + (p[3]-50)*4/256;
+        const pal = new Uint8Array(256*3);
+        for (let i = 0; i < 256; i++) {
+          const src = Math.max(0, Math.min(255, 128 + Math.floor((i-128)*gain)));
+          pal[i*3] = raw[src*3]; pal[i*3+1] = raw[src*3+1]; pal[i*3+2] = raw[src*3+2];
+        }
+        state._pal = pal; state._gen = THEME.gen; state._contrast = p[3];
+      }
       const pal = state._pal;
       const driftGain = 1.2*speedMulJS(p[0]);
+      // Layer speed scales the 2x and 4x octaves only; Drift angle turns all
+      // three direction vectors together. Both are 1 and 0 degrees at 50.
+      const layerGain = driftGain*(1 + (p[7]-50)*0.02);
+      const ang = (p[4]-50)*2.7/50, ca = Math.cos(ang), sa = Math.sin(ang);
       const t = tMs;
-      const scrollAx = (t*0.010*driftGain)%256, scrollAy = (t*0.006*driftGain)%256;
-      const scrollBx = (-t*0.017*driftGain)%256, scrollBy = (t*0.013*driftGain)%256;
-      const scrollCx = (t*0.026*driftGain)%256, scrollCy = (-t*0.021*driftGain)%256;
+      const rx = (x, y, g) => (t*g*(x*ca - y*sa))%256;
+      const ry = (x, y, g) => (t*g*(x*sa + y*ca))%256;
+      const scrollAx = rx(0.010, 0.006, driftGain), scrollAy = ry(0.010, 0.006, driftGain);
+      const scrollBx = rx(-0.017, 0.013, layerGain), scrollBy = ry(-0.017, 0.013, layerGain);
+      const scrollCx = rx(0.026, -0.021, layerGain), scrollCy = ry(0.026, -0.021, layerGain);
       const turb = p[2]/100;
-      const wA = 0.60-0.15*turb, wB = 0.25+0.05*turb, wC = 0.15+0.10*turb;
+      const wA = 0.60-0.15*turb;
+      // Fine detail moves weight between the 2x and the 4x octave and keeps
+      // their total, so the three weights still sum to 1.
+      const pool = 1 - wA;
+      const shift = (p[6]-50)*60/100/64;
+      let wB = Math.max(0, Math.min(pool, (0.25+0.05*turb) - shift));
+      const wC = pool - wB;
       const densOff = (p[1]-50)*1.1;
+      const grain = p[5]*p[5]/2500;
       for (let y = 0; y < h; y++) {
         for (let x = 0; x < w; x++) {
           const a = sampleNoiseBilinear(state.noise, 256, x+scrollAx, y+scrollAy);
           const b = sampleNoise(state.noise, 256, Math.floor(x*2+scrollBx), Math.floor(y*2+scrollBy));
           const c = sampleNoise(state.noise, 256, Math.floor(x*4+scrollCx), Math.floor(y*4+scrollCy));
           let v = wA*a + wB*b + wC*c + densOff;
-          v += (BAYER8[(y&7)*8+(x&7)]-31.5)/63 * 8;
+          v += (BAYER8[(y&7)*8+(x&7)]-31.5)/63 * 8 * grain;
           v = Math.max(0, Math.min(255, v))|0;
           const idx = v*3, o = (y*w+x)*4;
           data[o] = pal[idx]; data[o+1] = pal[idx+1]; data[o+2] = pal[idx+2]; data[o+3] = 255;

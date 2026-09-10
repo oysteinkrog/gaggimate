@@ -13,10 +13,15 @@
 // index paletteExt directly with no branch to clamp into [0,255] — the pad
 // entries already hold the clamped edge color. Range proof: the a/b/c blend
 // itself is a convex combination (wA+wB<=64, wC=64-wA-wB>=0 for all
-// turbulence 0-100) so it stays within a texel or two of [0,255]; density
-// offset is (p[1]-50)*1.1 in [-55,55]; dither is (bayerRow-31)/4 in [-7,8].
-// Empirically swept (see tools/animbench worklog) across full param range x
-// full a/b/c grid: v in [-62,318]. PAD=72 covers that with margin.
+// turbulence 0-100, and Fine detail moves weight between wB and wC keeping
+// their sum, so it stays one) and it lands in [-1,255]: (a-c)*wA + (b-c)*wB
+// is at least -64c and at most 64*(255-c), and the >>6 floors. Density
+// offset is (p[1]-50)*1.1 in [-55,55]. Dither is (bayerRow-31)/4 in [-7,8]
+// scaled by the Grain gain, which caps at 4x, so [-28,32]. Worst case v in
+// [-84,342], and PAD=112 covers that with margin. PAD was 72 while the
+// dither gain was fixed at 1x and the bound was [-63,318] (empirically
+// swept, see tools/animbench worklog, across full param range x full a/b/c
+// grid: v in [-62,318]).
 //
 // The dominant-octave blend loop (blendedA, built once per row and reused
 // for the whole 480px row via wraparound) special-cases the last texel
@@ -160,7 +165,7 @@ namespace {
 using namespace bganim;
 
 // Padding either side of the 256-entry palette ramp (see file header proof).
-constexpr int PAD = 72;
+constexpr int PAD = 112;
 constexpr int PAL_EXT_N = 256 + 2 * PAD;
 
 uint16_t *paletteExt = nullptr; // [PAL_EXT_N]; real ramp lives at paletteExt+PAD
@@ -171,6 +176,21 @@ uint32_t lastThemeGen = 0xFFFFFFFF;
 uint16_t sAx = 0, sAy = 0, sBx = 0, sBy = 0, sCx = 0, sCy = 0;
 int g_wA = 32, g_wB = 20, g_wC = 12, g_densOff = 0;
 int g_axI = 0, g_axF = 0, g_ayI = 0, g_ayF = 0, g_bx = 0, g_by = 0, g_cx = 0, g_cy = 0;
+// The 8x8 Bayer dither, already scaled by Grain, built once a frame instead
+// of once a row. Grain is a percentage of the term this animation always
+// added, applied after the /4 so that at 100 the multiply and the divide
+// cancel and every entry is the integer the per-row loop used to compute.
+// The values sit in [-28, 32] at the widest gain, which is why 16 bits is
+// enough; the file header's padding proof carries the same numbers.
+int16_t g_dith[64] = {0};
+// Drift angle, cached as its cosine and sine so the two library calls are
+// paid when the slider moves and not once a frame. 1 and 0 leave every drift
+// vector where it was.
+float g_driftCos = 1.0f, g_driftSin = 0.0f;
+uint8_t lastDrift = 50;
+// The palette also depends on Contrast, so it rebuilds when that moves.
+// 0xFF is not a slider value, so the first frame always rebuilds.
+uint8_t lastContrast = 0xFF;
 
 #if defined(__XTENSA__)
 // band()'s PIE combine-path tables. Round 1 made these function-local
@@ -203,6 +223,28 @@ void extendPalette() {
     }
 }
 
+// The palette, read through the Contrast gain. buildThemeRamp fills entry i
+// with rgb565 of themeRGB(i) scaled by a brightness of 256, which leaves the
+// channels alone, so this loop is that same function of a remapped index:
+// entry i takes the ramp colour at src(i) instead of at i.
+//
+// gainQ8 is 256 at the default and then src(i) == i for every i, because
+// (i - 128) * 256 is an exact multiple of 256 and the shift divides it back.
+// So the default palette is the old palette, entry for entry. Below 256 the
+// ramp is read over a narrower window and the clouds flatten toward one
+// tone; above it the window runs past both ends, the clamp holds the end
+// colours, and the clouds gain hard darks and bright cores.
+void buildContrastRamp(uint8_t contrast) {
+    const int gainQ8 = 256 + (static_cast<int>(contrast) - 50) * 4;
+    for (int i = 0; i < 256; i++) {
+        int src = 128 + (((i - 128) * gainQ8) >> 8);
+        src = src < 0 ? 0 : (src > 255 ? 255 : src);
+        uint8_t c[3];
+        themeRGB(src, c);
+        palette[i] = rgb565(c[0], c[1], c[2]);
+    }
+}
+
 bool init(int, int) {
     if (paletteExt == nullptr) {
         // Read once per pixel by nebulaGatherScalar's palette lookup --
@@ -221,9 +263,10 @@ bool init(int, int) {
 #if defined(__XTENSA__)
     if (hotBlendedA == nullptr) {
         // 2,304 B total (512 + 512 + 128*2 + 128*2 + 128*2 + 256*2), plus
-        // paletteExt's 800 B above = 3,104 B of the 9,216 B a resident
+        // paletteExt's 960 B above = 3,264 B of the 9,216 B a resident
         // animation gets from the 12 KB slab -- comfortably inside budget,
-        // nothing here needed shrinking.
+        // nothing here needed shrinking. paletteExt was 800 B while PAD was
+        // 72; Grain widened the index range and so the padding.
         hotBlendedA = static_cast<uint8_t *>(allocHot(512));
         hotIxBufs = static_cast<uint8_t *>(allocHot(2 * 256));
         hotBTable = static_cast<uint16_t *>(allocHot(128 * sizeof(uint16_t)));
@@ -237,28 +280,83 @@ bool init(int, int) {
     }
 #endif
     lastThemeGen = 0xFFFFFFFF;
+    lastContrast = 0xFF;
     return true;
 }
 
+// One drift component, from a float rate to the Q8.8 accumulator step. The
+// step goes through int32 first because a rotated component can be negative
+// and converting a negative float straight to an unsigned type is undefined.
+// int32 to uint16 is the ordinary wrap, which is what the old "-=" did.
+static inline uint16_t scrollStep(float v) {
+    return static_cast<uint16_t>(static_cast<int32_t>(v));
+}
+
 void frame(uint32_t, int, int, const uint8_t p[BG_ANIM_PARAMS]) {
-    if (themeGen() != lastThemeGen) {
-        buildThemeRamp(palette, 256);
+    if (themeGen() != lastThemeGen || p[3] != lastContrast) {
+        buildContrastRamp(p[3]);
         extendPalette();
         lastThemeGen = themeGen();
+        lastContrast = p[3];
+    }
+    if (p[4] != lastDrift) {
+        // Radians, and exactly 0.0f at the default, which is what makes the
+        // rotation below leave every vector where it was. Plus or minus 2.7
+        // rad is a little over plus or minus 155 degrees, so the two ends of
+        // the slider send the clouds in clearly different directions rather
+        // than in the same one, which a full half turn either way would.
+        const float ang = (static_cast<int>(p[4]) - 50) * (2.7f / 50.0f);
+        g_driftCos = cosf(ang);
+        g_driftSin = sinf(ang);
+        lastDrift = p[4];
     }
     // Per-frame deltas matched to the web preview at ~30fps: px/frame * 256.
     const float g = 1.2f * speedMul(p[0]);
-    sAx += static_cast<uint16_t>(85.0f * g);
-    sAy += static_cast<uint16_t>(51.0f * g);
-    sBx -= static_cast<uint16_t>(145.0f * g);
-    sBy += static_cast<uint16_t>(111.0f * g);
-    sCx += static_cast<uint16_t>(222.0f * g);
-    sCy -= static_cast<uint16_t>(179.0f * g);
+    // Layer speed: how much faster the 2x and 4x octaves drift than the
+    // dominant one. Exactly 1.0f at the default, 0.0f at slider 0 (the fine
+    // detail sits still over the moving base) and 2.0f at 100.
+    const float lg = 1.0f + (static_cast<int>(p[7]) - 50) * 0.02f;
+    const float gBC = g * lg;
+    // Drift angle turns all three octaves' direction vectors together:
+    // (x, y) -> (x cos - y sin, x sin + y cos). The base vectors are the
+    // deltas this animation has always used, A (85, 51), B (-145, 111) and
+    // C (222, -179). At the default the cosine is exactly 1 and the sine
+    // exactly 0, so every product below is the product it replaced and the
+    // rounding is unchanged.
+    const float ca = g_driftCos, sa = g_driftSin;
+    sAx += scrollStep(85.0f * g * ca - 51.0f * g * sa);
+    sAy += scrollStep(85.0f * g * sa + 51.0f * g * ca);
+    sBx += scrollStep(-145.0f * gBC * ca - 111.0f * gBC * sa);
+    sBy += scrollStep(-145.0f * gBC * sa + 111.0f * gBC * ca);
+    sCx += scrollStep(222.0f * gBC * ca + 179.0f * gBC * sa);
+    sCy += scrollStep(222.0f * gBC * sa - 179.0f * gBC * ca);
     const float turb = p[2] / 100.0f;
     g_wA = static_cast<int>((0.60f - 0.15f * turb) * 64.0f);
-    g_wB = static_cast<int>((0.25f + 0.05f * turb) * 64.0f);
-    g_wC = 64 - g_wA - g_wB;
+    const int wB0 = static_cast<int>((0.25f + 0.05f * turb) * 64.0f);
+    const int pool = 64 - g_wA; // what the 2x and 4x octaves share
+    // Fine detail moves weight from the 2x octave to the 4x one and back,
+    // keeping their total, so the three weights still sum to 64 and the
+    // blend stays convex (the palette padding depends on that). The shift is
+    // exactly 0 at the default, so wB and wC are the values turbulence alone
+    // used to give. 60 is wide enough that either end empties one of the two
+    // octaves: at 0 all of the pool goes to the 2x layer, at 100 all of it
+    // goes to the 4x layer.
+    const int shift = ((static_cast<int>(p[6]) - 50) * 60) / 100;
+    int wB = wB0 - shift;
+    wB = wB < 0 ? 0 : (wB > pool ? pool : wB);
+    g_wB = wB;
+    g_wC = pool - wB;
     g_densOff = static_cast<int>((p[1] - 50) * 1.1f);
+    // Grain scales the dither the two band paths add per pixel. 100 at the
+    // default, 0 at slider 0 (no dither, so the ramp's own steps show as
+    // bands) and 400 at 100 (four times the amplitude, a visible speckle).
+    // Quadratic so the useful low half of the slider is not squeezed, and
+    // 50 * 50 / 25 is exactly 100. Applied here, over the whole 8x8 Bayer
+    // matrix, so no band path pays a multiply or a divide per row.
+    const int grain = (static_cast<int>(p[5]) * static_cast<int>(p[5])) / 25;
+    for (int i = 0; i < 64; i++) {
+        g_dith[i] = static_cast<int16_t>((static_cast<int>(BAYER8[i]) - 31) / 4 * grain / 100);
+    }
     g_axI = sAx >> 8;
     g_axF = sAx & 0xFF;
     g_ayI = sAy >> 8;
@@ -973,14 +1071,16 @@ void bandRef(uint16_t *dst, int y0, int rows, int w, uint32_t, const uint8_t *) 
     for (int r = 0; r < rows; r++) {
         const int y = y0 + r;
         uint16_t *row = dst + static_cast<size_t>(r) * w;
-        const uint8_t *bayerRow = &BAYER8[(y & 7) * 8];
+        const int16_t *bayerRow = &g_dith[(y & 7) * 8];
         // int (not int8_t): a plain 32-bit load, no sign-extend per pixel.
         // densOff is folded in here too (dith2 = dith + densOff) so the
         // combine loop's per-pixel "+ densOff" becomes free -- one table
         // build of 8 adds replaces 256 (or, at half-res, up to 256) adds.
+        // The Bayer term and the Grain gain are already in g_dith, built
+        // once a frame, so this loop is the same 8 adds it always was.
         int dith2[8];
         for (int k = 0; k < 8; k++) {
-            dith2[k] = (static_cast<int>(bayerRow[k]) - 31) / 4 + densOff;
+            dith2[k] = bayerRow[k] + densOff;
         }
 #ifdef GM_NEBULA_CACHED_NOISE_PROBE
         // Diagnostic only, visually wrong: pin all four samplers to one noise
@@ -1352,10 +1452,10 @@ void band(uint16_t *dst, int y0, int rows, int w, uint32_t tMs, const uint8_t p[
     for (int r = 0; r < rows; r++) {
         const int y = y0 + r;
         uint16_t *row = dst + static_cast<size_t>(r) * w;
-        const uint8_t *bayerRow = &BAYER8[(y & 7) * 8];
+        const int16_t *bayerRow = &g_dith[(y & 7) * 8];
         int dith2[8];
         for (int k = 0; k < 8; k++) {
-            dith2[k] = (static_cast<int>(bayerRow[k]) - 31) / 4 + densOff;
+            dith2[k] = bayerRow[k] + densOff;
         }
         const uint8_t *rowA0 = noise + ((y + g_ayI) & 255) * 256;
         const uint8_t *rowA1 = noise + ((y + g_ayI + 1) & 255) * 256;
@@ -1530,10 +1630,11 @@ void release() {
     releaseTable(hotCDithTable, 128 * sizeof(uint16_t));
     releaseTable(hotIdxBuf, 256 * sizeof(int16_t));
 #endif
-    // The palette's content sentinel. init() resets it too, but a live
+    // The palette's content sentinels. init() resets them too, but a live
     // sentinel beside a null table is exactly the state this entry point
     // exists to prevent (see BgAnimCommon.h).
     lastThemeGen = 0xFFFFFFFF;
+    lastContrast = 0xFF;
 }
 
 } // namespace
@@ -1573,7 +1674,14 @@ extern const BgAnimation bg_anim_nebula;
 const BgAnimation bg_anim_nebula = {
     "nebula",
     "Nebula",
-    {{"speed", "Drift speed", 50}, {"density", "Density", 50}, {"turbulence", "Turbulence", 40}, {nullptr, nullptr, 0}},
+    {{"speed", "Drift speed", 50},
+     {"density", "Density", 50},
+     {"turbulence", "Turbulence", 40},
+     {"contrast", "Contrast", 50},
+     {"drift", "Drift angle", 50},
+     {"grain", "Grain", 50},
+     {"detail", "Fine detail", 50},
+     {"lspeed", "Layer speed", 50}},
     init,
     frame,
     band,

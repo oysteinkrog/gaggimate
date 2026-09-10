@@ -347,14 +347,15 @@ static void fillField4(void) {
     }
 }
 
-/* Gather call 1: full proven index range plus margin. PAD=72 in
+/* Gather call 1: full proven index range plus margin. PAD=112 in
  * AnimNebula.cpp (the palette clamp-padding proof in that file's header)
- * makes palette[v] valid for v in [-72, 327]; this sweeps exactly that
+ * makes palette[v] valid for v in [-112, 367]; this sweeps exactly that
  * range, forcing both endpoints, over 100 pixels (n4=25). palette is a ramp
- * (distinct, checkable values) offset so palette[-72] reads the buffer's
+ * (distinct, checkable values) offset so palette[-112] reads the buffer's
  * first entry, matching AnimNebula.cpp's `palette = paletteExt + PAD`
- * layout. */
-#define PAL_PAD 72
+ * layout. It was 72 and [-72, 327] until the Grain parameter widened the
+ * dither the index carries. */
+#define PAL_PAD 112
 #define PAL_N (2 * PAL_PAD + 256)
 static uint16_t g_palBuf[PAL_N];
 #define G1_N4 25
@@ -371,18 +372,18 @@ static void fillPalette(void) {
 static void fillGather1(const uint16_t *palette) {
     (void)palette;
     for (int i = 0; i < G1_N; i++) {
-        int v = -PAL_PAD + (i * 397) % (327 - (-PAL_PAD) + 1);
+        int v = -PAL_PAD + (i * 397) % (367 - (-PAL_PAD) + 1);
         g_g1_idx[i] = (int16_t)v;
     }
     g_g1_idx[0] = -PAL_PAD;
-    g_g1_idx[1] = 327;
+    g_g1_idx[1] = 367;
     g_g1_idx[G1_N - 2] = -PAL_PAD;
-    g_g1_idx[G1_N - 1] = 327;
+    g_g1_idx[G1_N - 1] = 367;
 }
 
 /* Gather call 2: production-shaped widths band() actually issues (60 for
- * w=240, 64 for w=480), values clustered near the empirically-observed
- * range [-62,318] from AnimNebula.cpp's header comment. */
+ * w=240, 64 for w=480), values clustered near the range the header's proof
+ * gives for the widest Grain gain, [-84,342]. */
 #define G2_N4 64
 #define G2_N (G2_N4 * 4)
 static int16_t g_g2_idx[G2_N];
@@ -390,7 +391,7 @@ static uint16_t g_g2_got[G2_N], g_g2_want[G2_N];
 
 static void fillGather2(void) {
     for (int i = 0; i < G2_N; i++) {
-        g_g2_idx[i] = (int16_t)(-62 + (i * 71) % (318 - (-62) + 1));
+        g_g2_idx[i] = (int16_t)(-84 + (i * 71) % (342 - (-84) + 1));
     }
 }
 
@@ -461,7 +462,7 @@ int main(void) {
     if (g_mismatches == 0) {
         uart_puts("GM_QEMUBENCH_ANIM: PASS nebulaFieldPie and nebulaGatherScalar bit-exact vs "
                   "nebulaFieldRef/nebulaGatherScalarRef (addressing boundary at the doubled-buffer "
-                  "real/copy seam, both real per-frame wA/wB/densOff extremes, full PAD=72 palette "
+                  "real/copy seam, both real per-frame wA/wB/densOff extremes, full PAD=112 palette "
                   "index range, minimal trip counts)\n");
         /* Also emit the PIE-prefixed marker run.sh's exit-code grep actually
          * looks for (see tools/qemubench/run.sh) -- ASM_BRIEF.md's own

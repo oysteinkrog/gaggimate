@@ -192,6 +192,11 @@ export const BG_ANIMATIONS = [
       { key: 'speed', label: 'Drift speed', def: 50 },
       { key: 'density', label: 'Density', def: 50 },
       { key: 'turbulence', label: 'Turbulence', def: 40 },
+      { key: 'contrast', label: 'Contrast', def: 50 },
+      { key: 'drift', label: 'Drift angle', def: 50 },
+      { key: 'grain', label: 'Grain', def: 50 },
+      { key: 'detail', label: 'Fine detail', def: 50 },
+      { key: 'lspeed', label: 'Layer speed', def: 50 },
     ],
   },
   {
