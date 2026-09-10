@@ -10,8 +10,11 @@
  *   r              -128..128   sin1024/4
  *   d              -16384..16384
  *   wid            42..86      42 + round(passage width * 0.44)
- *   dr entry       44..48      46 + Bayer offset, amplitude 2.2
- * The field f then spans -49152..49152 and the palette index 44..134.
+ *   dr entry       0..92       ground level 4..88 plus Bayer offset -4..4
+ * The field f then spans -49152..49152 and the palette index 0..178. The
+ * dither lane carries two sliders since gm-3vj.41, Ground level and Grain,
+ * which is why it reaches both palette ends; the kernel clamps neither, so
+ * the sweep below has to visit 0 and 92.
  *
  * Sweeps: every (low, r) pair, every high, every d, every wid, all eight
  * Bayer rows, the corner cross product, every production and boundary
@@ -128,9 +131,9 @@ GM_ANIM_IRAM __attribute__((noinline)) void gyroidRowAsm(
 }
 /* END VERBATIM PRODUCTION KERNEL */
 
-/* The page's pixel equation, written out. dr already carries the floor 46,
- * so this adds the clamped ramp to it exactly as bandRef's LO + max(g,0)
- * plus the Bayer offset does. */
+/* The page's pixel equation, written out. dr already carries the ground
+ * level, so this adds the clamped ramp to it exactly as bandRef's floor plus
+ * max(g,0) plus the Bayer offset does. */
 static void gyroidRowRef(uint16_t *out, const uint32_t *col, const uint16_t *pal,
                          const int32_t *dr, int r, int d, int wid, int w) {
     for (int x = 0; x < w; x++) {
@@ -200,11 +203,13 @@ int main(void) {
     for (int i = 0; i < 256; i++) palette[i] = (uint16_t)(i * 251);
     palette[0] = 0x0000;
     palette[255] = 0xffff;
-    /* The eight Bayer rows of 46 + round((BAYER8 - 31.5) / 31.5 * 2.2), whose
-     * span is the whole 44..48 the production dither can reach. */
+    /* Ground level 4..88 in even steps, one per Bayer row, plus the widest
+     * Bayer offsets -4..4 across the lanes: entry 0 in row 0 and entry 92 in
+     * row 7, so both palette ends of the index are exercised. */
+    static const int bayerOff[8] = {-4, -3, -1, 0, 1, 3, 4, 2};
     for (int row = 0; row < 8; row++)
         for (int lane = 0; lane < 8; lane++)
-            dither[row * 8 + lane] = 44 + ((row * 8 + lane) % 5);
+            dither[row * 8 + lane] = 4 + row * 12 + bayerOff[lane];
 
     uart_puts("gyroid: lengths, column offsets, destination offsets, Bayer rows\n");
     static const int lengths[] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 15, 16,

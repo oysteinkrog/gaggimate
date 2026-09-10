@@ -5149,6 +5149,11 @@ function pcDither(dst, amp) {
      flanks show the palette's own steps as bands.
    - The floor index is lifted from 40 to 46 and the ramp is a touch wider, so
      the dark ground sits inside the readable band instead of near-black.
+
+   Both softenings are sliders now, Ground level and Grain, and slider 50 is
+   the 46 and the 2.2 above. Aspect and Morph rate are the other two: one sets
+   the row cell count against the column one, the other runs the z clock on
+   its own so the section can hold still or turn three times as fast.
    --------------------------------------------------------------------------- */
 (() => {
   ANIMS.push({
@@ -5158,9 +5163,13 @@ function pcDither(dst, amp) {
       { key: 'scale', label: 'Passage size', def: 50 },
       { key: 'glow', label: 'Passage width', def: 55 },
       { key: 'bright', label: 'Brightness', def: 60 },
+      { key: 'aspect', label: 'Aspect', def: 50 },
+      { key: 'morph', label: 'Morph rate', def: 50 },
+      { key: 'floor', label: 'Ground level', def: 50 },
+      { key: 'grain', label: 'Grain', def: 50 },
     ],
     init(w, h, state) {
-      state.key = null; state.pal32 = null;
+      state.key = null; state.pal32 = null; state.dkey = null;
       state.C = new Uint32Array(w);
       state.R = new Int16Array(h);
       state.D = new Int16Array(h);
@@ -5172,25 +5181,40 @@ function pcDither(dst, amp) {
       if (state.key !== key) {
         state.key = key;
         state.pal32 = pcPal32(themeRamp(176 + Math.round(p[3] * 0.8)));
-        pcDither(state.dith, 2.2);
       }
+      // Grain is the dither amplitude: 2.2 at slider 50, written as an exact
+      // integer over 1000 so the port's float division lands on the same value.
+      const dkey = p[7];
+      if (state.dkey !== dkey) { state.dkey = dkey; pcDither(state.dith, (p[7] * 44) / 1000); }
       const pal32 = state.pal32, C = state.C, R = state.R, D = state.D, dith = state.dith;
       const sm = speedMulJS(p[0]);
       const tt = tMs * sm;
       const k = 2 + Math.round(p[1] * 0.04);        // 4 at the default: 256 px per cell
-      const tA = ((tt / 32000) * 1024) | 0;
+      // Aspect in Q8: half the column cell count at slider 0, the same at 50,
+      // double at 100. The rounding gives back exactly k at 50 for every k.
+      const aq = p[4] <= 50 ? 128 + Math.round(p[4] * 128 / 50) : 256 + Math.round((p[4] - 50) * 256 / 50);
+      const ky = Math.max(1, (k * aq + 128) >> 8);
+      // Morph rate scales the z clock alone: frozen at 0, the tuned rate at 50,
+      // three times it at 100.
+      const zm = p[5] <= 50 ? p[5] / 50 : 1 + (p[5] - 50) / 25;
+      const ticks = (tt / 32000) * 1024;
+      const tA = ticks | 0;
       const tB = ((tt / 64000) * 1024) | 0;
-      const z = SIN[tA & 1023], zc = SIN[(tA + 256) & 1023];
+      const tZ = (ticks * zm) | 0;
+      const z = SIN[tZ & 1023], zc = SIN[(tZ + 256) & 1023];
       for (let x = 0; x < w; x++) {
         const A = k * x - tA;
         C[x] = (((16384 + ((z * SIN[(A + 256) & 1023]) >> 4)) << 16) | (128 + (SIN[A & 1023] >> 2))) >>> 0;
       }
       for (let y = 0; y < h; y++) {
-        const B = k * y - tB;
+        const B = ky * y - tB;
         R[y] = SIN[(B + 256) & 1023] >> 2;
         D[y] = (SIN[B & 1023] * zc) >> 4;
       }
-      const lo = 46;
+      // Ground level: 4 at slider 0, the softened 46 at 50, 88 at 100. The
+      // bottom stop of 4 keeps floor plus the deepest Bayer offset at or above
+      // palette index 0, which is what the port's vector kernel relies on.
+      const lo = 4 + Math.round(p[6] * 84 / 100);
       const wid = 42 + Math.round(p[2] * 0.44);     // 66 at the default
       let ro = 0;
       for (let y = 0; y < h; y++, ro += w) {

@@ -546,6 +546,10 @@ export const BG_ANIMATIONS = [
       { key: 'scale', label: 'Passage size', def: 50 },
       { key: 'glow', label: 'Passage width', def: 55 },
       { key: 'bright', label: 'Brightness', def: 60 },
+      { key: 'aspect', label: 'Aspect', def: 50 },
+      { key: 'morph', label: 'Morph rate', def: 50 },
+      { key: 'floor', label: 'Ground level', def: 50 },
+      { key: 'grain', label: 'Grain', def: 50 },
     ],
   },
   {
