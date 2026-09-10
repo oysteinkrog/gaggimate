@@ -3257,21 +3257,24 @@ const pa_dith = (x, y) => (BAYER8[(y & 7) * 8 + (x & 7)] - 31.5) * (1 / 64);
     params: [
       { key: 'speed', label: 'Speed', def: 50 },
       { key: 'density', label: 'Shaft count', def: 50 },
-      { key: 'brightness', label: 'Brightness', def: 66 }],
+      { key: 'brightness', label: 'Brightness', def: 66 },
+      { key: 'contrast', label: 'Contrast', def: 50 },
+      { key: 'falloff', label: 'Falloff', def: 50 },
+      { key: 'reach', label: 'Reach', def: 50 },
+      { key: 'breath', label: 'Breath', def: 50 },
+      { key: 'sway', label: 'Sway', def: 50 }],
     init(w, h, state) {
       state.map = new Uint16Array(w * h);
       state.tex = new Uint32Array(A_N * D_N);
       state.ray = new Uint8Array(A_N);
+      // The fade is built by render(), which is the only place the parameters
+      // are visible. Monotone, and shallow. The cap that kept the top readable
+      // used to be a rise over the first five cells, and that rise was 21
+      // units per cell, about 13 palette steps: those were the steps banding
+      // across the shafts. Falling from 178 to 82 over 32 cells is 3 units per
+      // cell, about 2 palette steps, which the map's dither absorbs.
       state.fall = new Uint8Array(D_N);
-      for (let d = 0; d < D_N; d++) {
-        // Monotone, and shallow. The cap that kept the top readable used to be
-        // a rise over the first five cells, and that rise was 21 units per
-        // cell, about 13 palette steps: those were the steps banding across
-        // the shafts. Falling from 178 to 82 over 32 cells is 3 units per
-        // cell, about 2 palette steps, which the map's dither absorbs.
-        const u = d / (D_N - 1);
-        state.fall[d] = Math.round(82 + 96 * Math.pow(1 - u, 1.15));
-      }
+      state.fkey = null;
       const angK = (A_N - 1) / SPAN, half = SPAN * 0.5;
       const distK = (D_N - 1) / (D_HI - D_LO);
       for (let y = 0, i = 0; y < h; y++) {
@@ -3291,22 +3294,44 @@ const pa_dith = (x, y) => (BAYER8[(y & 7) * 8 + (x & 7)] - 31.5) * (1 / 64);
     render(data, w, h, tMs, p, state) {
       const key = p[2] + '|' + THEME.gen;
       if (state.key !== key) { state.key = key; state.pal = pa_ramp32(pa_bright(p[2])); }
+      // A slider mapped onto a constant this entry used to hard-code: lo at 0,
+      // exactly mid at 50, hi at 100. Same shape as paramSpan in
+      // AnimShafts.cpp, added with the five sliders on 2026-09-10.
+      const pspan = (v, lo, mid, hi) => v === 50 ? mid :
+        (v < 50 ? lo + (mid - lo) * (v / 50) : mid + (hi - mid) * ((v - 50) / 50));
+      // Falloff and Reach own the 32-entry distance fade: the exponent of the
+      // curve, and how bright the far end still is. Rebuilt only when one of
+      // the two sliders moves.
+      const fkey = p[4] + '|' + p[5];
+      if (state.fkey !== fkey) {
+        state.fkey = fkey;
+        const expo = pspan(p[4], 0.35, 1.15, 3.0), lo = pspan(p[5], 0, 82, 178);
+        for (let d = 0; d < D_N; d++) {
+          const u = d / (D_N - 1);
+          state.fall[d] = Math.round(lo + (178 - lo) * Math.pow(1 - u, expo));
+        }
+      }
       const spd = speedMulJS(p[0]);
       const t = tMs * spd;
       // k2 is the sharpest harmonic the 128 angle steps carry without striping
       // at the bottom edge; the knob runs it from 16 to 32 around the spec's 24.
       const k2 = 16 + Math.round(p[1] * 16 / 100);
       const k1 = k2 / 3, k3 = k2 / 8;
-      const sway = Math.round(60 * Math.sin(t * (2 * Math.PI / 20000) + 1.1));
+      // Contrast is a Q8 scale on the profile's swing, 256 (no change) at 50.
+      // Breath is the amplitude of the 9 s gain swing, 32 at 50. Sway is the
+      // amplitude of the 20 s side to side swing, 60 at 50.
+      const cQ8 = (p[3] * 256 / 50) | 0;
+      const breath = (p[6] * 32 / 50) | 0;
+      const sway = Math.round(pspan(p[7], 0, 60, 150) * Math.sin(t * (2 * Math.PI / 20000) + 1.1));
       const p2 = Math.round(t * 0.100) | 0;      // one shaft width per 15 s
       const p3 = Math.round(t * 0.028) | 0;
-      const gain = 200 + (SIN[(Math.round(t * (1024 / 9000)) + 300) & (SIN_N - 1)] >> 4);
+      const gain = 200 + ((SIN[(Math.round(t * (1024 / 9000)) + 300) & (SIN_N - 1)] * breath) >> 9);
       const { ray, fall, tex, pal, map } = state;
       for (let a = 0; a < A_N; a++) {
         const s = SIN[(Math.round(a * k1) + sway + p3) & (SIN_N - 1)] +
           (SIN[(Math.round(a * k2) + p2) & (SIN_N - 1)] >> 1) +
           SIN[(Math.round(a * k3) + p3) & (SIN_N - 1)];
-        const v = (s + 1280) >> 3;
+        const v = (((s * cQ8) >> 8) + 1280) >> 3;
         ray[a] = v < 0 ? 0 : v > 255 ? 255 : v;
       }
       for (let a = 0, c = 0; a < A_N; a++) {

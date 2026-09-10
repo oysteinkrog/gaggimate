@@ -12,6 +12,11 @@
 // including Bayer8 dithering of BOTH map coordinates, is the reference here.
 // Coordinates stay in the page's fixed pixel space even at smaller render
 // sizes: SX/SY and the distance bounds do not scale with w/h in its init().
+//
+// Eight sliders since 2026-09-10 (gm-3vj.29). The five added ones all act on
+// frame()'s per-frame constants or on the 32-entry fade, so band() and both
+// hand-written kernels are untouched, and each reproduces a constant this file
+// used to hard-code when its slider sits at 50.
 
 #include "BgAnim.h"
 #include "BgAnimCommon.h"
@@ -38,6 +43,10 @@ constexpr float SX = 240.0f, SY = -160.0f;
 constexpr float PI = 3.14159265358979323846f;
 constexpr float SPAN = 100.0f * PI / 180.0f; // 100 degree angular window
 constexpr float D_LO = 160.0f, D_HI = 700.0f;
+// Brightest fade cell, at the source end of the fan. The Reach slider moves
+// the far end up toward it; the near end never moves, so fall[] stays <= 178
+// and the two Q8 products below stay inside a uint16 lane.
+constexpr float FALL_HI = 178.0f;
 
 uint16_t *map = nullptr;
 uint16_t *tex = nullptr;
@@ -50,6 +59,7 @@ uint16_t *indices = nullptr;
 const int16_t *sl = nullptr; // borrowed shared sine table, never released here
 int allocW = 0, allocH = 0;
 int lastBrightness = -1;
+int lastFallKey = -1;
 uint32_t lastThemeGen = 0xFFFFFFFF;
 
 // Table budget at 480 x 480:
@@ -105,10 +115,10 @@ bool init(int w, int h) {
         return false;
     }
 
-    for (int d = 0; d < D_N; d++) {
-        const float u = static_cast<float>(d) / (D_N - 1);
-        fall[d] = static_cast<uint16_t>(82.0f + 96.0f * powf(1.0f - u, 1.15f) + 0.5f);
-    }
+    // fall[] is built by frame(), which is the only place the parameters are
+    // visible; lastFallKey == -1 makes the first frame after this init build
+    // it. band() is never called before frame(), which is the same contract
+    // the palette above already relies on.
     const float angK = (A_N - 1) / SPAN;
     const float half = SPAN * 0.5f;
     const float distK = (D_N - 1) / (D_HI - D_LO);
@@ -127,6 +137,18 @@ bool init(int w, int h) {
         }
     }
     return true;
+}
+
+// A slider mapped onto a value this file used to hard-code: lo at 0, exactly
+// mid at 50, hi at 100. The literal return at 50 is what keeps the default
+// output bit exact, because lo + (mid - lo) * (50 / 50.0f) is not always mid
+// in float and one changed low bit in the fade moves a palette index.
+float paramSpan(uint8_t v, float lo, float mid, float hi) {
+    if (v == 50) {
+        return mid;
+    }
+    return v < 50 ? lo + (mid - lo) * (static_cast<float>(v) * (1.0f / 50.0f))
+                  : mid + (hi - mid) * (static_cast<float>(v - 50) * (1.0f / 50.0f));
 }
 
 // Math.round for positive phase, then modulo one 1024-entry sine turn.
@@ -184,8 +206,10 @@ GM_ANIM_IRAM __attribute__((noinline)) void shaftsGatherAsm(uint16_t *out, const
 // index[d] = (ray * ((fall[d] * gain) >> 8)) >> 8.
 // All operands are byte-valued but widened to uint16 lanes. Even the wider
 // synthetic 0..255 test range has intermediate products <=65025, so neither
-// multiply loses bits beyond the specified SAR=8 shifts. In production,
-// fall<=178, gain<=232 and ray<=255 imply index<=160, inside palette[256].
+// multiply loses bits beyond the specified SAR=8 shifts. In production, with
+// every slider at either end, fall<=178, gain<=264 and ray<=255, so the two
+// products are at most 46,992 and 46,665, both inside a uint16 lane, and the
+// index reaches 182, inside palette[256].
 //
 // All three spans start at aligned offsets in the explicitly aligned work
 // allocation. Each vld/vst spans exactly 16 bytes and advances by 16; there
@@ -232,21 +256,49 @@ void frame(uint32_t tMs, int, int, const uint8_t p[BG_ANIM_PARAMS]) {
         lastBrightness = p[2];
         lastThemeGen = gen;
     }
+    // Falloff (p[4]) and Reach (p[5]) own the distance fade. Rebuilt here and
+    // not in init(), which never sees the parameters: 32 powf calls when a
+    // slider moves and none per frame. The bench's warm-up frame absorbs the
+    // first build, so the libm count per timed frame is what it always was.
+    const int fallKey = static_cast<int>(p[4]) | (static_cast<int>(p[5]) << 8);
+    if (lastFallKey != fallKey) {
+        const float expo = paramSpan(p[4], 0.35f, 1.15f, 3.0f);
+        const float lo = paramSpan(p[5], 0.0f, 82.0f, FALL_HI);
+        const float span = FALL_HI - lo; // exactly 96.0f at the default
+        for (int d = 0; d < D_N; d++) {
+            const float u = static_cast<float>(d) / (D_N - 1);
+            fall[d] = static_cast<uint16_t>(lo + span * powf(1.0f - u, expo) + 0.5f);
+        }
+        lastFallKey = fallKey;
+    }
     const float t = static_cast<float>(tMs) * speedMul(p[0]);
     const int k2 = 16 + (static_cast<int>(p[1]) * 16 + 50) / 100; // sharp harmonic, 16..32
-    // Sway: +/-60 sine-table units, 20 s cycle, initial phase 1.1 rad.
-    // floor(v+0.5) preserves JS Math.round's negative-half tie rule.
-    const int sway = static_cast<int>(floorf(60.0f * sinf(t * (2.0f * PI / 20000.0f) + 1.1f) + 0.5f));
+    // Contrast (p[3]) is a Q8 scale on the shaft profile's swing, 0 at slider
+    // 0 and 512 at 100. At 256 the multiply and the shift cancel exactly for
+    // every value the sum can take, so the default needs no special case.
+    const int cQ8 = (static_cast<int>(p[3]) * 256) / 50;
+    // Breath (p[6]) is the amplitude of the 9 s brightness swing, 0..64 units
+    // around 200. At 32 the product and shift are exactly the old sl >> 4.
+    const int breath = (static_cast<int>(p[6]) * 32) / 50;
+    // Sway (p[7]) is the amplitude of the side to side swing, 0 to 150
+    // sine-table units around the old 60, on a 20 s cycle with an initial
+    // phase of 1.1 rad. floor(v+0.5) preserves JS Math.round's negative-half
+    // tie rule.
+    const float swayAmp = paramSpan(p[7], 0.0f, 60.0f, 150.0f);
+    const int sway = static_cast<int>(floorf(swayAmp * sinf(t * (2.0f * PI / 20000.0f) + 1.1f) + 0.5f));
     const uint32_t p2 = phase1024(t * 0.100f); // 100 units/s, a shaft width per 15 s in the page
     const uint32_t p3 = phase1024(t * 0.028f); // 28 units/s, independent broad harmonics
-    const int gain = 200 + (sl[(phase1024(t * (1024.0f / 9000.0f)) + 300) & (SIN_N - 1)] >> 4);
-    // gain is 168..232 with a 9 s breath and a 300-unit initial phase.
+    const int gain = 200 + ((sl[(phase1024(t * (1024.0f / 9000.0f)) + 300) & (SIN_N - 1)] * breath) >> 9);
+    // gain is 168..232 at the default breath, 200 flat at 0 and 136..264 at
+    // 100, with a 9 s period and a 300-unit initial phase.
     for (int a = 0; a < A_N; a++) {
         // Exact integer Math.round(a*k2/3) and Math.round(a*k2/8).
         const int s = sl[((a * k2 + 1) / 3 + sway + p3) & (SIN_N - 1)] +
                       (sl[(a * k2 + p2) & (SIN_N - 1)] >> 1) +
                       sl[((a * k2 + 4) / 8 + p3) & (SIN_N - 1)];
-        const int v = (s + 1280) >> 3; // +/-1280 sum -> 0..320, clipped to byte profile
+        // +/-1280 sum at contrast 50, so 0..320 clipped to the byte profile;
+        // flat at 160 with the scale at 0 and -160..480 with it at 512.
+        const int v = (((s * cQ8) >> 8) + 1280) >> 3;
         ray[a] = static_cast<uint8_t>(v < 0 ? 0 : (v > 255 ? 255 : v));
     }
 #if GM_BGANIM_SHAFTS_ASM && defined(__XTENSA__) && !defined(GM_BGANIM_NO_ASM)
@@ -297,6 +349,7 @@ void release() {
     sl = nullptr;
     allocW = allocH = 0;
     lastBrightness = -1;
+    lastFallKey = -1;
     lastThemeGen = 0xFFFFFFFF;
 }
 
@@ -309,7 +362,11 @@ const BgAnimation bg_anim_shafts = {
     {{"speed", "Speed", 50},
      {"density", "Shaft count", 50},
      {"brightness", "Brightness", 66},
-     {nullptr, nullptr, 0}},
+     {"contrast", "Contrast", 50},
+     {"falloff", "Falloff", 50},
+     {"reach", "Reach", 50},
+     {"breath", "Breath", 50},
+     {"sway", "Sway", 50}},
     init,
     frame,
     band,

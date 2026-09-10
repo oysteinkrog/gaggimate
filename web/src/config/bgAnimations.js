@@ -365,6 +365,11 @@ export const BG_ANIMATIONS = [
       { key: 'speed', label: 'Speed', def: 50 },
       { key: 'density', label: 'Shaft count', def: 50 },
       { key: 'brightness', label: 'Brightness', def: 66 },
+      { key: 'contrast', label: 'Contrast', def: 50 },
+      { key: 'falloff', label: 'Falloff', def: 50 },
+      { key: 'reach', label: 'Reach', def: 50 },
+      { key: 'breath', label: 'Breath', def: 50 },
+      { key: 'sway', label: 'Sway', def: 50 },
     ],
   },
   {
