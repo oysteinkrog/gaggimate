@@ -819,13 +819,24 @@ ANIMS.push({
   id: 'caustics', name: 'Caustics',
   params: [
     {key:'speed',label:'Drift speed',def:50},{key:'scale',label:'Cell scale',def:45},
-    {key:'contrast',label:'Contrast',def:55}],
+    {key:'contrast',label:'Contrast',def:55},{key:'glow',label:'Glow',def:50},
+    {key:'spot',label:'Spot size',def:50},{key:'spread',label:'Wave spread',def:50},
+    {key:'tilt',label:'Pattern tilt',def:50},{key:'turn',label:'Turn rate',def:50}],
   init(w, h, state) {
     state.baseAngle = [0.35, 2.55, 4.55];
     state.angDrift = [0.014, -0.010, 0.007];
     state.phase0 = [0.0, 2.1, 4.6];
     state.freqBase = [0.046, 0.061, 0.037];
     state.speedMul = [1.0, 0.82, 1.28];
+    state.angMean = 2.4833333;
+    // Mirror of AnimCaustics.cpp's paramSpan: lo at 0, mid at 50, hi at 100,
+    // and the mid literal itself at 50 so the defaults are the old picture.
+    state.pspan = (v, lo, mid, hi) => {
+      const d = v - 50;
+      if (d === 0) return mid;
+      const f = d/50;
+      return d < 0 ? mid + (mid - lo)*f : mid + (hi - mid)*f;
+    };
     state._gen = -1;
   },
   render(data, w, h, tMs, p, state) {
@@ -835,9 +846,16 @@ ANIMS.push({
     const speedScale = 0.8*speedMulJS(p[0]);
     const thresh = 0.14 + 0.55*(p[2]/100);
     const invSpan = 1/Math.max(1e-3, 1-thresh);
+    const pspan = state.pspan;
+    const glow = pspan(p[3], 0.25, 1.0, 3.0);
+    const shapeExp = pspan(p[4], 6.0, 2.0, 0.6);
+    const spread = pspan(p[5], -1.0, 0.0, 1.0);
+    const tilt = pspan(p[6], -1.5707963, 0.0, 1.5707963);
+    const turn = pspan(p[7], 0.0, 1.0, 4.0);
     const cosA = [], sinA = [], freq = [], phase0Row = [], step = [];
     for (let k = 0; k < 3; k++) {
-      const ang = state.baseAngle[k] + state.angDrift[k]*t;
+      const ang = state.baseAngle[k] + (state.baseAngle[k] - state.angMean)*spread + tilt
+                + state.angDrift[k]*turn*t;
       cosA[k] = Math.cos(ang); sinA[k] = Math.sin(ang);
       freq[k] = state.freqBase[k]*freqScale;
       phase0Row[k] = state.phase0[k] + t*speedScale*state.speedMul[k]*2.0;
@@ -853,7 +871,8 @@ ANIMS.push({
         for (let k = 0; k < 3; k++) { sum += Math.sin(proj[k]); proj[k] += step[k]; }
         let bright = (Math.abs(sum/3)-thresh)*invSpan;
         bright = bright < 0 ? 0 : bright > 1 ? 1 : bright;
-        bright *= bright;
+        bright = shapeExp === 2.0 ? bright*bright : Math.pow(bright, shapeExp);
+        if (glow !== 1.0) { bright *= glow; if (bright > 1) bright = 1; }
         const li = (bright*255)|0;
         const r = pal[li*3], g = pal[li*3+1], b = pal[li*3+2];
         const dith = (BAYER4[(y&3)*4+(x&3)]-7.5)*0.5;

@@ -146,6 +146,23 @@
 // 9.01/9.01/9.01 after the GRID change), so min_ms is what this pass
 // tracked and first_ms is reported for completeness only.
 
+// Parameter pass (2026-09-10, gm-3vj.9): five more sliders, taking this
+// animation from 3 to 8. Every one of them acts in frame(), either on the
+// three waves' angles or on the shaping table frame() rebuilds, so the
+// portable pixel loop and the hand-written Xtensa kernel below are byte for
+// byte what they were. Each new slider defaults to 50, and paramSpan()
+// returns its middle argument as a literal at 50, so the default arithmetic
+// collapses to the constant this file hard-coded before: the angle terms
+// add a literal 0.0f, the turn rate multiplies by a literal 1.0f, and the
+// shaping loop takes the branch that writes the original expression. The
+// default output is therefore the old output bit for bit, which is what the
+// golden frames check.
+//
+// shapeLUT is no longer rebuilt on every frame. It used to be 1,552 cheap
+// iterations; the edge softness slider makes it 1,552 powf calls away from
+// the default, so the rebuild is now gated on the three values that shape
+// it moving (see g_lastThresh below).
+
 #include "BgAnim.h"
 #include "BgAnimCommon.h"
 #include <math.h>
@@ -159,6 +176,27 @@ constexpr float ANG_DRIFT[K] = {0.014f, -0.010f, 0.007f};
 constexpr float PHASE0[K] = {0.0f, 2.1f, 4.6f};
 constexpr float FREQ_BASE[K] = {0.046f, 0.061f, 0.037f};
 constexpr float SPEED_MUL[K] = {1.0f, 0.82f, 1.28f};
+
+// The mean of BASE_ANGLE, the pivot the wave spread slider scales the three
+// angles about. Written out rather than computed so the constant folding is
+// visible: (0.35 + 2.55 + 4.55) / 3.
+constexpr float ANG_MEAN = 2.4833333f;
+
+// A 0-100 slider as a piecewise linear value with an exact midpoint: lo at
+// 0, mid at 50, hi at 100, and at 50 it returns the mid literal itself
+// rather than an expression that happens to round to it. Every slider this
+// file gained on 2026-09-10 defaults to 50 and either scales or offsets a
+// constant that was hard-coded before, so the `d == 0` branch is what makes
+// the unchanged default a guarantee instead of a hope about float rounding.
+// Called five times per frame, never per row and never per pixel.
+inline float paramSpan(uint8_t v, float lo, float mid, float hi) {
+    const int d = static_cast<int>(v) - 50;
+    if (d == 0) {
+        return mid;
+    }
+    const float f = d / 50.0f;
+    return d < 0 ? mid + (mid - lo) * f : mid + (hi - mid) * f;
+}
 
 // DDS phase scale: a uint32_t phase accumulator's full range (2^32) maps to
 // one full circle (2*pi radians), same convention as AnimEmber's STEP1/2/3.
@@ -236,6 +274,14 @@ uint32_t g_stepQ[K];    // per-pixel (x) phase step, DDS units
 int8_t ditherI[DITHER_N]; // (BAYER4[i]-7.5)*0.5, precomputed once at init
 uint8_t *shapeLUT = nullptr;
 
+// What shapeLUT was last built for. The initial triple is unreachable
+// (thresh is 0.14..0.69, the exponent 0.6..6.0, the gain 0.25..3.0), so the
+// first frame after every init() rebuilds; release() puts it back.
+constexpr float SHAPE_NEVER_BUILT = -1.0f;
+float g_lastThresh = SHAPE_NEVER_BUILT;
+float g_lastShapeExp = SHAPE_NEVER_BUILT;
+float g_lastGlow = SHAPE_NEVER_BUILT;
+
 void buildThemePalette() {
     // Sampled at SHADE_LEVELS positions spread across the full 0..255 theme
     // gradient (li*255/(SHADE_LEVELS-1), integer division -- this runs once
@@ -298,6 +344,9 @@ bool init(int, int) {
     }
     buildThemePalette();
     lastThemeGen = themeGen();
+    g_lastThresh = SHAPE_NEVER_BUILT;
+    g_lastShapeExp = SHAPE_NEVER_BUILT;
+    g_lastGlow = SHAPE_NEVER_BUILT;
     return true;
 }
 
@@ -325,9 +374,30 @@ void frame(uint32_t tMs, int, int, const uint8_t p[BG_ANIM_PARAMS]) {
     const float speedScale = 0.8f * speedMul(p[0]);
     const float thresh = 0.14f + 0.55f * (p[2] / 100.0f); // p[2] = "contrast" param
     const float invSpan = 1.0f / fmaxf(1e-3f, 1.0f - thresh);
+    // p[3] "glow": gain on the shaped brightness, clamped at full. Dim, thin
+    // filaments at 0, wide saturated webs at 100.
+    const float glow = paramSpan(p[3], 0.25f, 1.0f, 3.0f);
+    // p[4] "spot": the shaping exponent, which sets how fast a lit spot
+    // falls off from its centre and so how large it reads. 6.0 at 0 is a
+    // hard bright point, the hard-coded 2.0 at 50, 0.6 at 100 a wide soft
+    // blob. Cell scale (p[1]) sets how far apart the spots sit; this sets
+    // how much of each cell one fills.
+    const float shapeExp = paramSpan(p[4], 6.0f, 2.0f, 0.6f);
+    // p[5] "spread": scales the three wave angles about their mean. At 0 all
+    // three collapse onto one heading and the picture is banded stripes; at
+    // 100 they are twice as far apart and the web is wider meshed.
+    const float spread = paramSpan(p[5], -1.0f, 0.0f, 1.0f);
+    // p[6] "tilt": one rotation added to every wave, a quarter turn each way.
+    const float tilt = paramSpan(p[6], -1.5707963f, 0.0f, 1.5707963f);
+    // p[7] "turn": how fast the headings drift, 0 for a fixed orientation and
+    // 4x the hard-coded rate at 100.
+    const float turn = paramSpan(p[7], 0.0f, 1.0f, 4.0f);
 
     for (int k = 0; k < K; k++) {
-        const float ang = BASE_ANGLE[k] + ANG_DRIFT[k] * t;
+        // At the defaults spread and tilt are literal zeros and turn a
+        // literal one, so this is BASE_ANGLE[k] + ANG_DRIFT[k] * t, the same
+        // bits as before.
+        const float ang = BASE_ANGLE[k] + (BASE_ANGLE[k] - ANG_MEAN) * spread + tilt + ANG_DRIFT[k] * turn * t;
         const float cosA = fastCosRad(ang);
         const float sinA = fastSinRad(ang);
         const float freq = FREQ_BASE[k] * freqScale; // rad/pixel
@@ -345,11 +415,23 @@ void frame(uint32_t tMs, int, int, const uint8_t p[BG_ANIM_PARAMS]) {
     // value shapeLUT[SHAPE_MAX] would hold, so band() never needs to clamp
     // mag.
     constexpr float NORM = 1.0f / static_cast<float>(SHAPE_MAX);
-    for (int i = 0; i < SHAPE_N; i++) {
-        float bright = (i * NORM - thresh) * invSpan;
-        bright = bright < 0 ? 0 : (bright > 1 ? 1 : bright);
-        bright *= bright;
-        shapeLUT[i] = static_cast<uint8_t>(bright * static_cast<float>(SHADE_LEVELS - 1) + 0.5f);
+    if (thresh != g_lastThresh || shapeExp != g_lastShapeExp || glow != g_lastGlow) {
+        for (int i = 0; i < SHAPE_N; i++) {
+            float bright = (i * NORM - thresh) * invSpan;
+            bright = bright < 0 ? 0 : (bright > 1 ? 1 : bright);
+            // The default exponent takes the multiply, not powf: powf(x, 2.0f)
+            // is not required to return x * x to the last bit, and the golden
+            // frames are checked against the bits this file wrote before.
+            bright = shapeExp == 2.0f ? bright * bright : powf(bright, shapeExp);
+            if (glow != 1.0f) {
+                bright *= glow;
+                bright = bright > 1 ? 1 : bright;
+            }
+            shapeLUT[i] = static_cast<uint8_t>(bright * static_cast<float>(SHADE_LEVELS - 1) + 0.5f);
+        }
+        g_lastThresh = thresh;
+        g_lastShapeExp = shapeExp;
+        g_lastGlow = glow;
     }
 }
 
@@ -692,6 +774,9 @@ void release() {
     releaseTable(rgbLUT, static_cast<size_t>(DITHER_N) * SHADE_LEVELS * sizeof(uint16_t));
     releaseTable(shapeLUT, static_cast<size_t>(SHAPE_N));
     lastThemeGen = 0xFFFFFFFF;
+    g_lastThresh = SHAPE_NEVER_BUILT;
+    g_lastShapeExp = SHAPE_NEVER_BUILT;
+    g_lastGlow = SHAPE_NEVER_BUILT;
 }
 
 } // namespace
@@ -700,7 +785,14 @@ extern const BgAnimation bg_anim_caustics;
 const BgAnimation bg_anim_caustics = {
     "caustics",
     "Caustics",
-    {{"speed", "Drift speed", 50}, {"scale", "Cell scale", 45}, {"contrast", "Contrast", 55}, {nullptr, nullptr, 0}},
+    {{"speed", "Drift speed", 50},
+     {"scale", "Cell scale", 45},
+     {"contrast", "Contrast", 55},
+     {"glow", "Glow", 50},
+     {"spot", "Spot size", 50},
+     {"spread", "Wave spread", 50},
+     {"tilt", "Pattern tilt", 50},
+     {"turn", "Turn rate", 50}},
     init,
     frame,
     band,

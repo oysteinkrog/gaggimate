@@ -106,6 +106,11 @@ export const BG_ANIMATIONS = [
       { key: 'speed', label: 'Drift speed', def: 50 },
       { key: 'scale', label: 'Cell scale', def: 45 },
       { key: 'contrast', label: 'Contrast', def: 55 },
+      { key: 'glow', label: 'Glow', def: 50 },
+      { key: 'spot', label: 'Spot size', def: 50 },
+      { key: 'spread', label: 'Wave spread', def: 50 },
+      { key: 'tilt', label: 'Pattern tilt', def: 50 },
+      { key: 'turn', label: 'Turn rate', def: 50 },
     ],
   },
   {
