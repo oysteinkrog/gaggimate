@@ -3123,7 +3123,11 @@ const pa_dith = (x, y) => (BAYER8[(y & 7) * 8 + (x & 7)] - 31.5) * (1 / 64);
     params: [
       { key: 'speed', label: 'Speed', def: 50 },
       { key: 'scale', label: 'Blotch scale', def: 50 },
-      { key: 'brightness', label: 'Brightness', def: 62 }],
+      { key: 'brightness', label: 'Brightness', def: 62 },
+      { key: 'contrast', label: 'Contrast', def: 50 },
+      { key: 'rays', label: 'Rays', def: 50 },
+      { key: 'vignette', label: 'Vignette', def: 50 },
+      { key: 'sweep', label: 'Sweep', def: 50 }],
     init(w, h, state) {
       state.map = new Uint16Array(w * h);
       state.tex = new Uint32Array(A_N * R_N);
@@ -3131,17 +3135,12 @@ const pa_dith = (x, y) => (BAYER8[(y & 7) * 8 + (x & 7)] - 31.5) * (1 / 64);
       // A ring vignette, not a centre-bright one. Every angular cell is a
       // constant-angle wedge, so a bright middle turns the blotches into rays
       // radiating out of it; peaking the gain at about half radius instead
-      // leaves them reading as blotches.
+      // leaves them reading as blotches. Vignette moves its floor and Contrast
+      // sets the level window, so render() fills both tables.
       state.rimDim = new Uint8Array(R_N);
-      for (let r = 0; r < R_N; r++) {
-        const u = r / (R_N - 1), d = (u - 0.52) / 0.52;
-        state.rimDim[r] = Math.round(104 + 132 * Math.pow(Math.max(0, 1 - d * d), 0.6));
-      }
-      // The source values compressed into 40..209 before the vignette, so the
-      // brightest blotch lands near palette 175 and never blows out.
       state.raw = new Uint8Array(A_N * R_N);
       state.lev = new Uint8Array(256);
-      for (let v = 0; v < 256; v++) state.lev[v] = 44 + ((v * 132) >> 8);
+      state.levKey = -1; state.rimKey = -1;
       const cx = w * 0.5 - 0.5, cy = h * 0.5 - 0.5;
       for (let y = 0, i = 0; y < h; y++) {
         const dy = y - cy;
@@ -3167,12 +3166,37 @@ const pa_dith = (x, y) => (BAYER8[(y & 7) * 8 + (x & 7)] - 31.5) * (1 / 64);
     render(data, w, h, tMs, p, state) {
       const key = p[2] + '|' + THEME.gen;
       if (state.key !== key) { state.key = key; state.pal = pa_ramp32(pa_bright(p[2])); }
+      // Contrast is the width of the level window, held about the midpoint
+      // 110: the page's own 44..175 at 50, one flat level at 0, the whole
+      // 0..255 range at 100.
+      if (state.levKey !== p[3]) {
+        state.levKey = p[3];
+        let span = Math.floor((264 * p[3] + 50) / 100);
+        if (span > 255) span = 255;
+        let base = 110 - (span >> 1);
+        if (base < 0) base = 0;
+        if (base + span > 255) span = 255 - base;
+        for (let v = 0; v < 256; v++) state.lev[v] = base + ((v * span) >> 8);
+      }
+      // Vignette is the central floor under the ring gain, which always peaks
+      // at 236 at radius 0.52: floor 104 at 50, 208 at 0 (nearly flat, the
+      // whole face lit), 0 at 100 (centre and rim both at the darkest tone).
+      if (state.rimKey !== p[5]) {
+        state.rimKey = p[5];
+        const fl = Math.floor(((100 - p[5]) * 208 + 50) / 100), sp = 236 - fl;
+        for (let r = 0; r < R_N; r++) {
+          const u = r / (R_N - 1), d = (u - 0.52) / 0.52;
+          state.rimDim[r] = Math.round(fl + sp * Math.pow(Math.max(0, 1 - d * d), 0.6));
+        }
+      }
       const spd = speedMulJS(p[0]);
       // One wrap of the source patch every 30 s across the wedge, and about one
       // revolution of the figure every 4 minutes along the folded angle.
       const oy = Math.round(tMs * 0.0032 * spd) | 0;
       // The figure opens and closes about its mirror axis once every 40 s.
-      const ox = Math.round(tMs * 0.0016 * spd) | 0;
+      // Sweep scales that rate on its own: 1x at 50, still at 0, twice as
+      // fast at 100.
+      const ox = Math.round(tMs * (0.0016 * (p[6] / 50)) * spd) | 0;
       const scA = 2 + Math.round(p[1] * 2 / 100);    // blotch size, angular
       const scR = 4 + Math.round(p[1] * 4 / 100);    // and radial
       const { tex, src, pal, rimDim, lev, map } = state;
@@ -3182,10 +3206,16 @@ const pa_dith = (x, y) => (BAYER8[(y & 7) * 8 + (x & 7)] - 31.5) * (1 / 64);
       // starburst; scaled, the blotches are about the same size at every
       // radius and the figure reads as blotches.
       const raw = state.raw;
+      // Rays is the Q4 weight the radius carries into the angular source
+      // term. 16 at 50, the term the page was written with; 0 reads one
+      // angular position across the whole wedge and the face collapses into
+      // plain concentric rings; 32 sweeps twice as far across the wedge at
+      // the rim as at the centre and sharpens the figure into a spiked star.
+      const rw = Math.floor((32 * p[4] + 50) / 100);
       for (let a = 0, c = 0; a < A_N; a++) {
         const aSh = (a + ox) * scA;
         for (let r = 0; r < R_N; r++, c++) {
-          const sa = ((aSh * (r + 5)) >> 9) & (SRC - 1);
+          const sa = ((aSh * (((r * rw) >> 4) + 5)) >> 9) & (SRC - 1);
           raw[c] = lev[src[sa * SRC + (((r * scR >> 3) + oy) & (SRC - 1))]];
         }
       }

@@ -18,6 +18,15 @@
 // Xtensa's fused multiply-add can also round noise differently from the
 // host. Both device render paths share those tables, so this never weakens
 // their required pixel-exact parity. No floating point runs in band().
+//
+// Seven parameters (gm-3vj.28). Speed, Blotch scale and Brightness are the
+// original three. Contrast sets the width of the level window, Rays the
+// weight the radius carries in the angular source term, Vignette the floor
+// under the ring gain, and Sweep the rate of the angular drift. All four act
+// in frame(), on the tables and the per-frame constants the band loop already
+// reads, so band(), bandRef() and both Xtensa kernels are untouched. At 50
+// each one reproduces a constant this file used to hard-code, so the default
+// output is the old output bit for bit.
 
 #include "BgAnim.h"
 #include "BgAnimCommon.h"
@@ -62,6 +71,8 @@ uint8_t *lev = nullptr;      // 256 byte level compression, PSRAM
 uint16_t *palette = nullptr; // 256 RGB565 entries, frame() only, PSRAM
 int allocW = 0, allocH = 0;
 int lastBrightness = -1;
+int lastContrast = -1;
+int lastVignette = -1;
 uint32_t lastThemeGen = 0xFFFFFFFF;
 
 // At 480x480: tex 8192 B is the entire hot-slab allocation, below 9216 B.
@@ -136,16 +147,10 @@ bool init(int w, int h) {
     buildNoise(lattice);
     releaseTable(lattice, 256 * sizeof(float));
 
-    for (int r = 0; r < R_N; r++) {
-        const float u = r * (1.0f / (R_N - 1));
-        const float d = (u - 0.52f) / 0.52f;
-        const float v = 1.0f - d * d;
-        // Ring gain peaks at radius 0.52, with a 104/256 central floor.
-        rimDim[r] = static_cast<uint8_t>(104.0f + 132.0f * powf(v > 0.0f ? v : 0.0f, 0.6f) + 0.5f);
-    }
-    for (int v = 0; v < 256; v++) {
-        lev[v] = static_cast<uint8_t>(44 + ((v * 132) >> 8));
-    }
+    // rimDim and lev are Vignette's and Contrast's tables; frame() builds
+    // both on the first call and again whenever their parameter moves.
+    lastContrast = -1;
+    lastVignette = -1;
     const float cx = w * 0.5f - 0.5f, cy = h * 0.5f - 0.5f;
     for (int y = 0; y < h; y++) {
         const float dy = y - cy;
@@ -278,21 +283,69 @@ void frame(uint32_t tMs, int, int, const uint8_t p[BG_ANIM_PARAMS]) {
         lastBrightness = p[2];
         lastThemeGen = gen;
     }
+    if (lastContrast != p[3]) {
+        // Contrast is the width of the level window the noise is compressed
+        // into, held about the page's midpoint of 110. At 50 it is 44..175,
+        // the page's own numbers; at 0 the window is one level wide and the
+        // face is a flat ring; at 100 it is the whole 0..255 range.
+        int span = (264 * static_cast<int>(p[3]) + 50) / 100;
+        if (span > 255) {
+            span = 255;
+        }
+        int base = 110 - span / 2;
+        if (base < 0) {
+            base = 0;
+        }
+        if (base + span > 255) {
+            span = 255 - base;
+        }
+        for (int v = 0; v < 256; v++) {
+            lev[v] = static_cast<uint8_t>(base + ((v * span) >> 8));
+        }
+        lastContrast = p[3];
+    }
+    if (lastVignette != p[5]) {
+        // Vignette is the central floor under the ring gain, which always
+        // peaks at 236 at radius 0.52. Floor 104 at 50, the page's number;
+        // 208 at 0, so the gain is nearly flat and the whole face is lit;
+        // 0 at 100, so the centre and the rim both go to the darkest tone.
+        const int floorI = ((100 - static_cast<int>(p[5])) * 208 + 50) / 100;
+        const float floorF = static_cast<float>(floorI);
+        const float spanF = static_cast<float>(236 - floorI);
+        for (int r = 0; r < R_N; r++) {
+            const float u = r * (1.0f / (R_N - 1));
+            const float d = (u - 0.52f) / 0.52f;
+            const float v = 1.0f - d * d;
+            rimDim[r] = static_cast<uint8_t>(floorF + spanF * powf(v > 0.0f ? v : 0.0f, 0.6f) + 0.5f);
+        }
+        lastVignette = p[5];
+    }
     const float spd = speedMul(p[0]);
     // Rebuild from time just as the page does, so arbitrary frame order is
     // deterministic. Float32 can round an offset differently from JS after
     // long uptime; it stays far below UINT32_MAX even at millis() wrap.
     const uint32_t oy = static_cast<uint32_t>(tMs * 0.0032f * spd + 0.5f);
-    const uint32_t ox = static_cast<uint32_t>(tMs * 0.0016f * spd + 0.5f);
+    // Sweep scales the angular offset only: 1.0 at 50, so the page's 0.0016
+    // survives exactly, 0 at 0 (the figure stops opening and closing and only
+    // flows outward) and 2.0 at 100. The division is exact at 50.
+    const float axRate = 0.0016f * (static_cast<float>(p[6]) / 50.0f);
+    const uint32_t ox = static_cast<uint32_t>(tMs * axRate * spd + 0.5f);
     const uint32_t scA = 2 + (static_cast<uint32_t>(p[1]) * 2 + 50) / 100;
     const uint32_t scR = 4 + (static_cast<uint32_t>(p[1]) * 4 + 50) / 100;
+    // Rays is the Q4 weight on the radius in the angular source term, 16
+    // (a weight of one, the page's own term) at 50. At 0 the whole wedge reads
+    // one angular source position, so the face collapses into plain concentric
+    // rings; at 100 the source sweeps twice as far across the wedge at the rim
+    // as at the centre and the figure sharpens into a spiked star.
+    const uint32_t rw = static_cast<uint32_t>((32 * static_cast<int>(p[4]) + 50) / 100);
     for (int a = 0; a < A_N; a++) {
         const uint32_t aSh = (a + ox) * scA;
         for (int r = 0; r < R_N; r++) {
             // Unsigned wrap preserves JS's bitwise ToInt32 product at long
             // uptimes. Only bits 9..16 survive >>9 and &255, so the sign
             // extension of JS's signed shift cannot affect the source index.
-            const uint32_t sa = ((aSh * (r + 5u)) >> 9) & (SRC - 1);
+            const uint32_t rt = ((static_cast<uint32_t>(r) * rw) >> 4) + 5u;
+            const uint32_t sa = ((aSh * rt) >> 9) & (SRC - 1);
             const uint32_t sr = (((r * scR) >> 3) + oy) & (SRC - 1);
             raw[a * R_N + r] = lev[src[sa * SRC + sr]];
         }
@@ -349,6 +402,8 @@ void release() {
     raw = rimDim = nullptr;
     allocW = allocH = 0;
     lastBrightness = -1;
+    lastContrast = -1;
+    lastVignette = -1;
     lastThemeGen = 0xFFFFFFFF;
 }
 
@@ -361,6 +416,10 @@ const BgAnimation bg_anim_kaleido = {
     {{"speed", "Speed", 50},
      {"scale", "Blotch scale", 50},
      {"brightness", "Brightness", 62},
+     {"contrast", "Contrast", 50},
+     {"rays", "Rays", 50},
+     {"vignette", "Vignette", 50},
+     {"sweep", "Sweep", 50},
      {nullptr, nullptr, 0}},
     init,
     frame,

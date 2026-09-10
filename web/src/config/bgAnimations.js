@@ -351,6 +351,10 @@ export const BG_ANIMATIONS = [
       { key: 'speed', label: 'Speed', def: 50 },
       { key: 'scale', label: 'Blotch scale', def: 50 },
       { key: 'brightness', label: 'Brightness', def: 62 },
+      { key: 'contrast', label: 'Contrast', def: 50 },
+      { key: 'rays', label: 'Rays', def: 50 },
+      { key: 'vignette', label: 'Vignette', def: 50 },
+      { key: 'sweep', label: 'Sweep', def: 50 },
     ],
   },
   {
