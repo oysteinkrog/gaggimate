@@ -64,8 +64,9 @@ GM_ANIM_IRAM __attribute__((noinline)) uint32_t stripesScalarAsm(uint16_t *out, 
 // across the loop back edge. That is an issue-count lower bound for hot
 // SRAM, not a device timing claim. Production timing decides the default.
 //
-// tab entries 544..2704 and offsets -256..256 sum to 288..2960: signed
-// saturation is inactive and extracting bits 4..11 is the exact >>4.
+// frame() clamps tab so tab + off lands in 0..4095 whatever the parameters
+// are: signed saturation is inactive and extracting bits 4..11 is the exact
+// >>4, with no negative sum for the unsigned extract to misread.
 // off is one complete 16-byte row in allocHot's aligned Bayer table, so
 // the only VLD span is aligned by construction and never crosses its end.
 // out needs only the contract's four-byte alignment, including widths 233
@@ -233,12 +234,16 @@ static void run_case(int n, int alignment, int rowPhase, uint32_t ph, uint32_t s
     if (n > 0) pixels += n;
 }
 
+/* The widest window frame() can hand the kernel: the coarsest grain leaves
+ * a dither offset of +-512 (ditherAmp caps at 16 and the grain parameter
+ * doubles it), and it clamps the table into 512..3583 to match, so tab + off
+ * covers 0..4095 and nothing outside it. */
 static void fill_tables(void) {
-    for (int i = 0; i < 4096; ++i) tab[i] = 544 + next_rand() % 2161;
+    for (int i = 0; i < 4096; ++i) tab[i] = 512 + next_rand() % 3072;
     // One-to-one palette, with both all-zero and all-one words, so wrong
     // indices cannot hide behind a quantized theme's repeated colours.
     for (int i = 0; i < 256; ++i) pal[i] = (uint16_t)(i * 257);
-    for (int i = 0; i < 64; ++i) dith[i] = (int)(next_rand() % 513) - 256;
+    for (int i = 0; i < 64; ++i) dith[i] = (int)(next_rand() % 1025) - 512;
 }
 
 int main(void) {
@@ -252,18 +257,22 @@ int main(void) {
         run_case(512, batch & 3, batch, ((uint32_t)batch << 29) - 1, 0u - (1u << 20), 0);
     }
     // Every table value and signed dither endpoint, with one full vector.
-    for (int v = 544; v <= 2704; ++v) {
+    for (int v = 512; v <= 3583; ++v) {
         tab[0] = v;
         for (int i = 0; i < 8; ++i) {
-            static const int16_t edge[] = {-256, -255, -1, 0, 1, 255, 256, -128};
+            static const int16_t edge[] = {-512, -511, -1, 0, 1, 511, 512, -128};
             dith[i] = edge[(i + v) & 7];
         }
         run_case(8, v & 3, 0, 0, 0, 0);
     }
-    // Every offset in the full ditherAmp cap, including negative values.
-    for (int d = -256; d <= 256; ++d) {
-        for (int i = 0; i < 8; ++i) dith[i] = d;
-        tab[0] = (d & 1) ? 544 : 2704;
+    // Every offset the coarsest grain can produce, against the lowest and
+    // the highest table value that is legal with it, so the sum sits on 0
+    // and on 4095 for every one of them.
+    for (int d = -512; d <= 512; ++d) {
+        for (int i = 0; i < 64; ++i) dith[i] = d;
+        tab[0] = (uint16_t)(d < 0 ? -d : 0);
+        run_case(9, d & 3, 0, 0xfffffu, 0, 0);
+        tab[0] = (uint16_t)(4095 - (d > 0 ? d : 0));
         run_case(9, d & 3, 0, 0xfffffu, 0, 0);
     }
     fill_tables();
@@ -287,22 +296,34 @@ int main(void) {
     for (int n = 0; n <= 17; ++n) {
         run_case(n, n & 3, n & 7, next_rand(), next_rand(), 1);
     }
-    // Parameter endpoints as they reach the kernel: span 70/135 and cycle
-    // 590/430. All waveform values are bounded by those spans; synthetic s
-    // traverses 0..8192, including both extremes. Exercise both rotation
-    // directions, row phases and phase wrap at each combination.
+    // Parameter endpoints as they reach the kernel: pitch 0/100 sets the
+    // step, and depth, black level and grain set the table window frame()
+    // clamps into. All waveform values are bounded by that window;
+    // synthetic s traverses 0..8192, including both extremes. Exercise both
+    // rotation directions, row phases and phase wrap at each combination.
     for (int pitch = 0; pitch <= 100; pitch += 100) {
         const uint32_t cycle = 590 - (pitch * 16 + 5) / 10;
         const uint32_t step = 0xffffffffu / cycle + ((0xffffffffu % cycle) == cycle - 1);
         for (int depth = 0; depth <= 100; depth += 100) {
             const int span = 70 + (depth * 65 + 50) / 100;
-            for (int i = 0; i < 4096; ++i) {
-                const int s = (i == 4095) ? 8192 : i * 2;
-                tab[i] = 544 + ((s * span) >> 9);
-            }
-            for (int r = 0; r < 8; ++r) {
-                run_case(480, r & 3, r, next_rand(), step, 0);
-                run_case(240, r & 3, r, next_rand(), 0u - step, 0);
+            for (int floorP = 0; floorP <= 100; floorP += 100) {
+                const int base = (floorP * 88 + 50) / 100;
+                for (int grainP = 0; grainP <= 100; grainP += 100) {
+                    const int dmax = grainP * 512 / 100;
+                    const int lo = dmax, hi = 4095 - dmax;
+                    for (int i = 0; i < 64; ++i) dith[i] = (int16_t)((i & 1) ? dmax : -dmax);
+                    for (int i = 0; i < 4096; ++i) {
+                        const int s = (i == 4095) ? 8192 : i * 2;
+                        int v = (base << 4) + ((s * span) >> 9);
+                        if (v < lo) v = lo;
+                        else if (v > hi) v = hi;
+                        tab[i] = (uint16_t)v;
+                    }
+                    for (int r = 0; r < 8; ++r) {
+                        run_case(480, r & 3, r, next_rand(), step, 0);
+                        run_case(240, r & 3, r, next_rand(), 0u - step, 0);
+                    }
+                }
             }
         }
     }
@@ -324,7 +345,7 @@ int main(void) {
     } else {
         puts_uart("GM_QEMUBENCH_PIE: PASS stripes calls="); put_dec(calls);
         puts_uart(" pixels="); put_dec(pixels);
-        puts_uart(" mismatches=0 (Q4, signed dither, DDS wraps, tails, alignment, parameter extremes)\n");
+        puts_uart(" mismatches=0 (Q4, signed dither to +-512, sums on 0 and 4095, DDS wraps, tails, alignment, all eight parameter extremes)\n");
     }
     puts_uart("GM_QEMUBENCH_PIE_DONE\n");
     for (;;) {}

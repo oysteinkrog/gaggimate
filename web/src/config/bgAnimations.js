@@ -470,6 +470,11 @@ export const BG_ANIMATIONS = [
       { key: 'speed', label: 'Speed', def: 50 },
       { key: 'pitch', label: 'Stripe pitch', def: 50 },
       { key: 'depth', label: 'Depth', def: 55 },
+      { key: 'beat', label: 'Beat depth', def: 75 },
+      { key: 'beats', label: 'Beat count', def: 20 },
+      { key: 'turn', label: 'Turn rate', def: 50 },
+      { key: 'floor', label: 'Black level', def: 39 },
+      { key: 'grain', label: 'Grain', def: 50 },
     ],
   },
   {

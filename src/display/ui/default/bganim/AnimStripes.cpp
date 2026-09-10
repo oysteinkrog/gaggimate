@@ -10,6 +10,20 @@
 // motion. Each pixel adds the screen-anchored 8x8 Bayer offset before the
 // four-bit shift and the ordinary 256-entry theme-ramp gather. No wheel,
 // row duplication, per-pixel float, or phase carried between band calls.
+//
+// All eight parameters act in frame(): the field table, the dither table
+// and the three DDS constants. The pixel loop and both hand-written Xtensa
+// kernels read the same three tables they always did and are untouched
+// (gm-3vj.36). Every default is the value the three-parameter version used,
+// so the goldens stay exact.
+//   p0 speed   time scale, speedMul
+//   p1 pitch   pixels per table cycle, 590..430
+//   p2 depth   palette indices the wave sweeps, 70..135
+//   p3 beat    weight of the second grating, 0..4 against 8 minus it
+//   p4 beats   beat nodes per table cycle, 0..5, set by the harmonic ratio
+//   p5 turn    turns per 150 s, 0 freezes the angle, 2x at 100
+//   p6 floor   darkest palette index the wave reaches, 0..88
+//   p7 grain   ordered-dither amplitude, 0 to 2x the palette step
 
 #include "BgAnim.h"
 #include "BgAnimCommon.h"
@@ -31,7 +45,6 @@ using namespace bganim;
 
 constexpr int TAB = 4096;
 constexpr int TURN_BITS = 20; // 32 - log2(TAB), not the size of a whole turn
-constexpr int BASE = 34;     // keeps the beat node above near-black
 constexpr float TURN = 4294967296.0f;
 
 // Every owned table is hot, with no width-dependent allocations:
@@ -45,6 +58,8 @@ uint16_t *palette = nullptr;
 int16_t *dith = nullptr;
 const int16_t *sl = nullptr;
 uint32_t lastThemeGen = 0;
+int lastGrain = -1;  // p7 the dither table was last built for
+int dithMax = 0;     // largest absolute Bayer offset in that table
 bool paletteValid = false;
 uint32_t phase0 = 0, stepX = 0, stepY = 0;
 
@@ -72,36 +87,77 @@ bool init(int, int) {
 
 void frame(uint32_t tMs, int, int, const uint8_t p[BG_ANIM_PARAMS]) {
     const uint32_t gen = themeGen();
-    if (!paletteValid || lastThemeGen != gen) {
+    const int grainQ = static_cast<int>(p[7]);
+    if (!paletteValid || lastThemeGen != gen || lastGrain != grainQ) {
         buildThemeRamp(palette, 256);
-        // Full ditherAmp, in sixteenths of an index. bayerOffsets on the
-        // page uses the same symmetric lround rule, including negatives.
-        const float scale = ditherAmp(palette, 256) * 16.0f / 31.5f;
+        // Full ditherAmp, in sixteenths of an index, times p7/50. bayerOffsets
+        // on the page uses the same symmetric lround rule, including negatives.
+        // Dividing the parameter by 50.0f gives exactly 1.0f at the default,
+        // and a float times exactly 1.0f is the float, so the default table is
+        // bit for bit the one this animation had before p7 existed.
+        const float scale = ditherAmp(palette, 256) * 16.0f / 31.5f * (static_cast<float>(grainQ) / 50.0f);
+        int m = 0;
         for (int k = 0; k < 64; ++k) {
-            dith[k] = static_cast<int16_t>(lroundf((BAYER8[k] - 31.5f) * scale));
+            const int d = static_cast<int>(lroundf((BAYER8[k] - 31.5f) * scale));
+            dith[k] = static_cast<int16_t>(d);
+            const int a = d < 0 ? -d : d;
+            if (a > m) m = a;
         }
+        dithMax = m; // at most 512: ditherAmp caps at 16 and p7 caps the scale at 2x
         lastThemeGen = gen;
+        lastGrain = grainQ;
         paletteValid = true;
     }
     // Integer forms of the page's positive Math.round: 70..135 indices,
     // 590..430 pixels per table cycle, or about 131..96 px per stripe.
     const int span = 70 + (static_cast<int>(p[2]) * 65 + 50) / 100;
     const int cyclePx = 590 - (static_cast<int>(p[1]) * 16 + 5) / 10;
+    // p3 is the second grating's weight, 0..4, against 8 minus it, so the
+    // beat node keeps |8 - 2*w| of the amplitude: the whole swing at 0, a
+    // quarter at the default 3, a complete null at 4.
+    const int beatW = (static_cast<int>(p[3]) * 4 + 50) / 100;
+    const int mainW = 8 - beatW;
+    // p4 is the number of beat nodes across one table cycle. The fundamental
+    // runs four cycles across the 4096-entry table, so a harmonic of
+    // (8 + 2n)/8 runs 4 + n and beats n times. n == 1 is the default, and
+    // (i * 10) >> 3 is (i * 5) >> 2 for every non-negative i.
+    const int harm = 8 + 2 * ((static_cast<int>(p[4]) * 5 + 50) / 100);
+    // p6 is the darkest palette index the wave reaches, 0..88, default 34.
+    // 88 + the widest span of 135 + the coarsest dither of 32 indices is 255,
+    // so the top of the table cannot run off the end of the palette.
+    const int base = (static_cast<int>(p[6]) * 88 + 50) / 100;
     const float K = TURN / static_cast<float>(cyclePx);
     const float tsec = (static_cast<float>(tMs) * speedMul(p[0])) * 0.001f;
     // 21 sine entries/s is the page's nominal 10 px/s envelope drift.
     // Wide conversions keep days of uptime defined before the phase masks.
     const unsigned beatPhase = static_cast<uint64_t>(tsec * 21.0f) & 1023u;
+    // The pixel loop adds a Bayer offset and shifts, with no clamp, so the
+    // table itself has to leave room for the offset at both ends. At every
+    // default this window is 256..3839 against a table of 544..2240 and the
+    // clamp never fires; a low floor with coarse grain crushes the dark
+    // flanks flat instead of reading outside the palette.
+    const int lo = dithMax, hi = 4095 - dithMax;
     for (int i = 0; i < TAB; ++i) {
-        const int s = sl[i & 1023] * 5 + sl[(((i * 5) >> 2) + beatPhase) & 1023] * 3 + 4096;
-        // s is 0..8192. /512 converts s/8192 * span to Q4 exactly as
-        // the page does, retaining its truncation before adding dither.
-        tabQ4[i] = static_cast<uint16_t>((BASE << 4) + ((s * span) >> 9));
+        const int s = sl[i & 1023] * mainW + sl[(((i * harm) >> 3) + beatPhase) & 1023] * beatW + 4096;
+        // s is 0..8192 for any split of the eight weights. /512 converts
+        // s/8192 * span to Q4 exactly as the page does, retaining its
+        // truncation before adding dither.
+        int v = (base << 4) + ((s * span) >> 9);
+        if (v < lo) {
+            v = lo;
+        } else if (v > hi) {
+            v = hi;
+        }
+        tabQ4[i] = static_cast<uint16_t>(v);
     }
     // Q8 interpolation between sine entries removes whole-entry angular
     // twitches. Arithmetic shifts round negative interpolation deltas down,
     // as JavaScript >> does on the page and both supported GCC targets do.
-    const uint64_t aQ8 = static_cast<uint64_t>(tsec * (1024.0f * 256.0f / 150.0f));
+    // p5 scales that rate: 0 freezes the angle (stripes stay vertical and
+    // only slide), 50 is one turn per 150 s, 100 is two. p5/50.0f is exactly
+    // 1.0f at the default, so the constant reaches tsec unchanged.
+    const float turnRate = (1024.0f * 256.0f / 150.0f) * (static_cast<float>(p[5]) / 50.0f);
+    const uint64_t aQ8 = static_cast<uint64_t>(tsec * turnRate);
     const unsigned ai = (aQ8 >> 8) & 1023u;
     const int af = aQ8 & 255u;
     const int cosA = sl[(ai + 256) & 1023] +
@@ -126,9 +182,10 @@ GM_ANIM_IRAM void bandRef(uint16_t *__restrict dst, int y0, int rows, int w, uin
         const int16_t *off = dith + (y & 7) * 8;
         for (int x = 0; x < w; ++x) {
             const int idx = (tab[ph >> TURN_BITS] + off[x & 7]) >> 4;
-            // The page clamps to 0..255. Here tab is 544..2704 and dither
-            // is at most +-256 (ditherAmp's cap of 16), so idx is 18..185
-            // for every legal parameter/theme. The clamp is an identity.
+            // The page clamps to 0..255. Here frame() has already clamped
+            // tab into [dithMax, 4095 - dithMax], so the sum is 0..4095 and
+            // idx is 0..255 for every parameter set and theme. The page's
+            // clamp is an identity, which is why it is not repeated here.
             *dst++ = pal[idx];
             ph += stepX;
         }
@@ -180,8 +237,9 @@ GM_ANIM_IRAM __attribute__((noinline)) uint32_t stripesScalarAsm(uint16_t *out, 
 // across the loop back edge. That is an issue-count lower bound for hot
 // SRAM, not a device timing claim. Production timing decides the default.
 //
-// tab entries 544..2704 and offsets -256..256 sum to 288..2960: signed
-// saturation is inactive and extracting bits 4..11 is the exact >>4.
+// frame() clamps tab so tab + off lands in 0..4095 whatever the parameters
+// are: signed saturation is inactive and extracting bits 4..11 is the exact
+// >>4, with no negative sum for the unsigned extract to misread.
 // off must address eight readable offsets at a 16-byte-aligned address.
 // band() checks dith's alignment before calling this kernel because
 // allocHot can fall back to PSRAM without guaranteeing that alignment.
@@ -326,6 +384,8 @@ void release() {
     sl = nullptr; // borrowed, never freed by this animation
     paletteValid = false;
     lastThemeGen = 0;
+    lastGrain = -1;
+    dithMax = 0;
     phase0 = stepX = stepY = 0;
 }
 
@@ -338,7 +398,11 @@ const BgAnimation bg_anim_stripes = {
     {{"speed", "Speed", 50},
      {"pitch", "Stripe pitch", 50},
      {"depth", "Depth", 55},
-     {nullptr, nullptr, 0}},
+     {"beat", "Beat depth", 75},
+     {"beats", "Beat count", 20},
+     {"turn", "Turn rate", 50},
+     {"floor", "Black level", 39},
+     {"grain", "Grain", 50}},
     init,
     frame,
     band,

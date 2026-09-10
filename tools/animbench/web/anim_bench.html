@@ -4226,6 +4226,11 @@ const pa_dith = (x, y) => (BAYER8[(y & 7) * 8 + (x & 7)] - 31.5) * (1 / 64);
       { key: 'speed', label: 'Speed', def: 50 },
       { key: 'pitch', label: 'Stripe pitch', def: 50 },
       { key: 'depth', label: 'Depth', def: 55 },
+      { key: 'beat', label: 'Beat depth', def: 75 },
+      { key: 'beats', label: 'Beat count', def: 20 },
+      { key: 'turn', label: 'Turn rate', def: 50 },
+      { key: 'floor', label: 'Black level', def: 39 },
+      { key: 'grain', label: 'Grain', def: 50 },
     ],
     init(w, h, state) {
       state.tabQ4 = new Uint16Array(TAB);
@@ -4238,33 +4243,56 @@ const pa_dith = (x, y) => (BAYER8[(y & 7) * 8 + (x & 7)] - 31.5) * (1 / 64);
       if (state.key !== key) {
         state.key = key;
         state.pal = themeRamp();
-        bayerOffsets(state.dith, ditherAmpJS(state.pal, 256), 16);
+        // p7/50 is exactly 1 at the default, so the default offsets are the
+        // ones this animation had before the grain slider existed.
+        bayerOffsets(state.dith, ditherAmpJS(state.pal, 256) * (p[7] / 50), 16);
+        let m = 0;
+        for (let k = 0; k < 64; k++) m = Math.max(m, Math.abs(state.dith[k]));
+        state.dithMax = m;
         state.span = 70 + Math.round(p[2] * 0.65);    // 70..135 index span
         // One table cycle across this many pixels, 4.5 stripes per cycle,
         // so the stripe pitch runs 131 px down to 96 px.
         state.cyclePx = 590 - Math.round(p[1] * 1.6); // 590..430 px
+        // Weight of the second grating, 0..4 against 8 minus it, so the node
+        // of the beat keeps the whole swing at 0 and nothing at all at 4.
+        state.beatW = ((p[3] * 4 + 50) / 100) | 0;
+        // Beat nodes per table cycle. The fundamental runs four cycles across
+        // the table, so a harmonic of (8 + 2n)/8 runs 4 + n and beats n times.
+        // n is 1 by default, and (i * 10) >> 3 is the old (i * 5) >> 2.
+        state.harm = 8 + 2 * (((p[4] * 5 + 50) / 100) | 0);
+        // Darkest palette index the wave reaches, 0..88, 34 by default.
+        state.base = ((p[6] * 88 + 50) / 100) | 0;
         // p is a 32-bit turn and the table takes its top 12 bits, so one
         // table cycle is 2^32 of phase, not 2^20.
         state.K = 4294967296 / state.cyclePx;
       }
-      const { tabQ4, dith, pal, span, K } = state;
+      const { tabQ4, dith, pal, span, K, beatW, harm, base, dithMax } = state;
+      const mainW = 8 - beatW;
       const t = tMs * speedMulJS(p[0]);
       const tsec = t / 1000;
       const beatPhase = Math.floor(tsec * 21) & 1023;             // envelope 10 px/s
-      const base = 34;
       // Weights 5 and 3, not 1 and 1: with equal gratings the node of the
       // beat is a complete null and the face goes flat for a few seconds,
       // which the candidate names as its own risk. At 5:3 the node keeps a
-      // quarter of the amplitude and the swell still reads.
+      // quarter of the amplitude and the swell still reads. p3 moves that
+      // split, and p6/p7 can carry the table past the ends of the palette,
+      // so the table is clamped to leave room for the dither offset. At the
+      // defaults the window is 256..3839 against a table of 544..2240 and the
+      // clamp never fires; the firmware clamps the same way, because its
+      // pixel loop has no clamp of its own.
+      const lo = dithMax, hi = 4095 - dithMax;
       for (let i = 0; i < TAB; i++) {
-        const s = sin1024(i) * 5 + sin1024(((i * 5) >> 2) + beatPhase) * 3 + 4096;
-        tabQ4[i] = (base << 4) + ((s * span) >> 9);   // 0..8192 -> 0..span in Q4
+        const s = sin1024(i) * mainW + sin1024(((i * harm) >> 3) + beatPhase) * beatW + 4096;
+        let v = (base << 4) + ((s * span) >> 9);      // 0..8192 -> 0..span in Q4
+        if (v < lo) v = lo; else if (v > hi) v = hi;
+        tabQ4[i] = v;
       }
       // One turn per 150 s, the sine table read at Q8 between entries.
       // A whole-entry step is 0.35 degrees, which moves a stripe 1.5 px at
       // the rim once every few frames and reads as a twitch; interpolating
       // costs two multiplies a frame and the turn comes out continuous.
-      const aQ8 = Math.floor(tsec * 1024 * 256 / 150);
+      // p5 scales that rate: 0 freezes the angle, 100 turns twice as fast.
+      const aQ8 = Math.floor(tsec * 1024 * 256 / 150 * (p[5] / 50));
       const ai = (aQ8 >> 8) & 1023, af = aQ8 & 255;
       const cosA = sin1024(ai + 256) + (((sin1024(ai + 257) - sin1024(ai + 256)) * af) >> 8);
       const sinA = sin1024(ai) + (((sin1024(ai + 1) - sin1024(ai)) * af) >> 8);
