@@ -16,6 +16,12 @@
 // Q16.16 u accumulator, two SRAM gathers and the fixed 8 x 8 Bayer dither.
 // Unsigned addition gives the page's modulo-2^32 |0/>>> behaviour without
 // signed overflow. Rows are rebuilt from absolute y, including parity skips.
+//
+// Eight sliders, all of them read in frame() or init(): speed, yaw sway,
+// plaid scale, brightness, glide rate, haze depth, horizon glow and tile
+// size. Each map gives this file's original literal at the slider default,
+// so the default frame is the frame the goldens hold, bit for bit, and
+// band(), bandRef() and the three Xtensa kernels never see a parameter.
 
 #include "BgAnim.h"
 #include "BgAnimCommon.h"
@@ -38,7 +44,7 @@ using namespace bganim;
 constexpr int HZ = 158;          // page's horizon row, in panel pixels
 constexpr int TU = 64;
 constexpr int TV = 256;          // four v samples per nominal texel
-constexpr int ZK = 20000;        // depth, texels times rows
+constexpr int ZK = 20000;        // depth, texels times rows, at tile size 50
 constexpr int FOCAL = 240;       // focal distance and horizontal centre
 constexpr int DMIN = 17;         // fully opaque rows below the horizon
 constexpr int FIRST = HZ + DMIN;
@@ -48,6 +54,8 @@ constexpr int TEX_BASE = 106;
 constexpr int TEX_LO = 40;
 constexpr int TEX_HI = 170;
 constexpr int DITHER_BIAS = 2;  // pcDither(2.4) rounds into [-2,2]
+constexpr int HAZE_DEF = 50;    // must equal the "haze" slot's default
+constexpr int TILE_DEF = 50;    // must equal the "tile" slot's default
 constexpr int TEX_BYTES = TU * TV + 15; // align PSRAM owner to 16 for PIE loads
 constexpr float PI = 3.14159265358979323846f;
 
@@ -75,7 +83,10 @@ uint32_t *dithPacked = nullptr;
 const int16_t *sine = nullptr; // borrowed shared 1024-entry, amplitude 512 LUT
 int allocH = 0;
 int nFloor = 0;
-int lastScale = -1, lastBright = -1;
+int lastScale = -1, lastBright = -1, lastGlow = -1;
+// fog and recip are built in init() at their slot defaults, so a device that
+// leaves these two sliders alone pays exactly the work it always did.
+int lastHaze = HAZE_DEF, lastTile = TILE_DEF;
 uint32_t lastThemeGen = 0xFFFFFFFF;
 
 // At 480 rows, payload bytes (slab rounding in parentheses):
@@ -86,6 +97,31 @@ uint32_t lastThemeGen = 0xFFFFFFFF;
 // is a sequential 64-byte row stream only; per-pixel gathers use rowIndex.
 // The sine table is borrowed from the separate 3072 B shared reservation.
 void release();
+
+// Slot maps. Each gives this file's original literal at the slot default, so
+// the default frame is the old frame, and each is integer arithmetic so the
+// firmware and the bench page land on the same value.
+int fogEndFor(int v) { return 60 + (v * 144 + 50) / 100; } // 132 at 50
+int glowAmpFor(int v) { return (v * 92 + 50) / 100; }      // 46 at 50
+int depthFor(int v) { return ZK / 2 + v * (ZK / 100); }     // ZK at 50
+
+// Haze: opaque out to DMIN, then a raised cosine down to nothing at fogEnd.
+void buildFog(int h, int fogEnd) {
+    for (int d = 1; d <= h + 1; d++) {
+        const float f = d <= DMIN ? 255.0f : d >= fogEnd ? 0.0f :
+            255.0f * 0.5f * (1.0f + cosf(PI * (d - DMIN) / (fogEnd - DMIN)));
+        fog[d] = static_cast<uint8_t>(f + 0.5f);
+    }
+}
+
+// Tile size: texels per row of depth. A larger constant packs more texels
+// into one pixel, so the plaid reads finer; a smaller one spreads it out.
+void buildRecip(int h, int zk) {
+    const float k = static_cast<float>(zk);
+    for (int d = 1; d <= h + 1; d++) {
+        recip[d] = k / d;
+    }
+}
 
 bool init(int, int h) {
     if (allocH != 0 && allocH != h) {
@@ -123,21 +159,29 @@ bool init(int, int h) {
     FLOOR_ALLOC(dithPacked, uint32_t, allocHot, 8 * sizeof(uint32_t))
     FLOOR_ALLOC(rowIndex, int16_t, allocHot, TU * sizeof(int16_t))
 #undef FLOOR_ALLOC
+    buildRecip(h, depthFor(TILE_DEF));
+    buildFog(h, fogEndFor(HAZE_DEF));
     for (int d = 1; d <= h + 1; d++) {
-        recip[d] = static_cast<float>(ZK) / d;
-        const float f = d <= DMIN ? 255.0f : d >= 132 ? 0.0f :
-            255.0f * 0.5f * (1.0f + cosf(PI * (d - DMIN) / (132 - DMIN)));
-        fog[d] = static_cast<uint8_t>(f + 0.5f);
         // The preview's executable formula reaches full contrast at d=150;
         // its earlier "row 95" comment is superseded by this squared curve.
         const float uu = d <= DMIN ? 0.0f : d >= 150 ? 1.0f :
             0.5f * (1.0f - cosf(PI * (d - DMIN) / (150 - DMIN)));
         flat[d] = static_cast<uint8_t>(255.0f * uu * uu + 0.5f);
     }
+    lastHaze = HAZE_DEF;
+    lastTile = TILE_DEF;
     return true;
 }
 
 void frame(uint32_t tMs, int, int h, const uint8_t p[BG_ANIM_PARAMS]) {
+    if (lastTile != p[7]) {
+        buildRecip(h, depthFor(p[7]));
+        lastTile = p[7];
+    }
+    if (lastHaze != p[5]) {
+        buildFog(h, fogEndFor(p[5]));
+        lastHaze = p[5];
+    }
     if (lastScale != p[2]) {
         // Integer positive rounding matches Math.round, without float ties.
         const int wide = 30 + (p[2] * 22 + 50) / 100;
@@ -158,18 +202,22 @@ void frame(uint32_t tMs, int, int h, const uint8_t p[BG_ANIM_PARAMS]) {
         lastScale = p[2];
     }
     const uint32_t gen = themeGen();
-    if (lastBright != p[3] || lastThemeGen != gen) {
+    if (lastBright != p[3] || lastGlow != p[6] || lastThemeGen != gen) {
         // The page deliberately scales this animation's ramp, 176..256 Q8.
         buildThemeRamp(ramp, 176 + (p[3] * 8 + 5) / 10);
         for (int i = 0; i < PAL_N; i++) {
             const int t = i - PAD;
             palPad[i] = ramp[t < 0 ? 0 : t > 255 ? 255 : t];
         }
+        // Sky: dark at the top, lifting into the glow line at the horizon.
+        // The glow slot scales only that last term, so at 0 the sky runs
+        // plain into the haze and at 100 the horizon line is twice as hot.
+        const float glowAmp = static_cast<float>(glowAmpFor(p[6]));
         for (int y = 0; y < HZ; y++) {
             const float f = static_cast<float>(y) / HZ;
             const float g = y <= HZ - 22 ? 0.0f : static_cast<float>(y - (HZ - 22)) / 22;
             const int idx = 14 + static_cast<int>(18.0f * f * f + 0.5f) +
-                static_cast<int>(46.0f * g * g + 0.5f);
+                static_cast<int>(glowAmp * g * g + 0.5f);
             sky[y] = ramp[idx];
         }
         for (int y = 0; y < 8; y++) {
@@ -184,13 +232,16 @@ void frame(uint32_t tMs, int, int h, const uint8_t p[BG_ANIM_PARAMS]) {
             dithPacked[y] = packed;
         }
         lastBright = p[3];
+        lastGlow = p[6];
         lastThemeGen = gen;
     }
     // Float only in frame/init. The page uses double here; float can move a
     // quantized u/v boundary by one texel, but preserves its Q16.16 scheme.
-    // Even UINT32_MAX at speed 100 keeps 4*(z+fz) below INT32_MAX.
+    // Even UINT32_MAX at speed 100 and glide 100 keeps 4*(z+fz) under 1e9,
+    // well below INT32_MAX. Dividing p[4] by 50 is exact, so glide 50 gives
+    // exactly 1.0f and the old product, bit for bit.
     const float tt = static_cast<float>(tMs) * speedMul(p[0]);
-    const float fz = tt * 0.0042f;
+    const float fz = tt * 0.0042f * (static_cast<float>(p[4]) / 50.0f);
     const float yaw = sinf(tt / 40000.0f * (2.0f * PI)) * (0.10f + p[1] * 0.004f);
     const float tanA = tanf(yaw);
     for (int y = FIRST; y < h; y++) {
@@ -406,7 +457,9 @@ void release() {
     tex = nullptr;
     sine = nullptr;
     allocH = nFloor = 0;
-    lastScale = lastBright = -1;
+    lastScale = lastBright = lastGlow = -1;
+    lastHaze = HAZE_DEF;
+    lastTile = TILE_DEF;
     lastThemeGen = 0xFFFFFFFF;
 }
 
@@ -419,7 +472,11 @@ const BgAnimation bg_anim_floor = {
     {{"speed", "Speed", 50},
      {"yaw", "Yaw sway", 50},
      {"scale", "Plaid scale", 50},
-     {"bright", "Brightness", 60}},
+     {"bright", "Brightness", 60},
+     {"glide", "Glide rate", 50},
+     {"haze", "Haze depth", 50}, // HAZE_DEF
+     {"glow", "Horizon glow", 50},
+     {"tile", "Tile size", 50}}, // TILE_DEF
     init,
     frame,
     band,

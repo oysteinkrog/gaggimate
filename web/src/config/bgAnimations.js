@@ -516,6 +516,10 @@ export const BG_ANIMATIONS = [
       { key: 'yaw', label: 'Yaw sway', def: 50 },
       { key: 'scale', label: 'Plaid scale', def: 50 },
       { key: 'bright', label: 'Brightness', def: 60 },
+      { key: 'glide', label: 'Glide rate', def: 50 },
+      { key: 'haze', label: 'Haze depth', def: 50 },
+      { key: 'glow', label: 'Horizon glow', def: 50 },
+      { key: 'tile', label: 'Tile size', def: 50 },
     ],
   },
   {

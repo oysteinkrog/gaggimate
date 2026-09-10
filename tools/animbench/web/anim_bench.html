@@ -4738,6 +4738,29 @@ function pcDither(dst, amp) {
   const PAD = 320;                 // palette pad, so fog can subtract freely
   const TEX_BASE = 106;            // the plaid's mean, what distance flattens toward
   const TEX_LO = 40, TEX_HI = 170; // the range the texture actually holds
+  const HAZE_DEF = 50, TILE_DEF = 50; // the two tables init builds
+
+  // Slot maps, integer so the firmware mirror lands on the same values.
+  const fogEndFor = (v) => 60 + Math.round(v * 144 / 100);  // 132 at 50
+  const glowAmpFor = (v) => Math.round(v * 92 / 100);       // 46 at 50
+  const depthFor = (v) => 10000 + v * 200;                  // 20000 at 50
+
+  // Haze: opaque out to DMIN, then a raised cosine down to nothing at fogEnd.
+  function buildFog(state, h, fogEnd) {
+    for (let d = 1; d <= h + 1; d++) {
+      let f;
+      if (d <= DMIN) f = 255;
+      else if (d >= fogEnd) f = 0;
+      else f = Math.round(255 * 0.5 * (1 + Math.cos(Math.PI * (d - DMIN) / (fogEnd - DMIN))));
+      state.fog[d] = f;
+    }
+  }
+
+  // Tile size: texels per row of depth. Larger packs more texels into one
+  // pixel, so the plaid reads finer; smaller spreads it out.
+  function buildRecip(state, h, zk) {
+    for (let d = 1; d <= h + 1; d++) state.recip[d] = zk / d;
+  }
 
   ANIMS.push({
     id: 'floor', name: 'Floor', proto: true,
@@ -4746,6 +4769,10 @@ function pcDither(dst, amp) {
       { key: 'yaw', label: 'Yaw sway', def: 50 },
       { key: 'scale', label: 'Plaid scale', def: 50 },
       { key: 'bright', label: 'Brightness', def: 60 },
+      { key: 'glide', label: 'Glide rate', def: 50 },
+      { key: 'haze', label: 'Haze depth', def: 50 },
+      { key: 'glow', label: 'Horizon glow', def: 50 },
+      { key: 'tile', label: 'Tile size', def: 50 },
     ],
     init(w, h, state) {
       state.key = null; state.texKey = null; state.pal32 = null;
@@ -4757,13 +4784,10 @@ function pcDither(dst, amp) {
       state.dith = new Int16Array(64);
       state.rowLut = new Int16Array(256);
       state.flat = new Uint8Array(h + 2);
+      state.hazeKey = HAZE_DEF; state.tileKey = TILE_DEF;
+      buildRecip(state, h, depthFor(TILE_DEF));
+      buildFog(state, h, fogEndFor(HAZE_DEF));
       for (let d = 1; d <= h + 1; d++) {
-        state.recip[d] = ZK / d;
-        let f;
-        if (d <= DMIN) f = 255;
-        else if (d >= 132) f = 0;
-        else f = Math.round(255 * 0.5 * (1 + Math.cos(Math.PI * (d - DMIN) / (132 - DMIN))));
-        state.fog[d] = f;
         // Plaid contrast: none at the haze wall, full by row 95.
         // Squared, and not full until row 150: the depth bands are only a few
         // pixels apart until about d 60, so anything less than this leaves
@@ -4775,6 +4799,8 @@ function pcDither(dst, amp) {
     },
     render(data, w, h, tMs, p, state) {
       const u32 = pcView(data, state);
+      if (state.tileKey !== p[7]) { state.tileKey = p[7]; buildRecip(state, h, depthFor(p[7])); }
+      if (state.hazeKey !== p[5]) { state.hazeKey = p[5]; buildFog(state, h, fogEndFor(p[5])); }
       const texKey = p[2] + '';
       if (state.texKey !== texKey) {
         state.texKey = texKey;
@@ -4792,7 +4818,7 @@ function pcDither(dst, amp) {
           }
         }
       }
-      const key = p[3] + '|' + THEME.gen;
+      const key = p[3] + '|' + p[6] + '|' + THEME.gen;
       if (state.key !== key) {
         state.key = key;
         const pal32 = pcPal32(themeRamp(176 + Math.round(p[3] * 0.8)));
@@ -4800,11 +4826,14 @@ function pcDither(dst, amp) {
         for (let i = 0; i < 768; i++) {
           state.palPad[i] = i < PAD ? pal32[0] : i - PAD > 255 ? pal32[255] : pal32[i - PAD];
         }
-        // Sky: dark at the top, lifting into a glow line at the horizon.
+        // Sky: dark at the top, lifting into a glow line at the horizon. The
+        // glow slot scales only that last term: at 0 the sky runs plain into
+        // the haze, at 100 the horizon line is twice as hot.
+        const glowAmp = glowAmpFor(p[6]);
         for (let y = 0; y < HZ; y++) {
           const f = y / HZ;
           const g = Math.max(0, (y - (HZ - 22)) / 22);
-          let idx = 14 + Math.round(18 * f * f) + Math.round(46 * g * g);
+          let idx = 14 + Math.round(18 * f * f) + Math.round(glowAmp * g * g);
           state.sky[y] = pal32[idx > 255 ? 255 : idx];
         }
         pcDither(state.dith, 2.4);
@@ -4814,7 +4843,8 @@ function pcDither(dst, amp) {
       const rowLut = state.rowLut, flat = state.flat;
       const sm = speedMulJS(p[0]);
       const tt = tMs * sm;
-      const fz = tt * 0.0042;                       // 4.2 texels per second forward
+      // 4.2 texels per second forward at glide 50, nothing at 0, double at 100.
+      const fz = tt * 0.0042 * (p[4] / 50);
       const yaw = Math.sin(tt / 40000 * 2 * Math.PI) * (0.10 + p[1] * 0.004);
       const tanA = Math.tan(yaw);
       const camU = 0;
