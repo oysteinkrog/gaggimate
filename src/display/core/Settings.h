@@ -413,19 +413,20 @@ class Settings {
     // 1 = render at half resolution and double on the way out. Defaults on:
     // it is the only way every animation clears 40 fps on this panel.
     Property<int> bgAnimHalfRes{registry, "bg_half", 1};
-    // 1 = push every other row pair, alternating each frame. Defaults on
-    // (gm-2cl.9, 2026-09-08): the interlaced loop is what the whole
-    // smooth-motion work was measured on. At cap 60 nine animations reach
-    // 41 to 52 fps interlaced with zero scan-out slips, and the whole-frame
-    // path cannot exceed 25.3 fps because a frame over one panel period
-    // takes two (CLAUDE.md, "Three refresh rates"). The earlier caution
-    // about the direct-DMA path's beam-racing writes is answered by those
-    // runs. NOTE: this is only the fallback for a key that has never been
-    // written to NVS. A device with bg_ilace persisted (the bench board
-    // stores 0) keeps reading its stored value back until it is set again
-    // or the NVS partition is erased; changing this line does not reach
-    // into storage that already exists.
-    Property<int> bgAnimInterlace{registry, "bg_ilace", 1};
+    // 1 = push every other row pair, alternating each frame. Defaults off
+    // (owner's decision, 2026-09-11; it was on from gm-2cl.9 on 2026-09-08
+    // to then). The trade is known and measured: interlaced, nine
+    // animations reach 41 to 52 fps at cap 60 with zero scan-out slips, and
+    // every animation runs about twice its whole-frame rate, because a
+    // whole frame over one panel period takes two (CLAUDE.md, "Three
+    // refresh rates" and the whole-frame sweep of 2026-09-11). Whole-frame
+    // refreshes every row every frame, which is the look the owner prefers
+    // at the cost of that rate. NOTE: this is only the fallback for a key
+    // that has never been written to NVS. A device with bg_ilace persisted
+    // keeps reading its stored value back until it is set again or the NVS
+    // partition is erased; changing this line does not reach into storage
+    // that already exists.
+    Property<int> bgAnimInterlace{registry, "bg_ilace", 0};
     // What to do with the opaque background plates on the screens that carry
     // one (brew, status, profile, info, and the pill holding the scale weight)
     // while the animation is running: 0 = leave them as the theme drew them,

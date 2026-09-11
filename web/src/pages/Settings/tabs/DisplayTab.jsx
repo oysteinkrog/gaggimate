@@ -195,7 +195,7 @@ function BackgroundAnimationSettings({ formData, onChange, setField }) {
             name='bgAnimInterlace'
             className='select select-bordered w-full'
             value={
-              formData.bgAnimInterlace === undefined ? 1 : parseInt(formData.bgAnimInterlace, 10)
+              formData.bgAnimInterlace === undefined ? 0 : parseInt(formData.bgAnimInterlace, 10)
             }
             onChange={onChange('bgAnimInterlace')}
           >

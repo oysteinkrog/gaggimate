@@ -503,10 +503,12 @@ telemetry-driven screen from a 650 ms LVGL pass (1.5 Hz widget updates,
   fixtures say, so a measurement that assumes the interlaced path must pin
   it (`interlace=1` on the debug endpoint, not stored) and say so. Every
   dial-element number above was taken on the whole-frame path (frame 52 to
-  78 ms). The build default is 1 since gm-2cl.9 (2026-09-08, `Settings.h`
-  `bg_ilace`, and the web form already fell back to 1); a stored 0 still
-  wins on a device that has one, which is why the bench board needs the
-  pin. What the whole-frame path costs on that board (2026-09-11, kernels
+  78 ms). **The build default is 0 (whole frame) since 2026-09-11, the
+  owner's decision** (`Settings.h` `bg_ilace` and the web form's fallback;
+  it was 1 from gm-2cl.9 on 2026-09-08 until then). Every row refreshes
+  every frame, at about half the interlaced rate. A stored value still
+  wins on a device that has one, so a measurement states which path it
+  ran on. What the whole-frame path costs on that board (2026-09-11, kernels
   in flash, cap 40, `tools/framefn_sweep.py` through the web preview;
   `/api/debug/pclk` read divider 7 after these runs, where every runner
   log up to 2026-09-10 22:54Z had read 8, and nothing in the rig writes
@@ -514,8 +516,9 @@ telemetry-driven screen from a 650 ms LVGL pass (1.5 Hz widget updates,
   ran 20 to 31 fps whole-frame, because
   a frame's work (18 to 36 ms) is more than one panel period and the flip
   waits for the next; the same animations interlaced run 34 to 37 fps. A
-  device that stores 0 is running every animation at about half speed,
-  and that is the first thing to check when the animation "got slow".
+  device on the whole-frame path (the default now) runs every animation at
+  about half its interlaced rate, and which path a device is on is the
+  first thing to check when the animation "got slow".
 - **An animation's `frame()` is timed on its own, and `band_us` does not
   see it** (`framefn_us` on `/api/debug/anim`, 2026-09-11). The stage
   counters cover the band kernel, the blend and the push; `frame()` runs
