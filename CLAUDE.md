@@ -507,8 +507,11 @@ telemetry-driven screen from a 650 ms LVGL pass (1.5 Hz widget updates,
   `bg_ilace`, and the web form already fell back to 1); a stored 0 still
   wins on a device that has one, which is why the bench board needs the
   pin. What the whole-frame path costs on that board (2026-09-11, kernels
-  in flash, divider 8, cap 40, `tools/framefn_sweep.py` through the web
-  preview): every animation but one ran 20 to 31 fps whole-frame, because
+  in flash, cap 40, `tools/framefn_sweep.py` through the web preview;
+  `/api/debug/pclk` read divider 7 after these runs, where every runner
+  log up to 2026-09-10 22:54Z had read 8, and nothing in the rig writes
+  it, so the day's rates are at 7 unless stated): every animation but one
+  ran 20 to 31 fps whole-frame, because
   a frame's work (18 to 36 ms) is more than one panel period and the flip
   waits for the next; the same animations interlaced run 34 to 37 fps. A
   device that stores 0 is running every animation at about half speed,
