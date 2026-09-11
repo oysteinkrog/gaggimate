@@ -1193,6 +1193,16 @@ void WebUIPlugin::setupDebugEndpoints() {
         doc["dma"] = a->dmaPathWanted();
         doc["rprio"] = a->renderPrioValue();
         doc["useref"] = a->useBandRefOn();
+#ifdef GM_TOUCH_PROBE
+        // harmostamp=0|1|2: Harmonograph's stamp pass, portable, PIE, or
+        // both with a compare (see BgAnimCommon.h).
+        if (request->hasArg("harmostamp")) {
+            bganim::g_harmoStampMode.store(request->arg("harmostamp").toInt());
+        }
+        doc["harmostamp"] = bganim::g_harmoStampMode.load();
+        doc["harmostamp_checked"] = bganim::g_harmoStampChecked.load();
+        doc["harmostamp_mismatch"] = bganim::g_harmoStampMismatch.load();
+#endif
 #ifdef GM_KBLOB
         doc["useblob"] = a->useBlobOn();
         doc["blob_resident"] = a->kblobResident();

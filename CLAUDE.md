@@ -526,9 +526,21 @@ telemetry-driven screen from a 650 ms LVGL pass (1.5 Hz widget updates,
   PSRAM line is fetched once a frame instead of once per lap of the
   curve), clearing only the union of the previous and current curve box,
   and skipping the zero corners of each stamp took it to about 17 ms and
-  the loop to 18 to 19 fps in the same post-boot window; the stamp pass
-  is what is left (11.5 ms, 9 instructions per byte with a branch for
-  the max). A pinned-IRAM build (`GM_BGANIM_IRAM_KERNELS=1`, all 21
+  the loop to 18 to 19 fps in the same post-boot window. The stamp pass
+  then went to the PIE (`harmonographStampAsm`: the padded stamp row is
+  loaded with `EE.LD.128.USAR.IP`, which latches the funnel shift from
+  the address's low four bits, scaled with `EE.VMUL.U8` at SAR 8, placed
+  in a 32-byte window by two `EE.SRC.Q`, and max-composited with
+  `EE.VMAX.S8` under an 0x80 bias since the PIE has no unsigned max;
+  the coverage buffer carries 16 bytes of slack on both sides for the
+  window), which took frame() to 11 to 13 ms and the loop to 18.9 fps
+  interlaced against 15.7 in the same state (whole-frame 10.7 to 12.1,
+  quantised at 68 ms). `harmostamp=0|1|2` on the loadtest build's
+  `/api/debug/anim` selects portable, PIE, or both with a byte compare
+  (`harmostamp_checked`, `harmostamp_mismatch`; 71 frames, 0), and
+  `tools/qemubench/tests/anim_harmonograph_stamp` is the bit-exact proof
+  over every window offset, level and a set of stamp shapes, guards
+  included. A pinned-IRAM build (`GM_BGANIM_IRAM_KERNELS=1`, all 21
   kernels) measured the same 14.5 fps as the flash build on the same
   serial channel, so IRAM was not the lever there either. A new
   animation whose `frame()` does per-pixel work belongs on this list, and

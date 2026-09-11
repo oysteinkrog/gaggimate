@@ -29,6 +29,11 @@ const int16_t *sinLut() {
 
 size_t g_allocSram = 0;
 size_t g_allocPsram = 0;
+#if defined(GM_TOUCH_PROBE) && defined(ESP_PLATFORM)
+std::atomic<int> g_harmoStampMode{1};
+std::atomic<uint32_t> g_harmoStampChecked{0};
+std::atomic<uint32_t> g_harmoStampMismatch{0};
+#endif
 
 namespace {
 // esp_ptr_external_ram() tests against the running target's real PSRAM window

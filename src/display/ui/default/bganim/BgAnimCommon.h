@@ -1,6 +1,7 @@
 #ifndef BGANIM_COMMON_H
 #define BGANIM_COMMON_H
 
+#include <atomic>
 #include <math.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -180,6 +181,15 @@ bool internalHasRoomFor(size_t size);
 // HTTP, and a torn 32-bit read here would only misreport a diagnostic.
 extern size_t g_allocSram;
 extern size_t g_allocPsram;
+
+#if defined(GM_TOUCH_PROBE) && defined(ESP_PLATFORM)
+// Harmonograph's stamp pass, loadtest builds: 0 portable, 1 PIE (the
+// default), 2 both with a byte compare of the coverage buffer (checked and
+// mismatch counters below; `harmostamp=` on /api/debug/anim).
+extern std::atomic<int> g_harmoStampMode;
+extern std::atomic<uint32_t> g_harmoStampChecked;
+extern std::atomic<uint32_t> g_harmoStampMismatch;
+#endif
 
 void *alloc(size_t size); // PSRAM; see the hot slab above for the placement policy
 

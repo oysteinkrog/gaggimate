@@ -34,6 +34,16 @@
 #ifndef GM_BGANIM_HARMONOGRAPH_ASM
 #define GM_BGANIM_HARMONOGRAPH_ASM 1
 #endif
+// The PIE stamp pass in frame() (harmonographStampAsm). Off renders the
+// portable stamp loop, which is also what the host and the simulator run.
+#ifndef GM_BGANIM_HARMONOGRAPH_STAMP_ASM
+#define GM_BGANIM_HARMONOGRAPH_STAMP_ASM 1
+#endif
+#if GM_BGANIM_HARMONOGRAPH_STAMP_ASM && defined(__XTENSA__) && !defined(GM_BGANIM_NO_ASM)
+#define HARMO_STAMP_ASM 1
+#else
+#define HARMO_STAMP_ASM 0
+#endif
 
 namespace {
 using namespace bganim;
@@ -45,6 +55,17 @@ constexpr int STAMP_BYTES = 16 * SW * SH;
 // box, so the corners are zero and the stamp pass skips them. About 20
 // percent of the bytes, and a zero can never raise a max.
 constexpr int EXT_BYTES = 16 * SH * 2;
+// The same sixteen stamps with every row padded to 16 bytes (bytes 11 to
+// 15 zero), 16-byte aligned, for the PIE stamp pass: one aligned vector
+// load per stamp row. STAMP16_BYTES carries 15 bytes of alignment slack.
+constexpr int STAMP16_ROW = 16;
+constexpr int STAMP16_BYTES = 16 * SH * STAMP16_ROW + 15;
+// Slack around the coverage buffer: the PIE pass reads and writes a
+// 32-byte aligned window around each stamp row, so its first window can
+// start 16 bytes before the row and its last can end 16 bytes after the
+// buffer. The bytes it touches outside the stamp are written back as
+// read (a max against zero), but they must be ours.
+constexpr int BUF_SLACK = 16 + 15 + 16;
 constexpr float PI = 3.14159265358979323846f;
 
 // At 480x480: ctPh 7,680 + rowTerm 960 + palette 512 + scratch 32 +
@@ -57,6 +78,12 @@ constexpr float PI = 3.14159265358979323846f;
 int16_t *ctPh = nullptr, *rowTerm = nullptr, *colTerm = nullptr;
 uint16_t *palette = nullptr, *scratch = nullptr, *ones = nullptr;
 uint8_t *bufStorage = nullptr, *buf = nullptr, *tail = nullptr, *stamp = nullptr, *stampExt = nullptr;
+uint8_t *stamp16Storage = nullptr, *stamp16 = nullptr;
+#if defined(GM_TOUCH_PROBE) && defined(ESP_PLATFORM)
+// Self-check scratch (mode 2 of bganim::g_harmoStampMode): a second
+// coverage buffer the portable pass writes so the two can be compared.
+uint8_t *chkStorage = nullptr, *chk = nullptr;
+#endif
 int16_t *dith = nullptr;
 // Per-sample stamp positions in Q2 (posX, posY, NS each), the samples in
 // stamp-row order (order, NS) and the counting sort's row cursors (rowCur,
@@ -70,9 +97,13 @@ int16_t *dith = nullptr;
 // order, 19.7 sorted, 17 with the stamp extents and the branchless max
 // below; of that, the stamp pass is about 11.5 ms, the union clear 3 to
 // 5, the position pass 1.5 to 2, the row and column terms 0.6 and the
-// sort 0.2. What is left in the stamp pass is 9 instructions per byte in
-// a zero-overhead loop (the compiler keeps a branch for the max), and a
-// PIE version would need an unaligned store path this file does not have.
+// sort 0.2. The scalar stamp pass was 9 instructions per byte in a
+// zero-overhead loop (the compiler keeps a branch for the max);
+// harmonographStampAsm below does a stamp row in 17 PIE instructions
+// and took frame() to 11 to 13 ms (mode 0 against mode 1 through
+// `harmostamp=` on the loadtest build, 19.2 and 21.3 ms against 11.8
+// and 11.1; 71 frames compared byte for byte in mode 2, 0 mismatches;
+// tools/qemubench/tests/anim_harmonograph_stamp is the QEMU proof).
 int16_t *posX = nullptr, *posY = nullptr;
 uint16_t *order = nullptr, *rowCur = nullptr;
 const int16_t *sl = nullptr; // borrowed shared slab table, never released here
@@ -123,17 +154,21 @@ bool init(int w, int h) {
     dith = static_cast<int16_t *>(alloc(64 * sizeof(int16_t)));
     stamp = static_cast<uint8_t *>(alloc(STAMP_BYTES));
     stampExt = static_cast<uint8_t *>(alloc(EXT_BYTES));
-    bufStorage = static_cast<uint8_t *>(alloc(static_cast<size_t>(bufStride) * h + 15));
-    if (!ctPh || !rowTerm || !palette || !scratch || !ones || !colTerm || !tail || !dith || !stamp || !stampExt || !bufStorage || !posX ||
+    stamp16Storage = static_cast<uint8_t *>(alloc(STAMP16_BYTES));
+    bufStorage = static_cast<uint8_t *>(alloc(static_cast<size_t>(bufStride) * h + BUF_SLACK));
+    if (!ctPh || !rowTerm || !palette || !scratch || !ones || !colTerm || !tail || !dith || !stamp || !stampExt || !stamp16Storage || !bufStorage || !posX ||
         !posY || !order || !rowCur) {
         // Every successful allocation is released, including those after
         // an earlier failure. A retry sees exactly the initial state.
         release();
         return false;
     }
-    buf = reinterpret_cast<uint8_t *>((reinterpret_cast<uintptr_t>(bufStorage) + 15) & ~uintptr_t(15));
-    // Once, here: frame() only clears where the thread was and is.
-    memset(buf, 0, static_cast<size_t>(bufStride) * h);
+    // 16 bytes of slack before buf and at least 16 after (see BUF_SLACK).
+    buf = reinterpret_cast<uint8_t *>((reinterpret_cast<uintptr_t>(bufStorage) + 16 + 15) & ~uintptr_t(15));
+    stamp16 = reinterpret_cast<uint8_t *>((reinterpret_cast<uintptr_t>(stamp16Storage) + 15) & ~uintptr_t(15));
+    // Once, here: frame() only clears where the thread was and is. The
+    // slack is zeroed too so the PIE pass's window reads defined bytes.
+    memset(bufStorage, 0, static_cast<size_t>(bufStride) * h + BUF_SLACK);
     prevX0 = prevX1 = prevY0 = prevY1 = 0;
     for (int k = 0; k < 8; ++k) ones[k] = 1;
     for (int fy = 0; fy < 4; ++fy) {
@@ -160,6 +195,10 @@ bool init(int w, int h) {
             stampExt[(k * SH + j) * 2 + 1] = static_cast<uint8_t>(i1);
         }
     }
+    memset(stamp16, 0, 16 * SH * STAMP16_ROW);
+    for (int k = 0; k < 16; ++k)
+        for (int j = 0; j < SH; ++j)
+            memcpy(stamp16 + (k * SH + j) * STAMP16_ROW, stamp + k * SW * SH + j * SW, SW);
     // pcDither(..., 2.6), whole palette indices. No half-integer ties occur,
     // so lroundf agrees with JavaScript Math.round for negative values too.
     for (int k = 0; k < 64; ++k)
@@ -180,6 +219,105 @@ uint32_t phase(float tt, float rate) {
 BGANIM_INLINE int sineQ6(uint32_t q) {
     const int k = (q >> 6) & 1023;
     return sl[k] + (((sl[(k + 1) & 1023] - sl[k]) * static_cast<int>(q & 63)) >> 6);
+}
+
+
+#if HARMO_STAMP_ASM
+// One stamp, eleven rows, through the PIE: per row one aligned load of the
+// padded stamp row, one EE.VMUL.U8 against the broadcast comet level with
+// SAR 8 (the exact (s * lvl) >> 8 of the portable loop, at most 254), two
+// funnel shifts that place the 16 bytes inside a 32-byte aligned window,
+// and a max against the two coverage vectors of that window. The window
+// starts at the last 16-byte boundary strictly before the stamp's left
+// edge, so the stamp sits at offset a in 1..16 and the funnel shift is
+// k = 16 - a in 0..15: L = {S, 0} >> k lands S at offset a, and H =
+// {0, S} >> k carries what spills past byte 16. SAR_BYTE is latched from
+// the low four bits of the address handed to EE.LD.128.USAR.IP, and the
+// packed rows are 16-byte aligned, so pointing it at rows16 + k loads the
+// row and sets the shift in one instruction. The PIE has no unsigned max,
+// so both sides are biased by 0x80 for EE.VMAX.S8 and the result is
+// biased back; every value is 0 to 254, so the bias is a bijection on the
+// range. Bytes of the window outside the stamp meet a zero lane and are
+// written back as read, which is why the coverage buffer carries 16 bytes
+// of slack on both sides. q0 to q7 are all used; SAR and PIE context
+// belong to FreeRTOS and CPENABLE is never written here.
+GM_ANIM_IRAM __attribute__((noinline)) void harmonographStampAsm(uint8_t *base, int stride, const uint8_t *rows16, int k,
+                                                                    const uint8_t *lvlPtr, int nrows) {
+    const uint32_t bias = 0x80808080u;
+    const uint8_t *usar = rows16 + k;
+    asm volatile("ee.movi.32.q q7, %[bias], 0\n"
+                 "ee.movi.32.q q7, %[bias], 1\n"
+                 "ee.movi.32.q q7, %[bias], 2\n"
+                 "ee.movi.32.q q7, %[bias], 3\n"
+                 "ee.vldbc.8 q6, %[lvl]\n"
+                 "ee.zero.q q1\n"
+                 "ssai 8\n"
+                 "loop %[n], 1f\n"
+                 "ee.ld.128.usar.ip q0, %[usar], 16\n"
+                 "ee.vmul.u8 q0, q0, q6\n"
+                 "ee.src.q q2, q1, q0\n"
+                 "ee.src.q q3, q0, q1\n"
+                 "ee.vld.128.ip q4, %[out], 16\n"
+                 "ee.vld.128.ip q5, %[out], -16\n"
+                 "ee.xorq q2, q2, q7\n"
+                 "ee.xorq q3, q3, q7\n"
+                 "ee.xorq q4, q4, q7\n"
+                 "ee.xorq q5, q5, q7\n"
+                 "ee.vmax.s8 q4, q4, q2\n"
+                 "ee.vmax.s8 q5, q5, q3\n"
+                 "ee.xorq q4, q4, q7\n"
+                 "ee.xorq q5, q5, q7\n"
+                 "ee.vst.128.ip q4, %[out], 16\n"
+                 "ee.vst.128.ip q5, %[out], -16\n"
+                 "add %[out], %[out], %[stride]\n"
+                 "1:\n"
+                 : [out] "+&r"(base), [usar] "+&r"(usar)
+                 : [n] "r"(nrows), [stride] "r"(stride), [lvl] "r"(lvlPtr), [bias] "r"(bias)
+                 : "memory");
+}
+#endif
+
+// The portable stamp: eleven rows of at most eleven bytes, max composited.
+// An 11-byte stamp row cannot contain an aligned 16-byte PIE span, so this
+// keeps to scalar byte stores and skips each row's zero corners through the
+// extents. Branchless max: the S3 has MAX, and the data-dependent branch
+// this replaces mispredicted on about every other byte.
+inline void stampScalar(uint8_t *dst, int dstStride, int x0, int y0, int sub, int lvl) {
+    const uint8_t *sb = stamp + sub * SW * SH;
+    const uint8_t *ext = stampExt + sub * SH * 2;
+    for (int j = 0; j < SH; ++j) {
+        uint8_t *out = dst + static_cast<size_t>(y0 + j) * dstStride + x0;
+        const uint8_t *sr = sb + j * SW;
+        const int i0 = ext[j * 2], i1 = ext[j * 2 + 1];
+        for (int i = i0; i < i1; ++i) {
+            const int g = (sr[i] * lvl) >> 8;
+            const int o = out[i];
+            out[i] = static_cast<uint8_t>(o > g ? o : g);
+        }
+    }
+}
+
+// Every stamp of the frame into dst, in the sorted order. usePie selects the
+// PIE pass where it is compiled in; otherwise the portable one.
+void stampAll(uint8_t *dst, int total, int head, bool usePie) {
+    for (int k = 0; k < total; ++k) {
+        const int s = order[k];
+        const int pxq = posX[s], pyq = posY[s];
+        const int x0 = (pxq >> 2) - 5, y0 = (pyq >> 2) - 5;
+        const int sub = ((pyq & 3) * 4) + (pxq & 3);
+        const uint8_t *lvlPtr = tail + ((s - head) & (NS - 1));
+#if HARMO_STAMP_ASM
+        if (usePie) {
+            const int base = (x0 - 1) & ~15;
+            harmonographStampAsm(dst + static_cast<size_t>(y0) * bufStride + base, bufStride,
+                                 stamp16 + sub * SH * STAMP16_ROW, 16 - (x0 - base), lvlPtr, SH);
+            continue;
+        }
+#else
+        (void)usePie;
+#endif
+        stampScalar(dst, bufStride, x0, y0, sub, *lvlPtr);
+    }
 }
 
 void frame(uint32_t tMs, int w, int h, const uint8_t p[BG_ANIM_PARAMS]) {
@@ -333,30 +471,32 @@ void frame(uint32_t tMs, int w, int h, const uint8_t p[BG_ANIM_PARAMS]) {
         prevY1 = curEmpty ? 0 : curY1;
     }
     // Stamp pass, in row order (see posX above for why).
-    for (int k = 0; k < total; ++k) {
-        const int s = order[k];
-        const int pxq = posX[s], pyq = posY[s];
-        const int x0 = (pxq >> 2) - 5, y0 = (pyq >> 2) - 5;
-        const int lvl = tail[(s - head) & (NS - 1)];
-        const int sub = ((pyq & 3) * 4) + (pxq & 3);
-        const uint8_t *sb = stamp + sub * SW * SH;
-        const uint8_t *ext = stampExt + sub * SH * 2;
-        // An 11-byte stamp row cannot contain an aligned 16-byte PIE span.
-        // Keep these short, arbitrarily aligned max stores scalar; widening
-        // their footprints would touch unrelated coverage beside the stamp.
-        // Branchless: the S3 has MAX, and the data-dependent branch this
-        // replaces mispredicted on about every other byte.
-        for (int j = 0; j < SH; ++j) {
-            uint8_t *out = buf + (y0 + j) * bufStride + x0;
-            const uint8_t *sr = sb + j * SW;
-            const int i0 = ext[j * 2], i1 = ext[j * 2 + 1];
-            for (int i = i0; i < i1; ++i) {
-                const int g = (sr[i] * lvl) >> 8;
-                const int o = out[i];
-                out[i] = static_cast<uint8_t>(o > g ? o : g);
-            }
+#if defined(GM_TOUCH_PROBE) && defined(ESP_PLATFORM)
+    const int mode = HARMO_STAMP_ASM ? bganim::g_harmoStampMode.load() : 0;
+    if (mode == 2) {
+        // Both passes on identical input, then a byte compare of the whole
+        // buffer including the slack: the PIE pass must leave the bytes
+        // beside a stamp exactly as it found them.
+        const size_t bytes = static_cast<size_t>(bufStride) * h + BUF_SLACK;
+        if (chkStorage == nullptr) {
+            chkStorage = static_cast<uint8_t *>(alloc(bytes));
+            chk = chkStorage != nullptr ? chkStorage + (buf - bufStorage) : nullptr;
+        }
+        if (chk != nullptr) {
+            memcpy(chkStorage, bufStorage, bytes);
+            stampAll(buf, total, head, true);
+            stampAll(chk, total, head, false);
+            uint32_t bad = 0;
+            for (size_t i = 0; i < bytes; ++i) bad += bufStorage[i] != chkStorage[i];
+            bganim::g_harmoStampChecked.fetch_add(1);
+            if (bad != 0) bganim::g_harmoStampMismatch.fetch_add(bad);
+            return;
         }
     }
+    stampAll(buf, total, head, mode != 0);
+#else
+    stampAll(buf, total, head, HARMO_STAMP_ASM != 0);
+#endif
 }
 
 GM_ANIM_IRAM void bandRef(uint16_t *__restrict dst, int y0, int rows, int w, uint32_t, const uint8_t *) {
@@ -523,8 +663,14 @@ void release() {
     releaseTable(dith, 64 * sizeof(int16_t));
     releaseTable(stamp, STAMP_BYTES);
     releaseTable(stampExt, EXT_BYTES);
-    releaseTable(bufStorage, static_cast<size_t>(bufStride) * allocH + 15);
+    releaseTable(stamp16Storage, STAMP16_BYTES);
+    releaseTable(bufStorage, static_cast<size_t>(bufStride) * allocH + BUF_SLACK);
+#if defined(GM_TOUCH_PROBE) && defined(ESP_PLATFORM)
+    releaseTable(chkStorage, static_cast<size_t>(bufStride) * allocH + BUF_SLACK);
+    chk = nullptr;
+#endif
     buf = nullptr;
+    stamp16 = nullptr;
     sl = nullptr;
     allocW = allocH = ctStride = bufStride = 0;
     lastThemeGen = 0xFFFFFFFF;
