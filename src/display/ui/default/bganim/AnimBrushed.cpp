@@ -1,204 +1,331 @@
 #ifndef GAGGIMATE_SIM
 
-// "Brushed Metal" - fine horizontal grain with one broad reflection sliding
-// across it. Brainstormed 2026-09-09 with GPT (Codex CLI, gpt-6-astra) as
-// candidate 1 of gm-4bd.
+// "Brushed" - a broad travelling reflection over fixed horizontal grain,
+// with a shorter swell moving the other way and a slow vertical tilt. This
+// is entry 14 in tools/animbench/web/anim_bench.html, including its metal
+// palette: a dark base, a broad highlight shoulder and a small second one.
+// The grain holds for 4..12 rows and is smoothed once at init, so the surface
+// stays still while the light moves across it.
 //
-// The kernel is Plasma's: one per-column table with the 8x8 Bayer dither
-// already folded into eight y-phase copies, one per-row scalar, an add, a
-// shift and one palette gather. What makes it read as metal rather than as
-// plasma is where the two terms get their content. The row term carries a
-// fixed-seed grain, so every row sits at its own slightly different level and
-// the field reads as horizontal brushing; the column term carries two wide,
-// slow lobes, which is the reflection. The grain's seed is fixed at init, so
-// a row's grain is the same every frame and nothing crawls: only the
-// reflection's phase and a very slow vertical breathe move.
-//
-// Index safety. band() computes (colTermPh[x] + rowTerm[y]) >> 4 and gathers
-// with it, with no per-pixel bound check. frame() guarantees the sum lands in
-// 0..4095 by construction: rowTerm is built first, its largest magnitude is
-// measured, and colTermPh is then clamped into [rowMax, 4095 - rowMax]. That
-// holds at every parameter combination, which is what the fuzz harness checks
-// with the sanitizers on.
+// The page's separable field is kept exactly: eight Bayer phase copies of
+// colTerm, plus one rowTerm at the absolute y, in sixteenths of a palette
+// index. bandRef gathers palette[(colTermPh[x] + rowTerm[y]) >> 4]. Sine
+// samples have amplitude 512, spatial steps are Q4 sine-table units per
+// pixel, and phase products wrap at 32 bits exactly as JS >>> 0. There is
+// no per-pixel float or dependency on band height. Each physical row has
+// its own grain and y & 7 dither phase.
+// The host PPM writer expands RGB565 with channel * 255 / (31 or 63),
+// while the page replicates high bits. Their RGB888 values can differ by
+// one with identical RGB565 pixels; this is export rounding, not the look.
 
 #include "BgAnim.h"
 #include "BgAnimCommon.h"
-#include <string.h>
+
+#ifndef GM_BGANIM_BRUSHED_ASM
+#define GM_BGANIM_BRUSHED_ASM 1
+#endif
 
 namespace {
 using namespace bganim;
 
-constexpr int INDEX_MAX = 4095; // (colTermPh + rowTerm) must stay in 0..INDEX_MAX
+constexpr int INDEX_MAX = 4095; // 256 palette entries, 16 field units each
+constexpr int MID = 2048;       // centre of the page's 12-bit field
 
-int16_t *colTerm = nullptr;   // frame() only -> PSRAM
-int16_t *colTermPh = nullptr; // read every pixel -> slab, 8 y-phase copies
-int16_t *rowTerm = nullptr;   // read once per row -> slab
-int16_t *grainBase = nullptr; // read once per row in frame() -> PSRAM
-uint16_t *palette = nullptr;  // read every pixel -> slab
+int16_t *colTerm = nullptr;   // page's un-dithered column table, frame only
+int16_t *colTermPh = nullptr; // eight Bayer phases, one read per pixel
+int16_t *rowTerm = nullptr;   // one read per absolute row
+int16_t *grainBase = nullptr; // fixed, smoothed grain, frame only
+int16_t *dithOff = nullptr;   // 64 offsets in sixteenths of a palette index
+uint16_t *ramp = nullptr;    // 256-entry theme ramp, palette rebuild only
+uint16_t *palette = nullptr; // shaped metal curve, one gather per pixel
+const int16_t *sl = nullptr; // borrowed shared SIN_N-entry sine table
 
-// Dither offsets in PRE-SHIFT units, where one palette index is 16, so a
-// sub-index amplitude survives band()'s >>4. Rebuilt with the palette.
-int16_t dithOff[64] = {0};
-
-uint8_t lastP[4] = {255, 255, 255, 255};
 uint32_t lastThemeGen = 0xFFFFFFFF;
-int allocW = 0, allocH = 0;
+bool paletteValid = false;
+int allocW = 0, allocH = 0, colStride = 0;
 
-// Table placement, against the 9,216 B per-animation slab:
-//   colTermPh  7,680 B  read every pixel                       HOT
-//   rowTerm      960 B  read once per row, and on the address
-//                       path to every pixel of that row        HOT
-//   palette      512 B  read every pixel, by a data-dependent
-//                       index, which is the access a PSRAM
-//                       miss punishes hardest                  HOT
-//   ----------------------------------------------------------------
-//              9,152 B of 9,216 B
-//   colTerm      960 B  read only in frame()                   PSRAM
-//   grainBase    960 B  read once per row in frame(), a
-//                       sequential sweep                       PSRAM
+// Table budget at 480x480, against the 9,216 B animation slab:
+//   colTermPh  7,680 B  slab, 8 * round_up(w, 8) * sizeof(int16_t)
+//   rowTerm      960 B  slab, h * sizeof(int16_t)
+//   palette      512 B  slab, 256 * sizeof(uint16_t)
+//              9,152 B  total, 64 B spare
+//   colTerm      960 B  PSRAM, w * sizeof(int16_t)
+//   grainBase    960 B  PSRAM, h * sizeof(int16_t)
+//   dithOff      128 B  PSRAM, 64 * sizeof(int16_t)
+//   ramp         512 B  PSRAM, 256 * sizeof(uint16_t)
+//              2,560 B  total PSRAM
+// rowTerm temporarily holds the page's raw grain during init, before frame
+// builds row terms. No extra raw allocation or permanent BSS table is needed.
+// Every phase starts on a 16-byte boundary, even at widths 466 and 233.
+// Padding is never sampled; rounding the stride does not rescale the image.
 void release();
 
 bool init(int w, int h) {
-    if (sinLut() == nullptr) {
+    if (w != allocW || h != allocH) {
+        release();
+    }
+    if (palette != nullptr) {
+        return true; // all allocations and the grain build already succeeded
+    }
+    // Supported panel dimensions also bound the stride and slab footprint.
+    if (w <= 0 || h <= 0 || w > 480 || h > 480) {
+        release();
         return false;
     }
-    if (colTerm == nullptr) {
-        colTerm = static_cast<int16_t *>(alloc(w * sizeof(int16_t)));
-        if (colTerm == nullptr) {
-            release(); // a partial set must not survive a failed init (gm-bzu.15)
-            return false;
-        }
-        allocW = w;
+    allocW = w;
+    allocH = h;
+    colStride = (w + 7) & ~7;
+    sl = sinLut();
+    if (sl == nullptr) {
+        release();
+        return false;
     }
-    if (colTermPh == nullptr) {
-        // Sized from allocW, not w, so a retried init() that finds colTerm
-        // already allocated at an earlier width agrees with what release()
-        // will free.
-        colTermPh = static_cast<int16_t *>(allocHot(8 * allocW * sizeof(int16_t)));
-        if (colTermPh == nullptr) {
-            release();
-            return false;
-        }
+    colTerm = static_cast<int16_t *>(alloc(static_cast<size_t>(w) * sizeof(int16_t)));
+    colTermPh = static_cast<int16_t *>(allocHot(static_cast<size_t>(8 * colStride) * sizeof(int16_t)));
+    rowTerm = static_cast<int16_t *>(allocHot(static_cast<size_t>(h) * sizeof(int16_t)));
+    grainBase = static_cast<int16_t *>(alloc(static_cast<size_t>(h) * sizeof(int16_t)));
+    dithOff = static_cast<int16_t *>(alloc(64 * sizeof(int16_t)));
+    ramp = static_cast<uint16_t *>(alloc(256 * sizeof(uint16_t)));
+    palette = static_cast<uint16_t *>(allocHot(256 * sizeof(uint16_t)));
+    if (!colTerm || !colTermPh || !rowTerm || !grainBase || !dithOff || !ramp || !palette) {
+        release(); // no partial set may survive a failed init or its retry
+        return false;
     }
-    if (rowTerm == nullptr) {
-        rowTerm = static_cast<int16_t *>(allocHot(h * sizeof(int16_t)));
-        if (rowTerm == nullptr) {
-            release();
-            return false;
+
+    // Same xorshift seed, draw order, hold lengths and 7:1 coarse/fine mix
+    // as the page. Signed right shifts on GCC round down, like JS >>.
+    uint32_t seed = 0x9E3779B9u;
+    int coarse = 0, hold = 0;
+    for (int y = 0; y < h; y++) {
+        if (hold == 0) {
+            coarse = static_cast<int>(nextRand(seed) & 1023u) - 512;
+            hold = 4 + static_cast<int>(nextRand(seed) % 9u);
         }
-        allocH = h;
+        hold--;
+        const int fine = static_cast<int>(nextRand(seed) & 1023u) - 512;
+        rowTerm[y] = static_cast<int16_t>((coarse * 7 + fine) >> 3);
     }
-    if (grainBase == nullptr) {
-        grainBase = static_cast<int16_t *>(alloc(allocH * sizeof(int16_t)));
-        if (grainBase == nullptr) {
-            release();
-            return false;
-        }
-        // Fixed seed: the grain is a property of the surface, not of time. Two
-        // scales, so the streaks vary in width the way a brushed finish does:
-        // a coarse level held for two to six rows, plus a fine per-row jitter.
-        uint32_t s = 0x9E3779B9u;
-        int coarse = 0, hold = 0;
-        for (int y = 0; y < allocH; y++) {
-            if (hold == 0) {
-                coarse = static_cast<int>(nextRand(s) & 1023) - 512;
-                hold = 2 + static_cast<int>(nextRand(s) % 5u);
-            }
-            hold--;
-            const int fine = static_cast<int>(nextRand(s) & 1023) - 512;
-            grainBase[y] = static_cast<int16_t>((coarse * 5 + fine * 3) >> 3);
-        }
-    }
-    if (palette == nullptr) {
-        palette = static_cast<uint16_t *>(allocHot(256 * sizeof(uint16_t)));
-        if (palette == nullptr) {
-            release();
-            return false;
-        }
+    // One 1-2-1 pass with replicated endpoints. Every neighbor is from the
+    // original raw grain, not from an in-place smoothing recurrence.
+    for (int y = 0; y < h; y++) {
+        const int a = rowTerm[y > 0 ? y - 1 : 0];
+        const int b = rowTerm[y];
+        const int c = rowTerm[y < h - 1 ? y + 1 : h - 1];
+        grainBase[y] = static_cast<int16_t>((a + 2 * b + c) >> 2);
     }
     return true;
 }
 
 void frame(uint32_t tMs, int w, int h, const uint8_t p[BG_ANIM_PARAMS]) {
-    if (memcmp(p, lastP, 4) != 0 || themeGen() != lastThemeGen) {
-        memcpy(lastP, p, 4);
-        lastThemeGen = themeGen();
-        buildThemeRamp(palette, 256);
-        // A plain ramp, so the whole dither amplitude is wanted: unlike
-        // Plasma's wheel there are no steep arcs here to over-dither.
-        const float amp = ditherAmp(palette, 256);
+    const uint32_t gen = themeGen();
+    if (!paletteValid || gen != lastThemeGen) {
+        buildThemeRamp(ramp, 256);
+        for (int i = 0; i < 256; i++) {
+            // Page's metal curve in theme-ramp positions: a 7..46 base and
+            // squared triangular shoulders, centre/radius/gain 182/56/132
+            // and 238/18/60. Divisions truncate before squaring.
+            int v = 7 + ((i * 40) >> 8);
+            int d = i - 182;
+            int ad = d < 0 ? -d : d;
+            if (ad < 56) {
+                const int k = 256 - ad * 256 / 56;
+                v += (((k * k) >> 8) * 132) >> 8;
+            }
+            d = i - 238;
+            ad = d < 0 ? -d : d;
+            if (ad < 18) {
+                const int k = 256 - ad * 256 / 18;
+                v += (((k * k) >> 8) * 60) >> 8;
+            }
+            v = v < 0 ? 0 : (v > 255 ? 255 : v);
+            palette[i] = ramp[v];
+        }
+        // Measured on the shaped RGB565 palette, then scaled by the page's
+        // 0.75 and 16 pre-shift units. lroundf matches its lround (ties away
+        // from zero). Float versus JS double rounding may move an offset by
+        // one field unit at a tie, never change the palette mapping.
+        const float amp = ditherAmp(palette, 256) * 0.75f;
         for (int k = 0; k < 64; k++) {
             const float d = (static_cast<float>(BAYER8[k]) - 31.5f) * (amp * 16.0f / 31.5f);
             dithOff[k] = static_cast<int16_t>(lroundf(d));
         }
+        lastThemeGen = gen;
+        paletteValid = true;
     }
-
-    // Time. Everything below is unsigned, so the wrap at 4.29e9 ms is a phase
-    // wrap and nothing else; the multiply is allowed to overflow for the same
-    // reason (Plasma does the same).
-    const uint32_t sp = 4 + static_cast<uint32_t>(p[0]) * 44 / 100; // 0.25x..3x
-    const uint32_t base = (tMs * sp) >> 4;
-    const uint32_t ph1 = base >> 5;         // the wide reflection, slowest
-    const uint32_t ph2 = (base * 3) >> 7;   // the narrower one, drifting apart
-    const uint32_t ph3 = base >> 7;         // the vertical breathe
-
-    const int16_t *sl = sinLut();
-
-    // Row term: the grain, plus a very slow vertical breathe so the surface is
-    // not completely static when the reflection is off to one side.
-    const int grainQ8 = static_cast<int>(p[1]) * 128 / 100; // 0..128
+    // The page also keys on params, but palette/dither use no parameter.
+    // Rebuilding only on theme changes therefore produces the same tables.
+    const uint32_t sp = 4 + static_cast<uint32_t>(p[0]) * 44 / 100; // 4..48, default 12
+    const uint32_t base = tMs * sp; // no old placeholder >> 4 here
+    const uint32_t ph1 = base >> 8;
+    const uint32_t ph2 = (base * 3u) >> 10;
+    const uint32_t ph3 = base >> 11;
+    // Default sine periods: 21.845333 s, 29.127111 s and 174.762667 s.
+    // Unsigned products preserve JS wrap at long uptime; computing from
+    // tMs also matches the page when the speed parameter changes.
+    const int grainQ8 = 16 + static_cast<int>(p[1]) * 68 / 100; // 16..84
+    const int tiltA = 120 + static_cast<int>(p[1]) * 150 / 100; // 120..270
     int rowMax = 0;
     for (int y = 0; y < h; y++) {
-        const int g = (grainBase[y] * grainQ8) >> 8;              // +-256
-        const int wave = (sl[((y * 3) + ph3) & (SIN_N - 1)] * 64) >> 8; // +-128
-        const int v = g + wave;
+        const int g = (grainBase[y] * grainQ8) >> 8;
+        const int v = g + ((sl[((static_cast<uint32_t>(y) * 9u >> 4) + ph3) & (SIN_N - 1)] * tiltA) >> 9);
         rowTerm[y] = static_cast<int16_t>(v);
         const int a = v < 0 ? -v : v;
         if (a > rowMax) {
             rowMax = a;
         }
     }
-
-    // Column term: two broad lobes. p[2] sets how wide they are (a lower
-    // spatial frequency is a wider reflection), p[3] how strong.
-    const uint32_t fQ4 = 48 - static_cast<uint32_t>(p[2]) * 36 / 100; // 48..12, /16 cycles per px
-    const int amp1 = 96 + static_cast<int>(p[3]) * 160 / 100;         // 96..256
-    const int amp2 = amp1 >> 1;
-    const int mid = (INDEX_MAX + 1) / 2;
+    // Wavelengths 380..900 px and 55% of that, quantized to Q4 sine-table
+    // steps as on the page. Default steps 26 and 48 give wavelengths
+    // 630.153846 and 341.333333 px, moving right at 28.846154 px/s and left
+    // at 11.718750 px/s. Width never rescales these physical-pixel speeds.
+    const int px = 380 + static_cast<int>(p[2]) * 520 / 100;
+    const uint32_t f1Q4 = 16 * 1024 / px;
+    const uint32_t f2Q4 = 16 * 1024 / (px * 55 / 100);
+    const int amp1 = 420 + static_cast<int>(p[3]) * 560 / 100; // 420..980
+    const int amp2 = amp1 >> 2;                             // 105..245
     for (int x = 0; x < w; x++) {
-        const uint32_t i1 = ((static_cast<uint32_t>(x) * fQ4) >> 4) + ph1;
-        const uint32_t i2 = ((static_cast<uint32_t>(x) * fQ4) >> 5) + ph2;
-        colTerm[x] = static_cast<int16_t>(mid + ((sl[i1 & (SIN_N - 1)] * amp1) >> 8) +
-                                          ((sl[i2 & (SIN_N - 1)] * amp2) >> 8));
+        const uint32_t i1 = ((static_cast<uint32_t>(x) * f1Q4) >> 4) - ph1;
+        const uint32_t i2 = ((static_cast<uint32_t>(x) * f2Q4) >> 4) + ph2;
+        colTerm[x] = static_cast<int16_t>(MID + ((sl[i1 & (SIN_N - 1)] * amp1) >> 9) +
+                                        ((sl[i2 & (SIN_N - 1)] * amp2) >> 9));
     }
-
-    // Expand into the eight y-phase copies, adding the dither and clamping so
-    // that colTermPh + rowTerm cannot leave 0..INDEX_MAX for any row.
+    // |grain| <= 512 and |rowTerm| <= 168 + 270 = 438 at every slider
+    // extreme. Clamp the dithered columns to [rowMax, 4095-rowMax], proving
+    // the final sum is 0..4095, including ditherAmp's maximum of 16.
     const int lo = rowMax;
     const int hi = INDEX_MAX - rowMax;
     for (int ph = 0; ph < 8; ph++) {
-        int16_t *dstPh = colTermPh + static_cast<size_t>(ph) * w;
-        const int16_t *off = &dithOff[ph * 8];
+        int16_t *ct = colTermPh + static_cast<size_t>(ph) * colStride;
+        const int16_t *off = dithOff + ph * 8;
         for (int x = 0; x < w; x++) {
             int v = colTerm[x] + off[x & 7];
-            v = v < lo ? lo : (v > hi ? hi : v);
-            dstPh[x] = static_cast<int16_t>(v);
+            ct[x] = static_cast<int16_t>(v < lo ? lo : (v > hi ? hi : v));
         }
     }
 }
 
-// The kernel. Portable C++ on every target, so the descriptor's bandRef slot
-// is nullptr: BgAnim.h asks for nullptr when band() is portable code and
-// there is no second path to compare it against.
-void band(uint16_t *dst, int y0, int rows, int w, uint32_t, const uint8_t *) {
+#if GM_BGANIM_BRUSHED_ASM && defined(__XTENSA__) && !defined(GM_BGANIM_NO_ASM)
+// GCC 14.2, xtensa-asm14.sh, before adding this kernel: bandRef's .L4 is
+// already a hardware loop with 15 instructions per pair, no spills inside
+// the loop and no adjacent scalar load/use. The short scalar loop below
+// transcribes its schedule verbatim. The edge for full blocks is PIE:
+// load eight columns and add the signed row term in eight s16 lanes. All
+// sums are 0..4095, so VADDS never saturates. MOVI.32.A keeps the result
+// in registers, and EXTUI extracts bits 4..11 and 20..27 as two indices.
+// There is no vector gather for a 16-bit palette; four interleaved scalar
+// pairs do the gathers and four S32I stores emit the eight RGB565 pixels.
+// No index scratch buffer, extra palette or PSRAM reads enter this loop.
+//
+// Full block: 44 instructions / 8 pixels = 5.5 instructions per pixel,
+// versus GCC's 60 / 8 = 7.5. ADDI between VLD and VADDS hides the vector
+// load/use slot; the independent high-half shift hides the low palette
+// load/use slot. No adjacent load/use remains. This is a schedule claim,
+// not a measured device speedup: flash fetch, PSRAM output and row-call
+// setup still need the production A/B. Host timings cannot settle that.
+//
+// ct is 16-byte aligned by allocHot and the padded colStride, out is only
+// required to be 4-byte aligned. Only complete eight-pixel spans use VLD;
+// the 0..7-pixel tail never reads the padding. The assembled 128-byte vector
+// body and 40-byte scalar body fit LOOPNEZ's 256-byte reach and never nest.
+// GCC does not allocate q registers and has no q-register clobber syntax.
+// q0/q1 are private to this asm; FreeRTOS saves them lazily. CPENABLE and
+// SAR are never written here. The MOVI.32.A selectors were executed first
+// in tools/qemubench/tests/anim_brushed/probe_movi.
+GM_ANIM_IRAM __attribute__((noinline)) void brushedRowAsm(uint16_t *out, const int16_t *ct,
+                                                         const uint16_t *pal, int rt, int n) {
+    const int blocks = n >> 3;
+    int32_t lo, hi;
+    if (blocks != 0) {
+        uint32_t rowPair = (uint16_t)rt;
+        rowPair |= rowPair << 16;
+        asm volatile("ee.movi.32.q q1, %[rt], 0\n"
+                     "ee.movi.32.q q1, %[rt], 1\n"
+                     "ee.movi.32.q q1, %[rt], 2\n"
+                     "ee.movi.32.q q1, %[rt], 3\n"
+                     "loopnez %[n], 1f\n"
+                     "ee.vld.128.ip q0, %[ct], 0\n"
+                     "addi    %[ct], %[ct], 16\n"
+                     "ee.vadds.s16 q0, q0, q1\n"
+                     "ee.movi.32.a q0, %[hi], 0\n"
+                     "extui   %[lo], %[hi], 4, 8\n"
+                     "extui   %[hi], %[hi], 20, 8\n"
+                     "addx2   %[lo], %[lo], %[pal]\n"
+                     "addx2   %[hi], %[hi], %[pal]\n"
+                     "l16ui   %[hi], %[hi], 0\n"
+                     "l16ui   %[lo], %[lo], 0\n"
+                     "slli    %[hi], %[hi], 16\n"
+                     "or      %[hi], %[hi], %[lo]\n"
+                     "s32i    %[hi], %[out], 0\n"
+                     "ee.movi.32.a q0, %[hi], 1\n"
+                     "extui   %[lo], %[hi], 4, 8\n"
+                     "extui   %[hi], %[hi], 20, 8\n"
+                     "addx2   %[lo], %[lo], %[pal]\n"
+                     "addx2   %[hi], %[hi], %[pal]\n"
+                     "l16ui   %[hi], %[hi], 0\n"
+                     "l16ui   %[lo], %[lo], 0\n"
+                     "slli    %[hi], %[hi], 16\n"
+                     "or      %[hi], %[hi], %[lo]\n"
+                     "s32i    %[hi], %[out], 4\n"
+                     "ee.movi.32.a q0, %[hi], 2\n"
+                     "extui   %[lo], %[hi], 4, 8\n"
+                     "extui   %[hi], %[hi], 20, 8\n"
+                     "addx2   %[lo], %[lo], %[pal]\n"
+                     "addx2   %[hi], %[hi], %[pal]\n"
+                     "l16ui   %[hi], %[hi], 0\n"
+                     "l16ui   %[lo], %[lo], 0\n"
+                     "slli    %[hi], %[hi], 16\n"
+                     "or      %[hi], %[hi], %[lo]\n"
+                     "s32i    %[hi], %[out], 8\n"
+                     "ee.movi.32.a q0, %[hi], 3\n"
+                     "extui   %[lo], %[hi], 4, 8\n"
+                     "extui   %[hi], %[hi], 20, 8\n"
+                     "addx2   %[lo], %[lo], %[pal]\n"
+                     "addx2   %[hi], %[hi], %[pal]\n"
+                     "l16ui   %[hi], %[hi], 0\n"
+                     "l16ui   %[lo], %[lo], 0\n"
+                     "slli    %[hi], %[hi], 16\n"
+                     "or      %[hi], %[hi], %[lo]\n"
+                     "s32i    %[hi], %[out], 12\n"
+                     "addi    %[out], %[out], 16\n"
+                     "1:\n"
+                     : [out] "+&r"(out), [ct] "+&r"(ct), [lo] "=&r"(lo), [hi] "=&r"(hi)
+                     : [rt] "r"(rowPair), [pal] "r"(pal), [n] "r"(blocks)
+                     : "memory");
+    }
+    const int pairs = (n & 7) >> 1;
+    asm volatile("loopnez %[n], 2f\n"
+                 "l16si   %[hi], %[ct], 2\n"
+                 "l16si   %[lo], %[ct], 0\n"
+                 "add     %[hi], %[hi], %[rt]\n"
+                 "srai    %[hi], %[hi], 4\n"
+                 "add     %[lo], %[lo], %[rt]\n"
+                 "addx2   %[hi], %[hi], %[pal]\n"
+                 "srai    %[lo], %[lo], 4\n"
+                 "l16ui   %[hi], %[hi], 0\n"
+                 "addx2   %[lo], %[lo], %[pal]\n"
+                 "l16ui   %[lo], %[lo], 0\n"
+                 "slli    %[hi], %[hi], 16\n"
+                 "or      %[hi], %[hi], %[lo]\n"
+                 "s32i    %[hi], %[out], 0\n"
+                 "addi    %[ct], %[ct], 4\n"
+                 "addi    %[out], %[out], 4\n"
+                 "2:\n"
+                 : [out] "+&r"(out), [ct] "+&r"(ct), [lo] "=&r"(lo), [hi] "=&r"(hi)
+                 : [rt] "r"(rt), [pal] "r"(pal), [n] "r"(pairs)
+                 : "memory");
+    if (n & 1) {
+        *out = pal[(*ct + rt) >> 4];
+    }
+}
+#endif
+
+GM_ANIM_IRAM void bandRef(uint16_t *__restrict dst, int y0, int rows, int w, uint32_t, const uint8_t *) {
     for (int y = y0; y < y0 + rows; y++) {
         const int rt = rowTerm[y];
-        const int16_t *ct = colTermPh + static_cast<size_t>(y & 7) * w;
+        const int16_t *__restrict ct = colTermPh + static_cast<size_t>(y & 7) * colStride;
         int x = 0;
-        // Pixel pairs as one 32-bit store, which band()'s alignment contract
-        // (BgAnim.h) allows: dst is 4-byte aligned and a multi-row call has an
-        // even w, so row r at r*w pixels stays aligned. An odd w arrives one
-        // row per call and falls through to the tail loop.
+        // BgAnim.h guarantees 4-byte dst alignment and even widths for
+        // multi-row calls. Odd widths arrive one row at a time.
         for (; x + 1 < w; x += 2) {
             const uint16_t c0 = palette[(ct[x] + rt) >> 4];
             const uint16_t c1 = palette[(ct[x + 1] + rt) >> 4];
@@ -211,15 +338,30 @@ void band(uint16_t *dst, int y0, int rows, int w, uint32_t, const uint8_t *) {
     }
 }
 
+GM_ANIM_IRAM void band(uint16_t *dst, int y0, int rows, int w, uint32_t tMs, const uint8_t *p) {
+#if GM_BGANIM_BRUSHED_ASM && defined(__XTENSA__) && !defined(GM_BGANIM_NO_ASM)
+    for (int y = y0; y < y0 + rows; y++) {
+        const int16_t *ct = colTermPh + static_cast<size_t>(y & 7) * colStride;
+        brushedRowAsm(dst, ct, palette, rowTerm[y], w);
+        dst += w;
+    }
+#else
+    bandRef(dst, y0, rows, w, tMs, p);
+#endif
+}
+
 void release() {
     releaseTable(colTerm, static_cast<size_t>(allocW) * sizeof(int16_t));
-    releaseTable(colTermPh, static_cast<size_t>(8 * allocW) * sizeof(int16_t));
+    releaseTable(colTermPh, static_cast<size_t>(8 * colStride) * sizeof(int16_t));
     releaseTable(rowTerm, static_cast<size_t>(allocH) * sizeof(int16_t));
     releaseTable(grainBase, static_cast<size_t>(allocH) * sizeof(int16_t));
+    releaseTable(dithOff, 64 * sizeof(int16_t));
+    releaseTable(ramp, 256 * sizeof(uint16_t));
     releaseTable(palette, 256 * sizeof(uint16_t));
-    allocW = allocH = 0;
+    sl = nullptr; // borrowed, never release the shared sine table
+    allocW = allocH = colStride = 0;
     lastThemeGen = 0xFFFFFFFF;
-    lastP[0] = lastP[1] = lastP[2] = lastP[3] = 255;
+    paletteValid = false;
 }
 
 } // namespace
@@ -233,7 +375,7 @@ const BgAnimation bg_anim_brushed = {
     frame,
     band,
     release,
-    nullptr,
+    bandRef,
 };
 
 #endif // GAGGIMATE_SIM
