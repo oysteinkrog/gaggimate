@@ -329,6 +329,7 @@ class SleepAnimation {
     bool objectInternal() const;
     uint32_t lastMsyncUsValue() const { return lastMsyncUs.load(); }
     uint32_t lastPushUsValue() const { return lastPushUs.load(); }
+    uint32_t lastFrameFnUsValue() const { return lastFrameFnUs.load(); }
 
     // Text scrim: how far to dim the animation behind and immediately around
     // overlaid widget pixels, 0-100 percent, where 0 is off and 100 is black.
@@ -1524,6 +1525,8 @@ class SleepAnimation {
     uint32_t profBlendScrimCyc = 0;
     std::atomic<uint32_t> lastMsyncUs{0};
     std::atomic<uint32_t> lastPushUs{0};
+    // The animation's frame() call, per frame (framefn_us). Outside band_us.
+    std::atomic<uint32_t> lastFrameFnUs{0};
     // Core the async-memcpy completion interrupt is bound to. Deliberately not
     // the render core: the RGB panel driver's ISR is on core 1 and must not
     // queue behind ours.

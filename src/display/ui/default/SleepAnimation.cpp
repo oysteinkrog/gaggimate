@@ -4436,7 +4436,16 @@ void IRAM_ATTR SleepAnimation::renderFrame() {
         initializedHalf = half;
     }
     BENCH_T0(tSetup);
+    // The animation's once-per-frame work, timed on its own. band_us only
+    // covers the band kernel, and an animation that rasterises a whole
+    // picture here (Harmonograph clears and stamps a 230 KB coverage buffer
+    // in PSRAM every frame) pays it before the first band, at every row
+    // count, and neither band_us nor the kblob bench can see it: on the
+    // bench board that was 27 ms of a 41 ms interlaced frame with nothing
+    // in the stage counters to account for it (2026-09-11).
+    const int64_t tFrameFn = esp_timer_get_time();
     anim.frame(tMs, rw, rh, p);
+    lastFrameFnUs.store(static_cast<uint32_t>(esp_timer_get_time() - tFrameFn));
     BENCH_ACC(accBandUs, tSetup);
 
     // One overlay for the whole frame; a publish mid-frame lands next frame.

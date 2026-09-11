@@ -1403,6 +1403,7 @@ void WebUIPlugin::setupDebugEndpoints() {
         doc["anim_internal"] = a->objectInternal();
         doc["msync_us"] = a->lastMsyncUsValue();
         doc["push_us"] = a->lastPushUsValue();
+        doc["framefn_us"] = a->lastFrameFnUsValue();
         for (int i = 0; i < 2; i++) {
             const void *bp = a->bandBufAddr(i);
             doc["band_psram"][i] = bp != nullptr && esp_ptr_external_ram(bp);

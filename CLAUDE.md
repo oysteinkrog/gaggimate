@@ -506,7 +506,33 @@ telemetry-driven screen from a 650 ms LVGL pass (1.5 Hz widget updates,
   78 ms). The build default is 1 since gm-2cl.9 (2026-09-08, `Settings.h`
   `bg_ilace`, and the web form already fell back to 1); a stored 0 still
   wins on a device that has one, which is why the bench board needs the
-  pin.
+  pin. What the whole-frame path costs on that board (2026-09-11, kernels
+  in flash, divider 8, cap 40, `tools/framefn_sweep.py` through the web
+  preview): every animation but one ran 20 to 31 fps whole-frame, because
+  a frame's work (18 to 36 ms) is more than one panel period and the flip
+  waits for the next; the same animations interlaced run 34 to 37 fps. A
+  device that stores 0 is running every animation at about half speed,
+  and that is the first thing to check when the animation "got slow".
+- **An animation's `frame()` is timed on its own, and `band_us` does not
+  see it** (`framefn_us` on `/api/debug/anim`, 2026-09-11). The stage
+  counters cover the band kernel, the blend and the push; `frame()` runs
+  once per frame before the first band and neither the counters nor the
+  kblob bench (which never calls it) show it. A sweep of all 44 animations
+  put every `frame()` at 0 to 2.3 ms except Harmonograph at 23.8: it
+  rasterises its 2,048-sample curve there, an 11x11 max stamp per sample
+  into a 230 KB coverage buffer in PSRAM, so the loop ran at 14.5 fps with
+  the stored animation and 27 ms of every frame was unaccounted for.
+  Stamping in coverage-row order (a counting sort by stamp row, so each
+  PSRAM line is fetched once a frame instead of once per lap of the
+  curve), clearing only the union of the previous and current curve box,
+  and skipping the zero corners of each stamp took it to about 17 ms and
+  the loop to 18 to 19 fps in the same post-boot window; the stamp pass
+  is what is left (11.5 ms, 9 instructions per byte with a branch for
+  the max). A pinned-IRAM build (`GM_BGANIM_IRAM_KERNELS=1`, all 21
+  kernels) measured the same 14.5 fps as the flash build on the same
+  serial channel, so IRAM was not the lever there either. A new
+  animation whose `frame()` does per-pixel work belongs on this list, and
+  the sweep is the way to find it.
 - **Rendering straight into the bounce ring without a framebuffer does not
   work on this bus** (gm-2cl.13, killed 2026-09-07). Two rounds, Starfield,
   standby screen, divider 8 (110 us per 2-row band): 36 to 45% of the 9,200
@@ -1096,7 +1122,17 @@ Debugging methodology that this codebase has already paid for:
 
 ## Bench facts
 
-- Device: 192.168.1.121 on the bench, UART on COM3.
+- Device: 192.168.1.121 on the bench, UART on COM3. **Opening COM3 with
+  pyserial's defaults resets the board** (reset reason `usb`, confirmed
+  2026-09-11 by opening the port with the board at 353 s of uptime and
+  reading 30 s after): the DTR and RTS pulse on open drives the
+  USB-serial-JTAG reset, so every serial capture taken before this note
+  was a fresh boot, and the reset seen at the end of the 2026-09-11 sweep
+  was this (the two from 2026-09-10 had no serial capture open and stay
+  unexplained). Open with
+  `s = serial.Serial(); s.port = "COM3"; s.dtr = False; s.rts = False;
+  s.open()`, which leaves the board running (checked the same way). The
+  flash step resets on purpose.
 - Windows tooling runs Python 3.10 (`GM_RIG_PY` env var to override):
   Python313 silently lacks esptool and pyserial.
 - Camera verification: `C:\work\camshots\grab.bat <file>` (one frame),

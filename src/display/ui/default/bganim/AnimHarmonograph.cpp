@@ -40,6 +40,11 @@ using namespace bganim;
 constexpr int NS = 2048;
 constexpr int SW = 11, SH = 11;
 constexpr int STAMP_BYTES = 16 * SW * SH;
+// Per stamp and stamp row, the first and one-past-last column with a
+// nonzero byte (i0, i1): the skirt ends at radius 5.4 px inside an 11 px
+// box, so the corners are zero and the stamp pass skips them. About 20
+// percent of the bytes, and a zero can never raise a max.
+constexpr int EXT_BYTES = 16 * SH * 2;
 constexpr float PI = 3.14159265358979323846f;
 
 // At 480x480: ctPh 7,680 + rowTerm 960 + palette 512 + scratch 32 +
@@ -51,12 +56,38 @@ constexpr float PI = 3.14159265358979323846f;
 // bufStorage 230,415 B at 480x480 (including 15 B alignment reserve).
 int16_t *ctPh = nullptr, *rowTerm = nullptr, *colTerm = nullptr;
 uint16_t *palette = nullptr, *scratch = nullptr, *ones = nullptr;
-uint8_t *bufStorage = nullptr, *buf = nullptr, *tail = nullptr, *stamp = nullptr;
+uint8_t *bufStorage = nullptr, *buf = nullptr, *tail = nullptr, *stamp = nullptr, *stampExt = nullptr;
 int16_t *dith = nullptr;
+// Per-sample stamp positions in Q2 (posX, posY, NS each), the samples in
+// stamp-row order (order, NS) and the counting sort's row cursors (rowCur,
+// h entries). All PSRAM, all swept sequentially. Why the sort: in curve
+// order each of the 2,048 samples lands on eleven coverage rows that the
+// curve last touched a lap ago, so every stamp row is a PSRAM line miss;
+// in row order the working set is eleven rows of the buffer and each line
+// is fetched once a frame. Max compositing does not care about the order,
+// so the picture is the same to the bit. Bench board, 2026-09-11, frame()
+// timed on its own (framefn_us on /api/debug/anim): 25.9 ms in curve
+// order, 19.7 sorted, 17 with the stamp extents and the branchless max
+// below; of that, the stamp pass is about 11.5 ms, the union clear 3 to
+// 5, the position pass 1.5 to 2, the row and column terms 0.6 and the
+// sort 0.2. What is left in the stamp pass is 9 instructions per byte in
+// a zero-overhead loop (the compiler keeps a branch for the max), and a
+// PIE version would need an unaligned store path this file does not have.
+int16_t *posX = nullptr, *posY = nullptr;
+uint16_t *order = nullptr, *rowCur = nullptr;
 const int16_t *sl = nullptr; // borrowed shared slab table, never released here
 int allocW = 0, allocH = 0, ctStride = 0, bufStride = 0;
 uint32_t lastThemeGen = 0xFFFFFFFF;
 int lastTailKey = -1, lastBright = -1, top = 0;
+// The box the previous frame stamped into buf, half open in buf
+// coordinates, empty when x1 <= x0. frame() clears the union of this box
+// and the frame's own box instead of the whole buffer: at 480x480 the
+// buffer is 230 KB of PSRAM and a default-size figure covers about half of
+// it. On the bench board the whole-buffer memset was not where frame()'s
+// time went (2026-09-11: 25.9 ms before, 25.9 after this change alone; the
+// stamp order above was), so this is the smaller saving of the two. Rows
+// and columns outside the union hold the zeros init() wrote once.
+int prevX0 = 0, prevX1 = 0, prevY0 = 0, prevY1 = 0;
 
 void release();
 
@@ -85,16 +116,25 @@ bool init(int w, int h) {
     ones = static_cast<uint16_t *>(allocHot(8 * sizeof(uint16_t)));
     colTerm = static_cast<int16_t *>(alloc(w * sizeof(int16_t)));
     tail = static_cast<uint8_t *>(alloc(NS));
+    posX = static_cast<int16_t *>(alloc(NS * sizeof(int16_t)));
+    posY = static_cast<int16_t *>(alloc(NS * sizeof(int16_t)));
+    order = static_cast<uint16_t *>(alloc(NS * sizeof(uint16_t)));
+    rowCur = static_cast<uint16_t *>(alloc(static_cast<size_t>(h) * sizeof(uint16_t)));
     dith = static_cast<int16_t *>(alloc(64 * sizeof(int16_t)));
     stamp = static_cast<uint8_t *>(alloc(STAMP_BYTES));
+    stampExt = static_cast<uint8_t *>(alloc(EXT_BYTES));
     bufStorage = static_cast<uint8_t *>(alloc(static_cast<size_t>(bufStride) * h + 15));
-    if (!ctPh || !rowTerm || !palette || !scratch || !ones || !colTerm || !tail || !dith || !stamp || !bufStorage) {
+    if (!ctPh || !rowTerm || !palette || !scratch || !ones || !colTerm || !tail || !dith || !stamp || !stampExt || !bufStorage || !posX ||
+        !posY || !order || !rowCur) {
         // Every successful allocation is released, including those after
         // an earlier failure. A retry sees exactly the initial state.
         release();
         return false;
     }
     buf = reinterpret_cast<uint8_t *>((reinterpret_cast<uintptr_t>(bufStorage) + 15) & ~uintptr_t(15));
+    // Once, here: frame() only clears where the thread was and is.
+    memset(buf, 0, static_cast<size_t>(bufStride) * h);
+    prevX0 = prevX1 = prevY0 = prevY1 = 0;
     for (int k = 0; k < 8; ++k) ones[k] = 1;
     for (int fy = 0; fy < 4; ++fy) {
         for (int fx = 0; fx < 4; ++fx) {
@@ -108,6 +148,16 @@ bool init(int w, int h) {
                     stamp[o + j * SW + i] = static_cast<uint8_t>(lroundf(255.0f * prof));
                 }
             }
+        }
+    }
+    for (int k = 0; k < 16; ++k) {
+        for (int j = 0; j < SH; ++j) {
+            const uint8_t *row = stamp + k * SW * SH + j * SW;
+            int i0 = 0, i1 = SW;
+            while (i0 < SW && row[i0] == 0) ++i0;
+            while (i1 > i0 && row[i1 - 1] == 0) --i1;
+            stampExt[(k * SH + j) * 2] = static_cast<uint8_t>(i0);
+            stampExt[(k * SH + j) * 2 + 1] = static_cast<uint8_t>(i1);
         }
     }
     // pcDither(..., 2.6), whole palette indices. No half-integer ties occur,
@@ -186,7 +236,6 @@ void frame(uint32_t tMs, int w, int h, const uint8_t p[BG_ANIM_PARAMS]) {
         for (int x = 0; x < w; ++x)
             ctPh[ph * ctStride + x] = colTerm[x] + dith[ph * 8 + (x & 7)] * 32;
     }
-    memset(buf, 0, static_cast<size_t>(bufStride) * h);
     const float at = 60.0f + p[1] * 0.95f;
     const int a1 = static_cast<int>(at * 0.69f), a2 = static_cast<int>(at * 0.31f);
     const uint32_t q1 = phase(tt, 0.704f), q2 = phase(tt, 0.4544f);
@@ -213,29 +262,98 @@ void frame(uint32_t tMs, int w, int h, const uint8_t p[BG_ANIM_PARAMS]) {
     const uint32_t rot = phase(tt, 0.18176f * turnMul); // Q6, 360 degrees per ~360.56 s at 50
     const int ca = sineQ6(rot + 256 * 64), sa = sineQ6(rot);
     const int head = phase(tt, NS / 8000.0f) & (NS - 1);
-    for (int s = 0; s < NS; ++s) {
-        // Q6 strides 192 and 128 are exactly 3 and 2 table entries; the two
-        // secondary strides are 320 and 256 at lobe count 50 and any other
-        // multiple of 32 otherwise, where the sine table's own interpolation
-        // carries the half entry. The weighted coordinates use Q9 sine, and
-        // the rotation shifts by 7 to Q2. Neither the strides nor the turn
-        // rate change how far a sample can land from the centre.
+    // Q6 strides 192 and 128 are exactly 3 and 2 table entries; the two
+    // secondary strides are 320 and 256 at lobe count 50 and any other
+    // multiple of 32 otherwise, where the sine table's own interpolation
+    // carries the half entry. The weighted coordinates use Q9 sine, and
+    // the rotation shifts by 7 to Q2. Neither the strides nor the turn
+    // rate change how far a sample can land from the centre. The stamp
+    // corner comes out in whole pixels, the sub-pixel phase in Q2.
+    const auto samplePos = [&](int s, int &pxq, int &pyq) {
         const int ux = (a1 * sineQ6(s * 192u + q1) + a2 * sineQ6(s * sx2 + q2)) >> 9;
         const int uy = (a1 * sineQ6(s * 128u + q3) + a2 * sineQ6(s * sy2 + q4)) >> 9;
-        const int pxq = 240 * 4 + ((ux * ca - uy * sa) >> 7);
-        const int pyq = 240 * 4 + ((ux * sa + uy * ca) >> 7);
+        pxq = 240 * 4 + ((ux * ca - uy * sa) >> 7);
+        pyq = 240 * 4 + ((ux * sa + uy * ca) >> 7);
+    };
+    // First pass: every sample's position, the box this frame's stamps will
+    // cover, and how many stamps start on each row. A sample the clip drops
+    // gets posY -1 and is skipped by the passes below; the clip is the one
+    // the stamp pass has always used.
+    int curX0 = w, curX1 = 0, curY0 = h, curY1 = 0;
+    memset(rowCur, 0, static_cast<size_t>(h) * sizeof(uint16_t));
+    for (int s = 0; s < NS; ++s) {
+        int pxq, pyq;
+        samplePos(s, pxq, pyq);
         const int x0 = (pxq >> 2) - 5, y0 = (pyq >> 2) - 5;
-        if (x0 < 0 || y0 < 0 || x0 + SW > w || y0 + SH > h) continue;
+        if (x0 < 0 || y0 < 0 || x0 + SW > w || y0 + SH > h) {
+            posY[s] = -1;
+            continue;
+        }
+        posX[s] = static_cast<int16_t>(pxq);
+        posY[s] = static_cast<int16_t>(pyq);
+        rowCur[y0]++;
+        if (x0 < curX0) curX0 = x0;
+        if (x0 + SW > curX1) curX1 = x0 + SW;
+        if (y0 < curY0) curY0 = y0;
+        if (y0 + SH > curY1) curY1 = y0 + SH;
+    }
+    // Counting sort by stamp row: turn the counts into start cursors, then
+    // scatter the sample indices. The index, not the position, is what the
+    // stamp pass needs, since the comet level is looked up by sample.
+    int total = 0;
+    for (int y = 0; y < h; ++y) {
+        const int c = rowCur[y];
+        rowCur[y] = static_cast<uint16_t>(total);
+        total += c;
+    }
+    for (int s = 0; s < NS; ++s) {
+        if (posY[s] < 0) continue;
+        order[rowCur[(posY[s] >> 2) - 5]++] = static_cast<uint16_t>(s);
+    }
+    // Clear the union of the previous frame's box and this one, row by row,
+    // and nothing else: everything outside it is still the zero init() wrote.
+    {
+        const bool curEmpty = curX1 <= curX0 || curY1 <= curY0;
+        const bool prevEmpty = prevX1 <= prevX0 || prevY1 <= prevY0;
+        int ux0 = curEmpty ? prevX0 : curX0, ux1 = curEmpty ? prevX1 : curX1;
+        int uy0 = curEmpty ? prevY0 : curY0, uy1 = curEmpty ? prevY1 : curY1;
+        if (!prevEmpty && !curEmpty) {
+            ux0 = prevX0 < ux0 ? prevX0 : ux0;
+            ux1 = prevX1 > ux1 ? prevX1 : ux1;
+            uy0 = prevY0 < uy0 ? prevY0 : uy0;
+            uy1 = prevY1 > uy1 ? prevY1 : uy1;
+        }
+        if (ux1 > ux0 && uy1 > uy0) {
+            const size_t n = static_cast<size_t>(ux1 - ux0);
+            for (int y = uy0; y < uy1; ++y) memset(buf + static_cast<size_t>(y) * bufStride + ux0, 0, n);
+        }
+        prevX0 = curEmpty ? 0 : curX0;
+        prevX1 = curEmpty ? 0 : curX1;
+        prevY0 = curEmpty ? 0 : curY0;
+        prevY1 = curEmpty ? 0 : curY1;
+    }
+    // Stamp pass, in row order (see posX above for why).
+    for (int k = 0; k < total; ++k) {
+        const int s = order[k];
+        const int pxq = posX[s], pyq = posY[s];
+        const int x0 = (pxq >> 2) - 5, y0 = (pyq >> 2) - 5;
         const int lvl = tail[(s - head) & (NS - 1)];
-        const uint8_t *sb = stamp + (((pyq & 3) * 4) + (pxq & 3)) * SW * SH;
+        const int sub = ((pyq & 3) * 4) + (pxq & 3);
+        const uint8_t *sb = stamp + sub * SW * SH;
+        const uint8_t *ext = stampExt + sub * SH * 2;
         // An 11-byte stamp row cannot contain an aligned 16-byte PIE span.
         // Keep these short, arbitrarily aligned max stores scalar; widening
         // their footprints would touch unrelated coverage beside the stamp.
+        // Branchless: the S3 has MAX, and the data-dependent branch this
+        // replaces mispredicted on about every other byte.
         for (int j = 0; j < SH; ++j) {
             uint8_t *out = buf + (y0 + j) * bufStride + x0;
-            for (int i = 0; i < SW; ++i) {
-                const int g = (sb[j * SW + i] * lvl) >> 8;
-                if (g > out[i]) out[i] = static_cast<uint8_t>(g);
+            const uint8_t *sr = sb + j * SW;
+            const int i0 = ext[j * 2], i1 = ext[j * 2 + 1];
+            for (int i = i0; i < i1; ++i) {
+                const int g = (sr[i] * lvl) >> 8;
+                const int o = out[i];
+                out[i] = static_cast<uint8_t>(o > g ? o : g);
             }
         }
     }
@@ -398,8 +516,13 @@ void release() {
     releaseTable(ones, 8 * sizeof(uint16_t));
     releaseTable(colTerm, static_cast<size_t>(allocW) * sizeof(int16_t));
     releaseTable(tail, NS);
+    releaseTable(posX, NS * sizeof(int16_t));
+    releaseTable(posY, NS * sizeof(int16_t));
+    releaseTable(order, NS * sizeof(uint16_t));
+    releaseTable(rowCur, static_cast<size_t>(allocH) * sizeof(uint16_t));
     releaseTable(dith, 64 * sizeof(int16_t));
     releaseTable(stamp, STAMP_BYTES);
+    releaseTable(stampExt, EXT_BYTES);
     releaseTable(bufStorage, static_cast<size_t>(bufStride) * allocH + 15);
     buf = nullptr;
     sl = nullptr;
