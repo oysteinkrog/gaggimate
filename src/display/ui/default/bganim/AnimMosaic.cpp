@@ -1,293 +1,534 @@
 #ifndef GAGGIMATE_SIM
 
-// "Quiet Mosaic" - large uneven tiles in restrained theme colours, separated
-// by a darker grout line, each tile changing brightness on its own slow clock.
-// Brainstormed 2026-09-09 with GPT (Codex CLI, gpt-6-astra) as candidate 2 of
-// gm-4bd.
+// "Mosaic": large, uneven tiles that brighten independently under a slow
+// diagonal wash. This is entry 18 in tools/animbench/web/anim_bench.html:
+// cubed raised sines light a few tiles at a time, 14-pixel smoothstep seams
+// join their levels, and signed sine domes shade the tile interiors.
 //
-// The separable kernel again, index = (colTermPh[x] + rowTerm[y]) >> 4, but
-// with piecewise constant terms: the column table holds one level per tile
-// column and the row table one level per tile row, so a tile's colour is the
-// sum of its column's level and its row's level. That is what a tiled screen
-// with light behind it looks like, and it is the only shape a two-gather
-// separable kernel can make a grid out of.
-//
-// The obvious failure of a separable grid is that whole rows and columns move
-// together and the field reads as sliding bands. Two things stop that here:
-// each tile column and each tile row has its own phase, taken from a fixed
-// seed at layout time, and its own rate multiplier, so no two neighbours peak
-// at the same moment. The tile edges are fixed at layout time as well, so
-// nothing about the grid itself crawls.
-//
-// The grout is the first two pixels of each tile, dropped by a fixed amount in
-// both tables. Where a column grout crosses a row grout the two drops add,
-// which is what makes the intersections read darker, as real grout does.
-//
-// Tile widths are a fraction of the render size, so the grid looks the same at
-// 480, 240 and 233 wide.
+// Field values have four fractional palette-index bits. Tile levels retain
+// the page's Q9 cube, seam weights are Q8, and the final signed sum is shifted
+// by four before clamping to the theme palette. All rounding shifts, PRNG
+// draws and unsigned 32-bit time wraps follow the page. No float runs per
+// pixel. The shared sine table can differ from JavaScript's double sine by a
+// rounding unit; the host PPM also expands RGB565 with division rather than
+// the page's bit replication. Neither changes the field or its motion.
 
 #include "BgAnim.h"
 #include "BgAnimCommon.h"
 #include <string.h>
 
+#ifndef GM_BGANIM_MOSAIC_ASM
+#define GM_BGANIM_MOSAIC_ASM 1
+#endif
+
 namespace {
 using namespace bganim;
 
-constexpr int MAX_TILES = 24;
-constexpr int MID = 1200;   // sum units at a tile's rest level, per axis
-constexpr int GROUT = 400;  // sum units a grout pixel drops
-constexpr int GROUT_PX = 2; // pixels of grout on the leading edge of a tile
-constexpr int SHADE = 90;   // sum units a tile's own shading ramps across it
+constexpr int MAX_TILES = 20;           // page's limit per axis, also bounds the tile RNG tables
+constexpr int MID = 560;                // resting field, in sixteenths of a palette index
+constexpr int BEVEL = 190;              // signed tile-interior dome amplitude, same units
+constexpr int BLEND_PX = 7;             // seven pixels on each side of a seam, fourteen total
+constexpr int MIN_WIDTH = 3 * BLEND_PX; // keeps a tile's two seam regions disjoint
+constexpr int TILE_COUNT = MAX_TILES * MAX_TILES;
+static_assert(SIN_N == 1024 && SIN_AMP == 512 && BLEND_PX == 7, "Mosaic's Q9 math and seam codes mirror the page");
 
-uint8_t *colTile = nullptr; // per column: tile index, bit 7 marks grout. PSRAM
-uint8_t *rowTile = nullptr; // per row, same packing. PSRAM
-int8_t *colShade = nullptr; // per column: the tile's own shading ramp. PSRAM
-int8_t *rowShade = nullptr; // per row, same. PSRAM
-int16_t *colTerm = nullptr; // frame() only -> PSRAM
-int16_t *colTermPh = nullptr; // read every pixel -> slab, 8 y-phase copies
-int16_t *rowTerm = nullptr;   // read once per row -> slab
-uint16_t *palette = nullptr;  // read every pixel -> slab
+// Only frame() reads the axis geometry and tile clocks. The combined column
+// tables and compressed row records are the tables band() actually reads.
+int16_t *colShade = nullptr, *rowShade = nullptr, *washCol = nullptr;
+uint8_t *cA = nullptr, *cB = nullptr;
+uint16_t *cW = nullptr;
+int16_t *level = nullptr;
+uint16_t *tPhase = nullptr;
+uint8_t *tRate = nullptr;
+uint16_t *ramp = nullptr;
 
-int16_t dithOff[64] = {0};
-uint16_t colPhase[MAX_TILES] = {0};
-uint16_t rowPhase[MAX_TILES] = {0};
-uint8_t colRate[MAX_TILES] = {0};
-uint8_t rowRate[MAX_TILES] = {0};
-int nColTiles = 0, nRowTiles = 0;
+int16_t *comb = nullptr;        // one aligned column table per reachable tile row
+int16_t *rowTerm = nullptr;     // page's rowShade[y] + washRow[y]
+uint8_t *rowBlend = nullptr;    // high nibble: tile A; low nibble: seam position
+uint16_t *seamWeight = nullptr; // sixteen Q8 weights; code 0 means no interpolation
+int16_t *dith = nullptr;        // 8x8 Bayer offsets, four fractional index bits
+uint16_t *palette = nullptr;    // the page's nonlinear remap of the theme ramp
+const int16_t *sl = nullptr;    // borrowed shared 1024-entry sine, never released here
 
-uint8_t lastP[4] = {255, 255, 255, 255};
-uint32_t lastThemeGen = 0xFFFFFFFF;
-int lastLayoutP1 = -1, lastLayoutP3 = -1;
-int allocW = 0, allocH = 0;
+int allocW = 0, allocH = 0, combStride = 0, combRows = 0;
+int nCol = 1, nRow = 1;
+int lastSize = -1, lastVariation = -1;
+uint32_t lastThemeGen = 0;
+bool paletteValid = false;
 
-// Table placement, against the 9,216 B per-animation slab:
-//   colTermPh  7,680 B  read every pixel                   HOT
-//   rowTerm      960 B  read once per row                  HOT
-//   palette      512 B  read every pixel, data-dependent   HOT
-//   -------------------------------------------------------------
-//              9,152 B of 9,216 B
-//   colTerm      960 B  read only in frame()               PSRAM
-//   colTile      480 B  read once per column in frame()    PSRAM
-//   rowTile      480 B  read once per row in frame()       PSRAM
-//   colShade     480 B  read once per column in frame()    PSRAM
-//   rowShade     480 B  read once per row in frame()       PSRAM
+// At 480x480, the fixed seeds and every size/variation combination require
+// at most seven tile rows. init() computes that bound, rather than trusting a
+// hard-coded observation or reserving all twenty rows of the page's array.
+// Stride rounds up to eight int16 elements so every PIE source row is aligned.
+// Slab: comb 6,736 (includes one 16-byte lookahead guard), rowTerm 960,
+// rowBlend 480, seamWeight 32, dith 128, palette 512 = 8,848 B.
+// No per-pixel or per-row table lives in PSRAM.
+// PSRAM: colShade/rowShade/washCol/cW 960 each, cA/cB 480 each,
+// level/tPhase 800 each, tRate 400, ramp 512 = 7,312 B.
+// Temporary layout arrays and the kernel's eight indices live on the stack.
+// No row caching across band calls: interlace and repeated-row timing see
+// the same work and the same pixels for a given absolute y.
 void release();
 
+// allocHot charges whole 16-byte blocks, including at odd render widths.
+size_t roundHot(size_t n) { return (n + 15u) & ~static_cast<size_t>(15u); }
+
+// Layout and capacity calculation share the exact same PRNG walk. Even the
+// count-only call consumes the sign draw, which changes subsequent widths.
+int axisWidths(int *start, int *width, int8_t *signs, int n, int wide0, int jitter, uint32_t seed) {
+    uint32_t s = seed;
+    int x = 0, count = 0;
+    while (x < n && count < MAX_TILES) {
+        int wide = wide0;
+        if (jitter > 0) {
+            wide += static_cast<int>(nextRand(s) % static_cast<uint32_t>(2 * jitter + 1)) - jitter;
+        }
+        if (wide < MIN_WIDTH)
+            wide = MIN_WIDTH;
+        if (n - x - wide < MIN_WIDTH || count == MAX_TILES - 1)
+            wide = n - x;
+        const int sign = (nextRand(s) & 1u) ? 1 : -1;
+        if (start != nullptr) {
+            start[count] = x;
+            width[count] = wide;
+            signs[count] = static_cast<int8_t>(sign);
+        }
+        x += wide;
+        ++count;
+    }
+    return count > 0 ? count : 1;
+}
+
+// Size moves the nominal tile width from one sixth to two fifths of an
+// axis. Variation's later /250 adds up to +/-40 percent of that width.
+int baseWidth(int n, int size) { return n / 6 + size * (n * 2 / 5 - n / 6) / 100; }
+
 bool init(int w, int h) {
-    if (sinLut() == nullptr) {
+    if (comb != nullptr && allocW == w && allocH == h)
+        return true;
+    release();
+    if (w <= 0 || h <= 0)
+        return false;
+    sl = sinLut();
+    if (sl == nullptr) {
+        release();
         return false;
     }
-    if (colTerm == nullptr) {
-        colTerm = static_cast<int16_t *>(alloc(w * sizeof(int16_t)));
-        if (colTerm == nullptr) {
-            release(); // a partial set must not survive a failed init (gm-bzu.15)
-            return false;
-        }
-        allocW = w;
-    }
-    if (colTile == nullptr) {
-        colTile = static_cast<uint8_t *>(alloc(allocW));
-        if (colTile == nullptr) {
-            release();
-            return false;
-        }
-    }
-    if (colShade == nullptr) {
-        colShade = static_cast<int8_t *>(alloc(allocW));
-        if (colShade == nullptr) {
-            release();
-            return false;
+    allocW = w;
+    allocH = h;
+    combStride = (w + 7) & ~7;
+    // Exhaust the finite slider domain once per init, outside frame/band.
+    // This preserves every layout the page can select while removing unused
+    // rows from its MAX_TILES*w allocation. No allocation when sliders move.
+    for (int size = 0; size <= 100; ++size) {
+        const int base = baseWidth(h, size);
+        for (int variation = 0; variation <= 100; ++variation) {
+            const int count = axisWidths(nullptr, nullptr, nullptr, h, base, base * variation / 250, 0x2F6B49E1u);
+            if (count > combRows)
+                combRows = count;
         }
     }
-    if (colTermPh == nullptr) {
-        colTermPh = static_cast<int16_t *>(allocHot(8 * allocW * sizeof(int16_t)));
-        if (colTermPh == nullptr) {
-            release();
-            return false;
-        }
+    const size_t hotBytes = roundHot((static_cast<size_t>(combRows) * combStride + 8) * 2) +
+                            roundHot(static_cast<size_t>(h) * 2) + roundHot(h) + 32 + 128 + 512;
+    // Four bits encode tile A; reject unsupported dimensions before asking
+    // allocHot to spill. All 480/466/240/233 panel modes fit with room left.
+    if (combRows > 16 || hotBytes > HOT_SLAB_BYTES - HOT_SHARED_RESERVE) {
+        release();
+        return false;
     }
-    if (rowTerm == nullptr) {
-        rowTerm = static_cast<int16_t *>(allocHot(h * sizeof(int16_t)));
-        if (rowTerm == nullptr) {
-            release();
-            return false;
-        }
-        allocH = h;
+    comb = static_cast<int16_t *>(allocHot((static_cast<size_t>(combRows) * combStride + 8) * sizeof(int16_t)));
+    rowTerm = static_cast<int16_t *>(allocHot(h * sizeof(int16_t)));
+    rowBlend = static_cast<uint8_t *>(allocHot(h));
+    seamWeight = static_cast<uint16_t *>(allocHot(16 * sizeof(uint16_t)));
+    dith = static_cast<int16_t *>(allocHot(64 * sizeof(int16_t)));
+    palette = static_cast<uint16_t *>(allocHot(256 * sizeof(uint16_t)));
+    colShade = static_cast<int16_t *>(alloc(w * sizeof(int16_t)));
+    rowShade = static_cast<int16_t *>(alloc(h * sizeof(int16_t)));
+    washCol = static_cast<int16_t *>(alloc(w * sizeof(int16_t)));
+    cA = static_cast<uint8_t *>(alloc(w));
+    cB = static_cast<uint8_t *>(alloc(w));
+    cW = static_cast<uint16_t *>(alloc(w * sizeof(uint16_t)));
+    level = static_cast<int16_t *>(alloc(TILE_COUNT * sizeof(int16_t)));
+    tPhase = static_cast<uint16_t *>(alloc(TILE_COUNT * sizeof(uint16_t)));
+    tRate = static_cast<uint8_t *>(alloc(TILE_COUNT));
+    ramp = static_cast<uint16_t *>(alloc(256 * sizeof(uint16_t)));
+    if (!comb || !rowTerm || !rowBlend || !seamWeight || !dith || !palette || !colShade || !rowShade || !washCol || !cA || !cB ||
+        !cW || !level || !tPhase || !tRate || !ramp) {
+        release(); // releases the entire partial set before a retry (gm-bzu.15)
+        return false;
     }
-    if (rowTile == nullptr) {
-        rowTile = static_cast<uint8_t *>(alloc(allocH));
-        if (rowTile == nullptr) {
-            release();
-            return false;
-        }
+    // allocHot aligns these in the slab. Also guard its PSRAM fallback,
+    // whose allocator promises only four bytes if another table owns the
+    // slab: no successful init may hand PIE a misaligned address.
+    if ((reinterpret_cast<uintptr_t>(comb) | reinterpret_cast<uintptr_t>(dith)) & 15u) {
+        release();
+        return false;
     }
-    if (rowShade == nullptr) {
-        rowShade = static_cast<int8_t *>(alloc(allocH));
-        if (rowShade == nullptr) {
-            release();
-            return false;
-        }
-    }
-    if (palette == nullptr) {
-        palette = static_cast<uint16_t *>(allocHot(256 * sizeof(uint16_t)));
-        if (palette == nullptr) {
-            release();
-            return false;
-        }
+    // The pipelined kernel reads one extra vector, never uses or writes it.
+    // Pad the last table as well as each odd-width row, and initialise the
+    // unused rows so every such load reads defined storage.
+    memset(comb, 0, (static_cast<size_t>(combRows) * combStride + 8) * sizeof(int16_t));
+    seamWeight[0] = seamWeight[15] = 0; // interior; code 15 is unused
+    for (int code = 1; code <= 14; ++code) {
+        // Codes 1..7 are the left half of a seam, 8..14 the right half.
+        // 128 is its midpoint in Q8; 64 sets the half-pixel sample spacing.
+        const int u = code <= 7 ? 128 - ((15 - 2 * code) * 64 / BLEND_PX) : 128 + ((2 * (code - 8) + 1) * 64 / BLEND_PX);
+        // 768 = 3*256: u^2*(3-2u) with u in Q8, returned in Q8.
+        seamWeight[code] = static_cast<uint16_t>((u * u * (768 - 2 * u)) >> 16);
     }
     return true;
 }
 
-// One axis of the grid: uneven tile widths from a fixed seed, the leading
-// GROUT_PX pixels of each tile marked, and a phase and rate per tile.
-int layoutAxis(uint8_t *tile, int8_t *shade, int n, int base, int jitter, uint32_t seed, uint16_t *phase,
-               uint8_t *rate) {
-    uint32_t s = seed;
-    int idx = 0;
-    int x = 0;
-    while (x < n && idx < MAX_TILES) {
-        int wide = base;
-        if (jitter > 0) {
-            wide += static_cast<int>(nextRand(s) % static_cast<uint32_t>(2 * jitter + 1)) - jitter;
+// The column tables retain the page's A/B/weight representation. Rows use
+// one byte instead: tile B is always A+1 at a seam, and the fourteen possible
+// smoothstep weights are selected by a nibble. This is lossless compression.
+int layoutAxis(int16_t *shade, uint8_t *a, uint8_t *b, uint16_t *weight, uint8_t *blend, int n, int base, int jitter,
+               uint32_t seed) {
+    int start[MAX_TILES], width[MAX_TILES];
+    int8_t signs[MAX_TILES];
+    const int count = axisWidths(start, width, signs, n, base, jitter, seed);
+    for (int i = 0; i < count; ++i) {
+        const int wide = width[i];
+        for (int k = 0; k < wide; ++k) {
+            const int x = start[i] + k;
+            const int u = k * (SIN_N / 2) / wide; // half sine across the tile
+            shade[x] = static_cast<int16_t>((signs[i] * sl[u & (SIN_N - 1)] * BEVEL) >> 9);
+            int ta = i, tb = i, code = 0;
+            const int e = wide - 1 - k;
+            if (k < BLEND_PX && i > 0) {
+                ta = i - 1;
+                code = 8 + k;
+            } else if (e < BLEND_PX && i < count - 1) {
+                tb = i + 1;
+                code = 7 - e;
+            }
+            if (blend != nullptr) {
+                blend[x] = static_cast<uint8_t>((ta << 4) | code);
+            } else {
+                a[x] = static_cast<uint8_t>(ta);
+                b[x] = static_cast<uint8_t>(tb);
+                weight[x] = seamWeight[code];
+            }
         }
-        if (wide < 6) {
-            wide = 6;
-        }
-        // The last tile takes whatever is left rather than starting a tile
-        // that would be a sliver against the edge.
-        if (n - x - wide < 6 || idx == MAX_TILES - 1) {
-            wide = n - x;
-        }
-        phase[idx] = static_cast<uint16_t>(nextRand(s) & (SIN_N - 1));
-        rate[idx] = static_cast<uint8_t>(5 + (nextRand(s) % 8u)); // 5..12, eighths
-        // Each tile carries its own shallow shading ramp, with a random sign,
-        // so a tile is not a dead flat patch and two neighbours do not shade
-        // the same way. This is baked once, at layout time: it is geometry.
-        const int sign = (nextRand(s) & 1u) != 0 ? 1 : -1;
-        for (int k = 0; k < wide && x < n; k++, x++) {
-            tile[x] = static_cast<uint8_t>(idx | (k < GROUT_PX ? 0x80 : 0));
-            shade[x] = static_cast<int8_t>((sign * ((2 * k - wide) * SHADE / 2)) / (wide > 0 ? wide : 1));
-        }
-        idx++;
     }
-    // A short axis can leave the tail unassigned if MAX_TILES ran out first.
-    for (; x < n; x++) {
-        tile[x] = static_cast<uint8_t>(idx > 0 ? idx - 1 : 0);
-        shade[x] = 0;
-    }
-    return idx > 0 ? idx : 1;
+    return count;
 }
 
 void frame(uint32_t tMs, int w, int h, const uint8_t p[BG_ANIM_PARAMS]) {
-    if (memcmp(p, lastP, 4) != 0 || themeGen() != lastThemeGen) {
-        buildThemeRamp(palette, 256);
-        lastThemeGen = themeGen();
+    const uint32_t gen = themeGen();
+    if (!paletteValid || gen != lastThemeGen) {
+        buildThemeRamp(ramp, 256);
+        // The page lifts black to theme index 5 and combines linear weight
+        // 95 with quadratic weight 105. The resulting ramp spans 5..203,
+        // keeping the brightest tiles below the theme's brightest stop.
+        for (int i = 0; i < 256; ++i) {
+            const int i2 = (i * i) >> 8;
+            palette[i] = ramp[5 + ((i * 95) >> 8) + ((i2 * 105) >> 8)];
+        }
+        // Dither follows the remapped palette, not the raw theme ramp. The
+        // page's bayerOffsets(...,16) keeps sub-index offsets until band().
+        // 31.5 is the midpoint of Bayer8's 0..63 entries.
         const float amp = ditherAmp(palette, 256);
-        for (int k = 0; k < 64; k++) {
-            const float d = (static_cast<float>(BAYER8[k]) - 31.5f) * (amp * 16.0f / 31.5f);
-            dithOff[k] = static_cast<int16_t>(lroundf(d));
+        for (int k = 0; k < 64; ++k) {
+            dith[k] = static_cast<int16_t>(lroundf((static_cast<float>(BAYER8[k]) - 31.5f) * (amp * 16.0f / 31.5f)));
         }
+        lastThemeGen = gen;
+        paletteValid = true;
     }
-    if (p[1] != lastLayoutP1 || p[3] != lastLayoutP3) {
-        // Tile size as a fraction of the render size: a twelfth of the panel at
-        // the small end, a third at the large end.
-        const int baseW = w / 16 + static_cast<int>(p[1]) * (w / 4 - w / 16) / 100;
-        const int baseH = h / 16 + static_cast<int>(p[1]) * (h / 4 - h / 16) / 100;
-        const int jitW = baseW * static_cast<int>(p[3]) / 250; // up to 40% of the base
-        const int jitH = baseH * static_cast<int>(p[3]) / 250;
-        nColTiles = layoutAxis(colTile, colShade, w, baseW > 6 ? baseW : 6, jitW, 0xA5C31D7Bu, colPhase, colRate);
-        nRowTiles = layoutAxis(rowTile, rowShade, h, baseH > 6 ? baseH : 6, jitH, 0x2F6B49E1u, rowPhase, rowRate);
-        lastLayoutP1 = p[1];
-        lastLayoutP3 = p[3];
-    }
-    memcpy(lastP, p, 4);
-
-    // Time. Unsigned, so the millis() wrap is a phase wrap.
-    const uint32_t sp = 4 + static_cast<uint32_t>(p[0]) * 44 / 100; // 0.25x..3x
-    const uint32_t base = (tMs * sp) >> 11;
-    const int16_t *sl = sinLut();
-    // Level swing per axis, so a tile's own swing is twice this at most.
-    const int ampQ = 150 + static_cast<int>(p[2]) * 350 / 100; // 150..500
-
-    int colLevel[MAX_TILES];
-    for (int i = 0; i < nColTiles; i++) {
-        const uint32_t idx = ((base * colRate[i]) >> 3) + colPhase[i];
-        colLevel[i] = (sl[idx & (SIN_N - 1)] * ampQ) >> 9;
-    }
-    int rowLevel[MAX_TILES];
-    for (int i = 0; i < nRowTiles; i++) {
-        const uint32_t idx = ((base * rowRate[i]) >> 3) + rowPhase[i];
-        rowLevel[i] = (sl[idx & (SIN_N - 1)] * ampQ) >> 9;
-    }
-
-    int rowMax = 0;
-    for (int y = 0; y < h; y++) {
-        const uint8_t t = rowTile[y];
-        int v = MID + rowLevel[t & 0x7F] + rowShade[y] - ((t & 0x80) != 0 ? GROUT : 0);
-        if (v < 0) {
-            v = 0;
+    if (p[1] != lastSize || p[3] != lastVariation) {
+        const int bw = baseWidth(w, p[1]), bh = baseWidth(h, p[1]);
+        nCol = layoutAxis(colShade, cA, cB, cW, nullptr, w, bw, bw * p[3] / 250, 0xA5C31D7Bu);
+        nRow = layoutAxis(rowShade, nullptr, nullptr, nullptr, rowBlend, h, bh, bh * p[3] / 250, 0x2F6B49E1u);
+        uint32_t s = 0x6C8E9CF7u;
+        for (int i = 0; i < nRow * nCol; ++i) {
+            tPhase[i] = static_cast<uint16_t>(nextRand(s) & (SIN_N - 1));
+            tRate[i] = static_cast<uint8_t>(4 + nextRand(s) % 8u); // four through eleven
         }
-        rowTerm[y] = static_cast<int16_t>(v);
-        if (v > rowMax) {
-            rowMax = v;
-        }
+        lastSize = p[1];
+        lastVariation = p[3];
     }
-    for (int x = 0; x < w; x++) {
-        const uint8_t t = colTile[x];
-        int v = MID + colLevel[t & 0x7F] + colShade[x] - ((t & 0x80) != 0 ? GROUT : 0);
-        if (v < 0) {
-            v = 0;
-        }
-        colTerm[x] = static_cast<int16_t>(v);
+    // This page uses a linear integer speed, not speedMul(). Wrapping each
+    // multiplication BEFORE shifting matches JavaScript's >>>0 exactly.
+    const uint32_t sp = 4 + static_cast<uint32_t>(p[0]) * 44 / 100;
+    const uint32_t base = tMs * sp;
+    const uint32_t phW1 = base >> 9, phW2 = (base * 3u) >> 10;
+    // Contrast sets a tile's maximum excursion to 1900..3600 Q4 units.
+    const int amp = 1900 + static_cast<int>(p[2]) * 1700 / 100;
+    // A tile's period is 1,048,576/(sp*rate) ms, 9.53..26.21 s at
+    // default speed (sp=10). The page header rounds that to 10..26 s.
+    for (int i = 0; i < nRow * nCol; ++i) {
+        const uint32_t idx = ((base * tRate[i]) >> 10) + tPhase[i];
+        const int u = (sl[idx & (SIN_N - 1)] + 512) >> 1;
+        const int u2 = (u * u) >> 9;
+        level[i] = static_cast<int16_t>((((u2 * u) >> 9) * amp) >> 9);
     }
-
-    // The sum has no per-pixel bound check, so the column copies are clamped
-    // into what the row term leaves of 0..4095.
-    const int hi = 4095 - rowMax;
-    for (int ph8 = 0; ph8 < 8; ph8++) {
-        int16_t *dstPh = colTermPh + static_cast<size_t>(ph8) * w;
-        const int16_t *off = &dithOff[ph8 * 8];
-        for (int x = 0; x < w; x++) {
-            int v = colTerm[x] + off[x & 7];
-            v = v < 0 ? 0 : (v > hi ? hi : v);
-            dstPh[x] = static_cast<int16_t>(v);
+    // Spatial step 18/16 sine entries per pixel, amplitude 210 field units.
+    // At sp=10 the x wash advances 17.36 px/s and y wash 26.04 px/s in
+    // opposite directions; periods are 52.4288 s and 34.9525 s respectively.
+    for (int x = 0; x < w; ++x) {
+        washCol[x] = static_cast<int16_t>((sl[(((static_cast<uint32_t>(x) * 18u) >> 4) - phW1) & (SIN_N - 1)] * 210) >> 9);
+    }
+    for (int y = 0; y < h; ++y) {
+        const int wash = (sl[(((static_cast<uint32_t>(y) * 18u) >> 4) + phW2) & (SIN_N - 1)] * 210) >> 9;
+        rowTerm[y] = static_cast<int16_t>(rowShade[y] + wash);
+    }
+    for (int ri = 0; ri < nRow; ++ri) {
+        int16_t *dst = comb + static_cast<size_t>(ri) * combStride;
+        const int lb = ri * nCol;
+        for (int x = 0; x < w; ++x) {
+            const int a = level[lb + cA[x]], b = level[lb + cB[x]];
+            dst[x] = static_cast<int16_t>(MID + a + (((b - a) * cW[x]) >> 8) + colShade[x] + washCol[x]);
         }
     }
 }
 
-// Portable on every target, so the descriptor's bandRef slot is nullptr, which
-// is what BgAnim.h asks for when there is no second path to compare against.
-void band(uint16_t *dst, int y0, int rows, int w, uint32_t, const uint8_t *) {
-    for (int y = y0; y < y0 + rows; y++) {
-        const int rt = rowTerm[y];
-        const int16_t *ct = colTermPh + static_cast<size_t>(y & 7) * w;
+// bandRef is the page's final two loops fused: the scratch assignment is an
+// exact int16 value (160..4560), so its store/reload is unnecessary. Its Q8
+// interpolation still rounds before adding the row term and ordered dither.
+// Differences are at most 4400, products at most 1,126,400, row terms are
+// -400..400, and dither is at most +/-256 (ditherAmp's cap is 16 indices).
+// The final field is -496..5216, so signed 16-bit PIE arithmetic cannot
+// saturate accidentally. Both ends of the palette still need their clamp.
+BGANIM_INLINE uint16_t mapPixel(int value, int rv, int d) {
+    int v = (value + rv + d) >> 4;
+    v = v < 0 ? 0 : (v > 255 ? 255 : v);
+    return palette[v];
+}
+
+GM_ANIM_IRAM void bandRef(uint16_t *dst, int y0, int rows, int w, uint32_t, const uint8_t *) {
+    for (int row = 0; row < rows; ++row) {
+        const int y = y0 + row;
+        const int code = rowBlend[y];
+        const int wy = seamWeight[code & 15];
+        const int16_t *a = comb + static_cast<size_t>(code >> 4) * combStride;
+        const int16_t *b = wy ? a + combStride : a;
+        const int rv = rowTerm[y];
+        const int16_t *off = dith + (y & 7) * 8;
         int x = 0;
-        for (; x + 1 < w; x += 2) {
-            const uint16_t c0 = palette[(ct[x] + rt) >> 4];
-            const uint16_t c1 = palette[(ct[x + 1] + rt) >> 4];
-            *reinterpret_cast<uint32_t *>(dst) = static_cast<uint32_t>(c0) | (static_cast<uint32_t>(c1) << 16);
-            dst += 2;
+        // Only seam rows pay for the second column table and Q8 multiply.
+        // Pair stores use BgAnim.h's four-byte destination alignment.
+        if (wy == 0) {
+            for (; x + 1 < w; x += 2) {
+                const uint16_t p0 = mapPixel(a[x], rv, off[x & 7]);
+                const uint16_t p1 = mapPixel(a[x + 1], rv, off[(x + 1) & 7]);
+                *reinterpret_cast<uint32_t *>(dst) = static_cast<uint32_t>(p0) | (static_cast<uint32_t>(p1) << 16);
+                dst += 2;
+            }
+        } else {
+            for (; x + 1 < w; x += 2) {
+                const int v0 = a[x] + (((b[x] - a[x]) * wy) >> 8);
+                const int v1 = a[x + 1] + (((b[x + 1] - a[x + 1]) * wy) >> 8);
+                const uint16_t p0 = mapPixel(v0, rv, off[x & 7]);
+                const uint16_t p1 = mapPixel(v1, rv, off[(x + 1) & 7]);
+                *reinterpret_cast<uint32_t *>(dst) = static_cast<uint32_t>(p0) | (static_cast<uint32_t>(p1) << 16);
+                dst += 2;
+            }
         }
-        for (; x < w; x++) {
-            *dst++ = palette[(ct[x] + rt) >> 4];
+        if (x < w) {
+            const int value = a[x] + (((b[x] - a[x]) * wy) >> 8);
+            *dst++ = mapPixel(value, rv, off[x & 7]);
         }
     }
+}
+
+#if GM_BGANIM_MOSAIC_ASM && defined(__XTENSA__) && !defined(GM_BGANIM_NO_ASM)
+// GCC 14.2 (-O2, xtensa-asm14.sh) baseline, read before this kernel:
+// bandRef's flat loop is 31 instructions/pair inside LOOP; the seam loop
+// spills wy, palette and its counter and uses a branch. Its gather schedule
+// loads both colours before packing. Keep that schedule, interleave four
+// independent gathers, and move the arithmetic into eight PIE lanes.
+//
+// The two bodies below share one loop per eight pixels. Flat rows cost 43
+// instructions (5.375/pixel); seams cost 47 (5.875/pixel). The scalar gather
+// and pair stores account for 36 of each body's instructions. Every scalar
+// load has an independent instruction before use. PIE multiplies produce
+// their result late: the next column load fills that gap, and row/dither
+// addition fills the seam multiply's gap. The lookahead reads one unused
+// vector on exit, covered by comb's explicit 16-byte guard. No PSRAM gather,
+// per-pixel spill, or per-iteration branch remains.
+//
+// Q0/Q1: current source rows; Q2: result; Q3: row+dither; Q4: seam weight;
+// Q5: zero; Q6: 4095 cap; Q7: 16. SAR stays 8, so multiply by Q7 also does
+// the final >>4 without changing SAR in the loop. Clamping to 0..4095 before
+// that shift equals the page's clamp to 0..255 afterwards. The probe in
+// tools/qemubench/tests/anim_mosaic/probe executes min/max/subtract/signed
+// multiply, including negative products. PIE subtraction can clamp negative
+// overflow to -32767; the proven +/-4400 difference never approaches it.
+//
+// The compiler never allocates Q registers, so there is no Q clobber syntax.
+// All scalar temporaries have early-clobber constraints; memory is clobbered.
+// No CPENABLE write: FreeRTOS owns lazy coprocessor context activation.
+// Source rows, dither and the local index buffer are 16-byte aligned by
+// construction. Output only uses s32i and needs BgAnim.h's four-byte alignment.
+// The scalar tail handles widths below eight and every non-multiple of eight.
+// Counts are code shape, not a timing claim. Rung 4 still decides the default.
+// clang-format off
+#define MOSAIC_GATHER8 \
+    "l16ui %[t0], %[idx], 0\n" \
+    "l16ui %[t1], %[idx], 2\n" \
+    "l16ui %[t2], %[idx], 4\n" \
+    "l16ui %[t3], %[idx], 6\n" \
+    "addx2 %[t0], %[t0], %[pal]\n" \
+    "addx2 %[t1], %[t1], %[pal]\n" \
+    "addx2 %[t2], %[t2], %[pal]\n" \
+    "addx2 %[t3], %[t3], %[pal]\n" \
+    "l16ui %[t0], %[t0], 0\n" \
+    "l16ui %[t1], %[t1], 0\n" \
+    "l16ui %[t2], %[t2], 0\n" \
+    "l16ui %[t3], %[t3], 0\n" \
+    "slli %[t1], %[t1], 16\n" \
+    "slli %[t3], %[t3], 16\n" \
+    "or %[t0], %[t0], %[t1]\n" \
+    "or %[t2], %[t2], %[t3]\n" \
+    "s32i %[t0], %[out], 0\n" \
+    "s32i %[t2], %[out], 4\n" \
+    "l16ui %[t0], %[idx], 8\n" \
+    "l16ui %[t1], %[idx], 10\n" \
+    "l16ui %[t2], %[idx], 12\n" \
+    "l16ui %[t3], %[idx], 14\n" \
+    "addx2 %[t0], %[t0], %[pal]\n" \
+    "addx2 %[t1], %[t1], %[pal]\n" \
+    "addx2 %[t2], %[t2], %[pal]\n" \
+    "addx2 %[t3], %[t3], %[pal]\n" \
+    "l16ui %[t0], %[t0], 0\n" \
+    "l16ui %[t1], %[t1], 0\n" \
+    "l16ui %[t2], %[t2], 0\n" \
+    "l16ui %[t3], %[t3], 0\n" \
+    "slli %[t1], %[t1], 16\n" \
+    "slli %[t3], %[t3], 16\n" \
+    "or %[t0], %[t0], %[t1]\n" \
+    "or %[t2], %[t2], %[t3]\n" \
+    "s32i %[t0], %[out], 8\n" \
+    "s32i %[t2], %[out], 12\n"
+
+// BEGIN VERBATIM QEMU KERNEL
+GM_ANIM_IRAM __attribute__((noinline)) void mosaicRowAsm(uint16_t *out, const int16_t *a, const int16_t *b,
+                                                        const int16_t *off, const uint16_t *pal,
+                                                        int rv, int wy, int n) {
+    const int groups = n / 8;
+    if (groups > 0) {
+        uint16_t indices[8] __attribute__((aligned(16)));
+        uint32_t rowWord = (uint16_t)rv;
+        rowWord |= rowWord << 16;
+        const uint32_t weightWord = (uint32_t)wy | ((uint32_t)wy << 16);
+        int t0, t1, t2, t3;
+        asm volatile(
+            "ee.vld.128.ip q3, %[off], 0\n"
+            "ee.movi.32.q q4, %[row], 0\n"
+            "ee.movi.32.q q4, %[row], 1\n"
+            "ee.movi.32.q q4, %[row], 2\n"
+            "ee.movi.32.q q4, %[row], 3\n"
+            "ee.vadds.s16 q3, q3, q4\n"
+            "ee.zero.q q5\n"
+            "movi %[t0], -1\n"
+            "extui %[t0], %[t0], 0, 12\n" // 4095, the maximum Q4 field before >>4
+            "slli %[t1], %[t0], 16\n"
+            "or %[t0], %[t0], %[t1]\n"
+            "ee.movi.32.q q6, %[t0], 0\n"
+            "ee.movi.32.q q6, %[t0], 1\n"
+            "ee.movi.32.q q6, %[t0], 2\n"
+            "ee.movi.32.q q6, %[t0], 3\n"
+            "movi %[t0], 16\n" // (field * 16) >> SAR(8) equals field >> 4
+            "slli %[t1], %[t0], 16\n"
+            "or %[t0], %[t0], %[t1]\n"
+            "ee.movi.32.q q7, %[t0], 0\n"
+            "ee.movi.32.q q7, %[t0], 1\n"
+            "ee.movi.32.q q7, %[t0], 2\n"
+            "ee.movi.32.q q7, %[t0], 3\n"
+            "ssai 8\n"
+            "beqz %[wy], 3f\n"
+            "ee.movi.32.q q4, %[wy], 0\n"
+            "ee.movi.32.q q4, %[wy], 1\n"
+            "ee.movi.32.q q4, %[wy], 2\n"
+            "ee.movi.32.q q4, %[wy], 3\n"
+            "ee.vld.128.ip q0, %[a], 16\n"
+            "ee.vld.128.ip q1, %[b], 16\n"
+            "loopnez %[n], 1f\n"
+            "ee.vsubs.s16 q2, q1, q0\n"
+            "ee.vmul.s16 q2, q2, q4\n"
+            "ee.vadds.s16 q0, q0, q3\n"
+            "ee.vadds.s16 q2, q2, q0\n"
+            "ee.vmax.s16 q2, q2, q5\n"
+            "ee.vmin.s16 q2, q2, q6\n"
+            "ee.vmul.s16 q2, q2, q7\n"
+            "ee.vld.128.ip q0, %[a], 16\n"
+            "ee.vst.128.ip q2, %[idx], 0\n"
+            "ee.vld.128.ip q1, %[b], 16\n"
+            MOSAIC_GATHER8
+            "addi %[out], %[out], 16\n"
+            "1:\n"
+            "addi %[b], %[b], -16\n" // rewind the unused lookahead before the scalar tail
+            "j 4f\n"
+            "3:\n"
+            "ee.vld.128.ip q0, %[a], 16\n"
+            "loopnez %[n], 2f\n"
+            "ee.vadds.s16 q2, q0, q3\n"
+            "ee.vmax.s16 q2, q2, q5\n"
+            "ee.vmin.s16 q2, q2, q6\n"
+            "ee.vmul.s16 q2, q2, q7\n"
+            "ee.vld.128.ip q0, %[a], 16\n"
+            "ee.vst.128.ip q2, %[idx], 0\n"
+            MOSAIC_GATHER8
+            "addi %[out], %[out], 16\n"
+            "2:\n"
+            "4:\n"
+            "addi %[a], %[a], -16\n"
+            : [out] "+&r"(out), [a] "+&r"(a), [b] "+&r"(b),
+              [t0] "=&r"(t0), [t1] "=&r"(t1), [t2] "=&r"(t2), [t3] "=&r"(t3)
+            : [off] "r"(off), [row] "r"(rowWord), [wy] "r"(weightWord), [pal] "r"(pal),
+              [n] "r"(groups), [idx] "r"(indices)
+            : "memory");
+    }
+    for (int x = 0; x < n % 8; ++x) {
+        const int value = wy ? a[x] + (((b[x] - a[x]) * wy) >> 8) : a[x];
+        int v = (value + rv + off[x]) >> 4; // groups always end at Bayer x phase zero
+        v = v < 0 ? 0 : (v > 255 ? 255 : v);
+        out[x] = pal[v];
+    }
+}
+// END VERBATIM QEMU KERNEL
+#undef MOSAIC_GATHER8
+// clang-format on
+#endif
+
+GM_ANIM_IRAM void band(uint16_t *dst, int y0, int rows, int w, uint32_t tMs, const uint8_t *p) {
+#if GM_BGANIM_MOSAIC_ASM && defined(__XTENSA__) && !defined(GM_BGANIM_NO_ASM)
+    for (int row = 0; row < rows; ++row) {
+        const int y = y0 + row;
+        const int code = rowBlend[y];
+        const int wy = seamWeight[code & 15];
+        const int16_t *a = comb + static_cast<size_t>(code >> 4) * combStride;
+        const int16_t *b = wy ? a + combStride : a;
+        mosaicRowAsm(dst + static_cast<size_t>(row) * w, a, b, dith + (y & 7) * 8, palette, rowTerm[y], wy, w);
+    }
+#else
+    bandRef(dst, y0, rows, w, tMs, p);
+#endif
 }
 
 void release() {
-    releaseTable(colTerm, static_cast<size_t>(allocW) * sizeof(int16_t));
-    releaseTable(colTile, static_cast<size_t>(allocW));
-    releaseTable(colShade, static_cast<size_t>(allocW));
-    releaseTable(colTermPh, static_cast<size_t>(8 * allocW) * sizeof(int16_t));
+    releaseTable(comb, (static_cast<size_t>(combRows) * combStride + 8) * sizeof(int16_t));
     releaseTable(rowTerm, static_cast<size_t>(allocH) * sizeof(int16_t));
-    releaseTable(rowTile, static_cast<size_t>(allocH));
-    releaseTable(rowShade, static_cast<size_t>(allocH));
+    releaseTable(rowBlend, static_cast<size_t>(allocH));
+    releaseTable(seamWeight, 16 * sizeof(uint16_t));
+    releaseTable(dith, 64 * sizeof(int16_t));
     releaseTable(palette, 256 * sizeof(uint16_t));
-    allocW = allocH = 0;
-    lastThemeGen = 0xFFFFFFFF;
-    lastLayoutP1 = lastLayoutP3 = -1;
-    nColTiles = nRowTiles = 0;
-    lastP[0] = lastP[1] = lastP[2] = lastP[3] = 255;
+    releaseTable(colShade, static_cast<size_t>(allocW) * sizeof(int16_t));
+    releaseTable(rowShade, static_cast<size_t>(allocH) * sizeof(int16_t));
+    releaseTable(washCol, static_cast<size_t>(allocW) * sizeof(int16_t));
+    releaseTable(cA, static_cast<size_t>(allocW));
+    releaseTable(cB, static_cast<size_t>(allocW));
+    releaseTable(cW, static_cast<size_t>(allocW) * sizeof(uint16_t));
+    releaseTable(level, TILE_COUNT * sizeof(int16_t));
+    releaseTable(tPhase, TILE_COUNT * sizeof(uint16_t));
+    releaseTable(tRate, TILE_COUNT);
+    releaseTable(ramp, 256 * sizeof(uint16_t));
+    sl = nullptr;
+    allocW = allocH = combStride = combRows = 0;
+    nCol = nRow = 1;
+    lastSize = lastVariation = -1;
+    lastThemeGen = 0;
+    paletteValid = false;
 }
 
 } // namespace
@@ -301,7 +542,7 @@ const BgAnimation bg_anim_mosaic = {
     frame,
     band,
     release,
-    nullptr,
+    bandRef,
 };
 
 #endif // GAGGIMATE_SIM
