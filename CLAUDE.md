@@ -1091,6 +1091,40 @@ survived, and what the device taught:
   derive everything from the pair row `y & ~1` and memcpy only when the
   partner is in the same call. `render_one --shapes` runs the same check on
   an unregistered candidate (480 and 240 wide) before it touches `src/`.
+- **Speed 50 is the default on every animation and means the same amount of
+  movement everywhere** (gm-33fm, 2026-09-12). Movement is the half change
+  time: how long the picture takes to change half as much as two unrelated
+  moments of the same animation differ (`tools/animbench/web/motion.js`,
+  guide in `MOTION.md`). Target 1200 ms at Speed 50, accept band 950 to 1500,
+  and above that the slider follows one universal curve,
+  `rate = 2^((sp - 50) / 18.2)`, so 0 gives 8050 ms and 100 gives 179. Before
+  the calibration the fleet spread 144x at Speed 50 and ten of the newest
+  ports shipped a Speed default of 10 to 20, which is what "the animations
+  barely move" was: Glint at its default 10 ran at 0.22 of every number
+  anyone had measured. A new animation is measured before it lands, and its
+  default is 50. Two metrics, and which one applies is a property of the
+  animation: read `thalfLpMs` (8x8 box average before differencing) for
+  Starfield, Orbits, Harmonograph, Nebula and Floor, `thalfMs` for the rest.
+  The half change time does not scale as one over the rate, so the multiplier
+  is a starting point and the measured band is the contract. It is also blind
+  to whole pixel stutter, which is what `grain_ratio.js` is for: read its
+  delta across a change, never its level.
+- **The goldens cannot catch a port drifting from its page design, and for
+  twenty animations it had** (gm-pciz, 2026-09-12). The goldens under
+  `tools/animbench/golden` are rendered by the firmware, so `make check` only
+  proves the firmware draws what it drew yesterday. `make pagecheck`
+  (`web/page_vs_golden.js`, third stage of `make check`) plays the page entry
+  the way `bench.cpp` plays the firmware, captures golden frames 30, 120 and
+  210, quantises both sides to RGB565 and counts differing pixels. Twenty-four
+  animations are exact, which is the rule a new port is held to; the other
+  twenty are debt recorded in `page_exact.json`, worst first: ember 230400 of
+  230400 pixels at a mean of 69 per channel, nebula 225839, mandala 175373,
+  silk 151983, starfield 145547, caustics 75312, lava 70404, aurora 44745.
+  Lower an allowance when you fix one; never raise one to pass a check. The
+  page entry is the approved design and the firmware is the side to change.
+  `bench.cpp` renders a warm-up frame at t = 0 before its loop, so an
+  animation that accumulates state per frame starts one frame ahead on the
+  firmware side, which is the recorded cause of Nebula's gap.
 
 ## Measuring the display rig
 
