@@ -2656,10 +2656,14 @@ function bayerOffsets(dithOff, amp, unit) {
         expandPhases(state.ctPh, state.colTerm, state.dith, w, 0, 4095 - HALF_SPAN);
         state.geomValid = true;
       }
-      const sp = 4 + Math.floor(p[0] * 44 / 100);
-      const base = ((t * sp) >>> 0);
-      const phB = base >>> 7, phB2 = ((base * 5) >>> 0) >>> 10;
-      const phRip = base >>> 7, phGain = ((base * 3) >>> 0) >>> 9;
+      // The fleet's speed curve, on the rate Speed 50 has always had
+      // (bead gm-kh2s): Q6, 1664 at 50, rounded the way AnimOculus.cpp
+      // rounds it, and the shifts take the six fraction bits back. The old
+      // affine law read 4 + Math.floor(p[0] * 44 / 100).
+      const speedQ6 = Math.round(F(1664 * speedMulF(p[0])));
+      const base = ((t * speedQ6) >>> 0);
+      const phB = base >>> 13, phB2 = ((base * 5) >>> 0) >>> 16;
+      const phRip = base >>> 13, phGain = ((base * 3) >>> 0) >>> 15;
       const edge = 12 + Math.floor(p[3] * 30 / 100);
       const breath = 6 + Math.floor(p[2] * 24 / 100);
       const lo = 14 + edge + breath, hi = DISC_IDX - 10 - edge - breath;
@@ -2913,15 +2917,21 @@ function bayerOffsets(dithOff, amp, unit) {
           s = nextRand32(s); state.tRate[i] = 4 + (s % 8);
         }
       }
-      const sp = 2 + Math.floor(p[0] * 28 / 100); // gm-33fm speed calibration, was 4 + p*44/100
-      const base = ((t * sp) >>> 0);
-      const phW1 = base >>> 9, phW2 = ((base * 3) >>> 0) >>> 10;
+      // The fleet's speed curve, on the rate gm-33fm calibrated (bead
+      // gm-kh2s): Q8, 4096 at 50, rounded the way AnimMosaic.cpp rounds it,
+      // and the shifts take the eight fraction bits back. The ramps before
+      // it were 4 + Math.floor(p[0] * 44 / 100) and then
+      // 2 + Math.floor(p[0] * 28 / 100). AnimMosaic.cpp carries what the
+      // integer ramp was for and why a Q8 multiplier keeps it.
+      const speedQ8 = Math.round(F(4096 * speedMulF(p[0])));
+      const base = ((t * speedQ8) >>> 0);
+      const phW1 = base >>> 17, phW2 = ((base * 3) >>> 0) >>> 18;
       const amp = 1900 + Math.floor(p[2] * 1700 / 100);
       const { colShade, rowShade, cA, cB, cW, rA, rB, rW, comb, scratch, level,
         tPhase, tRate, washCol, washRow, dith, pal } = state;
       const nCol = state.nCol, nRow = state.nRow, n = nRow * nCol;
       for (let i = 0; i < n; i++) {
-        const idx = ((((base * tRate[i]) >>> 0) >>> 10) + tPhase[i]) & (SIN_N - 1);
+        const idx = ((((base * tRate[i]) >>> 0) >>> 18) + tPhase[i]) & (SIN_N - 1);
         // A cubed raised sine, not a plain one: most tiles sit near the bottom
         // of their travel and only a few are lit at any moment, which is what
         // keeps the field mid to dark under white text.
@@ -3540,10 +3550,15 @@ function bayerOffsets(dithOff, amp, unit) {
       const lenQ8 = 200 + Math.trunc(p[1] * 400 / 100);
       let hwMax = Math.trunc(w * (14 + Math.trunc(p[2] * 40 / 100)) / 100);
       if (hwMax < 6) hwMax = 6;
-      const sp = 4 + Math.floor(p[0] * 44 / 100);
-      const base = ((t * sp) >>> 0);
-      const phSweep = base >>> 7, phTilt = base >>> 10, phBow = base >>> 11;
-      const phPulse = ((base * 3) >>> 0) >>> 9;
+      // The fleet's speed curve, on the rate Speed 50 has always had
+      // (bead gm-kh2s): Q6, 1664 at 50, rounded the way AnimGlint.cpp
+      // rounds it, and the shifts take the six fraction bits back. The old
+      // affine law read 4 + Math.floor(p[0] * 44 / 100). AnimGlint.cpp
+      // carries why the rate at Speed 50 did not move with it.
+      const speedQ6 = Math.round(F(1664 * speedMulF(p[0])));
+      const base = ((t * speedQ6) >>> 0);
+      const phSweep = base >>> 13, phTilt = base >>> 16, phBow = base >>> 17;
+      const phPulse = ((base * 3) >>> 0) >>> 15;
       const bright = (130 + Math.trunc(p[3] * 170 / 100)) *
         (236 + ((SIN[phPulse & (SIN_N - 1)] * 40) >> 9)) >> 8;
       // A slow swing about the centre rather than a loop across and back. A

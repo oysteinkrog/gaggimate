@@ -247,33 +247,53 @@ void frame(uint32_t tMs, int w, int h, const uint8_t p[BG_ANIM_PARAMS]) {
         lastSize = p[1];
         lastVariation = p[3];
     }
-    // This page uses a linear integer speed, not speedMul(). Wrapping each
-    // multiplication BEFORE shifting matches JavaScript's >>>0 exactly.
-    // Speed calibration (gm-33fm): the ramp was 4 + p*44/100, sp 4 to 48, and
-    // is now 2 + p*28/100, sp 2 to 30, which is 16 at Speed 50 where it was
-    // 26. That is the measured landing at 1198 ms against the fleet target of
-    // 1200 ms. The ramp keeps its shape, so the slider still spans a still
-    // field at 0 through to the fastest the design ever ran, at a lower rate.
+    // Wrapping each multiplication BEFORE shifting matches JavaScript's
+    // >>>0 exactly. That is what the old integer ramp was for: it kept
+    // tMs * sp an exact uint32 product with no rounding convention to agree
+    // on, and it kept the phase clocks on the full 32-bit time base. A Q8
+    // multiplier keeps both properties. The product stays exact because
+    // 2^32 * 27502, the largest speedQ8 can make, is 1.2e14 and the page's
+    // double holds integers to 9.0e15, and the shifts below are chosen so a
+    // uint32 wrap of any of these products moves the sine index by a whole
+    // number of 1024-entry cycles: the largest shift is 18 and 2^32 >> 18
+    // is 16 cycles.
+    // The integer property the ramp existed for therefore survives; only
+    // the rate it maps p[0] to changes.
+    //
+    // Speed follows the fleet's curve, speedMul() (bead gm-kh2s): 0.15x at
+    // 0, 1x at 50 and 6.7x at 100 of the rate the calibration set. The
+    // ramps before it were 4 + p*44/100 (sp 4 to 48) and then, from the
+    // calibration (gm-33fm), 2 + p*28/100 (sp 2 to 30, 16 at Speed 50).
+    // The first covered 12x of rate end to end and the second 15x, where
+    // the fleet covers 45x, so the top half of the slider was nearly flat. The multiplier is Q8 and 4096
+    // at 50, the calibration's 16 with eight more fraction bits, so the
+    // shifts below are the old 9, 10 and 10 plus eight and every clock at
+    // Speed 50 is unchanged. Rounded, not truncated: the nearest .5
+    // boundary over Speed 0 to 100 is 38 float ulps away, so exp2f on the
+    // host, exp2f on the device and Math.pow on the page land on the same
+    // integer.
+    //
     // This animation used to ship a Speed default of 15, so the shipped
     // picture ran at sp 10 and nobody saw the setting the fleet sweep
     // measured. The default is 50 now, the same as every other animation, so
     // the calibrated rate is the one a user gets without touching the slider.
-    const uint32_t sp = 2 + static_cast<uint32_t>(p[0]) * 28 / 100;
-    const uint32_t base = tMs * sp;
-    const uint32_t phW1 = base >> 9, phW2 = (base * 3u) >> 10;
+    const uint32_t speedQ8 = static_cast<uint32_t>(lroundf(4096.0f * speedMul(p[0])));
+    const uint32_t base = tMs * speedQ8;
+    const uint32_t phW1 = base >> 17, phW2 = (base * 3u) >> 18;
     // Contrast sets a tile's maximum excursion to 1900..3600 Q4 units.
     const int amp = 1900 + static_cast<int>(p[2]) * 1700 / 100;
-    // A tile's period is 1,048,576/(sp*rate) ms, 5.96..16.38 s at
-    // default speed (sp=16). The page header rounds that to 6..16 s.
+    // A tile's period is 268,435,456/(speedQ8*rate) ms, 5.96..16.38 s at
+    // the default Speed 50. The page header rounds that to 6..16 s.
     for (int i = 0; i < nRow * nCol; ++i) {
-        const uint32_t idx = ((base * tRate[i]) >> 10) + tPhase[i];
+        const uint32_t idx = ((base * tRate[i]) >> 18) + tPhase[i];
         const int u = (sl[idx & (SIN_N - 1)] + 512) >> 1;
         const int u2 = (u * u) >> 9;
         level[i] = static_cast<int16_t>((((u2 * u) >> 9) * amp) >> 9);
     }
     // Spatial step 18/16 sine entries per pixel, amplitude 210 field units.
-    // At sp=10 the x wash advances 17.36 px/s and y wash 26.04 px/s in
-    // opposite directions; periods are 52.4288 s and 34.9525 s respectively.
+    // At the default Speed 50 the x wash advances 27.78 px/s and the y wash
+    // 41.67 px/s in opposite directions; periods are 32.768 s and
+    // 21.845333 s respectively.
     for (int x = 0; x < w; ++x) {
         washCol[x] = static_cast<int16_t>((sl[(((static_cast<uint32_t>(x) * 18u) >> 4) - phW1) & (SIN_N - 1)] * 210) >> 9);
     }

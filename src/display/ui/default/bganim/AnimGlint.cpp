@@ -152,17 +152,41 @@ void frame(uint32_t tMs, int w, int h, const uint8_t p[BG_ANIM_PARAMS]) {
     int hwMax = w * (14 + static_cast<int>(p[2]) * 40 / 100) / 100;
     if (hwMax < 6) hwMax = 6;
 
-    // Page clocks, including both explicit uint32 wraps. Speed is its linear
-    // 4..48 integer multiplier, not speedMul(). At default sp=8 the sweep,
-    // tilt, bow and pulse periods are 16.384, 131.072, 262.144 and 21.845333 s.
-    // At speed 50, sp=26: 5.041231, 40.329846, 80.659692 and 6.721641 s.
-    // The page header's approximate 9 s pulse does not replace these clocks.
-    const uint32_t sp = 4 + static_cast<uint32_t>(p[0]) * 44 / 100;
-    const uint32_t base = tMs * sp;
-    const uint32_t phSweep = base >> 7;
-    const uint32_t phTilt = base >> 10;
-    const uint32_t phBow = base >> 11;
-    const uint32_t phPulse = (base * 3u) >> 9;
+    // Page clocks, including both explicit uint32 wraps. At the default
+    // Speed 50 the sweep, tilt, bow and pulse periods are 5.041231,
+    // 40.329846, 80.659692 and 6.721641 s, and the whole set scales by
+    // speedMul(), so the five sweep periods over the slider are 33.86,
+    // 13.06, 5.04, 1.95 and 0.75 s. The page header's approximate 9 s pulse
+    // does not replace these clocks.
+    //
+    // Speed follows the fleet's curve (bead gm-kh2s). The old private law,
+    // 4 + p[0] * 44 / 100, ran 4 to 48, so the last quarter of the slider
+    // bought 1.3x and the whole slider covered 12x of rate where the fleet
+    // covers 45x. The multiplier is Q6 and 1664 at 50, the old 26 with six
+    // more fraction bits, so the shifts below are the old 7, 10, 11 and 9
+    // plus six and every clock at Speed 50 is unchanged. The largest shift
+    // is 17, so a uint32 wrap of any of these products moves the sine index
+    // by a whole number of 1024-entry cycles and never shows. Rounded, not
+    // truncated: the nearest .5 boundary over Speed 0 to 100 is 19 float
+    // ulps away, so exp2f on the host, exp2f on the device and Math.pow on
+    // the page land on the same integer.
+    //
+    // The Speed 50 rate is left where the fleet calibration put it because
+    // the half change time that would judge a move is not a stable function
+    // of this animation's rate. Glint is near periodic on its sweep, the way
+    // MOTION.md warns Ripples and Steam are, and at Speed 50 its sweep period
+    // (5.0 s at 26, 6.2 s at 21, 7.7 s at 17) sits right under the 7.9 s
+    // where the measurement starts pooling separations for its "unrelated"
+    // level. Slowing the animation to 21 read 631 ms at Speed 50 and slowing
+    // it further to 17 read 923, against 1010 at 26: a 1.53x slower picture
+    // measured 9 percent faster. What the slider does to the picture is the
+    // sweep period above, 45x end to end.
+    const uint32_t speedQ6 = static_cast<uint32_t>(lroundf(1664.0f * speedMul(p[0])));
+    const uint32_t base = tMs * speedQ6;
+    const uint32_t phSweep = base >> 13;
+    const uint32_t phTilt = base >> 16;
+    const uint32_t phBow = base >> 17;
+    const uint32_t phPulse = (base * 3u) >> 15;
     // Brightness 130..300, pulsed by (236 +/-40)/256. The combined Q8
     // amplitude is at most floor(300*276/256)=323, before the row taper.
     const int bright = ((130 + static_cast<int>(p[3]) * 170 / 100) *

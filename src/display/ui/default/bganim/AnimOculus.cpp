@@ -7,14 +7,14 @@
 // and row terms add in Q4 palette-index units, then one RGB565 gather gives
 // the pixel. No square root, float, or moving state lives in the pixel loop.
 //
-// The page changes all 256 palette entries every frame. At default Speed 15,
-// sp=10 and the main breath/ripple period is 1024*128/10000 = 13.1072 s.
-// The second breath is 20.97152 s and the gain breath is 17.47627 s. Ripple
-// phase rises by 15 sine-table units per radial index and retreats with
-// time, so the wave travels outward. Pixel speed varies with radius because
-// the coordinate is squared radius; the page describes roughly 15 px/s. Keep
-// these integer clocks, including each uint32 multiplication's wrap, rather
-// than replacing them with the fleet's exponential speedMul curve.
+// The page changes all 256 palette entries every frame. Speed follows the
+// fleet's curve (bead gm-kh2s): at the default Speed 50 the main breath and
+// ripple period is 5.04123 s, the second breath is 8.06557 s and the gain
+// breath is 6.72164 s, and the whole set scales by speedMul(). Ripple phase
+// rises by 15 sine-table units per radial index and retreats with time, so
+// the wave travels outward. Pixel speed varies with radius because the
+// coordinate is squared radius. Keep these integer clocks, including each
+// uint32 multiplication's wrap.
 
 #include "BgAnim.h"
 #include "BgAnimCommon.h"
@@ -135,10 +135,35 @@ void frame(uint32_t tMs, int w, int h, const uint8_t p[BG_ANIM_PARAMS]) {
 
     // JavaScript >>>0 truncates EACH product, before the subsequent >>>.
     // Unsigned C++ products preserve those wraps, even near millis() rollover.
-    const uint32_t sp = 4u + static_cast<uint32_t>(p[0]) * 44u / 100u;
-    const uint32_t base = tMs * sp;
-    const uint32_t phB = base >> 7, phB2 = (base * 5u) >> 10;
-    const uint32_t phRip = base >> 7, phGain = (base * 3u) >> 9;
+    //
+    // Speed follows the fleet's curve, speedMul(): 0.15x at 0, 1x at 50 and
+    // 6.7x at 100 of the rate Speed 50 has always had (bead gm-kh2s). The
+    // old private law, 4 + p[0] * 44 / 100, ran 4 to 48 and so covered 12x
+    // where the fleet covers 45x, which left the whole slider compressed
+    // toward the middle. The multiplier is Q6 and 1664 at 50, the old 26
+    // with six more fraction bits, so the shifts below are the old 7, 10, 7
+    // and 9 plus six and every clock at Speed 50 is unchanged. The largest
+    // shift is 16, so a uint32 wrap of any of these products moves the sine
+    // index by a whole number of 1024-entry cycles and never shows.
+    // Rounded, not truncated: the nearest .5 boundary over Speed 0 to 100 is
+    // 19 float ulps away, so exp2f on the host, exp2f on the device and
+    // Math.pow on the page land on the same integer. The breath and ripple
+    // period over the slider is 33.86, 13.06, 5.04, 1.95 and 0.75 s at
+    // Speed 0, 25, 50, 75 and 100.
+    //
+    // Half change time at those five settings reads 5542, 3050, 1090, 484
+    // and 82 ms against fleet targets of 8050, 3120, 1200, 463 and 179. The
+    // first four are inside the accept band and Speed 100 is not, but the
+    // reading there is the measurement, not the picture: motion.js estimates
+    // its "unrelated" level from the top third of thirty sampled pairs, and
+    // for Oculus at Speed 100 that estimate is 40.1 against 57 to 59 at every
+    // other setting, which drops the half threshold with it. Speed 95 reads
+    // 173 ms, and the same measurement with 216 pairs reads 123 ms at
+    // Speed 100. Do not slow the animation to chase the 82.
+    const uint32_t speedQ6 = static_cast<uint32_t>(lroundf(1664.0f * speedMul(p[0])));
+    const uint32_t base = tMs * speedQ6;
+    const uint32_t phB = base >> 13, phB2 = (base * 5u) >> 16;
+    const uint32_t phRip = base >> 13, phGain = (base * 3u) >> 15;
     const int edge = 12 + static_cast<int>(p[3]) * 30 / 100;  // 12..42 radial indices
     const int breath = 6 + static_cast<int>(p[2]) * 24 / 100; // 6..30 radial indices
     const int lo = 14 + edge + breath, hi = DISC_IDX - 10 - edge - breath;

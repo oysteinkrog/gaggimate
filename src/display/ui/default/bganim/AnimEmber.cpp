@@ -420,6 +420,24 @@ void frame(uint32_t tMs, int w, int h, const uint8_t p[BG_ANIM_PARAMS]) {
     // every other animation. 1.75 is exact in float and in the page's
     // double, so the two stay bit identical. The Speed parameter, its
     // label and its default of 50 are unchanged.
+    //
+    // The speed law here is already the fleet's curve and it is correct
+    // (bead gm-kh2s). A fleet sweep reads Ember's half change time as 10474,
+    // 4310, 1135, 251 and 262 ms at Speed 0, 25, 50, 75 and 100, so Speed 100
+    // looks slower than Speed 75. That reversal is in the measurement, not in
+    // this file. Ember's whole motion at the defaults is one bounded, near
+    // periodic quantity: a global brightness breath of plus or minus 17
+    // palette steps at Pulse 50, plus a flicker of plus or minus 2 at
+    // Flicker 20. Two "unrelated" moments of it therefore differ by wherever
+    // the breath happens to be, not by a decorrelated amount, and motion.js
+    // estimates that level from the top third of thirty sampled pairs: the
+    // estimate read 33.9 at Speed 75 and 46.8 at Speed 100, a 1.38x jump in
+    // the threshold, which is the whole reversal. The same measurement with
+    // 216 pairs reads 9199, 3505, 1464, 547 and 219 ms, monotonic and inside
+    // the accept band at all five settings. The 66 ms frame to frame
+    // difference, which needs no such estimate, is 0.221, 0.472, 1.148, 2.796
+    // and 7.023: ratios of 2.14, 2.43, 2.44 and 2.51 against the curve's
+    // 2.59 per 25 slider steps.
     constexpr float RATE_CAL = 1.75f;
     const float spd = speedMul(p[0]) * RATE_CAL;
     const uint32_t vt = static_cast<uint32_t>(static_cast<int64_t>(static_cast<double>(tMs) * spd));
