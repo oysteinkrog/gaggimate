@@ -1767,13 +1767,19 @@ ANIMS.push({
     },
     render(data, w, h, tMs, p, state) {
       if (state._gen !== THEME.gen) { this.rebuildTheme(w, h, state); state._gen = THEME.gen; }
+      // Speed scales the clock, not one term (gm-kh2s). Every motion below
+      // reads ts: the rise is riseSpeed*age, a puff's age and lifetime decide
+      // its fade, and the sway is a frequency times ts. See AnimSteam.cpp for
+      // what multiplying the rise alone did to the fast end of the slider.
+      // Exactly 1 at Speed 50, so the default picture is unchanged.
+      const ts = tMs*speedMulJS(p[0]);
       const count = Math.round(2 + (p[1]/100)*3);
-      if (state.built !== count) buildWisps(state, count, tMs);
+      if (state.built !== count) buildWisps(state, count, ts);
       // Speed calibration (gm-33fm): all three of this animation's clocks
       // are scaled by 3/16 together, the rise here and the puff lifetime
       // and sway frequencies in buildWisps. Scaling the rise alone would
       // shorten every column instead of slowing it. See AnimSteam.cpp.
-      const riseSpeed = 0.006375*speedMulJS(p[0]);
+      const riseSpeed = 0.006375;
       const swirl = 0.5 + (p[2]/100)*1.7;
       const density = 0.5 + (p[3]/100)*0.8;
       // Same four sliders AnimSteam.cpp gained on 2026-09-10: t is 0 at the
@@ -1786,10 +1792,10 @@ ANIMS.push({
       const maxHeight = h*0.62;
       data.set(state.bg);
       for (const b of state.blobs) {
-        let age = tMs - b.birth;
+        let age = ts - b.birth;
         if (age > b.lifetime) {
-          b.birth = tMs - (age % b.lifetime) + state.rand()*40;
-          age = tMs - b.birth;
+          b.birth = ts - (age % b.lifetime) + state.rand()*40;
+          age = ts - b.birth;
         }
         const L = Math.max(0, Math.min(1, age/b.lifetime));
         const wisp = state.wisps[b.wisp];
@@ -1800,8 +1806,8 @@ ANIMS.push({
         const swayAmp = (5 + 22*heightFrac)*swirl;
         const wx0 = state.cx + (wisp.x0 - state.cx)*spreadMul;
         const x = wx0
-          + swayAmp*Math.sin(wisp.swayFreq1*tMs + wisp.swayPhase1 + b.seed)
-          + swayAmp*0.35*Math.sin(wisp.swayFreq2*tMs + wisp.swayPhase2 + b.seed*1.7);
+          + swayAmp*Math.sin(wisp.swayFreq1*ts + wisp.swayPhase1 + b.seed)
+          + swayAmp*0.35*Math.sin(wisp.swayFreq2*ts + wisp.swayPhase2 + b.seed*1.7);
         const alpha = Math.min(0.4, density*0.44*4*L*(1-L)*(1-heightFrac*taper));
         if (alpha <= 0.003) continue;
         const R = (10 + 26*heightFrac)*(0.85 + 0.3*Math.sin(b.seed))*sizeMul;

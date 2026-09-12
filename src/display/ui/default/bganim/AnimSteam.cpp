@@ -297,13 +297,24 @@ void frame(uint32_t tMs, int w, int h, const uint8_t p[BG_ANIM_PARAMS]) {
         rebuildTheme();
         lastThemeGen = themeGen();
     }
-    const double t = tMs;
+    // Speed scales the clock, not one term (gm-kh2s). Every motion here reads
+    // t: the rise is riseSpeed * age, a puff's age and lifetime decide its
+    // fade, and the sway is a frequency times t. Multiplying the rise alone,
+    // which is what this file did until 2026-09-12, made a column rise faster
+    // while each puff still lived the same wall-clock time and swayed at the
+    // same rate, so a fast setting shortened the plume instead of speeding it
+    // up and the picture stopped changing any faster past about Speed 75: the
+    // fleet sweep measured 482 ms at Speed 100 against a 179 ms target, the
+    // worst of the 44. Double pow, not the float speedMul(), because this
+    // animation is double throughout and the page's speedMulJS is Math.pow.
+    // Exactly 1 at Speed 50, so the default picture is unchanged.
+    const double t = tMs * pow(2.0, (static_cast<int>(p[0]) - 50) / 18.2);
     const int count = static_cast<int>(floor(2 + (p[1] / 100.0) * 3 + 0.5));
     if (count != builtCount) buildWisps(count, t);
     // Speed calibration (gm-33fm): the rise, the puff lifetime and the sway
     // frequencies are all scaled by 3/16 together; the page carries the
     // same constants.
-    const double riseSpeed = 0.006375 * pow(2.0, (static_cast<int>(p[0]) - 50) / 18.2);
+    const double riseSpeed = 0.006375;
     const double swirl = 0.5 + (p[2] / 100.0) * 1.7;
     const double density = 0.5 + (p[3] / 100.0) * 0.8;
     const double sizeT = (static_cast<int>(p[4]) - 50) / 50.0, sizeMul = 1 + sizeT * (sizeT < 0 ? 0.5 : 0.8);
