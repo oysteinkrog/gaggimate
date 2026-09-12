@@ -46,6 +46,9 @@ logs/
 .serena/
 .claude/
 
+# Gradient contact sheet (regenerate with tools/gradient_sheet.py)
+tools/gradient_sheet.png
+
 # Off-device kernel-bench build artifacts (generated .elf/.o + qemu traces)
 tools/qemubench/build/
 tools/animbench/kernels-blend/build/
