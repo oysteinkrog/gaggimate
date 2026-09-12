@@ -736,6 +736,8 @@ function gradLUT(stops) { // stops: [[t0..255, r, g, b], ...] -> Uint8Array 256*
 })();
 
 /* ---- 5: Ripples (anim-water) ---- */
+// Mirrors of RING_SPEED_50, FADE_REF_SPEED, LIFE_MUL and TAIL_FRAC in AnimRipples.cpp.
+const RIPPLE_SPEED_50 = 4.0, RIPPLE_FADE_REF_SPEED = 122.5, RIPPLE_LIFE_MUL = 8.0, RIPPLE_TAIL_FRAC = 0.4;
 ANIMS.push({
   id: 'ripples', name: 'Ripples',
   params: [
@@ -745,8 +747,13 @@ ANIMS.push({
     {key:'tone',label:'Water tone',def:50},{key:'trough',label:'Trough dip',def:50}],
   init(w, h, state) {
     state.ripples = [];
-    state.rand = mulberry32(0xC0FFEE ^ (w*31+h));
-    state.nextDrop = 600 + state.rand()*2000;
+    // xorshift32 from the same seed as AnimRipples.cpp (bganim::nextRandf),
+    // so the page's drops land where the firmware's do. Every value is a
+    // 24-bit integer over 2^24, exact in float as in double.
+    let seed = 0xC0FFEE;
+    state.rand = () => { seed ^= seed << 13; seed >>>= 0; seed ^= seed >>> 17; seed ^= seed << 5; seed >>>= 0; return (seed >>> 8) / 16777216; };
+    state.nextDrop = 0;
+    state.primed = false;
     state._gen = -1;
   },
   render(data, w, h, tMs, p, state) {
@@ -770,23 +777,49 @@ ANIMS.push({
     const envA = p[5] < 50 ? 1 - ((p[5]-50)/50)*0.6 : 1;
     const tone = pscale(p[6], 3);          // water gradient span and offset
     const interval = lerp(14000, 1500, p[1]/100);
-    if (tMs >= state.nextDrop && state.ripples.length < 4) {
-      state.ripples.push({ cx: rand()*w*spread + w*0.5*(1-spread), cy: rand()*h*spread + h*0.5*(1-spread), birth: tMs });
-      state.nextDrop = tMs + interval*(0.55+0.9*rand());
-    }
-    const speed = lerp(25, 220, p[0]/100);
-    const life = lerp(7.0, 2.2, p[2]/100);
+    // Speed law (2026-09-12, gm-kh2s), the same as AnimRipples.cpp frame():
+    // universal curve on the travel speed and on the swell, amplitude decays
+    // with radius over `travel`, and a ring lives `life` seconds whatever the
+    // speed, fading out over the last RIPPLE_TAIL_FRAC of that.
+    const spd = speedMulJS(p[0]);
+    const speed = RIPPLE_SPEED_50 * spd;
+    const lifeS = lerp(7.0, 2.2, p[2]/100);
+    const travel = RIPPLE_FADE_REF_SPEED * lifeS;
+    const life = RIPPLE_LIFE_MUL * lifeS;
+    const swellT = tMs * spd;
     const glow = 0.35 + 1.15*(p[3]/100);
+    // Same drop process as AnimRipples.cpp frame(): drops land on their
+    // deadlines, every deadline up to now is played out, the first frame
+    // (and a gap longer than a life) starts on the life boundary before the
+    // one preceding now so the pond is already rained on and the bench and
+    // the page play the same deadlines, a drop that finds all four slots
+    // taken is lost, and the next deadline is drawn either way.
+    const lifeMs = Math.trunc(Math.fround(life*1000));
+    if (!state.primed || tMs - state.nextDrop > lifeMs) {
+      state.primed = true;
+      state.nextDrop = Math.floor(tMs/lifeMs)*lifeMs - lifeMs;
+    }
+    while (tMs - state.nextDrop >= 0) {
+      const at = state.nextDrop;
+      state.ripples = state.ripples.filter(r => (at-r.birth)/1000 < life);
+      if (state.ripples.length < 4) {
+        state.ripples.push({ cx: rand()*w*spread + w*0.5*(1-spread), cy: rand()*h*spread + h*0.5*(1-spread), birth: at });
+      }
+      state.nextDrop = at + Math.trunc(interval*(0.55+0.9*rand()));
+    }
     state.ripples = state.ripples.filter(r => (tMs-r.birth)/1000 < life);
     const HALFW = 13, WAVEFREQ = 2*Math.PI/27;
     const R = state.ripples.map(r => {
       const ageS = (tMs-r.birth)/1000;
       const rise = Math.min(1, ageS/0.18);
-      return { cx: r.cx, cy: r.cy, radius: speed*ageS, amp: rise*Math.exp(-ageS/life) };
+      const radius = speed*ageS;
+      let tail = Math.min(1, (1 - ageS/life) * (1/RIPPLE_TAIL_FRAC));
+      tail = tail*tail*(3 - 2*tail);
+      return { cx: r.cx, cy: r.cy, radius, amp: rise*Math.exp(-radius/travel)*tail };
     }).filter(r => r.radius > 0 && r.amp > 0.008);
     for (let y = 0; y < h; y++) {
       const vt = y/(h-1);
-      const swell = Math.sin(tMs*0.00014 + y*0.014)*2.5;
+      const swell = Math.sin(swellT*0.00014 + y*0.014)*2.5;
       const baseC = themeRGB(Math.max(0, Math.min(127, (vt*20*tone+swell+3*tone)|0)));
       const baseR = baseC[0], baseG = baseC[1], baseB = baseC[2];
       const rows = [];
@@ -995,6 +1028,8 @@ ANIMS.push({
       }
     }
   }
+  // Innermost orbit's period at Speed 50, seconds; see BASE_PERIOD_S in AnimOrbits.cpp.
+  const ORBIT_BASE_PERIOD_S = 72.0;
   ANIMS.push({
     id: 'orbits', name: 'Orbits',
     params: [
@@ -1031,7 +1066,7 @@ ANIMS.push({
         const a = maxR*(0.30 + i*(0.62/(count-1)));
         const b = a*bRatio;
         const phi = i*phiStep, cphi = Math.cos(phi), sphi = Math.sin(phi);
-        const T = 6.0*Math.pow(1+golden, i)/spd;
+        const T = ORBIT_BASE_PERIOD_S*Math.pow(1+golden, i)/spd;
         const col = state.hues[i%6];
         for (let s = 0; s < 480; s++) {
           const u = s/480*Math.PI*2;

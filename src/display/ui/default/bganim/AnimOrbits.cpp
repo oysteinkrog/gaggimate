@@ -25,6 +25,13 @@ constexpr int PTS_PER_BAND = 32;
 // same silent-cap behavior pathBinCount already uses below.
 constexpr int SAMPLE_BIN_CAP = 48;
 constexpr float GOLDEN = 0.6180339887f;
+// Innermost orbit's period at Speed 50, in seconds; each further orbit is
+// 1.618x slower. It was 6.0 until 2026-09-12 (gm-kh2s), which put the half
+// change time at 119 ms against the fleet's 1200 ms target and moved the
+// innermost body 4.6 px per 66 ms frame, a dotted trail rather than travel.
+// The trail dots are spaced in phase (T/90), so the picture at rest is the
+// same at any period; only the rate changed.
+constexpr float BASE_PERIOD_S = 72.0f;
 
 struct OrbitDef {
     float a, b, phi, T, phase;
@@ -128,7 +135,7 @@ void rebuildGeometry(int countP, int eccP, int sizeP, int pathP, int tiltP, int 
         o.phi = i * phiStep;
         o.cosPhi = cosf(o.phi);
         o.sinPhi = sinf(o.phi);
-        o.T = 6.0f * powf(1.0f + GOLDEN, static_cast<float>(i));
+        o.T = BASE_PERIOD_S * powf(1.0f + GOLDEN, static_cast<float>(i));
         o.phase = i * 1.7f;
         // Bodies sample the theme's upper range, spread so neighbors differ.
         uint8_t col[3];

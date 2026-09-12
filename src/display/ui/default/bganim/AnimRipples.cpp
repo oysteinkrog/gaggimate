@@ -176,14 +176,45 @@ constexpr float INV_ROWMAX = 1.0f / 479.0f;  // replaces a per-row divide by 479
 constexpr float RAD_TO_TABLE = 256.0f / 6.2831853f;
 constexpr float WIN_MARGIN = 2.0f; // px slack on every crossing window (see file header)
 
+// Speed law (2026-09-12, gm-kh2s). Before this pass the Speed slider set
+// the ring travel speed linearly, 25 px/s at 0 to 220 px/s at 100, a ring
+// lived a fixed 7 s at the default Fade, and its amplitude decayed with
+// age. The fleet's movement metric (half change time, target 1200 ms at
+// Speed 50) read 118 ms at 50, and slower again above 50, because a fast
+// ring outran the panel and left it empty. The target needs a ring to move
+// about 6 px in 1.2 s, so the travel speed at 50 is now RING_SPEED_50 and
+// follows the universal curve, and the other quantities are defined so the
+// pond keeps rings on it at every speed:
+//   speed  = RING_SPEED_50 * speedMul(p[0])          px/s
+//   travel = FADE_REF_SPEED * lifeS(p[2])            px, amplitude decay length
+//   life   = LIFE_MUL * lifeS(p[2])                  s, independent of speed
+//   amp    = rise * exp(-radius / travel) * tail(age / life)
+// where lifeS is the old 7 s to 2.2 s Fade span and FADE_REF_SPEED is the
+// old speed at slider 50, so the brightness a ring has at a given radius is
+// the one this file shipped with. The life is a time, so at a slow speed a
+// ring fades out while still on the panel, which the old hard cut at
+// amp 0.37 could not do without a visible pop: tail() takes the amplitude
+// to zero over the last TAIL_FRAC of the life. With four slots and a drop
+// every 9 s at the default Drop rate, a 37 s life keeps three to four rings
+// on the pond; a life tied to the travel distance instead was tried first
+// and at slow speeds it held every slot for minutes, so the pond emptied
+// for a quarter of the time and then took four drops in a burst. The
+// swell of the water surface follows the same speed multiplier so the
+// whole picture obeys the slider.
+constexpr float RING_SPEED_50 = 4.0f;
+constexpr float FADE_REF_SPEED = 122.5f;
+constexpr float LIFE_MUL = 8.0f;
+constexpr float TAIL_FRAC = 0.4f;
+
 // Padded clamp-to-uint8 LUT sizing. Worst case for cr/cg/cb (see clamp8f
 // call sites below): baseR/baseG/baseB in [0,255] (themeRGB output, whatever
 // the water tone parameter does to the position it asks for); ring
 // term g*crestF/troughF where |g| = |hAcc * g_glow| and hAcc sums up to
 // MAX_RIPPLES per-ring contributions, each bounded by amp*cos*env <=
-// amp_max * env_max ~= 0.975 * 1.6 = 1.56 (rise in [0,1], expf(-ageS/life)
-// < 1 with its peak at ageS=0.18s -> ~0.975 for the largest tunable life of
-// 7s; envLUT holds a*(1-n*n)^e with the base in [0,1] and a <= 1.6 at the
+// amp_max * env_max ~= 0.98 * 1.6 = 1.57 (rise in [0,1], the tail in [0,1],
+// expf(-radius/travel) < 1 with its peak at ageS=0.18s, a radius under 6 px
+// at Speed 100 against a travel of at least 270 px -> ~0.98; envLUT holds
+// a*(1-n*n)^e with the base in [0,1] and a <= 1.6 at the
 // fattest ring width, p[5]=0), so |hAcc| <= 4*1.56 = 6.24; g_glow in
 // [0.35, 1.5] (p[3] 0..100) so |g| <= 9.36. crestF[ch] <= 255*0.65 = 165.75
 // (crest branch, g>0): cr_max ~= 255 + 9.36*165.75 + dith(4.125) ~= 1810.8.
@@ -270,11 +301,12 @@ struct RowState {
 
 struct Ripple {
     float cx, cy;
-    uint32_t birthMs;
+    int32_t birthMs; // signed so ages and deadlines survive the millis wrap
     bool active;
 };
 Ripple ripples[MAX_RIPPLES];
-uint32_t nextDropMs = 0;
+int32_t nextDropMs = 0;
+bool primed = false; // the first frame after init warms the pond, see frame()
 uint32_t rng = 0xC0FFEE;
 float *envLUT = nullptr;     // 256: 1-(i/255)^2
 uint8_t *clampU8 = nullptr;  // CLAMP_SIZE: clamp(idx-CLAMP_PAD, 0, 255) — see derivation above
@@ -298,7 +330,7 @@ int g_n = 0;
 float g_cx[MAX_RIPPLES], g_cy[MAX_RIPPLES], g_r[MAX_RIPPLES], g_amp[MAX_RIPPLES];
 int g_icx[MAX_RIPPLES], g_icy[MAX_RIPPLES]; // centers rounded to nearest pixel, for the integer tracker
 float g_glow = 1.0f;
-uint32_t g_tMs = 0;
+float g_swellT = 0.0f; // tMs scaled by the speed multiplier, for the swell
 
 // Ring width (p[5]): the radial envelope is a gather table, so the whole
 // parameter lives in this rebuild and neither pixel loop -- the portable one
@@ -411,7 +443,7 @@ bool init(int, int) {
         for (auto &r : ripples) {
             r.active = false;
         }
-        nextDropMs = 600 + static_cast<uint32_t>(nextRandf(rng) * 2000);
+        primed = false;
     }
     return true;
 }
@@ -437,7 +469,6 @@ void rebuildThemeAssets(uint8_t troughP) {
 }
 
 void frame(uint32_t tMs, int w, int h, const uint8_t p[BG_ANIM_PARAMS]) {
-    g_tMs = tMs;
     if (themeGen() != lastThemeGen || p[7] != lastTroughP) {
         lastTroughP = p[7];
         rebuildThemeAssets(lastTroughP);
@@ -464,35 +495,78 @@ void frame(uint32_t tMs, int w, int h, const uint8_t p[BG_ANIM_PARAMS]) {
     // same drops at the same times, moved.
     const float spread = 1.0f + static_cast<float>(static_cast<int>(p[4]) - 50) * 0.014f;
     const float interval = lerpf(14000.0f, 1500.0f, p[1] / 100.0f);
-    if (tMs >= nextDropMs) {
+    const float spd = speedMul(p[0]);
+    const float speed = RING_SPEED_50 * spd;
+    const float lifeS = lerpf(7.0f, 2.2f, p[2] / 100.0f);
+    const float travel = FADE_REF_SPEED * lifeS;
+    const float life = LIFE_MUL * lifeS;
+    g_swellT = static_cast<float>(tMs) * spd;
+    g_glow = 0.35f + 1.15f * (p[3] / 100.0f);
+
+    // Drops land on their deadlines, not on the frame that first passes one,
+    // and every deadline up to now is played out in turn. So the first frame
+    // after init, and the first frame after a gap longer than a ring's life,
+    // start from a pond that has been raining for one lifetime rather than
+    // from flat water: at the default Fade a ring takes 37 s to fade, and without
+    // this the panel would show empty water and then one small ring for the
+    // first half minute. The catch-up starts on the life boundary before
+    // the one that precedes now (between one and two lives back, so it is
+    // bounded at 2 * life / (0.55 * interval) deadlines, under a hundred at
+    // the fastest drop rate), and it starts there rather than at now minus
+    // one life so that the host bench, whose first frame is at 0, and the
+    // web page, whose first render is at 1990 ms, play the same deadlines
+    // from the same seed and draw the same rings. A deadline further back
+    // than one life restarts the same way. A ring that would have died
+    // before a deadline frees its slot before that deadline's drop, the
+    // same as it would have frame by frame.
+    const int32_t now = static_cast<int32_t>(tMs);
+    const int32_t lifeMs = static_cast<int32_t>(life * 1000.0f);
+    if (!primed || now - nextDropMs > lifeMs) {
+        primed = true;
+        int32_t q = now / lifeMs; // floor division for a negative now (after a wrap)
+        if (now % lifeMs < 0) {
+            q--;
+        }
+        nextDropMs = q * lifeMs - lifeMs;
+    }
+    while (now - nextDropMs >= 0) {
+        const int32_t at = nextDropMs;
+        for (auto &r : ripples) {
+            if (r.active && (at - r.birthMs) * 0.001f >= life) {
+                r.active = false;
+            }
+        }
         for (auto &r : ripples) {
             if (!r.active) {
                 const float rx = nextRandf(rng) * w;
                 const float ry = nextRandf(rng) * h;
                 const float invS = 1.0f - spread;
-                r = {rx * spread + (w * 0.5f) * invS, ry * spread + (h * 0.5f) * invS, tMs, true};
+                r = {rx * spread + (w * 0.5f) * invS, ry * spread + (h * 0.5f) * invS, at, true};
                 break;
             }
         }
-        nextDropMs = tMs + static_cast<uint32_t>(interval * (0.55f + 0.9f * nextRandf(rng)));
+        nextDropMs = at + static_cast<int32_t>(interval * (0.55f + 0.9f * nextRandf(rng)));
     }
-    const float speed = lerpf(25.0f, 220.0f, p[0] / 100.0f);
-    const float life = lerpf(7.0f, 2.2f, p[2] / 100.0f);
-    g_glow = 0.35f + 1.15f * (p[3] / 100.0f);
 
     g_n = 0;
     for (auto &r : ripples) {
         if (!r.active) {
             continue;
         }
-        const float ageS = (tMs - r.birthMs) * 0.001f;
+        const float ageS = (now - r.birthMs) * 0.001f;
         if (ageS >= life) {
             r.active = false;
             continue;
         }
         const float radius = speed * ageS;
         const float rise = ageS < 0.18f ? ageS / 0.18f : 1.0f;
-        const float amp = rise * expf(-ageS / life);
+        // Smoothstep from 1 at (1 - TAIL_FRAC) of the life to 0 at its end.
+        float tail = (1.0f - ageS / life) * (1.0f / TAIL_FRAC);
+        if (tail > 1.0f) {
+            tail = 1.0f;
+        }
+        tail = tail * tail * (3.0f - 2.0f * tail);
+        const float amp = rise * expf(-radius / travel) * tail;
         if (radius <= 0 || amp < 0.008f) {
             continue;
         }
@@ -524,7 +598,7 @@ void buildRowState(int y, int w, RowState &rs) {
     const float wMinus1 = static_cast<float>(w - 1);
     {
         const float vt = y * INV_ROWMAX;
-        const float swell = sinRadLocal(g_cosTable, g_tMs * 0.00014f + y * 0.014f) * 2.5f;
+        const float swell = sinRadLocal(g_cosTable, g_swellT * 0.00014f + y * 0.014f) * 2.5f;
         // g_toneSpan/g_toneOff are 20.0f/3.0f at the default water tone, so
         // this is the original expression there. The upper clamp is 127
         // rather than 31 because the highest tone (span 60, offset 9) asks
@@ -1017,13 +1091,12 @@ void release() {
     // a freed table set is the bug class this entry point exists to prevent.
     lastThemeGen = 0xFFFFFFFF;
     // `inited` is deliberately NOT reset. It gates the ripple SIMULATION
-    // state (active flags and nextDropMs), not any table's content: envLUT and
-    // clampU8 are pure functions of compile-time constants, so init() refills
-    // them identically whatever `inited` says. Resetting it would re-seed
-    // nextDropMs to a boot-relative 600-2600 ms while tMs is already far past
-    // that, firing a drop the instant the animation is selected. Leaving the
-    // simulation intact across a release/init cycle is both correct and the
-    // behaviour that existed before this entry point.
+    // state (active flags, nextDropMs and primed), not any table's content:
+    // envLUT and clampU8 are pure functions of compile-time constants, so
+    // init() refills them identically whatever `inited` says. Leaving the
+    // simulation intact across a release/init cycle means a short absence
+    // resumes the same pond, and a long one is caught up by frame() the
+    // same way the first frame is.
 }
 
 } // namespace
