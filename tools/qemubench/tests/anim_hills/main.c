@@ -1,23 +1,22 @@
-/* Real-Xtensa execution check for the two PIE kernels in
- * src/display/ui/default/bganim/AnimHills.cpp, hillsFill8 and hillsBlend8.
- * Neither tools/animbench/xtensa-asm14.sh (which proves the mnemonics and
- * the register allocation, never execution) nor the host bench (where
- * band() dispatches to the portable twins, because no compiler here can
- * assemble an EE.* block) actually runs these instructions. This test does,
- * under Espressif's qemu-system-xtensa fork, following the precedent of
- * tests/anim_kaleido/main.c and tests/anim_silk2/main.c: the kernel bodies
- * below are verbatim transcriptions of the ones in AnimHills.cpp, with the
- * mnemonics, operand names, immediates and load and store order unchanged,
- * and they are checked against two independent plain C references.
+/* Real-Xtensa execution check for the three PIE kernels in
+ * src/display/ui/default/bganim/AnimHills.cpp: hillsFill8, hillsLerp8 and
+ * hillsPack8. Neither tools/animbench/xtensa-asm14.sh (which proves the
+ * mnemonics and the register allocation, never execution) nor the host
+ * bench (where band() dispatches to the portable twins, because no compiler
+ * here can assemble an EE.* block) actually runs these instructions. This
+ * test does, under Espressif's qemu-system-xtensa fork, following the
+ * precedent of tests/anim_kaleido/main.c and tests/anim_silk2/main.c: the
+ * kernel bodies below are verbatim transcriptions of the ones in
+ * AnimHills.cpp, with the mnemonics, operand names, immediates and load and
+ * store order unchanged, and they are checked against plain C references.
  *
- * The second reference matters. hillsBlend8 computes each channel as
- * (fg * a + bg * (256 - a)) >> 8 on the channel's raw magnitude, because
- * that form needs only the unsigned products the vector unit has, while the
- * animation's scalar tail and every other caller in the firmware use
- * bganim::blendQ8's bg + (((fg - bg) * a) >> 8). Those are the same integer
- * for every alpha in 0..256, and blendRef565 below is blendQ8 written out,
- * so a PASS is evidence for the identity on real hardware as well as for
- * the kernel matching its twin.
+ * hillsLerp8 is the page's pcMix32 on one 8-bit channel held in a 16-bit
+ * lane: d + (((f - d) * a) >> 8), with the shift arithmetic so a negative
+ * step floors. The reference is that expression in C, and the sweep runs
+ * every alpha in 0..256 over every ordering of the channel corners, so the
+ * signed multiply's shift direction on a negative product is executed, not
+ * assumed. hillsPack8 turns three planes into RGB565, and its reference is
+ * the shift and or written out.
  *
  * CPENABLE is written once by main() because this is bare metal and there
  * is no lazy coprocessor-enable handler. The kernels themselves never touch
@@ -77,94 +76,72 @@ __attribute__((noinline)) void hillsFill8(uint16_t *dst, const uint16_t *colV, i
                  : "memory");
 }
 
-__attribute__((noinline)) void hillsBlend8(uint16_t *dst, const uint16_t *src, const uint16_t *aQ8,
-                                           const uint16_t *ct, int groups) {
+__attribute__((noinline)) void hillsLerp8(uint16_t *dst, const uint16_t *fg, const uint16_t *aQ8, int groups) {
     uint16_t *rd = dst;
     uint16_t *wr = dst;
-    const uint16_t *sv = src;
+    const uint16_t *fv = fg;
     const uint16_t *av = aQ8;
-    const uint16_t *cp = ct;
-    asm volatile("ee.vld.128.ip q7, %[cp], 16\n"
+    asm volatile("ssai 8\n"
                  "loopnez %[n], 1f\n"
                  "ee.vld.128.ip q2, %[av], 16\n"
-                 "ee.vld.128.ip q4, %[cp], 16\n"
-                 "ee.vld.128.ip q0, %[sv], 16\n"
-                 "ee.vsubs.s16 q3, q4, q2\n"
+                 "ee.vld.128.ip q0, %[fv], 16\n"
                  "ee.vld.128.ip q1, %[rd], 16\n"
-                 "ee.vld.128.ip q4, %[cp], 16\n"
-                 "ee.andq q5, q0, q4\n"
-                 "ee.andq q4, q1, q4\n"
-                 "ssai 11\n"
-                 "ee.vmul.u16 q5, q5, q7\n"
-                 "ee.vmul.u16 q4, q4, q7\n"
-                 "ssai 0\n"
-                 "ee.vmul.u16 q5, q5, q2\n"
-                 "ee.vmul.u16 q4, q4, q3\n"
-                 "ee.vadds.s16 q5, q5, q4\n"
-                 "ssai 8\n"
-                 "ee.vmul.u16 q5, q5, q7\n"
-                 "ee.vld.128.ip q4, %[cp], 16\n"
-                 "ssai 0\n"
-                 "ee.vmul.u16 q6, q5, q4\n"
-                 "ee.vld.128.ip q4, %[cp], 16\n"
-                 "ee.andq q5, q0, q4\n"
-                 "ee.andq q4, q1, q4\n"
-                 "ssai 5\n"
-                 "ee.vmul.u16 q5, q5, q7\n"
-                 "ee.vmul.u16 q4, q4, q7\n"
-                 "ssai 0\n"
-                 "ee.vmul.u16 q5, q5, q2\n"
-                 "ee.vmul.u16 q4, q4, q3\n"
-                 "ee.vadds.s16 q5, q5, q4\n"
-                 "ssai 8\n"
-                 "ee.vmul.u16 q5, q5, q7\n"
-                 "ee.vld.128.ip q4, %[cp], 16\n"
-                 "ssai 0\n"
-                 "ee.vmul.u16 q5, q5, q4\n"
-                 "ee.orq q6, q6, q5\n"
-                 "ee.vld.128.ip q4, %[cp], 16\n"
-                 "ee.andq q5, q0, q4\n"
-                 "ee.andq q4, q1, q4\n"
-                 "ee.vmul.u16 q5, q5, q2\n"
-                 "ee.vmul.u16 q4, q4, q3\n"
-                 "ee.vadds.s16 q5, q5, q4\n"
-                 "ssai 8\n"
-                 "ee.vmul.u16 q5, q5, q7\n"
-                 "ee.orq q6, q6, q5\n"
-                 "ee.vst.128.ip q6, %[wr], 16\n"
-                 "addi %[cp], %[cp], -96\n"
+                 "ee.vsubs.s16 q0, q0, q1\n"
+                 "ee.vmul.s16 q0, q0, q2\n"
+                 "ee.vadds.s16 q0, q0, q1\n"
+                 "ee.vst.128.ip q0, %[wr], 16\n"
                  "1:\n"
-                 : [rd] "+r"(rd), [wr] "+r"(wr), [sv] "+r"(sv), [av] "+r"(av), [cp] "+r"(cp)
+                 : [rd] "+r"(rd), [wr] "+r"(wr), [fv] "+r"(fv), [av] "+r"(av)
+                 : [n] "r"(groups)
+                 : "memory");
+}
+
+__attribute__((noinline)) void hillsPack8(uint16_t *dst, const uint16_t *r, const uint16_t *g, const uint16_t *b,
+                                          const uint16_t *ct, int groups) {
+    uint16_t *wr = dst;
+    const uint16_t *rp = r;
+    const uint16_t *gp = g;
+    const uint16_t *bp = b;
+    const uint16_t *cp = ct;
+    asm volatile("ee.vld.128.ip q5, %[cp], 16\n"
+                 "ee.vld.128.ip q6, %[cp], 16\n"
+                 "ee.vld.128.ip q7, %[cp], 16\n"
+                 "loopnez %[n], 1f\n"
+                 "ee.vld.128.ip q0, %[rp], 16\n"
+                 "ee.vld.128.ip q1, %[gp], 16\n"
+                 "ee.vld.128.ip q2, %[bp], 16\n"
+                 "ssai 3\n"
+                 "ee.vmul.u16 q0, q0, q5\n"
+                 "ee.vmul.u16 q2, q2, q5\n"
+                 "ssai 2\n"
+                 "ee.vmul.u16 q1, q1, q5\n"
+                 "ssai 0\n"
+                 "ee.vmul.u16 q0, q0, q6\n"
+                 "ee.vmul.u16 q1, q1, q7\n"
+                 "ee.orq q0, q0, q1\n"
+                 "ee.orq q0, q0, q2\n"
+                 "ee.vst.128.ip q0, %[wr], 16\n"
+                 "1:\n"
+                 : [wr] "+r"(wr), [rp] "+r"(rp), [gp] "+r"(gp), [bp] "+r"(bp), [cp] "+r"(cp)
                  : [n] "r"(groups)
                  : "memory");
 }
 
 /* ------------------------------------------------------------------ */
-/* References.                                                         */
+/* References: the portable twins from AnimHills.cpp.                  */
 /* ------------------------------------------------------------------ */
 
-/* The portable twin from AnimHills.cpp: the kernel's own arithmetic. */
-static void blendTwin(uint16_t *dst, const uint16_t *src, const uint16_t *aQ8, int groups) {
+static void lerpRef(uint16_t *dst, const uint16_t *fg, const uint16_t *aQ8, int groups) {
     const int n = groups * 8;
     for (int i = 0; i < n; i++) {
-        const int a = aQ8[i], inv = 256 - a;
-        const int bg = dst[i], fg = src[i];
-        const int r = (((fg >> 11) & 0x1F) * a + ((bg >> 11) & 0x1F) * inv) >> 8;
-        const int g = (((fg >> 5) & 0x3F) * a + ((bg >> 5) & 0x3F) * inv) >> 8;
-        const int b = ((fg & 0x1F) * a + (bg & 0x1F) * inv) >> 8;
-        dst[i] = (uint16_t)((r << 11) | (g << 5) | b);
+        const int d = dst[i];
+        dst[i] = (uint16_t)(d + (((fg[i] - d) * aQ8[i]) >> 8));
     }
 }
 
-/* bganim::blendQ8, written out. The scalar tail of the animation's blend
- * runs this, so the kernel has to agree with it too, not only with the twin. */
-static uint16_t blendRef565(uint16_t bg, uint16_t fg, int aQ8) {
-    const int br = (bg >> 11) & 0x1F, bgc = (bg >> 5) & 0x3F, bb = bg & 0x1F;
-    const int fr = (fg >> 11) & 0x1F, fgc = (fg >> 5) & 0x3F, fb = fg & 0x1F;
-    const int r = br + (((fr - br) * aQ8) >> 8);
-    const int g = bgc + (((fgc - bgc) * aQ8) >> 8);
-    const int b = bb + (((fb - bb) * aQ8) >> 8);
-    return (uint16_t)((r << 11) | (g << 5) | b);
+static void packRef(uint16_t *dst, const uint16_t *r, const uint16_t *g, const uint16_t *b, int groups) {
+    const int n = groups * 8;
+    for (int i = 0; i < n; i++) dst[i] = (uint16_t)(((r[i] >> 3) << 11) | ((g[i] >> 2) << 5) | (b[i] >> 3));
 }
 
 static void fillRef(uint16_t *dst, uint16_t colour, int groups) {
@@ -182,11 +159,13 @@ static void fillRef(uint16_t *dst, uint16_t colour, int groups) {
 #define CAP 512
 #define GUARD 16
 
-/* ones, 256, maskR, 2048, maskG, 32, maskB: the order the kernel walks. */
-static uint16_t constTab[7 * 8] __attribute__((aligned(16)));
+/* ones, 2048, 32: the order the pack kernel loads them. */
+static uint16_t constTab[3 * 8] __attribute__((aligned(16)));
 static uint16_t bgBuf[CAP] __attribute__((aligned(16)));
 static uint16_t fgBuf[CAP] __attribute__((aligned(16)));
 static uint16_t alBuf[CAP] __attribute__((aligned(16)));
+static uint16_t gBuf[CAP] __attribute__((aligned(16)));
+static uint16_t bBuf[CAP] __attribute__((aligned(16)));
 static uint16_t gotBuf[CAP + GUARD] __attribute__((aligned(16)));
 static uint16_t wantBuf[CAP] __attribute__((aligned(16)));
 static uint16_t colBuf[8] __attribute__((aligned(16)));
@@ -209,18 +188,14 @@ static void note(int caseId, int lane, uint32_t got, uint32_t want) {
 static void constInit(void) {
     for (int i = 0; i < 8; i++) {
         constTab[i] = 1;
-        constTab[8 + i] = 256;
-        constTab[16 + i] = 0xF800;
-        constTab[24 + i] = 2048;
-        constTab[32 + i] = 0x07E0;
-        constTab[40 + i] = 32;
-        constTab[48 + i] = 0x001F;
+        constTab[8 + i] = 2048;
+        constTab[16 + i] = 32;
     }
 }
 
-/* One blend call: run the kernel, run both references, compare every lane
- * and the guard words past the end of the written range. */
-static void runBlend(int caseId, int groups) {
+/* One lerp call: run the kernel and the reference on the same destination,
+ * compare every lane and the guard words past the written range. */
+static void runLerp(int caseId, int groups) {
     const int n = groups * 8;
     for (int i = 0; i < GUARD; i++) gotBuf[CAP + i] = 0xA5A5;
     for (int i = 0; i < n; i++) {
@@ -230,15 +205,12 @@ static void runBlend(int caseId, int groups) {
     /* A word past the range the kernel may not touch. */
     if (n < CAP) gotBuf[n] = 0x5C5C;
 
-    hillsBlend8(gotBuf, fgBuf, alBuf, constTab, groups);
-    blendTwin(wantBuf, fgBuf, alBuf, groups);
+    hillsLerp8(gotBuf, fgBuf, alBuf, groups);
+    lerpRef(wantBuf, fgBuf, alBuf, groups);
 
     for (int i = 0; i < n; i++) {
         g_checked++;
         if (gotBuf[i] != wantBuf[i]) note(caseId, i, gotBuf[i], wantBuf[i]);
-        const uint16_t alt = blendRef565(bgBuf[i], fgBuf[i], alBuf[i]);
-        g_checked++;
-        if (gotBuf[i] != alt) note(caseId + 1000, i, gotBuf[i], alt);
     }
     if (n < CAP && gotBuf[n] != 0x5C5C) note(caseId + 2000, n, gotBuf[n], 0x5C5C);
     for (int i = 0; i < GUARD; i++) {
@@ -256,9 +228,11 @@ static uint32_t rnd(void) {
 }
 
 /* Case 1: every channel corner against every channel corner, at the alpha
- * values where the arithmetic can turn over. */
+ * values where the arithmetic can turn over. 0 and 255 are the extremes a
+ * plane can hold; 8, 7, 248 and 252 are what a palette colour expands to
+ * around a field boundary. */
 static void testCorners(void) {
-    static const uint16_t corner[8] = {0x0000, 0xFFFF, 0xF800, 0x07E0, 0x001F, 0xFFE0, 0xF81F, 0x07FF};
+    static const uint16_t corner[8] = {0, 255, 8, 7, 248, 252, 128, 127};
     static const uint16_t alpha[8] = {0, 1, 2, 127, 128, 129, 255, 256};
     int caseId = 1;
     for (int b = 0; b < 8; b++) {
@@ -268,17 +242,18 @@ static void testCorners(void) {
                 fgBuf[i] = corner[f];
                 alBuf[i] = alpha[i];
             }
-            runBlend(caseId++, 1);
+            runLerp(caseId++, 1);
         }
     }
 }
 
 /* Case 2: the whole alpha range 0..256, eight lanes at a time, over the
- * darkest and brightest destinations and a mid pair, so every alpha value
- * the animation can produce is executed. */
+ * darkest and brightest values in both directions and a mid pair, so every
+ * alpha value the animation can produce is executed on a rising and on a
+ * falling step. */
 static void testAlphaSweep(void) {
     int caseId = 200;
-    static const uint16_t pairs[4][2] = {{0x0000, 0xFFFF}, {0xFFFF, 0x0000}, {0x39E7, 0x8410}, {0x8410, 0x39E7}};
+    static const uint16_t pairs[4][2] = {{0, 255}, {255, 0}, {66, 165}, {165, 66}};
     for (int p = 0; p < 4; p++) {
         for (int a0 = 0; a0 <= 256; a0 += 8) {
             for (int i = 0; i < 8; i++) {
@@ -287,20 +262,20 @@ static void testAlphaSweep(void) {
                 const int a = a0 + i;
                 alBuf[i] = (uint16_t)(a > 256 ? 256 : a);
             }
-            runBlend(caseId++, 1);
+            runLerp(caseId++, 1);
         }
     }
 }
 
 /* Case 3: production geometry. A 16-pixel tile is what the animation's edge
- * pass hands the kernel, and a 480-pixel and a 240-pixel row are what a full
- * width fill covers. Weights come from the same two profiles the animation
- * builds, a quadratic haze and a smoothstep, so the operand distribution is
- * the real one and not only the corners. */
+ * pass hands the kernel, and a 480-pixel and a 240-pixel row are the widest
+ * calls a plane can take. Weights come from the same two profiles the
+ * animation builds, a quadratic haze and a smoothstep, so the operand
+ * distribution is the real one and not only the corners. */
 static void testProduction(void) {
     /* The haze profile, GLOW_PEAK 185 falling quadratically over 88 quarter
-     * pixels, and the smoothstep, both as AnimHills.cpp's init() builds them
-     * but in integers so this file stays free of float. */
+     * pixels, and the smoothstep, both as AnimHills.cpp builds them but in
+     * integers so this file stays free of float. */
     static uint8_t glowTab[96];
     static uint16_t smooth[257];
     for (int k = 0; k < 96; k++) {
@@ -318,8 +293,8 @@ static void testProduction(void) {
     int caseId = 400;
     for (int rep = 0; rep < 24; rep++) {
         for (int i = 0; i < 16; i++) {
-            bgBuf[i] = (uint16_t)rnd();
-            fgBuf[i] = (uint16_t)rnd();
+            bgBuf[i] = (uint16_t)(rnd() & 255u);
+            fgBuf[i] = (uint16_t)(rnd() & 255u);
             const int dd = (int)(rnd() % 5632u) - 2816; /* +-11 rows in Q8 */
             if (dd < 0) {
                 const int gi = (-dd) >> 6;
@@ -331,32 +306,32 @@ static void testProduction(void) {
                 alBuf[i] = (uint16_t)(185 + (((256 - 185) * a) >> 8));
             }
         }
-        runBlend(caseId++, 2);
+        runLerp(caseId++, 2);
     }
     /* Full width rows: 480 pixels is 60 groups, 240 is 30. */
     for (int wcase = 0; wcase < 2; wcase++) {
         const int n = wcase == 0 ? 480 : 240;
         for (int i = 0; i < n; i++) {
-            bgBuf[i] = (uint16_t)rnd();
-            fgBuf[i] = (uint16_t)rnd();
+            bgBuf[i] = (uint16_t)(rnd() & 255u);
+            fgBuf[i] = (uint16_t)(rnd() & 255u);
             alBuf[i] = (uint16_t)(rnd() % 257u);
         }
-        runBlend(caseId++, n / 8);
+        runLerp(caseId++, n / 8);
     }
     /* Zero groups: loopnez has to skip the body and touch nothing. */
     for (int i = 0; i < 8; i++) {
-        bgBuf[i] = 0x1234;
-        fgBuf[i] = 0xFFFF;
+        bgBuf[i] = 18;
+        fgBuf[i] = 255;
         alBuf[i] = 256;
     }
-    runBlend(caseId++, 0);
+    runLerp(caseId++, 0);
 }
 
 /* Case 4: the fill kernel, at every group count the animation can ask for
  * including zero, with a guard word after the range. */
 static void testFill(void) {
     static const int counts[7] = {0, 1, 2, 3, 30, 59, 60};
-    static const uint16_t colours[7] = {0x0000, 0xFFFF, 0xF800, 0x07E0, 0x001F, 0x8410, 0x39E7};
+    static const uint16_t colours[7] = {0, 255, 8, 252, 128, 7, 248};
     int caseId = 600;
     for (int c = 0; c < 7; c++) {
         const int groups = counts[c];
@@ -378,6 +353,49 @@ static void testFill(void) {
     }
 }
 
+/* Case 5: the pack kernel. Every channel value 0..255 goes through each
+ * plane in turn (the other two planes carry a spread), then random planes
+ * at the two production widths, then zero groups, all with guard words. */
+static void runPack(int caseId, int groups) {
+    const int n = groups * 8;
+    for (int i = 0; i < GUARD; i++) gotBuf[CAP + i] = 0xA5A5;
+    if (n < CAP) gotBuf[n] = 0x5C5C;
+    hillsPack8(gotBuf, bgBuf, gBuf, bBuf, constTab, groups);
+    packRef(wantBuf, bgBuf, gBuf, bBuf, groups);
+    for (int i = 0; i < n; i++) {
+        g_checked++;
+        if (gotBuf[i] != wantBuf[i]) note(caseId, i, gotBuf[i], wantBuf[i]);
+    }
+    if (n < CAP && gotBuf[n] != 0x5C5C) note(caseId + 2000, n, gotBuf[n], 0x5C5C);
+    for (int i = 0; i < GUARD; i++) {
+        if (gotBuf[CAP + i] != 0xA5A5) note(caseId + 3000, CAP + i, gotBuf[CAP + i], 0xA5A5);
+    }
+}
+
+static void testPack(void) {
+    int caseId = 800;
+    for (int plane = 0; plane < 3; plane++) {
+        for (int i = 0; i < 256; i++) {
+            const uint16_t sweep = (uint16_t)i;
+            const uint16_t other = (uint16_t)((i * 37 + 11) & 255);
+            bgBuf[i] = plane == 0 ? sweep : other;
+            gBuf[i] = plane == 1 ? sweep : (uint16_t)(255 - other);
+            bBuf[i] = plane == 2 ? sweep : (uint16_t)((other * 3) & 255);
+        }
+        runPack(caseId++, 32);
+    }
+    for (int wcase = 0; wcase < 2; wcase++) {
+        const int n = wcase == 0 ? 480 : 240;
+        for (int i = 0; i < n; i++) {
+            bgBuf[i] = (uint16_t)(rnd() & 255u);
+            gBuf[i] = (uint16_t)(rnd() & 255u);
+            bBuf[i] = (uint16_t)(rnd() & 255u);
+        }
+        runPack(caseId++, n / 8);
+    }
+    runPack(caseId++, 0);
+}
+
 int main(void) {
     uint32_t cp = 8; /* CP3 only; bare metal has no lazy-enable handler. */
     asm volatile("wsr %0, cpenable\nrsync\n" ::"r"(cp) : "memory");
@@ -387,12 +405,14 @@ int main(void) {
     testCorners();
     testAlphaSweep();
     testProduction();
+    testPack();
 
     if (g_bad == 0) {
-        uart_puts("GM_QEMUBENCH_PIE: PASS hillsFill8 and hillsBlend8 bit-exact against their portable twin "
-                  "and against bganim::blendQ8, over RGB565 channel corners, the whole alpha range 0..256, "
-                  "production 16 pixel tiles with real haze and smoothstep weights, 480 and 240 pixel rows, "
-                  "zero group calls, and guard words past every written range. lanes=");
+        uart_puts("GM_QEMUBENCH_PIE: PASS hillsFill8, hillsLerp8 and hillsPack8 bit-exact against their portable "
+                  "twins, over 8-bit channel corners in both directions, the whole alpha range 0..256, "
+                  "production 16 lane tiles with real haze and smoothstep weights, 480 and 240 lane rows, "
+                  "every channel value through the pack, zero group calls, and guard words past every written "
+                  "range. lanes=");
         uart_put_dec(g_checked);
         uart_puts(" mismatches=0\n");
     } else {

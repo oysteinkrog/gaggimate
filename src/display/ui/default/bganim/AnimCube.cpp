@@ -19,6 +19,23 @@
 // ceil(size*1.7321)+26+2 box only bounds clearing and repainting. Clearing
 // one reusable row and gathering its background too is equivalent: every
 // projected vertex lies within sqrt(3)*size of the centre.
+//
+// What differs from the page, and why it stays (gm-pciz, 2026-09-12). The
+// page walks each face's four edge distances in doubles and truncates the
+// feather contribution amp * m / 26 to a whole palette index per pixel.
+// Here the coefficients are Q16.16 integers, so a distance walked 480
+// columns is off by up to 0.0073 of an index, and a feather pixel whose
+// page value sits closer than that to a whole index truncates the other way.
+// Measured on the golden frames 30, 120 and 210 with a double re-run of the
+// page's accumulator (tools/animbench/web/page_vs_golden.js for the pixel
+// count, the accumulator check for the cause): 74, 96 and 102 accumulator
+// pixels a frame differ, every one by exactly one index, every one inside a
+// feather band, and the page's value at every one is within 0.0033 of the
+// truncation boundary; 33, 32 and 23 of them survive RGB565 quantisation.
+// Making it exact would need a double recomputation of the near-boundary
+// pixels inside the PIE face walk, which has no per-lane branch, so it is
+// recorded here instead: one palette step on about thirty feather pixels a
+// frame, at the soft edge of a face.
 
 #include "BgAnim.h"
 #include "BgAnimCommon.h"

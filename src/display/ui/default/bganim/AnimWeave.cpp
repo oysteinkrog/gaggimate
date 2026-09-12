@@ -100,33 +100,38 @@ void frame(uint32_t tMs, int, int, const uint8_t p[BG_ANIM_PARAMS]) {
     // much per second as every other animation at Speed 50.
     // The 2.2f is that factor. Every clock below reads t, so one factor here
     // moves the turn, the drift and the breath together.
-    const float t = static_cast<float>(tMs) * speedMul(p[0]) * 2.2f;
-    // Turn rate, drift and breath rate are all 1.0f at slider 50, so each one
+    // The clocks below are the page's, in the page's double arithmetic and
+    // the page's operation order. In single precision the drift cursor came
+    // out one Q16 unit off at frame 120 (cu 1251476 against the page's
+    // 1251475, from fmodf of a product near 1.6e6), which moved two texel
+    // boundaries by a pixel (gm-pciz). This runs once a frame, so the
+    // software double is a few microseconds; nothing per pixel changes.
+    const double t = static_cast<double>(tMs) * speedMul(p[0]) * 2.2;
+    // Turn rate, drift and breath rate are all 1.0 at slider 50, so each one
     // multiplies its constant by exactly one and the default frame is the old
     // frame. Below 50 they run down to a standstill; above, up to three times
     // the old rate for the two clocks and twice the old speed for the drift.
-    const auto rateMul = [](uint8_t v) {
-        return v <= 50 ? static_cast<float>(v) / 50.0f : 1.0f + static_cast<float>(v - 50) * (2.0f / 50.0f);
-    };
-    const float turnMul = rateMul(p[5]);
-    const float breathMul = rateMul(p[7]);
-    const float driftMul = static_cast<float>(p[6]) / 50.0f;
+    const auto rateMul = [](uint8_t v) { return v <= 50 ? v / 50.0 : 1 + (v - 50) * (2.0 / 50); };
+    const double turnMul = rateMul(p[5]);
+    const double breathMul = rateMul(p[7]);
+    const double driftMul = p[6] / 50.0;
     // One turn in 120 seconds, using the same 1,024-step sine and cosine.
-    const int angle = static_cast<int>(t * (1024.0f / 120000.0f) * turnMul + 0.5f) & 1023;
+    // Math.round on a non-negative value is floor(v + 0.5).
+    const int angle = static_cast<int>(floor(t * (1024.0 / 120000) * turnMul + 0.5)) & 1023;
     // One 40-second breath of +/-22.5 percent. The unbreathed scale is
     // 0.20..0.50 texels/pixel, hence even the largest breath stays below 1.
     // Breath rate changes how often it breathes and never how far, which is
     // what keeps |du| and |dv| inside the kernel's bound below.
-    const float breath = 1.0f + 0.225f * sinf(t * (6.283185307179586f / 40000.0f) * breathMul);
-    const float sBase = 0.20f + p[1] * (0.30f / 100.0f);
-    const int scale = static_cast<int>(65536.0f * sBase * breath + 0.5f);
+    const double breath = 1 + 0.225 * sin(t * (2 * M_PI / 40000) * breathMul);
+    const double sBase = 0.20 + p[1] * (0.30 / 100);
+    const int scale = static_cast<int>(floor(65536 * sBase * breath + 0.5));
     du = (sine[(angle + 256) & 1023] * scale) >> 9;
     dv = (sine[angle] * scale) >> 9;
     // Translation is 5 and 3.2 px/s measured at the unbreathed scale.
     // Wrap before conversion so every uint32 timestamp stays in range.
-    const float nom = 65536.0f * sBase;
-    const uint32_t cu = static_cast<uint32_t>(fmodf(t * 0.005f * nom * driftMul, static_cast<float>(SPAN)) + 0.5f);
-    const uint32_t cv = static_cast<uint32_t>(fmodf(t * 0.0032f * nom * driftMul, static_cast<float>(SPAN)) + 0.5f);
+    const double nom = 65536 * sBase;
+    const uint32_t cu = static_cast<uint32_t>(floor(fmod(t * 0.005 * nom * driftMul, static_cast<double>(SPAN)) + 0.5));
+    const uint32_t cv = static_cast<uint32_t>(floor(fmod(t * 0.0032 * nom * driftMul, static_cast<double>(SPAN)) + 0.5));
     // The page anchors at (240,240), including when w/h differ. Retain that
     // fixed panel origin, rather than silently changing the crop at 240 wide.
     // Unsigned phases define the page's |0 wrap without signed C++ overflow.

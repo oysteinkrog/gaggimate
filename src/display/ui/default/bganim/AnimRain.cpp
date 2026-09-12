@@ -63,10 +63,11 @@ bool tablesValid = false;
 // factor is zero there and a float plus zero is the float. Narrow leaves a
 // two pixel core with almost nothing beside it, wide spreads the streak
 // across the whole eight pixel lane. Every entry is inside 0..1, so a Q4
-// sample stays between floor * 16 and head * 16 at any width.
-constexpr float GAIN_MID[4] = {0.18f, 0.45f, 0.80f, 1.00f};
-constexpr float GAIN_NARROW[4] = {0.00f, 0.06f, 0.55f, 1.00f};
-constexpr float GAIN_WIDE[4] = {0.62f, 0.82f, 0.94f, 1.00f};
+// sample stays between floor * 16 and head * 16 at any width. Doubles, as
+// the page's XGAIN tables are: 0.18f is not 0.18.
+constexpr double GAIN_MID[4] = {0.18, 0.45, 0.80, 1.00};
+constexpr double GAIN_NARROW[4] = {0.00, 0.06, 0.55, 1.00};
+constexpr double GAIN_WIDE[4] = {0.62, 0.82, 0.94, 1.00};
 
 // At 480 wide: tabQ4 3,968 B + lanePhase 120 B (128 B slab reservation)
 // + dith 128 B + pal 512 B + background 128 B = 4,856 B payload,
@@ -134,9 +135,14 @@ void frame(uint32_t tMs, int w, int, const uint8_t p[BG_ANIM_PARAMS]) {
     // so the offset is at most round(16 * 1.4 * 16) = 358 either way.
     const bool ditherDirty = themeDirty || lastGrain != p[7];
     if (ditherDirty) {
-        const float amp = ditherAmp(pal, 256) * (static_cast<float>(p[7] * 7) / 500.0f);
+        // In double, as the page's bayerOffsets is. ditherAmp returns the
+        // float of 128 / steps (n = 256), and steps is an integer, so the
+        // page's double amplitude is recovered exactly from it.
+        const int steps = static_cast<int>(lroundf(128.0f / ditherAmp(pal, 256)));
+        const double ampD = 128.0 / steps > 16 ? 16 : 128.0 / steps;
+        const double amp = ampD * (p[7] * 7 / 500.0);
         for (int k = 0; k < 64; k++) {
-            dith[k] = static_cast<int16_t>(lroundf((BAYER8[k] - 31.5f) * (amp * 16.0f / 31.5f)));
+            dith[k] = static_cast<int16_t>(lround((BAYER8[k] - 31.5) * (amp * 16 / 31.5)));
         }
         lastGrain = p[7];
     }
@@ -148,28 +154,31 @@ void frame(uint32_t tMs, int w, int, const uint8_t p[BG_ANIM_PARAMS]) {
     const int floorIdx = p[6] <= 50 ? 24 + p[6] * 42 / 50 : 66 + (p[6] - 50) * 60 / 50;
     if (ditherDirty || lastTail != p[1] || lastGlow != p[2] || lastWidth != p[3] || lastFade != p[4] ||
         lastBase != p[6]) {
-        // Single precision on host and device; the page's double arithmetic
-        // can round a boundary sample one Q4 unit differently. The profile
-        // shape and its final integer dither/shift are otherwise identical.
-        const int tail = static_cast<int>(lroundf(TAIL * (0.55f + p[1] * 0.009f)));
-        const int head = 148 + static_cast<int>(lroundf(p[2] * 0.8f));
-        const float invTail = 1.0f / tail;
+        // The profile is built in double, the page's own arithmetic in the
+        // page's own order, because single precision rounded one of its
+        // 8,192 samples the other way: class 0 at 116 units above the head
+        // is 1072.49998 in double and exactly 1072.5 in float, one Q4 unit
+        // apart, and that unit was one or two pixels a frame against the
+        // page (gm-pciz). This runs only when a slider moves, about a
+        // thousand samples, so the software double costs no frame time.
+        const int tail = static_cast<int>(floor(TAIL * (0.55 + p[1] * 0.009) + 0.5));
+        const int head = 148 + static_cast<int>(floor(p[2] * 0.8 + 0.5));
         // "Drop width": mix the middle cross-section toward the narrow or
         // the wide set. The factor is zero at 50, so each gain is the
         // middle value plus zero, which is the middle value.
-        const float *gTo = p[3] <= 50 ? GAIN_NARROW : GAIN_WIDE;
-        const float gMix = static_cast<float>(p[3] <= 50 ? 50 - p[3] : p[3] - 50) * (1.0f / 50.0f);
-        float gain[4];
+        const double *gTo = p[3] <= 50 ? GAIN_NARROW : GAIN_WIDE;
+        const double gMix = (p[3] <= 50 ? 50 - p[3] : p[3] - 50) / 50.0;
+        double gain[4];
         for (int cls = 0; cls < 4; cls++) gain[cls] = GAIN_MID[cls] + (gTo[cls] - GAIN_MID[cls]) * gMix;
         // "Tail fade": how much of the tail's brightness sits right under
         // the head. The two weights are n/100 and (100 - n)/100, so at
-        // n = 45 they are the float values of the literals 0.45f and 0.55f
-        // the profile was written with. Their sum is 1 at every n, so the
-        // sample at the head is the head whatever the fade is. n = 5 is a
-        // short bright dash, n = 85 an evenly lit streak.
+        // n = 45 they are the page's 0.45 and 0.55 the profile was written
+        // with. Their sum is 1 at every n, so the sample at the head is the
+        // head whatever the fade is. n = 5 is a short bright dash, n = 85
+        // an evenly lit streak.
         const int fadeN = 5 + p[4] * 8 / 10;
-        const float front = static_cast<float>(fadeN) / 100.0f;
-        const float slope = static_cast<float>(100 - fadeN) / 100.0f;
+        const double front = fadeN / 100.0;
+        const double slope = (100 - fadeN) / 100.0;
         // Every class outside the streak is exactly the floor in Q4. Cache
         // its final RGB565 here, including Bayer, once per rebuild.
         for (int k = 0; k < 64; k++) {
@@ -181,16 +190,17 @@ void frame(uint32_t tMs, int w, int, const uint8_t p[BG_ANIM_PARAMS]) {
         for (int i = 0; i < PROFILE_N; i++) {
             const int u = (i - MAX_TAIL) & (CYC - 1);
             const int d = (CYC - u) & (CYC - 1);
-            float v = 0.0f;
+            double v = 0;
             if (i != FLOOR_SLOT && d <= tail) {
-                const float f = 1.0f - d * invTail;
+                const double f = 1 - static_cast<double>(d) / tail;
                 v = (head - floorIdx) * f * f * (front + slope * f);
             } else if (i != FLOOR_SLOT && u > 0 && u <= BELOW) {
-                const float f = 1.0f - u * (1.0f / BELOW);
+                const double f = 1 - static_cast<double>(u) / BELOW;
                 v = (head - floorIdx) * f * f;
             }
             for (int cls = 0; cls < 4; cls++) {
-                const uint16_t q4 = static_cast<uint16_t>(lroundf((floorIdx + v * gain[cls]) * 16.0f));
+                // Math.round on a non-negative value is floor(v + 0.5).
+                const uint16_t q4 = static_cast<uint16_t>(floor((floorIdx + v * gain[cls]) * 16 + 0.5));
                 tabQ4[i * LANE + cls] = q4;
                 tabQ4[i * LANE + 7 - cls] = q4;
             }

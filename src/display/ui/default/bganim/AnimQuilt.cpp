@@ -94,12 +94,16 @@ void frame(uint32_t tMs, int w, int h, const uint8_t p[BG_ANIM_PARAMS]) {
     const uint32_t gen = themeGen();
     if (!paletteValid || gen != lastThemeGen) {
         buildThemeRamp(pal, 256);
-        const float amp = ditherAmp(pal, 256);
+        // In double, as the page's bayerOffsets is. ditherAmp returns the
+        // float of 128 / steps (n = 256), and steps is an integer, so the
+        // page's double amplitude is recovered exactly from it.
+        const int steps = static_cast<int>(lroundf(128.0f / ditherAmp(pal, 256)));
+        const double amp = 128.0 / steps > 16 ? 16 : 128.0 / steps;
         int cap = 0;
         for (int k = 0; k < 64; k++) {
             // Page bayerOffsets(..., amp, 16): whole Q4 units, rounded
             // half away from zero. ditherAmp caps at 16, so |dith| <= 256.
-            dith[k] = static_cast<int16_t>(lroundf((BAYER8[k] - 31.5f) * (amp * 16.0f / 31.5f)));
+            dith[k] = static_cast<int16_t>(lround((BAYER8[k] - 31.5) * (amp * 16 / 31.5)));
             const int a = dith[k] < 0 ? -dith[k] : dith[k];
             if (a > cap) cap = a;
         }
@@ -126,20 +130,27 @@ void frame(uint32_t tMs, int w, int h, const uint8_t p[BG_ANIM_PARAMS]) {
         int by = bx + static_cast<int>(p[6]) * 7 / 100 - 3;
         if (by < 0) by = 0;
         if (by > 5) by = 5;
-        const int amp = 200 + static_cast<int>(lroundf(p[2] * 3.4f));
+        const int amp = 200 + static_cast<int>(floor(p[2] * 3.4 + 0.5));
         // Puffiness is a Q8 gain on the page's 0.35 height share, so 256 is
         // that share unchanged and the default height table is the old one.
         const int domeQ8 = static_cast<int>(p[5]) * 512 / 100;
-        const int hAmp = (static_cast<int>(lroundf(amp * 0.35f)) * domeQ8) >> 8;
-        const float stepX = 2.0f * static_cast<float>(M_PI) / pitches[bx];
-        const float stepY = 2.0f * static_cast<float>(M_PI) / pitches[by];
+        const int hAmp = (static_cast<int>(floor(amp * 0.35 + 0.5)) * domeQ8) >> 8;
+        // The four tables are the page's, in the page's double arithmetic
+        // and operation order: lround(-Math.sin(2 * PI * x / pitch) * amp).
+        // Single precision rounded 23 of the 960 entries the other way,
+        // because at a pitch of 120 the sine lands on exact halves (x = 10
+        // gives 193.5 in double against 193.50003 in float) and lround
+        // takes the tie away from zero. Those entries were the 360 to 531
+        // pixels a frame this port differed from the page by (gm-pciz).
+        // Rebuilt only when a slider moves, so the software double is paid
+        // once, never per frame.
         for (int x = 0; x < w; x++) {
-            dHx[x] = static_cast<int16_t>(lroundf(-sinf(stepX * x) * amp));
-            hX[x] = static_cast<int16_t>(lroundf(cosf(stepX * x) * hAmp));
+            dHx[x] = static_cast<int16_t>(lround(-sin(2 * M_PI * x / pitches[bx]) * amp));
+            hX[x] = static_cast<int16_t>(lround(cos(2 * M_PI * x / pitches[bx]) * hAmp));
         }
         for (int y = 0; y < h; y++) {
-            dHy[y] = static_cast<int16_t>(lroundf(-sinf(stepY * y) * amp));
-            hY[y] = static_cast<int16_t>(lroundf(cosf(stepY * y) * hAmp));
+            dHy[y] = static_cast<int16_t>(lround(-sin(2 * M_PI * y / pitches[by]) * amp));
+            hY[y] = static_cast<int16_t>(lround(cos(2 * M_PI * y / pitches[by]) * hAmp));
         }
         // The palette index is (ct + rt) >> 4 masked to eight bits, so a
         // field that swings past either end of the ramp wraps from black to
@@ -169,20 +180,21 @@ void frame(uint32_t tMs, int w, int h, const uint8_t p[BG_ANIM_PARAMS]) {
     }
 
     // Absolute time, as on the page, so parameter changes immediately
-    // select that speed's phase. Use uint64_t before masking: at maximum
-    // uptime and speed, the Q8 sine cursor exceeds uint32_t. Float frame
-    // math can round a cursor/drift boundary differently from JS doubles;
-    // it never changes the periods, Q8 interpolation, or integer pixel math.
+    // select that speed's phase. The clocks are the page's doubles in the
+    // page's operation order, so a cursor or drift boundary falls where the
+    // page puts it; this runs once a frame, so the software double is a few
+    // microseconds. Use uint64_t before masking: at maximum uptime and
+    // speed, the Q8 sine cursor exceeds uint32_t.
     // Speed calibration, gm-33fm 2026-09-12: the base rate carries a
     // deliberate factor so that Speed 50 moves this animation about as
     // much per second as every other animation at Speed 50.
-    // The 2.4f is that factor, and tl below inherits it.
-    const float t = static_cast<float>(tMs) * speedMul(p[0]) * 2.4f;
+    // The 2.4 is that factor, and tl below inherits it.
+    const double t = static_cast<double>(tMs) * speedMul(p[0]) * 2.4;
     // The light turn carries its own speed curve on top of the master one,
     // so the highlight can walk faster or slower than the grid drifts.
     // speedMul(50) is exactly 1, so the default cursor is untouched.
-    const float tl = t * speedMul(p[3]);
-    const uint64_t lQ8 = static_cast<uint64_t>(tl * (1024.0f * 256.0f / 36000.0f)) + (128u << 8);
+    const double tl = t * speedMul(p[3]);
+    const uint64_t lQ8 = static_cast<uint64_t>(floor(tl * 1024 * 256 / 36000)) + (128u << 8);
     const int li = static_cast<int>((lQ8 >> 8) & 1023);
     const int lf = static_cast<int>(lQ8 & 255);
     const int lx0 = sl[(li + 256) & 1023];
@@ -194,8 +206,8 @@ void frame(uint32_t tMs, int w, int h, const uint8_t p[BG_ANIM_PARAMS]) {
     // Drift in whole pixels a second, 8 at the default, both operands exact
     // so the division gives back the page's own 8 there. At 0 the grid
     // stands still and only the light moves.
-    const float driftPx = static_cast<float>(p[4]) * 16.0f / 100.0f;
-    const int drift = static_cast<int>(static_cast<uint64_t>(t * driftPx / 1000.0f) % static_cast<unsigned>(h));
+    const double driftPx = p[4] * 16 / 100.0;
+    const int drift = static_cast<int>(static_cast<uint64_t>(floor(t * driftPx / 1000)) % static_cast<unsigned>(h));
     for (int ph = 0; ph < PHASES; ph++) {
         int16_t *ct = colTermPh + static_cast<size_t>(ph) * w;
         for (int x = 0; x < w; x++) {

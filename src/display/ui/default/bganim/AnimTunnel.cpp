@@ -106,6 +106,14 @@ uint32_t lastThemeGen = 0xFFFFFFFFu;
 
 void release();
 
+// True when a float cell term is within 1/1024 of a cell boundary, where the
+// float's own rounding (a few parts in ten million here) could have carried
+// it across; init() recomputes those in double.
+inline bool nearCellEdge(float v) {
+    const float f = v - floorf(v);
+    return f < (1.0f / 1024.0f) || f > (1023.0f / 1024.0f);
+}
+
 bool init(int w, int h) {
     if (map != nullptr && w == allocW && h == allocH) {
         return true;
@@ -137,10 +145,18 @@ bool init(int w, int h) {
     const float cy = h * 0.5f - 0.5f;
     const float depthK = (D_N - 1) / powf(R_OUT, DEPTH_P);
     const float angK = A_N / (2.0f * static_cast<float>(M_PI));
-    // Float is confined to geometry setup and frame clocks. The JavaScript
-    // map uses doubles, so float rounding can choose the adjacent cell at a
-    // dither threshold. The cell spacing, dither and palette remain identical.
+    // The page builds this map in doubles. Single precision reproduces it
+    // everywhere except where a cell fraction lands within a hair of a cell
+    // boundary: at (86, 300) the angle term is 120.0000019 in double and
+    // 119.9999924 in float, one cell apart, which was one pixel a frame
+    // against the page (gm-pciz). So a term whose float value sits within
+    // 1/1024 of a cell boundary is recomputed in double, the page's own
+    // arithmetic in the page's own order. That is about one term in 500 and
+    // it runs once at init(), so the software double costs nothing a frame.
     // R_OUT stays 240 even at other render sizes, matching init(w,h) on the page.
+    const double cxD = w * 0.5 - 0.5, cyD = h * 0.5 - 0.5;
+    const double depthKD = (D_N - 1) / pow(static_cast<double>(R_OUT), static_cast<double>(DEPTH_P));
+    const double angKD = A_N / (2 * M_PI);
     for (int y = 0; y < h; y++) {
         const float dy = y - cy;
         for (int x = 0; x < w; x++) {
@@ -149,12 +165,26 @@ bool init(int w, int h) {
             const float bay = (BAYER8[(y & 7) * 8 + (x & 7)] - 31.5f) * (1.0f / 64.0f);
             int d = 0;
             if (r < R_OUT) {
-                d = static_cast<int>(floorf(powf(r, DEPTH_P) * depthK + bay));
+                const float dv = powf(r, DEPTH_P) * depthK + bay;
+                if (nearCellEdge(dv)) {
+                    const double dxD = x - cxD, dyD = y - cyD;
+                    const double rD = sqrt(dxD * dxD + dyD * dyD);
+                    d = static_cast<int>(floor(pow(rD, static_cast<double>(DEPTH_P)) * depthKD +
+                                               (BAYER8[(y & 7) * 8 + (x & 7)] - 31.5) / 64));
+                } else {
+                    d = static_cast<int>(floorf(dv));
+                }
                 d = d < 0 ? 0 : (d >= D_N ? D_N - 1 : d);
             }
             int a = 0;
             if (r >= R_IN) {
-                a = static_cast<int>(floorf((atan2f(dy, dx) + static_cast<float>(M_PI)) * angK + bay));
+                const float av = (atan2f(dy, dx) + static_cast<float>(M_PI)) * angK + bay;
+                if (nearCellEdge(av)) {
+                    const double dxD = x - cxD, dyD = y - cyD;
+                    a = static_cast<int>(floor((atan2(dyD, dxD) + M_PI) * angKD + (BAYER8[(y & 7) * 8 + (x & 7)] - 31.5) / 64));
+                } else {
+                    a = static_cast<int>(floorf(av));
+                }
                 // Unsigned low bits implement the page's positive modulo,
                 // including floor(-epsilon) == -1 near the angle wrap.
                 a = static_cast<int>(static_cast<uint32_t>(a) & (A_N - 1));

@@ -70,6 +70,14 @@ constexpr int WORK_BYTES = 800;
 constexpr int WORK_ALLOC = WORK_BYTES + 15;
 void release();
 
+// True when a float cell term is within 1/1024 of a cell boundary, where the
+// float's own rounding (a few parts in ten million here) could have carried
+// it across; init() recomputes those pixels in double.
+inline bool nearCellEdge(float v) {
+    const float f = v - floorf(v);
+    return f < (1.0f / 1024.0f) || f > (1023.0f / 1024.0f);
+}
+
 bool init(int w, int h) {
     if (w <= 0 || h <= 0) {
         release();
@@ -115,6 +123,16 @@ bool init(int w, int h) {
     const float angK = (A_N - 1) / SPAN;
     const float half = SPAN * 0.5f;
     const float distK = (D_N - 1) / (D_HI - D_LO);
+    // The page builds this map in doubles. Single precision reproduces it
+    // everywhere except where a cell term lands within a hair of a cell
+    // boundary: at (306, 278) the angle term is 73.9999977 in double and
+    // exactly 74.0 in float, one cell apart, which was one pixel a frame
+    // against the page (gm-pciz). A term within 1/1024 of a boundary is
+    // therefore recomputed in double, the page's own expression: about one
+    // term in 500, once at init(), so the software double costs no frame time.
+    const double SPAN_D = 100.0 * M_PI / 180.0;
+    const double angKD = (A_N - 1) / SPAN_D, halfD = SPAN_D * 0.5;
+    const double distKD = (D_N - 1) / (static_cast<double>(D_HI) - D_LO);
     for (int y = 0; y < h; y++) {
         const float dy = static_cast<float>(y) - SY;
         for (int x = 0; x < w; x++) {
@@ -122,8 +140,18 @@ bool init(int w, int h) {
             // Same signed cell fraction for angle and distance, not palette
             // dither: [-31.5, 31.5]/64, indexed by absolute pixel coordinates.
             const float bay = (static_cast<float>(BAYER8[(y & 7) * 8 + (x & 7)]) - 31.5f) * (1.0f / 64.0f);
-            int a = static_cast<int>(floorf((atan2f(dx, dy) + half) * angK + bay));
-            int d = static_cast<int>(floorf((sqrtf(dx * dx + dy * dy) - D_LO) * distK + bay));
+            const float av = (atan2f(dx, dy) + half) * angK + bay;
+            const float dv = (sqrtf(dx * dx + dy * dy) - D_LO) * distK + bay;
+            int a, d;
+            if (nearCellEdge(av) || nearCellEdge(dv)) {
+                const double dxD = x - static_cast<double>(SX), dyD = y - static_cast<double>(SY);
+                const double bayD = (BAYER8[(y & 7) * 8 + (x & 7)] - 31.5) / 64;
+                a = static_cast<int>(floor((atan2(dxD, dyD) + halfD) * angKD + bayD));
+                d = static_cast<int>(floor((sqrt(dxD * dxD + dyD * dyD) - D_LO) * distKD + bayD));
+            } else {
+                a = static_cast<int>(floorf(av));
+                d = static_cast<int>(floorf(dv));
+            }
             a = a < 0 ? 0 : (a >= A_N ? A_N - 1 : a);
             d = d < 0 ? 0 : (d >= D_N ? D_N - 1 : d);
             map[static_cast<size_t>(y) * w + x] = static_cast<uint16_t>(a * D_N + d);

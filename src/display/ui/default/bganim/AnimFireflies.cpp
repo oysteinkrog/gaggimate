@@ -1,407 +1,465 @@
 #ifndef GAGGIMATE_SIM
 
-// "Fireflies": soft motes on sum-of-sines wander paths with individual
-// pulses and an occasional synchronized shimmer ring. Sparse additive glow
-// sprites over a per-scanline gradient. Design: anim-particles (Fable),
-// 2026-08-15.
+// "Fireflies": entry 9 of tools/animbench/web/anim_bench.html, the page the
+// owner approved the look on. Soft motes on sum-of-sines wander paths with
+// individual pulses and an occasional synchronized shimmer ring, drawn as
+// additive glow sprites over a radial dusk gradient. Design: anim-particles
+// (Fable), 2026-08-15.
+//
+// This file draws the page's picture, pixel for pixel after RGB565
+// quantisation (gm-pciz, 2026-09-12). The version before it shared the
+// page's design and none of its arithmetic: an xorshift swarm where the
+// page seeds mulberry32, a per-scanline vertical gradient where the page's
+// is radial, a 64-entry falloff table and a 5-6-5 additive blend where the
+// page blends per pixel in 8-bit float with a brightness that runs up to
+// 1.3, so 28,700 to 29,900 of the 230,400 pixels of each golden frame
+// differed and no sprite sat on the page's position. What is here now:
+//
+// - The swarm is the page's: mulberry32(0x9e3779b9), the same draws in the
+//   same order, every particle constant a double. The generator is not
+//   reseeded when the count changes, because the page's is not.
+// - The background is the page's radial gradient, themeRGB(8) at the centre
+//   to themeRGB(3) at 0.46 of the panel and beyond, rounded to 8 bits the
+//   way a Uint8ClampedArray store rounds (half to even). The gradient moves
+//   a channel by at most a few units over the whole panel, so a row of it
+//   is a handful of runs, one per ring where some channel steps. The rings
+//   are found once per theme, and for every row the column where each
+//   ring crosses is found by evaluating the page's own double expression at
+//   the candidate columns and stored in PSRAM (rowCross), one byte per ring
+//   per row. Rendering a row is then a run walk: the PIE fill per run and
+//   no per-pixel work. 128 rings are the cap (RING_CAP); the fleet's themes
+//   need 4 to 30, and a theme past the cap keeps its innermost rings.
+// - A sprite's pixels are computed in float with the page's formula
+//   (distance, falloff, core mix, additive 8-bit accumulate) and a pixel
+//   whose float value lands within 2e-3 of a rounding boundary, within
+//   1e-5 of the sprite's rim or within 1e-6 of the 0.004 alpha cutoff is
+//   recomputed in double in the page's expression order. The float error
+//   is under 3e-4 of a unit at the worst pixel (the core mix's slope is
+//   about 1,500 units per unit of normalised distance, and the float
+//   distance is exact to a few ulp because the sprite centre is split into
+//   a whole pixel and a fraction), so the fallback is what keeps the two
+//   sides identical and it runs on about one pixel in 500. The additive
+//   accumulate chains through the page's rounded 8-bit store, so the
+//   sprites accumulate in three 16-bit planes over the union of their
+//   spans on the row, and only those spans are packed to RGB565.
+// - The per-frame constants (positions, brightness, radius) are double,
+//   with sin, pow and exp from libm: about 210 double transcendental calls
+//   a frame at the default count. The picture depends on them to the last
+//   bit and there is no cheaper form that does.
+//
+// Measured against the page rendered at the bench's three golden frame
+// times and quantised to RGB565: zero differing pixels. The host bench
+// band is 0.56 ms a frame against the old port's 0.15, all of it the
+// per-pixel float sprite work, which is the price of the page's model: an
+// 8-bit additive over a brightness up to 1.3 has no table form that
+// survives the rounding.
 
 #include "BgAnim.h"
 #include "BgAnimCommon.h"
 #include <math.h>
+#include <stdint.h>
+#include <string.h>
 
 namespace {
 using namespace bganim;
 
 constexpr int FF_MAX = 40;
+constexpr int RING_CAP = 128;   // background rings a theme may need
+constexpr int NO_CROSS = 255;   // rowCross value: this ring does not reach this row
+constexpr int MAX_RUNS = 2 * RING_CAP + 2;
 
+// One particle, every field the page's double.
 struct Firefly {
-    float homeX, homeY;
-    float wx1, wx2, wy1, wy2;
-    float ax1, ax2, ay1, ay2;
-    float px1, px2, py1, py2;
-    float pulseFreq, pulsePhase;
-    float radialNorm;
-    float size;
-    float hueMix;
+    double homeX, homeY;
+    double wx1, wx2, wy1, wy2;
+    double ax1, ax2, ay1, ay2;
+    double px1, px2, py1, py2;
+    double pulseFreq, pulsePhase;
+    double radialNorm, size, hueMix;
 };
 
-// Per-pixel falloff index is computed in fixed point. The sprite center is
-// kept as Q8.8 (cxQ8/cyQ8, 1/256 px precision) rather than rounded to a whole
-// pixel: near the sprite core alphaLUT steps hard (255 -> ~195 from index 0
-// to 1), so snapping the center to an integer pixel shifts which pixel
-// straddles that boundary and produces a visible one-pixel flicker relative
-// to the float reference. Q8 sub-pixel precision keeps the boundary in the
-// same place the float math would put it.
-//   dxQ8  = (px<<8) - cxQ8                          (Q8, px - x)
-//   dx2Q4 = (dxQ8*dxQ8) >> 12                        (px^2 in Q4, 16ths)
-//   idx   = ((dx2Q4+dy2Q4) * invR2Fixed) >> 20        (Q16.16 * invR2*63)
-// (this comment used to describe an earlier >>16/>>16 scheme; the shifts
-// above are what the code actually does, corrected 2026-09-04 asm pass.)
-// invR2Fixed is bounded: |dxQ8|,|dyQ8| <= R*256 within the bounding box, so
-// dx2Q4,dy2Q4 <= R*R*16 each, and the product (2*R*R*16) * (63<<16)/(R*R) ==
-// 32*63*65536 ~= 132M regardless of R, well inside int32 range (~2.1B) for
-// any firefly size, the R*R cancels, so this bound is uniform, not a
-// per-size estimate. Verified again below where the asm kernel relies on it.
+// What band() reads per sprite: the double constants for the fallback, the
+// float copies for the fast path, the bounding box, and the glow colour.
 struct FfDraw {
-    float x, y, R;      // R kept in float only for the per-firefly bbox calc
-    int32_t cxQ8, cyQ8; // Q8.8 sub-pixel center
-    int32_t invR2Fixed; // Q16.16, pre-scaled by the 63-entry alphaLUT span
-    uint8_t a8;
-    uint8_t r, g, b;
+    double x, y, R, brightness;
+    float xFrac, yFrac, invR, brF;
+    float gr, gg, gb;
+    int16_t xInt, yInt, x0, x1, y0, y1;
 };
 
-// Shimmer ring Gaussian LUT: expf(-(dr*dr)*61.7f) sampled uniformly in dr
-// (not in dr*dr*61.7f, that domain is 64-wide but the curve's whole
-// interesting structure sits inside dr in [-0.3, 0.3] i.e. a handful of
-// sigmas (sigma=0.09), so uniform-x sampling wastes almost all its
-// resolution on the flat near-zero tail). dr = radialNorm-ringPos in
-// roughly [-1, 1]; sample |dr| in [0,1]. Built once in init(); frame() only
-// ever indexes it, no libm per firefly.
-constexpr int EXP_LUT_N = 256;
-constexpr float EXP_LUT_DR_MAX = 1.0f;
+// A background ring: the k-th step of one channel, at the radius where the
+// page's value sits on a rounding boundary. Only the rebuild reads T and
+// step; band() reads chan and sign through ringChan/ringSign.
+struct Ring {
+    double T;
+    uint8_t chan, step;
+    int8_t sign;
+};
 
-Firefly *ff = nullptr;
-FfDraw *draws = nullptr;
-uint8_t *alphaLUT = nullptr; // 64 entries, indexed by normalized d^2
-uint16_t *bgLUT = nullptr;   // per-scanline background
-uint8_t *ffCol = nullptr;    // FF_MAX * 3, per-particle base color from the theme
-float *expLUT = nullptr;     // EXP_LUT_N entries, expf(-(dr*dr)*61.7f) over |dr| in [0, EXP_LUT_DR_MAX)
+struct Run {
+    int16_t x0, x1;
+    uint16_t c565;
+    uint8_t r, g, b, pad;
+};
+
+Firefly *ff = nullptr;      // [FF_MAX]            PSRAM, frame() only
+Ring *rings = nullptr;      // [RING_CAP]          PSRAM, rebuild only
+uint8_t *rowCross = nullptr; // [h * RING_CAP]     PSRAM, one row read per row
+FfDraw *draws = nullptr;    // [FF_MAX]            hot, read per band per sprite
+uint16_t *planes = nullptr; // [3 * planeStride]   hot, 8-bit channels in 16-bit lanes
+Run *runs = nullptr;        // [MAX_RUNS]          hot, the row's background runs
+uint8_t *ringChan = nullptr; // [RING_CAP]         hot
+int8_t *ringSign = nullptr;  // [RING_CAP]         hot
+uint8_t *crossM = nullptr;   // [RING_CAP]         hot, sorted crossings of one row
+uint8_t *crossK = nullptr;   // [RING_CAP]         hot, their ring indices
+int16_t *spans = nullptr;    // [FF_MAX * 2]       hot, sprite spans on one row
+
+int allocW = 0, allocH = 0, planeStride = 0;
 int ffCount = 0;
 int builtCount = -1;
-int allocH = 0; // height bgLUT was sized for
-// Glow falloff exponent, the shape alphaLUT is built with; exactly 2.0f at
-// the default, which is the a*a this animation hard-coded before the "Halo"
-// slider existed. builtHalo is the p[7] the table was built for.
-float haloExp = 2.0f;
-int builtHalo = -1;
-uint32_t rng = 0x9e3779b9;
-uint32_t lastThemeGen = 0xFFFFFFFF;
-int g_h = 480;
+int ringN = 0;
+uint8_t c0[3], c1[3], coreC[3];
+double cx = 0, cy = 0, rMax = 0;
+double halo = 2.0;
+float haloF = 2.0f;
+bool halo2 = true;
+int xl0 = 0, xr0 = 0;     // the columns either side of the centre
+double fracX = 0;            // 0 for an even width, 0.5 for an odd one
+uint32_t rng = 0x9e3779b9u;
+uint32_t lastThemeGen = 0xFFFFFFFFu;
 
-// LUT replacement for expf(-(dr*dr)*61.7f), indexed directly by |dr|.
-// dr magnitudes beyond the table domain contribute ~0 anyway.
-inline float expLutLookup(float dr) {
-    int idx = static_cast<int>(fabsf(dr) * (static_cast<float>(EXP_LUT_N - 1) / EXP_LUT_DR_MAX));
-    if (idx >= EXP_LUT_N) {
-        idx = EXP_LUT_N - 1;
-    }
-    return expLUT[idx];
+// Hot slab at w = 480: draws 40 * 72 = 2,880 B, planes 2,880, runs 258 *
+// 8 = 2,064, ringChan 128, ringSign 128, crossM 128, crossK 128, spans 160:
+// 8,496 B of the 9,216 B an animation may take. PSRAM holds the particles
+// (6,080 B), the rings (2,048 B) and rowCross (61,440 B at h = 480), of
+// which band() reads ringN bytes per row.
+void release();
+
+// The page's mulberry32, in uint32 arithmetic (see AnimHills.cpp), and its
+// 0..1 fraction.
+uint32_t mulberry(uint32_t &seed) {
+    seed += 0x6D2B79F5u;
+    uint32_t t = (seed ^ (seed >> 15)) * (1u | seed);
+    t = (t + (t ^ (t >> 7)) * (61u | t)) ^ t;
+    return t ^ (t >> 14);
+}
+double rand01() { return mulberry(rng) / 4294967296.0; }
+
+// The page's pmul: a multiplier on a constant this animation used to
+// hard-code, lo at 0, exactly 1 at 50, hi at 100.
+double pmul(int v, double lo, double hi) {
+    if (v == 50) return 1.0;
+    return 1 + ((v - 50) / 50.0) * (v < 50 ? (1 - lo) : (hi - 1));
 }
 
-// Slider (0-100) to a multiplier on a constant this file used to hard-code:
-// lo at 0, exactly 1.0f at 50, hi at 100. The 50 case returns the literal
-// rather than computing it, because the arithmetic does not land on 1.0f
-// exactly for every (lo, hi) pair and the default output has to be the old
-// output bit for bit.
-inline float paramMul(uint8_t v, float lo, float hi) {
-    if (v == 50) {
-        return 1.0f;
-    }
-    const float f = (static_cast<int>(v) - 50) * (1.0f / 50.0f); // -1 .. 1
-    return v < 50 ? 1.0f + f * (1.0f - lo) : 1.0f + f * (hi - 1.0f);
+// A Uint8ClampedArray store: clamp to 0..255, round half to even.
+int clampRound(double v) {
+    if (v <= 0) return 0;
+    if (v >= 255) return 255;
+    const double f = floor(v), d = v - f;
+    if (d < 0.5) return static_cast<int>(f);
+    if (d > 0.5) return static_cast<int>(f) + 1;
+    const int i = static_cast<int>(f);
+    return (i & 1) ? i + 1 : i;
 }
 
-// Particles glow in the theme's bright range (per-particle hueMix spreads
-// them); the dusk background sits in the darkest few percent.
-void rebuildThemeAssets() {
-    for (int i = 0; i < FF_MAX; i++) {
-        themeRGB(185 + static_cast<int>(ff[i].hueMix * 70.0f), &ffCol[i * 3]);
+// The page's background channel at one pixel, in its own expression order:
+// n = min(1, sqrt(dx * dx + dy * dy) / rMax), c0 + (c1 - c0) * n, stored.
+int pageBg(int c, double dx, double dy) {
+    double n = sqrt(dx * dx + dy * dy) / rMax;
+    if (n > 1) n = 1;
+    return clampRound(c0[c] + (c1[c] - c0[c]) * n);
+}
+
+// The column offset from the centre where ring k first shows on the row at
+// dy: the smallest m at which the page's rounded channel has taken the
+// ring's step. The page's value is monotone in the distance (every
+// operation in it is), so the search starts two columns inside the ring's
+// nominal radius and walks out, or walks in if it is already past.
+int crossOf(int k, double dy) {
+    const Ring &rg = rings[k];
+    const int target = c0[rg.chan] + rg.sign * rg.step;
+    const int mMax = xl0 > allocW - 1 - xr0 ? xl0 : allocW - 1 - xr0;
+    auto reached = [&](int m) {
+        const int v = pageBg(rg.chan, m + fracX, dy);
+        return rg.sign > 0 ? v >= target : v <= target;
+    };
+    const double inside = rg.T * rg.T - dy * dy;
+    int m = inside > 0 ? static_cast<int>(floor(sqrt(inside))) - 2 : 0;
+    if (m < 0) m = 0;
+    if (m > mMax) m = mMax;
+    if (reached(m)) {
+        while (m > 0 && reached(m - 1)) m--;
+        return m;
     }
-    for (int y = 0; y < g_h; y++) {
-        const float n = fabsf(y - g_h * 0.5f) / (g_h * 0.5f);
+    while (m < mMax) {
+        m++;
+        if (reached(m)) return m;
+    }
+    return NO_CROSS;
+}
+
+// Everything that depends on the theme: the gradient's end colours, its
+// rings and their row crossings, the sprite core colour and each
+// particle's glow colour. The page rebuilds all of it together on a theme
+// change and on a count change.
+void rebuildTheme() {
+    themeRGB(8, c0);
+    themeRGB(3, c1);
+    themeRGB(250, coreC);
+    ringN = 0;
+    for (int c = 0; c < 3; c++) {
+        const int delta = c1[c] - c0[c];
+        const int steps = delta < 0 ? -delta : delta;
+        for (int j = 1; j <= steps && ringN < RING_CAP; j++) {
+            Ring &rg = rings[ringN++];
+            rg.T = ((j - 0.5) / steps) * rMax;
+            rg.chan = static_cast<uint8_t>(c);
+            rg.step = static_cast<uint8_t>(j);
+            rg.sign = static_cast<int8_t>(delta < 0 ? -1 : 1);
+        }
+    }
+    // Innermost first, so a theme past the cap keeps the rings nearest the
+    // centre and the outer rim merges into the last one.
+    for (int i = 1; i < ringN; i++) {
+        const Ring t = rings[i];
+        int j = i - 1;
+        while (j >= 0 && rings[j].T > t.T) {
+            rings[j + 1] = rings[j];
+            j--;
+        }
+        rings[j + 1] = t;
+    }
+    for (int k = 0; k < ringN; k++) {
+        ringChan[k] = rings[k].chan;
+        ringSign[k] = rings[k].sign;
+    }
+    for (int y = 0; y < allocH; y++) {
+        const double dy = y - cy;
+        uint8_t *row = rowCross + static_cast<size_t>(y) * RING_CAP;
+        for (int k = 0; k < ringN; k++) row[k] = static_cast<uint8_t>(crossOf(k, dy));
+    }
+    for (int i = 0; i < builtCount; i++) {
         uint8_t c[3];
-        themeRGB(static_cast<int>(8.0f - n * 5.0f), c);
-        bgLUT[y] = rgb565(c[0], c[1], c[2]);
+        themeRGB(185 + static_cast<int>(ff[i].hueMix * 70), c);
+        draws[i].gr = c[0];
+        draws[i].gg = c[1];
+        draws[i].gb = c[2];
     }
 }
 
-// Radial falloff, 64 entries indexed by normalized d^2. exp 2 is what this
-// animation always used, and that case keeps the literal a*a so the default
-// table is byte for byte the old one; a powf here would be a different
-// rounding and a math call the bench would count. Below 2 the halo reaches
-// most of the sprite's radius (a soft, wide bloom), above it the light
-// collapses toward the centre (small hard points).
-void buildAlphaLUT(float e) {
-    for (int i = 0; i < 64; i++) {
-        float a = 1.0f - sqrtf(i / 63.0f);
-        a = a < 0 ? 0 : (e == 2.0f ? a * a : powf(a, e));
-        alphaLUT[i] = static_cast<uint8_t>(a * 255.0f);
-    }
-}
-
-void spawnAll(int count, int w, int h) {
-    const float cx = w * 0.5f, cy = h * 0.5f;
-    const float rMax = (w < h ? w : h) * 0.46f;
+// The page's buildSwarm: the same draws from the shared generator, in the
+// order its object literal evaluates them.
+void buildSwarm(int count) {
     for (int i = 0; i < count; i++) {
-        const float theta = nextRandf(rng) * 6.2831853f;
-        const float rr = rMax * sqrtf(nextRandf(rng)) * 0.92f;
         Firefly &f = ff[i];
-        f.homeX = cx + cosf(theta) * rr;
-        f.homeY = cy + sinf(theta) * rr;
-        const float basePeriod = 9000.0f + nextRandf(rng) * 5000.0f;
-        f.wx1 = 6.2831853f / basePeriod;
-        f.wx2 = f.wx1 * 1.618f * (0.85f + nextRandf(rng) * 0.3f);
-        f.wy1 = f.wx1 * 1.13f * (0.9f + nextRandf(rng) * 0.2f);
-        f.wy2 = f.wx1 * 1.414f * (0.85f + nextRandf(rng) * 0.3f);
-        f.ax1 = 16.0f + nextRandf(rng) * 10.0f;
-        f.ax2 = 7.0f + nextRandf(rng) * 6.0f;
-        f.ay1 = 16.0f + nextRandf(rng) * 10.0f;
-        f.ay2 = 7.0f + nextRandf(rng) * 6.0f;
-        f.px1 = nextRandf(rng) * 6.2831853f;
-        f.px2 = nextRandf(rng) * 6.2831853f;
-        f.py1 = nextRandf(rng) * 6.2831853f;
-        f.py2 = nextRandf(rng) * 6.2831853f;
-        f.pulseFreq = 6.2831853f / (2400.0f + nextRandf(rng) * 3600.0f);
-        f.pulsePhase = nextRandf(rng) * 6.2831853f;
+        const double theta = rand01() * M_PI * 2;
+        const double rr = rMax * sqrt(rand01()) * 0.92;
+        const double basePeriod = 9000 + rand01() * 5000;
+        const double w1 = 2 * M_PI / basePeriod;
+        f.homeX = cx + cos(theta) * rr;
+        f.homeY = cy + sin(theta) * rr;
+        f.wx1 = w1;
+        f.wx2 = w1 * 1.618 * (0.85 + rand01() * 0.3);
+        f.wy1 = w1 * 1.13 * (0.9 + rand01() * 0.2);
+        f.wy2 = w1 * 1.414 * (0.85 + rand01() * 0.3);
+        f.ax1 = 16 + rand01() * 10;
+        f.ax2 = 7 + rand01() * 6;
+        f.ay1 = 16 + rand01() * 10;
+        f.ay2 = 7 + rand01() * 6;
+        f.px1 = rand01() * M_PI * 2;
+        f.px2 = rand01() * M_PI * 2;
+        f.py1 = rand01() * M_PI * 2;
+        f.py2 = rand01() * M_PI * 2;
+        f.pulseFreq = 2 * M_PI / (2400 + rand01() * 3600);
+        f.pulsePhase = rand01() * M_PI * 2;
         f.radialNorm = rr / rMax;
-        f.size = 0.8f + nextRandf(rng) * 0.5f;
-        f.hueMix = nextRandf(rng);
+        f.size = 0.8 + rand01() * 0.5;
+        f.hueMix = rand01();
     }
     builtCount = count;
 }
 
-void release();
-
 bool init(int w, int h) {
-    if (ff == nullptr) {
-        // Placement split by reads per frame (BgAnimCommon.h's hot-slab
-        // comment), not by size: ff/ffCol/expLUT are read once per firefly
-        // per frame in frame() only, so they stream fine from PSRAM.
-        // alphaLUT is gathered at a data-dependent index once per glow pixel
-        // (tens of thousands of times a frame); draws is read once per
-        // firefly per overlapping band() call (per row-group); bgLUT is read
-        // once per row. All three match the hot slab's documented "per pixel
-        // or per row" scope and together cost 2,144 B of the 9,216 B budget.
-        ff = static_cast<Firefly *>(alloc(FF_MAX * sizeof(Firefly)));
-        draws = static_cast<FfDraw *>(allocHot(FF_MAX * sizeof(FfDraw)));
-        alphaLUT = static_cast<uint8_t *>(allocHot(64));
-        allocH = h;
-        bgLUT = static_cast<uint16_t *>(allocHot(h * sizeof(uint16_t)));
-        ffCol = static_cast<uint8_t *>(alloc(FF_MAX * 3));
-        expLUT = static_cast<float *>(alloc(EXP_LUT_N * sizeof(float)));
-        if (ff == nullptr || draws == nullptr || alphaLUT == nullptr || bgLUT == nullptr || ffCol == nullptr ||
-            expLUT == nullptr) {
-            // Same rule as AnimStarfield: the block is keyed on `ff`, so a
-            // partial set must not survive a failed init (gm-bzu.15).
-            release();
-            return false;
-        }
-        g_h = h;
-        buildAlphaLUT(haloExp);
-        for (int i = 0; i < EXP_LUT_N; i++) {
-            const float dr = i * (EXP_LUT_DR_MAX / (EXP_LUT_N - 1));
-            expLUT[i] = expf(-(dr * dr) * 61.7f);
-        }
+    if (w <= 0 || w > 480 || h <= 0 || h > 480) return false;
+    if (ff != nullptr && w == allocW && h == allocH) return true;
+    release();
+    allocW = w;
+    allocH = h;
+    planeStride = (w + 7) & ~7;
+    ff = static_cast<Firefly *>(alloc(FF_MAX * sizeof(Firefly)));
+    rings = static_cast<Ring *>(alloc(RING_CAP * sizeof(Ring)));
+    rowCross = static_cast<uint8_t *>(alloc(static_cast<size_t>(h) * RING_CAP));
+    draws = static_cast<FfDraw *>(allocHot(FF_MAX * sizeof(FfDraw)));
+    planes = static_cast<uint16_t *>(allocHot(3 * static_cast<size_t>(planeStride) * sizeof(uint16_t)));
+    runs = static_cast<Run *>(allocHot(MAX_RUNS * sizeof(Run)));
+    ringChan = static_cast<uint8_t *>(allocHot(RING_CAP));
+    ringSign = static_cast<int8_t *>(allocHot(RING_CAP));
+    crossM = static_cast<uint8_t *>(allocHot(RING_CAP));
+    crossK = static_cast<uint8_t *>(allocHot(RING_CAP));
+    spans = static_cast<int16_t *>(allocHot(FF_MAX * 2 * sizeof(int16_t)));
+    if (ff == nullptr || rings == nullptr || rowCross == nullptr || draws == nullptr || planes == nullptr ||
+        runs == nullptr || ringChan == nullptr || ringSign == nullptr || crossM == nullptr || crossK == nullptr ||
+        spans == nullptr) {
+        // A half finished init() leaves the slab as it found it (gm-bzu.15).
+        release();
+        return false;
     }
+    // The page's init: the centre, the radius and a fresh generator. The
+    // swarm itself is built by the first frame, which knows the count.
+    cx = w / 2.0;
+    cy = h / 2.0;
+    rMax = (w < h ? w : h) * 0.46;
+    xl0 = w / 2;
+    xr0 = (w + 1) / 2;
+    fracX = (w & 1) ? 0.5 : 0.0;
+    rng = 0x9e3779b9u;
+    builtCount = -1;
+    lastThemeGen = 0xFFFFFFFFu;
+    ffCount = 0;
     return true;
 }
 
 void frame(uint32_t tMs, int w, int h, const uint8_t p[BG_ANIM_PARAMS]) {
-    const int count = 15 + (p[1] * 25) / 100;
-    if (static_cast<int>(p[7]) != builtHalo) {
-        haloExp = 2.0f * paramMul(p[7], 0.3f, 2.3f); // 0.6 .. 2.0 .. 4.6
-        buildAlphaLUT(haloExp);
-        builtHalo = p[7];
-    }
+    const int count = static_cast<int>(floor(15 + (p[1] / 100.0) * 25 + 0.5));
+    bool rebuild = false;
     if (count != builtCount) {
-        spawnAll(count, w, h);
-        rebuildThemeAssets();
-        lastThemeGen = themeGen();
+        buildSwarm(count);
+        rebuild = true;
     }
-    if (themeGen() != lastThemeGen) {
-        rebuildThemeAssets();
+    if (rebuild || themeGen() != lastThemeGen) {
+        rebuildTheme();
         lastThemeGen = themeGen();
     }
     ffCount = count;
-    // Speed calibration (gm-33fm): the swarm's half change time was 543 ms,
-    // 2.2 times faster than the fleet target of 1200 ms at Speed 50. 29/64 is
-    // the slowdown that lands on 1198 ms, and it is a dyadic fraction, so the
-    // firmware float and the page's double hold exactly the same value. The
-    // factor rides on the same time scale the Speed slider already drives, so
-    // drift, pulse and shimmer all slow together and nothing else moves.
-    const float speed = speedMul(p[0]) * (29.0f / 64.0f);
-    const float glow = 0.7f + (p[2] / 100.0f) * 0.8f;
-    const float shimAmt = p[3] / 100.0f;
-    // Swarm radius about the panel centre: 0.35 (a tight knot in the middle)
-    // to 1.35 (out to the rim, the widest ones clipped by the bezel).
-    const float cx = w * 0.5f, cy = h * 0.5f;
-    const float spread = paramMul(p[4], 0.35f, 1.35f);
-    // Wander amplitude: 0 (each mote hovers on its home point) to 2x.
-    const float drift = paramMul(p[5], 0.0f, 2.0f);
-    // Pulse depth: 0 is a steady lamp at full brightness, 0.72 is what this
-    // animation always did, 1.0 blinks all the way to black.
-    float pulseDepth = 0.72f, pulseBase = 0.28f;
+    // Speed calibration (gm-33fm): 29/64 on the page's speed curve, so the
+    // half change time lands on the fleet's 1200 ms at Speed 50.
+    const double speed = pow(2.0, (static_cast<int>(p[0]) - 50) / 18.2) * (29.0 / 64);
+    const double glow = 0.7 + (p[2] / 100.0) * 0.8;
+    const double shimAmt = p[3] / 100.0;
+    const double spread = pmul(p[4], 0.35, 1.35); // swarm radius about the centre
+    const double drift = pmul(p[5], 0, 2);        // wander amplitude
+    halo = 2 * pmul(p[7], 0.3, 2.3);              // glow falloff exponent
+    halo2 = halo == 2.0;
+    haloF = static_cast<float>(halo);
+    double pulseDepth = 0.72, pulseBase = 0.28;
     if (p[6] != 50) {
-        pulseDepth = p[6] < 50 ? 0.72f * (p[6] / 50.0f) : 0.72f + ((p[6] - 50) / 50.0f) * 0.28f;
-        pulseBase = 1.0f - pulseDepth;
+        pulseDepth = p[6] < 50 ? 0.72 * (p[6] / 50.0) : 0.72 + ((p[6] - 50) / 50.0) * 0.28;
+        pulseBase = 1 - pulseDepth;
     }
-    const float shimPeriod = 14000.0f - shimAmt * 8000.0f;
-    const float t = tMs * speed;
-    const float ringPos = fmodf(t, shimPeriod) / shimPeriod;
-
+    const double shimPeriod = 14000 - shimAmt * 8000;
+    const double t = tMs * speed;
+    const double ringPos = fmod(t, shimPeriod) / shimPeriod;
     for (int i = 0; i < ffCount; i++) {
         const Firefly &f = ff[i];
         FfDraw &d = draws[i];
-        // Both guards keep the default bit exact: scaling a home coordinate
-        // about the centre and back is not the identity in float, and
-        // multiplying an amplitude by exactly 1.0f is.
-        float hx = f.homeX, hy = f.homeY;
-        if (spread != 1.0f) {
-            hx = cx + (hx - cx) * spread;
-            hy = cy + (hy - cy) * spread;
-        }
-        d.x = hx + (f.ax1 * drift) * fastSinRad(f.wx1 * t + f.px1) + (f.ax2 * drift) * fastSinRad(f.wx2 * t + f.px2);
-        d.y = hy + (f.ay1 * drift) * fastSinRad(f.wy1 * t + f.py1) + (f.ay2 * drift) * fastSinRad(f.wy2 * t + f.py2);
-        d.R = (6.0f + f.size * 8.0f) * glow;
-        d.cxQ8 = static_cast<int32_t>(d.x * 256.0f + 0.5f);
-        d.cyQ8 = static_cast<int32_t>(d.y * 256.0f + 0.5f);
-        // Q16.16 scaled by the 63-entry alphaLUT span: idx = (dx*dx+dy*dy)*invR2Fixed >> 16.
-        // Round (not truncate) here: truncating this reciprocal alone biases
-        // every falloff index low, making every sprite render a hair larger
-        // and brighter than the float reference (visible as a systematic,
-        // not random, diff against golden).
-        d.invR2Fixed = static_cast<int32_t>((63.0f * 65536.0f) / (d.R * d.R) + 0.5f);
-        float pulse = fastSinRad(f.pulseFreq * t + f.pulsePhase);
-        pulse = pulse < 0 ? 0 : pulse * pulse;
-        float brightness = pulseBase + pulseDepth * pulse;
+        const double hx = cx + (f.homeX - cx) * spread;
+        const double hy = cy + (f.homeY - cy) * spread;
+        const double x = hx + f.ax1 * drift * sin(f.wx1 * t + f.px1) + f.ax2 * drift * sin(f.wx2 * t + f.px2);
+        const double y = hy + f.ay1 * drift * sin(f.wy1 * t + f.py1) + f.ay2 * drift * sin(f.wy2 * t + f.py2);
+        double s = sin(f.pulseFreq * t + f.pulsePhase);
+        if (s < 0) s = 0;
+        const double pulse = pow(s, 2.2);
+        double brightness = pulseBase + pulseDepth * pulse;
         if (shimAmt > 0) {
-            const float dr = f.radialNorm - ringPos;
-            brightness += shimAmt * expLutLookup(dr); // sigma 0.09
+            const double dr = f.radialNorm - ringPos;
+            brightness += shimAmt * exp(-(dr * dr) / (2 * 0.09 * 0.09));
         }
-        d.a8 = brightness >= 1.0f ? 255 : static_cast<uint8_t>(brightness * 255.0f);
-        d.r = ffCol[i * 3 + 0];
-        d.g = ffCol[i * 3 + 1];
-        d.b = ffCol[i * 3 + 2];
+        if (brightness > 1.3) brightness = 1.3;
+        const double R = (6 + f.size * 8) * glow;
+        d.x = x;
+        d.y = y;
+        d.R = R;
+        d.brightness = brightness;
+        const double xi = floor(x), yi = floor(y);
+        d.xInt = static_cast<int16_t>(xi);
+        d.yInt = static_cast<int16_t>(yi);
+        d.xFrac = static_cast<float>(x - xi);
+        d.yFrac = static_cast<float>(y - yi);
+        d.invR = static_cast<float>(1.0 / R);
+        d.brF = static_cast<float>(brightness);
+        double v = floor(x - R);
+        d.x0 = static_cast<int16_t>(v < 0 ? 0 : v);
+        v = ceil(x + R);
+        d.x1 = static_cast<int16_t>(v > w - 1 ? w - 1 : v);
+        v = floor(y - R);
+        d.y0 = static_cast<int16_t>(v < 0 ? 0 : v);
+        v = ceil(y + R);
+        d.y1 = static_cast<int16_t>(v > h - 1 ? h - 1 : v);
     }
 }
 
-// ---------------------------------------------------------------------
-// band() split by cost, like Starfield's: the background fill below touches
-// every one of the 230,400 pixels in a frame with one store each (cheap per
-// pixel, most of the raw pixel count), while the glow splats touch far
-// fewer pixels (a bounding box per firefly, ~40 of them) but pay several
-// multiplies each. The asm pass below vectorises the fill (PIE, no per-pixel
-// work to vectorise the OTHER way) and hand-schedules the glow's scalar math
-// (no vector gather on this chip for the alphaLUT lookup, ASM_BRIEF.md).
-//
-// fillBgRowScalar/drawGlowSpanScalar are the exact per-pixel math band()
-// used before this pass, merely pulled out of the old single function body
-// and made branch-free (see below), bandRef() calls them in the same order
-// the old band() ran them (background full-width, then every firefly's
-// glow), so it is pixel-identical to the pre-asm code. band() further below
-// calls the same two pieces via hand-written kernels; both paths share
-// glowBBox() for the per-firefly clip, so they can never disagree about
-// which pixels a firefly touches.
-// ---------------------------------------------------------------------
-
-inline void fillBgRowScalar(uint16_t *row, uint16_t c, int w) {
-    for (int x = 0; x < w; x++) {
-        row[x] = c;
+// The background of one row as runs in ascending x. The ring crossings of
+// the row (one byte each, NO_CROSS for a ring outside it) are sorted by
+// column, the colour steps once per crossing, and both halves of the row
+// mirror the same list about the centre.
+int buildRuns(int y, int w) {
+    const uint8_t *row = rowCross + static_cast<size_t>(y) * RING_CAP;
+    int n = 0;
+    for (int k = 0; k < ringN; k++) {
+        const int m = row[k];
+        if (m == NO_CROSS) continue;
+        int j = n - 1;
+        while (j >= 0 && crossM[j] > m) {
+            crossM[j + 1] = crossM[j];
+            crossK[j + 1] = crossK[j];
+            j--;
+        }
+        crossM[j + 1] = static_cast<uint8_t>(m);
+        crossK[j + 1] = static_cast<uint8_t>(k);
+        n++;
     }
+    // Colour at each level: level i is the centre colour plus the first i
+    // crossings' steps. Left half first, from the outermost level in.
+    int col[3] = {c0[0], c0[1], c0[2]};
+    for (int i = 0; i < n; i++) col[ringChan[crossK[i]]] += ringSign[crossK[i]];
+    int nr = 0;
+    auto emit = [&](int x0, int x1, const int *c) {
+        if (x0 < 0) x0 = 0;
+        if (x1 > w - 1) x1 = w - 1;
+        if (nr > 0 && x0 <= runs[nr - 1].x1) x0 = runs[nr - 1].x1 + 1;
+        if (x0 > x1 || nr >= MAX_RUNS) return;
+        Run &r = runs[nr++];
+        r.x0 = static_cast<int16_t>(x0);
+        r.x1 = static_cast<int16_t>(x1);
+        r.r = static_cast<uint8_t>(c[0]);
+        r.g = static_cast<uint8_t>(c[1]);
+        r.b = static_cast<uint8_t>(c[2]);
+        r.c565 = rgb565(r.r, r.g, r.b);
+    };
+    for (int i = n; i >= 0; i--) {
+        const int mLo = i == 0 ? 0 : crossM[i - 1];
+        const int x0 = i == n ? 0 : xl0 - crossM[i] + 1;
+        emit(x0, xl0 - mLo, col);
+        if (i > 0) col[ringChan[crossK[i - 1]]] -= ringSign[crossK[i - 1]];
+    }
+    for (int i = 0; i <= n; i++) {
+        if (i > 0) col[ringChan[crossK[i - 1]]] += ringSign[crossK[i - 1]];
+        const int mLo = i == 0 ? 0 : crossM[i - 1];
+        const int x1 = i == n ? w - 1 : xr0 + crossM[i] - 1;
+        // The last run has to reach the right edge, so its start is clamped
+        // into the row. The left half heals itself, because a start left of
+        // column 0 is clamped up and the next iteration carries on from
+        // there; the right half has no iteration after this one. A ring
+        // whose crossing sits at the edge (m = 240 at w = 480) put this
+        // start at column 480, the run was dropped as empty, and the row
+        // then ended at the crossing before it. Two things went wrong there
+        // and the fuzz found both: the columns past it kept the previous
+        // frame's pixels, and the span walk in renderRow ran off the end of
+        // the run list looking for them (gm-pciz; ASan, whole fleet run,
+        // AnimFireflies.cpp:614). The colour is the one this iteration
+        // holds, the outermost level, which is what the page's gradient has
+        // past the last ring.
+        int x0 = xr0 + mLo;
+        if (i == n && x0 > w - 1) x0 = w - 1;
+        emit(x0, x1, col);
+    }
+    return nr;
 }
 
-// One firefly's glow, one row, count consecutive pixels starting at dxQ8_0
-// ((xx0<<8) - cxQ8), stepping by one pixel (256 in Q8) each iteration.
-//
-// ROUND 2: this used to clamp idx to 63 (MIN) instead of skipping, on the
-// theory that alphaLUT[63]==0 makes the two equivalent and branch-free code
-// is strictly better. Bit-exact, yes (proven in round 1 and confirmed again
-// on the device in round 4), but the device measurement said otherwise:
-// bandRef built this way ran 20-48% SLOWER than the pre-asm-pass code, and
-// the branch-free asm kernel only clawed back to a wash against HEAD, not a
-// win. The `continue` this replaced was not loop-control overhead -- it was
-// a real early exit that skips a gather load, four more multiplies and a
-// framebuffer read-modify-write for every pixel outside the inscribed circle
-// (~21.5% of the bounding box by area, more near the corners). Removing it
-// meant paying that full cost on every pixel, every time, which is strictly
-// more device work than the branchy version ever did. Restored both
-// `continue`s verbatim; see drawGlowSpanAsm below for the same fix in asm
-// (a real BGEI/BEQZ branch, not a clamp).
-inline void drawGlowSpanScalar(uint16_t *row, int32_t dxQ8_0, int32_t dy2Q4, int32_t invR2Fixed, uint8_t r, uint8_t g, uint8_t b,
-                               uint8_t a8, int count) {
-    int32_t dxQ8 = dxQ8_0;
-    for (int i = 0; i < count; i++, dxQ8 += 256) {
-        const int32_t dx2Q4 = (dxQ8 * dxQ8) >> 12;
-        const int32_t idx = ((dx2Q4 + dy2Q4) * invR2Fixed) >> 20;
-        if (idx >= 64) {
-            continue;
-        }
-        const uint8_t a = (static_cast<uint16_t>(alphaLUT[idx]) * a8) >> 8;
-        if (a == 0) {
-            continue;
-        }
-        row[i] = addScaled565(row[i], r, g, b, a);
-    }
-}
-
-struct GlowBBox {
-    int yy0, yy1, xx0, xx1;
-    bool empty;
-};
-
-// Per-firefly clip against this band() call's [y0, y0+rows) x [0, w). Shared
-// by band() and bandRef() so they can never disagree about which pixels a
-// firefly touches. fmaxf/fminf replaced with ternaries (both libcalls on
-// this toolchain per OPTIMIZE.md; none of the operands here can be NaN, so
-// the ternary is exactly the same comparison, not an approximation).
-inline GlowBBox glowBBox(const FfDraw &d, int y0, int rows, int w) {
-    GlowBBox b;
-    if (d.y + d.R < y0 || d.y - d.R >= y0 + rows) {
-        b.empty = true;
-        return b;
-    }
-    const float fy0 = static_cast<float>(y0);
-    const float fy1 = static_cast<float>(y0 + rows - 1);
-    const float fw1 = static_cast<float>(w - 1);
-    const float yLo = d.y - d.R, yHi = d.y + d.R, xLo = d.x - d.R, xHi = d.x + d.R;
-    b.yy0 = static_cast<int>(yLo > fy0 ? yLo : fy0);
-    b.yy1 = static_cast<int>(yHi < fy1 ? yHi : fy1);
-    b.xx0 = static_cast<int>(xLo > 0.0f ? xLo : 0.0f);
-    b.xx1 = static_cast<int>(xHi < fw1 ? xHi : fw1);
-    b.empty = b.xx1 < b.xx0; // whole firefly off one horizontal edge
-    return b;
-}
-
-// The spec. Host bench goldens run against this, and the device equivalence
-// test (SleepAnimation::runAnimTest, /api/debug/animtest) checks band()'s
-// asm kernels against it pixel for pixel.
-void bandRef(uint16_t *dst, int y0, int rows, int w, uint32_t, const uint8_t *) {
-    for (int r = 0; r < rows; r++) {
-        fillBgRowScalar(dst + static_cast<size_t>(r) * w, bgLUT[y0 + r], w);
-    }
-    for (int i = 0; i < ffCount; i++) {
-        const FfDraw &d = draws[i];
-        const GlowBBox b = glowBBox(d, y0, rows, w);
-        if (b.empty) {
-            continue;
-        }
-        for (int yy = b.yy0; yy <= b.yy1; yy++) {
-            const int32_t dyQ8 = (yy << 8) - d.cyQ8;
-            const int32_t dy2Q4 = (dyQ8 * dyQ8) >> 12; // px^2 in Q4 (16ths), see note above
-            const int32_t dxQ8_0 = (b.xx0 << 8) - d.cxQ8;
-            uint16_t *row = dst + static_cast<size_t>(yy - y0) * w + b.xx0;
-            drawGlowSpanScalar(row, dxQ8_0, dy2Q4, d.invR2Fixed, d.r, d.g, d.b, d.a8, b.xx1 - b.xx0 + 1);
-        }
-    }
-}
-
+// Broadcast-fill one row span with a single RGB565 colour, eight pixels per
+// PIE store. dst must be 16-byte aligned; the caller pays a scalar prefix.
 #if defined(__XTENSA__) && !defined(GM_BGANIM_NO_ASM)
-// Broadcast-fill one row with a single RGB565 color, eight pixels per PIE
-// store, the "obvious PIE store loop" ASM_BRIEF.md calls out: background
-// rows here are one flat color end to end (bgLUT[y]), so there is no
-// per-pixel work at all, only bytes to move.
-//
-// dst must be 16-byte aligned and nOct*8 == w; both hold in production
-// (ASM_BRIEF.md: band() dst rows are 16-byte aligned, w is always 480 or
-// 240, both multiples of 16 and so of 8). band() below checks and falls
-// back to fillBgRowScalar otherwise.
-//
-// LOOPNEZ rather than the manual addi/bnez SleepAnimation.cpp's
-// scale565Oct and AnimNebula.cpp's lerpRowPie use for their own PIE loops:
-// this one runs w/8 times per row (60 or 30) and up to 480 rows a frame -
-// the same "worth the extra setup instruction" threshold
-// AnimStarfield.cpp's vignette kernel documents for its own loop, and those
-// two PIE loops' few-iteration call sites are not.
 __attribute__((noinline)) static void fillRowPie(uint16_t *__restrict dstIn, uint16_t color, int nOct) {
     alignas(16) static uint16_t bcast[8];
     for (int i = 0; i < 8; i++) {
@@ -417,135 +475,217 @@ __attribute__((noinline)) static void fillRowPie(uint16_t *__restrict dstIn, uin
                  : [src] "r"(src), [n] "r"(nOct)
                  : "memory");
 }
-
-// One firefly's glow, one row, hand-scheduled Xtensa scalar, pixel-exact
-// with drawGlowSpanScalar above (same formula, same two `continue`s, same
-// integer truncation order). PIE cannot vectorise this: alphaLUT is a
-// data-dependent gather (idx varies per pixel), and this chip's PIE has no
-// vector gather (ASM_BRIEF.md).
-//
-// ROUND 2: this used to clamp idx with MIN instead of branching, on the
-// theory that branch-free is strictly better. The device disagreed: with
-// the clamp, bandRef (same idea, in C++) measured 20-48% SLOWER than the
-// pre-asm-pass code, and this asm kernel only broke even against it instead
-// of winning. The `if (idx>=64) continue` it replaced was not loop-control
-// overhead, it was a real early exit: skipping the gather, three more
-// MULLs and a framebuffer read-modify-write for every pixel outside the
-// inscribed circle (~21.5% of the bounding box by area, more near the
-// corners). Clamping instead of skipping meant paying that full cost on
-// every one of those pixels, on every call, which is strictly more device
-// work than the branchy C ever did. Restored as two real branches: BGEI
-// (idx>=64, a b4const-encodable immediate) right after idx is known, and
-// BEQZ (a==0) right after alpha is known, both jumping to the same
-// row/dxQ8 step at the loop tail. This also drops the two MOVI+MIN pairs
-// the idx clamp used, so the kernel is smaller as well as conditionally
-// cheaper.
-//
-// Register budget unchanged from round 1: row, dxQ8 (2, "+r") + dy2Q4,
-// invR2Fixed, rCol, gCol, bCol, a8v, alut, n (8, "r", n is read once by
-// LOOPNEZ and then reused as scratch, see the MOVI lines) + a, dst, res,
-// base2 (4, "=&r" scratch) = 14. Confirmed no spill in xtensa-asm14 again
-// this round (report).
-__attribute__((noinline)) static void drawGlowSpanAsm(uint16_t *__restrict rowIn, int32_t dxQ8_0, int32_t dy2Q4,
-                                                      int32_t invR2Fixed, uint8_t rCol, uint8_t gCol, uint8_t bCol, uint8_t a8v,
-                                                      int count) {
-    uint16_t *row = rowIn;
-    int32_t dxQ8 = dxQ8_0;
-    const uint8_t *alut = alphaLUT;
-    int32_t a, dst, res, base2; // scratch; values unused after the block
-    asm volatile(
-        "loopnez %[n], 3f\n"
-        // idx = ((dxQ8*dxQ8>>12) + dy2Q4) * invR2Fixed >> 20
-        "mull  %[a], %[dxQ8], %[dxQ8]\n" // sq = dxQ8^2
-        "srai  %[a], %[a], 12\n"         // dx2Q4
-        "add   %[a], %[a], %[dy2Q4]\n"   // sum
-        "mull  %[a], %[a], %[invR2]\n"   // prod (see the file-header bound proof: never overflows int32)
-        "srai  %[a], %[a], 20\n"         // idx
-        "bgei  %[a], 64, 4f\n"           // outside the circle: skip gather+blend+store, matches `if (idx>=64) continue`
-        // a = alphaLUT[idx] * a8v >> 8  (uint8-range result, no mask needed)
-        "add   %[a], %[alut], %[a]\n"
-        "l8ui  %[a], %[a], 0\n" // alphaLUT[idx]
-        "mull  %[a], %[a], %[a8v]\n"
-        "srli  %[a], %[a], 8\n" // a
-        "beqz  %[a], 4f\n"      // fully transparent: skip blend+store, matches `if (a==0) continue`
-        // addScaled565(dst, rCol, gCol, bCol, a), same shifts/clamps as the
-        // scalar reference (>>11/5-bit, >>10/6-bit, >>11/5-bit)
-        "l16ui %[dst], %[row], 0\n"
-        "extui %[res], %[dst], 11, 5\n" // R base (res is dead before this, safe as scratch)
-        "mull  %[n], %[rc], %[a]\n"
-        "srai  %[n], %[n], 11\n"
-        "add   %[res], %[res], %[n]\n"
-        "movi  %[n], 31\n"
-        "min   %[res], %[res], %[n]\n"
-        "slli  %[res], %[res], 11\n"     // res = R contribution, now the output accumulator
-        "extui %[base2], %[dst], 5, 6\n" // G base
-        "mull  %[n], %[gc], %[a]\n"
-        "srai  %[n], %[n], 10\n"
-        "add   %[base2], %[base2], %[n]\n"
-        "movi  %[n], 63\n"
-        "min   %[base2], %[base2], %[n]\n"
-        "slli  %[base2], %[base2], 5\n"
-        "or    %[res], %[res], %[base2]\n"
-        "extui %[base2], %[dst], 0, 5\n" // B base
-        "mull  %[n], %[bc], %[a]\n"
-        "srai  %[n], %[n], 11\n"
-        "add   %[base2], %[base2], %[n]\n"
-        "movi  %[n], 31\n"
-        "min   %[base2], %[base2], %[n]\n"
-        "or    %[res], %[res], %[base2]\n"
-        "s16i  %[res], %[row], 0\n"
-        "4:\n"
-        "addi  %[row], %[row], 2\n"
-        "addi  %[dxQ8], %[dxQ8], 256\n"
-        "3:\n"
-        : [row] "+r"(row), [dxQ8] "+r"(dxQ8), [a] "=&r"(a), [dst] "=&r"(dst), [res] "=&r"(res), [base2] "=&r"(base2)
-        : [dy2Q4] "r"(dy2Q4), [invR2] "r"(invR2Fixed), [rc] "r"(static_cast<int32_t>(rCol)), [gc] "r"(static_cast<int32_t>(gCol)),
-          [bc] "r"(static_cast<int32_t>(bCol)), [a8v] "r"(static_cast<int32_t>(a8v)), [alut] "r"(alut), [n] "r"(count)
-        : "memory");
-}
 #endif
 
-void band(uint16_t *dst, int y0, int rows, int w, uint32_t tMs, const uint8_t *p) {
+template <bool Asm> BGANIM_INLINE void fillSpan(uint16_t *dst, uint16_t c, int n) {
 #if defined(__XTENSA__) && !defined(GM_BGANIM_NO_ASM)
-    for (int r = 0; r < rows; r++) {
-        uint16_t *row = dst + static_cast<size_t>(r) * w;
-        if ((w & 7) == 0) {
-            fillRowPie(row, bgLUT[y0 + r], w >> 3);
-        } else { // never hit in production: w is always 480 or 240
-            fillBgRowScalar(row, bgLUT[y0 + r], w);
-        }
+    if (Asm && n >= 16) {
+        const int pre = static_cast<int>((-reinterpret_cast<uintptr_t>(dst)) & 15u) >> 1;
+        for (int i = 0; i < pre; i++) dst[i] = c;
+        const int groups = (n - pre) >> 3;
+        fillRowPie(dst + pre, c, groups);
+        for (int i = pre + (groups << 3); i < n; i++) dst[i] = c;
+        return;
     }
-    for (int i = 0; i < ffCount; i++) {
-        const FfDraw &d = draws[i];
-        const GlowBBox b = glowBBox(d, y0, rows, w);
-        if (b.empty) {
+#endif
+    for (int i = 0; i < n; i++) dst[i] = c;
+}
+
+// A fast inverse square root: the classic bit estimate and two Newton
+// steps, which leaves a few ulp of float error. The sprite loop's tie
+// windows are sized for that error; sqrtf is a library call here.
+BGANIM_INLINE float rsqrtF(float x) {
+    union {
+        float f;
+        uint32_t u;
+    } v;
+    v.f = x;
+    v.u = 0x5f3759dfu - (v.u >> 1);
+    float y = v.f;
+    y = y * (1.5f - 0.5f * x * y * y);
+    y = y * (1.5f - 0.5f * x * y * y);
+    return y;
+}
+
+// The page's per-pixel sprite expression in double, for a pixel the float
+// path could not settle. Writes the three planes and returns.
+void spritePixelDouble(const FfDraw &d, int xx, int yy, uint16_t *pr, uint16_t *pg, uint16_t *pb) {
+    const double dx = xx - d.x, dy = yy - d.y;
+    const double dist = sqrt(dx * dx + dy * dy);
+    if (dist > d.R) return;
+    const double norm = dist / d.R;
+    const double falloff = halo2 ? (1 - norm) * (1 - norm) : pow(1 - norm, halo);
+    double core = 1 - norm * 2.6;
+    if (core < 0) core = 0;
+    const double a = falloff * d.brightness;
+    if (a <= 0.004) return;
+    const double cr = coreC[0] * core + d.gr * (1 - core);
+    const double cg = coreC[1] * core + d.gg * (1 - core);
+    const double cb = coreC[2] * core + d.gb * (1 - core);
+    double v = pr[xx] + cr * a;
+    pr[xx] = static_cast<uint16_t>(clampRound(v > 255 ? 255 : v));
+    v = pg[xx] + cg * a;
+    pg[xx] = static_cast<uint16_t>(clampRound(v > 255 ? 255 : v));
+    v = pb[xx] + cb * a;
+    pb[xx] = static_cast<uint16_t>(clampRound(v > 255 ? 255 : v));
+}
+
+// One sprite over one row of the planes. Float, with the double fallback
+// at every discontinuity: the rim, the alpha cutoff and the half-unit
+// rounding boundary of each channel. The tie windows (RIM, CUT, HALF) are
+// above the float error by a margin of about three.
+constexpr float RIM = 1e-5f;
+constexpr float CUT = 1e-6f;
+constexpr float HALF = 2e-3f;
+
+// Round half to even in float, used only where HALF has ruled out a tie.
+// Both of these are only ever given a plane byte plus a non-negative
+// contribution, so floor is truncation and the FPU's own convert
+// instructions do it. Written with floorf they were a library call each,
+// six a sprite pixel, about 130,000 a frame on the default parameters; the
+// device toolchain emits a real call8 to floorf. Same bits either way for a
+// non-negative value under 2^24.
+BGANIM_INLINE float truncPos(float v) { return static_cast<float>(static_cast<int>(v)); }
+BGANIM_INLINE int roundF(float v) { return static_cast<int>(v + 0.5f); }
+
+void spriteRow(const FfDraw &d, int yy, uint16_t *pr, uint16_t *pg, uint16_t *pb) {
+    const float dyf = static_cast<float>(yy - d.yInt) - d.yFrac;
+    const float dy2 = dyf * dyf;
+    const float cr0 = coreC[0], cg0 = coreC[1], cb0 = coreC[2];
+    for (int xx = d.x0; xx <= d.x1; xx++) {
+        const float dxf = static_cast<float>(xx - d.xInt) - d.xFrac;
+        const float d2 = dxf * dxf + dy2;
+        const float dist = d2 > 0 ? d2 * rsqrtF(d2) : 0.0f;
+        const float norm = dist * d.invR;
+        if (norm > 1.0f + RIM) continue;
+        if (norm > 1.0f - RIM) {
+            spritePixelDouble(d, xx, yy, pr, pg, pb);
             continue;
         }
-        for (int yy = b.yy0; yy <= b.yy1; yy++) {
-            const int32_t dyQ8 = (yy << 8) - d.cyQ8;
-            const int32_t dy2Q4 = (dyQ8 * dyQ8) >> 12;
-            const int32_t dxQ8_0 = (b.xx0 << 8) - d.cxQ8;
-            uint16_t *row = dst + static_cast<size_t>(yy - y0) * w + b.xx0;
-            drawGlowSpanAsm(row, dxQ8_0, dy2Q4, d.invR2Fixed, d.r, d.g, d.b, d.a8, b.xx1 - b.xx0 + 1);
+        const float u = 1.0f - norm;
+        const float falloff = halo2 ? u * u : powf(u, haloF);
+        const float a = falloff * d.brF;
+        if (a < 0.004f - CUT) continue;
+        if (a < 0.004f + CUT) {
+            spritePixelDouble(d, xx, yy, pr, pg, pb);
+            continue;
+        }
+        float core = 1.0f - norm * 2.6f;
+        if (core < 0) core = 0;
+        const float ic = 1.0f - core;
+        const float vr = pr[xx] + (cr0 * core + d.gr * ic) * a;
+        const float vg = pg[xx] + (cg0 * core + d.gg * ic) * a;
+        const float vb = pb[xx] + (cb0 * core + d.gb * ic) * a;
+        const float fr = vr - truncPos(vr), fg = vg - truncPos(vg), fb = vb - truncPos(vb);
+        if (fabsf(fr - 0.5f) < HALF || fabsf(fg - 0.5f) < HALF || fabsf(fb - 0.5f) < HALF) {
+            spritePixelDouble(d, xx, yy, pr, pg, pb);
+            continue;
+        }
+        pr[xx] = static_cast<uint16_t>(vr >= 255.0f ? 255 : roundF(vr));
+        pg[xx] = static_cast<uint16_t>(vg >= 255.0f ? 255 : roundF(vg));
+        pb[xx] = static_cast<uint16_t>(vb >= 255.0f ? 255 : roundF(vb));
+    }
+}
+
+template <bool Asm> void renderRow(uint16_t *out, int y, int w) {
+    const int nr = buildRuns(y, w);
+    for (int i = 0; i < nr; i++) fillSpan<Asm>(out + runs[i].x0, runs[i].c565, runs[i].x1 - runs[i].x0 + 1);
+
+    // The sprites on this row, and the union of their spans, sorted.
+    int ns = 0;
+    for (int i = 0; i < ffCount; i++) {
+        const FfDraw &d = draws[i];
+        if (y < d.y0 || y > d.y1) continue;
+        int j = ns - 1;
+        while (j >= 0 && spans[2 * j] > d.x0) {
+            spans[2 * j + 2] = spans[2 * j];
+            spans[2 * j + 3] = spans[2 * j + 1];
+            j--;
+        }
+        spans[2 * j + 2] = d.x0;
+        spans[2 * j + 3] = d.x1;
+        ns++;
+    }
+    if (ns == 0) return;
+    int nm = 0;
+    for (int i = 0; i < ns; i++) {
+        if (nm > 0 && spans[2 * i] <= spans[2 * nm - 1] + 1) {
+            if (spans[2 * i + 1] > spans[2 * nm - 1]) spans[2 * nm - 1] = spans[2 * i + 1];
+        } else {
+            spans[2 * nm] = spans[2 * i];
+            spans[2 * nm + 1] = spans[2 * i + 1];
+            nm++;
         }
     }
-#else
-    bandRef(dst, y0, rows, w, tMs, p);
-#endif
+    // The background under the spans, in 8 bits, from the runs.
+    uint16_t *pr = planes;
+    uint16_t *pg = pr + planeStride;
+    uint16_t *pb = pg + planeStride;
+    int ri = 0;
+    for (int i = 0; i < nm; i++) {
+        int x = spans[2 * i];
+        const int xe = spans[2 * i + 1];
+        while (ri > 0 && runs[ri].x0 > x) ri--;
+        // The runs cover the whole row, so these bounds never stop the walk
+        // early. They are here so that a future change to buildRuns cannot
+        // turn a gap in the coverage into a read past the run list.
+        while (ri + 1 < nr && runs[ri].x1 < x) ri++;
+        while (x <= xe) {
+            const Run &r = runs[ri];
+            const int stop = r.x1 < xe ? r.x1 : xe;
+            for (; x <= stop; x++) {
+                pr[x] = r.r;
+                pg[x] = r.g;
+                pb[x] = r.b;
+            }
+            if (x > xe) break;
+            if (ri + 1 >= nr) break;
+            ri++;
+        }
+    }
+    // The sprites in index order, which is the order the page chains them.
+    for (int i = 0; i < ffCount; i++) {
+        const FfDraw &d = draws[i];
+        if (y < d.y0 || y > d.y1) continue;
+        spriteRow(d, y, pr, pg, pb);
+    }
+    // Pack the spans: (r >> 3, g >> 2, b >> 3), the quantisation the page's
+    // check applies.
+    for (int i = 0; i < nm; i++) {
+        for (int x = spans[2 * i]; x <= spans[2 * i + 1]; x++) {
+            out[x] = static_cast<uint16_t>(((pr[x] >> 3) << 11) | ((pg[x] >> 2) << 5) | (pb[x] >> 3));
+        }
+    }
+}
+
+// The spec. Host bench goldens run against this, and the device equivalence
+// test (SleepAnimation::runAnimTest, /api/debug/animtest) checks band()
+// against it pixel for pixel. The two differ only in the run fill.
+void bandRef(uint16_t *dst, int y0, int rows, int w, uint32_t, const uint8_t *) {
+    for (int r = 0; r < rows; r++) renderRow<false>(dst + static_cast<size_t>(r) * w, y0 + r, w);
+}
+
+void band(uint16_t *dst, int y0, int rows, int w, uint32_t, const uint8_t *) {
+    for (int r = 0; r < rows; r++) renderRow<true>(dst + static_cast<size_t>(r) * w, y0 + r, w);
 }
 
 void release() {
     releaseTable(ff, static_cast<size_t>(FF_MAX) * sizeof(Firefly));
+    releaseTable(rings, static_cast<size_t>(RING_CAP) * sizeof(Ring));
+    releaseTable(rowCross, static_cast<size_t>(allocH) * RING_CAP);
     releaseTable(draws, static_cast<size_t>(FF_MAX) * sizeof(FfDraw));
-    releaseTable(alphaLUT, 64);
-    releaseTable(bgLUT, static_cast<size_t>(allocH) * sizeof(uint16_t));
-    releaseTable(ffCol, static_cast<size_t>(FF_MAX) * 3);
-    releaseTable(expLUT, static_cast<size_t>(EXP_LUT_N) * sizeof(float));
-    allocH = 0;
+    releaseTable(planes, 3 * static_cast<size_t>(planeStride) * sizeof(uint16_t));
+    releaseTable(runs, static_cast<size_t>(MAX_RUNS) * sizeof(Run));
+    releaseTable(ringChan, RING_CAP);
+    releaseTable(ringSign, RING_CAP);
+    releaseTable(crossM, RING_CAP);
+    releaseTable(crossK, RING_CAP);
+    releaseTable(spans, static_cast<size_t>(FF_MAX) * 2 * sizeof(int16_t));
+    allocW = allocH = planeStride = 0;
+    ffCount = 0;
     builtCount = -1;
-    builtHalo = -1;
-    haloExp = 2.0f;
-    lastThemeGen = 0xFFFFFFFF;
+    ringN = 0;
+    lastThemeGen = 0xFFFFFFFFu;
 }
 
 } // namespace

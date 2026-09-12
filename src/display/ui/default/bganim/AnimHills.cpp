@@ -20,9 +20,7 @@
 // palette index the sky starts from. Star density (p[7]) sets how many of one
 // fixed star field are drawn. At 50 each of the four is exactly the constant
 // this file used to hard-code, so the default picture is unchanged pixel for
-// pixel. band(), bandRef() and the two Xtensa
-// kernels are untouched: what the four parameters change is the tables and
-// the per-layer constants frame() writes.
+// pixel.
 //
 // The page scales the shared theme ramp by its own Brightness parameter,
 // themeRamp(176 + round(p[3] * 0.8)), and frame() keeps that: the parameter
@@ -60,9 +58,7 @@
 // at all. That is where the cost went: rendering every column of every row in
 // the layer's vertical span cost 1.18 ms of the 1.33 ms host frame, and the
 // tile test takes it to the columns whose own band actually covers the row.
-// The host bench now reports 0.428 ms a frame against plasma's 0.130 in the
-// same run, which puts this fourth in the fleet behind ember at 0.743 and
-// nebula at 0.627. About 52,700 columns a frame reach the edge pass, against
+// About 52,700 columns a frame reach the edge pass, against
 // the 42,000 a per-column pass would touch, so the 16-column tile grain costs
 // a quarter over the ideal and the row scan it replaced cost six times it.
 //
@@ -78,20 +74,38 @@
 // runs after them. frame() records each layer's global height extremes so
 // renderRow can find the last such layer and start there.
 //
-// Palette indices, Q8 cover weights and the JS truncation points all match the
-// page. Blends run in RGB565 channel units with the same floor rounding
-// pcMix32 uses; the page blends expanded RGB888 and keeps intermediate low
-// bits the panel does not have, so a blended channel can land one RGB565 step
-// low. Measured against the page rendered at the bench's three golden frame
-// times, with the page output quantized to RGB565 to separate the two
-// effects: mean absolute channel-sum difference 0.91 of 765, maximum 27, and
-// the whole difference is one step inside the haze and fade bands. Nothing is
-// cached across band() calls and no row is copied from another.
+// The row is built in RGB888 and packed to RGB565 once, at the end (gm-pciz,
+// 2026-09-12). The page blends expanded 8-bit channels with pcMix32,
+// a + (((b - a) * t) >> 8), and chains those blends: haze over sky, the fade
+// cover over that, a star's cross over the sky, the next layer's haze over
+// the last layer's fill. An intermediate keeps low bits the panel does not
+// have, and the earlier version, which blended in RGB565 channel units,
+// landed one RGB565 step low on 13,543 to 13,877 of the 230,400 pixels of
+// each golden frame, all of them inside the haze and fade bands and under
+// the stars. So renderRow now holds one row as three planes of 16-bit
+// lanes carrying 8-bit channel values, fills and blends those with the
+// page's arithmetic, and packs (r >> 3, g >> 2, b >> 3) into the output at
+// the end of the row, which is the quantisation page_vs_golden.js applies
+// to the page. Palette colours expand as the page's q565r/q565g do,
+// (v & 0xF8) | (v >> 5) and (v & 0xFC) | (v >> 6), so a fill and a blend
+// toward a palette colour start from the same bytes on both sides. The
+// heights, the row colours, the stars and the profile tables follow the
+// page's double arithmetic where a float would round the other way at a
+// tie (frame() says where). Against the page rendered at the bench's three
+// golden frame times and quantised to RGB565: zero differing pixels.
+//
+// What the planes cost: three 16-byte stores per eight pixels of fill
+// instead of one, and one pack pass over every output row. The planes are
+// 2,880 B of the hot slab at w = 480, paid for by dropping the per-row sky
+// colour table (the index is a division per row now) and the star row
+// table (the row scan reads the star records). Nothing is cached across
+// band() calls and no row is copied from another.
 
 #include "BgAnim.h"
 #include "BgAnimCommon.h"
 #include <math.h>
 #include <stdint.h>
+#include <string.h>
 
 // -DGM_BGANIM_HILLS_ASM=0 drops the Xtensa kernels and renders through
 // bandRef() verbatim, which is the A/B for the kernels on the device.
@@ -117,27 +131,38 @@ constexpr int TILE = 16;                          // columns per skip tile
 constexpr int MAX_W = 480;                        // panel width, the largest render width
 constexpr int MAX_TILES = (MAX_W + TILE - 1) / TILE;
 constexpr int SS_N = 257;                         // smoothstep entries, 0..256 inclusive
-constexpr int CONST_VECS = 7;                     // PIE constant vectors, 8 lanes each
-constexpr int WORK_N = 5 * TILE + CONST_VECS * 8; // scratch lanes plus the constant table
+// Scratch lanes, in 16-byte units so every sub-buffer is vector aligned:
+// the fade weight and the cover weight for one tile, the three planes of
+// the fade's target colour, the three planes of the layer colour and of
+// the haze colour broadcast over a tile, and the pack kernel's three
+// constant vectors (ones, 2048, 32).
+constexpr int WK_A = 0;
+constexpr int WK_B = TILE;
+constexpr int WK_TGT = 2 * TILE;
+constexpr int WK_COL = 5 * TILE;
+constexpr int WK_GLOW = 8 * TILE;
+constexpr int WK_CT = 11 * TILE;
+constexpr int WORK_N = WK_CT + 3 * 8;
 
 // Per layer, as the page's LAY table has it. Periods are pixels per sine
-// cycle, rates are extra harmonic phase cycles per ms, and idx is the
-// palette index at the ridge line before the contrast parameter.
+// cycle, rates are extra harmonic phase cycles per ms (the page's doubles),
+// and idx is the palette index at the ridge line before the contrast
+// parameter.
 struct LayerDef {
     int base, a1, a2, period1, period2, speed, index, fade, glow;
-    float rate1, rate2;
+    double rate1, rate2;
 };
 
 // Returned by value rather than held in a table: three of these would be a
 // permanent read-only object in DRAM, and frame() reads each one once.
 LayerDef definition(int l) {
-    if (l == 0) return {268, 26, 9, 380, 168, 4, 126, 14, GLOWN, 0.000041f, 0.000027f};
-    if (l == 1) return {346, 31, 11, 320, 141, 8, 98, 12, 16, 0.000033f, 0.000051f};
-    return {424, 35, 12, 265, 116, 16, 64, 10, 11, 0.000059f, 0.000037f};
+    if (l == 0) return {268, 26, 9, 380, 168, 4, 126, 14, GLOWN, 0.000041, 0.000027};
+    if (l == 1) return {346, 31, 11, 320, 141, 8, 98, 12, 16, 0.000033, 0.000051};
+    return {424, 35, 12, 265, 116, 16, 64, 10, 11, 0.000059, 0.000037};
 }
 
 // Row constants for one layer, rebuilt every frame. topFloor and topCeil
-// bracket the layer's float top row so rowIndex() can reproduce the page's
+// bracket the layer's top row so rowIndex() can reproduce the page's
 // truncation toward zero on either side of it.
 struct Layer {
     int base, fade, gn, fadeInv, idx0, topFloor, topCeil, hmin, hmax;
@@ -161,32 +186,30 @@ uint8_t *glowTab = nullptr;    // [GLOW_SIZE]            quarter-pixel haze weig
 uint16_t *smooth = nullptr;    // [SS_N]                 smoothstep, 0..256
 uint16_t *palette = nullptr;   // [256]                  theme ramp at this brightness
 Star *stars = nullptr;         // [NSTAR_MAX]            projected stars
-uint8_t *starRow = nullptr;    // [NSTAR_MAX]            star rows alone, for the row scan
 Layer *layers = nullptr;       // [LAYERS]
 uint16_t *work = nullptr;      // [WORK_N]               tile scratch plus PIE constants
-uint16_t *skyCol = nullptr;    // [allocH]               sky colour per row, dither included
+uint16_t *planes = nullptr;    // [3 * planeStride]      one row as r, g, b lanes, 0..255 each
 StarDef *starDef = nullptr;    // [NSTAR_MAX]            fixed star field, frame() only, PSRAM
 const int16_t *sine = nullptr; // borrowed shared sine LUT
 
 int allocW = 0, allocH = 0;
+int planeStride = 0;          // w rounded up to eight, so every plane starts vector aligned
 int starTop = 0, starBot = 0; // rows a star can touch, inclusive
 int starN = NSTAR;            // stars actually drawn, from the density parameter
+int skyBase = 22;             // palette index the sky starts from, from Sky tone
 int lastBright = -1;
 int lastHaze = -1;
-int lastSky = -1;
 uint32_t lastThemeGen = 0xFFFFFFFFu;
 
 // Hot slab at w = 480, h = 480, each table's own size and then what allocHot
 // rounds it to: heightQ 2,880, tileBound 360 (368), glowTab 184 (192), smooth
-// 514 (528), palette 512 (512), stars 1,080 (1,088), starRow 180 (192),
-// layers 120 (128), work 272 (272), skyCol 960 (960). The star and haze
-// tables are sized for the top of their parameter ranges, not for the
-// defaults. Measured total 7,120 B of the 9,216 B an animation may take,
-// 5,200 B at w = 240 and 5,168 B at w = 233, with no fallback to PSRAM and
-// the slab back to empty after release(). PSRAM holds starDef, 2,160 B,
-// which frame() reads and band() never does. Every table read per pixel or
-// per row comes from allocHot, and nothing is allocated in frame() or
-// band().
+// 514 (528), palette 512 (512), stars 1,080 (1,088), layers 120 (128), work
+// 400 (400), planes 2,880. The star and haze tables are sized for the top of
+// their parameter ranges, not for the defaults. Total 8,976 B of the 9,216 B
+// an animation may take, with no fallback to PSRAM and the slab back to
+// empty after release(). PSRAM holds starDef, 2,160 B, which frame() reads
+// and band() never does. Every table read per pixel or per row comes from
+// allocHot, and nothing is allocated in frame() or band().
 void release();
 
 // The page's mulberry32, in uint32 arithmetic. JS does the same work on
@@ -199,12 +222,32 @@ uint32_t mulberry(uint32_t &seed) {
     return t ^ (t >> 14);
 }
 
+// The page's q565r and q565g: an RGB565 colour expanded to the 8-bit
+// channels its palette holds, the high bits repeated into the low ones.
+BGANIM_INLINE int chanR(uint16_t c) {
+    const int v = (c >> 11) & 0x1F;
+    return (v << 3) | (v >> 2);
+}
+BGANIM_INLINE int chanG(uint16_t c) {
+    const int v = (c >> 5) & 0x3F;
+    return (v << 2) | (v >> 4);
+}
+BGANIM_INLINE int chanB(uint16_t c) {
+    const int v = c & 0x1F;
+    return (v << 3) | (v >> 2);
+}
+
+// pcMix32 on one channel: d + (((f - d) * a) >> 8), a in 0..256, and the
+// shift is arithmetic, so a negative step floors, as JS's >> does.
+BGANIM_INLINE int lerp8(int d, int f, int a) { return d + (((f - d) * a) >> 8); }
+
 bool init(int w, int h) {
     if (w <= 0 || w > MAX_W || h <= 0 || h > 480) return false;
     if (heightQ != nullptr && w == allocW && h == allocH) return true;
     release();
     allocW = w;
     allocH = h;
+    planeStride = (w + 7) & ~7;
     sine = sinLut();
     if (sine == nullptr) {
         release();
@@ -216,37 +259,32 @@ bool init(int w, int h) {
     smooth = static_cast<uint16_t *>(allocHot(SS_N * sizeof(uint16_t)));
     palette = static_cast<uint16_t *>(allocHot(256 * sizeof(uint16_t)));
     stars = static_cast<Star *>(allocHot(NSTAR_MAX * sizeof(Star)));
-    starRow = static_cast<uint8_t *>(allocHot(NSTAR_MAX));
     layers = static_cast<Layer *>(allocHot(LAYERS * sizeof(Layer)));
     work = static_cast<uint16_t *>(allocHot(WORK_N * sizeof(uint16_t)));
-    skyCol = static_cast<uint16_t *>(allocHot(static_cast<size_t>(h) * sizeof(uint16_t)));
+    planes = static_cast<uint16_t *>(allocHot(3 * static_cast<size_t>(planeStride) * sizeof(uint16_t)));
     starDef = static_cast<StarDef *>(alloc(NSTAR_MAX * sizeof(StarDef)));
     // One test over every pointer, and release() on any failure, so a half
     // finished init() leaves the slab exactly as it found it and the retry
     // BgAnim.h promises starts from scratch.
     if (heightQ == nullptr || tileBound == nullptr || glowTab == nullptr || smooth == nullptr || palette == nullptr ||
-        stars == nullptr || starRow == nullptr || layers == nullptr || work == nullptr || skyCol == nullptr ||
-        starDef == nullptr) {
+        stars == nullptr || layers == nullptr || work == nullptr || planes == nullptr || starDef == nullptr) {
         release();
         return false;
     }
+    // The page's Math.round(256 * t * t * (3 - 2 * t)) in double, in its
+    // own multiplication order: a float form of this table rounded one
+    // entry the other way.
     for (int k = 0; k < SS_N; k++) {
-        const float t = k * (1.0f / 256.0f);
-        smooth[k] = static_cast<uint16_t>(256.0f * t * t * (3.0f - 2.0f * t) + 0.5f);
+        const double t = k / 256.0;
+        smooth[k] = static_cast<uint16_t>(256.0 * t * t * (3.0 - 2.0 * t) + 0.5);
     }
-    // PIE constant table, in the order the blend kernel walks it: ones,
-    // 256, and then per channel a mask and the constant that puts the
-    // channel back in its bit field. There is no vector left shift, so the
-    // repositioning is a real multiply by 2048 (red) or 32 (green).
-    uint16_t *c = work + 5 * TILE;
+    // The pack kernel's constants: ones, and the multipliers that put the
+    // red and green fields back in place (there is no vector left shift).
+    uint16_t *c = work + WK_CT;
     for (int i = 0; i < 8; i++) {
         c[i] = 1;
-        c[8 + i] = 256;
-        c[16 + i] = 0xF800;
-        c[24 + i] = 2048;
-        c[32 + i] = 0x07E0;
-        c[40 + i] = 32;
-        c[48 + i] = 0x001F;
+        c[8 + i] = 2048;
+        c[16 + i] = 32;
     }
     // Star field: fixed positions, a twinkle phase and a brightness class
     // each, drawn from the page's seed in the page's call order.
@@ -287,15 +325,22 @@ BGANIM_INLINE int ditherY(int y) { return ((y & 1) << 7) | ((y & 2) << 5); }
 // reads a weight of nothing, which is also what lets a layer whose own haze
 // is shorter than gn truncate the profile instead of rescaling it, the way
 // the page does by running its haze loop from its own height down to 1.
+// Built in double, in the page's multiplication order.
 void buildGlow(int gn) {
     for (int k = 0; k < GLOW_SIZE; k++) {
-        const float u = k < gn * 4 ? k * (1.0f / (gn * 4)) : 1.0f;
-        glowTab[k] = static_cast<uint8_t>(GLOW_PEAK * (1.0f - u) * (1.0f - u) + 0.5f);
+        const double u = k < gn * 4 ? k / static_cast<double>(gn * 4) : 1.0;
+        glowTab[k] = static_cast<uint8_t>(GLOW_PEAK * (1.0 - u) * (1.0 - u) + 0.5);
     }
 }
 
+// True when v sits within tol of a whole number, where a float and the
+// page's double can floor to different integers.
+BGANIM_INLINE bool nearInteger(float v, float tol) {
+    const float f = v - floorf(v);
+    return f < tol || f > 1.0f - tol;
+}
+
 void frame(uint32_t tMs, int w, int h, const uint8_t p[BG_ANIM_PARAMS]) {
-    bool palNew = false;
     if (lastBright != p[3] || lastThemeGen != themeGen()) {
         // The page's own brightness, 176 + round(p[3] * 0.8), on top of the
         // shared theme tone. round(x) is floor(x + 1/2), which for p in
@@ -303,7 +348,6 @@ void frame(uint32_t tMs, int w, int h, const uint8_t p[BG_ANIM_PARAMS]) {
         buildThemeRamp(palette, static_cast<uint16_t>(176 + (static_cast<int>(p[3]) * 4 + 2) / 5));
         lastBright = p[3];
         lastThemeGen = themeGen();
-        palNew = true;
     }
     // Ridge haze, p[5]: the height of every haze band as a fraction of the
     // page's, none at 0, the page's own 22, 16 and 11 rows at 50, twice that
@@ -324,50 +368,36 @@ void frame(uint32_t tMs, int w, int h, const uint8_t p[BG_ANIM_PARAMS]) {
     // and dropped: the sky is a flat row fill dithered over four rows, so a
     // steeper ramp puts a palette step every five or six rows and the sky
     // reads as horizontal bands. Shifting the whole ramp adds no step at all.
-    // The row colours go in a table because it is rebuilt only when the
-    // slider or the palette moves, never per frame, which also takes a
-    // division out of the row path.
-    if (palNew || lastSky != p[6]) {
-        const int skyBase = 22 * static_cast<int>(p[6]) / 50;
-        for (int y = 0; y < allocH; y++) {
-            // The numerator is under 2^32 for any height up to 480 and the
-            // height is never zero.
-            const uint32_t skyQ = 44u * static_cast<uint32_t>(y) * static_cast<uint32_t>(y) * 256u /
-                                  (static_cast<uint32_t>(allocH) * static_cast<uint32_t>(allocH));
-            int skyIdx = (skyBase * 256 + static_cast<int>(skyQ) + ditherY(y)) >> 8;
-            if (skyIdx > 255) skyIdx = 255;
-            skyCol[y] = palette[skyIdx];
-        }
-        lastSky = p[6];
-    }
+    skyBase = 22 * static_cast<int>(p[6]) / 50;
     // Speed calibration (gm-33fm): the clock runs at 1.875x of the original
     // rate, so Speed 50 gives about the same visible movement here as on
-    // every other animation. 1.875 is exact in float and in the page's
-    // double, so the two stay bit identical. The Speed parameter, its
-    // label and its default of 50 are unchanged.
-    constexpr float RATE_CAL = 1.875f;
-    const float tt = static_cast<float>(tMs) * (speedMul(p[0]) * RATE_CAL);
-    const float relief = 0.5f + p[1] * 0.012f;
-    const float contrast = 0.6f + p[2] * 0.008f;
+    // every other animation. The clock is the page's double, pow(2, ...)
+    // included, so the two stay bit identical at any speed. The Speed
+    // parameter, its label and its default of 50 are unchanged.
+    const double sm = pow(2.0, (static_cast<int>(p[0]) - 50) / 18.2) * 1.875;
+    const double tt = static_cast<double>(tMs) * sm;
+    const double relief = 0.5 + p[1] * 0.012;
+    const double contrast = 0.6 + p[2] * 0.008;
     // Star density, p[7]: none at 0, the page's 90 at 50, 180 at 100. The
     // stars drawn are always the first starN of one fixed field, so raising
     // the slider adds stars and never moves the ones already there.
     starN = static_cast<int>(p[7]) * 9 / 5;
     if (starN > NSTAR_MAX) starN = NSTAR_MAX;
 
-    const float drift = fmodf(tt * 0.0006f, static_cast<float>(w)); // 0.6 px/s at speed 50
-    const uint32_t tw = static_cast<uint32_t>(tt * 0.0009f);        // twinkle phase, ~19 min per turn
+    // Stars in double, as the page has them: a float drift put the column
+    // fraction one unit off where the sum sat on a 1/256 boundary.
+    const double drift = fmod(tt * 0.0006, static_cast<double>(w)); // 0.6 px/s at speed 50
+    const uint32_t tw = static_cast<uint32_t>(static_cast<int64_t>(tt * 0.0009)); // twinkle phase
     for (int i = 0; i < starN; i++) {
         const StarDef &s = starDef[i];
-        const float xf = s.x + drift; // below 2w: s.x < w and drift < w
+        const double xf = static_cast<double>(s.x) + drift; // below 2w: s.x < w and drift < w
         const int xi = static_cast<int>(xf);
         Star &out = stars[i];
         out.x = static_cast<uint16_t>(xi >= w ? xi - w : xi);
         out.y = static_cast<uint8_t>(s.y);
-        out.fraction = static_cast<uint8_t>((xf - xi) * 256.0f);
+        out.fraction = static_cast<uint8_t>(static_cast<int>((xf - xi) * 256.0));
         const int idx = s.bright + ((sine[(s.phase + tw) & (SIN_N - 1)] * 9) >> 9);
         out.colour = palette[idx > 255 ? 255 : idx];
-        starRow[i] = out.y;
     }
 
     const int nT = (w + TILE - 1) / TILE;
@@ -383,34 +413,31 @@ void frame(uint32_t tMs, int w, int h, const uint8_t p[BG_ANIM_PARAMS]) {
         s.fade = d.fade;
         s.gn = d.glow * static_cast<int>(p[5]) / 50;
         s.fadeInv = 256 / d.fade; // 18, 21, 25: the page's truncated Q8 reciprocal
-        s.idx0 = static_cast<int>(30.0f + (d.index - 30) * contrast + 0.5f);
+        s.idx0 = static_cast<int>(floor(30.0 + (d.index - 30) * contrast + 0.5));
         s.glow = palette[s.idx0 + 26 > 255 ? 255 : s.idx0 + 26];
-        const float a1 = d.a1 * relief, a2 = d.a2 * relief;
+        const double a1 = d.a1 * relief, a2 = d.a2 * relief;
         // The page truncates y - topRow toward zero before scaling it, so
-        // both brackets of the float top row are needed, not one rounding.
-        const float top = base - (a1 + a2);
-        s.topFloor = static_cast<int>(floorf(top));
-        s.topCeil = static_cast<int>(ceilf(top));
-        const float scroll = tt * d.speed * 0.001f;
-        const float q1 = tt * d.rate1 * 1024.0f, q2 = tt * d.rate2 * 1024.0f;
-        const float k1 = 1024.0f / d.period1, k2 = 1024.0f / d.period2;
+        // both brackets of the top row are needed, not one rounding.
+        const double top = base - (a1 + a2);
+        s.topFloor = static_cast<int>(floor(top));
+        s.topCeil = static_cast<int>(ceil(top));
         // The page evaluates ((x + scroll) * k + q) | 0 & 1023 per column in
-        // doubles. Here the column term is an integer Q16 accumulator over a
-        // phase reduced once per layer, for two reasons. The float form needs
-        // a 64-bit widening before the mask, because a long uptime at a high
-        // speed setting carries the product past INT32_MAX, and that widening
-        // is a soft-float helper call on every one of the 2,880 columns a
-        // frame. And the unreduced float itself is the less faithful of the
-        // two: at an uptime of an hour the phase is around 1e6, where a
-        // float's step is 0.06 table entries, while the reduced form's step
-        // is 1e-4. The accumulator's own drift is the Q16 rounding of k over
-        // 480 columns, under 0.004 of an entry.
-        const float p1 = fmodf(scroll * k1 + q1, static_cast<float>(SIN_N));
-        const float p2 = fmodf(scroll * k2 + q2, static_cast<float>(SIN_N));
-        uint32_t ph1 = static_cast<uint32_t>(p1 * 65536.0f);
-        uint32_t ph2 = static_cast<uint32_t>(p2 * 65536.0f);
-        const uint32_t st1 = static_cast<uint32_t>(k1 * 65536.0f + 0.5f);
-        const uint32_t st2 = static_cast<uint32_t>(k2 * 65536.0f + 0.5f);
+        // doubles, and (SIN[i1] * a1 + SIN[i2] * a2) >> 1 on the result. A
+        // double per column is a software helper call on the device, so
+        // each column runs in float with the phase reduced once per layer
+        // (the float's rounding is then under 1/2048 of a table entry, and
+        // the height sum's under 1/128 of a unit), and only a column whose
+        // float lands within 1/512 of a table boundary, or whose sum lands
+        // within 1/64 of a whole number, is recomputed in double in the
+        // page's own expression order. At the bench's golden frames those
+        // ties were the only heights that differed.
+        const double scroll = tt * d.speed / 1000.0;
+        const double q1 = tt * d.rate1 * 1024, q2 = tt * d.rate2 * 1024;
+        const double k1 = 1024.0 / d.period1, k2 = 1024.0 / d.period2;
+        const float b1 = static_cast<float>(fmod(scroll * k1 + q1, static_cast<double>(SIN_N)));
+        const float b2 = static_cast<float>(fmod(scroll * k2 + q2, static_cast<double>(SIN_N)));
+        const float k1f = static_cast<float>(k1), k2f = static_cast<float>(k2);
+        const float a1f = static_cast<float>(a1), a2f = static_cast<float>(a2);
         int16_t *hq = heightQ + l * w;
         int16_t *tb = tileBound + l * MAX_TILES * 2;
         int gmin = 32767, gmax = -32768;
@@ -419,14 +446,28 @@ void frame(uint32_t tMs, int w, int h, const uint8_t p[BG_ANIM_PARAMS]) {
             const int xe = xs + TILE < w ? xs + TILE : w;
             int lo = 32767, hi = -32768;
             for (int x = xs; x < xe; x++) {
-                const int i1 = static_cast<int>((ph1 >> 16) & (SIN_N - 1));
-                const int i2 = static_cast<int>((ph2 >> 16) & (SIN_N - 1));
-                ph1 += st1;
-                ph2 += st2;
+                const float v1 = x * k1f + b1, v2 = x * k2f + b2;
+                int i1, i2;
+                if (nearInteger(v1, 1.0f / 512.0f)) {
+                    i1 = static_cast<int>(static_cast<int64_t>(floor((x + scroll) * k1 + q1)) & (SIN_N - 1));
+                } else {
+                    i1 = static_cast<int>(floorf(v1)) & (SIN_N - 1);
+                }
+                if (nearInteger(v2, 1.0f / 512.0f)) {
+                    i2 = static_cast<int>(static_cast<int64_t>(floor((x + scroll) * k2 + q2)) & (SIN_N - 1));
+                } else {
+                    i2 = static_cast<int>(floorf(v2)) & (SIN_N - 1);
+                }
                 // The page truncates the weighted sine sum toward zero before
                 // halving it, and JS's >> is an arithmetic shift, so a
                 // negative sum floors. Both are reproduced here.
-                const int v = static_cast<int>(sine[i1] * a1 + sine[i2] * a2) >> 1;
+                const float sf = sine[i1] * a1f + sine[i2] * a2f;
+                int v;
+                if (nearInteger(sf, 1.0f / 64.0f)) {
+                    v = static_cast<int>(sine[i1] * a1 + sine[i2] * a2) >> 1;
+                } else {
+                    v = static_cast<int>(sf) >> 1;
+                }
                 hq[x] = static_cast<int16_t>(v);
                 if (v < lo) lo = v;
                 if (v > hi) hi = v;
@@ -453,30 +494,46 @@ BGANIM_INLINE int rowIndex(const Layer &l, int y) {
     return idx < 8 ? 8 : (idx > 255 ? 255 : idx);
 }
 
+// The sky's palette index for one row: a quadratic ramp from skyBase that
+// lifts 44 toward the far ridge line, dithered over four rows. The page
+// truncates (44 * (y / h) * (y / h) * 256) in double; the integer form here
+// is the same floor at every row, because whenever the exact value is a
+// whole number (y a multiple of 15 at h = 480 or 240) y / h is exact in
+// binary and every product with it is too, and everywhere else the value
+// is at least 1/225 away from a whole number, far beyond a double's error.
+BGANIM_INLINE int skyIndex(int y) {
+    // The numerator is under 2^32 for any height up to 480 and the height
+    // is never zero.
+    const uint32_t skyQ = 44u * static_cast<uint32_t>(y) * static_cast<uint32_t>(y) * 256u /
+                          (static_cast<uint32_t>(allocH) * static_cast<uint32_t>(allocH));
+    const int idx = (skyBase * 256 + static_cast<int>(skyQ) + ditherY(y)) >> 8;
+    return idx > 255 ? 255 : idx;
+}
+
 #if GM_BGANIM_HILLS_ASM
 #if defined(__XTENSA__) && !defined(GM_BGANIM_NO_ASM)
 
 // ---------------------------------------------------------------------------
-// Xtensa LX7 kernels. Both use the PIE unit (CP3), eight 16-bit lanes per q
-// register. band() runs on the SleepAnim task and never in an ISR, so
+// Xtensa LX7 kernels. All three use the PIE unit (CP3), eight 16-bit lanes
+// per q register. band() runs on the SleepAnim task and never in an ISR, so
 // FreeRTOS saves the q registers and SAR lazily per task and an ssai hoisted
 // above a loop survives an interrupt or a task switch. The compiler never
 // allocates q registers, so these blocks use q0 to q7 freely and there is no
-// constraint syntax to declare them. Neither kernel writes CPENABLE.
+// constraint syntax to declare them. No kernel writes CPENABLE.
 //
 // ee.vld.128.ip and ee.vst.128.ip mask the low four address bits silently
 // instead of trapping, so every span these kernels touch is 16-byte aligned
-// by construction: allocHot() hands back 16-byte aligned tables, the scratch
-// sub-buffers sit at multiples of TILE * 2 = 32 B inside one of them, and the
+// by construction: allocHot() hands back 16-byte aligned tables, the planes
+// and the scratch sub-buffers sit at multiples of 16 B inside them, and the
 // callers below pay a scalar prefix or fall back to scalar code rather than
-// hand either kernel a destination that is not aligned.
+// hand a kernel a destination that is not aligned.
 // ---------------------------------------------------------------------------
 
-// Constant fill, eight pixels per store. colV holds the colour in all eight
+// Constant fill, eight lanes per store. colV holds the value in all eight
 // lanes, so the whole body is one vector store and the loop has no back edge.
 // This is the animation's largest single cost: the sky is a full-width fill on
 // every row and each layer fills the runs it covers, which is about 575,000
-// pixels a frame at 480 x 480.
+// pixels a frame at 480 x 480, three planes each.
 GM_ANIM_IRAM __attribute__((noinline)) void hillsFill8(uint16_t *dst, const uint16_t *colV, int groups) {
     uint16_t *wr = dst;
     const uint16_t *cv = colV;
@@ -489,169 +546,178 @@ GM_ANIM_IRAM __attribute__((noinline)) void hillsFill8(uint16_t *dst, const uint
                  : "memory");
 }
 
-// dst = blendQ8(dst, src, a) over eight lanes at a time, a in 0..256 per lane.
-//
-// blendQ8's bg + (((fg - bg) * a) >> 8) is rewritten as
-// (fg * a + bg * (256 - a)) >> 8 on each channel's raw magnitude, 0..31 for
-// red and blue and 0..63 for green, because the raw form needs only unsigned
-// products the vector unit has. The two are the same integer for every a in
-// 0..256, not only nearly: bg * 256 + (fg - bg) * a over 256, floored, is
-// bg + floor((fg - bg) * a / 256), and an arithmetic right shift is that
-// floor. Checked exhaustively over all 64 x 64 x 257 operand triples. The
-// largest intermediate is max(fg, bg) * 256 = 16,128, well inside the 16 bits
-// ee.vmul.u16 keeps and far below the 32,767 where ee.vadds.s16, the only
-// vector add, would saturate.
-//
-// ee.vmul.u16 only shifts right, product >> SAR with the low 16 bits kept, so
-// pulling a channel out of its bit field (>> 11 red, >> 5 green, nothing for
-// blue) and putting it back (* 2048, * 32, nothing) both go through it: the
-// extraction multiplies by the ones vector at SAR 11 or 5, the repositioning
-// multiplies by a real constant at SAR 0.
-//
-// Register budget is what forces channel-serial order rather than grouping
-// the extractions by SAR value: q7 (ones) is pinned for the whole call and
-// q0 (fg), q1 (bg), q2 (a), q3 (inv) for the whole group, leaving q4 and q5
-// as scratch and q6 as the running OR accumulator, so no finished channel
-// ever spills. The cost is more ssai than a SAR-batched schedule, and ssai is
-// one cycle. The six per-group constants are re-read from the table each
-// group and the pointer is rewound once at the bottom, which is one
-// instruction against pinning them in registers the file does not have.
-//
-// 47 instructions per eight pixels, 5.9 per pixel, against about 20 for the
-// scalar blend. GCC 14 wraps the block in the windowed-ABI entry, one
-// register copy for the write pointer and retw, and spills nothing:
-// xtensa-asm14/AnimHills.S has no stack traffic anywhere in the function.
-GM_ANIM_IRAM __attribute__((noinline)) void hillsBlend8(uint16_t *dst, const uint16_t *src, const uint16_t *aQ8,
-                                                        const uint16_t *ct, int groups) {
+// dst = dst + (((fg - dst) * a) >> 8) over eight lanes at a time, on one
+// plane of 8-bit channel values held in 16-bit lanes, a in 0..256 per lane.
+// This is pcMix32's channel arithmetic exactly: ee.vsubs.s16 gives the
+// signed step, at most 255 in magnitude, ee.vmul.s16 multiplies it by the
+// weight and shifts the 32-bit product right by SAR arithmetically, which is
+// the floor JS's >> takes on a negative product, and ee.vadds.s16 adds the
+// result back. Nothing here can saturate: the largest product is 65,280 and
+// the result is always 0..255. Nine instructions per eight lanes, three
+// planes per pixel group.
+GM_ANIM_IRAM __attribute__((noinline)) void hillsLerp8(uint16_t *dst, const uint16_t *fg, const uint16_t *aQ8,
+                                                       int groups) {
     uint16_t *rd = dst;
     uint16_t *wr = dst;
-    const uint16_t *sv = src;
+    const uint16_t *fv = fg;
     const uint16_t *av = aQ8;
-    const uint16_t *cp = ct;
     // rd and wr are the same address at entry and are separate registers
     // because ee.vld.128.ip and ee.vst.128.ip each post-increment their own
     // pointer, and the group's destination has to be read before the other
-    // pointers move and written after. scale565Oct in SleepAnimation.cpp
-    // splits its pointers for the same reason.
-    asm volatile("ee.vld.128.ip q7, %[cp], 16\n" // ones, pinned for the call
+    // pointers move and written after.
+    asm volatile("ssai 8\n"
                  "loopnez %[n], 1f\n"
-                 "ee.vld.128.ip q2, %[av], 16\n"  // a
-                 "ee.vld.128.ip q4, %[cp], 16\n"  // 256
-                 "ee.vld.128.ip q0, %[sv], 16\n"  // fg
-                 "ee.vsubs.s16 q3, q4, q2\n"      // inv = 256 - a
-                 "ee.vld.128.ip q1, %[rd], 16\n"  // bg
-                 "ee.vld.128.ip q4, %[cp], 16\n"  // maskR 0xF800
-                 "ee.andq q5, q0, q4\n"           // fg red, in place
-                 "ee.andq q4, q1, q4\n"           // bg red, in place
-                 "ssai 11\n"
-                 "ee.vmul.u16 q5, q5, q7\n"       // fg red raw, 0..31
-                 "ee.vmul.u16 q4, q4, q7\n"       // bg red raw
-                 "ssai 0\n"
-                 "ee.vmul.u16 q5, q5, q2\n"       // fg raw * a
-                 "ee.vmul.u16 q4, q4, q3\n"       // bg raw * inv
-                 "ee.vadds.s16 q5, q5, q4\n"      // sum, at most 7,936
-                 "ssai 8\n"
-                 "ee.vmul.u16 q5, q5, q7\n"       // out red raw = sum >> 8
-                 "ee.vld.128.ip q4, %[cp], 16\n"  // 2048
-                 "ssai 0\n"
-                 "ee.vmul.u16 q6, q5, q4\n"       // accumulator = red << 11
-                 "ee.vld.128.ip q4, %[cp], 16\n"  // maskG 0x07E0
-                 "ee.andq q5, q0, q4\n"
-                 "ee.andq q4, q1, q4\n"
-                 "ssai 5\n"
-                 "ee.vmul.u16 q5, q5, q7\n"       // fg green raw, 0..63
-                 "ee.vmul.u16 q4, q4, q7\n"
-                 "ssai 0\n"
-                 "ee.vmul.u16 q5, q5, q2\n"
-                 "ee.vmul.u16 q4, q4, q3\n"
-                 "ee.vadds.s16 q5, q5, q4\n"      // sum, at most 16,128
-                 "ssai 8\n"
-                 "ee.vmul.u16 q5, q5, q7\n"
-                 "ee.vld.128.ip q4, %[cp], 16\n"  // 32
-                 "ssai 0\n"
-                 "ee.vmul.u16 q5, q5, q4\n"       // green << 5
-                 "ee.orq q6, q6, q5\n"
-                 "ee.vld.128.ip q4, %[cp], 16\n"  // maskB 0x001F
-                 "ee.andq q5, q0, q4\n"           // blue is already raw
-                 "ee.andq q4, q1, q4\n"
-                 "ee.vmul.u16 q5, q5, q2\n"       // SAR is still 0 here
-                 "ee.vmul.u16 q4, q4, q3\n"
-                 "ee.vadds.s16 q5, q5, q4\n"
-                 "ssai 8\n"
-                 "ee.vmul.u16 q5, q5, q7\n"       // out blue raw
-                 "ee.orq q6, q6, q5\n"
-                 "ee.vst.128.ip q6, %[wr], 16\n"
-                 "addi %[cp], %[cp], -96\n"       // rewind the six per-group vectors
+                 "ee.vld.128.ip q2, %[av], 16\n" // a
+                 "ee.vld.128.ip q0, %[fv], 16\n" // fg
+                 "ee.vld.128.ip q1, %[rd], 16\n" // dst
+                 "ee.vsubs.s16 q0, q0, q1\n"     // fg - dst, -255..255
+                 "ee.vmul.s16 q0, q0, q2\n"      // ((fg - dst) * a) >> 8
+                 "ee.vadds.s16 q0, q0, q1\n"     // dst + step
+                 "ee.vst.128.ip q0, %[wr], 16\n"
                  "1:\n"
-                 : [rd] "+r"(rd), [wr] "+r"(wr), [sv] "+r"(sv), [av] "+r"(av), [cp] "+r"(cp)
+                 : [rd] "+r"(rd), [wr] "+r"(wr), [fv] "+r"(fv), [av] "+r"(av)
+                 : [n] "r"(groups)
+                 : "memory");
+}
+
+// Pack eight pixels from the three planes into RGB565: (r >> 3) << 11 |
+// (g >> 2) << 5 | (b >> 3). ee.vmul.u16 only shifts right, product >> SAR
+// with the low 16 bits kept, so the channel shifts multiply by the ones
+// vector at SAR 3 or 2, and the repositioning multiplies by 2048 and 32 at
+// SAR 0. The three constants are loaded once and pinned in q5 to q7.
+// Twelve instructions per eight pixels, once per output row.
+GM_ANIM_IRAM __attribute__((noinline)) void hillsPack8(uint16_t *dst, const uint16_t *r, const uint16_t *g,
+                                                       const uint16_t *b, const uint16_t *ct, int groups) {
+    uint16_t *wr = dst;
+    const uint16_t *rp = r;
+    const uint16_t *gp = g;
+    const uint16_t *bp = b;
+    const uint16_t *cp = ct;
+    asm volatile("ee.vld.128.ip q5, %[cp], 16\n" // ones
+                 "ee.vld.128.ip q6, %[cp], 16\n" // 2048
+                 "ee.vld.128.ip q7, %[cp], 16\n" // 32
+                 "loopnez %[n], 1f\n"
+                 "ee.vld.128.ip q0, %[rp], 16\n"
+                 "ee.vld.128.ip q1, %[gp], 16\n"
+                 "ee.vld.128.ip q2, %[bp], 16\n"
+                 "ssai 3\n"
+                 "ee.vmul.u16 q0, q0, q5\n" // r >> 3
+                 "ee.vmul.u16 q2, q2, q5\n" // b >> 3
+                 "ssai 2\n"
+                 "ee.vmul.u16 q1, q1, q5\n" // g >> 2
+                 "ssai 0\n"
+                 "ee.vmul.u16 q0, q0, q6\n" // red << 11
+                 "ee.vmul.u16 q1, q1, q7\n" // green << 5
+                 "ee.orq q0, q0, q1\n"
+                 "ee.orq q0, q0, q2\n"
+                 "ee.vst.128.ip q0, %[wr], 16\n"
+                 "1:\n"
+                 : [wr] "+r"(wr), [rp] "+r"(rp), [gp] "+r"(gp), [bp] "+r"(bp), [cp] "+r"(cp)
                  : [n] "r"(groups)
                  : "memory");
 }
 
 #else
-// Portable twins of the two kernels above: same names, same signatures, same
-// arithmetic, so the dispatching code below is one piece of source whichever
-// branch compiled. This branch is what the host bench and the fuzzers run,
-// and what GM_BGANIM_NO_ASM selects on the device. Both are copied from
-// tools/qemubench/tests/anim_hills/main.c, the plain C references that file
-// checks the kernels against under QEMU.
+// Portable twins of the three kernels above: same names, same signatures,
+// same arithmetic, so the dispatching code below is one piece of source
+// whichever branch compiled. This branch is what the host bench and the
+// fuzzers run, and what GM_BGANIM_NO_ASM selects on the device. All three
+// are copied from tools/qemubench/tests/anim_hills/main.c, the plain C
+// references that file checks the kernels against under QEMU.
 void hillsFill8(uint16_t *dst, const uint16_t *colV, int groups) {
     const uint16_t c = colV[0];
     const int n = groups * 8;
     for (int i = 0; i < n; i++) dst[i] = c;
 }
-void hillsBlend8(uint16_t *dst, const uint16_t *src, const uint16_t *aQ8, const uint16_t *, int groups) {
+void hillsLerp8(uint16_t *dst, const uint16_t *fg, const uint16_t *aQ8, int groups) {
     const int n = groups * 8;
     for (int i = 0; i < n; i++) {
-        const int a = aQ8[i], inv = 256 - a;
-        const int bg = dst[i], fg = src[i];
-        const int r = (((fg >> 11) & 0x1F) * a + ((bg >> 11) & 0x1F) * inv) >> 8;
-        const int g = (((fg >> 5) & 0x3F) * a + ((bg >> 5) & 0x3F) * inv) >> 8;
-        const int b = ((fg & 0x1F) * a + (bg & 0x1F) * inv) >> 8;
-        dst[i] = static_cast<uint16_t>((r << 11) | (g << 5) | b);
+        const int d = dst[i];
+        dst[i] = static_cast<uint16_t>(d + (((fg[i] - d) * aQ8[i]) >> 8));
+    }
+}
+void hillsPack8(uint16_t *dst, const uint16_t *r, const uint16_t *g, const uint16_t *b, const uint16_t *,
+                int groups) {
+    const int n = groups * 8;
+    for (int i = 0; i < n; i++) {
+        dst[i] = static_cast<uint16_t>(((r[i] >> 3) << 11) | ((g[i] >> 2) << 5) | (b[i] >> 3));
     }
 }
 #endif // __XTENSA__ && !GM_BGANIM_NO_ASM
 #endif // GM_BGANIM_HILLS_ASM
 
-// Fill n pixels with one colour. The vector path needs a 16-byte aligned
-// destination, so it pays a scalar prefix of up to seven pixels to get there
-// and a scalar tail for the last group; below 16 pixels the prefix would eat
-// the whole run, so short runs stay scalar.
-template <bool Asm> BGANIM_INLINE void fillRun(uint16_t *dst, const uint16_t *colV, uint16_t colour, int n) {
+// Fill n pixels of the three planes, from column x, with one colour. The
+// vector path needs a 16-byte aligned destination, so it pays a scalar
+// prefix of up to seven pixels to get there and a scalar tail for the last
+// group; below 16 pixels the prefix would eat the whole run, so short runs
+// stay scalar. The three planes share one alignment because the stride is
+// a multiple of eight lanes. colV holds the three channel values broadcast
+// over a tile, at WK_COL or WK_GLOW.
+template <bool Asm>
+BGANIM_INLINE void fillRun(int x, int n, const uint16_t *colV, int r, int g, int b) {
+    uint16_t *pr = planes + x;
+    uint16_t *pg = pr + planeStride;
+    uint16_t *pb = pg + planeStride;
 #if GM_BGANIM_HILLS_ASM
     if (Asm && n >= 16) {
-        const int pre = static_cast<int>((-reinterpret_cast<uintptr_t>(dst)) & 15u) >> 1;
-        for (int i = 0; i < pre; i++) dst[i] = colour;
+        const int pre = static_cast<int>((-reinterpret_cast<uintptr_t>(pr)) & 15u) >> 1;
+        for (int i = 0; i < pre; i++) {
+            pr[i] = static_cast<uint16_t>(r);
+            pg[i] = static_cast<uint16_t>(g);
+            pb[i] = static_cast<uint16_t>(b);
+        }
         const int groups = (n - pre) >> 3;
-        hillsFill8(dst + pre, colV, groups);
-        for (int i = pre + (groups << 3); i < n; i++) dst[i] = colour;
+        hillsFill8(pr + pre, colV, groups);
+        hillsFill8(pg + pre, colV + TILE, groups);
+        hillsFill8(pb + pre, colV + 2 * TILE, groups);
+        for (int i = pre + (groups << 3); i < n; i++) {
+            pr[i] = static_cast<uint16_t>(r);
+            pg[i] = static_cast<uint16_t>(g);
+            pb[i] = static_cast<uint16_t>(b);
+        }
         return;
     }
 #else
     (void)colV;
 #endif
-    for (int i = 0; i < n; i++) dst[i] = colour;
+    for (int i = 0; i < n; i++) {
+        pr[i] = static_cast<uint16_t>(r);
+        pg[i] = static_cast<uint16_t>(g);
+        pb[i] = static_cast<uint16_t>(b);
+    }
 }
 
-// dst = blendQ8(dst, src, a) over n pixels. src and a are scratch buffers and
-// are always aligned; dst is a row offset by a whole tile, so it is aligned
-// whenever the row itself is, which the panel's 64-byte aligned band buffer
-// and a width that is a multiple of eight both give. Anything else takes the
+// dst = lerp8(dst, fg, a) over n pixels of three planes at stride s. Every
+// caller hands over vector aligned planes: the row planes offset by a whole
+// tile, or scratch inside work. Anything past the last whole group takes the
 // scalar loop, which is the same integer either way.
 template <bool Asm>
-BGANIM_INLINE void blendRun(uint16_t *dst, const uint16_t *src, const uint16_t *aQ8, const uint16_t *ct, int n) {
+BGANIM_INLINE void blendRun(uint16_t *dst, int ds, const uint16_t *fg, int fs, const uint16_t *aQ8, int n) {
+    int i0 = 0;
 #if GM_BGANIM_HILLS_ASM
-    if (Asm && (reinterpret_cast<uintptr_t>(dst) & 15u) == 0) {
+    if (Asm) {
         const int groups = n >> 3;
-        hillsBlend8(dst, src, aQ8, ct, groups);
-        for (int i = groups << 3; i < n; i++) dst[i] = blendQ8(dst[i], src[i], aQ8[i]);
-        return;
+        hillsLerp8(dst, fg, aQ8, groups);
+        hillsLerp8(dst + ds, fg + fs, aQ8, groups);
+        hillsLerp8(dst + 2 * ds, fg + 2 * fs, aQ8, groups);
+        i0 = groups << 3;
     }
-#else
-    (void)ct;
 #endif
-    for (int i = 0; i < n; i++) dst[i] = blendQ8(dst[i], src[i], aQ8[i]);
+    for (int i = i0; i < n; i++) {
+        dst[i] = static_cast<uint16_t>(lerp8(dst[i], fg[i], aQ8[i]));
+        dst[ds + i] = static_cast<uint16_t>(lerp8(dst[ds + i], fg[fs + i], aQ8[i]));
+        dst[2 * ds + i] = static_cast<uint16_t>(lerp8(dst[2 * ds + i], fg[2 * fs + i], aQ8[i]));
+    }
+}
+
+// Broadcast one colour's three channels over a tile of lanes at v.
+BGANIM_INLINE void broadcast(uint16_t *v, uint16_t colour) {
+    const int r = chanR(colour), g = chanG(colour), b = chanB(colour);
+    for (int i = 0; i < TILE; i++) {
+        v[i] = static_cast<uint16_t>(r);
+        v[TILE + i] = static_cast<uint16_t>(g);
+        v[2 * TILE + i] = static_cast<uint16_t>(b);
+    }
 }
 
 // Cover weight for a tile of columns that lies wholly above its ridge, where
@@ -721,13 +787,33 @@ GM_ANIM_IRAM void hillsWeights(uint16_t *aQ8, uint16_t *bQ8, const int16_t *hq, 
     }
 }
 
+// Pack the row planes into the output row. The vector path needs a 16-byte
+// aligned destination, which the panel's 64-byte aligned band buffer and a
+// width that is a multiple of eight both give; anything else, and the tail
+// past the last whole group, takes the scalar form of the same shift and or.
+template <bool Asm> BGANIM_INLINE void packRow(uint16_t *out, int w) {
+    const uint16_t *pr = planes;
+    const uint16_t *pg = pr + planeStride;
+    const uint16_t *pb = pg + planeStride;
+    int i0 = 0;
+#if GM_BGANIM_HILLS_ASM
+    if (Asm && (reinterpret_cast<uintptr_t>(out) & 15u) == 0) {
+        const int groups = w >> 3;
+        hillsPack8(out, pr, pg, pb, work + WK_CT, groups);
+        i0 = groups << 3;
+    }
+#endif
+    for (int i = i0; i < w; i++) {
+        out[i] = static_cast<uint16_t>(((pr[i] >> 3) << 11) | ((pg[i] >> 2) << 5) | (pb[i] >> 3));
+    }
+}
+
 template <bool Asm> GM_ANIM_IRAM void renderRow(uint16_t *out, int y, int w, int nT) {
-    uint16_t *aQ8 = work;
-    uint16_t *bQ8 = work + TILE;
-    uint16_t *tgt = work + 2 * TILE;
-    uint16_t *colV = work + 3 * TILE;
-    uint16_t *glowV = work + 4 * TILE;
-    const uint16_t *ct = work + 5 * TILE;
+    uint16_t *aQ8 = work + WK_A;
+    uint16_t *bQ8 = work + WK_B;
+    uint16_t *tgt = work + WK_TGT;
+    uint16_t *colV = work + WK_COL;
+    uint16_t *glowV = work + WK_GLOW;
 
     // A layer that covers this row from edge to edge hides the sky, the stars
     // and every layer before it, because its own fill is the full width and
@@ -746,26 +832,35 @@ template <bool Asm> GM_ANIM_IRAM void renderRow(uint16_t *out, int y, int w, int
     }
 
     if (first == 0) {
-        // Sky: a quadratic ramp that lifts toward the far ridge line, built
-        // per row in frame() with the dither already in it.
-        const uint16_t sky = skyCol[y];
-        for (int i = 0; i < TILE; i++) colV[i] = sky;
-        fillRun<Asm>(out, colV, sky, w);
+        // Sky: a quadratic ramp that lifts toward the far ridge line, with
+        // the dither already in the index.
+        const uint16_t sky = palette[skyIndex(y)];
+        broadcast(colV, sky);
+        fillRun<Asm>(0, w, colV, chanR(sky), chanG(sky), chanB(sky));
 
         if (y >= starTop && y <= starBot) {
+            uint16_t *pr = planes;
+            uint16_t *pg = pr + planeStride;
+            uint16_t *pb = pg + planeStride;
             for (int i = 0; i < starN; i++) {
-                const int dy = y - starRow[i];
-                if (dy < -1 || dy > 1) continue;
                 const Star &s = stars[i];
+                const int dy = y - s.y;
+                if (dy < -1 || dy > 1) continue;
                 const int a = dy == 0 ? 200 : 58; // the core, then the cross arms
-                const int x1 = s.x + 1 == w ? 0 : s.x + 1;
-                out[s.x] = blendQ8(out[s.x], s.colour, (a * (256 - s.fraction)) >> 8);
-                out[x1] = blendQ8(out[x1], s.colour, (a * s.fraction) >> 8);
+                const int x0 = s.x, x1 = s.x + 1 == w ? 0 : s.x + 1;
+                const int a0 = (a * (256 - s.fraction)) >> 8, a1 = (a * s.fraction) >> 8;
+                const int r = chanR(s.colour), g = chanG(s.colour), b = chanB(s.colour);
+                pr[x0] = static_cast<uint16_t>(lerp8(pr[x0], r, a0));
+                pg[x0] = static_cast<uint16_t>(lerp8(pg[x0], g, a0));
+                pb[x0] = static_cast<uint16_t>(lerp8(pb[x0], b, a0));
+                pr[x1] = static_cast<uint16_t>(lerp8(pr[x1], r, a1));
+                pg[x1] = static_cast<uint16_t>(lerp8(pg[x1], g, a1));
+                pb[x1] = static_cast<uint16_t>(lerp8(pb[x1], b, a1));
             }
         }
     } else {
-        for (int i = 0; i < TILE; i++) colV[i] = firstCol;
-        fillRun<Asm>(out, colV, firstCol, w);
+        broadcast(colV, firstCol);
+        fillRun<Asm>(0, w, colV, chanR(firstCol), chanG(firstCol), chanB(firstCol));
     }
 
     for (int l = first; l < LAYERS; l++) {
@@ -777,12 +872,11 @@ template <bool Asm> GM_ANIM_IRAM void renderRow(uint16_t *out, int y, int w, int
         // Nothing of this layer reaches the row: no coverage and no band.
         if (s.hmin >= edgeHi) continue;
         const uint16_t colour = palette[rowIndex(s, y)];
+        const int cr = chanR(colour), cg = chanG(colour), cb = chanB(colour);
         const int16_t *hq = heightQ + l * w;
         const int16_t *tb = tileBound + l * MAX_TILES * 2;
-        for (int i = 0; i < TILE; i++) {
-            colV[i] = colour;
-            glowV[i] = s.glow;
-        }
+        broadcast(colV, colour);
+        broadcast(glowV, s.glow);
 
         // Runs. covered is the coverage of the column just passed, pos the
         // start of the run it belongs to, and n the number of toggles, capped
@@ -800,7 +894,7 @@ template <bool Asm> GM_ANIM_IRAM void renderRow(uint16_t *out, int y, int w, int
                 }
             } else if (lo >= covThr) { // none of it is
                 if (t != 0 && covered) {
-                    fillRun<Asm>(out + pos, colV, colour, xs - pos);
+                    fillRun<Asm>(pos, xs - pos, colV, cr, cg, cb);
                     pos = xs;
                     covered = false;
                     n++;
@@ -810,7 +904,7 @@ template <bool Asm> GM_ANIM_IRAM void renderRow(uint16_t *out, int y, int w, int
                 for (int x = t != 0 ? xs : 1; x < xe; x++) {
                     const bool cur = hq[x] < covThr;
                     if (cur != covered) {
-                        if (covered) fillRun<Asm>(out + pos, colV, colour, x - pos);
+                        if (covered) fillRun<Asm>(pos, x - pos, colV, cr, cg, cb);
                         pos = x;
                         covered = cur;
                         if (++n >= CAP) break;
@@ -818,7 +912,7 @@ template <bool Asm> GM_ANIM_IRAM void renderRow(uint16_t *out, int y, int w, int
                 }
             }
         }
-        if (covered) fillRun<Asm>(out + pos, colV, colour, w - pos);
+        if (covered) fillRun<Asm>(pos, w - pos, colV, cr, cg, cb);
 
         // The anti-aliased ridge line and the haze band above it, then the
         // fade below it, over whatever is already on the row.
@@ -829,15 +923,16 @@ template <bool Asm> GM_ANIM_IRAM void renderRow(uint16_t *out, int y, int w, int
             const int nn = xs + TILE < w ? TILE : w - xs;
             if (lo > yq) { // wholly above the ridge: haze over one colour
                 hillsHaze(bQ8, hq + xs, yq, edgeHi, nn);
-                blendRun<Asm>(out + xs, glowV, bQ8, ct, nn);
+                blendRun<Asm>(planes + xs, planeStride, glowV, TILE, bQ8, nn);
                 continue;
             }
             hillsWeights(aQ8, bQ8, hq + xs, yr, s.gn, s.fade, s.fadeInv, nn);
-            for (int i = 0; i < nn; i++) tgt[i] = s.glow;
-            blendRun<Asm>(tgt, colV, aQ8, ct, nn);       // haze colour walking to the layer
-            blendRun<Asm>(out + xs, tgt, bQ8, ct, nn);   // that cover over the row
+            memcpy(tgt, glowV, 3 * TILE * sizeof(uint16_t));
+            blendRun<Asm>(tgt, TILE, colV, TILE, aQ8, nn);              // haze colour walking to the layer
+            blendRun<Asm>(planes + xs, planeStride, tgt, TILE, bQ8, nn); // that cover over the row
         }
     }
+    packRow<Asm>(out, w);
 }
 
 template <bool Asm> GM_ANIM_IRAM void render(uint16_t *dst, int y0, int rows, int w) {
@@ -870,18 +965,18 @@ void release() {
     releaseTable(smooth, SS_N * sizeof(uint16_t));
     releaseTable(palette, 256 * sizeof(uint16_t));
     releaseTable(stars, NSTAR_MAX * sizeof(Star));
-    releaseTable(starRow, static_cast<size_t>(NSTAR_MAX));
     releaseTable(layers, LAYERS * sizeof(Layer));
     releaseTable(work, WORK_N * sizeof(uint16_t));
-    releaseTable(skyCol, static_cast<size_t>(allocH) * sizeof(uint16_t));
+    releaseTable(planes, 3 * static_cast<size_t>(planeStride) * sizeof(uint16_t));
     releaseTable(starDef, NSTAR_MAX * sizeof(StarDef));
     sine = nullptr;
     allocW = allocH = 0;
+    planeStride = 0;
     starTop = starBot = 0;
     starN = NSTAR;
+    skyBase = 22;
     lastBright = -1;
     lastHaze = -1;
-    lastSky = -1;
     lastThemeGen = 0xFFFFFFFFu;
 }
 
