@@ -264,7 +264,21 @@ void frame(uint32_t tMs, int, int, const uint8_t p[BG_ANIM_PARAMS]) {
         }
         lastFallKey = fallKey;
     }
-    const float t = static_cast<float>(tMs) * speedMul(p[0]);
+    // Speed calibration (gm-33fm): the shafts' half change time was 4652 ms,
+    // 3.9 times slower than the fleet target of 1200 ms at Speed 50. 15/4 is
+    // the landing, 1191 ms, and it is exact in float and double. Picking it
+    // took two instruments. Once this animation is sped up its sway and breath
+    // cycles are short enough that the six anchors the fleet sweep averages
+    // over stop sampling unrelated moments: its saturation estimate swings
+    // with the sampling and drags the reported time with it, so the sweep read
+    // 854 ms at 3.0 and 1002 at 3.875, neither of them monotone in the rate.
+    // A 24 anchor rerun of the same metric read 1057 ms here, and 15/4 is the
+    // one value where both instruments agree and both sit inside the accept
+    // band. Every phase this
+    // frame derives (sway, the two shaft harmonics, the breath gain) reads t,
+    // so they speed up together; the map, the palette and the fade are built
+    // from parameters alone and do not move.
+    const float t = static_cast<float>(tMs) * speedMul(p[0]) * (15.0f / 4.0f);
     const int k2 = 16 + (static_cast<int>(p[1]) * 16 + 50) / 100; // sharp harmonic, 16..32
     // Contrast (p[3]) is a Q8 scale on the shaft profile's swing, 0 at slider
     // 0 and 512 at 100. At 256 the multiply and the shift cancel exactly for

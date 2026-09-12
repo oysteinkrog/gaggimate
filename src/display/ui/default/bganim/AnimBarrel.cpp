@@ -4,8 +4,8 @@
 // This is entry 'barrel' in tools/animbench/web/anim_bench.html, including
 // its wider, approved palette window. The arcsine maps columns onto the
 // cylinder; cosine shading and a smoothstep fade hide its edges. At the
-// default parameters the bands climb at 16 pixels/second at Speed 50,
-// repeating in 32 seconds.
+// default parameters the bands climb at 50 pixels/second at Speed 50,
+// repeating in 10.24 seconds.
 //
 // The page's integer pixel scheme is preserved without resampling:
 //   v = (angle[x] * bandK + y * rowStep + phase) & 131071;
@@ -55,7 +55,14 @@ constexpr int CREST = H_BASE_DEF + FOLD_SPAN; // 33314, the height Band depth pi
 constexpr uint32_t SHADE_MASK = 1023u << 17;  // shade reaches 346, so nine bits, not eight
 constexpr int IDX_LO = 22;
 constexpr int ROW_STEP_DEF = 256; // phase units per pixel of vertical travel, Band tilt 50
-constexpr int CLIMB_PX_S = 16;
+// Speed calibration (gm-33fm): the climb was 16 px/s, which put the half
+// change time at 4454 ms, 3.7 times slower than the fleet target of 1200 ms
+// at Speed 50. 50 px/s is 3.125 times that and is the measured landing at
+// 1226 ms. It is
+// the one rate constant here, it divides 2^26*1000/ROW_STEP_DEF exactly, so
+// TIME_DEN stays a whole number and the phase stays exact, and it changes
+// nothing the pixel loop or the kernel reads beyond the phase value itself.
+constexpr int CLIMB_PX_S = 50;
 constexpr int EDGE_PX_DEF = 24; // Edge fade 50
 constexpr int EDGE_PX_MIN = 2;  // Edge fade 0, a nearly hard silhouette edge
 
@@ -275,8 +282,9 @@ void frame(uint32_t tMs, int w, int, const uint8_t p[BG_ANIM_PARAMS]) {
     // Q26 holds every bit of speedMul's float over params 0..100. Using an
     // integer product retains millisecond precision through uint32 uptime
     // instead of multiplying a many-day timestamp in float. Cancelling the
-    // 4096 = CLIMB_PX_S*ROW_STEP_DEF gives denominator 1000*2^(26-12).
-    // At speed 50 this is exactly round(tMs*4096/1000), period 32000 ms.
+    // 12800 = CLIMB_PX_S*ROW_STEP_DEF gives denominator 2^26*1000/12800,
+    // a whole 5242880. At speed 50 this is exactly round(tMs*12800/1000),
+    // period 10240 ms.
     // The rate is the default tilt's, not the current tilt's, so the pattern
     // keeps moving at every tilt, including the vertical bands at tilt 0
     // where there is no vertical travel to measure. What that means for the

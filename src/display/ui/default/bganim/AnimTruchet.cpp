@@ -233,7 +233,17 @@ void frame(uint32_t tMs, int, int, const uint8_t p[BG_ANIM_PARAMS]) {
     // the default the angle is exactly 0.0f, so cosf gives 1.0f and sinf
     // 0.0f, the two components are exactly 18.0f and 12.0f, and vx / 1000.0f
     // is the same correctly rounded quotient the old constant folded to.
-    const float t = static_cast<float>(tMs) * speedMul(p[0]);
+    // Speed calibration (gm-33fm): the tiles' half change time was 577 ms,
+    // 2.1 times faster than the fleet target of 1200 ms at Speed 50. 31/64
+    // lands on 1191 ms and is exact in float and double. t is the drift
+    // distance along the tile field, so the whole scroll slows and the tile
+    // art, the palette and the dither are untouched. What the slower scroll
+    // does cost is smoothness: the field moves in whole pixels, and at 18 and
+    // 12 px/s scaled by 31/64 it advances 0.58 and 0.38 px per 66 ms panel
+    // row refresh, so about a quarter of refreshes now repeat the previous
+    // picture exactly where none did before. That is inherent to slowing a
+    // whole pixel scroll and not something the rate constant can avoid.
+    const float t = static_cast<float>(tMs) * speedMul(p[0]) * (31.0f / 64.0f);
     const float ang = (static_cast<int>(p[3]) - 50) * (2.8f / 50.0f);
     const float ca = cosf(ang), sa = sinf(ang);
     const float vx = 18.0f * ca - 12.0f * sa;

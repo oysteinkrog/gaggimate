@@ -493,7 +493,7 @@ function gradLUT(stops) { // stops: [[t0..255, r, g, b], ...] -> Uint8Array 256*
     },
     render(data, w, h, tMs, p, state) {
       const [speed, scale, glow, spread, twist, wobble, vignette, grain] = p;
-      const omega0 = 2*Math.PI / 55000 * speedMulJS(speed); // 55s base drift at 50
+      const omega0 = 2*Math.PI / 11650 * speedMulJS(speed); // 11.65s base drift at 50 (gm-33fm)
       const k0 = 0.008 + 0.022*(scale/100);
       const contrastExp = 0.6 + 2.0*(glow/100);
       // Same mappings as AnimSilk.cpp's frame(): every default is a factor of
@@ -1103,7 +1103,7 @@ ANIMS.push({
       const count = Math.round(15 + (p[1]/100)*25);
       if (state.built !== count) { buildSwarm(w, h, state, count); state._gen = -1; }
       if (state._gen !== THEME.gen) { this.rebuildTheme(w, h, state); state._gen = THEME.gen; }
-      const speed = speedMulJS(p[0]);
+      const speed = speedMulJS(p[0]) * (29/64); // gm-33fm speed calibration
       const glow = 0.7 + (p[2]/100)*0.8;
       const shimAmt = p[3]/100;
       // Multiplier on a constant this animation used to hard-code: lo at 0,
@@ -2142,7 +2142,7 @@ function bayerOffsets(dithOff, amp, unit) {
    one column's brightness ran the whole height of the panel. Each tile now
    carries its own level in a small two-dimensional table (at most 20 by 20,
    rebuilt per frame) driven by a cubed raised sine, so most tiles sit dark and
-   only a few are lit at any moment; they ease over 10 to 26 s at a per-tile
+   only a few are lit at any moment; they ease over 16 to 44 s at a per-tile
    rate under a slow diagonal wash. The tiles are large, about 110 px, and they
    no longer meet at a step: each axis carries the two tiles a pixel lies
    between and a smoothstep weight, so a tile crossfades into its neighbour over
@@ -2248,7 +2248,7 @@ function bayerOffsets(dithOff, amp, unit) {
           s = nextRand32(s); state.tRate[i] = 4 + (s % 8);
         }
       }
-      const sp = 4 + Math.floor(p[0] * 44 / 100);
+      const sp = 2 + Math.floor(p[0] * 28 / 100); // gm-33fm speed calibration, was 4 + p*44/100
       const base = ((t * sp) >>> 0);
       const phW1 = base >>> 9, phW2 = ((base * 3) >>> 0) >>> 10;
       const amp = 1900 + Math.floor(p[2] * 1700 / 100);
@@ -3356,7 +3356,7 @@ const pa_dith = (x, y) => (BAYER8[(y & 7) * 8 + (x & 7)] - 31.5) * (1 / 64);
           state.fall[d] = Math.round(lo + (178 - lo) * Math.pow(1 - u, expo));
         }
       }
-      const spd = speedMulJS(p[0]);
+      const spd = speedMulJS(p[0]) * (15/4); // gm-33fm speed calibration
       const t = tMs * spd;
       // k2 is the sharpest harmonic the 128 angle steps carry without striping
       // at the bottom edge; the knob runs it from 16 to 32 around the spec's 24.
@@ -3952,7 +3952,7 @@ const pa_dith = (x, y) => (BAYER8[(y & 7) * 8 + (x & 7)] - 31.5) * (1 / 64);
         }
       }
       const { rowView, obit, scan, dith, pal } = state;
-      const t = tMs * speedMulJS(p[0]);
+      const t = tMs * speedMulJS(p[0]) * (31/64); // gm-33fm speed calibration
       // 18 and 12 px/s, not the spec's 12 and 8. A tile blit scrolls in
       // whole pixels, so at 12 px/s and 30 fps half the frames repeat and
       // the field creeps in visible steps. At 18 px/s two frames in three
@@ -4667,7 +4667,7 @@ function pcDither(dst, amp) {
       const pal32 = state.pal32, buf = state.buf, tail = state.tail;
       const colTerm = state.colTerm, ctPh = state.ctPh, rowTerm = state.rowTerm;
       const dith = state.dith, stamp = state.stamp;
-      const sm = speedMulJS(p[0]);
+      const sm = speedMulJS(p[0]) * (7/2); // gm-33fm speed calibration
       const tt = tMs * sm;
 
       // Ground: two sines per axis, drifting, in the mid-dark band.
@@ -5308,7 +5308,8 @@ function pcDither(dst, amp) {
 
 /* ---- D1: Barrel Roll (astra_brainstorm.txt candidate 5) ----
    Wide diagonal bands wrapped around a shaded vertical cylinder, climbing
-   at 16 px/s with a 32 s period, exactly as the candidate specifies.
+   at 50 px/s with a 10.24 s period (gm-33fm speed calibration; the candidate
+   specified 16 px/s and a 32 s period).
    Column table is baked on the first frame and again whenever one of the
    four geometry sliders moves: the arcsine angle phase and the cosine
    shade with a smooth edge fade, packed side by side (the firmware packs
@@ -5333,7 +5334,7 @@ function pcDither(dst, amp) {
   const PERIOD = 131072;        // 17-bit fold, as the candidate specifies
   const HALF = PERIOD >> 1;
   const IDX_LO = 22;            // darkest edge of the cylinder
-  const CLIMB_PX_S = 16;        // candidate: climbs at about 16 px/s
+  const CLIMB_PX_S = 50;        // gm-33fm: 3.125x the candidate's 16 px/s
   const ROW_STEP_DEF = 256;     // Band tilt 50: 512 rows per band, 32 s period
   const FOLD_SPAN = 24576;      // the fold's whole contribution to the height
   const CREST = 8738 + FOLD_SPAN; // the height Band depth pins the crest to

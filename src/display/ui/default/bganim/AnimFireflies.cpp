@@ -213,7 +213,13 @@ void frame(uint32_t tMs, int w, int h, const uint8_t p[BG_ANIM_PARAMS]) {
         lastThemeGen = themeGen();
     }
     ffCount = count;
-    const float speed = speedMul(p[0]);
+    // Speed calibration (gm-33fm): the swarm's half change time was 543 ms,
+    // 2.2 times faster than the fleet target of 1200 ms at Speed 50. 29/64 is
+    // the slowdown that lands on 1198 ms, and it is a dyadic fraction, so the
+    // firmware float and the page's double hold exactly the same value. The
+    // factor rides on the same time scale the Speed slider already drives, so
+    // drift, pulse and shimmer all slow together and nothing else moves.
+    const float speed = speedMul(p[0]) * (29.0f / 64.0f);
     const float glow = 0.7f + (p[2] / 100.0f) * 0.8f;
     const float shimAmt = p[3] / 100.0f;
     // Swarm radius about the panel centre: 0.35 (a tight knot in the middle)

@@ -684,7 +684,14 @@ constexpr float TURN = 4294967296.0f / 6.2831853f;
 // 50 and p/80.0f exactly 1.0f at 80, `0.15f * 1.0f` is 0.15f, and adding a
 // term multiplied by (1.0f - 1.0f) leaves the operand alone.
 void frame(uint32_t tMs, int, int, const uint8_t p[BG_ANIM_PARAMS]) {
-    const float omega0 = 6.2831853f / 55000.0f * speedMul(p[0]); // 55s base drift at speed 50
+    // Speed calibration (gm-33fm): the base drift period was 55000 ms, which
+    // put the picture's half change time at 5660 ms, 4.7 times the fleet
+    // target of 1200 ms at Speed 50. 11650 ms is that period divided by
+    // 4.721. Only the rate moved: omega0 feeds the wave travel and the twist
+    // rotation exactly as before, the pixel loop and the kernel read the same
+    // kx, ky and wt, and the three breathe periods are untouched, which is
+    // what the Speed slider itself has always done.
+    const float omega0 = 6.2831853f / 11650.0f * speedMul(p[0]); // 11.65s base drift at speed 50
     const float k0 = 0.008f + 0.022f * (p[1] / 100.0f);
     // "spread": how far apart the three waves point. 1.0 leaves each wave's
     // tuned heading alone; 0 collapses all three onto SPREAD_MID, which

@@ -347,7 +347,16 @@ void frame(uint32_t tMs, int w, int h, const uint8_t p[BG_ANIM_PARAMS]) {
         top = 196 + (static_cast<int>(p[2]) * 55 + 50) / 100;
         lastTailKey = tailKey;
     }
-    const float tt = static_cast<float>(tMs) * speedMul(p[0]);
+    // Speed calibration (gm-33fm): the figure's half change time on the low
+    // pass metric was 3558 ms, 3.0 times slower than the fleet target of
+    // 1200 ms at Speed 50. A factor of 7/2 is the measured landing at
+    // 1214 ms, and it is exact in float and double. It moves only the six phases tt feeds, so
+    // the figure's shape, amplitude and lobe count are the same curve drawn
+    // at a higher rate. The sample count is fixed at NS whatever the rate,
+    // so the stamp pass costs the same; the only frame() cost that moves is
+    // the clear, whose union of the previous and current curve box grows a
+    // little because the figure turns further between frames.
+    const float tt = static_cast<float>(tMs) * speedMul(p[0]) * (7.0f / 2.0f);
     const uint32_t g1 = phase(tt, 0.0170f), g2 = phase(tt, 0.0119f);
     const uint32_t g3 = phase(tt, 0.0098f), g4 = phase(tt, 0.0145f);
     // Vignette scales the half quadratic each axis subtracts, which is what
