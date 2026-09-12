@@ -365,17 +365,51 @@ function gradLUT(stops) { // stops: [[t0..255, r, g, b], ...] -> Uint8Array 256*
 
 /* ---- 1: Lava (anim-fluid) ---- */
 (() => {
+  // This entry mirrors AnimLava.cpp step for step (gm-pciz, 2026-09-12), so
+  // the page and the device draw the same pixels. What the firmware does
+  // that the first version of this entry did not:
+  //  - it evaluates one row of each vertical pair and duplicates it into the
+  //    row below (ySrc = y & ~1), with the Bayer row phase keyed on the pair,
+  //    (y >> 1) & 3. The pairing cut the device's frame from 19.1 ms to
+  //    10.1 ms (kb.py, see the firmware's 2026-09-05 note) and is the one
+  //    departure from the design the device budget forces;
+  //  - it reads the falloff curve out of a 512-bucket table indexed by tt in
+  //    Q12.20, walked by forward differencing, so tt is quantised to the
+  //    bucket midpoint;
+  //  - it keeps the field in integer palette-index units, caps it at 255,
+  //    then adds an integer ordered dither of one index unit (the amplitude
+  //    this design always had) and clamps;
+  //  - blob positions and radii come from the 256-entry float cosine table
+  //    (fastSinRad), and every float step is rounded to single precision
+  //    with F, in the order the C++ evaluates it.
+  const FIXED_SCALE = 1048576;       // 1 << 20
+  const LUT_HALF = 512, LUT_MARGIN = 64, LUT_OFFSET = LUT_HALF + LUT_MARGIN;
+  const LUT_SIZE = 2 * LUT_HALF + 2 * LUT_MARGIN, LUT_SHIFT = 11;
+  const kFieldScale = 159.375;  // 0.625f * 255.0f, exact in float
+  const kIndexCap = 255;
   // Contrast: index i reads the colour that sat at 128 + (i-128)*gain, the
   // same remap AnimLava.cpp applies to its palette LUT. gain 1 is identity.
   function palContrast(pal, gain) {
     if (gain === 1) return pal;
     const out = new Uint8Array(256 * 3);
     for (let i = 0; i < 256; i++) {
-      let j = Math.round(128 + (i - 128) * gain);
+      const f = F(128 + F(F(i - 128) * gain));
+      let j = Math.trunc(F(f + 0.5));
       if (j < 0) j = 0; else if (j > 255) j = 255;
       out[i*3] = pal[j*3]; out[i*3+1] = pal[j*3+1]; out[i*3+2] = pal[j*3+2];
     }
     return out;
+  }
+  // bganim ordered dither in index units: (BAYER - 7.5) * (amp / 7.5) rounded
+  // half away from zero, at the design's amplitude of one index unit.
+  function ditherLUT() {
+    const lut = new Int32Array(16);
+    const k = F(1.0 / 7.5);
+    for (let i = 0; i < 16; i++) {
+      const d = F(F(BAYER4[i] - 7.5) * k);
+      lut[i] = Math.trunc(d >= 0 ? F(d + 0.5) : F(d - 0.5));
+    }
+    return lut;
   }
   ANIMS.push({
     id: 'lava', name: 'Lava',
@@ -388,83 +422,108 @@ function gradLUT(stops) { // stops: [[t0..255, r, g, b], ...] -> Uint8Array 256*
       state.blobs = [];
       // Eight definitions, of which the count param picks the first 2 to 8
       // (six at the default), matching NUM_BLOBS in AnimLava.cpp.
+      const m = Math.min(w, h);
       for (let i = 0; i < 8; i++) {
-        const ga = i * 2.39996323;
+        const ga = F(i * F(2.39996323));
         state.blobs.push({
-          cx: w*0.5 + w*0.28*Math.cos(ga), cy: h*0.5 + h*0.28*Math.sin(ga*1.3),
-          fx1: 0.55+0.11*i, fx2: 1.41421356*(0.35+0.05*i),
-          fy1: 0.63+0.09*((i*3)%5), fy2: 1.73205081*(0.30+0.04*i),
-          ax1: w*0.14, ax2: w*0.07, ay1: h*0.14, ay2: h*0.07,
-          px1: ga, px2: ga*2.1, py1: ga*1.7, py2: ga*0.6,
-          R0: Math.min(w,h)*0.19, Rpulse: Math.min(w,h)*0.05,
-          wR: 0.00011+0.00003*i, phR: ga*2.7,
+          cx: F(F(w * F(0.5)) + F(F(w * F(0.28)) * F(Math.cos(ga)))),
+          cy: F(F(h * F(0.5)) + F(F(h * F(0.28)) * F(Math.sin(F(ga * F(1.3)))))),
+          fx1: F(F(0.55) + F(F(0.11) * i)), fx2: F(F(1.41421356) * F(F(0.35) + F(F(0.05) * i))),
+          fy1: F(F(0.63) + F(F(0.09) * ((i * 3) % 5))), fy2: F(F(1.73205081) * F(F(0.30) + F(F(0.04) * i))),
+          ax1: F(w * F(0.14)), ax2: F(w * F(0.07)), ay1: F(h * F(0.14)), ay2: F(h * F(0.07)),
+          px1: ga, px2: F(ga * F(2.1)), py1: F(ga * F(1.7)), py2: F(ga * F(0.6)),
+          R0: F(m * F(0.19)), Rpulse: F(m * F(0.05)),
+          wR: F(F(0.00011) + F(F(0.00003) * i)), phR: F(ga * F(2.7)),
         });
       }
-      state.field = new Float32Array(w * h);
+      state.field = new Int32Array(w);
+      state.lut = new Int16Array(LUT_SIZE);
+      state.dith = ditherLUT();
       state._gen = -1;
       state._gain = -1;
     },
     render(data, w, h, tMs, p, state) {
       const [speed, scale, glow, count, core, falloff, contrast, wander] = p;
       // Speed calibration (gm-33fm). The whole clock is multiplied, both the
-      // orbit rate below and the radius pulse further down, so the picture
-      // sequence is the one this entry always drew and only the pace changes.
-      // 4.0 is an exact binary fraction, so the page's double clock and the
-      // firmware's float clock scale by the same amount.
+      // orbit rate below and the radius pulse further down. 4.0 is an exact
+      // binary fraction, so the page's clock and the firmware's float clock
+      // scale by the same amount.
       const RATE_CAL = 4.0;
-      const omega0 = 2*Math.PI / 45000 * speedMulJS(speed); // 45s base cycle at 50
-      const sizeMul = 0.6 + (scale/100);
-      const intensity = 0.5 + (glow/100)*1.3;
+      const omega0 = F(F(F(6.2831853) / 45000) * speedMulF(speed)); // 45s base cycle at 50
+      const sizeMul = F(F(0.6) + F(scale / 100));
+      const intensity = F(F(0.5) + F(F(glow / 100) * F(1.3)));
       const nBlobs = 2 + Math.floor((count*6 + 50)/100);   // 2..8, 6 at def 67
-      const coreW = core/100*1.2;                          // 0..1.2, 0.6 at def 50
+      const coreW = F(F(core / 100) * F(1.2));             // 0..1.2, 0.6 at def 50
       const falloffExp = 1 + Math.floor(falloff*5/100);    // 1..6, 3 at def 40
-      const gain = 0.5 + contrast/100;                     // 0.5..1.5, 1 at def 50
-      const wanderMul = wander/50;                         // 0..2, 1 at def 50
+      const gain = F(F(0.5) + F(contrast / 100));          // 0.5..1.5, 1 at def 50
+      const wanderMul = F(wander / 50);                    // 0..2, 1 at def 50
       if (state._gen !== THEME.gen || state._gain !== gain) {
         state.pal = palContrast(themeRamp(), gain);
         state._gen = THEME.gen; state._gain = gain;
       }
-      const pal = state.pal;
-      const tCal = tMs * RATE_CAL;
-      const t = tCal * omega0;
+      const pal = state.pal, lut = state.lut, dith = state.dith, field = state.field;
+      // Falloff table: bucket midpoints of tt in (0, 1], clamped above 1,
+      // zero below 0, in palette-index units, rounded.
+      const bucket = F(1.0 / LUT_HALF), seven = F(0.7);
+      for (let q = 0; q < LUT_SIZE; q++) {
+        const shifted = q - LUT_OFFSET;
+        if (shifted < 0) { lut[q] = 0; continue; }
+        let tt = F(F(shifted + 0.5) * bucket);
+        if (tt > 1) tt = 1;
+        let t3 = tt;
+        for (let k = 1; k < falloffExp; k++) t3 = F(t3 * tt);
+        const coreTerm = tt > seven ? F(F(F(t3 * t3) * intensity) * coreW) : 0;
+        const contribution = F(F(F(t3 * intensity) + coreTerm) * kFieldScale);
+        lut[q] = Math.trunc(F(contribution + 0.5));
+      }
+      const tCal = F(tMs * RATE_CAL);
+      const t = F(tCal * omega0);
       const live = state.blobs.slice(0, nBlobs);
       for (const b of live) {
-        const ax1 = b.ax1*wanderMul, ax2 = b.ax2*wanderMul;
-        const ay1 = b.ay1*wanderMul, ay2 = b.ay2*wanderMul;
-        b.bx = b.cx + ax1*Math.sin(t*b.fx1+b.px1) + ax2*Math.sin(t*b.fx2*1.7+b.px2);
-        b.by = b.cy + ay1*Math.cos(t*b.fy1*1.13+b.py1) + ay2*Math.sin(t*b.fy2*0.9+b.py2);
-        const R = (b.R0 + b.Rpulse*Math.sin(tCal*b.wR + b.phR)) * sizeMul;
-        b.R2 = R*R; b.invR2 = 1/b.R2;
+        const ax1 = F(b.ax1*wanderMul), ax2 = F(b.ax2*wanderMul);
+        const ay1 = F(b.ay1*wanderMul), ay2 = F(b.ay2*wanderMul);
+        b.bx = F(F(b.cx + F(ax1 * fastSinRad(F(F(t*b.fx1) + b.px1)))) +
+                 F(ax2 * fastSinRad(F(F(F(t*b.fx2) * F(1.7)) + b.px2))));
+        b.by = F(F(b.cy + F(ay1 * fastCosRad(F(F(F(t*b.fy1) * F(1.13)) + b.py1)))) +
+                 F(ay2 * fastSinRad(F(F(F(t*b.fy2) * F(0.9)) + b.py2))));
+        const R = F(F(b.R0 + F(b.Rpulse * fastSinRad(F(F(tCal*b.wR) + b.phR)))) * sizeMul);
+        b.R2 = F(R*R); b.invR2 = F(1/b.R2);
+        b.step2Q = lround(F(F(-2 * b.invR2) * FIXED_SCALE));
+        let xlo = Math.trunc(F(b.bx - R)), xhi = Math.trunc(F(b.bx + R));
+        if (xlo < 0) xlo = 0;
+        if (xhi > w - 1) xhi = w - 1;
+        b.xlo = xlo; b.xhi = xhi;
       }
-      const field = state.field;
-      field.fill(0);
-      for (const b of live) {
-        const half0 = Math.sqrt(b.R2);
-        const ylo = Math.max(0, Math.floor(b.by-half0)), yhi = Math.min(h-1, Math.ceil(b.by+half0));
-        for (let y = ylo; y <= yhi; y++) {
-          const dy = y-b.by, dy2 = dy*dy;
+      // One row of each pair is evaluated, the other is its copy.
+      let prevSrc = -1;
+      for (let y = 0; y < h; y++) {
+        const ySrc = y & ~1, phase = (y >> 1) & 3, rowOff = y * w * 4;
+        if (ySrc === prevSrc) {
+          data.copyWithin(rowOff, rowOff - w * 4, rowOff);
+          continue;
+        }
+        prevSrc = ySrc;
+        field.fill(0);
+        for (const b of live) {
+          const dy = F(ySrc - b.by), dy2 = F(dy*dy);
           if (dy2 >= b.R2) continue;
-          const half = Math.sqrt(b.R2-dy2);
-          const xlo = Math.max(0, Math.floor(b.bx-half)), xhi = Math.min(w-1, Math.ceil(b.bx+half));
-          const rowOff = y*w;
-          for (let x = xlo; x <= xhi; x++) {
-            const dx = x-b.bx, tt = 1 - (dx*dx+dy2)*b.invR2;
-            if (tt <= 0) continue;
-            let t3 = tt;
-            for (let k = 1; k < falloffExp; k++) t3 *= tt;
-            field[rowOff+x] += t3*intensity + (tt > 0.7 ? t3*t3*intensity*coreW : 0);
+          const dx0 = F(b.xlo - b.bx);
+          const tt0f = F(1 - F(b.invR2 * F(dy2 + F(dx0*dx0))));
+          const step0f = F(F(-b.invR2) * F(F(2*dx0) + 1));
+          let ttQ = Math.trunc(F(F(tt0f * FIXED_SCALE) + (tt0f >= 0 ? 0.5 : -0.5))) | 0;
+          let stepQ = Math.trunc(F(F(step0f * FIXED_SCALE) + (step0f >= 0 ? 0.5 : -0.5))) | 0;
+          const step2Q = b.step2Q;
+          for (let x = b.xlo; x <= b.xhi; x++) {
+            field[x] += lut[(ttQ >> LUT_SHIFT) + LUT_OFFSET];
+            ttQ = (ttQ + stepQ) | 0;
+            stepQ = (stepQ + step2Q) | 0;
           }
         }
-      }
-      for (let y = 0; y < h; y++) {
-        const rowOff = y*w;
+        const dRow = phase * 4;
         for (let x = 0; x < w; x++) {
-          let f = field[rowOff+x];
-          if (f > 1.6) f = 1.6;
-          const dith = (BAYER4[(y&3)*4+(x&3)]/16-0.5)*(1/128);
-          let idx = Math.round((f/1.6+dith)*255);
+          let idx = (field[x] < kIndexCap ? field[x] : kIndexCap) + dith[dRow + (x & 3)];
           if (idx < 0) idx = 0; else if (idx > 255) idx = 255;
-          const o = (rowOff+x)*4;
+          const o = rowOff + x * 4;
           data[o] = pal[idx*3]; data[o+1] = pal[idx*3+1]; data[o+2] = pal[idx*3+2]; data[o+3] = 255;
         }
       }
@@ -932,68 +991,236 @@ ANIMS.push({
 });
 
 /* ---- 7: Mandala (anim-geometric) ---- */
-ANIMS.push({
-  id: 'mandala', name: 'Mandala',
-  params: [
-    {key:'speed',label:'Speed',def:50},{key:'symmetry',label:'Symmetry',def:50},
-    {key:'complexity',label:'Complexity',def:45},{key:'drift',label:'Ring drift',def:50},
-    {key:'vignette',label:'Vignette',def:50},{key:'breathe',label:'Breathe',def:50},
-    {key:'contrast',label:'Contrast',def:50},{key:'rings',label:'Ring pitch',def:50}],
-  init(w, h, state) {
-    state._gen = -1;
-  },
-  render(data, w, h, tMs, p, state) {
-    if (state._gen !== THEME.gen) {
-      state.pal = themeRamp();
-      state.outside = themeRGB(0);
-      state._gen = THEME.gen;
+(() => {
+  // This entry mirrors AnimMandala.cpp step for step (gm-pciz, 2026-09-12),
+  // so the page and the device draw the same pixels. The picture is the one
+  // this entry always described,
+  //   v = sin(N*theta + rn*7*turb - 1.4t)
+  //     + 0.55*cos(2N*theta - rn*4.5*turb*ringScale + 0.8t)
+  //     + 0.3*sin(3N*theta + rn*3*turb + 0.5t)        (complexity > 60)
+  //     + 0.4*sin(rn*9 - t),
+  //   rescaled to 0..1, contrast about 0.5, times breathe, times
+  //   (0.30 + 0.70*vignette), through the theme ramp,
+  // evaluated the way the device evaluates it: the angle in 512ths of a
+  // turn from a reciprocal table and an atan polynomial, the radius in
+  // 2-pixel buckets, Q7 sine tables, the radial terms baked per frame into
+  // a per-bucket table, and the sample chain run on the top-left pixel of
+  // every 2x2 block with the other three pixels blended from the pre-palette
+  // magnitude (the centre 64x64 square at full resolution). Every float
+  // step is rounded to single precision with F, in the order the C++
+  // evaluates it, and the sliders take the device's integer forms (floor
+  // for N, Q8 for the vignette depth).
+  const ANG_N = 512, ANG_MASK = 511, OCT_MAX = 128;
+  const R_BITS = 7, R_MASK = 127, R_ENTRIES = 128, OUTSIDE_R = 127;
+  const AMP_A = 127, AMP_B = 70, AMP_C = 38, AMP_D = 51, D_BIAS = 64;
+  const VMAX2 = AMP_A + AMP_B + AMP_D, VMAX3 = VMAX2 + AMP_C;
+  const INNER_BAND = 32, INNER_HALF_W = 32;
+  const WRAP_GUARD = 48;
+  function buildTables(w, h, st) {
+    st.sinA = new Int16Array(ANG_N); st.sinB = new Int16Array(ANG_N); st.sinC = new Int16Array(ANG_N);
+    const twoPi = F(6.2831853), kB = F(F(0.55) * 127), kC = F(F(0.3) * 127);
+    for (let i = 0; i < ANG_N; i++) {
+      const s = F(Math.sin(F(F(i * twoPi) / ANG_N)));
+      st.sinA[i] = lround(F(127 * s)); st.sinB[i] = lround(F(kB * s)); st.sinC[i] = lround(F(kC * s));
     }
-    const N = Math.max(3, Math.round(4 + (p[1]/100)*8));
-    const turb = 0.25 + (p[2]/100)*1.1;
-    // 0.35 was the base rate; 1.75 is the speed calibration (gm-33fm), an
-    // exact binary fraction so the page's double clock and the firmware's
-    // float clock scale alike. Every term below reads this one clock, so the
-    // picture sequence is unchanged and only the pace moves.
-    const t = tMs*0.001*0.35*1.75*speedMulJS(p[0]);
-    const threeLayers = p[2] > 60;
-    const cx = w/2, cy = h/2, maxR = Math.min(w,h)*0.5;
-    const pal = state.pal, outside = state.outside;
-    // The five sliders added on 2026-09-10 (gm-3vj.10). Each is 1x, or 0,
-    // at 50, so the default picture here is the one this entry drew before
-    // them, the same way AnimMandala.cpp's defaults reproduce its own.
-    const spinTurns = t*0.35*((p[3]-50)/50);
-    const bAmp = 0.18*(p[5]/50);
-    const vigStr = p[4]/50;
-    const kC = p[6] <= 50 ? (64 + (p[6]*192)/50)/256 : (256 + ((p[6]-50)*768)/50)/256;
-    const ringScale = (p[7] <= 50 ? (p[7]*60)/50 : 60 + ((p[7]-50)*120)/50)/60;
-    const breathe = (1-bAmp) + bAmp*Math.sin(t*0.45);
-    const norm = 1 + 0.55 + (threeLayers ? 0.3 : 0) + 0.4;
-    let idx = 0;
-    for (let y = 0; y < h; y++) {
-      const dy = y-cy;
-      for (let x = 0; x < w; x++) {
-        const dx = x-cx;
-        const rn = Math.sqrt(dx*dx+dy*dy)/maxR;
-        if (rn > 1) { data[idx]=outside[0]; data[idx+1]=outside[1]; data[idx+2]=outside[2]; data[idx+3]=255; idx += 4; continue; }
-        const theta = Math.atan2(dy, dx) + spinTurns*2*Math.PI;
-        let v = Math.sin(N*theta + rn*7.0*turb - t*1.4);
-        v += 0.55*Math.cos(N*2*theta - rn*4.5*turb*ringScale + t*0.8);
-        if (threeLayers) v += 0.3*Math.sin(N*3*theta + rn*3.0*turb + t*0.5);
-        v += 0.4*Math.sin(rn*9.0 - t*1.0);
-        v = (v/norm)*0.5 + 0.5;
-        v = Math.min(1, Math.max(0, 0.5 + (v-0.5)*kC));
-        const vig = Math.max(0, 1 - (1-Math.pow(1-rn, 0.55))*vigStr);
-        v *= breathe*(0.30 + 0.70*vig);
-        const li = (Math.min(1, Math.max(0, v))*255)|0;
-        data[idx]   = pal[li*3];
-        data[idx+1] = pal[li*3+1];
-        data[idx+2] = pal[li*3+2];
-        data[idx+3] = 255;
-        idx += 4;
+    const cx = w >> 1, mapDim = cx + 1, qDim = (cx >> 1) + 1;
+    st.cx = cx; st.mapDim = mapDim; st.qDim = qDim;
+    const recip = new Uint32Array(241);
+    for (let i = 0; i < 241; i++) recip[i] = lround(F(65536 / (i + 1)));
+    const rMax = cx >> 1;
+    st.vigByR = new Uint8Array(R_ENTRIES);
+    for (let r = 0; r < R_ENTRIES; r++) {
+      const rr = r < rMax ? r : rMax;
+      st.vigByR[r] = lround(F(255 * F(Math.pow(F(1 - F(rr / rMax)), F(0.55)))));
+    }
+    const kInv = F(1 / 65536), c1 = F(0.9817), c2 = F(0.1963), kOct = F(256 / F(3.14159265));
+    const octantAngle = (ax, ay) => {
+      const swap = ax < ay, hi = swap ? ay : ax, lo = swap ? ax : ay;
+      if (hi === 0) return 0;
+      const ratio = F((lo * recip[hi - 1]) * kInv);
+      const ang = F(ratio * F(c1 - F(F(c2 * ratio) * ratio)));
+      let oct = Math.trunc(F(ang * kOct));
+      if (swap) oct = OCT_MAX - oct;
+      return oct;
+    };
+    st.map = new Uint16Array(mapDim * mapDim);
+    st.mapQ = new Uint16Array(qDim * qDim);
+    const maxR2 = cx * cx;
+    for (let ay = 0; ay < mapDim; ay++) for (let ax = 0; ax < mapDim; ax++) {
+      const r2 = ax * ax + ay * ay;
+      const rOrOut = r2 > maxR2 ? OUTSIDE_R : lround(F(F(Math.sqrt(r2)) * 0.5));
+      const entry = (octantAngle(ax, ay) << R_BITS) | rOrOut;
+      st.map[ay * mapDim + ax] = entry;
+      if ((ax & 1) === 0 && (ay & 1) === 0) st.mapQ[(ay >> 1) * qDim + (ax >> 1)] = entry;
+    }
+    st.rParams = new Uint32Array(R_ENTRIES).fill(D_BIAS << 25 >>> 0);
+    st.rParamsC = new Uint16Array(R_ENTRIES);
+    st.rescale = new Uint8Array(2 * VMAX3 + 1);
+    st.sample = new Uint8Array(cx);
+    st.sampleY = null;
+    st.row0 = new Uint16Array(w); st.row1 = new Uint16Array(w);
+  }
+  function buildRescale(st, kC, vmax) {
+    const span = 2 * vmax + 1, lut = st.rescale;
+    for (let i = 0; i < span; i++) {
+      const lin = Math.floor((i * 255) / (2 * vmax));
+      let v = 128 + Math.trunc(F(F(lin - 128) * kC));
+      if (v < 0) v = 0; else if (v > 255) v = 255;
+      lut[i] = v;
+    }
+    st.rescaleOff = vmax - D_BIAS;
+  }
+  // The per-sample chain, a magnitude in 0..254.
+  function index(st, oct, r, gN_eff, halfOffset) {
+    const base = halfOffset + oct * gN_eff;
+    const params = st.rParams[r];
+    const A = params & ANG_MASK, B = (params >>> 9) & ANG_MASK, vig = (params >>> 18) & 0x7F, dB = params >>> 25;
+    let v = st.sinA[(base + A) & ANG_MASK] + st.sinB[(2 * base + B) & ANG_MASK] + dB;
+    if (st.three) v += st.sinC[(3 * base + st.rParamsC[r]) & ANG_MASK];
+    v = st.rescale[v + st.rescaleOff];
+    return (v * vig) >> 7;
+  }
+  // Every even column of an even row y, one magnitude per 2-pixel block.
+  function sampleRow(st, y, w) {
+    if (st.sampleY === y) return st.sample;
+    const cx = w >> 1, dy = y - cx, ay = dy < 0 ? -dy : dy, sy = dy < 0;
+    const rowBase = (ay >> 1) * st.qDim, out = st.sample;
+    const gL = sy ? st.N : -st.N, gR = sy ? -st.N : st.N;
+    const nL = cx >> 1, nR = (w - cx) >> 1;
+    for (let i = 0; i < nL; i++) {
+      const e = st.mapQ[rowBase + (st.cx >> 1) - i];
+      out[i] = index(st, e >> R_BITS, e & R_MASK, gL, st.halfOffL);
+    }
+    for (let i = 0; i < nR; i++) {
+      const e = st.mapQ[rowBase + i];
+      out[nL + i] = index(st, e >> R_BITS, e & R_MASK, gR, st.halfOffR);
+    }
+    st.sampleY = y;
+    return out;
+  }
+  // Every pixel of row y through the full chain, into idx[] (palette
+  // indices), over the columns [x0, x0 + count) walking the full map.
+  function fullRun(st, idx, x0, y, w, count) {
+    const cx = w >> 1, dy = y - cx, ay = dy < 0 ? -dy : dy, sy = dy < 0;
+    const rowBase = ay * st.mapDim;
+    for (let i = 0; i < count; i++) {
+      const x = x0 + i, dx = x - cx, ax = dx < 0 ? -dx : dx, sx = dx < 0;
+      const e = st.map[rowBase + ax];
+      const g = sx === sy ? st.N : -st.N;
+      idx[x] = index(st, e >> R_BITS, e & R_MASK, g, sx ? st.halfOffL : st.halfOffR);
+    }
+  }
+  function emit(data, o, pal, li) {
+    const q = li * 3;
+    data[o] = pal[q]; data[o + 1] = pal[q + 1]; data[o + 2] = pal[q + 2]; data[o + 3] = 255;
+  }
+  ANIMS.push({
+    id: 'mandala', name: 'Mandala',
+    params: [
+      {key:'speed',label:'Speed',def:50},{key:'symmetry',label:'Symmetry',def:50},
+      {key:'complexity',label:'Complexity',def:45},{key:'drift',label:'Ring drift',def:50},
+      {key:'vignette',label:'Vignette',def:50},{key:'breathe',label:'Breathe',def:50},
+      {key:'contrast',label:'Contrast',def:50},{key:'rings',label:'Ring pitch',def:50}],
+    init(w, h, state) {
+      state._gen = -1;
+      state._contrast = -1;
+      state._three = null;
+      buildTables(w, h, state);
+      state.top = new Uint8Array(w >> 1);
+      state.bot = new Uint8Array(w >> 1);
+      state.idx = new Uint8Array(w);
+    },
+    render(data, w, h, tMs, p, state) {
+      const st = state;
+      if (st._gen !== THEME.gen) {
+        st.pal = themeRamp();
+        st._gen = THEME.gen;
       }
-    }
-  },
-});
+      st.N = 4 + Math.floor((p[1] * 8 + 50) / 100);
+      const sxOffset = (st.N & 1) ? ANG_N / 2 : 0;
+      // 0.35 was the base rate; 1.75 is the speed calibration (gm-33fm), an
+      // exact binary fraction so the page's clock and the firmware's float
+      // clock scale alike. Every term below reads this one clock.
+      const t = F(F(F(F(F(tMs) * F(0.001)) * F(0.35)) * 1.75) * speedMulF(p[0]));
+      const turb = F(F(0.25) + F(F(p[2] / 100) * F(1.1)));
+      st.three = p[2] > 60;
+      if (p[6] !== st._contrast || st.three !== st._three) {
+        const kC = p[6] <= 50 ? F(F(64 + F(F(p[6] * 192) / 50)) / 256)
+                              : F(F(256 + F(F((p[6] - 50) * 768) / 50)) / 256);
+        buildRescale(st, kC, st.three ? VMAX3 : VMAX2);
+        st._contrast = p[6]; st._three = st.three;
+      }
+      const ringScale = F((p[7] <= 50 ? F(F(p[7] * 60) / 50) : F(60 + F(F((p[7] - 50) * 120) / 50))) / 60);
+      const K512 = F(512 / F(6.2831853));
+      const stepA = F(F(F(7 * turb) / 120) * K512);
+      const stepB = F(F(F(F(F(4.5) * turb) * ringScale) / 120) * K512);
+      const stepC = F(F(F(3 * turb) / 120) * K512);
+      const phA = F(F(t * F(1.4)) * K512);
+      const phB = F(F(F(t * F(0.8)) * K512) + 128);
+      const phC = F(F(t * F(0.5)) * K512);
+      let steepest = stepA > stepB ? stepA : stepB;
+      if (st.three && stepC > steepest) steepest = stepC;
+      const fine = F(steepest * 0.5) >= WRAP_GUARD;
+      const driftRate = F((p[3] - 50) / 50);
+      const driftQ = Math.trunc(F(F(F(t * F(0.35)) * driftRate) * ANG_N)) & ANG_MASK;
+      const driftOffset = (driftQ * st.N) & ANG_MASK;
+      st.halfOffL = (sxOffset + driftOffset) & ANG_MASK;
+      st.halfOffR = driftOffset;
+      const breatheAmp = F(F(0.18) * F(p[5] / 50));
+      const breatheQ8 = Math.trunc(F(F(F(1 - breatheAmp) + F(breatheAmp * fastSinRad(F(t * F(0.45))))) * 256));
+      const vigStrengthQ8 = Math.floor((p[4] * 512) / 100);
+      st.sampleY = null;
+      const rMax = st.cx >> 1, k9 = F(9 / 120);
+      for (let r = 0; r <= rMax; r++) {
+        const a = Math.trunc(F(F(r * stepA) - phA)) & ANG_MASK;
+        const b = Math.trunc(F(phB - F(r * stepB))) & ANG_MASK;
+        const c = Math.trunc(F(F(r * stepC) + phC)) & ANG_MASK;
+        const dIdx = Math.trunc(F(F(F(r * k9) - t) * K512)) & ANG_MASK;
+        const d = Math.trunc((st.sinA[dIdx] * 2) / 5) + D_BIAS;
+        let vb = 255 - (((255 - st.vigByR[r]) * vigStrengthQ8) >> 8);
+        if (vb < 0) vb = 0;
+        const vf = Math.floor((765 + 7 * vb) / 10);
+        const vig = (vf * breatheQ8) >> 9;
+        st.rParams[r] = (a | (b << 9) | (vig << 18) | (d << 25)) >>> 0;
+        st.rParamsC[r] = c;
+      }
+      const pal = st.pal, nBlocks = w >> 1, cx = w >> 1, idx = st.idx;
+      if (fine) {
+        for (let y = 0; y < h; y++) {
+          fullRun(st, idx, 0, y, w, w);
+          const o = y * w * 4;
+          for (let x = 0; x < w; x++) emit(data, o + x * 4, pal, idx[x]);
+        }
+        return;
+      }
+      const top = st.top, bot = st.bot;
+      for (let y = 0; y < h; y += 2) {
+        top.set(sampleRow(st, y, w));
+        const bottom = sampleRow(st, y + 2, w);
+        bot.set(bottom);
+        const oT = y * w * 4, oB = oT + w * 4;
+        for (let b = 0; b < nBlocks; b++) {
+          const va = top[b], vb = (b + 1 < nBlocks) ? top[b + 1] : va;
+          const vc = bot[b], vd = (b + 1 < nBlocks) ? bot[b + 1] : vc;
+          const hMidTop = (va + vb) >> 1, hMidBot = (vc + vd) >> 1;
+          emit(data, oT + (2 * b) * 4, pal, va);
+          emit(data, oT + (2 * b + 1) * 4, pal, hMidTop);
+          emit(data, oB + (2 * b) * 4, pal, (va + vc) >> 1);
+          emit(data, oB + (2 * b + 1) * 4, pal, (hMidTop + hMidBot) >> 1);
+        }
+        // The centre square at full resolution.
+        for (let yy = y; yy <= y + 1; yy++) {
+          const dy = yy - cx, ay = dy < 0 ? -dy : dy;
+          if (ay >= INNER_BAND) continue;
+          const kk = INNER_HALF_W < cx ? INNER_HALF_W : cx;
+          fullRun(st, idx, cx - kk, yy, w, 2 * kk);
+          const o = yy * w * 4;
+          for (let x = cx - kk; x < cx + kk; x++) emit(data, o + x * 4, pal, idx[x]);
+        }
+      }
+    },
+  });
+})();
 
 /* ---- 8: Orbits (anim-geometric) ---- */
 (() => {
