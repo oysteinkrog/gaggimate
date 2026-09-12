@@ -35,8 +35,10 @@ import {
 // once, including one of your own gradients, and the whole fleet follows.
 //
 // scope={kind:'anim', animIdx} edits one slot of bgAnimThemeMap, an override
-// for that animation alone. Its first choice is "Same as global", which is
-// what an untouched animation stores, so an override always reads as one.
+// for that animation alone. Its first choice is "Global (<name>)", which is
+// what an untouched animation stores; on that choice the editor collapses to
+// the name and one swatch, so an animation using the default does not look
+// like a second gradient setting sitting under the first.
 //
 // The library itself (bgAnimGradients) is shared by both scopes and is edited
 // wherever it is selected. Built-in themes cannot be edited in place; "Copy to
@@ -52,6 +54,26 @@ import {
 // being configured with the gradient being edited before anything is saved.
 // The firmware holds a preview for 15 s per message; the editor re-sends on
 // every change and every 5 s, and ends the preview when it unmounts.
+
+const previewOwner = { id: 'global', subs: new Set() };
+
+function claimPreview(id) {
+  if (previewOwner.id === id) return;
+  previewOwner.id = id;
+  previewOwner.subs.forEach(f => f());
+}
+
+function usePreviewOwner(id) {
+  const [, bump] = useState(0);
+  useEffect(() => {
+    const f = () => bump(n => n + 1);
+    previewOwner.subs.add(f);
+    return () => {
+      previewOwner.subs.delete(f);
+    };
+  }, []);
+  return previewOwner.id === id;
+}
 
 const PREVIEW_DEBOUNCE_MS = 80;
 const PREVIEW_KEEPALIVE_MS = 5000;
@@ -93,6 +115,8 @@ export function GradientEditor({ scope, formData, setField, previewAnimIdx }) {
   const apiService = useContext(ApiServiceContext);
   const isGlobal = scope.kind === 'global';
   const animIdx = isGlobal ? null : scope.animIdx;
+  const editorId = isGlobal ? 'global' : `anim-${scope.animIdx}`;
+  const owns = usePreviewOwner(editorId);
   const library = useMemo(
     () => parseGradientLibrary(formData.bgAnimGradients),
     [formData.bgAnimGradients],
@@ -121,6 +145,8 @@ export function GradientEditor({ scope, formData, setField, previewAnimIdx }) {
   const anim = BG_ANIMATIONS[previewIdx];
   const wraps = anim?.id === 'plasma';
   const overrideCount = refs.filter(r => r !== '' && refResolves(r, library)).length;
+  // Clearing every override is not undoable in one step, so it asks first.
+  const [confirmClear, setConfirmClear] = useState(false);
   const tone = {
     brightness:
       formData.bgAnimBrightness === undefined ? 100 : parseInt(formData.bgAnimBrightness, 10),
@@ -131,7 +157,10 @@ export function GradientEditor({ scope, formData, setField, previewAnimIdx }) {
   const writeLibrary = next => setField('bgAnimGradients', serializeGradientLibrary(next));
   const writeRefs = next => setField('bgAnimThemeMap', serializeThemeMap(next));
 
+  const takePreview = () => claimPreview(editorId);
+
   const assign = nextRef => {
+    takePreview();
     if (isGlobal) {
       setField('bgAnimGradientRef', nextRef);
       // A built-in is mirrored into bgAnimTheme, which is the last fallback
@@ -148,7 +177,10 @@ export function GradientEditor({ scope, formData, setField, previewAnimIdx }) {
   // Clears every per-animation override so the global applies everywhere. This
   // replaces the old "Use for all animations", which wrote the same ref into
   // every slot and left the global with no effect at all.
-  const clearOverrides = () => writeRefs(refs.map(() => ''));
+  const clearOverrides = () => {
+    writeRefs(refs.map(() => ''));
+    setConfirmClear(false);
+  };
 
   const updateStops = nextStops => {
     if (!editable) return;
@@ -255,11 +287,13 @@ export function GradientEditor({ scope, formData, setField, previewAnimIdx }) {
   }, []);
 
   useEffect(() => {
+    if (!owns) return undefined;
     const t = setTimeout(sendPreview, PREVIEW_DEBOUNCE_MS);
     return () => clearTimeout(t);
-  }, [previewIdx, serialized, sendPreview]);
+  }, [owns, previewIdx, serialized, sendPreview]);
 
   useEffect(() => {
+    if (!owns) return undefined;
     const t = setInterval(sendPreview, PREVIEW_KEEPALIVE_MS);
     return () => {
       clearInterval(t);
@@ -271,27 +305,29 @@ export function GradientEditor({ scope, formData, setField, previewAnimIdx }) {
         // Already disconnected; the firmware lapses the preview on its own.
       }
     };
-  }, [sendPreview]);
+  }, [owns, sendPreview]);
 
   const libraryFull = library.length >= BG_GRADIENT_LIB_MAX;
   const selectId = isGlobal ? 'bgAnimGradientRef' : `bgAnimGradientRef-${animIdx}`;
 
-  return (
-    <div className='border-base-content/10 rounded-lg border p-3'>
-      <div className='grid grid-cols-1 gap-4 md:grid-cols-2'>
-        <div className='form-control'>
-          <label htmlFor={selectId} className='mb-1 block text-sm font-medium'>
-            {isGlobal
-              ? 'Gradient for all animations'
-              : `Gradient for ${BG_ANIMATIONS[animIdx]?.name ?? 'this animation'}`}
-          </label>
+  if (!isGlobal && ref === '') {
+    return (
+      <div
+        className='border-base-content/10 rounded-lg border p-3'
+        onPointerDownCapture={takePreview}
+        onFocusCapture={takePreview}
+      >
+        <label htmlFor={selectId} className='mb-1 block text-sm font-medium'>
+          Gradient for {BG_ANIMATIONS[animIdx]?.name ?? 'this animation'}
+        </label>
+        <div className='flex flex-wrap items-center gap-3'>
           <select
             id={selectId}
-            className='select select-bordered w-full'
-            value={ref}
+            className='select select-bordered w-full sm:w-72'
+            value=''
             onChange={e => assign(e.target.value)}
           >
-            {!isGlobal && <option value=''>Same as global ({globalName})</option>}
+            <option value=''>Global ({globalName})</option>
             {library.length > 0 && (
               <optgroup label='My gradients'>
                 {library.map(g => (
@@ -309,6 +345,63 @@ export function GradientEditor({ scope, formData, setField, previewAnimIdx }) {
               ))}
             </optgroup>
           </select>
+          <div
+            className='h-8 min-w-40 flex-1 rounded-md border border-black/20'
+            style={{ background: gradientCss(stops) }}
+            aria-label={`Global gradient, ${globalName}`}
+          />
+        </div>
+        <p className='text-base-content/60 mt-2 text-sm'>
+          This animation uses the global gradient set above. Pick another here to give it one of its
+          own.
+        </p>
+      </div>
+    );
+  }
+
+  return (
+    <div
+      className='border-base-content/10 rounded-lg border p-3'
+      onPointerDownCapture={takePreview}
+      onFocusCapture={takePreview}
+    >
+      <div className='grid grid-cols-1 gap-4 md:grid-cols-2'>
+        <div className='form-control'>
+          <label htmlFor={selectId} className='mb-1 block text-sm font-medium'>
+            {isGlobal
+              ? 'Gradient for all animations'
+              : `Gradient for ${BG_ANIMATIONS[animIdx]?.name ?? 'this animation'}`}
+          </label>
+          <select
+            id={selectId}
+            className='select select-bordered w-full'
+            value={ref}
+            onChange={e => assign(e.target.value)}
+          >
+            {!isGlobal && <option value=''>Global ({globalName})</option>}
+            {library.length > 0 && (
+              <optgroup label='My gradients'>
+                {library.map(g => (
+                  <option key={g.id} value={`c${g.id}`}>
+                    {g.name}
+                  </option>
+                ))}
+              </optgroup>
+            )}
+            <optgroup label='Built-in'>
+              {BG_THEMES.map((t, i) => (
+                <option key={t.name} value={String(i)}>
+                  {t.name}
+                </option>
+              ))}
+            </optgroup>
+          </select>
+          {!isGlobal && (
+            <p className='text-base-content/60 mt-2 text-sm'>
+              {BG_ANIMATIONS[animIdx]?.name ?? 'This animation'} has its own gradient and ignores
+              the global one. Choose Global ({globalName}) to put it back.
+            </p>
+          )}
         </div>
         <div className='flex flex-wrap items-end gap-2'>
           <button
@@ -323,12 +416,19 @@ export function GradientEditor({ scope, formData, setField, previewAnimIdx }) {
           {isGlobal && (
             <button
               type='button'
-              className='btn btn-sm'
+              className={`btn btn-sm sm:ml-auto ${confirmClear ? 'btn-warning' : ''}`}
               disabled={overrideCount === 0}
-              title={overrideCount === 0 ? 'No animation has a gradient of its own' : undefined}
-              onClick={clearOverrides}
+              title={
+                overrideCount === 0
+                  ? 'No animation has a gradient of its own'
+                  : 'Puts every animation back on the global gradient. Your saved gradients are kept.'
+              }
+              onClick={() => (confirmClear ? clearOverrides() : setConfirmClear(true))}
+              onBlur={() => setConfirmClear(false)}
             >
-              Clear {overrideCount} per-animation gradient{overrideCount === 1 ? '' : 's'}
+              {confirmClear
+                ? `Reset all ${overrideCount}?`
+                : `Reset ${overrideCount} animation${overrideCount === 1 ? '' : 's'} to global`}
             </button>
           )}
           {editable && (
@@ -429,28 +529,29 @@ export function GradientEditor({ scope, formData, setField, previewAnimIdx }) {
         )}
       </div>
 
-      {/* What the panel makes of it: tone applied, and the plasma wrap. */}
-      <div className='mt-4 grid grid-cols-1 gap-3 md:grid-cols-2'>
+      {/* What the panel makes of it: tone applied, and the loop if it loops. */}
+      <div className={`mt-4 grid grid-cols-1 gap-3 ${wraps ? 'md:grid-cols-2' : ''}`}>
         <div>
           <div className='mb-1 text-xs opacity-70'>
-            On the panel (brightness {tone.brightness}%, highlight knee {tone.knee}%)
+            On the panel (animation brightness {tone.brightness}%, highlight rolloff {tone.knee}
+            %)
           </div>
           <div
             className='h-6 w-full rounded border border-black/20'
             style={{ background: gradientCss(stops, tone) }}
           />
         </div>
-        <div>
-          <div className='mb-1 text-xs opacity-70'>
-            {wraps
-              ? 'Plasma loops the gradient, so its ends meet'
-              : 'Looped, as Plasma would draw it'}
+        {wraps && (
+          <div>
+            <div className='mb-1 text-xs opacity-70'>
+              {anim?.name ?? 'This animation'} loops the gradient, so its ends meet
+            </div>
+            <div
+              className='h-6 w-full rounded border border-black/20'
+              style={{ background: wheelCss(stops, tone) }}
+            />
           </div>
-          <div
-            className='h-6 w-full rounded border border-black/20'
-            style={{ background: wheelCss(stops, tone) }}
-          />
-        </div>
+        )}
       </div>
       <p className='text-base-content/60 mt-2 text-xs'>
         Stops run dark to bright. The panel shows {anim?.name ?? 'the animation'} with this gradient

@@ -648,6 +648,12 @@ def check_gradient_precedence_across_animations(rig):
     s0 = rig.settings()
     anim_a = int(s0["bgAnimId"])
     anim_b = (anim_a + 1) % len(ANIM_NAMES)
+    # What the two slots held before this check touched them. Not assumed to
+    # be "": the bench board carries overrides on fourteen animations, and a
+    # restore is back to what was there, not to Default.
+    map0 = s0["bgAnimThemeMap"]
+    ref0_a = map_ref(map0, anim_a)
+    ref0_b = map_ref(map0, anim_b)
 
     open_animation(rig)
     tap_row(rig, "Gradient", "next")
@@ -693,11 +699,10 @@ def check_gradient_precedence_across_animations(rig):
           "anim %d got %r want %r" % (anim_b, map_ref(final_map, anim_b), ref_b))
     check(rig, "gradient_precedence_both_survive", bool(ok))
 
-    # Restore both to Default through the UI, never by a second POST. This
-    # visit opens on animId==anim_b (bgAnimId was written live by the
-    # "Animation next" tap above), Gradient showing ref_b one step from
-    # Default; undo it, step Animation back to A, undo A's edit the same
-    # way.
+    # Restore both through the UI, never by a second POST. This visit opens
+    # on animId==anim_b (bgAnimId was written live by the "Animation next" tap
+    # above), Gradient showing ref_b one step on from where it started; undo
+    # it, step Animation back to A, undo A's edit the same way.
     open_animation(rig)
     tap_row(rig, "Gradient", "prev")
     tap_row(rig, "Animation", "prev")
@@ -705,11 +710,12 @@ def check_gradient_precedence_across_animations(rig):
     close_animation(rig)
 
     restored_map = rig.settings()["bgAnimThemeMap"]
-    a_default = map_ref(restored_map, anim_a) == ""
-    b_default = map_ref(restored_map, anim_b) == ""
-    check(rig, "gradient_precedence_restored", a_default and b_default,
-          "anim_a=%r anim_b=%r" % (map_ref(restored_map, anim_a), map_ref(restored_map, anim_b)))
-    if not (a_default and b_default):
+    a_back = map_ref(restored_map, anim_a) == ref0_a
+    b_back = map_ref(restored_map, anim_b) == ref0_b
+    check(rig, "gradient_precedence_restored", a_back and b_back,
+          "anim_a=%r want %r, anim_b=%r want %r" %
+          (map_ref(restored_map, anim_a), ref0_a, map_ref(restored_map, anim_b), ref0_b))
+    if not (a_back and b_back):
         rig.log("could_not_restore", bgAnimThemeMap=restored_map)
 
 

@@ -230,13 +230,13 @@ function BackgroundAnimationSettings({ formData, onChange, setField }) {
         />
       </SettingsGroup>
 
-      <SettingsGroup title={`${tuningAnim.name} tuning`}>
+      <section className='border-base-content/10 border-t pt-5'>
         {standbySeparate && (
-          <div className='mb-4' role='group' aria-label='Which animation to tune'>
+          <div className='mb-3' role='group' aria-label='Which animation to tune'>
             <div className='join'>
               <button
                 type='button'
-                className={`btn join-item btn-sm ${tuning === 'main' ? 'btn-active' : ''}`}
+                className={`btn join-item btn-sm ${tuning === 'main' ? 'btn-primary' : ''}`}
                 aria-pressed={tuning === 'main'}
                 onClick={() => setTuningPick('main')}
               >
@@ -244,7 +244,7 @@ function BackgroundAnimationSettings({ formData, onChange, setField }) {
               </button>
               <button
                 type='button'
-                className={`btn join-item btn-sm ${tuning === 'standby' ? 'btn-active' : ''}`}
+                className={`btn join-item btn-sm ${tuning === 'standby' ? 'btn-primary' : ''}`}
                 aria-pressed={tuning === 'standby'}
                 onClick={() => setTuningPick('standby')}
               >
@@ -256,6 +256,11 @@ function BackgroundAnimationSettings({ formData, onChange, setField }) {
             </p>
           </div>
         )}
+        <h3 className='mb-3 text-base font-semibold'>
+          {standbySeparate
+            ? `${tuning === 'main' ? 'Main' : 'Standby'} animation: ${tuningAnim.name}`
+            : `${tuningAnim.name} tuning`}
+        </h3>
         <div className={FIELD_GRID}>
           {tuningAnim.params.map((param, j) => (
             <AnimationParamField
@@ -277,7 +282,7 @@ function BackgroundAnimationSettings({ formData, onChange, setField }) {
             setField={setField}
           />
         </div>
-      </SettingsGroup>
+      </section>
 
       <SettingsGroup title='Motion and performance'>
         <div className={FIELD_GRID}>
@@ -333,7 +338,7 @@ function BackgroundAnimationSettings({ formData, onChange, setField }) {
             label='Animation resolution'
             htmlFor='bgAnimHalfRes'
             noMargin
-            helpText='Trades sharpness for smoothness; full resolution is sharper but heavier.'
+            helpText='Sharpness, not speed. Half resolution on its own does not raise the frame rate.'
             tooltip='Half resolution plus interlacing is what lets every animation run above 40 fps; full resolution can drop the heaviest animations to around 15 fps. Half resolution alone does not raise frame rate because doubling rows costs what the smaller render saves, measured 2026-09-05.'
             tooltipLabel='Animation resolution'
           >
@@ -352,7 +357,7 @@ function BackgroundAnimationSettings({ formData, onChange, setField }) {
             label='Interlace animation'
             htmlFor='bgAnimInterlace'
             noMargin
-            helpText='Interlacing is the setting that improves smoothness.'
+            helpText='The setting that raises the frame rate: on, an animation runs about twice as fast.'
             tooltip='It refreshes half the rows on each frame, which roughly doubles the rate. That is not usually noticeable while something is moving.'
             tooltipLabel='Interlace animation'
           >
