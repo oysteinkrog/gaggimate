@@ -32,10 +32,10 @@
 #include <display/ui/default/DefaultUI.h>
 #include <display/ui/default/bganim/BgAnim.h>
 #ifdef GAGGIMATE_SIM
-// The simulator cannot link BgAnimThemes.cpp, so it reads the generated table
-// that file reads. Device builds go through bg_theme_count()/bg_theme_name()
-// and must not pull the stops in a second time.
-#include <display/ui/default/bganim/BgAnimThemeTable.h>
+// The simulator cannot link BgAnimThemes.cpp, so its theme provider reads the
+// generated table that file reads. Device builds go through the bg_theme_*
+// functions and must not pull the stops in a second time.
+#include "ThemeProviderTable.h"
 #endif
 #include <display/ui/default/eez/images.h>
 
@@ -134,23 +134,31 @@ const SimAnim &simAnim(int i) {
 }
 const char *animNameFn(int i) { return simAnim(i).name; }
 const BgAnimParamDef *animParamsFn(int i) { return simAnim(i).params; }
-// The simulator cannot link BgAnimThemes.cpp, so it reads the same generated
-// table that file does rather than carrying a third copy of the names.
-int themeCountFn() { return bganim_gen::THEME_DEF_COUNT; }
-const char *themeNameFn(int i) {
-    const int n = themeCountFn();
-    return bganim_gen::THEME_DEFS[(i >= 0 && i < n) ? i : 0].name;
-}
+// Reads the same generated table BgAnimThemes.cpp does, rather than carrying
+// a third copy of the names. The wiring itself is in ThemeProviderTable.h,
+// because the host test runs this path too.
+settingsui::ThemeNameProvider makeThemeProvider() { return settingsui::generatedThemeProvider(); }
 #else
 int animCountFn() { return bg_animation_count(); }
 const char *animNameFn(int i) { return bg_animation(i).name; }
 const BgAnimParamDef *animParamsFn(int i) { return bg_animation(i).params; }
-int themeCountFn() { return bg_theme_count(); }
-const char *themeNameFn(int i) { return bg_theme_name(i); }
+
+// The device reads all six through BgAnimThemes.cpp, which clamps an
+// out-of-range index to 0 in every one of them.
+settingsui::ThemeNameProvider makeThemeProvider() {
+    settingsui::ThemeNameProvider p;
+    p.count = bg_theme_count;
+    p.name = bg_theme_name;
+    p.category = bg_theme_category;
+    p.categoryCount = bg_theme_category_count;
+    p.categoryName = bg_theme_category_name;
+    p.stops = bg_theme_stops;
+    return p;
+}
 #endif
 
 const settingsui::AnimationNameProvider kAnimProvider{animCountFn, animNameFn};
-const settingsui::ThemeNameProvider kThemeProvider{themeCountFn, themeNameFn};
+const settingsui::ThemeNameProvider kThemeProvider = makeThemeProvider();
 
 constexpr int kThemeModeCount = sizeof(settingsui::kThemeModeLabels) / sizeof(settingsui::kThemeModeLabels[0]);
 constexpr int kPlatesCount = sizeof(settingsui::kPlatesLabels) / sizeof(settingsui::kPlatesLabels[0]);

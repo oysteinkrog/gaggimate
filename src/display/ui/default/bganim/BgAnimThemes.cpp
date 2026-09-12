@@ -225,6 +225,15 @@ int bg_theme_count() { return THEME_COUNT; }
 
 const char *bg_theme_name(int i) { return THEMES[(i >= 0 && i < THEME_COUNT) ? i : 0].name; }
 
+const char *bg_theme_category(int i) { return THEMES[(i >= 0 && i < THEME_COUNT) ? i : 0].category; }
+
+int bg_theme_category_count() { return bganim_gen::THEME_CATEGORY_COUNT; }
+
+const char *bg_theme_category_name(int i) {
+    const int n = bganim_gen::THEME_CATEGORY_COUNT;
+    return bganim_gen::THEME_CATEGORIES[(i >= 0 && i < n) ? i : 0];
+}
+
 const uint8_t (*bg_theme_stops(int i))[3] { return THEMES[(i >= 0 && i < THEME_COUNT) ? i : 0].stops; }
 
 void bg_resolve_theme(int themeId, const char *custom, uint8_t stops[BG_THEME_MAX_STOPS][3], int &nStops) {

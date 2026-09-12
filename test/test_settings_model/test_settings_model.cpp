@@ -10,12 +10,16 @@
 // (see the provider comment at the top of SettingsModel.h) -- it lets group
 // D check the model's gradient-map writer against the real bg_map_valid()
 // and read real built-in theme names, without the model depending on it.
+// Because it is linked here, group D also builds the simulator's provider
+// (ThemeProviderTable.h) explicitly: on the device the two paths read the
+// same generated table through different code, and only checking both shows
+// they agree.
 //
 // Groups:
 //   A -- numeric spec: clamp, wrap, off-grid snap, fast step
 //   B -- formatters
 //   C -- index-based choice lists (wrap at both ends)
-//   D -- gradients: choice list, map read/write
+//   D -- gradients: theme providers, choice list, map read/write
 //   E -- palette
 //   F -- time zones (real 461-entry table)
 //   G -- wake-up schedules
@@ -26,12 +30,17 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <string>
 #include <vector>
 
 #include "display/core/zones.cpp"
 #include "display/ui/default/bganim/BgAnimThemes.cpp"
 #include "display/ui/default/settings/SettingsModel.cpp"
+// The provider the simulator builds, so group D checks that path too and not
+// just the bg_theme_* functions this file happens to link (see the header).
+#include "display/ui/default/bganim/BgAnimThemeTable.h"
+#include "display/ui/default/settings/ThemeProviderTable.h"
 
 using namespace settingsui;
 
@@ -155,7 +164,7 @@ static void test_wrap_animation_names_stub() {
 }
 
 // ---------------------------------------------------------------------------
-// Group D -- gradients: choice list, map read/write
+// Group D -- gradients: theme providers, choice list, map read/write
 // ---------------------------------------------------------------------------
 
 static void test_gradient_choices_real_themes() {
@@ -181,6 +190,182 @@ static void test_gradient_choices_real_themes() {
     TEST_ASSERT_EQUAL(lastIndex, gradientChoiceIndexForRef(choices, "c3"));
     // A ref naming a deleted library entry falls back to Default (index 0).
     TEST_ASSERT_EQUAL(0, gradientChoiceIndexForRef(choices, "c99"));
+}
+
+// The device's provider: the same six firmware lookups CatAnimation.cpp
+// wires up when GAGGIMATE_SIM is not defined. Built here rather than in the
+// header because on the device it is three lines of CatAnimation.cpp, which
+// this test cannot link (LVGL).
+static ThemeNameProvider firmwareThemeProvider() {
+    ThemeNameProvider p;
+    p.count = bg_theme_count;
+    p.name = bg_theme_name;
+    p.category = bg_theme_category;
+    p.categoryCount = bg_theme_category_count;
+    p.categoryName = bg_theme_category_name;
+    p.stops = bg_theme_stops;
+    return p;
+}
+
+static void check_provider_against_table(const char *who, const ThemeNameProvider &p) {
+    char msg[128];
+    TEST_ASSERT_EQUAL(bganim_gen::THEME_DEF_COUNT, p.count());
+    for (int i = 0; i < bganim_gen::THEME_DEF_COUNT; i++) {
+        const bganim_gen::ThemeDef &def = bganim_gen::THEME_DEFS[i];
+        snprintf(msg, sizeof(msg), "%s: name %d", who, i);
+        TEST_ASSERT_EQUAL_STRING_MESSAGE(def.name, p.name(i), msg);
+        snprintf(msg, sizeof(msg), "%s: category %d (%s)", who, i, def.name);
+        TEST_ASSERT_EQUAL_STRING_MESSAGE(def.category, p.category(i), msg);
+        // Six stops, three channels each, byte for byte.
+        const uint8_t(*stops)[3] = p.stops(i);
+        TEST_ASSERT_NOT_NULL(stops);
+        for (int s = 0; s < 6; s++) {
+            for (int ch = 0; ch < 3; ch++) {
+                snprintf(msg, sizeof(msg), "%s: %s stop %d ch %d", who, def.name, s, ch);
+                TEST_ASSERT_EQUAL_UINT8_MESSAGE(def.stops[s][ch], stops[s][ch], msg);
+            }
+        }
+    }
+    // The declared list, in its declared order.
+    TEST_ASSERT_EQUAL(bganim_gen::THEME_CATEGORY_COUNT, p.categoryCount());
+    for (int c = 0; c < bganim_gen::THEME_CATEGORY_COUNT; c++) {
+        snprintf(msg, sizeof(msg), "%s: category name %d", who, c);
+        TEST_ASSERT_EQUAL_STRING_MESSAGE(bganim_gen::THEME_CATEGORIES[c], p.categoryName(c), msg);
+    }
+    // Out of range reads as index 0 on both paths, so a stored id from a
+    // longer table gives a wrong gradient and never a fault.
+    TEST_ASSERT_EQUAL_STRING(p.name(0), p.name(-1));
+    TEST_ASSERT_EQUAL_STRING(p.name(0), p.name(bganim_gen::THEME_DEF_COUNT));
+    TEST_ASSERT_EQUAL_STRING(p.category(0), p.category(-1));
+    TEST_ASSERT_EQUAL_STRING(p.category(0), p.category(bganim_gen::THEME_DEF_COUNT));
+    TEST_ASSERT_EQUAL_PTR(p.stops(0), p.stops(-1));
+    TEST_ASSERT_EQUAL_PTR(p.stops(0), p.stops(bganim_gen::THEME_DEF_COUNT));
+    TEST_ASSERT_EQUAL_STRING(p.categoryName(0), p.categoryName(-1));
+    TEST_ASSERT_EQUAL_STRING(p.categoryName(0), p.categoryName(bganim_gen::THEME_CATEGORY_COUNT));
+}
+
+static void test_theme_provider_device_path_matches_table() {
+    // Every built-in's name, category and six stops, read the way the device
+    // reads them, against the generated data.
+    check_provider_against_table("firmware", firmwareThemeProvider());
+    // Every declared category is used by at least one built-in, so a picker
+    // never shows an empty group. The generator does not enforce this; the
+    // owner's list is meant to describe the gradients that exist.
+    for (int c = 0; c < bganim_gen::THEME_CATEGORY_COUNT; c++) {
+        bool used = false;
+        for (int i = 0; i < bganim_gen::THEME_DEF_COUNT && !used; i++) {
+            used = strcmp(bganim_gen::THEME_DEFS[i].category, bganim_gen::THEME_CATEGORIES[c]) == 0;
+        }
+        TEST_ASSERT_TRUE_MESSAGE(used, bganim_gen::THEME_CATEGORIES[c]);
+    }
+    // And every built-in's category is declared, so none of them falls out of
+    // a picker that walks the declared list.
+    for (int i = 0; i < bganim_gen::THEME_DEF_COUNT; i++) {
+        bool declared = false;
+        for (int c = 0; c < bganim_gen::THEME_CATEGORY_COUNT && !declared; c++) {
+            declared = strcmp(bganim_gen::THEME_DEFS[i].category, bganim_gen::THEME_CATEGORIES[c]) == 0;
+        }
+        TEST_ASSERT_TRUE_MESSAGE(declared, bganim_gen::THEME_DEFS[i].name);
+    }
+}
+
+static void test_theme_provider_simulator_path_matches_table() {
+    // The provider CatAnimation.cpp builds under GAGGIMATE_SIM. This test
+    // links the real bg_theme_* functions, so without this case the
+    // simulator's path, which is where the picker bead is tested, would be
+    // unproved.
+    check_provider_against_table("generated", generatedThemeProvider());
+    // The two paths are the same data, which is the point of having both.
+    const ThemeNameProvider sim = generatedThemeProvider();
+    const ThemeNameProvider dev = firmwareThemeProvider();
+    TEST_ASSERT_EQUAL(dev.count(), sim.count());
+    TEST_ASSERT_EQUAL(dev.categoryCount(), sim.categoryCount());
+    for (int i = 0; i < dev.count(); i++) {
+        TEST_ASSERT_EQUAL_STRING(dev.name(i), sim.name(i));
+        TEST_ASSERT_EQUAL_STRING(dev.category(i), sim.category(i));
+        TEST_ASSERT_EQUAL_UINT8_ARRAY(reinterpret_cast<const uint8_t *>(dev.stops(i)),
+                                      reinterpret_cast<const uint8_t *>(sim.stops(i)), 6 * 3);
+    }
+    for (int c = 0; c < dev.categoryCount(); c++) {
+        TEST_ASSERT_EQUAL_STRING(dev.categoryName(c), sim.categoryName(c));
+    }
+}
+
+static void test_gradient_choices_carry_categories() {
+    const std::string library = "3|Custom Sky|ff0000,0000ff;4|Second|00ff00,ffffff";
+    const std::vector<GradientChoice> choices = gradientChoices(generatedThemeProvider(), library);
+    TEST_ASSERT_EQUAL(static_cast<size_t>(1 + bganim_gen::THEME_DEF_COUNT + 2), choices.size());
+
+    // The default entry: no ref, and no category, because it is not a
+    // gradient. A picker gives it a group of its own.
+    TEST_ASSERT_EQUAL_STRING("Default", choices[0].label.c_str());
+    TEST_ASSERT_EQUAL_STRING("", choices[0].ref.c_str());
+    TEST_ASSERT_EQUAL_STRING("", choices[0].category.c_str());
+
+    // Built-ins keep their table order, their decimal ref and their category.
+    for (int i = 0; i < bganim_gen::THEME_DEF_COUNT; i++) {
+        const GradientChoice &c = choices[1 + i];
+        TEST_ASSERT_EQUAL_STRING(bganim_gen::THEME_DEFS[i].name, c.label.c_str());
+        TEST_ASSERT_EQUAL_STRING(std::to_string(i).c_str(), c.ref.c_str());
+        TEST_ASSERT_EQUAL_STRING(bganim_gen::THEME_DEFS[i].category, c.category.c_str());
+    }
+
+    // Saved gradients keep "c<id>" and carry no category: the picker groups
+    // them under My gradients, not under one of the declared eight.
+    const GradientChoice &first = choices[1 + bganim_gen::THEME_DEF_COUNT];
+    TEST_ASSERT_EQUAL_STRING("Custom Sky", first.label.c_str());
+    TEST_ASSERT_EQUAL_STRING("c3", first.ref.c_str());
+    TEST_ASSERT_EQUAL_STRING("", first.category.c_str());
+    TEST_ASSERT_EQUAL_STRING("Second", choices.back().label.c_str());
+    TEST_ASSERT_EQUAL_STRING("c4", choices.back().ref.c_str());
+    TEST_ASSERT_EQUAL_STRING("", choices.back().category.c_str());
+}
+
+static void test_gradient_choices_without_category_accessor() {
+    // The two-field provider a caller that does not group still works, and
+    // every category reads empty rather than faulting on an unset accessor.
+    ThemeNameProvider themes;
+    themes.count = []() { return 2; };
+    themes.name = [](int i) { return i == 0 ? "One" : "Two"; };
+    const std::vector<GradientChoice> choices = gradientChoices(themes, "");
+    TEST_ASSERT_EQUAL(static_cast<size_t>(3), choices.size());
+    TEST_ASSERT_EQUAL_STRING("", choices[1].category.c_str());
+    TEST_ASSERT_EQUAL_STRING("", choices[2].category.c_str());
+}
+
+static void test_theme_category_order_is_declared_not_encountered() {
+    // A fixture whose first gradient sits in the second declared category,
+    // and whose third declared category has no gradient at all. The declared
+    // list is the picker's group order, so it must come back untouched by
+    // what the gradients happen to mention first.
+    static const char *const kCategories[3] = {"Coffee", "Neon", "Pastel"};
+    struct Def {
+        const char *name;
+        const char *category;
+    };
+    static const Def kDefs[3] = {{"Cyber", "Neon"}, {"Espresso", "Coffee"}, {"Glow", "Neon"}};
+
+    ThemeNameProvider themes;
+    themes.count = []() { return 3; };
+    themes.name = [](int i) { return kDefs[(i >= 0 && i < 3) ? i : 0].name; };
+    themes.category = [](int i) { return kDefs[(i >= 0 && i < 3) ? i : 0].category; };
+    themes.categoryCount = []() { return 3; };
+    themes.categoryName = [](int i) { return kCategories[(i >= 0 && i < 3) ? i : 0]; };
+
+    TEST_ASSERT_EQUAL(3, themes.categoryCount());
+    TEST_ASSERT_EQUAL_STRING("Coffee", themes.categoryName(0));
+    TEST_ASSERT_EQUAL_STRING("Neon", themes.categoryName(1));
+    TEST_ASSERT_EQUAL_STRING("Pastel", themes.categoryName(2));
+    // Encounter order would have put Neon first.
+    TEST_ASSERT_EQUAL_STRING("Neon", themes.category(0));
+
+    const std::vector<GradientChoice> choices = gradientChoices(themes, "");
+    TEST_ASSERT_EQUAL_STRING("Neon", choices[1].category.c_str());
+    TEST_ASSERT_EQUAL_STRING("Coffee", choices[2].category.c_str());
+    TEST_ASSERT_EQUAL_STRING("Neon", choices[3].category.c_str());
+    // Refs are the stored indices whatever the grouping does with them.
+    TEST_ASSERT_EQUAL_STRING("0", choices[1].ref.c_str());
+    TEST_ASSERT_EQUAL_STRING("2", choices[3].ref.c_str());
 }
 
 static void test_gradient_map_read_write_empty() {
@@ -587,6 +772,11 @@ int main(int argc, char **argv) {
     RUN_TEST(test_wrap_animation_names_stub);
 
     RUN_TEST(test_gradient_choices_real_themes);
+    RUN_TEST(test_theme_provider_device_path_matches_table);
+    RUN_TEST(test_theme_provider_simulator_path_matches_table);
+    RUN_TEST(test_gradient_choices_carry_categories);
+    RUN_TEST(test_gradient_choices_without_category_accessor);
+    RUN_TEST(test_theme_category_order_is_declared_not_encountered);
     RUN_TEST(test_gradient_map_read_write_empty);
     RUN_TEST(test_gradient_map_read_write_shorter_than_n);
     RUN_TEST(test_gradient_map_write_trims_trailing_empty_slots);

@@ -114,18 +114,48 @@ const char *animationLabel(const AnimationNameProvider &provider, int index);
 
 // ---- gradients --------------------------------------------------------------
 
+// Six RGB stops, dark to bright: the shape bg_theme_stops returns, named so
+// the provider can carry it without spelling the array-pointer type out.
+using ThemeStops = const uint8_t (*)[3];
+
+// Everything a picker needs about the built-in gradients, so that neither the
+// model nor a picker has to link BgAnimThemes.cpp (which the simulator
+// cannot). A device build wires these to bg_theme_*; the simulator and the
+// host tests wire them to the generated table through
+// settingsui::generatedThemeProvider() (ThemeProviderTable.h).
+//
+// Every accessor but count and name is optional: unset category reads empty,
+// unset categoryCount reads zero, unset stops reads null. That is what an
+// ungrouped, swatchless picker wants, and it is what the older two-field
+// callers get without changing.
 struct ThemeNameProvider {
     std::function<int()> count;
     std::function<const char *(int)> name;
+    // The category one built-in belongs to, indexed the same way as name.
+    std::function<const char *(int)> category;
+    // The declared category list, which is the order a picker groups by. It
+    // is the order of data/gradients.json's categories array, not the order
+    // the gradients happen to first mention a category in, and a category
+    // with no gradients in it is still declared.
+    std::function<int()> categoryCount;
+    std::function<const char *(int)> categoryName;
+    // One built-in's six stops, for a swatch row.
+    std::function<ThemeStops(int)> stops;
 };
 
-// One entry a gradient row can land on: a label to show and the
-// bgAnimThemeMap ref that entry writes ("" for Default/global theme, a
-// decimal built-in theme index, or "c<id>" for a library entry). Built in
-// this fixed order: Default, every built-in theme, every library entry.
+// One entry a gradient row can land on: a label to show, the bgAnimThemeMap
+// ref that entry writes ("" for Default/global theme, a decimal built-in
+// theme index, or "c<id>" for a library entry), and the category the picker
+// groups it under. Built in this fixed order: Default, every built-in theme,
+// every library entry.
+//
+// The category is empty for Default and for a library entry, because neither
+// belongs to one: Default is not a gradient, and a saved gradient is the
+// user's own. A picker puts those two in groups of their own.
 struct GradientChoice {
     std::string label;
     std::string ref;
+    std::string category;
 };
 
 std::vector<GradientChoice> gradientChoices(const ThemeNameProvider &themes, const std::string &library);

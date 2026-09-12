@@ -222,14 +222,15 @@ uint8_t clampParam(long value) { return static_cast<uint8_t>(value < 0 ? 0 : (va
 
 std::vector<GradientChoice> gradientChoices(const ThemeNameProvider &themes, const std::string &library) {
     std::vector<GradientChoice> out;
-    out.push_back({"Default", ""});
+    out.push_back({"Default", "", ""});
     const int themeCount = themes.count ? themes.count() : 0;
     for (int t = 0; t < themeCount; t++) {
         const char *name = themes.name ? themes.name(t) : nullptr;
-        out.push_back({name ? name : "", std::to_string(t)});
+        const char *cat = themes.category ? themes.category(t) : nullptr;
+        out.push_back({name ? name : "", std::to_string(t), cat ? cat : ""});
     }
     for (const LibraryEntry &entry : parseGradientLibrary(library)) {
-        out.push_back({entry.name, "c" + std::to_string(entry.id)});
+        out.push_back({entry.name, "c" + std::to_string(entry.id), ""});
     }
     return out;
 }

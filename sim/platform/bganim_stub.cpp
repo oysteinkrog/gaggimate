@@ -26,6 +26,9 @@ uint32_t hotFailCount() { return 0; }
 bool bg_library_valid(const char *) { return false; }
 bool bg_map_valid(const char *) { return false; }
 bool bg_ref_valid(const char *) { return false; }
+const char *bg_theme_category(int) { return ""; }
+int bg_theme_category_count() { return 0; }
+const char *bg_theme_category_name(int) { return ""; }
 
 // The built-in theme table lives in BgAnimThemes.cpp, which is excluded here
 // too. The settings writer only reads the count to range-check a built-in

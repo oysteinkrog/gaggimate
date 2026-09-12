@@ -9,6 +9,7 @@ import {
   BG_GRADIENT_LIB_MAX,
   BG_GRADIENT_NAME_MAX,
   BG_THEMES,
+  BG_THEME_CATEGORIES,
   BG_THEME_MAX_STOPS,
   globalGradientRef,
   gradientCss,
@@ -307,6 +308,26 @@ export function GradientEditor({ scope, formData, setField, previewAnimIdx }) {
     };
   }, [owns, sendPreview]);
 
+  // The built-ins, grouped for the picker. Category order is the generated
+  // list's order, and a category with nothing in it is dropped rather than
+  // shown empty. A gradient whose category is not in the list would otherwise
+  // vanish from the picker, so it falls into a last group instead: the
+  // generator rejects that case, and this is the belt for a hand-edited file.
+  const builtinGroups = useMemo(() => {
+    const byCategory = new Map(BG_THEME_CATEGORIES.map(c => [c, []]));
+    const strays = [];
+    BG_THEMES.forEach((t, index) => {
+      const bucket = byCategory.get(t.category);
+      (bucket ?? strays).push({ name: t.name, index });
+    });
+    const groups = BG_THEME_CATEGORIES.filter(c => byCategory.get(c).length > 0).map(c => ({
+      category: c,
+      items: byCategory.get(c),
+    }));
+    if (strays.length > 0) groups.push({ category: 'Other', items: strays });
+    return groups;
+  }, []);
+
   const libraryFull = library.length >= BG_GRADIENT_LIB_MAX;
   const selectId = isGlobal ? 'bgAnimGradientRef' : `bgAnimGradientRef-${animIdx}`;
 
@@ -337,13 +358,15 @@ export function GradientEditor({ scope, formData, setField, previewAnimIdx }) {
                 ))}
               </optgroup>
             )}
-            <optgroup label='Built-in'>
-              {BG_THEMES.map((t, i) => (
-                <option key={t.name} value={String(i)}>
-                  {t.name}
-                </option>
-              ))}
-            </optgroup>
+            {builtinGroups.map(group => (
+              <optgroup key={group.category} label={group.category}>
+                {group.items.map(t => (
+                  <option key={t.name} value={String(t.index)}>
+                    {t.name}
+                  </option>
+                ))}
+              </optgroup>
+            ))}
           </select>
           <div
             className='h-8 min-w-40 flex-1 rounded-md border border-black/20'
@@ -388,13 +411,15 @@ export function GradientEditor({ scope, formData, setField, previewAnimIdx }) {
                 ))}
               </optgroup>
             )}
-            <optgroup label='Built-in'>
-              {BG_THEMES.map((t, i) => (
-                <option key={t.name} value={String(i)}>
-                  {t.name}
-                </option>
-              ))}
-            </optgroup>
+            {builtinGroups.map(group => (
+              <optgroup key={group.category} label={group.category}>
+                {group.items.map(t => (
+                  <option key={t.name} value={String(t.index)}>
+                    {t.name}
+                  </option>
+                ))}
+              </optgroup>
+            ))}
           </select>
           {!isGlobal && (
             <p className='text-base-content/60 mt-2 text-sm'>

@@ -139,6 +139,14 @@ bool bg_map_valid(const char *map);
 // exists; resolution falls back on its own when it does not.
 bool bg_ref_valid(const char *ref);
 
+// The category a built-in gradient belongs to, and the ordered category list
+// the pickers group by. Both come from data/gradients.json through
+// scripts/gen_gradients.py. An out-of-range index reads as index 0, the same
+// way bg_theme_name does, so a stored id from a longer table cannot fault.
+const char *bg_theme_category(int i);
+int bg_theme_category_count();
+const char *bg_theme_category_name(int i);
+
 // The gradient animId draws with, in three steps: its own map entry when that
 // resolves (a built-in, or a library id that exists), else globalRef by the
 // same rule, else the global theme via bg_resolve_theme. A caller with no
