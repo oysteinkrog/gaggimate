@@ -29,6 +29,7 @@ pagecheck:
 
 # What CI runs. Every part exits non-zero on failure.
 check: $(BIN) $(ICBIN)
+	python3 ../../scripts/gen_gradients.py --check
 	./$(BIN) --compare golden --frames 240
 	./$(ICBIN)
 	node web/page_vs_golden.js

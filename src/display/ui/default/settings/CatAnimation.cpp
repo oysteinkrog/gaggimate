@@ -31,6 +31,12 @@
 #include <display/main.h>
 #include <display/ui/default/DefaultUI.h>
 #include <display/ui/default/bganim/BgAnim.h>
+#ifdef GAGGIMATE_SIM
+// The simulator cannot link BgAnimThemes.cpp, so it reads the generated table
+// that file reads. Device builds go through bg_theme_count()/bg_theme_name()
+// and must not pull the stops in a second time.
+#include <display/ui/default/bganim/BgAnimThemeTable.h>
+#endif
 #include <display/ui/default/eez/images.h>
 
 #include <cstdio>
@@ -121,11 +127,6 @@ constexpr SimAnim kSimAnims[] = {
     {"Cube", {{"speed", "Speed", 50}, {"size", "Cube size", 50}, {"glow", "Face glow", 55}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}}},
 };
 
-constexpr const char *kSimThemeNames[] = {
-    "Espresso", "Ocean", "Violet Dusk", "Forest", "Sunset", "Fire", "Ice", "Mono", "Rose", "Gold", "Aurora", "Cyber",
-    "Ember Coal", "Deep Space", "Teal Reef", "Sakura", "Lime", "Arctic Night",
-};
-
 int animCountFn() { return static_cast<int>(sizeof(kSimAnims) / sizeof(kSimAnims[0])); }
 const SimAnim &simAnim(int i) {
     const int n = animCountFn();
@@ -133,10 +134,12 @@ const SimAnim &simAnim(int i) {
 }
 const char *animNameFn(int i) { return simAnim(i).name; }
 const BgAnimParamDef *animParamsFn(int i) { return simAnim(i).params; }
-int themeCountFn() { return static_cast<int>(sizeof(kSimThemeNames) / sizeof(kSimThemeNames[0])); }
+// The simulator cannot link BgAnimThemes.cpp, so it reads the same generated
+// table that file does rather than carrying a third copy of the names.
+int themeCountFn() { return bganim_gen::THEME_DEF_COUNT; }
 const char *themeNameFn(int i) {
     const int n = themeCountFn();
-    return kSimThemeNames[(i >= 0 && i < n) ? i : 0];
+    return bganim_gen::THEME_DEFS[(i >= 0 && i < n) ? i : 0].name;
 }
 #else
 int animCountFn() { return bg_animation_count(); }

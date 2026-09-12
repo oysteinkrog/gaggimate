@@ -770,6 +770,22 @@ the design cannot show and what the runs measured.
   picker's first choice says the same. Adding a function to
   BgAnimThemes.cpp needs a matching stub in `sim/platform/bganim_stub.cpp`,
   which is where the display-sim link breaks first.
+- **A built-in gradient is added in `data/gradients.json` and nowhere else**
+  (gm-nov3.1, 2026-09-12). `scripts/gen_gradients.py` writes
+  `src/display/ui/default/bganim/BgAnimThemeTable.h` (what BgAnimThemes.cpp's
+  `THEMES` now points at) and `web/src/config/bgThemes.js` (what
+  bgAnimations.js re-exports as `BG_THEMES`), both checked in so no build
+  needs Python, and `--check` fails on a stale copy from `tools/animbench`
+  `make check`. Before it the same 18 gradients were written out three times
+  and synced by hand, the third copy being `kSimThemeNames[]` in
+  CatAnimation.cpp, which existed because the simulator cannot link
+  BgAnimThemes.cpp; the simulator now includes the generated header instead,
+  and device builds must not, because they would pull the stops in twice. The
+  list is append only and the generator does not enforce that: an entry's
+  position is its stored id, in `bgAnimGradientRef` and in every slot of
+  `bgAnimThemeMap`, so reordering or removing one changes what a device
+  already set. Six stops each, because the palette arithmetic assumes even
+  spacing and `bg_resolve_theme` copies 6 x 3 bytes.
 - **The standby animation's parameters and gradient are stored per animation
   id**, so they already existed before there was any way to edit them. The
   web tab reaches them through the main and standby selector above the

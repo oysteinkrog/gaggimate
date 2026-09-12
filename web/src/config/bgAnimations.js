@@ -8,6 +8,12 @@
 // defaults for the slots it does not name.
 // By convention p0 is always Speed.
 
+// The built-in gradients and their categories come from data/gradients.json
+// through scripts/gen_gradients.py, which writes the firmware's table from the
+// same source. Imported here and re-exported below so every importer of
+// BG_THEMES is unaffected.
+import { BG_THEMES, BG_THEME_CATEGORIES } from './bgThemes.js';
+
 export const BG_ANIMATIONS = [
   {
     id: 'plasma',
@@ -619,34 +625,7 @@ export const BG_ANIMATIONS = [
   },
 ];
 
-// Shared color themes — MUST mirror BgAnimThemes.cpp (append only, the theme
-// index is persisted in the bgAnimTheme setting). Stops run dark -> bright.
-export const BG_THEMES = [
-  { name: 'Espresso', stops: ['#080402', '#2a1206', '#6b3413', '#b8703a', '#e8b268', '#f8e6c8'] },
-  { name: 'Ocean', stops: ['#02060c', '#06284a', '#0a5276', '#2596be', '#66d3e8', '#d8f6ff'] },
-  {
-    name: 'Violet Dusk',
-    stops: ['#0a0512', '#2a1050', '#5c2a94', '#9a5ad4', '#d09af0', '#f4e2ff'],
-  },
-  { name: 'Forest', stops: ['#020803', '#0c2c12', '#1e5c28', '#46963c', '#8cd464', '#e6ffc8'] },
-  { name: 'Sunset', stops: ['#0c0410', '#4a1030', '#952038', '#d4542c', '#f89c3c', '#ffe8a0'] },
-  { name: 'Fire', stops: ['#0a0200', '#401004', '#8c2808', '#d85c10', '#f8a428', '#ffe8b0'] },
-  { name: 'Ice', stops: ['#020408', '#10203c', '#2c4a74', '#5486b4', '#9cc8e4', '#eafaff'] },
-  { name: 'Mono', stops: ['#000000', '#202020', '#484848', '#808080', '#c0c0c0', '#ffffff'] },
-  { name: 'Rose', stops: ['#0e0407', '#3c1020', '#7a2440', '#c04868', '#ee8ca4', '#ffdce6'] },
-  { name: 'Gold', stops: ['#060402', '#2e2008', '#6e5014', '#b48c24', '#e8c453', '#fff0b8'] },
-  { name: 'Aurora', stops: ['#010806', '#063020', '#0c6444', '#14a878', '#48e0b0', '#c8ffec'] },
-  { name: 'Cyber', stops: ['#050008', '#240448', '#501090', '#9018d8', '#e030f8', '#ff9cf0'] },
-  { name: 'Ember Coal', stops: ['#0a0604', '#2b0a06', '#6b1a08', '#b8420f', '#e2751f', '#f4a94a'] },
-  { name: 'Deep Space', stops: ['#05050f', '#150a28', '#341840', '#6b2f5e', '#b3477d', '#e6b3d6'] },
-  { name: 'Teal Reef', stops: ['#050a0f', '#0a1c28', '#123a44', '#1f6b6e', '#3fb3a8', '#bdeee0'] },
-  { name: 'Sakura', stops: ['#0c060a', '#341828', '#6e3050', '#b45c80', '#e896b0', '#ffe0ec'] },
-  { name: 'Lime', stops: ['#040802', '#16300a', '#326016', '#5ea024', '#9ee44c', '#eaffc0'] },
-  {
-    name: 'Arctic Night',
-    stops: ['#020206', '#0a1424', '#1a3048', '#34587c', '#6c94bc', '#c4e4f8'],
-  },
-];
+export { BG_THEMES, BG_THEME_CATEGORIES };
 
 // bgAnimTheme == BG_THEMES.length selected the pre-library custom theme
 // (bgAnimCustomTheme); the firmware moves that into the gradient library on
