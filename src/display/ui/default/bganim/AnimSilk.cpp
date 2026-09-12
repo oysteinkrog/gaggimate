@@ -741,9 +741,19 @@ void frame(uint32_t tMs, int, int, const uint8_t p[BG_ANIM_PARAMS]) {
         // (every A0 here is non-zero).
         const float A0i = wv.A0 + (SPREAD_MID - wv.A0) * (1.0f - sprK);
         const float A = A0i + (omega0 * rotK * wv.rotMult) * tMs;
-        const float k = k0 * (1.0f + wobK * fastSinRad(wv.wk * tMs + wv.phk));
-        wv.kx = k * fastCosRad(A);
-        wv.ky = k * fastSinRad(A);
+        // The real heading and breathing phase, not the 256-entry
+        // cosTableF() lookup (gm-pciz). The table truncates the heading to
+        // 1/256 of a turn, so the fringes ran up to 1.4 degrees off the
+        // page's heading: the smooth part of the deviation against the page
+        // was 2.0 per channel, 0.5 with the exact functions. Evaluated in
+        // double and rounded once, because the single-precision libm
+        // routines are not correctly rounded: sinf() on the host and
+        // Math.sin() on the page disagreed by one float ulp on a few calls in
+        // two hundred frames, and one ulp here moves a phase step by one
+        // unit. Nine calls a frame, none per pixel.
+        const float k = k0 * (1.0f + wobK * static_cast<float>(sin(static_cast<double>(wv.wk * tMs + wv.phk))));
+        wv.kx = k * static_cast<float>(cos(static_cast<double>(A)));
+        wv.ky = k * static_cast<float>(sin(static_cast<double>(A)));
         g_step[i] = static_cast<int32_t>(wv.kx * TURN);
         g_bigStep[i] = g_step[i] * SILK_GRID; // see g_bigStep declaration
         g_rowStep[i] = static_cast<int32_t>(wv.ky * TURN);

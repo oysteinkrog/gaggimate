@@ -385,9 +385,14 @@ void frame(uint32_t tMs, int, int, const uint8_t p[BG_ANIM_PARAMS]) {
 // Pure helpers shared by both bandRef and the asm dispatch path below (both
 // need identical row-constant tables; these are the only piece it is safe
 // to share, since they take no hidden state beyond their arguments).
+// The page adds (BAYER8 - 31.5) / 63 * 0.03 to an intensity of 0..1, which is
+// a swing of 3.8 levels of 255 either way. The fold used to shift by 2, a
+// swing of -8..+7, twice the design's (gm-pciz); shifting by 3 gives -4..+3,
+// the design's amplitude within the integer rounding. ROWLUT_PAD still
+// covers the low end.
 void buildDitherFold(int32_t out[64]) {
     for (int i = 0; i < 64; i++) {
-        out[i] = ROWLUT_PAD + ((static_cast<int32_t>(BAYER8[i]) - 32) >> 2);
+        out[i] = ROWLUT_PAD + ((static_cast<int32_t>(BAYER8[i]) - 32) >> 3);
     }
 }
 

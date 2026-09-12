@@ -531,8 +531,48 @@ function gradLUT(stops) { // stops: [[t0..255, r, g, b], ...] -> Uint8Array 256*
   });
 })();
 
-/* ---- 2: Silk (anim-fluid) ---- */
+/* ---- 2: Silk (anim-fluid; firmware AnimSilk.cpp frame and bandRef, ported) ---- */
 (() => {
+  // What the device draws, step for step (gm-pciz). The design is three
+  // rotating sine waves summed, a contrast power curve, a radial edge fade
+  // and an ordered dither; the firmware draws it with Q32 phase turns, the
+  // 1024-entry sine table, a 3073-entry contrast table, 16 px cells whose
+  // contrast-times-envelope product is interpolated linearly when the sine
+  // sum bows little across the cell (the cell is evaluated at 2 px steps
+  // otherwise), 2x1 pixel pairs, and a dither whose swing comes from the
+  // palette's own step spacing (ditherAmp). Against the per-pixel design
+  // this entry drew before, the port is 1.7 to 1.9 per channel on average,
+  // almost all of it grain from the pairs and the dither swing; the smooth
+  // part is 0.5. The heading and the breathing phase are exact (double,
+  // rounded once), as in the firmware.
+  const f32 = Math.fround;
+  const SPREAD_MID = f32(2.2333333);
+  const CONTRAST_N = 3073, PAD = 40, SIN_SUM_BIAS = 1536, SILK_BOW_TOL = 512;
+  const GRID = 16, GRID_SHIFT = 4, Q_BITS = 8;
+  const TURN = f32(4294967296 / f32(6.2831853));
+  const lroundf = v => Math.sign(v) * Math.round(Math.abs(v));
+  const waves = [
+    { A0: f32(0.20), rotMult: f32(0.6), wMult: f32(1.00), wk: f32(f32(6.2831853) / 71000), phk: f32(0.4) },
+    { A0: f32(2.15), rotMult: f32(-1.0), wMult: f32(1.37), wk: f32(f32(6.2831853) / 95000), phk: f32(2.1) },
+    { A0: f32(4.35), rotMult: f32(1.4), wMult: f32(0.71), wk: f32(f32(6.2831853) / 123000), phk: f32(4.0) },
+  ];
+  function ditherAmp(pal) { // mirror of bganim::ditherAmp on a 256-entry RGB565 ramp
+    let cr = 0, cg = 0, cb = 0;
+    for (let i = 1; i < 256; i++) {
+      const p = pal[i - 1], q = pal[i];
+      if (((q >> 11) & 31) !== ((p >> 11) & 31)) cr++;
+      if (((q >> 5) & 63) !== ((p >> 5) & 63)) cg++;
+      if ((q & 31) !== (p & 31)) cb++;
+    }
+    const flat = 256 >> 6;
+    let steps = 256;
+    if (cr > flat && cr < steps) steps = cr;
+    if (cg > flat && cg < steps) steps = cg;
+    if (cb > flat && cb < steps) steps = cb;
+    if (steps < 1) steps = 1;
+    const a = f32(f32(0.5 * 256) / steps);
+    return a > 16 ? 16 : a;
+  }
   ANIMS.push({
     id: 'silk', name: 'Silk',
     params: [
@@ -541,76 +581,158 @@ function gradLUT(stops) { // stops: [[t0..255, r, g, b], ...] -> Uint8Array 256*
       {key:'twist',label:'Twist',def:50},{key:'wobble',label:'Breathe',def:50},
       {key:'vignette',label:'Edge fade',def:80},{key:'grain',label:'Grain',def:50}],
     init(w, h, state) {
-      state.waves = [
-        {A0:0.20, rotMult:0.6,  wMult:1.00, wk:2*Math.PI/71000,  phk:0.4},
-        {A0:2.15, rotMult:-1.0, wMult:1.37, wk:2*Math.PI/95000,  phk:2.1},
-        {A0:4.35, rotMult:1.4,  wMult:0.71, wk:2*Math.PI/123000, phk:4.0},
-      ];
-      // Mean of the three A0 above: the heading all three collapse onto at
-      // spread 0. Matches SPREAD_MID in AnimSilk.cpp.
-      state.spreadMid = 2.2333333;
-      state.cx = w/2; state.cy = h/2;
-      state.Rscreen = Math.min(w,h)/2;
-      state._gen = -1;
+      state.contrast = new Uint16Array(CONTRAST_N);
+      state.palExt = new Uint16Array(256 + 2 * PAD);
+      state.ditherQ = new Int32Array(16);
+      state.dx2Row = new Uint8Array(w);
+      state.dx2Node = new Uint8Array((w >> GRID_SHIFT) + 1);
+      const R = f32(Math.min(w, h) * 0.5);
+      state.invR2 = f32(1 / f32(R * R));
+      state.step = new Int32Array(3); state.bigStep = new Int32Array(3); state.rowStep = new Int32Array(3); state.wtTurn = new Uint32Array(3);
+      state.out = new Uint16Array(w);
+      state._gen = -1; state._glow = -1; state._grain = -1; state._vign = -1;
     },
     render(data, w, h, tMs, p, state) {
-      const [speed, scale, glow, spread, twist, wobble, vignette, grain] = p;
-      const omega0 = 2*Math.PI / 11650 * speedMulJS(speed); // 11.65s base drift at 50 (gm-33fm)
-      const k0 = 0.008 + 0.022*(scale/100);
-      const contrastExp = 0.6 + 2.0*(glow/100);
-      // Same mappings as AnimSilk.cpp's frame(): every default is a factor of
-      // exactly 1, so the picture at the defaults is the one this entry drew
-      // before the params existed.
-      const sprK = spread/50, rotK = 0.15*(twist/50), wobK = 0.15*(wobble/50);
-      const vignK = 0.32*(vignette/80), grainK = grain/50;
-      if (state._gen !== THEME.gen) { state.pal = themeRamp(); state._gen = THEME.gen; }
-      const pal = state.pal;
-      const W = state.waves;
-      for (let i = 0; i < 3; i++) {
-        const wv = W[i];
-        const A0i = wv.A0 + (state.spreadMid - wv.A0)*(1-sprK);
-        const A = A0i + (omega0*rotK*wv.rotMult)*tMs;
-        const k = k0*(1+wobK*Math.sin(wv.wk*tMs+wv.phk));
-        wv.kx = k*Math.cos(A); wv.ky = k*Math.sin(A);
-        wv.wt = (omega0*wv.wMult)*tMs;
+      const omega0 = f32(f32(f32(6.2831853) / 11650) * f32(speedMulJS(p[0]))); // 11.65s base drift at 50 (gm-33fm)
+      const k0 = f32(f32(0.008) + f32(f32(0.022) * f32(p[1] / 100)));
+      const sprK = f32(p[3] / 50), rotK = f32(f32(0.15) * f32(p[4] / 50)), wobK = f32(f32(0.15) * f32(p[5] / 50));
+      let ditherStale = false;
+      if (state._gen !== THEME.gen) {
+        for (let i = 0; i < 256; i++) { const c = themeRGB(i); state.palExt[PAD + i] = ((c[0] >> 3) << 11) | ((c[1] >> 2) << 5) | (c[2] >> 3); }
+        for (let i = 0; i < PAD; i++) { state.palExt[i] = state.palExt[PAD]; state.palExt[PAD + 256 + i] = state.palExt[PAD + 255]; }
+        state._gen = THEME.gen; ditherStale = true;
       }
-      const [w1, w2, w3] = W;
-      const cx = state.cx, cy = state.cy, invR2 = 1/(state.Rscreen*state.Rscreen);
+      if (p[2] !== state._glow) {
+        const e = f32(f32(0.6) + f32(2 * f32(p[2] / 100)));
+        for (let idx = 0; idx < CONTRAST_N; idx++) {
+          const nc = f32(f32(Math.pow(f32(idx / (CONTRAST_N - 1)), e)) * 255);
+          state.contrast[idx] = lroundf(f32(nc * 256));
+        }
+        state._glow = p[2];
+      }
+      if (p[7] !== state._grain) { state.ditherGain = f32(p[7] / 50); state._grain = p[7]; ditherStale = true; }
+      if (ditherStale) {
+        const amp = ditherAmp(state.palExt.subarray(PAD, PAD + 256));
+        const scale = f32(f32(amp / f32(7.5)) * state.ditherGain);
+        for (let k = 0; k < 16; k++) state.ditherQ[k] = lroundf(f32(f32(f32(BAYER4[k] - 7.5) * scale) * 65536));
+      }
+      if (p[6] !== state._vign) {
+        const vignBase = f32(f32(0.32) * f32(p[6] / 80));
+        state.vignK = f32(vignBase * state.invR2);
+        const cx = f32(w * 0.5);
+        for (let x = 0; x < w; x++) { const dx = f32(x - cx); state.dx2Row[x] = lroundf(f32(f32(f32(state.vignK * dx) * dx) * 256)); }
+        for (let j = 0; j < state.dx2Node.length; j++) { const dx = f32(j * GRID - cx); state.dx2Node[j] = lroundf(f32(f32(f32(state.vignK * dx) * dx) * 256)); }
+        state._vign = p[6];
+      }
+      const tF = f32(tMs >>> 0);
+      for (let i = 0; i < 3; i++) {
+        const wv = waves[i];
+        const A0i = f32(wv.A0 + f32(f32(SPREAD_MID - wv.A0) * f32(1 - sprK)));
+        const A = f32(A0i + f32(f32(f32(omega0 * rotK) * wv.rotMult) * tF));
+        const k = f32(k0 * f32(1 + f32(wobK * f32(Math.sin(f32(f32(wv.wk * tF) + wv.phk))))));
+        const kx = f32(k * f32(Math.cos(A))), ky = f32(k * f32(Math.sin(A)));
+        state.step[i] = Math.trunc(f32(kx * TURN));
+        state.bigStep[i] = Math.imul(state.step[i], GRID);
+        state.rowStep[i] = Math.trunc(f32(ky * TURN));
+        const wRate = f32(omega0 * wv.wMult);
+        const wRateQ = Math.trunc(f32(wRate * TURN));
+        state.wtTurn[i] = Math.imul(wRateQ, tMs | 0) >>> 0;
+      }
+      const lut = state.contrast, palExt = state.palExt, ditherQ = state.ditherQ, dx2Row = state.dx2Row, dx2Node = state.dx2Node;
+      const vignK = state.vignK, cy = f32(w * 0.5);
+      const sinT = t => SIN[t >>> 22];
+      const cellsFull = w >> GRID_SHIFT;
+      const out = state.out;
       for (let y = 0; y < h; y++) {
-        const dy = y-cy, dy2 = dy*dy;
-        let ph1 = w1.ky*y + w1.wt, ph2 = w2.ky*y + w2.wt, ph3 = w3.ky*y + w3.wt;
-        const kx1 = w1.kx, kx2 = w2.kx, kx3 = w3.kx;
-        const rowOff = y*w;
-        for (let x = 0; x < w; x++) {
-          const s = Math.sin(ph1)+Math.sin(ph2)+Math.sin(ph3);
-          ph1 += kx1; ph2 += kx2; ph3 += kx3;
-          let n = (s/3+1)/2;
-          if (n < 0) n = 0; else if (n > 1) n = 1;
-          n = Math.pow(n, contrastExp);
-          const dx = x-cx;
-          let env = 1-vignK*(dx*dx+dy2)*invR2;
-          if (env < 0) env = 0;
-          const dith = (BAYER4[(y&3)*4+(x&3)]/16-0.5)*(1/160)*grainK;
-          let idx = Math.round((n*env+dith)*255);
-          if (idx < 0) idx = 0; else if (idx > 255) idx = 255;
-          const o = (rowOff+x)*4;
-          data[o] = pal[idx*3]; data[o+1] = pal[idx*3+1]; data[o+2] = pal[idx*3+2]; data[o+3] = 255;
+        const dy = f32(y - cy);
+        const envRowBase = Math.trunc(f32(f32(f32(1 - f32(f32(vignK * dy) * dy)) * 256) + 0.5));
+        const yph = y & 3;
+        let a = (state.wtTurn[0] + Math.imul(state.rowStep[0], y)) >>> 0;
+        let b = (state.wtTurn[1] + Math.imul(state.rowStep[1], y)) >>> 0;
+        let c = (state.wtTurn[2] + Math.imul(state.rowStep[2], y)) >>> 0;
+        let sCur = SIN_SUM_BIAS + sinT(a) + sinT(b) + sinT(c);
+        let ncCur = lut[sCur];
+        let Pcur = ncCur * (envRowBase - dx2Node[0]);
+        const dq = [ditherQ[yph * 4] * GRID, ditherQ[yph * 4 + 1] * GRID, ditherQ[yph * 4 + 2] * GRID, ditherQ[yph * 4 + 3] * GRID];
+        let x = 0;
+        for (let cell = 0; cell < cellsFull; cell++) {
+          a = (a + state.bigStep[0]) >>> 0; b = (b + state.bigStep[1]) >>> 0; c = (c + state.bigStep[2]) >>> 0;
+          const sNext = SIN_SUM_BIAS + sinT(a) + sinT(b) + sinT(c);
+          const ncNext = lut[sNext];
+          const Pnext = ncNext * (envRowBase - dx2Node[cell + 1]);
+          const ncMid = lut[(sCur + sNext) >> 1];
+          let bow = 2 * ncMid - (ncCur + ncNext);
+          bow = bow < 0 ? -bow : bow;
+          if (bow <= SILK_BOW_TOL) {
+            let PQ = Pcur << GRID_SHIFT;
+            const dP2 = (Pnext - Pcur) * 2;
+            for (let k = 0; k < 8; k++) {
+              const v = palExt[PAD + ((PQ + dq[k & 3]) >> (16 + GRID_SHIFT))];
+              out[x + 2 * k] = v; out[x + 2 * k + 1] = v;
+              PQ += dP2;
+            }
+            x += GRID;
+          } else {
+            const stepQ2 = (sNext - sCur) * (2 << (Q_BITS - GRID_SHIFT));
+            let sQ = sCur << Q_BITS;
+            for (let i = 0; i < GRID; i += 2) {
+              const s = sQ >> Q_BITS;
+              const nc = lut[s];
+              const env = envRowBase - dx2Row[x];
+              const idxq = nc * env + ditherQ[yph * 4 + ((x >> 1) & 3)];
+              const v = palExt[PAD + (idxq >> 16)];
+              out[x] = v; out[x + 1] = v;
+              sQ += stepQ2;
+              x += 2;
+            }
+          }
+          sCur = sNext; ncCur = ncNext; Pcur = Pnext;
+        }
+        for (; x < w; x++) {
+          const s = SIN_SUM_BIAS + sinT(a) + sinT(b) + sinT(c);
+          a = (a + state.step[0]) >>> 0; b = (b + state.step[1]) >>> 0; c = (c + state.step[2]) >>> 0;
+          const nc = lut[s];
+          const env = envRowBase - dx2Row[x];
+          const idxq = nc * env + ditherQ[yph * 4 + ((x >> 1) & 3)];
+          out[x] = palExt[PAD + (idxq >> 16)];
+        }
+        let o = y * w * 4;
+        for (let xx = 0; xx < w; xx++) {
+          const v = out[xx];
+          data[o] = q565r((v >> 11) << 3); data[o + 1] = q565g(((v >> 5) & 63) << 2); data[o + 2] = q565r((v & 31) << 3); data[o + 3] = 255;
+          o += 4;
         }
       }
     },
   });
 })();
 
-/* ---- 3: Starfield (anim-celestial) ---- */
+/* ---- 3: Starfield (anim-celestial; firmware AnimStarfield.cpp frame and bandRef, ported) ---- */
 (() => {
-  function plot(data, w, h, x, y, r, g, b) {
-    if (x < 0 || x >= w || y < 0 || y >= h) return;
-    const idx = (y*w+x)*4;
-    data[idx]   = Math.min(255, Math.max(data[idx],   r));
-    data[idx+1] = Math.min(255, Math.max(data[idx+1], g));
-    data[idx+2] = Math.min(255, Math.max(data[idx+2], b));
-    data[idx+3] = 255;
-  }
+  // What the device draws, step for step (gm-pciz). The star placement is the
+  // design's (mulberry32 from 0xC0FFEE, the same draws in the same order,
+  // nearest-pixel positions, per-channel max when a star lands on the sky,
+  // the first shooting star 2 to 6 s in). What the page takes from the
+  // firmware is the sky: a 128-step table over squared radius (a per-pixel
+  // square root is not affordable on the device) and a 4x4 colour dither of
+  // 0.75 of one RGB565 step, which the device needs because the sky spans
+  // only the darkest 14% of the theme and undithered it showed contour rings.
+  // Against the smooth sky this entry drew before, the port is 2.0 per
+  // channel on average, 0.9 of it the table's steps and the rest the dither;
+  // the stars are the same stars. The twinkle reads the firmware's 256-entry
+  // cosine table (400 stars a frame), a brightness error under one level of
+  // 255. The twinkle depth follows the firmware's curve: identical to the
+  // old page formula at 50, and reaching a full extinguish at 100 where the
+  // old formula only dimmed to 40%.
+  const f32 = Math.fround;
+  const MAX_STARS = 400;
+  const RAD_TO_TAB = f32(256 / f32(6.2831853));
+  const COS = new Float32Array(256);
+  const cstep = f32(f32(2 * f32(Math.PI)) / 256);
+  for (let i = 0; i < 256; i++) COS[i] = Math.cos(f32(i * cstep));
+  const clamp8f = v => v < 0 ? 0 : (v > 255 ? 255 : Math.trunc(v));
+  const to565 = (r, g, b) => ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3);
+  const INV14 = f32(1 / 14);
   ANIMS.push({
     id: 'starfield', name: 'Starfield',
     params: [
@@ -622,43 +744,57 @@ function gradLUT(stops) { // stops: [[t0..255, r, g, b], ...] -> Uint8Array 256*
       const rand = mulberry32(0xC0FFEE);
       state.rand = rand;
       const stars = [];
-      for (let i = 0; i < 400; i++) {
-        const roll = rand();
-        const layer = roll < 0.7 ? 0 : (roll < 0.92 ? 1 : 2);
-        stars.push({
-          x: rand()*w, y: rand()*h,
-          phase: rand()*Math.PI*2, rate: 0.3+rand()*1.1,
-          baseBrightness: layer===0 ? 0.25+rand()*0.25 : layer===1 ? 0.45+rand()*0.25 : 0.7+rand()*0.3,
-          size: layer, hue: rand(), driftSpeed: 0.5+rand(),
-        });
+      for (let i = 0; i < MAX_STARS; i++) {
+        const roll = f32(rand());
+        const layer = roll < f32(0.7) ? 0 : (roll < f32(0.92) ? 1 : 2);
+        const x = f32(f32(rand()) * w), y = f32(f32(rand()) * h);
+        const phase = f32(f32(rand()) * f32(6.2831853));
+        const rate = f32(f32(0.3) + f32(f32(rand()) * f32(1.1)));
+        const r = f32(rand());
+        const baseBrightness = layer === 0 ? f32(f32(0.25) + f32(r * f32(0.25)))
+          : layer === 1 ? f32(f32(0.45) + f32(r * f32(0.25))) : f32(f32(0.7) + f32(r * f32(0.3)));
+        const hue = f32(rand());
+        const driftSpeed = f32(f32(0.5) + f32(rand()));
+        // yi: nearest row. driftQ: Q16.16 drift phase, stepped per frame like the firmware's.
+        stars.push({ x, y, phase, rate, baseBrightness, size: layer, hue, driftSpeed,
+          yi: Math.trunc(f32(y + 0.5)), driftQ: Math.trunc(f32(x * 65536)) });
       }
       state.stars = stars;
+      state.nextShootTime = f32(2000 + f32(f32(rand()) * 4000));
       state.shootingStar = null;
-      state.nextShootTime = 2000 + rand()*4000;
-      state.lastT = null;
-      state._gen = -1;
-      state._sky = 50; state._fall = 50; state._tint = 50;
+      state.haveLastT = false; state.lastT = 0; state.lastDrift = 0;
+      state.dx2 = new Int32Array(w); state.dy2 = new Int32Array(h);
+      const cx = f32(w * 0.5), cy = f32(h * 0.5);
+      for (let x = 0; x < w; x++) { const d = f32(x - cx); state.dx2[x] = Math.trunc(f32(d * d)); }
+      for (let y = 0; y < h; y++) { const d = f32(y - cy); state.dy2[y] = Math.trunc(f32(d * d)); }
+      state.maxR2 = f32(f32(cx * cx) + f32(cy * cy));
+      state.vigColor = new Uint16Array(128 * 16);
+      state.fb = new Uint16Array(w * h);
+      state._gen = -1; state._sky = -1; state._fall = -1; state._tint = -1;
     },
     // Theme-tinted assets: vignette from the darkest ~14%, stars from the
     // bright end (per-star hue picks the exact spot), shooting star = stop 5.
     rebuildTheme(w, h, state, p) {
-      const skySpan = (p[5]*36/50)|0;
-      const gamma = p[6] === 50 ? 1 : 0.25 + p[6]*0.015;
-      const tintSpan = (p[7]*150/100)|0, tintBase = 255-tintSpan;
-      state.bg = new Uint8ClampedArray(w*h*4);
-      const cx = w/2, cy = h/2, maxR = Math.sqrt(cx*cx+cy*cy);
-      for (let y = 0; y < h; y++) {
-        const dy = y-cy;
-        for (let x = 0; x < w; x++) {
-          const dx = x-cx;
-          let shade = Math.max(0, 1 - Math.sqrt(dx*dx+dy*dy)/maxR);
-          if (gamma !== 1) shade = Math.pow(shade, gamma);
-          const c = themeRGB((shade*255*skySpan/256)|0);
-          const idx = (y*w+x)*4;
-          state.bg[idx] = c[0]; state.bg[idx+1] = c[1]; state.bg[idx+2] = c[2]; state.bg[idx+3] = 255;
+      const skySpan = Math.trunc(p[5] * 36 / 50);
+      const gamma = p[6] === 50 ? 1 : f32(f32(0.25) + f32(p[6] * f32(f32(1.5) / 100)));
+      const tintSpan = Math.trunc(p[7] * 150 / 100), tintBase = 255 - tintSpan, tintSpanF = f32(tintSpan);
+      const vig = new Uint8Array(128);
+      const maxR2 = state.maxR2;
+      for (let i = 0; i < 128; i++) {
+        const rn = f32(f32(Math.sqrt(f32(f32(i / 127) * maxR2))) / f32(Math.sqrt(maxR2)));
+        let shade = Math.max(0, f32(1 - rn));
+        if (gamma !== 1) shade = f32(Math.pow(shade, gamma));
+        vig[i] = Math.trunc(f32(shade * 255));
+      }
+      const dstep = f32(f32(0.75) / f32(7.5));
+      for (let idx = 0; idx < 128; idx++) {
+        const c = themeRGB((vig[idx] * skySpan) >> 8);
+        for (let ph = 0; ph < 16; ph++) {
+          const d = f32(f32(BAYER4[ph] - 7.5) * dstep);
+          state.vigColor[ph * 128 + idx] = to565(clamp8f(f32(c[0] + f32(d * f32(8.226)))), clamp8f(f32(c[1] + f32(d * f32(4.048)))), clamp8f(f32(c[2] + f32(d * f32(8.226)))));
         }
       }
-      state.starCol = state.stars.map(st => themeRGB(tintBase + (st.hue*tintSpan)|0));
+      state.starCol = state.stars.map(st => themeRGB(tintBase + Math.trunc(f32(st.hue * tintSpanF))));
       state.shootCol = themeRGB(255);
     },
     render(data, w, h, tMs, p, state) {
@@ -666,69 +802,126 @@ function gradLUT(stops) { // stops: [[t0..255, r, g, b], ...] -> Uint8Array 256*
         this.rebuildTheme(w, h, state, p);
         state._gen = THEME.gen; state._sky = p[5]; state._fall = p[6]; state._tint = p[7];
       }
-      const nStars = Math.round(40 + (p[1]/100)*360);
-      const twinkleAmt = p[2]/100, shootFreq = p[3];
-      // Star glow, mirroring the firmware's integer numerators over 40:
-      // 50 gives 0.4 and 0.3, the constants that were fixed before.
-      const h1 = ((p[4]*32/100)|0)/40, h2 = ((p[4]*24/100)|0)/40;
-      const h0 = p[4] > 50 ? (((p[4]-50)*32/50)|0)/40 : 0;
-      const t = tMs/1000;
-      const dt = state.lastT != null ? Math.max(0, (tMs-state.lastT)/1000) : 1/30;
-      state.lastT = tMs;
-      data.set(state.bg);
-      const driftPxPerSec = 3.0*speedMulJS(p[0]);
-      for (let i = 0; i < nStars; i++) {
-        const s = state.stars[i];
-        let x = (s.x + t*driftPxPerSec*s.driftSpeed) % w;
-        if (x < 0) x += w;
-        const edgeFade = Math.min(1, Math.min(x, w-x)/20);
-        const twinkle = 0.7 + 0.3*Math.sin(t*s.rate + s.phase);
-        let b = s.baseBrightness*(1-twinkleAmt+twinkleAmt*twinkle)*edgeFade;
-        b = Math.max(0, Math.min(1, b));
-        const sc = state.starCol[i];
-        const r = sc[0]*b, g = sc[1]*b, bl = sc[2]*b;
-        const xi = Math.round(x), yi = Math.round(s.y);
-        plot(data, w, h, xi, yi, r, g, bl);
-        if (s.size === 0 && h0 > 0) plot(data, w, h, xi+1, yi, r*h0, g*h0, bl*h0);
-        if (s.size >= 1) plot(data, w, h, xi+1, yi, r*h1, g*h1, bl*h1);
-        if (s.size >= 2) {
-          plot(data, w, h, xi, yi+1, r*h1, g*h1, bl*h1);
-          plot(data, w, h, xi-1, yi, r*h2, g*h2, bl*h2);
+      const fb = state.fb, vigColor = state.vigColor, dx2 = state.dx2, dy2 = state.dy2;
+      for (let y = 0; y < h; y++) {
+        const dyv = dy2[y], vb = (y & 3) * 512;
+        for (let x = 0; x < w; x++) {
+          let i = (dyv + dx2[x]) >> 10;
+          if (i > 127) i = 127;
+          fb[y * w + x] = vigColor[vb + (x & 3) * 128 + i];
         }
       }
-      if (!state.shootingStar && shootFreq > 0 && tMs > state.nextShootTime) {
+      const plotMax = (x, y, r, g, b) => {
+        if (x < 0 || x >= w || y < 0 || y >= h) return;
+        const o = y * w + x, px = fb[o], c = to565(r, g, b);
+        fb[o] = Math.max(c & 0xF800, px & 0xF800) | Math.max(c & 0x07E0, px & 0x07E0) | Math.max(c & 0x1F, px & 0x1F);
+      };
+      // Star glow: integer numerators over 40, so 50 gives 16/40 and 12/40.
+      const haloNum1 = Math.trunc(p[4] * 32 / 100), haloNum2 = Math.trunc(p[4] * 24 / 100);
+      const haloNum0 = p[4] > 50 ? Math.trunc((p[4] - 50) * 32 / 50) : 0;
+      const nStars = 40 + Math.trunc(p[1] * (MAX_STARS - 40) / 100);
+      const t = f32(tMs * f32(0.001));
+      const twinkleAmt = f32(p[2] * f32(1 / 100));
+      const twinkleDepth = f32(twinkleAmt * f32(f32(twinkleAmt * f32(4 / 3)) + f32(1 / 3)));
+      const driftPxPerSec = f32(3 * f32(speedMulJS(p[0])));
+      const rawDt = f32(((tMs - state.lastDrift) >>> 0) * f32(0.001));
+      const driftDt = rawDt < 2 ? rawDt : 2;
+      state.lastDrift = tMs;
+      const wQ = w << 16;
+      for (let i = 0; i < nStars; i++) {
+        const s = state.stars[i];
+        const v = f32(driftPxPerSec * s.driftSpeed);
+        let pos = (s.driftQ + Math.trunc(f32(f32(v * driftDt) * 65536))) | 0;
+        if (pos >= wQ) pos -= wQ; else if (pos < 0) pos += wQ;
+        s.driftQ = pos;
+        const x = f32(f32(pos) * (1 / 65536));
+        const wx = f32(w - x);
+        const edgeRaw = f32((x < wx ? x : wx) * f32(0.05));
+        const edgeFade = edgeRaw < 1 ? edgeRaw : 1;
+        const twinkleRad = f32(f32(f32(t * s.rate) + s.phase) - f32(1.5707963));
+        const twinkle = f32(f32(0.7) + f32(f32(0.3) * COS[Math.trunc(f32(twinkleRad * RAD_TO_TAB)) & 255]));
+        let bF = f32(f32(s.baseBrightness * f32(1 - f32(twinkleDepth * f32(1 - twinkle)))) * edgeFade);
+        bF = bF < 0 ? 0 : (bF > 1 ? 1 : bF);
+        const xi = Math.trunc(f32(x + 0.5)), yi = s.yi;
+        const sc = state.starCol[i];
+        const r = clamp8f(f32(sc[0] * bF)), g = clamp8f(f32(sc[1] * bF)), b = clamp8f(f32(sc[2] * bF));
+        plotMax(xi, yi, r, g, b);
+        if (s.size === 0 && haloNum0 > 0) plotMax(xi + 1, yi, Math.trunc(r * haloNum0 / 40), Math.trunc(g * haloNum0 / 40), Math.trunc(b * haloNum0 / 40));
+        if (s.size >= 1) plotMax(xi + 1, yi, Math.trunc(r * haloNum1 / 40), Math.trunc(g * haloNum1 / 40), Math.trunc(b * haloNum1 / 40));
+        if (s.size >= 2) {
+          plotMax(xi, yi + 1, Math.trunc(r * haloNum1 / 40), Math.trunc(g * haloNum1 / 40), Math.trunc(b * haloNum1 / 40));
+          plotMax(xi - 1, yi, Math.trunc(r * haloNum2 / 40), Math.trunc(g * haloNum2 / 40), Math.trunc(b * haloNum2 / 40));
+        }
+      }
+      const dt = !state.haveLastT ? f32(1 / 30) : (tMs > state.lastT ? f32((tMs - state.lastT) * f32(0.001)) : 0);
+      state.haveLastT = true; state.lastT = tMs;
+      const shootFreq = p[3];
+      if (!state.shootingStar && shootFreq > 0 && f32(tMs) > state.nextShootTime) {
         const rand = state.rand;
-        const angle = Math.PI*0.15 + rand()*Math.PI*0.2;
-        const speed = 260 + rand()*140;
-        state.shootingStar = {
-          x: rand()*w*0.6, y: rand()*h*0.3,
-          vx: Math.cos(angle)*speed, vy: Math.sin(angle)*speed,
-          life: 0, maxLife: 0.5+rand()*0.3,
-        };
-        const interval = Math.max(1500, 30000 - shootFreq*280);
-        state.nextShootTime = tMs + interval + rand()*interval*0.5;
+        const angle = f32(f32(f32(3.14159265) * f32(0.15)) + f32(f32(f32(rand()) * f32(3.14159265)) * f32(0.2)));
+        const speed = f32(260 + f32(f32(rand()) * 140));
+        const sx = f32(f32(f32(rand()) * w) * f32(0.6)), sy = f32(f32(f32(rand()) * h) * f32(0.3));
+        const maxLife = f32(f32(0.5) + f32(f32(rand()) * f32(0.3)));
+        state.shootingStar = { x: sx, y: sy, vx: f32(f32(Math.cos(angle)) * speed), vy: f32(f32(Math.sin(angle)) * speed), life: 0, maxLife, invMaxLife: f32(1 / maxLife) };
+        const interval = Math.max(1500, 30000 - shootFreq * 280);
+        state.nextShootTime = f32(f32(tMs + interval) + f32(f32(f32(rand()) * interval) * f32(0.5)));
       }
       if (state.shootingStar) {
         const ss = state.shootingStar;
-        ss.life += dt;
-        const progress = ss.life/ss.maxLife;
+        ss.life = f32(ss.life + dt);
+        const progress = f32(ss.life * ss.invMaxLife);
         if (progress >= 1) state.shootingStar = null;
         else {
-          const hx = ss.x + ss.vx*ss.life, hy = ss.y + ss.vy*ss.life;
+          const hx = f32(ss.x + f32(ss.vx * ss.life)), hy = f32(ss.y + f32(ss.vy * ss.life));
           const shc = state.shootCol;
           for (let k = 0; k < 14; k++) {
-            const f = k/14;
-            const fade = (1-f)*(1-progress*0.3);
-            plot(data, w, h, Math.round(hx-ss.vx*0.02*k), Math.round(hy-ss.vy*0.02*k), shc[0]*fade, shc[1]*fade, shc[2]*fade);
+            const f = f32(k * INV14);
+            const px = f32(hx - f32(f32(ss.vx * f32(0.02)) * k)), py = f32(hy - f32(f32(ss.vy * f32(0.02)) * k));
+            const fade = f32(f32(1 - f) * f32(1 - f32(progress * f32(0.3))));
+            plotMax(Math.floor(f32(px + 0.5)), Math.floor(f32(py + 0.5)), clamp8f(f32(shc[0] * fade)), clamp8f(f32(shc[1] * fade)), clamp8f(f32(shc[2] * fade)));
           }
         }
+      }
+      for (let i = 0, o = 0; i < w * h; i++, o += 4) {
+        const c = fb[i];
+        data[o] = q565r((c >> 11) << 3); data[o + 1] = q565g(((c >> 5) & 63) << 2); data[o + 2] = q565r((c & 31) << 3); data[o + 3] = 255;
       }
     },
   });
 })();
 
-/* ---- 4: Aurora (anim-celestial) ---- */
+/* ---- 4: Aurora (anim-celestial; firmware AnimAurora.cpp frame and bandRef, ported) ---- */
 (() => {
+  // What the device draws, step for step (gm-pciz). The design is two warped
+  // sine curtains, squared, under a vertical envelope, added to a dark sky
+  // through a glow ramp, with an 8x8 ordered dither. The firmware evaluates
+  // it on even rows and even columns only (each row pair shares one row, the
+  // odd pixel is the mean of its neighbours), from the 1024-entry sine table
+  // pre-weighted 0.62 and 0.38 in Q7, with the per-row warp read from the
+  // 256-entry cosine table and the dither folded to integer levels. Against
+  // the per-pixel design this entry drew before, the port is 0.7 per channel
+  // on average, 0.5 of it smooth (the row and column halving), the rest
+  // grain. The warp table alone is worth 0.1 of that and would cost the
+  // device 480 sine calls a frame, so it stays. The dither swing is the
+  // design's, 3.8 levels of 255 either way: the fold used to be twice that.
+  const f32 = Math.fround;
+  const TICKS = f32(f32(1024 * 256) / f32(6.2831853));
+  const STEP1 = Math.trunc(f32(f32(0.026) * TICKS)) >>> 0;
+  const STEP2 = Math.trunc(f32(f32(0.017) * TICKS)) >>> 0;
+  const W1 = 635, W2 = 393;
+  const ROWLUT_PAD = 8;
+  const V_MAX = (512 * (W1 + W2)) >> 7;
+  const SQ_MAX = (V_MAX * V_MAX) >> 12;
+  const INTEN14_MAX = 358;
+  const ROWLUT_SIZE = ((SQ_MAX * INTEN14_MAX) >> 12) + 7 + ROWLUT_PAD + 1 + 8;
+  const RAD_TO_TAB = f32(256 / f32(6.2831853));
+  const COS = new Float32Array(256);
+  const cstep = f32(f32(2 * f32(Math.PI)) / 256);
+  for (let i = 0; i < 256; i++) COS[i] = Math.cos(f32(i * cstep));
+  const rowCos = r => COS[Math.trunc(f32(r * RAD_TO_TAB)) & 255];
+  const rowSin = r => rowCos(f32(r - f32(1.5707963)));
+  const clamp8f = v => v < 0 ? 0 : (v > 255 ? 255 : Math.trunc(v));
+  const to565 = (r, g, b) => ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3);
   ANIMS.push({
     id: 'aurora', name: 'Aurora',
     params: [
@@ -737,57 +930,87 @@ function gradLUT(stops) { // stops: [[t0..255, r, g, b], ...] -> Uint8Array 256*
       {key:'spread',label:'Spread',def:50},{key:'glow',label:'Glow',def:50},
       {key:'drift',label:'Drift',def:50}],
     init(w, h, state) {
-      state._gen = -1;
-      state._glowP = -1;
-      state.lut = new Uint8Array(256*3);
+      state.glowLUT = new Uint16Array(256);
+      state.wLut1 = new Int32Array(SIN_N); state.wLut2 = new Int32Array(SIN_N);
+      for (let i = 0; i < SIN_N; i++) { state.wLut1[i] = (SIN[i] * W1) >> 7; state.wLut2[i] = (SIN[i] * W2) >> 7; }
+      state.rowLUT = new Uint16Array(ROWLUT_SIZE);
+      state.ditherFold = new Int32Array(64);
+      for (let i = 0; i < 64; i++) state.ditherFold[i] = ROWLUT_PAD + ((BAYER8[i] - 32) >> 3);
+      state.row = new Uint16Array(w);
+      state._gen = -1; state._glowP = -1;
+    },
+    // Curtain rides the theme's mid-to-bright range; low intensity fades to black.
+    buildGlowLUT(state, glowGain) {
+      for (let i = 0; i < 256; i++) {
+        const c = themeRGB(40 + ((i * 215) >> 8));
+        const scale = Math.min(1, f32(f32(i / 255) * glowGain));
+        state.glowLUT[i] = to565(clamp8f(f32(c[0] * scale)), clamp8f(f32(c[1] * scale)), clamp8f(f32(c[2] * scale)));
+      }
+    },
+    buildRowLUT(state, bgIdx) {
+      const bg = themeRGB(bgIdx);
+      const bgR5 = bg[0] >> 3, bgG6 = bg[1] >> 2, bgB5 = bg[2] >> 3;
+      const out = state.rowLUT, glowLUT = state.glowLUT;
+      for (let i = 0; i < ROWLUT_SIZE; i++) {
+        let inten = i - ROWLUT_PAD;
+        inten = inten < 0 ? 0 : (inten > 255 ? 255 : inten);
+        const glow = glowLUT[inten];
+        const r = Math.min(0x1F, bgR5 + ((glow >> 11) & 0x1F));
+        const g = Math.min(0x3F, bgG6 + ((glow >> 5) & 0x3F));
+        const b = Math.min(0x1F, bgB5 + (glow & 0x1F));
+        out[i] = (r << 11) | (g << 5) | b;
+      }
     },
     render(data, w, h, tMs, p, state) {
-      const intensityP = p[1]/100, wavinessP = p[2]/100;
-      // Height, Spread, Glow and Drift map as an offset from the midpoint, the
-      // same way AnimAurora.cpp maps them, so 50 lands on the old constant.
-      const center = 0.32 + (p[3]-50)*0.006;
-      const spread = 0.85 + (p[4]-50)*0.011;
-      const glowGain = 2.2 + (p[5]-50)*0.032;
-      const drift = 1 + (p[6]-50)*0.08;
-      if (state._gen !== THEME.gen || state._glowP !== p[5]) {
-        state._gen = THEME.gen;
-        state._glowP = p[5];
-        // Curtain rides the theme's mid-to-bright range; low intensity fades to black.
-        for (let i = 0; i < 256; i++) {
-          const c = themeRGB(40 + ((i*215)>>8));
-          const scale = Math.min(1, (i/255)*glowGain);
-          state.lut[i*3] = c[0]*scale; state.lut[i*3+1] = c[1]*scale; state.lut[i*3+2] = c[2]*scale;
-        }
-      }
-      const lut = state.lut;
+      // Height, Spread, Glow and Drift map as an offset from the midpoint, so 50 lands on the old constant.
+      const glowGain = f32(f32(2.2) + f32((p[5] - 50) * f32(0.032)));
+      if (state._gen !== THEME.gen || state._glowP !== p[5]) { this.buildGlowLUT(state, glowGain); state._gen = THEME.gen; state._glowP = p[5]; }
       // Speed calibration (gm-33fm): 0.45 before, times 2.33.
-      const t = (tMs/1000)*1.05*speedMulJS(p[0]);
-      const f1 = 0.026, f1b = 0.017;
-      const A1 = 0.6+wavinessP*2.4, A2 = 0.4+wavinessP*1.6;
-      for (let y = 0; y < h; y++) {
-        const warp1 = Math.sin(y*0.021 + t*0.5)*A1;
-        const warp2 = Math.sin(y*0.013 - t*0.44 + 1.7)*A2;
-        const yn = y/h;
-        let env = 1 - Math.abs(yn-center)/spread;
-        env = env < 0 ? 0 : env*env;
-        const bgC = themeRGB((yn*10)|0);
-        const bgR = bgC[0], bgG = bgC[1], bgB = bgC[2];
-        let ph1 = warp1 + t*0.12*drift, ph2 = warp2 + t*0.07*drift;
-        const rowOff = (y&7)*8;
-        for (let x = 0; x < w; x++) {
-          const v1 = Math.sin(ph1), v2 = Math.sin(ph2);
-          ph1 += f1; ph2 += f1b;
-          let v = 0.62*v1 + 0.38*v2;
-          v = v < 0 ? 0 : v*v;
-          const dither = (BAYER8[rowOff+(x&7)]-31.5)/63*0.03;
-          let inten = v*env*intensityP*1.4 + dither;
-          inten = Math.max(0, Math.min(1, inten));
-          const li = (inten*255)|0;
-          const idx = (y*w+x)*4;
-          data[idx]   = Math.min(255, bgR + lut[li*3]);
-          data[idx+1] = Math.min(255, bgG + lut[li*3+1]);
-          data[idx+2] = Math.min(255, bgB + lut[li*3+2]);
-          data[idx+3] = 255;
+      const t = f32(f32(f32((tMs >>> 0) * f32(0.001)) * f32(1.05)) * f32(speedMulJS(p[0])));
+      const A1 = f32(f32(0.6) + f32(f32(p[2] / 100) * f32(2.4)));
+      const A2 = f32(f32(0.4) + f32(f32(p[2] / 100) * f32(1.6)));
+      const inten14 = Math.trunc(f32(f32(f32(p[1] / 100) * f32(1.4)) * 256));
+      const envCenter = f32(f32(0.32) + f32((p[3] - 50) * f32(0.006)));
+      const envInv = f32(1 / f32(f32(0.85) + f32((p[4] - 50) * f32(0.011))));
+      const drift = f32(1 + f32((p[6] - 50) * f32(0.08)));
+      const phBase1 = Math.trunc(f32(f32(f32(t * f32(0.12)) * drift) * TICKS)) >>> 0;
+      const phBase2 = Math.trunc(f32(f32(f32(t * f32(0.07)) * drift) * TICKS)) >>> 0;
+      const w1 = state.wLut1, w2 = state.wLut2, rowLUT = state.rowLUT, df = state.ditherFold, row = state.row;
+      let lastBgIdx = -1;
+      for (let ySrc = 0; ySrc < h; ySrc += 2) {
+        const warp1 = f32(rowSin(f32(f32(ySrc * f32(0.021)) + f32(t * f32(0.5)))) * A1);
+        const warp2 = f32(rowSin(f32(f32(f32(ySrc * f32(0.013)) - f32(t * f32(0.44))) + f32(1.7))) * A2);
+        const yn = f32(ySrc * f32(1 / 480));
+        let env = f32(1 - f32(Math.abs(f32(yn - envCenter)) * envInv));
+        env = env < 0 ? 0 : f32(env * env);
+        const envQ12 = Math.trunc(f32(env * 4096));
+        const rowScale = (envQ12 * inten14) >> 12;
+        const bgIdx = Math.trunc(f32(yn * 10)); // sky sits in the darkest ~4% of the theme
+        if (bgIdx !== lastBgIdx) { this.buildRowLUT(state, bgIdx); lastBgIdx = bgIdx; }
+        let ph1 = (phBase1 + (Math.trunc(f32(warp1 * TICKS)) | 0)) >>> 0;
+        let ph2 = (phBase2 + (Math.trunc(f32(warp2 * TICKS)) | 0)) >>> 0;
+        const dbase = ((ySrc >> 1) & 7) * 8;
+        const sample = () => {
+          const v = w1[(ph1 >>> 8) & 1023] + w2[(ph2 >>> 8) & 1023];
+          const vc = v > 0 ? v : 0;
+          return (((vc * vc) >> 12) * rowScale) >> 12;
+        };
+        let scur = sample();
+        for (let x = 0; x + 2 <= w; x += 2) {
+          ph1 = (ph1 + STEP1 + STEP1) >>> 0;
+          ph2 = (ph2 + STEP2 + STEP2) >>> 0;
+          const snext = sample();
+          row[x] = rowLUT[scur + df[dbase + (x & 7)]];
+          row[x + 1] = rowLUT[((scur + snext) >> 1) + df[dbase + ((x + 1) & 7)]];
+          scur = snext;
+        }
+        for (let yy = ySrc; yy < ySrc + 2 && yy < h; yy++) {
+          let o = yy * w * 4;
+          for (let x = 0; x < w; x++) {
+            const c = row[x];
+            data[o] = q565r((c >> 11) << 3); data[o + 1] = q565g(((c >> 5) & 63) << 2); data[o + 2] = q565r((c & 31) << 3); data[o + 3] = 255;
+            o += 4;
+          }
         }
       }
     },
@@ -917,78 +1140,136 @@ ANIMS.push({
   },
 });
 
-/* ---- 6: Caustics (anim-water) ---- */
-ANIMS.push({
-  id: 'caustics', name: 'Caustics',
-  params: [
-    {key:'speed',label:'Drift speed',def:50},{key:'scale',label:'Cell scale',def:45},
-    {key:'contrast',label:'Contrast',def:55},{key:'glow',label:'Glow',def:50},
-    {key:'spot',label:'Spot size',def:50},{key:'spread',label:'Wave spread',def:50},
-    {key:'tilt',label:'Pattern tilt',def:50},{key:'turn',label:'Turn rate',def:50}],
-  init(w, h, state) {
-    state.baseAngle = [0.35, 2.55, 4.55];
-    state.angDrift = [0.014, -0.010, 0.007];
-    state.phase0 = [0.0, 2.1, 4.6];
-    state.freqBase = [0.046, 0.061, 0.037];
-    state.speedMul = [1.0, 0.82, 1.28];
-    state.angMean = 2.4833333;
-    // Mirror of AnimCaustics.cpp's paramSpan: lo at 0, mid at 50, hi at 100,
-    // and the mid literal itself at 50 so the defaults are the old picture.
-    state.pspan = (v, lo, mid, hi) => {
-      const d = v - 50;
-      if (d === 0) return mid;
-      const f = d/50;
-      return d < 0 ? mid + (mid - lo)*f : mid + (hi - mid)*f;
-    };
-    state._gen = -1;
-  },
-  render(data, w, h, tMs, p, state) {
-    if (state._gen !== THEME.gen) { state.pal = themeRamp(); state._gen = THEME.gen; }
-    // Speed calibration (gm-33fm): 0.25x the original rate, mirroring
-    // AnimCaustics.cpp. Scaling time itself keeps the wave phases and the
-    // heading drift in the same ratio, so only the pace changes.
-    const RATE_CAL = 0.25;
-    const t = tMs*RATE_CAL/1000;
-    const freqScale = lerp(0.55, 1.9, p[1]/100);
-    const speedScale = 0.8*speedMulJS(p[0]);
-    const thresh = 0.14 + 0.55*(p[2]/100);
-    const invSpan = 1/Math.max(1e-3, 1-thresh);
-    const pspan = state.pspan;
-    const glow = pspan(p[3], 0.25, 1.0, 3.0);
-    const shapeExp = pspan(p[4], 6.0, 2.0, 0.6);
-    const spread = pspan(p[5], -1.0, 0.0, 1.0);
-    const tilt = pspan(p[6], -1.5707963, 0.0, 1.5707963);
-    const turn = pspan(p[7], 0.0, 1.0, 4.0);
-    const cosA = [], sinA = [], freq = [], phase0Row = [], step = [];
-    for (let k = 0; k < 3; k++) {
-      const ang = state.baseAngle[k] + (state.baseAngle[k] - state.angMean)*spread + tilt
-                + state.angDrift[k]*turn*t;
-      cosA[k] = Math.cos(ang); sinA[k] = Math.sin(ang);
-      freq[k] = state.freqBase[k]*freqScale;
-      phase0Row[k] = state.phase0[k] + t*speedScale*state.speedMul[k]*2.0;
-      step[k] = cosA[k]*freq[k];
-    }
-    const pal = state.pal;
-    for (let y = 0; y < h; y++) {
-      const proj = [];
-      for (let k = 0; k < 3; k++) proj[k] = y*sinA[k]*freq[k] + phase0Row[k];
-      const rowOff = y*w*4;
-      for (let x = 0; x < w; x++) {
-        let sum = 0;
-        for (let k = 0; k < 3; k++) { sum += Math.sin(proj[k]); proj[k] += step[k]; }
-        let bright = (Math.abs(sum/3)-thresh)*invSpan;
-        bright = bright < 0 ? 0 : bright > 1 ? 1 : bright;
-        bright = shapeExp === 2.0 ? bright*bright : Math.pow(bright, shapeExp);
-        if (glow !== 1.0) { bright *= glow; if (bright > 1) bright = 1; }
-        const li = (bright*255)|0;
-        const r = pal[li*3], g = pal[li*3+1], b = pal[li*3+2];
-        const dith = (BAYER4[(y&3)*4+(x&3)]-7.5)*0.5;
-        const idx = rowOff + x*4;
-        data[idx] = clamp8(r+dith); data[idx+1] = clamp8(g+dith); data[idx+2] = clamp8(b+dith); data[idx+3] = 255;
+/* ---- 6: Caustics (anim-water; firmware AnimCaustics.cpp frame and bandRef, ported) ---- */
+(() => {
+  // What the device draws, step for step (gm-pciz). The design is three
+  // plane waves summed, the sum's magnitude thresholded and shaped, read
+  // through the theme ramp with a 4x4 dither in colour. The firmware drives
+  // each wave as a 32-bit phase word (DDS) into the 1024-entry sine table,
+  // evaluates the sum every 8 px and interpolates linearly between, shapes
+  // it through a 1552-entry table into 128 shade levels, and reads a
+  // dithered RGB565 palette. The wave headings are exact (double, rounded
+  // once), as in the firmware: the 256-entry cosine table it used before
+  // put every wave up to 1.4 degrees off and was 5.5 per channel of
+  // deviation. Against the per-pixel design this entry drew before, the port
+  // is 1.0 per channel on average, of which the 8 px interpolation is about
+  // 0.1 and the rest is the 128 shade levels and the integer dither.
+  const f32 = Math.fround;
+  const K = 3;
+  const BASE_ANGLE = [0.35, 2.55, 4.55].map(f32);
+  const ANG_DRIFT = [0.014, -0.010, 0.007].map(f32);
+  const PHASE0 = [0.0, 2.1, 4.6].map(f32);
+  const FREQ_BASE = [0.046, 0.061, 0.037].map(f32);
+  const SPEED_MUL = [1.0, 0.82, 1.28].map(f32);
+  const ANG_MEAN = f32(2.4833333);
+  const PHASE_SCALE = 4294967296.0 / 6.283185307179586;
+  const GRID = 8, SHAPE_MAX = K * SIN_AMP, SHAPE_N = SHAPE_MAX + 16, SHADE_LEVELS = 128;
+  // Mirror of AnimCaustics.cpp's paramSpan: lo at 0, mid at 50, hi at 100,
+  // and the mid literal itself at 50 so the defaults are the old picture.
+  const paramSpan = (v, lo, mid, hi) => {
+    const d = v - 50;
+    if (d === 0) return mid;
+    const f = f32(d / 50);
+    return d < 0 ? f32(mid + f32(f32(mid - lo) * f)) : f32(mid + f32(f32(hi - mid) * f));
+  };
+  const ddsQ = v => { const m = v % 4294967296; return Math.trunc(m) >>> 0; };
+  const lroundf = v => Math.sign(v) * Math.round(Math.abs(v));
+  ANIMS.push({
+    id: 'caustics', name: 'Caustics',
+    params: [
+      {key:'speed',label:'Drift speed',def:50},{key:'scale',label:'Cell scale',def:45},
+      {key:'contrast',label:'Contrast',def:55},{key:'glow',label:'Glow',def:50},
+      {key:'spot',label:'Spot size',def:50},{key:'spread',label:'Wave spread',def:50},
+      {key:'tilt',label:'Pattern tilt',def:50},{key:'turn',label:'Turn rate',def:50}],
+    init(w, h, state) {
+      state.rgbLUT = new Uint16Array(16 * SHADE_LEVELS);
+      state.shapeLUT = new Uint8Array(SHAPE_N);
+      state.ditherI = new Int8Array(16);
+      for (let i = 0; i < 16; i++) state.ditherI[i] = lroundf(f32(f32(BAYER4[i] - 7.5) * 0.5));
+      state.rowFreqQ = new Uint32Array(K); state.phaseQ = new Uint32Array(K); state.stepQ = new Uint32Array(K);
+      state._gen = -1; state.shapeKey = null;
+    },
+    buildPalette(state) {
+      const base = [];
+      for (let i = 0; i < SHADE_LEVELS; i++) base.push(themeRGB(Math.trunc(i * 255 / (SHADE_LEVELS - 1))));
+      for (let rowPhase = 0; rowPhase < 4; rowPhase++) for (let colSlot = 0; colSlot < 4; colSlot++) {
+        const d = state.ditherI[(rowPhase << 2) | colSlot];
+        for (let li = 0; li < SHADE_LEVELS; li++) {
+          const c = base[li].map(v => Math.max(0, Math.min(255, v + d)));
+          state.rgbLUT[rowPhase * 512 + li * 4 + colSlot] = ((c[0] >> 3) << 11) | ((c[1] >> 2) << 5) | (c[2] >> 3);
+        }
       }
-    }
-  },
-});
+    },
+    render(data, w, h, tMs, p, state) {
+      if (state._gen !== THEME.gen) { this.buildPalette(state); state._gen = THEME.gen; }
+      // Speed calibration (gm-33fm): 0.25x the original rate, mirroring AnimCaustics.cpp.
+      const t = f32(f32((tMs >>> 0) * 0.25) * f32(0.001));
+      const freqScale = f32(f32(0.55) + f32(f32(f32(1.9) - f32(0.55)) * f32(p[1] / 100)));
+      const speedScale = f32(f32(0.8) * f32(speedMulJS(p[0])));
+      const thresh = f32(f32(0.14) + f32(f32(0.55) * f32(p[2] / 100)));
+      const invSpan = f32(1 / Math.max(f32(1e-3), f32(1 - thresh)));
+      const glow = paramSpan(p[3], f32(0.25), 1.0, 3.0);
+      const shapeExp = paramSpan(p[4], 6.0, 2.0, f32(0.6));
+      const spread = paramSpan(p[5], -1.0, 0.0, 1.0);
+      const tilt = paramSpan(p[6], f32(-1.5707963), 0.0, f32(1.5707963));
+      const turn = paramSpan(p[7], 0.0, 1.0, 4.0);
+      for (let k = 0; k < K; k++) {
+        const ang = f32(f32(f32(BASE_ANGLE[k] + f32(f32(BASE_ANGLE[k] - ANG_MEAN) * spread)) + tilt) + f32(f32(ANG_DRIFT[k] * turn) * t));
+        const cosA = f32(Math.cos(ang)), sinA = f32(Math.sin(ang));
+        const freq = f32(FREQ_BASE[k] * freqScale);
+        const phaseRad = f32(PHASE0[k] + f32(f32(f32(t * speedScale) * SPEED_MUL[k]) * 2));
+        state.rowFreqQ[k] = ddsQ(f32(sinA * freq) * PHASE_SCALE);
+        state.phaseQ[k] = ddsQ(phaseRad * PHASE_SCALE);
+        state.stepQ[k] = ddsQ(f32(cosA * freq) * PHASE_SCALE);
+      }
+      const shapeKey = thresh + ',' + shapeExp + ',' + glow;
+      if (state.shapeKey !== shapeKey) {
+        const NORM = f32(1 / SHAPE_MAX);
+        for (let i = 0; i < SHAPE_N; i++) {
+          let bright = f32(f32(f32(i * NORM) - thresh) * invSpan);
+          bright = bright < 0 ? 0 : (bright > 1 ? 1 : bright);
+          bright = shapeExp === 2.0 ? f32(bright * bright) : f32(Math.pow(bright, shapeExp));
+          if (glow !== 1.0) { bright = f32(bright * glow); bright = bright > 1 ? 1 : bright; }
+          state.shapeLUT[i] = Math.trunc(f32(f32(bright * (SHADE_LEVELS - 1)) + 0.5));
+        }
+        state.shapeKey = shapeKey;
+      }
+      const lut = SIN, shapeLUT = state.shapeLUT, rgbLUT = state.rgbLUT;
+      const rq = state.rowFreqQ, pq = state.phaseQ, sq = state.stepQ;
+      const s8 = [(sq[0] * 8) >>> 0, (sq[1] * 8) >>> 0, (sq[2] * 8) >>> 0];
+      for (let y = 0; y < h; y++) {
+        let ph0 = ((y * rq[0]) % 4294967296 + pq[0]) >>> 0;
+        let ph1 = ((y * rq[1]) % 4294967296 + pq[1]) >>> 0;
+        let ph2 = ((y * rq[2]) % 4294967296 + pq[2]) >>> 0;
+        let sumCur = lut[ph0 >>> 22] + lut[ph1 >>> 22] + lut[ph2 >>> 22];
+        const rowBase = (y & 3) * 512;
+        let o = y * w * 4;
+        let x = 0;
+        while (x + GRID <= w) {
+          const np0 = (ph0 + s8[0]) >>> 0, np1 = (ph1 + s8[1]) >>> 0, np2 = (ph2 + s8[2]) >>> 0;
+          const sumNext = lut[np0 >>> 22] + lut[np1 >>> 22] + lut[np2 >>> 22];
+          const stepInterp = (sumNext - sumCur) >> 3;
+          let val = sumCur;
+          for (let i = 0; i < GRID; i++) {
+            const m = val >> 31;
+            const c = rgbLUT[rowBase + shapeLUT[(val ^ m) - m] * 4 + (i & 3)];
+            data[o] = q565r((c >> 11) << 3); data[o + 1] = q565g(((c >> 5) & 63) << 2); data[o + 2] = q565r((c & 31) << 3); data[o + 3] = 255;
+            o += 4;
+            val += stepInterp;
+          }
+          ph0 = np0; ph1 = np1; ph2 = np2; sumCur = sumNext; x += GRID;
+        }
+        for (let i = 0; x < w; i++, x++) {
+          const sum = lut[((ph0 + (sq[0] * i) % 4294967296) >>> 0) >>> 22] + lut[((ph1 + (sq[1] * i) % 4294967296) >>> 0) >>> 22] + lut[((ph2 + (sq[2] * i) % 4294967296) >>> 0) >>> 22];
+          const m = sum >> 31;
+          const c = rgbLUT[rowBase + shapeLUT[(sum ^ m) - m] * 4 + (x & 3)];
+          data[o] = q565r((c >> 11) << 3); data[o + 1] = q565g(((c >> 5) & 63) << 2); data[o + 2] = q565r((c & 31) << 3); data[o + 3] = 255;
+          o += 4;
+        }
+      }
+    },
+  });
+})();
 
 /* ---- 7: Mandala (anim-geometric) ---- */
 (() => {

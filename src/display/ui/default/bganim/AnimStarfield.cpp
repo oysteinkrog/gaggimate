@@ -97,11 +97,27 @@ struct Shoot {
                       // per-band progress calc is a multiply, not a divide.
 };
 Shoot shoot;
-uint32_t nextShootMs = 6000;
+// The first shooting star comes 2 to 6 s in, drawn from the same random
+// stream as the stars, and every later one is scheduled the same way the
+// page schedules it. A float, not a ms count: the page keeps a fractional
+// deadline and the check is "tMs is past it".
+float nextShootMs = 6000.0f;
 uint32_t rng = 0xC0FFEE;
 uint32_t lastTMs = 0;
-uint32_t lastDriftMs = 0xFFFFFFFF; // sentinel: no drift step on the very first frame() call
-int allocW = 0, allocH = 0;        // dimensions dx2/dy2 were sized for
+bool haveLastT = false;   // false until the first frame(): that frame takes dt = 1/30
+uint32_t lastDriftMs = 0; // drift accumulates from t = 0, the page's origin, capped at 2 s a step
+int allocW = 0, allocH = 0; // dimensions dx2/dy2 were sized for
+
+// The page uses mulberry32, not bganim's xorshift32 (gm-pciz). Unsigned
+// arithmetic reproduces Math.imul's low 32 bits; the float is the page's
+// u / 2^32 rounded to single, which is what its arithmetic then sees.
+uint32_t mulberry32(uint32_t &s) {
+    s += 0x6D2B79F5u;
+    uint32_t t = (s ^ (s >> 15)) * (1u | s);
+    t ^= t + (t ^ (t >> 7)) * (61u | t);
+    return t ^ (t >> 14);
+}
+float randf() { return static_cast<float>(mulberry32(rng)) * (1.0f / 4294967296.0f); }
 
 // Hot-slab placement (BgAnimCommon.h's GM_BGANIM_HOT_SLAB): 9,216 B budget.
 // Round 2 ranked by reads/frame and left dx2 in PSRAM on the theory that its
@@ -183,24 +199,31 @@ bool init(int w, int h) {
         }
         maxR2f = cx * cx + cy * cy;
         buildVigLUT();
+        // Reseed every init(): the page draws the same field every time it
+        // starts, and a release() and init() pair must give it back.
+        rng = 0xC0FFEE;
         for (int i = 0; i < MAX_STARS; i++) {
-            const float roll = nextRandf(rng);
+            const float roll = randf();
             const uint8_t layer = roll < 0.7f ? 0 : (roll < 0.92f ? 1 : 2);
-            stars[i].x = nextRandf(rng) * w;
-            stars[i].y = nextRandf(rng) * h;
-            stars[i].phase = nextRandf(rng) * 6.2831853f;
-            stars[i].rate = 0.3f + nextRandf(rng) * 1.1f;
-            stars[i].baseBrightness = layer == 0   ? (0.25f + nextRandf(rng) * 0.25f)
-                                      : layer == 1 ? (0.45f + nextRandf(rng) * 0.25f)
-                                                   : (0.7f + nextRandf(rng) * 0.3f);
+            stars[i].x = randf() * w;
+            stars[i].y = randf() * h;
+            stars[i].phase = randf() * 6.2831853f;
+            stars[i].rate = 0.3f + randf() * 1.1f;
+            stars[i].baseBrightness = layer == 0   ? (0.25f + randf() * 0.25f)
+                                      : layer == 1 ? (0.45f + randf() * 0.25f)
+                                                   : (0.7f + randf() * 0.3f);
             stars[i].sizeClass = layer;
-            stars[i].hue = nextRandf(rng);
-            stars[i].driftSpeed = 0.5f + nextRandf(rng);
-            starY[i] = static_cast<int16_t>(stars[i].y);
+            stars[i].hue = randf();
+            stars[i].driftSpeed = 0.5f + randf();
+            // Nearest row, as the page rounds it. y can round up to h, which
+            // no band ever reaches; the bucket index is clamped for it in frame().
+            starY[i] = static_cast<int16_t>(stars[i].y + 0.5f);
             // Q16.16 fixed-point drift phase, seeded from the initial float position
             // so frame 0 (dt=0 below) reproduces the old closed-form x exactly.
             driftQ[i] = static_cast<int32_t>(stars[i].x * 65536.0f);
         }
+        nextShootMs = 2000.0f + randf() * 4000.0f;
+        shoot.active = false;
         rebuildThemeAssets();
         lastThemeGen = themeGen();
     }
@@ -309,11 +332,13 @@ void frame(uint32_t tMs, int w, int h, const uint8_t p[BG_ANIM_PARAMS]) {
     // Integer phase-wrap drift: replaces the old fmodf(absolute_position, w) with
     // a per-star Q16.16 accumulator stepped by real elapsed time (dt) and wrapped
     // with a single compare+subtract (no libm, no divide). dt is clamped so a long
-    // pause between frame() calls can't overflow the Q16.16 delta; the very first
-    // call (lastDriftMs sentinel) takes dt=0 so star positions start exactly at
-    // their init()-seeded x, matching the old t=0 closed form exactly.
+    // pause between frame() calls can't overflow the Q16.16 delta. The
+    // accumulator starts from t = 0, the origin of the page's closed form, so
+    // the first call after init() steps by its own tMs (capped at 2 s like any
+    // other step) and the page, stepping the same accumulator, lands on the
+    // same positions.
     const float rawDt = (tMs - lastDriftMs) * 0.001f;
-    const float driftDt = lastDriftMs == 0xFFFFFFFF ? 0.0f : (rawDt < 2.0f ? rawDt : 2.0f);
+    const float driftDt = rawDt < 2.0f ? rawDt : 2.0f;
     lastDriftMs = tMs;
     const int32_t wQ = w << 16;
 
@@ -349,37 +374,47 @@ void frame(uint32_t tMs, int w, int h, const uint8_t p[BG_ANIM_PARAMS]) {
         const float twinkle = 0.7f + 0.3f * cosTab[static_cast<int>(twinkleRad * RAD_TO_TAB) & 255];
         float bF = s.baseBrightness * (1.0f - twinkleDepth * (1.0f - twinkle)) * edgeFade;
         bF = bF < 0.0f ? 0.0f : (bF > 1.0f ? 1.0f : bF);
-        draws[i].x = static_cast<int16_t>(x);
+        draws[i].x = static_cast<int16_t>(x + 0.5f); // nearest column, as the page rounds it
         draws[i].r = clamp8f(starCol[i * 3 + 0] * bF);
         draws[i].g = clamp8f(starCol[i * 3 + 1] * bF);
         draws[i].b = clamp8f(starCol[i * 3 + 2] * bF);
         draws[i].sizeClass = s.sizeClass;
-        const int bandIdx = starY[i] >> 4;
+        // A star rounded to row h lands in the bucket past the last one; it is
+        // never drawn (no band reaches row h), so it just joins the last bucket.
+        int bandIdx = starY[i] >> 4;
+        if (bandIdx > NUM_BANDS - 1) {
+            bandIdx = NUM_BANDS - 1;
+        }
         bandNext[i] = bandHead[bandIdx];
         bandHead[bandIdx] = static_cast<int16_t>(i);
     }
 
     // Shooting star lifecycle (dt from the frame delta; robust to pauses).
-    const float dt = lastTMs != 0 && tMs > lastTMs ? (tMs - lastTMs) * 0.001f : 0.033f;
+    // The page's rule: 1/30 s on its first frame, the real delta after that,
+    // and never negative.
+    const float dt = !haveLastT ? (1.0f / 30.0f) : (tMs > lastTMs ? (tMs - lastTMs) * 0.001f : 0.0f);
+    haveLastT = true;
     lastTMs = tMs;
     const uint8_t shootFreq = p[3];
-    if (!shoot.active && shootFreq > 0 && tMs > nextShootMs) {
-        const float angle = 3.14159265f * 0.15f + nextRandf(rng) * 3.14159265f * 0.2f;
-        const float speed = 260.0f + nextRandf(rng) * 140.0f;
+    if (!shoot.active && shootFreq > 0 && static_cast<float>(tMs) > nextShootMs) {
+        const float angle = 3.14159265f * 0.15f + randf() * 3.14159265f * 0.2f;
+        const float speed = 260.0f + randf() * 140.0f;
         shoot.active = true;
-        shoot.x = nextRandf(rng) * w * 0.6f;
-        shoot.y = nextRandf(rng) * w * 0.3f;
+        shoot.x = randf() * w * 0.6f;
+        shoot.y = randf() * h * 0.3f;
         shoot.vx = cosf(angle) * speed;
         shoot.vy = sinf(angle) * speed;
         shoot.life = 0;
-        shoot.maxLife = 0.5f + nextRandf(rng) * 0.3f;
+        shoot.maxLife = 0.5f + randf() * 0.3f;
         shoot.invMaxLife = 1.0f / shoot.maxLife; // one divide per shoot trigger (rare), not per band()
         const uint32_t interval = 1500 > 30000 - shootFreq * 280 ? 1500 : 30000 - shootFreq * 280;
-        nextShootMs = tMs + interval + static_cast<uint32_t>(nextRandf(rng) * interval * 0.5f);
+        nextShootMs = static_cast<float>(tMs + interval) + randf() * interval * 0.5f;
     }
     if (shoot.active) {
         shoot.life += dt;
-        if (shoot.life >= shoot.maxLife) {
+        // The same product band() uses for progress, so the two never disagree
+        // about the last frame of a star.
+        if (shoot.life * shoot.invMaxLife >= 1.0f) {
             shoot.active = false;
         }
     }
@@ -389,12 +424,14 @@ inline void plotMax(uint16_t *dst, int rows, int w, int x, int y, uint8_t r, uin
     if (x < 0 || x >= w || y < 0 || y >= rows) {
         return;
     }
-    // Stars replace (max) rather than blend — background is near-black.
+    // Stars replace (max) rather than blend: the background is near-black.
+    // The max is per channel, as the page takes it, not on the packed word.
     uint16_t &px = dst[static_cast<size_t>(y) * w + x];
     const uint16_t c = rgb565(r, g, b);
-    if (c > px) {
-        px = c;
-    }
+    const uint16_t rm = (c & 0xF800) > (px & 0xF800) ? (c & 0xF800) : (px & 0xF800);
+    const uint16_t gm = (c & 0x07E0) > (px & 0x07E0) ? (c & 0x07E0) : (px & 0x07E0);
+    const uint16_t bm = (c & 0x001F) > (px & 0x001F) ? (c & 0x001F) : (px & 0x001F);
+    px = static_cast<uint16_t>(rm | gm | bm);
 }
 
 // ---------------------------------------------------------------------
@@ -476,8 +513,10 @@ void plotStarsAndShoot(uint16_t *dst, int y0, int rows, int w) {
             const float px = hx - shoot.vx * 0.02f * k;
             const float py = hy - shoot.vy * 0.02f * k;
             const float fade = (1.0f - f) * (1.0f - progress * 0.3f);
-            plotMax(dst, rows, w, static_cast<int>(px), static_cast<int>(py) - y0, clamp8f(shootCol[0] * fade),
-                    clamp8f(shootCol[1] * fade), clamp8f(shootCol[2] * fade));
+            // Nearest pixel, as the page rounds it: floor(v + 0.5), which also
+            // sends a segment just left of the edge off screen instead of to column 0.
+            plotMax(dst, rows, w, static_cast<int>(floorf(px + 0.5f)), static_cast<int>(floorf(py + 0.5f)) - y0,
+                    clamp8f(shootCol[0] * fade), clamp8f(shootCol[1] * fade), clamp8f(shootCol[2] * fade));
         }
     }
 }
@@ -663,7 +702,9 @@ void release() {
     allocW = allocH = 0;
     lastThemeGen = 0xFFFFFFFF;
     lastTMs = 0;
-    lastDriftMs = 0xFFFFFFFF;
+    haveLastT = false;
+    lastDriftMs = 0;
+    shoot.active = false;
     // Back to the defaults, so the next init() builds the tables the default
     // parameters describe and frame()'s first pass rebuilds only what the
     // stored parameters actually move.

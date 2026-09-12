@@ -406,8 +406,18 @@ void frame(uint32_t tMs, int, int, const uint8_t p[BG_ANIM_PARAMS]) {
         // literal one, so this is BASE_ANGLE[k] + ANG_DRIFT[k] * t, the same
         // bits as before.
         const float ang = BASE_ANGLE[k] + (BASE_ANGLE[k] - ANG_MEAN) * spread + tilt + ANG_DRIFT[k] * turn * t;
-        const float cosA = fastCosRad(ang);
-        const float sinA = fastSinRad(ang);
+        // The real heading, not the 256-entry cosTableF() lookup (gm-pciz).
+        // The table truncates the heading to 1/256 of a turn, so every wave
+        // ran up to 1.4 degrees off the page's heading and the pattern sat
+        // several pixels away from the design at the rim: a mean deviation of
+        // 5.5 per channel against the page, 1.0 with the exact heading.
+        // Evaluated in double and rounded once, like ddsQ() below: the
+        // single-precision libm routines are not correctly rounded, so cosf()
+        // on the host and Math.cos() on the page disagreed by one float ulp
+        // on a few calls in two hundred frames, and one ulp in the heading
+        // moves a phase step by one unit. Six calls a frame, none per pixel.
+        const float cosA = static_cast<float>(cos(static_cast<double>(ang)));
+        const float sinA = static_cast<float>(sin(static_cast<double>(ang)));
         const float freq = FREQ_BASE[k] * freqScale; // rad/pixel
         const float phaseRad = PHASE0[k] + t * speedScale * SPEED_MUL[k] * 2.0f;
         g_rowFreqQ[k] = ddsQ(static_cast<double>(sinA * freq) * PHASE_SCALE);
