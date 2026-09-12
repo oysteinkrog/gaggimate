@@ -753,6 +753,29 @@ the design cannot show and what the runs measured.
   CLICKED on scrolling and not on a gesture, so a swipe across a toggle
   row would otherwise flip it on release. `/api/debug/tap` takes `x2=`
   and `y2=` for a scripted drag and `Rig.swipe()` wraps it.
+- **A gradient resolves in three steps, and both writers mirror a built-in
+  into `bgAnimTheme`** (gm-tany, 2026-09-12). `bg_resolve_anim_theme`
+  (BgAnimThemes.cpp) reads this animation's own `bgAnimThemeMap` slot, then
+  the global `bgAnimGradientRef`, then the older `bgAnimTheme` plus
+  `bgAnimCustomTheme`. Step three is what a build without the ref key reads,
+  so an upgrade changes nothing on screen; the mirror is what keeps a
+  rollback showing the same picture, and both the web POST handler
+  (`WebUIPlugin.cpp`) and the display's own row do it. The ref grammar is
+  shared by the map slots and the global: a decimal built-in index, "c<id>"
+  for a library entry, or "" for neither, parsed by `bg_ref_valid` and
+  rejected at the POST handler rather than stored. A ref that no longer
+  resolves (a deleted library entry) reads as "" on both surfaces, which is
+  what the firmware draws. Both surfaces call the same thing Global: the
+  display's per-animation row shows "Global (<name>)" at index 0 and the web
+  picker's first choice says the same. Adding a function to
+  BgAnimThemes.cpp needs a matching stub in `sim/platform/bganim_stub.cpp`,
+  which is where the display-sim link breaks first.
+- **The standby animation's parameters and gradient are stored per animation
+  id**, so they already existed before there was any way to edit them. The
+  web tab reaches them through the main and standby selector above the
+  tuning block, the display through the "Standby params" and "Standby grad"
+  rows, and both are inert when `bgAnimStandbyId` is -1 (follow the main
+  animation).
 - **Ranges live in three places that must agree.** `SettingsModel.h` owns the
   display's editing ranges, steps, wrap rules and formats. `Settings` clamps
   a few fields on store (`setBrewDelay` and `setGrindDelay` to 0 to 4000,
