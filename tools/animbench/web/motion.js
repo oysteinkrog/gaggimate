@@ -48,14 +48,36 @@ const LADDER = [1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64, 96, 128, 192, 256, 384
 const SAT_FROM_STEPS = 120; // 7.9 s and up feeds the saturation estimate
 const CHG_THR = 12;
 const PLAY_MS = Math.max(...ANCHOR_MS) + Math.max(...LADDER) * STEP_MS + STEP_MS;
+// The fleet's Speed curve, the same one the firmware and the page entries use.
+const rateOf = sp => Math.pow(2, (sp - 50) / 18.2);
 
-function measure(anim, p) {
+// --matched: does the slider scale the animation?
+//
+// The default window is fixed in wall clock, so at Speed 100 it sees 6.7 times
+// more animation time than at Speed 50 and at Speed 0 it sees 6.7 times less.
+// The saturation estimate, which reads separations of 7.9 s and up, therefore
+// changes meaning with the setting, and comparing a half change time against a
+// fixed target across the slider compares two different measurements. Seven
+// animations read outside the fleet tolerance for that reason alone and none
+// of them had anything wrong with its clock.
+//
+// With --matched every time in the playback (the step, the anchors and so the
+// ladder) is divided by the setting's rate, so each Speed sees the same window
+// of animation time, and the reported thalfAdjMs multiplies the result back by
+// the rate. An animation whose Speed is one multiplier on one clock is then
+// flat across the slider by construction, and one that leaves a term unscaled
+// is not. That makes it the check for the law, and the wall-clock numbers stay
+// the check for how much a setting moves in front of a person.
+function measure(anim, p, scale) {
   const state = {};
   if (anim.init) anim.init(M.W, M.H, state);
 
-  const nSteps = Math.ceil(PLAY_MS / STEP_MS);
-  const anchorStep = ANCHOR_MS.map(ms => Math.round(ms / STEP_MS));
-  const anchorBuf = ANCHOR_MS.map(() => new Uint8ClampedArray(M.W * M.H * 4));
+  const stepMs = STEP_MS * scale;
+  const anchorMs = ANCHOR_MS.map(ms => ms * scale);
+  const playMs = PLAY_MS * scale;
+  const nSteps = Math.ceil(playMs / stepMs);
+  const anchorStep = anchorMs.map(ms => Math.round(ms / stepMs));
+  const anchorBuf = anchorMs.map(() => new Uint8ClampedArray(M.W * M.H * 4));
   const cur = new Uint8ClampedArray(M.W * M.H * 4);
   const wanted = new Map(); // step index -> [{anchor, k}]
   anchorStep.forEach((s0, ai) => {
@@ -66,7 +88,7 @@ function measure(anim, p) {
     }
   });
 
-  const anchorLp = ANCHOR_MS.map(() => new Float32Array(M.LPW * M.LPH * 3));
+  const anchorLp = anchorMs.map(() => new Float32Array(M.LPW * M.LPH * 3));
   const curLp = new Float32Array(M.LPW * M.LPH * 3);
   const prevLp = new Float32Array(M.LPW * M.LPH * 3);
   let prev = new Uint8ClampedArray(M.W * M.H * 4);
@@ -84,7 +106,15 @@ function measure(anim, p) {
   let stepSum = 0, stepLpSum = 0, stepMoved = 0, stepMax = 0, stepN = 0;
 
   for (let s = 0; s <= nSteps; s++) {
-    const t = s * STEP_MS;
+    // Whole milliseconds, because that is all a frame() ever gets: tMs is a
+    // uint32 of milliseconds on the device and on the page. It matters only
+    // under --matched, where a step can be a fraction of a millisecond: an
+    // animation that truncates its own frame delta (Starfield's drift
+    // accumulator) would then lose that fraction on every step and read as
+    // though its clock did not scale. Rounding jitters a separation by half a
+    // millisecond and biases nothing. Without --matched every step and anchor
+    // is already whole, so this changes no existing number.
+    const t = Math.round(s * stepMs);
     anim.render(cur2, M.W, M.H, t, p, state);
     M.lowpass(cur2, curLp);
     const ai = anchorStep.indexOf(s);
@@ -129,8 +159,8 @@ function measure(anim, p) {
       const d = curve.get(k);
       if (d >= half) {
         thalf = prevK === 0
-          ? k * STEP_MS * (half / d)
-          : Math.exp(Math.log(prevK) + ((half - prevD) / (d - prevD)) * (Math.log(k) - Math.log(prevK))) * STEP_MS;
+          ? k * stepMs * (half / d)
+          : Math.exp(Math.log(prevK) + ((half - prevD) / (d - prevD)) * (Math.log(k) - Math.log(prevK))) * stepMs;
         break;
       }
       prevK = k; prevD = d;
@@ -146,6 +176,13 @@ function measure(anim, p) {
     thalfMs: raw.thalf == null ? null : +raw.thalf.toFixed(0),
     scoreLp: lp.sat > 0 ? lp.short / lp.sat : 0,
     thalfLpMs: lp.thalf == null ? null : +lp.thalf.toFixed(0),
+    // The half change time in animation time rather than wall clock. Equal to
+    // thalfMs when scale is 1, which is every run without --matched and Speed
+    // 50 with it.
+    thalfAdjMs: raw.thalf == null ? null : +(raw.thalf / scale).toFixed(0),
+    thalfLpAdjMs: lp.thalf == null ? null : +(lp.thalf / scale).toFixed(0),
+    scale: +scale.toFixed(5),
+    stepMs: +stepMs.toFixed(3),
     short: +raw.short.toFixed(4),
     sat: +raw.sat.toFixed(4),
     shortLp: +lp.short.toFixed(4),
@@ -155,8 +192,8 @@ function measure(anim, p) {
     stepMax: +stepMax.toFixed(4),
     spread: +mean(spreads).toFixed(2),
     luma: +mean(lumas).toFixed(1),
-    curve: Object.fromEntries([...raw.curve].map(([k, v]) => [k * STEP_MS, +v.toFixed(4)])),
-    curveLp: Object.fromEntries([...lp.curve].map(([k, v]) => [k * STEP_MS, +v.toFixed(4)])),
+    curve: Object.fromEntries([...raw.curve].map(([k, v]) => [+(k * stepMs).toFixed(1), +v.toFixed(4)])),
+    curveLp: Object.fromEntries([...lp.curve].map(([k, v]) => [+(k * stepMs).toFixed(1), +v.toFixed(4)])),
   };
 }
 
@@ -168,6 +205,7 @@ function main() {
   const idsArg = flag('--ids');
   const ids = idsArg ? idsArg.split(',').map(Number) : ANIMS.map((_, i) => i);
   const speeds = (flag('--speeds') || '50').split(',').map(Number);
+  const matched = argv.includes('--matched');
 
   const rows = [];
   for (const id of ids) {
@@ -182,14 +220,17 @@ function main() {
       const p = a.params.map(x => x.def);
       p[0] = sp;
       const t0 = Date.now();
+      const scale = matched ? 1 / rateOf(sp) : 1;
       let r;
-      try { r = measure(a, p); } catch (e) { r = { error: String((e && e.stack) || e) }; }
+      try { r = measure(a, p, scale); } catch (e) { r = { error: String((e && e.stack) || e) }; }
       r.ms = Date.now() - t0;
       row.speeds[sp] = r;
       process.stderr.write(
         `${String(id).padStart(2)} ${String(a.name).padEnd(14)} sp=${String(sp).padStart(3)}` +
         ` score=${r.score != null ? r.score.toFixed(4) : 'ERR'}` +
         ` thalf=${r.thalfMs == null ? '  none' : String(r.thalfMs).padStart(6)}` +
+        (matched ? ` adj=${r.thalfAdjMs == null ? '  none' : String(r.thalfAdjMs).padStart(6)}` +
+                   ` adjLp=${r.thalfLpAdjMs == null ? '  none' : String(r.thalfLpAdjMs).padStart(6)}` : '') +
         ` scoreLp=${r.scoreLp != null ? r.scoreLp.toFixed(4) : '-'}` +
         ` thalfLp=${r.thalfLpMs == null ? '  none' : String(r.thalfLpMs).padStart(6)}` +
         ` chg66=${r.chg66 != null ? (100 * r.chg66).toFixed(2) + '%' : '-'}` +
@@ -201,7 +242,7 @@ function main() {
   }
   fs.writeFileSync(out, JSON.stringify({
     generated: new Date().toISOString(),
-    W: M.W, H: M.H, stepMs: STEP_MS, playMs: PLAY_MS, anchorMs: ANCHOR_MS,
+    W: M.W, H: M.H, stepMs: STEP_MS, playMs: PLAY_MS, anchorMs: ANCHOR_MS, matched,
     ladderSteps: LADDER, satFromMs: SAT_FROM_STEPS * STEP_MS, changedThreshold: CHG_THR,
     rows,
   }, null, 1));

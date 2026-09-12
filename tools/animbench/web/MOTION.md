@@ -15,7 +15,7 @@ same loader `page_render.js` uses, cut down to what the measurements need.
 ## motion.js
 
 ```
-node motion.js anim_bench.html out.json [--ids 1,2] [--speeds 0,50,100]
+node motion.js anim_bench.html out.json [--ids 1,2] [--speeds 0,50,100] [--matched]
 ```
 
 Movement is the **half change time**: how long the picture takes to change
@@ -39,6 +39,40 @@ For sparse or grainy animations, read `thalfLpMs` rather than `thalfMs`: it
 low passes with an 8x8 box average before differencing, so single pixel content
 and near Nyquist grain do not inflate the score. Starfield, Orbits,
 Harmonograph, Nebula and Floor need it.
+
+### Two questions, two runs
+
+**How much does this animation move at Speed 50, next to the others?** Run
+without `--matched` and read the half change time against the 1200 ms target.
+The window is fixed in wall clock, which is right: it is a person watching for
+a fixed time.
+
+**Does the Speed slider scale this animation?** Run with `--matched` and read
+`thalfAdjMs` (or `thalfLpAdjMs`) across the slider. It has to be flat.
+
+Do not use the first run to answer the second question. Its window is fixed in
+wall clock, so at Speed 100 it sees 6.7 times more animation time than at
+Speed 50 and at Speed 0 it sees 6.7 times less, and the unrelated level, which
+reads separations of 7.9 s and up, changes meaning with the setting. Comparing
+a half change time against a fixed target across the slider therefore compares
+two different measurements. On 2026-09-12 that put seven animations outside the
+fleet tolerance with nothing wrong with any of their clocks, and passed three
+that had a real defect.
+
+`--matched` divides every time in the playback by the setting's rate, so each
+Speed sees the same window of animation time, and multiplies the result back.
+An animation whose Speed is one multiplier on one clock is then flat by
+construction. One that leaves a term unscaled is not, and the spread says how
+much of its motion is unscaled. The three it caught, all of which the
+wall-clock run had passed: Starfield scaled the drift but not the twinkle or
+the shooting stars, Lava scaled the orbits but not the radius pulse, and Silk
+scaled the travel and the rotation but not the width wobble.
+
+Both runs render at whole milliseconds, because that is all a `frame()` ever
+gets. It matters only under `--matched`, where a step can be a fraction of a
+millisecond: an animation that truncates its own frame delta, as Starfield's
+drift accumulator does, would otherwise lose that fraction on every step and
+read as though its clock did not scale.
 
 ## grain_ratio.js
 
