@@ -1119,17 +1119,36 @@ survived, and what the device taught:
   is a starting point and the measured band is the contract. It is also blind
   to whole pixel stutter, which is what `grain_ratio.js` is for: read its
   delta across a change, never its level.
+  **Where the fleet stands: 44 of 44 inside the band at Speed 50** (median
+  1180 ms, spread 1.5x, down from 144x), and 37 of 44 inside a factor of 1.6
+  of the curve at Speed 0, 25, 50, 75 and 100. The other seven are Glint,
+  Oculus, Ember, Brushed, Harmonograph, Stripes and Tide, and each of them
+  puts the fleet multiplier on one clock that every motion reads, so the rate
+  does follow the curve. What does not follow is how much of the picture that
+  rate changes, and the reason is the metric rather than the animation: the
+  half change time divides the one-step change by an estimate of "fully
+  changed", and that estimate is unreliable for a near-periodic picture, which
+  `MOTION.md` warns about. **So before changing a clock to chase the band,
+  read `chg66` across the slider**, which is the fraction of pixels that
+  change in one step and needs no such estimate. All seven rise at every stop,
+  so the slider does speed the picture up. Two that did not rise were real
+  defects and are fixed: Steam scaled its rise but not the puff lifetime or
+  the sway, and Ripples scaled the ring travel but not the drop interval or
+  the ring life, so Speed 100 showed less movement than Speed 75.
 - **The goldens cannot catch a port drifting from its page design, and for
   twenty animations it had** (gm-pciz, 2026-09-12). The goldens under
   `tools/animbench/golden` are rendered by the firmware, so `make check` only
   proves the firmware draws what it drew yesterday. `make pagecheck`
   (`web/page_vs_golden.js`, third stage of `make check`) plays the page entry
   the way `bench.cpp` plays the firmware, captures golden frames 30, 120 and
-  210, quantises both sides to RGB565 and counts differing pixels. Twenty-four
-  animations are exact, which is the rule a new port is held to; the other
-  twenty are debt recorded in `page_exact.json`, worst first: ember 230400 of
-  230400 pixels at a mean of 69 per channel, nebula 225839, mandala 175373,
-  silk 151983, starfield 145547, caustics 75312, lava 70404, aurora 44745.
+  210, quantises both sides to RGB565 and counts differing pixels. Forty of
+  the 44 are exact, which is the rule a new port is held to; the other four
+  are debt recorded in `page_exact.json`: ripples 18369, steam 16724, orbits
+  5535 and cube 33. It was 24 exact and 20 in debt when the check was
+  written, and every one of the sixteen closed since had a different cause,
+  three of them user-visible defects that had shipped (Mandala drew
+  concentric rings where the page draws petals, Ember was materially darker
+  than the design, and Nebula's drift speed depended on the frame rate).
   Lower an allowance when you fix one; never raise one to pass a check. The
   page entry is the approved design and the firmware is the side to change.
   `bench.cpp` renders a warm-up frame at t = 0 before its loop, so an
