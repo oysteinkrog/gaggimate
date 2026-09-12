@@ -2,7 +2,7 @@
  "_comment": [
   "Allowance, in differing pixels at RGB565, for web/page_vs_golden.js.",
   "The page entry in web/anim_bench.html is the approved design and the",
-  "firmware is meant to draw it. Zero is the rule and 27 of the 44",
+  "firmware is meant to draw it. Zero is the rule and 40 of the 44",
   "animations meet it, so a new port is expected to.",
   "Every number below is debt recorded against bead gm-pciz, measured on the",
   "worst of golden frames 30, 120 and 210. Lower one when you fix it.",
@@ -15,17 +15,10 @@
  "recorded": "2026-09-12",
  "bead": "gm-pciz",
  "animations": {
-  "fireflies": 29910,
-  "steam": 23108,
   "ripples": 18369,
-  "hills": 13877,
+  "steam": 16724,
   "orbits": 5535,
-  "quilt": 531,
-  "cube": 33,
-  "weave": 2,
-  "rain": 2,
-  "tunnel": 1,
-  "shafts": 1
+  "cube": 33
  },
  "notes": {
   "ripples": [
