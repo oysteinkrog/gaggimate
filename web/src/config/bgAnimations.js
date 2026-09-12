@@ -827,18 +827,32 @@ export function serializeThemeMap(refs) {
   return out.join(';');
 }
 
-// The ref an animation effectively draws with, after the firmware's
-// fallbacks: its map entry when it resolves, else the global theme.
-export function effectiveRef(refs, animIdx, library, globalThemeId) {
-  const ref = refs[animIdx] ?? '';
-  if (ref.startsWith('c')) {
-    if (library.some(g => g.id === parseInt(ref.slice(1), 10))) return ref;
-  } else if (ref !== '') {
-    const idx = parseInt(ref, 10);
-    if (idx >= 0 && idx < BG_THEMES.length) return ref;
-  }
+// Whether a ref names something that exists right now: a built-in index in
+// this build's table, or a library entry that has not been deleted.
+export function refResolves(ref, library) {
+  const r = String(ref ?? '');
+  if (r.startsWith('c')) return library.some(g => g.id === parseInt(r.slice(1), 10));
+  if (r === '') return false;
+  const idx = parseInt(r, 10);
+  return idx >= 0 && idx < BG_THEMES.length;
+}
+
+// The ref the global default resolves to: bgAnimGradientRef when it names
+// something that exists, else the built-in bgAnimTheme. These are steps two
+// and three of the firmware's bg_resolve_anim_theme, and the result is always
+// a concrete ref, never ''.
+export function globalGradientRef(globalRef, library, globalThemeId) {
+  if (refResolves(globalRef, library)) return String(globalRef);
   const g = parseInt(globalThemeId, 10);
   return String(g >= 0 && g < BG_THEMES.length ? g : 0);
+}
+
+// The ref an animation effectively draws with, after the firmware's
+// fallbacks: its own map entry when it resolves, else the global default.
+export function effectiveRef(refs, animIdx, library, globalThemeId, globalRef) {
+  const ref = refs[animIdx] ?? '';
+  if (refResolves(ref, library)) return ref;
+  return globalGradientRef(globalRef, library, globalThemeId);
 }
 
 export function gradientForRef(ref, library) {

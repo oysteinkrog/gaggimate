@@ -66,3 +66,11 @@ gather
 palette
 dither
 dithering
+gradient
+gradients
+override
+overrides
+overridden
+interlace
+interlaced
+interlacing

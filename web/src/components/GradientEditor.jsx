@@ -10,13 +10,14 @@ import {
   BG_GRADIENT_NAME_MAX,
   BG_THEMES,
   BG_THEME_MAX_STOPS,
-  effectiveRef,
+  globalGradientRef,
   gradientCss,
   gradientForRef,
   isUniformStops,
   nextGradientId,
   parseGradientLibrary,
   parseThemeMap,
+  refResolves,
   rgbToHex,
   sanitizeGradientName,
   serializeGradient,
@@ -26,12 +27,20 @@ import {
   wheelCss,
 } from '../config/bgAnimations.js';
 
-// Per-animation gradient picker plus an editor for the user's own gradients.
+// Gradient picker plus an editor for the user's own gradients, in one of two
+// scopes.
 //
-// Two settings back it, both edited through setField so the ordinary settings
-// save writes them: bgAnimThemeMap (which gradient each animation draws
-// with) and bgAnimGradients (the named library). Built-in themes cannot be
-// edited in place; "Copy to my gradients" clones one into the library.
+// scope={kind:'global'} edits bgAnimGradientRef, the gradient every animation
+// draws with unless it has one of its own. That is the simple path: choose
+// once, including one of your own gradients, and the whole fleet follows.
+//
+// scope={kind:'anim', animIdx} edits one slot of bgAnimThemeMap, an override
+// for that animation alone. Its first choice is "Same as global", which is
+// what an untouched animation stores, so an override always reads as one.
+//
+// The library itself (bgAnimGradients) is shared by both scopes and is edited
+// wherever it is selected. Built-in themes cannot be edited in place; "Copy to
+// my gradients" clones one into the library.
 //
 // The stop editing itself is react-linear-gradient-picker (drag to move,
 // click the bar to add, drag a stop downwards or double-click it to remove)
@@ -80,18 +89,38 @@ function StopColorPicker({ color, onSelect }) {
   );
 }
 
-export function GradientEditor({ animIdx, formData, setField }) {
+export function GradientEditor({ scope, formData, setField, previewAnimIdx }) {
   const apiService = useContext(ApiServiceContext);
+  const isGlobal = scope.kind === 'global';
+  const animIdx = isGlobal ? null : scope.animIdx;
   const library = useMemo(
     () => parseGradientLibrary(formData.bgAnimGradients),
     [formData.bgAnimGradients],
   );
   const refs = useMemo(() => parseThemeMap(formData.bgAnimThemeMap), [formData.bgAnimThemeMap]);
-  const ref = effectiveRef(refs, animIdx, library, formData.bgAnimTheme);
-  const current = gradientForRef(ref, library);
+  // Always concrete, never '': what an animation with no override draws with.
+  const globalRef = globalGradientRef(formData.bgAnimGradientRef, library, formData.bgAnimTheme);
+  const globalName = gradientForRef(globalRef, library).name;
+  // What the picker shows. In animation scope '' means "same as global", and
+  // an override naming a deleted library entry reads as '' too, because that
+  // is what the firmware draws.
+  const rawRef = isGlobal ? globalRef : (refs[animIdx] ?? '');
+  const ref = isGlobal || refResolves(rawRef, library) ? rawRef : '';
+  // What is edited and previewed; '' resolves to the global.
+  const editRef = ref === '' ? globalRef : ref;
+  const current = gradientForRef(editRef, library);
   const stops = current.stops;
-  const anim = BG_ANIMATIONS[animIdx];
+  // An animation showing "Same as global" is looking at the global's gradient,
+  // so editing the stops here would change every animation, which is not what
+  // the reader of this panel is asking for. Read-only until they pick a
+  // gradient of their own, or copy this one into the library.
+  const editable = current.editable && (isGlobal || ref !== '');
+  // The animation the panel previews while this editor is open. In global
+  // scope that is whatever is playing, so the change can be seen.
+  const previewIdx = previewAnimIdx ?? animIdx ?? 0;
+  const anim = BG_ANIMATIONS[previewIdx];
   const wraps = anim?.id === 'plasma';
+  const overrideCount = refs.filter(r => r !== '' && refResolves(r, library)).length;
   const tone = {
     brightness:
       formData.bgAnimBrightness === undefined ? 100 : parseInt(formData.bgAnimBrightness, 10),
@@ -103,39 +132,54 @@ export function GradientEditor({ animIdx, formData, setField }) {
   const writeRefs = next => setField('bgAnimThemeMap', serializeThemeMap(next));
 
   const assign = nextRef => {
+    if (isGlobal) {
+      setField('bgAnimGradientRef', nextRef);
+      // A built-in is mirrored into bgAnimTheme, which is the last fallback
+      // and what a build without bgAnimGradientRef reads. The firmware's POST
+      // handler does the same, so the two writers agree.
+      if (nextRef !== '' && !nextRef.startsWith('c')) setField('bgAnimTheme', nextRef);
+      return;
+    }
     const next = refs.slice();
     next[animIdx] = nextRef;
     writeRefs(next);
   };
 
-  const assignAll = () => writeRefs(refs.map(() => ref));
+  // Clears every per-animation override so the global applies everywhere. This
+  // replaces the old "Use for all animations", which wrote the same ref into
+  // every slot and left the global with no effect at all.
+  const clearOverrides = () => writeRefs(refs.map(() => ''));
 
   const updateStops = nextStops => {
-    if (!current.editable) return;
+    if (!editable) return;
     const sorted = nextStops.slice().sort((a, b) => a.pos - b.pos);
     writeLibrary(library.map(g => (g.id === current.id ? { ...g, stops: sorted } : g)));
   };
 
   const rename = name => {
-    if (!current.editable) return;
+    if (!editable) return;
     writeLibrary(library.map(g => (g.id === current.id ? { ...g, name } : g)));
   };
 
   const copyToLibrary = () => {
     if (library.length >= BG_GRADIENT_LIB_MAX) return;
     const id = nextGradientId(library);
-    const base = current.editable ? `${current.name} copy` : current.name;
+    const base = editable ? `${current.name} copy` : current.name;
     const name = sanitizeGradientName(base);
     writeLibrary([...library, { id, name, stops: stops.map(s => ({ ...s })) }]);
     assign(`c${id}`);
   };
 
   const removeFromLibrary = () => {
-    if (!current.editable) return;
+    if (!editable) return;
+    const gone = `c${current.id}`;
     writeLibrary(library.filter(g => g.id !== current.id));
-    // Animations that used it fall back to the global theme, which is what
-    // the firmware does with a dangling reference anyway.
-    writeRefs(refs.map(r => (r === ref ? '' : r)));
+    // Animations that used it fall back to the global, and the global to the
+    // built-in theme, which is what the firmware does with a dangling
+    // reference anyway. Clearing both here keeps the form showing what the
+    // panel will draw.
+    writeRefs(refs.map(r => (r === gone ? '' : r)));
+    if (formData.bgAnimGradientRef === gone) setField('bgAnimGradientRef', '');
   };
 
   const reverse = () => {
@@ -191,8 +235,8 @@ export function GradientEditor({ animIdx, formData, setField }) {
   // The timers read the latest values through a ref so neither effect has to
   // re-arm on every edit; only the debounce keys on the gradient itself.
   const serialized = serializeGradient({ stops });
-  const latestRef = useRef({ apiService, animIdx, serialized });
-  latestRef.current = { apiService, animIdx, serialized };
+  const latestRef = useRef({ apiService, previewIdx, serialized });
+  latestRef.current = { apiService, previewIdx, serialized };
 
   // A send that finds the socket closed (it reconnects on its own) is retried
   // shortly rather than left to the 5 s keepalive: the firmware keeps showing
@@ -200,7 +244,7 @@ export function GradientEditor({ animIdx, formData, setField }) {
   // panel on a stale gradient for that long.
   const retryRef = useRef(null);
   const sendPreview = useCallback(() => {
-    const { apiService: api, animIdx: a, serialized: s } = latestRef.current;
+    const { apiService: api, previewIdx: a, serialized: s } = latestRef.current;
     clearTimeout(retryRef.current);
     retryRef.current = null;
     try {
@@ -213,7 +257,7 @@ export function GradientEditor({ animIdx, formData, setField }) {
   useEffect(() => {
     const t = setTimeout(sendPreview, PREVIEW_DEBOUNCE_MS);
     return () => clearTimeout(t);
-  }, [animIdx, serialized, sendPreview]);
+  }, [previewIdx, serialized, sendPreview]);
 
   useEffect(() => {
     const t = setInterval(sendPreview, PREVIEW_KEEPALIVE_MS);
@@ -230,20 +274,24 @@ export function GradientEditor({ animIdx, formData, setField }) {
   }, [sendPreview]);
 
   const libraryFull = library.length >= BG_GRADIENT_LIB_MAX;
+  const selectId = isGlobal ? 'bgAnimGradientRef' : `bgAnimGradientRef-${animIdx}`;
 
   return (
     <div className='border-base-content/10 rounded-lg border p-3'>
       <div className='grid grid-cols-1 gap-4 md:grid-cols-2'>
         <div className='form-control'>
-          <label htmlFor='bgAnimGradientRef' className='mb-1 block text-sm font-medium'>
-            Gradient for {anim?.name ?? 'this animation'}
+          <label htmlFor={selectId} className='mb-1 block text-sm font-medium'>
+            {isGlobal
+              ? 'Gradient for all animations'
+              : `Gradient for ${BG_ANIMATIONS[animIdx]?.name ?? 'this animation'}`}
           </label>
           <select
-            id='bgAnimGradientRef'
+            id={selectId}
             className='select select-bordered w-full'
             value={ref}
             onChange={e => assign(e.target.value)}
           >
+            {!isGlobal && <option value=''>Same as global ({globalName})</option>}
             {library.length > 0 && (
               <optgroup label='My gradients'>
                 {library.map(g => (
@@ -270,12 +318,20 @@ export function GradientEditor({ animIdx, formData, setField }) {
             title={libraryFull ? `Up to ${BG_GRADIENT_LIB_MAX} gradients can be saved` : undefined}
             onClick={copyToLibrary}
           >
-            {current.editable ? 'Duplicate' : 'Copy to my gradients'}
+            {editable ? 'Duplicate' : 'Copy to my gradients'}
           </button>
-          <button type='button' className='btn btn-sm' onClick={assignAll}>
-            Use for all animations
-          </button>
-          {current.editable && (
+          {isGlobal && (
+            <button
+              type='button'
+              className='btn btn-sm'
+              disabled={overrideCount === 0}
+              title={overrideCount === 0 ? 'No animation has a gradient of its own' : undefined}
+              onClick={clearOverrides}
+            >
+              Clear {overrideCount} per-animation gradient{overrideCount === 1 ? '' : 's'}
+            </button>
+          )}
+          {editable && (
             <button
               type='button'
               className='btn btn-sm btn-outline btn-error'
@@ -287,7 +343,7 @@ export function GradientEditor({ animIdx, formData, setField }) {
         </div>
       </div>
 
-      {current.editable && (
+      {editable && (
         <div className='form-control mt-3'>
           <label htmlFor='bgAnimGradientName' className='mb-1 block text-sm font-medium'>
             Name
@@ -309,7 +365,7 @@ export function GradientEditor({ animIdx, formData, setField }) {
       )}
 
       <div className='gm-gradient mt-4' ref={holderRef}>
-        {current.editable ? (
+        {editable ? (
           <>
             <GradientPicker
               width={barWidth}
@@ -365,7 +421,9 @@ export function GradientEditor({ animIdx, formData, setField }) {
               aria-label='Gradient'
             />
             <p className='text-base-content/60 mt-2 text-sm'>
-              Built-in gradients cannot be changed. Copy one to your gradients to edit it.
+              {ref === '' && current.editable
+                ? 'This is the global gradient, shared by every animation. Copy it to your gradients to give this animation one of its own.'
+                : 'Built-in gradients cannot be changed. Copy one to your gradients to edit it.'}
             </p>
           </>
         )}
@@ -395,8 +453,8 @@ export function GradientEditor({ animIdx, formData, setField }) {
         </div>
       </div>
       <p className='text-base-content/60 mt-2 text-xs'>
-        Stops run dark to bright. The panel shows this animation with the gradient while you edit;
-        save to keep it.
+        Stops run dark to bright. The panel shows {anim?.name ?? 'the animation'} with this gradient
+        while you edit; save to keep it.
       </p>
     </div>
   );

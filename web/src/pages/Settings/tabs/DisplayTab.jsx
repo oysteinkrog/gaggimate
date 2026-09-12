@@ -1,3 +1,4 @@
+import { useState } from 'preact/hooks';
 import { FontAwesomeIcon } from '@fortawesome/react-fontawesome';
 import { faUndo } from '@fortawesome/free-solid-svg-icons/faUndo';
 import { BG_ANIMATIONS, parseBgAnimParams, setBgAnimParam } from '../../../config/bgAnimations.js';
@@ -118,17 +119,33 @@ function AnimationParamField({ anim, animIdx, formData, param, paramIdx, setFiel
   );
 }
 
-// Animation picker, placement and parameter controls for the selected
-// animation only. Params live in formData.bgAnimParams as the same packed
-// string the firmware stores ("p0,p1,p2,p3;..." indexed by animation id) and
-// are edited via setField.
+// Animation picker, placement, colour and per-animation tuning.
+//
+// The order is the point: what applies to every animation comes first (which
+// animation plays, and the gradient they all draw with), then the tuning for
+// one animation at a time. Params and gradients are both stored per animation
+// id, so the standby animation has its own whenever it differs from the main
+// one; the tuning block switches between the two rather than showing both,
+// which would double the length of the tab.
+//
+// Params live in formData.bgAnimParams as the same packed string the firmware
+// stores ("p0,p1,p2,p3;..." indexed by animation id) and are edited via
+// setField.
 function BackgroundAnimationSettings({ formData, onChange, setField }) {
   const animIdx = Math.min(
     BG_ANIMATIONS.length - 1,
     Math.max(0, parseInt(formData.bgAnimId, 10) || 0),
   );
   const anim = BG_ANIMATIONS[animIdx];
-  const values = parseBgAnimParams(formData.bgAnimParams)[animIdx];
+  const standbyIdx = standbyAnimValue(formData.bgAnimStandbyId);
+  // "Same as main" and "the same animation as main" both mean one set of
+  // parameters, so there is nothing to switch between.
+  const standbySeparate = standbyIdx >= 0 && standbyIdx !== animIdx;
+  const [tuningPick, setTuningPick] = useState('main');
+  const tuning = standbySeparate ? tuningPick : 'main';
+  const tuningIdx = tuning === 'standby' ? standbyIdx : animIdx;
+  const tuningAnim = BG_ANIMATIONS[tuningIdx];
+  const values = parseBgAnimParams(formData.bgAnimParams)[tuningIdx];
   const bgAnimFps = parseInt(formData.bgAnimFps, 10) || 30;
   const panelVcom = valueWithDefault(formData.panelVcom, 45);
   const bgAnimHalfRes = valueWithDefault(formData.bgAnimHalfRes, 1);
@@ -171,7 +188,7 @@ function BackgroundAnimationSettings({ formData, onChange, setField }) {
             htmlFor='bgAnimStandbyId'
             noMargin
             helpText='Standby can use the main animation or its own selection.'
-            tooltip='It keeps its own parameters and its own gradient. With show animation behind all screens turned off, only the standby animation is ever seen.'
+            tooltip='It keeps its own parameters and its own gradient, both editable under tuning below. With show animation behind all screens turned off, only the standby animation is ever seen.'
             tooltipLabel='Standby screen animation'
           >
             <select
@@ -201,13 +218,50 @@ function BackgroundAnimationSettings({ formData, onChange, setField }) {
         </div>
       </SettingsGroup>
 
-      <SettingsGroup title={`${anim.name} tuning`}>
+      <SettingsGroup title='Colour'>
+        <p className='text-base-content/70 mb-3 text-sm'>
+          Every animation draws with this gradient unless it has been given one of its own below.
+        </p>
+        <GradientEditor
+          scope={{ kind: 'global' }}
+          previewAnimIdx={animIdx}
+          formData={formData}
+          setField={setField}
+        />
+      </SettingsGroup>
+
+      <SettingsGroup title={`${tuningAnim.name} tuning`}>
+        {standbySeparate && (
+          <div className='mb-4' role='group' aria-label='Which animation to tune'>
+            <div className='join'>
+              <button
+                type='button'
+                className={`btn join-item btn-sm ${tuning === 'main' ? 'btn-active' : ''}`}
+                aria-pressed={tuning === 'main'}
+                onClick={() => setTuningPick('main')}
+              >
+                Main: {anim.name}
+              </button>
+              <button
+                type='button'
+                className={`btn join-item btn-sm ${tuning === 'standby' ? 'btn-active' : ''}`}
+                aria-pressed={tuning === 'standby'}
+                onClick={() => setTuningPick('standby')}
+              >
+                Standby: {BG_ANIMATIONS[standbyIdx].name}
+              </button>
+            </div>
+            <p className='text-base-content/70 mt-2 text-sm'>
+              The two animations keep separate parameters and separate gradients.
+            </p>
+          </div>
+        )}
         <div className={FIELD_GRID}>
-          {anim.params.map((param, j) => (
+          {tuningAnim.params.map((param, j) => (
             <AnimationParamField
-              key={`${anim.id}-${param.key}`}
-              anim={anim}
-              animIdx={animIdx}
+              key={`${tuningAnim.id}-${param.key}`}
+              anim={tuningAnim}
+              animIdx={tuningIdx}
               formData={formData}
               param={param}
               paramIdx={j}
@@ -217,7 +271,11 @@ function BackgroundAnimationSettings({ formData, onChange, setField }) {
           ))}
         </div>
         <div className='mt-4'>
-          <GradientEditor animIdx={animIdx} formData={formData} setField={setField} />
+          <GradientEditor
+            scope={{ kind: 'anim', animIdx: tuningIdx }}
+            formData={formData}
+            setField={setField}
+          />
         </div>
       </SettingsGroup>
 
