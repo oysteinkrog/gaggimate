@@ -6,7 +6,12 @@
 // scanline. The approved entry's deviations are part of the design: radius
 // 64, half width 16..34 pixels, and scroll 18/12 pixels per second at speed 50.
 // Coordinates increase as time advances, so the visible paths move up-left,
-// unless Drift angle turns the scroll vector somewhere else.
+// unless Drift angle turns the scroll vector somewhere else. The scroll is
+// carried in sixteenths of a pixel (gm-kh2s): the whole part picks tile rows
+// and columns, and the fraction weights a bilinear read between each row
+// and the row below, then each column and the next, so every frame moves.
+// With a whole pixel scroll the field advanced 0.58 and 0.38 px per 66 ms
+// step at Speed 50 and 28 percent of steps repeated the previous picture.
 //
 // Eight user parameters, all of them acting in frame(): Speed and Drift angle
 // on the two scroll accumulators, Arc width, Glow and Sharpness on the two
@@ -40,24 +45,32 @@ constexpr int TILE = 128;
 constexpr int HALF = TILE / 2;
 constexpr int CELLS = 5;
 constexpr int SCAN = CELLS * TILE; // 640 covers x + subX at every width <= 480
+// One vector of slack past the scan: the lerp kernel loads the block after
+// the one it is finishing, so its last output vector reads entries 640..647.
+// Those outputs are never displayed (the gather stops at subX + w - 1, at
+// most 606) and the slack is zeroed once at init so the read is defined.
+constexpr int SCAN_ALLOC = SCAN + 8;
 constexpr int GROUND = 26;        // darkest arc-free position in the theme ramp
 constexpr size_t TILE_BYTES = 2 * TILE * TILE * sizeof(uint16_t);
 constexpr size_t TILE_ALLOC = TILE_BYTES + 15; // align the PSRAM owner up to 16 B
 
 uint8_t *tileOwner = nullptr; // PSRAM allocation owner; tiles below is an alias
 uint16_t *tiles = nullptr;    // two orientations, 32,768 B each, row stride 256 B
-uint16_t *scan = nullptr;     // 1,280 B, slab: assembled Q4 scanline
+uint16_t *scan = nullptr;     // 1,296 B, slab: assembled Q4 scanline of the row above
+uint16_t *scanB = nullptr;    // 1,296 B, slab: the row below it, blended into scan
 uint16_t *palette = nullptr;  // 512 B, slab: direct 256-entry theme ramp
 uint8_t *orient = nullptr;    // 256 B, slab: full mulberry32 output bytes
 uint8_t *obit = nullptr;      // 256 B, slab: the orientation bit Tile bias picked
 int16_t *dith = nullptr;      // 128 B, slab: eight Bayer rows, Q4 index offsets
 int16_t *dithScan = nullptr;  // 128 B, slab: same rows rotated by -subX
+int16_t *zeroOff = nullptr;   // 16 B, slab: a zero dither row for the plain copies
 
 uint32_t lastThemeGen = 0;
 int lastArc = -1, lastGlow = -1, lastSoft = -1;
 int lastContrast = -1, lastGlowPal = -1, lastGrain = -1, lastBias = -1;
 bool paletteValid = false;
-uint32_t scrollX = 0, scrollY = 0;
+uint32_t scrollX = 0, scrollY = 0; // whole pixels, biased
+uint32_t fracX = 0, fracY = 0;     // sixteenths, 0..15
 
 // The scroll accumulators are unsigned, and Drift angle can point the scroll
 // vector backwards, so both carry this bias. It is a multiple of 256 * TILE,
@@ -68,7 +81,7 @@ uint32_t scrollX = 0, scrollY = 0;
 constexpr uint32_t SCROLL_BIAS = 0x40000000u;
 static_assert(SCROLL_BIAS % (256u * TILE) == 0, "SCROLL_BIAS must not move the orientation hash");
 
-// 2,560 B of the 9,216 B animation slab, independent of render resolution.
+// 3,888 B of the 9,216 B animation slab, independent of render resolution.
 // The tiles are bulk sequential input, not per-pixel PSRAM gathers. Their
 // aligned alias is never passed to releaseTable(), only the original owner.
 void release();
@@ -82,7 +95,14 @@ bool init(int, int) {
         }
         tiles = reinterpret_cast<uint16_t *>((reinterpret_cast<uintptr_t>(tileOwner) + 15u) & ~uintptr_t(15));
     }
-    if (scan == nullptr) scan = static_cast<uint16_t *>(allocHot(SCAN * sizeof(uint16_t)));
+    if (scan == nullptr) {
+        scan = static_cast<uint16_t *>(allocHot(SCAN_ALLOC * sizeof(uint16_t)));
+        if (scan != nullptr) memset(scan, 0, SCAN_ALLOC * sizeof(uint16_t));
+    }
+    if (scanB == nullptr) {
+        scanB = static_cast<uint16_t *>(allocHot(SCAN_ALLOC * sizeof(uint16_t)));
+        if (scanB != nullptr) memset(scanB, 0, SCAN_ALLOC * sizeof(uint16_t));
+    }
     if (palette == nullptr) palette = static_cast<uint16_t *>(allocHot(256 * sizeof(uint16_t)));
     if (orient == nullptr) {
         orient = static_cast<uint8_t *>(allocHot(256));
@@ -101,8 +121,12 @@ bool init(int, int) {
     if (obit == nullptr) obit = static_cast<uint8_t *>(allocHot(256));
     if (dith == nullptr) dith = static_cast<int16_t *>(allocHot(64 * sizeof(int16_t)));
     if (dithScan == nullptr) dithScan = static_cast<int16_t *>(allocHot(64 * sizeof(int16_t)));
-    if (scan == nullptr || palette == nullptr || orient == nullptr || obit == nullptr || dith == nullptr ||
-        dithScan == nullptr) {
+    if (zeroOff == nullptr) {
+        zeroOff = static_cast<int16_t *>(allocHot(8 * sizeof(int16_t)));
+        if (zeroOff != nullptr) memset(zeroOff, 0, 8 * sizeof(int16_t));
+    }
+    if (scan == nullptr || scanB == nullptr || palette == nullptr || orient == nullptr || obit == nullptr ||
+        dith == nullptr || dithScan == nullptr || zeroOff == nullptr) {
         release();
         return false;
     }
@@ -237,25 +261,32 @@ void frame(uint32_t tMs, int, int, const uint8_t p[BG_ANIM_PARAMS]) {
     // 2.1 times faster than the fleet target of 1200 ms at Speed 50. 31/64
     // lands on 1191 ms and is exact in float and double. t is the drift
     // distance along the tile field, so the whole scroll slows and the tile
-    // art, the palette and the dither are untouched. What the slower scroll
-    // does cost is smoothness: the field moves in whole pixels, and at 18 and
-    // 12 px/s scaled by 31/64 it advances 0.58 and 0.38 px per 66 ms panel
-    // row refresh, so about a quarter of refreshes now repeat the previous
-    // picture exactly where none did before. That is inherent to slowing a
-    // whole pixel scroll and not something the rate constant can avoid.
+    // art, the palette and the dither are untouched. At 18 and 12 px/s
+    // scaled by 31/64 the field advances 0.58 and 0.38 px per 66 ms panel
+    // row refresh, which a whole pixel scroll cannot show on every refresh;
+    // the sixteenths below and the bilinear read in the band are what make
+    // every refresh move (gm-kh2s). With the fraction carried the half
+    // change time reads 1135 ms against 1117 before, so the rate stays.
     const float t = static_cast<float>(tMs) * speedMul(p[0]) * (31.0f / 64.0f);
     const float ang = (static_cast<int>(p[3]) - 50) * (2.8f / 50.0f);
     const float ca = cosf(ang), sa = sinf(ang);
     const float vx = 18.0f * ca - 12.0f * sa;
     const float vy = 18.0f * sa + 12.0f * ca;
-    // floorf, not the old truncating cast, so a backwards drift steps the
-    // same way a forwards one does. Both agree for t >= 0, which is the only
-    // case the default reaches. The reachable magnitude is under 7e8 pixels
-    // (tMs 4.3e9 x speed 6.7 x 0.0217 px/ms), well inside the bias.
-    scrollX = static_cast<uint32_t>(static_cast<int64_t>(floorf(t * (vx / 1000.0f))) +
-                                    static_cast<int64_t>(SCROLL_BIAS));
-    scrollY = static_cast<uint32_t>(static_cast<int64_t>(floorf(t * (vy / 1000.0f))) +
-                                    static_cast<int64_t>(SCROLL_BIAS));
+    // floorf, not a truncating cast, so a backwards drift steps the same
+    // way a forwards one does. The scroll is floored in sixteenths: the
+    // multiply by 16 is exact in float, the arithmetic shift of the int64
+    // floors the whole part for a negative drift too, and the low four bits
+    // are the fraction. The reachable magnitude is under 7e8 pixels (tMs
+    // 4.3e9 x speed 6.7 x 0.0217 px/ms), well inside the bias; past about a
+    // day of uptime the float product no longer resolves a sixteenth, and
+    // the fraction then steps coarser, which is the limit the whole pixel
+    // version already had.
+    const int64_t sx16 = static_cast<int64_t>(floorf(t * (vx / 1000.0f) * 16.0f));
+    const int64_t sy16 = static_cast<int64_t>(floorf(t * (vy / 1000.0f) * 16.0f));
+    scrollX = static_cast<uint32_t>((sx16 >> 4) + static_cast<int64_t>(SCROLL_BIAS));
+    scrollY = static_cast<uint32_t>((sy16 >> 4) + static_cast<int64_t>(SCROLL_BIAS));
+    fracX = static_cast<uint32_t>(sx16 & 15);
+    fracY = static_cast<uint32_t>(sy16 & 15);
     for (int y = 0; y < 8; y++) {
         for (int x = 0; x < 8; x++) {
             // scan[j] eventually lands at screen x = j - subX. TILE is a
@@ -265,24 +296,44 @@ void frame(uint32_t tMs, int, int, const uint8_t p[BG_ANIM_PARAMS]) {
     }
 }
 
+// One tile row of the field for absolute row yy: five cell copies, each
+// picked by the page's spatial hash (seven per cell in x, thirteen per cell
+// in y, wrapped over the 256 seeded bytes).
+inline void assembleRow(uint16_t *dstScan, uint32_t yy, uint32_t cellX0) {
+    const int ty = yy % TILE;
+    const uint32_t cellY = yy / TILE;
+    for (int c = 0; c < CELLS; c++) {
+        const int which = obit[((cellX0 + c) * 7u + cellY * 13u) & 255u] & 1;
+        memcpy(dstScan + c * TILE, tiles + which * TILE * TILE + ty * TILE, TILE * sizeof(uint16_t));
+    }
+}
+
+// The row's Q4 values blended in y between the row above and the row below
+// (fy sixteenths), then in x between each entry and the next (fx), then the
+// screen-anchored dither added. The shifts are arithmetic, the floor the
+// PIE's EE.VMUL.S16 takes, so the kernel below reproduces this bit for bit.
+// A blend never leaves the range of its two inputs, so the 416..2880 tile
+// range and the index proof the kernels rely on are untouched.
+inline int lerpQ4(int a, int b, int f) { return a + (((b - a) * f) >> 4); }
+
 GM_ANIM_IRAM void bandRef(uint16_t *__restrict dst, int y0, int rows, int w, uint32_t, const uint8_t *) {
     const uint32_t cellX0 = scrollX / TILE;
     const int subX = scrollX % TILE;
+    const int fx = static_cast<int>(fracX), fy = static_cast<int>(fracY);
     for (int row = 0; row < rows; row++) {
         const int y = y0 + row;
         const uint32_t yy = static_cast<uint32_t>(y) + scrollY;
-        const int ty = yy % TILE;
-        const uint32_t cellY = yy / TILE;
-        for (int c = 0; c < CELLS; c++) {
-            // The page's spatial hash strides are seven per cell in x and
-            // thirteen per cell in y, wrapped over the 256 seeded bytes.
-            const int which = obit[((cellX0 + c) * 7u + cellY * 13u) & 255u] & 1;
-            memcpy(scan + c * TILE, tiles + which * TILE * TILE + ty * TILE, TILE * sizeof(uint16_t));
+        assembleRow(scan, yy, cellX0);
+        assembleRow(scanB, yy + 1u, cellX0);
+        // In place: entry j reads only entries j of both rows.
+        for (int j = 0; j < SCAN; j++) {
+            scan[j] = static_cast<uint16_t>(lerpQ4(scan[j], scanB[j], fy));
         }
         const int16_t *off = dith + (y & 7) * 8;
         uint16_t *out = dst + static_cast<size_t>(row) * w;
         for (int x = 0; x < w; x++) {
-            int idx = (scan[x + subX] + off[x & 7]) >> 4;
+            const int j = x + subX;
+            int idx = (lerpQ4(scan[j], scan[j + 1], fx) + off[x & 7]) >> 4;
             if (idx < 0) idx = 0;
             else if (idx > 255) idx = 255;
             out[x] = palette[idx];
@@ -388,16 +439,82 @@ GM_ANIM_IRAM __attribute__((noinline)) void truchetGatherAsm(uint16_t *out, cons
                  : "memory");
 }
 
+// The bilinear blend of bandRef, eight entries per iteration, in place into
+// the row above (a). Per output vector j: ly = a + (((b - a) * fy) >> 4) for
+// blocks j and j + 8, the block j + 1 window of ly through EE.SRC.Q with
+// SAR_BYTE 2 (one 16-bit lane), then ly + (((ly1 - ly) * fx) >> 4) + dither.
+// EE.VMUL.S16 shifts the 32-bit product right by SAR (4 here) and keeps the
+// low 16 bits, which is the C reference's arithmetic shift; no product
+// reaches 16 bits ((2880 - 416) * 15 >> 4 is 2310) and no sum saturates
+// (3290 at most with the dither), so the saturating adds are plain adds.
+//
+// Iteration k loads block k + 1 of both rows before it stores block k, so
+// the in-place write never overtakes a read, and n8 iterations read
+// entries 0..8 * n8 + 7: at n8 = 80 that is the SCAN_ALLOC slack, whose
+// eight outputs are never gathered. Every pointer is 16-byte aligned by
+// construction (allocHot rows, whole vectors), and the dither row is one
+// aligned 16-byte load. fx2 and fy2 carry the fraction in both halves so
+// four EE.MOVI.32.Q fill a lane vector without a table. q0..q7 are
+// compiler-unallocated; SAR and SAR_BYTE belong to the task context and
+// CPENABLE is never written here. 13 instructions per 8 entries against
+// the gather's 6.5 per pixel, and the copies gain nothing but a zero add.
+GM_ANIM_IRAM __attribute__((noinline)) void truchetLerpAsm(uint16_t *a, const uint16_t *b, const int16_t *dither,
+                                                         uint32_t fx2, uint32_t fy2, int n8) {
+    const uint16_t *aNext = a + 8;
+    uint32_t sarByte = 2;
+    asm volatile("ee.vld.128.ip q7, %[dither], 0\n"
+                 "ee.movi.32.q q5, %[fx2], 0\n"
+                 "ee.movi.32.q q5, %[fx2], 1\n"
+                 "ee.movi.32.q q5, %[fx2], 2\n"
+                 "ee.movi.32.q q5, %[fx2], 3\n"
+                 "ee.movi.32.q q6, %[fy2], 0\n"
+                 "ee.movi.32.q q6, %[fy2], 1\n"
+                 "ee.movi.32.q q6, %[fy2], 2\n"
+                 "ee.movi.32.q q6, %[fy2], 3\n"
+                 "ssai 4\n"
+                 "wur.sar_byte %[sb]\n"
+                 "ee.vld.128.ip q0, %[a], 0\n" // block 0 of the row above; a is the store pointer
+                 "ee.vld.128.ip q1, %[b], 16\n"
+                 "ee.vsubs.s16 q1, q1, q0\n"
+                 "ee.vmul.s16 q1, q1, q6\n"
+                 "ee.vadds.s16 q2, q0, q1\n" // ly of block 0
+                 "loopnez %[n], 1f\n"
+                 "ee.vld.128.ip q0, %[an], 16\n" // block k + 1 of both rows
+                 "ee.vld.128.ip q1, %[b], 16\n"
+                 "ee.vsubs.s16 q1, q1, q0\n"
+                 "ee.vmul.s16 q1, q1, q6\n"
+                 "ee.vadds.s16 q3, q0, q1\n" // ly of block k + 1
+                 "ee.src.q q4, q2, q3\n"     // ly entries 8k + 1 .. 8k + 8
+                 "ee.vsubs.s16 q4, q4, q2\n"
+                 "ee.vmul.s16 q4, q4, q5\n"
+                 "ee.vadds.s16 q4, q4, q2\n"
+                 "ee.vadds.s16 q4, q4, q7\n"
+                 "ee.vst.128.ip q4, %[a], 16\n" // block k, in place
+                 "ee.orq q2, q3, q3\n"
+                 "1:\n"
+                 : [a] "+&r"(a), [an] "+&r"(aNext), [b] "+&r"(b)
+                 : [dither] "r"(dither), [fx2] "r"(fx2), [fy2] "r"(fy2), [sb] "r"(sarByte), [n] "r"(n8)
+                 : "memory");
+}
+
 GM_ANIM_IRAM void band(uint16_t *dst, int y0, int rows, int w, uint32_t, const uint8_t *) {
     const uint32_t cellXHash = (scrollX / TILE) * 7u;
     const int subX = scrollX % TILE;
+    const uint32_t fx2 = fracX | (fracX << 16), fy2 = fracY | (fracY << 16);
     for (int row = 0; row < rows; row++) {
         // All state comes from absolute y, even when interlace skips rows
         // or band() is called with a different number of neighbouring rows.
         const int y = y0 + row;
         const uint32_t yy = static_cast<uint32_t>(y) + scrollY;
+        const uint32_t yy1 = yy + 1u;
         const uint32_t hash = cellXHash + (yy / TILE) * 13u;
-        truchetScanAsm(scan, tiles + (yy % TILE) * TILE, obit, dithScan + (y & 7) * 8, hash, CELLS);
+        const uint32_t hash1 = cellXHash + (yy1 / TILE) * 13u;
+        // Plain copies (the dither row is zero): the dither joins after the
+        // blend so the grain stays anchored to the screen, not blended
+        // between two Bayer cells.
+        truchetScanAsm(scan, tiles + (yy % TILE) * TILE, obit, zeroOff, hash, CELLS);
+        truchetScanAsm(scanB, tiles + (yy1 % TILE) * TILE, obit, zeroOff, hash1, CELLS);
+        truchetLerpAsm(scan, scanB, dithScan + (y & 7) * 8, fx2, fy2, SCAN / 8);
         uint16_t *out = dst + static_cast<size_t>(row) * w;
         truchetGatherAsm(out, scan + subX, palette, w / 2);
         // The 233-wide half-resolution path calls one aligned row at a time.
@@ -412,12 +529,14 @@ GM_ANIM_IRAM void band(uint16_t *dst, int y0, int rows, int w, uint32_t tMs, con
 #endif
 
 void release() {
+    releaseTable(zeroOff, 8 * sizeof(int16_t));
     releaseTable(dithScan, 64 * sizeof(int16_t));
     releaseTable(dith, 64 * sizeof(int16_t));
     releaseTable(obit, 256);
     releaseTable(orient, 256);
     releaseTable(palette, 256 * sizeof(uint16_t));
-    releaseTable(scan, SCAN * sizeof(uint16_t));
+    releaseTable(scanB, SCAN_ALLOC * sizeof(uint16_t));
+    releaseTable(scan, SCAN_ALLOC * sizeof(uint16_t));
     releaseTable(tileOwner, TILE_ALLOC);
     tiles = nullptr;
     lastThemeGen = 0;
@@ -425,6 +544,7 @@ void release() {
     lastArc = lastGlow = lastSoft = -1;
     lastContrast = lastGlowPal = lastGrain = lastBias = -1;
     scrollX = scrollY = 0;
+    fracX = fracY = 0;
 }
 
 } // namespace

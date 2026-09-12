@@ -493,8 +493,30 @@ void frame(uint32_t tMs, int w, int h, const uint8_t p[BG_ANIM_PARAMS]) {
     // the two waves' cells don't lock into a repeating grid. Its own clock,
     // distinct from the angle wobbles above and the sheen's clock below, so
     // all three drift out of lockstep with each other. ----
-    const uint32_t foldSpeed = 4 + static_cast<uint32_t>(p[0]) * 44 / 100; // 4..48, /16 = 0.25x..3x
-    const uint32_t foldBase = tMs * foldSpeed >> 4;
+    // Speed law (gm-kh2s). The fringe scroll used to read Speed through its
+    // own linear curve, 4 + p0 * 44 / 100 sixteenths (0.25x at 0, 1.625x at
+    // 50, 3x at 100), while the sheen and the angle wobbles read the fleet's
+    // exp2 curve (speedMul: 0.15x, 1x, 6.7x). Between 50 and 75 the scroll
+    // only gained 1.42x where the sheen gained 2.6x, and the measured half
+    // change time went from 3290 ms to 3314 ms: the slider ran backwards.
+    // Now the scroll rides speedMul too. 1150 / 256 = 4.49 sixteenths per
+    // ms at 50, which is 2.77 times the old 26 / 16 and puts the half change
+    // time at 988 ms against the 1200 ms target (motion.js, raw metric,
+    // accept band 950 to 1500), with Speed 0, 25, 75 and 100 at 1.09, 1.04,
+    // 1.20 and 1.51 times their targets and every step of the slider
+    // faster than the last. The sheen and the wobbles keep their rates:
+    // scaling them by the same factor put Speed 50 at 560 ms and made
+    // Speed 100 slower than 75 again, because the sheen's sweep then
+    // dominates the picture and aliases against the metric's 66 ms step.
+    // The reading is sensitive to where in the sheen's 70 s cycle it is
+    // taken: the picture is nearly black from about 33 s to 60 s of every
+    // cycle at Speed 50 (mean luma 5 to 8 against 45 to 63 when lit), so a
+    // window that starts 20 s later reads 1506 ms and one 35 s later reads
+    // nothing at all. The 64-bit product keeps the phase continuous across
+    // a 32-bit wrap; the old tMs * foldSpeed product wrapped before its
+    // shift and jumped once a day. Exactly 1150 at 50.
+    const uint32_t foldRateQ8 = static_cast<uint32_t>(lroundf(1150.0f * speedF));
+    const uint32_t foldBase = static_cast<uint32_t>((static_cast<uint64_t>(tMs) * foldRateQ8) >> 8);
     const uint32_t phaseA0 = foldBase * 9 >> 8;
     const uint32_t phaseA1 = foldBase * 8 >> 8; // close to phaseA0: a slow beat, not a fixed second grating
     const uint32_t phaseB0 = foldBase * 7 >> 8; // different ratio again: the cells drift, not just scroll

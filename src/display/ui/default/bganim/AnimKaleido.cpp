@@ -10,8 +10,9 @@
 // The page's executable constants are the spec. Its older prose mentions a
 // 128-square source, two samples, levels 40..209 and 30/40 second wraps. The
 // approved render actually uses one 256-square source, levels 44..175, and
-// offsets of 3.2 and 1.6 source units/second at Speed 50. Keep those numbers.
-// Angular source position is Q9, radial position Q3, smoothing divides by 4
+// offsets of 8.96 and 4.48 source units/second at Speed 50 (2.8 times the
+// page's original 3.2 and 1.6, gm-kh2s). Keep those numbers. Both source
+// positions are Q8 and read bilinearly, smoothing divides by 4
 // BEFORE the Q8 vignette multiply. Dither changes the map's cell selection,
 // not the palette: (Bayer8 - 31.5)/64, suppressed at both mirror axes.
 // Float32 init math can select a neighbouring cell at a rounding boundary;
@@ -50,6 +51,12 @@ constexpr float WEDGE = PI / 3.0f;
 constexpr float HALF = PI / 6.0f;
 // This is a fixed 240 px radius in the page's init(w,h), not min(w,h)/2.
 constexpr float R_OUT = 240.0f;
+// Scroll rates at Speed 50 in Q24 source units per ms: radial and angular.
+// The page's originals were 0.0032 and 0.0016 (53687 and 26844); these are
+// 2.8 times that (gm-kh2s). Mirrored by KAL_OY_Q24 and KAL_OX_Q24 in
+// tools/animbench/web/anim_bench.html.
+constexpr uint32_t KAL_OY_Q24 = 150324;
+constexpr uint32_t KAL_OX_Q24 = 75163;
 constexpr size_t RAW_BYTES = CELLS + 15; // align the byte streams for PIE
 constexpr size_t RIM_BYTES = R_N + 15;
 
@@ -314,15 +321,27 @@ void frame(uint32_t tMs, int, int, const uint8_t p[BG_ANIM_PARAMS]) {
         lastVignette = p[5];
     }
     const float spd = speedMul(p[0]);
-    // Rebuild from time just as the page does, so arbitrary frame order is
-    // deterministic. Float32 can round an offset differently from JS after
-    // long uptime; it stays far below UINT32_MAX even at millis() wrap.
-    const uint32_t oy = static_cast<uint32_t>(tMs * 0.0032f * spd + 0.5f);
-    // Sweep scales the angular offset only: 1.0 at 50, so the page's 0.0016
+    // Fractional scroll (gm-kh2s). The two source offsets carry 8 fraction
+    // bits and the source is read bilinearly below, so every frame moves.
+    // With whole-unit offsets the picture stood still on 68 percent of
+    // 66 ms steps at Speed 50 (motion.js, raw metric): the radial offset
+    // ticked once per 4.7 steps and the angular product only changed the
+    // sampled cell when its discarded fraction crossed an integer. The
+    // rates are Q24 source units per ms: KAL_OY_Q24 along the radius and
+    // KAL_OX_Q24 along the folded angle, 2.8 times the page's original
+    // 0.0032 and 0.0016 (53687 and 26844 in Q24), which puts the half
+    // change time on the 1200 ms target from 3316 ms. Integer time math,
+    // so the fraction keeps its precision at any uptime: the old float
+    // product lost whole units past a day. The 64-bit product is exact and
+    // its low 32 bits are all the modular arithmetic below reads.
+    const uint32_t oyRate = static_cast<uint32_t>(lroundf(static_cast<float>(KAL_OY_Q24) * spd));
+    const uint32_t oyQ8 = static_cast<uint32_t>((static_cast<uint64_t>(tMs) * oyRate) >> 16);
+    // Sweep scales the angular rate only: 1.0 at 50, so the constant
     // survives exactly, 0 at 0 (the figure stops opening and closing and only
     // flows outward) and 2.0 at 100. The division is exact at 50.
-    const float axRate = 0.0016f * (static_cast<float>(p[6]) / 50.0f);
-    const uint32_t ox = static_cast<uint32_t>(tMs * axRate * spd + 0.5f);
+    const float axRate = static_cast<float>(KAL_OX_Q24) * (static_cast<float>(p[6]) / 50.0f);
+    const uint32_t oxRate = static_cast<uint32_t>(lroundf(axRate * spd));
+    const uint32_t oxQ8 = static_cast<uint32_t>((static_cast<uint64_t>(tMs) * oxRate) >> 16);
     const uint32_t scA = 2 + (static_cast<uint32_t>(p[1]) * 2 + 50) / 100;
     const uint32_t scR = 4 + (static_cast<uint32_t>(p[1]) * 4 + 50) / 100;
     // Rays is the Q4 weight on the radius in the angular source term, 16
@@ -331,16 +350,27 @@ void frame(uint32_t tMs, int, int, const uint8_t p[BG_ANIM_PARAMS]) {
     // rings; at 100 the source sweeps twice as far across the wedge at the rim
     // as at the centre and the figure sharpens into a spiked star.
     const uint32_t rw = static_cast<uint32_t>((32 * static_cast<int>(p[4]) + 50) / 100);
+    // Both source coordinates are Q8 here: the angular product keeps the
+    // eight bits the old >> 9 discarded, the radial one carries oyQ8. The
+    // integer parts index the source exactly as before and the fractions
+    // weight a bilinear read of the four neighbouring source cells, which
+    // wrap at 256 like the source does. Unsigned wrap preserves the page's
+    // Math.imul products at long uptimes; only bits 9..24 of the angular
+    // product are read.
     for (int a = 0; a < A_N; a++) {
-        const uint32_t aSh = (a + ox) * scA;
+        const uint32_t aSh = ((static_cast<uint32_t>(a) << 8) + oxQ8) * scA;
         for (int r = 0; r < R_N; r++) {
-            // Unsigned wrap preserves JS's bitwise ToInt32 product at long
-            // uptimes. Only bits 9..16 survive >>9 and &255, so the sign
-            // extension of JS's signed shift cannot affect the source index.
             const uint32_t rt = ((static_cast<uint32_t>(r) * rw) >> 4) + 5u;
-            const uint32_t sa = ((aSh * rt) >> 9) & (SRC - 1);
-            const uint32_t sr = (((r * scR) >> 3) + oy) & (SRC - 1);
-            raw[a * R_N + r] = lev[src[sa * SRC + sr]];
+            const uint32_t saQ = (aSh * rt) >> 9;
+            const uint32_t srQ = ((static_cast<uint32_t>(r * scR) >> 3) << 8) + oyQ8;
+            const uint32_t sa = (saQ >> 8) & (SRC - 1), fa = saQ & 255u;
+            const uint32_t sr = (srQ >> 8) & (SRC - 1), fr = srQ & 255u;
+            const uint8_t *row0 = src + sa * SRC;
+            const uint8_t *row1 = src + ((sa + 1) & (SRC - 1)) * SRC;
+            const uint32_t sr1 = (sr + 1) & (SRC - 1);
+            const uint32_t top = row0[sr] * (256u - fr) + row0[sr1] * fr;
+            const uint32_t bot = row1[sr] * (256u - fr) + row1[sr1] * fr;
+            raw[a * R_N + r] = lev[(top * (256u - fa) + bot * fa) >> 16];
         }
     }
     for (int a = 0; a < A_N; a++) {

@@ -1770,8 +1770,11 @@ function bayerOffsets(dithOff, amp, unit) {
       const slopeA = F(fastSinRad(angleA) / fastCosRad(angleA));
       const slopeB = F(fastSinRad(angleB) / fastCosRad(angleB));
 
-      const foldSpeed = 4 + Math.floor(p[0] * 44 / 100);
-      const foldBase = ((t * foldSpeed) >>> 0) >>> 4;
+      // Speed law (gm-kh2s): the fringe scroll rides speedMul like the sheen
+      // and the wobbles, 1150 / 256 sixteenths per ms at 50 (2.77 times the old
+      // linear law's 26 / 16). Exact product: t * 915 * speedF < 2^53.
+      const foldRateQ8 = lround(F(1150 * speedF));
+      const foldBase = Math.floor(t * foldRateQ8 / 256) % 4294967296;
       const phaseA0 = ((foldBase * 9) >>> 0) >>> 8, phaseA1 = ((foldBase * 8) >>> 0) >>> 8;
       const phaseB0 = ((foldBase * 7) >>> 0) >>> 8, phaseB1 = ((foldBase * 6) >>> 0) >>> 8;
       const sxScale = 128 + Math.floor(p[1] * 384 / 100);
@@ -3292,6 +3295,8 @@ const pa_dith = (x, y) => (BAYER8[(y & 7) * 8 + (x & 7)] - 31.5) * (1 / 64);
 (() => {
   const A_N = 64, R_N = 64, SRC = 256, R_OUT = 240;
   const WEDGE = Math.PI / 3, HALF = Math.PI / 6;
+  // Q24 source units per ms at Speed 50, mirror of AnimKaleido.cpp.
+  const KAL_OY_Q24 = 150324, KAL_OX_Q24 = 75163;
   ANIMS.push({
     id: 'kaleido', name: 'Kaleido', proto: true,
     params: [
@@ -3363,14 +3368,21 @@ const pa_dith = (x, y) => (BAYER8[(y & 7) * 8 + (x & 7)] - 31.5) * (1 / 64);
           state.rimDim[r] = Math.round(fl + sp * Math.pow(Math.max(0, 1 - d * d), 0.6));
         }
       }
-      const spd = speedMulJS(p[0]);
-      // One wrap of the source patch every 30 s across the wedge, and about one
-      // revolution of the figure every 4 minutes along the folded angle.
-      const oy = Math.round(tMs * 0.0032 * spd) | 0;
-      // The figure opens and closes about its mirror axis once every 40 s.
-      // Sweep scales that rate on its own: 1x at 50, still at 0, twice as
-      // fast at 100.
-      const ox = Math.round(tMs * (0.0016 * (p[6] / 50)) * spd) | 0;
+      const spd = speedMulF(p[0]);
+      // Fractional scroll (gm-kh2s). The two source offsets carry 8 fraction
+      // bits and the source is sampled bilinearly, so every frame moves; with
+      // whole-unit offsets the picture stood still on 68 percent of 66 ms
+      // steps at Speed 50. The rates are Q24 source units per ms: KAL_OY_Q24
+      // along the radius and KAL_OX_Q24 along the folded angle, 2.8 times the
+      // page's original 0.0032 and 0.0016 (53687 and 26844 in Q24), which
+      // puts the half change time on the 1200 ms target. Exact integers at
+      // the defaults, and the product t * rate stays below 2^53.
+      const oyRate = lround(F(KAL_OY_Q24 * spd));
+      const oyQ8 = Math.floor(tMs * oyRate / 65536) % 4294967296;
+      // Sweep scales the angular rate on its own: 1x at 50, still at 0, twice
+      // as fast at 100.
+      const oxRate = lround(F(F(KAL_OX_Q24 * F(p[6] / 50)) * spd));
+      const oxQ8 = Math.floor(tMs * oxRate / 65536) % 4294967296;
       const scA = 2 + Math.round(p[1] * 2 / 100);    // blotch size, angular
       const scR = 4 + Math.round(p[1] * 4 / 100);    // and radial
       const { tex, src, pal, rimDim, lev, map } = state;
@@ -3386,11 +3398,23 @@ const pa_dith = (x, y) => (BAYER8[(y & 7) * 8 + (x & 7)] - 31.5) * (1 / 64);
       // plain concentric rings; 32 sweeps twice as far across the wedge at
       // the rim as at the centre and sharpens the figure into a spiked star.
       const rw = Math.floor((32 * p[4] + 50) / 100);
+      // Both source coordinates are Q8 here: the angular product keeps the
+      // eight bits the old >> 9 discarded, the radial one carries oyQ8. The
+      // integer parts index the source exactly as before and the fractions
+      // weight a bilinear read of the four neighbouring source cells, which
+      // wrap at 256 like the source does. All 32-bit wrapping arithmetic,
+      // the same as the firmware's uint32.
       for (let a = 0, c = 0; a < A_N; a++) {
-        const aSh = (a + ox) * scA;
+        const aSh = Math.imul(((a << 8) + oxQ8) >>> 0, scA) >>> 0;
         for (let r = 0; r < R_N; r++, c++) {
-          const sa = ((aSh * (((r * rw) >> 4) + 5)) >> 9) & (SRC - 1);
-          raw[c] = lev[src[sa * SRC + (((r * scR >> 3) + oy) & (SRC - 1))]];
+          const saQ = (Math.imul(aSh, ((r * rw) >> 4) + 5) >>> 0) >>> 9;
+          const srQ = ((((r * scR) >> 3) << 8) + oyQ8) >>> 0;
+          const sa = (saQ >>> 8) & (SRC - 1), fa = saQ & 255;
+          const sr = (srQ >>> 8) & (SRC - 1), fr = srQ & 255;
+          const row0 = sa * SRC, row1 = ((sa + 1) & (SRC - 1)) * SRC, sr1 = (sr + 1) & (SRC - 1);
+          const top = src[row0 + sr] * (256 - fr) + src[row0 + sr1] * fr;
+          const bot = src[row1 + sr] * (256 - fr) + src[row1 + sr1] * fr;
+          raw[c] = lev[(top * (256 - fa) + bot * fa) >> 16];
         }
       }
       // A 1-2-1 smoothing along the angle. The wedge is 64 cells wide and only
@@ -3999,6 +4023,8 @@ const pa_dith = (x, y) => (BAYER8[(y & 7) * 8 + (x & 7)] - 31.5) * (1 / 64);
       for (let i = 0; i < 256; i++) state.orient[i] = (rnd() * 256) | 0;
       state.obit = new Uint8Array(256);
       state.scan = new Uint16Array(SCAN);
+      state.scanB = new Uint16Array(SCAN);
+      state.lerp = new Int16Array(SCAN);
       state.dith = new Int16Array(64);
       state.pal = null;
       state.key = null;
@@ -4080,8 +4106,10 @@ const pa_dith = (x, y) => (BAYER8[(y & 7) * 8 + (x & 7)] - 31.5) * (1 / 64);
           for (let ty = 0; ty < TILE; ty++) state.rowView[o].push(state.tile[o].subarray(ty * TILE, ty * TILE + TILE));
         }
       }
-      const { rowView, obit, scan, dith, pal } = state;
-      const t = tMs * speedMulJS(p[0]) * (31/64); // gm-33fm speed calibration
+      const { rowView, obit, scan, scanB, lerp, dith, pal } = state;
+      // Float steps mirror AnimTruchet.cpp's frame(), so the Q4 scroll below
+      // floors on the same side of every sixteenth the firmware does.
+      const t = F(F(tMs * speedMulF(p[0])) * F(31 / 64)); // gm-33fm speed calibration
       // 18 and 12 px/s, not the spec's 12 and 8. A tile blit scrolls in
       // whole pixels, so at 12 px/s and 30 fps half the frames repeat and
       // the field creeps in visible steps. At 18 px/s two frames in three
@@ -4095,19 +4123,36 @@ const pa_dith = (x, y) => (BAYER8[(y & 7) * 8 + (x & 7)] - 31.5) * (1 / 64);
       const ang = (p[3] - 50) * (2.8 / 50);
       const vx = 18 * Math.cos(ang) - 12 * Math.sin(ang);
       const vy = 18 * Math.sin(ang) + 12 * Math.cos(ang);
-      const ox = Math.floor(t * vx / 1000) + SCROLL_BIAS;
-      const oy = Math.floor(t * vy / 1000) + SCROLL_BIAS;
+      // Fractional scroll (gm-kh2s). The scroll is carried in sixteenths of
+      // a pixel: the whole part picks the tile rows and columns as before,
+      // and the fraction weights a bilinear read between the row and the
+      // row below (lerp), then between each column and the next. With a
+      // whole pixel scroll the field advanced 0.58 and 0.38 px per 66 ms
+      // step at Speed 50 and 28 percent of steps repeated the previous
+      // picture exactly; now every step moves. Dither is added after the
+      // blend, so the grain stays anchored to the screen and is not itself
+      // blended between two Bayer cells.
+      const sx16 = Math.floor(F(F(t * F(vx / 1000)) * 16));
+      const sy16 = Math.floor(F(F(t * F(vy / 1000)) * 16));
+      const ox = Math.floor(sx16 / 16) + SCROLL_BIAS, fx = sx16 & 15;
+      const oy = Math.floor(sy16 / 16) + SCROLL_BIAS, fy = sy16 & 15;
       const cellX0 = ox / TILE | 0, subX = ox % TILE;
       let o = 0;
       for (let y = 0; y < h; y++) {
         const yy = y + oy, ty = yy % TILE, cellY = yy / TILE | 0;
+        const yy1 = yy + 1, ty1 = yy1 % TILE, cellY1 = yy1 / TILE | 0;
         for (let c = 0; c < CELLS; c++) {
           const which = obit[(((cellX0 + c) * 7 + cellY * 13) & 255)] & 1;
           scan.set(rowView[which][ty], c * TILE);
+          const which1 = obit[(((cellX0 + c) * 7 + cellY1 * 13) & 255)] & 1;
+          scanB.set(rowView[which1][ty1], c * TILE);
         }
+        // Arithmetic shifts, the same floor the firmware's EE.VMUL.S16 takes.
+        for (let j = 0; j < SCAN; j++) lerp[j] = scan[j] + (((scanB[j] - scan[j]) * fy) >> 4);
         const off = (y & 7) * 8;
         for (let x = 0; x < w; x++) {
-          let idx = (scan[x + subX] + dith[off + (x & 7)]) >> 4;
+          const j = x + subX, l0 = lerp[j];
+          let idx = (l0 + (((lerp[j + 1] - l0) * fx) >> 4) + dith[off + (x & 7)]) >> 4;
           if (idx < 0) idx = 0; else if (idx > 255) idx = 255;
           const q = idx * 3;
           data[o] = pal[q]; data[o + 1] = pal[q + 1]; data[o + 2] = pal[q + 2]; data[o + 3] = 255;
