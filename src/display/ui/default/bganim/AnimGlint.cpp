@@ -447,7 +447,7 @@ extern const BgAnimation bg_anim_glint;
 const BgAnimation bg_anim_glint = {
     "glint",
     "Glint",
-    {{"speed", "Speed", 10},
+    {{"speed", "Speed", 50},
      {"length", "Length", 35},
      {"width", "Width", 45},
      {"brightness", "Brightness", 55}},

@@ -370,7 +370,7 @@ extern const BgAnimation bg_anim_brushed;
 const BgAnimation bg_anim_brushed = {
     "brushed",
     "Brushed",
-    {{"speed", "Speed", 20}, {"grain", "Grain", 35}, {"reflection", "Reflection", 45}, {"contrast", "Contrast", 30}},
+    {{"speed", "Speed", 50}, {"grain", "Grain", 35}, {"reflection", "Reflection", 45}, {"contrast", "Contrast", 30}},
     init,
     frame,
     band,

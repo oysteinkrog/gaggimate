@@ -4,8 +4,8 @@
 // and a dim reflection below. This implements entry 15 of
 // tools/animbench/web/anim_bench.html, including its unsigned time wraps.
 // Two opposing sine waves ride a curvature parabola; two more move the whole
-// vertical gradient. At Speed 10 the swells travel about +11.90 and -6.82
-// px/s, and the main vertical drift repeats every 16.384 s.
+// vertical gradient. At Speed 50, the default, the swells travel about
+// +23.81 and -13.64 px/s, and the main vertical drift repeats every 8.192 s.
 //
 // The field is separable in Q4 palette-index units:
 //   pixel = palette[(colTermPh[(y & 7) * colStride + x] + rowTerm[y]) >> 4].
@@ -137,9 +137,12 @@ void frame(uint32_t tMs, int w, int h, const uint8_t p[BG_ANIM_PARAMS]) {
     }
 
     // Exactly the page's >>> 0 after each multiplication, before shifting.
-    // Speed 10 gives sp=8. The main vertical phase advances 62.5 sine
-    // samples/s (1024 per turn); the other advances 39.0625/s.
-    const uint32_t sp = 4 + static_cast<uint32_t>(p[0]) * 44 / 100;
+    // Speed 50 gives sp=16. The main vertical phase advances 125 sine
+    // samples/s (1024 per turn); the other advances 78.125/s.
+    // The speed law is the same affine shape this entry has always had,
+    // scaled to 0.615 of it so that Speed 50 gives the fleet's target
+    // movement (bead gm-33fm). It used to read 4 + p[0] * 44 / 100.
+    const uint32_t sp = 3 + static_cast<uint32_t>(p[0]) * 26 / 100;
     const uint32_t base = tMs * sp;
     const uint32_t phu = base >> 9, phu2 = (base * 3u) >> 10;
     const uint32_t phd = base >> 7, phd2 = (base * 5u) >> 10;
@@ -336,7 +339,7 @@ extern const BgAnimation bg_anim_horizon;
 const BgAnimation bg_anim_horizon = {
     "horizon",
     "Horizon",
-    {{"speed", "Speed", 10}, {"height", "Height", 45}, {"curvature", "Curvature", 35}, {"softness", "Softness", 60}},
+    {{"speed", "Speed", 50}, {"height", "Height", 45}, {"curvature", "Curvature", 35}, {"softness", "Softness", 60}},
     init,
     frame,
     band,

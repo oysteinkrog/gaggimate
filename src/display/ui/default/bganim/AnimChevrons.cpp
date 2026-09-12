@@ -128,17 +128,23 @@ void frame(uint32_t tMs, int w, int h, const uint8_t p[BG_ANIM_PARAMS]) {
     const int denom = h > 0 ? h : 1;
     const int folds = 2 + static_cast<int>(p[1]) * 3 / 100; // 2..5, three at 65
     const int rowStep = folds * WRAP / denom;
-    const uint32_t sp = 4 + static_cast<uint32_t>(p[0]) * 44 / 100; // 4..48, ten at 15
+    // Speed is carried in quarter units so the rate can be scaled to 0.260
+    // of what this entry used to run at (bead gm-33fm) without coarsening
+    // the slider: the law keeps its affine shape and the two extra
+    // fractional bits are taken back in the three shifts below. It used to
+    // read 4 + p[0] * 44 / 100 with shifts of 4, 10 and 11. Speed 50, the
+    // default, gives sp4 = 27, an effective 6.75 against the old 26.
     // Preserve every JS >>>0 before shifting: both products wrap as
     // uint32, including base*3. Do not substitute speedMul or an elapsed
-    // time accumulator. Phase advances sp*1000/16 sum units per second,
-    // 25 px/s at defaults on a 480-high panel (rowStep == 25).
-    const uint32_t base = tMs * sp;
-    const uint32_t phase = (base >> 4) & (WRAP - 1);
-    const uint32_t phW = base >> 10;
-    const uint32_t phB = (base * 3u) >> 11;
+    // time accumulator. Phase advances sp4*1000/64 sum units per second,
+    // 16.9 px/s at defaults on a 480-high panel (rowStep == 25).
+    const uint32_t sp4 = 4 + static_cast<uint32_t>(p[0]) * 46 / 100; // 4..50 quarters
+    const uint32_t base = tMs * sp4;
+    const uint32_t phase = (base >> 6) & (WRAP - 1);
+    const uint32_t phW = base >> 12;
+    const uint32_t phB = (base * 3u) >> 13;
     // Q8 slant 110..290, modulated by 256 +/-30. At default speed the
-    // wobble period is 104.8576 s and the swell period 69.9051 s, as the
+    // wobble period is 155.3446 s and the swell period 103.5631 s, as the
     // page computes, despite its older approximate 30 s comment.
     const int angleQ8 = 110 + static_cast<int>(p[2]) * 180 / 100;
     const int wob = 256 + ((sine[phW & (SIN_N - 1)] * 30) >> 9);
@@ -352,7 +358,7 @@ extern const BgAnimation bg_anim_chevrons;
 const BgAnimation bg_anim_chevrons = {
     "chevrons",
     "Chevrons",
-    {{"speed", "Speed", 15}, {"spacing", "Spacing", 65}, {"angle", "Angle", 50}, {"contrast", "Contrast", 35}},
+    {{"speed", "Speed", 50}, {"spacing", "Spacing", 65}, {"angle", "Angle", 50}, {"contrast", "Contrast", 35}},
     init,
     frame,
     band,

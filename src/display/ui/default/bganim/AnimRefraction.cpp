@@ -351,7 +351,7 @@ extern const BgAnimation bg_anim_refraction;
 const BgAnimation bg_anim_refraction = {
     "refraction",
     "Refraction",
-    {{"speed", "Speed", 18}, {"bend", "Bend", 35}, {"width", "Channel width", 65}, {"contrast", "Contrast", 30}},
+    {{"speed", "Speed", 50}, {"bend", "Bend", 35}, {"width", "Channel width", 65}, {"contrast", "Contrast", 30}},
     init,
     frame,
     band,

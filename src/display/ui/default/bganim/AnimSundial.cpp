@@ -512,7 +512,7 @@ extern const BgAnimation bg_anim_sundial;
 const BgAnimation bg_anim_sundial = {
     "sundial",
     "Sundial",
-    {{"speed", "Speed", 10}, {"width", "Wedge width", 40}, {"contrast", "Contrast", 25}, {"shading", "Surface shading", 30}},
+    {{"speed", "Speed", 50}, {"width", "Wedge width", 40}, {"contrast", "Contrast", 25}, {"shading", "Surface shading", 30}},
     init,
     frame,
     band,

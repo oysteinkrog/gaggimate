@@ -223,7 +223,7 @@ export const BG_ANIMATIONS = [
     name: 'Brushed',
     description: 'A dark brushed surface with a wide sheen sliding across it.',
     params: [
-      { key: 'speed', label: 'Speed', def: 20 },
+      { key: 'speed', label: 'Speed', def: 50 },
       { key: 'grain', label: 'Grain', def: 35 },
       { key: 'reflection', label: 'Reflection', def: 45 },
       { key: 'contrast', label: 'Contrast', def: 30 },
@@ -234,7 +234,7 @@ export const BG_ANIMATIONS = [
     name: 'Horizon',
     description: 'A glowing horizon line between ground and sky, drifting slowly.',
     params: [
-      { key: 'speed', label: 'Speed', def: 10 },
+      { key: 'speed', label: 'Speed', def: 50 },
       { key: 'height', label: 'Height', def: 45 },
       { key: 'curvature', label: 'Curvature', def: 35 },
       { key: 'softness', label: 'Softness', def: 60 },
@@ -245,7 +245,7 @@ export const BG_ANIMATIONS = [
     name: 'Oculus',
     description: 'A dark pupil inside a softly lit ring that breathes.',
     params: [
-      { key: 'speed', label: 'Speed', def: 15 },
+      { key: 'speed', label: 'Speed', def: 50 },
       { key: 'diameter', label: 'Diameter', def: 65 },
       { key: 'breath', label: 'Breath', def: 20 },
       { key: 'edge', label: 'Edge softness', def: 55 },
@@ -256,7 +256,7 @@ export const BG_ANIMATIONS = [
     name: 'Chevrons',
     description: 'Wide soft folds travelling down the face.',
     params: [
-      { key: 'speed', label: 'Speed', def: 15 },
+      { key: 'speed', label: 'Speed', def: 50 },
       { key: 'spacing', label: 'Spacing', def: 65 },
       { key: 'angle', label: 'Angle', def: 50 },
       { key: 'contrast', label: 'Contrast', def: 35 },
@@ -289,7 +289,7 @@ export const BG_ANIMATIONS = [
     name: 'Refraction',
     description: 'Broad tonal channels bending as if seen through uneven glass.',
     params: [
-      { key: 'speed', label: 'Speed', def: 18 },
+      { key: 'speed', label: 'Speed', def: 50 },
       { key: 'bend', label: 'Bend', def: 35 },
       { key: 'width', label: 'Channel width', def: 65 },
       { key: 'contrast', label: 'Contrast', def: 30 },
@@ -300,7 +300,7 @@ export const BG_ANIMATIONS = [
     name: 'Sundial',
     description: 'A soft wedge of light turning slowly around the centre.',
     params: [
-      { key: 'speed', label: 'Speed', def: 10 },
+      { key: 'speed', label: 'Speed', def: 50 },
       { key: 'width', label: 'Wedge width', def: 40 },
       { key: 'contrast', label: 'Contrast', def: 25 },
       { key: 'shading', label: 'Surface shading', def: 30 },
@@ -322,7 +322,7 @@ export const BG_ANIMATIONS = [
     name: 'Glint',
     description: 'A soft curved highlight sweeping across a dark face.',
     params: [
-      { key: 'speed', label: 'Speed', def: 10 },
+      { key: 'speed', label: 'Speed', def: 50 },
       { key: 'length', label: 'Length', def: 35 },
       { key: 'width', label: 'Width', def: 45 },
       { key: 'brightness', label: 'Brightness', def: 55 },
