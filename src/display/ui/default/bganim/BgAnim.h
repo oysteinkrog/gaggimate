@@ -85,12 +85,17 @@ void bg_parse_params(const char *packed, int animId, uint8_t out[BG_ANIM_PARAMS]
 // web/src/config/bgAnimations.js — keep in sync, append only (the index is
 // persisted). Which gradient an animation draws with comes from three
 // settings, resolved by bg_resolve_anim_theme:
-//   bgAnimThemeMap   "ref;ref;..." indexed by animation id, ref = built-in
-//                    index, "c<id>" for a library gradient, or empty
-//   bgAnimGradients  the user's library, "id|name|gradient;..." (<= 12)
-//   bgAnimTheme      built-in index used by animations with no map entry
-//                    (bg_theme_count() with bgAnimCustomTheme is the
-//                    pre-library custom gradient; still honoured)
+//   bgAnimThemeMap     "ref;ref;..." indexed by animation id, ref = built-in
+//                      index, "c<id>" for a library gradient, or empty
+//   bgAnimGradients    the user's library, "id|name|gradient;..." (<= 12)
+//   bgAnimGradientRef  the global default, one ref in the same grammar, used
+//                      by every animation with no map entry of its own. Empty
+//                      means fall through to the two fields below, which is
+//                      what a device that has never set it stores.
+//   bgAnimTheme        built-in index, the fallback when the global ref is
+//                      empty or does not resolve (bg_theme_count() with
+//                      bgAnimCustomTheme is the pre-library custom gradient;
+//                      still honoured)
 // A gradient string is "rrggbb[@pos],rrggbb[@pos],..."; without positions the
 // stops are spaced evenly, which is also the original palette arithmetic.
 // With positions, the colour holds flat before the first stop and after the
@@ -129,10 +134,17 @@ bool bg_library_lookup(const char *lib, int id, uint8_t stops[BG_THEME_MAX_STOPS
 // Map: each ref is empty, a built-in index, or "c<id>".
 bool bg_map_valid(const char *map);
 
-// The gradient animId draws with: its map entry when it resolves (a built-in
-// or a library id that exists), else the global theme via bg_resolve_theme.
-void bg_resolve_anim_theme(int animId, const char *map, const char *library, int themeId, const char *custom,
-                           uint8_t stops[BG_THEME_MAX_STOPS][3], uint8_t pos[BG_THEME_MAX_STOPS], int &nStops,
-                           bool &uniform);
+// True when ref is one the gradient settings accept: empty, a decimal
+// built-in index, or "c<id>". Says nothing about whether the thing it names
+// exists; resolution falls back on its own when it does not.
+bool bg_ref_valid(const char *ref);
+
+// The gradient animId draws with, in three steps: its own map entry when that
+// resolves (a built-in, or a library id that exists), else globalRef by the
+// same rule, else the global theme via bg_resolve_theme. A caller with no
+// globalRef passes nullptr and gets the two-step behaviour this had before.
+void bg_resolve_anim_theme(int animId, const char *map, const char *library, const char *globalRef, int themeId,
+                           const char *custom, uint8_t stops[BG_THEME_MAX_STOPS][3], uint8_t pos[BG_THEME_MAX_STOPS],
+                           int &nStops, bool &uniform);
 
 #endif // BGANIM_H

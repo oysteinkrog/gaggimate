@@ -345,12 +345,35 @@ bool bg_map_valid(const char *map) {
     return true;
 }
 
-void bg_resolve_anim_theme(int animId, const char *map, const char *library, int themeId, const char *custom,
-                           uint8_t stops[BG_THEME_MAX_STOPS][3], uint8_t pos[BG_THEME_MAX_STOPS], int &nStops,
-                           bool &uniform) {
+bool bg_ref_valid(const char *ref) {
     int builtin;
     int libId;
+    if (ref == nullptr || *ref == '\0') {
+        return true;
+    }
+    return parseRef(ref, builtin, libId);
+}
+
+void bg_resolve_anim_theme(int animId, const char *map, const char *library, const char *globalRef, int themeId,
+                           const char *custom, uint8_t stops[BG_THEME_MAX_STOPS][3], uint8_t pos[BG_THEME_MAX_STOPS],
+                           int &nStops, bool &uniform) {
+    int builtin;
+    int libId;
+    // Step one: this animation's own override.
     if (parseRef(mapRef(map, animId), builtin, libId)) {
+        if (libId > 0 && bg_library_lookup(library, libId, stops, pos, nStops, uniform)) {
+            return;
+        }
+        if (builtin >= 0 && builtin < THEME_COUNT) {
+            themeId = builtin;
+            globalRef = nullptr; // an override that names a built-in wins outright
+        }
+    }
+    // Step two: the global default, which unlike themeId can name one of the
+    // user's own gradients. A ref that does not resolve (a deleted library
+    // entry, an index from a longer table) falls through, the same way a
+    // dangling map entry does.
+    if (globalRef != nullptr && *globalRef != '\0' && parseRef(globalRef, builtin, libId)) {
         if (libId > 0 && bg_library_lookup(library, libId, stops, pos, nStops, uniform)) {
             return;
         }
@@ -358,6 +381,7 @@ void bg_resolve_anim_theme(int animId, const char *map, const char *library, int
             themeId = builtin;
         }
     }
+    // Step three: what the setting did before the global ref existed.
     bg_resolve_theme(themeId, custom, stops, nStops);
     uniform = true;
     for (int i = 0; i < nStops; i++) {

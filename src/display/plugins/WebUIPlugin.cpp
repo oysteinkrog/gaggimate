@@ -1361,6 +1361,19 @@ void WebUIPlugin::handleSettings(AsyncWebServerRequest *request) const {
                 settings->setBgAnimGradients(request->arg("bgAnimGradients"));
             if (request->hasArg("bgAnimThemeMap") && bg_map_valid(request->arg("bgAnimThemeMap").c_str()))
                 settings->setBgAnimThemeMap(request->arg("bgAnimThemeMap"));
+            // The global gradient, in the same grammar as one map slot. A
+            // built-in written here is mirrored into bgAnimTheme so the two
+            // agree: bgAnimTheme is the last fallback and the on-display
+            // "Default (<name>)" label reads it.
+            if (request->hasArg("bgAnimGradientRef") && bg_ref_valid(request->arg("bgAnimGradientRef").c_str())) {
+                const String ref = request->arg("bgAnimGradientRef");
+                settings->setBgAnimGradientRef(ref);
+                if (!ref.isEmpty() && ref[0] != 'c') {
+                    const int builtin = ref.toInt();
+                    if (builtin >= 0 && builtin < bg_theme_count())
+                        settings->setBgAnimTheme(builtin);
+                }
+            }
             if (request->hasArg("bgAnimId") || request->hasArg("bgAnimParams"))
                 settings->setBgAnimAllScreens(request->hasArg("bgAnimAllScreens"));
             if (request->hasArg("smartGrindIp"))
@@ -1487,7 +1500,7 @@ void WebUIPlugin::handleSettings(AsyncWebServerRequest *request) const {
         // its state every 5 s while it is open, so an unsaved edit still being
         // previewed comes back on its own.
         if (request->hasArg("bgAnimThemeMap") || request->hasArg("bgAnimGradients") || request->hasArg("bgAnimTheme") ||
-            request->hasArg("bgAnimId")) {
+            request->hasArg("bgAnimGradientRef") || request->hasArg("bgAnimId")) {
             pluginManager->trigger("bganim:preview-end");
         }
         controller->setTargetTemp(controller->getTargetTemp());
@@ -1575,6 +1588,7 @@ void WebUIPlugin::handleSettings(AsyncWebServerRequest *request) const {
     doc["bgAnimCustomTheme"] = settings.getBgAnimCustomTheme();
     doc["bgAnimGradients"] = settings.getBgAnimGradients();
     doc["bgAnimThemeMap"] = settings.getBgAnimThemeMap();
+    doc["bgAnimGradientRef"] = settings.getBgAnimGradientRef();
     doc["smartGrindIp"] = settings.getSmartGrindIp();
     doc["smartGrindMode"] = settings.getSmartGrindMode();
     doc["momentaryButtons"] = settings.isMomentaryButtons();

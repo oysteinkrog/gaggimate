@@ -177,6 +177,7 @@ class Settings {
     String getBgAnimCustomTheme() const { return bgAnimCustomTheme.get(); }
     // By reference: the UI task compares these (up to a few KB) every pass.
     const String &getBgAnimGradients() const { return bgAnimGradients.get(); }
+    const String &getBgAnimGradientRef() const { return bgAnimGradientRef.get(); }
     const String &getBgAnimThemeMap() const { return bgAnimThemeMap.get(); }
     int getBgAnimFps() const { return bgAnimFps.get(); }
     int getBgAnimHalfRes() const { return bgAnimHalfRes.get(); }
@@ -281,6 +282,7 @@ class Settings {
     void setBgAnimTheme(int bg_anim_theme);
     void setBgAnimCustomTheme(const String &bg_anim_custom_theme);
     void setBgAnimGradients(const String &bg_anim_gradients);
+    void setBgAnimGradientRef(const String &bg_anim_gradient_ref);
     void setBgAnimThemeMap(const String &bg_anim_theme_map);
     void setBgAnimFps(int bg_anim_fps);
     void setBgAnimHalfRes(int bg_anim_half_res);
@@ -406,6 +408,24 @@ class Settings {
     // the theme section of display/ui/default/bganim/BgAnim.h.
     Property<String> bgAnimGradients{registry, "bg_gl", ""};
     Property<String> bgAnimThemeMap{registry, "bg_thm", ""};
+    // The gradient every animation draws with unless its own map slot says
+    // otherwise, in the same grammar one map slot uses: a decimal built-in
+    // theme index, "c<id>" for a library entry, or "" for neither.
+    //
+    // "" is what every device that has never set this stores, and it means
+    // fall back to bgAnimTheme with bgAnimCustomTheme, which is exactly what
+    // the setting did before this field existed. So nothing migrates and no
+    // stored value changes meaning. It exists because bgAnimTheme is an int
+    // index into the built-in table and cannot name a library gradient: the
+    // only way to make one of the user's own gradients the default used to be
+    // writing it into every slot of bgAnimThemeMap, after which every
+    // animation carried an override and the global had no effect at all.
+    //
+    // Whoever writes a built-in here writes bgAnimTheme with it as well, so
+    // the legacy field stays in step for the on-display "Default (<name>)"
+    // label. A library gradient leaves bgAnimTheme where it was, which is then
+    // the fallback if that library entry is deleted.
+    Property<String> bgAnimGradientRef{registry, "bg_gref", ""};
     // Animation task frame-rate cap. Lower values cut the animation's PSRAM
     // write bandwidth (~460 KB/frame), which is the lever against RGB scan-out
     // underruns at high panel refresh rates.

@@ -4576,6 +4576,7 @@ void DefaultUI::updateState() {
     static String lastCustom;
     static String lastMap;
     static String lastLibrary;
+    static String lastGlobalRef;
     if (previewActive) {
         lastThemeAnim = -1; // force a re-resolve once the preview lapses
         if (previewApply) {
@@ -4596,19 +4597,21 @@ void DefaultUI::updateState() {
         const String custom = settings.getBgAnimCustomTheme();
         const String &map = settings.getBgAnimThemeMap();
         const String &library = settings.getBgAnimGradients();
+        const String &globalRef = settings.getBgAnimGradientRef();
         if (animId != lastThemeAnim || themeId != lastThemeId || custom != lastCustom || map != lastMap ||
-            library != lastLibrary) {
+            library != lastLibrary || globalRef != lastGlobalRef) {
             lastThemeAnim = animId;
             lastThemeId = themeId;
             lastCustom = custom;
             lastMap = map;
             lastLibrary = library;
+            lastGlobalRef = globalRef;
             uint8_t stops[BG_THEME_MAX_STOPS][3];
             uint8_t pos[BG_THEME_MAX_STOPS];
             int nStops = 0;
             bool uniform = true;
-            bg_resolve_anim_theme(animId, map.c_str(), library.c_str(), themeId, custom.c_str(), stops, pos, nStops,
-                                  uniform);
+            bg_resolve_anim_theme(animId, map.c_str(), library.c_str(), globalRef.c_str(), themeId, custom.c_str(),
+                                  stops, pos, nStops, uniform);
             if (uniform) {
                 bganim::setThemeStops(stops, nStops);
             } else {

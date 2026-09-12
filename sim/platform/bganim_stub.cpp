@@ -25,3 +25,11 @@ uint32_t hotFailCount() { return 0; }
 // stored setting unchanged rather than accepting an unchecked string.
 bool bg_library_valid(const char *) { return false; }
 bool bg_map_valid(const char *) { return false; }
+bool bg_ref_valid(const char *) { return false; }
+
+// The built-in theme table lives in BgAnimThemes.cpp, which is excluded here
+// too. The settings writer only reads the count to range-check a built-in
+// index before mirroring it into bgAnimTheme, and zero makes every index fail
+// that check, which is the same "leave the stored setting alone" answer the
+// two validators above give.
+int bg_theme_count() { return 0; }

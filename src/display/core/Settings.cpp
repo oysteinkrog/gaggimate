@@ -258,6 +258,9 @@ void Settings::setPanelClockDiv(int panel_clock_div) { panelClockDiv.set(panel_c
 void Settings::setPanelVcom(int panel_vcom) { panelVcom.set(panel_vcom < 0 ? 0 : (panel_vcom > 127 ? 127 : panel_vcom)); }
 void Settings::setBgAnimCustomTheme(const String &bg_anim_custom_theme) { bgAnimCustomTheme.set(bg_anim_custom_theme); }
 void Settings::setBgAnimGradients(const String &bg_anim_gradients) { bgAnimGradients.set(bg_anim_gradients); }
+void Settings::setBgAnimGradientRef(const String &bg_anim_gradient_ref) {
+    bgAnimGradientRef.set(bg_anim_gradient_ref);
+}
 void Settings::setBgAnimThemeMap(const String &bg_anim_theme_map) { bgAnimThemeMap.set(bg_anim_theme_map); }
 
 void Settings::setSmartGrindIp(String smart_grind_ip) { smartGrindIp.set(smart_grind_ip); }
