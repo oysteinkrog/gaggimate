@@ -2511,6 +2511,20 @@ function bayerOffsets(dithOff, amp, unit) {
   // palette index. The beam fades to nothing between 55% of that and all of it,
   // so the wedge never ends on the disc's edge.
   const RAD_RIM = (4080 * FACE_K) >> 8, RAD_LO = Math.trunc(RAD_RIM * 6 / 10);
+  // The shared Bayer matrix balances its columns (every column sums to 252)
+  // but not its rows (168 to 336), so a face this flat showed every eighth row
+  // a third of a dither swing brighter than its neighbour: measured on the
+  // goldens, row to row steps in mean brightness were 1.09 against 0.25 for
+  // columns. This matrix is Bayer with each column rotated by ROT[x] (an xor
+  // on the row index), which keeps the column sums and makes every row sum
+  // 252 as well. Of the 5,832 rotations that balance both, this one has the
+  // least power at low spatial frequencies, 2% above plain Bayer, with no
+  // row or column stripe component at all.
+  const SUNDIAL_ROT = [0, 6, 2, 4, 5, 3, 7, 1];
+  function sundialDither(dithOff, amp, unit) {
+    for (let y = 0; y < 8; y++) for (let x = 0; x < 8; x++)
+      dithOff[y * 8 + x] = lround((BAYER8[((y ^ SUNDIAL_ROT[x]) & 7) * 8 + x] - 31.5) * (amp * unit / 31.5));
+  }
   ANIMS.push({
     id: 'sundial', name: 'Sundial', webOnly: true,
     params: [
@@ -2536,7 +2550,7 @@ function bayerOffsets(dithOff, amp, unit) {
       if (state.key !== key) {
         state.key = key;
         state.pal = themeRamp(256);
-        bayerOffsets(state.dith, ditherAmpJS(state.pal, 256) * 0.6, 16);
+        sundialDither(state.dith, ditherAmpJS(state.pal, 256) * 0.6, 16);
         const R = (cx < cy ? cx : cy) - 1, R2 = R * R > 0 ? R * R : 1;
         const shade = Math.trunc(p[3] * 24 / 100);
         const denomW = w > 1 ? w - 1 : 1;

@@ -39,6 +39,16 @@ constexpr int RAD_LO = RAD_RIM * 6 / 10;      // 879; the code uses 60%, not the
 constexpr int RAD_SPAN = RAD_RIM - RAD_LO;    // 587, the radial smoothstep's width
 constexpr int SOFT = SOFT_PX * 512, SOFT_HALF = SOFT / 2;
 constexpr int INV_SOFT = 65536 * 256 / SOFT; // 348, exactly the page's truncated reciprocal
+// The shared Bayer matrix balances its columns (every column sums to 252) but
+// not its rows (168 to 336), and on a face this flat every eighth row came out
+// a third of a dither swing brighter than its neighbour: row to row steps in
+// mean brightness were 1.09 against 0.25 for columns on the goldens. The page
+// rotates each Bayer column by DITHER_ROT[x] (an xor on the row index), which
+// keeps the column sums and makes every row sum 252 too; of the 5,832
+// rotations that balance both it has the least low frequency power, 2% above
+// plain Bayer, with no row or column stripe component. The table is still
+// indexed dith[(y & 7) * 8 + (x & 7)] everywhere, so the kernels are untouched.
+constexpr uint8_t DITHER_ROT[8] = {0, 6, 2, 4, 5, 3, 7, 1};
 
 int32_t *colFace = nullptr;    // static radius and light gradient, frame() only
 int16_t *colSurface = nullptr; // colFace plus this frame's two surface sines
@@ -120,8 +130,11 @@ void frame(uint32_t tMs, int w, int h, const uint8_t p[BG_ANIM_PARAMS]) {
     if (!geometryValid || gen != lastThemeGen) {
         buildThemeRamp(palette, 256);
         const float amp = ditherAmp(palette, 256) * 0.6f;
-        for (int k = 0; k < 64; k++) {
-            dith[k] = static_cast<int16_t>(lroundf((BAYER8[k] - 31.5f) * (amp * 16.0f / 31.5f)));
+        for (int y = 0; y < 8; y++) {
+            for (int x = 0; x < 8; x++) {
+                const int src = ((y ^ DITHER_ROT[x]) & 7) * 8 + x;
+                dith[y * 8 + x] = static_cast<int16_t>(lroundf((BAYER8[src] - 31.5f) * (amp * 16.0f / 31.5f)));
+            }
         }
         lastThemeGen = gen;
     }
