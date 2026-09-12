@@ -173,7 +173,11 @@ void frame(uint32_t tMs, int w, int h, const uint8_t p[BG_ANIM_PARAMS]) {
     // uptime and speed, the Q8 sine cursor exceeds uint32_t. Float frame
     // math can round a cursor/drift boundary differently from JS doubles;
     // it never changes the periods, Q8 interpolation, or integer pixel math.
-    const float t = static_cast<float>(tMs) * speedMul(p[0]);
+    // Speed calibration, gm-33fm 2026-09-12: the base rate carries a
+    // deliberate factor so that Speed 50 moves this animation about as
+    // much per second as every other animation at Speed 50.
+    // The 2.4f is that factor, and tl below inherits it.
+    const float t = static_cast<float>(tMs) * speedMul(p[0]) * 2.4f;
     // The light turn carries its own speed curve on top of the master one,
     // so the highlight can walk faster or slower than the grid drifts.
     // speedMul(50) is exactly 1, so the default cursor is untouched.

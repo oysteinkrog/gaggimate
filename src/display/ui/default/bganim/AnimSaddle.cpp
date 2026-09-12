@@ -205,10 +205,14 @@ void frame(uint32_t tMs, int w, int h, const uint8_t p[BG_ANIM_PARAMS]) {
 
     // Match JavaScript's >>>0 after each product, including long uptimes:
     // these are modulo-2^32 clocks, not floating seconds or speedMul().
-    // At Speed=12, sp=9: contours advance 9000/1024 = 8.7890625 indices/s
-    // (29.127111 s per palette turn); x/y drift periods are 14.563556 s
-    // and 16.644063 s, and curvature breathes once per 9.709037 s.
-    const uint32_t sp = 4 + static_cast<uint32_t>(p[0]) * 44 / 100; // 4..48, page's linear speed knob
+    // Speed calibration, gm-33fm 2026-09-12: the whole linear map was
+    // multiplied by about 1.12 so that Speed 50 moves this animation about
+    // as much per second as every other animation at Speed 50. sp is the
+    // rate, and it was 4..48 before; at Speed 50 it went 26 -> 29.
+    // At Speed=12, sp=10: contours advance 10000/1024 = 9.765625 indices/s
+    // (26.2144 s per palette turn); x/y drift periods are 13.1072 s and
+    // 14.979657 s, and curvature breathes once per 8.738133 s.
+    const uint32_t sp = 5 + static_cast<uint32_t>(p[0]) * 48 / 100; // 5..53, page's linear speed knob
     const uint32_t base = tMs * sp;
     contourPhase = (base >> 10) & 255;
     const uint32_t phD = base >> 7;

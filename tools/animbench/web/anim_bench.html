@@ -698,7 +698,8 @@ function gradLUT(stops) { // stops: [[t0..255, r, g, b], ...] -> Uint8Array 256*
         }
       }
       const lut = state.lut;
-      const t = (tMs/1000)*0.45*speedMulJS(p[0]);
+      // Speed calibration (gm-33fm): 0.45 before, times 2.33.
+      const t = (tMs/1000)*1.05*speedMulJS(p[0]);
       const f1 = 0.026, f1b = 0.017;
       const A1 = 0.6+wavinessP*2.4, A2 = 0.4+wavinessP*1.6;
       for (let y = 0; y < h; y++) {
@@ -1176,13 +1177,13 @@ ANIMS.push({
       state.wisps.push({
         x0: state.cx + (rand()*2-1)*halfSpan, y0,
         swayPhase1: rand()*Math.PI*2, swayPhase2: rand()*Math.PI*2,
-        swayFreq1: 0.00045+rand()*0.0003, swayFreq2: 0.0013+rand()*0.0007,
+        swayFreq1: 0.000084375+rand()*0.00005625, swayFreq2: 0.00024375+rand()*0.00013125,
       });
     }
     state.blobs = [];
     for (let i = 0; i < count; i++) {
       for (let k = 0; k < 11; k++) {
-        const lifetime = 4200 + rand()*1800;
+        const lifetime = 22400 + rand()*9600;
         state.blobs.push({ wisp: i, birth: tMs - rand()*lifetime, lifetime, seed: rand()*Math.PI*2 });
       }
     }
@@ -1218,7 +1219,11 @@ ANIMS.push({
       if (state._gen !== THEME.gen) { this.rebuildTheme(w, h, state); state._gen = THEME.gen; }
       const count = Math.round(2 + (p[1]/100)*3);
       if (state.built !== count) buildWisps(state, count, tMs);
-      const riseSpeed = 0.034*speedMulJS(p[0]);
+      // Speed calibration (gm-33fm): all three of this animation's clocks
+      // are scaled by 3/16 together, the rise here and the puff lifetime
+      // and sway frequencies in buildWisps. Scaling the rise alone would
+      // shorten every column instead of slowing it. See AnimSteam.cpp.
+      const riseSpeed = 0.006375*speedMulJS(p[0]);
       const swirl = 0.5 + (p[2]/100)*1.7;
       const density = 0.5 + (p[3]/100)*0.8;
       // Same four sliders AnimSteam.cpp gained on 2026-09-10: t is 0 at the
@@ -2339,7 +2344,9 @@ function bayerOffsets(dithOff, amp, unit) {
         // index at the largest row value.
         bayerOffsets(state.dith, ditherAmpJS(pal, 256) * 0.5, 8);
       }
-      const sp = 4 + Math.floor(p[0] * 44 / 100);
+      // Speed calibration (gm-33fm): the linear map was 4 + p0*44/100,
+      // multiplied by about 1.12 throughout. sp at Speed 50 went 26 to 29.
+      const sp = 5 + Math.floor(p[0] * 48 / 100);
       const base = ((t * sp) >>> 0);
       const phC = base >>> 10;                       // the contour slide
       const phD = base >>> 7, phD2 = ((base * 7) >>> 0) >>> 10;
@@ -3428,7 +3435,7 @@ const pa_dith = (x, y) => (BAYER8[(y & 7) * 8 + (x & 7)] - 31.5) * (1 / 64);
         }
       }
       const spd = speedMulJS(p[0]);
-      const t = tMs * spd;
+      const t = tMs * spd * 2.2;   // speed calibration (gm-33fm)
       // Turn rate and breath rate run each clock from a standstill to three
       // times its old rate; drift from anchored to twice its old speed.
       // Breath rate never changes how far the scale swings, which is what
@@ -4075,7 +4082,7 @@ const pa_dith = (x, y) => (BAYER8[(y & 7) * 8 + (x & 7)] - 31.5) * (1 / 64);
         state.ambient = Math.min(255 * 16 - devMax, Math.max(devMax, AMBIENT + (p[7] - 50) * 24));
       }
       const { dHx, dHy, hX, hY, colTermPh, rowTerm, dith, pal } = state;
-      const t = tMs * speedMulJS(p[0]);
+      const t = tMs * speedMulJS(p[0]) * 2.4;   // speed calibration (gm-33fm)
       // One turn per 36 s at light turn 50, the sine table read at Q8
       // between entries so the light sweeps instead of stepping between
       // table entries. The turn carries its own speed curve on top of the
@@ -4881,7 +4888,7 @@ function pcDither(dst, amp) {
       const fog = state.fog, sky = state.sky, dith = state.dith, pal32 = state.pal32;
       const rowLut = state.rowLut, flat = state.flat;
       const sm = speedMulJS(p[0]);
-      const tt = tMs * sm;
+      const tt = tMs * sm * 1.62;   // speed calibration (gm-33fm)
       // 4.2 texels per second forward at glide 50, nothing at 0, double at 100.
       const fz = tt * 0.0042 * (p[4] / 50);
       const yaw = Math.sin(tt / 40000 * 2 * Math.PI) * (0.10 + p[1] * 0.004);
@@ -5537,7 +5544,9 @@ function pcDither(dst, amp) {
           state.bgRow[y] = 60 + Math.round(span * y / (h - 1));
         }
       }
-      const te = tMs * speedMulJS(p[0]);
+      // Speed calibration (gm-33fm). A binary fraction on purpose: the
+      // firmware's integer phase arithmetic has to land on the same value.
+      const te = tMs * speedMulJS(p[0]) * (19/32);
       const ts = te / 1000;
       const dens = 128 + Math.round(p[1] * 256 / 100);   // 128..384, /256
       // Side drift scales the lateral rate: held still at slider 0, exactly

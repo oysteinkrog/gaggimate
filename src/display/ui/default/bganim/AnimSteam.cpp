@@ -116,13 +116,13 @@ void buildWisps(int count, int w, int h, uint32_t tMs) {
                     y0,
                     nextRandf(rng) * 6.2831853f,
                     nextRandf(rng) * 6.2831853f,
-                    0.00045f + nextRandf(rng) * 0.0003f,
-                    0.0013f + nextRandf(rng) * 0.0007f};
+                    0.000084375f + nextRandf(rng) * 0.00005625f,
+                    0.00024375f + nextRandf(rng) * 0.00013125f};
     }
     for (int i = 0; i < count; i++) {
         for (int k = 0; k < BLOBS_PER_WISP; k++) {
             const int idx = i * BLOBS_PER_WISP + k;
-            const float lifetime = 4200.0f + nextRandf(rng) * 1800.0f;
+            const float lifetime = 22400.0f + nextRandf(rng) * 9600.0f;
             blobs[idx] = {static_cast<uint8_t>(i), tMs - static_cast<uint32_t>(nextRandf(rng) * lifetime), lifetime,
                           nextRandf(rng) * 6.2831853f};
         }
@@ -201,7 +201,18 @@ void frame(uint32_t tMs, int w, int h, const uint8_t p[BG_ANIM_PARAMS]) {
         buildWisps(count, w, h, tMs);
     }
     wispCount = count;
-    const float riseSpeed = 0.034f * speedMul(p[0]);
+    // Speed calibration, gm-33fm 2026-09-12: this animation ran 5.3 times
+    // too fast at Speed 50, and slowing it is not a change to this rate
+    // alone. Rise, puff lifetime and sway are three independent clocks
+    // here, and only the rise reads the Speed slider, so scaling the rise
+    // by itself would stop each puff sooner instead of later and leave a
+    // short stub where a column of steam used to be (measured: the frame's
+    // own spread fell from 8.6 to 4.1). All three clocks are therefore
+    // scaled by 3/16 together, which is the same animation played 5.33
+    // times more slowly and leaves every frame it already drew intact:
+    // rise 0.034f -> 0.006375f here, lifetime 4200/1800 -> 22400/9600 and
+    // the two sway frequencies -> 3/16 of themselves in buildWisps.
+    const float riseSpeed = 0.006375f * speedMul(p[0]);
     const float swirl = 0.5f + (p[2] / 100.0f) * 1.7f;
     const float density = 0.5f + (p[3] / 100.0f) * 0.8f;
     // The four sliders added on 2026-09-10 (gm-3vj.13) all share this shape:

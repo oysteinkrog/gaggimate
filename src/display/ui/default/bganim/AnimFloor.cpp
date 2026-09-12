@@ -233,7 +233,11 @@ void frame(uint32_t tMs, int, int h, const uint8_t p[BG_ANIM_PARAMS]) {
     // Even UINT32_MAX at speed 100 and glide 100 keeps 4*(z+fz) under 1e9,
     // well below INT32_MAX. Dividing p[4] by 50 is exact, so glide 50 gives
     // exactly 1.0f and the old product, bit for bit.
-    const float tt = static_cast<float>(tMs) * speedMul(p[0]);
+    // Speed calibration, gm-33fm 2026-09-12: the base rate carries a
+    // deliberate factor so that Speed 50 moves this animation about as
+    // much per second as every other animation at Speed 50.
+    // The 1.62f is that factor, and both the glide and the yaw read tt.
+    const float tt = static_cast<float>(tMs) * speedMul(p[0]) * 1.62f;
     const float fz = tt * 0.0042f * (static_cast<float>(p[4]) / 50.0f);
     const float yaw = sinf(tt / 40000.0f * (2.0f * PI)) * (0.10f + p[1] * 0.004f);
     const float tanA = tanf(yaw);

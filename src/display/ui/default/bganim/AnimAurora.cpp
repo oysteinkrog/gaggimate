@@ -352,7 +352,11 @@ void frame(uint32_t tMs, int, int, const uint8_t p[BG_ANIM_PARAMS]) {
     // One real rebuild per frame at most per background segment: see g_rowLUT.
     // This also republishes the new glow colours through every row table.
     g_lastBgIdx = -1;
-    g_t = (tMs * 0.001f) * 0.45f * speedMul(p[0]);
+    // Speed calibration, gm-33fm 2026-09-12: the base rate carries a
+    // deliberate factor so that Speed 50 moves this animation about as
+    // much per second as every other animation at Speed 50.
+    // Was 0.45f before the calibration; 1.05f is that rate times 2.33.
+    g_t = (tMs * 0.001f) * 1.05f * speedMul(p[0]);
     g_A1 = 0.6f + (p[2] / 100.0f) * 2.4f;
     g_A2 = 0.4f + (p[2] / 100.0f) * 1.6f;
     g_inten14 = static_cast<int32_t>((p[1] / 100.0f) * 1.4f * 256.0f);

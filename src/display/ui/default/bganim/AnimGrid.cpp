@@ -234,7 +234,15 @@ void frame(uint32_t tMs, int w, int h, const uint8_t p[BG_ANIM_PARAMS]) {
     // millis() near UINT32_MAX does not throw away sub-second motion in a
     // float multiplication. JS uses double here; the float speed curve can
     // differ by a few phase units after long uptimes, but never overflows.
-    const uint32_t speedQ24 = static_cast<uint32_t>(lroundf(speedMul(p[0]) * 16777216.0f));
+    // Speed calibration, gm-33fm 2026-09-12: the base rate carries a
+    // deliberate factor so that Speed 50 moves this animation about as much
+    // per second as every other animation at Speed 50. Grid ran 1.7 times
+    // too fast, so the factor is 19/32. It is written as a binary fraction
+    // on purpose: 16777216*19/32 is exact in float and in the page's double,
+    // so the integer phase arithmetic below still lands on the page's value
+    // rather than a unit either side of it.
+    const uint32_t speedQ24 =
+        static_cast<uint32_t>(lroundf(speedMul(p[0]) * 16777216.0f * 19.0f / 32.0f));
     const uint64_t scaledMs = static_cast<uint64_t>(tMs) * speedQ24;
     constexpr uint64_t TIME_DEN = 1000ull * 16777216ull;
     // Side drift scales the 2 Q16 units per second lateral rate: held still

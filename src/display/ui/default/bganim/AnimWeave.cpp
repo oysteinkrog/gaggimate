@@ -95,7 +95,12 @@ void frame(uint32_t tMs, int, int, const uint8_t p[BG_ANIM_PARAMS]) {
         lastThemeGen = gen;
     }
 
-    const float t = static_cast<float>(tMs) * speedMul(p[0]);
+    // Speed calibration, gm-33fm 2026-09-12: the base rate carries a
+    // deliberate factor so that Speed 50 moves this animation about as
+    // much per second as every other animation at Speed 50.
+    // The 2.2f is that factor. Every clock below reads t, so one factor here
+    // moves the turn, the drift and the breath together.
+    const float t = static_cast<float>(tMs) * speedMul(p[0]) * 2.2f;
     // Turn rate, drift and breath rate are all 1.0f at slider 50, so each one
     // multiplies its constant by exactly one and the default frame is the old
     // frame. Below 50 they run down to a standstill; above, up to three times
