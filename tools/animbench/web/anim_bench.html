@@ -1306,6 +1306,40 @@ function buildTileableNoise(size, seed) {
   }
   return tex;
 }
+// bganim::noiseTex256, the texture the device shares between Ember and
+// Nebula: a 16x16 lattice from xorshift32 seed 1337, quintic smoothstep, float
+// arithmetic at every step (Math.fround where the C rounds to float) and a
+// truncating clamp to a byte. Built once and shared, as on the device. The
+// page's own buildTileableNoise above (mulberry32, rounded bytes) stays for the
+// entries that were designed on it.
+let NOISE256 = null;
+function noiseTex256JS() {
+  if (NOISE256) return NOISE256;
+  const F = Math.fround;
+  const PERIOD = 16, CELL = F(256 / PERIOD);
+  const lattice = new Float32Array(PERIOD * PERIOD);
+  let s = 1337;
+  const INV24 = F(1 / 16777216);
+  for (let i = 0; i < PERIOD * PERIOD; i++) {
+    s ^= s << 13; s >>>= 0; s ^= s >>> 17; s ^= s << 5; s >>>= 0;
+    lattice[i] = F((s >>> 8) * INV24);
+  }
+  const at = (ix, iy) => lattice[(iy & (PERIOD - 1)) * PERIOD + (ix & (PERIOD - 1))];
+  const smooth = v => F(F(F(F(v * v) * v) * F(F(v * F(F(v * 6) - 15)) + 10)));
+  const tex = new Uint8Array(256 * 256);
+  for (let y = 0; y < 256; y++) {
+    const gy = F(y / CELL), iy0 = Math.trunc(gy), fy = smooth(F(gy - iy0));
+    for (let x = 0; x < 256; x++) {
+      const gx = F(x / CELL), ix0 = Math.trunc(gx), fx = smooth(F(gx - ix0));
+      const v00 = at(ix0, iy0), v10 = at(ix0 + 1, iy0), v01 = at(ix0, iy0 + 1), v11 = at(ix0 + 1, iy0 + 1);
+      const a = F(v00 + F(F(v10 - v00) * fx)), b = F(v01 + F(F(v11 - v01) * fx));
+      const v = F(F(a + F(F(b - a) * fy)) * 255);
+      tex[y * 256 + x] = v < 0 ? 0 : v > 255 ? 255 : Math.trunc(v);
+    }
+  }
+  NOISE256 = tex;
+  return tex;
+}
 function sampleNoise(tex, size, x, y) {
   const xi = ((x%size)+size)%size, yi = ((y%size)+size)%size;
   return tex[yi*size+xi];
@@ -1343,13 +1377,27 @@ function buildRamp(stopsA, stopsB, blend) {
 }
 
 /* ---- 11: Ember (anim-atmosphere) ---- */
+/* A mirror of AnimEmber.cpp, so the page and the device agree pixel for
+   pixel (gm-pciz, 2026-09-12). The device's picture starts the reversed theme
+   ramp 72 entries in (CORE_FLOOR): the owner reported the original design,
+   which put the ramp's brightest stop under the screen-centre readouts, as
+   "unreadable behind text" (d3fbd7f0, 2026-08-17), and the device has drawn
+   it with the floor since. The page entry was written from the design and
+   never carried the floor, which is why every pixel differed by about 70
+   index steps. The floor is the approved picture, and the device's byte-wide
+   kernel is built around it (its range proof needs the floor at 45 or more),
+   so the page takes the floor rather than the device losing it.
+
+   Everything else here is the device's integer arithmetic: the radius comes
+   from a 256-entry table indexed by (dx*dx + dy*dy) >> 9 and shared by each
+   row pair, the breathing runs on the 1024-entry sine table off a 32-bit
+   phase, dither, flicker and breathe are whole index steps, and the three
+   terms are added with the same two saturating byte adds the kernel uses. */
 (() => {
-  const emberStops = [
-    {p:0.00,c:'#f4a94a'},{p:0.12,c:'#e2751f'},{p:0.30,c:'#b8420f'},
-    {p:0.55,c:'#6b1a08'},{p:0.80,c:'#2b0a06'},{p:1.00,c:'#0a0604'}];
-  const goldStops = [
-    {p:0.00,c:'#ffe0a3'},{p:0.12,c:'#ffb454'},{p:0.30,c:'#e07a1a'},
-    {p:0.55,c:'#8a2e0a'},{p:0.80,c:'#331006'},{p:1.00,c:'#0b0704'}];
+  const CORE_FLOOR = 72, CORE_SPAN = 27, FIELD_BIAS = 163, INDEX_UNBIAS = 35, RSHIFT = 9, RLUT_N = 320;
+  const STEP1 = Math.trunc(4294967296 / 11300), STEP2 = Math.trunc(4294967296 / 17700), STEP3 = Math.trunc(4294967296 / 6100);
+  const PHOFF2 = Math.trunc(1.7 / 6.2831853 * 4294967296), PHOFF3 = Math.trunc(4.2 / 6.2831853 * 4294967296);
+  const sat8 = v => (v > 127 ? 127 : v < -128 ? -128 : v);
   ANIMS.push({
     id: 'ember', name: 'Ember',
     params: [
@@ -1358,59 +1406,94 @@ function buildRamp(stopsA, stopsB, blend) {
       {key:'height',label:'Height',def:50},{key:'falloff',label:'Falloff',def:50},
       {key:'core',label:'Core heat',def:50},{key:'grain',label:'Grain',def:50}],
     init(w, h, state) {
-      state.noise = buildTileableNoise(256, 1337);
-      state.cx = w*0.5;
+      state.noise = noiseTex256JS();
       state._gen = -1; state._pal = null;
+      state.radiusLUT = new Int8Array(RLUT_N);
+      state.flickerLUT = new Int16Array(256);
+      state.fieldRow = new Int8Array(w);
+      state.flickerRow = new Int8Array(w);
+      state.lastGlow = -1; state.lastFalloff = -1; state.lastCore = -1; state.lastHeight = -1; state.lastFlicker = -1;
     },
     render(data, w, h, tMs, p, state) {
-      if (state._gen !== THEME.gen) { state._pal = themeRampBytes(true); state._gen = THEME.gen; }
+      const F = Math.fround;
+      if (state._gen !== THEME.gen) { state._pal = themeRamp(256, true); state._gen = THEME.gen; }
       const pal = state._pal;
-      const glowGain = 0.55 + 0.014*p[1];
-      // Speed calibration (gm-33fm): 1.75x, mirroring AnimEmber.cpp.
-      const RATE_CAL = 1.75;
-      const t = (tMs*(speedMulJS(p[0])*RATE_CAL))/1000;
-      const pulseGain = p[3]/100;
-      const B = 0.5 + pulseGain*(0.30*Math.sin(2*Math.PI*t/11.3)
-                                + 0.15*Math.sin(2*Math.PI*t/17.7 + 1.7)
-                                + 0.05*Math.sin(2*Math.PI*t/6.1 + 4.2));
-      const breatheOffset = (B-0.5)*70;
-      const flickerGain = p[2]/100;
-      const flickerAmp = 10*flickerGain;
-      const vtMs = tMs*(speedMulJS(p[0])*RATE_CAL);
-      const scrollX = (vtMs*0.006)%256, scrollY = (vtMs*0.004)%256;
-      // Height, Falloff, Core heat and Grain map as an offset from the
-      // midpoint, the same way AnimEmber.cpp maps them, so 50 lands on the old
-      // constant and the picture at the defaults does not move.
-      const cx = state.cx;
-      const cy = h*0.5 + (20 + (p[4]-50))*(h/480);
-      const corners = [[0,0],[w,0],[0,h],[w,h]];
-      const maxR = Math.max(...corners.map(([x,y]) => Math.hypot(x-cx, y-cy)))*glowGain;
-      const shape = (p[5]-50)*0.016;
-      const coreOff = (p[6]-50)*(27/50);
-      // Two segments, mirroring AnimEmber.cpp's g_ditherMul: no dither at 0,
-      // exactly the old term at 50, three times it at 100.
-      const grain = p[7] <= 50 ? p[7]/50 : 1 + (p[7]-50)*(2/50);
+      // applyCenter: the centre row and the farthest corner, integer rows
+      // and a float radius, as AnimEmber.cpp computes them.
+      if (p[4] !== state.lastHeight) {
+        state.cx = Math.trunc(w / 2);
+        state.cy = Math.trunc(h / 2) + Math.trunc(((20 + (p[4] - 50)) * h) / 480);
+        const dx = state.cx, dy = state.cy > h - state.cy ? state.cy : h - state.cy;
+        state.maxR = F(Math.sqrt(F(F(dx * dx) + F(dy * dy))));
+        state.lastHeight = p[4]; state.lastGlow = -1;
+      }
+      // buildRadiusLut: r * scale, bent by Falloff, floored by Core heat,
+      // clamped to a byte and stored biased by FIELD_BIAS.
+      if (p[1] !== state.lastGlow || p[5] !== state.lastFalloff || p[6] !== state.lastCore) {
+        const glowGain = F(F(0.55) + F(F(0.014) * p[1]));
+        const scale = F(255 / F(state.maxR * glowGain));
+        const shape = F((p[5] - 50) * F(0.016));
+        const coreFloor = CORE_FLOOR + Math.trunc(((p[6] - 50) * CORE_SPAN) / 50);
+        const lut = state.radiusLUT;
+        for (let i = 0; i < 256; i++) {
+          const r = F(Math.sqrt(i << RSHIFT));
+          let t = F(r * scale);
+          if (t > 255) t = 255;
+          t = F(t + F(F(F(shape * t) * F(255 - t)) * F(1 / 255)));
+          const v = F(coreFloor + t);
+          lut[i] = (v < 0 ? 0 : v > 255 ? 255 : Math.trunc(v)) - FIELD_BIAS;
+        }
+        for (let i = 256; i < RLUT_N; i++) lut[i] = lut[255];
+        state.lastGlow = p[1]; state.lastFalloff = p[5]; state.lastCore = p[6];
+      }
+      // Speed calibration (gm-33fm): 1.75x, mirroring AnimEmber.cpp. The
+      // clock is a 32-bit integer of calibrated milliseconds.
+      const spd = F(speedMulF(p[0]) * F(1.75));
+      const vt = Math.trunc(tMs * spd) >>> 0;
+      const pulseGain = F(p[3] / 100);
+      const s1 = F(sin1024((Math.imul(vt, STEP1) >>> 0) >>> 22) * F(1 / SIN_AMP));
+      const s2 = F(sin1024(((Math.imul(vt, STEP2) + PHOFF2) >>> 0) >>> 22) * F(1 / SIN_AMP));
+      const s3 = F(sin1024(((Math.imul(vt, STEP3) + PHOFF3) >>> 0) >>> 22) * F(1 / SIN_AMP));
+      const sum = F(F(F(F(0.30) * s1) + F(F(0.15) * s2)) + F(F(0.05) * s3));
+      const breathe = Math.trunc(F(F(pulseGain * sum) * 70));
+      const flickerAmp = Math.trunc((10 * p[2]) / 100);
+      if (p[2] !== state.lastFlicker) {
+        for (let i = 0; i < 256; i++) state.flickerLUT[i] = ((i - 128) * flickerAmp) >> 7;
+        state.lastFlicker = p[2];
+      }
+      const sx = (Math.imul(vt, 6) >>> 10) & 255;
+      const sy = (Math.imul(vt, 4) >>> 10) & 255;
+      const grainP = p[7];
+      const ditherMul = grainP <= 50 ? Math.trunc((32 * grainP) / 50) : 32 + Math.trunc(((grainP - 50) * 64) / 50);
+      const doFlicker = flickerAmp !== 0;
+      const noise = state.noise, lut = state.radiusLUT, flut = state.flickerLUT;
+      const fieldRow = state.fieldRow, flickerRow = state.flickerRow;
+      const perCol = new Int8Array(8);
+      let cachedFieldP = -1;
       for (let y = 0; y < h; y++) {
-        const dy = y-cy;
-        const noiseY = Math.floor(y+scrollY);
-        for (let x = 0; x < w; x++) {
-          const dx = x-cx;
-          const r = Math.sqrt(dx*dx+dy*dy);
-          let rn = (r/maxR)*255;
-          // Falloff bends the ramp between the same two ends. The clamped copy
-          // is what keeps the bend monotone; at slider 50 the term is 0 and rn
-          // is untouched.
-          const rc = rn > 255 ? 255 : rn;
-          rn += shape*rc*(255-rc)/255;
-          rn += coreOff - breatheOffset;
-          rn += (BAYER8[(y&7)*8+(x&7)]-31.5)/63 * 6 * grain;
-          if (flickerGain > 0) {
-            const nv = sampleNoise(state.noise, 256, Math.floor(x+scrollX), noiseY);
-            rn += (nv-128)*flickerAmp/128;
+        const fieldP = y & ~1;
+        if (fieldP !== cachedFieldP) {
+          const dyP = fieldP - state.cy, dyP2 = dyP * dyP;
+          for (let x = 0; x < w; x++) {
+            const dx = x - state.cx;
+            fieldRow[x] = lut[(dx * dx + dyP2) >> RSHIFT];
           }
-          rn = Math.max(0, Math.min(255, rn))|0;
-          const idx = rn*3, o = (y*w+x)*4;
-          data[o] = pal[idx]; data[o+1] = pal[idx+1]; data[o+2] = pal[idx+2]; data[o+3] = 255;
+          if (doFlicker) {
+            const noiseRow = ((fieldP + sy) & 255) * 256;
+            for (let x = 0; x < w; x++) flickerRow[x] = flut[noise[noiseRow + ((x + sx) & 255)]];
+          }
+          cachedFieldP = fieldP;
+        }
+        const bayerRow = (y & 7) * 8;
+        for (let j = 0; j < 8; j++) perCol[j] = Math.trunc(((BAYER8[bayerRow + j] - 31) * ditherMul) / 160) - breathe;
+        for (let x = 0; x < w; x++) {
+          const step1 = sat8(fieldRow[x] + (doFlicker ? flickerRow[x] : 0));
+          const step2 = sat8(step1 + perCol[x & 7]);
+          // The kernel reads paletteExt + PAD + INDEX_UNBIAS at the unsigned
+          // byte; the pad above 255 holds the ramp's last entry.
+          let idx = ((step2 & 0xFF) ^ 0x80) + INDEX_UNBIAS;
+          if (idx > 255) idx = 255;
+          writePx(data, (y * w + x) * 4, pal, idx);
         }
       }
     },
@@ -1418,13 +1501,16 @@ function buildRamp(stopsA, stopsB, blend) {
 })();
 
 /* ---- 12: Nebula (anim-atmosphere) ---- */
+/* A mirror of AnimNebula.cpp (gm-pciz, 2026-09-12). The device used to step
+   each octave's scroll phase by a whole Q8.8 unit per frame, so its drift
+   depended on the loop rate and no absolute-time render could reproduce it;
+   it now reads the phase off the clock at the design's rates, the same
+   expression as here. The rest is the device's integer arithmetic: the
+   dominant octave is bilinear in Q8 (a lerp per axis, floored), the 2x and
+   4x octaves are nearest texels, the three weights are 64ths, the blend is
+   floored by a shift, and the dither is the Bayer term in whole steps. */
 (() => {
-  const violetStops = [
-    {p:0.00,c:'#05050f'},{p:0.35,c:'#150a28'},{p:0.60,c:'#341840'},
-    {p:0.80,c:'#6b2f5e'},{p:0.93,c:'#b3477d'},{p:1.00,c:'#e6b3d6'}];
-  const tealStops = [
-    {p:0.00,c:'#050a0f'},{p:0.35,c:'#0a1c28'},{p:0.60,c:'#123a44'},
-    {p:0.80,c:'#1f6b6e'},{p:0.93,c:'#3fb3a8'},{p:1.00,c:'#bdeee0'}];
+  const lerp8 = (a, b, f) => a + (((b - a) * f) >> 8);
   ANIMS.push({
     id: 'nebula', name: 'Nebula',
     params: [
@@ -1433,60 +1519,79 @@ function buildRamp(stopsA, stopsB, blend) {
       {key:'drift',label:'Drift angle',def:50},{key:'grain',label:'Grain',def:50},
       {key:'detail',label:'Fine detail',def:50},{key:'lspeed',label:'Layer speed',def:50}],
     init(w, h, state) {
-      state.noise = buildTileableNoise(256, 4242);
+      state.noise = noiseTex256JS();
       state._gen = -1; state._pal = null; state._contrast = -1;
+      state.ix0 = new Uint8Array(256); state.ix1 = new Uint8Array(256); state.blendedA = new Uint8Array(256);
+      state.dith = new Int16Array(64);
     },
     render(data, w, h, tMs, p, state) {
+      const F = Math.fround;
       // Contrast reads the theme ramp through a gain about its midpoint, the
       // same remap AnimNebula.cpp's buildContrastRamp does. A gain of 1 reads
       // entry i at i, so the default palette is the plain ramp.
       if (state._gen !== THEME.gen || state._contrast !== p[3]) {
-        const raw = themeRampBytes(false);
-        const gain = 1 + (p[3]-50)*4/256;
-        const pal = new Uint8Array(256*3);
+        const raw = themeRamp(256, false);
+        const gainQ8 = 256 + (p[3] - 50) * 4;
+        const pal = new Uint8Array(256 * 3);
         for (let i = 0; i < 256; i++) {
-          const src = Math.max(0, Math.min(255, 128 + Math.floor((i-128)*gain)));
-          pal[i*3] = raw[src*3]; pal[i*3+1] = raw[src*3+1]; pal[i*3+2] = raw[src*3+2];
+          const src = Math.max(0, Math.min(255, 128 + (((i - 128) * gainQ8) >> 8)));
+          pal[i * 3] = raw[src * 3]; pal[i * 3 + 1] = raw[src * 3 + 1]; pal[i * 3 + 2] = raw[src * 3 + 2];
         }
         state._pal = pal; state._gen = THEME.gen; state._contrast = p[3];
       }
       const pal = state._pal;
       // 1.2 was the base drift gain; 0.3925 is the speed calibration
-      // (gm-33fm), which slows every octave by the same factor. The value is
-      // not a round one because the firmware truncates each octave's step to a
-      // whole Q8 unit per frame: at 0.3925 all six components land just above
-      // an integer, so the port keeps this rate to within 0.6%.
-      const driftGain = 1.2*0.3925*speedMulJS(p[0]);
-      // Layer speed scales the 2x and 4x octaves only; Drift angle turns all
-      // three direction vectors together. Both are 1 and 0 degrees at 50.
-      const layerGain = driftGain*(1 + (p[7]-50)*0.02);
-      const ang = (p[4]-50)*2.7/50, ca = Math.cos(ang), sa = Math.sin(ang);
-      const t = tMs;
-      const rx = (x, y, g) => (t*g*(x*ca - y*sa))%256;
-      const ry = (x, y, g) => (t*g*(x*sa + y*ca))%256;
-      const scrollAx = rx(0.010, 0.006, driftGain), scrollAy = ry(0.010, 0.006, driftGain);
-      const scrollBx = rx(-0.017, 0.013, layerGain), scrollBy = ry(-0.017, 0.013, layerGain);
-      const scrollCx = rx(0.026, -0.021, layerGain), scrollCy = ry(0.026, -0.021, layerGain);
-      const turb = p[2]/100;
-      const wA = 0.60-0.15*turb;
+      // (gm-33fm), which slows every octave by the same factor. Layer speed
+      // scales the 2x and 4x octaves only; Drift angle turns all three
+      // direction vectors together. Both are 1 and 0 degrees at 50.
+      const g = F(F(F(1.2) * F(0.3925)) * speedMulF(p[0]));
+      const lg = F(1 + F((p[7] - 50) * F(0.02)));
+      const gBC = F(g * lg);
+      const ang = F((p[4] - 50) * F(F(2.7) / 50));
+      const ca = F(Math.cos(ang)), sa = F(Math.sin(ang));
+      // Q8.8 texels per ms: (0.010, 0.006), (-0.017, 0.013), (0.026, -0.021)
+      // texels per ms times 256, rotated. The phase is the truncated product
+      // with the clock, wrapped to 16 bits (AnimNebula.cpp scrollPhase).
+      const phase = rate => Math.trunc(tMs * rate) & 0xFFFF;
+      const sAx = phase(F(F(F(F(2.56) * g) * ca) - F(F(F(1.536) * g) * sa)));
+      const sAy = phase(F(F(F(F(2.56) * g) * sa) + F(F(F(1.536) * g) * ca)));
+      const sBx = phase(F(F(F(F(-4.352) * gBC) * ca) - F(F(F(3.328) * gBC) * sa)));
+      const sBy = phase(F(F(F(F(-4.352) * gBC) * sa) + F(F(F(3.328) * gBC) * ca)));
+      const sCx = phase(F(F(F(F(6.656) * gBC) * ca) + F(F(F(5.376) * gBC) * sa)));
+      const sCy = phase(F(F(F(F(6.656) * gBC) * sa) - F(F(F(5.376) * gBC) * ca)));
+      const axI = sAx >> 8, axF = sAx & 255, ayI = sAy >> 8, ayF = sAy & 255;
+      const bx = sBx >> 8, by = sBy >> 8, cx = sCx >> 8, cy = sCy >> 8;
+      const turb = F(p[2] / 100);
+      const wA = Math.trunc(F(F(F(0.60) - F(F(0.15) * turb)) * 64));
+      const wB0 = Math.trunc(F(F(F(0.25) + F(F(0.05) * turb)) * 64));
+      const pool = 64 - wA;
       // Fine detail moves weight between the 2x and the 4x octave and keeps
-      // their total, so the three weights still sum to 1.
-      const pool = 1 - wA;
-      const shift = (p[6]-50)*60/100/64;
-      let wB = Math.max(0, Math.min(pool, (0.25+0.05*turb) - shift));
-      const wC = pool - wB;
-      const densOff = (p[1]-50)*1.1;
-      const grain = p[5]*p[5]/2500;
+      // their total, so the three weights still sum to 64.
+      const shift = Math.trunc(((p[6] - 50) * 60) / 100);
+      let wB = wB0 - shift;
+      wB = wB < 0 ? 0 : wB > pool ? pool : wB;
+      const densOff = Math.trunc(F((p[1] - 50) * F(1.1)));
+      const grain = Math.trunc((p[5] * p[5]) / 25);
+      const dith = state.dith;
+      for (let i = 0; i < 64; i++) dith[i] = Math.trunc((Math.trunc((BAYER8[i] - 31) / 4) * grain) / 100);
+      const noise = state.noise, ix0 = state.ix0, ix1 = state.ix1, blendedA = state.blendedA;
       for (let y = 0; y < h; y++) {
+        const rowA0 = ((y + ayI) & 255) * 256, rowA1 = ((y + ayI + 1) & 255) * 256;
+        const rowB = ((y * 2 + by) & 255) * 256, rowC = ((y * 4 + cy) & 255) * 256;
+        for (let i = 0; i < 256; i++) {
+          const n = (i + 1) & 255;
+          ix0[i] = lerp8(noise[rowA0 + i], noise[rowA0 + n], axF);
+          ix1[i] = lerp8(noise[rowA1 + i], noise[rowA1 + n], axF);
+        }
+        for (let i = 0; i < 256; i++) blendedA[i] = lerp8(ix0[i], ix1[i], ayF);
+        const dithRow = (y & 7) * 8;
         for (let x = 0; x < w; x++) {
-          const a = sampleNoiseBilinear(state.noise, 256, x+scrollAx, y+scrollAy);
-          const b = sampleNoise(state.noise, 256, Math.floor(x*2+scrollBx), Math.floor(y*2+scrollBy));
-          const c = sampleNoise(state.noise, 256, Math.floor(x*4+scrollCx), Math.floor(y*4+scrollCy));
-          let v = wA*a + wB*b + wC*c + densOff;
-          v += (BAYER8[(y&7)*8+(x&7)]-31.5)/63 * 8 * grain;
-          v = Math.max(0, Math.min(255, v))|0;
-          const idx = v*3, o = (y*w+x)*4;
-          data[o] = pal[idx]; data[o+1] = pal[idx+1]; data[o+2] = pal[idx+2]; data[o+3] = 255;
+          const a = blendedA[(axI + x) & 255];
+          const b = noise[rowB + ((bx + x * 2) & 255)];
+          const c = noise[rowC + ((cx + x * 4) & 255)];
+          let v = c + ((((a - c) * wA) + ((b - c) * wB)) >> 6) + dith[dithRow + (x & 7)] + densOff;
+          v = v < 0 ? 0 : v > 255 ? 255 : v;
+          writePx(data, (y * w + x) * 4, pal, v);
         }
       }
     },

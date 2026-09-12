@@ -3,9 +3,10 @@
 // "Nebula" — deep-space clouds from three samples of the shared tileable
 // noise texture at 1x/2x/4x scale with independent drift directions (cheap
 // multi-octave turbulence from one 64KB asset). The dominant 1x octave is
-// bilinear-sampled to kill banding; 2x/4x are nearest. Scroll state lives in
-// persistent Q8.8 accumulators whose overflow is texel-aligned, so the drift
-// never jumps. Design: anim-atmosphere (Fable), 2026-08-15.
+// bilinear-sampled to kill banding; 2x/4x are nearest. Each octave's scroll
+// phase is a Q8.8 texel position read from the animation clock every frame
+// (see frame()); the wrap at 65536 is texel-aligned, so the drift never
+// jumps. Design: anim-atmosphere (Fable), 2026-08-15.
 //
 // Palette is stored "padded" (same trick as Ember): paletteExt has PAD clamp
 // entries on each side of the real 256-entry ramp, so the per-pixel index
@@ -172,7 +173,8 @@ uint16_t *paletteExt = nullptr; // [PAL_EXT_N]; real ramp lives at paletteExt+PA
 uint16_t *palette = nullptr;    // = paletteExt + PAD, 256 entries
 const uint8_t *noise = nullptr;
 uint32_t lastThemeGen = 0xFFFFFFFF;
-// Q8.8 scroll accumulators — texel-aligned wraparound (65536 = 256 texels).
+// Q8.8 scroll phases, one per octave and axis, set from the clock in frame()
+// (65536 = 256 texels, so the uint16 wrap is texel-aligned).
 uint16_t sAx = 0, sAy = 0, sBx = 0, sBy = 0, sCx = 0, sCy = 0;
 int g_wA = 32, g_wB = 20, g_wC = 12, g_densOff = 0;
 int g_axI = 0, g_axF = 0, g_ayI = 0, g_ayF = 0, g_bx = 0, g_by = 0, g_cx = 0, g_cy = 0;
@@ -284,15 +286,25 @@ bool init(int, int) {
     return true;
 }
 
-// One drift component, from a float rate to the Q8.8 accumulator step. The
-// step goes through int32 first because a rotated component can be negative
-// and converting a negative float straight to an unsigned type is undefined.
-// int32 to uint16 is the ordinary wrap, which is what the old "-=" did.
-static inline uint16_t scrollStep(float v) {
-    return static_cast<uint16_t>(static_cast<int32_t>(v));
+// One drift component's Q8.8 phase at time tMs, from its rate in Q8.8 texels
+// per ms. The product goes through int64 first because a rotated component
+// can be negative and converting a negative float straight to an unsigned
+// type is undefined; int64 to uint16 is the ordinary wrap, which is what
+// keeps the phase texel-aligned across 65536. The product is a double so the
+// bench page, which computes it in JavaScript doubles, lands on the same
+// integer for every tMs (six of these a frame; Ember's clock does the same).
+//
+// This used to be a per-frame accumulator, sAx += (int)(rate per frame),
+// which made the drift speed depend on the loop rate: the same setting moved
+// two thirds as fast on the whole-frame path at 20 fps as at 30 fps, and the
+// page, which reads absolute time, could not reproduce either (gm-pciz,
+// 2026-09-12). Reading the clock gives one speed at every frame rate, and it
+// is the page's speed.
+static inline uint16_t scrollPhase(uint32_t tMs, float rate) {
+    return static_cast<uint16_t>(static_cast<int64_t>(static_cast<double>(tMs) * rate));
 }
 
-void frame(uint32_t, int, int, const uint8_t p[BG_ANIM_PARAMS]) {
+void frame(uint32_t tMs, int, int, const uint8_t p[BG_ANIM_PARAMS]) {
     if (themeGen() != lastThemeGen || p[3] != lastContrast) {
         buildContrastRamp(p[3]);
         extendPalette();
@@ -310,12 +322,9 @@ void frame(uint32_t, int, int, const uint8_t p[BG_ANIM_PARAMS]) {
         g_driftSin = sinf(ang);
         lastDrift = p[4];
     }
-    // Per-frame deltas matched to the web preview at ~30fps: px/frame * 256.
     // 1.2 was the base drift gain; 0.3925 is the speed calibration
-    // (gm-33fm), which slows every octave by the same factor. The value is
-    // not a round one because scrollStep below truncates each octave's step
-    // to a whole Q8 unit per frame: at 0.3925 all six components land just
-    // above an integer, so this port keeps the page's rate to within 0.6%.
+    // (gm-33fm), which slows every octave by the same factor. The bench page
+    // carries the same two constants.
     const float g = 1.2f * 0.3925f * speedMul(p[0]);
     // Layer speed: how much faster the 2x and 4x octaves drift than the
     // dominant one. Exactly 1.0f at the default, 0.0f at slider 0 (the fine
@@ -324,17 +333,18 @@ void frame(uint32_t, int, int, const uint8_t p[BG_ANIM_PARAMS]) {
     const float gBC = g * lg;
     // Drift angle turns all three octaves' direction vectors together:
     // (x, y) -> (x cos - y sin, x sin + y cos). The base vectors are the
-    // deltas this animation has always used, A (85, 51), B (-145, 111) and
-    // C (222, -179). At the default the cosine is exactly 1 and the sine
-    // exactly 0, so every product below is the product it replaced and the
-    // rounding is unchanged.
+    // design's, in Q8.8 texels per ms: A (0.010, 0.006), B (-0.017, 0.013)
+    // and C (0.026, -0.021) texels per ms times 256. The old per-frame
+    // steps, A (85, 51), B (-145, 111), C (222, -179), were these rounded to
+    // one 33 ms frame. At the default the cosine is exactly 1 and the sine
+    // exactly 0, so the rotation leaves every product as it is.
     const float ca = g_driftCos, sa = g_driftSin;
-    sAx += scrollStep(85.0f * g * ca - 51.0f * g * sa);
-    sAy += scrollStep(85.0f * g * sa + 51.0f * g * ca);
-    sBx += scrollStep(-145.0f * gBC * ca - 111.0f * gBC * sa);
-    sBy += scrollStep(-145.0f * gBC * sa + 111.0f * gBC * ca);
-    sCx += scrollStep(222.0f * gBC * ca + 179.0f * gBC * sa);
-    sCy += scrollStep(222.0f * gBC * sa - 179.0f * gBC * ca);
+    sAx = scrollPhase(tMs, 2.56f * g * ca - 1.536f * g * sa);
+    sAy = scrollPhase(tMs, 2.56f * g * sa + 1.536f * g * ca);
+    sBx = scrollPhase(tMs, -4.352f * gBC * ca - 3.328f * gBC * sa);
+    sBy = scrollPhase(tMs, -4.352f * gBC * sa + 3.328f * gBC * ca);
+    sCx = scrollPhase(tMs, 6.656f * gBC * ca + 5.376f * gBC * sa);
+    sCy = scrollPhase(tMs, 6.656f * gBC * sa - 5.376f * gBC * ca);
     const float turb = p[2] / 100.0f;
     g_wA = static_cast<int>((0.60f - 0.15f * turb) * 64.0f);
     const int wB0 = static_cast<int>((0.25f + 0.05f * turb) * 64.0f);
