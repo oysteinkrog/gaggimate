@@ -1,8 +1,19 @@
-// Animation category: background animation, the standby screen's own
-// animation, the parameters of the chosen one (a row that pushes
-// CatAnimParams.cpp's page), frame rate, all-screens, the UI theme, the
-// current animation's gradient, plate handling, element tint, the text
-// scrim, the screen fade (out, in, curve) and interlacing. Every value row
+// Animation category: which animation plays, which one the standby screen
+// plays, the gradient they all draw with, then the parameters and the
+// gradient override of one animation at a time (rows that push
+// CatAnimParams.cpp's page, one for the main animation and one for the
+// standby animation), frame rate, all-screens, the UI theme, plate handling,
+// element tint, the text scrim, the screen fade (out, in, curve) and
+// interlacing.
+//
+// The order is the point, and it is the epic's principle: the controls that
+// apply to every animation come before the ones that override for a single
+// animation. The global gradient row is the simple path, the per-animation
+// Gradient rows read as "Global (<name>)" until they are changed, and the
+// standby rows are disabled rather than hidden while the standby animation is
+// "Same", so the page does not reflow under the finger when that row cycles.
+//
+// Every value row
 // is live (SettingsUI.h): a row writes Settings and calls markDirty() the
 // moment it changes, rather than waiting for commit, so
 // DefaultUI::updateState applies it on the next rerender pass (CLAUDE.md,
@@ -23,6 +34,7 @@
 #include <display/ui/default/eez/images.h>
 
 #include <cstdio>
+#include <cstdlib>
 #include <string>
 #include <vector>
 
@@ -192,14 +204,49 @@ int gradientIndexForAnim(int animId, const std::vector<settingsui::GradientChoic
     return settingsui::gradientChoiceIndexForRef(choices, ref);
 }
 
-// Requirement: "for Default it shows 'Default (<global theme name>)'".
+// Where the global gradient sits in the choice list. bgAnimGradientRef when
+// it names something that exists, else the built-in bgAnimTheme, which is what
+// bg_resolve_anim_theme falls back to and what a device that has never set the
+// global stores. Never returns 0: choices[0] is the per-animation "Global"
+// entry, which is not a value the global itself can take.
+int globalGradientChoiceIndex(const std::vector<settingsui::GradientChoice> &choices) {
+    Settings &settings = controller.getSettings();
+    const std::string ref(settings.getBgAnimGradientRef().c_str());
+    if (!ref.empty()) {
+        const int i = settingsui::gradientChoiceIndexForRef(choices, ref);
+        if (i != 0) {
+            return i;
+        }
+    }
+    const int i = settingsui::gradientChoiceIndexForRef(choices, std::to_string(settings.getBgAnimTheme()));
+    if (i != 0) {
+        return i;
+    }
+    return choices.size() > 1 ? 1 : 0;
+}
+
+// A per-animation Gradient row's value. Index 0 is "no override", which draws
+// whatever the global row is set to, so it names it rather than saying
+// "Default" and leaving the reader to find out where the default lives.
 std::string gradientDisplayText(int index, const std::vector<settingsui::GradientChoice> &choices) {
     if (index == 0) {
-        char buf[40];
-        std::snprintf(buf, sizeof(buf), "Default (%s)", themeNameFn(controller.getSettings().getBgAnimTheme()));
+        char buf[48];
+        const int g = globalGradientChoiceIndex(choices);
+        std::snprintf(buf, sizeof(buf), "Global (%s)", choices[static_cast<size_t>(g)].label.c_str());
         return buf;
     }
     return choices[static_cast<size_t>(index)].label;
+}
+
+// The choice index the map holds for the standby animation, or 0 while it is
+// "Same as main": there is no separate slot to override then, because the
+// standby screen draws the main animation with the main animation's gradient.
+int standbyGradientIndexFor(int standbyAnimId, const std::vector<settingsui::GradientChoice> &choices) {
+    if (standbyAnimId < 0) {
+        return 0;
+    }
+    const std::string map(controller.getSettings().getBgAnimThemeMap().c_str());
+    return settingsui::gradientChoiceIndexForRef(choices, settingsui::gradientMapReadRef(map, standbyAnimId));
 }
 
 struct CatAnimationCtx {
@@ -223,6 +270,19 @@ struct CatAnimationCtx {
     std::string gradientRef;
     std::vector<bool> gradientTouched;   // per animId
     std::vector<std::string> gradientLastRef; // per animId, valid where gradientTouched[i]
+
+    // The standby animation's own slot of the same map. It shares the two
+    // vectors above rather than keeping a second pair, because it writes the
+    // same per-animation field and the touched-ness that matters is the
+    // animation's, not which row wrote it.
+    int standbyGradientIndex = 0;
+    std::string standbyGradientRef;
+
+    // The global gradient, one field of its own, so one touched flag like
+    // every other scalar row here.
+    int globalGradientIndex = 0;
+    std::string globalGradientRef;
+    bool globalGradientTouched = false;
 
     int plates = 0; // 0 Keep, 1 Hide, 2 Custom
 
@@ -269,6 +329,9 @@ struct CatAnimationCtx {
     lv_obj_t *animRow = nullptr;
     lv_obj_t *standbyRow = nullptr;
     lv_obj_t *paramsRow = nullptr;
+    lv_obj_t *standbyParamsRow = nullptr;
+    lv_obj_t *standbyGradientRow = nullptr;
+    lv_obj_t *globalGradientRow = nullptr;
     lv_obj_t *frameRateRow = nullptr;
     lv_obj_t *themeRow = nullptr;
     lv_obj_t *gradientRow = nullptr;
@@ -291,6 +354,75 @@ struct CatAnimationCtx {
     // is set before any of them ever run.
     SettingsUI *ui = nullptr;
 };
+
+// Brings the two standby rows in line with the current pair of ids: live
+// while the standby animation is a different one, disabled and showing the
+// main animation's own values otherwise. Called from both id rows, since
+// either can make the ids meet or part.
+void refreshStandbyRows(CatAnimationCtx *ctx, const std::vector<settingsui::GradientChoice> &choices) {
+    const bool separate = ctx->standbyAnimId >= 0 && ctx->standbyAnimId != ctx->animId;
+    const bool touched = ctx->standbyAnimId >= 0 &&
+                         static_cast<size_t>(ctx->standbyAnimId) < ctx->gradientTouched.size() &&
+                         ctx->gradientTouched[static_cast<size_t>(ctx->standbyAnimId)];
+    if (touched) {
+        ctx->standbyGradientIndex = settingsui::gradientChoiceIndexForRef(
+            choices, ctx->gradientLastRef[static_cast<size_t>(ctx->standbyAnimId)]);
+    } else {
+        ctx->standbyGradientIndex = standbyGradientIndexFor(ctx->standbyAnimId, choices);
+    }
+    ctx->standbyGradientRef = choices[static_cast<size_t>(ctx->standbyGradientIndex)].ref;
+    if (ctx->standbyParamsRow != nullptr) {
+        settingsRowSetValue(ctx->standbyParamsRow, separate ? animNameFn(ctx->standbyAnimId) : "Same as main");
+        settingsRowSetEnabled(ctx->standbyParamsRow, separate);
+    }
+    if (ctx->standbyGradientRow != nullptr) {
+        settingsRowSetValue(ctx->standbyGradientRow,
+                            separate ? gradientDisplayText(ctx->standbyGradientIndex, choices).c_str()
+                                     : "Same as main");
+        settingsRowSetEnabled(ctx->standbyGradientRow, separate);
+    }
+}
+
+// ---- Gradient for all animations ---------------------------------------------
+
+// The gradient every animation draws with unless it has one of its own. Cycles
+// the choice list from index 1: index 0 is the per-animation "Global" entry
+// and is not a value the global itself can take.
+void globalGradientOnCycle(void *user, int dir) {
+    auto *ctx = static_cast<CatAnimationCtx *>(user);
+    const auto choices = currentGradientChoices();
+    const int n = static_cast<int>(choices.size()) - 1;
+    if (n <= 0) {
+        return;
+    }
+    const int rel = settingsui::wrapIndex(ctx->globalGradientIndex - 1, n, dir);
+    ctx->globalGradientIndex = rel + 1;
+    ctx->globalGradientRef = choices[static_cast<size_t>(ctx->globalGradientIndex)].ref;
+    ctx->globalGradientTouched = true;
+    Settings &settings = controller.getSettings();
+    settings.setBgAnimGradientRef(ctx->globalGradientRef.c_str());
+    // A built-in is mirrored into bgAnimTheme, which is the last fallback and
+    // what a build without this field reads. The web POST handler does the
+    // same, so the two writers agree.
+    if (!ctx->globalGradientRef.empty() && ctx->globalGradientRef[0] != 'c') {
+        settings.setBgAnimTheme(std::atoi(ctx->globalGradientRef.c_str()));
+    }
+    if (ctx->globalGradientRow != nullptr) {
+        settingsRowSetValue(ctx->globalGradientRow, choices[static_cast<size_t>(ctx->globalGradientIndex)].label.c_str());
+    }
+    // Both per-animation rows name the global while they are on "Global", so
+    // they follow this one.
+    if (ctx->gradientRow != nullptr) {
+        settingsRowSetValue(ctx->gradientRow, gradientDisplayText(ctx->gradientIndex, choices).c_str());
+    }
+    if (ctx->standbyGradientRow != nullptr && ctx->standbyAnimId >= 0 && ctx->standbyAnimId != ctx->animId) {
+        settingsRowSetValue(ctx->standbyGradientRow, gradientDisplayText(ctx->standbyGradientIndex, choices).c_str());
+    }
+    if (ctx->ui != nullptr) {
+        ctx->ui->ui().markDirty();
+        ctx->ui->plugins().trigger("bganim:preview-end");
+    }
+}
 
 // ---- Animation --------------------------------------------------------------
 
@@ -322,6 +454,9 @@ void animIdOnCycle(void *user, int dir) {
     if (ctx->paramsRow != nullptr) {
         settingsRowSetValue(ctx->paramsRow, animNameFn(ctx->animId));
     }
+    // The standby rows are live only while the standby animation is a
+    // different one, and cycling this row can make the two ids meet or part.
+    refreshStandbyRows(ctx, choices);
     if (ctx->ui != nullptr) {
         ctx->ui->ui().markDirty();
         ctx->ui->plugins().trigger("bganim:preview-end");
@@ -346,6 +481,7 @@ void standbyAnimOnCycle(void *user, int dir) {
     if (ctx->standbyRow != nullptr) {
         settingsRowSetValue(ctx->standbyRow, standbyChoiceLabel(ctx->standbyAnimId));
     }
+    refreshStandbyRows(ctx, currentGradientChoices());
     if (ctx->ui != nullptr) {
         ctx->ui->ui().markDirty();
     }
@@ -362,6 +498,46 @@ void paramsOnActivate(void *user) {
     auto *ctx = static_cast<CatAnimationCtx *>(user);
     if (ctx->ui != nullptr) {
         settingsAnimParamsPush(*ctx->ui, ctx->animId);
+    }
+}
+
+// ---- Standby parameters and standby gradient ---------------------------------
+
+// Both rows edit the standby animation's own per-animation fields, which exist
+// only while it is a different animation from the main one; the same id on
+// both rows is one animation with one set of parameters. Disabled rather than
+// hidden so the page keeps its shape while Standby anim is cycled.
+void standbyParamsOnActivate(void *user) {
+    auto *ctx = static_cast<CatAnimationCtx *>(user);
+    if (ctx->ui != nullptr && ctx->standbyAnimId >= 0) {
+        settingsAnimParamsPush(*ctx->ui, ctx->standbyAnimId);
+    }
+}
+
+void standbyGradientOnCycle(void *user, int dir) {
+    auto *ctx = static_cast<CatAnimationCtx *>(user);
+    if (ctx->standbyAnimId < 0) {
+        return;
+    }
+    Settings &settings = controller.getSettings();
+    const auto choices = currentGradientChoices();
+    ctx->standbyGradientIndex = settingsui::wrapIndex(ctx->standbyGradientIndex, static_cast<int>(choices.size()), dir);
+    ctx->standbyGradientRef = choices[static_cast<size_t>(ctx->standbyGradientIndex)].ref;
+    // Same per-animation touched-ness as the Gradient row above, keyed by the
+    // animation this row is editing.
+    ctx->gradientTouched[static_cast<size_t>(ctx->standbyAnimId)] = true;
+    ctx->gradientLastRef[static_cast<size_t>(ctx->standbyAnimId)] = ctx->standbyGradientRef;
+    {
+        Settings::Guard guard(settings);
+        const std::string map(settings.getBgAnimThemeMap().c_str());
+        settings.setBgAnimThemeMap(
+            settingsui::gradientMapWriteRef(map, ctx->standbyAnimId, ctx->standbyGradientRef).c_str());
+    }
+    if (ctx->standbyGradientRow != nullptr) {
+        settingsRowSetValue(ctx->standbyGradientRow, gradientDisplayText(ctx->standbyGradientIndex, choices).c_str());
+    }
+    if (ctx->ui != nullptr) {
+        ctx->ui->ui().markDirty();
     }
 }
 
@@ -590,7 +766,7 @@ void interlaceOnToggle(void *user, bool value) {
 
 // ---- shell plumbing ---------------------------------------------------------
 
-int animRowCount(void * /*ctx*/) { return 17; }
+int animRowCount(void * /*ctx*/) { return 20; }
 
 void animBuildRow(void *ctx0, int index, lv_obj_t *parent, SettingsUI &ui) {
     auto *ctx = static_cast<CatAnimationCtx *>(ctx0);
@@ -616,7 +792,18 @@ void animBuildRow(void *ctx0, int index, lv_obj_t *parent, SettingsUI &ui) {
         settingsRowSetValue(row, standbyChoiceLabel(ctx->standbyAnimId));
         break;
     }
-    case 2: { // Parameters (pushes CatAnimParams.cpp's page)
+    case 2: { // Gradient for all animations
+        lv_obj_t *row = settingsRowChoiceCreate(ui, parent, "Gradient all", "Gradient all", globalGradientOnCycle, ctx);
+        ctx->globalGradientRow = row;
+        lv_obj_add_event_cb(
+            row,
+            [](lv_event_t *e) { static_cast<CatAnimationCtx *>(lv_event_get_user_data(e))->globalGradientRow = nullptr; },
+            LV_EVENT_DELETE, ctx);
+        const auto choices = currentGradientChoices();
+        settingsRowSetValue(row, choices[static_cast<size_t>(ctx->globalGradientIndex)].label.c_str());
+        break;
+    }
+    case 3: { // Parameters (pushes CatAnimParams.cpp's page)
         lv_obj_t *row = settingsRowActionCreate(ui, parent, "Parameters", "Parameters", paramsOnActivate, ctx);
         ctx->paramsRow = row;
         lv_obj_add_event_cb(
@@ -627,29 +814,7 @@ void animBuildRow(void *ctx0, int index, lv_obj_t *parent, SettingsUI &ui) {
         settingsRowSetValue(row, animNameFn(ctx->animId));
         break;
     }
-    case 3: { // Frame rate
-        lv_obj_t *row = settingsRowStepperCreate(ui, parent, "Frame rate", "Frame rate", frameRateOnStep, ctx);
-        ctx->frameRateRow = row;
-        lv_obj_add_event_cb(
-            row,
-            [](lv_event_t *e) { static_cast<CatAnimationCtx *>(lv_event_get_user_data(e))->frameRateRow = nullptr; },
-            LV_EVENT_DELETE, ctx);
-        settingsRowSetValue(row, settingsui::formatNumeric(ctx->fps, settingsui::kBgAnimFpsSpec).c_str());
-        break;
-    }
-    case 4: // All screens
-        settingsRowToggleCreate(ui, parent, "All screens", "All screens", ctx->allScreens, allScreensOnToggle, ctx);
-        break;
-    case 5: { // Theme
-        lv_obj_t *row = settingsRowChoiceCreate(ui, parent, "Theme", "Theme", themeOnCycle, ctx);
-        ctx->themeRow = row;
-        lv_obj_add_event_cb(
-            row, [](lv_event_t *e) { static_cast<CatAnimationCtx *>(lv_event_get_user_data(e))->themeRow = nullptr; },
-            LV_EVENT_DELETE, ctx);
-        settingsRowSetValue(row, settingsui::kThemeModeLabels[ctx->themeMode]);
-        break;
-    }
-    case 6: { // Gradient
+    case 4: { // Gradient (the main animation's override)
         lv_obj_t *row = settingsRowChoiceCreate(ui, parent, "Gradient", "Gradient", gradientOnCycle, ctx);
         ctx->gradientRow = row;
         lv_obj_add_event_cb(
@@ -660,7 +825,59 @@ void animBuildRow(void *ctx0, int index, lv_obj_t *parent, SettingsUI &ui) {
         settingsRowSetValue(row, gradientDisplayText(ctx->gradientIndex, choices).c_str());
         break;
     }
-    case 7: { // Plates
+    case 5: { // Standby parameters
+        const bool separate = ctx->standbyAnimId >= 0 && ctx->standbyAnimId != ctx->animId;
+        lv_obj_t *row =
+            settingsRowActionCreate(ui, parent, "Standby params", "Standby params", standbyParamsOnActivate, ctx);
+        ctx->standbyParamsRow = row;
+        lv_obj_add_event_cb(
+            row,
+            [](lv_event_t *e) { static_cast<CatAnimationCtx *>(lv_event_get_user_data(e))->standbyParamsRow = nullptr; },
+            LV_EVENT_DELETE, ctx);
+        settingsRowSetValue(row, separate ? animNameFn(ctx->standbyAnimId) : "Same as main");
+        settingsRowSetEnabled(row, separate);
+        break;
+    }
+    case 6: { // Standby gradient
+        const bool separate = ctx->standbyAnimId >= 0 && ctx->standbyAnimId != ctx->animId;
+        lv_obj_t *row =
+            settingsRowChoiceCreate(ui, parent, "Standby grad", "Standby grad", standbyGradientOnCycle, ctx);
+        ctx->standbyGradientRow = row;
+        lv_obj_add_event_cb(
+            row,
+            [](lv_event_t *e) {
+                static_cast<CatAnimationCtx *>(lv_event_get_user_data(e))->standbyGradientRow = nullptr;
+            },
+            LV_EVENT_DELETE, ctx);
+        const auto choices = currentGradientChoices();
+        settingsRowSetValue(row, separate ? gradientDisplayText(ctx->standbyGradientIndex, choices).c_str()
+                                          : "Same as main");
+        settingsRowSetEnabled(row, separate);
+        break;
+    }
+    case 7: // All screens
+        settingsRowToggleCreate(ui, parent, "All screens", "All screens", ctx->allScreens, allScreensOnToggle, ctx);
+        break;
+    case 8: { // Theme
+        lv_obj_t *row = settingsRowChoiceCreate(ui, parent, "Theme", "Theme", themeOnCycle, ctx);
+        ctx->themeRow = row;
+        lv_obj_add_event_cb(
+            row, [](lv_event_t *e) { static_cast<CatAnimationCtx *>(lv_event_get_user_data(e))->themeRow = nullptr; },
+            LV_EVENT_DELETE, ctx);
+        settingsRowSetValue(row, settingsui::kThemeModeLabels[ctx->themeMode]);
+        break;
+    }
+    case 9: { // Frame rate
+        lv_obj_t *row = settingsRowStepperCreate(ui, parent, "Frame rate", "Frame rate", frameRateOnStep, ctx);
+        ctx->frameRateRow = row;
+        lv_obj_add_event_cb(
+            row,
+            [](lv_event_t *e) { static_cast<CatAnimationCtx *>(lv_event_get_user_data(e))->frameRateRow = nullptr; },
+            LV_EVENT_DELETE, ctx);
+        settingsRowSetValue(row, settingsui::formatNumeric(ctx->fps, settingsui::kBgAnimFpsSpec).c_str());
+        break;
+    }
+    case 10: { // Plates
         lv_obj_t *row = settingsRowChoiceCreate(ui, parent, "Plates", "Plates", platesOnCycle, ctx);
         ctx->platesRow = row;
         lv_obj_add_event_cb(
@@ -669,7 +886,7 @@ void animBuildRow(void *ctx0, int index, lv_obj_t *parent, SettingsUI &ui) {
         settingsRowSetValue(row, settingsui::kPlatesLabels[ctx->plates]);
         break;
     }
-    case 8: { // Plate colour
+    case 11: { // Plate colour
         lv_obj_t *row = settingsRowChoiceCreate(ui, parent, "Plate colour", "Plate colour", plateColorOnCycle, ctx);
         ctx->plateColorRow = row;
         lv_obj_add_event_cb(
@@ -680,7 +897,7 @@ void animBuildRow(void *ctx0, int index, lv_obj_t *parent, SettingsUI &ui) {
         settingsRowSetEnabled(row, ctx->plates == 2);
         break;
     }
-    case 9: { // Plate opacity
+    case 12: { // Plate opacity
         lv_obj_t *row = settingsRowStepperCreate(ui, parent, "Plate opacity", "Plate opacity", plateOpacityOnStep, ctx);
         ctx->plateOpacityRow = row;
         lv_obj_add_event_cb(
@@ -691,10 +908,10 @@ void animBuildRow(void *ctx0, int index, lv_obj_t *parent, SettingsUI &ui) {
         settingsRowSetEnabled(row, ctx->plates == 2);
         break;
     }
-    case 10: // Element tint
+    case 13: // Element tint
         settingsRowToggleCreate(ui, parent, "Element tint", "Element tint", ctx->tintEnabled, tintEnabledOnToggle, ctx);
         break;
-    case 11: { // Tint colour
+    case 14: { // Tint colour
         lv_obj_t *row = settingsRowChoiceCreate(ui, parent, "Tint colour", "Tint colour", tintColorOnCycle, ctx);
         ctx->tintColorRow = row;
         lv_obj_add_event_cb(
@@ -705,7 +922,7 @@ void animBuildRow(void *ctx0, int index, lv_obj_t *parent, SettingsUI &ui) {
         settingsRowSetEnabled(row, ctx->tintEnabled);
         break;
     }
-    case 12: { // Text scrim
+    case 15: { // Text scrim
         lv_obj_t *row = settingsRowStepperCreate(ui, parent, "Text scrim", "Text scrim", scrimOnStep, ctx);
         ctx->scrimRow = row;
         lv_obj_add_event_cb(
@@ -714,7 +931,7 @@ void animBuildRow(void *ctx0, int index, lv_obj_t *parent, SettingsUI &ui) {
         settingsRowSetValue(row, settingsui::formatNumeric(ctx->scrim, settingsui::kBgAnimScrimSpec).c_str());
         break;
     }
-    case 13: { // Fade out
+    case 16: { // Fade out
         lv_obj_t *row = settingsRowStepperCreate(ui, parent, "Fade out", "Fade out", fadeOutOnStep, ctx);
         ctx->fadeOutRow = row;
         lv_obj_add_event_cb(
@@ -723,7 +940,7 @@ void animBuildRow(void *ctx0, int index, lv_obj_t *parent, SettingsUI &ui) {
         settingsRowSetValue(row, settingsui::formatNumeric(ctx->fadeOut, settingsui::kBgFadeSpec).c_str());
         break;
     }
-    case 14: { // Fade in
+    case 17: { // Fade in
         lv_obj_t *row = settingsRowStepperCreate(ui, parent, "Fade in", "Fade in", fadeInOnStep, ctx);
         ctx->fadeInRow = row;
         lv_obj_add_event_cb(
@@ -732,7 +949,7 @@ void animBuildRow(void *ctx0, int index, lv_obj_t *parent, SettingsUI &ui) {
         settingsRowSetValue(row, settingsui::formatNumeric(ctx->fadeIn, settingsui::kBgFadeSpec).c_str());
         break;
     }
-    case 15: { // Fade curve
+    case 18: { // Fade curve
         lv_obj_t *row = settingsRowChoiceCreate(ui, parent, "Fade curve", "Fade curve", fadeCurveOnCycle, ctx);
         ctx->fadeCurveRow = row;
         lv_obj_add_event_cb(
@@ -742,7 +959,7 @@ void animBuildRow(void *ctx0, int index, lv_obj_t *parent, SettingsUI &ui) {
         settingsRowSetValue(row, settingsui::kFadeCurveLabels[ctx->fadeCurve]);
         break;
     }
-    case 16: // Interlace
+    case 19: // Interlace
         settingsRowToggleCreate(ui, parent, "Interlace", "Interlace", ctx->interlace, interlaceOnToggle, ctx);
         break;
     default:
@@ -779,6 +996,10 @@ void animEnter(void *ctx0) {
     const auto choices = currentGradientChoices();
     ctx->gradientIndex = gradientIndexForAnim(ctx->animId, choices);
     ctx->gradientRef = choices[static_cast<size_t>(ctx->gradientIndex)].ref;
+    ctx->standbyGradientIndex = standbyGradientIndexFor(ctx->standbyAnimId, choices);
+    ctx->standbyGradientRef = choices[static_cast<size_t>(ctx->standbyGradientIndex)].ref;
+    ctx->globalGradientIndex = globalGradientChoiceIndex(choices);
+    ctx->globalGradientRef = choices[static_cast<size_t>(ctx->globalGradientIndex)].ref;
 
     ctx->animIdTouched = false;
     ctx->standbyAnimIdTouched = false;
@@ -787,6 +1008,7 @@ void animEnter(void *ctx0) {
     ctx->themeModeTouched = false;
     ctx->gradientTouched.assign(static_cast<size_t>(animCountFn()), false);
     ctx->gradientLastRef.assign(static_cast<size_t>(animCountFn()), std::string());
+    ctx->globalGradientTouched = false;
     ctx->platesTouched = false;
     ctx->plateColorTouched = false;
     ctx->plateOpacityTouched = false;
@@ -870,6 +1092,21 @@ void animReconcile(void *ctx0) {
         ctx->gradientIndex = gradientIndexForAnim(ctx->animId, choices);
     }
     ctx->gradientRef = choices[static_cast<size_t>(ctx->gradientIndex)].ref;
+
+    // The standby animation's slot of the same map, by the same rule; the
+    // row's own refresh is the shell's rebuildPage pass right after this.
+    if (ctx->standbyAnimId >= 0 && ctx->gradientTouched[static_cast<size_t>(ctx->standbyAnimId)]) {
+        ctx->standbyGradientIndex = settingsui::gradientChoiceIndexForRef(
+            choices, ctx->gradientLastRef[static_cast<size_t>(ctx->standbyAnimId)]);
+    } else {
+        ctx->standbyGradientIndex = standbyGradientIndexFor(ctx->standbyAnimId, choices);
+    }
+    ctx->standbyGradientRef = choices[static_cast<size_t>(ctx->standbyGradientIndex)].ref;
+
+    if (!ctx->globalGradientTouched) {
+        ctx->globalGradientIndex = globalGradientChoiceIndex(choices);
+        ctx->globalGradientRef = choices[static_cast<size_t>(ctx->globalGradientIndex)].ref;
+    }
 }
 
 void animCommit(void *ctx0) {
@@ -932,6 +1169,15 @@ void animCommit(void *ctx0) {
             settings.setBgAnimThemeMap(map.c_str());
             wrote = true;
         }
+    }
+    if (ctx->globalGradientTouched &&
+        std::string(settings.getBgAnimGradientRef().c_str()) != ctx->globalGradientRef) {
+        settings.setBgAnimGradientRef(ctx->globalGradientRef.c_str());
+        if (!ctx->globalGradientRef.empty() && ctx->globalGradientRef[0] != 'c') {
+            settings.setBgAnimTheme(std::atoi(ctx->globalGradientRef.c_str()));
+        }
+        settingsLogAppend(log, sizeof(log), used, " gradientAll=%s", ctx->globalGradientRef.c_str());
+        wrote = true;
     }
     if (ctx->platesTouched && settings.getBgAnimClearPlates() != ctx->plates) {
         settings.setBgAnimClearPlates(ctx->plates);

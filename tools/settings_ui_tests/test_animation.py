@@ -131,31 +131,48 @@ def map_write_ref(theme_map, anim_id, ref):
     return ";".join(parts)
 
 
+def expected_global_gradient_text(settings):
+    """The Gradient all row's value: bgAnimGradientRef when it names a
+    built-in, else bgAnimTheme. A library ref ("cN") returns None for the
+    reason in expected_gradient_text."""
+    ref = str(settings.get("bgAnimGradientRef", "") or "")
+    if ref.startswith("c"):
+        return None
+    if ref != "":
+        try:
+            idx = int(ref)
+        except ValueError:
+            idx = -1
+        if 0 <= idx < len(THEME_NAMES):
+            return THEME_NAMES[idx]
+    theme_idx = int(settings["bgAnimTheme"])
+    return THEME_NAMES[theme_idx] if 0 <= theme_idx < len(THEME_NAMES) else THEME_NAMES[0]
+
+
 def expected_gradient_text(settings, anim_id=None):
     """Python mirror of gradientChoices()/gradientChoiceIndexForRef() plus
-    CatAnimation.cpp's "Default (<name>)" formatting, for the built-in-theme
-    and Default cases only. Returns None for a library ref ("cN"): the
+    CatAnimation.cpp's "Global (<name>)" formatting, for the built-in-theme
+    and no-override cases only. Returns None for a library ref ("cN"): the
     simulator's bg_library_valid always returns false (sim/platform/
     bganim_stub.cpp), so bgAnimGradients can never legitimately hold a
     library entry here and this script never needs to resolve one."""
     if anim_id is None:
         anim_id = int(settings["bgAnimId"])
     ref = map_ref(settings["bgAnimThemeMap"], anim_id)
-    if ref == "":
-        theme_idx = int(settings["bgAnimTheme"])
-        name = THEME_NAMES[theme_idx] if 0 <= theme_idx < len(THEME_NAMES) else THEME_NAMES[0]
-        return "Default (%s)" % name
     if ref.startswith("c"):
         return None
-    try:
-        idx = int(ref)
-    except ValueError:
-        idx = -1
-    if 0 <= idx < len(THEME_NAMES):
-        return THEME_NAMES[idx]
-    theme_idx = int(settings["bgAnimTheme"])
-    name = THEME_NAMES[theme_idx] if 0 <= theme_idx < len(THEME_NAMES) else THEME_NAMES[0]
-    return "Default (%s)" % name
+    if ref != "":
+        try:
+            idx = int(ref)
+        except ValueError:
+            idx = -1
+        if 0 <= idx < len(THEME_NAMES):
+            return THEME_NAMES[idx]
+    # No override, or one naming something this build cannot resolve: the row
+    # names the global rather than saying "Default" and leaving the reader to
+    # find out where the default lives.
+    gname = expected_global_gradient_text(settings)
+    return None if gname is None else "Global (%s)" % gname
 
 
 def expected_standby_text(settings):
@@ -324,6 +341,26 @@ def check_rows_match_settings(rig):
         check(rig, "row_gradient", v["Gradient"] == exp_grad, "%r vs %r" % (v["Gradient"], exp_grad))
     else:
         rig.log("row_gradient_skipped", reason="library ref not reachable on the simulator")
+    exp_all = expected_global_gradient_text(s)
+    if exp_all is not None:
+        check(rig, "row_gradient_all", v["Gradient all"] == exp_all, "%r vs %r" % (v["Gradient all"], exp_all))
+    else:
+        rig.log("row_gradient_all_skipped", reason="library ref not reachable on the simulator")
+    # The standby rows are live only while the standby animation is a
+    # different one; the same id on both means one animation with one set of
+    # parameters, and both rows say so (CatAnimation.cpp, refreshStandbyRows).
+    standby = int(s["bgAnimStandbyId"])
+    separate = 0 <= standby < len(ANIM_NAMES) and standby != int(s["bgAnimId"])
+    if separate:
+        check(rig, "row_standby_params", v["Standby params"] == ANIM_NAMES[standby],
+              "%r vs bgAnimStandbyId=%s" % (v["Standby params"], s["bgAnimStandbyId"]))
+        exp_sgrad = expected_gradient_text(s, standby)
+        if exp_sgrad is not None:
+            check(rig, "row_standby_gradient", v["Standby grad"] == exp_sgrad,
+                  "%r vs %r" % (v["Standby grad"], exp_sgrad))
+    else:
+        check(rig, "row_standby_params", v["Standby params"] == "Same as main", v["Standby params"])
+        check(rig, "row_standby_gradient", v["Standby grad"] == "Same as main", v["Standby grad"])
 
     check(rig, "row_plates", v["Plates"] == PLATES_LABELS[int(s["bgAnimClearPlates"])], v["Plates"])
     check(rig, "row_plate_colour", v["Plate colour"] == expected_palette_text(hex_to_int(s["bgAnimPlateColor"])),
@@ -455,7 +492,10 @@ def check_frame_rate_live_and_precedence(rig):
     delta = -5 if direction == "minus" else 5
     fps1_expected = max(5, min(60, fps0 + delta))
 
-    d0 = open_animation(rig)
+    open_animation(rig)
+    # Frame rate moved off page 0 when the gradient and standby rows landed;
+    # find it by name, the way every other row in this file is found.
+    d0 = page_with_row(rig, "Frame rate")
     btn = rig.find_tag(d0, "Frame rate", direction)
     if btn is None:
         check(rig, "frame_rate_button_found", False, "no %r button tagged Frame rate" % direction)
@@ -481,7 +521,8 @@ def check_frame_rate_live_and_precedence(rig):
         rig.settingsui(pop=1)
 
     # Restore fps0 through the UI, never by POST.
-    d = open_animation(rig)
+    open_animation(rig)
+    d = page_with_row(rig, "Frame rate")
     current = int(rig.settings()["bgAnimFps"])
     if current != fps0:
         restore_dir = "minus" if current > fps0 else "plus"

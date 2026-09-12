@@ -83,13 +83,17 @@ CATEGORY_PAGES = [
     PageSpec("display-p0", CAT_DISPLAY, 0,
              ["Main brightness", "Standby brightness", "Dim after", "24-hour clock", "Time zone region"], "display"),
     PageSpec("display-p1", CAT_DISPLAY, 1, ["City"], "display"),
+    # Global before per-animation: which animations play, the gradient they all
+    # draw with, then the parameters and gradient of one animation at a time
+    # (CatAnimation.cpp's header comment carries the reasoning).
     PageSpec("animation-p0", CAT_ANIMATION, 0,
-             ["Animation", "Standby anim", "Parameters", "Frame rate", "All screens"], "animation"),
+             ["Animation", "Standby anim", "Gradient all", "Parameters", "Gradient"], "animation"),
     PageSpec("animation-p1", CAT_ANIMATION, 1,
-             ["Theme", "Gradient", "Plates", "Plate colour", "Plate opacity"], "animation"),
+             ["Standby params", "Standby grad", "All screens", "Theme", "Frame rate"], "animation"),
     PageSpec("animation-p2", CAT_ANIMATION, 2,
-             ["Element tint", "Tint colour", "Text scrim", "Fade out", "Fade in"], "animation"),
-    PageSpec("animation-p3", CAT_ANIMATION, 3, ["Fade curve", "Interlace"], "animation"),
+             ["Plates", "Plate colour", "Plate opacity", "Element tint", "Tint colour"], "animation"),
+    PageSpec("animation-p3", CAT_ANIMATION, 3,
+             ["Text scrim", "Fade out", "Fade in", "Fade curve", "Interlace"], "animation"),
     PageSpec("machine-p0", CAT_MACHINE, 0,
              ["Startup mode", "Standby timeout", "Auto wake-up", "Schedules"], "machine"),
     PageSpec("status-p0", CAT_STATUS, 0,
