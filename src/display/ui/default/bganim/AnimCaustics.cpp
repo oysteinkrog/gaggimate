@@ -376,10 +376,17 @@ void frame(uint32_t tMs, int, int, const uint8_t p[BG_ANIM_PARAMS]) {
     // label and its default of 50 are unchanged.
     // Scaling time itself keeps the wave phases and the heading drift in the
     // same ratio, so only the pace changes.
+    // Speed rides that same clock (gm-kh2s). It used to scale speedScale
+    // alone, which is the wave phases, and left the heading drift below on
+    // the unscaled clock. The drift is small next to the phases at Speed 50,
+    // but it does not slow down, so at Speed 0 it was most of what still
+    // moved: the measured half change there was 4648 ms against a fleet
+    // target of 8050, and the drift is why. speedMul(50) is exactly 1, so
+    // every frame at the default is bit for bit the frame this drew before.
     constexpr float RATE_CAL = 0.25f;
-    const float t = tMs * RATE_CAL * 0.001f;
+    const float t = tMs * RATE_CAL * 0.001f * speedMul(p[0]);
     const float freqScale = lerpf(0.55f, 1.9f, p[1] / 100.0f);
-    const float speedScale = 0.8f * speedMul(p[0]);
+    const float speedScale = 0.8f;
     const float thresh = 0.14f + 0.55f * (p[2] / 100.0f); // p[2] = "contrast" param
     const float invSpan = 1.0f / fmaxf(1e-3f, 1.0f - thresh);
     // p[3] "glow": gain on the shaped brightness, clamped at full. Dim, thin

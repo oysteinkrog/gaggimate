@@ -1203,9 +1203,13 @@ ANIMS.push({
     render(data, w, h, tMs, p, state) {
       if (state._gen !== THEME.gen) { this.buildPalette(state); state._gen = THEME.gen; }
       // Speed calibration (gm-33fm): 0.25x the original rate, mirroring AnimCaustics.cpp.
-      const t = f32(f32((tMs >>> 0) * 0.25) * f32(0.001));
+      // Speed rides the same clock (gm-kh2s): it used to scale the wave
+      // phases alone and leave the heading drift below running at full rate,
+      // which is why Speed 0 still moved. speedMulJS(50) is exactly 1, so the
+      // default frame is unchanged.
+      const t = f32(f32(f32((tMs >>> 0) * 0.25) * f32(0.001)) * f32(speedMulJS(p[0])));
       const freqScale = f32(f32(0.55) + f32(f32(f32(1.9) - f32(0.55)) * f32(p[1] / 100)));
-      const speedScale = f32(f32(0.8) * f32(speedMulJS(p[0])));
+      const speedScale = f32(0.8);
       const thresh = f32(f32(0.14) + f32(f32(0.55) * f32(p[2] / 100)));
       const invSpan = f32(1 / Math.max(f32(1e-3), f32(1 - thresh)));
       const glow = paramSpan(p[3], f32(0.25), 1.0, 3.0);
