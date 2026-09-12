@@ -1119,22 +1119,26 @@ survived, and what the device taught:
   is a starting point and the measured band is the contract. It is also blind
   to whole pixel stutter, which is what `grain_ratio.js` is for: read its
   delta across a change, never its level.
+  **Two questions, two runs, and mixing them up cost a day** (gm-kh2s,
+  2026-09-12). How much an animation moves at Speed 50 next to the others is
+  the run above: a window fixed in wall clock, which is right, because it is a
+  person watching for a fixed time. Whether the Speed slider scales that
+  animation is `motion.js --matched`, which divides every time in the playback
+  by the setting's rate so each Speed sees the same window of animation time,
+  and reports `thalfAdjMs` with the rate multiplied back. **Do not use the
+  first run to answer the second question.** Its window sees 6.7 times more
+  animation time at Speed 100 than at Speed 50, so the level it calls "fully
+  changed" moves with the setting; judging the slider that way failed seven
+  animations whose clocks were correct and passed three that were not.
   **Where the fleet stands: 44 of 44 inside the band at Speed 50** (median
-  1180 ms, spread 1.5x, down from 144x), and 37 of 44 inside a factor of 1.6
-  of the curve at Speed 0, 25, 50, 75 and 100. The other seven are Glint,
-  Oculus, Ember, Brushed, Harmonograph, Stripes and Tide, and each of them
-  puts the fleet multiplier on one clock that every motion reads, so the rate
-  does follow the curve. What does not follow is how much of the picture that
-  rate changes, and the reason is the metric rather than the animation: the
-  half change time divides the one-step change by an estimate of "fully
-  changed", and that estimate is unreliable for a near-periodic picture, which
-  `MOTION.md` warns about. **So before changing a clock to chase the band,
-  read `chg66` across the slider**, which is the fraction of pixels that
-  change in one step and needs no such estimate. All seven rise at every stop,
-  so the slider does speed the picture up. Two that did not rise were real
-  defects and are fixed: Steam scaled its rise but not the puff lifetime or
-  the sway, and Ripples scaled the ring travel but not the drop interval or
-  the ring life, so Speed 100 showed less movement than Speed 75.
+  1180 ms, spread 1.5x, down from 144x) and **44 of 44 flat across the
+  slider** under `--matched`, worst 1.017x. Five animations scaled one term
+  and not the rest, and all five are fixed: Steam's rise without the puff
+  lifetime or the sway, Ripples' ring travel without the drop interval or the
+  ring life (so Speed 100 showed less movement than Speed 75), Starfield's
+  drift without the twinkle or the shooting stars, Lava's orbits without the
+  radius pulse, and Silk's travel and rotation without the width wobble. The
+  last three had passed every check the fleet had.
 - **The goldens cannot catch a port drifting from its page design, and for
   twenty animations it had** (gm-pciz, 2026-09-12). The goldens under
   `tools/animbench/golden` are rendered by the firmware, so `make check` only

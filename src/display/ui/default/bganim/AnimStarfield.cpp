@@ -315,7 +315,16 @@ void frame(uint32_t tMs, int w, int h, const uint8_t p[BG_ANIM_PARAMS]) {
         lastThemeGen = themeGen();
     }
     g_nStars = 40 + (p[1] * (MAX_STARS - 40)) / 100;
-    const float t = tMs * 0.001f;
+    // Speed scales the twinkle and the shooting stars as well as the drift
+    // (gm-kh2s, 2026-09-12). Only driftPxPerSec carried the multiplier, so
+    // raising the slider blew the stars across faster while each one still
+    // twinkled at its Speed 50 rate and the shooting stars still arrived on
+    // the same wall clock: the matched-window sweep read 1130 ms of half
+    // change time at Speed 0 against 1391 at Speed 100, where one clock for
+    // the whole animation reads the same number at every setting.
+    // speedMul(50) is exactly 1, so nothing moves at the default.
+    const float spd = speedMul(p[0]);
+    const float t = tMs * 0.001f * spd;
     const float twinkleAmt = p[2] * (1.0f / 100.0f); // reciprocal multiply: dividend isn't a compile-time
                                                      // constant, so the compiler can't fold /100.0f itself
     // Old formula was `scale = 1 - twinkleAmt*(1-twinkle)`, i.e. a depth
@@ -327,7 +336,7 @@ void frame(uint32_t tMs, int w, int h, const uint8_t p[BG_ANIM_PARAMS]) {
     // extinguish) at p[2]=100: 1 - (5/3)*(1-0.4) = 0. Expands only the top of
     // the range; p[2]<=50 is unchanged from before.
     const float twinkleDepth = twinkleAmt * (twinkleAmt * (4.0f / 3.0f) + (1.0f / 3.0f));
-    const float driftPxPerSec = 3.0f * speedMul(p[0]);
+    const float driftPxPerSec = 3.0f * spd;
 
     // Integer phase-wrap drift: replaces the old fmodf(absolute_position, w) with
     // a per-star Q16.16 accumulator stepped by real elapsed time (dt) and wrapped
@@ -392,11 +401,15 @@ void frame(uint32_t tMs, int w, int h, const uint8_t p[BG_ANIM_PARAMS]) {
     // Shooting star lifecycle (dt from the frame delta; robust to pauses).
     // The page's rule: 1/30 s on its first frame, the real delta after that,
     // and never negative.
-    const float dt = !haveLastT ? (1.0f / 30.0f) : (tMs > lastTMs ? (tMs - lastTMs) * 0.001f : 0.0f);
+    // The shooting-star clock is the same virtual one: dt is a virtual second
+    // and nextShootMs a virtual millisecond, so a star's flight and the wait
+    // for the next both scale. tv is the plain float cast at Speed 50.
+    const float tv = static_cast<float>(tMs) * spd;
+    const float dt = (!haveLastT ? (1.0f / 30.0f) : (tMs > lastTMs ? (tMs - lastTMs) * 0.001f : 0.0f)) * spd;
     haveLastT = true;
     lastTMs = tMs;
     const uint8_t shootFreq = p[3];
-    if (!shoot.active && shootFreq > 0 && static_cast<float>(tMs) > nextShootMs) {
+    if (!shoot.active && shootFreq > 0 && tv > nextShootMs) {
         const float angle = 3.14159265f * 0.15f + randf() * 3.14159265f * 0.2f;
         const float speed = 260.0f + randf() * 140.0f;
         shoot.active = true;
@@ -408,7 +421,7 @@ void frame(uint32_t tMs, int w, int h, const uint8_t p[BG_ANIM_PARAMS]) {
         shoot.maxLife = 0.5f + randf() * 0.3f;
         shoot.invMaxLife = 1.0f / shoot.maxLife; // one divide per shoot trigger (rare), not per band()
         const uint32_t interval = 1500 > 30000 - shootFreq * 280 ? 1500 : 30000 - shootFreq * 280;
-        nextShootMs = static_cast<float>(tMs + interval) + randf() * interval * 0.5f;
+        nextShootMs = tv + static_cast<float>(interval) + randf() * interval * 0.5f;
     }
     if (shoot.active) {
         shoot.life += dt;

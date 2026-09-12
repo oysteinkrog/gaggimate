@@ -691,7 +691,16 @@ void frame(uint32_t tMs, int, int, const uint8_t p[BG_ANIM_PARAMS]) {
     // rotation exactly as before, the pixel loop and the kernel read the same
     // kx, ky and wt, and the three breathe periods are untouched, which is
     // what the Speed slider itself has always done.
-    const float omega0 = 6.2831853f / 11650.0f * speedMul(p[0]); // 11.65s base drift at speed 50
+    // Speed also scales the k wobble below (gm-kh2s, 2026-09-12). omega0 feeds
+    // the travel and the rotation, and wv.wk is a third clock that read tMs on
+    // its own, so raising the slider left the waves' width breathing at its
+    // Speed 50 rate while everything else sped up: the matched-window sweep
+    // read 1187 ms of half change time at Speed 0 against 1198 at Speed 100
+    // with 1245 at 50, where one clock for the whole animation reads the same
+    // number at every setting. speedMul(50) is exactly 1, so nothing moves at
+    // the default.
+    const float spd = speedMul(p[0]);
+    const float omega0 = 6.2831853f / 11650.0f * spd; // 11.65s base drift at speed 50
     const float k0 = 0.008f + 0.022f * (p[1] / 100.0f);
     // "spread": how far apart the three waves point. 1.0 leaves each wave's
     // tuned heading alone; 0 collapses all three onto SPREAD_MID, which
@@ -751,7 +760,8 @@ void frame(uint32_t tMs, int, int, const uint8_t p[BG_ANIM_PARAMS]) {
         // Math.sin() on the page disagreed by one float ulp on a few calls in
         // two hundred frames, and one ulp here moves a phase step by one
         // unit. Nine calls a frame, none per pixel.
-        const float k = k0 * (1.0f + wobK * static_cast<float>(sin(static_cast<double>(wv.wk * tMs + wv.phk))));
+        const float wkSpd = wv.wk * spd;
+        const float k = k0 * (1.0f + wobK * static_cast<float>(sin(static_cast<double>(wkSpd * tMs + wv.phk))));
         wv.kx = k * static_cast<float>(cos(static_cast<double>(A)));
         wv.ky = k * static_cast<float>(sin(static_cast<double>(A)));
         g_step[i] = static_cast<int32_t>(wv.kx * TURN);
