@@ -311,7 +311,7 @@ export const BG_ANIMATIONS = [
     name: 'Crescent',
     description: 'A pale crescent turning, swelling and thinning.',
     params: [
-      { key: 'speed', label: 'Speed', def: 15 },
+      { key: 'speed', label: 'Speed', def: 50 },
       { key: 'size', label: 'Size', def: 70 },
       { key: 'phase', label: 'Phase range', def: 40 },
       { key: 'contrast', label: 'Contrast', def: 40 },

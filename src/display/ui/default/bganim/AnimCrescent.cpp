@@ -415,7 +415,7 @@ void release() {
 extern const BgAnimation bg_anim_crescent;
 const BgAnimation bg_anim_crescent = {
     "crescent", "Crescent",
-    {{"speed", "Speed", 15}, {"size", "Size", 70},
+    {{"speed", "Speed", 50}, {"size", "Size", 70},
      {"phase", "Phase range", 40}, {"contrast", "Contrast", 40}},
     init, frame, band, release, bandRef,
 };
