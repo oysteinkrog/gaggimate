@@ -191,7 +191,15 @@ extern std::atomic<uint32_t> g_harmoStampChecked;
 extern std::atomic<uint32_t> g_harmoStampMismatch;
 #endif
 
-void *alloc(size_t size); // PSRAM; see the hot slab above for the placement policy
+// Both allocators return memory aligned to this, so any table from bganim can
+// be a PIE kernel's source or destination: ee.vld/vst.128 zero the low four
+// address bits of their own access, and an unaligned table means reading the
+// wrong bytes or writing outside the block (see alloc() in the .cpp for the
+// crash that set this).
+constexpr size_t GM_BGANIM_ALLOC_ALIGN = 16;
+
+// PSRAM, 16-byte aligned; see the hot slab above for the placement policy.
+void *alloc(size_t size);
 
 // Give back one table from alloc() or allocHot(). Takes the size because the
 // counters have to be decremented by the same amount they were charged.

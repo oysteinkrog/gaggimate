@@ -167,11 +167,23 @@ void *allocHotShared(size_t size) {
 }
 
 void *alloc(size_t size) {
+    // 16-byte aligned, the same guarantee allocHot() gives, because a table
+    // from here can be a PIE kernel's source or destination and ee.vld/vst.128
+    // zero the low four address bits of their own access. ps_malloc promises
+    // four. On 2026-09-12 Truchet's blendLast came back 4-byte aligned on the
+    // bench board, every vector store landed up to twelve bytes before the
+    // block, the heap's head canary went with it, and the next free took the
+    // board down inside /api/debug/animtest. The host never showed it: glibc
+    // malloc is 16-byte aligned, so the goldens, the fuzzer and QEMU all agreed
+    // with a device that was writing outside its allocation. Aligning here
+    // rather than per table closes the whole class: an animation cannot get an
+    // unaligned table from bganim at all.
+    //
     // PSRAM by policy (see the header). The internal fall-back is for a build
     // without PSRAM or one that has exhausted it; on this board it never runs.
-    void *p = ps_malloc(size);
+    void *p = heap_caps_aligned_alloc(GM_BGANIM_ALLOC_ALIGN, size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (p == nullptr) {
-        p = heap_caps_malloc(size, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+        p = heap_caps_aligned_alloc(GM_BGANIM_ALLOC_ALIGN, size, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
         if (p != nullptr) {
             log_w("bganim: %u B in internal SRAM (PSRAM exhausted)", static_cast<unsigned>(size));
         }

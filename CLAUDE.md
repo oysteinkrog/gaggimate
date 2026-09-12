@@ -1014,7 +1014,17 @@ survived, and what the device taught:
   float state. The bare-metal QEMU harness sets it once in its own main().
 - **ee.vld/vst.128.ip mask the low four address bits silently**, so a PIE
   kernel aligns its spans with a scalar prefix, never by trusting the
-  pointer; `allocHot` returns 16-byte-aligned tables for this reason.
+  pointer. Both bganim allocators return 16-byte-aligned memory for this
+  reason: `allocHot` always did, and `alloc` does since 2026-09-12, when
+  Truchet's `blendLast` came back 4-byte aligned from `ps_malloc` and every
+  vector store landed up to twelve bytes before the block. That is the heap's
+  head canary, so the next free took the board down inside
+  `/api/debug/animtest` (`multi_heap_free ... head != NULL`, the render task's
+  backtrace ending in the animation's own `release`). **The host cannot show
+  this class of bug**: glibc malloc is 16-byte aligned, so the goldens, the
+  fuzzer, the lifecycle check and QEMU all agreed with a device that was
+  writing outside its allocation. Only `/api/debug/animtest` on the board
+  found it, and only because the free that asserts came after the test.
 - BAND_H is 2 (240 band() calls per frame), so per-call setup is paid 240
   times: a kernel's row-state builder is as hot as its pixel loop.
 - **Iterate on the device, not on predictions**: the `display-kdev` env

@@ -19,6 +19,11 @@ inline void (*gm_shim_free_hook)(void *) = nullptr;
 static inline void *gm_shim_malloc(size_t size) { return gm_shim_malloc_hook ? gm_shim_malloc_hook(size) : malloc(size); }
 static inline void *heap_caps_malloc(size_t size, int) { return gm_shim_malloc(size); }
 static inline void *ps_malloc(size_t size) { return gm_shim_malloc(size); }
+// The device needs this for the 16-byte alignment every PIE kernel depends on.
+// Host malloc already returns 16-byte aligned memory for every size the
+// animations ask for, so routing it through the same hook keeps the alignment
+// and keeps lifecycle_check's fault injection working.
+static inline void *heap_caps_aligned_alloc(size_t, size_t size, int) { return gm_shim_malloc(size); }
 static inline void heap_caps_free(void *p) {
     if (gm_shim_free_hook) {
         gm_shim_free_hook(p);
