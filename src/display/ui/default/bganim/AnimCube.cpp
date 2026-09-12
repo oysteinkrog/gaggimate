@@ -127,7 +127,13 @@ void frame(uint32_t tMs, int w, int h, const uint8_t p[BG_ANIM_PARAMS]) {
     // product before converting to float so days of uptime cannot erase
     // the fractional pose or overflow an integer conversion. 120,000 ms
     // is the common pose period; the 60 s spin repeats twice inside it.
-    const uint32_t speedQ24 = static_cast<uint32_t>(speedMul(p[0]) * 16777216.0f + 0.5f);
+    // Speed calibration (gm-33fm): the clock runs at 2.25x of the original
+    // rate, so Speed 50 gives about the same visible movement here as on
+    // every other animation. 2.25 is exact in float and in the page's
+    // double, so the two stay bit identical. The Speed parameter, its
+    // label and its default of 50 are unchanged.
+    constexpr float RATE_CAL = 2.25f;
+    const uint32_t speedQ24 = static_cast<uint32_t>(speedMul(p[0]) * RATE_CAL * 16777216.0f + 0.5f);
     const uint64_t timeQ24 = static_cast<uint64_t>(tMs) * speedQ24;
     const float ts = static_cast<float>(timeQ24 % (120000ULL << 24)) * (0.001f / 16777216.0f);
     // The page's pose offsets: tilt centres on 0.62 rad with a 0.30 rad

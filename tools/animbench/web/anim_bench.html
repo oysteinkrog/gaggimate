@@ -848,7 +848,11 @@ ANIMS.push({
   },
   render(data, w, h, tMs, p, state) {
     if (state._gen !== THEME.gen) { state.pal = themeRamp(); state._gen = THEME.gen; }
-    const t = tMs/1000;
+    // Speed calibration (gm-33fm): 0.25x the original rate, mirroring
+    // AnimCaustics.cpp. Scaling time itself keeps the wave phases and the
+    // heading drift in the same ratio, so only the pace changes.
+    const RATE_CAL = 0.25;
+    const t = tMs*RATE_CAL/1000;
     const freqScale = lerp(0.55, 1.9, p[1]/100);
     const speedScale = 0.8*speedMulJS(p[0]);
     const thresh = 0.14 + 0.55*(p[2]/100);
@@ -1354,7 +1358,9 @@ function buildRamp(stopsA, stopsB, blend) {
       if (state._gen !== THEME.gen) { state._pal = themeRampBytes(true); state._gen = THEME.gen; }
       const pal = state._pal;
       const glowGain = 0.55 + 0.014*p[1];
-      const t = (tMs*speedMulJS(p[0]))/1000;
+      // Speed calibration (gm-33fm): 1.75x, mirroring AnimEmber.cpp.
+      const RATE_CAL = 1.75;
+      const t = (tMs*(speedMulJS(p[0])*RATE_CAL))/1000;
       const pulseGain = p[3]/100;
       const B = 0.5 + pulseGain*(0.30*Math.sin(2*Math.PI*t/11.3)
                                 + 0.15*Math.sin(2*Math.PI*t/17.7 + 1.7)
@@ -1362,7 +1368,7 @@ function buildRamp(stopsA, stopsB, blend) {
       const breatheOffset = (B-0.5)*70;
       const flickerGain = p[2]/100;
       const flickerAmp = 10*flickerGain;
-      const vtMs = tMs*speedMulJS(p[0]);
+      const vtMs = tMs*(speedMulJS(p[0])*RATE_CAL);
       const scrollX = (vtMs*0.006)%256, scrollY = (vtMs*0.004)%256;
       // Height, Falloff, Core heat and Grain map as an offset from the
       // midpoint, the same way AnimEmber.cpp maps them, so 50 lands on the old
@@ -2694,8 +2700,11 @@ function bayerOffsets(dithOff, amp, unit) {
         }
       }
       const discR = state.discR, R2c = discR * discR, invK = state.invK;
-      const sp = 4 + Math.floor(p[0] * 44 / 100);
-      const base = ((t * sp) >>> 0);
+      // Speed calibration (gm-33fm): 0.75x, mirroring AnimCrescent.cpp.
+      // Three quarters of a whole-number rate is not a whole number, so the
+      // rate is carried as quarters and the product is shifted back down.
+      const sp4 = 3 * (4 + Math.floor(p[0] * 44 / 100));
+      const base = (Math.floor(t * sp4 / 4)) >>> 0;
       const angIdx = (base >>> 7) & (SIN_N - 1);
       const swellIdx = (base >>> 7) & (SIN_N - 1);
       const phBr = ((base * 3) >>> 0) >>> 9;
@@ -3573,7 +3582,9 @@ const pa_dith = (x, y) => (BAYER8[(y & 7) * 8 + (x & 7)] - 31.5) * (1 / 64);
         for (let k = 0; k < R; k++) state.chordO[k] = Math.round(Math.sqrt(R * R - k * k));
         for (let k = 0; k < RI; k++) state.chordI[k] = Math.round(Math.sqrt(RI * RI - k * k));
       }
-      const spd = speedMulJS(p[0]);
+      // Speed calibration (gm-33fm): 2.25x, mirroring AnimLens.cpp.
+      const RATE_CAL = 2.25;
+      const spd = speedMulJS(p[0]) * RATE_CAL;
       const t = tMs * spd;
       const { R, RI, chordO, chordI, tex, rimMul, ri2, span, invSpan } = state;
       // Travel scales how far the lens roams about the centre, drift the rate
@@ -4290,7 +4301,9 @@ const pa_dith = (x, y) => (BAYER8[(y & 7) * 8 + (x & 7)] - 31.5) * (1 / 64);
       }
       const { tabQ4, dith, pal, span, K, beatW, harm, base, dithMax } = state;
       const mainW = 8 - beatW;
-      const t = tMs * speedMulJS(p[0]);
+      // Speed calibration (gm-33fm): 0.59375x, mirroring AnimStripes.cpp.
+      const RATE_CAL = 0.59375;
+      const t = tMs * (speedMulJS(p[0]) * RATE_CAL);
       const tsec = t / 1000;
       const beatPhase = Math.floor(tsec * 21) & 1023;             // envelope 10 px/s
       // Weights 5 and 3, not 1 and 1: with equal gratings the node of the
@@ -5008,7 +5021,9 @@ function pcDither(dst, amp) {
       const pal32 = state.pal32, hQ = state.hQ, hI = state.hI;
       const ev = state.ev, evn = state.evn, rowCol = state.rowCol;
       const sky = state.sky, glowTab = state.glowTab, ss = state.ss;
-      const sm = speedMulJS(p[0]);
+      // Speed calibration (gm-33fm): 1.875x, mirroring AnimHills.cpp.
+      const RATE_CAL = 1.875;
+      const sm = speedMulJS(p[0]) * RATE_CAL;
       const tt = tMs * sm;
       const relief = 0.5 + p[1] * 0.012;
       const contrast = 0.6 + p[2] * 0.008;
@@ -5961,7 +5976,9 @@ function pcDither(dst, amp) {
       }
       data.set(state.bg);
 
-      const te = tMs * speedMulJS(p[0]);
+      // Speed calibration (gm-33fm): 2.25x, mirroring AnimCube.cpp.
+      const RATE_CAL = 2.25;
+      const te = tMs * (speedMulJS(p[0]) * RATE_CAL);
       const ts = te / 1000;
       const s = 88 + p[1] * 0.64;                          // half-size, ~88..152 px
       const AMP = 52 + Math.round(p[2] * 34 / 100);        // brightest single face

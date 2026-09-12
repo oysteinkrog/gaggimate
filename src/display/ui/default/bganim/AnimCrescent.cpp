@@ -127,11 +127,21 @@ void frame(uint32_t tMs, int w, int h, const uint8_t p[BG_ANIM_PARAMS]) {
         tablesValid = true;
     }
     // Use the actual page clocks. Its prose says about 13/16.5 seconds, but
-    // BOTH turn and swell use base>>7: a nominal 13107.2 ms cycle at default p0=15, sp=10.
-    // Body breathing is base*3>>9: 17476.2667 ms. Unsigned products preserve
-    // the page's >>>0 wraps at both multiplies, even near millis() rollover.
-    const uint32_t sp = 4 + static_cast<uint32_t>(p[0]) * 44 / 100;
-    const uint32_t base = tMs * sp;
+    // BOTH turn and swell use base>>7: a nominal 13107.2 ms cycle at default
+    // p0=15, sp=10, which the speed calibration below stretches to 17476.3 ms.
+    // Body breathing is base*3>>9: 17476.2667 ms, stretched to 23301.7 ms.
+    // The base*3 product still wraps as uint32, matching the page's >>>0, even
+    // near millis() rollover.
+    // Speed calibration (gm-33fm): the clock runs at 0.75x the original rate,
+    // so Speed 50 gives about the same visible movement here as on every other
+    // animation. The Speed parameter, its label and its default of 50 are
+    // unchanged. Three quarters of a whole-number rate is not a whole number,
+    // so the rate is carried as quarters (sp4 = 3 * the old rate) and the
+    // product is shifted back down. The multiply widens to 64 bits first: the
+    // old uint32 wrap would have thrown away the top two bits of the rate
+    // before the shift could use them. The page does the same arithmetic.
+    const uint32_t sp4 = 3u * (4u + static_cast<uint32_t>(p[0]) * 44 / 100);
+    const uint32_t base = static_cast<uint32_t>((static_cast<uint64_t>(tMs) * sp4) >> 2);
     const uint32_t angIdx = (base >> 7) & (SIN_N - 1);
     const uint32_t swellIdx = (base >> 7) & (SIN_N - 1);
     const uint32_t phBr = (base * 3u) >> 9;

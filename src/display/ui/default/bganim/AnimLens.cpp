@@ -237,7 +237,13 @@ void frame(uint32_t tMs, int, int, const uint8_t p[BG_ANIM_PARAMS]) {
     // precision after long uptimes; subsequent pixel math is exact integer.
     // Even UINT32_MAX at speed 100 keeps scrolls inside int32. Texture
     // cursors deliberately wrap uint32, avoiding signed left-shift overflow.
-    const float t = static_cast<float>(tMs) * speedMul(p[0]);
+    // Speed calibration (gm-33fm): the clock runs at 2.25x of the original
+    // rate, so Speed 50 gives about the same visible movement here as on
+    // every other animation. 2.25 is exact in float and in the page's
+    // double, so the two stay bit identical. The Speed parameter, its
+    // label and its default of 50 are unchanged.
+    constexpr float RATE_CAL = 2.25f;
+    const float t = static_cast<float>(tMs) * (speedMul(p[0]) * RATE_CAL);
     constexpr float TAU = 6.2831853071795864769f;
     // Travel scales how far the lens roams about the centre; at 0 it parks
     // at (240, 240) and only the ground moves under it. Drift scales the

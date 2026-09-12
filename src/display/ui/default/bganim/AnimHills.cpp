@@ -340,7 +340,13 @@ void frame(uint32_t tMs, int w, int h, const uint8_t p[BG_ANIM_PARAMS]) {
         }
         lastSky = p[6];
     }
-    const float tt = static_cast<float>(tMs) * speedMul(p[0]);
+    // Speed calibration (gm-33fm): the clock runs at 1.875x of the original
+    // rate, so Speed 50 gives about the same visible movement here as on
+    // every other animation. 1.875 is exact in float and in the page's
+    // double, so the two stay bit identical. The Speed parameter, its
+    // label and its default of 50 are unchanged.
+    constexpr float RATE_CAL = 1.875f;
+    const float tt = static_cast<float>(tMs) * (speedMul(p[0]) * RATE_CAL);
     const float relief = 0.5f + p[1] * 0.012f;
     const float contrast = 0.6f + p[2] * 0.008f;
     // Star density, p[7]: none at 0, the page's 90 at 50, 180 at 100. The

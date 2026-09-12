@@ -120,7 +120,13 @@ void frame(uint32_t tMs, int, int, const uint8_t p[BG_ANIM_PARAMS]) {
     // so the top of the table cannot run off the end of the palette.
     const int base = (static_cast<int>(p[6]) * 88 + 50) / 100;
     const float K = TURN / static_cast<float>(cyclePx);
-    const float tsec = (static_cast<float>(tMs) * speedMul(p[0])) * 0.001f;
+    // Speed calibration (gm-33fm): the clock runs at 0.59375x of the original
+    // rate, so Speed 50 gives about the same visible movement here as on
+    // every other animation. 0.59375 is exact in float and in the page's
+    // double, so the two stay bit identical. The Speed parameter, its
+    // label and its default of 50 are unchanged.
+    constexpr float RATE_CAL = 0.59375f;
+    const float tsec = (static_cast<float>(tMs) * (speedMul(p[0]) * RATE_CAL)) * 0.001f;
     // 21 sine entries/s is the page's nominal 10 px/s envelope drift.
     // Wide conversions keep days of uptime defined before the phase masks.
     const unsigned beatPhase = static_cast<uint64_t>(tsec * 21.0f) & 1023u;

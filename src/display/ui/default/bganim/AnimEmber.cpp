@@ -415,7 +415,13 @@ void frame(uint32_t tMs, int w, int h, const uint8_t p[BG_ANIM_PARAMS]) {
         lastFalloff = p[5];
         lastCore = p[6];
     }
-    const float spd = speedMul(p[0]);
+    // Speed calibration (gm-33fm): the clock runs at 1.75x of the original
+    // rate, so Speed 50 gives about the same visible movement here as on
+    // every other animation. 1.75 is exact in float and in the page's
+    // double, so the two stay bit identical. The Speed parameter, its
+    // label and its default of 50 are unchanged.
+    constexpr float RATE_CAL = 1.75f;
+    const float spd = speedMul(p[0]) * RATE_CAL;
     const uint32_t vt = static_cast<uint32_t>(static_cast<int64_t>(static_cast<double>(tMs) * spd));
     const float pulseGain = p[3] / 100.0f;
     const float s1 = sin1024((vt * STEP1) >> 22) * (1.0f / SIN_AMP);

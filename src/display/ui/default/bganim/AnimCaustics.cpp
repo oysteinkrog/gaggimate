@@ -369,7 +369,15 @@ void frame(uint32_t tMs, int, int, const uint8_t p[BG_ANIM_PARAMS]) {
         buildThemePalette();
         lastThemeGen = themeGen();
     }
-    const float t = tMs * 0.001f;
+    // Speed calibration (gm-33fm): the clock runs at 0.25x of the original
+    // rate, so Speed 50 gives about the same visible movement here as on
+    // every other animation. 0.25 is exact in float and in the page's
+    // double, so the two stay bit identical. The Speed parameter, its
+    // label and its default of 50 are unchanged.
+    // Scaling time itself keeps the wave phases and the heading drift in the
+    // same ratio, so only the pace changes.
+    constexpr float RATE_CAL = 0.25f;
+    const float t = tMs * RATE_CAL * 0.001f;
     const float freqScale = lerpf(0.55f, 1.9f, p[1] / 100.0f);
     const float speedScale = 0.8f * speedMul(p[0]);
     const float thresh = 0.14f + 0.55f * (p[2] / 100.0f); // p[2] = "contrast" param
