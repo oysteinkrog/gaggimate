@@ -267,7 +267,7 @@ export const BG_ANIMATIONS = [
     name: 'Mosaic',
     description: 'Large soft tiles, each fading on its own clock.',
     params: [
-      { key: 'speed', label: 'Speed', def: 15 },
+      { key: 'speed', label: 'Speed', def: 50 },
       { key: 'size', label: 'Tile size', def: 45 },
       { key: 'contrast', label: 'Contrast', def: 30 },
       { key: 'variation', label: 'Variation', def: 55 },

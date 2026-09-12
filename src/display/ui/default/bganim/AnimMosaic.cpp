@@ -254,16 +254,17 @@ void frame(uint32_t tMs, int w, int h, const uint8_t p[BG_ANIM_PARAMS]) {
     // 26. That is the measured landing at 1198 ms against the fleet target of
     // 1200 ms. The ramp keeps its shape, so the slider still spans a still
     // field at 0 through to the fastest the design ever ran, at a lower rate.
-    // Note that this animation's own Speed default is 15, not the 50 the
-    // fleet sweep measured at, so the shipped picture is slower still: sp is
-    // 6 there where it was 10.
+    // This animation used to ship a Speed default of 15, so the shipped
+    // picture ran at sp 10 and nobody saw the setting the fleet sweep
+    // measured. The default is 50 now, the same as every other animation, so
+    // the calibrated rate is the one a user gets without touching the slider.
     const uint32_t sp = 2 + static_cast<uint32_t>(p[0]) * 28 / 100;
     const uint32_t base = tMs * sp;
     const uint32_t phW1 = base >> 9, phW2 = (base * 3u) >> 10;
     // Contrast sets a tile's maximum excursion to 1900..3600 Q4 units.
     const int amp = 1900 + static_cast<int>(p[2]) * 1700 / 100;
-    // A tile's period is 1,048,576/(sp*rate) ms, 15.89..43.69 s at
-    // default speed (sp=6). The page header rounds that to 16..44 s.
+    // A tile's period is 1,048,576/(sp*rate) ms, 5.96..16.38 s at
+    // default speed (sp=16). The page header rounds that to 6..16 s.
     for (int i = 0; i < nRow * nCol; ++i) {
         const uint32_t idx = ((base * tRate[i]) >> 10) + tPhase[i];
         const int u = (sl[idx & (SIN_N - 1)] + 512) >> 1;
@@ -545,7 +546,7 @@ extern const BgAnimation bg_anim_mosaic;
 const BgAnimation bg_anim_mosaic = {
     "mosaic",
     "Mosaic",
-    {{"speed", "Speed", 15}, {"size", "Tile size", 45}, {"contrast", "Contrast", 30}, {"variation", "Variation", 55}},
+    {{"speed", "Speed", 50}, {"size", "Tile size", 45}, {"contrast", "Contrast", 30}, {"variation", "Variation", 55}},
     init,
     frame,
     band,

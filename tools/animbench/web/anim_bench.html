@@ -2142,7 +2142,7 @@ function bayerOffsets(dithOff, amp, unit) {
    one column's brightness ran the whole height of the panel. Each tile now
    carries its own level in a small two-dimensional table (at most 20 by 20,
    rebuilt per frame) driven by a cubed raised sine, so most tiles sit dark and
-   only a few are lit at any moment; they ease over 16 to 44 s at a per-tile
+   only a few are lit at any moment; they ease over 6 to 16 s at a per-tile
    rate under a slow diagonal wash. The tiles are large, about 110 px, and they
    no longer meet at a step: each axis carries the two tiles a pixel lies
    between and a smoothstep weight, so a tile crossfades into its neighbour over
@@ -2199,7 +2199,7 @@ function bayerOffsets(dithOff, amp, unit) {
   ANIMS.push({
     id: 'mosaic', name: 'Mosaic', webOnly: true,
     params: [
-      { key: 'speed', label: 'Speed', def: 15 },
+      { key: 'speed', label: 'Speed', def: 50 },
       { key: 'size', label: 'Tile size', def: 45 },
       { key: 'contrast', label: 'Contrast', def: 30 },
       { key: 'variation', label: 'Variation', def: 55 }],
