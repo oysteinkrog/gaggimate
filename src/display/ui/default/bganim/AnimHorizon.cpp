@@ -1,272 +1,332 @@
 #ifndef GAGGIMATE_SIM
 
-// "Quiet Horizon" - one gently curved horizon dividing two broad theme tones,
-// with a soft band of light along its edge, rising and falling slowly.
-// Brainstormed 2026-09-09 with GPT (Codex CLI, gpt-6-astra) as candidate 4 of
-// gm-4bd.
+// "Horizon" - a curved, gently swelling horizon with a soft glow above it
+// and a dim reflection below. This implements entry 15 of
+// tools/animbench/web/anim_bench.html, including its unsigned time wraps.
+// Two opposing sine waves ride a curvature parabola; two more move the whole
+// vertical gradient. At Speed 10 the swells travel about +11.90 and -6.82
+// px/s, and the main vertical drift repeats every 16.384 s.
 //
-// Same separable kernel as Plasma and Brushed Metal: index =
-// (colTermPh[x] + rowTerm[y]) >> 4, one palette gather. The two terms are
-// pure geometry. rowTerm is a linear ramp in y plus the height the horizon
-// currently sits at, so it is what moves; colTermPh is a shallow quadratic in
-// (x - cx), which is what bends the line into an arc, and it only changes when
-// the curvature parameter does.
+// The field is separable in Q4 palette-index units:
+//   pixel = palette[(colTermPh[(y & 7) * colStride + x] + rowTerm[y]) >> 4].
+// The palette contains the sky/ground gradients and both quartic glows.
+// Eight column copies carry the page's Bayer8 dither before the Q4 shift.
+// Each row uses its absolute y, including single-row interlaced calls.
 //
-// The horizon itself is entirely a palette shape, not a per-pixel test. The
-// palette is built once per parameter or theme change with the transition
-// pinned at index 128: a dark tone below, a lighter tone above, a smooth
-// crossing whose width is the Softness slider, and a rim highlight on top of
-// the crossing. Moving the horizon is then just moving rowTerm's offset, which
-// slides the whole index field past that fixed palette feature. Nothing per
-// pixel knows the horizon exists.
-//
-// Index safety. band() has no per-pixel bound check, so frame() keeps both
-// terms non-negative and clamps colTermPh into [0, 4095 - rowMax] after
-// measuring rowTerm's largest value. That holds at every parameter
-// combination, which is what the fuzz harness checks with the sanitizers on.
+// All per-pixel work is integer. The page's truncating signed divisions are
+// C++ divisions here, and its signed >> operations are arithmetic shifts on
+// both supported compilers. Float only builds the 64 dither offsets. No
+// speedMul() substitution: this page uses its older integer speed curve.
+// The host PPM writer expands RGB565 with channel*255/31 (or /63); the
+// page replicates bits instead. Their RGB888 values can differ by one
+// while the underlying panel RGB565 word agrees exactly.
 
 #include "BgAnim.h"
 #include "BgAnimCommon.h"
 #include <string.h>
 
+// On by default as requested; device parity and a production A/B still
+// decide the speed claim. Setting this to 0 renders bandRef on the device.
+#ifndef GM_BGANIM_HORIZON_ASM
+#define GM_BGANIM_HORIZON_ASM 1
+#endif
+
 namespace {
 using namespace bganim;
 
-constexpr int INDEX_MAX = 4095; // (colTermPh + rowTerm) must stay in 0..INDEX_MAX
-// Sum-unit budget, where 16 sum units are one palette index. The vertical
-// ramp spans ROW_SPAN from the bottom row to the top, the horizon's height
-// offset lives in [HEIGHT_LO, HEIGHT_HI], and the arc bends by at most
-// CURVE_SPAN. The largest sum is HEIGHT_HI + ROW_SPAN + CURVE_SPAN plus the
-// dither, which is 3,956 of the 4,095 the palette index allows.
-constexpr int ROW_SPAN = 1400;
-constexpr int HEIGHT_LO = 600;
-constexpr int HEIGHT_HI = 1900;
-constexpr int HEIGHT_TRAVEL = 210; // the largest drift either side of the mean
-constexpr int CURVE_SPAN = 400;
+constexpr int INDEX_MAX = 4095; // 12-bit Q4 sum, hence a 0..255 palette index
+constexpr int ROW_SPAN = 2200;  // bottom-to-top rise in Q4 sum units
+constexpr int CURVE_SPAN = 420; // maximum signed parabola amplitude
+constexpr int HEIGHT_LO = 520, HEIGHT_HI = 1420; // Height slider's mean offset
 
-int16_t *colCurve = nullptr;  // frame() only -> PSRAM
-int16_t *colTermPh = nullptr; // read every pixel -> slab, 8 y-phase copies
-int16_t *rowTerm = nullptr;   // read once per row -> slab
-uint16_t *themeRamp = nullptr; // frame() only -> PSRAM
-uint16_t *palette = nullptr;  // read every pixel -> slab
+int16_t *colCurve = nullptr;   // w samples, rebuilt in frame(): PSRAM
+int16_t *colTermPh = nullptr;  // eight Bayer row phases, read per pixel: slab
+int16_t *rowTerm = nullptr;    // one Q4 offset per absolute row: slab
+uint16_t *themeRamp = nullptr; // 256 theme colours, palette rebuild only: PSRAM
+uint16_t *palette = nullptr;   // 256 RGB565 colours, per-pixel gather: slab
+int16_t *dithOff = nullptr;    // 64 Bayer offsets, frame() only: PSRAM
 
-int16_t dithOff[64] = {0};
-
+int allocW = 0, allocH = 0, colStride = 0;
 uint8_t lastP[4] = {255, 255, 255, 255};
 uint32_t lastThemeGen = 0xFFFFFFFF;
-int lastCurveP = -1;
-int allocW = 0, allocH = 0;
 
-// Table placement, against the 9,216 B per-animation slab:
-//   colTermPh  7,680 B  read every pixel                   HOT
-//   rowTerm      960 B  read once per row                  HOT
-//   palette      512 B  read every pixel, data-dependent   HOT
-//   -------------------------------------------------------------
-//              9,152 B of 9,216 B
-//   colCurve     960 B  read only in frame()               PSRAM
-//   themeRamp    512 B  read only when the palette is
-//                       rebuilt                            PSRAM
+// At 480x480: colTermPh 7,680 B + rowTerm 960 B + palette 512 B =
+// 9,152 B of the 9,216 B slab. colCurve 960 B, themeRamp 512 B and
+// dithOff 128 B use PSRAM. colStride rounds w up to eight int16 samples,
+// aligning every phase for PIE without changing the page's useful samples.
+// At 466x466 the allocations plus slab alignment consume 9,008 B, and
+// at 233x233 they consume 4,832 B. No pixel gather falls back to PSRAM.
 void release();
 
 bool init(int w, int h) {
-    if (sinLut() == nullptr) {
+    if (w != allocW || h != allocH) {
+        release();
+    }
+    if (w <= 0 || h <= 0 || sinLut() == nullptr) {
+        release();
         return false;
     }
+    allocW = w;
+    allocH = h;
+    colStride = (w + 7) & ~7;
     if (colCurve == nullptr) {
-        colCurve = static_cast<int16_t *>(alloc(w * sizeof(int16_t)));
-        if (colCurve == nullptr) {
-            release(); // a partial set must not survive a failed init (gm-bzu.15)
-            return false;
-        }
-        allocW = w;
+        colCurve = static_cast<int16_t *>(alloc(static_cast<size_t>(w) * sizeof(int16_t)));
     }
     if (colTermPh == nullptr) {
-        colTermPh = static_cast<int16_t *>(allocHot(8 * allocW * sizeof(int16_t)));
-        if (colTermPh == nullptr) {
-            release();
-            return false;
-        }
+        colTermPh = static_cast<int16_t *>(allocHot(static_cast<size_t>(8 * colStride) * sizeof(int16_t)));
     }
     if (rowTerm == nullptr) {
-        rowTerm = static_cast<int16_t *>(allocHot(h * sizeof(int16_t)));
-        if (rowTerm == nullptr) {
-            release();
-            return false;
-        }
-        allocH = h;
+        rowTerm = static_cast<int16_t *>(allocHot(static_cast<size_t>(h) * sizeof(int16_t)));
     }
     if (themeRamp == nullptr) {
         themeRamp = static_cast<uint16_t *>(alloc(256 * sizeof(uint16_t)));
-        if (themeRamp == nullptr) {
-            release();
-            return false;
-        }
     }
     if (palette == nullptr) {
         palette = static_cast<uint16_t *>(allocHot(256 * sizeof(uint16_t)));
-        if (palette == nullptr) {
-            release();
-            return false;
-        }
+    }
+    if (dithOff == nullptr) {
+        dithOff = static_cast<int16_t *>(alloc(64 * sizeof(int16_t)));
+    }
+    if (!colCurve || !colTermPh || !rowTerm || !themeRamp || !palette || !dithOff) {
+        release(); // release the entire partial set before an OOM retry
+        return false;
     }
     return true;
 }
 
-// The palette carries the whole look: ground below, sky above, a crossing of
-// half-width `soft` centred on index 128, and a rim highlight inside it.
-void buildPalette(int softP) {
+void buildHorizonPalette(int softP) {
     buildThemeRamp(themeRamp, 256);
-    // Half-width of the crossing in palette indices. The vertical ramp puts
-    // about 0.18 of an index on each row, so 2..24 indices is a transition
-    // 11 to 130 pixels tall: wide enough to read as soft, narrow enough that
-    // the horizon does not dissolve into a plain gradient.
-    const int soft = 2 + softP * 22 / 100;
-    const int rim = 2 + soft / 4;
+    const int soft = 22 + softP * 50 / 100; // glow half-width: 22..72 indices
+    const int glow = 100 + softP * 64 / 100; // main glow gain: 100..164
     for (int i = 0; i < 256; i++) {
-        const int d = i - 128;
-        // Smooth crossing from the ground tone to the sky tone. The cubic is
-        // the usual smoothstep, evaluated in Q8 so there is no float here.
-        int t;
-        if (d <= -soft) {
-            t = 0;
-        } else if (d >= soft) {
-            t = 256;
-        } else {
-            const int u = ((d + soft) << 8) / (2 * soft); // 0..256
-            t = (u * u * (768 - 2 * u)) >> 16;            // 3u^2 - 2u^3, Q8
-            t = t < 0 ? 0 : (t > 256 ? 256 : t);
+        const int d = i - 128; // horizon at the middle of the palette
+        // Actual page ramp positions: sky 42 down to 12, ground 10 up to
+        // 34, before the two glows. Signed division truncates toward zero.
+        int v = d >= 0 ? 42 - d * 30 / 127 : 34 + d * 24 / 128;
+        int c = d - soft / 6; // main crest slightly above the horizon
+        int ac = c < 0 ? -c : c;
+        if (ac < soft) {
+            const int k = 256 - ac * 256 / soft;
+            const int kk = (k * k) >> 8; // Q8 triangle squared, then squared again
+            v += (((kk * kk) >> 8) * glow) >> 8;
         }
-        // Ground 24..64 of the theme ramp, sky 96..208, plus a slow gradient
-        // inside each so neither half is a flat wash.
-        const int ground = 24 + ((i * 40) >> 8);
-        const int sky = 96 + ((i * 112) >> 8);
-        int v = ground + (((sky - ground) * t) >> 8);
-        // Rim: a triangular bump right at the crossing.
-        const int ad = d < 0 ? -d : d;
-        if (ad < rim) {
-            v += ((255 - v) * (rim - ad)) / (2 * rim);
+        c = d + soft / 2; // reflection below, at one third the gain
+        ac = c < 0 ? -c : c;
+        if (d < 0 && ac < soft) {
+            const int k = 256 - ac * 256 / soft;
+            const int kk = (k * k) >> 8;
+            v += (((kk * kk) >> 8) * (glow / 3)) >> 8;
         }
         palette[i] = themeRamp[v < 0 ? 0 : (v > 255 ? 255 : v)];
     }
-    // ditherAmp() returns the MEAN step spacing of the palette, and this
-    // palette is deliberately not uniform: the two broad tones step slowly and
-    // want a large amplitude, the crossing between them steps every index or
-    // two and wants almost none. At full amplitude the crossing showed a
-    // visible crosshatch in the host render while the flat tones were already
-    // clean, so the mean is halved here. The flat tones still dither, which is
-    // where the banding actually is.
-    const float amp = ditherAmp(palette, 256) * 0.5f;
+    // bayerOffsets(ditherAmpJS(pal) * 0.45, 16): 16 converts palette
+    // indices to Q4, and 31.5 centres the 0..63 Bayer matrix. lroundf
+    // matches the page's lround (half away from zero).
+    const float amp = ditherAmp(palette, 256) * 0.45f;
     for (int k = 0; k < 64; k++) {
-        const float d = (static_cast<float>(BAYER8[k]) - 31.5f) * (amp * 16.0f / 31.5f);
-        dithOff[k] = static_cast<int16_t>(lroundf(d));
-    }
-}
-
-// The arc. p[2] is signed about its midpoint, so 0 bends the horizon one way,
-// 100 the other and 50 is a straight line. The result is shifted so its
-// smallest value is 0, which is what keeps the sum non-negative later.
-void buildCurve(int curveP, int w) {
-    const int cx = w / 2;
-    const int span = cx > 0 ? cx : 1;
-    const int k = (curveP - 50) * CURVE_SPAN / 50; // -CURVE_SPAN..CURVE_SPAN
-    int lo = 32767;
-    for (int x = 0; x < w; x++) {
-        const int dx = x - cx;
-        // dx*dx/span^2 in Q8, so the edge of the panel is 256 and the centre 0.
-        const int q = (dx * dx * 256) / (span * span);
-        const int v = (k * (q > 256 ? 256 : q)) >> 8;
-        colCurve[x] = static_cast<int16_t>(v);
-        if (v < lo) {
-            lo = v;
-        }
-    }
-    for (int x = 0; x < w; x++) {
-        colCurve[x] = static_cast<int16_t>(colCurve[x] - lo);
+        dithOff[k] = static_cast<int16_t>(lroundf((BAYER8[k] - 31.5f) * (amp * 16.0f / 31.5f)));
     }
 }
 
 void frame(uint32_t tMs, int w, int h, const uint8_t p[BG_ANIM_PARAMS]) {
-    if (memcmp(p, lastP, 4) != 0 || themeGen() != lastThemeGen) {
-        buildPalette(p[3]);
-        lastThemeGen = themeGen();
+    const uint32_t gen = themeGen();
+    if (memcmp(p, lastP, 4) != 0 || gen != lastThemeGen) {
+        buildHorizonPalette(p[3]);
+        lastThemeGen = gen;
+        memcpy(lastP, p, 4);
     }
-    if (p[2] != lastCurveP) {
-        buildCurve(p[2], w);
-        lastCurveP = p[2];
-    }
-    memcpy(lastP, p, 4);
 
-    // Time. Unsigned throughout, so the millis() wrap is a phase wrap.
-    const uint32_t sp = 4 + static_cast<uint32_t>(p[0]) * 44 / 100; // 0.25x..3x
-    const uint32_t ph = (tMs * sp) >> 12;                           // very slow
+    // Exactly the page's >>> 0 after each multiplication, before shifting.
+    // Speed 10 gives sp=8. The main vertical phase advances 62.5 sine
+    // samples/s (1024 per turn); the other advances 39.0625/s.
+    const uint32_t sp = 4 + static_cast<uint32_t>(p[0]) * 44 / 100;
+    const uint32_t base = tMs * sp;
+    const uint32_t phu = base >> 9, phu2 = (base * 3u) >> 10;
+    const uint32_t phd = base >> 7, phd2 = (base * 5u) >> 10;
     const int16_t *sl = sinLut();
-    // Height: the mean comes from the slider, the travel is a slow sine plus a
-    // second one at an unrelated rate so the motion never looks like a loop.
-    // The mean is inset by the travel, so the sum of the two always lands
-    // inside [HEIGHT_LO, HEIGHT_HI] and the drift is never clipped flat at the
-    // ends of the slider.
-    const int lo = HEIGHT_LO + HEIGHT_TRAVEL;
-    const int hiMean = HEIGHT_HI - HEIGHT_TRAVEL;
-    const int mean = lo + static_cast<int>(p[1]) * (hiMean - lo) / 100;
-    const int drift = ((sl[ph & (SIN_N - 1)] * 150) >> 9) + ((sl[((ph * 3) >> 2) & (SIN_N - 1)] * 60) >> 9);
-    int offset = mean + drift;
-    if (offset < HEIGHT_LO) {
-        offset = HEIGHT_LO;
-    }
-    if (offset > HEIGHT_HI) {
-        offset = HEIGHT_HI;
-    }
-
-    const int denom = h > 1 ? h - 1 : 1;
-    int rowMax = 0;
-    for (int y = 0; y < h; y++) {
-        const int v = offset + (h - 1 - y) * ROW_SPAN / denom;
-        rowTerm[y] = static_cast<int16_t>(v);
-        if (v > rowMax) {
-            rowMax = v;
+    const int cx = w / 2, span = cx > 0 ? cx : 1;
+    const int k = (static_cast<int>(p[2]) - 50) * CURVE_SPAN / 50;
+    int lo = 32767, hi = -32768;
+    for (int x = 0; x < w; x++) {
+        const int dx = x - cx;
+        int q = dx * dx * 256 / (span * span); // squared radius, Q8
+        if (q > 256) {
+            q = 256;
         }
+        // 21/16 and 55/16 sine samples/pixel. Subtract phu for rightward
+        // travel, add phu2 for leftward travel. Amplitudes are Q4 units.
+        const int v = ((k * q) >> 8) +
+                      ((sl[(static_cast<uint32_t>((x * 21) >> 4) - phu) & (SIN_N - 1)] * 150) >> 9) +
+                      ((sl[(static_cast<uint32_t>((x * 55) >> 4) + phu2) & (SIN_N - 1)] * 72) >> 9);
+        colCurve[x] = static_cast<int16_t>(v);
+        if (v < lo) lo = v;
+        if (v > hi) hi = v;
     }
-
-    const int hi = INDEX_MAX - rowMax;
-    for (int ph8 = 0; ph8 < 8; ph8++) {
-        int16_t *dstPh = colTermPh + static_cast<size_t>(ph8) * w;
-        const int16_t *off = &dithOff[ph8 * 8];
+    for (int x = 0; x < w; x++) {
+        colCurve[x] = static_cast<int16_t>(colCurve[x] - lo);
+    }
+    // Reserve the page's 40 sum units beyond the measured profile range,
+    // then clamp dither to that range even when its amplitude is larger.
+    const int colMax = hi - lo + 40;
+    const int mean = HEIGHT_LO + static_cast<int>(p[1]) * (HEIGHT_HI - HEIGHT_LO) / 100;
+    const int offset = mean + ((sl[phd & (SIN_N - 1)] * 240) >> 9) +
+                       ((sl[phd2 & (SIN_N - 1)] * 110) >> 9);
+    const int denom = h > 1 ? h - 1 : 1;
+    const int rowHi = INDEX_MAX - colMax;
+    for (int y = 0; y < h; y++) {
+        int v = offset + (h - 1 - y) * ROW_SPAN / denom;
+        rowTerm[y] = static_cast<int16_t>(v < 0 ? 0 : (v > rowHi ? rowHi : v));
+    }
+    for (int ph = 0; ph < 8; ph++) {
+        int16_t *ct = colTermPh + static_cast<size_t>(ph) * colStride;
         for (int x = 0; x < w; x++) {
-            int v = colCurve[x] + off[x & 7];
-            v = v < 0 ? 0 : (v > hi ? hi : v);
-            dstPh[x] = static_cast<int16_t>(v);
+            const int v = colCurve[x] + dithOff[ph * 8 + (x & 7)];
+            ct[x] = static_cast<int16_t>(v < 0 ? 0 : (v > colMax ? colMax : v));
         }
     }
 }
 
-// Portable on every target, so the descriptor's bandRef slot is nullptr, which
-// is what BgAnim.h asks for when there is no second path to compare against.
-void band(uint16_t *dst, int y0, int rows, int w, uint32_t, const uint8_t *) {
+// The page's sepBand, packing pairs into aligned 32-bit stores. Bounds are
+// established in frame(): ct is 0..colMax and rt is 0..4095-colMax, hence
+// sum is 0..4095 and the page's final &255 is redundant. No row state or
+// dither phase depends on band size.
+// Even at parameter extremes colMax <= 420 + 2*(150+72) + 40 = 904,
+// so rowHi stays positive and PIE's signed 16-bit sum cannot saturate.
+GM_ANIM_IRAM void bandRef(uint16_t *__restrict dst, int y0, int rows, int w, uint32_t, const uint8_t *) {
     for (int y = y0; y < y0 + rows; y++) {
         const int rt = rowTerm[y];
-        const int16_t *ct = colTermPh + static_cast<size_t>(y & 7) * w;
+        const int16_t *__restrict ct = colTermPh + static_cast<size_t>(y & 7) * colStride;
+        const uint16_t *__restrict pal = palette;
         int x = 0;
         for (; x + 1 < w; x += 2) {
-            const uint16_t c0 = palette[(ct[x] + rt) >> 4];
-            const uint16_t c1 = palette[(ct[x + 1] + rt) >> 4];
+            const uint16_t c0 = pal[(ct[x] + rt) >> 4];
+            const uint16_t c1 = pal[(ct[x + 1] + rt) >> 4];
             *reinterpret_cast<uint32_t *>(dst) = static_cast<uint32_t>(c0) | (static_cast<uint32_t>(c1) << 16);
             dst += 2;
         }
-        for (; x < w; x++) {
-            *dst++ = palette[(ct[x] + rt) >> 4];
+        if (x < w) {
+            *dst++ = pal[(ct[x] + rt) >> 4];
         }
     }
 }
 
+#if GM_BGANIM_HORIZON_ASM && defined(__XTENSA__) && !defined(GM_BGANIM_NO_ASM)
+// GCC 14's bandRef .L4 loop was the starting schedule: l16si hi/lo,
+// add hi, srai hi, add lo, addx2 hi, srai lo, l16ui hi, addx2 lo,
+// l16ui lo, slli hi, or, s32i, then two pointer increments. That is
+// 15 instructions/pair with every load-use gap filled already.
+//
+// The edge GCC cannot take is eight parallel Q4 adds in PIE. Keep the sums
+// in q0, extract four 32-bit pairs with EE.MOVI.32.A, and use EXTUI at
+// bits 4 and 20 for the two 8-bit indices. This avoids a vector store and
+// eight scalar reloads through scratch. The palette remains a scalar
+// gather, scheduled high then low so SLLI fills the low load's use gap.
+// 43 instructions/eight pixels, 5.375 instructions/pixel, inside LOOPNEZ.
+// The vector load's gap is the output pointer increment. With SRAM hits
+// there are no unfilled load-use gaps in the body: 5.375 cycles/pixel is
+// an issue-model floor, not a measured device time. Flash fetch, task
+// preemption and per-row setup still need the production timing rung.
+//
+// ct is 16-byte aligned by allocHot and colStride, including 466/233
+// widths. Only complete vectors are loaded, so padding is never read.
+// out is only required to be 4-byte aligned, as BgAnim.h promises; PIE
+// never stores through it. Subtracting 16 inside asm lets the loop's first
+// increment fill the load gap without a negative-offset store. That
+// temporary address is never dereferenced. No C++ pointer goes before out.
+//
+// q0/q1 are compiler-invisible PIE registers and need no GCC clobber names.
+// Production never writes CPENABLE: FreeRTOS saves CP3 state lazily. This
+// kernel does not change SAR. EE.MOVI.32.A selectors 0..3 were separately
+// probed under QEMU before inclusion here; the full kernel has a verbatim
+// twin in tools/qemubench/tests/anim_horizon/main.c.
+GM_ANIM_IRAM __attribute__((noinline)) void horizonRowAsm(uint16_t *out, const int16_t *ct,
+                                                        const uint16_t *pal, int rt, int w) {
+    uint16_t *outp = out;
+    const int16_t *ctp = ct;
+    const uint32_t rowPair = (uint32_t)rt | ((uint32_t)rt << 16);
+    const int groups = w >> 3;
+    uint32_t packed, lo, hi;
+    asm volatile("ee.movi.32.q q1, %[rt], 0\n"
+                 "ee.movi.32.q q1, %[rt], 1\n"
+                 "ee.movi.32.q q1, %[rt], 2\n"
+                 "ee.movi.32.q q1, %[rt], 3\n"
+                 "addi %[out], %[out], -16\n"
+                 "loopnez %[n], 1f\n"
+                 "ee.vld.128.ip q0, %[ct], 16\n"
+                 "addi %[out], %[out], 16\n"
+                 "ee.vadds.s16 q0, q0, q1\n"
+                 "ee.movi.32.a q0, %[packed], 0\n"
+                 "extui %[lo], %[packed], 4, 8\n"
+                 "extui %[hi], %[packed], 20, 8\n"
+                 "addx2 %[lo], %[lo], %[pal]\n"
+                 "addx2 %[hi], %[hi], %[pal]\n"
+                 "l16ui %[hi], %[hi], 0\n"
+                 "l16ui %[lo], %[lo], 0\n"
+                 "slli %[hi], %[hi], 16\n"
+                 "or %[hi], %[hi], %[lo]\n"
+                 "s32i %[hi], %[out], 0\n"
+                 "ee.movi.32.a q0, %[packed], 1\n"
+                 "extui %[lo], %[packed], 4, 8\n"
+                 "extui %[hi], %[packed], 20, 8\n"
+                 "addx2 %[lo], %[lo], %[pal]\n"
+                 "addx2 %[hi], %[hi], %[pal]\n"
+                 "l16ui %[hi], %[hi], 0\n"
+                 "l16ui %[lo], %[lo], 0\n"
+                 "slli %[hi], %[hi], 16\n"
+                 "or %[hi], %[hi], %[lo]\n"
+                 "s32i %[hi], %[out], 4\n"
+                 "ee.movi.32.a q0, %[packed], 2\n"
+                 "extui %[lo], %[packed], 4, 8\n"
+                 "extui %[hi], %[packed], 20, 8\n"
+                 "addx2 %[lo], %[lo], %[pal]\n"
+                 "addx2 %[hi], %[hi], %[pal]\n"
+                 "l16ui %[hi], %[hi], 0\n"
+                 "l16ui %[lo], %[lo], 0\n"
+                 "slli %[hi], %[hi], 16\n"
+                 "or %[hi], %[hi], %[lo]\n"
+                 "s32i %[hi], %[out], 8\n"
+                 "ee.movi.32.a q0, %[packed], 3\n"
+                 "extui %[lo], %[packed], 4, 8\n"
+                 "extui %[hi], %[packed], 20, 8\n"
+                 "addx2 %[lo], %[lo], %[pal]\n"
+                 "addx2 %[hi], %[hi], %[pal]\n"
+                 "l16ui %[hi], %[hi], 0\n"
+                 "l16ui %[lo], %[lo], 0\n"
+                 "slli %[hi], %[hi], 16\n"
+                 "or %[hi], %[hi], %[lo]\n"
+                 "s32i %[hi], %[out], 12\n"
+                 "1:\n"
+                 : [out] "+&r"(outp), [ct] "+&r"(ctp), [packed] "=&r"(packed), [lo] "=&r"(lo), [hi] "=&r"(hi)
+                 : [rt] "r"(rowPair), [n] "r"(groups), [pal] "r"(pal)
+                 : "memory");
+    // At most seven remaining pixels, including the 233-wide odd tail.
+    // Use the original pointers: the asm output cursor names its last group.
+    for (int x = groups << 3; x < w; x++) {
+        out[x] = pal[(ct[x] + rt) >> 4];
+    }
+}
+
+GM_ANIM_IRAM void band(uint16_t *dst, int y0, int rows, int w, uint32_t, const uint8_t *) {
+    for (int y = y0; y < y0 + rows; y++) {
+        horizonRowAsm(dst, colTermPh + static_cast<size_t>(y & 7) * colStride, palette, rowTerm[y], w);
+        dst += w;
+    }
+}
+#else
+GM_ANIM_IRAM void band(uint16_t *dst, int y0, int rows, int w, uint32_t tMs, const uint8_t *p) {
+    bandRef(dst, y0, rows, w, tMs, p);
+}
+#endif
+
 void release() {
     releaseTable(colCurve, static_cast<size_t>(allocW) * sizeof(int16_t));
-    releaseTable(colTermPh, static_cast<size_t>(8 * allocW) * sizeof(int16_t));
+    releaseTable(colTermPh, static_cast<size_t>(8 * colStride) * sizeof(int16_t));
     releaseTable(rowTerm, static_cast<size_t>(allocH) * sizeof(int16_t));
     releaseTable(themeRamp, 256 * sizeof(uint16_t));
     releaseTable(palette, 256 * sizeof(uint16_t));
-    allocW = allocH = 0;
+    releaseTable(dithOff, 64 * sizeof(int16_t));
+    allocW = allocH = colStride = 0;
     lastThemeGen = 0xFFFFFFFF;
-    lastCurveP = -1;
     lastP[0] = lastP[1] = lastP[2] = lastP[3] = 255;
 }
 
@@ -281,7 +341,7 @@ const BgAnimation bg_anim_horizon = {
     frame,
     band,
     release,
-    nullptr,
+    bandRef,
 };
 
 #endif // GAGGIMATE_SIM
