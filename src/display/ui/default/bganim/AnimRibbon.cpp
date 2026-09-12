@@ -152,12 +152,15 @@ void frame(uint32_t tMs, int w, int h, const uint8_t p[BG_ANIM_PARAMS]) {
         lastGlow = p[5];
     }
     // Time remains a pure function of tMs, including speed changes. Q24
-    // carries the float speed multiplier over the 0..100 range; the 64-bit
-    // product stays below 2^59 even at millis() wrap. Reduce each cycle
+    // carries the float speed multiplier over the 0..100 range, and the 1.5
+    // speed calibration (gm-33fm) with it: an exact binary fraction, so this
+    // clock and the page's double clock scale alike, and both the twist and
+    // the backdrop wash below read it. The 64-bit product stays below 2^60
+    // even at millis() wrap. Reduce each cycle
     // before converting to float so days of uptime do not erase sub-row
     // phase precision. JS uses double speed math; its last bits can drift
     // from this float speed at long uptimes, on host and device alike.
-    const uint32_t speedQ24 = static_cast<uint32_t>(speedMul(p[0]) * 16777216.0f);
+    const uint32_t speedQ24 = static_cast<uint32_t>(speedMul(p[0]) * 1.5f * 16777216.0f);
     const uint64_t ttQ24 = static_cast<uint64_t>(tMs) * speedQ24;
     const float tPhase = static_cast<float>(ttQ24 % (24000ull << 24)) *
                          (1024.0f / (24000.0f * 16777216.0f)); // 24 s twist

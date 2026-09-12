@@ -655,6 +655,12 @@ bool init(int w, int h) {
 }
 
 void frame(uint32_t tMs, int w, int, const uint8_t p[BG_ANIM_PARAMS]) {
+    // Speed calibration (gm-33fm). The whole clock is multiplied, both the
+    // orbit rate below and the radius pulse further down, so the picture
+    // sequence is the one this file always drew and only the pace changes.
+    // 4.0 is an exact binary fraction, so the page's double clock and this
+    // float clock scale by the same amount.
+    constexpr float RATE_CAL = 4.0f;
     const float omega0 = 6.2831853f / 45000.0f * speedMul(p[0]); // 45s base cycle at speed 50
     const float sizeMul = 0.6f + (p[1] / 100.0f);
     const float intensity = 0.5f + (p[2] / 100.0f) * 1.3f;
@@ -721,7 +727,8 @@ void frame(uint32_t tMs, int w, int, const uint8_t p[BG_ANIM_PARAMS]) {
         lavaLUT[p2] = static_cast<int16_t>(contribution + 0.5f);
     }
 
-    const float t = tMs * omega0;
+    const float tCal = tMs * RATE_CAL;
+    const float t = tCal * omega0;
     for (int i = 0; i < activeBlobs; i++) {
         const BlobDef &d = blobDef[i];
         BlobState &b = blob[i];
@@ -734,7 +741,7 @@ void frame(uint32_t tMs, int w, int, const uint8_t p[BG_ANIM_PARAMS]) {
         const float ay2 = d.ay2 * wander;
         b.bx = d.cx + ax1 * fastSinRad(t * d.fx1 + d.px1) + ax2 * fastSinRad(t * d.fx2 * 1.7f + d.px2);
         b.by = d.cy + ay1 * fastCosRad(t * d.fy1 * 1.13f + d.py1) + ay2 * fastSinRad(t * d.fy2 * 0.9f + d.py2);
-        const float R = (d.R0 + d.Rpulse * fastSinRad(tMs * d.wR + d.phR)) * sizeMul;
+        const float R = (d.R0 + d.Rpulse * fastSinRad(tCal * d.wR + d.phR)) * sizeMul;
         b.R2 = R * R;
         b.invR2 = 1.0f / b.R2;
         // Constant curvature of tt(x) = 1 - invR2*((x-bx)^2 + dy^2): the x^2

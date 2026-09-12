@@ -167,13 +167,16 @@ bool init(int w, int h) {
 
 // Rounded tMs*rate*speed modulo 1024. A Q0.32 rate keeps sub-unit motion
 // throughout millis()'s uint32 range, where a float product would lose whole
-// sine cells. The largest rate is 0.090*speedMul(100) < 1 unit/ms, so its
-// Q32 value fits uint32 and the product plus the rounding bit fits uint64.
+// sine cells. The largest rate is 0.1593*speedMul(100), which is just over
+// 1 unit/ms since the speed calibration (gm-33fm), so the Q32 rate is held
+// in uint64. The product can then pass 2^64 at the very top of millis(); the
+// wrap is harmless because it keeps the low 64 bits and the phase is read
+// out of bits 32 to 41.
 // This is derived from absolute time, like the page, with no frame history.
 // Rates are single precision on the device, so phase thresholds can differ
 // slightly from the page's double clock. There is no per-pixel wide math.
 uint32_t phaseAt(uint32_t tMs, float rate, float speed) {
-    const uint32_t rateQ32 = static_cast<uint32_t>(rate * speed * 4294967296.0f);
+    const uint64_t rateQ32 = static_cast<uint64_t>(rate * speed * 4294967296.0f);
     return static_cast<uint32_t>((static_cast<uint64_t>(tMs) * rateQ32 + (uint64_t(1) << 31)) >> 32) &
            (SIN_N - 1);
 }
@@ -316,12 +319,15 @@ void frame(uint32_t tMs, int, int, const uint8_t p[BG_ANIM_PARAMS]) {
         lastContrast = p[4];
     }
     const float speed = speedMul(p[0]);
-    // Page rates: outward bands at 90 sine units/s (1024/90 = 11.377... s
-    // per cycle), angular phase at 11.38 units/s (89.982... s per cycle).
+    // Page rates: outward bands at 159.3 sine units/s (6.428... s per
+    // cycle), angular phase at 20.14 units/s (50.838... s per cycle). Both
+    // are the old 0.090 and 0.01138 times the 1.77 speed calibration
+    // (gm-33fm), folded into one literal each so this file and the page read
+    // the same decimal.
     // The wall's rotation takes a second speed curve of its own, exactly 1x
     // at 50, so the turn can be paced apart from the outward bands.
-    const uint32_t dPhase = 0u - phaseAt(tMs, 0.090f, speed);
-    const uint32_t aPhase = phaseAt(tMs, 0.01138f, speed * speedMul(p[7]));
+    const uint32_t dPhase = 0u - phaseAt(tMs, 0.1593f, speed);
+    const uint32_t aPhase = phaseAt(tMs, 0.0201426f, speed * speedMul(p[7]));
     const int bandK = 14 + (static_cast<int>(p[1]) * 20 + 50) / 100; // 14..34, default 24
     // Q9 gains that always sum to 1024, so s keeps its 0..2048 range at every
     // split and neither the saturating add nor the u16 multiply can overflow.

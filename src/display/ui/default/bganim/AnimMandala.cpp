@@ -638,7 +638,11 @@ void frame(uint32_t tMs, int, int, const uint8_t p[BG_ANIM_PARAMS]) {
     }
     g_N = 4 + (p[1] * 8) / 100;
     g_sxOffset = (g_N & 1) ? 128 : 0;
-    const float t = tMs * 0.001f * 0.35f * speedMul(p[0]);
+    // 0.35 was the base rate; 1.75 is the speed calibration (gm-33fm), an
+    // exact binary fraction so the page's double clock and this float clock
+    // scale alike. Every term below reads this one clock, so the picture
+    // sequence is unchanged and only the pace moves.
+    const float t = tMs * 0.001f * 0.35f * 1.75f * speedMul(p[0]);
     const float turb = 0.25f + (p[2] / 100.0f) * 1.1f;
     g_rOffsetScale = static_cast<int>(turb * 18.0f);
     g_ringNum = p[7] <= 50 ? (p[7] * 60) / 50 : 60 + ((p[7] - 50) * 120) / 50;

@@ -311,7 +311,12 @@ void frame(uint32_t, int, int, const uint8_t p[BG_ANIM_PARAMS]) {
         lastDrift = p[4];
     }
     // Per-frame deltas matched to the web preview at ~30fps: px/frame * 256.
-    const float g = 1.2f * speedMul(p[0]);
+    // 1.2 was the base drift gain; 0.3925 is the speed calibration
+    // (gm-33fm), which slows every octave by the same factor. The value is
+    // not a round one because scrollStep below truncates each octave's step
+    // to a whole Q8 unit per frame: at 0.3925 all six components land just
+    // above an integer, so this port keeps the page's rate to within 0.6%.
+    const float g = 1.2f * 0.3925f * speedMul(p[0]);
     // Layer speed: how much faster the 2x and 4x octaves drift than the
     // dominant one. Exactly 1.0f at the default, 0.0f at slider 0 (the fine
     // detail sits still over the moving base) and 2.0f at 100.

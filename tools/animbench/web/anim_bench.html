@@ -403,6 +403,12 @@ function gradLUT(stops) { // stops: [[t0..255, r, g, b], ...] -> Uint8Array 256*
     },
     render(data, w, h, tMs, p, state) {
       const [speed, scale, glow, count, core, falloff, contrast, wander] = p;
+      // Speed calibration (gm-33fm). The whole clock is multiplied, both the
+      // orbit rate below and the radius pulse further down, so the picture
+      // sequence is the one this entry always drew and only the pace changes.
+      // 4.0 is an exact binary fraction, so the page's double clock and the
+      // firmware's float clock scale by the same amount.
+      const RATE_CAL = 4.0;
       const omega0 = 2*Math.PI / 45000 * speedMulJS(speed); // 45s base cycle at 50
       const sizeMul = 0.6 + (scale/100);
       const intensity = 0.5 + (glow/100)*1.3;
@@ -416,14 +422,15 @@ function gradLUT(stops) { // stops: [[t0..255, r, g, b], ...] -> Uint8Array 256*
         state._gen = THEME.gen; state._gain = gain;
       }
       const pal = state.pal;
-      const t = tMs * omega0;
+      const tCal = tMs * RATE_CAL;
+      const t = tCal * omega0;
       const live = state.blobs.slice(0, nBlobs);
       for (const b of live) {
         const ax1 = b.ax1*wanderMul, ax2 = b.ax2*wanderMul;
         const ay1 = b.ay1*wanderMul, ay2 = b.ay2*wanderMul;
         b.bx = b.cx + ax1*Math.sin(t*b.fx1+b.px1) + ax2*Math.sin(t*b.fx2*1.7+b.px2);
         b.by = b.cy + ay1*Math.cos(t*b.fy1*1.13+b.py1) + ay2*Math.sin(t*b.fy2*0.9+b.py2);
-        const R = (b.R0 + b.Rpulse*Math.sin(tMs*b.wR + b.phR)) * sizeMul;
+        const R = (b.R0 + b.Rpulse*Math.sin(tCal*b.wR + b.phR)) * sizeMul;
         b.R2 = R*R; b.invR2 = 1/b.R2;
       }
       const field = state.field;
@@ -902,7 +909,11 @@ ANIMS.push({
     }
     const N = Math.max(3, Math.round(4 + (p[1]/100)*8));
     const turb = 0.25 + (p[2]/100)*1.1;
-    const t = tMs*0.001*0.35*speedMulJS(p[0]);
+    // 0.35 was the base rate; 1.75 is the speed calibration (gm-33fm), an
+    // exact binary fraction so the page's double clock and the firmware's
+    // float clock scale alike. Every term below reads this one clock, so the
+    // picture sequence is unchanged and only the pace moves.
+    const t = tMs*0.001*0.35*1.75*speedMulJS(p[0]);
     const threeLayers = p[2] > 60;
     const cx = w/2, cy = h/2, maxR = Math.min(w,h)*0.5;
     const pal = state.pal, outside = state.outside;
@@ -1426,7 +1437,12 @@ function buildRamp(stopsA, stopsB, blend) {
         state._pal = pal; state._gen = THEME.gen; state._contrast = p[3];
       }
       const pal = state._pal;
-      const driftGain = 1.2*speedMulJS(p[0]);
+      // 1.2 was the base drift gain; 0.3925 is the speed calibration
+      // (gm-33fm), which slows every octave by the same factor. The value is
+      // not a round one because the firmware truncates each octave's step to a
+      // whole Q8 unit per frame: at 0.3925 all six components land just above
+      // an integer, so the port keeps this rate to within 0.6%.
+      const driftGain = 1.2*0.3925*speedMulJS(p[0]);
       // Layer speed scales the 2x and 4x octaves only; Drift angle turns all
       // three direction vectors together. Both are 1 and 0 degrees at 50.
       const layerGain = driftGain*(1 + (p[7]-50)*0.02);
@@ -3052,12 +3068,15 @@ const pa_dith = (x, y) => (BAYER8[(y & 7) * 8 + (x & 7)] - 31.5) * (1 / 64);
         state.contrastKey = p[4];
       }
       const spd = speedMulJS(p[0]);
-      // Bands out at one cycle per 11.4 s, the wall around at 1024 units per 90 s.
+      // Bands out at one cycle per 6.4 s, the wall around at 1024 units per
+      // 51 s. Both rates are the old 0.090 and 0.01138 times the 1.77 speed
+      // calibration (gm-33fm), folded into one literal each so the page and
+      // the firmware read the same decimal.
       // aTerm carries the +1024 bias, so s stays in 0..2048 and never wraps.
       // The wall's rotation takes a second speed curve of its own, exactly 1x
       // at 50, so the turn can be paced apart from the outward bands.
-      const dPhase = -Math.round(tMs * 0.090 * spd) | 0;
-      const aPhase = Math.round(tMs * 0.01138 * spd * speedMulJS(p[7])) | 0;
+      const dPhase = -Math.round(tMs * 0.1593 * spd) | 0;
+      const aPhase = Math.round(tMs * 0.0201426 * spd * speedMulJS(p[7])) | 0;
       // 14 to 34, 24 at the default. The ceiling is the ring budget: the band
       // gradient is 0.24 palette steps per unit of pitch at the rim, where the
       // depth gain is highest, and past about 8 steps per cell the cell edges
@@ -3729,7 +3748,10 @@ const pa_dith = (x, y) => (BAYER8[(y & 7) * 8 + (x & 7)] - 31.5) * (1 / 64);
         state.baseIdx = Math.floor((p[6] * 40 + 50) / 100);       // 0..40
       }
       const { bell, rowQ4, dith, pat, pal, invW, nBand, amp, baseIdx } = state;
-      const t = tMs * speedMulJS(p[0]);
+      // 2.125 is the speed calibration (gm-33fm), an exact binary fraction so
+      // the page's double clock and the firmware's float clock scale alike.
+      // Every band period below reads this one clock.
+      const t = tMs * 2.125 * speedMulJS(p[0]);
       // Band centres: one sine table read each, Q0 pixels.
       const cy = new Array(NBAND_MAX).fill(0);
       for (let k = 0; k < nBand; k++) {
@@ -4448,8 +4470,12 @@ function pcDither(dst, amp) {
       }
       const pal32 = state.pal32, gt = state.gt, dith = state.dith, bgIdx = state.bgIdx;
       const sm = speedMulJS(p[0]);
-      const tt = tMs * sm;
-      const tPhase = (tt / 24000) * 1024;              // one twist per 24 s at speed 50
+      // 1.5 is the speed calibration (gm-33fm), an exact binary fraction so
+      // the page's double clock and the firmware's Q24 clock scale alike.
+      // Both the twist and the backdrop wash read this one clock, so the
+      // picture sequence is unchanged and only the pace moves.
+      const tt = tMs * sm * 1.5;
+      const tPhase = (tt / 24000) * 1024;              // one twist per 16 s at speed 50
       const ky = (1024 / 600) * (0.45 + p[2] * 0.011); // turns along y
       const halfMax = 58 + p[1] * 1.15;                // px, 115 at the default
       const bgPh = (tt / 21000) * 1024;
@@ -5188,7 +5214,11 @@ function pcDither(dst, amp) {
       if (state.dkey !== dkey) { state.dkey = dkey; pcDither(state.dith, (p[7] * 44) / 1000); }
       const pal32 = state.pal32, C = state.C, R = state.R, D = state.D, dith = state.dith;
       const sm = speedMulJS(p[0]);
-      const tt = tMs * sm;
+      // 1.65625 is the speed calibration (gm-33fm), an exact binary fraction
+      // so the page's double clock and the firmware's float clock scale
+      // alike. All three clocks below read it, so the picture sequence is
+      // unchanged and only the pace moves.
+      const tt = tMs * sm * 1.65625;
       const k = 2 + Math.round(p[1] * 0.04);        // 4 at the default: 256 px per cell
       // Aspect in Q8: half the column cell count at slider 0, the same at 50,
       // double at 100. The rounding gives back exactly k at 50 for every k.

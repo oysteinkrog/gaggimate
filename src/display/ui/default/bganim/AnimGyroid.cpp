@@ -137,7 +137,11 @@ void frame(uint32_t tMs, int w, int h, const uint8_t p[BG_ANIM_PARAMS]) {
         buildDither(floorFromParam(ground), ampFromParam(grain));
         lastDitherKey = ditherKey(ground, grain);
     }
-    const float tt = static_cast<float>(tMs) * speedMul(p[0]);
+    // 1.65625 is the speed calibration (gm-33fm), an exact binary fraction
+    // so the page's double clock and this float clock scale alike. All three
+    // clocks below read it, so the picture sequence is unchanged and only the
+    // pace moves.
+    const float tt = static_cast<float>(tMs) * 1.65625f * speedMul(p[0]);
     const int k = 2 + (static_cast<int>(p[1]) * 4 + 50) / 100;
     // Aspect, Q8 against the column cell count: half at slider 0, the same at
     // 50, double at 100. The +128 rounds, so slider 50 gives back exactly k
@@ -155,13 +159,16 @@ void frame(uint32_t tMs, int w, int h, const uint8_t p[BG_ANIM_PARAMS]) {
     const float zm = mo <= 50 ? static_cast<float>(mo) / 50.0f : 1.0f + static_cast<float>(mo - 50) / 25.0f;
     // The page's |0 truncates before its &1023. Float setup is intentional
     // on LX7; uint32 covers the whole uint32 tMs lifetime at speed 100
-    // (under 924 million ticks), then the table lookup wraps the phase.
+    // (under 1.53 billion ticks since the speed calibration), then the table
+    // lookup wraps the phase. The z clock alone can pass uint32 at the top of
+    // the morph slider, so it goes through uint64 first and wraps modulo
+    // 2^32, which is what the page's |0 does.
     // Float can move a late-uptime boundary by a tick versus JS doubles;
     // it never changes the rates or overflows a conversion.
     const float aTicks = (tt / 32000.0f) * 1024.0f;
     const uint32_t tA = static_cast<uint32_t>(aTicks);
     const uint32_t tB = static_cast<uint32_t>((tt / 64000.0f) * 1024.0f);
-    const uint32_t tZ = static_cast<uint32_t>(aTicks * zm);
+    const uint32_t tZ = static_cast<uint32_t>(static_cast<uint64_t>(aTicks * zm));
     const int z = sine[tZ & 1023u];
     const int zc = sine[(tZ + 256u) & 1023u];
     for (int x = 0; x < w; ++x) {

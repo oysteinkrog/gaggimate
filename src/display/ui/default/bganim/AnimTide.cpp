@@ -181,7 +181,10 @@ void frame(uint32_t tMs, int, int h, const uint8_t p[BG_ANIM_PARAMS]) {
     // float rounding can move a phase bucket relative to JavaScript double,
     // but the periods and speeds are unchanged. uint64 conversion before
     // masking stays defined even at UINT32_MAX milliseconds.
-    const float t = static_cast<float>(tMs) * speedMul(p[0]);
+    // 2.125 is the speed calibration (gm-33fm), an exact binary fraction so
+    // the page's double clock and this float clock scale alike. Every band
+    // period below reads this one clock.
+    const float t = static_cast<float>(tMs) * 2.125f * speedMul(p[0]);
     // The page uses an arithmetic >>9 on signed sine*amp. Explicit floor
     // division preserves that rule on a portable C++17 implementation too.
     int cy[BAND_MAX];
