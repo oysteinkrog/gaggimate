@@ -3,7 +3,9 @@
 #include "BgAnim.h"
 #include "BgAnimThemeTable.h"
 #include <ctype.h>
+#include <stdio.h>
 #include <string.h>
+#include <vector>
 
 // Built-in color themes: 6 RGB stops each, dark -> bright. The table comes
 // from data/gradients.json through scripts/gen_gradients.py, which writes the
@@ -14,8 +16,16 @@ namespace {
 
 using Theme = bganim_gen::ThemeDef;
 
+#ifdef GM_BGANIM_TEST_TABLE
+// Host tests swap this for a longer table (bg_test_set_theme_table), which is
+// how the frozen legacy sentinel is checked against a table this build does
+// not ship. Firmware never defines the macro and keeps the constants.
+const Theme *THEMES = bganim_gen::THEME_DEFS;
+int THEME_COUNT = bganim_gen::THEME_DEF_COUNT;
+#else
 constexpr const Theme *THEMES = bganim_gen::THEME_DEFS;
 constexpr int THEME_COUNT = bganim_gen::THEME_DEF_COUNT;
+#endif
 
 int hexNibble(char c) {
     if (c >= '0' && c <= '9') {
@@ -236,13 +246,23 @@ const char *bg_theme_category_name(int i) {
 
 const uint8_t (*bg_theme_stops(int i))[3] { return THEMES[(i >= 0 && i < THEME_COUNT) ? i : 0].stops; }
 
+bool bg_custom_valid(const char *custom) {
+    uint8_t stops[BG_THEME_MAX_STOPS][3];
+    return parseCustom(custom, stops) > 0;
+}
+
 void bg_resolve_theme(int themeId, const char *custom, uint8_t stops[BG_THEME_MAX_STOPS][3], int &nStops) {
-    if (themeId == THEME_COUNT) {
+    // The legacy namespace, frozen at BG_THEME_LEGACY_CUSTOM rather than read
+    // off the table length (BgAnim.h says why at length). Anything outside
+    // 0..18 is a legacy integer this firmware never wrote and reads as 0.
+    if (themeId == BG_THEME_LEGACY_CUSTOM) {
         const int n = parseCustom(custom, stops);
         if (n > 0) {
             nStops = n;
             return;
         }
+        themeId = 0;
+    } else if (themeId < 0 || themeId >= BG_THEME_LEGACY_CUSTOM) {
         themeId = 0;
     }
     const uint8_t(*src)[3] = bg_theme_stops(themeId);
@@ -342,19 +362,39 @@ bool bg_ref_valid(const char *ref) {
     return parseRef(ref, builtin, libId);
 }
 
+namespace {
+
+// A built-in straight out of the table, evenly spaced, which is how built-in
+// gradients have always been drawn.
+void fillBuiltin(int themeId, uint8_t stops[BG_THEME_MAX_STOPS][3], uint8_t pos[BG_THEME_MAX_STOPS], int &nStops,
+                 bool &uniform) {
+    memcpy(stops, bg_theme_stops(themeId), 6 * 3);
+    nStops = 6;
+    uniform = true;
+    for (int i = 0; i < 6; i++) {
+        pos[i] = static_cast<uint8_t>((i * 255) / 5);
+    }
+}
+
+} // namespace
+
 void bg_resolve_anim_theme(int animId, const char *map, const char *library, const char *globalRef, int themeId,
                            const char *custom, uint8_t stops[BG_THEME_MAX_STOPS][3], uint8_t pos[BG_THEME_MAX_STOPS],
                            int &nStops, bool &uniform) {
     int builtin;
     int libId;
-    // Step one: this animation's own override.
+    // Step one: this animation's own override. An explicit ref is its own
+    // namespace, so a built-in it names is read straight out of the table and
+    // never routed through the legacy branch below: on a build whose table is
+    // long enough, the ref "18" is the built-in at index 18, even while a
+    // legacy 18 in bgAnimTheme still means the custom gradient.
     if (parseRef(mapRef(map, animId), builtin, libId)) {
         if (libId > 0 && bg_library_lookup(library, libId, stops, pos, nStops, uniform)) {
             return;
         }
         if (builtin >= 0 && builtin < THEME_COUNT) {
-            themeId = builtin;
-            globalRef = nullptr; // an override that names a built-in wins outright
+            fillBuiltin(builtin, stops, pos, nStops, uniform);
+            return; // an override that names a built-in wins outright
         }
     }
     // Step two: the global default, which unlike themeId can name one of the
@@ -366,7 +406,8 @@ void bg_resolve_anim_theme(int animId, const char *map, const char *library, con
             return;
         }
         if (builtin >= 0 && builtin < THEME_COUNT) {
-            themeId = builtin;
+            fillBuiltin(builtin, stops, pos, nStops, uniform);
+            return;
         }
     }
     // Step three: what the setting did before the global ref existed.
@@ -375,6 +416,247 @@ void bg_resolve_anim_theme(int animId, const char *map, const char *library, con
     for (int i = 0; i < nStops; i++) {
         pos[i] = static_cast<uint8_t>((i * 255) / (nStops - 1));
     }
+}
+
+#ifdef GM_BGANIM_TEST_TABLE
+void bg_test_set_theme_table(const bganim_gen::ThemeDef *defs, int count) {
+    THEMES = defs != nullptr ? defs : bganim_gen::THEME_DEFS;
+    THEME_COUNT = defs != nullptr ? count : bganim_gen::THEME_DEF_COUNT;
+}
+#endif
+
+// ---- carrying the legacy custom gradient into the library ----------------
+
+namespace {
+
+// The name a migrated entry gets. Never used to find one: a device migrated
+// by the first version of this code has an entry called "Custom" and a user
+// can rename or delete it, so the match below is on the gradient itself.
+constexpr const char *kMigratedName = "Custom";
+
+// Does ref name something that exists right now? An unresolved ref is the
+// reason the legacy fallback behind it has to be kept.
+bool refResolves(const char *ref, const char *library) {
+    int builtin;
+    int libId;
+    if (ref == nullptr || *ref == '\0' || !parseRef(ref, builtin, libId)) {
+        return false;
+    }
+    if (libId > 0) {
+        uint8_t stops[BG_THEME_MAX_STOPS][3];
+        uint8_t pos[BG_THEME_MAX_STOPS];
+        int nStops = 0;
+        bool uniform = true;
+        return bg_library_lookup(library, libId, stops, pos, nStops, uniform);
+    }
+    return builtin >= 0 && builtin < THEME_COUNT;
+}
+
+// Marks every library id a stored ref names, whether or not it exists today.
+// A new entry must not take one of these: a dangling "c5" that suddenly
+// resolved would change what that animation draws.
+void reserveRefIds(const char *refs, bool *reserved, int reservedLen) {
+    if (refs == nullptr) {
+        return;
+    }
+    const char *s = refs;
+    while (*s != '\0') {
+        if (*s != ';') {
+            int builtin;
+            int libId;
+            if (parseRef(s, builtin, libId) && libId > 0 && libId < reservedLen) {
+                reserved[libId] = true;
+            }
+        }
+        skipEntry(s);
+    }
+}
+
+} // namespace
+
+BgGradientMigration bg_plan_gradient_migration(const char *library, const char *custom, int themeId,
+                                               const char *globalRef, const char *map) {
+    BgGradientMigration plan;
+
+    uint8_t stops[BG_THEME_MAX_STOPS][3];
+    uint8_t pos[BG_THEME_MAX_STOPS];
+    bool uniform = true;
+    const int n = parseGradient(custom, stops, pos, uniform);
+    if (n == 0) {
+        plan.reason = "no legacy custom gradient stored";
+        return plan;
+    }
+    // The legacy resolver throws explicit positions away and interpolates
+    // evenly, so the copy has to be the uniform form, or the picture changes
+    // the moment it is drawn from the library instead.
+    char wanted[BG_GRADIENT_STR_MAX];
+    if (bg_format_gradient(stops, pos, n, true, wanted, sizeof(wanted)) == 0) {
+        plan.action = BgGradientMigration::Deferred;
+        plan.reason = "the custom gradient does not fit the library format";
+        return plan;
+    }
+
+    if (!bg_library_valid(library)) {
+        plan.action = BgGradientMigration::Deferred;
+        plan.reason = "the stored gradient library is malformed";
+        return plan;
+    }
+
+    // Ids 1..BG_GRADIENT_LIB_MAX + 1: with at most BG_GRADIENT_LIB_MAX entries
+    // one of them is always free, unless a stored ref has reserved it.
+    constexpr int kIdSlots = BG_GRADIENT_LIB_MAX + 2;
+    bool taken[kIdSlots] = {false};
+    int entryCount = 0;
+    int matchId = -1;
+    walkLibrary(library, [&](int id, const char *, int, const char *gradient) {
+        entryCount++;
+        if (id > 0 && id < kIdSlots) {
+            taken[id] = true;
+        }
+        if (matchId < 0) {
+            uint8_t s2[BG_THEME_MAX_STOPS][3];
+            uint8_t p2[BG_THEME_MAX_STOPS];
+            bool u2 = true;
+            const int n2 = parseGradient(gradient, s2, p2, u2);
+            // Same semantics means the same colours in the same order AND
+            // even spacing. An entry with the same colours at its own
+            // positions draws differently, and it is the user's, so it is
+            // left alone and a new entry is allocated instead.
+            if (n2 == n && u2) {
+                char canon[BG_GRADIENT_STR_MAX];
+                if (bg_format_gradient(s2, p2, n2, true, canon, sizeof(canon)) > 0 && strcmp(canon, wanted) == 0) {
+                    matchId = id;
+                }
+            }
+        }
+        return false;
+    });
+    reserveRefIds(globalRef, taken, kIdSlots);
+    reserveRefIds(map, taken, kIdSlots);
+
+    if (matchId > 0) {
+        plan.entryId = matchId;
+    } else {
+        if (entryCount >= BG_GRADIENT_LIB_MAX) {
+            plan.action = BgGradientMigration::Deferred;
+            plan.reason = "the gradient library is full";
+            return plan;
+        }
+        int id = 1;
+        while (id < kIdSlots && taken[id]) {
+            id++;
+        }
+        if (id >= kIdSlots) {
+            plan.action = BgGradientMigration::Deferred;
+            plan.reason = "no free gradient id";
+            return plan;
+        }
+        const int written = snprintf(plan.entry, sizeof(plan.entry), "%d|%s|%s", id, kMigratedName, wanted);
+        if (written <= 0 || static_cast<size_t>(written) >= sizeof(plan.entry)) {
+            plan.action = BgGradientMigration::Deferred;
+            plan.reason = "the custom gradient does not fit the library format";
+            return plan;
+        }
+        const size_t have = library != nullptr ? strlen(library) : 0;
+        const size_t grown = have + (have > 0 ? 1 : 0) + static_cast<size_t>(written);
+        if (grown > static_cast<size_t>(BG_GRADIENT_LIB_MAX_LEN)) {
+            plan.action = BgGradientMigration::Deferred;
+            plan.reason = "the gradient library is full";
+            return plan;
+        }
+        plan.appendEntry = true;
+        plan.entryId = id;
+    }
+
+    // Is the custom gradient what the global fallback draws right now? Only
+    // then does the migration publish a ref of its own.
+    const bool globalEmpty = globalRef == nullptr || *globalRef == '\0';
+    const bool legacyNamesCustom = themeId == BG_THEME_LEGACY_CUSTOM;
+    if (globalEmpty && legacyNamesCustom) {
+        plan.setGlobalRef = true;
+        snprintf(plan.globalRef, sizeof(plan.globalRef), "c%d", plan.entryId);
+    }
+
+    // Retiring the legacy pair is safe only when nothing still needs it:
+    //  - the migration is publishing the replacement ref itself, or
+    //  - bgAnimTheme does not name the custom gradient at all, so the legacy
+    //    fallback draws a built-in and the string is already inert, or
+    //  - the stored global ref already resolves to this very entry, which is
+    //    what a re-run after a partly persisted migration sees.
+    // Anything else means an unresolved ref could come back to the legacy
+    // fallback, so both legacy fields stay exactly as they are.
+    char ownRef[8];
+    snprintf(ownRef, sizeof(ownRef), "c%d", plan.entryId);
+    const bool globalIsThisEntry = !globalEmpty && strcmp(globalRef, ownRef) == 0 && refResolves(globalRef, library);
+    if (plan.setGlobalRef || !legacyNamesCustom || globalIsThisEntry) {
+        plan.retireLegacy = true;
+        plan.themeAfter = legacyNamesCustom ? 0 : themeId;
+    } else {
+        plan.reason = "a newer global gradient is stored; the legacy fallback stays";
+    }
+
+    plan.action = (plan.appendEntry || plan.setGlobalRef || plan.retireLegacy) ? BgGradientMigration::Migrate
+                                                                              : BgGradientMigration::None;
+    if (plan.action == BgGradientMigration::None && plan.reason[0] == '\0') {
+        plan.reason = "already carried over";
+    }
+    return plan;
+}
+
+BgMigrateResult bg_run_gradient_migration(const BgGradientStore &store, const BgGradientMigration &plan) {
+    if (plan.action == BgGradientMigration::None) {
+        return BgMigrateResult::NothingToDo;
+    }
+    if (plan.action == BgGradientMigration::Deferred) {
+        return BgMigrateResult::Deferred;
+    }
+    if (store.library == nullptr || store.setLibrary == nullptr || store.setGlobalRef == nullptr ||
+        store.setLegacy == nullptr || store.flush == nullptr) {
+        return BgMigrateResult::Incomplete;
+    }
+    // Step one: the destination entry, durable before anything points at it.
+    if (plan.appendEntry) {
+        const char *have = store.library(store.user);
+        const size_t haveLen = have != nullptr ? strlen(have) : 0;
+        const size_t need = haveLen + (haveLen > 0 ? 1 : 0) + strlen(plan.entry) + 1;
+        if (need > static_cast<size_t>(BG_GRADIENT_LIB_MAX_LEN) + 1) {
+            return BgMigrateResult::Incomplete;
+        }
+        // Heap, not stack: this runs at boot on a task whose stack is sized
+        // for the UI, and the library can be 3800 characters.
+        std::vector<char> buf(need);
+        if (haveLen > 0) {
+            memcpy(buf.data(), have, haveLen);
+            buf[haveLen] = ';';
+        }
+        memcpy(buf.data() + haveLen + (haveLen > 0 ? 1 : 0), plan.entry, strlen(plan.entry) + 1);
+        // Never publish a library that would not parse: a malformed one makes
+        // every ref into it fall back, silently.
+        if (!bg_library_valid(buf.data())) {
+            return BgMigrateResult::Incomplete;
+        }
+        store.setLibrary(store.user, buf.data());
+        if (!store.flush(store.user)) {
+            return BgMigrateResult::Incomplete;
+        }
+    }
+    // Step two: the ref, durable before the legacy fallback is retired.
+    if (plan.setGlobalRef) {
+        store.setGlobalRef(store.user, plan.globalRef);
+        if (!store.flush(store.user)) {
+            return BgMigrateResult::Incomplete;
+        }
+    }
+    // Step three. Not a verified clear: Preferences reports a failed
+    // empty-string write as success (Property.h, nvsPutString), so this can
+    // silently not happen. Everything above is already durable and the next
+    // boot re-plans from whatever actually landed, which is why nothing
+    // downstream may treat a cleared string as proof of anything.
+    if (plan.retireLegacy) {
+        store.setLegacy(store.user, plan.themeAfter, "");
+        store.flush(store.user);
+    }
+    return BgMigrateResult::Done;
 }
 
 #endif // GAGGIMATE_SIM

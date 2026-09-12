@@ -199,39 +199,83 @@ void DefaultUI::openSettings() { settingsUI.open(); }
 void DefaultUI::closeSettings() { settingsUI.close(); }
 
 #ifndef GAGGIMATE_SIM
-// One-time carry-over from the single custom gradient (bgAnimCustomTheme,
-// selected by bgAnimTheme == bg_theme_count()) to the library: the string
-// becomes library entry 1 "Custom", and if it was the active theme every
-// animation is pointed at it so nothing changes on screen. Runs only while
-// the library is empty, so a user who has since built their own is left
-// alone.
+// One-time carry-over of the pre-library custom gradient (bgAnimCustomTheme,
+// selected by bgAnimTheme == BG_THEME_LEGACY_CUSTOM) into the library. The
+// decisions are all in bg_plan_gradient_migration and the ordering in
+// bg_run_gradient_migration (BgAnimThemes.cpp, which documents both at
+// length); this is only the Settings store they run against.
+//
+// Each step is its own flushNow(). Settings::doSave writes properties in
+// registration order, bg_th and bg_ct before bg_gl and bg_gref, and carries
+// on past a failed key, so one combined save could durably clear the custom
+// string before the library entry that replaces it exists.
+namespace {
+
+struct MigrateStore {
+    ::Settings *settings;
+    String library;
+};
+
+const char *migrateLibrary(void *user) {
+    auto *s = static_cast<MigrateStore *>(user);
+    s->library = s->settings->getBgAnimGradients();
+    return s->library.c_str();
+}
+
+void migrateSetLibrary(void *user, const char *library) {
+    auto *s = static_cast<MigrateStore *>(user);
+    ::Settings::Guard guard(*s->settings);
+    s->settings->setBgAnimGradients(String(library));
+}
+
+void migrateSetGlobalRef(void *user, const char *ref) {
+    auto *s = static_cast<MigrateStore *>(user);
+    ::Settings::Guard guard(*s->settings);
+    s->settings->setBgAnimGradientRef(String(ref));
+}
+
+void migrateSetLegacy(void *user, int themeId, const char *custom) {
+    auto *s = static_cast<MigrateStore *>(user);
+    ::Settings::Guard guard(*s->settings);
+    s->settings->setBgAnimTheme(themeId);
+    s->settings->setBgAnimCustomTheme(String(custom));
+}
+
+bool migrateFlush(void *user) { return static_cast<MigrateStore *>(user)->settings->flushNow(); }
+
+} // namespace
+
 void DefaultUI::migrateBgAnimGradients() {
     ::Settings &settings = controller->getSettings();
-    if (!settings.getBgAnimGradients().isEmpty()) {
-        return;
+    BgGradientMigration plan;
+    {
+        ::Settings::Guard guard(settings);
+        plan = bg_plan_gradient_migration(settings.getBgAnimGradients().c_str(),
+                                          settings.getBgAnimCustomTheme().c_str(), settings.getBgAnimTheme(),
+                                          settings.getBgAnimGradientRef().c_str(), settings.getBgAnimThemeMap().c_str());
     }
-    uint8_t stops[BG_THEME_MAX_STOPS][3];
-    uint8_t pos[BG_THEME_MAX_STOPS];
-    bool uniform = true;
-    const int n = bg_parse_gradient(settings.getBgAnimCustomTheme().c_str(), stops, pos, uniform);
-    if (n == 0) {
-        return;
+    MigrateStore store{&settings, String()};
+    BgGradientStore api;
+    api.user = &store;
+    api.library = migrateLibrary;
+    api.setLibrary = migrateSetLibrary;
+    api.setGlobalRef = migrateSetGlobalRef;
+    api.setLegacy = migrateSetLegacy;
+    api.flush = migrateFlush;
+    switch (bg_run_gradient_migration(api, plan)) {
+    case BgMigrateResult::NothingToDo:
+        break;
+    case BgMigrateResult::Deferred:
+        ESP_LOGW("DefaultUI", "custom gradient left where it is: %s", plan.reason);
+        break;
+    case BgMigrateResult::Incomplete:
+        ESP_LOGE("DefaultUI", "custom gradient migration did not persist; retrying on the next boot");
+        break;
+    case BgMigrateResult::Done:
+        ESP_LOGI("DefaultUI", "custom gradient carried over to library entry %d (%s)", plan.entryId,
+                 plan.reason[0] != '\0' ? plan.reason : "complete");
+        break;
     }
-    char gradient[BG_GRADIENT_STR_MAX];
-    bg_format_gradient(stops, pos, n, uniform, gradient, sizeof(gradient));
-    settings.setBgAnimGradients(String("1|Custom|") + gradient);
-    if (settings.getBgAnimTheme() == bg_theme_count() && settings.getBgAnimThemeMap().isEmpty()) {
-        String map;
-        for (int i = 0; i < bg_animation_count(); i++) {
-            if (i > 0) {
-                map += ';';
-            }
-            map += "c1";
-        }
-        settings.setBgAnimThemeMap(map);
-        settings.setBgAnimTheme(0);
-    }
-    ESP_LOGI("DefaultUI", "custom gradient moved to the library (%d stops)", n);
 }
 #endif
 

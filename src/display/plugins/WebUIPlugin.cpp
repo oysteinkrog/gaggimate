@@ -1271,8 +1271,15 @@ void WebUIPlugin::handleSettings(AsyncWebServerRequest *request) const {
                 settings->setBgAnimStandbyId(request->arg("bgAnimStandbyId").toInt());
             if (request->hasArg("bgAnimParams"))
                 settings->setBgAnimParams(request->arg("bgAnimParams"));
-            if (request->hasArg("bgAnimTheme"))
-                settings->setBgAnimTheme(request->arg("bgAnimTheme").toInt());
+            if (request->hasArg("bgAnimTheme")) {
+                // The legacy integer's namespace is frozen (BgAnim.h): 0 to
+                // 17 are the original built-ins and 18 is the pre-library
+                // custom gradient. Anything outside it is a stale form or a
+                // hand-made request, and is stored as 0 rather than kept to
+                // start meaning an appended built-in later.
+                const int theme = request->arg("bgAnimTheme").toInt();
+                settings->setBgAnimTheme(theme >= 0 && theme <= BG_THEME_LEGACY_CUSTOM ? theme : 0);
+            }
             if (request->hasArg("bgAnimFps"))
                 settings->setBgAnimFps(request->arg("bgAnimFps").toInt());
             // Guarded on hasArg rather than read as a checkbox: a checkbox that
@@ -1364,15 +1371,15 @@ void WebUIPlugin::handleSettings(AsyncWebServerRequest *request) const {
             // The global gradient, in the same grammar as one map slot. A
             // built-in written here is mirrored into bgAnimTheme so the two
             // agree: bgAnimTheme is the last fallback and the on-display
-            // "Default (<name>)" label reads it.
+            // "Global (<name>)" label reads it. bg_legacy_mirror_for_ref
+            // (BgAnim.h) is the one mirror policy, shared with the display's
+            // two writers and mirrored by the web form.
             if (request->hasArg("bgAnimGradientRef") && bg_ref_valid(request->arg("bgAnimGradientRef").c_str())) {
                 const String ref = request->arg("bgAnimGradientRef");
                 settings->setBgAnimGradientRef(ref);
-                if (!ref.isEmpty() && ref[0] != 'c') {
-                    const int builtin = ref.toInt();
-                    if (builtin >= 0 && builtin < bg_theme_count())
-                        settings->setBgAnimTheme(builtin);
-                }
+                const int mirror = bg_legacy_mirror_for_ref(ref.c_str(), bg_theme_count());
+                if (mirror >= 0)
+                    settings->setBgAnimTheme(mirror);
             }
             if (request->hasArg("bgAnimId") || request->hasArg("bgAnimParams"))
                 settings->setBgAnimAllScreens(request->hasArg("bgAnimAllScreens"));

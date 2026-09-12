@@ -36,3 +36,11 @@ const char *bg_theme_category_name(int) { return ""; }
 // that check, which is the same "leave the stored setting alone" answer the
 // two validators above give.
 int bg_theme_count() { return 0; }
+
+// The gradient parser lives in the same excluded file. The simulator has no
+// pre-library custom gradient to carry over (it never ran a firmware that
+// wrote one), and false is the answer that keeps the display's Animation
+// category reading a legacy 18 as built-in 0, which is what it did before
+// the sentinel was frozen. bg_legacy_builtin and bg_legacy_mirror_for_ref
+// are inline in BgAnim.h and need no stub.
+bool bg_custom_valid(const char *) { return false; }

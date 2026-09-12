@@ -8,9 +8,11 @@ import {
   BG_ANIMATIONS,
   BG_GRADIENT_LIB_MAX,
   BG_GRADIENT_NAME_MAX,
+  BG_LEGACY_CUSTOM_REF,
   BG_THEMES,
   BG_THEME_CATEGORIES,
   BG_THEME_MAX_STOPS,
+  globalAssignFields,
   globalGradientRef,
   gradientCss,
   gradientForRef,
@@ -124,8 +126,16 @@ export function GradientEditor({ scope, formData, setField, previewAnimIdx }) {
   );
   const refs = useMemo(() => parseThemeMap(formData.bgAnimThemeMap), [formData.bgAnimThemeMap]);
   // Always concrete, never '': what an animation with no override draws with.
-  const globalRef = globalGradientRef(formData.bgAnimGradientRef, library, formData.bgAnimTheme);
-  const globalName = gradientForRef(globalRef, library).name;
+  // It can be BG_LEGACY_CUSTOM_REF, the read-only stand-in for a pre-library
+  // custom gradient the firmware's migration had to leave where it is.
+  const globalRef = globalGradientRef(
+    formData.bgAnimGradientRef,
+    library,
+    formData.bgAnimTheme,
+    formData.bgAnimCustomTheme,
+  );
+  const globalName = gradientForRef(globalRef, library, formData.bgAnimCustomTheme).name;
+  const globalIsLegacy = globalRef === BG_LEGACY_CUSTOM_REF;
   // What the picker shows. In animation scope '' means "same as global", and
   // an override naming a deleted library entry reads as '' too, because that
   // is what the firmware draws.
@@ -133,7 +143,7 @@ export function GradientEditor({ scope, formData, setField, previewAnimIdx }) {
   const ref = isGlobal || refResolves(rawRef, library) ? rawRef : '';
   // What is edited and previewed; '' resolves to the global.
   const editRef = ref === '' ? globalRef : ref;
-  const current = gradientForRef(editRef, library);
+  const current = gradientForRef(editRef, library, formData.bgAnimCustomTheme);
   const stops = current.stops;
   // An animation showing "Same as global" is looking at the global's gradient,
   // so editing the stops here would change every animation, which is not what
@@ -163,11 +173,15 @@ export function GradientEditor({ scope, formData, setField, previewAnimIdx }) {
   const assign = nextRef => {
     takePreview();
     if (isGlobal) {
-      setField('bgAnimGradientRef', nextRef);
-      // A built-in is mirrored into bgAnimTheme, which is the last fallback
-      // and what a build without bgAnimGradientRef reads. The firmware's POST
-      // handler does the same, so the two writers agree.
-      if (nextRef !== '' && !nextRef.startsWith('c')) setField('bgAnimTheme', nextRef);
+      // globalAssignFields carries the rollback mirror: a built-in is written
+      // into bgAnimTheme, which is the last fallback and what a build without
+      // bgAnimGradientRef reads, while a library selection and the read-only
+      // legacy stand-in leave it alone. The firmware's POST handler and both
+      // of the display's writers apply the same policy, so a later library
+      // selection cannot leave an appended index behind in the legacy field.
+      for (const [key, value] of Object.entries(globalAssignFields(nextRef))) {
+        setField(key, value);
+      }
       return;
     }
     const next = refs.slice();
@@ -402,6 +416,15 @@ export function GradientEditor({ scope, formData, setField, previewAnimIdx }) {
             onChange={e => assign(e.target.value)}
           >
             {!isGlobal && <option value=''>Global ({globalName})</option>}
+            {/* The pre-library custom gradient, while the firmware has had to
+                leave it where it is. Shown so the current value reads
+                truthfully; it is not a choice, and picking anything else
+                replaces it. */}
+            {isGlobal && globalIsLegacy && (
+              <option value={BG_LEGACY_CUSTOM_REF} disabled>
+                {globalName}
+              </option>
+            )}
             {library.length > 0 && (
               <optgroup label='My gradients'>
                 {library.map(g => (

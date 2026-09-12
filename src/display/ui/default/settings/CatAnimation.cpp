@@ -215,11 +215,31 @@ int gradientIndexForAnim(int animId, const std::vector<settingsui::GradientChoic
     return settingsui::gradientChoiceIndexForRef(choices, ref);
 }
 
+// True while the pre-library custom gradient is still what the global
+// fallback draws: bgAnimGradientRef names nothing that exists and the legacy
+// pair resolves to the custom string rather than to a built-in. Reachable
+// whenever DefaultUI::migrateBgAnimGradients had to defer (BgAnimThemes.cpp
+// lists the reasons), and the row has to say so rather than name a built-in.
+bool legacyCustomFallbackActive(const std::vector<settingsui::GradientChoice> &choices) {
+    Settings &settings = controller.getSettings();
+    const std::string ref(settings.getBgAnimGradientRef().c_str());
+    if (!ref.empty() && settingsui::gradientChoiceIndexForRef(choices, ref) != 0) {
+        return false;
+    }
+    return bg_legacy_builtin(settings.getBgAnimTheme(), bg_custom_valid(settings.getBgAnimCustomTheme().c_str())) < 0;
+}
+
 // Where the global gradient sits in the choice list. bgAnimGradientRef when
-// it names something that exists, else the built-in bgAnimTheme, which is what
-// bg_resolve_anim_theme falls back to and what a device that has never set the
-// global stores. Never returns 0: choices[0] is the per-animation "Global"
-// entry, which is not a value the global itself can take.
+// it names something that exists, else the built-in the legacy pair resolves
+// to, which is what bg_resolve_anim_theme falls back to and what a device
+// that has never set the global stores. Never returns 0: choices[0] is the
+// per-animation "Global" entry, which is not a value the global itself can
+// take.
+//
+// The legacy integer goes through bg_legacy_builtin rather than being used as
+// a choice index directly: its namespace is frozen, so a stored 18 means the
+// custom gradient and must never select the built-in that lands at index 18
+// once the table is longer than 18 entries.
 int globalGradientChoiceIndex(const std::vector<settingsui::GradientChoice> &choices) {
     Settings &settings = controller.getSettings();
     const std::string ref(settings.getBgAnimGradientRef().c_str());
@@ -229,11 +249,39 @@ int globalGradientChoiceIndex(const std::vector<settingsui::GradientChoice> &cho
             return i;
         }
     }
-    const int i = settingsui::gradientChoiceIndexForRef(choices, std::to_string(settings.getBgAnimTheme()));
-    if (i != 0) {
-        return i;
+    const int legacy =
+        bg_legacy_builtin(settings.getBgAnimTheme(), bg_custom_valid(settings.getBgAnimCustomTheme().c_str()));
+    if (legacy >= 0) {
+        const int i = settingsui::gradientChoiceIndexForRef(choices, std::to_string(legacy));
+        if (i != 0) {
+            return i;
+        }
     }
     return choices.size() > 1 ? 1 : 0;
+}
+
+// What the "Gradient all" row shows for its current value. A retained legacy
+// custom gradient has no choice entry of its own (it is not in the library
+// yet, and it is not a built-in), so it is named for what it is. Read only:
+// cycling the row moves to a real choice and never writes this back.
+std::string globalGradientLabel(const std::vector<settingsui::GradientChoice> &choices) {
+    if (legacyCustomFallbackActive(choices)) {
+        return "Custom (legacy)";
+    }
+    return choices[static_cast<size_t>(globalGradientChoiceIndex(choices))].label;
+}
+
+// The one rollback-mirror rule, applied by both writers here. A built-in
+// selection writes bgAnimTheme so a build without bgAnimGradientRef draws the
+// same thing; an appended built-in mirrors as 0, and a library selection or
+// an unresolvable ref leaves the legacy field alone. bg_legacy_mirror_for_ref
+// (BgAnim.h) is the same policy the web form and the POST handler apply.
+void mirrorGlobalRefIntoLegacyTheme(Settings &settings, const std::string &ref) {
+    const int count = kThemeProvider.count ? kThemeProvider.count() : 0;
+    const int mirror = bg_legacy_mirror_for_ref(ref.c_str(), count);
+    if (mirror >= 0) {
+        settings.setBgAnimTheme(mirror);
+    }
 }
 
 // A per-animation Gradient row's value. Index 0 is "no override", which draws
@@ -242,8 +290,7 @@ int globalGradientChoiceIndex(const std::vector<settingsui::GradientChoice> &cho
 std::string gradientDisplayText(int index, const std::vector<settingsui::GradientChoice> &choices) {
     if (index == 0) {
         char buf[48];
-        const int g = globalGradientChoiceIndex(choices);
-        std::snprintf(buf, sizeof(buf), "Global (%s)", choices[static_cast<size_t>(g)].label.c_str());
+        std::snprintf(buf, sizeof(buf), "Global (%s)", globalGradientLabel(choices).c_str());
         return buf;
     }
     return choices[static_cast<size_t>(index)].label;
@@ -413,11 +460,9 @@ void globalGradientOnCycle(void *user, int dir) {
     Settings &settings = controller.getSettings();
     settings.setBgAnimGradientRef(ctx->globalGradientRef.c_str());
     // A built-in is mirrored into bgAnimTheme, which is the last fallback and
-    // what a build without this field reads. The web POST handler does the
-    // same, so the two writers agree.
-    if (!ctx->globalGradientRef.empty() && ctx->globalGradientRef[0] != 'c') {
-        settings.setBgAnimTheme(std::atoi(ctx->globalGradientRef.c_str()));
-    }
+    // what a build without this field reads. The web form and the POST
+    // handler apply the same rule, so all four writers agree.
+    mirrorGlobalRefIntoLegacyTheme(settings, ctx->globalGradientRef);
     if (ctx->globalGradientRow != nullptr) {
         settingsRowSetValue(ctx->globalGradientRow, choices[static_cast<size_t>(ctx->globalGradientIndex)].label.c_str());
     }
@@ -811,7 +856,10 @@ void animBuildRow(void *ctx0, int index, lv_obj_t *parent, SettingsUI &ui) {
             [](lv_event_t *e) { static_cast<CatAnimationCtx *>(lv_event_get_user_data(e))->globalGradientRow = nullptr; },
             LV_EVENT_DELETE, ctx);
         const auto choices = currentGradientChoices();
-        settingsRowSetValue(row, choices[static_cast<size_t>(ctx->globalGradientIndex)].label.c_str());
+        // globalGradientLabel, not the choice at globalGradientIndex: while a
+        // legacy custom gradient is still the fallback there is no choice
+        // that stands for it, and naming a built-in there would be a lie.
+        settingsRowSetValue(row, globalGradientLabel(choices).c_str());
         break;
     }
     case 3: { // Parameters (pushes CatAnimParams.cpp's page)
@@ -1184,9 +1232,7 @@ void animCommit(void *ctx0) {
     if (ctx->globalGradientTouched &&
         std::string(settings.getBgAnimGradientRef().c_str()) != ctx->globalGradientRef) {
         settings.setBgAnimGradientRef(ctx->globalGradientRef.c_str());
-        if (!ctx->globalGradientRef.empty() && ctx->globalGradientRef[0] != 'c') {
-            settings.setBgAnimTheme(std::atoi(ctx->globalGradientRef.c_str()));
-        }
+        mirrorGlobalRefIntoLegacyTheme(settings, ctx->globalGradientRef);
         settingsLogAppend(log, sizeof(log), used, " gradientAll=%s", ctx->globalGradientRef.c_str());
         wrote = true;
     }

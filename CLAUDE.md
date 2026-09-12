@@ -753,14 +753,41 @@ the design cannot show and what the runs measured.
   CLICKED on scrolling and not on a gesture, so a swipe across a toggle
   row would otherwise flip it on release. `/api/debug/tap` takes `x2=`
   and `y2=` for a scripted drag and `Rig.swipe()` wraps it.
-- **A gradient resolves in three steps, and both writers mirror a built-in
+- **`bgAnimTheme`'s legacy namespace is frozen at 18 and is never the table
+  length** (gm-nov3.7, 2026-09-12). Before the gradient library existed
+  `bgAnimTheme` was the whole setting: 0 to 17 were the built-ins of an
+  18-entry table and 18 meant the single custom gradient in
+  `bgAnimCustomTheme`. `bg_resolve_theme` used to read that sentinel as
+  `bg_theme_count()`, so growing the table to 60 would have made a device
+  that stored 18 draw whatever new built-in landed at index 18.
+  `BG_THEME_LEGACY_CUSTOM` (BgAnim.h) pins it at 18 for good, mirrored by
+  `BG_THEME_CUSTOM` in `web/src/config/bgAnimations.js`, and a legacy integer
+  outside 0 to 18 reads as built-in 0. An explicit ref is a different
+  namespace over the same digits: `bg_resolve_anim_theme` fills a built-in
+  ref straight from the table and never through the legacy branch, so the ref
+  "18" is the built-in at index 18 while a legacy 18 still means the custom
+  gradient. Four writers apply the rollback mirror and all four go through
+  `bg_legacy_mirror_for_ref` or its JS twin `legacyThemeMirror`: the web
+  form's `globalAssignFields`, the firmware POST handler, and the display's
+  live row and its commit. Built-ins 0 to 17 mirror unchanged, 18 and above
+  mirror as 0 (never as 17, and never as the index itself), a library ref and
+  an unresolvable ref leave the field alone. The carry-over of the custom
+  string into the library is `bg_plan_gradient_migration` (pure) plus
+  `bg_run_gradient_migration` (an abstract store), because
+  `Settings::doSave` writes `bg_th` and `bg_ct` before `bg_gl` and `bg_gref`
+  and carries on past a failed key: one combined save could clear the source
+  before its replacement existed. A clear is never verified, because
+  Preferences reports a failed empty-string write as success (Property.h), so
+  the next boot re-plans from what actually landed. The whole policy is
+  checked by `pio test -e native_settingsui` (groups I, J and K, against a
+  60-entry test table) and `node tools/gradient_mirror_check.mjs`.
+- **A gradient resolves in three steps, and all four writers mirror a built-in
   into `bgAnimTheme`** (gm-tany, 2026-09-12). `bg_resolve_anim_theme`
   (BgAnimThemes.cpp) reads this animation's own `bgAnimThemeMap` slot, then
   the global `bgAnimGradientRef`, then the older `bgAnimTheme` plus
   `bgAnimCustomTheme`. Step three is what a build without the ref key reads,
   so an upgrade changes nothing on screen; the mirror is what keeps a
-  rollback showing the same picture, and both the web POST handler
-  (`WebUIPlugin.cpp`) and the display's own row do it. The ref grammar is
+  rollback showing the same picture, under the frozen rules above. The ref grammar is
   shared by the map slots and the global: a decimal built-in index, "c<id>"
   for a library entry, or "" for neither, parsed by `bg_ref_valid` and
   rejected at the POST handler rather than stored. A ref that no longer

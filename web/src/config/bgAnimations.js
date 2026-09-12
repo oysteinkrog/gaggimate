@@ -627,10 +627,14 @@ export const BG_ANIMATIONS = [
 
 export { BG_THEMES, BG_THEME_CATEGORIES };
 
-// bgAnimTheme == BG_THEMES.length selected the pre-library custom theme
-// (bgAnimCustomTheme); the firmware moves that into the gradient library on
-// boot, so the editor only ever deals in built-ins and library entries.
-export const BG_THEME_CUSTOM = BG_THEMES.length;
+// The legacy bgAnimTheme namespace, frozen at 18 to match BG_THEME_LEGACY_CUSTOM
+// in src/display/ui/default/bganim/BgAnim.h. Before the gradient library
+// existed, bgAnimTheme was an index into an 18-entry built-in table, and 18
+// meant the single custom gradient in bgAnimCustomTheme. It is NOT
+// BG_THEMES.length: deriving it from the table would hand a device that stored
+// 18 whatever built-in is appended at index 18. Legacy integers outside 0..18
+// read as built-in 0.
+export const BG_THEME_CUSTOM = 18;
 export const BG_THEME_MAX_STOPS = 16;
 export const BG_GRADIENT_LIB_MAX = 12;
 export const BG_GRADIENT_NAME_MAX = 24;
@@ -816,25 +820,74 @@ export function refResolves(ref, library) {
   return idx >= 0 && idx < BG_THEMES.length;
 }
 
-// The ref the global default resolves to: bgAnimGradientRef when it names
-// something that exists, else the built-in bgAnimTheme. These are steps two
-// and three of the firmware's bg_resolve_anim_theme, and the result is always
-// a concrete ref, never ''.
-export function globalGradientRef(globalRef, library, globalThemeId) {
-  if (refResolves(globalRef, library)) return String(globalRef);
+// A ref the picker shows but never stores: the pre-library custom gradient is
+// still what the global fallback draws, because the firmware's one-time
+// migration had to defer. It is read only, and no stored field ever holds it.
+export const BG_LEGACY_CUSTOM_REF = 'legacy';
+export const BG_LEGACY_CUSTOM_NAME = 'Custom (legacy)';
+
+// What the legacy pair (bgAnimTheme, bgAnimCustomTheme) draws: the built-in
+// index, or -1 when the custom string is what draws. Mirrors bg_legacy_builtin
+// in BgAnim.h, including the frozen sentinel, so the form never labels a
+// stored 18 as the built-in that lands at index 18.
+export function legacyBuiltin(globalThemeId, customTheme) {
   const g = parseInt(globalThemeId, 10);
-  return String(g >= 0 && g < BG_THEMES.length ? g : 0);
+  if (g === BG_THEME_CUSTOM) return parseGradient(customTheme) ? -1 : 0;
+  return g >= 0 && g < BG_THEME_CUSTOM ? g : 0;
+}
+
+// The rollback mirror: the bgAnimTheme value that goes with a selected ref, or
+// null to leave bgAnimTheme alone. Mirrors bg_legacy_mirror_for_ref in
+// BgAnim.h. A built-in 0 to 17 mirrors unchanged, an appended built-in mirrors
+// as 0 (never as its own index, which would mean the custom gradient or a
+// gradient nobody chose to an older build), a library ref and a ref that does
+// not resolve leave the legacy fallback where it is.
+export function legacyThemeMirror(ref, themeCount = BG_THEMES.length) {
+  const r = String(ref ?? '');
+  if (r === '' || r.startsWith('c') || !/^\d+$/.test(r)) return null;
+  const idx = parseInt(r, 10);
+  if (idx < 0 || idx >= themeCount) return null;
+  return idx < BG_THEME_CUSTOM ? idx : 0;
+}
+
+// The form fields a global gradient selection writes, and nothing else. The
+// editor applies exactly this map, so the mirror policy can be checked without
+// rendering anything (tools/gradient_mirror_check.mjs). The legacy stand-in is
+// read only and writes nothing at all.
+export function globalAssignFields(nextRef, themeCount = BG_THEMES.length) {
+  if (nextRef === BG_LEGACY_CUSTOM_REF) return {};
+  const fields = { bgAnimGradientRef: nextRef };
+  const mirror = legacyThemeMirror(nextRef, themeCount);
+  if (mirror !== null) fields.bgAnimTheme = String(mirror);
+  return fields;
+}
+
+// The ref the global default resolves to: bgAnimGradientRef when it names
+// something that exists, else the built-in the legacy pair resolves to, or
+// BG_LEGACY_CUSTOM_REF when that pair is still the custom gradient. These are
+// steps two and three of the firmware's bg_resolve_anim_theme, and the result
+// is always a concrete ref, never ''.
+export function globalGradientRef(globalRef, library, globalThemeId, customTheme) {
+  if (refResolves(globalRef, library)) return String(globalRef);
+  const b = legacyBuiltin(globalThemeId, customTheme);
+  return b < 0 ? BG_LEGACY_CUSTOM_REF : String(b);
 }
 
 // The ref an animation effectively draws with, after the firmware's
 // fallbacks: its own map entry when it resolves, else the global default.
-export function effectiveRef(refs, animIdx, library, globalThemeId, globalRef) {
+export function effectiveRef(refs, animIdx, library, globalThemeId, globalRef, customTheme) {
   const ref = refs[animIdx] ?? '';
   if (refResolves(ref, library)) return ref;
-  return globalGradientRef(globalRef, library, globalThemeId);
+  return globalGradientRef(globalRef, library, globalThemeId, customTheme);
 }
 
-export function gradientForRef(ref, library) {
+export function gradientForRef(ref, library, customTheme) {
+  if (ref === BG_LEGACY_CUSTOM_REF) {
+    const gradient = parseGradient(customTheme);
+    // Read only: it is not in the library, so there is nothing to edit or
+    // rename, and the editor must not write it anywhere.
+    if (gradient) return { name: BG_LEGACY_CUSTOM_NAME, stops: gradient.stops, editable: false };
+  }
   if (ref.startsWith('c')) {
     const entry = library.find(g => g.id === parseInt(ref.slice(1), 10));
     if (entry) return { name: entry.name, stops: entry.stops, editable: true, id: entry.id };
