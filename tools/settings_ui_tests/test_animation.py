@@ -32,14 +32,20 @@ REPO_ROOT = os.path.abspath(os.path.join(HERE, "..", ".."))
 sys.path.insert(0, REPO_ROOT)
 
 from tools.settings_ui_tests import Rig, Sim  # noqa: E402
+from tools.settings_ui_tests.gradients_gen import GRADIENT_NAMES as THEME_NAMES  # noqa: E402
 
 DEFAULT_PROGRAM = os.path.join(REPO_ROOT, ".pio", "build", "display-sim", "program")
 
-# Mirrors of the two firmware tables CatAnimation.cpp itself keeps a mirror
-# of (see that file's comment): BgAnimRegistry.cpp's REGISTRY order
-# (animation display names) and BgAnimThemes.cpp's THEMES order (built-in
-# gradient names). Both compile only outside GAGGIMATE_SIM, so there is no
-# device route this script could read them from instead.
+# THEME_NAMES above is BgAnimThemes.cpp's THEMES order (the built-in gradient
+# names), generated from data/gradients.json by scripts/gen_gradients.py along
+# with the firmware and web tables, so the runner cannot drift from what the
+# display shows. tools/animbench make check fails on a stale copy.
+#
+# ANIM_NAMES below is still hand written: it mirrors BgAnimRegistry.cpp's
+# REGISTRY order (animation display names), which CatAnimation.cpp also keeps
+# a mirror of (see that file's comment). REGISTRY compiles only outside
+# GAGGIMATE_SIM, so there is no device route this script could read it from
+# instead.
 #
 # ANIM_NAMES was regenerated from the real structs at HEAD 096292af
 # (gm-3vj.2), along with CatAnimation.cpp's own mirror. It had drifted twice
@@ -55,10 +61,6 @@ ANIM_NAMES = [
     "Mosaic", "Saddle", "Refraction", "Sundial", "Crescent", "Glint", "Tunnel", "Kaleido", "Shafts",
     "Weave", "Lens", "Tide", "Truchet", "Quilt", "Rain", "Stripes", "Ribbon", "Harmonograph",
     "Floor", "Hills", "Gyroid", "Barrel", "Grid", "Cells", "Dimples", "Cube",
-]
-THEME_NAMES = [
-    "Espresso", "Ocean", "Violet Dusk", "Forest", "Sunset", "Fire", "Ice", "Mono", "Rose", "Gold", "Aurora", "Cyber",
-    "Ember Coal", "Deep Space", "Teal Reef", "Sakura", "Lime", "Arctic Night",
 ]
 THEME_MODE_LABELS = ["Dark", "Light"]
 PLATES_LABELS = ["Keep", "Hide", "Custom"]
