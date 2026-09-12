@@ -169,20 +169,28 @@ void frame(uint32_t tMs, int w, int h, const uint8_t p[BG_ANIM_PARAMS]) {
     }
     geometryValid = true;
 
-    // The page intentionally has its own linear speed knob, not speedMul().
-    // sp=8 at default 10: the angle period is 1024*512/8 = 65.536 seconds,
-    // or 22.91 pixels/s at radius 239. Breath periods are 16.384 and 26.2144
-    // seconds; the header's "12 s" is approximate, not another time constant.
-    const uint32_t sp = 4 + p[0] * 44 / 100;
-    const uint32_t base = tMs * sp;
-    const uint32_t angIdx = (base >> 9) & 1023;
-    const uint32_t phBr = base >> 7, phBr2 = (base * 5u) >> 10;
+    // Speed follows the fleet's curve, speedMul(): 0.15x at 0, 1x at 50 and
+    // 6.7x at 100 of the rate Speed 50 has since gm-33fm (bead gm-kh2s).
+    // The multiplier is Q6 and 1664 at 50, the old rate of 26 with six
+    // fraction bits, and the five shifts below take those bits back, so
+    // Speed 50 is the same picture: the angle period is 1024*512/26 =
+    // 20.1649 seconds and the breath periods 5.0412 and 8.0660 seconds.
+    // The old affine law read 4 + p[0] * 44 / 100 and covered 0.15x to
+    // 1.85x. Every phase below reads at most bit 20 of its product, and Q6
+    // keeps bits 0..25, so the uint32 wrap never shows and the Speed 50
+    // output is bit identical to the old law's. Rounded, not truncated: the
+    // nearest .5 boundary over Speed 0..100 is 19 float ulps away, so the
+    // host, the device and the page agree.
+    const uint32_t speedQ6 = static_cast<uint32_t>(lroundf(1664.0f * speedMul(p[0])));
+    const uint32_t base = tMs * speedQ6;
+    const uint32_t angIdx = (base >> 15) & 1023;
+    const uint32_t phBr = base >> 13, phBr2 = (base * 5u) >> 16;
     const int breathQ4 = ((sine[phBr & 1023] * 210) >> 9) + ((sine[phBr2 & 1023] * 120) >> 9);
     // Spatial steps 55/16 and 126/16 give wavelengths 297.891 and 130.032
-    // pixels. At sp=8, the column waves drift -2.273 and +1.488 px/s;
-    // the row waves drift +3.409 and -0.992 px/s. Do not scale with w/h:
+    // pixels. At Speed 50, the column waves drift -7.386 and +4.836 px/s;
+    // the row waves drift +11.079 and -3.224 px/s. Do not scale with w/h:
     // the page holds these wavelengths and the 94-pixel softness fixed.
-    const uint32_t phS1 = base >> 10, phS2 = (base * 3u) >> 11;
+    const uint32_t phS1 = base >> 16, phS2 = (base * 3u) >> 17;
     for (int x = 0; x < w; x++) {
         const int sc = ((sine[(((x * 55) >> 4) + phS1) & 1023] * 70) >> 9) + ((sine[(((x * 126) >> 4) - phS2) & 1023] * 40) >> 9);
         colSurface[x] = static_cast<int16_t>(colFace[x] + sc);

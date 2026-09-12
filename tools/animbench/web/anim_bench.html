@@ -2466,9 +2466,13 @@ function bayerOffsets(dithOff, amp, unit) {
         }
         bayerOffsets(state.dith, ditherAmpJS(pal, 256) * 0.75, 16);
       }
-      const sp = 4 + Math.floor(p[0] * 44 / 100);
-      const base = ((t * sp) >>> 0);
-      const ph1 = base >>> 8, ph2 = ((base * 3) >>> 0) >>> 10, ph3 = base >>> 11;
+      // The fleet's speed curve on the rate Speed 50 has since gm-33fm
+      // (gm-kh2s): Q6, 1664 at 50, rounded the way AnimBrushed.cpp rounds it,
+      // and the three shifts take the six fraction bits back. The old affine
+      // law read 4 + Math.floor(p[0] * 44 / 100).
+      const speedQ6 = Math.round(F(1664 * speedMulF(p[0])));
+      const base = ((t * speedQ6) >>> 0);
+      const ph1 = base >>> 14, ph2 = ((base * 3) >>> 0) >>> 16, ph3 = base >>> 17;
       const { colTerm, ctPh, rowTerm, grain, pal } = state;
       const grainQ8 = 16 + Math.floor(p[1] * 68 / 100);
       const tiltA = 120 + Math.floor(p[1] * 150 / 100);
@@ -3006,13 +3010,15 @@ function bayerOffsets(dithOff, amp, unit) {
         // index at the largest row value.
         bayerOffsets(state.dith, ditherAmpJS(pal, 256) * 0.5, 8);
       }
-      // Speed calibration (gm-33fm): the linear map was 4 + p0*44/100,
-      // multiplied by about 1.12 throughout. sp at Speed 50 went 26 to 29.
-      const sp = 5 + Math.floor(p[0] * 48 / 100);
-      const base = ((t * sp) >>> 0);
-      const phC = base >>> 10;                       // the contour slide
-      const phD = base >>> 7, phD2 = ((base * 7) >>> 0) >>> 10;
-      const phK = ((base * 3) >>> 0) >>> 8;
+      // The fleet's speed curve on the rate Speed 50 has since gm-33fm
+      // (gm-kh2s): Q7, 3712 at 50, rounded the way AnimSaddle.cpp rounds it,
+      // and the four shifts take the seven fraction bits back. The old
+      // affine law read 5 + Math.floor(p[0] * 48 / 100).
+      const speedQ7 = Math.round(F(3712 * speedMulF(p[0])));
+      const base = ((t * speedQ7) >>> 0);
+      const phC = base >>> 17;                       // the contour slide
+      const phD = base >>> 14, phD2 = ((base * 7) >>> 0) >>> 17;
+      const phK = ((base * 3) >>> 0) >>> 15;
       const driftW = Math.trunc(w * p[2] / 300), driftH = Math.trunc(h * p[2] / 300);
       const x0 = Math.floor(w / 2) + Math.trunc(SIN[phD & (SIN_N - 1)] * driftW / 512);
       const y0 = Math.floor(h / 2) + Math.trunc(SIN[phD2 & (SIN_N - 1)] * driftH / 512);
@@ -3217,15 +3223,19 @@ function bayerOffsets(dithOff, amp, unit) {
           state.halfPx[y] = inside > 0 ? Math.floor(Math.sqrt(inside)) : -1;
         }
       }
-      const sp = 4 + Math.floor(p[0] * 44 / 100);
-      const base = ((t * sp) >>> 0);
-      const angIdx = (base >>> 9) & (SIN_N - 1);       // one turn in about 65 s
-      const phBr = base >>> 7, phBr2 = ((base * 5) >>> 0) >>> 10;
+      // The fleet's speed curve on the rate Speed 50 has since gm-33fm
+      // (gm-kh2s): Q6, 1664 at 50, rounded the way AnimSundial.cpp rounds it,
+      // and the five shifts take the six fraction bits back. The old affine
+      // law read 4 + Math.floor(p[0] * 44 / 100).
+      const speedQ6 = Math.round(F(1664 * speedMulF(p[0])));
+      const base = ((t * speedQ6) >>> 0);
+      const angIdx = (base >>> 15) & (SIN_N - 1);      // one turn in about 20 s
+      const phBr = base >>> 13, phBr2 = ((base * 5) >>> 0) >>> 16;
       const breathQ4 = ((SIN[phBr & (SIN_N - 1)] * 210) >> 9) +
         ((SIN[phBr2 & (SIN_N - 1)] * 120) >> 9);
-      // The dial has a surface: two long sines per axis, drifting a couple of
+      // The dial has a surface: two long sines per axis, drifting a few
       // pixels a second, so the face is matte rather than a plain vignette.
-      const phS1 = base >>> 10, phS2 = ((base * 3) >>> 0) >>> 11;
+      const phS1 = base >>> 16, phS2 = ((base * 3) >>> 0) >>> 17;
       const { colFace, colPh, rowQ4, surfRow, halfPx, dith, pal } = state;
       for (let ph = 0; ph < 8; ph++) {
         const dst = ph * w, off = ph * 8;
@@ -3392,11 +3402,13 @@ function bayerOffsets(dithOff, amp, unit) {
         }
       }
       const discR = state.discR, R2c = discR * discR, invK = state.invK;
-      // Speed calibration (gm-33fm): 0.75x, mirroring AnimCrescent.cpp.
-      // Three quarters of a whole-number rate is not a whole number, so the
-      // rate is carried as quarters and the product is shifted back down.
-      const sp4 = 3 * (4 + Math.floor(p[0] * 44 / 100));
-      const base = (Math.floor(t * sp4 / 4)) >>> 0;
+      // The fleet's speed curve on the rate Speed 50 has since gm-33fm
+      // (gm-kh2s): Q6, 1248 at 50, rounded the way AnimCrescent.cpp rounds
+      // it, which is the same 19.5 units per millisecond the old quarter-rate
+      // law gave at Speed 50, so the shifts below are unchanged. That law
+      // read 3 * (4 + Math.floor(p[0] * 44 / 100)) quarters.
+      const speedQ6 = Math.round(F(1248 * speedMulF(p[0])));
+      const base = (Math.floor(t * speedQ6 / 64)) >>> 0;
       const angIdx = (base >>> 7) & (SIN_N - 1);
       const swellIdx = (base >>> 7) & (SIN_N - 1);
       const phBr = ((base * 3) >>> 0) >>> 9;

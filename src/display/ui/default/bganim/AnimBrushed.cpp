@@ -154,12 +154,25 @@ void frame(uint32_t tMs, int w, int h, const uint8_t p[BG_ANIM_PARAMS]) {
     }
     // The page also keys on params, but palette/dither use no parameter.
     // Rebuilding only on theme changes therefore produces the same tables.
-    const uint32_t sp = 4 + static_cast<uint32_t>(p[0]) * 44 / 100; // 4..48, default 12
-    const uint32_t base = tMs * sp; // no old placeholder >> 4 here
-    const uint32_t ph1 = base >> 8;
-    const uint32_t ph2 = (base * 3u) >> 10;
-    const uint32_t ph3 = base >> 11;
-    // Default sine periods: 21.845333 s, 29.127111 s and 174.762667 s.
+    // Speed follows the fleet's curve, speedMul(): 0.15x at 0, 1x at 50 and
+    // 6.7x at 100 of the rate Speed 50 has since gm-33fm (bead gm-kh2s).
+    // The multiplier is Q6 and 1664 at 50, the old rate of 26 with six
+    // fraction bits, and the three shifts below take those bits back, so
+    // Speed 50 is the same picture. The old affine law read
+    // 4 + p[0] * 44 / 100 and covered 0.15x to 1.85x, so the whole top half
+    // of the slider bought less than a doubling. Every phase below reads at
+    // most bit 20 of its product, and Q6 keeps bits 0..25, so the uint32 wrap
+    // never shows and the Speed 50 output is bit identical to the old law's.
+    // Rounded, not truncated: the nearest .5 boundary over Speed 0..100 is
+    // 19 float ulps away, so the host, the device and the page agree.
+    const uint32_t speedQ6 = static_cast<uint32_t>(lroundf(1664.0f * speedMul(p[0])));
+    const uint32_t base = tMs * speedQ6; // no old placeholder >> 4 here
+    const uint32_t ph1 = base >> 14;
+    const uint32_t ph2 = (base * 3u) >> 16;
+    const uint32_t ph3 = base >> 17;
+    // Sine periods at Speed 50: 10.082462 s, 13.443282 s and 80.659692 s.
+    // The older figures of 21.845333, 29.127111 and 174.762667 s were the
+    // periods at the Speed default of 12 this entry had before gm-33fm.
     // Unsigned products preserve JS wrap at long uptime; computing from
     // tMs also matches the page when the speed parameter changes.
     const int grainQ8 = 16 + static_cast<int>(p[1]) * 68 / 100; // 16..84
@@ -176,8 +189,9 @@ void frame(uint32_t tMs, int w, int h, const uint8_t p[BG_ANIM_PARAMS]) {
     }
     // Wavelengths 380..900 px and 55% of that, quantized to Q4 sine-table
     // steps as on the page. Default steps 26 and 48 give wavelengths
-    // 630.153846 and 341.333333 px, moving right at 28.846154 px/s and left
-    // at 11.718750 px/s. Width never rescales these physical-pixel speeds.
+    // 630.153846 and 341.333333 px, moving right at 62.5 px/s and left at
+    // 25.390625 px/s at Speed 50, and scaling with speedMul() from there.
+    // Width never rescales these physical-pixel speeds.
     const int px = 380 + static_cast<int>(p[2]) * 520 / 100;
     const uint32_t f1Q4 = 16 * 1024 / px;
     const uint32_t f2Q4 = 16 * 1024 / (px * 55 / 100);

@@ -204,22 +204,26 @@ void frame(uint32_t tMs, int w, int h, const uint8_t p[BG_ANIM_PARAMS]) {
     }
 
     // Match JavaScript's >>>0 after each product, including long uptimes:
-    // these are modulo-2^32 clocks, not floating seconds or speedMul().
-    // Speed calibration, gm-33fm 2026-09-12: the whole linear map was
-    // multiplied by about 1.12 so that Speed 50 moves this animation about
-    // as much per second as every other animation at Speed 50. sp is the
-    // rate, and it was 4..48 before; at Speed 50 it went 26 -> 29.
-    // The Speed default was 12 and is now 50, per the fleet rule that 50 is
-    // the default everywhere and means the same amount of movement.
-    // At Speed=50, sp=29: contours advance 29000/1024 = 28.320313 indices/s
-    // (9.039448 s per palette turn); x/y drift periods are 4.519724 s and
-    // 5.165399 s, and curvature breathes once per 3.013149 s.
-    const uint32_t sp = 5 + static_cast<uint32_t>(p[0]) * 48 / 100; // 5..53, page's linear speed knob
-    const uint32_t base = tMs * sp;
-    contourPhase = (base >> 10) & 255;
-    const uint32_t phD = base >> 7;
-    const uint32_t phD2 = (base * 7u) >> 10;
-    const uint32_t phK = (base * 3u) >> 8;
+    // these are modulo-2^32 clocks, not floating seconds.
+    // Speed follows the fleet's curve, speedMul(): 0.15x at 0, 1x at 50 and
+    // 6.7x at 100 of the rate Speed 50 has since gm-33fm (bead gm-kh2s).
+    // The multiplier is Q7 and 3712 at 50, the old rate of 29 with seven
+    // fraction bits, and the four shifts below take those bits back, so
+    // Speed 50 is the same picture: contours advance 29000/1024 = 28.320313
+    // indices/s (9.039448 s per palette turn), the x and y drift periods are
+    // 4.519724 s and 5.165399 s, and curvature breathes once per 3.013149 s.
+    // The old affine law read 5 + p[0] * 48 / 100 and covered 0.17x to 1.83x,
+    // the flattest slider in the fleet. Every phase below reads at most bit
+    // 19 of its product, and Q7 keeps bits 0..24, so the uint32 wrap never
+    // shows and the Speed 50 output is bit identical to the old law's.
+    // Rounded, not truncated: the nearest .5 boundary over Speed 0..100 is
+    // 11 float ulps away, so the host, the device and the page agree.
+    const uint32_t speedQ7 = static_cast<uint32_t>(lroundf(3712.0f * speedMul(p[0])));
+    const uint32_t base = tMs * speedQ7;
+    contourPhase = (base >> 17) & 255;
+    const uint32_t phD = base >> 14;
+    const uint32_t phD2 = (base * 7u) >> 17;
+    const uint32_t phK = (base * 3u) >> 15;
     const int16_t *sl = sine;
     for (int i = 0; i < 8; i++) {
         kernelWork[16 + i] = static_cast<int16_t>(128 + contourPhase);

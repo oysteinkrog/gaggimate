@@ -127,21 +127,23 @@ void frame(uint32_t tMs, int w, int h, const uint8_t p[BG_ANIM_PARAMS]) {
         tablesValid = true;
     }
     // Use the actual page clocks. Its prose says about 13/16.5 seconds, but
-    // BOTH turn and swell use base>>7: a nominal 13107.2 ms cycle at default
-    // p0=15, sp=10, which the speed calibration below stretches to 17476.3 ms.
-    // Body breathing is base*3>>9: 17476.2667 ms, stretched to 23301.7 ms.
-    // The base*3 product still wraps as uint32, matching the page's >>>0, even
-    // near millis() rollover.
-    // Speed calibration (gm-33fm): the clock runs at 0.75x the original rate,
-    // so Speed 50 gives about the same visible movement here as on every other
-    // animation. The Speed parameter, its label and its default of 50 are
-    // unchanged. Three quarters of a whole-number rate is not a whole number,
-    // so the rate is carried as quarters (sp4 = 3 * the old rate) and the
-    // product is shifted back down. The multiply widens to 64 bits first: the
-    // old uint32 wrap would have thrown away the top two bits of the rate
-    // before the shift could use them. The page does the same arithmetic.
-    const uint32_t sp4 = 3u * (4u + static_cast<uint32_t>(p[0]) * 44 / 100);
-    const uint32_t base = static_cast<uint32_t>((static_cast<uint64_t>(tMs) * sp4) >> 2);
+    // BOTH turn and swell use base>>7, which at the Speed 50 rate below is a
+    // 6721.6 ms cycle. Body breathing is base*3>>9: 8962.2 ms. The base*3
+    // product still wraps as uint32, matching the page's >>>0, even near
+    // millis() rollover.
+    // Speed follows the fleet's curve, speedMul(): 0.15x at 0, 1x at 50 and
+    // 6.7x at 100 of the rate Speed 50 has since gm-33fm (bead gm-kh2s).
+    // The multiplier is Q6 and 1248 at 50, which is the 19.5 units per
+    // millisecond the quarter-rate law gave at Speed 50, so the shifts below
+    // are unchanged and Speed 50 is the same picture. The old law read
+    // 3 * (4 + p[0] * 44 / 100) quarters and covered 0.15x to 1.85x.
+    // Rounded, not truncated: the nearest .5 boundary over Speed 0..100 is
+    // 20 float ulps away, so the host, the device and the page agree.
+    // The multiply widens to 64 bits first, as the quarter-rate law did: a
+    // uint32 product would throw away the top bits of the rate before the
+    // shift could use them. The page does the same arithmetic.
+    const uint32_t speedQ6 = static_cast<uint32_t>(lroundf(1248.0f * speedMul(p[0])));
+    const uint32_t base = static_cast<uint32_t>((static_cast<uint64_t>(tMs) * speedQ6) >> 6);
     const uint32_t angIdx = (base >> 7) & (SIN_N - 1);
     const uint32_t swellIdx = (base >> 7) & (SIN_N - 1);
     const uint32_t phBr = (base * 3u) >> 9;
