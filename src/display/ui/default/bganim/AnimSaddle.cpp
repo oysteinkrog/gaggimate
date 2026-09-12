@@ -209,9 +209,11 @@ void frame(uint32_t tMs, int w, int h, const uint8_t p[BG_ANIM_PARAMS]) {
     // multiplied by about 1.12 so that Speed 50 moves this animation about
     // as much per second as every other animation at Speed 50. sp is the
     // rate, and it was 4..48 before; at Speed 50 it went 26 -> 29.
-    // At Speed=12, sp=10: contours advance 10000/1024 = 9.765625 indices/s
-    // (26.2144 s per palette turn); x/y drift periods are 13.1072 s and
-    // 14.979657 s, and curvature breathes once per 8.738133 s.
+    // The Speed default was 12 and is now 50, per the fleet rule that 50 is
+    // the default everywhere and means the same amount of movement.
+    // At Speed=50, sp=29: contours advance 29000/1024 = 28.320313 indices/s
+    // (9.039448 s per palette turn); x/y drift periods are 4.519724 s and
+    // 5.165399 s, and curvature breathes once per 3.013149 s.
     const uint32_t sp = 5 + static_cast<uint32_t>(p[0]) * 48 / 100; // 5..53, page's linear speed knob
     const uint32_t base = tMs * sp;
     contourPhase = (base >> 10) & 255;
@@ -495,7 +497,7 @@ extern const BgAnimation bg_anim_saddle;
 const BgAnimation bg_anim_saddle = {
     "saddle",
     "Saddle",
-    {{"speed", "Speed", 12}, {"curvature", "Curvature", 35}, {"drift", "Drift", 25}, {"contrast", "Contrast", 30}},
+    {{"speed", "Speed", 50}, {"curvature", "Curvature", 35}, {"drift", "Drift", 25}, {"contrast", "Contrast", 30}},
     init,
     frame,
     band,

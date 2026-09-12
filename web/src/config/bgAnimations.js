@@ -278,7 +278,7 @@ export const BG_ANIMATIONS = [
     name: 'Saddle',
     description: 'Tonal contours flowing along a drifting saddle surface.',
     params: [
-      { key: 'speed', label: 'Speed', def: 12 },
+      { key: 'speed', label: 'Speed', def: 50 },
       { key: 'curvature', label: 'Curvature', def: 35 },
       { key: 'drift', label: 'Drift', def: 25 },
       { key: 'contrast', label: 'Contrast', def: 30 },
