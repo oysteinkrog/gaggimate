@@ -187,7 +187,8 @@ constexpr float WIN_MARGIN = 2.0f; // px slack on every crossing window (see fil
 // pond keeps rings on it at every speed:
 //   speed  = RING_SPEED_50 * speedMul(p[0])          px/s
 //   travel = FADE_REF_SPEED * lifeS(p[2])            px, amplitude decay length
-//   life   = LIFE_MUL * lifeS(p[2])                  s, independent of speed
+//   life   = LIFE_MUL * lifeS(p[2]) / speedMul(p[0]) s
+//   drops  = interval(p[1]) / speedMul(p[0])         ms between deadlines
 //   amp    = rise * exp(-radius / travel) * tail(age / life)
 // where lifeS is the old 7 s to 2.2 s Fade span and FADE_REF_SPEED is the
 // old speed at slider 50, so the brightness a ring has at a given radius is
@@ -494,12 +495,26 @@ void frame(uint32_t tMs, int w, int h, const uint8_t p[BG_ANIM_PARAMS]) {
     // bit for bit, and the random stream is untouched at every setting: the
     // same drops at the same times, moved.
     const float spread = 1.0f + static_cast<float>(static_cast<int>(p[4]) - 50) * 0.014f;
-    const float interval = lerpf(14000.0f, 1500.0f, p[1] / 100.0f);
     const float spd = speedMul(p[0]);
+    // Speed divides every time constant and multiplies the travel speed, so
+    // the fast end is the Speed 50 pond played faster rather than a different
+    // pond (gm-kh2s). Until 2026-09-12 only the travel speed scaled: a ring
+    // then reached the rim in a fraction of the time while drops still landed
+    // every nine seconds and a ring still took 37 s to fade, so the top of the
+    // slider showed less movement than three quarters of it. The fleet sweep
+    // caught it as a dip in the one-step change fraction, 6.04 percent at
+    // Speed 75 against 3.93 at Speed 100, which is the slider running
+    // backwards as far as the eye is concerned.
+    //
+    // travel is a distance, not a time, and stays where it is: a ring's
+    // brightness at a given radius is the one this file shipped with, at every
+    // speed. The catch-up bound below is unchanged, because life and interval
+    // are divided by the same number and only their ratio enters it.
+    const float interval = lerpf(14000.0f, 1500.0f, p[1] / 100.0f) / spd;
     const float speed = RING_SPEED_50 * spd;
     const float lifeS = lerpf(7.0f, 2.2f, p[2] / 100.0f);
     const float travel = FADE_REF_SPEED * lifeS;
-    const float life = LIFE_MUL * lifeS;
+    const float life = LIFE_MUL * lifeS / spd;
     g_swellT = static_cast<float>(tMs) * spd;
     g_glow = 0.35f + 1.15f * (p[3] / 100.0f);
 

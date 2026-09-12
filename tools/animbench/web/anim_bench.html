@@ -1058,16 +1058,19 @@ ANIMS.push({
     const envE = p[5] < 50 ? 1 + ((p[5]-50)/50)*0.8 : 1;
     const envA = p[5] < 50 ? 1 - ((p[5]-50)/50)*0.6 : 1;
     const tone = pscale(p[6], 3);          // water gradient span and offset
-    const interval = lerp(14000, 1500, p[1]/100);
-    // Speed law (2026-09-12, gm-kh2s), the same as AnimRipples.cpp frame():
-    // universal curve on the travel speed and on the swell, amplitude decays
-    // with radius over `travel`, and a ring lives `life` seconds whatever the
-    // speed, fading out over the last RIPPLE_TAIL_FRAC of that.
+    // Speed law (gm-kh2s), the same as AnimRipples.cpp frame(): the universal
+    // curve multiplies the travel speed and the swell and divides both time
+    // constants, the drop interval and the ring life, so the fast end is the
+    // Speed 50 pond played faster rather than a different pond. `travel` is a
+    // distance and stays put, so a ring's brightness at a given radius is the
+    // same at every speed. Fading out over the last RIPPLE_TAIL_FRAC of the
+    // life is unchanged.
     const spd = speedMulJS(p[0]);
+    const interval = lerp(14000, 1500, p[1]/100) / spd;
     const speed = RIPPLE_SPEED_50 * spd;
     const lifeS = lerp(7.0, 2.2, p[2]/100);
     const travel = RIPPLE_FADE_REF_SPEED * lifeS;
-    const life = RIPPLE_LIFE_MUL * lifeS;
+    const life = RIPPLE_LIFE_MUL * lifeS / spd;
     const swellT = tMs * spd;
     const glow = 0.35 + 1.15*(p[3]/100);
     // Same drop process as AnimRipples.cpp frame(): drops land on their
