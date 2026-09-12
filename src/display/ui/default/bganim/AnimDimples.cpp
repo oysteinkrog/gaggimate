@@ -1,10 +1,11 @@
 #ifndef GAGGIMATE_SIM
 
 // "Dimples": a matte surface pressed into a lattice of shallow round dimples,
-// lit by one light that circles the panel once every 24 seconds. Nothing in
-// the picture moves. What changes is the shading, so the rims of the dimples
-// brighten and darken as the light goes round, and the whole sheet breathes
-// as the light's height rises and falls on a 37 second cycle. This is entry
+// lit by one light that circles the panel once every 7.5 seconds at Speed 50
+// (a 24 second turn scaled by RATE_CAL in frame()). Nothing in the picture
+// moves. What changes is the shading, so the rims of the dimples brighten
+// and darken as the light goes round, and the whole sheet breathes as the
+// light's height rises and falls on an 11.6 second cycle. This is entry
 // 42, id 'dimples', in tools/animbench/web/anim_bench.html, including the
 // softened design in that entry's comment: a raised cosine bell of radius 18
 // and depth 9 on a staggered lattice rather than the candidate's cubic on a
@@ -183,11 +184,15 @@ void frame(uint32_t tMs, int, int, const uint8_t p[4]) {
         lastThemeGen = gen;
     }
     // Time stays a pure function of tMs, speed changes included. Q24 carries
-    // the float speed multiplier and the 64-bit product stays below 2^59 even
+    // the float speed multiplier and the 64-bit product stays below 2^61 even
     // at millis() wrap. Each cycle is reduced before the conversion to double,
     // so days of uptime do not erase phase precision the way the page's own
     // t * 2 * pi / period does. At the bench frame times the two agree.
-    const uint32_t speedQ24 = static_cast<uint32_t>(speedMul(p[0]) * 16777216.0f);
+    // RATE_CAL is the Speed calibration (bead gm-kh2s): 3.2x the rate this
+    // entry was designed at, so Speed 50 gives the fleet's target movement.
+    // The light circles in 7.5 s and its height breathes on 11.6 s at 50.
+    constexpr float RATE_CAL = 3.2f;
+    const uint32_t speedQ24 = static_cast<uint32_t>(speedMul(p[0]) * RATE_CAL * 16777216.0f);
     const uint64_t ttQ24 = static_cast<uint64_t>(tMs) * speedQ24;
     const double ang = static_cast<double>(ttQ24 % (static_cast<uint64_t>(TURN_MS) << 24)) *
                        (6.283185307179586 / (static_cast<double>(TURN_MS) * 16777216.0));

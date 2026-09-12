@@ -15,8 +15,9 @@
 //
 // All per-pixel work is integer. The page's truncating signed divisions are
 // C++ divisions here, and its signed >> operations are arithmetic shifts on
-// both supported compilers. Float only builds the 64 dither offsets. No
-// speedMul() substitution: this page uses its older integer speed curve.
+// both supported compilers. Float builds the 64 dither offsets and the
+// per frame speed multiplier, which is rounded to an integer before any
+// time arithmetic.
 // The host PPM writer expands RGB565 with channel*255/31 (or /63); the
 // page replicates bits instead. Their RGB888 values can differ by one
 // while the underlying panel RGB565 word agrees exactly.
@@ -137,15 +138,20 @@ void frame(uint32_t tMs, int w, int h, const uint8_t p[BG_ANIM_PARAMS]) {
     }
 
     // Exactly the page's >>> 0 after each multiplication, before shifting.
-    // Speed 50 gives sp=16. The main vertical phase advances 125 sine
-    // samples/s (1024 per turn); the other advances 78.125/s.
-    // The speed law is the same affine shape this entry has always had,
-    // scaled to 0.615 of it so that Speed 50 gives the fleet's target
-    // movement (bead gm-33fm). It used to read 4 + p[0] * 44 / 100.
-    const uint32_t sp = 3 + static_cast<uint32_t>(p[0]) * 26 / 100;
-    const uint32_t base = tMs * sp;
-    const uint32_t phu = base >> 9, phu2 = (base * 3u) >> 10;
-    const uint32_t phd = base >> 7, phd2 = (base * 5u) >> 10;
+    // Speed follows the fleet's curve, speedMul(): 0.15x at 0, 1x at 50 and
+    // 6.7x at 100 of the rate Speed 50 has since gm-33fm (bead gm-kh2s).
+    // The multiplier is Q8 and 4096 at 50, the old sp of 16 with eight
+    // fraction bits, and the four shifts take those bits back, so Speed 50
+    // is the same picture: the main vertical phase advances 125 sine
+    // samples/s (1024 per turn) and the other 78.125/s. The phases read
+    // bits 15..27 of the product at most, so its wrap never shows. The old
+    // affine law read 3 + p[0] * 26 / 100 and covered 0.19x to 1.8x.
+    // Rounded, not truncated: the nearest .5 boundary over Speed 0..100 is
+    // 38 float ulps away, so the host, the device and the page agree.
+    const uint32_t speedQ8 = static_cast<uint32_t>(lroundf(4096.0f * speedMul(p[0])));
+    const uint32_t base = tMs * speedQ8;
+    const uint32_t phu = base >> 17, phu2 = (base * 3u) >> 18;
+    const uint32_t phd = base >> 15, phd2 = (base * 5u) >> 18;
     const int16_t *sl = sinLut();
     const int cx = w / 2, span = cx > 0 ? cx : 1;
     const int k = (static_cast<int>(p[2]) - 50) * CURVE_SPAN / 50;

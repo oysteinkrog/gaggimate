@@ -133,10 +133,18 @@ void frame(uint32_t tMs, int w, int h, const uint8_t p[BG_ANIM_PARAMS]) {
             dithOff[k] = static_cast<int16_t>(lroundf(d));
         }
     }
-    // Speed 0-100 -> 0.25x..3x of the original drift (which advanced ~60
-    // sine-index units per second on the fastest term).
-    const uint32_t speedMul = 4 + static_cast<uint32_t>(p[0]) * 44 / 100; // 4..48, /16 = 0.25..3
-    const uint32_t base = tMs * speedMul >> 4;                            // ~= original frame*2 at 50
+    // Speed follows the fleet's curve, speedMul(): 0.15x at 0, 1x at 50 and
+    // 6.7x at 100 of the drift Speed 50 has always had (bead gm-kh2s). The
+    // old private law, 4 + p[0] * 44 / 100 over 16, covered 0.25x to 3x.
+    // The multiplier is Q9 and 832 at 50, the old 26 over 16 with five more
+    // fraction bits, so the shift gives the base the old (tMs * 26) >> 4
+    // gave. The product wraps at 2^32 like the page's >>> 0, and the phases
+    // below read only bits 9..27 of it, so the wrap never shows. Rounded,
+    // not truncated: the nearest .5 boundary over Speed 0..100 is 63 float
+    // ulps away, so exp2f on the host, exp2f on the device and Math.pow on
+    // the page land on the same integer.
+    const uint32_t speedQ9 = static_cast<uint32_t>(lroundf(832.0f * speedMul(p[0])));
+    const uint32_t base = tMs * speedQ9 >> 9;
     phase1 = base * 30 >> 9; // ratios preserved from the frame-based original
     phase2 = base * 23 >> 9;
     phase3 = base * 26 >> 9;

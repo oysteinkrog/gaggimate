@@ -144,15 +144,24 @@ void frame(uint32_t tMs, int, int h, const uint8_t p[BG_ANIM_PARAMS]) {
         lastThemeGen = gen;
         tablesValid = true;
     }
-    // This entry uses its own integer speed curve, not speedMul(). Both
-    // products wrap BEFORE shifting, exactly like JavaScript's >>> 0.
-    const uint32_t sp = 4 + static_cast<uint32_t>(p[0]) * 44 / 100; // 4..48, default 11
-    const uint32_t base = tMs * sp;
-    const uint32_t scroll = base >> 9;
-    const uint32_t bendPh1 = base >> 9;
-    const uint32_t bendPh2 = (base * 3u) >> 11;
-    const uint32_t bendPh3 = base >> 12;
-    const uint32_t glowPh = base >> 8;
+    // Speed follows the fleet's curve, speedMul(): 0.15x at 0, 1x at 50 and
+    // 6.7x at 100 of the rate Speed 50 has always had (bead gm-kh2s). The
+    // multiplier is Q6 and 1664 at 50, the old sp of 26 with six fraction
+    // bits, and the five shifts below take them back, so Speed 50 is the
+    // same picture. The old affine law read 4 + p[0] * 44 / 100 and covered
+    // 0.15x to 1.85x; the flat top half of its slider was the law, not a
+    // saturating term. Both products wrap BEFORE shifting, exactly like
+    // JavaScript's >>> 0, and the phases read bits 14..28 of them at most,
+    // so the wrap never shows. Rounded, not truncated: the nearest .5
+    // boundary over Speed 0..100 is 19 float ulps away, so the host, the
+    // device and the page agree.
+    const uint32_t speedQ6 = static_cast<uint32_t>(lroundf(1664.0f * speedMul(p[0])));
+    const uint32_t base = tMs * speedQ6;
+    const uint32_t scroll = base >> 15;
+    const uint32_t bendPh1 = base >> 15;
+    const uint32_t bendPh2 = (base * 3u) >> 17;
+    const uint32_t bendPh3 = base >> 18;
+    const uint32_t glowPh = base >> 14;
     // At default Speed, scroll is 21.484375 px/s. The bend periods are
     // 47.6625, 63.55 and 381.3 seconds; glow's period is 23.8313 seconds.
     // fgQ4=27 gives a 606.815-pixel glow wavelength and 25.463 px/s down.

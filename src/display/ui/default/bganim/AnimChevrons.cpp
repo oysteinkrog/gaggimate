@@ -128,21 +128,24 @@ void frame(uint32_t tMs, int w, int h, const uint8_t p[BG_ANIM_PARAMS]) {
     const int denom = h > 0 ? h : 1;
     const int folds = 2 + static_cast<int>(p[1]) * 3 / 100; // 2..5, three at 65
     const int rowStep = folds * WRAP / denom;
-    // Speed is carried in quarter units so the rate can be scaled to 0.260
-    // of what this entry used to run at (bead gm-33fm) without coarsening
-    // the slider: the law keeps its affine shape and the two extra
-    // fractional bits are taken back in the three shifts below. It used to
-    // read 4 + p[0] * 44 / 100 with shifts of 4, 10 and 11. Speed 50, the
-    // default, gives sp4 = 27, an effective 6.75 against the old 26.
-    // Preserve every JS >>>0 before shifting: both products wrap as
-    // uint32, including base*3. Do not substitute speedMul or an elapsed
-    // time accumulator. Phase advances sp4*1000/64 sum units per second,
-    // 16.9 px/s at defaults on a 480-high panel (rowStep == 25).
-    const uint32_t sp4 = 4 + static_cast<uint32_t>(p[0]) * 46 / 100; // 4..50 quarters
-    const uint32_t base = tMs * sp4;
-    const uint32_t phase = (base >> 6) & (WRAP - 1);
-    const uint32_t phW = base >> 12;
-    const uint32_t phB = (base * 3u) >> 13;
+    // Speed follows the fleet's curve, speedMul(): 0.15x at 0, 1x at 50 and
+    // 6.7x at 100 of the rate Speed 50 has since gm-33fm (bead gm-kh2s).
+    // The multiplier is Q9 and 3456 at 50, the old sp4 of 27 quarters with
+    // seven more fraction bits, and the three shifts below take them back,
+    // so Speed 50 is the same picture: the phase advances 27000/256 sum
+    // units per second, 16.9 px/s at defaults on a 480-high panel (rowStep
+    // == 25). The old affine law read 4 + p[0] * 46 / 100 quarters and
+    // covered 0.15x to 1.85x. Preserve every JS >>>0 before shifting: both
+    // products wrap as uint32, including base*3, and the phases read bits
+    // 13..29 of them at most, so the wrap never shows. Do not substitute an
+    // elapsed time accumulator. Rounded, not truncated: the nearest .5
+    // boundary over Speed 0..100 is 22 float ulps away, so the host, the
+    // device and the page agree.
+    const uint32_t speedQ9 = static_cast<uint32_t>(lroundf(3456.0f * speedMul(p[0])));
+    const uint32_t base = tMs * speedQ9;
+    const uint32_t phase = (base >> 13) & (WRAP - 1);
+    const uint32_t phW = base >> 19;
+    const uint32_t phB = (base * 3u) >> 20;
     // Q8 slant 110..290, modulated by 256 +/-30. At default speed the
     // wobble period is 155.3446 s and the swell period 103.5631 s, as the
     // page computes, despite its older approximate 30 s comment.

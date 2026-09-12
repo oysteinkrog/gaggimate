@@ -283,8 +283,11 @@ ANIMS.push({
       const grain = p[6] <= 50 ? p[6] * 0.75 / 50 : 0.75 + (p[6] - 50) * 2.25 / 50;
       bayerOffsets(state.dith, ditherAmpJS(state.pal, 256) * grain, 16);
     }
-    const speedMul = 4 + Math.floor(p[0] * 44 / 100); // 4 to 48, /16 = 0.25x to 3x
-    const base = ((t * speedMul) >>> 0) >>> 4;
+    // The fleet's speed curve on the rate Speed 50 has always had (gm-kh2s):
+    // Q9, 832 at 50, rounded the way AnimPlasma.cpp rounds it. The old
+    // private law read 4 + Math.floor(p[0] * 44 / 100) over 16.
+    const speedQ9 = Math.round(F(832 * speedMulF(p[0])));
+    const base = ((t * speedQ9) >>> 0) >>> 9;
     const phase1 = ((base * 30) >>> 0) >>> 9; // ratios from the frame-based original
     const phase2 = ((base * 23) >>> 0) >>> 9;
     const phase3 = ((base * 26) >>> 0) >>> 9;
@@ -1898,12 +1901,14 @@ function bayerOffsets(dithOff, amp, unit) {
         }
         bayerOffsets(state.dith, ditherAmpJS(pal, 256) * 0.45, 16);
       }
-      // Calibrated to 0.615 of the original rate (gm-33fm): the affine
-      // speed law keeps its shape, it used to read 4 + p[0] * 44 / 100.
-      const sp = 3 + Math.floor(p[0] * 26 / 100);
-      const base = ((t * sp) >>> 0);
-      const phu = base >>> 9, phu2 = ((base * 3) >>> 0) >>> 10;
-      const phd = base >>> 7, phd2 = ((base * 5) >>> 0) >>> 10;
+      // The fleet's speed curve on the rate Speed 50 has since gm-33fm
+      // (gm-kh2s): Q8, 4096 at 50, rounded the way AnimHorizon.cpp rounds
+      // it, and the shifts take the eight fraction bits back. The old
+      // affine law read 3 + Math.floor(p[0] * 26 / 100).
+      const speedQ8 = Math.round(F(4096 * speedMulF(p[0])));
+      const base = ((t * speedQ8) >>> 0);
+      const phu = base >>> 17, phu2 = ((base * 3) >>> 0) >>> 18;
+      const phd = base >>> 15, phd2 = ((base * 5) >>> 0) >>> 18;
       // The horizon profile: curvature plus two travelling swells.
       const cx = Math.floor(w / 2), span = cx > 0 ? cx : 1;
       const k = Math.trunc((p[2] - 50) * CURVE_SPAN / 50);
@@ -2097,13 +2102,14 @@ function bayerOffsets(dithOff, amp, unit) {
       const denom = h > 0 ? h : 1;
       const folds = 2 + Math.floor(p[1] * 3 / 100);
       const rowStep = Math.trunc(folds * WRAP / denom);
-      // Speed in quarter units, calibrated to 0.260 of the original rate
-      // (gm-33fm). It used to read 4 + p[0] * 44 / 100 with shifts of 4,
-      // 10 and 11; the two extra fractional bits are taken back here.
-      const sp4 = 4 + Math.floor(p[0] * 46 / 100);
-      const base = ((t * sp4) >>> 0);
-      const phase = (base >>> 6) % WRAP;
-      const phW = base >>> 12, phB = ((base * 3) >>> 0) >>> 13;
+      // The fleet's speed curve on the rate Speed 50 has since gm-33fm
+      // (gm-kh2s): Q9, 3456 at 50, rounded the way AnimChevrons.cpp rounds
+      // it, and the shifts take the nine fraction bits back. The old
+      // affine law read 4 + Math.floor(p[0] * 46 / 100) quarters.
+      const speedQ9 = Math.round(F(3456 * speedMulF(p[0])));
+      const base = ((t * speedQ9) >>> 0);
+      const phase = (base >>> 13) % WRAP;
+      const phW = base >>> 19, phB = ((base * 3) >>> 0) >>> 20;
       // A slow wobble on the slant: the V opens and closes over about 30 s.
       const angleQ8 = 110 + Math.floor(p[2] * 180 / 100);
       const wob = 256 + ((SIN[phW & (SIN_N - 1)] * 30) >> 9);
@@ -2447,11 +2453,15 @@ function bayerOffsets(dithOff, amp, unit) {
         }
         bayerOffsets(state.dith, ditherAmpJS(pal, 256) * 0.8, 16);
       }
-      const sp = 4 + Math.floor(p[0] * 44 / 100);
-      const base = ((t * sp) >>> 0);
-      const scroll = base >>> 9;
-      const bendPh1 = base >>> 9, bendPh2 = ((base * 3) >>> 0) >>> 11, bendPh3 = base >>> 12;
-      const glowPh = base >>> 8;
+      // The fleet's speed curve on the rate Speed 50 has always had
+      // (gm-kh2s): Q6, 1664 at 50, rounded the way AnimRefraction.cpp
+      // rounds it, and the shifts take the six fraction bits back. The old
+      // affine law read 4 + Math.floor(p[0] * 44 / 100).
+      const speedQ6 = Math.round(F(1664 * speedMulF(p[0])));
+      const base = ((t * speedQ6) >>> 0);
+      const scroll = base >>> 15;
+      const bendPh1 = base >>> 15, bendPh2 = ((base * 3) >>> 0) >>> 17, bendPh3 = base >>> 18;
+      const glowPh = base >>> 14;
       const amp1 = Math.trunc(p[1] * 90 / 100), amp2 = Math.trunc(p[1] * 210 / 100);
       const amp3 = Math.trunc(p[1] * 150 / 100);
       const denom = h > 0 ? h : 1;
@@ -5879,7 +5889,10 @@ function pcDither(dst, amp) {
         state.pal = themeRamp(180 + Math.round(p[2] * 76 / 100));
         bayerOffsets(state.dith, 1.5, 1);
       }
-      const te = tMs * speedMulJS(p[0]);
+      // Speed calibration (gm-kh2s): 3.2x, mirroring AnimDimples.cpp. The
+      // light circles in 7.5 s and its height breathes on 11.6 s at 50.
+      const RATE_CAL = 3.2;
+      const te = tMs * (speedMulJS(p[0]) * RATE_CAL);
       const ts = te / 1000;
       // The relief knob rides on the light's lateral reach, which is the
       // same thing as scaling the normal's xy and costs nothing per texel.
