@@ -908,19 +908,24 @@ static void test_bgparams_spec_steps_and_clamps() {
 // longer than the sentinel.
 // ---------------------------------------------------------------------------
 
-// A 60-entry table: the shipped 18 unchanged, then 42 distinguishable ones.
+// A 60-entry table: the original 18 unchanged, then 42 distinguishable ones.
+// It is built from the first 18 rather than from the whole shipped table so
+// that entries 18 and above stay synthetic and keep carrying their index, which
+// is how these cases name which built-in a gradient resolved to. The shipped
+// table has 60 entries of its own since gm-nov3.5, and a table built on top of
+// that one would have no marked entry at 18 at all.
 static const bganim_gen::ThemeDef *bigTable(int &count) {
     static std::vector<bganim_gen::ThemeDef> table;
     static std::vector<std::string> names;
     if (table.empty()) {
-        for (int i = 0; i < bganim_gen::THEME_DEF_COUNT; i++) {
+        for (int i = 0; i < BG_THEME_LEGACY_CUSTOM; i++) {
             table.push_back(bganim_gen::THEME_DEFS[i]);
         }
         names.reserve(64);
-        for (int i = bganim_gen::THEME_DEF_COUNT; i < 60; i++) {
+        for (int i = BG_THEME_LEGACY_CUSTOM; i < 60; i++) {
             names.push_back("Test " + std::to_string(i));
         }
-        for (int i = bganim_gen::THEME_DEF_COUNT, k = 0; i < 60; i++, k++) {
+        for (int i = BG_THEME_LEGACY_CUSTOM, k = 0; i < 60; i++, k++) {
             bganim_gen::ThemeDef def{};
             def.name = names[static_cast<size_t>(k)].c_str();
             def.category = "Test";
@@ -942,6 +947,13 @@ static void useBigTable() {
     int n = 0;
     const bganim_gen::ThemeDef *defs = bigTable(n);
     bg_test_set_theme_table(defs, n);
+}
+
+// The table a firmware from before gm-nov3.5 had: the original 18 and nothing
+// past the legacy Custom sentinel. This is what a rollback lands on, and it is
+// the only way to reach that state now that the shipped table is longer.
+static void useShortTable() {
+    bg_test_set_theme_table(bganim_gen::THEME_DEFS, BG_THEME_LEGACY_CUSTOM);
 }
 
 // The custom gradient every fixture below uses, and its canonical uniform
@@ -1044,9 +1056,9 @@ static void test_explicit_builtin_refs_resolve_directly() {
     // An override wins over the global outright.
     TEST_ASSERT_EQUAL_STRING(want18.c_str(), resolved(1, ";18", "", "30", 0, "").c_str());
 
-    // On the shipped 18-entry table neither ref resolves, so both fall
-    // through to the legacy pair, which still means the custom gradient.
-    useShippedTable();
+    // On an 18-entry table neither ref resolves, so both fall through to the
+    // legacy pair, which still means the custom gradient.
+    useShortTable();
     const std::string legacy = resolved(0, "", "", "", BG_THEME_LEGACY_CUSTOM, kCustom);
     TEST_ASSERT_EQUAL_STRING(legacy.c_str(), resolved(0, "", "", "18", BG_THEME_LEGACY_CUSTOM, kCustom).c_str());
     TEST_ASSERT_EQUAL_STRING(legacy.c_str(), resolved(0, "", "", "30", BG_THEME_LEGACY_CUSTOM, kCustom).c_str());
@@ -1061,7 +1073,7 @@ static void test_upgrade_rollback_upgrade_keeps_the_same_gradient() {
     useBigTable();
     const std::string up = resolved(0, "", "", "30", mirror, "");
     TEST_ASSERT_TRUE(up.rfind("1e0040@0,", 0) == 0);
-    useShippedTable();
+    useShortTable();
     const std::string back = resolved(0, "", "", "30", mirror, "");
     TEST_ASSERT_EQUAL_STRING(builtinStops(0).c_str(), legacyStops(mirror, "").c_str());
     TEST_ASSERT_TRUE(back.rfind("080402@0,", 0) == 0); // built-in 0, Espresso
@@ -1073,7 +1085,7 @@ static void test_upgrade_rollback_upgrade_keeps_the_same_gradient() {
     TEST_ASSERT_EQUAL(0, mirror18);
     const std::string up18 = resolved(0, "", "", "18", mirror18, "");
     TEST_ASSERT_TRUE(up18.rfind("120040@0,", 0) == 0);
-    useShippedTable();
+    useShortTable();
     TEST_ASSERT_TRUE(resolved(0, "", "", "18", mirror18, "").rfind("080402@0,", 0) == 0);
     useBigTable();
     TEST_ASSERT_EQUAL_STRING(up18.c_str(), resolved(0, "", "", "18", mirror18, "").c_str());
@@ -1081,7 +1093,7 @@ static void test_upgrade_rollback_upgrade_keeps_the_same_gradient() {
     // A per-animation override that does not resolve falls through the global,
     // on both builds.
     TEST_ASSERT_EQUAL_STRING(up.c_str(), resolved(1, ";c9", "", "30", mirror, "").c_str());
-    useShippedTable();
+    useShortTable();
     TEST_ASSERT_TRUE(resolved(1, ";c9", "", "30", mirror, "").rfind("080402@0,", 0) == 0);
 }
 

@@ -25,9 +25,10 @@
 // Exit code is 1 on any differing entry.
 
 import { spawn } from 'node:child_process';
-import { existsSync } from 'node:fs';
+import { closeSync, existsSync, mkdtempSync, openSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
-import { dirname, resolve } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 
 import { BG_THEMES } from '../../../web/src/config/bgThemes.js';
 import { parseGradientWire, publishStops, toneFromPercent, buildThemeRamp, buildThemeWheel } from '../../../web/src/config/gradientRamp.js';
@@ -121,13 +122,27 @@ if (!existsSync(DUMP)) {
 }
 
 const input = queries.map(q => `${q.wire} ${q.brightPct} ${q.kneePct} ${q.gain} ${q.mode}\n`).join('');
-const child = spawn(DUMP, [], { stdio: ['pipe', 'pipe', 'inherit'] });
-let out = '';
-child.stdout.setEncoding('utf8');
-child.stdout.on('data', d => (out += d));
-child.stdin.end(input);
+
+// Through files, not pipes. The child streams a 256-number line per query and
+// flushes each one, and node drains its stdout, so this looked like a case
+// pipes handle. On WSL1 they do not: with the 18-gradient table the whole
+// exchange fitted in the socket buffers, and at 60 gradients (gm-nov3.5, 4,300
+// queries in, about 8 MB out) node and ramp_dump both parked with no CPU time
+// and `make check` hung until it was killed. The same queries through a file
+// finish in 0.2 s.
+const tmp = mkdtempSync(join(tmpdir(), 'ramp-parity-'));
+const inPath = join(tmp, 'queries.txt');
+const outPath = join(tmp, 'ramps.txt');
+writeFileSync(inPath, input);
+const fdIn = openSync(inPath, 'r');
+const fdOut = openSync(outPath, 'w');
+const child = spawn(DUMP, [], { stdio: [fdIn, fdOut, 'inherit'] });
 
 child.on('close', code => {
+  closeSync(fdIn);
+  closeSync(fdOut);
+  const out = readFileSync(outPath, 'utf8');
+  rmSync(tmp, { recursive: true, force: true });
   if (code !== 0) {
     console.error(`ramp_dump exited ${code}`);
     process.exit(1);
