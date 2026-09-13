@@ -39,20 +39,18 @@
 //   on the squared distance alone.
 // - The per-frame constants are double with libm's sin and pow.
 //
-// What page_vs_golden.js still reports for this animation, and why it is
-// the harness and not this file. Both sides build their wisps at the time
-// of the first frame they are given, and the birth of every blob is that
-// time minus a draw from the generator, so the whole picture hangs on when
-// the first frame arrived. bench.cpp renders a warm-up frame at t = 0
-// before the timed frames start at 1000 ms; the tool starts the page at
-// 1000 ms, which its own header records as the one thing it cannot model.
-// Measured both ways on frames 30, 120 and 210 (gm-pciz, 2026-09-12):
-// with the page given the same warm-up frame at t = 0, 0 differing pixels
-// at all three; without it, 14,742, 16,162 and 16,724 of 230,400, mean
-// absolute deviation 2.17, 2.16 and 2.19 per channel. The device does not
-// have a warm-up frame, so on the device this file and the page build at
-// the same time and draw the same picture. Nothing here can close the gap
-// the tool reports without moving away from the page's own model.
+// Both sides build their wisps at the time of the first frame they are
+// given, and the birth of every blob is that time minus a draw from the
+// generator, so the whole picture hangs on when the first frame arrived.
+// bench.cpp renders a warm-up frame at t = 0 before the timed frames start
+// at 1000 ms, so the goldens are built at t = 0. page_vs_golden.js used to
+// start the page at 1000 ms and reported the difference as this file's:
+// 14,742, 16,162 and 16,724 of 230,400 pixels at frames 30, 120 and 210,
+// mean absolute deviation 2.17, 2.16 and 2.19 per channel. The tool plays
+// the warm-up frame too since 2026-09-13 (gm-pciz) and this animation reads
+// 0 differing pixels at all three frames. The device has no warm-up frame
+// and does not need one: there this file and the page both build at the
+// same clock.
 //
 // The host bench band is 0.61 ms a frame against the old port's 0.16,
 // all of it the per-pixel float blob work, which is the price of the

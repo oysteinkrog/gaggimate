@@ -18,10 +18,17 @@
 // rendering at 4960 ms without the 119 frames before it does not give the
 // picture the firmware has at frame 120.
 //
-// One thing this cannot model: bench.cpp renders a warm-up frame at t = 0
-// before the loop, to build lazy tables outside the timed region. An animation
-// that accumulates state per frame therefore starts one frame ahead on the
-// firmware side. That is a real difference and the tool reports it as one.
+// The warm-up frame is part of the playback, because the goldens were made
+// with it. bench.cpp renders one frame at t = 0 before its timed loop, to
+// build lazy tables outside the timed region, so an animation that builds
+// its picture on the first frame it is given builds it at t = 0 on the
+// firmware side. The page is played the same way here. Without it the tool
+// reported a harness artefact as a design gap: Steam, whose wisps are born
+// at the time of its first frame, read 16,724 differing pixels at a mean of
+// 2.19 per channel, and reads 0 at all three frames with the warm-up
+// (gm-pciz, 2026-09-13). Adding it moved no other animation by a single
+// pixel. The device has no warm-up frame, and neither does it need one:
+// there the firmware and the page both start at the same clock.
 //
 // usage:
 //   node page_vs_golden.js [--ids 1,2] [--json out.json] [--frames 30,120,210]
@@ -123,6 +130,7 @@ function main() {
     const p = a.params.map(x => x.def);
     const buf = new Uint8ClampedArray(W * H * 4);
     const got = new Map();
+    a.render(buf, W, H, 0, p, state); // bench.cpp's warm-up frame, see the header
     for (let i = 0; i <= last; i++) {
       a.render(buf, W, H, START_MS + i * FRAME_MS, p, state);
       if (frames.includes(i)) got.set(i, buf.slice());
