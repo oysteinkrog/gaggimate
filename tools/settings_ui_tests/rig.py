@@ -18,6 +18,7 @@ import json
 import math
 import os
 import re
+import signal
 import socket
 import struct
 import subprocess
@@ -727,6 +728,12 @@ class Sim:
     # here.
     BOOT_SETTLE_S = 1.5
 
+    # The exit status a clean ESP.restart() leaves: sim/platform/Esp.h maps
+    # EspClass::restart() (and esp_system.h maps esp_restart()) to exit(0).
+    # A restart check compares against this rather than accepting any exit;
+    # see wait_exited().
+    CLEAN_RESTART_STATUS = 0
+
     def __init__(self, program_path, data_dir, port=8080, log_path=None):
         if os.path.basename(os.path.normpath(data_dir)) != "sim_data":
             raise ValueError('data_dir must be a directory named "sim_data", got %r' % data_dir)
@@ -822,16 +829,42 @@ class Sim:
         running (or was never launched)."""
         return None if self.proc is None else self.proc.poll()
 
+    @staticmethod
+    def describe_exit(code):
+        """A readable form of a Popen exit status, for a check's detail
+        line. Popen reports a signal death as the negated signal number,
+        which reads as an arbitrary integer otherwise."""
+        if code is None:
+            return "still running"
+        if code < 0:
+            try:
+                name = signal.Signals(-code).name
+            except ValueError:
+                name = "unknown signal"
+            return "killed by signal %d (%s)" % (-code, name)
+        return "exited with status %d" % code
+
     def wait_exited(self, timeout=10):
         """Waits up to timeout for the simulator process to exit and
         returns its exit status, or None if it is still running.
 
-        This is the only evidence a check has that ESP.restart() ran (the
-        sim's Esp.h maps it to exit(0), so the status is 0 and a caller
-        must test `is not None`, not truthiness). A failed request is not
-        evidence: Rig folds every HTTP status error and every socket error
-        into one RigHTTPError, and an HTTP 500, a malformed reply and a
-        dropped connection all leave the process running (gm-nov3.29)."""
+        This is the only evidence a check has that ESP.restart() ran. A
+        failed request is not evidence: Rig folds every HTTP status error
+        and every socket error into one RigHTTPError, and an HTTP 500, a
+        malformed reply and a dropped connection all leave the process
+        running (gm-nov3.29).
+
+        The status matters as well as the exit. A clean restart on the
+        simulator is `Sim.CLEAN_RESTART_STATUS`, which is 0, because the
+        sim's Esp.h maps ESP.restart() to exit(0); that is the only status
+        a restart check should accept. Every other status is the
+        simulator dying some other way, which is a firmware fault, not the
+        restart the check is testing for: a crash on the way to the
+        restart, an abort inside a settings commit, or a signal death
+        (Popen reports that as minus the signal number, so -6 is SIGABRT).
+        Testing `is not None` accepts all of those and so cannot fail on
+        them (gm-nov3.37). Compare against CLEAN_RESTART_STATUS, and use
+        describe_exit() for the detail line."""
         if self.proc is None:
             return None
         t0 = time.time()

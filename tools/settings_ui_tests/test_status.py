@@ -316,12 +316,14 @@ def check_restart_persistence_and_relaunch(rig, sim):
     target = rig.find_tag(d_status, "Restart", "confirm")
 
     # The evidence that the hold restarted the device is the simulator
-    # process exiting, not the tap request failing. A failed request is
-    # RigHTTPError either way: Rig folds every HTTP status error and every
-    # socket error into that one exception, so an HTTP 500, a malformed
-    # reply or a dropped connection with the process still running used to
-    # pass this check (gm-nov3.29). ESP.restart() is exit(0) on the sim, so
-    # the status to look for is "not None", not "non-zero".
+    # process exiting cleanly, not the tap request failing and not the
+    # process dying somehow. A failed request is RigHTTPError either way:
+    # Rig folds every HTTP status error and every socket error into that
+    # one exception, so an HTTP 500, a malformed reply or a dropped
+    # connection with the process still running used to pass this check
+    # (gm-nov3.29). Then "a status, any status" passed on a crash or a
+    # signal death on the way to the restart (gm-nov3.37), so the status
+    # a clean ESP.restart() leaves is what is compared against.
     tap_error = None
     try:
         rig.tap_target(target, ms=2500)
@@ -331,8 +333,8 @@ def check_restart_persistence_and_relaunch(rig, sim):
     check(
         rig,
         "long_hold_restarts_process",
-        code is not None,
-        "exit_code=%r tap_error=%s" % (code, tap_error),
+        code == Sim.CLEAN_RESTART_STATUS,
+        "%s, want status %d; tap_error=%s" % (Sim.describe_exit(code), Sim.CLEAN_RESTART_STATUS, tap_error),
     )
 
     sim.restart()
@@ -398,8 +400,12 @@ def check_fail_flush_scenario(program, workdir, port):
             )
             check(rig, "forced_flush_failure_does_not_restart", True, "reached here without a connection error")
 
-            # Same rule as the restart check above: the process exiting is
-            # the evidence, a failed request is not (gm-nov3.29).
+            # Same rule as the restart check above: a clean exit is the
+            # evidence. A failed request is not (gm-nov3.29), and neither
+            # is an unclean exit (gm-nov3.37), which matters most here:
+            # this hold runs right after a settings save was forced to
+            # fail, so a crash on that path is exactly the fault the check
+            # would otherwise report as a successful restart.
             target2 = rig.find_tag(d2, "Restart", "confirm")
             tap_error = None
             try:
@@ -410,8 +416,8 @@ def check_fail_flush_scenario(program, workdir, port):
             check(
                 rig,
                 "second_hold_restarts_after_forced_failure",
-                code is not None,
-                "exit_code=%r tap_error=%s" % (code, tap_error),
+                code == Sim.CLEAN_RESTART_STATUS,
+                "%s, want status %d; tap_error=%s" % (Sim.describe_exit(code), Sim.CLEAN_RESTART_STATUS, tap_error),
             )
     finally:
         if prior is None:
