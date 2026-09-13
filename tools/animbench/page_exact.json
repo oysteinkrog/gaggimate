@@ -31,7 +31,18 @@
    "file header, spread over far more ring pixels than before.",
    "The mean absolute deviation per channel is the number that shows it:",
    "5.02, 3.49 and 3.31 at the three frames before, 2.82, 2.79 and 2.76",
-   "after. Fixing the tracker is what takes this to zero."
+   "after. Fixing the tracker is what takes this to zero.",
+   "",
+   "Confirmed by measurement on 2026-09-13 and accepted as debt. A variant",
+   "that takes the page's per-pixel arithmetic (exact float centre, real",
+   "square root, the page's envelope and cosine, and the page's double row",
+   "swell) is exact: 0 differing pixels at all three frames. The distance",
+   "and the two per-pixel tables are 97% of the gap and the row swell 3%.",
+   "It is not shipped because the page's model is per-pixel libm over about",
+   "100,000 ring pixels a frame: the host bench band goes from 0.118 to",
+   "0.541 ms a frame, and it would have to be transcribed bit for bit into",
+   "two hand-written Xtensa kernels that have no fallback flag. The reason",
+   "and the numbers are in AnimRipples.cpp's header."
   ]
  }
 }

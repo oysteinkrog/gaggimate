@@ -18,6 +18,35 @@
 // error against a 27px wavelength (~13 degrees) — invisible under the
 // existing dither.
 //
+// That integer distance is why this animation does not draw its page design
+// pixel for pixel, and it is recorded debt against gm-pciz rather than a bug
+// to fix. Measured 2026-09-13 by building a variant that takes the page's
+// arithmetic per pixel and nothing else: the exact float centre instead of
+// the floored g_icx/g_icy, sqrt of the exact distance instead of the
+// tracker's floor(r), the page's envelope 1 - n*n instead of envLUT, the
+// page's cos(delta * 2*PI/27) instead of the 256-entry truncated cosine
+// table, and the page's own double row expression for the swell instead of
+// the same table. That variant is exact: 0 differing pixels at all three
+// golden frames, against 17,441, 18,369 and 15,358 here. Taken apart, the
+// distance and the two per-pixel tables are 97% of it and the row swell the
+// other 3% (593, 649 and 311 pixels left when only the distance and the
+// tables were fixed, and the largest deviation anywhere fell from 46 to 8,
+// one palette step).
+//
+// It is not shipped because the page's model is per-pixel libm. The host
+// bench band goes from 0.118 to 0.541 ms a frame, and the device pays worse:
+// band_us is already 14,004 for a full frame, this is about 100,000 ring
+// pixels a frame, and every one of them would need a square root, a cosine
+// and a divide where it now does integer adds and two table reads. A float
+// version with a double fallback near the rounding boundaries, the scheme
+// AnimFireflies.cpp uses, would cut that but not to nothing, and it would
+// have to be transcribed bit for bit into the two hand-written Xtensa
+// kernels below, which have no build flag to fall back to the portable path.
+// Anyone taking that on should measure the device band first: the wave is
+// 27 px long, so what the error buys the panel is a ring up to 2 px off its
+// design radius, which is a fine-detail difference and not a defect of the
+// kind Mandala's wrong shape or Ember's darkness were.
+//
 // Row-window fix (this pass): a ring is a thin annulus (radial thickness
 // 2*HALFW), not a filled disk. The previous version bounded a ring-row's
 // x-range using only the OUTER edge (r+HALFW), which for a mature ring
