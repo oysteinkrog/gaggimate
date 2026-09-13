@@ -57,8 +57,9 @@ int16_t *surfRow = nullptr;
 int16_t *halfPx = nullptr;
 int16_t *dith = nullptr;
 uint16_t *palette = nullptr;
-uint16_t *smooth = nullptr;
-uint16_t *radialAmp = nullptr;
+uint32_t *palette32 = nullptr;  // same entries, 32-bit, for EE.LDXQ.32
+uint32_t *smooth32 = nullptr;
+uint32_t *radialAmp32 = nullptr;
 int16_t *field = nullptr;
 uint16_t *work = nullptr;      // 64 aligned bytes, beam terms then palette constants
 const int16_t *sine = nullptr; // borrowed shared table, never released here
@@ -100,28 +101,30 @@ bool init(int w, int h) {
     if (rowQ4 == nullptr)
         rowQ4 = static_cast<int16_t *>(allocHot(h * sizeof(int16_t)));
     if (surfRow == nullptr)
-        surfRow = static_cast<int16_t *>(allocHot(h * sizeof(int16_t)));
+        surfRow = static_cast<int16_t *>(alloc(h * sizeof(int16_t)));
     if (halfPx == nullptr)
-        halfPx = static_cast<int16_t *>(allocHot(h * sizeof(int16_t)));
+        halfPx = static_cast<int16_t *>(alloc(h * sizeof(int16_t)));
     if (dith == nullptr)
         dith = static_cast<int16_t *>(allocHot(64 * sizeof(int16_t)));
     if (palette == nullptr)
         palette = static_cast<uint16_t *>(allocHot(256 * sizeof(uint16_t)));
-    if (smooth == nullptr)
-        smooth = static_cast<uint16_t *>(allocHot(257 * sizeof(uint16_t)));
-    if (radialAmp == nullptr)
-        radialAmp = static_cast<uint16_t *>(allocHot((RAD_SPAN + 1) * sizeof(uint16_t)));
+    if (palette32 == nullptr)
+        palette32 = static_cast<uint32_t *>(allocHot(256 * sizeof(uint32_t)));
+    if (smooth32 == nullptr)
+        smooth32 = static_cast<uint32_t *>(allocHot(257 * sizeof(uint32_t)));
+    if (radialAmp32 == nullptr)
+        radialAmp32 = static_cast<uint32_t *>(allocHot((RAD_SPAN + 1) * sizeof(uint32_t)));
     if (field == nullptr)
         field = static_cast<int16_t *>(allocHot(w * sizeof(int16_t)));
     if (work == nullptr)
-        work = static_cast<uint16_t *>(allocHot(64));
-    if (!work || !colFace || !colSurface || !rowQ4 || !surfRow || !halfPx || !dith || !palette || !smooth || !radialAmp ||
-        !field) {
+        work = static_cast<uint16_t *>(allocHot(192));
+    if (!work || !colFace || !colSurface || !rowQ4 || !surfRow || !halfPx || !dith || !palette || !palette32 ||
+        !smooth32 || !radialAmp32 || !field) {
         release();
         return false;
     }
     for (int u = 0; u <= 256; u++)
-        smooth[u] = static_cast<uint16_t>(smoothQ8(u));
+        smooth32[u] = static_cast<uint32_t>(smoothQ8(u));
     return true;
 }
 
@@ -129,6 +132,7 @@ void frame(uint32_t tMs, int w, int h, const uint8_t p[BG_ANIM_PARAMS]) {
     const uint32_t gen = themeGen();
     if (!geometryValid || gen != lastThemeGen) {
         buildThemeRamp(palette, 256);
+        for (int i = 0; i < 256; i++) palette32[i] = palette[i];
         const float amp = ditherAmp(palette, 256) * 0.6f;
         for (int y = 0; y < 8; y++) {
             for (int x = 0; x < 8; x++) {
@@ -163,7 +167,7 @@ void frame(uint32_t tMs, int w, int h, const uint8_t p[BG_ANIM_PARAMS]) {
     if (!geometryValid || lastContrast != p[2]) {
         for (int r = 0; r <= RAD_SPAN; r++) {
             const int ur = r * 256 / RAD_SPAN;
-            radialAmp[r] = static_cast<uint16_t>((beamQ4 * smoothQ8(ur)) >> 8);
+            radialAmp32[r] = static_cast<uint32_t>((beamQ4 * smoothQ8(ur)) >> 8);
         }
         lastContrast = p[2];
     }
@@ -332,19 +336,29 @@ GM_ANIM_IRAM __attribute__((noinline)) void sundialColumnsAsm(int16_t *out, cons
         out[x] = col[x] + off[x & 7];
 }
 
-GM_ANIM_IRAM __attribute__((noinline)) void sundialBeamAsm(int16_t *pixels, uint16_t *work, const uint16_t *sm,
-                                                           const uint16_t *rad, int g0q, int g1q, int step0, int step1,
+GM_ANIM_IRAM __attribute__((noinline)) void sundialBeamAsm(int16_t *pixels, uint16_t *work, const uint32_t *sm,
+                                                           const uint32_t *rad, int g0q, int g1q, int step0, int step1,
                                                            int radialBias, int n) {
     // q = (g + 24064)*348, exactly the reference before >>16. No reduced
     // precision in the cursor. radialBias = 1466-rowRad; rad[r] includes the
     // contrast-scaled radial cubic for r clamped to 0..587. Production cp
     // stays within [-2254,264], steps within +/-178176, and |q| stays below
-    // 100 million at 480 pixels, so the signed accumulators cannot overflow.
-    // The two VMULs plus three loads, one field load, add and store cost
-    // eight instructions per eight beam pixels, plus SSAI and block control.
-    // Together with the scalar gather this is 26 instructions/beam pixel
-    // before that setup, on top of the 6.625 instructions/pixel face path.
-    // These are issue-count lower bounds, not measured LX7 cycle timings.
+    // 100 million at 480 pixels, so the signed accumulators cannot overflow,
+    // and q >> 16 stays within +/-1433, which is why the cursor can be
+    // narrowed to a 16-bit lane after the shift.
+    //
+    // Eight pixels an iteration. The three table reads the reference makes per
+    // pixel are the reason this used to be a scalar loop: PIE has no gather.
+    // EE.LDXQ.32 is the exception, a one-lane indexed 32-bit load, so eight of
+    // them plus one unzip fetch eight entries, and smooth and radialAmp are
+    // held as 32-bit tables for it. That is nine instructions for what cost
+    // about eight per pixel before. 62 instructions per eight pixels, 7.75 a
+    // pixel, against 25 for the scalar loop this replaces, and the arithmetic
+    // that follows is the same two multiplies and the same add as before.
+    //
+    // Register budget is the whole file: q0..q3 carry the two cursors as four
+    // 32-bit lane pairs and q4..q7 are scratch, so the five loop constants are
+    // read from the work area with a walking pointer that resets at the end.
     while (n > 0) {
         if (((uintptr_t)pixels & 15u) != 0 || n < 8) {
             int u0 = g0q >> 16, u1 = g1q >> 16;
@@ -352,76 +366,107 @@ GM_ANIM_IRAM __attribute__((noinline)) void sundialBeamAsm(int16_t *pixels, uint
             u1 = u1 < 0 ? 0 : (u1 > 256 ? 256 : u1);
             int r = radialBias + *pixels;
             r = r < 0 ? 0 : (r > 587 ? 587 : r);
-            *pixels += (rad[r] * ((sm[u0] * sm[u1]) >> 8)) >> 8;
+            *pixels += (int16_t)((rad[r] * ((sm[u0] * sm[u1]) >> 8)) >> 8);
             pixels++;
             n--;
             g0q += step0;
             g1q += step1;
             continue;
         }
-        int16_t *src = pixels;
-        uint16_t *tmp = work;
-        int t0, t1;
-        // Twenty-five instructions per pixel, at most 75 bytes in the 256-byte loop
-        // limit. Three table loads each have an independent cursor/pointer
-        // update before the store consumes the loaded value. Thirteen ARs,
-        // no spill or division inside the loop. work holds three eight-lane
-        // vectors: sm0, sm1, radial amplitude, at byte offsets 0, 16, 32.
-        asm volatile("loop %[eight], 1f\n"
-                     "srai %[t0], %[g0], 16\n"
-                     "movi %[t1], 256\n"
-                     "max %[t0], %[t0], %[zero]\n"
-                     "min %[t0], %[t0], %[t1]\n"
-                     "addx2 %[t0], %[t0], %[sm]\n"
-                     "l16ui %[t0], %[t0], 0\n"
-                     "add %[g0], %[g0], %[s0]\n"
-                     "s16i %[t0], %[tmp], 0\n"
-                     "srai %[t0], %[g1], 16\n"
-                     "max %[t0], %[t0], %[zero]\n"
-                     "min %[t0], %[t0], %[t1]\n"
-                     "addx2 %[t0], %[t0], %[sm]\n"
-                     "l16ui %[t0], %[t0], 0\n"
-                     "add %[g1], %[g1], %[s1]\n"
-                     "s16i %[t0], %[tmp], 16\n"
-                     "l16si %[t0], %[src], 0\n"
-                     "movi %[t1], 587\n"
-                     "add %[t0], %[t0], %[bias]\n"
-                     "max %[t0], %[t0], %[zero]\n"
-                     "min %[t0], %[t0], %[t1]\n"
-                     "addx2 %[t0], %[t0], %[rad]\n"
-                     "l16ui %[t0], %[t0], 0\n"
-                     "addi %[src], %[src], 2\n"
-                     "s16i %[t0], %[tmp], 32\n"
-                     "addi %[tmp], %[tmp], 2\n"
+        int16_t *c16 = (int16_t *)work;
+        int32_t *c32 = (int32_t *)work;
+        for (int k = 0; k < 8; k++) c16[k] = 256;          // +0   u clamp ceiling
+        for (int k = 0; k < 4; k++) c32[4 + k] = step0 * 8; // +16  cursor stride
+        for (int k = 0; k < 4; k++) c32[8 + k] = step1 * 8; // +32
+        for (int k = 0; k < 8; k++) c16[24 + k] = (int16_t)radialBias; // +48
+        for (int k = 0; k < 8; k++) c16[32 + k] = 587;     // +64  radial ceiling
+        for (int k = 0; k < 8; k++) {                      // +80  cursor seeds
+            c32[20 + k] = g0q + step0 * k;
+            c32[28 + k] = g1q + step1 * k;
+        }
+        const int blocks = n >> 3;
+        const int32_t *seed = c32 + 20;
+        const int16_t *cp = c16;
+        int16_t *px = pixels;
+        asm volatile("ee.vld.128.ip q0, %[seed], 16\n"
+                     "ee.vld.128.ip q1, %[seed], 16\n"
+                     "ee.vld.128.ip q2, %[seed], 16\n"
+                     "ee.vld.128.ip q3, %[seed], 0\n"
+                     "loopnez %[n], 1f\n"
+                     "ssai 16\n"
+                     "ee.vsr.32 q4, q0\n"
+                     "ee.vsr.32 q5, q1\n"
+                     "ee.vunzip.16 q4, q5\n"
+                     "ee.vsr.32 q5, q2\n"
+                     "ee.vsr.32 q6, q3\n"
+                     "ee.vunzip.16 q5, q6\n"
+                     "ee.zero.q q6\n"
+                     "ee.vmax.s16 q4, q4, q6\n"
+                     "ee.vmax.s16 q5, q5, q6\n"
+                     "ee.vld.128.ip q6, %[cp], 16\n"
+                     "ee.vmin.s16 q4, q4, q6\n"
+                     "ee.vmin.s16 q5, q5, q6\n"
+                     "ee.vld.128.ip q6, %[cp], 16\n"
+                     "ee.vadds.s32 q0, q0, q6\n"
+                     "ee.vadds.s32 q1, q1, q6\n"
+                     "ee.vld.128.ip q6, %[cp], 16\n"
+                     "ee.vadds.s32 q2, q2, q6\n"
+                     "ee.vadds.s32 q3, q3, q6\n"
+                     "ee.ldxq.32 q6, q4, %[sm], 0, 0\n"
+                     "ee.ldxq.32 q6, q4, %[sm], 1, 1\n"
+                     "ee.ldxq.32 q6, q4, %[sm], 2, 2\n"
+                     "ee.ldxq.32 q6, q4, %[sm], 3, 3\n"
+                     "ee.ldxq.32 q7, q4, %[sm], 0, 4\n"
+                     "ee.ldxq.32 q7, q4, %[sm], 1, 5\n"
+                     "ee.ldxq.32 q7, q4, %[sm], 2, 6\n"
+                     "ee.ldxq.32 q7, q4, %[sm], 3, 7\n"
+                     "ee.vunzip.16 q6, q7\n"
+                     "ee.ldxq.32 q4, q5, %[sm], 0, 0\n"
+                     "ee.ldxq.32 q4, q5, %[sm], 1, 1\n"
+                     "ee.ldxq.32 q4, q5, %[sm], 2, 2\n"
+                     "ee.ldxq.32 q4, q5, %[sm], 3, 3\n"
+                     "ee.ldxq.32 q7, q5, %[sm], 0, 4\n"
+                     "ee.ldxq.32 q7, q5, %[sm], 1, 5\n"
+                     "ee.ldxq.32 q7, q5, %[sm], 2, 6\n"
+                     "ee.ldxq.32 q7, q5, %[sm], 3, 7\n"
+                     "ee.vunzip.16 q4, q7\n"
+                     "ssai 8\n"
+                     "ee.vmul.u16 q6, q6, q4\n"
+                     "ee.vld.128.ip q4, %[px], 0\n"
+                     "ee.vld.128.ip q5, %[cp], 16\n"
+                     "ee.vadds.s16 q4, q4, q5\n"
+                     "ee.zero.q q5\n"
+                     "ee.vmax.s16 q4, q4, q5\n"
+                     "ee.vld.128.ip q5, %[cp], 16\n"
+                     "ee.vmin.s16 q4, q4, q5\n"
+                     "ee.ldxq.32 q5, q4, %[rad], 0, 0\n"
+                     "ee.ldxq.32 q5, q4, %[rad], 1, 1\n"
+                     "ee.ldxq.32 q5, q4, %[rad], 2, 2\n"
+                     "ee.ldxq.32 q5, q4, %[rad], 3, 3\n"
+                     "ee.ldxq.32 q7, q4, %[rad], 0, 4\n"
+                     "ee.ldxq.32 q7, q4, %[rad], 1, 5\n"
+                     "ee.ldxq.32 q7, q4, %[rad], 2, 6\n"
+                     "ee.ldxq.32 q7, q4, %[rad], 3, 7\n"
+                     "ee.vunzip.16 q5, q7\n"
+                     "ee.vmul.u16 q5, q5, q6\n"
+                     "ee.vld.128.ip q7, %[px], 0\n"
+                     "ee.vadds.s16 q7, q7, q5\n"
+                     "ee.vst.128.ip q7, %[px], 16\n"
+                     "addi %[cp], %[cp], -80\n"
                      "1:\n"
-                     : [src] "+&r"(src), [tmp] "+&r"(tmp), [g0] "+&r"(g0q), [g1] "+&r"(g1q), [t0] "=&r"(t0), [t1] "=&r"(t1)
-                     : [sm] "r"(sm), [rad] "r"(rad), [s0] "r"(step0), [s1] "r"(step1), [bias] "r"(radialBias), [zero] "r"(0),
-                       [eight] "r"(8)
+                     : [px] "+&r"(px), [cp] "+&r"(cp), [seed] "+&r"(seed)
+                     : [sm] "r"(sm), [rad] "r"(rad), [n] "r"(blocks)
                      : "memory");
-        tmp = work;
-        // 256*256 needs a 32-bit product. VMUL.U16 shifts that full product
-        // before narrowing, preserving the endpoint 256 and BOTH >>8 stages.
-        // The column and contribution sum stays in int16 at all knob extremes.
-        // VMUL defines its result in stage 2: decrementing n before the add
-        // fills the last multiply-use gap. The post-store advances pixels.
-        asm volatile("ssai 8\n"
-                     "ee.vld.128.ip q0, %[tmp], 16\n"
-                     "ee.vld.128.ip q1, %[tmp], 16\n"
-                     "ee.vld.128.ip q2, %[tmp], 0\n"
-                     "ee.vmul.u16 q0, q0, q1\n"
-                     "ee.vld.128.ip q3, %[px], 0\n"
-                     "ee.vmul.u16 q0, q0, q2\n"
-                     "addi %[n], %[n], -8\n"
-                     "ee.vadds.s16 q3, q3, q0\n"
-                     "ee.vst.128.ip q3, %[px], 16\n"
-                     : [tmp] "+&r"(tmp), [px] "+&r"(pixels), [n] "+&r"(n)
-                     :
-                     : "memory");
+        const int done = blocks * 8;
+        pixels += done;
+        n -= done;
+        g0q += step0 * done;
+        g1q += step1 * done;
     }
 }
 
-GM_ANIM_IRAM __attribute__((noinline)) void sundialPaletteAsm(uint16_t *out, int16_t *pixels, const uint16_t *pal, uint16_t *work,
-                                                              int rowBase, int n) {
+GM_ANIM_IRAM __attribute__((noinline)) void sundialPaletteAsm(uint16_t *out, int16_t *pixels, const uint16_t *pal,
+                                                              const uint32_t *pal32, uint16_t *work, int rowBase, int n) {
     // Four aligned vectors. Clamping in Q4 to [64,4080] before >>4 gives
     // exactly the page's palette clamp to [4,255]. Multiplication by one
     // with SAR=4 is the PIE arithmetic right shift for 16-bit lanes.
@@ -461,6 +506,35 @@ GM_ANIM_IRAM __attribute__((noinline)) void sundialPaletteAsm(uint16_t *out, int
         int v = (pixels[x] + rowBase) >> 4;
         pixels[x] = v < 4 ? 4 : (v > 255 ? 255 : v);
     }
+    if ((((uintptr_t)out | (uintptr_t)pixels) & 15u) == 0 && n >= 8) {
+        // EE.LDXQ.32 reads eight palette entries with eight indexed loads and
+        // one unzip, where the scalar pair loop below needs eleven instructions
+        // for two pixels. palette32 holds the same entries, 32-bit, because the
+        // instruction's index is scaled by four. Both pointers are 16-byte
+        // aligned here, which EE.VLD.128.IP and EE.VST.128.IP require: they
+        // clear the low four address bits without complaint.
+        const int16_t *ip = pixels;
+        uint16_t *vop = out;
+        asm volatile("loopnez %[n], 1f\n"
+                     "ee.vld.128.ip q0, %[idx], 16\n"
+                     "ee.ldxq.32 q1, q0, %[pal32], 0, 0\n"
+                     "ee.ldxq.32 q1, q0, %[pal32], 1, 1\n"
+                     "ee.ldxq.32 q1, q0, %[pal32], 2, 2\n"
+                     "ee.ldxq.32 q1, q0, %[pal32], 3, 3\n"
+                     "ee.ldxq.32 q2, q0, %[pal32], 0, 4\n"
+                     "ee.ldxq.32 q2, q0, %[pal32], 1, 5\n"
+                     "ee.ldxq.32 q2, q0, %[pal32], 2, 6\n"
+                     "ee.ldxq.32 q2, q0, %[pal32], 3, 7\n"
+                     "ee.vunzip.16 q1, q2\n"
+                     "ee.vst.128.ip q1, %[out], 16\n"
+                     "1:\n"
+                     : [idx] "+&r"(ip), [out] "+&r"(vop)
+                     : [pal32] "r"(pal32), [n] "r"(n >> 3)
+                     : "memory");
+        const int done = (n >> 3) * 8;
+        for (int x = done; x < n; x++) out[x] = pal[pixels[x]];
+        return;
+    }
     const int16_t *idx = pixels;
     uint16_t *op = out;
     int t0, t1;
@@ -497,10 +571,11 @@ GM_ANIM_IRAM void band(uint16_t *dst, int y0, int rows, int w, uint32_t tMs, con
         beamSpan(y, w, a, b);
         if (b > a) {
             const int g0 = d0x * dy - d0y * (a - w / 2), g1 = (a - w / 2) * d1y - dy * d1x;
-            sundialBeamAsm(field + a, work, smooth, radialAmp, (g0 + SOFT_HALF) * INV_SOFT, (g1 + SOFT_HALF) * INV_SOFT,
-                           -d0y * INV_SOFT, d1y * INV_SOFT, RAD_RIM + rowQ4[y], b - a);
+            sundialBeamAsm(field + a, work, smooth32, radialAmp32, (g0 + SOFT_HALF) * INV_SOFT,
+                           (g1 + SOFT_HALF) * INV_SOFT, -d0y * INV_SOFT, d1y * INV_SOFT, RAD_RIM + rowQ4[y], b - a);
         }
-        sundialPaletteAsm(dst + static_cast<size_t>(r) * w, field, palette, work, faceBase + rowQ4[y] + surfRow[y], w);
+        sundialPaletteAsm(dst + static_cast<size_t>(r) * w, field, palette, palette32, work,
+                          faceBase + rowQ4[y] + surfRow[y], w);
     }
 #else
     bandRef(dst, y0, rows, w, tMs, p);
@@ -515,10 +590,11 @@ void release() {
     releaseTable(halfPx, static_cast<size_t>(allocH) * sizeof(int16_t));
     releaseTable(dith, 64 * sizeof(int16_t));
     releaseTable(palette, 256 * sizeof(uint16_t));
-    releaseTable(smooth, 257 * sizeof(uint16_t));
-    releaseTable(radialAmp, (RAD_SPAN + 1) * sizeof(uint16_t));
+    releaseTable(palette32, 256 * sizeof(uint32_t));
+    releaseTable(smooth32, 257 * sizeof(uint32_t));
+    releaseTable(radialAmp32, (RAD_SPAN + 1) * sizeof(uint32_t));
     releaseTable(field, static_cast<size_t>(allocW) * sizeof(int16_t));
-    releaseTable(work, 64);
+    releaseTable(work, 192);
     sine = nullptr;
     allocW = allocH = 0;
     lastThemeGen = 0xFFFFFFFF;

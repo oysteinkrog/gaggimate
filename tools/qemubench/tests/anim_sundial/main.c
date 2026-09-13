@@ -45,19 +45,29 @@ GM_ANIM_IRAM __attribute__((noinline)) void sundialColumnsAsm(int16_t *out, cons
         out[x] = col[x] + off[x & 7];
 }
 
-GM_ANIM_IRAM __attribute__((noinline)) void sundialBeamAsm(int16_t *pixels, uint16_t *work, const uint16_t *sm,
-                                                           const uint16_t *rad, int g0q, int g1q, int step0, int step1,
+GM_ANIM_IRAM __attribute__((noinline)) void sundialBeamAsm(int16_t *pixels, uint16_t *work, const uint32_t *sm,
+                                                           const uint32_t *rad, int g0q, int g1q, int step0, int step1,
                                                            int radialBias, int n) {
     // q = (g + 24064)*348, exactly the reference before >>16. No reduced
     // precision in the cursor. radialBias = 1466-rowRad; rad[r] includes the
     // contrast-scaled radial cubic for r clamped to 0..587. Production cp
     // stays within [-2254,264], steps within +/-178176, and |q| stays below
-    // 100 million at 480 pixels, so the signed accumulators cannot overflow.
-    // The two VMULs plus three loads, one field load, add and store cost
-    // eight instructions per eight beam pixels, plus SSAI and block control.
-    // Together with the scalar gather this is 26 instructions/beam pixel
-    // before that setup, on top of the 6.625 instructions/pixel face path.
-    // These are issue-count lower bounds, not measured LX7 cycle timings.
+    // 100 million at 480 pixels, so the signed accumulators cannot overflow,
+    // and q >> 16 stays within +/-1433, which is why the cursor can be
+    // narrowed to a 16-bit lane after the shift.
+    //
+    // Eight pixels an iteration. The three table reads the reference makes per
+    // pixel are the reason this used to be a scalar loop: PIE has no gather.
+    // EE.LDXQ.32 is the exception, a one-lane indexed 32-bit load, so eight of
+    // them plus one unzip fetch eight entries, and smooth and radialAmp are
+    // held as 32-bit tables for it. That is nine instructions for what cost
+    // about eight per pixel before. 62 instructions per eight pixels, 7.75 a
+    // pixel, against 25 for the scalar loop this replaces, and the arithmetic
+    // that follows is the same two multiplies and the same add as before.
+    //
+    // Register budget is the whole file: q0..q3 carry the two cursors as four
+    // 32-bit lane pairs and q4..q7 are scratch, so the five loop constants are
+    // read from the work area with a walking pointer that resets at the end.
     while (n > 0) {
         if (((uintptr_t)pixels & 15u) != 0 || n < 8) {
             int u0 = g0q >> 16, u1 = g1q >> 16;
@@ -65,76 +75,107 @@ GM_ANIM_IRAM __attribute__((noinline)) void sundialBeamAsm(int16_t *pixels, uint
             u1 = u1 < 0 ? 0 : (u1 > 256 ? 256 : u1);
             int r = radialBias + *pixels;
             r = r < 0 ? 0 : (r > 587 ? 587 : r);
-            *pixels += (rad[r] * ((sm[u0] * sm[u1]) >> 8)) >> 8;
+            *pixels += (int16_t)((rad[r] * ((sm[u0] * sm[u1]) >> 8)) >> 8);
             pixels++;
             n--;
             g0q += step0;
             g1q += step1;
             continue;
         }
-        int16_t *src = pixels;
-        uint16_t *tmp = work;
-        int t0, t1;
-        // Twenty-five instructions per pixel, at most 75 bytes in the 256-byte loop
-        // limit. Three table loads each have an independent cursor/pointer
-        // update before the store consumes the loaded value. Thirteen ARs,
-        // no spill or division inside the loop. work holds three eight-lane
-        // vectors: sm0, sm1, radial amplitude, at byte offsets 0, 16, 32.
-        asm volatile("loop %[eight], 1f\n"
-                     "srai %[t0], %[g0], 16\n"
-                     "movi %[t1], 256\n"
-                     "max %[t0], %[t0], %[zero]\n"
-                     "min %[t0], %[t0], %[t1]\n"
-                     "addx2 %[t0], %[t0], %[sm]\n"
-                     "l16ui %[t0], %[t0], 0\n"
-                     "add %[g0], %[g0], %[s0]\n"
-                     "s16i %[t0], %[tmp], 0\n"
-                     "srai %[t0], %[g1], 16\n"
-                     "max %[t0], %[t0], %[zero]\n"
-                     "min %[t0], %[t0], %[t1]\n"
-                     "addx2 %[t0], %[t0], %[sm]\n"
-                     "l16ui %[t0], %[t0], 0\n"
-                     "add %[g1], %[g1], %[s1]\n"
-                     "s16i %[t0], %[tmp], 16\n"
-                     "l16si %[t0], %[src], 0\n"
-                     "movi %[t1], 587\n"
-                     "add %[t0], %[t0], %[bias]\n"
-                     "max %[t0], %[t0], %[zero]\n"
-                     "min %[t0], %[t0], %[t1]\n"
-                     "addx2 %[t0], %[t0], %[rad]\n"
-                     "l16ui %[t0], %[t0], 0\n"
-                     "addi %[src], %[src], 2\n"
-                     "s16i %[t0], %[tmp], 32\n"
-                     "addi %[tmp], %[tmp], 2\n"
+        int16_t *c16 = (int16_t *)work;
+        int32_t *c32 = (int32_t *)work;
+        for (int k = 0; k < 8; k++) c16[k] = 256;          // +0   u clamp ceiling
+        for (int k = 0; k < 4; k++) c32[4 + k] = step0 * 8; // +16  cursor stride
+        for (int k = 0; k < 4; k++) c32[8 + k] = step1 * 8; // +32
+        for (int k = 0; k < 8; k++) c16[24 + k] = (int16_t)radialBias; // +48
+        for (int k = 0; k < 8; k++) c16[32 + k] = 587;     // +64  radial ceiling
+        for (int k = 0; k < 8; k++) {                      // +80  cursor seeds
+            c32[20 + k] = g0q + step0 * k;
+            c32[28 + k] = g1q + step1 * k;
+        }
+        const int blocks = n >> 3;
+        const int32_t *seed = c32 + 20;
+        const int16_t *cp = c16;
+        int16_t *px = pixels;
+        asm volatile("ee.vld.128.ip q0, %[seed], 16\n"
+                     "ee.vld.128.ip q1, %[seed], 16\n"
+                     "ee.vld.128.ip q2, %[seed], 16\n"
+                     "ee.vld.128.ip q3, %[seed], 0\n"
+                     "loopnez %[n], 1f\n"
+                     "ssai 16\n"
+                     "ee.vsr.32 q4, q0\n"
+                     "ee.vsr.32 q5, q1\n"
+                     "ee.vunzip.16 q4, q5\n"
+                     "ee.vsr.32 q5, q2\n"
+                     "ee.vsr.32 q6, q3\n"
+                     "ee.vunzip.16 q5, q6\n"
+                     "ee.zero.q q6\n"
+                     "ee.vmax.s16 q4, q4, q6\n"
+                     "ee.vmax.s16 q5, q5, q6\n"
+                     "ee.vld.128.ip q6, %[cp], 16\n"
+                     "ee.vmin.s16 q4, q4, q6\n"
+                     "ee.vmin.s16 q5, q5, q6\n"
+                     "ee.vld.128.ip q6, %[cp], 16\n"
+                     "ee.vadds.s32 q0, q0, q6\n"
+                     "ee.vadds.s32 q1, q1, q6\n"
+                     "ee.vld.128.ip q6, %[cp], 16\n"
+                     "ee.vadds.s32 q2, q2, q6\n"
+                     "ee.vadds.s32 q3, q3, q6\n"
+                     "ee.ldxq.32 q6, q4, %[sm], 0, 0\n"
+                     "ee.ldxq.32 q6, q4, %[sm], 1, 1\n"
+                     "ee.ldxq.32 q6, q4, %[sm], 2, 2\n"
+                     "ee.ldxq.32 q6, q4, %[sm], 3, 3\n"
+                     "ee.ldxq.32 q7, q4, %[sm], 0, 4\n"
+                     "ee.ldxq.32 q7, q4, %[sm], 1, 5\n"
+                     "ee.ldxq.32 q7, q4, %[sm], 2, 6\n"
+                     "ee.ldxq.32 q7, q4, %[sm], 3, 7\n"
+                     "ee.vunzip.16 q6, q7\n"
+                     "ee.ldxq.32 q4, q5, %[sm], 0, 0\n"
+                     "ee.ldxq.32 q4, q5, %[sm], 1, 1\n"
+                     "ee.ldxq.32 q4, q5, %[sm], 2, 2\n"
+                     "ee.ldxq.32 q4, q5, %[sm], 3, 3\n"
+                     "ee.ldxq.32 q7, q5, %[sm], 0, 4\n"
+                     "ee.ldxq.32 q7, q5, %[sm], 1, 5\n"
+                     "ee.ldxq.32 q7, q5, %[sm], 2, 6\n"
+                     "ee.ldxq.32 q7, q5, %[sm], 3, 7\n"
+                     "ee.vunzip.16 q4, q7\n"
+                     "ssai 8\n"
+                     "ee.vmul.u16 q6, q6, q4\n"
+                     "ee.vld.128.ip q4, %[px], 0\n"
+                     "ee.vld.128.ip q5, %[cp], 16\n"
+                     "ee.vadds.s16 q4, q4, q5\n"
+                     "ee.zero.q q5\n"
+                     "ee.vmax.s16 q4, q4, q5\n"
+                     "ee.vld.128.ip q5, %[cp], 16\n"
+                     "ee.vmin.s16 q4, q4, q5\n"
+                     "ee.ldxq.32 q5, q4, %[rad], 0, 0\n"
+                     "ee.ldxq.32 q5, q4, %[rad], 1, 1\n"
+                     "ee.ldxq.32 q5, q4, %[rad], 2, 2\n"
+                     "ee.ldxq.32 q5, q4, %[rad], 3, 3\n"
+                     "ee.ldxq.32 q7, q4, %[rad], 0, 4\n"
+                     "ee.ldxq.32 q7, q4, %[rad], 1, 5\n"
+                     "ee.ldxq.32 q7, q4, %[rad], 2, 6\n"
+                     "ee.ldxq.32 q7, q4, %[rad], 3, 7\n"
+                     "ee.vunzip.16 q5, q7\n"
+                     "ee.vmul.u16 q5, q5, q6\n"
+                     "ee.vld.128.ip q7, %[px], 0\n"
+                     "ee.vadds.s16 q7, q7, q5\n"
+                     "ee.vst.128.ip q7, %[px], 16\n"
+                     "addi %[cp], %[cp], -80\n"
                      "1:\n"
-                     : [src] "+&r"(src), [tmp] "+&r"(tmp), [g0] "+&r"(g0q), [g1] "+&r"(g1q), [t0] "=&r"(t0), [t1] "=&r"(t1)
-                     : [sm] "r"(sm), [rad] "r"(rad), [s0] "r"(step0), [s1] "r"(step1), [bias] "r"(radialBias), [zero] "r"(0),
-                       [eight] "r"(8)
+                     : [px] "+&r"(px), [cp] "+&r"(cp), [seed] "+&r"(seed)
+                     : [sm] "r"(sm), [rad] "r"(rad), [n] "r"(blocks)
                      : "memory");
-        tmp = work;
-        // 256*256 needs a 32-bit product. VMUL.U16 shifts that full product
-        // before narrowing, preserving the endpoint 256 and BOTH >>8 stages.
-        // The column and contribution sum stays in int16 at all knob extremes.
-        // VMUL defines its result in stage 2: decrementing n before the add
-        // fills the last multiply-use gap. The post-store advances pixels.
-        asm volatile("ssai 8\n"
-                     "ee.vld.128.ip q0, %[tmp], 16\n"
-                     "ee.vld.128.ip q1, %[tmp], 16\n"
-                     "ee.vld.128.ip q2, %[tmp], 0\n"
-                     "ee.vmul.u16 q0, q0, q1\n"
-                     "ee.vld.128.ip q3, %[px], 0\n"
-                     "ee.vmul.u16 q0, q0, q2\n"
-                     "addi %[n], %[n], -8\n"
-                     "ee.vadds.s16 q3, q3, q0\n"
-                     "ee.vst.128.ip q3, %[px], 16\n"
-                     : [tmp] "+&r"(tmp), [px] "+&r"(pixels), [n] "+&r"(n)
-                     :
-                     : "memory");
+        const int done = blocks * 8;
+        pixels += done;
+        n -= done;
+        g0q += step0 * done;
+        g1q += step1 * done;
     }
 }
 
-GM_ANIM_IRAM __attribute__((noinline)) void sundialPaletteAsm(uint16_t *out, int16_t *pixels, const uint16_t *pal, uint16_t *work,
-                                                              int rowBase, int n) {
+GM_ANIM_IRAM __attribute__((noinline)) void sundialPaletteAsm(uint16_t *out, int16_t *pixels, const uint16_t *pal,
+                                                              const uint32_t *pal32, uint16_t *work, int rowBase, int n) {
     // Four aligned vectors. Clamping in Q4 to [64,4080] before >>4 gives
     // exactly the page's palette clamp to [4,255]. Multiplication by one
     // with SAR=4 is the PIE arithmetic right shift for 16-bit lanes.
@@ -174,6 +215,35 @@ GM_ANIM_IRAM __attribute__((noinline)) void sundialPaletteAsm(uint16_t *out, int
         int v = (pixels[x] + rowBase) >> 4;
         pixels[x] = v < 4 ? 4 : (v > 255 ? 255 : v);
     }
+    if ((((uintptr_t)out | (uintptr_t)pixels) & 15u) == 0 && n >= 8) {
+        // EE.LDXQ.32 reads eight palette entries with eight indexed loads and
+        // one unzip, where the scalar pair loop below needs eleven instructions
+        // for two pixels. palette32 holds the same entries, 32-bit, because the
+        // instruction's index is scaled by four. Both pointers are 16-byte
+        // aligned here, which EE.VLD.128.IP and EE.VST.128.IP require: they
+        // clear the low four address bits without complaint.
+        const int16_t *ip = pixels;
+        uint16_t *vop = out;
+        asm volatile("loopnez %[n], 1f\n"
+                     "ee.vld.128.ip q0, %[idx], 16\n"
+                     "ee.ldxq.32 q1, q0, %[pal32], 0, 0\n"
+                     "ee.ldxq.32 q1, q0, %[pal32], 1, 1\n"
+                     "ee.ldxq.32 q1, q0, %[pal32], 2, 2\n"
+                     "ee.ldxq.32 q1, q0, %[pal32], 3, 3\n"
+                     "ee.ldxq.32 q2, q0, %[pal32], 0, 4\n"
+                     "ee.ldxq.32 q2, q0, %[pal32], 1, 5\n"
+                     "ee.ldxq.32 q2, q0, %[pal32], 2, 6\n"
+                     "ee.ldxq.32 q2, q0, %[pal32], 3, 7\n"
+                     "ee.vunzip.16 q1, q2\n"
+                     "ee.vst.128.ip q1, %[out], 16\n"
+                     "1:\n"
+                     : [idx] "+&r"(ip), [out] "+&r"(vop)
+                     : [pal32] "r"(pal32), [n] "r"(n >> 3)
+                     : "memory");
+        const int done = (n >> 3) * 8;
+        for (int x = done; x < n; x++) out[x] = pal[pixels[x]];
+        return;
+    }
     const int16_t *idx = pixels;
     uint16_t *op = out;
     int t0, t1;
@@ -207,25 +277,54 @@ static int16_t field[MAX_N + 2 * GUARD] __attribute__((aligned(16)));
 static int16_t expected[MAX_N + 2 * GUARD] __attribute__((aligned(16)));
 static uint16_t output[MAX_N + 2 * GUARD] __attribute__((aligned(16)));
 static int16_t offsets[8] __attribute__((aligned(16)));
-static uint16_t workspace[64] __attribute__((aligned(16)));
-static uint16_t sm[257] __attribute__((aligned(16)));
-static uint16_t radial[588] __attribute__((aligned(16)));
+/* The beam writes 144 bytes of constants and cursor seeds into its work area
+ * and the palette pass 64, so the guards below start at 8 and resume past
+ * whichever the call under test uses. sm, radial and palette32 are 32-bit
+ * because EE.LDXQ.32 scales its index by four. */
+#define BEAM_WORK 72
+#define PAL_WORK 32
+static uint16_t workspace[128] __attribute__((aligned(16)));
+static uint32_t sm[257] __attribute__((aligned(16)));
+static uint32_t radial[588] __attribute__((aligned(16)));
 static uint16_t palette[256] __attribute__((aligned(16)));
-static uint32_t calls, lanes, failures;
+static uint32_t palette32[256] __attribute__((aligned(16)));
+static uint32_t calls, lanes, failures, vecRuns, scalarRuns;
 static int amplitude;
+
+/* This QEMU fork computes ee.ldxq.32's indexed address four bytes too low
+ * (espressif/qemu issue #162, reproduced on its own by tests/probe_ldxq32).
+ * The beam and the palette pass gather through that instruction, so running
+ * them verbatim here measures the emulator's address arithmetic and says
+ * nothing about the kernel. The harness hands the vector paths a table
+ * pointer one word high, which cancels the emulator's error exactly, so
+ * everything the kernel computes is still checked lane by lane: the shifts,
+ * the clamps, the unzips, the multiplies, the cursor advance, the stores and
+ * the guard zones. What this file cannot check is the gather address itself.
+ * That is checked on silicon, by /api/debug/animtest and by the kblob rig
+ * hashing the kernel's output against the shipped band().
+ *
+ * The bias belongs to the vector path alone. The beam's scalar path reads the
+ * same pointers, so a call that takes both paths runs twice: once biased,
+ * checking the lanes the vector body wrote, and once true, checking the tail.
+ * The tail's inputs do not depend on the vector lanes, so the second run's
+ * tail is exact. The palette pass needs no such split, because its tail reads
+ * the separate 16-bit palette. */
+#define QEMU_LDXQ_BIAS 1
 
 static int clamp(int x, int a, int b) { return x < a ? a : (x > b ? b : x); }
 static int cubic(int u) { return (u * u * (768 - 2 * u)) >> 16; }
 static void prepare(int contrast) {
     amplitude = (60 + contrast * 88 / 100) * 16;
     for (int i = 0; i < 257; i++)
-        sm[i] = (uint16_t)cubic(i);
+        sm[i] = (uint32_t)cubic(i);
     for (int i = 0; i < 588; i++)
-        radial[i] = (uint16_t)((amplitude * cubic(i * 256 / 587)) >> 8);
+        radial[i] = (uint32_t)((amplitude * cubic(i * 256 / 587)) >> 8);
     /* An injective permutation of all 256 indices. A wrong gather cannot
      * disappear inside a run of repeated theme colours. */
-    for (int i = 0; i < 256; i++)
+    for (int i = 0; i < 256; i++) {
         palette[i] = (uint16_t)(i * 251 + 37);
+        palette32[i] = palette[i];
+    }
 }
 
 static void bad(const char *stage, int x, int got, int want) {
@@ -265,28 +364,62 @@ static void beamRef(int16_t *p, int n, int g0q, int g1q, int step0, int step1,
 /* Every call checks red zones around the beam, column, output and work spans.
  * shift=0..7 covers all 16-bit source alignments; output has only four-byte
  * alignment, with all four possible offsets modulo 16. */
+static void beamRun(int n, int shift, int g0q, int g1q, int step0, int step1,
+                    int bias, int seed, int ldxqBias, int vecLo, int vecHi,
+                    int wantVec) {
+    for (int i = 0; i < MAX_N + 2 * GUARD; i++)
+        field[i] = (int16_t)0x5234;
+    for (int i = 0; i < 128; i++)
+        workspace[i] = 0x6789;
+    for (int x = 0; x < n; x++)
+        field[GUARD + shift + x] = (int16_t)((x * 37 + seed * 71) % 2519 - 2254);
+    sundialBeamAsm(field + GUARD + shift, workspace + 8, sm + ldxqBias,
+                   radial + ldxqBias, g0q, g1q, step0, step1, bias, n);
+    for (int i = 0; i < MAX_N + 2 * GUARD; i++) {
+        int x = i - GUARD - shift;
+        if (x >= 0 && x < n) {
+            int isVec = x >= vecLo && x < vecHi;
+            if (isVec != wantVec)
+                continue; /* written by the path this run is not checking */
+        }
+        if (field[i] != expected[i])
+            bad("beam", i, field[i], expected[i]);
+    }
+    for (int i = 0; i < 128; i++)
+        if ((i < 8 || i >= 8 + BEAM_WORK) && workspace[i] != 0x6789)
+            bad("work", i, workspace[i], 0x6789);
+}
+
 static void beamCase(int n, int shift, int g0q, int g1q, int step0, int step1,
                      int bias, int seed) {
     calls++;
     for (int i = 0; i < MAX_N + 2 * GUARD; i++)
-        field[i] = expected[i] = (int16_t)0x5234;
-    for (int i = 0; i < 64; i++)
-        workspace[i] = 0x6789;
-    for (int x = 0; x < n; x++) {
-        /* cp spans every integer -2254..264 over the sweep. This covers the
-         * surface, shading=100 and ditherAmp's maximum 154 Q4 offset. */
-        int v = (x * 37 + seed * 71) % 2519 - 2254;
-        field[GUARD + shift + x] = expected[GUARD + shift + x] = (int16_t)v;
-    }
+        expected[i] = (int16_t)0x5234;
+    for (int x = 0; x < n; x++)
+        expected[GUARD + shift + x] =
+            (int16_t)((x * 37 + seed * 71) % 2519 - 2254);
     beamRef(expected + GUARD + shift, n, g0q, g1q, step0, step1, bias);
-    sundialBeamAsm(field + GUARD + shift, workspace + 8, sm, radial, g0q, g1q,
-                   step0, step1, bias, n);
-    for (int i = 0; i < MAX_N + 2 * GUARD; i++)
-        if (field[i] != expected[i])
-            bad("beam", i, field[i], expected[i]);
-    for (int i = 0; i < 64; i++)
-        if ((i < 8 || i >= 32) && workspace[i] != 0x6789)
-            bad("work", i, workspace[i], 0x6789);
+    /* The kernel walks single pixels until its cursor is 16-byte aligned,
+     * then takes whole blocks of eight, then walks the tail. Eight pixels are
+     * sixteen bytes, so alignment holds once reached: this is the exact lane
+     * split, and getting it wrong is how the first version of this harness
+     * blamed the kernel for a case it had mislabelled. */
+    int vecLo = 0;
+    while (vecLo < n && (((uintptr_t)(field + GUARD + shift + vecLo) & 15u) != 0))
+        vecLo++;
+    int vecHi = vecLo;
+    if (n - vecLo >= 8)
+        vecHi = vecLo + ((n - vecLo) >> 3) * 8;
+    if (vecHi > vecLo) {
+        beamRun(n, shift, g0q, g1q, step0, step1, bias, seed, QEMU_LDXQ_BIAS,
+                vecLo, vecHi, 1);
+        vecRuns++;
+    }
+    if (vecHi - vecLo < n) {
+        beamRun(n, shift, g0q, g1q, step0, step1, bias, seed, 0, vecLo, vecHi,
+                0);
+        scalarRuns++;
+    }
     lanes += n;
 }
 
@@ -296,7 +429,7 @@ static void rowCase(int n, int shift, int rowBase, int seed, int extreme) {
         field[i] = expected[i] = (int16_t)0x5234;
         output[i] = 0x4567;
     }
-    for (int i = 0; i < 64; i++)
+    for (int i = 0; i < 128; i++)
         workspace[i] = 0x6789;
     for (int k = 0; k < 8; k++)
         offsets[k] =
@@ -314,7 +447,7 @@ static void rowCase(int n, int shift, int rowBase, int seed, int extreme) {
         if (field[i] != expected[i])
             bad("columns", i, field[i], expected[i]);
     sundialPaletteAsm(output + GUARD + shift, field + GUARD, palette,
-                      workspace + 8, rowBase, n);
+                      palette32 + QEMU_LDXQ_BIAS, workspace + 8, rowBase, n);
     for (int i = 0; i < MAX_N + 2 * GUARD; i++) {
         int x = i - GUARD - shift;
         int want =
@@ -324,8 +457,8 @@ static void rowCase(int n, int shift, int rowBase, int seed, int extreme) {
         if (output[i] != want)
             bad("palette", i, output[i], want);
     }
-    for (int i = 0; i < 64; i++)
-        if ((i < 8 || i >= 40) && workspace[i] != 0x6789)
+    for (int i = 0; i < 128; i++)
+        if ((i < 8 || i >= 8 + PAL_WORK) && workspace[i] != 0x6789)
             bad("constants", i, workspace[i], 0x6789);
     lanes += n;
 }
@@ -367,8 +500,13 @@ int main(void) {
         uart_uint(calls);
         uart_puts(" lanes=");
         uart_uint(lanes);
+        uart_puts(" beamvec=");
+        uart_uint(vecRuns);
+        uart_puts(" beamscalar=");
+        uart_uint(scalarRuns);
         uart_puts(" mismatches=0; Q8 pairs, radial range, contrast 0/25/100, "
-                  "steps -512..512, widths 0..480, alignments and guards\n");
+                  "steps -512..512, widths 0..480, alignments and guards; "
+                  "gather addresses proved on silicon, not here\n");
     }
     uart_puts("GM_QEMUBENCH_PIE_DONE\n");
     for (;;) {
