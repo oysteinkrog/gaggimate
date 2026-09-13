@@ -320,6 +320,21 @@ class SleepAnimation {
     // Frames painted since the last arm, so a host can tell a strip that is
     // on screen from one that was only just requested.
     uint32_t rampFixtureFrames() const { return rampFixFrames.load(); }
+    // The published palette word (bganim::themeApplied()) the strip in the
+    // framebuffer was drawn from, and how many whole frames have carried it.
+    //
+    // rampFixtureFrames() alone cannot gate a sample: it counts from the arm,
+    // so by the time a tone change reaches the palette it is long past any
+    // threshold, and the frames it counted were painted with the previous
+    // tone. A host compares this word against the one the endpoint reports
+    // for the live palette and waits for the count, which is what makes the
+    // wait a gate on observed frames rather than an assumed delay.
+    //
+    // Zero frames means the fixture was just armed, or that the last frame
+    // rebuilt the LUT part way through, so its strip is half one palette and
+    // half the other and is not evidence about either.
+    uint32_t rampFixtureApplied() const { return rampFixLutApplied.load(); }
+    uint32_t rampFixtureTonedFrames() const { return rampFixTonedFrames.load(); }
 #endif
     uint8_t fpsOverrideValue() const { return fpsOverride.load(); }
     // Tearing: live writes over frames actually checked. The denominator is
@@ -1636,8 +1651,14 @@ class SleepAnimation {
     std::atomic<uint32_t> rampFixFrames{0};
     std::atomic<int> rampFixXoff{0};
     uint16_t rampFixLut[256] = {0};
-    uint32_t rampFixLutGen = 0;
+    // Which published palette the LUT was built from, and whole frames drawn
+    // with it. Written by the render task, read over HTTP, hence atomic.
+    std::atomic<uint32_t> rampFixLutApplied{0};
+    std::atomic<uint32_t> rampFixTonedFrames{0};
     int rampFixLutMode = 0;
+    // Set when the LUT was rebuilt part way through the frame being rendered,
+    // cleared when that frame ends. Render task only.
+    bool rampFixLutTorn = false;
 #endif
     int initializedAnimId = -1; // last id whose init() ran on the render task
     // Which animation currently holds allocated tables, or -1 for none. Kept

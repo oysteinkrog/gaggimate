@@ -355,6 +355,25 @@ bool themeUniform(); // equal spacing: the original arithmetic is in use
 // positions into outPos when it is not null), sets *outUniform, and returns
 // the number copied. Reporting only; not on any render path.
 int themeRawStops(uint8_t (*outStops)[3], uint8_t *outPos, int cap, bool *outUniform);
+
+// The tone that went into the palette that is published right now, and the
+// generation that published it, in one word (gm-nov3.27).
+//
+// Reading the brightness and the knee as two plain variables is not safe from
+// another task, and not because of tearing: they are aligned 32 bit integers
+// and a torn read is not the failure. The ordering is. setThemeTone() assigns
+// both integers and only then rebuilds and publishes the palette, so a reader
+// of the integers alone can see the new tone while the render task is still
+// drawing the old palette, and report a tone the panel has not applied. This
+// word is stored last, with release ordering, so seeing a tone here means the
+// palette it was applied to is the published one.
+//
+// Compare whole words for equality rather than picking the generation apart:
+// it is truncated (see the definition) and carries no meaning beyond "the
+// same published state or a different one".
+uint32_t themeApplied();
+void themeAppliedUnpack(uint32_t applied, int *brightness256, int *knee);
+// Shorthand for unpacking themeApplied(). Reporting only, like themeRawStops.
 void themeToneState(int *brightness256, int *knee);
 
 // Tone controls, applied to the stops before any animation sees them.

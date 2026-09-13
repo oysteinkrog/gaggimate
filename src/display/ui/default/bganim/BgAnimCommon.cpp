@@ -381,6 +381,33 @@ int g_rawCount = 6;
 int g_brightness256 = 256; // Q8, 256 = unchanged
 int g_knee = 255;          // 255 = shoulder off
 
+// The tone the published palette was built with, packed together with the
+// generation that published it (gm-nov3.27).
+//
+// Bits 0..8 hold brightness256 (0..256), bits 9..16 the knee (0..255), and
+// bits 17..31 the low 15 bits of the generation. One load answers both halves
+// of "which palette is live and what tone went into it", which a reader cannot
+// get by reading two plain variables: it would see whichever pairing the two
+// separate loads happened to land on.
+//
+// The store is the LAST thing publishStops() does, with release ordering, so a
+// reader that acquire-loads this word and sees a tone has, by that fact, the
+// palette that tone was applied to. That direction is the whole point.
+// setThemeTone() assigns g_brightness256 and g_knee and only then rebuilds the
+// palette, so a reader of those two integers could see the new pair while the
+// render task was still drawing the old palette, and report a tone the panel
+// had not applied. Those two stay as the writer's own state and are now read
+// only on the task that writes them.
+//
+// The generation is truncated to 15 bits. It is only ever compared for
+// equality against another copy of this same word, and any publish makes the
+// render task rebuild within one frame, so nothing can be 32,768 generations
+// behind and match by accident.
+constexpr uint32_t packApplied(uint32_t gen, int bright, int knee) {
+    return (static_cast<uint32_t>(bright) & 0x1ffu) | ((static_cast<uint32_t>(knee) & 0xffu) << 9) | (gen << 17);
+}
+std::atomic<uint32_t> g_themeApplied{packApplied(0, 256, 255)};
+
 // Applies the tone to g_rawStops and publishes the result. Integer throughout:
 // this runs on a settings write, but the same arithmetic has to be describable
 // to the preview UI, and exact integer steps make the two agree.
@@ -415,6 +442,9 @@ void publishStops() {
     g_themeUniform[buf] = g_rawUniform;
     g_themeCount[buf] = g_rawCount;
     g_themeGen = next;
+    // Last, and with release ordering, so that seeing this tone means seeing
+    // the palette above and the generation that carries it.
+    g_themeApplied.store(packApplied(next, bright, knee), std::memory_order_release);
 }
 
 // Positions as a positional theme would carry them: p_i = i * 255 / (n - 1).
@@ -519,14 +549,18 @@ int themeRawStops(uint8_t (*outStops)[3], uint8_t *outPos, int cap, bool *outUni
     return n;
 }
 
-void themeToneState(int *brightness256, int *knee) {
+uint32_t themeApplied() { return g_themeApplied.load(std::memory_order_acquire); }
+
+void themeAppliedUnpack(uint32_t applied, int *brightness256, int *knee) {
     if (brightness256 != nullptr) {
-        *brightness256 = g_brightness256;
+        *brightness256 = static_cast<int>(applied & 0x1ffu);
     }
     if (knee != nullptr) {
-        *knee = g_knee;
+        *knee = static_cast<int>((applied >> 9) & 0xffu);
     }
 }
+
+void themeToneState(int *brightness256, int *knee) { themeAppliedUnpack(themeApplied(), brightness256, knee); }
 
 void themeRGB(int pos, uint8_t out[3]) {
     const int gen = g_themeGen & 1;

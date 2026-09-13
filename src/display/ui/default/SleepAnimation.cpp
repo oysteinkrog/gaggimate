@@ -1673,6 +1673,10 @@ void SleepAnimation::setRampFixture(int mode, int y0, int y1, int xoff) {
     rampFixY0.store(y0);
     rampFixY1.store(y1);
     rampFixFrames.store(0);
+    // The region and the column offset move with the arm, so frames counted
+    // before it say nothing about the strip a host is about to read, whatever
+    // palette they were drawn with.
+    rampFixTonedFrames.store(0);
     rampFixMode.store(mode);
 }
 #endif
@@ -4188,6 +4192,14 @@ void IRAM_ATTR SleepAnimation::renderLoop() {
 #ifdef GM_TOUCH_PROBE
         if (rampFixMode.load() != 0) {
             rampFixFrames.fetch_add(1);
+            // Whole frames drawn with one palette, which is what a host may
+            // gate a sample on. A frame whose LUT changed mid way is not one.
+            if (rampFixLutTorn) {
+                rampFixLutTorn = false;
+                rampFixTonedFrames.store(0);
+            } else {
+                rampFixTonedFrames.fetch_add(1);
+            }
         }
 #endif
 #ifdef GM_ANIM_BENCH
@@ -5170,18 +5182,32 @@ void IRAM_ATTR SleepAnimation::renderFrame() {
 #ifdef GM_TOUCH_PROBE
         // The gradient framebuffer fixture, painted last on purpose: every
         // compositing stage has already run, so the rows below carry the ramp
-        // and nothing else. The LUT is rebuilt when the theme generation moves
+        // and nothing else. The LUT is rebuilt when the published palette moves
         // or the mode changes, which is once per settings write, not per band.
         if (rampFix != 0) {
-            const uint32_t gen = bganim::themeGen();
-            if (gen != rampFixLutGen || rampFix != rampFixLutMode) {
+            // Keyed on the published word rather than on the generation alone
+            // (gm-nov3.27), because the host's question is not "has the
+            // palette changed" but "was this strip drawn with the tone the
+            // endpoint is reporting", and that word answers both at once.
+            const uint32_t applied = bganim::themeApplied();
+            if (applied != rampFixLutApplied.load() || rampFix != rampFixLutMode) {
                 if (rampFix == 3) {
                     bganim::buildThemeWheel(rampFixLut, 256);
                 } else {
                     bganim::buildThemeRamp(rampFixLut, 256, rampFix == 2);
                 }
-                rampFixLutGen = gen;
+                rampFixLutApplied.store(applied);
                 rampFixLutMode = rampFix;
+                // The bands before this one in this frame carried the old LUT,
+                // so the strip this frame leaves behind is part one palette and
+                // part the other. renderLoop() restarts the whole-frame count.
+                //
+                // A publish that lands between the load above and the build
+                // leaves the LUT a frame ahead of the word recorded for it.
+                // That is self correcting: the next band reads the newer word,
+                // sees it differ, and rebuilds, and the frame it happens in is
+                // torn and does not count either way.
+                rampFixLutTorn = true;
             }
             const int fy0 = rampFixY0.load();
             const int fy1 = rampFixY1.load();

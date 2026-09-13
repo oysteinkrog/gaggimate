@@ -1794,10 +1794,25 @@ void WebUIPlugin::setupDebugEndpoints() {
         gm_tone_unpack(g_animToneOverride.load(std::memory_order_acquire), overrideB, overrideK);
         const int brightnessPct = overrideB >= 0 ? overrideB : controller->getSettings().getBgAnimBrightness();
         const int kneePct = overrideK >= 0 ? overrideK : controller->getSettings().getBgAnimHighlightKnee();
+        // The tone that went into the palette that is published right now, in
+        // one acquire load (gm-nov3.27). Reading bganim's two plain integers
+        // here used to report the tone setThemeTone() had just assigned while
+        // the render task was still drawing the palette from before it, so a
+        // host could be told a tone the panel had not applied. Reported as one
+        // word as well, because the fixture below names the palette it drew
+        // with in the same currency and the host compares them.
+        const uint32_t applied = bganim::themeApplied();
         int bright256 = 256, knee = 255;
-        bganim::themeToneState(&bright256, &knee);
+        bganim::themeAppliedUnpack(applied, &bright256, &knee);
+        doc["applied"] = applied;
         doc["brightness256"] = bright256;
         doc["knee"] = knee;
+        // Which palette the strip in the framebuffer actually came from, and
+        // how many whole frames have carried it. Equal to "applied" and at
+        // least one frame is the condition a host samples on: "frames" counts
+        // from the arm and says nothing about which tone painted them.
+        doc["fixApplied"] = a->rampFixtureApplied();
+        doc["tonedFrames"] = a->rampFixtureTonedFrames();
         // The two settings the render task's tone came from, so the host can
         // run the same percent-to-integer conversion and check it landed on
         // the values above.
@@ -1826,6 +1841,15 @@ void WebUIPlugin::setupDebugEndpoints() {
             wire += part;
         }
         doc["stops"] = wire;
+        // Whether the palette stood still for the whole of this report. The
+        // raw stops above are written before the palette that carries them is
+        // published, so a report taken across a publish can pair one with the
+        // other. A host waits for a report that was not, rather than sampling
+        // one that was. It does not close the last microseconds of
+        // setThemeStops itself (new raw stops, previous palette, no publish
+        // inside the read), and nothing here can: the next poll does not land
+        // there, and the fixture comparison catches it if one does.
+        doc["consistent"] = bganim::themeApplied() == applied;
         serializeJson(doc, *response);
         request->send(response);
     });
