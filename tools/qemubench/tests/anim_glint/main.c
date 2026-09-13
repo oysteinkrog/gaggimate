@@ -78,9 +78,8 @@ GM_ANIM_IRAM __attribute__((noinline)) void glintFillAsm(uint16_t *out, const ui
 GM_ANIM_IRAM __attribute__((noinline)) uint32_t glintPairsAsm(uint16_t *out, const uint16_t *prof,
                                                             const uint16_t *pal, const uint16_t *bg,
                                                             uint32_t acc, int K, int x, int nPairs) {
-    uint32_t t0, t1, t2, t3, cap;
-    asm volatile("movi %[cap], 255\n"
-                 "loopnez %[n], 1f\n"
+    uint32_t t0, t1, t2, t3;
+    asm volatile("loopnez %[n], 1f\n"
                  "srli %[t0], %[acc], 8\n"
                  "add %[acc], %[acc], %[K]\n"
                  "srli %[t1], %[acc], 8\n"
@@ -94,8 +93,6 @@ GM_ANIM_IRAM __attribute__((noinline)) uint32_t glintPairsAsm(uint16_t *out, con
                  "l16ui %[t2], %[t2], 2\n"
                  "add %[t0], %[t0], %[t3]\n"
                  "add %[t1], %[t1], %[t2]\n"
-                 "min %[t0], %[t0], %[cap]\n"
-                 "min %[t1], %[t1], %[cap]\n"
                  "addx2 %[t0], %[t0], %[pal]\n"
                  "addx2 %[t1], %[t1], %[pal]\n"
                  "l16ui %[t0], %[t0], 0\n"
@@ -108,8 +105,62 @@ GM_ANIM_IRAM __attribute__((noinline)) uint32_t glintPairsAsm(uint16_t *out, con
                  "addi %[x], %[x], 2\n"
                  "1:\n"
                  : [out] "+&r"(out), [acc] "+&r"(acc), [x] "+&r"(x),
-                   [t0] "=&r"(t0), [t1] "=&r"(t1), [t2] "=&r"(t2), [t3] "=&r"(t3), [cap] "=&r"(cap)
+                   [t0] "=&r"(t0), [t1] "=&r"(t1), [t2] "=&r"(t2), [t3] "=&r"(t3)
                  : [prof] "r"(prof), [pal] "r"(pal), [bg] "r"(bg), [K] "r"(K), [n] "r"(nPairs)
+                 : "memory");
+    return acc;
+}
+
+GM_ANIM_IRAM __attribute__((noinline)) uint32_t glintQuadsAsm(uint16_t *out, const uint16_t *prof,
+                                                              const uint16_t *pal, const uint16_t *bgRot,
+                                                              uint32_t acc, int K, int nQuads) {
+    uint32_t t0, t1, t2, t3;
+    const uint16_t *bg = bgRot;
+    asm volatile("loopnez %[n], 1f\n"
+                 "srli %[t0], %[acc], 8\n"
+                 "add %[acc], %[acc], %[K]\n"
+                 "srli %[t1], %[acc], 8\n"
+                 "add %[acc], %[acc], %[K]\n"
+                 "addx2 %[t0], %[t0], %[prof]\n"
+                 "addx2 %[t1], %[t1], %[prof]\n"
+                 "l16ui %[t2], %[bg], 0\n"
+                 "l16ui %[t3], %[bg], 2\n"
+                 "l16ui %[t0], %[t0], 0\n"
+                 "l16ui %[t1], %[t1], 0\n"
+                 "add %[t0], %[t0], %[t2]\n"
+                 "add %[t1], %[t1], %[t3]\n"
+                 "addx2 %[t0], %[t0], %[pal]\n"
+                 "addx2 %[t1], %[t1], %[pal]\n"
+                 "l16ui %[t1], %[t1], 0\n"
+                 "l16ui %[t0], %[t0], 0\n"
+                 "slli %[t1], %[t1], 16\n"
+                 "or %[t0], %[t0], %[t1]\n"
+                 "s32i %[t0], %[out], 0\n"
+                 "srli %[t0], %[acc], 8\n"
+                 "add %[acc], %[acc], %[K]\n"
+                 "srli %[t1], %[acc], 8\n"
+                 "add %[acc], %[acc], %[K]\n"
+                 "addx2 %[t0], %[t0], %[prof]\n"
+                 "addx2 %[t1], %[t1], %[prof]\n"
+                 "l16ui %[t2], %[bg], 4\n"
+                 "l16ui %[t3], %[bg], 6\n"
+                 "l16ui %[t0], %[t0], 0\n"
+                 "l16ui %[t1], %[t1], 0\n"
+                 "add %[t0], %[t0], %[t2]\n"
+                 "add %[t1], %[t1], %[t3]\n"
+                 "addx2 %[t0], %[t0], %[pal]\n"
+                 "addx2 %[t1], %[t1], %[pal]\n"
+                 "l16ui %[t1], %[t1], 0\n"
+                 "l16ui %[t0], %[t0], 0\n"
+                 "slli %[t1], %[t1], 16\n"
+                 "or %[t0], %[t0], %[t1]\n"
+                 "s32i %[t0], %[out], 4\n"
+                 "xor %[bg], %[bg], %[eight]\n"
+                 "addi %[out], %[out], 8\n"
+                 "1:\n"
+                 : [out] "+&r"(out), [acc] "+&r"(acc), [bg] "+&r"(bg),
+                   [t0] "=&r"(t0), [t1] "=&r"(t1), [t2] "=&r"(t2), [t3] "=&r"(t3)
+                 : [prof] "r"(prof), [pal] "r"(pal), [K] "r"(K), [n] "r"(nQuads), [eight] "r"(8)
                  : "memory");
     return acc;
 }
@@ -117,7 +168,7 @@ GM_ANIM_IRAM __attribute__((noinline)) uint32_t glintPairsAsm(uint16_t *out, con
 GM_ANIM_IRAM __attribute__((noinline)) void glintRowAsm(uint16_t *row, const uint16_t *rec,
                                                       const uint8_t *prof, const uint16_t *pal,
                                                       const uint16_t *bg, uint16_t *scaled,
-                                                      uint16_t *colors, int w) {
+                                                      uint16_t *colors, uint16_t *bgRot, int w) {
     const int phase = (int)((0u - (uintptr_t)row) & 15u) >> 1;
     for (int k = 0; k < 8; k++) {
         colors[k] = pal[bg[k]];
@@ -134,16 +185,22 @@ GM_ANIM_IRAM __attribute__((noinline)) void glintRowAsm(uint16_t *row, const uin
     uint32_t acc = rec[3];
     const int K = rec[2];
     if (x & 1) {
-        int v = scaled[acc >> 8] + bg[x & 7];
-        row[x++] = pal[v > 255 ? 255 : v];
+        const int v = scaled[acc >> 8] + bg[x & 7];
+        row[x] = pal[v];
+        x++;
         acc += K;
+    }
+    const int quads = (x1 - x) >> 2;
+    if (quads > 0) {
+        for (int k = 0; k < 8; k++) bgRot[k] = bg[(x + k) & 7];
+        acc = glintQuadsAsm(row + x, scaled, pal, bgRot, acc, K, quads);
+        x += quads * 4;
     }
     const int pairs = (x1 - x) >> 1;
     acc = glintPairsAsm(row + x, scaled, pal, bg, acc, K, x, pairs);
     x += pairs * 2;
     if (x < x1) {
-        const int v = scaled[acc >> 8] + bg[x & 7];
-        row[x] = pal[v > 255 ? 255 : v];
+        row[x] = pal[scaled[acc >> 8] + bg[x & 7]];
     }
     glintFillAsm(row + x1, colors, x1, w - x1);
 }
@@ -158,10 +215,15 @@ static uint16_t scaleWant[SCALE_N] __attribute__((aligned(16)));
 static uint16_t got[ROW_N] __attribute__((aligned(16)));
 static uint16_t want[ROW_N] __attribute__((aligned(16)));
 static uint16_t scaled[256] __attribute__((aligned(16)));
-static uint16_t pal[256] __attribute__((aligned(16)));
+/* PAL_N in AnimGlint.cpp. Above 255 the padding repeats the top entry, which
+ * is what lets the kernels gather with an uncapped sum. The references below
+ * keep the cap, so every comparison also proves the padding is equivalent. */
+#define PAL_N 512
+static uint16_t pal[PAL_N] __attribute__((aligned(16)));
 static uint16_t bg[8] __attribute__((aligned(16)));
 static uint16_t colors[24] __attribute__((aligned(16)));
-static uint32_t cases, scaleCases, pairCases, fillCases, rowCases;
+static uint16_t bgRot[8] __attribute__((aligned(16)));
+static uint32_t cases, scaleCases, pairCases, quadCases, fillCases, rowCases;
 static uint32_t mismatches, firstCase, firstLane, firstGot, firstWant;
 
 static void mismatch(uint32_t lane, uint32_t a, uint32_t b) {
@@ -218,6 +280,15 @@ static void checkPairs(uint32_t acc, int K, int x, int nPairs) {
     compare(got, want, ROW_N);
     mismatch(ROW_N, a, b);
 }
+static void checkQuads(uint32_t acc, int K, int x, int nQuads) {
+    ++cases; ++quadCases;
+    clearPair(got, want, ROW_N);
+    for (int k = 0; k < 8; ++k) bgRot[k] = bg[(x + k) & 7];
+    uint32_t a = glintQuadsAsm(got + 8, scaled, pal, bgRot, acc, K, nQuads);
+    uint32_t b = pairsRef(want + 8, scaled, pal, bg, acc, K, x, nQuads * 2);
+    compare(got, want, ROW_N);
+    mismatch(ROW_N, a, b);
+}
 static void testScale(void) {
     /* Every byte value appears once per 256 samples. Both actual source
      * alignments from the 264-byte page layout take the vector body. */
@@ -250,14 +321,44 @@ static void testPairs(void) {
         if (pairs > 240) pairs = 240;
         checkPairs(acc, K, K & 6, pairs);
     }
-    /* Every background value, including the production maximum 28 and
-     * defensive full uint16 profile values. Saturation must precede gather. */
+    /* The kernels' contract: scaledProf is at most (255*323)>>8 = 321 and the
+     * ground index at most BG_PAT_MAX = 63, so a sum reaches 384 and lands in
+     * the palette's padding. Walk both ceilings together, which is what the
+     * removed per-pixel cap used to absorb. */
     for (int i = 0; i < 256; ++i) {
-        for (int k = 0; k < 8; ++k) bg[k] = (uint16_t)i;
-        scaled[i] = (uint16_t)(i * 257);
+        for (int k = 0; k < 8; ++k) bg[k] = (uint16_t)(i & 63);
+        scaled[i] = (uint16_t)(i + 66);
         checkPairs((unsigned)i << 8, 0, i & 6, 8);
     }
+    for (int i = 0; i < 256; ++i) scaled[i] = 321;
+    for (int k = 0; k < 8; ++k) bg[k] = 63;
+    checkPairs(0, 257, 0, 120);
     checkPairs(65535u, 8160, 6, 0);
+}
+static void testQuads(void) {
+    /* Same shapes as the pair tests, plus every start phase, so the rotated
+     * ground table and its half-flip are exercised at all eight offsets. */
+    for (int i = 0; i < 256; ++i) scaled[i] = (uint16_t)((i * 127) % 322);
+    for (int k = 0; k < 8; ++k) bg[k] = (uint16_t)(k * 4);
+    for (int x = 0; x < 8; ++x) {
+        for (int q = 0; q <= 9; ++q) checkQuads((unsigned)(x * 8191) & 32767u, 17, x, q);
+    }
+    /* Eight pixels a case, so a unit step needs seven counts of headroom.
+     * frame() already guarantees the cursor never leaves 0..65535 (maxSteps),
+     * and a case that broke it would only read past scaledProf. */
+    for (uint32_t acc = 0; acc <= 65535u; acc += 7) {
+        checkQuads(acc, acc <= 65528u ? 1 : 0, (int)(acc & 7u), 2);
+    }
+    for (int K = 1; K <= 8160; ++K) {
+        unsigned acc = (unsigned)(K * 73) & 4095u;
+        int quads = (int)((65535u - acc) / (unsigned)K + 1u) / 4;
+        if (quads > 120) quads = 120;
+        checkQuads(acc, K, K & 7, quads);
+    }
+    for (int i = 0; i < 256; ++i) scaled[i] = 321;
+    for (int k = 0; k < 8; ++k) bg[k] = 63;
+    checkQuads(0, 257, 3, 60);
+    checkQuads(65535u, 8160, 6, 0);
 }
 static void testFill(void) {
     for (int offset = 0; offset < 8; offset += 2) {
@@ -310,7 +411,7 @@ static void testRows(void) {
                     for (int k = 0; k < 8; ++k) bg[k] = (uint16_t)((ph * 3 + k * 7) % 29);
                     ++cases; ++rowCases;
                     clearPair(got, want, ROW_N);
-                    glintRowAsm(got + 8 + offset, rec, source + ph * 264, pal, bg, scaled, colors, w);
+                    glintRowAsm(got + 8 + offset, rec, source + ph * 264, pal, bg, scaled, colors, bgRot, w);
                     rowRef(want + 8 + offset, rec, source + ph * 264, w);
                     compare(got, want, ROW_N);
                 }
@@ -325,8 +426,10 @@ int main(void) {
     for (unsigned i = 0; i < sizeof(source); ++i) source[i] = (uint8_t)(i * 73u + 19u);
     for (int i = 0; i < 256; ++i) pal[i] = (uint16_t)(i * 251u + 7u);
     pal[0] = 0; pal[255] = 65535;
+    for (int i = 256; i < PAL_N; ++i) pal[i] = pal[255];
     testScale();
     testPairs();
+    testQuads();
     testFill();
     testRows();
     if (mismatches) {
@@ -339,6 +442,7 @@ int main(void) {
         putsU("GM_QEMUBENCH_PIE: PASS glint cases="); decU(cases);
         putsU(" scale="); decU(scaleCases);
         putsU(" pairs="); decU(pairCases);
+        putsU(" quads="); decU(quadCases);
         putsU(" fill="); decU(fillCases);
         putsU(" rows="); decU(rowCases);
         putsU(" mismatches=0");

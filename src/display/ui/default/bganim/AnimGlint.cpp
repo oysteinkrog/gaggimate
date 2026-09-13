@@ -35,11 +35,22 @@ constexpr int BG_LO = 5;         // bottom of the compressed theme ramp
 constexpr int BG_HI = 226;       // page's highlight ceiling in the theme ramp
 constexpr int BG_SPAN = 16;      // ground rises by 16 palette indices from top to bottom
 constexpr int REC = 5;          // x0, exclusive x1, Q8 step K, Q8 cursor acc0, Q8 amplitude A
+// The highlight's per-pixel cap lives in the palette, not in the pixel loop.
+// scaledProf holds (prof * A) >> 8, at most (255 * 323) >> 8 = 321, and the
+// ground index is capped at BG_PAT_MAX below, so the sum a pixel gathers with
+// is at most 321 + 63 = 384. PAL_N covers that; every entry from 256 up
+// repeats palette[255], which is what the reference's cap produces. Removing
+// the cap takes two instructions out of every highlight pixel.
+constexpr int BG_PAT_MAX = 63;
+constexpr int PAL_N = 512;
 
 // At 480 rows, every per-pixel/per-row table fits the 9,216 B hot slab:
-// rowRec 4,800; profPh 2,112; palette 512; bgQ4 960; dith 128; bgPat 16;
-// scaledProf 512; bgColors 32. Total 9,072 B, leaving 144 B. All sizes are
-// multiples of 16 at 480 and 240 rows; odd heights add allocator padding.
+// rowRec 4,800; profPh 2,112; palette 1,024; dith 128; bgPat 16;
+// scaledProf 512; bgColors 32; bgRun 16. Total 8,640 B, leaving 576 B. All
+// sizes are multiples of 16 at 480 and 240 rows; odd heights add allocator
+// padding. The padded palette costs 512 B more than the bare 256 entries and
+// bgQ4 pays for it: one int16 per row, read once in buildGround, so it is a
+// sequential PSRAM sweep of 960 B a frame rather than a per-pixel gather.
 // The 512 B source ramp is only read when the theme changes, so it is PSRAM.
 // rowRec narrows the page's Int32Array to uint16_t: x <= 480, K <= 8,160,
 // acc <= 65,535, A <= 323. No record field loses a bit at supported widths.
@@ -51,6 +62,7 @@ int16_t *dith = nullptr;
 uint16_t *bgPat = nullptr;
 uint16_t *scaledProf = nullptr; // row-local prof*A>>8, widened because A can exceed 256
 uint16_t *bgColors = nullptr;   // eight ground colors, then a rotated aligned-store pattern
+uint16_t *bgRun = nullptr;      // this run's eight ground indices, rotated to its start
 uint16_t *ramp = nullptr;
 const int16_t *sine = nullptr; // borrowed shared 1,024-entry, +/-512 sine table
 int allocW = 0;
@@ -84,14 +96,15 @@ bool init(int w, int h) {
     allocH = h;
     rowRec = static_cast<uint16_t *>(allocHot(static_cast<size_t>(REC) * h * sizeof(uint16_t)));
     profPh = static_cast<uint8_t *>(allocHot(8 * PROF_STRIDE));
-    palette = static_cast<uint16_t *>(allocHot(256 * sizeof(uint16_t)));
-    bgQ4 = static_cast<int16_t *>(allocHot(static_cast<size_t>(h) * sizeof(int16_t)));
+    palette = static_cast<uint16_t *>(allocHot(PAL_N * sizeof(uint16_t)));
+    bgQ4 = static_cast<int16_t *>(alloc(static_cast<size_t>(h) * sizeof(int16_t)));
     dith = static_cast<int16_t *>(allocHot(64 * sizeof(int16_t)));
     bgPat = static_cast<uint16_t *>(allocHot(8 * sizeof(uint16_t)));
     scaledProf = static_cast<uint16_t *>(allocHot(PROF_N * sizeof(uint16_t)));
     bgColors = static_cast<uint16_t *>(allocHot(16 * sizeof(uint16_t)));
+    bgRun = static_cast<uint16_t *>(allocHot(8 * sizeof(uint16_t)));
     ramp = static_cast<uint16_t *>(alloc(256 * sizeof(uint16_t)));
-    if (!rowRec || !profPh || !palette || !bgQ4 || !dith || !bgPat || !scaledProf || !bgColors || !ramp) {
+    if (!rowRec || !profPh || !palette || !bgQ4 || !dith || !bgPat || !scaledProf || !bgColors || !bgRun || !ramp) {
         // A retry must start with no live allocation and no stale dimensions.
         release();
         return false;
@@ -108,6 +121,9 @@ void rebuildTheme() {
     for (int i = 0; i < 256; i++) {
         palette[i] = ramp[BG_LO + i * (BG_HI - BG_LO) / 255];
     }
+    // Above 255 the padding repeats the top entry, so a gather with an
+    // uncapped sum returns exactly what the reference's cap returns.
+    for (int i = 256; i < PAL_N; i++) palette[i] = palette[255];
     // bayerOffsets(dith, ditherAmpJS(pal,256)*0.75,16) on the page.
     // Keep Q4 offsets until the use site: the profile floors them with >>4,
     // while the ground adds them to bgQ4 before flooring. Rounding offsets
@@ -240,7 +256,12 @@ void frame(uint32_t tMs, int w, int h, const uint8_t p[BG_ANIM_PARAMS]) {
 void buildGround(int y) {
     for (int k = 0; k < 8; k++) {
         const int v = floorShift(bgQ4[y] + dith[(y & 7) * 8 + k], 4);
-        bgPat[k] = static_cast<uint16_t>(v < 0 ? 0 : (v > 255 ? 255 : v));
+        // The real ceiling is 28: bgQ4 reaches BG_SPAN*16 = 256 and the Q4
+        // dither reaches 192, since ditherAmp() itself clamps at 16 and this
+        // animation scales it by 0.75. BG_PAT_MAX is more than twice that, so
+        // this clamp never fires; it is what makes the palette's padding a
+        // bound the kernel can rely on rather than an argument about rounding.
+        bgPat[k] = static_cast<uint16_t>(v < 0 ? 0 : (v > BG_PAT_MAX ? BG_PAT_MAX : v));
     }
 }
 
@@ -352,18 +373,20 @@ GM_ANIM_IRAM __attribute__((noinline)) void glintFillAsm(uint16_t *out, const ui
 
 // Two profile gathers and two palette gathers cannot be vectorised. The
 // bg pair shares one address because x is even, so x&7 never wraps between
-// its pixels. 25 instructions per pair, 12.5 per highlight pixel. Every
-// scalar load has at least one independent instruction before consumption;
-// at an ideal single issue per cycle this is a 12.5 cycle/pixel floor, not
-// a device timing claim. No per-iteration spill and no branch back edge.
-// Register budget is 13: three walking operands, five inputs, four scratch
-// registers and the cap. Earlyclobber prevents input overlap across a loop.
+// its pixels. This is the tail kernel: it runs at most three times a row,
+// after glintOctsAsm has taken the eight-pixel groups, and it still derives
+// the ground address from x so that any start phase works. 23 instructions
+// per pair, 11.5 per highlight pixel. Every scalar load has at least one
+// independent instruction before consumption. No per-iteration spill and no
+// branch back edge. Register budget is 12: three walking operands, five
+// inputs and four scratch registers. Earlyclobber prevents input overlap.
+// The cap the reference applies before its gather lives in the palette's
+// padding now (PAL_N above), so neither kernel pays for it per pixel.
 GM_ANIM_IRAM __attribute__((noinline)) uint32_t glintPairsAsm(uint16_t *out, const uint16_t *prof,
                                                             const uint16_t *pal, const uint16_t *bg,
                                                             uint32_t acc, int K, int x, int nPairs) {
-    uint32_t t0, t1, t2, t3, cap;
-    asm volatile("movi %[cap], 255\n"
-                 "loopnez %[n], 1f\n"
+    uint32_t t0, t1, t2, t3;
+    asm volatile("loopnez %[n], 1f\n"
                  "srli %[t0], %[acc], 8\n"
                  "add %[acc], %[acc], %[K]\n"
                  "srli %[t1], %[acc], 8\n"
@@ -377,8 +400,6 @@ GM_ANIM_IRAM __attribute__((noinline)) uint32_t glintPairsAsm(uint16_t *out, con
                  "l16ui %[t2], %[t2], 2\n"
                  "add %[t0], %[t0], %[t3]\n"
                  "add %[t1], %[t1], %[t2]\n"
-                 "min %[t0], %[t0], %[cap]\n"
-                 "min %[t1], %[t1], %[cap]\n"
                  "addx2 %[t0], %[t0], %[pal]\n"
                  "addx2 %[t1], %[t1], %[pal]\n"
                  "l16ui %[t0], %[t0], 0\n"
@@ -391,8 +412,74 @@ GM_ANIM_IRAM __attribute__((noinline)) uint32_t glintPairsAsm(uint16_t *out, con
                  "addi %[x], %[x], 2\n"
                  "1:\n"
                  : [out] "+&r"(out), [acc] "+&r"(acc), [x] "+&r"(x),
-                   [t0] "=&r"(t0), [t1] "=&r"(t1), [t2] "=&r"(t2), [t3] "=&r"(t3), [cap] "=&r"(cap)
+                   [t0] "=&r"(t0), [t1] "=&r"(t1), [t2] "=&r"(t2), [t3] "=&r"(t3)
                  : [prof] "r"(prof), [pal] "r"(pal), [bg] "r"(bg), [K] "r"(K), [n] "r"(nPairs)
+                 : "memory");
+    return acc;
+}
+
+// Four pixels an iteration, which is what takes the ground index out of the
+// pixel loop. glintPairsAsm derives the ground address from x every pair;
+// here the caller rotates eight ground indices into bgRun so a group reads
+// them at fixed offsets, and the pointer flips between the two halves of that
+// 16-byte table with one XOR per group, since the ground repeats every eight
+// pixels. bgRun is 16-byte aligned, so flipping bit 3 stays inside it.
+// 40 instructions per four pixels, 10 per highlight pixel, against 12.5 for
+// the pair kernel: the ground address, the cap and half the loop bookkeeping
+// are gone. Every scalar load still has an independent instruction before its
+// consumer, and the body is small enough for a hardware loop, so there is no
+// branch back edge. Register budget is 12. The uncapped sum is safe because
+// of the palette padding described at PAL_N.
+GM_ANIM_IRAM __attribute__((noinline)) uint32_t glintQuadsAsm(uint16_t *out, const uint16_t *prof,
+                                                              const uint16_t *pal, const uint16_t *bgRot,
+                                                              uint32_t acc, int K, int nQuads) {
+    uint32_t t0, t1, t2, t3;
+    const uint16_t *bg = bgRot;
+    asm volatile("loopnez %[n], 1f\n"
+                 "srli %[t0], %[acc], 8\n"
+                 "add %[acc], %[acc], %[K]\n"
+                 "srli %[t1], %[acc], 8\n"
+                 "add %[acc], %[acc], %[K]\n"
+                 "addx2 %[t0], %[t0], %[prof]\n"
+                 "addx2 %[t1], %[t1], %[prof]\n"
+                 "l16ui %[t2], %[bg], 0\n"
+                 "l16ui %[t3], %[bg], 2\n"
+                 "l16ui %[t0], %[t0], 0\n"
+                 "l16ui %[t1], %[t1], 0\n"
+                 "add %[t0], %[t0], %[t2]\n"
+                 "add %[t1], %[t1], %[t3]\n"
+                 "addx2 %[t0], %[t0], %[pal]\n"
+                 "addx2 %[t1], %[t1], %[pal]\n"
+                 "l16ui %[t1], %[t1], 0\n"
+                 "l16ui %[t0], %[t0], 0\n"
+                 "slli %[t1], %[t1], 16\n"
+                 "or %[t0], %[t0], %[t1]\n"
+                 "s32i %[t0], %[out], 0\n"
+                 "srli %[t0], %[acc], 8\n"
+                 "add %[acc], %[acc], %[K]\n"
+                 "srli %[t1], %[acc], 8\n"
+                 "add %[acc], %[acc], %[K]\n"
+                 "addx2 %[t0], %[t0], %[prof]\n"
+                 "addx2 %[t1], %[t1], %[prof]\n"
+                 "l16ui %[t2], %[bg], 4\n"
+                 "l16ui %[t3], %[bg], 6\n"
+                 "l16ui %[t0], %[t0], 0\n"
+                 "l16ui %[t1], %[t1], 0\n"
+                 "add %[t0], %[t0], %[t2]\n"
+                 "add %[t1], %[t1], %[t3]\n"
+                 "addx2 %[t0], %[t0], %[pal]\n"
+                 "addx2 %[t1], %[t1], %[pal]\n"
+                 "l16ui %[t1], %[t1], 0\n"
+                 "l16ui %[t0], %[t0], 0\n"
+                 "slli %[t1], %[t1], 16\n"
+                 "or %[t0], %[t0], %[t1]\n"
+                 "s32i %[t0], %[out], 4\n"
+                 "xor %[bg], %[bg], %[eight]\n"
+                 "addi %[out], %[out], 8\n"
+                 "1:\n"
+                 : [out] "+&r"(out), [acc] "+&r"(acc), [bg] "+&r"(bg),
+                   [t0] "=&r"(t0), [t1] "=&r"(t1), [t2] "=&r"(t2), [t3] "=&r"(t3)
+                 : [prof] "r"(prof), [pal] "r"(pal), [K] "r"(K), [n] "r"(nQuads), [eight] "r"(8)
                  : "memory");
     return acc;
 }
@@ -402,7 +489,7 @@ GM_ANIM_IRAM __attribute__((noinline)) uint32_t glintPairsAsm(uint16_t *out, con
 GM_ANIM_IRAM __attribute__((noinline)) void glintRowAsm(uint16_t *row, const uint16_t *rec,
                                                       const uint8_t *prof, const uint16_t *pal,
                                                       const uint16_t *bg, uint16_t *scaled,
-                                                      uint16_t *colors, int w) {
+                                                      uint16_t *colors, uint16_t *bgRot, int w) {
     const int phase = (int)((0u - (uintptr_t)row) & 15u) >> 1;
     for (int k = 0; k < 8; k++) {
         colors[k] = pal[bg[k]];
@@ -419,16 +506,22 @@ GM_ANIM_IRAM __attribute__((noinline)) void glintRowAsm(uint16_t *row, const uin
     uint32_t acc = rec[3];
     const int K = rec[2];
     if (x & 1) {
-        int v = scaled[acc >> 8] + bg[x & 7];
-        row[x++] = pal[v > 255 ? 255 : v];
+        const int v = scaled[acc >> 8] + bg[x & 7];
+        row[x] = pal[v];
+        x++;
         acc += K;
+    }
+    const int quads = (x1 - x) >> 2;
+    if (quads > 0) {
+        for (int k = 0; k < 8; k++) bgRot[k] = bg[(x + k) & 7];
+        acc = glintQuadsAsm(row + x, scaled, pal, bgRot, acc, K, quads);
+        x += quads * 4;
     }
     const int pairs = (x1 - x) >> 1;
     acc = glintPairsAsm(row + x, scaled, pal, bg, acc, K, x, pairs);
     x += pairs * 2;
     if (x < x1) {
-        const int v = scaled[acc >> 8] + bg[x & 7];
-        row[x] = pal[v > 255 ? 255 : v];
+        row[x] = pal[scaled[acc >> 8] + bg[x & 7]];
     }
     glintFillAsm(row + x1, colors, x1, w - x1);
 }
@@ -442,7 +535,7 @@ GM_ANIM_IRAM void band(uint16_t *dst, int y0, int rows, int w, uint32_t tMs, con
         const int y = y0 + r;
         buildGround(y);
         glintRowAsm(dst + static_cast<size_t>(r) * w, rowRec + static_cast<size_t>(y) * REC,
-                    profPh + (y & 7) * PROF_STRIDE, palette, bgPat, scaledProf, bgColors, w);
+                    profPh + (y & 7) * PROF_STRIDE, palette, bgPat, scaledProf, bgColors, bgRun, w);
     }
 #else
     bandRef(dst, y0, rows, w, tMs, p);
@@ -452,12 +545,13 @@ GM_ANIM_IRAM void band(uint16_t *dst, int y0, int rows, int w, uint32_t tMs, con
 void release() {
     releaseTable(rowRec, static_cast<size_t>(REC) * allocH * sizeof(uint16_t));
     releaseTable(profPh, 8 * PROF_STRIDE);
-    releaseTable(palette, 256 * sizeof(uint16_t));
+    releaseTable(palette, PAL_N * sizeof(uint16_t));
     releaseTable(bgQ4, static_cast<size_t>(allocH) * sizeof(int16_t));
     releaseTable(dith, 64 * sizeof(int16_t));
     releaseTable(bgPat, 8 * sizeof(uint16_t));
     releaseTable(scaledProf, PROF_N * sizeof(uint16_t));
     releaseTable(bgColors, 16 * sizeof(uint16_t));
+    releaseTable(bgRun, 8 * sizeof(uint16_t));
     releaseTable(ramp, 256 * sizeof(uint16_t));
     sine = nullptr;
     allocW = allocH = 0;
