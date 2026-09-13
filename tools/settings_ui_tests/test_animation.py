@@ -1931,18 +1931,56 @@ def check_gradient_precedence_across_animations(rig):
     # The review's interference step: one web save replacing the whole map,
     # with a different value in A's touched slot and in C's untouched one.
     web_ref_a = builtin_ref_other_than(ref_a, category=category_for_ref(ref_a, "Pastel"))
+    web_ref_b = builtin_ref_other_than(ref_b, category=category_for_ref(ref_b, "Water and Ice"))
     web_ref_c = builtin_ref_other_than(ref0_c, category=category_for_ref(ref0_c, "Metal and Stone"))
-    web_map = map_write_ref(map_write_ref(map_after_b, anim_a, web_ref_a), anim_c, web_ref_c)
+    web_map = map_write_ref(map_write_ref(map_write_ref(map_after_b, anim_a, web_ref_a),
+                                          anim_b, web_ref_b), anim_c, web_ref_c)
     interference = web_save_available(rig)
     if not interference:
         skip(rig, "precedence_web_interference",
              "replacing the whole map is a web save, and web_save runs on the simulator only")
     if interference:
-        web_save(rig, {"bgAnimThemeMap": web_map})
-        landed = rig.wait_until(lambda: rig.settings()["bgAnimThemeMap"] == web_map, timeout=5)
-        check(rig, "precedence_web_map_landed", bool(landed),
-              "the web save has to reach Settings before its effect can be judged: %r" %
-              rig.settings()["bgAnimThemeMap"])
+        # The map cannot be its own evidence that the POST landed. Since
+        # gm-nov3.36 the open category merges every touched slot back into the
+        # stored map within a UI pass, by design, so bgAnimThemeMap never
+        # equals web_map: the wait raised, the scenario aborted and the
+        # restore below never ran. A witness field the visit has not touched
+        # rides in the same request instead, and WebUIPlugin::handleSettings
+        # applies the whole document in one batchUpdate, so the witness
+        # arriving is the map arriving. Same shape as store_over_draft in
+        # test_gradientdraft.py.
+        fps_witness = 35 if int(s0["bgAnimFps"]) != 35 else 40
+        web_save(rig, {"bgAnimThemeMap": web_map, "bgAnimFps": fps_witness})
+        try:
+            landed = bool(rig.wait_until(lambda: int(rig.settings()["bgAnimFps"]) == fps_witness, timeout=5))
+        except TimeoutError:
+            landed = False
+        check(rig, "precedence_web_map_landed", landed,
+              "witness bgAnimFps %d, got %r" % (fps_witness, rig.settings()["bgAnimFps"]))
+
+        # What the old reading could not see at all, because it judged only
+        # after the pop: both touched slots go back to the display's values
+        # while the category is still open, and the untouched one keeps the
+        # web's. The web writes a different ref into all three slots, so each
+        # of these can fail on its own.
+        def live_settled():
+            m = rig.settings()["bgAnimThemeMap"]
+            return map_ref(m, anim_a) == ref_a and map_ref(m, anim_b) == ref_b
+
+        try:
+            live_ok = bool(rig.wait_until(live_settled, timeout=5))
+        except TimeoutError:
+            live_ok = False
+        live_map = rig.settings()["bgAnimThemeMap"]
+        check(rig, "precedence_live_a_reasserted", map_ref(live_map, anim_a) == ref_a,
+              "anim %d got %r want %r, the web wrote %r" %
+              (anim_a, map_ref(live_map, anim_a), ref_a, web_ref_a))
+        check(rig, "precedence_live_b_reasserted", map_ref(live_map, anim_b) == ref_b,
+              "anim %d got %r want %r, the web wrote %r" %
+              (anim_b, map_ref(live_map, anim_b), ref_b, web_ref_b))
+        check(rig, "precedence_live_both_reasserted", live_ok, live_map)
+        check(rig, "precedence_live_untouched_keeps_web", map_ref(live_map, anim_c) == web_ref_c,
+              "anim %d got %r want the web's %r" % (anim_c, map_ref(live_map, anim_c), web_ref_c))
 
     rig.settingsui(pop=1)
 
@@ -1987,7 +2025,8 @@ def check_gradient_precedence_across_animations(rig):
         rig.log("could_not_restore", bgAnimThemeMap=restored_map)
     # The slots resolve back to what they were, but clearing one through the
     # picker leaves the separators in the string; put the stored bytes back.
-    restore_fields_exactly(rig, "gradient_precedence_map_string_restored", {"bgAnimThemeMap": map0})
+    restore_fields_exactly(rig, "gradient_precedence_map_string_restored",
+                           {"bgAnimThemeMap": map0, "bgAnimFps": int(s0["bgAnimFps"])})
 
 
 def check_plates_and_tint_coupling(rig):
