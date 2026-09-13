@@ -742,8 +742,14 @@ the design cannot show and what the runs measured.
   while held: menu buttons 19 to 29, tiles 0 before the rule and 42 after,
   rows 32 to 49 before (text jumped to the dim colour itself and vanished)
   and 13 to 27 after. The probe is a hold through `/api/debug/tap` with a
-  framebuffer read mid-hold; the device only delivers `/api/debug/fb` at
-  step 2.
+  framebuffer read mid-hold. That note used to add that the device only
+  delivers `/api/debug/fb` at step 2. It delivers every step since gm-6ivh
+  (28cec8ec, 2026-09-13): the filler wrote whole output rows and returned 0
+  when the send budget could not hold one, which the web server reads as the
+  end of the body, so a step 1 request always returned exactly 5 rows, 4,800
+  of 460,800 bytes, with a 200 and no error. It was never heap dependent and
+  never request dependent. Step 2 and above have rows of 480 bytes and under,
+  which always fit, which is why only step 1 ever looked broken.
 - **Holds are driven only by the events LVGL delivers to the row**, never by
   an `lv_timer` that could outlive it. Steppers step once on `PRESSED` and
   once per `LONG_PRESSED_REPEAT` (LVGL default: 400 ms, then every 100 ms)
