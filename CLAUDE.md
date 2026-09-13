@@ -1270,6 +1270,65 @@ survived, and what the device taught:
   stores took it to 8.2 ms with the picture unchanged (goldens moved 2.0 of
   255, all of it the dither grain going 2x1); a redesign for the same speed
   (Silk 2, four rounds) never matched the look.
+- **The kblob rig runs the kernel from IRAM and the board runs it from
+  flash, so the rig under-reports, and by an amount that is a property of the
+  kernel** (gm-4bd.6 and .7, 2026-09-13, bench board, divider 7). Same code,
+  same session: plasma 6.81 ms in the blob against 8.14 on the board, 1.22
+  times; crescent 8.53 against 14.8, 1.73 times. What the board pays on top is
+  fetching the kernel's own code through the 16 KB instruction cache the two
+  cores share, so a tight kernel reads close to the board and one with library
+  calls or a lot of per-row setup reads far better in the blob than it will
+  run. The proof that the gap is the kernel's and not noise: crescent's second
+  commit (98afb42b) left the blob time at 8.53 and took the board time to
+  12.5, changing nothing in the pixel loops, because two `sqrtf` calls a row, a
+  flash resident library function, came out of `band()` and became a table
+  built once a frame. There is no fixed factor to correct by. A blob win that
+  does not appear on the board is code volume, not pixels, and the gap is the
+  number to watch.
+- **A band time ratio holds only within one run and one board state, and the
+  state moves it a long way** (2026-09-13). The same binaries read sundial 1.21
+  and glint 1.09 of plasma on a fresh boot, and 1.52 and 1.21 later the same
+  evening; crescent read 1.48 by animtest on a fresh boot, 1.61 by whole frame
+  sweep in the same session, and 1.42 to 1.83 by interlaced sweep in a third.
+  Plasma is the least affected because its kernel is the smallest and has the
+  least to lose from a cold instruction cache, which is what makes the ratio
+  move rather than both numbers together. A 1.00 reading taken before the
+  method was pinned down was simply false. The states differed in at least four
+  ways at once (uptime of hours against minutes, the synthetic brew cycling the
+  two heaviest screens, the web preview path instead of animtest, and the
+  interlaced path pinned on), and nobody has run the experiment that says which
+  one matters. **The repeatable method, and the one to quote:** hard reset,
+  `/api/debug/synth?brew=0`, settle 40 s, then `/api/debug/animtest` with
+  plasma measured in the same run, three times. Three runs of that agreed
+  within 3% for four animations; nothing else tried agreed that well. Quote a
+  ratio only with the plasma it was measured against and the state it was taken
+  in.
+- **`EE.LDXQ.32` is the PIE unit's only gather, and this QEMU fork gets it
+  wrong** (gm-4bd.6 and .7, 2026-09-13). The instruction takes a 16-bit lane of
+  a vector, scales it by four, adds a base and loads 32 bits into one lane, so
+  eight of them plus an `EE.VUNZIP.16` fetch eight table entries where a scalar
+  pair loop costs eleven instructions for two. Two consequences in source. The
+  index scales by four, so a gathered table is 32-bit and its entry count is
+  not its byte count: establish the largest index the caller can produce and
+  check it against the allocation, the way glint pads a 512 entry palette for a
+  sum that reaches 384. And paying for 32-bit tables in the 9,216 byte hot slab
+  means moving something out, which is safe only for a table read once a row
+  rather than per pixel (sundial's `halfPx` and `surfRow`). **The emulator
+  returns the entry one 32-bit word below the correct one, every time, for
+  every lane** (espressif/qemu issue 162);
+  `tools/qemubench/tests/probe_ldxq32` is the eleven line reproduction. The
+  sundial and crescent tests hand the vector path a table pointer one word
+  high, marked `QEMU_LDXQ_BIAS`, so the error cancels: every lane of arithmetic
+  is checked (sundial 2,260,707 lanes, crescent 6,024,680, zero mismatches) and
+  only the gather address is left to silicon, where `/api/debug/animtest` and
+  the kblob hash check it. So a QEMU pass on one of those tests says the
+  arithmetic is right, not that the address is. A test that uses the
+  instruction and passes with no bias is either not reaching it or comparing
+  two wrong things. One trap that cost a rebuild: a kernel walks single pixels
+  until its output pointer is 16-byte aligned and only then enters the vector
+  body, so one call uses both paths, and the harness has to split the call the
+  same way the kernel does and run it twice, biased for the vector span and
+  true for the rest.
 - **The fuzzer is only a fuzzer with the sanitizers on**
   (`tools/animbench/Makefile.fuzz`, run with
   `ASAN_OPTIONS=verify_asan_link_order=0` on WSL1). Without ASan a
