@@ -342,8 +342,9 @@ reading. The recurring shapes, with the instance that taught each one:
   carry identical tags, so every check past the row count read the first
   of them twice (gm-nov3.28). `Rig.row_slots` and `Rig.find_in_row`
   address a row by its position, which is unique where its name is not.
-  `picker_selected_rows` still reads the marker by name and is the last
-  known instance.
+  `picker_selected_rows` was the last instance and now walks the slots too
+  (gm-nov3.33): with the two "Custom" entries it used to report both rows
+  marked when the first was selected, and no row at all when the second was.
 - **Existence stood in for identity.** `len(set(strip)) > 4` over a swatch
   says a ramp was drawn, not which one. Every entry in the fixture library
   clears that threshold by a factor of ten (measured: 46 to 80 distinct
@@ -355,7 +356,10 @@ reading. The recurring shapes, with the instance that taught each one:
   `tools/animbench/swatch_parity.cpp` is what holds it to the real one.
   Measured on the simulator, `ff0000,ff2000` draws `(255,0,0)` to
   `(255,28,0)` against a nominal `(255,32,0)`, which is where the tolerance
-  of 20 comes from.
+  of 20 comes from. The four remaining count-only checks were pointed at it
+  by gm-nov3.33, which proved each one against a firmware mutation: a saved
+  gradient resolving to the first library entry, one built-in resolving to
+  the next, and the two high ids resolving to each other.
 - **A side effect stood in for the act.** `picker_choose` asserted that the
   page stack shrank, which happened whether or not anything was selected;
   ten checks leaned on it (gm-nov3.31).
@@ -363,6 +367,45 @@ reading. The recurring shapes, with the instance that taught each one:
 The test for a new check is the one the beads above ask for: name the fault
 it is meant to catch, build that fault, and watch the check fail. A check
 that has never been seen to fail has not been tested.
+
+### Confirming a web save landed
+
+A check that drives a web save has to prove the POST was applied before it
+judges anything by it. A rejected POST leaves the UI showing the old value,
+and every assertion after it passes for the wrong reason.
+
+Reading the saved field back is the obvious way, and it is wrong for any
+field the open category writes. The display puts its own value back within a
+UI pass, by design, so the read-back either never matches, and the check
+times out and abandons its remaining assertions and its restore, or it
+matches only by accident.
+
+A field the category never writes is what confirms the save instead. The
+whole document goes in one request and `WebUIPlugin::handleSettings` applies
+it in one `batchUpdate`, so any field arriving proves the request was
+accepted and applied. Carry a witness of the same form in the same POST and
+wait on that. In `test_gradientdraft.py`, `store()` is the read-back form,
+for a field no open page owns, and `store_over_draft()` is the witness form.
+
+The fields that need the witness form today are `bgAnimGradientRef` and
+`bgAnimTheme` (gm-nov3.23) and every slot of `bgAnimThemeMap` (gm-nov3.36).
+Ask the question first rather than treating it as a special case: before
+waiting on a field, ask whether the open page writes it. The list grows
+whenever a row becomes a live field, and a check written before that happens
+goes red when it does. `check_gradient_precedence_across_animations` in
+`test_animation.py` is the worked example: it waited on `bgAnimThemeMap`
+itself, and gm-nov3.36 made that field one the display restores.
+
+Whether the ref or map in the form is one the POST handler stores, rather
+than one `bg_ref_valid` or `bg_map_valid` drops, is a separate question and
+needs its own preflight save against a closed shell. A witness cannot answer
+it: the document is applied in one `batchUpdate` whether or not one of its
+fields is dropped.
+
+And a check about a live field asserts on the stored field before the
+category is popped. After the pop, commit has written the draft, so the
+assertion passes whether or not the row and the panel agreed during the
+visit.
 
 ### Proving a check fails, without breaking the shared checkout
 
