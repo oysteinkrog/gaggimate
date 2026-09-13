@@ -36,31 +36,99 @@ So it ships in production firmware on the T-RGB panel, and is absent from the
 simulator and the headless build. An earlier version of this header said
 "loadtest and bench builds only". That was wrong.
 
+HOW IT DECIDES WHAT WAS COMPARED
+================================
+
+An animation whose kernel is compiled out is worse than untested: band() is
+then the portable code again, so the device compares a function against
+itself and reports 0 differing pixels, as it must. That is noncoverage, not
+parity, and telling the two apart is the whole of this tool's source
+inventory.
+
+It is not decided by a naming convention. Until gm-nov3.40 the inventory
+scanned for literal `#define GM_BGANIM_<X>_ASM n` lines and matched each
+animation to one by uppercasing its id, and neither of those is what the
+compiler reads. A guard changed to `#if 0`, a guard moved to a differently
+named macro, a band() body edited down to a call to the reference, or a -D on
+the build line all left the old scan believing the kernel was live.
+
+What it reads instead, per animation, is the condition at the guard:
+
+  1. The `const BgAnimation bg_anim_<id> = {...}` initialiser says which
+     function is band() and which is the reference. Both are fields, not
+     names: Steam calls its reference bandPortable.
+  2. The file is evaluated the way the preprocessor would evaluate it for the
+     target build (below), so only the branch that really compiles is read.
+  3. The kernel is dormant when band() is the reference by any of four
+     routes: the two fields name the same function, band()'s body is one call
+     to the reference, band()'s body is token for token the reference's body
+     (Hills dispatches through render<true> and render<false>), or no inline
+     assembly is reachable from band() at all through the file's own call
+     graph (Steam dispatches through renderRow<Asm>).
+  4. Which macros select the kernel is measured, not assumed: every macro the
+     file's own conditions mention is forced on, forced to 0 and removed in
+     turn, and the ones that change the classification are this animation's
+     switches. Eleven animations (Aurora, Caustics, Ember, Fireflies,
+     Mandala, Nebula, Orbits, Plasma, Ripples, Starfield, Steam) come back
+     with nothing but the fleet-wide __XTENSA__ and GM_BGANIM_NO_ASM, so
+     there is no build-time way to turn one of them off on its own for an
+     A/B. /api/debug/anim?useref=1 is the only isolated A/B for those.
+
+The target build is the production `display` environment: __XTENSA__ and
+ESP_PLATFORM, plus every -D and -U in that environment's build_flags in
+platformio.ini, with ${section.key} references expanded. `--pio-env` picks a
+different one. Every run prints the environment, the overrides that reach a
+kernel switch, and the blind spots below.
+
 WHAT THIS CANNOT ESTABLISH
 ==========================
 
 It compares band() against bandRef() as the running firmware compiled them.
-It says nothing about a path the running firmware did not compile.
+It says nothing about a path the running firmware did not compile, and
+nothing about a board running firmware built from another checkout.
 
-Eleven animations (Aurora, Caustics, Ember, Fireflies, Mandala, Nebula,
-Orbits, Plasma, Ripples, Starfield, Steam) have no named GM_BGANIM_<NAME>_ASM
-switch: their Xtensa path is guarded only by the fleet-wide GM_BGANIM_NO_ASM.
-Their kernels are compared here like any other, but there is no build-time way
-to turn one of them off on its own for an A/B, because GM_BGANIM_NO_ASM
-changes the whole fleet at once. The runtime /api/debug/anim?useref=1 path is
-the only isolated A/B for those eleven unless a named switch is added. The
-tool prints the current set at the end of a run rather than trusting this
-paragraph.
+Three ways a define can reach the compiler without appearing in
+platformio.ini, all of which would make this inventory wrong. The run refuses
+to start when it finds one rather than reporting a pass it cannot support:
 
-An animation whose named switch defaults to 0 is worse than untested: its
-band() is one line that calls bandRef(), so the device compares a function
-against itself and reports 0 differing pixels, as it must. That is noncoverage,
-not parity. DORMANT below names every such animation, the run refuses to start
-if the sources disagree with it, and the summary counts those animations
-separately and never as a pass. Nothing reachable from the board can test a
-dormant kernel; the flag has to be turned on first, and then the ladder in
-CLAUDE.md applies (host goldens, the real compiler's disassembly, QEMU
-bit-exactness, and only then this tool).
+  - PLATFORMIO_BUILD_FLAGS or PLATFORMIO_BUILD_UNFLAGS in the environment.
+  - an extra_script of the target environment that touches CPPDEFINES or
+    BUILD_FLAGS. None does today, and the check is run rather than asserted.
+  - a build driven by hand with extra -D arguments, which leaves no trace
+    anywhere the tool can read. That one it cannot detect, so it is printed
+    on every run as a standing limit.
+
+DORMANT below names every animation whose kernel is compiled out. The run
+refuses to start if the sources disagree with it, and the summary counts
+those animations separately and never as a pass. Nothing reachable from the
+board can test a dormant kernel; the flag has to be turned on first, and then
+the ladder in CLAUDE.md applies (host goldens, the real compiler's
+disassembly, QEMU bit-exactness, and only then this tool).
+
+WHAT --host-test DOES NOT COVER
+===============================
+
+The host cases drive check_fleet() and run_one() against FakeDevice, whose
+get() is called directly, and main() through a stub urlopen. So they do cover
+main()'s exit codes and the JSON decoding faults that stub can raise, and
+they do not cover:
+
+  - make_getter()'s retry and exhaustion loop against a real socket: its
+    timeout path, its 1.5 s backoff, and a transport fault that recovers on
+    the second try. Only the 404 and non-JSON branches are driven, through a
+    substituted urlopen.
+  - a real HTTP response: chunked transfer, a truncated body, a wrong
+    content type, a body that is JSON but not an object arriving from the
+    firmware rather than from a stub.
+  - run_one()'s `pending` branch. FakeDevice publishes complete results and
+    never answers pending true, so the poll that waits out a render-task
+    window in progress is not exercised.
+  - main()'s unavailable-pclk fallback. FakeDevice always answers
+    /api/debug/pclk, so the ResultError path that prints "pclk: unavailable"
+    and carries on is not reached.
+
+A --host-test pass is a statement about the gate's logic, not about talking
+to a board.
 """
 
 import argparse
@@ -95,10 +163,10 @@ NAMES = [
 # becomes dormant without being declared here, or is declared here and is no
 # longer dormant, fails the run.
 DORMANT = {
-    "silk": "GM_BGANIM_SILK_ASM defaults to 0 (AnimSilk.cpp), and under that "
-            "default band() is one line that calls bandRef(). The kernel lost "
-            "to the compiler on the chip (2026-09-04) and stays in the file "
-            "for the next attempt.",
+    "silk": "band() is one line that calls bandRef() in the build this "
+            "inventory read. The kernel lost to the compiler on the chip "
+            "(2026-09-04) and stays in AnimSilk.cpp behind a switch that "
+            "defaults to 0, for the next attempt.",
 }
 
 # The fields a result must carry before it means anything. Their types are
@@ -187,65 +255,860 @@ def registry_symbols(bganim_dir):
     return syms
 
 
-def animation_ids(bganim_dir):
-    """Every `const BgAnimation bg_anim_X = {"id", ...}` in the directory.
+def blank_comments(text):
+    """C++ comments replaced by spaces, string literals and line count kept.
 
-    Returns {symbol suffix: (id string, file name)}."""
+    strip_comments() above deletes comment text outright, which is right for
+    the registry regex and wrong here: this scan matches `#` at the start of a
+    line and brace-matches function bodies, so it needs the file's line
+    structure and offsets left alone."""
+    out, i, n = [], 0, len(text)
+    while i < n:
+        c = text[i]
+        if c == '"' or c == "'":
+            quote = c
+            out.append(c)
+            i += 1
+            while i < n:
+                out.append(text[i])
+                if text[i] == '\\' and i + 1 < n:
+                    out.append(text[i + 1])
+                    i += 2
+                    continue
+                if text[i] == quote:
+                    i += 1
+                    break
+                i += 1
+            continue
+        if c == '/' and i + 1 < n and text[i + 1] == '/':
+            while i < n and text[i] != '\n':
+                out.append(' ')
+                i += 1
+            continue
+        if c == '/' and i + 1 < n and text[i + 1] == '*':
+            out.append('  ')
+            i += 2
+            while i + 1 < n and not (text[i] == '*' and text[i + 1] == '/'):
+                out.append('\n' if text[i] == '\n' else ' ')
+                i += 1
+            out.append('  ')
+            i += 2
+            continue
+        out.append(c)
+        i += 1
+    return ''.join(out)
+
+
+# ------------------------------------------------- the preprocessor's view
+
+PP_TOKEN = re.compile(r'0[xX][0-9a-fA-F]+[uUlL]*|\d+[uUlL]*|[A-Za-z_]\w*'
+                      r'|&&|\|\||<<|>>|[<>=!]=|[-+*/%&|^~!()<>,?:]')
+IDENT = re.compile(r'[A-Za-z_]\w*')
+
+
+def pp_tokens(expr):
+    return PP_TOKEN.findall(expr)
+
+
+def pp_names(expr):
+    """Every macro name an #if condition mentions, `defined` itself aside."""
+    return set(t for t in pp_tokens(expr) if IDENT.match(t) and t != 'defined')
+
+
+class PPExpr:
+    """The subset of the #if grammar these sources use.
+
+    An undefined name is 0 and `defined(X)` is 1 or 0, as in the standard. A
+    defined name with a value is its value re-evaluated as an expression, so
+    `#define HARMO_STAMP_ASM 1` then `#if HARMO_STAMP_ASM` works. Function-like
+    macros evaluate to 0 rather than being expanded: none of these conditions
+    calls one, and guessing at one would be worse than the honest zero, which
+    can only ever make a branch look inactive."""
+
+    def __init__(self, tokens, macros, depth=0):
+        self.t = tokens
+        self.i = 0
+        self.m = macros
+        self.depth = depth
+
+    def peek(self):
+        return self.t[self.i] if self.i < len(self.t) else None
+
+    def take(self):
+        v = self.peek()
+        self.i += 1
+        return v
+
+    def parse(self):
+        return self.cond()
+
+    def cond(self):
+        v = self.binary(0)
+        if self.peek() == '?':
+            self.take()
+            a = self.cond()
+            if self.peek() == ':':
+                self.take()
+            b = self.cond()
+            return a if v else b
+        return v
+
+    LEVELS = (('||',), ('&&',), ('|',), ('^',), ('&',), ('==', '!='),
+              ('<', '>', '<=', '>='), ('<<', '>>'), ('+', '-'), ('*', '/', '%'))
+
+    def binary(self, level):
+        if level >= len(self.LEVELS):
+            return self.unary()
+        v = self.binary(level + 1)
+        while self.peek() in self.LEVELS[level]:
+            op = self.take()
+            r = self.binary(level + 1)
+            v = self.apply(op, v, r)
+        return v
+
+    @staticmethod
+    def apply(op, a, b):
+        if op == '||':
+            return 1 if (a or b) else 0
+        if op == '&&':
+            return 1 if (a and b) else 0
+        if op == '|':
+            return a | b
+        if op == '^':
+            return a ^ b
+        if op == '&':
+            return a & b
+        if op == '==':
+            return int(a == b)
+        if op == '!=':
+            return int(a != b)
+        if op == '<':
+            return int(a < b)
+        if op == '>':
+            return int(a > b)
+        if op == '<=':
+            return int(a <= b)
+        if op == '>=':
+            return int(a >= b)
+        if op == '<<':
+            return a << min(b, 64) if b >= 0 else 0
+        if op == '>>':
+            return a >> min(b, 64) if b >= 0 else 0
+        if op == '+':
+            return a + b
+        if op == '-':
+            return a - b
+        if op == '*':
+            return a * b
+        if b == 0:
+            return 0
+        q = int(a / b)
+        return q if op == '/' else a - b * q
+
+    def unary(self):
+        p = self.peek()
+        if p == '!':
+            self.take()
+            return 0 if self.unary() else 1
+        if p == '~':
+            self.take()
+            return ~self.unary()
+        if p == '-':
+            self.take()
+            return -self.unary()
+        if p == '+':
+            self.take()
+            return self.unary()
+        return self.primary()
+
+    def primary(self):
+        p = self.take()
+        if p is None:
+            return 0
+        if p == '(':
+            v = self.cond()
+            if self.peek() == ')':
+                self.take()
+            return v
+        if p == 'defined':
+            name = self.take()
+            if name == '(':
+                name = self.take()
+                if self.peek() == ')':
+                    self.take()
+            return 1 if name in self.m else 0
+        if p[0].isdigit():
+            return int(p.rstrip('uUlL'), 0)
+        if p in self.m and self.depth < 16:
+            value = self.m[p]
+            if not value:
+                return 0
+            return PPExpr(pp_tokens(value), self.m, self.depth + 1).parse()
+        return 0
+
+
+def pp_eval(expr, macros):
+    return PPExpr(pp_tokens(expr), macros).parse()
+
+
+PP_DIRECTIVE = re.compile(r'^\s*#\s*(\w+)(.*)$')
+PP_KEYWORDS = ('if', 'ifdef', 'ifndef', 'elif', 'else', 'endif', 'define', 'undef')
+
+_BLANKED = {}
+
+
+def _blanked(text):
+    """blank_comments() memoised. It does not depend on the macros, and the
+    inventory preprocesses each source about twenty times to find out which
+    macros select its kernel."""
+    key = hash(text)
+    hit = _BLANKED.get(key)
+    if hit is None or hit[0] != text:
+        hit = (text, blank_comments(text))
+        _BLANKED[key] = hit
+    return hit[1]
+
+
+def expand_macros(line, macros, hidden=(), depth=0):
+    """Object-like macros substituted, string and character literals left alone.
+
+    Only object-like macros with a replacement, and never one already being
+    expanded, which is the standard's own rule against recursion. Crescent
+    dispatches through `#define CR_OUTER crescentOuterAsm` inside band()'s own
+    body (2026-09-13), so without this the call graph stops at CR_OUTER and the
+    kernel looks unreachable."""
+    if depth > 16 or not macros:
+        return line
+    if not any(w in macros for w in IDENT.findall(line)):
+        return line
+    out, i, n, changed = [], 0, len(line), False
+    while i < n:
+        c = line[i]
+        if c == '"' or c == "'":
+            quote = c
+            out.append(c)
+            i += 1
+            while i < n:
+                out.append(line[i])
+                if line[i] == '\\' and i + 1 < n:
+                    out.append(line[i + 1])
+                    i += 2
+                    continue
+                if line[i] == quote:
+                    i += 1
+                    break
+                i += 1
+            continue
+        if c.isalpha() or c == '_':
+            j = i
+            while j < n and (line[j].isalnum() or line[j] == '_'):
+                j += 1
+            word = line[i:j]
+            value = macros.get(word)
+            if value and word not in hidden:
+                out.append(expand_macros(value, macros, tuple(hidden) + (word,), depth + 1))
+                changed = True
+            else:
+                out.append(word)
+            i = j
+            continue
+        out.append(c)
+        i += 1
+    text = ''.join(out)
+    return expand_macros(text, macros, hidden, depth + 1) if changed else text
+
+
+def preprocess(text, macros):
+    """The file as the compiler would see it, minus macro expansion.
+
+    Every line that a conditional excluded comes back empty, and every
+    directive line comes back empty, so offsets and line numbers still line up
+    with the original. #define and #undef are obeyed only inside a live
+    branch, which is what makes the `#ifndef X / #define X 1 / #endif` idiom
+    yield to a -D on the build line.
+
+    Returns (text, macros after the file, names every condition mentioned)."""
+    macros = dict(macros)
+    raw = _blanked(text).split('\n')
+    lines, pending = [], None
+    for line in raw:
+        if pending is not None:
+            pending = pending.rstrip()[:-1] + ' ' + line
+            lines.append('')
+        else:
+            pending = line
+        if pending.rstrip().endswith('\\'):
+            continue
+        lines.append(pending)
+        pending = None
+    if pending is not None:
+        lines.append(pending)
+
+    out, stack, mentioned = [], [], set()
+    for line in lines:
+        active = all(frame[2] for frame in stack)
+        m = PP_DIRECTIVE.match(line)
+        if m and m.group(1) in PP_KEYWORDS:
+            kw, rest = m.group(1), m.group(2).strip()
+            if kw in ('if', 'ifdef', 'ifndef'):
+                if kw == 'if':
+                    expr = rest
+                elif not rest.split():
+                    expr = '0'
+                elif kw == 'ifdef':
+                    expr = 'defined(%s)' % rest.split()[0]
+                else:
+                    expr = '!defined(%s)' % rest.split()[0]
+                mentioned |= pp_names(expr)
+                taken = bool(pp_eval(expr, macros)) if active else False
+                # [parent was live, some branch has been taken, this one is live]
+                stack.append([active, taken, active and taken])
+            elif kw == 'elif':
+                if not stack:
+                    raise InventoryError('#elif outside a conditional')
+                frame = stack[-1]
+                mentioned |= pp_names(rest)
+                if frame[1] or not frame[0]:
+                    frame[2] = False
+                else:
+                    taken = bool(pp_eval(rest, macros))
+                    frame[1] = taken
+                    frame[2] = taken
+            elif kw == 'else':
+                if not stack:
+                    raise InventoryError('#else outside a conditional')
+                frame = stack[-1]
+                frame[2] = frame[0] and not frame[1]
+                frame[1] = True
+            elif kw == 'endif':
+                if not stack:
+                    raise InventoryError('#endif outside a conditional')
+                stack.pop()
+            elif kw == 'define' and active:
+                d = re.match(r'(\w+)(\([^)]*\))?\s*(.*)$', rest)
+                if d:
+                    # None marks a function-like macro: defined, so defined()
+                    # is 1 and #if reads it as 0, but never substituted, since
+                    # expanding one needs its arguments.
+                    macros[d.group(1)] = None if d.group(2) else d.group(3).strip()
+            elif kw == 'undef' and active:
+                if rest.split():
+                    macros.pop(rest.split()[0], None)
+            out.append('')
+        else:
+            out.append(expand_macros(line, macros) if active else '')
+    if stack:
+        raise InventoryError('a conditional is never closed')
+    return '\n'.join(out), macros, mentioned
+
+
+# -------------------------------------------------- what band() dispatches to
+
+BGANIM_REG = re.compile(r'\bconst\s+BgAnimation\s+bg_anim_(\w+)\s*=\s*\{')
+# The field order of BgAnimation (BgAnim.h): id, name, params, init, frame,
+# band, release, bandRef. The last is optional and absent means nullptr.
+FIELD_ID, FIELD_BAND, FIELD_REF = 0, 5, 7
+
+NOT_A_CALL = {'if', 'for', 'while', 'switch', 'do', 'else', 'catch', 'return',
+              'sizeof', 'static_cast', 'reinterpret_cast', 'const_cast',
+              'dynamic_cast', 'decltype', 'alignas', 'alignof', 'noexcept',
+              'throw', 'new', 'delete', 'and', 'or', 'not', 'constexpr'}
+ASM_KEYWORD = re.compile(r'\b(?:asm|__asm|__asm__)\b')
+BODY_TOKEN = re.compile(r'[A-Za-z_]\w*|\d+\.?\d*[a-zA-Z]*|\S')
+TYPE_WORDS = {'int', 'char', 'void', 'float', 'double', 'unsigned', 'signed',
+              'short', 'long', 'bool', 'const', 'restrict', '__restrict'}
+
+
+def match_brace(text, i):
+    """The index of the `}` that closes the `{` at i, strings skipped."""
+    depth, n = 0, len(text)
+    while i < n:
+        c = text[i]
+        if c == '"' or c == "'":
+            quote = c
+            i += 1
+            while i < n:
+                if text[i] == '\\':
+                    i += 2
+                    continue
+                if text[i] == quote:
+                    i += 1
+                    break
+                i += 1
+            continue
+        if c == '{':
+            depth += 1
+        elif c == '}':
+            depth -= 1
+            if depth == 0:
+                return i
+        i += 1
+    raise InventoryError('a brace is never closed')
+
+
+def split_fields(text):
+    """A braced initialiser's top-level comma-separated fields."""
+    out, depth, cur = [], 0, []
+    i, n = 0, len(text)
+    while i < n:
+        c = text[i]
+        if c == '"' or c == "'":
+            quote = c
+            cur.append(c)
+            i += 1
+            while i < n:
+                cur.append(text[i])
+                if text[i] == '\\' and i + 1 < n:
+                    cur.append(text[i + 1])
+                    i += 2
+                    continue
+                if text[i] == quote:
+                    i += 1
+                    break
+                i += 1
+            continue
+        if c in '{([':
+            depth += 1
+        elif c in '})]':
+            depth -= 1
+        if c == ',' and depth == 0:
+            out.append(''.join(cur).strip())
+            cur = []
+            i += 1
+            continue
+        cur.append(c)
+        i += 1
+    if ''.join(cur).strip():
+        out.append(''.join(cur).strip())
+    return out
+
+
+def registrations(pptext):
+    """{symbol suffix: [field, ...]} for every BgAnimation initialiser."""
+    out = {}
+    for m in BGANIM_REG.finditer(pptext):
+        end = match_brace(pptext, m.end() - 1)
+        out[m.group(1)] = split_fields(pptext[m.end():end])
+    return out
+
+
+def _back(text, i):
+    while i >= 0 and text[i] in ' \t\n':
+        i -= 1
+    return i
+
+
+def function_bodies(pptext):
+    """{name: [(params, body), ...]} for every function defined in the text.
+
+    Found by walking back from each `{` rather than by matching a return type,
+    because the definitions here carry GM_ANIM_IRAM, template headers and
+    trailing const in every combination. A `{` that is not preceded by an
+    identifier and a parenthesised list, or whose identifier is a control
+    keyword, is not a definition."""
+    out = {}
+    for m in re.finditer(r'\{', pptext):
+        brace = m.start()
+        i = _back(pptext, brace - 1)
+        for word in ('noexcept', 'const', 'override', 'final'):
+            while i >= len(word) - 1 and pptext[i - len(word) + 1:i + 1] == word:
+                i = _back(pptext, i - len(word))
+        if i < 0 or pptext[i] != ')':
+            continue
+        depth, open_at = 0, -1
+        j = i
+        while j >= 0:
+            if pptext[j] == ')':
+                depth += 1
+            elif pptext[j] == '(':
+                depth -= 1
+                if depth == 0:
+                    open_at = j
+                    break
+            j -= 1
+        if open_at < 0:
+            continue
+        end_name = _back(pptext, open_at - 1)
+        start_name = end_name
+        while start_name >= 0 and (pptext[start_name].isalnum() or pptext[start_name] == '_'):
+            start_name -= 1
+        name = pptext[start_name + 1:end_name + 1]
+        if not name or not IDENT.fullmatch(name) or name in NOT_A_CALL:
+            continue
+        if start_name >= 0 and pptext[start_name] in '.=':
+            continue
+        if start_name >= 1 and pptext[start_name - 1:start_name + 1] == '->':
+            continue
+        try:
+            close = match_brace(pptext, brace)
+        except InventoryError:
+            continue
+        out.setdefault(name, []).append((pptext[open_at + 1:i], pptext[brace + 1:close]))
+    return out
+
+
+def reaches_asm(bodies, start, seen=None):
+    """Whether inline assembly is reachable from `start` in this translation
+    unit, following calls by name. A kernel that the preprocessor removed took
+    its asm with it, so this is what separates a real dispatch from one that
+    landed back on the portable code through a template argument."""
+    if seen is None:
+        seen = set()
+    if start in seen or start not in bodies:
+        return False
+    seen.add(start)
+    for _params, body in bodies[start]:
+        if ASM_KEYWORD.search(body):
+            return True
+        for token in set(IDENT.findall(body)):
+            if token in bodies and token not in seen and reaches_asm(bodies, token, seen):
+                return True
+    return False
+
+
+def param_names(params):
+    """The declared name of each parameter, None where it has none."""
+    out = []
+    for p in params.split(','):
+        m = re.search(r'([A-Za-z_]\w*)\s*$', p.strip())
+        if m and m.group(1) not in TYPE_WORDS and not m.group(1).endswith('_t'):
+            out.append(m.group(1))
+        else:
+            out.append(None)
+    return out
+
+
+def normalised_body(params, body):
+    """The body's tokens with each parameter renamed to its position, so two
+    functions that differ only in what they call their arguments compare
+    equal."""
+    renamed = {n: '@%d' % k for k, n in enumerate(param_names(params)) if n}
+    return tuple(renamed.get(t, t) for t in BODY_TOKEN.findall(body))
+
+
+LIVE = 'live'
+
+
+def classify_kernel(band_sym, ref_sym, bodies):
+    """LIVE, or the reason the device would be comparing the reference with
+    itself. Four routes, because the dispatch takes four shapes across the
+    fleet (see the module docstring)."""
+    if ref_sym == 'nullptr' or not IDENT.fullmatch(ref_sym or ''):
+        return "the registration's reference field is %s" % (ref_sym or 'absent')
+    if band_sym == 'nullptr' or not IDENT.fullmatch(band_sym or ''):
+        return "the registration's band field is %s" % (band_sym or 'absent')
+    if band_sym == ref_sym:
+        return 'band() and the reference are both %s()' % band_sym
+    band = bodies.get(band_sym, [])
+    ref = bodies.get(ref_sym, [])
+    if len(band) != 1 or len(ref) != 1:
+        raise InventoryError(
+            'this build defines %s() %d times and %s() %d times, so which one '
+            'band() dispatches to cannot be read from the source'
+            % (band_sym, len(band), ref_sym, len(ref)))
+    if re.match(r'^\s*' + re.escape(ref_sym) + r'\s*\([^;{}]*\)\s*;\s*$', band[0][1].strip()):
+        return 'band() is one call to %s()' % ref_sym
+    if normalised_body(*band[0]) == normalised_body(*ref[0]):
+        return 'band() and %s() have the same body in this build' % ref_sym
+    if not reaches_asm(bodies, band_sym):
+        return 'no assembly is reachable from band() in this build'
+    return LIVE
+
+
+def kernel_macros(path, sym, state, mentioned, macros):
+    """Which of the macros this file's conditions mention actually select the
+    kernel, measured by forcing each one on, to 0 and away in turn.
+
+    This is the answer to "what could turn this kernel off on its own", and it
+    is measured rather than derived from the name, because the compiler does
+    not read the name."""
+    out = []
+    for macro in sorted(mentioned):
+        for probe in (None, '0', '1'):
+            probed = dict(macros)
+            if probe is None:
+                probed.pop(macro, None)
+            else:
+                probed[macro] = probe
+            if probed == macros:
+                continue
+            try:
+                other, _mentioned = read_animations(path, probed)
+            except InventoryError:
+                out.append(macro)
+                break
+            if sym not in other:
+                # The animation is not registered at all under that macro
+                # (GAGGIMATE_SIM drops the whole file), which is a question
+                # about whether the file compiles, not about the kernel.
+                continue
+            if other[sym][2] != state:
+                out.append(macro)
+                break
+    return out
+
+
+_ANIM_CACHE = {}
+
+
+def read_animations(path, macros):
+    """({symbol: (id, band symbol, kernel state)}, macros the conditions
+    mention) for one animation source, read as the target build's
+    preprocessor would see it."""
+    text = read_source(path)
+    key = (path, hash(text), tuple(sorted(macros.items())))
+    hit = _ANIM_CACHE.get(key)
+    if hit is not None:
+        return hit
+    pptext, _macros, mentioned = preprocess(text, macros)
+    bodies = function_bodies(pptext)
+    out = {}
+    for sym, fields in registrations(pptext).items():
+        ident = fields[FIELD_ID].strip('"') if fields else ''
+        band = fields[FIELD_BAND] if len(fields) > FIELD_BAND else 'nullptr'
+        ref = fields[FIELD_REF] if len(fields) > FIELD_REF else 'nullptr'
+        out[sym] = (ident, band, classify_kernel(band, ref, bodies))
+    _ANIM_CACHE[key] = (out, mentioned)
+    return out, mentioned
+
+
+def scan_animations(bganim_dir, macros):
+    """{symbol: (id, file, kernel state, selecting macros)} for the directory."""
     found = {}
     for name in sorted(os.listdir(bganim_dir)):
         if not name.endswith('.cpp'):
             continue
-        text = strip_comments(read_source(os.path.join(bganim_dir, name)))
-        for sym, ident in re.findall(
-                r'\bconst\s+BgAnimation\s+bg_anim_(\w+)\s*=\s*\{\s*"([^"]*)"', text):
-            found[sym] = (ident, name)
+        path = os.path.join(bganim_dir, name)
+        anims, mentioned = read_animations(path, macros)
+        for sym, (ident, _band, state) in anims.items():
+            found[sym] = (ident, name, state,
+                          kernel_macros(path, sym, state, mentioned, macros))
     return found
 
 
-def asm_switches(bganim_dir):
-    """{ANIMATION_NAME: (value, file)} for every `#define GM_BGANIM_<X>_ASM n`.
+# ------------------------------------------------ what the build line says
 
-    The default lives in the animation's own source behind an #ifndef, so a
-    -D on the build line overrides it and this scan does not see that. A build
-    that turns a kernel on or off from platformio.ini would therefore have to
-    say so here; none does today, and `grep GM_BGANIM platformio.ini` is the
-    check."""
-    out = {}
-    for name in sorted(os.listdir(bganim_dir)):
-        if not name.endswith('.cpp'):
+# The macros the toolchain defines for the panel target. Everything else that
+# can change a kernel comes off the build line and is read from platformio.ini.
+TARGET_MACROS = {'__XTENSA__': '1', 'ESP_PLATFORM': '1'}
+
+# Turning either of these off changes the whole fleet at once, so an animation
+# whose only selecting macros are these has no isolated build-time A/B.
+FLEET_MACROS = ('__XTENSA__', 'GM_BGANIM_NO_ASM')
+
+PIO_SECTION = re.compile(r'^\[([^\]]+)\]\s*$')
+PIO_KEY = re.compile(r'^([A-Za-z_][\w.\-]*)\s*=(.*)$')
+PIO_REF = re.compile(r'\$\{([^}]*)\}')
+PIO_DEFINE = re.compile(r'-D\s*([A-Za-z_]\w*)(?:=(\S+))?')
+PIO_UNDEF = re.compile(r'-U\s*([A-Za-z_]\w*)')
+
+
+def pio_read(path):
+    """platformio.ini as {section: {key: [value line, ...]}}.
+
+    Its own format, not configparser's: a continuation line is any indented
+    line, and a line whose first non-blank character is `;` is a comment even
+    inside a multi-line value, which is most of this file."""
+    out, section, key = {}, None, None
+    try:
+        with open(path, encoding='utf-8') as f:
+            lines = f.readlines()
+    except OSError as exc:
+        raise InventoryError('cannot read %s: %s' % (path, exc))
+    for raw in lines:
+        line = raw.rstrip('\n')
+        stripped = line.strip()
+        if not stripped or stripped[0] in ';#':
             continue
-        text = strip_comments(read_source(os.path.join(bganim_dir, name)))
-        for flag, value in re.findall(r'#\s*define\s+GM_BGANIM_([A-Z0-9_]+)_ASM\s+(\d+)', text):
-            out[flag] = (int(value), name)
+        m = PIO_SECTION.match(stripped)
+        if m:
+            section = m.group(1)
+            out.setdefault(section, {})
+            key = None
+            continue
+        if section is None:
+            continue
+        if line[:1] in (' ', '\t') and key is not None:
+            out[section][key].append(stripped)
+            continue
+        m = PIO_KEY.match(stripped)
+        if m:
+            key = m.group(1)
+            out[section][key] = [m.group(2).strip()] if m.group(2).strip() else []
     return out
 
 
+def pio_value(ini, section, key, depth=0):
+    """The value lines of [section] key, with ${a.b} expanded and `extends`
+    followed. Returns (lines, references it could not expand)."""
+    if depth > 12:
+        raise InventoryError('%s.%s references itself' % (section, key))
+    values, opaque = None, set()
+    seen = set()
+    while section is not None and section not in seen:
+        seen.add(section)
+        if key in ini.get(section, {}):
+            values = ini[section][key]
+            break
+        parent = ini.get(section, {}).get('extends')
+        section = parent[0].strip() if parent else None
+    if values is None:
+        return [], opaque
+
+    def expand_in(line):
+        def expand(m):
+            ref = m.group(1)
+            if '.' in ref:
+                rsec, rkey = ref.rsplit('.', 1)
+                if rsec not in ('platformio', 'sysenv', 'this'):
+                    lines, more = pio_value(ini, rsec, rkey, depth + 1)
+                    opaque.update(more)
+                    return ' '.join(lines)
+            # PlatformIO substitutes this one and this scan cannot. Whether
+            # that matters depends on where it sits: inside a token the scan
+            # has already read (`-DLV_CONF_PATH="${platformio.src_dir}/..."`)
+            # it cannot introduce a flag, while a reference standing on its own
+            # is a whole flag list of unknown content.
+            alone = ((m.start() == 0 or line[m.start() - 1].isspace()) and
+                     (m.end() >= len(line) or line[m.end()].isspace()))
+            opaque.add((ref, alone))
+            return ''
+        return PIO_REF.sub(expand, line)
+
+    return [expand_in(line) for line in values], opaque
+
+
+def pio_defines(ini_path, env):
+    """({macro: value}, [undefined macro], [(reference, stands alone)]) for one
+    environment's build_flags, with [env]'s shared flags underneath."""
+    ini = pio_read(ini_path)
+    if ('env:' + env) not in ini:
+        raise InventoryError('%s has no [env:%s]; --pio-env names the build '
+                             'this inventory is for' % (ini_path, env))
+    shared, opaque = pio_value(ini, 'env', 'build_flags')
+    own, more = pio_value(ini, 'env:' + env, 'build_flags')
+    opaque |= more
+    defines, undefined = {}, []
+    for line in shared + own:
+        for m in PIO_DEFINE.finditer(line):
+            defines[m.group(1)] = m.group(2) if m.group(2) is not None else ''
+        for m in PIO_UNDEF.finditer(line):
+            undefined.append(m.group(1))
+            defines.pop(m.group(1), None)
+    return defines, undefined, sorted(opaque)
+
+
+def pio_hidden_defines(ini_path, env, root):
+    """Reasons this inventory cannot see every -D that reaches the compiler.
+
+    An extra_script runs as SCons and can append to CPPDEFINES or rewrite
+    BUILD_FLAGS, which would not show up in build_flags at all. None of this
+    project's does, and this runs the check rather than repeating the claim."""
+    ini = pio_read(ini_path)
+    scripts, _opaque = pio_value(ini, 'env:' + env, 'extra_scripts')
+    reasons = []
+    for line in scripts:
+        for name in line.replace(',', ' ').split():
+            name = name.strip()
+            if name.startswith('pre:') or name.startswith('post:'):
+                name = name.split(':', 1)[1]
+            if not name.endswith('.py'):
+                continue
+            path = name if os.path.isabs(name) else os.path.join(root, name)
+            try:
+                text = read_source(path)
+            except OSError:
+                reasons.append('extra_script %s cannot be read, so whether it '
+                               'adds a -D is unknown' % name)
+                continue
+            if 'CPPDEFINES' in text or 'BUILD_FLAGS' in text:
+                reasons.append('extra_script %s touches CPPDEFINES or '
+                               'BUILD_FLAGS, so the build line is not what '
+                               'platformio.ini says' % name)
+    return reasons
+
+
+class BuildConfig:
+    """The macro environment one firmware build compiles the animations with."""
+
+    def __init__(self, env, macros, defines, undefined, opaque, hidden):
+        self.env = env              # the platformio environment it came from
+        self.macros = macros        # what the preprocessor is run with
+        self.defines = defines      # the -D flags read out of platformio.ini
+        self.undefined = undefined  # the -U flags
+        self.opaque = opaque        # ${...} references left unexpanded
+        self.hidden = hidden        # reasons a -D could be invisible here
+
+
+def build_config(ini_path, env, root=ROOT, environ=None):
+    """The target build's macros, and every reason they might be incomplete."""
+    environ = os.environ if environ is None else environ
+    defines, undefined, opaque = pio_defines(ini_path, env)
+    hidden = pio_hidden_defines(ini_path, env, root)
+    for ref, alone in opaque:
+        if alone:
+            hidden.append('build_flags carries ${%s} as a flag of its own, and '
+                          'PlatformIO substitutes it, so what it adds to the '
+                          'build line cannot be read here' % ref)
+    for var in ('PLATFORMIO_BUILD_FLAGS', 'PLATFORMIO_BUILD_UNFLAGS'):
+        if environ.get(var):
+            hidden.append('%s is set in the environment, so the build line '
+                          'carries flags platformio.ini does not: %r'
+                          % (var, environ[var]))
+    macros = dict(TARGET_MACROS)
+    macros.update(defines)
+    for name in undefined:
+        macros.pop(name, None)
+    return BuildConfig(env, macros, defines, undefined, opaque, hidden)
+
+
 class Inventory:
-    """The fleet as the firmware sources describe it."""
+    """The fleet as the firmware sources describe it, for one build."""
 
-    def __init__(self, names, dormant, unswitched):
+    def __init__(self, names, dormant, unswitched, switches, config, overrides):
         self.names = names
-        self.dormant = dormant        # {id: flag text} compiled out of the build
-        self.unswitched = unswitched  # ids with no named switch, so no isolated A/B
+        self.dormant = dormant        # {id: why the kernel is not in the build}
+        self.unswitched = unswitched  # ids with no isolated switch, so no A/B
+        self.switches = switches      # {id: [macro that selects this kernel]}
+        self.config = config          # the BuildConfig it was all read under
+        self.overrides = overrides    # build-line defines that reach a switch
 
 
-def build_inventory(bganim_dir=BGANIM_DIR, expect_names=None, expect_dormant=None):
-    """Reads the registry and the per-animation switches, and checks both
-    against what this tool was written for.
+def build_inventory(bganim_dir=BGANIM_DIR, expect_names=None, expect_dormant=None,
+                    ini_path=None, pio_env='display', environ=None, root=ROOT):
+    """Reads the registry and each animation's real kernel guard, and checks
+    both against what this tool was written for.
 
     Raises InventoryError, which aborts the run, when the sources have moved.
     That is the point: appending a registry entry, or letting a kernel go
     dormant, has to fail rather than shrink what a passing run covered."""
     expect_names = NAMES if expect_names is None else expect_names
     expect_dormant = DORMANT if expect_dormant is None else expect_dormant
+    ini_path = os.path.join(root, 'platformio.ini') if ini_path is None else ini_path
+
+    config = build_config(ini_path, pio_env, root=root, environ=environ)
+    if config.hidden:
+        # A define this scan cannot see could turn any kernel into its own
+        # reference, and the run would then report a pass over a comparison
+        # that never happened. There is nothing to fall back on, so stop.
+        raise InventoryError(
+            'the build line cannot be read from the sources, so which kernels '
+            'are compiled in is unknown:\n  %s\n'
+            'Clear it and run again, or say which build this is with --pio-env.'
+            % '\n  '.join(config.hidden))
 
     syms = registry_symbols(bganim_dir)
-    defs = animation_ids(bganim_dir)
+    sources = scan_animations(bganim_dir, config.macros)
     names = []
     for sym in syms:
-        if sym not in defs:
-            raise InventoryError('REGISTRY[] names bg_anim_%s and no source defines it' % sym)
-        ident, src = defs[sym]
+        if sym not in sources:
+            raise InventoryError(
+                'REGISTRY[] names bg_anim_%s and no source defines it in the '
+                '[env:%s] build. Every animation file opens with #ifndef '
+                'GAGGIMATE_SIM, so an environment that defines it compiles none '
+                'of them, and /api/debug/animtest is absent from that firmware '
+                'anyway: name a panel build with --pio-env.' % (sym, config.env))
+        ident, src, _state, _macros = sources[sym]
         if ident != sym:
             # The device echoes the id string, and this tool compares it
             # against the name it derived. If the two ever part company the
@@ -262,22 +1125,20 @@ def build_inventory(bganim_dir=BGANIM_DIR, expect_names=None, expect_dormant=Non
             % (len(names), os.path.join(bganim_dir, 'BgAnimRegistry.cpp'), len(expect_names),
                ', '.join(names), ', '.join(expect_names)))
 
-    switches = asm_switches(bganim_dir)
-    dormant, unswitched = {}, []
-    # The switch for animation "foo" is GM_BGANIM_FOO_ASM by convention, and
-    # this match is the convention, not a fact the compiler enforces. An
-    # animation that named its switch something else would be listed as having
-    # none, which understates what can be A/B'd and never overstates what was
-    # compared. Today the eleven this finds are exactly the eleven that have
-    # only the fleet-wide GM_BGANIM_NO_ASM guard.
+    # Dormancy is the classification of the band() the target build compiles,
+    # not a switch value and not a naming convention: see the module docstring.
+    dormant, unswitched, switches = {}, [], {}
     for ident in names:
-        flag = ident.upper()
-        if flag not in switches:
+        _id, src, state, macros = sources[ident]
+        isolated = [m for m in macros if m not in FLEET_MACROS]
+        switches[ident] = macros
+        if not isolated:
             unswitched.append(ident)
-            continue
-        value, src = switches[flag]
-        if value == 0:
-            dormant[ident] = 'GM_BGANIM_%s_ASM is 0 in %s' % (flag, src)
+        if state is not LIVE:
+            dormant[ident] = '%s (%s)' % (state, src)
+
+    overrides = sorted((n, v) for n, v in config.defines.items()
+                       if any(n in macros for macros in switches.values()))
 
     undeclared = sorted(set(dormant) - set(expect_dormant))
     if undeclared:
@@ -286,17 +1147,17 @@ def build_inventory(bganim_dir=BGANIM_DIR, expect_names=None, expect_dormant=Non
             'noncoverage: %s.\n  %s\n'
             'The device compares bandRef() against itself for these, so a run '
             'that counted them as passes would be claiming work it did not do. '
-            'Add them to DORMANT with the reason, or turn the switch back on.'
+            'Add them to DORMANT with the reason, or turn the kernel back on.'
             % (', '.join(undeclared), '\n  '.join(dormant[d] for d in undeclared)))
 
     revived = sorted(set(expect_dormant) - set(dormant))
     if revived:
         raise InventoryError(
             'DORMANT declares %s noncoverage and the sources no longer agree. '
-            'If the switch is back on, drop the entry so the run counts the '
-            'animation as compared.' % ', '.join(revived))
+            'If the kernel is back in the build, drop the entry so the run '
+            'counts the animation as compared.' % ', '.join(revived))
 
-    return Inventory(names, dormant, unswitched)
+    return Inventory(names, dormant, unswitched, switches, config, overrides)
 
 
 # ------------------------------------------------------------------- device
@@ -336,7 +1197,7 @@ def make_getter(host, tries=4, timeout=30, sleep=time.sleep):
     return get
 
 
-def run_one(get, anim, frames, deadline_s=120.0, sleep=time.sleep, now=time.time):
+def run_one(get, anim, frames, deadline_s=120.0, sleep=None, now=None):
     """Queues one run and returns the result it published.
 
     The render task runs the test between frames, so the result arrives a few
@@ -350,6 +1211,12 @@ def run_one(get, anim, frames, deadline_s=120.0, sleep=time.sleep, now=time.time
     accept condition. A result for another animation means the board answered
     the wrong question, and the run has to say that rather than keep polling
     until the deadline and report a timeout."""
+    # Resolved here, not in the signature: a default bound at import time is
+    # still the real time.sleep after a caller has replaced time.sleep, which
+    # is what made the end-to-end host cases wait 0.7 s per animation for a
+    # scripted board that answers at once.
+    sleep = time.sleep if sleep is None else sleep
+    now = time.time if now is None else now
     before = get('/api/debug/animtest')
     seq0 = before.get('seq', 0)
     get('/api/debug/animtest?anim=%d&frames=%d' % (anim, frames))
@@ -434,7 +1301,7 @@ ROW = '%-3s %-13s %-9s %-7s %-7s %-9s %-9s %-6s %s'
 
 
 def check_fleet(get, inv, ids, frames, out=None, deadline_s=120.0,
-                sleep=time.sleep, now=time.time):
+                sleep=None, now=None):
     """Drives the board over `ids` and returns the list of problems.
 
     `out` is resolved here rather than in the signature: a default bound at
@@ -475,7 +1342,8 @@ def check_fleet(get, inv, ids, frames, out=None, deadline_s=120.0,
 
     print('', file=out, flush=True)
     if inv.unswitched:
-        print('no named GM_BGANIM_<NAME>_ASM switch, so no isolated build-time A/B (%d): %s'
+        print('no macro of their own selects the kernel, so no isolated '
+              'build-time A/B (%d): %s'
               % (len(inv.unswitched), ', '.join(inv.unswitched)), file=out, flush=True)
     if skipped:
         print('NOT COMPARED (%d): %s' % (len(skipped), ', '.join(skipped)), file=out, flush=True)
@@ -612,37 +1480,112 @@ class FakeDevice:
         return dict(self.result)
 
 
-def _scratch_sources(tmp, extra_registration=None, dormant_flag=None):
-    """A copy of the bganim sources with one thing changed.
+class _Scratch:
+    """A throwaway copy of everything build_inventory() reads.
 
-    Mutation 1 needs a registry that has grown since this tool was last
-    touched, and the noncoverage mutation needs a second kernel to have gone
-    dormant. Both are source edits, so they are made in a throwaway tree: this
-    checkout is shared with other agents and a file put back "for a moment" is
-    a file another agent's pathspec can capture."""
-    import shutil
-    dst = os.path.join(tmp, 'bganim')
-    os.makedirs(dst, exist_ok=True)
-    for name in os.listdir(BGANIM_DIR):
-        if name.endswith('.cpp') or name.endswith('.h'):
-            shutil.copy2(os.path.join(BGANIM_DIR, name), os.path.join(dst, name))
-    if extra_registration is not None:
-        sym, ident = extra_registration
-        reg = os.path.join(dst, 'BgAnimRegistry.cpp')
+    Built unmutated, so a mutation case can read the inventory before and
+    after its own edit on one tree. A mutation that only ever reports the
+    failure proves nothing: the tree it ran against might have been broken to
+    begin with."""
+
+    def __init__(self, root, bganim, ini):
+        self.root = root
+        self.bganim = bganim
+        self.ini = ini
+
+    def inventory(self, **kw):
+        kw.setdefault('bganim_dir', self.bganim)
+        kw.setdefault('ini_path', self.ini)
+        kw.setdefault('root', self.root)
+        kw.setdefault('environ', {})
+        return build_inventory(**kw)
+
+    def edit(self, name, old, new):
+        """One text substitution in one copied source.
+
+        The old text has to be there: a mutation that silently matched nothing
+        would leave the case checking unmutated sources and passing."""
+        path = os.path.join(self.bganim, name)
+        text = read_source(path)
+        if old not in text:
+            raise InventoryError('the scratch edit of %s matched nothing: %r' % (name, old[:60]))
+        with open(path, 'w', encoding='utf-8') as f:
+            f.write(text.replace(old, new))
+
+    def rewrite_band(self, name, body):
+        """band()'s body replaced, brace-matched rather than pattern-matched.
+
+        The mutation it serves is "band() calls only the reference with its
+        switch still on", and an animation kernel is edited often enough that
+        a literal anchor on its current body would rot into a mutation that
+        matched nothing."""
+        path = os.path.join(self.bganim, name)
+        text = read_source(path)
+        m = re.search(r'^(?:GM_ANIM_IRAM\s+)?void\s+band\s*\([^)]*\)\s*\{', text, re.M)
+        if m is None:
+            raise InventoryError('%s has no band() to rewrite' % path)
+        close = match_brace(text, m.end() - 1)
+        with open(path, 'w', encoding='utf-8') as f:
+            f.write(text[:m.end()] + '\n    ' + body + '\n' + text[close:])
+
+    def add_build_flags(self, flags):
+        """Flags appended to [env:display]'s build_flags, which is what a -D
+        override of a kernel switch would look like in the real file."""
+        text = read_source(self.ini)
+        marker = '[env:display]\n'
+        if marker not in text:
+            raise InventoryError('the scratch platformio.ini has no [env:display]')
+        head, tail = text.split(marker, 1)
+        key = 'build_flags =\n'
+        if key not in tail:
+            raise InventoryError('[env:display] has no build_flags to append to')
+        before, after = tail.split(key, 1)
+        with open(self.ini, 'w', encoding='utf-8') as f:
+            f.write(head + marker + before + key + ''.join('\t%s\n' % x for x in flags) + after)
+
+    def append_to_script(self, relpath, text):
+        """Text appended to one copied extra_script, which is how a build line
+        grows a -D that platformio.ini never mentions."""
+        path = os.path.join(self.root, relpath)
+        if not os.path.exists(path):
+            raise InventoryError('the scratch tree has no %s' % relpath)
+        with open(path, 'a', encoding='utf-8') as f:
+            f.write(text)
+
+    def append_registration(self, sym, ident):
+        """One more entry in REGISTRY[], and a source that defines it."""
+        reg = os.path.join(self.bganim, 'BgAnimRegistry.cpp')
         text = read_source(reg).replace('    &bg_anim_cube,\n',
                                         '    &bg_anim_cube,\n    &bg_anim_%s,\n' % sym)
         with open(reg, 'w', encoding='utf-8') as f:
             f.write(text)
-        with open(os.path.join(dst, 'AnimZZTest.cpp'), 'w', encoding='utf-8') as f:
+        with open(os.path.join(self.bganim, 'AnimZZTest.cpp'), 'w', encoding='utf-8') as f:
             f.write('const BgAnimation bg_anim_%s = {\n    "%s",\n    "ZZ",\n};\n' % (sym, ident))
-    if dormant_flag is not None:
-        flag, src = dormant_flag
-        path = os.path.join(dst, src)
-        text = read_source(path).replace('#define GM_BGANIM_%s_ASM 1' % flag,
-                                         '#define GM_BGANIM_%s_ASM 0' % flag)
-        with open(path, 'w', encoding='utf-8') as f:
-            f.write(text)
-    return dst
+
+
+def _scratch_sources(tmp):
+    """An untouched copy of the sources and the build file the inventory reads.
+
+    Every mutation below is an edit to a file this checkout shares with other
+    agents, and a file put back "for a moment" is a file another agent's
+    pathspec can capture, so they are made on this copy instead. The scripts
+    directory comes along because the inventory reads the target environment's
+    extra_scripts to check none of them adds a -D."""
+    import shutil
+    root = os.path.join(tmp, 'tree')
+    dst = os.path.join(root, 'bganim')
+    os.makedirs(dst, exist_ok=True)
+    os.makedirs(os.path.join(root, 'scripts'), exist_ok=True)
+    for name in os.listdir(BGANIM_DIR):
+        if name.endswith('.cpp') or name.endswith('.h'):
+            shutil.copy2(os.path.join(BGANIM_DIR, name), os.path.join(dst, name))
+    for name in os.listdir(os.path.join(ROOT, 'scripts')):
+        if name.endswith('.py'):
+            shutil.copy2(os.path.join(ROOT, 'scripts', name),
+                         os.path.join(root, 'scripts', name))
+    ini = os.path.join(root, 'platformio.ini')
+    shutil.copy2(os.path.join(ROOT, 'platformio.ini'), ini)
+    return _Scratch(root, dst, ini)
 
 
 def host_test(out=None):
@@ -682,6 +1625,23 @@ def host_test(out=None):
             return
         problems.append('%s: did not abort' % name)
 
+    def expect_live(name, scratch):
+        """The inventory of an unmutated scratch tree, with Tide's kernel in
+        the build. Every guard mutation below runs this on its own tree first,
+        so its abort is the mutation's doing and not a broken copy's."""
+        try:
+            got = scratch.inventory()
+        except InventoryError as exc:
+            problems.append('%s: the tree does not pass before the mutation: %s' % (name, exc))
+            return None
+        if 'tide' in got.dormant:
+            problems.append('%s: tide is dormant before the mutation' % name)
+            return None
+        named = [m for m in got.switches.get('tide', []) if m not in FLEET_MACROS]
+        print('host test, %s: before, tide compares a kernel, selected by %s'
+              % (name, ', '.join(named) or 'nothing of its own'), file=out)
+        return got
+
     # 0. The baseline. The real sources, a healthy board, and a pass that says
     #    what it covered and what it did not.
     inv = build_inventory()
@@ -708,11 +1668,12 @@ def host_test(out=None):
     #    longer covered. The inventory is now re-read every run, so the two
     #    disagree before a single request goes out.
     with tempfile.TemporaryDirectory() as tmp:
-        grown = _scratch_sources(tmp, extra_registration=('zztest', 'zztest'))
+        grown = _scratch_sources(tmp)
+        grown.append_registration('zztest', 'zztest')
         expect_abort('mutation 1, an animation appended to the registry',
-                     lambda: build_inventory(grown), 'the registry has moved under this tool')
+                     grown.inventory, 'the registry has moved under this tool')
         # And the count really did grow, so the abort is about the right thing.
-        syms = registry_symbols(grown)
+        syms = registry_symbols(grown.bganim)
         if len(syms) != len(NAMES) + 1:
             problems.append('mutation 1 did not grow the registry: %d symbols' % len(syms))
 
@@ -753,14 +1714,122 @@ def host_test(out=None):
     #     dormant without being declared is what mutation 4 looks like the
     #     next time, and that the run does refuse.
     with tempfile.TemporaryDirectory() as tmp:
-        dulled = _scratch_sources(tmp, dormant_flag=('TIDE', 'AnimTide.cpp'))
+        dulled = _scratch_sources(tmp)
+        expect_live('mutation 4b, a second kernel compiled out of the build', dulled)
+        dulled.edit('AnimTide.cpp', '#define GM_BGANIM_TIDE_ASM 1',
+                    '#define GM_BGANIM_TIDE_ASM 0')
         expect_abort('mutation 4b, a second kernel compiled out of the build',
-                     lambda: build_inventory(dulled), 'is not declared')
+                     dulled.inventory, 'is not declared')
         # And a declaration that no longer matches the sources is refused too,
         # so DORMANT cannot rot into a blanket excuse.
         expect_abort('a stale noncoverage declaration',
                      lambda: build_inventory(expect_dormant={'silk': 'x', 'cube': 'y'}),
                      'the sources no longer agree')
+
+    # 4c. The four ways a kernel leaves the build that the switch scan this
+    #     replaced could not see (gm-nov3.40). Each is built in a scratch copy
+    #     of Tide, whose conventional `#define GM_BGANIM_TIDE_ASM 1` is left
+    #     enabled in all four, and each is read once before its own edit, so
+    #     the abort is the mutation's and not the tree's.
+    TIDE_GUARD = '#if GM_BGANIM_TIDE_ASM && defined(__XTENSA__) && !defined(GM_BGANIM_NO_ASM)'
+
+    with tempfile.TemporaryDirectory() as tmp:
+        name = 'mutation 5a, a kernel guard changed to #if 0 with its conventional ' \
+               'define left enabled'
+        blanked = _scratch_sources(tmp)
+        expect_live(name, blanked)
+        blanked.edit('AnimTide.cpp', TIDE_GUARD, '#if 0')
+        expect_abort(name, blanked.inventory, 'is not declared')
+
+    with tempfile.TemporaryDirectory() as tmp:
+        name = 'mutation 5b, a kernel guard moved to a macro nothing defines'
+        renamed = _scratch_sources(tmp)
+        expect_live(name, renamed)
+        renamed.edit('AnimTide.cpp', TIDE_GUARD,
+                     TIDE_GUARD.replace('GM_BGANIM_TIDE_ASM', 'GM_BGANIM_TIDE_KERNEL'))
+        expect_abort(name, renamed.inventory, 'is not declared')
+
+    with tempfile.TemporaryDirectory() as tmp:
+        name = 'mutation 5c, band() rewritten to one call to bandRef() with its switch still on'
+        hollow = _scratch_sources(tmp)
+        expect_live(name, hollow)
+        hollow.rewrite_band('AnimTide.cpp', 'bandRef(dst, y0, rows, w, tMs, p);')
+        expect_abort(name, hollow.inventory, 'is not declared')
+
+    with tempfile.TemporaryDirectory() as tmp:
+        name = 'mutation 5d, -DGM_BGANIM_TIDE_ASM=0 added to platformio.ini'
+        overridden = _scratch_sources(tmp)
+        before = expect_live(name, overridden)
+        if before is not None and before.overrides:
+            problems.append('mutation 5d: the unmutated tree already reports build-line '
+                            'overrides: %r' % (before.overrides,))
+        overridden.add_build_flags(['-DGM_BGANIM_TIDE_ASM=0'])
+        expect_abort(name, overridden.inventory, 'is not declared')
+
+    with tempfile.TemporaryDirectory() as tmp:
+        # A build_flags line that is nothing but a reference PlatformIO
+        # expands. Its content is unknown here and could be any -D, so the run
+        # stops. The one the real file carries is inside a -D already read
+        # (-DLV_CONF_PATH="${platformio.src_dir}/...") and does not stop it,
+        # which is what every passing case above shows.
+        name = 'mutation 5h, a build_flags line that is only ${sysenv.EXTRA_FLAGS}'
+        vague = _scratch_sources(tmp)
+        expect_live(name, vague)
+        vague.add_build_flags(['${sysenv.EXTRA_FLAGS}'])
+        expect_abort(name, vague.inventory, 'as a flag of its own')
+
+    with tempfile.TemporaryDirectory() as tmp:
+        # An extra_script that appends to CPPDEFINES. None of this project's
+        # does, and that is checked on every run rather than asserted here.
+        name = 'mutation 5i, an extra_script that appends to CPPDEFINES'
+        scripted = _scratch_sources(tmp)
+        expect_live(name, scripted)
+        scripted.append_to_script('scripts/pioarduino_env.py',
+                                  '\nenv.Append(CPPDEFINES=["GM_BGANIM_TIDE_ASM=0"])\n')
+        expect_abort(name, scripted.inventory, 'touches CPPDEFINES')
+
+    # 4d. A switch named against the convention. The scan this replaced matched
+    #     GM_BGANIM_<ID>_ASM to the animation by uppercasing its id, so a switch
+    #     under any other name was invisible: on, the animation looked
+    #     unswitched, and off, the run reported a pass over a comparison of
+    #     bandRef with itself. Neither happens now, because nothing reads the
+    #     name.
+    with tempfile.TemporaryDirectory() as tmp:
+        name = 'mutation 5e, a switch named against the convention'
+        odd = _scratch_sources(tmp)
+        base = expect_live(name, odd)
+        odd.edit('AnimTide.cpp', 'GM_BGANIM_TIDE_ASM', 'TIDE_WANTS_THE_KERNEL')
+        after = expect_live(name + ', still on', odd)
+        if base is not None and after is not None:
+            named = [m for m in after.switches.get('tide', []) if m not in FLEET_MACROS]
+            if named != ['TIDE_WANTS_THE_KERNEL']:
+                problems.append('%s: the scan names tide\'s switches %r, not the one '
+                                'the file uses' % (name, named))
+            elif 'tide' in after.unswitched:
+                problems.append('%s: tide is reported as having no switch' % name)
+            elif set(after.dormant) != set(base.dormant):
+                problems.append('%s: renaming the switch changed the dormant set: %r'
+                                % (name, sorted(after.dormant)))
+            else:
+                print('host test, %s: found anyway, and the run passes' % name, file=out)
+        odd.edit('AnimTide.cpp', '#define TIDE_WANTS_THE_KERNEL 1',
+                 '#define TIDE_WANTS_THE_KERNEL 0')
+        expect_abort('mutation 5f, a switch named against the convention, turned off',
+                     odd.inventory, 'is not declared')
+
+    # 4e. A -D that reaches the compiler from outside platformio.ini. The tool
+    #     cannot evaluate it, so it refuses rather than reporting an inventory
+    #     it cannot support.
+    expect_abort('mutation 5g, PLATFORMIO_BUILD_FLAGS set in the environment',
+                 lambda: build_inventory(environ={'PLATFORMIO_BUILD_FLAGS': '-DGM_BGANIM_TIDE_ASM=0'}),
+                 'the build line cannot be read from the sources')
+
+    # 4f. And the standing limits are printed, not left in a comment.
+    banner = io.StringIO()
+    print_build(inv, out=banner)
+    for want in ('[env:display]', 'not visible from any source'):
+        if want not in banner.getvalue():
+            problems.append('the build banner does not say %r: %r' % (want, banner.getvalue()))
 
     # 5. The three cases that already aborted, which must keep aborting.
     inv_get = make_getter('fake', tries=2, sleep=lambda _s: None)
@@ -897,11 +1966,43 @@ def host_test(out=None):
 
 # ------------------------------------------------------------------- driver
 
+def print_build(inv, out=None):
+    """What build this inventory was read for, and what it could not see.
+
+    Printed on every run rather than written down in a comment, because the
+    answer moves with platformio.ini and with the environment the run was
+    started in."""
+    out = sys.stdout if out is None else out
+    print('build: [env:%s] of platformio.ini, __XTENSA__ and ESP_PLATFORM plus '
+          'its build_flags' % inv.config.env, file=out, flush=True)
+    if inv.overrides:
+        print('  build-line overrides that select a kernel: %s'
+              % ', '.join('%s=%s' % (n, v or '(empty)') for n, v in inv.overrides),
+              file=out, flush=True)
+    else:
+        print('  no -D in that environment names a macro that selects a kernel',
+              file=out, flush=True)
+    if inv.config.undefined:
+        print('  -U: %s' % ', '.join(inv.config.undefined), file=out, flush=True)
+    if inv.config.opaque:
+        print('  references PlatformIO expands and this scan does not, each '
+              'inside a flag already read, so none of them can add a -D: %s'
+              % ', '.join('${%s}' % ref for ref, _alone in sorted(inv.config.opaque)),
+              file=out, flush=True)
+    print('  not visible from any source: a build driven by hand with extra -D '
+          'arguments. PLATFORMIO_BUILD_FLAGS and an extra_script that touches '
+          'CPPDEFINES are checked and would have stopped the run.',
+          file=out, flush=True)
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description='band() against bandRef() for every animation')
     ap.add_argument('ids', nargs='*', type=int, help='animation ids (default: the whole registry)')
     ap.add_argument('--host', default=os.environ.get('HOST', '192.168.1.121'))
     ap.add_argument('--frames', type=int, default=int(os.environ.get('FRAMES', '8')))
+    ap.add_argument('--pio-env', default=os.environ.get('PIOENV', 'display'),
+                    help='the platformio environment whose build_flags decide which '
+                         'kernels are compiled in (default: display)')
     ap.add_argument('--host-test', action='store_true',
                     help='run the gate against a scripted device and exit; needs no board')
     args = ap.parse_args(argv)
@@ -915,7 +2016,7 @@ def main(argv=None):
         return 2
 
     try:
-        inv = build_inventory()
+        inv = build_inventory(pio_env=args.pio_env)
     except InventoryError as exc:
         print('ABORT: %s' % exc, file=sys.stderr)
         return 2
@@ -925,6 +2026,7 @@ def main(argv=None):
         print('pclk: %s' % json.dumps(get('/api/debug/pclk')), flush=True)
     except ResultError as exc:
         print('pclk: unavailable (%s)' % exc, flush=True)
+    print_build(inv)
     print('registry: %d animations, %d not compared (%s)'
           % (len(inv.names), len(inv.dormant), ', '.join(sorted(inv.dormant)) or 'none'), flush=True)
 
