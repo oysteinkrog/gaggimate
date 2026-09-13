@@ -36,6 +36,15 @@
 // pixels inside the PIE face walk, which has no per-lane branch, so it is
 // recorded here instead: one palette step on about thirty feather pixels a
 // frame, at the soft edge of a face.
+//
+// Looked at again on 2026-09-13, the last of the four gaps gm-pciz was left
+// with, and it stays. The signature still fits the cause and nothing else:
+// the largest deviation at any of the three golden frames is 9 per channel,
+// which is one step of the palette, not a shape or a position moving. The
+// Q16.16 walk is what the PIE face kernel needs, a wider accumulator would
+// double its work per lane, and the pixels this costs are the softest part
+// of the picture. Accepted debt, with the allowance held at 33 in
+// tools/animbench/page_exact.json.
 
 #include "BgAnim.h"
 #include "BgAnimCommon.h"

@@ -43,6 +43,21 @@
    "0.541 ms a frame, and it would have to be transcribed bit for bit into",
    "two hand-written Xtensa kernels that have no fallback flag. The reason",
    "and the numbers are in AnimRipples.cpp's header."
+  ],
+  "cube": [
+   "Thirty-three pixels, and it stays. Every one is a feather pixel at the",
+   "soft edge of a cube face, one palette step out, because this file walks",
+   "each face's edge distances as Q16.16 integers where the page walks them",
+   "in doubles. A distance carried 480 columns is off by up to 0.0073 of an",
+   "index, and a pixel whose page value sits closer than that to the",
+   "truncation boundary truncates the other way. Looked at again on",
+   "2026-09-13 (gm-pciz): the largest deviation at any of the three golden",
+   "frames is 9 per channel, which is exactly one step of the palette, and",
+   "the derivation and the per-frame counts are in AnimCube.cpp's header.",
+   "Closing it would need the near-boundary pixels recomputed in double",
+   "inside the PIE face walk, which has no per-lane branch, so it is the",
+   "owner-accepted outcome the bead's done-when clause allows rather than",
+   "work left undone."
   ]
  }
 }
