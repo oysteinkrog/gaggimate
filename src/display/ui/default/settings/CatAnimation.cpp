@@ -213,21 +213,29 @@ int gradientIndexForAnim(int animId, const std::vector<settingsui::GradientChoic
     return settingsui::gradientChoiceIndexForRef(choices, ref);
 }
 
+// The global gradient's ref as this page sees it: the choice this visit made
+// if it made one, else the stored field. Both readings below go through it,
+// so the row, the swatches and the picker all describe the value commit will
+// write rather than a web save that landed mid-visit (the touched-field
+// precedence rule, CLAUDE.md). Defined under CatAnimationCtx, which holds the
+// draft.
+std::string globalRefInEffect();
+
 // True while the pre-library custom gradient is still what the global
-// fallback draws: bgAnimGradientRef names nothing that exists and the legacy
+// fallback draws: the ref in effect names nothing that exists and the legacy
 // pair resolves to the custom string rather than to a built-in. Reachable
 // whenever DefaultUI::migrateBgAnimGradients had to defer (BgAnimThemes.cpp
 // lists the reasons), and the row has to say so rather than name a built-in.
 bool legacyCustomFallbackActive(const std::vector<settingsui::GradientChoice> &choices) {
     Settings &settings = controller.getSettings();
-    const std::string ref(settings.getBgAnimGradientRef().c_str());
+    const std::string ref = globalRefInEffect();
     if (!ref.empty() && settingsui::gradientChoiceIndexForRef(choices, ref) != 0) {
         return false;
     }
     return bg_legacy_builtin(settings.getBgAnimTheme(), bg_custom_valid(settings.getBgAnimCustomTheme().c_str())) < 0;
 }
 
-// Where the global gradient sits in the choice list. bgAnimGradientRef when
+// Where the global gradient sits in the choice list. The ref in effect when
 // it names something that exists, else the built-in the legacy pair resolves
 // to, which is what bg_resolve_anim_theme falls back to and what a device
 // that has never set the global stores. Never returns 0: choices[0] is the
@@ -240,7 +248,7 @@ bool legacyCustomFallbackActive(const std::vector<settingsui::GradientChoice> &c
 // once the table is longer than 18 entries.
 int globalGradientChoiceIndex(const std::vector<settingsui::GradientChoice> &choices) {
     Settings &settings = controller.getSettings();
-    const std::string ref(settings.getBgAnimGradientRef().c_str());
+    const std::string ref = globalRefInEffect();
     if (!ref.empty()) {
         const int i = settingsui::gradientChoiceIndexForRef(choices, ref);
         if (i != 0) {
@@ -425,6 +433,27 @@ struct CatAnimationCtx {
     SettingsUI *ui = nullptr;
 };
 
+// The Animation category's ctx while its page is on the stack, null
+// otherwise. Set and cleared by animCreateCtx/animDestroyCtx, which the shell
+// runs on push and on pop, so at most one is ever live.
+//
+// globalRefInEffect needs it because two of the places that describe the
+// global gradient are reached without a ctx: settingsGlobalGradientLabel and
+// settingsGlobalGradientRef (CatGradientPicker.h), which the picker's
+// "Global" entry reads. Without this the row, the swatch and the picker's
+// marker showed the stored field while commit wrote the draft, so a web save
+// during a visit made the display name one gradient and save another
+// (gm-nov3.16). The per-animation rows never had that split: their draft is
+// per animation id and draftRefForAnim below is the one reading of it.
+CatAnimationCtx *gOpenAnimCtx = nullptr;
+
+std::string globalRefInEffect() {
+    if (gOpenAnimCtx != nullptr && gOpenAnimCtx->globalGradientTouched) {
+        return gOpenAnimCtx->globalGradientRef;
+    }
+    return std::string(controller.getSettings().getBgAnimGradientRef().c_str());
+}
+
 // Defined with the three gradient rows below, where the picker wiring lives.
 void applyRowSwatch(lv_obj_t *row, const std::string &ref);
 
@@ -558,9 +587,9 @@ void globalGradientOnActivate(void *user) {
     spec.allowGlobal = false;
     spec.currentRef = [](void *user) -> const char * {
         auto *c = static_cast<CatAnimationCtx *>(user);
-        // What the global resolves to now, which is "" while a retained
-        // legacy custom gradient is still the fallback: that state is not one
-        // of the picker's entries, so nothing is marked.
+        // What the global resolves to for this visit, which is "" while a
+        // retained legacy custom gradient is still the fallback: that state is
+        // not one of the picker's entries, so nothing is marked.
         c->pickerRefScratch = settingsGlobalGradientRef();
         return c->pickerRefScratch.c_str();
     };
@@ -1440,9 +1469,18 @@ void animCommit(void *ctx0) {
     }
 }
 
-void *animCreateCtx() { return new CatAnimationCtx(); }
+void *animCreateCtx() {
+    auto *ctx = new CatAnimationCtx();
+    gOpenAnimCtx = ctx;
+    return ctx;
+}
 
-void animDestroyCtx(void *ctx) { delete static_cast<CatAnimationCtx *>(ctx); }
+void animDestroyCtx(void *ctx) {
+    if (gOpenAnimCtx == ctx) {
+        gOpenAnimCtx = nullptr;
+    }
+    delete static_cast<CatAnimationCtx *>(ctx);
+}
 
 } // namespace
 
@@ -1456,6 +1494,9 @@ void animDestroyCtx(void *ctx) { delete static_cast<CatAnimationCtx *>(ctx); }
 // reading of them.
 const settingsui::ThemeNameProvider &settingsThemeProvider() { return kThemeProvider; }
 
+// Both readings follow the Animation category's draft while it is open
+// (globalRefInEffect), so the picker's "Global" entry names and samples the
+// same gradient the category's own row shows.
 std::string settingsGlobalGradientLabel() { return globalGradientLabel(currentGradientChoices()); }
 
 std::string settingsGlobalGradientRef() {
