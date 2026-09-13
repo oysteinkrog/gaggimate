@@ -21,6 +21,8 @@
 // touched-field precedence rule: if a web save landed on a touched field
 // while this page was open, re-assert this visit's value (gm-flw.9).
 #include "CatAnimParams.h"
+#include "CatGradientPicker.h"
+#include "GradientSwatch.h"
 #include "SettingsModel.h"
 #include "SettingsLog.h"
 #include "SettingsRows.h"
@@ -31,12 +33,6 @@
 #include <display/main.h>
 #include <display/ui/default/DefaultUI.h>
 #include <display/ui/default/bganim/BgAnim.h>
-#ifdef GAGGIMATE_SIM
-// The simulator cannot link BgAnimThemes.cpp, so its theme provider reads the
-// generated table that file reads. Device builds go through the bg_theme_*
-// functions and must not pull the stops in a second time.
-#include "ThemeProviderTable.h"
-#endif
 #include <display/ui/default/eez/images.h>
 
 #include <cstdio>
@@ -48,21 +44,24 @@
 
 namespace {
 
-// bg_animation()/bg_animation_count() (BgAnimRegistry.cpp) and
-// bg_theme_name()/bg_theme_count() (BgAnimThemes.cpp) compile only outside
-// GAGGIMATE_SIM: both files carry the animation render kernels and the
-// simulator's stub SleepAnimation never calls them (CLAUDE.md: "SleepAnimation
-// is a stub under GAGGIMATE_SIM and updateState skips animation and plate
-// application"), so the whole translation unit is excluded there and neither
-// symbol exists to link against on the host. This category still has to show
-// real names on the sim (the bead's own acceptance criteria: "the model's
-// animation names and gradient parsing are host code, so the sim shows them
-// without a renderer"), so it keeps a mirror of both tables here rather than
-// touching BgAnimRegistry.cpp/BgAnimThemes.cpp, which carry the kernels the
-// animation workers are editing. The animation half of the mirror now
-// carries each animation's parameter table too, because the Parameters page
-// (gm-3vj.2, CatAnimParams.cpp) shows one row per parameter and needs the
-// labels and defaults, not just the names.
+// bg_animation()/bg_animation_count() (BgAnimRegistry.cpp) compile only
+// outside GAGGIMATE_SIM: that file carries the animation render kernels and
+// the simulator's stub SleepAnimation never calls them (CLAUDE.md:
+// "SleepAnimation is a stub under GAGGIMATE_SIM and updateState skips
+// animation and plate application"), so the whole translation unit is
+// excluded there and neither symbol exists to link against on the host. This
+// category still has to show real names on the sim (the bead's own acceptance
+// criteria: "the model's animation names and gradient parsing are host code,
+// so the sim shows them without a renderer"), so it keeps a mirror of the
+// roster here rather than touching BgAnimRegistry.cpp, which carries the
+// kernels the animation workers are editing. The mirror carries each
+// animation's parameter table too, because the Parameters page (gm-3vj.2,
+// CatAnimParams.cpp) shows one row per parameter and needs the labels and
+// defaults, not just the names.
+//
+// The gradients are not in that boat any more: BgAnimThemes.cpp has no device
+// dependency and compiles on the host since gm-nov3.3, so both builds read
+// the real bg_theme_* table and the real ref validators.
 #ifdef GAGGIMATE_SIM
 // One entry per registry slot, in REGISTRY order (BgAnimRegistry.cpp), each
 // carrying the animation's display name and its whole eight-slot parameter
@@ -134,17 +133,17 @@ const SimAnim &simAnim(int i) {
 }
 const char *animNameFn(int i) { return simAnim(i).name; }
 const BgAnimParamDef *animParamsFn(int i) { return simAnim(i).params; }
-// Reads the same generated table BgAnimThemes.cpp does, rather than carrying
-// a third copy of the names. The wiring itself is in ThemeProviderTable.h,
-// because the host test runs this path too.
-settingsui::ThemeNameProvider makeThemeProvider() { return settingsui::generatedThemeProvider(); }
 #else
 int animCountFn() { return bg_animation_count(); }
 const char *animNameFn(int i) { return bg_animation(i).name; }
 const BgAnimParamDef *animParamsFn(int i) { return bg_animation(i).params; }
+#endif
 
-// The device reads all six through BgAnimThemes.cpp, which clamps an
-// out-of-range index to 0 in every one of them.
+// Both builds read all six through BgAnimThemes.cpp, which clamps an
+// out-of-range index to 0 in every one of them. That file is the one bganim
+// translation unit with no device dependency, so the simulator links the real
+// gradient rules rather than a stub (gm-nov3.3); before that it had to build
+// this provider from the generated table instead.
 settingsui::ThemeNameProvider makeThemeProvider() {
     settingsui::ThemeNameProvider p;
     p.count = bg_theme_count;
@@ -155,7 +154,6 @@ settingsui::ThemeNameProvider makeThemeProvider() {
     p.stops = bg_theme_stops;
     return p;
 }
-#endif
 
 const settingsui::AnimationNameProvider kAnimProvider{animCountFn, animNameFn};
 const settingsui::ThemeNameProvider kThemeProvider = makeThemeProvider();
@@ -342,6 +340,20 @@ struct CatAnimationCtx {
     std::string globalGradientRef;
     bool globalGradientTouched = false;
 
+    // Which row opened the gradient picker, and the animation slot it was
+    // opened for. Captured at the push and never re-derived while the picker
+    // is open, so a web save that changes the main or the standby animation
+    // cannot silently point the open picker at a different slot (gm-nov3.3).
+    // One set of fields is enough: the shell's page stack holds at most one
+    // picker.
+    enum class PickerTarget { None, GlobalAll, Main, Standby };
+    PickerTarget pickerTarget = PickerTarget::None;
+    int pickerAnimId = -1;
+    // Storage for the ref the picker reads back through its spec, which
+    // returns a pointer the picker copies at once. A temporary's c_str()
+    // would dangle before it got there.
+    std::string pickerRefScratch;
+
     int plates = 0; // 0 Keep, 1 Hide, 2 Custom
 
     // Palette rows: the anchor is the colour Settings held when the row was
@@ -413,6 +425,9 @@ struct CatAnimationCtx {
     SettingsUI *ui = nullptr;
 };
 
+// Defined with the three gradient rows below, where the picker wiring lives.
+void applyRowSwatch(lv_obj_t *row, const std::string &ref);
+
 // Brings the two standby rows in line with the current pair of ids: live
 // while the standby animation is a different one, disabled and showing the
 // main animation's own values otherwise. Called from both id rows, since
@@ -438,24 +453,86 @@ void refreshStandbyRows(CatAnimationCtx *ctx, const std::vector<settingsui::Grad
                             separate ? gradientDisplayText(ctx->standbyGradientIndex, choices).c_str()
                                      : "Same as main");
         settingsRowSetEnabled(ctx->standbyGradientRow, separate);
+        if (separate) {
+            applyRowSwatch(ctx->standbyGradientRow, ctx->standbyGradientRef);
+        } else {
+            // "Same as main" is not a gradient, so the row shows no ramp.
+            // applyEnabledRecurse dims labels and images by exact class and a
+            // canvas is neither, so hiding it is what a disabled row needs.
+            settingsRowSetSwatch(ctx->standbyGradientRow, nullptr);
+        }
     }
 }
 
-// ---- Gradient for all animations ---------------------------------------------
+// ---- the three gradient rows --------------------------------------------------
+//
+// Each is a whole-row target that pushes the picker (CatGradientPicker.h) and
+// takes the chosen ref back through a callback. They were prev/next cycles
+// over one flat list until gm-nov3.3; at sixty built-ins a name on its own
+// stops saying what the gradient looks like, and the arrows are gone rather
+// than covered, because a second target over them would overlap theirs.
+//
+// The pick callbacks run while the picker is still the page on screen, so
+// every row pointer here is null (each row's DELETE callback cleared it when
+// the picker's push deleted this page's objects). They write the draft and
+// Settings; the shell's popPages rebuilds this page from the draft on the way
+// out, which is what puts the new value on the row.
 
-// The gradient every animation draws with unless it has one of its own. Cycles
-// the choice list from index 1: index 0 is the per-animation "Global" entry
-// and is not a value the global itself can take.
-void globalGradientOnCycle(void *user, int dir) {
-    auto *ctx = static_cast<CatAnimationCtx *>(user);
-    const auto choices = currentGradientChoices();
-    const int n = static_cast<int>(choices.size()) - 1;
-    if (n <= 0) {
+// The ref this visit holds for one animation: the choice it made if it made
+// one, else what the stored map says.
+std::string draftRefForAnim(const CatAnimationCtx *ctx, int animId) {
+    if (animId < 0 || static_cast<size_t>(animId) >= ctx->gradientTouched.size()) {
+        return std::string();
+    }
+    if (ctx->gradientTouched[static_cast<size_t>(animId)]) {
+        return ctx->gradientLastRef[static_cast<size_t>(animId)];
+    }
+    const std::string map(controller.getSettings().getBgAnimThemeMap().c_str());
+    return settingsui::gradientMapReadRef(map, animId);
+}
+
+// Paints an entry row's swatch with the ramp the panel would build for `ref`,
+// at the stored tone. An empty ref is a per-animation row on "Global", which
+// draws whatever the global draws, so it shows the global's own gradient. A
+// ref that resolves to nothing (a deleted library entry, or the retained
+// legacy custom gradient, which no ref names) leaves the swatch hidden.
+void applyRowSwatch(lv_obj_t *row, const std::string &ref) {
+    if (row == nullptr) {
         return;
     }
-    const int rel = settingsui::wrapIndex(ctx->globalGradientIndex - 1, n, dir);
-    ctx->globalGradientIndex = rel + 1;
-    ctx->globalGradientRef = choices[static_cast<size_t>(ctx->globalGradientIndex)].ref;
+    const std::string effective = ref.empty() ? settingsGlobalGradientRef() : ref;
+    Settings &settings = controller.getSettings();
+    settingsui::SwatchGradient gradient;
+    if (effective.empty() ||
+        !settingsui::swatchResolveRef(effective.c_str(), settings.getBgAnimGradients().c_str(), gradient)) {
+        settingsRowSetSwatch(row, nullptr);
+        return;
+    }
+    settingsui::swatchApplyTone(gradient, settings.getBgAnimBrightness(), settings.getBgAnimHighlightKnee());
+    uint16_t ramp[kSettingsRowSwatchSamples];
+    settingsui::swatchBuildRamp565(gradient, ramp, kSettingsRowSwatchSamples);
+    settingsRowSetSwatch(row, ramp);
+}
+
+void animReconcile(void *ctx0);
+void animGradientPicked(void *user, const char *ref);
+
+// Shared by all three rows: the picker's view of this category's draft.
+// SettingsUI::service() reconciles only the top page, so while the picker is
+// open this is the only thing keeping this category's untouched fields
+// current, exactly as the schedule editor does for the Machine draft.
+void gradientPickerReconcileParent(void *user) { animReconcile(user); }
+
+// ---- Gradient for all animations ---------------------------------------------
+
+// The gradient every animation draws with unless it has one of its own. The
+// picker offers no "Global" entry here: the global is what "Global" means, so
+// this row must land on a gradient.
+void globalGradientPicked(void *user, const char *ref) {
+    auto *ctx = static_cast<CatAnimationCtx *>(user);
+    const auto choices = currentGradientChoices();
+    ctx->globalGradientRef = ref != nullptr ? ref : "";
+    ctx->globalGradientIndex = settingsui::gradientChoiceIndexForRef(choices, ctx->globalGradientRef);
     ctx->globalGradientTouched = true;
     Settings &settings = controller.getSettings();
     settings.setBgAnimGradientRef(ctx->globalGradientRef.c_str());
@@ -463,21 +540,35 @@ void globalGradientOnCycle(void *user, int dir) {
     // what a build without this field reads. The web form and the POST
     // handler apply the same rule, so all four writers agree.
     mirrorGlobalRefIntoLegacyTheme(settings, ctx->globalGradientRef);
-    if (ctx->globalGradientRow != nullptr) {
-        settingsRowSetValue(ctx->globalGradientRow, choices[static_cast<size_t>(ctx->globalGradientIndex)].label.c_str());
-    }
-    // Both per-animation rows name the global while they are on "Global", so
-    // they follow this one.
-    if (ctx->gradientRow != nullptr) {
-        settingsRowSetValue(ctx->gradientRow, gradientDisplayText(ctx->gradientIndex, choices).c_str());
-    }
-    if (ctx->standbyGradientRow != nullptr && ctx->standbyAnimId >= 0 && ctx->standbyAnimId != ctx->animId) {
-        settingsRowSetValue(ctx->standbyGradientRow, gradientDisplayText(ctx->standbyGradientIndex, choices).c_str());
-    }
     if (ctx->ui != nullptr) {
         ctx->ui->ui().markDirty();
         ctx->ui->plugins().trigger("bganim:preview-end");
     }
+}
+
+void globalGradientOnActivate(void *user) {
+    auto *ctx = static_cast<CatAnimationCtx *>(user);
+    if (ctx->ui == nullptr) {
+        return;
+    }
+    ctx->pickerTarget = CatAnimationCtx::PickerTarget::GlobalAll;
+    ctx->pickerAnimId = -1;
+    SettingsGradientPickerSpec spec;
+    spec.title = "Gradient all";
+    spec.allowGlobal = false;
+    spec.currentRef = [](void *user) -> const char * {
+        auto *c = static_cast<CatAnimationCtx *>(user);
+        // What the global resolves to now, which is "" while a retained
+        // legacy custom gradient is still the fallback: that state is not one
+        // of the picker's entries, so nothing is marked.
+        c->pickerRefScratch = settingsGlobalGradientRef();
+        return c->pickerRefScratch.c_str();
+    };
+    spec.onPick = globalGradientPicked;
+    spec.onReconcileParent = gradientPickerReconcileParent;
+    spec.stillValid = [](void *) { return true; }; // the global is always a slot worth editing
+    spec.user = ctx;
+    settingsGradientPickerPush(*ctx->ui, spec);
 }
 
 // ---- Animation --------------------------------------------------------------
@@ -570,31 +661,33 @@ void standbyParamsOnActivate(void *user) {
     }
 }
 
-void standbyGradientOnCycle(void *user, int dir) {
+void standbyGradientOnActivate(void *user) {
     auto *ctx = static_cast<CatAnimationCtx *>(user);
-    if (ctx->standbyAnimId < 0) {
+    if (ctx->ui == nullptr || ctx->standbyAnimId < 0 || ctx->standbyAnimId == ctx->animId) {
         return;
     }
-    Settings &settings = controller.getSettings();
-    const auto choices = currentGradientChoices();
-    ctx->standbyGradientIndex = settingsui::wrapIndex(ctx->standbyGradientIndex, static_cast<int>(choices.size()), dir);
-    ctx->standbyGradientRef = choices[static_cast<size_t>(ctx->standbyGradientIndex)].ref;
-    // Same per-animation touched-ness as the Gradient row above, keyed by the
-    // animation this row is editing.
-    ctx->gradientTouched[static_cast<size_t>(ctx->standbyAnimId)] = true;
-    ctx->gradientLastRef[static_cast<size_t>(ctx->standbyAnimId)] = ctx->standbyGradientRef;
-    {
-        Settings::Guard guard(settings);
-        const std::string map(settings.getBgAnimThemeMap().c_str());
-        settings.setBgAnimThemeMap(
-            settingsui::gradientMapWriteRef(map, ctx->standbyAnimId, ctx->standbyGradientRef).c_str());
-    }
-    if (ctx->standbyGradientRow != nullptr) {
-        settingsRowSetValue(ctx->standbyGradientRow, gradientDisplayText(ctx->standbyGradientIndex, choices).c_str());
-    }
-    if (ctx->ui != nullptr) {
-        ctx->ui->ui().markDirty();
-    }
+    ctx->pickerTarget = CatAnimationCtx::PickerTarget::Standby;
+    ctx->pickerAnimId = ctx->standbyAnimId;
+    SettingsGradientPickerSpec spec;
+    spec.title = "Standby grad";
+    spec.allowGlobal = true;
+    spec.currentRef = [](void *user) -> const char * {
+        auto *c = static_cast<CatAnimationCtx *>(user);
+        c->pickerRefScratch = draftRefForAnim(c, c->pickerAnimId);
+        return c->pickerRefScratch.c_str();
+    };
+    spec.onPick = animGradientPicked;
+    spec.onReconcileParent = gradientPickerReconcileParent;
+    // The standby animation's own slot exists only while it is a different
+    // animation from the main one. A web save that turns standby off, or onto
+    // the main animation, leaves this row disabled, so the picker over it has
+    // nothing left to write.
+    spec.stillValid = [](void *user) {
+        auto *c = static_cast<CatAnimationCtx *>(user);
+        return c->pickerAnimId >= 0 && c->pickerAnimId == c->standbyAnimId && c->standbyAnimId != c->animId;
+    };
+    spec.user = ctx;
+    settingsGradientPickerPush(*ctx->ui, spec);
 }
 
 // ---- Frame rate --------------------------------------------------------------
@@ -648,14 +741,20 @@ void themeOnCycle(void *user, int dir) {
 
 // ---- Gradient --------------------------------------------------------------
 
-void gradientOnCycle(void *user, int dir) {
+// One animation's own gradient, for whichever of the two per-animation rows
+// opened the picker: both write the same per-animation field, keyed by the id
+// captured at the push, so the touched-ness that matters is the animation's
+// and not which row wrote it.
+void animGradientPicked(void *user, const char *ref) {
     auto *ctx = static_cast<CatAnimationCtx *>(user);
+    const int animId = ctx->pickerAnimId;
+    if (animId < 0 || static_cast<size_t>(animId) >= ctx->gradientTouched.size()) {
+        return;
+    }
     Settings &settings = controller.getSettings();
-    const auto choices = currentGradientChoices();
-    ctx->gradientIndex = settingsui::wrapIndex(ctx->gradientIndex, static_cast<int>(choices.size()), dir);
-    ctx->gradientRef = choices[static_cast<size_t>(ctx->gradientIndex)].ref;
-    ctx->gradientTouched[static_cast<size_t>(ctx->animId)] = true;
-    ctx->gradientLastRef[static_cast<size_t>(ctx->animId)] = ctx->gradientRef;
+    const std::string picked(ref != nullptr ? ref : "");
+    ctx->gradientTouched[static_cast<size_t>(animId)] = true;
+    ctx->gradientLastRef[static_cast<size_t>(animId)] = picked;
     {
         // Read-modify-write of the whole map string: guarded so a web save's
         // batchUpdate touching a different animation's slot in the same
@@ -665,15 +764,52 @@ void gradientOnCycle(void *user, int dir) {
         // Property::set, but this one reads the string before it writes it).
         Settings::Guard guard(settings);
         const std::string map(settings.getBgAnimThemeMap().c_str());
-        settings.setBgAnimThemeMap(settingsui::gradientMapWriteRef(map, ctx->animId, ctx->gradientRef).c_str());
+        settings.setBgAnimThemeMap(settingsui::gradientMapWriteRef(map, animId, picked).c_str());
     }
-    if (ctx->gradientRow != nullptr) {
-        settingsRowSetValue(ctx->gradientRow, gradientDisplayText(ctx->gradientIndex, choices).c_str());
+    // Whichever draft fields this animation feeds. Both when the main and the
+    // standby rows are on the same animation, which is also when the standby
+    // row is disabled and could not have opened the picker.
+    const auto choices = currentGradientChoices();
+    if (animId == ctx->animId) {
+        ctx->gradientRef = picked;
+        ctx->gradientIndex = settingsui::gradientChoiceIndexForRef(choices, picked);
+    }
+    if (animId == ctx->standbyAnimId) {
+        ctx->standbyGradientRef = picked;
+        ctx->standbyGradientIndex = settingsui::gradientChoiceIndexForRef(choices, picked);
     }
     if (ctx->ui != nullptr) {
         ctx->ui->ui().markDirty();
         ctx->ui->plugins().trigger("bganim:preview-end");
     }
+}
+
+void gradientOnActivate(void *user) {
+    auto *ctx = static_cast<CatAnimationCtx *>(user);
+    if (ctx->ui == nullptr) {
+        return;
+    }
+    ctx->pickerTarget = CatAnimationCtx::PickerTarget::Main;
+    ctx->pickerAnimId = ctx->animId;
+    SettingsGradientPickerSpec spec;
+    spec.title = "Gradient";
+    spec.allowGlobal = true;
+    spec.currentRef = [](void *user) -> const char * {
+        auto *c = static_cast<CatAnimationCtx *>(user);
+        c->pickerRefScratch = draftRefForAnim(c, c->pickerAnimId);
+        return c->pickerRefScratch.c_str();
+    };
+    spec.onPick = animGradientPicked;
+    spec.onReconcileParent = gradientPickerReconcileParent;
+    // The captured animation stays the one being edited even if a web save
+    // moves bgAnimId underneath, the same rule the Parameters page follows.
+    // Only an id that has left the roster makes the slot unwritable.
+    spec.stillValid = [](void *user) {
+        auto *c = static_cast<CatAnimationCtx *>(user);
+        return c->pickerAnimId >= 0 && c->pickerAnimId < animCountFn();
+    };
+    spec.user = ctx;
+    settingsGradientPickerPush(*ctx->ui, spec);
 }
 
 // ---- Plates --------------------------------------------------------------
@@ -848,8 +984,9 @@ void animBuildRow(void *ctx0, int index, lv_obj_t *parent, SettingsUI &ui) {
         settingsRowSetValue(row, standbyChoiceLabel(ctx->standbyAnimId));
         break;
     }
-    case 2: { // Gradient for all animations
-        lv_obj_t *row = settingsRowChoiceCreate(ui, parent, "Gradient all", "Gradient all", globalGradientOnCycle, ctx);
+    case 2: { // Gradient for all animations (pushes the picker)
+        lv_obj_t *row =
+            settingsRowSwatchCreate(ui, parent, "Gradient all", "Gradient all", globalGradientOnActivate, ctx);
         ctx->globalGradientRow = row;
         lv_obj_add_event_cb(
             row,
@@ -860,6 +997,7 @@ void animBuildRow(void *ctx0, int index, lv_obj_t *parent, SettingsUI &ui) {
         // legacy custom gradient is still the fallback there is no choice
         // that stands for it, and naming a built-in there would be a lie.
         settingsRowSetValue(row, globalGradientLabel(choices).c_str());
+        applyRowSwatch(row, settingsGlobalGradientRef());
         break;
     }
     case 3: { // Parameters (pushes CatAnimParams.cpp's page)
@@ -873,8 +1011,8 @@ void animBuildRow(void *ctx0, int index, lv_obj_t *parent, SettingsUI &ui) {
         settingsRowSetValue(row, animNameFn(ctx->animId));
         break;
     }
-    case 4: { // Gradient (the main animation's override)
-        lv_obj_t *row = settingsRowChoiceCreate(ui, parent, "Gradient", "Gradient", gradientOnCycle, ctx);
+    case 4: { // Gradient (the main animation's override; pushes the picker)
+        lv_obj_t *row = settingsRowSwatchCreate(ui, parent, "Gradient", "Gradient", gradientOnActivate, ctx);
         ctx->gradientRow = row;
         lv_obj_add_event_cb(
             row,
@@ -882,6 +1020,7 @@ void animBuildRow(void *ctx0, int index, lv_obj_t *parent, SettingsUI &ui) {
             LV_EVENT_DELETE, ctx);
         const auto choices = currentGradientChoices();
         settingsRowSetValue(row, gradientDisplayText(ctx->gradientIndex, choices).c_str());
+        applyRowSwatch(row, ctx->gradientRef);
         break;
     }
     case 5: { // Standby parameters
@@ -897,10 +1036,10 @@ void animBuildRow(void *ctx0, int index, lv_obj_t *parent, SettingsUI &ui) {
         settingsRowSetEnabled(row, separate);
         break;
     }
-    case 6: { // Standby gradient
+    case 6: { // Standby gradient (pushes the picker)
         const bool separate = ctx->standbyAnimId >= 0 && ctx->standbyAnimId != ctx->animId;
         lv_obj_t *row =
-            settingsRowChoiceCreate(ui, parent, "Standby grad", "Standby grad", standbyGradientOnCycle, ctx);
+            settingsRowSwatchCreate(ui, parent, "Standby grad", "Standby grad", standbyGradientOnActivate, ctx);
         ctx->standbyGradientRow = row;
         lv_obj_add_event_cb(
             row,
@@ -912,6 +1051,9 @@ void animBuildRow(void *ctx0, int index, lv_obj_t *parent, SettingsUI &ui) {
         settingsRowSetValue(row, separate ? gradientDisplayText(ctx->standbyGradientIndex, choices).c_str()
                                           : "Same as main");
         settingsRowSetEnabled(row, separate);
+        if (separate) {
+            applyRowSwatch(row, ctx->standbyGradientRef);
+        }
         break;
     }
     case 7: // All screens
@@ -1307,6 +1449,23 @@ void animDestroyCtx(void *ctx) { delete static_cast<CatAnimationCtx *>(ctx); }
 // The roster, for the Parameters page (CatAnimParams.h). Exported from here
 // rather than duplicated there because this file already owns the split
 // between the real registry and the simulator's mirror.
+// The built-in gradient table and the two readings of the global gradient
+// the picker shows (CatGradientPicker.h). Exported from here for the same
+// reason the roster is: this file already owns how the Animation category
+// reads the stored gradient fields, and the picker must not grow a second
+// reading of them.
+const settingsui::ThemeNameProvider &settingsThemeProvider() { return kThemeProvider; }
+
+std::string settingsGlobalGradientLabel() { return globalGradientLabel(currentGradientChoices()); }
+
+std::string settingsGlobalGradientRef() {
+    const auto choices = currentGradientChoices();
+    if (legacyCustomFallbackActive(choices)) {
+        return std::string(); // no ref names the retained legacy gradient
+    }
+    return choices[static_cast<size_t>(globalGradientChoiceIndex(choices))].ref;
+}
+
 int settingsAnimCount() { return animCountFn(); }
 const char *settingsAnimName(int animId) { return animNameFn(clampAnimId(animId)); }
 const BgAnimParamDef *settingsAnimParams(int animId) { return animParamsFn(clampAnimId(animId)); }

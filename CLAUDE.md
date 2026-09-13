@@ -805,14 +805,49 @@ the design cannot show and what the runs measured.
   needs Python, and `--check` fails on a stale copy from `tools/animbench`
   `make check`. Before it the same 18 gradients were written out three times
   and synced by hand, the third copy being `kSimThemeNames[]` in
-  CatAnimation.cpp, which existed because the simulator cannot link
-  BgAnimThemes.cpp; the simulator now includes the generated header instead,
-  and device builds must not, because they would pull the stops in twice. The
+  CatAnimation.cpp, which existed because the simulator did not link
+  BgAnimThemes.cpp; since gm-nov3.3 it does, so the display reads the same
+  table everywhere and only the host model test includes the generated
+  header directly (through `ThemeProviderTable.h`). A device build must not
+  include it, because it would pull the stops in twice. The
   list is append only and the generator does not enforce that: an entry's
   position is its stored id, in `bgAnimGradientRef` and in every slot of
   `bgAnimThemeMap`, so reordering or removing one changes what a device
   already set. Six stops each, because the palette arithmetic assumes even
   spacing and `bg_resolve_theme` copies 6 x 3 bytes.
+- **A gradient is chosen on a pushed picker page, and the picker keeps the
+  slot it was opened for** (gm-nov3.3, 2026-09-13, `CatGradientPicker.cpp`,
+  the swatch row in `SettingsRows.cpp`). The three gradient rows are
+  whole-row targets now, not prev/next cycles: the arrows are gone rather
+  than covered, because a row-wide target laid over them is two targets in
+  one place and `Rig.audit()` fails on the overlap. Four rules the page
+  cannot show. A pick is written before `popPages`, because the pop rebuilds
+  the page underneath from the draft and a write after it would leave the
+  old value on screen. Each level calls the opening category's reconcile
+  itself, since the shell reconciles only the top page. The picker captures
+  the animation slot it was opened for and never retargets it under a web
+  save; if that slot stops being editable (the standby animation turned off)
+  it closes without selecting, and both reconciles return immediately after
+  the pop that frees their ctx. And a swatch must not publish the gradient
+  it draws: the real palette code works on the globals the render task draws
+  with, so `GradientSwatch.cpp` is a separate transcription, held to the
+  real one by `tools/animbench/swatch_parity.cpp` (all 256 ramp entries, every
+  built-in, library strings of 2 to 16 stops with repeated positions and flat
+  endpoint runs, seven tone settings). The rest is in
+  `src/display/ui/default/settings/README.md`.
+- **The simulator runs the real gradient rules, so a gradient test can
+  fail** (gm-nov3.3). `sim/platform/bganim_stub.cpp` used to stub
+  `bg_map_valid`, `bg_library_valid`, `bg_ref_valid` and the rest as always
+  false, and `WebUIPlugin.cpp` gates every POST to `bgAnimThemeMap`,
+  `bgAnimGradients` and `bgAnimGradientRef` behind them, so on the simulator
+  no web save of any of those fields could land: two runner checks were
+  asserting that the POST bounced and reported a pass for a step that could
+  not fail. BgAnimThemes.cpp turned out to have no device dependency, so it
+  compiles into the simulator and the stubs are gone. Keep it that way: a
+  device-only call added to that file takes the simulator's gradient tests
+  back to a state where they cannot fail. Every web-interference step in
+  `tools/settings_ui_tests/test_animation.py` reads the field back before
+  judging the UI, for the same reason.
 - **The standby animation's parameters and gradient are stored per animation
   id**, so they already existed before there was any way to edit them. The
   web tab reaches them through the main and standby selector above the
@@ -879,9 +914,9 @@ Instruments, and where each one exists:
 
 Three test commands, and what each proves:
 
-- `pio test -e native_settingsui` runs the value model on the host, 28 cases,
+- `pio test -e native_settingsui` runs the value model on the host, 59 cases,
   no LVGL and no Arduino. It proves ranges, steps, wrap, formats, the zone
-  split, the gradient map and schedule parsing.
+  split, the gradient map, the picker's grouping and schedule parsing.
 - `python3 tools/settings_ui_test.py` builds nothing and launches
   `.pio/build/display-sim/program` itself, seeded from
   `tools/settings_ui_tests/fixtures/controller.json`. It proves navigation,

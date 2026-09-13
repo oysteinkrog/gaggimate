@@ -246,28 +246,30 @@ void SettingsUI::pushPage(const SettingsCategoryDef *def, void *ctx) {
     rebuildPage();
 }
 
-void SettingsUI::popPage() {
-    if (pageStack.empty()) {
+void SettingsUI::popPages(int count) {
+    if (pageStack.empty() || count <= 0) {
         return;
     }
     ui_.beginOverlayTransition("settings_pop");
-    const SettingsCategoryDef *def = pageStack.back().def;
-    void *ctx = pageStack.back().ctx;
-    lv_obj_t *root = pageStack.back().root;
-    pageStack.pop_back();
-    {
-        Settings::Guard guard(controller_.getSettings());
-        if (def->commit) {
-            def->commit(ctx);
+    for (int i = 0; i < count && !pageStack.empty(); i++) {
+        const SettingsCategoryDef *def = pageStack.back().def;
+        void *ctx = pageStack.back().ctx;
+        lv_obj_t *root = pageStack.back().root;
+        pageStack.pop_back();
+        {
+            Settings::Guard guard(controller_.getSettings());
+            if (def->commit) {
+                def->commit(ctx);
+            }
         }
-    }
-    // The page's objects go before the ctx: row DELETE callbacks a category
-    // registered with its ctx as user data run during lv_obj_del.
-    if (root) {
-        lv_obj_del(root);
-    }
-    if (def->destroyCtx && ctx) {
-        def->destroyCtx(ctx);
+        // The page's objects go before the ctx: row DELETE callbacks a
+        // category registered with its ctx as user data run during lv_obj_del.
+        if (root) {
+            lv_obj_del(root);
+        }
+        if (def->destroyCtx && ctx) {
+            def->destroyCtx(ctx);
+        }
     }
     if (pageStack.empty()) {
         buildTilePage();

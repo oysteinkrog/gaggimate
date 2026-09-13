@@ -116,7 +116,16 @@ class SettingsUI {
     // and reveals whatever is now on top (the tile page, or the parent page,
     // rebuilt so it reflects any edit the child made to a shared draft,
     // without re-entering it).
-    void popPage();
+    void popPage() { popPages(1); }
+    // The same, `count` pages deep and with one rebuild at the end rather
+    // than one per level. The gradient picker (CatGradientPicker.cpp) is two
+    // pages deep and a choice on its second page returns all the way to the
+    // category that opened it; popping level by level would build the
+    // intermediate page, allocate its swatch buffers and throw it away again
+    // before anyone saw it. Each level still commits, in top-down order.
+    // `count` past the bottom of the stack empties it, which is what a
+    // caller that has lost count wants.
+    void popPages(int count);
     // Clamps `page` to the top category's current page count and rebuilds
     // its five row slots from buildRow. Never calls enter or commit.
     void gotoPage(int page);
