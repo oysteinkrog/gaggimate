@@ -480,8 +480,11 @@ bool refResolves(const char *ref, const char *library) {
 // that suddenly resolved would change what that animation draws.
 //
 // A list rather than a flag per id, because the accepted range runs to
-// BG_GRADIENT_ID_MAX and the ids in use are not dense: the web editor
-// allocates by incrementing the largest one, so a three-entry library can
+// BG_GRADIENT_ID_MAX and the ids in use are not dense. The web editor takes
+// the lowest id nothing reserves, so it fills gaps rather than climbing, but
+// an id a stored ref names stays reserved even after its entry is deleted,
+// and a device may still carry entries the editor this replaced wrote by
+// incrementing the largest id, which is how a three-entry library comes to
 // hold 1, 40 and 41. The list stays short whatever the ids are. There are at
 // most BG_GRADIENT_LIB_MAX entries and the map is capped at 256 characters,
 // so a few dozen ids in all, and the lowest free one is never far above that

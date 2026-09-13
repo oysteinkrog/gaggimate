@@ -1096,9 +1096,13 @@ def library_renumbered(lib, new_ids):
     order, plus the (id, name, gradient) triples that came out.
 
     How many entries a library may hold (twelve) is not what bounds the ids
-    they carry: the web allocates a new entry as the largest existing id plus
-    one, so a few rounds of copying and deleting leave a small library whose
-    ids are large. That is the state this builds, without adding an entry."""
+    they carry. The web allocator hands out the lowest id nothing reserves,
+    and a ref that still names a deleted entry keeps that id reserved, so a
+    few rounds of copying and deleting leave a small library whose ids are
+    larger than its entry count. Larger still are legacy: the allocator this
+    replaced returned the largest id plus one with no ceiling (gm-nov3.21),
+    and the entries it wrote are still on devices. That is the state this
+    builds, without adding an entry."""
     entries = library_entries(lib)
     if len(entries) < len(new_ids):
         raise AssertionError("the stored library has %d entries, %d are needed" % (len(entries), len(new_ids)))
@@ -1137,8 +1141,11 @@ def check_gradient_picker_high_library_ids(rig):
     standby0 = int(s0["bgAnimStandbyId"])
     anim0 = int(s0["bgAnimId"])
 
-    # 14 is the first id the old resolver refused; 99999 is the largest the
-    # ref grammar accepts.
+    # 14 is the first id the old resolver refused, and the current allocator
+    # still reaches it once 1 to 13 are held by entries or by refs that name
+    # a deleted one. 99999 is the largest the ref grammar accepts, and a
+    # legacy id: the allocator this replaced could climb to it, and the UI
+    # cannot normally reach it now under the library and map caps.
     high_lib, high = library_renumbered(lib0, [14, 99999])
     web_save(rig, {"bgAnimGradients": high_lib})
     landed = rig.wait_until(lambda: rig.settings()["bgAnimGradients"] == high_lib, timeout=5)

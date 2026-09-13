@@ -135,11 +135,16 @@ int main() {
     //
     // The library ids here are 1, 14 and 99999 on purpose (gm-nov3.15). The
     // number of entries a library may hold is twelve; the ids they carry run
-    // to 99999, because the web allocates a new entry as the largest existing
-    // id plus one, so a library of three entries can hold c14 after a few
-    // rounds of copying and deleting. A resolver that stopped at c13 left
-    // every saved gradient above it listed, drawn by the panel, and
-    // unselectable, since CatGradientPicker.cpp gates a selection on this.
+    // to 99999. Each of the two high ids stands for a different way of
+    // getting one. 14 is what the current allocator produces: it hands out
+    // the lowest id nothing reserves, and a ref that still names a deleted
+    // entry keeps that id reserved, so a few rounds of copying and deleting
+    // leave a three-entry library holding c14. 99999 is the top of the
+    // grammar and a legacy id: the allocator this replaced returned the
+    // largest id plus one with no ceiling (gm-nov3.21), and the entries it
+    // wrote are still on devices. A resolver that stopped at c13 left every
+    // saved gradient above it listed, drawn by the panel, and unselectable,
+    // since CatGradientPicker.cpp gates a selection on this.
     {
         char library[BG_GRADIENT_LIB_MAX_LEN];
         std::snprintf(library, sizeof(library), "1|Two|%s;14|Wide|%s;99999|Sixteen|%s", kWires[0], kWires[2],

@@ -110,9 +110,16 @@ constexpr int BG_GRADIENT_NAME_MAX = 24;      // characters, as the UI counts th
 constexpr int BG_GRADIENT_STR_MAX = BG_THEME_MAX_STOPS * 11; // "rrggbb@255," per stop
 // The largest entry id the grammar accepts, in the library and in a ref:
 // the parser reads at most five decimal digits. Ids are not positions, are
-// not dense, and do not have to stay under BG_GRADIENT_LIB_MAX: the web
-// editor allocates by incrementing the largest id in use, so a library of
-// three entries can carry ids 1, 40 and 41.
+// not dense, and do not have to stay under BG_GRADIENT_LIB_MAX. The web
+// editor hands out the lowest id in 1 to BG_GRADIENT_ID_MAX that no entry
+// carries and no stored ref names, so it reuses a gap rather than climbing
+// (nextGradientId, web/src/config/bgAnimations.js, gm-nov3.21). A gap stays
+// reserved while a ref still names it, so deleting entry 7 while a slot of
+// bgAnimThemeMap still says "c7" leaves 7 unavailable and the next id is 8.
+// Ids of 14 and above are reachable that way once the ids below are taken,
+// and much larger ids exist on devices in the field: the allocator this
+// replaced returned the largest id plus one, so a library of three entries
+// could carry 1, 40 and 41, and those entries are still valid.
 constexpr int BG_GRADIENT_ID_MAX = 99999;
 
 // ---- the legacy bgAnimTheme namespace, frozen -----------------------------
@@ -273,8 +280,10 @@ void bg_resolve_anim_theme(int animId, const char *map, const char *library, con
 //    leaves every existing entry exactly as it is.
 //  - It allocates from the whole 1..BG_GRADIENT_ID_MAX range, skipping every
 //    id an entry or a stored ref already holds, rather than from the first
-//    BG_GRADIENT_LIB_MAX ids. Ids in use are not dense: the web editor
-//    allocates by incrementing the largest one.
+//    BG_GRADIENT_LIB_MAX ids. Ids in use are not dense: the web editor takes
+//    the lowest unreserved id, which leaves whatever a stored ref still names
+//    reserved, and entries written by the editor this replaced can carry any
+//    id up to BG_GRADIENT_ID_MAX.
 struct BgGradientMigration {
     enum Action {
         None,     // nothing to carry over, or it is already carried over

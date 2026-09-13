@@ -44,12 +44,16 @@ uint16_t rgb565(uint8_t r, uint8_t g, uint8_t b) {
 // The library's id range is not its capacity. The first version of this
 // resolver rejected any id above BG_GRADIENT_LIB_MAX + 1 (gm-nov3.15), which
 // confused the twelve entries a library may hold at one time with the ids
-// those entries carry: the web allocates a new entry as the largest existing
-// id plus one (web/src/config/bgAnimations.js), so a user who copies and
-// deletes a few gradients reaches c14 with three entries saved. Since the
-// picker gates a selection on this resolver (CatGradientPicker.cpp,
-// applyPick), every saved gradient above c13 was listed in My gradients, drawn
-// by the panel, and silently unselectable.
+// those entries carry. Both ways of reaching a high id are live. The web
+// allocator hands out the lowest id nothing reserves
+// (web/src/config/bgAnimations.js), and a ref that still names a deleted
+// entry keeps its id reserved, so a user who copies and deletes a few
+// gradients reaches c14 with three entries saved. Larger ids than that are
+// legacy: the allocator this replaced returned the largest id plus one and
+// had no ceiling (gm-nov3.21), and the entries it wrote are still on devices
+// and still valid. Since the picker gates a selection on this resolver
+// (CatGradientPicker.cpp, applyPick), every saved gradient above c13 was
+// listed in My gradients, drawn by the panel, and silently unselectable.
 constexpr int kRefMaxDigits = 5;
 
 // Reads the decimal at s, advancing it past the digits. False when there is
