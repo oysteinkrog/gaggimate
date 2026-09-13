@@ -2,9 +2,9 @@
 # Run the script after changing the source file; make check fails on a stale copy.
 """Built-in gradients, for the on-display settings UI runner.
 
-The runner drives the Gradient row by the name the display shows, and the
-firmware table it has to agree with (BgAnimThemes.cpp) compiles only outside
-GAGGIMATE_SIM, so there is no route the runner could read it from instead.
+The runner is Python and drives the display over HTTP, so it cannot call
+the firmware table it has to agree with. It gets its own copy from the same
+source file instead, which is what keeps the two in step.
 """
 
 # The category order the pickers group by.

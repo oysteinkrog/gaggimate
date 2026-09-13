@@ -497,7 +497,7 @@ telemetry-driven screen from a 650 ms LVGL pass (1.5 Hz widget updates,
   block.** Only the bench and loadtest builds define it, and twice the
   production env stopped building without anyone noticing for a day: the
   anonymous namespace was closed inside the block, and the planar kernel
-  itself was inside it (fixed 2026-09-08, d0781460 and 45367098). The
+  itself was inside it (fixed 2026-09-08, d0781460 and 45367098).
   **That build works in a worktree, whatever this file said before**
   (2026-09-13): `-e display` linked here in 5 min 17 s, 5,895,863 B of a
   6,553,600 B app partition (90.0%), with the real 505,988 B web blob. The
