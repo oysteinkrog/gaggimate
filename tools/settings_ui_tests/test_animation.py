@@ -1030,13 +1030,32 @@ def check_frame_rate_live_and_precedence(rig):
 
     if web_save_available(rig):
         fps_web = next(c for c in (40, 45, 50, 55, 20, 25, 15, 10) if c not in (fps0, fps1))
-        web_save(rig, {"bgAnimFps": fps_web})
-        check(rig, "web_save_landed", int(rig.settings()["bgAnimFps"]) == fps_web,
-              "got %r want %d" % (rig.settings()["bgAnimFps"], fps_web))
+        # bgAnimFps is a live field the open category restores within a UI
+        # pass (gm-nov3.39), so it cannot confirm its own POST. A field of the
+        # same form that no row of this category writes does: the document
+        # goes in one batchUpdate, so the witness arriving proves the request
+        # was accepted and applied (settings_ui_tests/README.md, "Confirming
+        # a web save landed").
+        bright0 = int(rig.settings()["bgAnimBrightness"])
+        bright_web = next(c for c in (95, 90, 85, 80) if c != bright0)
+        web_save(rig, {"bgAnimFps": fps_web, "bgAnimBrightness": bright_web})
+        landed = rig.wait_until(lambda: int(rig.settings()["bgAnimBrightness"]) == bright_web, timeout=6)
+        check(rig, "web_save_landed", bool(landed),
+              "witness bgAnimBrightness got %r want %d" % (rig.settings()["bgAnimBrightness"], bright_web))
+
+        # Before the pop: reconciliation has to put this visit's value back
+        # into the field the panel reads. After the pop commit has written it,
+        # so a version that reconciled nothing would pass either way.
+        live = rig.wait_until(lambda: int(rig.settings()["bgAnimFps"]) == fps1, timeout=6)
+        check(rig, "touched_field_live_before_pop", bool(live),
+              "expected %d before the pop, got %r (web posted %d)"
+              % (fps1, rig.settings()["bgAnimFps"], fps_web))
 
         rig.settingsui(pop=1)
         ok = rig.wait_until(lambda: int(rig.settings()["bgAnimFps"]) == fps1, timeout=6)
         check(rig, "touched_field_precedence", bool(ok), "expected %d after pop, got %r" % (fps1, rig.settings()["bgAnimFps"]))
+        web_save(rig, {"bgAnimBrightness": bright0})
+        rig.wait_until(lambda: int(rig.settings()["bgAnimBrightness"]) == bright0, timeout=6)
     else:
         skip(rig, "touched_field_precedence",
              "the interfering save is a web save, and web_save runs on the simulator only")
@@ -2625,6 +2644,16 @@ def check_parameters_web_precedence(rig):
     d = page_with_row(rig, touched_row)
     check(rig, "params_touched_slot_keeps_draft", int(rig.row_value(d, touched_row)) == expected,
           "row %r shows %r, want %d" % (touched_row, rig.row_value(d, touched_row), expected))
+
+    # Before the pop, because the slots are live fields: reconciliation has to
+    # put the touched slot back into the string the panel re-parses every
+    # pass, while the untouched slot keeps the web's value (gm-nov3.39).
+    stored = params_group(rig.settings().get("bgAnimParams", ""), anim0).split(",")
+    check(rig, "params_touched_slot_stored_before_pop", stored and stored[0] == str(expected),
+          "slot 0 is %r, want %r (web posted %r)"
+          % (stored[0] if stored else None, str(expected), web_touched))
+    check(rig, "params_untouched_slot_stored_before_pop", len(stored) > 1 and stored[1] == web_untouched,
+          "slot 1 is %r, want %r" % (stored[1] if len(stored) > 1 else None, web_untouched))
 
     rig.settingsui(pop=1)
     wait_depth(rig, 1)
