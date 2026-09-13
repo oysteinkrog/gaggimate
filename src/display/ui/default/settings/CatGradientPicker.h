@@ -60,8 +60,15 @@ struct SettingsGradientPickerSpec {
     const char *(*currentRef)(void *user) = nullptr;
 
     // A choice. `ref` is the same grammar, already validated against the
-    // stored library under Settings::Guard, so the callee only has to write
-    // it where it belongs.
+    // stored library, so the callee only has to write it where it belongs.
+    //
+    // Called with Settings::Guard held, inside the same transaction as that
+    // validation (gm-nov3.17, GradientPickTransaction.h): a web save cannot
+    // delete the entry between the two, and every write the callee makes is
+    // part of one transaction, so a pair that must agree with each other (the
+    // global ref and its legacy mirror) cannot be split either. The guard is
+    // recursive, so a callee that takes its own for a read-modify-write is
+    // still correct. Keep the callee short and do not block in it.
     void (*onPick)(void *user, const char *ref) = nullptr;
 
     // Bring the opening category's retained draft up to date after a web

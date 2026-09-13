@@ -12,11 +12,15 @@
 //
 // Two rules the pages are built around:
 //
-// A choice is validated against the stored data before it is written. The
-// list a page shows was built when the page was entered, and a web save can
-// delete the library entry a row names while the finger is on the way down.
-// The tap re-resolves the ref under Settings::Guard and, if it no longer
-// names anything, closes the picker rather than writing a stale ref.
+// A choice is validated against the stored data before it is written, and
+// the validation and the write are one transaction. The list a page shows
+// was built when the page was entered, and a web save can delete the library
+// entry a row names while the finger is on the way down. The tap re-resolves
+// the ref and, if it no longer names anything, closes the picker rather than
+// writing a stale ref. Both steps run inside the single Settings::Guard that
+// gradientPickTransaction (GradientPickTransaction.h) holds over its whole
+// body, so a web batchUpdate cannot land in between and delete an entry the
+// resolve has already approved.
 //
 // The picker stays on the slot it was opened for. SettingsUI::service()
 // reconciles only the top page, so while the picker is open the opening
@@ -26,6 +30,7 @@
 // the picker at a different animation, which is the Parameters page's rule
 // too (CatAnimParams.cpp).
 #include "CatGradientPicker.h"
+#include "GradientPickTransaction.h"
 #include "GradientSwatch.h"
 #include "SettingsModel.h"
 #include "SettingsRows.h"
@@ -186,35 +191,55 @@ bool rampForChoice(const PickerCtx *ctx, int choice, uint16_t *ramp) {
 
 void pickerPushGroup(SettingsUI &ui, PickerCtx *parent, int group);
 
-// A choice, from either page. Validates the ref against the stored data,
-// hands it to the opening category and then leaves the picker. The order
-// matters: onPick updates that category's draft, and popPages rebuilds its
-// page from the draft on the way out, so a pick after the pop would show the
-// old value until something else redrew the page.
+// Production's side of gradientPickTransaction: the three steps that have to
+// be one transaction, and nothing else. The picker's own guard is what covers
+// them, so the opening category's onPick needs no guard of its own for the
+// selection to be atomic; animGradientPicked still takes one for its
+// read-modify-write of the map string, which nests because Settings::Guard is
+// recursive.
+struct PickOps {
+    using Guard = Settings::Guard;
+
+    const SettingsGradientPickerSpec &spec;
+
+    Settings &guarded() { return controller.getSettings(); }
+
+    bool refResolves(const char *ref) {
+        settingsui::SwatchGradient gradient;
+        return settingsui::swatchResolveRef(ref, storedLibrary().c_str(), gradient);
+    }
+
+    bool targetValid() { return spec.stillValid == nullptr || spec.stillValid(spec.user); }
+
+    void assign(const char *ref) {
+        if (spec.onPick != nullptr) {
+            spec.onPick(spec.user, ref);
+        }
+    }
+};
+
+// A choice, from either page. Runs the selection as one guarded transaction
+// and then leaves the picker. The order matters: onPick updates the opening
+// category's draft, and popPages rebuilds its page from the draft on the way
+// out, so a pick after the pop would show the old value until something else
+// redrew the page. popPages stays outside the transaction: it deletes LVGL
+// objects and runs the category's commit, which takes the lock itself.
 void applyPick(PickerCtx *ctx, const std::string &ref, int depth) {
     SettingsUI *ui = ctx->ui;
     if (ui == nullptr) {
         return;
     }
     const SettingsGradientPickerSpec spec = ctx->spec; // copied: the pop below frees ctx
-    bool valid = ref.empty();                          // "" is Global, which names no gradient
-    if (!valid) {
-        Settings::Guard guard(controller.getSettings());
-        settingsui::SwatchGradient gradient;
-        valid = settingsui::swatchResolveRef(ref.c_str(), storedLibrary().c_str(), gradient);
-    }
-    if (!valid) {
+    PickOps ops{spec};
+    switch (settingsui::gradientPickTransaction(ops, ref.c_str())) {
+    case settingsui::GradientPickOutcome::RefGone:
         ESP_LOGW("SettingsUI", "SettingsGradientPicker: %s no longer resolves, closing without a change", ref.c_str());
-        ui->popPages(depth);
-        return;
-    }
-    if (spec.stillValid != nullptr && !spec.stillValid(spec.user)) {
+        break;
+    case settingsui::GradientPickOutcome::TargetGone:
         ESP_LOGW("SettingsUI", "SettingsGradientPicker: the edited slot is gone, closing without a change");
-        ui->popPages(depth);
-        return;
-    }
-    if (spec.onPick != nullptr) {
-        spec.onPick(spec.user, ref.c_str());
+        break;
+    case settingsui::GradientPickOutcome::Assigned:
+        break;
     }
     ui->popPages(depth);
 }

@@ -24,6 +24,10 @@
 //   F -- time zones (real 461-entry table)
 //   G -- wake-up schedules
 //   H -- background animation parameters (the packed bgAnimParams string)
+//   I -- the frozen legacy bgAnimTheme namespace and explicit refs
+//   J -- the legacy custom gradient's migration
+//   K -- fault injection across the persistence steps
+//   L -- the gradient pick transaction (validate and assign as one)
 
 // Group I and J below need a built-in table longer than the one this build
 // ships, because the whole point of freezing the legacy sentinel is what
@@ -43,6 +47,9 @@
 #include "display/core/zones.cpp"
 #include "display/ui/default/bganim/BgAnimThemes.cpp"
 #include "display/ui/default/settings/SettingsModel.cpp"
+// Header-only and free of Arduino, LVGL and controller: group K instantiates
+// the production pick transaction against a fake Settings (gm-nov3.17).
+#include "display/ui/default/settings/GradientPickTransaction.h"
 // The provider the simulator builds, so group D checks that path too and not
 // just the bg_theme_* functions this file happens to link (see the header).
 #include "display/ui/default/bganim/BgAnimThemeTable.h"
@@ -1837,6 +1844,245 @@ static void test_migrate_reboot_after_each_durable_step() {
 }
 
 // ---------------------------------------------------------------------------
+// Group L -- the gradient pick transaction (gm-nov3.17)
+// ---------------------------------------------------------------------------
+//
+// What this checks, and what it cannot. gradientPickTransaction is the
+// production template the display's gradient picker runs a tap through
+// (CatGradientPicker.cpp's applyPick is its only call site). The template is
+// the code under test here; the Ops below are a fake one, with a modelled
+// lock and a scripted web writer that behaves the way the device's does: it
+// blocks while the lock is held and its write lands at the release.
+//
+// So these cases prove that the template keeps the resolve, the target check
+// and the assignment inside one lock scope, and that no library change can
+// become visible between the resolve and the assignment. If someone splits
+// the transaction again, the writer's deletion lands in the gap and
+// test_gradient_pick_excludes_a_deletion_during_the_transaction fails.
+//
+// They do not prove that the device's Settings::Guard is a real mutex: that
+// is Settings.cpp (xSemaphoreTakeRecursive, untouched by this bead), and a
+// no-op under GAGGIMATE_SIM, which is why the simulator cannot show any of
+// this.
+
+namespace pickfake {
+
+// The stored library, plus the lock that orders whole transactions against
+// the web save. `revision` moves on every write, which is how a test tells
+// that the data under a transaction did not change while it ran.
+struct World {
+    std::vector<std::string> refs;
+    int revision = 0;
+    int lockDepth = 0;
+
+    // A web deletion waiting on the lock, the way a batchUpdate on the async
+    // task waits on Settings::lock().
+    bool pending = false;
+    std::string pendingRef;
+    int blocked = 0; // times a write had to wait for the lock
+
+    bool has(const std::string &ref) const {
+        for (const std::string &r : refs) {
+            if (r == ref) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // What the web task does. Outside the lock it lands at once; inside, it
+    // waits and is applied when the last holder releases.
+    void webDelete(const std::string &ref) {
+        if (lockDepth > 0) {
+            pending = true;
+            pendingRef = ref;
+            blocked++;
+            return;
+        }
+        erase(ref);
+    }
+
+    void erase(const std::string &ref) {
+        for (size_t i = 0; i < refs.size(); i++) {
+            if (refs[i] == ref) {
+                refs.erase(refs.begin() + static_cast<long>(i));
+                revision++;
+                return;
+            }
+        }
+    }
+
+    void release() {
+        if (pending) {
+            pending = false;
+            erase(pendingRef);
+        }
+    }
+};
+
+struct Guard {
+    World &world;
+    explicit Guard(World &w) : world(w) { world.lockDepth++; }
+    ~Guard() {
+        if (--world.lockDepth == 0) {
+            world.release();
+        }
+    }
+    Guard(const Guard &) = delete;
+    Guard &operator=(const Guard &) = delete;
+};
+
+// The fake picker. `duringResolve` is the concurrent web save: it runs at the
+// moment the transaction has finished resolving the ref, which is the exact
+// window this bead is about.
+struct Ops {
+    using Guard = pickfake::Guard;
+
+    World &world;
+    bool target = true;
+    std::string duringResolve; // a ref the web task tries to delete, or ""
+
+    int resolves = 0;
+    int assigns = 0;
+    std::string assignedRef;
+    int assignedAtRevision = -1;
+    int assignedAtDepth = 0;
+    bool assignedRefWasPresent = false;
+
+    explicit Ops(World &w) : world(w) {}
+
+    World &guarded() { return world; }
+
+    bool refResolves(const char *ref) {
+        resolves++;
+        const bool ok = world.has(ref);
+        if (!duringResolve.empty()) {
+            world.webDelete(duringResolve);
+        }
+        return ok;
+    }
+
+    bool targetValid() { return target; }
+
+    void assign(const char *ref) {
+        assigns++;
+        assignedRef = ref;
+        assignedAtRevision = world.revision;
+        assignedAtDepth = world.lockDepth;
+        assignedRefWasPresent = world.has(ref);
+    }
+};
+
+World twoEntries() {
+    World w;
+    w.refs.push_back("c1");
+    w.refs.push_back("c2");
+    return w;
+}
+
+} // namespace pickfake
+
+// The ordinary tap: resolved and assigned inside one lock scope, with the
+// stored data unchanged in between.
+static void test_gradient_pick_assigns_inside_one_lock() {
+    pickfake::World world = pickfake::twoEntries();
+    pickfake::Ops ops(world);
+    const int before = world.revision;
+    TEST_ASSERT_EQUAL(static_cast<int>(settingsui::GradientPickOutcome::Assigned),
+                      static_cast<int>(settingsui::gradientPickTransaction(ops, "c2")));
+    TEST_ASSERT_EQUAL(1, ops.assigns);
+    TEST_ASSERT_EQUAL_STRING("c2", ops.assignedRef.c_str());
+    TEST_ASSERT_TRUE(ops.assignedAtDepth > 0);         // the lock was held at the write
+    TEST_ASSERT_EQUAL(before, ops.assignedAtRevision); // nothing landed in between
+    TEST_ASSERT_TRUE(ops.assignedRefWasPresent);
+    TEST_ASSERT_EQUAL(0, world.lockDepth); // and released on the way out
+}
+
+// The entry was already gone when the finger landed: the tap is refused and
+// nothing is written, so nothing is marked touched either.
+static void test_gradient_pick_refuses_a_ref_deleted_before_the_tap() {
+    pickfake::World world = pickfake::twoEntries();
+    world.webDelete("c2");
+    pickfake::Ops ops(world);
+    TEST_ASSERT_EQUAL(static_cast<int>(settingsui::GradientPickOutcome::RefGone),
+                      static_cast<int>(settingsui::gradientPickTransaction(ops, "c2")));
+    TEST_ASSERT_EQUAL(0, ops.assigns);
+    TEST_ASSERT_EQUAL(0, world.lockDepth);
+}
+
+// The regression this bead is about. The web task tries to delete the very
+// entry the tap has just resolved. It cannot land while the transaction
+// holds the lock, so the assignment still sees the library the resolve
+// approved; the deletion takes effect afterwards. A transaction that
+// released the lock after resolving would assign a ref that had already
+// stopped naming anything.
+static void test_gradient_pick_excludes_a_deletion_during_the_transaction() {
+    pickfake::World world = pickfake::twoEntries();
+    pickfake::Ops ops(world);
+    ops.duringResolve = "c2";
+    TEST_ASSERT_EQUAL(static_cast<int>(settingsui::GradientPickOutcome::Assigned),
+                      static_cast<int>(settingsui::gradientPickTransaction(ops, "c2")));
+    TEST_ASSERT_EQUAL(1, world.blocked); // the writer did try
+    TEST_ASSERT_EQUAL(1, ops.assigns);
+    TEST_ASSERT_TRUE(ops.assignedRefWasPresent);  // validated against the library in force
+    TEST_ASSERT_EQUAL(0, ops.assignedAtRevision); // which had not moved
+    TEST_ASSERT_FALSE(world.has("c2"));           // and the deletion landed at the release
+    TEST_ASSERT_EQUAL(1, world.revision);
+}
+
+// A deletion of some other entry during the transaction is excluded the same
+// way: one transaction, not one field.
+static void test_gradient_pick_excludes_an_unrelated_deletion_too() {
+    pickfake::World world = pickfake::twoEntries();
+    pickfake::Ops ops(world);
+    ops.duringResolve = "c1";
+    TEST_ASSERT_EQUAL(static_cast<int>(settingsui::GradientPickOutcome::Assigned),
+                      static_cast<int>(settingsui::gradientPickTransaction(ops, "c2")));
+    TEST_ASSERT_EQUAL(0, ops.assignedAtRevision);
+    TEST_ASSERT_TRUE(ops.assignedRefWasPresent);
+    TEST_ASSERT_FALSE(world.has("c1"));
+    TEST_ASSERT_TRUE(world.has("c2"));
+}
+
+// The slot the picker was opened for is gone (an animation id that has left
+// the roster). The ref resolved, but nothing is written.
+static void test_gradient_pick_writes_nothing_when_the_target_is_gone() {
+    pickfake::World world = pickfake::twoEntries();
+    pickfake::Ops ops(world);
+    ops.target = false;
+    TEST_ASSERT_EQUAL(static_cast<int>(settingsui::GradientPickOutcome::TargetGone),
+                      static_cast<int>(settingsui::gradientPickTransaction(ops, "c2")));
+    TEST_ASSERT_EQUAL(1, ops.resolves);
+    TEST_ASSERT_EQUAL(0, ops.assigns);
+    TEST_ASSERT_EQUAL(0, world.lockDepth);
+}
+
+// The Global entry names no gradient, so there is nothing to resolve. It is
+// still assigned under the lock, because the writes behind it (the global ref
+// and its legacy mirror) have to agree with each other.
+static void test_gradient_pick_global_skips_resolution_but_keeps_the_lock() {
+    pickfake::World world; // empty library: nothing would resolve
+    pickfake::Ops ops(world);
+    TEST_ASSERT_EQUAL(static_cast<int>(settingsui::GradientPickOutcome::Assigned),
+                      static_cast<int>(settingsui::gradientPickTransaction(ops, "")));
+    TEST_ASSERT_EQUAL(0, ops.resolves);
+    TEST_ASSERT_EQUAL(1, ops.assigns);
+    TEST_ASSERT_EQUAL_STRING("", ops.assignedRef.c_str());
+    TEST_ASSERT_TRUE(ops.assignedAtDepth > 0);
+}
+
+// A null ref is the same case as Global, and reaches assign() as "" rather
+// than as a null the callee would have to defend against.
+static void test_gradient_pick_null_ref_is_global() {
+    pickfake::World world = pickfake::twoEntries();
+    pickfake::Ops ops(world);
+    TEST_ASSERT_EQUAL(static_cast<int>(settingsui::GradientPickOutcome::Assigned),
+                      static_cast<int>(settingsui::gradientPickTransaction(ops, nullptr)));
+    TEST_ASSERT_EQUAL(0, ops.resolves);
+    TEST_ASSERT_EQUAL_STRING("", ops.assignedRef.c_str());
+}
+
+// ---------------------------------------------------------------------------
 // Unity entrypoint
 // ---------------------------------------------------------------------------
 
@@ -1916,5 +2162,13 @@ int main(int argc, char **argv) {
     RUN_TEST(test_migrate_survives_a_failed_ref_write);
     RUN_TEST(test_migrate_survives_a_clear_that_lies);
     RUN_TEST(test_migrate_reboot_after_each_durable_step);
+
+    RUN_TEST(test_gradient_pick_assigns_inside_one_lock);
+    RUN_TEST(test_gradient_pick_refuses_a_ref_deleted_before_the_tap);
+    RUN_TEST(test_gradient_pick_excludes_a_deletion_during_the_transaction);
+    RUN_TEST(test_gradient_pick_excludes_an_unrelated_deletion_too);
+    RUN_TEST(test_gradient_pick_writes_nothing_when_the_target_is_gone);
+    RUN_TEST(test_gradient_pick_global_skips_resolution_but_keeps_the_lock);
+    RUN_TEST(test_gradient_pick_null_ref_is_global);
     return UNITY_END();
 }
