@@ -49,11 +49,18 @@ bool tablesValid = false, laneSafe = false;
 uint32_t lastThemeGen = 0xFFFFFFFF;
 uint8_t lastP[4] = {255, 255, 255, 255};
 
-// At 480x480, all tables are allocHot: radCol 1920, radRow 1920, bgRow 960,
-// spanPx 960, dith 128, paletteStorage 1408, smooth 514 (528 aligned), weights
-// 960. Payload 8770 B, slab 8784 B of 9216 B. The palette is 32-bit because
-// EE.LDXQ.32 scales its index by four. ozHalf and osHalf are read once a row,
-// so they are PSRAM, 960 B each.
+// At 480x480 the per-pixel tables take 8,784 B of the resident 9,216 B slab
+// (8,770 B of payload, the rest alignment): radCol 1,920 B, radRow 1,920 B,
+// bgRow 960 B, spanPx 960 B, dith 128 B, paletteStorage 1,408 B, smooth 514 B
+// (528 aligned), weights 960 B. Read back as hot_used on /api/debug/heap with
+// this animation resident rather than added up here.
+// paletteStorage is 32-bit because EE.LDXQ.32 scales its index by four and so
+// can only gather from a 32-bit table. That costs 704 B more than the 16-bit
+// version would.
+// Six row tables are in PSRAM, 960 B each, 5,760 B in all: ozHalf and osHalf,
+// the outer disc's chord half widths, and czLoRow, czHiRow, csLoRow and
+// csHiRow, the cut's per-row coverage boundaries. Each is read once per row
+// rather than per pixel, which is the rule for what may leave the slab.
 // The borrowed sine is 2048 B in the existing shared reservation. The palette
 // has 256 real theme entries plus clamped ends for the device's plain gather.
 // Exact integer roots. The float root is within one of the true value over
