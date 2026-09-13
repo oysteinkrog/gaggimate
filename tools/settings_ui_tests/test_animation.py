@@ -351,20 +351,121 @@ def goto_page(rig, page):
     return rig.touchmap(screen=0)
 
 
+class AmbiguousRowName(AssertionError):
+    """A visible row name that more than one row of the open list carries.
+
+    Raised rather than resolved (gm-nov3.34). Every tag on a page is built
+    from the row's name, so a helper handed a repeated name has no way to
+    tell which row the caller meant, and the first row is not a safer guess
+    than any other: with two saved gradients both called "Custom", taking
+    the first made a check about the second read, tap and mark the first and
+    pass. A caller that means one of them addresses it by its position in
+    the list, which is unique where the name is not."""
+
+    def __init__(self, name, places):
+        self.name = name
+        self.places = list(places)
+        super().__init__(
+            "row name %r is carried by %d rows of this list (%s); address one by index instead"
+            % (name, len(self.places),
+               ", ".join("index %d on page %d" % (index, page) for page, index in self.places)))
+
+
+def raises_ambiguity(call):
+    """Whether `call` refused a repeated row name, as (raised, detail). Any
+    other exception is a failure with its type and message as the detail,
+    so a helper that breaks for an unrelated reason does not read as a
+    refusal."""
+    try:
+        call()
+    except AmbiguousRowName as e:
+        return True, str(e)
+    except Exception as e:  # noqa: BLE001 -- reported as the check's detail
+        return False, "raised %s: %s" % (type(e).__name__, e)
+    return False, "returned without raising"
+
+
+def list_rows(rig):
+    """Every row of the list on top, across all its pages, as
+    (page, index, slot_index, name) tuples in page order, with the dumps
+    they were read from.
+
+    `index` counts from the first row of the first page, so it is the row's
+    position in the list the user sees, and that position is what addresses
+    one of two rows sharing a name. `slot_index` is its position within its
+    own page, which is what Rig.row_slots indexes.
+
+    Every page is turned to, because a duplicate can sit on any of them: a
+    sweep that stopped at the first match is how the second "Custom" of the
+    repeated-name fixture became unreachable (gm-nov3.34). The shell is left
+    on the last page; row_place() and row_at() turn back."""
+    pages = int(rig.settingsui_state().get("pages", 1))
+    rows, dumps = [], {}
+    index = 0
+    for page in range(pages):
+        dump = goto_page(rig, page)
+        dumps[page] = dump
+        for slot_index, name in enumerate(rig.rows_on_page(dump)):
+            rows.append((page, index, slot_index, name))
+            index += 1
+    return rows, dumps
+
+
+def _turn_to_row(rig, page, slot_index, dumps, what):
+    """The (dump, slot) of one row from a list_rows() sweep, with the shell
+    turned back to its page. The sweep's own dump is reused when the shell
+    is still on that page (it is, for the last page of every sweep)."""
+    dump = dumps.get(page) if int(rig.settingsui_state().get("page", -1)) == page else None
+    if dump is None:
+        dump = goto_page(rig, page)
+    slots = rig.row_slots(dump)
+    if slot_index >= len(slots):
+        raise AssertionError("%s was slot %d of page %d during the sweep and that page now holds %d rows"
+                             % (what, slot_index, page, len(slots)))
+    return dump, slots[slot_index]
+
+
+def row_place(rig, name):
+    """The one row called `name` as (dump, slot, index), with the shell left
+    on its page. Raises AmbiguousRowName when the list holds more than one
+    row of that name, and AssertionError when it holds none."""
+    rows, dumps = list_rows(rig)
+    hits = [r for r in rows if r[3] == name]
+    if not hits:
+        raise AssertionError("no row %r on any of the %d pages; the list holds %r"
+                             % (name, len({p for p, _i, _s, _n in rows}), [n for _p, _i, _s, n in rows]))
+    if len(hits) > 1:
+        raise AmbiguousRowName(name, [(p, i) for p, i, _s, _n in hits])
+    page, index, slot_index, _n = hits[0]
+    dump, slot = _turn_to_row(rig, page, slot_index, dumps, "row %r" % name)
+    return dump, slot, index
+
+
+def row_at(rig, index):
+    """The row at list position `index` as (dump, slot), with the shell left
+    on its page. The address a repeated name cannot give."""
+    rows, dumps = list_rows(rig)
+    for page, i, slot_index, _name in rows:
+        if i == index:
+            return _turn_to_row(rig, page, slot_index, dumps, "row index %d" % index)
+    raise AssertionError("no row at index %d; the list holds %d rows" % (index, len(rows)))
+
+
 def page_with_row(rig, name):
     """Turns to the page carrying the row called `name` and returns its dump.
     Addressed by name rather than by page number because this category's rows
     move across page boundaries whenever one is added: gm-3vj.2's Parameters
     row pushed five of them onto the next page and made a fourth page. The
     audit table (audit_pages.py) still pins the exact per-page row lists, so
-    nothing here has to."""
-    state = rig.settingsui_state()
-    pages = int(state.get("pages", 1))
-    for page in range(pages):
-        dump = goto_page(rig, page)
-        if rig.find_tag(dump, name, "value") is not None:
-            return dump
-    raise AssertionError("no row %r on any of the %d pages" % (name, pages))
+    nothing here has to.
+
+    Every page is searched, not just pages up to the first hit, and a name
+    two rows carry raises AmbiguousRowName (gm-nov3.34). It used to return
+    the first page holding the name, so with the two "Custom" entries of the
+    repeated-name fixture on different pages the second one could not be
+    reached at all: every helper that goes through here landed on the first
+    one's page and then read, tapped or marked that row instead."""
+    return row_place(rig, name)[0]
 
 
 def tap_row(rig, name, role):
@@ -408,11 +509,8 @@ def rows_across_pages(rig):
     reports them. This used to drop a name it had already seen, which on
     the library list meant two saved gradients called "Custom" read as one
     row and the list read one entry short."""
-    pages = int(rig.settingsui_state().get("pages", 1))
-    names = []
-    for page in range(pages):
-        names.extend(rig.rows_on_page(goto_page(rig, page)))
-    return names
+    rows, _dumps = list_rows(rig)
+    return [name for _page, _index, _slot, name in rows]
 
 
 def open_picker(rig, row):
@@ -434,18 +532,36 @@ def open_picker(rig, row):
     return rig.touchmap(screen=0)
 
 
-def picker_tap(rig, name):
-    """Turns to the picker page carrying `name` and taps it. Returns the dump
-    of whatever is on screen afterwards."""
-    dump = page_with_row(rig, name)
-    target = rig.find_tag(dump, name, "action")
+def picker_tap_slot(rig, dump, slot, what):
+    """Taps the whole-row target of one picker row, addressed by its slot.
+    `what` names the row in the failure message."""
+    target = rig.find_in_row(dump, slot, "action")
     if target is None:
-        raise AssertionError("no picker row %r on its page" % name)
+        raise AssertionError("picker row %s offers no whole-row target" % what)
     rig.tap_target(target)
     return rig.touchmap(screen=0)
 
 
-def picker_choose(rig, group, name):
+def picker_tap(rig, name):
+    """Turns to the picker page carrying `name` and taps it. Returns the dump
+    of whatever is on screen afterwards.
+
+    The row is taken from its slot rather than from find_tag, and a name two
+    rows carry raises AmbiguousRowName (gm-nov3.34): both rows carry the tag
+    "<name>/action", so tapping the second of them by name was impossible and
+    asking for it tapped the first without saying so. picker_tap_at() is the
+    address that works on a repeated name."""
+    dump, slot, _index = row_place(rig, name)
+    return picker_tap_slot(rig, dump, slot, repr(name))
+
+
+def picker_tap_at(rig, index):
+    """The same tap, by the row's position in the list across its pages."""
+    dump, slot = row_at(rig, index)
+    return picker_tap_slot(rig, dump, slot, "at index %d" % index)
+
+
+def picker_choose(rig, group, name, index=None):
     """Opens a group, chooses one gradient in it, and leaves the picker, so
     the caller is back on the page that opened it.
 
@@ -454,14 +570,29 @@ def picker_choose(rig, group, name):
     what leaves, so this helper taps it on the way out, once per level. Every
     caller here wants one choice and then the page underneath, which is what
     it did before; a check that wants to see the picker still open after a
-    pick drives the taps itself."""
+    pick drives the taps itself.
+
+    `index` chooses the row at that position in the list instead of the one
+    called `name`, which is the only way to reach one of two rows sharing a
+    name; `name` is then only what the failure messages say.
+
+    The marker is checked by position (gm-nov3.34). This used to wait on
+    `name in picker_selected_rows(rig)`, and with two library rows called
+    "Custom" a marker landing on the wrong one satisfied that membership: the
+    helper returned having confirmed the row it had not chosen, and ten
+    checks reach here. The wait now asks for the marker on the row that was
+    tapped and on no other row."""
     before = depth(rig)
     picker_tap(rig, group)
     rig.wait_until(lambda: depth(rig) == before + 1, timeout=5)
-    picker_tap(rig, name)
+    if index is None:
+        dump, slot, index = row_place(rig, name)
+        picker_tap_slot(rig, dump, slot, repr(name))
+    else:
+        picker_tap_at(rig, index)
     # The marker lands on the tapped row in the same UI pass that applies the
     # pick, so waiting for it is waiting for the write as well.
-    rig.wait_until(lambda: name in picker_selected_rows(rig), timeout=5)
+    rig.wait_until(lambda: picker_selected_slots(rig) == [index], timeout=5)
     picker_cancel(rig)
     picker_cancel(rig)
     rig.wait_until(lambda: depth(rig) == before - 1, timeout=5)
@@ -478,9 +609,10 @@ def picker_cancel(rig):
     rig.wait_until(lambda: depth(rig) == before - 1, timeout=5)
 
 
-def picker_selected_rows(rig):
+def picker_selected(rig):
     """The picker rows whose marker dot is showing, across all pages of the
-    page on top, named in page order.
+    page on top, as (index, name) pairs in page order. `index` is the row's
+    position in the list, the way list_rows() counts.
 
     Walked by position rather than looked up by name (gm-nov3.33). Every tag
     on a page is built from the row's name, so find_tag handed back the first
@@ -488,25 +620,48 @@ def picker_selected_rows(rig):
     called "Custom" and the second one selected, this reported no marked row
     at all, and reported the first one as marked when the second was. Rig
     keeps rows_on_page and row_slots in the same order, so zipping them names
-    the row a slot belongs to.
-
-    What comes back is still names, so on a repeated name it says one row of
-    that name is marked and not which one. A check that needs that reads the
-    slots directly, the way check_gradient_picker_repeated_names does."""
+    the row a slot belongs to."""
     pages = int(rig.settingsui_state().get("pages", 1))
     marked = []
+    index = 0
     for page in range(pages):
         dump = goto_page(rig, page)
         for name, slot in zip(rig.rows_on_page(dump), rig.row_slots(dump)):
             if slot_marked(rig, dump, slot):
-                marked.append(name)
+                marked.append((index, name))
+            index += 1
     return marked
 
 
-def swatch_strip(rig, dump, row, data=None):
+def picker_selected_rows(rig):
+    """The marked picker rows by name, in page order.
+
+    Names, so on a repeated name this says one row of that name is marked and
+    not which one: the 19 checks that read it compare against a name they
+    expect. A check about which of two rows sharing a name is marked reads
+    picker_selected_slots() instead, and so does picker_choose."""
+    return [name for _index, name in picker_selected(rig)]
+
+
+def picker_selected_slots(rig):
+    """The marked picker rows by list position, in page order. The address
+    that stays true on a repeated name (gm-nov3.34)."""
+    return [index for index, _name in picker_selected(rig)]
+
+
+def swatch_strip(rig, dump, row=None, data=None, slot=None):
     """The row's swatch as a list of RGB triples, read straight out of the
     full-resolution framebuffer along the middle of the canvas. None when
     the row has no visible swatch. `data` reuses a framebuffer already read.
+
+    The row is found among the dumped page's own row containers, so `row` has
+    to name exactly one of them: a name two rows carry raises
+    AmbiguousRowName (gm-nov3.34). It used to go through find_tag, which
+    reads the first row of a repeated name whichever one was asked for, so
+    both "Custom" rows of the repeated-name fixture reported the first one's
+    swatch and a check that a row draws its own gradient could not fail.
+    `slot` reads the swatch of one row of the dump by position, from
+    Rig.row_slots, which is how a repeated name is addressed.
 
     Rig.fb() is what reads it, so a body shorter than the X-FB-Size header
     promised raises with both byte counts instead of being sampled. That
@@ -514,7 +669,20 @@ def swatch_strip(rig, dump, row, data=None):
     bytes at step 1 (gm-6ivh, fixed in 28cec8ec), and reading a swatch out
     of the five rows that arrived would have been a narrower sample with
     nothing to say so."""
-    obj = rig.find_tag(dump, row, "swatch")
+    if slot is None:
+        if row is None:
+            raise AssertionError("swatch_strip needs a row name or a slot")
+        slots = rig.row_slots(dump)
+        hits = [s for s in slots if rig.tag_row(s) == row]
+        if len(hits) > 1:
+            # Slot numbers within the dumped page, which is the only address
+            # this signature has: the caller brought the dump, not the list.
+            page = int(rig.settingsui_state().get("page", -1))
+            raise AmbiguousRowName(row, [(page, i) for i, s in enumerate(slots) if rig.tag_row(s) == row])
+        if not hits:
+            return None
+        slot = hits[0]
+    obj = rig.find_in_row(dump, slot, "swatch")
     if obj is None or obj.get("h"):
         return None
     if data is None:
@@ -936,23 +1104,53 @@ def check_theme_recolor(rig):
     close_animation(rig)
 
 
+def library_row_index(settings, ref):
+    """The position of a "cN" ref in the My gradients list, or None when the
+    library holds no such entry. The picker lists the library in stored
+    order, so an entry's place in library_entries() is its row's place in
+    the list, and that is the address a repeated name cannot give
+    (gm-nov3.34)."""
+    if not str(ref).startswith("c") or not str(ref)[1:].isdigit():
+        return None
+    wanted = int(str(ref)[1:])
+    for index, (entry_id, _name, _gradient) in enumerate(library_entries(settings.get("bgAnimGradients", ""))):
+        if entry_id == wanted:
+            return index
+    return None
+
+
 def pick_ref(rig, row, settings, ref):
     """Chooses `ref` through the picker opened from `row`: "" taps Global on
     the first page, a decimal index opens its category, "cN" opens My
-    gradients. Used both to make a choice and to put one back."""
+    gradients. Used both to make a choice and to put one back.
+
+    A "cN" ref is chosen by its position in the library, not by the name it
+    resolves to (gm-nov3.34). Saved gradient names are whatever the user
+    typed, so two entries can carry one name, and restoring the second of
+    them by name silently selected the first. Built-in names are unique (60
+    of 60, generated from data/gradients.json), so a built-in is still
+    chosen by name."""
     open_picker(rig, row)
     if ref == "":
-        picker_tap(rig, "Global")
+        dump, slot, index = row_place(rig, "Global")
+        picker_tap_slot(rig, dump, slot, "'Global'")
         # Assigning Global keeps the picker open too (gm-nov3.31), so the
         # marker is what says the tap landed and the chevron is what leaves.
-        rig.wait_until(lambda: "Global" in picker_selected_rows(rig), timeout=5)
+        # Membership of the Global row's own index, because this page can
+        # also mark the group the global gradient itself belongs to.
+        rig.wait_until(lambda: index in picker_selected_slots(rig), timeout=5)
         picker_cancel(rig)
         return
     name = gradient_name_for_ref(settings, ref)
     if name is None:
         raise AssertionError("ref %r names nothing the picker can choose" % ref)
-    group = "My gradients" if ref.startswith("c") else GRADIENT_CATEGORY_OF[int(ref)]
-    picker_choose(rig, group, name)
+    if str(ref).startswith("c"):
+        index = library_row_index(settings, ref)
+        if index is None:
+            raise AssertionError("ref %r is not in the library the picker lists" % ref)
+        picker_choose(rig, "My gradients", name, index=index)
+        return
+    picker_choose(rig, GRADIENT_CATEGORY_OF[int(ref)], name)
 
 
 def picker_choose_from_row(rig, row, group, name):
@@ -1449,31 +1647,52 @@ def check_gradient_picker_reachability(rig):
     close_animation(rig)
 
 
-# The repeated-name fixture (gm-xiu6, gm-nov3.28). Twelve entries, five to a
-# page, so three pages with the last one partial: the same shape the bench
-# board's library had. Two are called "Custom" and they are not adjacent, so
-# a reading that keeps only the first of a name loses the twelfth row rather
-# than the second.
+# The repeated-name fixture (gm-xiu6, gm-nov3.28, gm-nov3.34). Twelve
+# entries, five to a page, so three pages with the last one partial: the
+# same shape the bench board's library had. Two names repeat, and each pair
+# reaches a different fault:
 #
-# c1 and c3 carry different stops on purpose. With the same stops in both,
-# nothing downstream of the name could tell the two rows apart: both rows
-# drawing c1's swatch, a tap on the second row writing c1, the two entries'
-# callbacks swapped and the selection marker on the wrong duplicate all
-# looked identical to a check that read names and counts. Each is a flat run
-# toward one primary, so the difference survives whatever the tone setting
-# does to a swatch, and neither can be confused with the grey ramp the other
-# ten carry.
-REPEATED_NAMES = ["Custom", "Sunrise", "Custom"] + ["Saved %d" % n for n in range(4, 13)]
+#   "Custom" at list positions 0 and 5, which is page 0 and page 1. A helper
+#   that turned to the first page holding the name never reached the second
+#   row at all, so page_with_row's fault is only visible across a page
+#   boundary (gm-nov3.34). Both duplicates were on page 0 until then, which
+#   hid it completely.
+#
+#   "Sunrise" at positions 1 and 3, both on page 0. That is what keeps
+#   gm-xiu6's own fault reachable: a page reading that collects rows into a
+#   dict keyed by the name loses one of two rows on the same page, and no
+#   cross-page pair can show that.
+#
+# The four duplicated entries carry different stops on purpose. With the
+# same stops in both halves of a pair, nothing downstream of the name could
+# tell the two rows apart: both rows drawing the first one's swatch, a tap
+# on the second row writing the first one's ref, the two entries' callbacks
+# swapped and the selection marker on the wrong duplicate all looked
+# identical to a check that read names and counts. Each is a flat run toward
+# one primary, so the difference survives whatever the tone setting does to
+# a swatch, and none can be confused with the grey ramp the other eight
+# carry.
+REPEATED_NAMES = ["Custom", "Sunrise", "Saved 3", "Sunrise", "Saved 5", "Custom"] \
+    + ["Saved %d" % n for n in range(7, 13)]
 REPEATED_PLAIN_STOPS = "202020,f0f0f0"
-REPEATED_C1_STOPS = "ff0000,ff2000"
-REPEATED_C3_STOPS = "0000ff,0020ff"
+# List position -> (library id, stops). The id is the position plus one, the
+# way the web form numbers a saved gradient.
+REPEATED_DUPS = {
+    0: (1, "ff0000,ff2000"),   # "Custom", page 0
+    5: (6, "0000ff,0020ff"),   # "Custom", page 1
+    1: (2, "00ff00,20ff00"),   # "Sunrise", page 0
+    3: (4, "ff00ff,ff20ff"),   # "Sunrise", page 0
+}
+# The two pairs, as (list position, library id) each, in list order.
+REPEATED_CROSS_PAGE = ((0, 1), (5, 6))
+REPEATED_SAME_PAGE = ((1, 2), (3, 4))
 
 
 def repeated_names_library():
     """The fixture library string, and the stop string of every entry by id."""
     stops = [REPEATED_PLAIN_STOPS] * len(REPEATED_NAMES)
-    stops[0] = REPEATED_C1_STOPS
-    stops[2] = REPEATED_C3_STOPS
+    for index, (_entry_id, entry_stops) in REPEATED_DUPS.items():
+        stops[index] = entry_stops
     packed = ";".join("%d|%s|%s" % (i + 1, name, s)
                       for i, (name, s) in enumerate(zip(REPEATED_NAMES, stops)))
     return packed, {i + 1: s for i, s in enumerate(stops)}
@@ -1528,6 +1747,17 @@ def check_gradient_picker_repeated_names(rig):
     own ref, and a preselected ref marks that row and not its twin
     (gm-nov3.28).
 
+    The fixture repeats two names now, one pair inside page 0 and one pair
+    across the page 0/page 1 boundary, and the cross-page pair is what
+    reaches the last of the four helpers (gm-nov3.34): a helper that turned
+    to the first page holding the name read, tapped and marked the page 0
+    row whichever row it was asked for, and the page 1 row could not be
+    addressed at all. The same-page pair keeps gm-xiu6's own fault
+    reachable, which no cross-page pair can show. What a name cannot say,
+    the helpers now refuse to guess: page_with_row, picker_tap and
+    swatch_strip raise AmbiguousRowName on a repeated name, and the checks
+    below say so.
+
     Simulator only: the twelve-entry library is written through a web
     save."""
     if not web_save_available(rig):
@@ -1557,11 +1787,16 @@ def check_gradient_picker_repeated_names(rig):
           "%d rows listed for %d library entries: %r" % (len(listed), len(names), listed))
     check(rig, "repeated_names_rows_in_stored_order", listed == names,
           "got %r want %r" % (listed, names))
-    check(rig, "repeated_names_both_customs_listed", listed.count("Custom") == 2,
-          "%d rows named Custom in %r" % (listed.count("Custom"), listed))
+    for label, pair in (("customs", REPEATED_CROSS_PAGE), ("sunrises", REPEATED_SAME_PAGE)):
+        dup_name = names[pair[0][0]]
+        check(rig, "repeated_names_both_%s_listed" % label, listed.count(dup_name) == 2,
+              "%d rows named %r in %r" % (listed.count(dup_name), dup_name, listed))
 
     # The same count, read one page at a time, so the fix is in
-    # Rig.rows_on_page and not only in this file's walk over the pages.
+    # Rig.rows_on_page and not only in this file's walk over the pages. The
+    # repeat this reaches is the same-page pair: a page reading keyed by the
+    # name loses one of two rows on one page, and the cross-page pair cannot
+    # show that however the pages are walked.
     dump0 = goto_page(rig, 0)
     first_page = rig.rows_on_page(dump0)
     check(rig, "repeated_names_first_page_full", len(first_page) == 5,
@@ -1569,63 +1804,94 @@ def check_gradient_picker_repeated_names(rig):
     check(rig, "repeated_names_first_page_keeps_repeat", first_page == names[:5],
           "got %r want %r" % (first_page, names[:5]))
 
-    # Both Custom rows are on page 0, at slots 0 and 2, and each must draw
-    # its own entry. Slots, not names: find_tag would hand back the first
-    # Custom row's swatch for both.
+    # Each duplicate draws its own entry. Slots, not names: find_tag would
+    # hand back the first row of the name for both halves of a pair, and for
+    # the cross-page pair it would not reach page 1 at all.
     slots = rig.row_slots(dump0)
     slot_names = [rig.tag_row(o) for o in slots]
     check(rig, "repeated_names_slots_match_names", slot_names == names[:5], "%r" % (slot_names,))
-    _w, _h, fb = rig.fb(step=1)
-    strips = []
-    for slot_i, lib_id in ((0, 1), (2, 3)):
-        sw = rig.find_in_row(dump0, slots[slot_i], "swatch") if slot_i < len(slots) else None
-        strip = None
-        if sw is not None and not sw.get("h"):
-            y = (sw["y1"] + sw["y2"]) // 2
-            strip = [rgb565_pixel(fb, x, y) for x in range(sw["x1"], sw["x2"] + 1)]
-        strips.append(strip)
-        name = "repeated_names_slot%d_swatch_is_c%d" % (slot_i, lib_id)
+    strips = {}
+    for index, lib_id in REPEATED_CROSS_PAGE + REPEATED_SAME_PAGE:
+        # One framebuffer read per row, taken after the turn to its page:
+        # the pair straddles a page boundary, so one read cannot carry both
+        # halves of it.
+        dump, slot = row_at(rig, index)
+        strip = swatch_strip(rig, dump, slot=slot)
+        strips[index] = strip
+        name = "repeated_names_index%d_swatch_is_c%d" % (index, lib_id)
         if strip is None:
-            check(rig, name, False, "no visible swatch in slot %d" % slot_i)
+            check(rig, name, False, "no visible swatch at list index %d" % index)
             continue
         ok, detail = swatch_matches_stops(strip, stops_by_id[lib_id])
         check(rig, name, ok, detail)
-    check(rig, "repeated_names_custom_swatches_differ",
-          strips[0] is not None and strips[1] is not None and strips[0] != strips[1],
-          "first %r second %r" % (None if strips[0] is None else strips[0][0],
-                                  None if strips[1] is None else strips[1][0]))
+    for label, pair in (("customs", REPEATED_CROSS_PAGE), ("sunrises", REPEATED_SAME_PAGE)):
+        a, b = strips.get(pair[0][0]), strips.get(pair[1][0])
+        check(rig, "repeated_names_%s_swatches_differ" % label,
+              a is not None and b is not None and a != b,
+              "first %r second %r" % (None if a is None else a[0], None if b is None else b[0]))
+
+    # A repeated name is refused, not resolved. Every helper that used to
+    # take the first row of the name now says which rows carry it, and a
+    # name only one row carries still resolves.
+    dup = names[REPEATED_CROSS_PAGE[0][0]]
+    same_page_dup = names[REPEATED_SAME_PAGE[0][0]]
+    unique = names[2]
+    for helper, call in (
+            ("page_with_row", lambda: page_with_row(rig, dup)),
+            ("picker_tap", lambda: picker_tap(rig, dup)),
+            ("swatch_strip", lambda: swatch_strip(rig, goto_page(rig, 0), same_page_dup)),
+    ):
+        raised, detail = raises_ambiguity(call)
+        check(rig, "repeated_names_%s_refuses_a_repeated_name" % helper, raised, detail)
+    raised, detail = raises_ambiguity(lambda: page_with_row(rig, unique))
+    check(rig, "repeated_names_page_with_row_takes_a_unique_name", not raised, detail)
 
     picker_leave(rig)
 
-    # A tap on each Custom row writes that row's own ref. Waiting on the
-    # stored ref rather than on the depth, because a pick leaves the picker
-    # open (gm-nov3.31) and this check is about the write either way.
-    for slot_i, lib_id in ((2, 3), (0, 1)):
+    # A tap addressed by list position writes that row's own ref, for both
+    # halves of both pairs. Waiting on the stored ref rather than on the
+    # depth, because a pick leaves the picker open (gm-nov3.31) and this
+    # check is about the write either way.
+    for index, lib_id in (REPEATED_CROSS_PAGE[1], REPEATED_CROSS_PAGE[0], REPEATED_SAME_PAGE[1]):
         open_my_gradients(rig)
-        dump = goto_page(rig, 0)
-        slots = rig.row_slots(dump)
-        rig.tap_target(slots[slot_i])
+        picker_tap_at(rig, index)
         want = "c%d" % lib_id
         got = rig.wait_until(lambda: map_ref(rig.settings()["bgAnimThemeMap"], anim0) or None, timeout=5)
-        check(rig, "repeated_names_slot%d_tap_writes_c%d" % (slot_i, lib_id), got == want,
-              "slot %d wrote %r, want %r" % (slot_i, got, want))
+        check(rig, "repeated_names_index%d_tap_writes_c%d" % (index, lib_id), got == want,
+              "index %d wrote %r, want %r" % (index, got, want))
         picker_leave(rig)
 
     # A preselected ref marks its own row and not its twin. Written through
     # the web save so the marker is read on a picker the check did not tap
-    # its way into.
+    # its way into. Positions across the whole list, so a marker on the
+    # page 1 duplicate is told apart from one on the page 0 duplicate.
     close_animation(rig)
-    for slot_i, lib_id in ((0, 1), (2, 3)):
+    for index, lib_id in (REPEATED_CROSS_PAGE[0], REPEATED_CROSS_PAGE[1], REPEATED_SAME_PAGE[1]):
         web_save(rig, {"bgAnimThemeMap": map_write_ref(map0, anim0, "c%d" % lib_id)})
         rig.wait_until(lambda: map_ref(rig.settings()["bgAnimThemeMap"], anim0) == "c%d" % lib_id, timeout=5)
         open_animation(rig)
         open_my_gradients(rig)
-        dump = goto_page(rig, 0)
-        slots = rig.row_slots(dump)
-        marked = [i for i, o in enumerate(slots) if slot_marked(rig, dump, o)]
-        check(rig, "repeated_names_c%d_marks_slot%d" % (lib_id, slot_i), marked == [slot_i],
-              "marked slots %r, want [%d]" % (marked, slot_i))
+        marked = picker_selected_slots(rig)
+        check(rig, "repeated_names_c%d_marks_index%d" % (lib_id, index), marked == [index],
+              "marked %r, want [%d]" % (marked, index))
         picker_leave(rig)
+        close_animation(rig)
+
+    # pick_ref puts a saved gradient back by its place in the library, which
+    # is the restore every other check in this file leans on. Both halves of
+    # the cross-page pair, each starting from the other one being in force,
+    # so choosing the first row would leave the setting where it already was
+    # and prove nothing.
+    fixture_settings = rig.settings()
+    for index, lib_id in (REPEATED_CROSS_PAGE[1], REPEATED_CROSS_PAGE[0]):
+        other = REPEATED_CROSS_PAGE[0][1] if lib_id == REPEATED_CROSS_PAGE[1][1] else REPEATED_CROSS_PAGE[1][1]
+        web_save(rig, {"bgAnimThemeMap": map_write_ref(map0, anim0, "c%d" % other)})
+        rig.wait_until(lambda: map_ref(rig.settings()["bgAnimThemeMap"], anim0) == "c%d" % other, timeout=5)
+        open_animation(rig)
+        pick_ref(rig, "Gradient", fixture_settings, "c%d" % lib_id)
+        got = map_ref(rig.settings()["bgAnimThemeMap"], anim0)
+        check(rig, "repeated_names_pick_ref_restores_c%d" % lib_id, got == "c%d" % lib_id,
+              "pick_ref(c%d) left %r (index %d of the library)" % (lib_id, got, index))
         close_animation(rig)
 
     restore_fields_exactly(rig, "repeated_names_restored", {

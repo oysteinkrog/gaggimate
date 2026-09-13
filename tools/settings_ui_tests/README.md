@@ -342,9 +342,23 @@ reading. The recurring shapes, with the instance that taught each one:
   carry identical tags, so every check past the row count read the first
   of them twice (gm-nov3.28). `Rig.row_slots` and `Rig.find_in_row`
   address a row by its position, which is unique where its name is not.
-  `picker_selected_rows` was the last instance and now walks the slots too
-  (gm-nov3.33): with the two "Custom" entries it used to report both rows
-  marked when the first was selected, and no row at all when the second was.
+  Five helpers in `test_animation.py` were instances of it and all five
+  are fixed. `picker_selected_rows` walks the slots (gm-nov3.33): with the
+  two "Custom" entries it used to report both rows marked when the first
+  was selected, and no row at all when the second was. `page_with_row`,
+  `picker_tap` and `swatch_strip` take the row from its slot and raise
+  `AmbiguousRowName` when the name is not unique, and `pick_ref` chooses a
+  saved gradient by its place in the library (gm-nov3.34). Before that,
+  `page_with_row` returned the first page carrying the name, so a
+  duplicate on a later page could not be reached at all, and `pick_ref`
+  asked for the second "Custom" and tapped the first.
+  Two rules came out of it. A helper handed an ambiguous name refuses
+  rather than guesses: a loud failure is recoverable and a silent wrong
+  answer is not. And a helper that confirms an act names the row it acted
+  on: `picker_choose` waited on `name in picker_selected_rows(rig)`, which
+  a marker on the wrong duplicate satisfied, so ten checks could confirm a
+  row they had not chosen; it now waits for the marker on the position it
+  tapped and on no other row.
 - **Existence stood in for identity.** `len(set(strip)) > 4` over a swatch
   says a ramp was drawn, not which one. Every entry in the fixture library
   clears that threshold by a factor of ten (measured: 46 to 80 distinct
