@@ -354,6 +354,60 @@ class Rig:
         except OSError as e:
             raise RigHTTPError("%s -> %s" % (url, e)) from e
 
+    def fetch(self, path, timeout=None):
+        """GET path and return (status, headers, body) instead of raising
+        on an HTTP status error, so a caller can assert on the status and
+        the body itself. A socket-level failure still raises RigHTTPError:
+        there is no response to describe.
+
+        _open() exists for the callers that only want the body and treat
+        every failure alike. It folds an HTTP status error and a socket
+        error into one RigHTTPError, so a check written on top of it can
+        only ever ask "did something go wrong", never "did this specific
+        thing go wrong". Use fetch() for a check that has to tell a 500
+        from a 404 from a fallback (gm-nov3.29).
+        """
+        url = self._url(path)
+        try:
+            resp = urllib.request.urlopen(url, timeout=timeout or self.timeout)
+        except urllib.error.HTTPError as e:
+            with e:
+                return e.code, dict(e.headers), e.read()
+        except OSError as e:
+            raise RigHTTPError("%s -> %s" % (url, e)) from e
+        with resp:
+            return resp.getcode(), dict(resp.headers), resp.read()
+
+    def route_absent(self, path, timeout=None):
+        """Whether this build compiles no route for path, established
+        positively: the reply must be the same SPA fallback GET / gets.
+        Returns (absent, detail), detail naming both replies either way.
+
+        WebUIPlugin.cpp's onNotFound sends every unrouted request through
+        serveWebAsset(), and resolveWebAsset() rewrites any URL outside
+        /assets/ to index.html. So an absent route answers 200, text/html,
+        gzip, with the index bundle byte for byte, exactly as GET / does.
+        Anything else means the route exists and answered for itself: a
+        registered route returning 500, or returning 200 with a body of
+        its own, is present however broken its reply is.
+
+        The reference reply is fetched from the same venue on every call
+        rather than hard-coded, because the embedded bundle changes with
+        every web build and its length is not a constant this package can
+        know."""
+        ref_status, ref_headers, ref_body = self.fetch("/", timeout)
+        ref_ctype = ref_headers.get("Content-Type", "")
+        status, headers, body = self.fetch(path, timeout)
+        ctype = headers.get("Content-Type", "")
+        detail = "%s -> HTTP %d %s %d bytes; GET / -> HTTP %d %s %d bytes" % (
+            path, status, ctype or "(none)", len(body),
+            ref_status, ref_ctype or "(none)", len(ref_body),
+        )
+        if ref_status != 200:
+            return False, "no SPA fallback to compare against: " + detail
+        absent = status == ref_status and ctype == ref_ctype and body == ref_body
+        return absent, detail
+
     def get_json(self, path, timeout=None):
         """GET path and parse the body as JSON. Raises RigHTTPError (with
         the URL, status and Content-Type) rather than a bare json/unicode
@@ -715,6 +769,31 @@ class Sim:
             return True
         except RigHTTPError:
             return False
+
+    def exit_code(self):
+        """The simulator's exit status, or None while it is still
+        running (or was never launched)."""
+        return None if self.proc is None else self.proc.poll()
+
+    def wait_exited(self, timeout=10):
+        """Waits up to timeout for the simulator process to exit and
+        returns its exit status, or None if it is still running.
+
+        This is the only evidence a check has that ESP.restart() ran (the
+        sim's Esp.h maps it to exit(0), so the status is 0 and a caller
+        must test `is not None`, not truthiness). A failed request is not
+        evidence: Rig folds every HTTP status error and every socket error
+        into one RigHTTPError, and an HTTP 500, a malformed reply and a
+        dropped connection all leave the process running (gm-nov3.29)."""
+        if self.proc is None:
+            return None
+        t0 = time.time()
+        while time.time() - t0 < timeout:
+            code = self.proc.poll()
+            if code is not None:
+                return code
+            time.sleep(0.05)
+        return self.proc.poll()
 
     def stop(self):
         if self.proc is not None and self.proc.poll() is None:

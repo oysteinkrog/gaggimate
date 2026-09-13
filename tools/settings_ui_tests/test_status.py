@@ -315,11 +315,25 @@ def check_restart_persistence_and_relaunch(rig, sim):
     d_status = rig.touchmap(screen=0)
     target = rig.find_tag(d_status, "Restart", "confirm")
 
+    # The evidence that the hold restarted the device is the simulator
+    # process exiting, not the tap request failing. A failed request is
+    # RigHTTPError either way: Rig folds every HTTP status error and every
+    # socket error into that one exception, so an HTTP 500, a malformed
+    # reply or a dropped connection with the process still running used to
+    # pass this check (gm-nov3.29). ESP.restart() is exit(0) on the sim, so
+    # the status to look for is "not None", not "non-zero".
+    tap_error = None
     try:
         rig.tap_target(target, ms=2500)
-        check(rig, "long_hold_restarts_process", False, "tap completed normally; process should have exited")
-    except RigHTTPError:
-        check(rig, "long_hold_restarts_process", True, "connection refused, as expected after ESP.restart()")
+    except RigHTTPError as e:
+        tap_error = e
+    code = sim.wait_exited(timeout=10)
+    check(
+        rig,
+        "long_hold_restarts_process",
+        code is not None,
+        "exit_code=%r tap_error=%s" % (code, tap_error),
+    )
 
     sim.restart()
     after = int(sim.rig.settings_value("standbyBrightness"))
@@ -384,12 +398,21 @@ def check_fail_flush_scenario(program, workdir, port):
             )
             check(rig, "forced_flush_failure_does_not_restart", True, "reached here without a connection error")
 
+            # Same rule as the restart check above: the process exiting is
+            # the evidence, a failed request is not (gm-nov3.29).
             target2 = rig.find_tag(d2, "Restart", "confirm")
+            tap_error = None
             try:
                 rig.tap_target(target2, ms=2500)
-                check(rig, "second_hold_restarts_after_forced_failure", False, "tap completed normally; process should have exited")
-            except RigHTTPError:
-                check(rig, "second_hold_restarts_after_forced_failure", True, "connection refused, as expected")
+            except RigHTTPError as e:
+                tap_error = e
+            code = sim.wait_exited(timeout=10)
+            check(
+                rig,
+                "second_hold_restarts_after_forced_failure",
+                code is not None,
+                "exit_code=%r tap_error=%s" % (code, tap_error),
+            )
     finally:
         if prior is None:
             os.environ.pop("GM_SIM_FAIL_FLUSH", None)
