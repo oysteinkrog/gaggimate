@@ -711,44 +711,36 @@ the design cannot show and what the runs measured.
   not touched, and the touched fields keep their draft and win at commit. A
   web-requested restart reboots from the web task at once and an uncommitted
   draft is lost, the same as a power cut, and that is accepted.
-- **A touched live field is re-asserted at reconcile, and the gradient rows
-  are the ones** (gm-nov3.23 and gm-nov3.36, 2026-09-13, `animReconcile` in
-  `CatAnimation.cpp`). The rule that decides this is not "did the visit touch
-  it" but "does the display resolve the panel from it while the category is
-  open". A field that only the draft reads is ordinary: nothing re-asserts it,
-  it wins at commit and nowhere earlier, and gm-nov3.16's rejection of
-  re-asserting touched fields stands for every one of them. The three gradient
-  rows are not ordinary. Each writes a stored field the moment a pick or an
-  arrow lands: the global row writes `bgAnimGradientRef`
-  (`globalGradientPicked`), and the Gradient and Standby grad rows write one
-  slot of `bgAnimThemeMap` (`animGradientAssign`). `DefaultUI::updateState`
-  draws from both. So a web save landing mid-visit left the row, the swatch and
-  the picker's marker naming gradient A (gm-nov3.16's touched-field rule, which
-  is right) while the panel drew gradient B, with nothing on screen to say so,
-  and leaving the category moved the panel back to A. `animReconcile` now puts
-  the touched global ref and its legacy mirror back, and merges every touched
-  map slot back, when it sees the stored value has moved away from the draft.
-  Those are the same writes the rows themselves make, so they restore live
-  fields rather than adding a rule, and commit still writes exactly what the
-  rows said. **Reconcile and commit share `mergeTouchedGradientSlots`**, which
-  is the part to preserve: the map is one field per animation and the rule for
-  which slots survive a web save used to be written out twice, once in each
-  function, so the two could drift. One function, two callers, and commit
-  passes it the log buffer while reconcile passes null. **Every touched map
-  slot goes back, not only the current animation's**: a slot touched for the
-  standby animation, or for one the visit has since stepped away from, can be
-  the animation on screen later in the same visit. An untouched slot still
-  adopts whatever the web posted, and so does an untouched global. One window
-  survives on all of them: `SettingsUI::service()` reconciles before
+- **A field is live if the display reads its stored value while the category
+  is open, and every touched live field is re-asserted at reconcile**
+  (gm-nov3.23, gm-nov3.36, gm-nov3.39; `reassertTouchedLiveFields` in
+  `CatAnimation.cpp`, `mergeTouchedSlots` in `CatAnimParams.cpp`). The rule
+  above describes the draft, and for a field nothing reads during the visit
+  the draft is the whole story until commit. A live field is different: the
+  row writes `Settings` the moment it changes and `DefaultUI` resolves the
+  panel from the stored value on its next pass, so a web save landing
+  mid-visit drew the web's value behind a row still naming this visit's, with
+  nothing on screen to say so, until commit moved it back at the exit. Apply
+  the test rather than keeping a list: read the row's write, then find whether
+  `DefaultUI` reads that field on a path the open cover reaches. The list went
+  stale twice on 2026-09-13, once for the global gradient and once for
+  everything that was not a gradient. Today it takes in every value row of the
+  Animation category except the standby animation id, whose read at
+  `DefaultUI.cpp:4561` is gated on the standby screen while the cover sits on
+  the menu screen, plus every slot of `bgAnimParams`. The field by field
+  inventory, with the write and the read line for each, is the comment above
+  `reassertTouchedLiveFields`; keep it true when a row is added. One function
+  writes the set and both reconcile and commit call it, so the two cannot
+  drift about which fields a visit owns; commit still writes exactly what the
+  rows said, and an untouched field still adopts whatever the web posted. One
+  window survives: `SettingsUI::service()` reconciles before
   `DefaultUI::updateState()` in the same pass, so a POST landing between those
-  two calls shows the web's gradient for that pass, a few hundred
-  milliseconds, and the next pass puts it back. That window is accepted, not a
-  defect to chase. The cases are covered in
-  `tools/settings_ui_tests/test_gradientdraft.py`
-  (`touched_global_agrees_with_panel` and the three
-  `touched_*_agrees_with_panel` checks beside it), at the category page and at
-  both levels of the picker, because the shell reconciles only the top page
-  and the picker is a pushed page.
+  two calls shows the web's value for that pass, a few hundred milliseconds.
+  The checks are `check_touched_scalars_agree_with_panel` and
+  `check_touched_param_slot_agrees_with_panel` in
+  `tools/settings_ui_tests/test_gradientdraft.py`, and both assert on the
+  stored value before the page is popped, because after the pop commit has
+  written the draft and a version that reconciled nothing would pass.
 - **`reconcile` reaches only the top page.** A pushed child page (the
   schedule list, the schedule editor) refreshes its parent's draft itself
   through `machineDraftReconcile` (`CatMachine.h`), because `kCatMachine`'s

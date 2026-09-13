@@ -1453,6 +1453,33 @@ bool mergeTouchedGradientSlots(const CatAnimationCtx *ctx, std::string &map, cha
 // it on its own), because DefaultUI takes it only on the standby screen and
 // the settings cover sits on the menu screen.
 //
+// The inventory, read off this file and DefaultUI.cpp on 2026-09-13. Keep it
+// true when a row is added: written here / read there.
+//
+//   bgAnimId           714 / 4559  updateState, every pass
+//   bgAnimFps          833 / 4589
+//   bgAnimAllScreens   850 / 4543
+//   themeMode          862 / 4929  applyTheme, called at 1967 every rerender
+//   bgAnimThemeMap     902 / 4642
+//   bgAnimGradientRef  644 / 4644  legacy mirror written at 291
+//   bgAnimClearPlates 1003 / 2248  every pass while the animation runs
+//   bgAnimPlateColor  1021 / 2249
+//   bgAnimPlateOpacity 1035 / 2249
+//   elementTintEnabled 1051 / 4940 and 4961
+//   elementTintColor  1064 / 4940 and 4962
+//   bgAnimScrim       1080 / 4680
+//   bgFadeOutMs       1100 / 3873  through beginOverlayTransition (2128), and
+//                                  pushing or popping a child page of this
+//                                  category is a transition (SettingsUI.cpp
+//                                  225 and 253), so it is read during a visit
+//   bgFadeInMs        1110 / 3878  through 2173 and 3902
+//   bgFadeCurve       1120 / 4592
+//   bgAnimInterlace   1135 / 4591
+//   bgAnimParams      CatAnimParams.cpp 138 / 4584, per slot, through
+//                                  mergeTouchedSlots there
+//
+//   bgAnimStandbyId    761 / 4561  NOT live, see above
+//
 // Shared by animReconcile and animCommit so the two cannot disagree about
 // which fields this visit owns, the same reason mergeTouchedGradientSlots is
 // shared. Reconcile passes no log; commit names each field it wrote.
