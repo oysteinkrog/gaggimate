@@ -711,6 +711,30 @@ the design cannot show and what the runs measured.
   not touched, and the touched fields keep their draft and win at commit. A
   web-requested restart reboots from the web task at once and an uncommitted
   draft is lost, the same as a power cut, and that is accepted.
+- **A touched live field is re-asserted at reconcile, and the global gradient
+  is the only one** (gm-nov3.23, 2026-09-13, `animReconcile` in
+  `CatAnimation.cpp`). The rule above describes the draft, and for an ordinary
+  field the draft is the whole story until commit. The global gradient row is
+  not ordinary: `globalGradientPicked` writes `bgAnimGradientRef` the moment
+  the picker returns and `DefaultUI::updateState` draws the panel from that
+  stored ref. So a web save landing mid-visit left the row, the swatch and the
+  picker's marker naming gradient A (gm-nov3.16's touched-field rule, which is
+  right) while the panel drew gradient B, with nothing on screen to say so, and
+  leaving the category moved the panel back to A. `animReconcile` now writes
+  the touched ref and its legacy mirror back when it sees the stored value has
+  moved away from the draft. That is the same write the row itself makes, so it
+  restores a live field rather than adding a rule, and commit still writes
+  exactly what the row said. **Scoped to this one field on purpose**:
+  re-asserting every touched field at reconcile would change the commit-time
+  precedence the rest of the category depends on, which is what gm-nov3.16
+  rejected. An untouched global still adopts a web save at once. One window
+  survives: `SettingsUI::service()` reconciles before `DefaultUI::updateState()`
+  in the same pass, so a POST landing between those two calls shows the web's
+  gradient for that pass, a few hundred milliseconds, and the next pass puts it
+  back. The case is covered at all three levels in
+  `tools/settings_ui_tests/test_gradientdraft.py`
+  (`touched_global_agrees_with_panel`), because the shell reconciles only the
+  top page and the picker is a pushed page.
 - **`reconcile` reaches only the top page.** A pushed child page (the
   schedule list, the schedule editor) refreshes its parent's draft itself
   through `machineDraftReconcile` (`CatMachine.h`), because `kCatMachine`'s
