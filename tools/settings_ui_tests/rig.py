@@ -110,7 +110,13 @@ def _annotate(dump):
 
 def find_tag(dump, row, role):
     """The object tagged "row/role" in dump, or None. Used directly for a
-    one-off lookup, and by row_value()/rows_on_page() below."""
+    one-off lookup, and by row_value()/rows_on_page() below.
+
+    This returns the FIRST match, so it cannot address the second of two
+    rows with the same name. Row names are user supplied on the gradient
+    picker, where a library may hold two entries both called "Custom", and
+    every one of those rows carries the same tag. Use row_slots() and
+    find_in_row() when the page can hold a repeated name (gm-nov3.28)."""
     target = "%s/%s" % (row, role)
     for o in dump["objects"]:
         if o.get("tag") == target:
@@ -162,14 +168,51 @@ def rows_on_page(dump):
 
     A caller that wants the distinct names asks for them: the name of a row
     is not a key here."""
+    return [tag_row(o) for o in row_slots(dump)]
+
+
+def row_slots(dump):
+    """The row containers on the dumped page as objects, top to bottom: the
+    same rows rows_on_page() names, in the same order, so index i in one is
+    index i in the other.
+
+    This is how a check addresses one of two rows that share a name. A row's
+    position on the page is stable and unique where its name is neither, and
+    every tag on the page is built from the name, so find_tag() cannot tell
+    the two apart. Pass a slot from here to find_in_row() for its controls,
+    or to Rig.tap_target() when the slot is itself the whole-row target
+    (gm-nov3.28)."""
     rows = []
     for o in dump["objects"]:
         if tag_role(o) not in ROW_CONTAINER_ROLES:
             continue
         y = o["hit"][1] if "hit" in o else o["y1"]
-        rows.append((y, tag_row(o)))
-    rows.sort(key=lambda ry: ry[0])
-    return [row for _y, row in rows]
+        rows.append((y, o))
+    rows.sort(key=lambda ro: ro[0])
+    return [o for _y, o in rows]
+
+
+def find_in_row(dump, slot, role):
+    """The object tagged "<slot's row name>/role" inside slot's own subtree,
+    or None. slot is an object from row_slots(); slot itself matches when it
+    carries the role (a whole-row target's container is tagged with the
+    role it doubles as).
+
+    Same lookup find_tag() does, narrowed to one row, which is what makes it
+    right on a page holding two rows of the same name (gm-nov3.28)."""
+    target = "%s/%s" % (tag_row(slot), role)
+    if slot.get("tag") == target:
+        return slot
+    objs = {o["i"]: o for o in dump["objects"]}
+    for o in dump["objects"]:
+        if o.get("tag") != target:
+            continue
+        p = objs.get(o["p"])
+        while p is not None:
+            if p["i"] == slot["i"]:
+                return o
+            p = objs.get(p["p"])
+    return None
 
 
 def targets(dump, include_hidden=False):
@@ -508,8 +551,12 @@ class Rig:
         raise TimeoutError("touchmap seq did not move on from %r within %.1fs" % (prev_seq, timeout))
 
     find_tag = staticmethod(find_tag)
+    find_in_row = staticmethod(find_in_row)
+    tag_row = staticmethod(tag_row)
+    tag_role = staticmethod(tag_role)
     row_value = staticmethod(row_value)
     rows_on_page = staticmethod(rows_on_page)
+    row_slots = staticmethod(row_slots)
     targets = staticmethod(targets)
     audit = staticmethod(audit)
 

@@ -1286,6 +1286,90 @@ def check_gradient_picker_reachability(rig):
     close_animation(rig)
 
 
+# The repeated-name fixture (gm-xiu6, gm-nov3.28). Twelve entries, five to a
+# page, so three pages with the last one partial: the same shape the bench
+# board's library had. Two are called "Custom" and they are not adjacent, so
+# a reading that keeps only the first of a name loses the twelfth row rather
+# than the second.
+#
+# c1 and c3 carry different stops on purpose. With the same stops in both,
+# nothing downstream of the name could tell the two rows apart: both rows
+# drawing c1's swatch, a tap on the second row writing c1, the two entries'
+# callbacks swapped and the selection marker on the wrong duplicate all
+# looked identical to a check that read names and counts. Each is a flat run
+# toward one primary, so the difference survives whatever the tone setting
+# does to a swatch, and neither can be confused with the grey ramp the other
+# ten carry.
+REPEATED_NAMES = ["Custom", "Sunrise", "Custom"] + ["Saved %d" % n for n in range(4, 13)]
+REPEATED_PLAIN_STOPS = "202020,f0f0f0"
+REPEATED_C1_STOPS = "ff0000,ff2000"
+REPEATED_C3_STOPS = "0000ff,0020ff"
+
+
+def repeated_names_library():
+    """The fixture library string, and the stop string of every entry by id."""
+    stops = [REPEATED_PLAIN_STOPS] * len(REPEATED_NAMES)
+    stops[0] = REPEATED_C1_STOPS
+    stops[2] = REPEATED_C3_STOPS
+    packed = ";".join("%d|%s|%s" % (i + 1, name, s)
+                      for i, (name, s) in enumerate(zip(REPEATED_NAMES, stops)))
+    return packed, {i + 1: s for i, s in enumerate(stops)}
+
+
+def hex_rgb(s):
+    n = int(s, 16)
+    return ((n >> 16) & 0xFF, (n >> 8) & 0xFF, n & 0xFF)
+
+
+def swatch_matches_stops(strip, stops, tol=20):
+    """Whether a swatch strip is the ramp `stops` describes, judged at its
+    two ends. Returns (ok, detail).
+
+    The ends are the whole oracle on purpose. A swatch is drawn by
+    GradientSwatch.cpp, which is a separate transcription of the palette
+    arithmetic and is held to the real one on the host by
+    tools/animbench/swatch_parity.cpp; re-deriving the interior here would
+    be a third transcription with nothing checking it. What this has to
+    tell apart is which entry a row drew, and the ends do that. The
+    tolerance covers RGB565 quantisation (8 per channel at the ends) and
+    the ramp not sampling its last stop exactly; measured on the simulator,
+    "ff0000,ff2000" reads (255,0,0) to (255,28,0) against a nominal
+    (255,32,0)."""
+    want_first = hex_rgb(stops.split(",")[0].split("@")[0])
+    want_last = hex_rgb(stops.split(",")[-1].split("@")[0])
+    got_first, got_last = tuple(strip[0]), tuple(strip[-1])
+    ok = (max(abs(a - b) for a, b in zip(got_first, want_first)) <= tol
+          and max(abs(a - b) for a, b in zip(got_last, want_last)) <= tol)
+    return ok, "%r..%r against %s (%r..%r)" % (got_first, got_last, stops, want_first, want_last)
+
+
+def slot_marked(rig, dump, slot):
+    """Whether the selection dot inside `slot` is showing. The dump's "h" is
+    the hidden flag as an integer, so this is a truth test, not an identity
+    one against False."""
+    obj = rig.find_in_row(dump, slot, "selected")
+    return obj is not None and not obj.get("h", 1)
+
+
+def picker_leave(rig):
+    """Back to the category page underneath the picker, however many levels
+    are still open. A pick used to pop both levels by itself and now stays
+    on the page (gm-nov3.31), so a check that taps a row itself cannot
+    assume either depth."""
+    guard = 0
+    while depth(rig) > 1 and guard < 4:
+        picker_cancel(rig)
+        guard += 1
+
+
+def open_my_gradients(rig, row="Gradient"):
+    """Opens the picker from `row` and descends into My gradients, leaving
+    the library list on top."""
+    open_picker(rig, row)
+    picker_tap(rig, "My gradients")
+    rig.wait_until(lambda: depth(rig) == 3, timeout=5)
+
+
 def check_gradient_picker_repeated_names(rig):
     """Regression for gm-xiu6: two saved gradients with the same name are
     two rows on the list, not one.
@@ -1299,6 +1383,15 @@ def check_gradient_picker_repeated_names(rig):
     (gm-nov3.11). A count is the thing to assert, because the names on
     their own cannot tell the two readings apart.
 
+    Counting rows was as far as it went, though, and everything the picker
+    does after listing them was still addressed by name: find_tag returns
+    the first object with a matching tag, and both Custom rows carry the
+    same tags. This now walks the rows by position (Rig.row_slots and
+    Rig.find_in_row) and checks the three things a name cannot reach: each
+    row draws its own entry's stops, a tap on each row writes that row's
+    own ref, and a preselected ref marks that row and not its twin
+    (gm-nov3.28).
+
     Simulator only: the twelve-entry library is written through a web
     save."""
     if not web_save_available(rig):
@@ -1309,14 +1402,10 @@ def check_gradient_picker_repeated_names(rig):
     lib0 = s0["bgAnimGradients"]
     map0 = s0["bgAnimThemeMap"]
     ref0 = s0["bgAnimGradientRef"]
+    anim0 = int(s0["bgAnimId"])
 
-    # Twelve entries, five to a page, so three pages, and the last one
-    # partial: the same shape the board's library had. Two are called
-    # "Custom" and they are not adjacent, so a reading that keeps only the
-    # first of a name loses the twelfth row rather than the second.
-    names = ["Custom", "Sunrise", "Custom"] + ["Saved %d" % n for n in range(4, 13)]
-    stops = "202020,f0f0f0"
-    packed = ";".join("%d|%s|%s" % (i + 1, name, stops) for i, name in enumerate(names))
+    names = REPEATED_NAMES
+    packed, stops_by_id = repeated_names_library()
     web_save(rig, {"bgAnimGradients": packed})
     landed = rig.wait_until(lambda: rig.settings()["bgAnimGradients"] == packed, timeout=5)
     check(rig, "repeated_names_library_landed", bool(landed), rig.settings()["bgAnimGradients"])
@@ -1326,9 +1415,7 @@ def check_gradient_picker_repeated_names(rig):
         return
 
     open_animation(rig)
-    open_picker(rig, "Gradient")
-    picker_tap(rig, "My gradients")
-    rig.wait_until(lambda: depth(rig) == 3, timeout=5)
+    open_my_gradients(rig)
     listed = rows_across_pages(rig)
     check(rig, "repeated_names_row_count", len(listed) == len(names),
           "%d rows listed for %d library entries: %r" % (len(listed), len(names), listed))
@@ -1339,15 +1426,71 @@ def check_gradient_picker_repeated_names(rig):
 
     # The same count, read one page at a time, so the fix is in
     # Rig.rows_on_page and not only in this file's walk over the pages.
-    first_page = rig.rows_on_page(goto_page(rig, 0))
+    dump0 = goto_page(rig, 0)
+    first_page = rig.rows_on_page(dump0)
     check(rig, "repeated_names_first_page_full", len(first_page) == 5,
           "%d rows on page 0: %r" % (len(first_page), first_page))
     check(rig, "repeated_names_first_page_keeps_repeat", first_page == names[:5],
           "got %r want %r" % (first_page, names[:5]))
 
-    picker_cancel(rig)
-    picker_cancel(rig)
+    # Both Custom rows are on page 0, at slots 0 and 2, and each must draw
+    # its own entry. Slots, not names: find_tag would hand back the first
+    # Custom row's swatch for both.
+    slots = rig.row_slots(dump0)
+    slot_names = [rig.tag_row(o) for o in slots]
+    check(rig, "repeated_names_slots_match_names", slot_names == names[:5], "%r" % (slot_names,))
+    _w, _h, fb = rig.fb(step=1)
+    strips = []
+    for slot_i, lib_id in ((0, 1), (2, 3)):
+        sw = rig.find_in_row(dump0, slots[slot_i], "swatch") if slot_i < len(slots) else None
+        strip = None
+        if sw is not None and not sw.get("h"):
+            y = (sw["y1"] + sw["y2"]) // 2
+            strip = [rgb565_pixel(fb, x, y) for x in range(sw["x1"], sw["x2"] + 1)]
+        strips.append(strip)
+        name = "repeated_names_slot%d_swatch_is_c%d" % (slot_i, lib_id)
+        if strip is None:
+            check(rig, name, False, "no visible swatch in slot %d" % slot_i)
+            continue
+        ok, detail = swatch_matches_stops(strip, stops_by_id[lib_id])
+        check(rig, name, ok, detail)
+    check(rig, "repeated_names_custom_swatches_differ",
+          strips[0] is not None and strips[1] is not None and strips[0] != strips[1],
+          "first %r second %r" % (None if strips[0] is None else strips[0][0],
+                                  None if strips[1] is None else strips[1][0]))
+
+    picker_leave(rig)
+
+    # A tap on each Custom row writes that row's own ref. Waiting on the
+    # stored ref rather than on the depth, because a pick leaves the picker
+    # open (gm-nov3.31) and this check is about the write either way.
+    for slot_i, lib_id in ((2, 3), (0, 1)):
+        open_my_gradients(rig)
+        dump = goto_page(rig, 0)
+        slots = rig.row_slots(dump)
+        rig.tap_target(slots[slot_i])
+        want = "c%d" % lib_id
+        got = rig.wait_until(lambda: map_ref(rig.settings()["bgAnimThemeMap"], anim0) or None, timeout=5)
+        check(rig, "repeated_names_slot%d_tap_writes_c%d" % (slot_i, lib_id), got == want,
+              "slot %d wrote %r, want %r" % (slot_i, got, want))
+        picker_leave(rig)
+
+    # A preselected ref marks its own row and not its twin. Written through
+    # the web save so the marker is read on a picker the check did not tap
+    # its way into.
     close_animation(rig)
+    for slot_i, lib_id in ((0, 1), (2, 3)):
+        web_save(rig, {"bgAnimThemeMap": map_write_ref(map0, anim0, "c%d" % lib_id)})
+        rig.wait_until(lambda: map_ref(rig.settings()["bgAnimThemeMap"], anim0) == "c%d" % lib_id, timeout=5)
+        open_animation(rig)
+        open_my_gradients(rig)
+        dump = goto_page(rig, 0)
+        slots = rig.row_slots(dump)
+        marked = [i for i, o in enumerate(slots) if slot_marked(rig, dump, o)]
+        check(rig, "repeated_names_c%d_marks_slot%d" % (lib_id, slot_i), marked == [slot_i],
+              "marked slots %r, want [%d]" % (marked, slot_i))
+        picker_leave(rig)
+        close_animation(rig)
 
     restore_fields_exactly(rig, "repeated_names_restored", {
         "bgAnimGradients": lib0,
