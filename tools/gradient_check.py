@@ -104,6 +104,74 @@ Exemptions are named pairs, and both names must be in ORIGINAL_18 below. That
 is the whole mechanism that stops the list from growing to admit a new
 gradient: a pair involving anything added later cannot be exempted, so a new
 entry has to clear 8.0 against everything, exempt pairs included.
+
+
+WHAT THE PAIR GATE CANNOT SEE
+=============================
+
+The 8.0 gate is per pair. It asks whether two named gradients are the same
+picture and nothing else, so it cannot see how dense the set is as a whole: the
+shipped 60 have 36 pairs under 10.0 and 133 under 12.0, and the gate passes
+every one of them. A floor that each pair clears still allows a set that is
+crowded everywhere. So this file also prints a crowding report. The report is
+advisory. It fails nothing, and it is not a reason to move the 8.0 or to add an
+exemption.
+
+Raising the floor is the wrong lever, and gm-2tqj measured why. Two readers
+looked at the contact sheet of the 60 independently and called sixteen pairs
+hard to tell apart. Scored with this file's own metric and ranked against all
+1770 pairs, nine of the sixteen land in the closest 100, so the metric does
+track a reader over the crowded end. The other seven sit between rank 181 and
+480, and the furthest of them, Sandstone and Graphite, scores 19.52, more than
+twice the gate. No floor the shipped set could clear would catch those.
+
+What does separate them is the category. All sixteen pairs those readers flagged
+are pairs inside one category, and within-category pairs are 196 of the 1770. So
+the report's review list is the within-category pairs, closest first: 11% of the
+pair table, holding every pair a reader flagged. Fifteen of the sixteen are in
+the closest 89 of those 196 and the last is at 125. This is a lens, not a score.
+A user opens one category and compares what is in front of them, and two ramps
+that travel the same hues at different rates read alike as whole pictures while
+scoring far apart.
+
+Two more reads were taken at the picker's own swatch size for gm-nov3.24, one of
+them by a different model, and they hold the lens up. Across the three reads, 27
+distinct pairs have been called hard to tell apart, every one of them inside a
+category, and 26 of the 27 are in the review list. The exception is Gold and
+Basalt at 20.99, named once, which is where the list ends rather than a number
+to move. The bead records all 27 with their ranks. Whether an entry looks like
+its name is a separate question and belongs to gm-2tqj: this file measures
+distance and has no opinion about a name.
+
+  Review bands      10.0, 16.0 and 20.0 mean dE2000, taken from those tables.
+                    Of the 27 pairs, 8 are under 10.0, 24 under 16.0 and 26
+                    under 20.0, and only the one pair above it was ever named.
+                    The counts are printed per category because that is where a
+                    reader's eye works.
+
+  Review size       The settings picker paints a 96 by 30 pixel swatch from 96
+                    ramp samples (kSettingsRowSwatchSamples and kSwatchH in
+                    src/display/ui/default/settings/SettingsRows.cpp). A visual
+                    review of the set belongs at that size, not at whatever
+                    size a contact sheet happens to use.
+
+Two limits of this file, stated so nobody reads more into a pass than is there.
+It measures distance, never whether a gradient looks like its name or belongs
+in its category. And its ranking predicts a reader only over the crowded end:
+above roughly the closest hundred pairs of the full table, the order stops
+meaning anything about what a person can tell apart.
+
+
+THE FROZEN ORIGINALS
+====================
+
+The first 18 entries are frozen by full record, not by name. ORIGINAL_18_RECORDS
+below holds the name, the category and all six stops of each as they stood when
+the thresholds above were measured. A change to any of the three fails, and so
+does a reordering, because a record is compared at the index it is frozen at.
+Every margin quoted above is measured against that set and a device's stored
+gradient id points into it, so it is not a set this file may quietly
+re-measure.
 """
 
 import argparse
@@ -133,13 +201,56 @@ FIRST_STOP_LUMINANCE_CEILING = 0.0040
 ENDPOINT_LSTAR_FLOOR = 58.0
 NEAR_DUPLICATE_DE = 8.0
 
-# The set as it stood when these thresholds were measured. An exemption may
-# only name two of these.
-ORIGINAL_18 = (
-    'Espresso', 'Ocean', 'Violet Dusk', 'Forest', 'Sunset', 'Fire', 'Ice', 'Mono',
-    'Rose', 'Gold', 'Aurora', 'Cyber', 'Ember Coal', 'Deep Space', 'Teal Reef',
-    'Sakura', 'Lime', 'Arctic Night',
+# The review bands the crowding report counts against. Advisory: nothing here
+# rejects a gradient. See WHAT THE PAIR GATE CANNOT SEE above for where the
+# three numbers come from.
+REVIEW_BANDS = (10.0, 16.0, 20.0)
+
+# The set as it stood when these thresholds were measured, complete: name,
+# category and every stop, at the index each is frozen at. This is the trusted
+# baseline that check_original_set compares against, and it is a copy of
+# data/gradients.json as of commit 8f61e73a, before the set grew past 18. An
+# exemption may only name two of these.
+ORIGINAL_18_RECORDS = (
+    ('Espresso', 'Coffee',
+     ('#080402', '#2a1206', '#6b3413', '#b8703a', '#e8b268', '#f8e6c8')),
+    ('Ocean', 'Water and Ice',
+     ('#02060c', '#06284a', '#0a5276', '#2596be', '#66d3e8', '#d8f6ff')),
+    ('Violet Dusk', 'Night Sky',
+     ('#0a0512', '#2a1050', '#5c2a94', '#9a5ad4', '#d09af0', '#f4e2ff')),
+    ('Forest', 'Nature',
+     ('#020803', '#0c2c12', '#1e5c28', '#46963c', '#8cd464', '#e6ffc8')),
+    ('Sunset', 'Fire and Heat',
+     ('#0c0410', '#4a1030', '#952038', '#d4542c', '#f89c3c', '#ffe8a0')),
+    ('Fire', 'Fire and Heat',
+     ('#0a0200', '#401004', '#8c2808', '#d85c10', '#f8a428', '#ffe8b0')),
+    ('Ice', 'Water and Ice',
+     ('#020408', '#10203c', '#2c4a74', '#5486b4', '#9cc8e4', '#eafaff')),
+    ('Mono', 'Metal and Stone',
+     ('#000000', '#202020', '#484848', '#808080', '#c0c0c0', '#ffffff')),
+    ('Rose', 'Pastel',
+     ('#0e0407', '#3c1020', '#7a2440', '#c04868', '#ee8ca4', '#ffdce6')),
+    ('Gold', 'Metal and Stone',
+     ('#060402', '#2e2008', '#6e5014', '#b48c24', '#e8c453', '#fff0b8')),
+    ('Aurora', 'Night Sky',
+     ('#010806', '#063020', '#0c6444', '#14a878', '#48e0b0', '#c8ffec')),
+    ('Cyber', 'Neon',
+     ('#050008', '#240448', '#501090', '#9018d8', '#e030f8', '#ff9cf0')),
+    ('Ember Coal', 'Fire and Heat',
+     ('#0a0604', '#2b0a06', '#6b1a08', '#b8420f', '#e2751f', '#f4a94a')),
+    ('Deep Space', 'Night Sky',
+     ('#05050f', '#150a28', '#341840', '#6b2f5e', '#b3477d', '#e6b3d6')),
+    ('Teal Reef', 'Water and Ice',
+     ('#050a0f', '#0a1c28', '#123a44', '#1f6b6e', '#3fb3a8', '#bdeee0')),
+    ('Sakura', 'Pastel',
+     ('#0c060a', '#341828', '#6e3050', '#b45c80', '#e896b0', '#ffe0ec')),
+    ('Lime', 'Nature',
+     ('#040802', '#16300a', '#326016', '#5ea024', '#9ee44c', '#eaffc0')),
+    ('Arctic Night', 'Water and Ice',
+     ('#020206', '#0a1424', '#1a3048', '#34587c', '#6c94bc', '#c4e4f8')),
 )
+
+ORIGINAL_18 = tuple(name for name, _category, _stops in ORIGINAL_18_RECORDS)
 
 # Pairs in the original 18 that are closer than the threshold. The measured
 # mean dE2000 on 2026-09-12 is recorded with each, so a later change to the
@@ -361,14 +472,50 @@ def check_source_rules(doc):
 
 def check_original_set(doc):
     """Ids 0 to 17 are what the thresholds were measured against and what
-    devices already store. If they move, every recorded margin in this file is
-    about a different set and a device's stored id points somewhere else."""
-    names = [g.get('name') for g in doc.get('gradients', [])[:len(ORIGINAL_18)]]
-    if len(names) < len(ORIGINAL_18) or tuple(names) != ORIGINAL_18:
-        return [Finding('original_set_moved', '',
-                        'the first %d gradients are no longer the original set; '
-                        'the list is append only' % len(ORIGINAL_18))]
-    return []
+    devices already store. If any of them changes, every recorded margin in
+    this file is about a different set and a device's stored id points at a
+    different picture.
+
+    The whole record is compared, not the name: a stop edit or a category move
+    leaves the names in place and is exactly the change that would go unnoticed.
+    Comparing at the index also catches a reordering, because a swap puts each
+    name where another one is frozen."""
+    findings = []
+    gradients = doc.get('gradients', [])
+    if len(gradients) < len(ORIGINAL_18_RECORDS):
+        findings.append(Finding('original_set_short', '',
+                                'the document has %d gradients; the first %d are frozen '
+                                'and the list is append only'
+                                % (len(gradients), len(ORIGINAL_18_RECORDS))))
+    for index, (name, category, stops) in enumerate(ORIGINAL_18_RECORDS):
+        if index >= len(gradients):
+            break
+        g = gradients[index]
+        got_name = g.get('name')
+        if got_name != name:
+            findings.append(Finding('original_name_changed', str(got_name),
+                                    'id %d is frozen as %r; the first %d entries are '
+                                    'append only and may not be renamed or reordered'
+                                    % (index, name, len(ORIGINAL_18_RECORDS))))
+            # The rest of the record belongs to a different gradient now, so
+            # comparing its category and stops would only add noise.
+            continue
+        if g.get('category') != category:
+            findings.append(Finding('original_category_changed', name,
+                                    'id %d is frozen in %r, the document says %r'
+                                    % (index, category, g.get('category'))))
+        got_stops = g.get('stops')
+        got_stops = tuple(got_stops) if isinstance(got_stops, list) else got_stops
+        if got_stops != stops:
+            # A malformed document reaches here too, so the stops are printed
+            # through repr unless they really are a list of strings.
+            shown = (', '.join(got_stops)
+                     if isinstance(got_stops, tuple) and all(isinstance(s, str) for s in got_stops)
+                     else repr(got_stops))
+            findings.append(Finding('original_stops_changed', name,
+                                    'id %d is frozen as %s, the document says %s'
+                                    % (index, ', '.join(stops), shown)))
+    return findings
 
 
 def check_exemptions(doc):
@@ -407,6 +554,105 @@ def check_near_duplicates(doc, ramps):
     return findings, pairs
 
 
+# --- the crowding report -----------------------------------------------------
+# Beside the gate, never inside it. Nothing below returns a Finding and nothing
+# below can fail a run. See WHAT THE PAIR GATE CANNOT SEE at the top for why the
+# review list is the within-category pairs and where the bands come from.
+
+def category_order(doc):
+    """The declared categories first, then any category a gradient claims that
+    the document did not declare. The second group is a fault the source rules
+    already report; the report still has to put those entries somewhere."""
+    declared = doc.get('categories')
+    order = list(declared) if isinstance(declared, list) else []
+    extra = set()
+    for g in doc.get('gradients', []):
+        c = g.get('category')
+        if isinstance(c, str) and c not in order:
+            extra.add(c)
+    return order + sorted(extra)
+
+
+def crowding_report(doc, pairs):
+    """How dense the set is, as a table a reviewer can act on.
+
+    `pairs` is what check_near_duplicates returns, sorted closest first. The
+    answer has three parts: how many pairs sit under each review band, the same
+    counts per category, and every gradient's nearest neighbour. A set can pass
+    the 8.0 gate on every pair and still be crowded, and this is what says so.
+    """
+    category = {}
+    for g in doc.get('gradients', []):
+        name = g.get('name')
+        if isinstance(name, str) and name not in category:
+            category[name] = g.get('category')
+
+    def same_category(a, b):
+        ca = category.get(a)
+        return ca is not None and ca == category.get(b)
+
+    within = [p for p in pairs if same_category(p[2], p[3])]
+
+    # pairs is sorted, so the first time a name appears is its nearest.
+    nearest = {}
+    nearest_in_category = {}
+    for mean, _low, a, b, _exempt in pairs:
+        for one, other in ((a, b), (b, a)):
+            nearest.setdefault(one, (mean, other))
+            if same_category(one, other):
+                nearest_in_category.setdefault(one, (mean, other))
+
+    def counts(subset):
+        return [sum(1 for p in subset if p[0] < band) for band in REVIEW_BANDS]
+
+    categories = []
+    for cname in category_order(doc):
+        members = [n for n, c in category.items() if c == cname]
+        cpairs = [p for p in within if category.get(p[2]) == cname]
+        categories.append({
+            'name': cname,
+            'entries': len(members),
+            'pairs': len(cpairs),
+            'counts': counts(cpairs),
+            'closest': ({'mean': cpairs[0][0], 'min': cpairs[0][1],
+                         'a': cpairs[0][2], 'b': cpairs[0][3], 'exempt': cpairs[0][4]}
+                        if cpairs else None),
+        })
+
+    rows = []
+    for g in doc.get('gradients', []):
+        name = g.get('name')
+        if not isinstance(name, str) or name not in nearest:
+            continue
+        mean, other = nearest[name]
+        cmean, cother = nearest_in_category.get(name, (None, None))
+        rows.append({
+            'name': name,
+            'category': category.get(name),
+            'neighbour': other,
+            'mean': mean,
+            'sameCategory': same_category(name, other),
+            'categoryNeighbour': cother,
+            'categoryMean': cmean,
+        })
+
+    widest = REVIEW_BANDS[-1]
+    review = [{'mean': m, 'min': lo, 'a': a, 'b': b, 'exempt': ex,
+               'category': category.get(a)}
+              for m, lo, a, b, ex in within if m < widest]
+
+    return {
+        'bands': list(REVIEW_BANDS),
+        'pairs': len(pairs),
+        'withinCategoryPairs': len(within),
+        'bandCounts': [{'band': band, 'all': a, 'withinCategory': w}
+                       for band, a, w in zip(REVIEW_BANDS, counts(pairs), counts(within))],
+        'categories': categories,
+        'nearest': rows,
+        'review': review,
+    }
+
+
 def check(doc, ramps=None, node='node'):
     """Every rule. Returns (findings, pairs)."""
     findings = check_source_rules(doc) + check_original_set(doc) + check_exemptions(doc)
@@ -426,7 +672,47 @@ def die(message):
     sys.exit(2)
 
 
-def report(doc, findings, pairs, show_pairs=10):
+def report_crowding(crowding, show_review=15):
+    """Print the advisory half. Reads, never decides."""
+    bands = crowding['bands']
+    print('\n  crowding, advisory: %d of %d pairs are inside one category'
+          % (crowding['withinCategoryPairs'], crowding['pairs']))
+    print('    %-10s %8s %18s' % ('band', 'all pairs', 'within a category'))
+    for row in crowding['bandCounts']:
+        print('    under %-4.1f %8d %18d' % (row['band'], row['all'], row['withinCategory']))
+
+    print('\n    per category, pairs inside it under each band:')
+    print('      %-18s %7s %6s %s   %s'
+          % ('category', 'entries', 'pairs',
+             ' '.join('%6s' % ('<%.0f' % b) for b in bands), 'closest pair inside it'))
+    for c in crowding['categories']:
+        closest = ('%6.2f  %s / %s%s'
+                   % (c['closest']['mean'], c['closest']['a'], c['closest']['b'],
+                      ' [exempt]' if c['closest']['exempt'] else '')) if c['closest'] else '-'
+        print('      %-18s %7d %6d %s   %s'
+              % (c['name'], c['entries'], c['pairs'],
+                 ' '.join('%6d' % n for n in c['counts']), closest))
+
+    review = crowding['review']
+    if show_review and review:
+        print('\n    review list: the closest %d of %d within-category pairs under %.1f'
+              % (min(show_review, len(review)), len(review), bands[-1]))
+        for r in review[:show_review]:
+            print('      %6.2f  (min %5.2f)  %s / %s  [%s]%s'
+                  % (r['mean'], r['min'], r['a'], r['b'], r['category'],
+                     ' [exempt]' if r['exempt'] else ''))
+
+    print('\n    each gradient and its nearest neighbour (and its nearest inside its own category):')
+    for row in crowding['nearest']:
+        if row['categoryMean'] is None:
+            inside = '%6s  %s' % ('-', '(alone in its category)')
+        else:
+            inside = '%6.2f  %s' % (row['categoryMean'], row['categoryNeighbour'])
+        print('      %-16s %6.2f  %-16s   %s'
+              % (row['name'], row['mean'], row['neighbour'], inside))
+
+
+def report(doc, findings, pairs, show_pairs=10, crowding=None, show_review=15):
     print('gradient set check: %d gradients, %d categories'
           % (len(doc.get('gradients', [])), len(doc.get('categories', []))))
     print('  contract: brightness %d%%, rolloff %d%%, gain %d, %s, %d ramp samples, '
@@ -462,6 +748,9 @@ def report(doc, findings, pairs, show_pairs=10):
         print('  dimmest endpoint:     %s at L* %.2f (floor %.1f, margin %.2f)'
               % (last[1], last[0], ENDPOINT_LSTAR_FLOOR, last[0] - ENDPOINT_LSTAR_FLOOR))
 
+    if crowding:
+        report_crowding(crowding, show_review=show_review)
+
     if findings:
         print('\n  FAIL: %d finding%s' % (len(findings), '' if len(findings) == 1 else 's'))
         for f in findings:
@@ -475,6 +764,10 @@ def main(argv=None):
     ap.add_argument('--source', default=SOURCE, help='gradient document to check')
     ap.add_argument('--json', dest='json_out', help='write the pair table and findings here')
     ap.add_argument('--pairs', type=int, default=10, help='how many closest pairs to print')
+    ap.add_argument('--review', type=int, default=15,
+                    help='how many within-category pairs to list in the crowding report')
+    ap.add_argument('--no-crowding', dest='crowding', action='store_false',
+                    help='skip the advisory crowding report')
     ap.add_argument('--node', default='node', help='node executable')
     args = ap.parse_args(argv)
 
@@ -485,7 +778,9 @@ def main(argv=None):
         die('cannot read %s: %s' % (args.source, exc))
 
     findings, pairs = check(doc, node=args.node)
-    report(doc, findings, pairs, show_pairs=args.pairs)
+    crowding = crowding_report(doc, pairs) if args.crowding else None
+    report(doc, findings, pairs, show_pairs=args.pairs, crowding=crowding,
+           show_review=args.review)
 
     if args.json_out:
         with open(args.json_out, 'w', encoding='utf-8') as f:
@@ -508,6 +803,7 @@ def main(argv=None):
                           for m, lo, a, b, ex in pairs],
                 'findings': [{'code': f.code, 'name': f.name, 'detail': f.detail}
                              for f in findings],
+                'crowding': crowding if crowding else crowding_report(doc, pairs),
             }, f, indent=1)
 
     return 1 if findings else 0
