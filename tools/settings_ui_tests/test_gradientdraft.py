@@ -42,9 +42,11 @@ to POST /api/settings against anything but the simulator's loopback, which is
 the one venue where that stands in for the browser.
 """
 import argparse
+import json
 import os
 import sys
 import tempfile
+import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO_ROOT = os.path.abspath(os.path.join(HERE, "..", ".."))
@@ -64,6 +66,9 @@ from tools.settings_ui_tests.test_animation import (  # noqa: E402
     ANIM_NAMES,
     close_animation,
     depth,
+    goto_page,
+    gradient_name_for_ref,
+    library_entries,
     map_ref,
     map_write_ref,
     open_animation,
@@ -98,6 +103,15 @@ GROUND = {}
 # The scenarios run in one process against one NVS, and this one deliberately
 # leaves the legacy custom fixture and a stepped frame rate behind.
 STARTING = {}
+
+# The simulator's NVS file, sim_data/nvs/controller.json under the venue's
+# working directory (preferences_shim.cpp hard-codes the relative path). Set
+# by run() and by main(), and left None where there is none to watch, which is
+# every device run. check_hold_repeats_without_flushing_per_step is the only
+# user: it is the one question about these rows that the HTTP surface cannot
+# answer, because GET /api/settings reads the in-memory properties and says
+# nothing about what reached NVS.
+NVS_PATH = None
 
 
 def check(rig, name, cond, detail=""):
@@ -252,6 +266,103 @@ def legacy_swatch_detail(strip, ground):
     if strip == ground["positioned"]:
         return "the stored positions were kept: this is the positional reading"
     return "neither the uniform nor the positional reading"
+
+
+# ---------------------------------------------------------------------------
+# Stepping from the row (gm-nov3.32)
+#
+# The three gradient rows carry three targets each now: a centre band that
+# pushes the picker and a prev and a next arrow that step to the adjacent
+# gradient without opening anything. The checks below are about the arrows;
+# everything above still drives the band, through open_picker, which finds the
+# row container by its "action" tag and taps its centre.
+
+
+def step_order(rig, allow_global):
+    """The refs a row's arrows walk, in order. Python mirror of
+    CatAnimation.cpp's gradientStepOrder, which is CatGradientPicker's own
+    order flattened: Global where the row offers it, then the saved
+    gradients in stored order, then each declared category's built-ins in
+    table order.
+
+    Built from the stored library and the generated category table rather
+    than from the picker's pages, so a walk that agreed with a broken picker
+    would still fail here."""
+    order = []
+    if allow_global:
+        order.append("")
+    for entry_id, _name, _gradient in library_entries(rig.settings().get("bgAnimGradients", "")):
+        order.append("c%d" % entry_id)
+    for category in GRADIENT_CATEGORIES:
+        for i in range(len(THEME_NAMES)):
+            if GRADIENT_CATEGORY_OF[i] == category:
+                order.append(str(i))
+    return order
+
+
+def arrow(rig, row, which):
+    """One of a gradient row's two arrows ("prev" or "next") as a target."""
+    dump = page_with_row(rig, row)
+    target = rig.find_tag(dump, row, which)
+    if target is None:
+        raise AssertionError("row %r has no %r arrow" % (row, which))
+    return target
+
+
+def tap_arrow(rig, row, which):
+    rig.tap_target(arrow(rig, row, which))
+
+
+def category_of_ref(ref):
+    """The picker group a ref belongs to, for a check that wants to open it."""
+    if ref.startswith("c"):
+        return "My gradients"
+    return GRADIENT_CATEGORY_OF[int(ref)]
+
+
+def middle_builtin(order):
+    """A built-in with a neighbour on each side in the stepping order, so one
+    step either way stays inside the list and neither direction is testing
+    the wrap by accident."""
+    for i, ref in enumerate(order):
+        if i > 0 and i < len(order) - 1 and not ref.startswith("c") and ref != "":
+            return i
+    raise AssertionError("no built-in with neighbours in an order of %d" % len(order))
+
+
+# The three rows this bead changed. Named once: two checks below walk pages
+# looking for them.
+GRADIENT_ROWS = ("Gradient all", "Gradient", "Standby grad")
+
+
+def target_gap(a, b):
+    """Pixels between two hit rects along whichever axis separates them, 0
+    when they touch and negative when they overlap. Rig.audit already fails
+    an overlap; this is the number that says how much room was left, which
+    "no violations" does not."""
+    dx = max(b[0] - a[2], a[0] - b[2])
+    dy = max(b[1] - a[3], a[1] - b[3])
+    return max(dx, dy) - 1
+
+
+# The NVS key bgAnimThemeMap is stored under (Settings.h:410). Read rather
+# than the whole file: Preferences::save() is fopen, fwrite, fclose, so a poll
+# can catch a half-written file, and counting distinct file bytes would count
+# torn reads as writes.
+NVS_THEME_MAP_KEY = "bg_thm"
+
+
+def nvs_theme_map():
+    """What the simulator's NVS file says bgAnimThemeMap is, or None when
+    there is nothing to read: no file for this venue, no key yet, or a poll
+    that landed mid-write and did not parse."""
+    if NVS_PATH is None:
+        return None
+    try:
+        with open(NVS_PATH, "rb") as fp:
+            return json.loads(fp.read().decode("utf-8")).get(NVS_THEME_MAP_KEY)
+    except (OSError, ValueError, UnicodeDecodeError):
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -779,6 +890,355 @@ def check_picker_closes_when_the_slot_goes_away(rig):
     restore_fields_exactly(rig, "slot_gone_restored", {"bgAnimStandbyId": standby0, "bgAnimThemeMap": map0})
 
 
+def check_arrows_step_in_the_pickers_order(rig):
+    """Acceptance (gm-nov3.32): the main Gradient row's arrows step to the
+    adjacent gradient in the picker's own flat order, wrapping at both ends,
+    and each step applies at once.
+
+    The order is the whole point of the check. Stepping over a list of its
+    own would be easy and would put the user somewhere the picker does not
+    agree with, so every expected ref here comes from step_order(), which is
+    built from the stored library and the generated category table."""
+    order = step_order(rig, allow_global=True)
+    if not check(rig, "step_order_has_room", len(order) > 3, "%d entries" % len(order)):
+        return
+    at = middle_builtin(order)
+    s0 = rig.settings()
+    anim0 = int(s0["bgAnimId"])
+    start = map_write_ref(str(s0["bgAnimThemeMap"]), anim0, order[at])
+    if not store(rig, "step_setup", {"bgAnimThemeMap": start}):
+        return
+
+    open_animation(rig)
+    tap_arrow(rig, "Gradient", "next")
+    moved = settled(rig, lambda: map_ref(rig.settings()["bgAnimThemeMap"], anim0) == order[at + 1])
+    check(rig, "step_next_applies", moved, "slot %d is %r want %r" % (
+        anim0, map_ref(rig.settings()["bgAnimThemeMap"], anim0), order[at + 1]))
+    want_text = gradient_name_for_ref(rig.settings(), order[at + 1])
+    shown = rig.row_value(page_with_row(rig, "Gradient"), "Gradient")
+    check(rig, "step_next_row_text", shown == want_text, "row %r want %r" % (shown, want_text))
+
+    tap_arrow(rig, "Gradient", "prev")
+    tap_arrow(rig, "Gradient", "prev")
+    back = settled(rig, lambda: map_ref(rig.settings()["bgAnimThemeMap"], anim0) == order[at - 1])
+    check(rig, "step_prev_applies", back, "slot %d is %r want %r" % (
+        anim0, map_ref(rig.settings()["bgAnimThemeMap"], anim0), order[at - 1]))
+    close_animation(rig)
+
+    # Both ends. The list wraps, so the step off the tail is the head and the
+    # step off the head is the tail.
+    for name, from_ref, which, want in (
+            ("tail", order[-1], "next", order[0]),
+            ("head", order[0], "prev", order[-1])):
+        if not store(rig, "step_wrap_%s_setup" % name,
+                     {"bgAnimThemeMap": map_write_ref(str(rig.settings()["bgAnimThemeMap"]), anim0, from_ref)}):
+            continue
+        open_animation(rig)
+        tap_arrow(rig, "Gradient", which)
+        wrapped = settled(rig, lambda w=want: map_ref(rig.settings()["bgAnimThemeMap"], anim0) == w)
+        check(rig, "step_wraps_at_the_%s" % name, wrapped, "slot %d is %r want %r" % (
+            anim0, map_ref(rig.settings()["bgAnimThemeMap"], anim0), want))
+        close_animation(rig)
+
+    restore_fields_exactly(rig, "step_restored", {"bgAnimThemeMap": str(s0["bgAnimThemeMap"])})
+
+
+def check_a_stepped_row_marks_the_picker(rig):
+    """Acceptance (gm-nov3.32): stepping to a gradient and then opening the
+    picker shows the marker on that gradient. This is what the shared order
+    buys, and it is the half a list of its own would silently get wrong: the
+    step would look right on the row and put the marker somewhere else."""
+    order = step_order(rig, allow_global=True)
+    at = middle_builtin(order)
+    want = order[at + 1]
+    s0 = rig.settings()
+    anim0 = int(s0["bgAnimId"])
+    if not store(rig, "mark_setup",
+                 {"bgAnimThemeMap": map_write_ref(str(s0["bgAnimThemeMap"]), anim0, order[at])}):
+        return
+
+    open_animation(rig)
+    tap_arrow(rig, "Gradient", "next")
+    stepped = settled(rig, lambda: map_ref(rig.settings()["bgAnimThemeMap"], anim0) == want)
+    if not check(rig, "mark_step_applied", stepped, "slot %d is %r want %r" % (
+            anim0, map_ref(rig.settings()["bgAnimThemeMap"], anim0), want)):
+        close_animation(rig)
+        restore_fields_exactly(rig, "mark_restored", {"bgAnimThemeMap": str(s0["bgAnimThemeMap"])})
+        return
+
+    open_picker(rig, "Gradient")
+    group = category_of_ref(want)
+    marked_group = picker_selected_rows(rig)
+    check(rig, "mark_group_marked", marked_group == [group], "marked %r want %r" % (marked_group, [group]))
+    picker_tap(rig, group)
+    name = gradient_name_for_ref(rig.settings(), want)
+    marked = settled(rig, lambda: picker_selected_rows(rig) == [name])
+    check(rig, "mark_entry_marked", marked, "marked %r want %r" % (picker_selected_rows(rig), [name]))
+    picker_cancel(rig)
+    picker_cancel(rig)
+    close_animation(rig)
+    restore_fields_exactly(rig, "mark_restored", {"bgAnimThemeMap": str(s0["bgAnimThemeMap"])})
+
+
+def check_all_three_rows_step(rig):
+    """Acceptance (gm-nov3.32): all three gradient rows step, not just the
+    one. They write three different fields (the global ref, and two slots of
+    the map), so a fix wired into one of them passes nothing here.
+
+    The global row's arrows walk a list with no Global entry in it, because
+    the global is what "Global" means and its own picker offers no such row."""
+    s0 = rig.settings()
+    anim0 = int(s0["bgAnimId"])
+    standby = (anim0 + 1) % len(ANIM_NAMES)
+    map0 = str(s0["bgAnimThemeMap"])
+    ref0 = str(s0.get("bgAnimGradientRef", ""))
+    theme0 = str(s0.get("bgAnimTheme", ""))
+
+    per_anim = step_order(rig, allow_global=True)
+    global_order = step_order(rig, allow_global=False)
+    check(rig, "three_rows_global_order_has_no_global", "" not in global_order,
+          "global order starts %r" % global_order[:3])
+
+    at = middle_builtin(per_anim)
+    gat = middle_builtin(global_order)
+    seeded = {
+        "bgAnimStandbyId": standby,
+        "bgAnimThemeMap": map_write_ref(map_write_ref(map0, anim0, per_anim[at]), standby, per_anim[at]),
+        "bgAnimGradientRef": global_order[gat],
+    }
+    if not store(rig, "three_rows_setup", seeded):
+        return
+
+    open_animation(rig)
+    tap_arrow(rig, "Gradient all", "next")
+    moved = settled(rig, lambda: str(rig.settings().get("bgAnimGradientRef", "")) == global_order[gat + 1])
+    check(rig, "three_rows_global_steps", moved, "ref %r want %r" % (
+        rig.settings().get("bgAnimGradientRef"), global_order[gat + 1]))
+
+    tap_arrow(rig, "Gradient", "next")
+    moved = settled(rig, lambda: map_ref(rig.settings()["bgAnimThemeMap"], anim0) == per_anim[at + 1])
+    check(rig, "three_rows_main_steps", moved, "slot %d is %r want %r" % (
+        anim0, map_ref(rig.settings()["bgAnimThemeMap"], anim0), per_anim[at + 1]))
+
+    tap_arrow(rig, "Standby grad", "prev")
+    moved = settled(rig, lambda: map_ref(rig.settings()["bgAnimThemeMap"], standby) == per_anim[at - 1])
+    check(rig, "three_rows_standby_steps", moved, "slot %d is %r want %r" % (
+        standby, map_ref(rig.settings()["bgAnimThemeMap"], standby), per_anim[at - 1]))
+
+    close_animation(rig)
+    restore_fields_exactly(rig, "three_rows_restored", {
+        "bgAnimStandbyId": int(s0["bgAnimStandbyId"]),
+        "bgAnimThemeMap": map0,
+        "bgAnimGradientRef": ref0,
+        "bgAnimTheme": theme0,
+    })
+
+
+def check_standby_arrows_are_inert_when_the_row_is(rig):
+    """Acceptance (gm-nov3.32): the standby row is inert while the standby
+    animation follows the main one, and its arrows are inert with it. A row
+    that reads "Same as main" and steps a value nobody can see is worse than
+    one that does nothing."""
+    s0 = rig.settings()
+    standby0 = int(s0["bgAnimStandbyId"])
+    map0 = str(s0["bgAnimThemeMap"])
+    if not store(rig, "inert_setup", {"bgAnimStandbyId": -1, "bgAnimThemeMap": map0}):
+        return
+
+    open_animation(rig)
+    shown = rig.row_value(page_with_row(rig, "Standby grad"), "Standby grad")
+    check(rig, "inert_row_says_same_as_main", shown == "Same as main", "row %r" % shown)
+    tap_arrow(rig, "Standby grad", "next")
+    tap_arrow(rig, "Standby grad", "prev")
+    now = str(rig.settings()["bgAnimThemeMap"])
+    check(rig, "inert_arrows_wrote_nothing", now == map0, "map %r want %r" % (now, map0))
+    shown = rig.row_value(page_with_row(rig, "Standby grad"), "Standby grad")
+    check(rig, "inert_row_still_says_same_as_main", shown == "Same as main", "row %r" % shown)
+    close_animation(rig)
+    restore_fields_exactly(rig, "inert_restored", {"bgAnimStandbyId": standby0, "bgAnimThemeMap": map0})
+
+
+def check_hold_repeats_without_flushing_per_step(rig):
+    """Acceptance (gm-nov3.32): holding an arrow repeats at LVGL's own
+    cadence, and five seconds of it does not write NVS once per step.
+
+    The write question is what makes the hold safe. A step is one
+    Property::set, which stores the value and raises a dirty flag
+    (src/display/core/Property.h:85); NVS is written by the periodic flush,
+    Settings::loopTask calling doSave() and then waiting 5000 ms
+    (src/display/core/Settings.cpp:496), and doSave returns early when
+    nothing is dirty. So ten steps a second cost ten property writes a second
+    and at most one NVS write per five seconds.
+
+    That is checked here rather than asserted: the simulator's NVS is one
+    JSON file, so the value it holds for this field is sampled ten times a
+    second through the hold and the distinct readings counted. One per step
+    would be dozens.
+
+    The bound is the venue's own flush period. The simulator does not run
+    Settings::loopTask at all; sim/main.cpp flushes from its main loop every
+    2000 ms, so a five second hold spans at most three flushes, and the
+    reading taken before the hold is a fourth value. One more is allowed for
+    a flush landing on the boundary. The device's period is the 5000 ms above,
+    which is stricter, so a device run passing this is saying more than a
+    simulator run is. The step count comes out of the same hold, so a pass
+    means both halves held at once."""
+    order = step_order(rig, allow_global=True)
+    at = middle_builtin(order)
+    s0 = rig.settings()
+    anim0 = int(s0["bgAnimId"])
+    map0 = str(s0["bgAnimThemeMap"])
+    if not store(rig, "hold_setup", {"bgAnimThemeMap": map_write_ref(map0, anim0, order[at])}):
+        return
+
+    open_animation(rig)
+    target = arrow(rig, "Gradient", "next")
+    x1, y1, x2, y2 = target["hit"]
+    hold_ms = 5000
+    seen = set()
+    first = nvs_theme_map()
+    if first is not None:
+        seen.add(first)
+    rig.get_json("/api/debug/tap?x=%d&y=%d&ms=%d" % ((x1 + x2) // 2, (y1 + y2) // 2, hold_ms))
+    deadline = time.time() + hold_ms / 1000.0
+    while time.time() < deadline:
+        stored = nvs_theme_map()
+        if stored is not None:
+            seen.add(stored)
+        time.sleep(0.1)
+    rig.wait_until(lambda: bool(rig.get_json("/api/debug/tap").get("released_at_ms")), timeout=10)
+    time.sleep(0.3)
+
+    now = map_ref(str(rig.settings()["bgAnimThemeMap"]), anim0)
+    # LVGL repeats a held button after 400 ms and then every 100 ms, so five
+    # seconds is one press plus about 46 repeats. The list is 60-odd long and
+    # wraps, so the landing place is counted as a distance forward from the
+    # start rather than as an exact index.
+    steps = (order.index(now) - at) % len(order) if now in order else -1
+    check(rig, "hold_landed_on_a_real_gradient", now in order, "slot %d is %r" % (anim0, now))
+    check(rig, "hold_repeats", steps >= 10, "slot %d moved %d steps to %r" % (anim0, steps, now))
+    if NVS_PATH is None:
+        rig.log("hold_nvs_not_watched", reason="no simulator NVS file for this venue")
+    else:
+        check(rig, "hold_did_not_flush_per_step", len(seen) <= 5,
+              "%d distinct NVS readings of %s over %d ms of hold and %d steps: %r" % (
+                  len(seen), NVS_THEME_MAP_KEY, hold_ms, steps, sorted(seen)))
+
+    close_animation(rig)
+    restore_fields_exactly(rig, "hold_restored", {"bgAnimThemeMap": map0})
+
+
+def check_step_survives_an_anim_id_past_the_registry(rig):
+    """Acceptance (gm-nov3.32), in the shape 91cb0ed5 fixed: a stored
+    bgAnimId from a longer registry used to index past the end of this
+    category's two per-animation vectors on the first Gradient arrow press,
+    because nothing range-checks that field on the way in. clampAnimId at
+    enter is what stops it, and the arrows are back, so the clamp is load
+    bearing again.
+
+    The check is the original crash's shape: store an id past the roster, open
+    the category, press the arrow. A pass is the simulator still answering
+    afterwards and the write landing in the clamped slot, the last animation
+    of the live roster, rather than anywhere else."""
+    s0 = rig.settings()
+    anim0 = int(s0["bgAnimId"])
+    map0 = str(s0["bgAnimThemeMap"])
+    clamped = len(ANIM_NAMES) - 1
+    if not store(rig, "clamp_setup", {"bgAnimId": len(ANIM_NAMES) + 7, "bgAnimThemeMap": map0}):
+        return
+
+    order = step_order(rig, allow_global=True)
+    open_animation(rig)
+    shown = rig.row_value(page_with_row(rig, "Animation"), "Animation")
+    check(rig, "clamp_row_names_the_last_animation", shown == ANIM_NAMES[clamped],
+          "row %r want %r" % (shown, ANIM_NAMES[clamped]))
+    before = map_ref(map0, clamped)
+    tap_arrow(rig, "Gradient", "next")
+    landed = settled(rig, lambda: map_ref(str(rig.settings()["bgAnimThemeMap"]), clamped) != before)
+    check(rig, "clamp_step_wrote_the_clamped_slot", landed, "slot %d is %r, was %r" % (
+        clamped, map_ref(str(rig.settings()["bgAnimThemeMap"]), clamped), before))
+    now = map_ref(str(rig.settings()["bgAnimThemeMap"]), clamped)
+    check(rig, "clamp_step_wrote_a_real_gradient", now in order, "slot %d is %r" % (clamped, now))
+    # The simulator answering this at all is half the check: the old failure
+    # was a write past the end of a heap vector on that press.
+    check(rig, "clamp_survived_the_press", rig.settingsui_state().get("open") is True,
+          "shell state %r" % rig.settingsui_state())
+
+    close_animation(rig)
+    restore_fields_exactly(rig, "clamp_restored", {"bgAnimId": anim0, "bgAnimThemeMap": map0})
+
+
+def check_the_rows_audit_clean(rig):
+    """Acceptance (gm-nov3.32): three targets in one 320x56 row, none
+    overlapping, each at least 56x56 effective, on every page that carries a
+    gradient row. This is what gm-nov3.3 said could not be done with the
+    arrows on, and it is why the band is the row's left 200 px rather than
+    the whole row.
+
+    The report carries the smallest target and the closest non overlapping
+    pair, because "no violations" does not say how much room was left."""
+    open_animation(rig)
+    pages = int(rig.settingsui_state().get("pages", 1))
+    worst = None
+    closest = None
+    rows_seen = 0
+    violations = []
+    for page in range(pages):
+        dump = goto_page(rig, page)
+        names = rig.rows_on_page(dump)
+        if not any(n in GRADIENT_ROWS for n in names):
+            continue
+        violations.extend(rig.audit(dump)["violations"])
+        for slot, name in zip(rig.row_slots(dump), names):
+            if name not in GRADIENT_ROWS:
+                continue
+            rows_seen += 1
+            # The three targets of this row, found by their y band rather
+            # than by the tree, so a target that escaped the row's subtree
+            # would still be measured against the others.
+            band = [o for o in rig.targets(dump)
+                    if o["hit"][1] >= slot["hit"][1] and o["hit"][3] <= slot["hit"][3]]
+            check(rig, "audit_%s_has_three_targets" % name.replace(" ", "_"), len(band) == 3,
+                  "%r" % [o.get("tag") for o in band])
+            for o in band:
+                w, h = o["hit"][2] - o["hit"][0] + 1, o["hit"][3] - o["hit"][1] + 1
+                if worst is None or min(w, h) < min(worst[1], worst[2]):
+                    worst = (o.get("tag"), w, h)
+            for i in range(len(band)):
+                for j in range(i + 1, len(band)):
+                    gap = target_gap(band[i]["hit"], band[j]["hit"])
+                    if closest is None or gap < closest[0]:
+                        closest = (gap, band[i].get("tag"), band[j].get("tag"))
+    check(rig, "audit_saw_all_three_rows", rows_seen == 3, "%d gradient rows" % rows_seen)
+    check(rig, "audit_clean_on_the_gradient_pages", not violations, repr(violations))
+    check(rig, "audit_smallest_target_is_big_enough", worst is not None and min(worst[1], worst[2]) >= 56,
+          "smallest %r" % (worst,))
+    rig.log("audit_geometry", smallest=repr(worst), closest=repr(closest))
+    check(rig, "audit_closest_pair_in_a_row_has_a_gap", closest is not None and closest[0] >= 1,
+          "closest %r" % (closest,))
+    close_animation(rig)
+
+
+def check_the_band_still_opens_the_picker(rig):
+    """Acceptance (gm-nov3.32): a tap on the row's centre band still opens the
+    picker, on all three rows. The arrows took the row's right-hand 116 px, so
+    this is the half of the row that had to keep working."""
+    s0 = rig.settings()
+    standby0 = int(s0["bgAnimStandbyId"])
+    if not store(rig, "band_setup", {"bgAnimStandbyId": (int(s0["bgAnimId"]) + 1) % len(ANIM_NAMES)}):
+        return
+    open_animation(rig)
+    for row in ("Gradient all", "Gradient", "Standby grad"):
+        before = depth(rig)
+        open_picker(rig, row)
+        check(rig, "band_opens_%s" % row.replace(" ", "_"), depth(rig) == before + 1,
+              "depth %d want %d" % (depth(rig), before + 1))
+        picker_cancel(rig)
+        settled(rig, lambda b=before: depth(rig) == b)
+    close_animation(rig)
+    restore_fields_exactly(rig, "band_restored", {"bgAnimStandbyId": standby0})
+
+
 def check_starting_state_restored(rig):
     """Not an acceptance criterion: the scenarios share one NVS, and this one
     ends on the legacy custom fixture and a stepped frame rate, neither of
@@ -795,6 +1255,14 @@ CHECKS = [
     ("pick_keeps_the_picker_open", check_pick_keeps_the_picker_open),
     ("global_entry_keeps_the_picker_open", check_global_entry_keeps_the_picker_open),
     ("picker_closes_when_the_slot_goes_away", check_picker_closes_when_the_slot_goes_away),
+    ("arrows_step_in_the_pickers_order", check_arrows_step_in_the_pickers_order),
+    ("a_stepped_row_marks_the_picker", check_a_stepped_row_marks_the_picker),
+    ("all_three_rows_step", check_all_three_rows_step),
+    ("standby_arrows_are_inert_when_the_row_is", check_standby_arrows_are_inert_when_the_row_is),
+    ("hold_repeats_without_flushing_per_step", check_hold_repeats_without_flushing_per_step),
+    ("step_survives_an_anim_id_past_the_registry", check_step_survives_an_anim_id_past_the_registry),
+    ("the_rows_audit_clean", check_the_rows_audit_clean),
+    ("the_band_still_opens_the_picker", check_the_band_still_opens_the_picker),
     ("starting_state_restored", check_starting_state_restored),
 ]
 
@@ -810,6 +1278,9 @@ def run(rig, report, venue):
     if venue is not None and venue.is_device:
         report.step("scenario_skipped", scenario="gradientdraft", reason="needs the simulator's web save route")
         return
+    global NVS_PATH
+    if venue is not None and getattr(venue, "workdir", None):
+        NVS_PATH = os.path.join(venue.workdir, "sim_data", "nvs", "controller.json")
     first_fail, first_total = len(FAILURES), TOTAL
     for name, fn in CHECKS:
         run_check(rig, name, fn)
@@ -834,6 +1305,8 @@ def main():
         return 1
     data_dir = os.path.join(args.workdir, "sim_data")
     os.makedirs(args.workdir, exist_ok=True)
+    global NVS_PATH
+    NVS_PATH = os.path.join(data_dir, "nvs", "controller.json")
     with Sim(args.program, data_dir, port=args.port) as sim:
         rig = sim.rig
         rig.log("boot", program=args.program, port=args.port, workdir=args.workdir)

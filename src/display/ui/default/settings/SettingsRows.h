@@ -145,8 +145,27 @@ constexpr int kSettingsRowSwatchSamples = 96;
 lv_obj_t *settingsRowSwatchCreate(SettingsUI &ui, lv_obj_t *parent, const char *rowName, const char *label,
                                    SettingsRowActivateFn onActivate, void *user);
 
+// A swatch row that also steps (gm-nov3.32): three targets in one slot, the
+// centre band and a prev and a next arrow. Tapping the band calls onActivate,
+// same as the plain swatch row above; the arrows call onCycle(user, dir) with
+// the choice row's press-and-repeat protocol (once on PRESSED, once per
+// LV_EVENT_LONG_PRESSED_REPEAT, and no fast tier, because ten gradients a
+// second is already fast and a fast tier would skip the one being looked for).
+//
+// The band is kTextColW wide, so the two arrows land exactly where a choice
+// row's do and the geometry audit sees the same three rectangles it already
+// passes there. That leaves the band 120 px narrower than a whole-row target,
+// so its ramp is a bar across its foot rather than a block at its right: the
+// name needs the width more than the ramp does. The marker dot the picker
+// uses has no place here (nothing marks a category row as "in force"), so
+// this kind has none and settingsRowSetSelected is a no-op on it.
+lv_obj_t *settingsRowSwatchStepCreate(SettingsUI &ui, lv_obj_t *parent, const char *rowName, const char *label,
+                                       SettingsRowActivateFn onActivate, SettingsRowCycleFn onCycle, void *user);
+
 // Paints the row's swatch from kSettingsRowSwatchSamples RGB565 samples, or
 // hides it when `ramp` is null. No-op on a row that is not a swatch row.
+// Both swatch kinds take it; a ramp wider or narrower than the row's own
+// canvas is sampled across it.
 void settingsRowSetSwatch(lv_obj_t *row, const uint16_t *ramp);
 
 // Shows or hides the row's marker dot (tagged role "selected", so a test can

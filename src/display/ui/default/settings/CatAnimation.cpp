@@ -497,11 +497,20 @@ void refreshStandbyRows(CatAnimationCtx *ctx, const std::vector<settingsui::Grad
 
 // ---- the three gradient rows --------------------------------------------------
 //
-// Each is a whole-row target that pushes the picker (CatGradientPicker.h) and
-// takes the chosen ref back through a callback. They were prev/next cycles
-// over one flat list until gm-nov3.3; at sixty built-ins a name on its own
-// stops saying what the gradient looks like, and the arrows are gone rather
-// than covered, because a second target over them would overlap theirs.
+// Each carries three targets (gm-nov3.32): a centre band that pushes the
+// picker (CatGradientPicker.h) and takes the chosen ref back through a
+// callback, and a prev and a next arrow that step to the adjacent gradient
+// without opening anything.
+//
+// The rows were prev/next cycles over one flat list until gm-nov3.3, which
+// added the picker and took the arrows off, because a row-wide target laid
+// over them is two targets in one place and Rig.audit() rejects the overlap.
+// That reason was the target being row wide, not the arrows existing: the
+// band is the row's left 200 px now, which is the width a choice row's text
+// column has, so the three rectangles are ones the audit already passes.
+// Both ways in survive, and they answer different questions: the arrows are
+// for trying the next gradient, the picker for finding a particular one
+// among sixty, where a name on its own stops saying what it looks like.
 //
 // The pick callbacks run while the picker is still the page on screen, so
 // every row pointer here is null (each row's DELETE callback cleared it when
@@ -550,6 +559,70 @@ void applyRowSwatch(lv_obj_t *row, const std::string &ref) {
 void animReconcile(void *ctx0);
 void animGradientPicked(void *user, const char *ref);
 
+// ---- stepping through the gradients from the row (gm-nov3.32) ----------------
+//
+// The arrows walk the same flat list the picker shows, in the picker's own
+// order, so somebody who steps to a gradient and then opens the picker finds
+// the marker where they left it. CatGradientPicker's first page lists Global
+// (per-animation rows only), then "My gradients", then each declared category
+// that has built-ins; a group page lists its entries in table order. Flattened,
+// that is exactly the loop below.
+std::vector<int> gradientStepOrder(const std::vector<settingsui::GradientChoice> &choices, bool allowGlobal) {
+    std::vector<int> order;
+    if (allowGlobal) {
+        // choices[0] is the "" entry, which the picker shows as "Global" and a
+        // per-animation row can land on. The global row itself cannot: it is
+        // what "Global" means, so its picker offers no such entry and neither
+        // do its arrows.
+        order.push_back(0);
+    }
+    for (int i : settingsui::gradientLibraryChoices(kThemeProvider, choices)) {
+        order.push_back(i);
+    }
+    for (const settingsui::GradientGroup &group : settingsui::gradientBuiltinGroups(kThemeProvider, choices)) {
+        for (int i : group.choices) {
+            order.push_back(i);
+        }
+    }
+    return order;
+}
+
+// The ref one step away from `ref` in that order, wrapping at both ends.
+//
+// A ref that is not a position in the list gets the end the arrow points from:
+// the next arrow enters at the head and the prev arrow at the tail. Two states
+// reach that path, and neither is a gradient the list contains: a per-animation
+// slot naming a library entry that has since been deleted, and the global row
+// while the retained pre-library custom gradient is still what it draws
+// (gm-nov3.18). gradientChoiceIndexForRef is deliberately not used for the
+// lookup, because it answers 0 ("Global") for a ref that names nothing, which
+// would make a dangling ref step as though it were Global.
+bool gradientStepRef(const std::vector<settingsui::GradientChoice> &choices, bool allowGlobal, const std::string &ref,
+                     int dir, std::string &out) {
+    const std::vector<int> order = gradientStepOrder(choices, allowGlobal);
+    if (order.empty()) {
+        return false;
+    }
+    int here = -1;
+    for (size_t i = 0; i < choices.size(); i++) {
+        if (choices[i].ref == ref) {
+            here = static_cast<int>(i);
+            break;
+        }
+    }
+    int at = -1;
+    for (size_t i = 0; here >= 0 && i < order.size(); i++) {
+        if (order[i] == here) {
+            at = static_cast<int>(i);
+            break;
+        }
+    }
+    const int n = static_cast<int>(order.size());
+    const int to = at < 0 ? (dir > 0 ? 0 : n - 1) : settingsui::wrapIndex(at, n, dir);
+    out = choices[static_cast<size_t>(order[static_cast<size_t>(to)])].ref;
+    return true;
+}
+
 // Shared by all three rows: the picker's view of this category's draft.
 // SettingsUI::service() reconciles only the top page, so while the picker is
 // open this is the only thing keeping this category's untouched fields
@@ -576,6 +649,34 @@ void globalGradientPicked(void *user, const char *ref) {
     if (ctx->ui != nullptr) {
         ctx->ui->ui().markDirty();
         ctx->ui->plugins().trigger("bganim:preview-end");
+    }
+}
+
+// The prev/next arrows on the same row (gm-nov3.32). The step writes exactly
+// what a pick writes, through the same function, so the panel follows a tap
+// the way it follows a pick and the touched-field rule of gm-nov3.23 applies
+// to a stepped value as well. What a step also has to do, and a pick does not,
+// is redraw the row: a pick is followed by the picker's pop rebuilding this
+// page from the draft, and nothing pops here.
+void globalGradientOnCycle(void *user, int dir) {
+    auto *ctx = static_cast<CatAnimationCtx *>(user);
+    const auto choices = currentGradientChoices();
+    // Step from what the row says, not from the raw ref: with no ref stored
+    // the row names the built-in the legacy pair resolves to, and stepping
+    // from the head of the list instead would skip whatever is on screen.
+    const std::string from = legacyCustomFallbackActive(choices)
+                                 ? std::string()
+                                 : choices[static_cast<size_t>(globalGradientChoiceIndex(choices))].ref;
+    std::string next;
+    if (!gradientStepRef(choices, false, from, dir, next)) {
+        return;
+    }
+    globalGradientPicked(ctx, next.c_str());
+    if (ctx->globalGradientRow != nullptr) {
+        // Both readings are the ones animBuildRow makes for this row, so the
+        // stepped row and a rebuilt one show the same thing.
+        settingsRowSetValue(ctx->globalGradientRow, globalGradientLabel(choices).c_str());
+        applyRowSwatch(ctx->globalGradientRow, std::string());
     }
 }
 
@@ -774,13 +875,14 @@ void themeOnCycle(void *user, int dir) {
 
 // ---- Gradient --------------------------------------------------------------
 
-// One animation's own gradient, for whichever of the two per-animation rows
-// opened the picker: both write the same per-animation field, keyed by the id
-// captured at the push, so the touched-ness that matters is the animation's
-// and not which row wrote it.
-void animGradientPicked(void *user, const char *ref) {
-    auto *ctx = static_cast<CatAnimationCtx *>(user);
-    const int animId = ctx->pickerAnimId;
+// One animation's gradient, written for whatever named the animation: the
+// picker through the id it captured at the push, or an arrow through the id
+// the row is showing. The bounds check is load bearing and not defensive
+// habit: the draft's two per-animation vectors are sized to the live registry,
+// and a stored bgAnimId from a longer one wrote past the end of them on the
+// first Gradient arrow press once already (91cb0ed5). clampAnimId at enter and
+// at reconcile is what keeps ctx->animId inside them; this is the second line.
+void animGradientAssign(CatAnimationCtx *ctx, int animId, const char *ref) {
     if (animId < 0 || static_cast<size_t>(animId) >= ctx->gradientTouched.size()) {
         return;
     }
@@ -814,6 +916,53 @@ void animGradientPicked(void *user, const char *ref) {
     if (ctx->ui != nullptr) {
         ctx->ui->ui().markDirty();
         ctx->ui->plugins().trigger("bganim:preview-end");
+    }
+}
+
+// The picker's side: the animation is the one captured at the push, so a web
+// save moving bgAnimId under an open picker cannot retarget it.
+void animGradientPicked(void *user, const char *ref) {
+    auto *ctx = static_cast<CatAnimationCtx *>(user);
+    animGradientAssign(ctx, ctx->pickerAnimId, ref);
+}
+
+// The main Gradient row's arrows (gm-nov3.32). The animation is ctx->animId,
+// which clampAnimId has already brought inside the live registry, and which
+// is also the animation the row is naming.
+void gradientOnCycle(void *user, int dir) {
+    auto *ctx = static_cast<CatAnimationCtx *>(user);
+    const auto choices = currentGradientChoices();
+    std::string next;
+    if (!gradientStepRef(choices, true, ctx->gradientRef, dir, next)) {
+        return;
+    }
+    animGradientAssign(ctx, ctx->animId, next.c_str());
+    if (ctx->gradientRow != nullptr) {
+        settingsRowSetValue(ctx->gradientRow, gradientDisplayText(ctx->gradientIndex, choices).c_str());
+        applyRowSwatch(ctx->gradientRow, ctx->gradientRef);
+    }
+    // The standby rows read the same map, and when the two ids meet they read
+    // the very slot this just wrote, exactly as after an Animation cycle.
+    refreshStandbyRows(ctx, choices);
+}
+
+// The Standby grad row's arrows. Disabling a row already stops its arrows
+// (settingsRowSetEnabled adds LV_STATE_DISABLED, which lv_obj_hit_test
+// refuses), so this guard is the second line rather than the first.
+void standbyGradientOnCycle(void *user, int dir) {
+    auto *ctx = static_cast<CatAnimationCtx *>(user);
+    if (ctx->standbyAnimId < 0 || ctx->standbyAnimId == ctx->animId) {
+        return;
+    }
+    const auto choices = currentGradientChoices();
+    std::string next;
+    if (!gradientStepRef(choices, true, ctx->standbyGradientRef, dir, next)) {
+        return;
+    }
+    animGradientAssign(ctx, ctx->standbyAnimId, next.c_str());
+    if (ctx->standbyGradientRow != nullptr) {
+        settingsRowSetValue(ctx->standbyGradientRow, gradientDisplayText(ctx->standbyGradientIndex, choices).c_str());
+        applyRowSwatch(ctx->standbyGradientRow, ctx->standbyGradientRef);
     }
 }
 
@@ -1017,9 +1166,10 @@ void animBuildRow(void *ctx0, int index, lv_obj_t *parent, SettingsUI &ui) {
         settingsRowSetValue(row, standbyChoiceLabel(ctx->standbyAnimId));
         break;
     }
-    case 2: { // Gradient for all animations (pushes the picker)
+    case 2: { // Gradient for all animations (arrows step, the band pushes the picker)
         lv_obj_t *row =
-            settingsRowSwatchCreate(ui, parent, "Gradient all", "Gradient all", globalGradientOnActivate, ctx);
+            settingsRowSwatchStepCreate(ui, parent, "Gradient all", "Gradient all", globalGradientOnActivate,
+                                        globalGradientOnCycle, ctx);
         ctx->globalGradientRow = row;
         lv_obj_add_event_cb(
             row,
@@ -1047,8 +1197,9 @@ void animBuildRow(void *ctx0, int index, lv_obj_t *parent, SettingsUI &ui) {
         settingsRowSetValue(row, animNameFn(ctx->animId));
         break;
     }
-    case 4: { // Gradient (the main animation's override; pushes the picker)
-        lv_obj_t *row = settingsRowSwatchCreate(ui, parent, "Gradient", "Gradient", gradientOnActivate, ctx);
+    case 4: { // Gradient (the main animation's override; arrows step, the band pushes the picker)
+        lv_obj_t *row =
+            settingsRowSwatchStepCreate(ui, parent, "Gradient", "Gradient", gradientOnActivate, gradientOnCycle, ctx);
         ctx->gradientRow = row;
         lv_obj_add_event_cb(
             row,
@@ -1072,10 +1223,11 @@ void animBuildRow(void *ctx0, int index, lv_obj_t *parent, SettingsUI &ui) {
         settingsRowSetEnabled(row, separate);
         break;
     }
-    case 6: { // Standby gradient (pushes the picker)
+    case 6: { // Standby gradient (arrows step, the band pushes the picker)
         const bool separate = ctx->standbyAnimId >= 0 && ctx->standbyAnimId != ctx->animId;
         lv_obj_t *row =
-            settingsRowSwatchCreate(ui, parent, "Standby grad", "Standby grad", standbyGradientOnActivate, ctx);
+            settingsRowSwatchStepCreate(ui, parent, "Standby grad", "Standby grad", standbyGradientOnActivate,
+                                        standbyGradientOnCycle, ctx);
         ctx->standbyGradientRow = row;
         lv_obj_add_event_cb(
             row,
