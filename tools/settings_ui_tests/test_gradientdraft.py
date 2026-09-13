@@ -1319,6 +1319,108 @@ def check_all_three_rows_step(rig):
     })
 
 
+def check_stepping_the_global_redraws_a_row_on_global(rig):
+    """Acceptance (gm-nov3.41): a per-animation gradient row with no override
+    of its own reads as "Global (<name>)" and draws the global's ramp, so it is
+    a second view of the "Gradient all" row's value and has to follow a step of
+    it. Nothing rebuilds the page after a step, and the row two below the
+    global used to go on naming the gradient the global had been.
+
+    The text and the swatch are both asserted, because a fix that rewrote the
+    label and left the old ramp would pass on the text alone. Then the same
+    step is made against a row holding an override, which the global cannot
+    reach and must not move.
+
+    The main animation's "Gradient" row is the one this can catch: it shares
+    page 0 with "Gradient all", so it is on screen when the step lands.
+    "Standby grad" is on page 1 and reaching it rebuilds that page, so its
+    text is right either way and the check below asserts its stored slot
+    instead.
+
+    Every reading after the step is a plain touchmap of the active screen,
+    never page_with_row. Turning to a page rebuilds it whether or not the
+    page number changes (SettingsUI::gotoPage always calls rebuildPage), and
+    the helper sweeps every page to find a row by name, so a reading taken
+    through it shows a freshly built row and passes with or without the fix.
+    A first version of this check did exactly that and passed on a build
+    with the fault still in it."""
+    s0 = rig.settings()
+    anim0 = int(s0["bgAnimId"])
+    standby = (anim0 + 1) % len(ANIM_NAMES)
+    map0 = str(s0["bgAnimThemeMap"])
+    ref0 = str(s0.get("bgAnimGradientRef", ""))
+    theme0 = str(s0.get("bgAnimTheme", ""))
+    standby0 = int(s0["bgAnimStandbyId"])
+
+    order = step_order(rig, allow_global=False)
+    at = middle_builtin(order)
+    before, after = order[at], order[at + 1]
+    # A third gradient for the override, so "did not move" cannot be satisfied
+    # by either of the two the global steps between.
+    override = next(ref for ref in order if ref not in (before, after))
+
+    seeded = {
+        "bgAnimStandbyId": standby,
+        "bgAnimThemeMap": map_write_ref(map_write_ref(map0, anim0, ""), standby, override),
+        "bgAnimGradientRef": before,
+    }
+    if not store(rig, "global_redraw_setup", seeded):
+        return
+
+    open_animation(rig)
+    want_before = "Global (%s)" % gradient_name_for_ref(rig.settings(), before)
+    shown = rig.row_value(page_with_row(rig, "Gradient"), "Gradient")
+    check(rig, "global_redraw_starts_on_global", shown == want_before, "row %r want %r" % (shown, want_before))
+
+    # tap_arrow turns to the page and then taps, so the rebuild it causes is
+    # before the step, not after it.
+    tap_arrow(rig, "Gradient all", "next")
+    moved = settled(rig, lambda: str(rig.settings().get("bgAnimGradientRef", "")) == after)
+    check(rig, "global_redraw_global_stepped", moved,
+          "ref %r want %r" % (rig.settings().get("bgAnimGradientRef"), after))
+
+    want_after = "Global (%s)" % gradient_name_for_ref(rig.settings(), after)
+    dump = rig.touchmap(screen=0)
+    shown = rig.row_value(dump, "Gradient")
+    check(rig, "global_redraw_row_follows", shown == want_after, "row %r want %r" % (shown, want_after))
+    check(rig, "global_redraw_swatch_follows",
+          swatch_strip(rig, dump, "Gradient") == swatch_strip(rig, dump, "Gradient all"),
+          "the row's ramp is not the one the global row draws")
+
+    # The step wrote the global and nothing else: an overridden slot is not
+    # the global's to move, whatever page its row is on.
+    slot = map_ref(str(rig.settings()["bgAnimThemeMap"]), standby)
+    check(rig, "global_redraw_override_slot_untouched", slot == override, "slot %r want %r" % (slot, override))
+    close_animation(rig)
+
+    # The same step with the main animation's slot holding an override of its
+    # own. The row names that gradient and the global cannot reach it.
+    if not store(rig, "global_redraw_override_setup", {
+            "bgAnimStandbyId": standby,
+            "bgAnimThemeMap": map_write_ref(map0, anim0, override),
+            "bgAnimGradientRef": after}):
+        return
+    open_animation(rig)
+    want_override = gradient_name_for_ref(rig.settings(), override)
+    shown = rig.row_value(page_with_row(rig, "Gradient"), "Gradient")
+    check(rig, "global_redraw_override_named", shown == want_override, "row %r want %r" % (shown, want_override))
+    tap_arrow(rig, "Gradient all", "prev")
+    moved = settled(rig, lambda: str(rig.settings().get("bgAnimGradientRef", "")) == before)
+    check(rig, "global_redraw_global_stepped_back", moved,
+          "ref %r want %r" % (rig.settings().get("bgAnimGradientRef"), before))
+    shown = rig.row_value(rig.touchmap(screen=0), "Gradient")
+    check(rig, "global_redraw_override_still_named", shown == want_override,
+          "row %r want %r" % (shown, want_override))
+    close_animation(rig)
+
+    restore_fields_exactly(rig, "global_redraw_restored", {
+        "bgAnimStandbyId": standby0,
+        "bgAnimThemeMap": map0,
+        "bgAnimGradientRef": ref0,
+        "bgAnimTheme": theme0,
+    })
+
+
 def check_standby_arrows_are_inert_when_the_row_is(rig):
     """Acceptance (gm-nov3.32): the standby row is inert while the standby
     animation follows the main one, and its arrows are inert with it. A row
@@ -1765,6 +1867,7 @@ CHECKS = [
     ("arrows_step_in_the_pickers_order", check_arrows_step_in_the_pickers_order),
     ("a_stepped_row_marks_the_picker", check_a_stepped_row_marks_the_picker),
     ("all_three_rows_step", check_all_three_rows_step),
+    ("stepping_the_global_redraws_a_row_on_global", check_stepping_the_global_redraws_a_row_on_global),
     ("standby_arrows_are_inert_when_the_row_is", check_standby_arrows_are_inert_when_the_row_is),
     ("hold_repeats_without_flushing_per_step", check_hold_repeats_without_flushing_per_step),
     ("step_survives_an_anim_id_past_the_registry", check_step_survives_an_anim_id_past_the_registry),

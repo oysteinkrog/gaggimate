@@ -634,6 +634,38 @@ void gradientPickerReconcileParent(void *user) { animReconcile(user); }
 
 // ---- Gradient for all animations ---------------------------------------------
 
+// The rows a change to the global gradient also changes. A per-animation
+// gradient row with no override of its own reads as "Global (<name>)" and
+// samples what the global resolves to, so it is a second view of the value the
+// "Gradient all" row holds and has to follow it.
+//
+// Called from globalGradientPicked, which both routes into the global go
+// through. On the picker route this page's rows have already been deleted and
+// the null checks skip them, and the pop rebuilds the page anyway. The arrow
+// step is the route that needs it: nothing rebuilds anything after a step, and
+// until gm-nov3.41 the two rows below the global went on naming the gradient it
+// used to be. Each refresh writes exactly what animBuildRow writes for that
+// row, so a stepped row and a rebuilt one show the same thing.
+void refreshRowsReadingGlobalGradient(CatAnimationCtx *ctx) {
+    const auto choices = currentGradientChoices();
+    if (ctx->globalGradientRow != nullptr) {
+        settingsRowSetValue(ctx->globalGradientRow, globalGradientLabel(choices).c_str());
+        applyRowSwatch(ctx->globalGradientRow, std::string());
+    }
+    // Index 0 is the "Global" entry. A row holding an override of its own names
+    // a gradient the global cannot move, so it is left alone.
+    if (ctx->gradientRow != nullptr && ctx->gradientIndex == 0) {
+        settingsRowSetValue(ctx->gradientRow, gradientDisplayText(ctx->gradientIndex, choices).c_str());
+        applyRowSwatch(ctx->gradientRow, ctx->gradientRef);
+    }
+    const bool standbySeparate = ctx->standbyAnimId >= 0 && ctx->standbyAnimId != ctx->animId;
+    if (ctx->standbyGradientRow != nullptr && standbySeparate && ctx->standbyGradientIndex == 0) {
+        settingsRowSetValue(ctx->standbyGradientRow,
+                            gradientDisplayText(ctx->standbyGradientIndex, choices).c_str());
+        applyRowSwatch(ctx->standbyGradientRow, ctx->standbyGradientRef);
+    }
+}
+
 // The gradient every animation draws with unless it has one of its own. The
 // picker offers no "Global" entry here: the global is what "Global" means, so
 // this row must land on a gradient.
@@ -649,6 +681,7 @@ void globalGradientPicked(void *user, const char *ref) {
     // what a build without this field reads. The web form and the POST
     // handler apply the same rule, so all four writers agree.
     mirrorGlobalRefIntoLegacyTheme(settings, ctx->globalGradientRef);
+    refreshRowsReadingGlobalGradient(ctx);
     if (ctx->ui != nullptr) {
         ctx->ui->ui().markDirty();
         ctx->ui->plugins().trigger("bganim:preview-end");
@@ -659,8 +692,10 @@ void globalGradientPicked(void *user, const char *ref) {
 // what a pick writes, through the same function, so the panel follows a tap
 // the way it follows a pick and the touched-field rule of gm-nov3.23 applies
 // to a stepped value as well. What a step also has to do, and a pick does not,
-// is redraw the row: a pick is followed by the picker's pop rebuilding this
-// page from the draft, and nothing pops here.
+// is redraw the rows: a pick is followed by the picker's pop rebuilding this
+// page from the draft, and nothing pops here. globalGradientPicked does that
+// redraw for both routes (refreshRowsReadingGlobalGradient), because the rows
+// below this one read the global too (gm-nov3.41).
 void globalGradientOnCycle(void *user, int dir) {
     auto *ctx = static_cast<CatAnimationCtx *>(user);
     const auto choices = currentGradientChoices();
@@ -675,12 +710,6 @@ void globalGradientOnCycle(void *user, int dir) {
         return;
     }
     globalGradientPicked(ctx, next.c_str());
-    if (ctx->globalGradientRow != nullptr) {
-        // Both readings are the ones animBuildRow makes for this row, so the
-        // stepped row and a rebuilt one show the same thing.
-        settingsRowSetValue(ctx->globalGradientRow, globalGradientLabel(choices).c_str());
-        applyRowSwatch(ctx->globalGradientRow, std::string());
-    }
 }
 
 void globalGradientOnActivate(void *user) {
