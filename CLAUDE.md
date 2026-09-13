@@ -873,23 +873,51 @@ the design cannot show and what the runs measured.
   `bgAnimThemeMap`, so reordering or removing one changes what a device
   already set. Six stops each, because the palette arithmetic assumes even
   spacing and `bg_resolve_theme` copies 6 x 3 bytes.
-- **A gradient is chosen on a pushed picker page, and the picker keeps the
-  slot it was opened for** (gm-nov3.3, 2026-09-13, `CatGradientPicker.cpp`,
-  the swatch row in `SettingsRows.cpp`). The three gradient rows are
-  whole-row targets now, not prev/next cycles: the arrows are gone rather
-  than covered, because a row-wide target laid over them is two targets in
-  one place and `Rig.audit()` fails on the overlap. Four rules the page
-  cannot show. A pick is written before `popPages`, because the pop rebuilds
-  the page underneath from the draft and a write after it would leave the
-  old value on screen. Each level calls the opening category's reconcile
-  itself, since the shell reconciles only the top page. The picker captures
-  the animation slot it was opened for and never retargets it under a web
-  save; if that slot stops being editable (the standby animation turned off)
-  it closes without selecting, and both reconciles return immediately after
-  the pop that frees their ctx. And a swatch must not publish the gradient
-  it draws: the real palette code works on the globals the render task draws
-  with, so `GradientSwatch.cpp` is a separate transcription, held to the
-  real one by `tools/animbench/swatch_parity.cpp` (all 256 ramp entries, every
+- **A gradient row carries three targets: a band that opens the picker and
+  two arrows that step, and the picker keeps the slot it was opened for**
+  (gm-nov3.3 and gm-nov3.32, 2026-09-13, `CatGradientPicker.cpp`, the two
+  swatch rows in `SettingsRows.cpp`). gm-nov3.3 made the three gradient rows
+  whole-row targets that push a picker and took the prev/next arrows off,
+  because a row-wide target laid over them is two targets in one place and
+  `Rig.audit()` fails on the overlap. The owner asked for the stepping back,
+  and the overlap came from the target being row wide rather than from the
+  arrows existing: since gm-nov3.32 the picker is opened by a centre band
+  200 px wide (`kTextColW`, the width a choice row's text column has) and the
+  row container is not clickable at all, so the arrows land on the pixels a
+  choice row's arrows already occupy. Measured on the simulator, all four
+  Animation pages: no audit violations, smallest target 56x56, which is the
+  two arrows sitting exactly on the minimum with nothing to spare; the band
+  is 200x56, the closest pair inside a row is prev to next at 4 px, and band
+  to prev is 12 px. There is
+  no room for a wider band: the bottom row's far corner is 227.2 px from the
+  panel centre against the 228 px edge rule. The arrows walk the picker's own
+  flat order (Global where the row offers it, then the saved gradients, then
+  each category's built-ins, wrapping both ways), so stepping and then opening
+  the picker finds the marker where it should be, and a step writes the same
+  field a pick writes, through `animGradientAssign`. Holding an arrow is safe
+  because a step is one `Property::set`, which only raises a dirty flag
+  (`Property.h`), and NVS is written by the periodic flush
+  (`Settings::loopTask`): a five second hold stepped 45 times and left three
+  distinct readings of the stored field. The stepping row's ramp is a bar
+  under the name rather than a block beside it, and it keeps the picker row's
+  96 columns on purpose, because two checks compare a category row's swatch
+  pixels against a picker row's. Six rules the pages cannot show. A pick is
+  written before `popPages`, because the pop rebuilds the page underneath
+  from the draft and a write after it would leave the old value on screen.
+  Each level calls the opening category's reconcile itself, since the shell
+  reconciles only the top page. The picker captures the animation slot it was
+  opened for and never retargets it under a web save; if that slot stops
+  being editable (the standby animation turned off) it closes without
+  selecting, and both reconciles return immediately after the pop that frees
+  their ctx. `clampAnimId` at `enter` and at `reconcile` is load bearing
+  again now the arrows are back: a stored `bgAnimId` from a longer registry
+  wrote past the end of a heap vector on the first Gradient arrow press once
+  (91cb0ed5). An inert row's arrows are inert with it, which
+  `settingsRowSetEnabled` gives for free (`LV_STATE_DISABLED`, which
+  `lv_obj_hit_test` refuses). And a swatch must not publish the gradient it
+  draws: the real palette code works on the globals the render task draws
+  with, so `GradientSwatch.cpp` is a separate transcription, held to the real
+  one by `tools/animbench/swatch_parity.cpp` (all 256 ramp entries, every
   built-in, library strings of 2 to 16 stops with repeated positions and flat
   endpoint runs, seven tone settings). The rest is in
   `src/display/ui/default/settings/README.md`.
