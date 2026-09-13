@@ -498,8 +498,15 @@ telemetry-driven screen from a 650 ms LVGL pass (1.5 Hz widget updates,
   production env stopped building without anyone noticing for a day: the
   anonymous namespace was closed inside the block, and the planar kernel
   itself was inside it (fixed 2026-09-08, d0781460 and 45367098). The
-  worktree's `display` libdeps do not install on WSL1 (a permission
-  error unpacking Nanopb), so that build runs in the main checkout.
+  **That build works in a worktree, whatever this file said before**
+  (2026-09-13): `-e display` linked here in 5 min 17 s, 5,895,863 B of a
+  6,553,600 B app partition (90.0%), with the real 505,988 B web blob. The
+  earlier note said the worktree's libdeps would not install on WSL1 (a
+  permission error unpacking Nanopb) and sent the build to the main checkout.
+  The libdeps were already unpacked by then, in the main checkout and in the
+  worktree, and the nanopb generator ran from the main checkout's copy, so a
+  clone with no libdeps at all may still hit the original error. Try the build
+  before believing it cannot run.
 - **The overlay footprint per page is measured, not guessed** (gm-2cl.15,
   `tools/overlay_footprint.py`, report under `tools/overlay_footprint/`).
   `ov_px` on `/api/debug/anim` is the overlay pixels inside the composite's
