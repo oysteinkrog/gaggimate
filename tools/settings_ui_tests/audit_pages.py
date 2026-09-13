@@ -372,8 +372,9 @@ def open_schedule_editor(rig, n=1):
 
 
 def category_pages(include_fixture=True):
-    """The category pages to visit. A production build has no Fixture tile;
-    the runner passes include_fixture from the tile count it saw."""
+    """The category pages to visit. Only the simulator has a Fixture tile, so
+    no device build has one; the runner passes include_fixture from the tile
+    count it saw rather than from which build it is talking to."""
     if include_fixture:
         return list(CATEGORY_PAGES)
     return [p for p in CATEGORY_PAGES if p.cat != CAT_FIXTURE]

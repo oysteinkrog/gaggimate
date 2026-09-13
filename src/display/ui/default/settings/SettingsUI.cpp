@@ -19,16 +19,16 @@
 namespace {
 
 // Category registry, in the epic's order. The tile page and openCategory()
-// index into this; production builds carry five tiles, GM_TOUCH_PROBE and
-// GAGGIMATE_SIM builds carry the bench-only Fixture tile (SettingsFixture.cpp)
-// as a sixth.
+// index into this; every firmware build carries five tiles, and only the
+// simulator carries the Fixture tile (SettingsFixture.cpp) as a sixth.
 const SettingsCategoryDef *const kCategories[] = {
     &kCatTemps, &kCatDisplay, &kCatAnimation, &kCatMachine, &kCatStatus,
-#if defined(GM_TOUCH_PROBE) || defined(GAGGIMATE_SIM)
+#if defined(GAGGIMATE_SIM)
     &kCatFixture,
 #endif
 };
 constexpr int kCategoryCount = sizeof(kCategories) / sizeof(kCategories[0]);
+static_assert(kCategoryCount == kSettingsCategoryCount, "kSettingsCategoryCount is out of step with kCategories");
 
 } // namespace
 
@@ -335,8 +335,8 @@ void SettingsUI::buildTile(lv_obj_t *parent, int index, const SettingsCategoryDe
     // the 96x96/12px-edge/56x56-arrow rules in the epic's shared contract
     // (kTileRadius=145, kSize=96 keeps every corner inside radius 228 with
     // 15-30 px to spare, and every pair of adjacent tiles at least a few px
-    // apart). Production uses the first five; Fixture (bench/sim only) takes
-    // the sixth.
+    // apart). Every firmware build uses the first five; the simulator's
+    // Fixture tile takes the sixth.
     static constexpr int16_t kAngles[6] = {45, 90, 135, 225, 270, 315};
     static constexpr int kRadius = 145;
     static constexpr int kSize = 96;
@@ -701,7 +701,7 @@ SettingsUI::State SettingsUI::state() const {
 }
 
 SettingsUI::FixtureCounters SettingsUI::fixtureCounters() const {
-#if defined(GM_TOUCH_PROBE) || defined(GAGGIMATE_SIM)
+#if defined(GAGGIMATE_SIM)
     void *liveCtx = (!pageStack.empty() && pageStack.back().def == &kCatFixture) ? pageStack.back().ctx : nullptr;
     return fixtureCountersFor(liveCtx);
 #else

@@ -65,8 +65,9 @@ def main():
     ap.add_argument("--x", type=int)
     ap.add_argument("--y", type=int)
     ap.add_argument("--gap", type=float, default=0.7)
-    ap.add_argument("--settings-cat", type=int, help="open the settings cover and this category first "
-                    "(5 is the Fixture page; its toggle row at 240,254 is a harmless repeat target)")
+    ap.add_argument("--settings-cat", type=int, help="open the settings cover and this category first. "
+                    "The Fixture page this used to name is simulator-only now, so on a board pick a real "
+                    "category and pass --x/--y for a target whose press changes nothing")
     ap.add_argument("--uianim", action="store_true", help="run the uianim=1 motion test during the taps "
                     "(LVGL refreshing 4 to 5 times a second) instead of the synthetic brew")
     ap.add_argument("--out", default=os.path.join(os.environ.get("CLAUDE_JOB_DIR", "/tmp"), "tmp", "touch_lat.log"))

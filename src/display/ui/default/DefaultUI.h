@@ -142,14 +142,11 @@ class DefaultUI {
         int fixtureRepeats = 0;
         int fixtureFastRepeats = 0;
     };
-    // Valid range for a Cat command's arg: SettingsUI.cpp's kCategories
-    // holds the five real categories plus the Fixture tile that
-    // GM_TOUCH_PROBE and GAGGIMATE_SIM builds carry as a sixth, but
-    // SettingsUI.h exports neither the array nor its size, so this is kept
-    // in step with it by hand. The shared contract fixes this roster (five
-    // categories plus Fixture) for the epic's life, so it will not drift
-    // out from under a hardcoded count here.
-    static constexpr int kSettingsUiCategoryCount = 6;
+    // Valid range for a Cat command's arg. SettingsUI.h derives the count
+    // from the same condition that builds kCategories and static_asserts it
+    // against the array, so a script that asks for category 5 on a build
+    // without the Fixture tile is refused rather than indexing past the end.
+    static constexpr int kSettingsUiCategoryCount = kSettingsCategoryCount;
     // Queues cmd/arg if no command is already in flight and returns true
     // with seqOut set to the seq a caller should poll settingsUiState()
     // for; returns false, seqOut untouched, when a command is already

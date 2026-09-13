@@ -78,8 +78,8 @@ to run the tests, and what never to do here.
   opens the info screen (the WiFi setup QR code lives there), and the
   Restart confirm row.
 - `SettingsFixture.cpp`: the sixth tile. One of each row widget, and the
-  counters the Fixture scenario asserts on. Compiled only under
-  `GM_TOUCH_PROBE` or `GAGGIMATE_SIM`.
+  counters the fixture checks assert on. Compiled only under
+  `GAGGIMATE_SIM`, so it is a simulator tile and never a device one.
 
 ### The Standby anim row
 

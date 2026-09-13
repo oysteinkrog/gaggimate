@@ -971,10 +971,20 @@ the design cannot show and what the runs measured.
   returns false and the Restart row shows "Save failed, hold to retry"
   (`CatStatus.cpp`). `GM_SIM_FAIL_FLUSH=1` on the simulator arms one forced
   failure (`Settings::debugFailNextFlush`) so the path is testable.
-- **The Fixture tile (the sixth) exists only under `GM_TOUCH_PROBE` or
-  `GAGGIMATE_SIM`** (`SettingsFixture.cpp`): one of each row widget, so the
-  shell and the widgets stay exercisable whatever the five real categories
-  do. Production links five tiles.
+- **The Fixture tile (the sixth) exists only under `GAGGIMATE_SIM`**
+  (`SettingsFixture.cpp`): one of each row widget, so the shell and the
+  widgets stay exercisable whatever the five real categories do. It was
+  compiled for `GM_TOUCH_PROBE` as well until 2026-09-13, which put a test
+  tile in the settings menu of every bench board; the owner asked for it gone
+  from the display, and every check that reads its counters runs on the
+  simulator anyway. All three firmware builds link five tiles now.
+  `kSettingsCategoryCount` in `SettingsUI.h` follows the same condition and is
+  static_asserted against `kCategories`, so `/api/debug/settingsui?cat=5` on a
+  board is refused rather than indexing past the end of the array. The page
+  audit reads the tile count off the device (`audit_pages.category_pages`), so
+  it needed no change. Two device tools named the tile and now do not:
+  `tools/touch_lat.py --settings-cat 5` needs a real category and an explicit
+  `--x/--y`, and `tools/overlay_footprint.py` sweeps five.
 
 Instruments, and where each one exists:
 

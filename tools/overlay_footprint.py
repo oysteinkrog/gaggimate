@@ -49,9 +49,9 @@ SCREENS = [
     (11, "new_profile"),
     (10, "info"),
 ]
-# SettingsUI.cpp kCategories order; the Fixture tile (5) exists only on
-# loadtest and sim builds and is a test category, so it is included last.
-CATEGORIES = ["temps", "display", "animation", "machine", "status", "fixture"]
+# SettingsUI.cpp kCategories order. The Fixture tile is simulator-only since
+# the tile was taken off device builds, so a board has categories 0 to 4.
+CATEGORIES = ["temps", "display", "animation", "machine", "status"]
 RUN_GAP_MERGE = 4  # SleepAnimation.cpp emitRun
 
 
