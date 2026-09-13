@@ -39,9 +39,15 @@
    "swell) is exact: 0 differing pixels at all three frames. The distance",
    "and the two per-pixel tables are 97% of the gap and the row swell 3%.",
    "It is not shipped because the page's model is per-pixel libm over about",
-   "100,000 ring pixels a frame: the host bench band goes from 0.118 to",
-   "0.541 ms a frame, and it would have to be transcribed bit for bit into",
-   "two hand-written Xtensa kernels that have no fallback flag. The reason",
+   "100,000 ring pixels a frame, and it would have to be transcribed bit for",
+   "bit into two hand-written Xtensa kernels that have no fallback flag.",
+   "The partial variant is not a cheaper way in, which is what decides it:",
+   "three binaries from one tree, timed interleaved, seven runs each, host",
+   "bench band per frame, this file 0.263 ms, the distance and tables fixed",
+   "0.562, everything exact 0.546. So 97% of the gap costs 100% of the",
+   "price and the row swell is free. An earlier note here said 0.118 to",
+   "0.541: the 0.118 was a stale baseline from a fleet run three days older",
+   "than the variant, and the same binary measures 0.263 today. The reason",
    "and the numbers are in AnimRipples.cpp's header."
   ],
   "cube": [

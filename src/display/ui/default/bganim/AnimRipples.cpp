@@ -33,11 +33,27 @@
 // tables were fixed, and the largest deviation anywhere fell from 46 to 8,
 // one palette step).
 //
-// It is not shipped because the page's model is per-pixel libm. The host
-// bench band goes from 0.118 to 0.541 ms a frame, and the device pays worse:
-// band_us is already 14,004 for a full frame, this is about 100,000 ring
-// pixels a frame, and every one of them would need a square root, a cosine
-// and a divide where it now does integer adds and two table reads. A float
+// That partial variant is not a cheaper option, which is the number that
+// decides this. Three binaries built from the same tree and timed
+// interleaved, seven runs each, minimum of 240-frame host bench band times:
+// this file 0.263 ms a frame, the distance and tables fixed with the row
+// swell left on its table 0.562, everything exact 0.546. So the middle
+// option buys 97% of the gap for 100% of the cost, and the row swell is
+// free: it is one sine per row against about 100,000 ring pixels a frame.
+// The two alternatives are exactness at about 2.1x, or this file.
+//
+// (An earlier note here said 0.118 to 0.541, about 4.6x. The 0.118 was a
+// stale baseline read off a fleet run from 2026-09-10, before something
+// outside this file changed what ripples does per frame; the same binary
+// measures 0.263 today, and the mathcount column reads 5 libm calls a frame
+// where the old runs read 1. Time a baseline in the same session as the
+// variant it is being compared with.)
+//
+// It is not shipped because the page's model is per-pixel libm, and the
+// device pays worse than the host does: band_us is already 14,004 for a
+// full frame, this is about 100,000 ring pixels a frame, and every one of
+// them would need a square root, a cosine and a divide where it now does
+// integer adds and two table reads. A float
 // version with a double fallback near the rounding boundaries, the scheme
 // AnimFireflies.cpp uses, would cut that but not to nothing, and it would
 // have to be transcribed bit for bit into the two hand-written Xtensa
