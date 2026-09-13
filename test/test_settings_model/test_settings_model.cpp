@@ -1439,6 +1439,153 @@ static void test_migrate_destination_choice() {
     }
 }
 
+// True when nothing in the library carries this id, i.e. a ref to it still
+// dangles. Uses the production lookup, which is what a ref is resolved with.
+static bool libraryHasId(const std::string &library, int id) {
+    uint8_t stops[BG_THEME_MAX_STOPS][3];
+    uint8_t pos[BG_THEME_MAX_STOPS];
+    int n = 0;
+    bool uniform = true;
+    return bg_library_lookup(library.c_str(), id, stops, pos, n, uniform);
+}
+
+static void test_migrate_never_reuses_an_ambiguous_duplicate_id() {
+    // Duplicate ids validate, and bg_library_lookup answers with the first
+    // entry carrying one. Here the entry that matches the legacy gradient is
+    // the second of the two, so it is not what c1 draws. Reusing it would
+    // publish c1, retire the legacy string, and leave every animation drawing
+    // 000000..ffffff: the user's gradient gone.
+    {
+        FakeNvs nvs;
+        nvs.library = "1|Other|000000,ffffff;1|Match|112233,445566,778899";
+        nvs.custom = kCustom;
+        nvs.theme = BG_THEME_LEGACY_CUSTOM;
+        TEST_ASSERT_TRUE(bg_library_valid(nvs.library.c_str()));
+        const std::string lib = nvs.library;
+        const std::string before = effective(nvs);
+
+        TEST_ASSERT_EQUAL(static_cast<int>(BgMigrateResult::Done), static_cast<int>(boot(nvs)));
+
+        // Both existing entries are exactly as they were, and the copy went
+        // to an id of its own.
+        TEST_ASSERT_EQUAL_STRING((lib + ";2|Custom|112233,445566,778899").c_str(), nvs.library.c_str());
+        TEST_ASSERT_EQUAL_STRING("c2", nvs.globalRef.c_str());
+        // The published ref resolves, through the production lookup, to the
+        // gradient that was retired.
+        TEST_ASSERT_EQUAL_STRING("", nvs.custom.c_str());
+        TEST_ASSERT_EQUAL(0, nvs.theme);
+        TEST_ASSERT_EQUAL_STRING(before.c_str(), effective(nvs).c_str());
+        // And c1 still draws what it drew: the first entry, untouched.
+        TEST_ASSERT_EQUAL_STRING(
+            resolved(0, "", lib.c_str(), "c1", 0, "").c_str(),
+            resolved(0, "", nvs.library.c_str(), "c1", 0, "").c_str());
+        // Nothing left for the next boot.
+        TEST_ASSERT_EQUAL(static_cast<int>(BgMigrateResult::NothingToDo), static_cast<int>(boot(nvs)));
+    }
+    // The mirror case: the duplicated id names the entry that matches, so
+    // reuse is safe and nothing is appended.
+    {
+        FakeNvs nvs;
+        nvs.library = "1|Match|112233,445566,778899;1|Other|000000,ffffff";
+        nvs.custom = kCustom;
+        nvs.theme = BG_THEME_LEGACY_CUSTOM;
+        const std::string lib = nvs.library;
+        const std::string before = effective(nvs);
+
+        TEST_ASSERT_EQUAL(static_cast<int>(BgMigrateResult::Done), static_cast<int>(boot(nvs)));
+        TEST_ASSERT_EQUAL_STRING(lib.c_str(), nvs.library.c_str());
+        TEST_ASSERT_EQUAL_STRING("c1", nvs.globalRef.c_str());
+        TEST_ASSERT_EQUAL_STRING(before.c_str(), effective(nvs).c_str());
+    }
+    // A duplicate whose colours match but at its own positions is not a
+    // destination either, whichever entry the id names.
+    {
+        FakeNvs nvs;
+        nvs.library = "1|Positioned|112233@0,445566@10,778899@255;1|Other|000000,ffffff";
+        nvs.custom = kCustom;
+        nvs.theme = BG_THEME_LEGACY_CUSTOM;
+        const std::string lib = nvs.library;
+        const std::string before = effective(nvs);
+
+        TEST_ASSERT_EQUAL(static_cast<int>(BgMigrateResult::Done), static_cast<int>(boot(nvs)));
+        TEST_ASSERT_EQUAL_STRING((lib + ";2|Custom|112233,445566,778899").c_str(), nvs.library.c_str());
+        TEST_ASSERT_EQUAL_STRING("c2", nvs.globalRef.c_str());
+        TEST_ASSERT_EQUAL_STRING(before.c_str(), effective(nvs).c_str());
+    }
+}
+
+static void test_migrate_allocates_past_the_first_thirteen_ids() {
+    // Thirteen dangling map refs and an empty library. Ids 1..13 are all
+    // spoken for, and 14 is a perfectly good id: the accepted range runs to
+    // BG_GRADIENT_ID_MAX, and the web editor allocates by incrementing the
+    // largest id in use, so ids above the entry limit arise in normal use.
+    {
+        FakeNvs nvs;
+        nvs.map = "c1;c2;c3;c4;c5;c6;c7;c8;c9;c10;c11;c12;c13";
+        nvs.custom = kCustom;
+        nvs.theme = BG_THEME_LEGACY_CUSTOM;
+        const std::string map = nvs.map;
+        std::vector<std::string> before;
+        for (int a = 0; a < 15; a++) {
+            before.push_back(resolved(a, nvs.map.c_str(), nvs.library.c_str(), nvs.globalRef.c_str(), nvs.theme,
+                                      nvs.custom.c_str()));
+        }
+
+        TEST_ASSERT_EQUAL(static_cast<int>(BgMigrateResult::Done), static_cast<int>(boot(nvs)));
+        TEST_ASSERT_EQUAL_STRING("14|Custom|112233,445566,778899", nvs.library.c_str());
+        TEST_ASSERT_EQUAL_STRING("c14", nvs.globalRef.c_str());
+        TEST_ASSERT_EQUAL_STRING(map.c_str(), nvs.map.c_str());
+        // The thirteen refs still dangle, so what they draw has not moved.
+        for (int id = 1; id <= 13; id++) {
+            TEST_ASSERT_FALSE(libraryHasId(nvs.library, id));
+        }
+        for (int a = 0; a < 15; a++) {
+            TEST_ASSERT_EQUAL_STRING(before[static_cast<size_t>(a)].c_str(),
+                                     resolved(a, nvs.map.c_str(), nvs.library.c_str(), nvs.globalRef.c_str(),
+                                              nvs.theme, nvs.custom.c_str())
+                                         .c_str());
+        }
+    }
+    // The same with an entry at the top of the accepted range in the way:
+    // the new id goes in the gap the refs leave, and 99999 is untouched.
+    {
+        FakeNvs nvs;
+        nvs.library = "99999|Top|010203,040506";
+        nvs.map = "c1;c2;c3;c4;c5;c6;c7;c8;c9;c10;c11;c12;c13";
+        nvs.custom = kCustom;
+        nvs.theme = BG_THEME_LEGACY_CUSTOM;
+        const std::string before = effective(nvs);
+        const std::string top = resolved(0, "", nvs.library.c_str(), "c99999", 0, "");
+
+        TEST_ASSERT_EQUAL(static_cast<int>(BgMigrateResult::Done), static_cast<int>(boot(nvs)));
+        TEST_ASSERT_EQUAL_STRING("99999|Top|010203,040506;14|Custom|112233,445566,778899", nvs.library.c_str());
+        TEST_ASSERT_EQUAL_STRING("c14", nvs.globalRef.c_str());
+        TEST_ASSERT_EQUAL_STRING(top.c_str(), resolved(0, "", nvs.library.c_str(), "c99999", 0, "").c_str());
+        TEST_ASSERT_EQUAL_STRING(before.c_str(), effective(nvs).c_str());
+        for (int id = 1; id <= 13; id++) {
+            TEST_ASSERT_FALSE(libraryHasId(nvs.library, id));
+        }
+    }
+    // A dangling ref at the top of the range reserves only itself.
+    {
+        FakeNvs nvs;
+        nvs.globalRef = "c99999";
+        nvs.map = "c99999";
+        nvs.custom = kCustom;
+        nvs.theme = BG_THEME_LEGACY_CUSTOM;
+        const std::string before = effective(nvs);
+
+        TEST_ASSERT_EQUAL(static_cast<int>(BgMigrateResult::Done), static_cast<int>(boot(nvs)));
+        TEST_ASSERT_EQUAL_STRING("1|Custom|112233,445566,778899", nvs.library.c_str());
+        // The stored global ref is not this migration's to replace, so the
+        // legacy pair stays behind it and what draws does not move.
+        TEST_ASSERT_EQUAL_STRING("c99999", nvs.globalRef.c_str());
+        TEST_ASSERT_EQUAL_STRING(kCustom, nvs.custom.c_str());
+        TEST_ASSERT_EQUAL_STRING(before.c_str(), effective(nvs).c_str());
+        TEST_ASSERT_FALSE(libraryHasId(nvs.library, 99999));
+    }
+}
+
 static void test_migrate_defers_rather_than_evicting() {
     // A full library with nothing matching: deferred, nothing written, and
     // the custom gradient still resolves.
@@ -1463,35 +1610,48 @@ static void test_migrate_defers_rather_than_evicting() {
         TEST_ASSERT_EQUAL(0, nvs.writes);
         TEST_ASSERT_EQUAL_STRING(before.c_str(), effective(nvs).c_str());
     }
-    // The serialized length limit, with room to spare on the entry count.
+    // The serialized length limit, with room to spare on the entry count, so
+    // the deferral can only be the length.
+    //
+    // Entry content alone cannot reach the cap: the widest entry the grammar
+    // allows is a five-digit id, a 96-byte name and sixteen positioned stops,
+    // 278 characters, so twelve of them are 3347 against a 3800-character
+    // cap. The fixture uses eleven such entries and pads the last gradient
+    // with the spaces the parser tolerates between stops, which is what a
+    // hand-edited library can look like. The earlier version of this fixture
+    // padded a name instead, past the length walkLibrary accepts, so the
+    // library was malformed and the planner deferred for that reason without
+    // ever reaching the length check.
     {
         FakeNvs nvs;
-        std::string big = "1|Big|";
-        for (int i = 0; i < BG_THEME_MAX_STOPS; i++) {
-            if (i > 0) {
-                big += ',';
+        for (int i = 1; i <= BG_GRADIENT_LIB_MAX - 1; i++) {
+            if (i > 1) {
+                nvs.library += ';';
             }
-            big += "010203";
-        }
-        nvs.library = big;
-        while (static_cast<int>(nvs.library.size()) < BG_GRADIENT_LIB_MAX_LEN - 10) {
-            nvs.library += ";" + std::to_string(libraryEntryCount(nvs.library) + 1) + "|" +
-                           std::string(BG_GRADIENT_NAME_MAX, 'x') + "|010203,040506";
-            if (libraryEntryCount(nvs.library) >= BG_GRADIENT_LIB_MAX) {
-                break;
+            nvs.library += std::to_string(i) + "|" + std::string(BG_GRADIENT_NAME_MAX * 4, 'x') + "|";
+            for (int s = 0; s < BG_THEME_MAX_STOPS; s++) {
+                char buf[16];
+                std::snprintf(buf, sizeof(buf), "%s0102%02x@%d", s > 0 ? "," : "", s, 100 + s * 10);
+                nvs.library += buf;
             }
         }
-        // Pad the last name until the string is within a few characters of
-        // the cap, so one more entry cannot fit.
-        while (static_cast<int>(nvs.library.size()) < BG_GRADIENT_LIB_MAX_LEN - 8) {
-            nvs.library.insert(nvs.library.rfind("|010203,040506"), "y");
-        }
+        nvs.library.append(static_cast<size_t>(BG_GRADIENT_LIB_MAX_LEN) - nvs.library.size(), ' ');
+        // Exactly at the cap, valid, and one entry short of the entry limit.
+        TEST_ASSERT_EQUAL(BG_GRADIENT_LIB_MAX_LEN, static_cast<int>(nvs.library.size()));
+        TEST_ASSERT_TRUE(bg_library_valid(nvs.library.c_str()));
+        TEST_ASSERT_EQUAL(BG_GRADIENT_LIB_MAX - 1, libraryEntryCount(nvs.library));
+
         const std::string lib = nvs.library;
         nvs.custom = kCustom;
         nvs.theme = BG_THEME_LEGACY_CUSTOM;
+        const std::string before = effective(nvs);
         TEST_ASSERT_EQUAL(static_cast<int>(BgMigrateResult::Deferred), static_cast<int>(boot(nvs)));
         TEST_ASSERT_EQUAL_STRING(lib.c_str(), nvs.library.c_str());
+        TEST_ASSERT_EQUAL_STRING("", nvs.globalRef.c_str());
+        TEST_ASSERT_EQUAL_STRING(kCustom, nvs.custom.c_str());
+        TEST_ASSERT_EQUAL(BG_THEME_LEGACY_CUSTOM, nvs.theme);
         TEST_ASSERT_EQUAL(0, nvs.writes);
+        TEST_ASSERT_EQUAL_STRING(before.c_str(), effective(nvs).c_str());
     }
     // A malformed library: never appended to, never replaced.
     {
@@ -1520,9 +1680,23 @@ static void test_migrate_defers_rather_than_evicting() {
 
 // ---------------------------------------------------------------------------
 // Group K -- fault injection across the persistence steps
+//
+// Every fixture here is run twice, against the table this build ships and
+// against the longer test table. The planner reads the table (refResolves
+// asks whether a built-in ref resolves), so the staged persistence has to
+// come out the same on a device whose firmware has more built-ins than the
+// one that wrote the settings.
 // ---------------------------------------------------------------------------
 
-static void test_migrate_survives_a_failed_library_write() {
+template <typename F> static void underBothThemeTables(F body) {
+    useShippedTable();
+    body();
+    useBigTable();
+    body();
+    useShippedTable();
+}
+
+static void migrate_survives_a_failed_library_write() {
     FakeNvs nvs;
     nvs.custom = kCustom;
     nvs.theme = BG_THEME_LEGACY_CUSTOM;
@@ -1545,7 +1719,7 @@ static void test_migrate_survives_a_failed_library_write() {
     TEST_ASSERT_EQUAL_STRING(before.c_str(), effective(nvs).c_str());
 }
 
-static void test_migrate_survives_a_failed_ref_write() {
+static void migrate_survives_a_failed_ref_write() {
     FakeNvs nvs;
     nvs.custom = kCustom;
     nvs.theme = BG_THEME_LEGACY_CUSTOM;
@@ -1569,7 +1743,7 @@ static void test_migrate_survives_a_failed_ref_write() {
     TEST_ASSERT_EQUAL_STRING(before.c_str(), effective(nvs).c_str());
 }
 
-static void test_migrate_survives_a_clear_that_lies() {
+static void migrate_survives_a_clear_that_lies() {
     FakeNvs nvs;
     nvs.custom = kCustom;
     nvs.theme = BG_THEME_LEGACY_CUSTOM;
@@ -1608,7 +1782,7 @@ static void test_migrate_survives_a_clear_that_lies() {
     TEST_ASSERT_EQUAL(1, libraryEntryCount(inactive.library));
 }
 
-static void test_migrate_reboot_after_each_durable_step() {
+static void migrate_reboot_after_each_durable_step() {
     // Reboot with only the library durable: the entry is reused and the ref
     // is published, never a second entry.
     {
@@ -1651,6 +1825,15 @@ static void test_migrate_reboot_after_each_durable_step() {
         TEST_ASSERT_EQUAL(1, libraryEntryCount(nvs.library));
         TEST_ASSERT_EQUAL_STRING(before.c_str(), effective(nvs).c_str());
     }
+}
+
+static void test_migrate_survives_a_failed_library_write() {
+    underBothThemeTables(migrate_survives_a_failed_library_write);
+}
+static void test_migrate_survives_a_failed_ref_write() { underBothThemeTables(migrate_survives_a_failed_ref_write); }
+static void test_migrate_survives_a_clear_that_lies() { underBothThemeTables(migrate_survives_a_clear_that_lies); }
+static void test_migrate_reboot_after_each_durable_step() {
+    underBothThemeTables(migrate_reboot_after_each_durable_step);
 }
 
 // ---------------------------------------------------------------------------
@@ -1725,6 +1908,8 @@ int main(int argc, char **argv) {
     RUN_TEST(test_migrate_already_migrated_device_is_not_reactivated);
     RUN_TEST(test_migrate_preserves_newer_selections);
     RUN_TEST(test_migrate_destination_choice);
+    RUN_TEST(test_migrate_never_reuses_an_ambiguous_duplicate_id);
+    RUN_TEST(test_migrate_allocates_past_the_first_thirteen_ids);
     RUN_TEST(test_migrate_defers_rather_than_evicting);
 
     RUN_TEST(test_migrate_survives_a_failed_library_write);

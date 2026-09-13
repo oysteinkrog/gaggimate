@@ -108,6 +108,12 @@ constexpr int BG_GRADIENT_LIB_MAX = 12;       // library entries
 constexpr int BG_GRADIENT_LIB_MAX_LEN = 3800; // chars; NVS strings cap at 4000
 constexpr int BG_GRADIENT_NAME_MAX = 24;      // characters, as the UI counts them
 constexpr int BG_GRADIENT_STR_MAX = BG_THEME_MAX_STOPS * 11; // "rrggbb@255," per stop
+// The largest entry id the grammar accepts, in the library and in a ref:
+// the parser reads at most five decimal digits. Ids are not positions, are
+// not dense, and do not have to stay under BG_GRADIENT_LIB_MAX: the web
+// editor allocates by incrementing the largest id in use, so a library of
+// three entries can carry ids 1, 40 and 41.
+constexpr int BG_GRADIENT_ID_MAX = 99999;
 
 // ---- the legacy bgAnimTheme namespace, frozen -----------------------------
 //
@@ -201,6 +207,14 @@ int bg_parse_gradient(const char *s, uint8_t stops[BG_THEME_MAX_STOPS][3], uint8
 int bg_format_gradient(const uint8_t stops[][3], const uint8_t *pos, int nStops, bool uniform, char *out, int outLen);
 
 // Library: every entry has a positive numeric id, a name, a parsable gradient.
+// Ids are not checked for uniqueness here, and the shipped writers do not
+// create duplicates, but a hand-written or rolled-back library can carry
+// them. bg_library_lookup answers with the FIRST entry holding the id, so
+// that entry is what every ref into the library draws, and a later entry
+// with the same id is unreachable. Code that picks an entry by walking the
+// library must therefore confirm its choice through bg_library_lookup before
+// storing a ref to it; walking and looking up otherwise disagree about which
+// entry an id names.
 bool bg_library_valid(const char *lib);
 bool bg_library_lookup(const char *lib, int id, uint8_t stops[BG_THEME_MAX_STOPS][3], uint8_t pos[BG_THEME_MAX_STOPS],
                        int &nStops, bool &uniform);
@@ -251,6 +265,16 @@ void bg_resolve_anim_theme(int animId, const char *map, const char *library, con
 //    the legacy fallback behind it is preserved too.
 //  - It never evicts a library entry or writes a library that does not
 //    validate. When no destination fits it defers and changes nothing.
+//  - It never reuses an entry whose id resolves, through bg_library_lookup,
+//    to a different gradient. With duplicate ids the entry that matches the
+//    legacy colours need not be the entry its own id names, and publishing a
+//    ref to it would retire the legacy string while the panel drew the other
+//    entry. Such a match is passed over and a fresh id is allocated, which
+//    leaves every existing entry exactly as it is.
+//  - It allocates from the whole 1..BG_GRADIENT_ID_MAX range, skipping every
+//    id an entry or a stored ref already holds, rather than from the first
+//    BG_GRADIENT_LIB_MAX ids. Ids in use are not dense: the web editor
+//    allocates by incrementing the largest one.
 struct BgGradientMigration {
     enum Action {
         None,     // nothing to carry over, or it is already carried over

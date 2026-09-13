@@ -10,6 +10,7 @@
 
 #include "BgAnim.h"
 #include "BgAnimThemeTable.h"
+#include <algorithm>
 #include <ctype.h>
 #include <stdio.h>
 #include <string.h>
@@ -460,24 +461,78 @@ bool refResolves(const char *ref, const char *library) {
     return builtin >= 0 && builtin < THEME_COUNT;
 }
 
-// Marks every library id a stored ref names, whether or not it exists today.
-// A new entry must not take one of these: a dangling "c5" that suddenly
-// resolved would change what that animation draws.
-void reserveRefIds(const char *refs, bool *reserved, int reservedLen) {
-    if (refs == nullptr) {
-        return;
-    }
-    const char *s = refs;
-    while (*s != '\0') {
-        if (*s != ';') {
-            int builtin;
-            int libId;
-            if (parseRef(s, builtin, libId) && libId > 0 && libId < reservedLen) {
-                reserved[libId] = true;
-            }
+// The ids a migration may not hand out: every id an entry carries, plus every
+// id a stored ref names, whether or not it resolves today. A dangling "c5"
+// that suddenly resolved would change what that animation draws.
+//
+// A list rather than a flag per id, because the accepted range runs to
+// BG_GRADIENT_ID_MAX and the ids in use are not dense: the web editor
+// allocates by incrementing the largest one, so a three-entry library can
+// hold 1, 40 and 41. The list stays short whatever the ids are. There are at
+// most BG_GRADIENT_LIB_MAX entries and the map is capped at 256 characters,
+// so a few dozen ids in all, and the lowest free one is never far above that
+// count.
+struct ReservedIds {
+    std::vector<int> ids;
+
+    void add(int id) {
+        if (id > 0 && id <= BG_GRADIENT_ID_MAX) {
+            ids.push_back(id);
         }
-        skipEntry(s);
     }
+
+    // Every library id named by "ref;ref;...", one map or the global ref.
+    void addRefs(const char *refs) {
+        if (refs == nullptr) {
+            return;
+        }
+        const char *s = refs;
+        while (*s != '\0') {
+            if (*s != ';') {
+                int builtin;
+                int libId;
+                if (parseRef(s, builtin, libId)) {
+                    add(libId);
+                }
+            }
+            skipEntry(s);
+        }
+    }
+
+    // The lowest id nothing has reserved, or -1 when the range is exhausted.
+    int firstFree() {
+        std::sort(ids.begin(), ids.end());
+        int candidate = 1;
+        for (const int id : ids) {
+            if (id < candidate) {
+                continue; // a duplicate, or an id below where the scan is
+            }
+            if (id > candidate) {
+                break; // the gap under it is free
+            }
+            candidate = id + 1;
+        }
+        return candidate <= BG_GRADIENT_ID_MAX ? candidate : -1;
+    }
+};
+
+// Does the production lookup for id give back exactly this gradient, evenly
+// spaced? Walking the library and looking an id up do not have to agree:
+// duplicate ids validate, and bg_library_lookup answers with the first entry
+// carrying one. So an entry that matches the legacy gradient is a usable
+// destination only when its own id resolves to it. Publishing a ref to an id
+// that resolves elsewhere and then retiring the legacy fields is how the
+// user's gradient would be lost.
+bool idResolvesTo(const char *library, int id, const char *wanted) {
+    uint8_t stops[BG_THEME_MAX_STOPS][3];
+    uint8_t pos[BG_THEME_MAX_STOPS];
+    int nStops = 0;
+    bool uniform = true;
+    if (!bg_library_lookup(library, id, stops, pos, nStops, uniform) || nStops == 0 || !uniform) {
+        return false;
+    }
+    char canon[BG_GRADIENT_STR_MAX];
+    return bg_format_gradient(stops, pos, nStops, true, canon, sizeof(canon)) > 0 && strcmp(canon, wanted) == 0;
 }
 
 } // namespace
@@ -510,37 +565,24 @@ BgGradientMigration bg_plan_gradient_migration(const char *library, const char *
         return plan;
     }
 
-    // Ids 1..BG_GRADIENT_LIB_MAX + 1: with at most BG_GRADIENT_LIB_MAX entries
-    // one of them is always free, unless a stored ref has reserved it.
-    constexpr int kIdSlots = BG_GRADIENT_LIB_MAX + 2;
-    bool taken[kIdSlots] = {false};
+    ReservedIds reserved;
     int entryCount = 0;
     int matchId = -1;
-    walkLibrary(library, [&](int id, const char *, int, const char *gradient) {
+    walkLibrary(library, [&](int id, const char *, int, const char *) {
         entryCount++;
-        if (id > 0 && id < kIdSlots) {
-            taken[id] = true;
-        }
-        if (matchId < 0) {
-            uint8_t s2[BG_THEME_MAX_STOPS][3];
-            uint8_t p2[BG_THEME_MAX_STOPS];
-            bool u2 = true;
-            const int n2 = parseGradient(gradient, s2, p2, u2);
-            // Same semantics means the same colours in the same order AND
-            // even spacing. An entry with the same colours at its own
-            // positions draws differently, and it is the user's, so it is
-            // left alone and a new entry is allocated instead.
-            if (n2 == n && u2) {
-                char canon[BG_GRADIENT_STR_MAX];
-                if (bg_format_gradient(s2, p2, n2, true, canon, sizeof(canon)) > 0 && strcmp(canon, wanted) == 0) {
-                    matchId = id;
-                }
-            }
+        reserved.add(id);
+        // A destination is judged by what its id resolves to, not by what the
+        // entry in front of us holds. Same semantics means the same colours
+        // in the same order AND even spacing: an entry with the same colours
+        // at its own positions draws differently, and it is the user's, so it
+        // is left alone and a new entry is allocated instead.
+        if (matchId < 0 && idResolvesTo(library, id, wanted)) {
+            matchId = id;
         }
         return false;
     });
-    reserveRefIds(globalRef, taken, kIdSlots);
-    reserveRefIds(map, taken, kIdSlots);
+    reserved.addRefs(globalRef);
+    reserved.addRefs(map);
 
     if (matchId > 0) {
         plan.entryId = matchId;
@@ -550,11 +592,8 @@ BgGradientMigration bg_plan_gradient_migration(const char *library, const char *
             plan.reason = "the gradient library is full";
             return plan;
         }
-        int id = 1;
-        while (id < kIdSlots && taken[id]) {
-            id++;
-        }
-        if (id >= kIdSlots) {
+        const int id = reserved.firstFree();
+        if (id < 0) {
             plan.action = BgGradientMigration::Deferred;
             plan.reason = "no free gradient id";
             return plan;
