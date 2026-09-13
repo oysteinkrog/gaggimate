@@ -26,6 +26,12 @@ rejected. The saves that the open category is expected to overwrite are read
 back on a field of the same form that the display never writes, because their
 own gradient field is the thing under test (store_over_draft).
 
+Since gm-nov3.31 the scenario also covers what a pick does to the picker
+itself. A pick applies and stays on the page, so browsing is one tap per
+gradient, and the three checks at the end of CHECKS are that: three picks in
+one visit, the "Global" entry on the first page, and the one case that still
+closes the picker under the user, the edited slot going away.
+
 Usage:
     python3 tools/settings_ui_tests/test_gradientdraft.py
         [--program PATH/to/.pio/build/display-sim/program]
@@ -55,8 +61,10 @@ from tools.settings_ui_tests.gradients_gen import (  # noqa: E402
 # drives the same category through the same rows and must not grow a second
 # reading of them.
 from tools.settings_ui_tests.test_animation import (  # noqa: E402
+    ANIM_NAMES,
     close_animation,
     depth,
+    map_ref,
     map_write_ref,
     open_animation,
     open_picker,
@@ -65,6 +73,7 @@ from tools.settings_ui_tests.test_animation import (  # noqa: E402
     picker_choose,
     picker_selected_rows,
     picker_tap,
+    restore_fields_exactly,
     rows_across_pages,
     swatch_strip,
     web_save,
@@ -623,6 +632,153 @@ def check_legacy_unparsable_custom_falls_back(rig):
         check(rig, "legacy_%s_visit_writes_nothing" % name, after == before, "%r want %r" % (after, before))
 
 
+# ---------------------------------------------------------------------------
+# gm-nov3.31: a pick applies and leaves the picker open
+
+
+def three_in_one_category():
+    """Three built-ins out of one category, so one group page lists all three
+    and a marker there names exactly one of them. Read out of the table rather
+    than written down, so appending to data/gradients.json does not move what
+    these checks drive. The first three of the category, so a category of
+    seven or eight does not spread them across two pages of five."""
+    for cat in GRADIENT_CATEGORIES:
+        found = [{"ref": str(i), "name": n, "cat": cat}
+                 for i, n in enumerate(THEME_NAMES) if GRADIENT_CATEGORY_OF[i] == cat]
+        if len(found) >= 3:
+            return found[:3]
+    raise AssertionError("no gradient category holds three built-ins")
+
+
+def check_pick_keeps_the_picker_open(rig):
+    """Acceptance (gm-nov3.31): three picks in one visit are three taps. Each
+    applies at once, moves the marker onto the row that was tapped, and leaves
+    the picker on the page it was on. The chevron is what leaves, and the row
+    underneath then shows the third pick, which is also what commits.
+
+    The stored map is read after every tap, not only at the end: the owner's
+    request is that the panel follows each tap, and the map is what the render
+    task resolves a per animation gradient from."""
+    picks = three_in_one_category()
+    s0 = rig.settings()
+    anim0 = int(s0["bgAnimId"])
+    # Start on the third pick, so every tap in the loop below is a real change
+    # and none of the three can pass by the slot already holding it.
+    start = map_write_ref(str(s0["bgAnimThemeMap"]), anim0, picks[2]["ref"])
+    if not store(rig, "stay_open_setup", {"bgAnimThemeMap": start}):
+        return
+
+    open_animation(rig)
+    open_picker(rig, "Gradient")
+    at_group = depth(rig) + 1
+    picker_tap(rig, picks[0]["cat"])
+    if not check(rig, "stay_open_group_opened", settled(rig, lambda: depth(rig) == at_group),
+                 "depth %d want %d" % (depth(rig), at_group)):
+        close_animation(rig)
+        return
+
+    for n, pick in enumerate(picks):
+        picker_tap(rig, pick["name"])
+        applied = settled(rig, lambda p=pick: map_ref(rig.settings()["bgAnimThemeMap"], anim0) == p["ref"])
+        check(rig, "stay_open_pick%d_applies" % n, applied,
+              "slot %d is %r want %r" % (anim0, map_ref(rig.settings()["bgAnimThemeMap"], anim0), pick["ref"]))
+        check(rig, "stay_open_pick%d_stays_open" % n, depth(rig) == at_group,
+              "depth %d want %d" % (depth(rig), at_group))
+        marked = picker_selected_rows(rig)
+        check(rig, "stay_open_pick%d_marker_moved" % n, marked == [pick["name"]],
+              "marked %r want %r" % (marked, [pick["name"]]))
+
+    picker_cancel(rig)
+    picker_cancel(rig)
+    check(rig, "stay_open_chevron_leaves", depth(rig) == 1, "depth %d want 1" % depth(rig))
+    value = rig.row_value(page_with_row(rig, "Gradient"), "Gradient")
+    check(rig, "stay_open_row_under_shows_last_pick", value == picks[2]["name"],
+          "row %r want %r" % (value, picks[2]["name"]))
+
+    close_animation(rig)
+    after = str(rig.settings()["bgAnimThemeMap"])
+    check(rig, "stay_open_commits_last_pick", map_ref(after, anim0) == picks[2]["ref"],
+          "slot %d is %r want %r" % (anim0, map_ref(after, anim0), picks[2]["ref"]))
+    moved = [i for i in range(len(ANIM_NAMES)) if i != anim0 and map_ref(after, i) != map_ref(start, i)]
+    check(rig, "stay_open_leaves_other_slots", not moved,
+          "slots %r moved" % moved)
+
+
+def check_global_entry_keeps_the_picker_open(rig):
+    """Acceptance (gm-nov3.31): the "Global" entry on the picker's first page
+    assigns and stays open with the marker moved. Someone comparing the global
+    gradient against a per animation override should not be thrown out for
+    picking one of them."""
+    picks = three_in_one_category()
+    s0 = rig.settings()
+    anim0 = int(s0["bgAnimId"])
+    start = map_write_ref(str(s0["bgAnimThemeMap"]), anim0, picks[0]["ref"])
+    if not store(rig, "global_entry_setup", {"bgAnimThemeMap": start}):
+        return
+
+    open_animation(rig)
+    open_picker(rig, "Gradient")
+    at_top = depth(rig)
+    marked = picker_selected_rows(rig)
+    check(rig, "global_entry_starts_on_the_override", marked == [picks[0]["cat"]],
+          "marked %r want %r" % (marked, [picks[0]["cat"]]))
+
+    picker_tap(rig, "Global")
+    assigned = settled(rig, lambda: map_ref(rig.settings()["bgAnimThemeMap"], anim0) == "")
+    check(rig, "global_entry_assigns", assigned,
+          "slot %d is %r want %r" % (anim0, map_ref(rig.settings()["bgAnimThemeMap"], anim0), ""))
+    check(rig, "global_entry_stays_open", depth(rig) == at_top, "depth %d want %d" % (depth(rig), at_top))
+    marked = picker_selected_rows(rig)
+    check(rig, "global_entry_marker_moved", marked == ["Global"], "marked %r want %r" % (marked, ["Global"]))
+
+    picker_cancel(rig)
+    check(rig, "global_entry_chevron_leaves", depth(rig) == 1, "depth %d want 1" % depth(rig))
+    value = rig.row_value(page_with_row(rig, "Gradient"), "Gradient")
+    check(rig, "global_entry_row_under_follows_global", value.startswith("Global ("),
+          "row %r want a Global (...) reading" % value)
+    close_animation(rig)
+
+
+def check_picker_closes_when_the_slot_goes_away(rig):
+    """Acceptance (gm-nov3.31): the one route that still closes the picker
+    under the user works now that a pick does not. A web save turns the
+    standby animation off while its own picker is open two levels deep, so
+    pickerReconcile's stillValid pop has to free both ctxs and write nothing.
+
+    Two levels deep on purpose: test_animation.py's own web interference check
+    covers the same fixture at one level, and the two level pop is the one a
+    pick used to perform on every visit and now never does."""
+    picks = three_in_one_category()
+    s0 = rig.settings()
+    anim0 = int(s0["bgAnimId"])
+    map0 = str(s0["bgAnimThemeMap"])
+    standby0 = int(s0["bgAnimStandbyId"])
+    target = (anim0 + 1) % len(ANIM_NAMES)
+    if not store(rig, "slot_gone_setup", {"bgAnimStandbyId": target, "bgAnimThemeMap": map0}):
+        return
+
+    open_animation(rig)
+    open_picker(rig, "Standby grad")
+    picker_tap(rig, picks[0]["cat"])
+    if not check(rig, "slot_gone_group_opened", settled(rig, lambda: depth(rig) == 3),
+                 "depth %d want 3" % depth(rig)):
+        close_animation(rig)
+        restore_fields_exactly(rig, "slot_gone_restored", {"bgAnimStandbyId": standby0, "bgAnimThemeMap": map0})
+        return
+
+    web_save(rig, {"bgAnimStandbyId": -1})
+    landed = settled(rig, lambda: int(rig.settings()["bgAnimStandbyId"]) == -1, timeout=6)
+    check(rig, "slot_gone_write_landed", landed, rig.settings()["bgAnimStandbyId"])
+    closed = settled(rig, lambda: depth(rig) == 1, timeout=8)
+    check(rig, "slot_gone_picker_closed", closed, "depth %d want 1" % depth(rig))
+    now = str(rig.settings()["bgAnimThemeMap"])
+    check(rig, "slot_gone_wrote_nothing", map_ref(now, target) == map_ref(map0, target),
+          "slot %d is %r want %r" % (target, map_ref(now, target), map_ref(map0, target)))
+
+    close_animation(rig)
+    restore_fields_exactly(rig, "slot_gone_restored", {"bgAnimStandbyId": standby0, "bgAnimThemeMap": map0})
+
+
 def check_starting_state_restored(rig):
     """Not an acceptance criterion: the scenarios share one NVS, and this one
     ends on the legacy custom fixture and a stepped frame rate, neither of
@@ -636,6 +792,9 @@ CHECKS = [
     ("touched_global_agrees_with_panel", check_touched_global_agrees_with_panel),
     ("legacy_fallback_named_and_inert", check_legacy_fallback_named_and_inert),
     ("legacy_unparsable_custom_falls_back", check_legacy_unparsable_custom_falls_back),
+    ("pick_keeps_the_picker_open", check_pick_keeps_the_picker_open),
+    ("global_entry_keeps_the_picker_open", check_global_entry_keeps_the_picker_open),
+    ("picker_closes_when_the_slot_goes_away", check_picker_closes_when_the_slot_goes_away),
     ("starting_state_restored", check_starting_state_restored),
 ]
 

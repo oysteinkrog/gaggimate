@@ -388,8 +388,11 @@ def close_animation(rig):
 #
 # The three gradient rows are whole-row targets that push a two-level picker:
 # a page of groups (Global, My gradients, the built-in categories) and, under
-# each, the gradients in it. Choosing one returns all the way to Animation;
-# the exit chevron pops one level and chooses nothing.
+# each, the gradients in it. Choosing one applies it and stays on the page
+# with the marker moved (gm-nov3.31), so browsing is one tap per gradient;
+# the exit chevron pops one level and chooses nothing. picker_choose below
+# wraps the pair, because every check here wants one choice and then the page
+# underneath.
 
 
 def depth(rig):
@@ -436,13 +439,24 @@ def picker_tap(rig, name):
 
 
 def picker_choose(rig, group, name):
-    """Opens a group and chooses one gradient in it, then waits for the
-    picker to be gone (both levels: a choice returns to the category that
-    opened it)."""
+    """Opens a group, chooses one gradient in it, and leaves the picker, so
+    the caller is back on the page that opened it.
+
+    Choosing no longer pops by itself (gm-nov3.31): a pick applies and stays
+    on the page so that trying the next gradient is one tap. The chevron is
+    what leaves, so this helper taps it on the way out, once per level. Every
+    caller here wants one choice and then the page underneath, which is what
+    it did before; a check that wants to see the picker still open after a
+    pick drives the taps itself."""
     before = depth(rig)
     picker_tap(rig, group)
     rig.wait_until(lambda: depth(rig) == before + 1, timeout=5)
     picker_tap(rig, name)
+    # The marker lands on the tapped row in the same UI pass that applies the
+    # pick, so waiting for it is waiting for the write as well.
+    rig.wait_until(lambda: name in picker_selected_rows(rig), timeout=5)
+    picker_cancel(rig)
+    picker_cancel(rig)
     rig.wait_until(lambda: depth(rig) == before - 1, timeout=5)
 
 
@@ -778,9 +792,11 @@ def pick_ref(rig, row, settings, ref):
     gradients. Used both to make a choice and to put one back."""
     open_picker(rig, row)
     if ref == "":
-        before = depth(rig)
         picker_tap(rig, "Global")
-        rig.wait_until(lambda: depth(rig) == before - 1, timeout=5)
+        # Assigning Global keeps the picker open too (gm-nov3.31), so the
+        # marker is what says the tap landed and the chevron is what leaves.
+        rig.wait_until(lambda: "Global" in picker_selected_rows(rig), timeout=5)
+        picker_cancel(rig)
         return
     name = gradient_name_for_ref(settings, ref)
     if name is None:
@@ -939,9 +955,13 @@ def check_gradient_picker_navigation(rig):
     check(rig, "picker_library_does_not_mirror_legacy", s2["bgAnimTheme"] == theme_before,
           "bgAnimTheme %r -> %r" % (theme_before, s2["bgAnimTheme"]))
 
-    # Global clears the slot and returns from the first page, with no second tap.
+    # Global clears the slot from the first page, with no second tap. It also
+    # stays open on it (gm-nov3.31), so the marker says it landed and the
+    # chevron is what leaves.
     open_picker(rig, "Gradient")
     picker_tap(rig, "Global")
+    rig.wait_until(lambda: "Global" in picker_selected_rows(rig), timeout=5)
+    picker_cancel(rig)
     rig.wait_until(lambda: depth(rig) == 1, timeout=5)
     s3 = rig.settings()
     check(rig, "picker_global_clears_slot", map_ref(s3["bgAnimThemeMap"], anim0) == "",
@@ -1142,8 +1162,12 @@ def check_gradient_picker_high_library_ids(rig):
     check(rig, "high_id_picker_row_draws_a_ramp", picker_strip is not None and len(set(picker_strip)) > 4,
           "distinct colours across the swatch: %r" % (None if picker_strip is None else len(set(picker_strip))))
     picker_tap(rig, high_name)
-    chosen = rig.wait_until(lambda: depth(rig) == 1, timeout=5)
-    check(rig, "high_id_pick_returns_to_animation", bool(chosen), depth(rig))
+    # The pick stays on the page (gm-nov3.31), so the marker is what says it
+    # landed; the two chevrons are what return to the Animation page.
+    rig.wait_until(lambda: high_name in picker_selected_rows(rig), timeout=5)
+    picker_cancel(rig)
+    picker_cancel(rig)
+    check(rig, "high_id_pick_returns_to_animation", depth(rig) == 1, depth(rig))
     s1 = rig.settings()
     check(rig, "high_id_writes_exact_ref", map_ref(s1["bgAnimThemeMap"], anim0) == "c%d" % high_id,
           "got %r want %r" % (map_ref(s1["bgAnimThemeMap"], anim0), "c%d" % high_id))
@@ -1445,6 +1469,11 @@ def check_gradient_picker_web_interference(rig):
         # the deleted one's.
         names = rows_across_pages(rig)
         picker_tap(rig, names[0])
+        # The pick stays on the page (gm-nov3.31); the chevrons are what take
+        # the run back to the Animation page for the checks below.
+        rig.wait_until(lambda: names[0] in picker_selected_rows(rig), timeout=5)
+        picker_cancel(rig)
+        picker_cancel(rig)
         rig.wait_until(lambda: depth(rig) == 1, timeout=5)
         chosen = map_ref(rig.settings()["bgAnimThemeMap"], anim_a)
         check(rig, "picker_never_writes_deleted_ref", chosen != "c%d" % lib_id, chosen)

@@ -10,7 +10,14 @@
 // in SettingsUI.h's tile registry and are reached only by pointer from the
 // row that pushes them.
 //
-// Two rules the pages are built around:
+// Three rules the pages are built around:
+//
+// A pick applies and stays on the page (gm-nov3.31). Applying is live, so the
+// panel is on the tapped gradient at once, the marker moves to the tapped
+// row, and trying the next one is one more tap instead of a trip back in
+// through two pages. Only the chevron leaves, and only the edited slot going
+// away (TargetGone, and stillValid at reconcile) still closes the picker
+// under the user.
 //
 // A choice is validated against the stored data before it is written, and
 // the validation and the write are one transaction. The list a page shows
@@ -221,29 +228,46 @@ struct PickOps {
 };
 
 // A choice, from either page. Runs the selection as one guarded transaction
-// and then leaves the picker. The order matters: onPick updates the opening
-// category's draft, and popPages rebuilds its page from the draft on the way
-// out, so a pick after the pop would show the old value until something else
-// redrew the page. popPages stays outside the transaction: it deletes LVGL
-// objects and runs the category's commit, which takes the lock itself.
-void applyPick(PickerCtx *ctx, const std::string &ref, int depth) {
-    SettingsUI *ui = ctx->ui;
-    if (ui == nullptr) {
-        return;
-    }
-    const SettingsGradientPickerSpec spec = ctx->spec; // copied: the pop below frees ctx
-    PickOps ops{spec};
+// and says whether the picker may stay open on the result.
+//
+// A pick used to end in popPages, which put the user back on the page that
+// opened the picker. Applying is live, so the gradient is on the panel the
+// moment the row is tapped, and that trip out of a two level page stack was
+// the whole cost of trying five gradients one after another (gm-nov3.31). A
+// pick now leaves the user where they are, and the chevron is how you leave.
+//
+// The write ordering the old comment described still holds and still
+// matters, because the chevron pops in the end: onPick updates the opening
+// category's draft, and popPages rebuilds that page from the draft on the way
+// out, so a write after the pop would show the old value until something else
+// redrew the page.
+//
+// Redrawing the picker's own page belongs to the caller, which knows which of
+// the two pages it is on. It stays outside the transaction along with every
+// other effect outside Settings: it deletes LVGL objects, and a pop runs the
+// opening category's commit, which takes the lock itself.
+bool applyPick(PickerCtx *ctx, const std::string &ref) {
+    PickOps ops{ctx->spec};
     switch (settingsui::gradientPickTransaction(ops, ref.c_str())) {
     case settingsui::GradientPickOutcome::RefGone:
-        ESP_LOGW("SettingsUI", "SettingsGradientPicker: %s no longer resolves, closing without a change", ref.c_str());
-        break;
+        // The library entry this row named was deleted from the web UI
+        // between the page being built and the finger landing. Nothing is
+        // written, and the caller's rebuild is what drops the row, so the
+        // user is left looking at the list that is really there rather than
+        // being thrown out for somebody else's edit.
+        ESP_LOGW("SettingsUI", "SettingsGradientPicker: %s no longer resolves, ignoring the pick", ref.c_str());
+        return true;
     case settingsui::GradientPickOutcome::TargetGone:
+        // The slot itself stopped being worth editing, so no pick on this
+        // page can ever land. This is the one outcome that still closes the
+        // picker, which is what pickerReconcile does when stillValid goes
+        // false.
         ESP_LOGW("SettingsUI", "SettingsGradientPicker: the edited slot is gone, closing without a change");
-        break;
+        return false;
     case settingsui::GradientPickOutcome::Assigned:
         break;
     }
-    ui->popPages(depth);
+    return true;
 }
 
 void pickerRowActivate(void *user) {
@@ -252,12 +276,22 @@ void pickerRowActivate(void *user) {
     if (rc->row < 0 || rc->row >= static_cast<int>(ctx->entries.size()) || ctx->ui == nullptr) {
         return;
     }
+    SettingsUI *ui = ctx->ui;
     const PickerEntry &entry = ctx->entries[static_cast<size_t>(rc->row)];
     if (entry.group == PickerEntry::kGlobalEntry) {
-        applyPick(ctx, std::string(), 1);
+        if (!applyPick(ctx, std::string())) {
+            ui->popPages(1); // frees ctx: nothing below may touch it
+            return;
+        }
+        // `entry`, and this row along with the RowCtx that reached it, do not
+        // survive the rebuild. Nothing below reads either. Deleting the page
+        // from inside one of its own row callbacks is safe in LVGL 8.4
+        // (CLAUDE.md), which is what pickerPushGroup below already relies on.
+        rebuildEntries(ctx);
+        ui->rebuildPage();
         return;
     }
-    pickerPushGroup(*ctx->ui, ctx, entry.group);
+    pickerPushGroup(*ui, ctx, entry.group);
 }
 
 int pickerRowCount(void *ctx0) { return static_cast<int>(static_cast<PickerCtx *>(ctx0)->entries.size()); }
@@ -271,9 +305,9 @@ void pickerBuildRow(void *ctx0, int index, lv_obj_t *parent, SettingsUI &ui) {
     const PickerEntry &entry = ctx->entries[static_cast<size_t>(index)];
     // The row name is the entry's own label. SettingsUI::tag keeps the
     // pointer it is handed rather than copying, and these strings live in the
-    // ctx for as long as the page does; nothing here reorders or resizes
-    // `entries` while a row exists (rebuildEntries runs from enter and
-    // reconcile, both followed by a full page rebuild).
+    // ctx for as long as the page does; every caller of rebuildEntries (enter,
+    // reconcile, a pick) rebuilds the whole page right after it, so no row
+    // outlives the strings it was tagged with.
     auto *rc = new RowCtx{ctx, index};
     lv_obj_t *row =
         settingsRowSwatchCreate(ui, parent, entry.label.c_str(), entry.label.c_str(), pickerRowActivate, rc);
@@ -348,12 +382,32 @@ void refreshGroup(GroupCtx *ctx) {
 void groupRowActivate(void *user) {
     auto *rc = static_cast<RowCtx *>(user);
     auto *ctx = static_cast<GroupCtx *>(rc->page);
-    if (rc->row < 0 || rc->row >= static_cast<int>(ctx->choices.size()) || ctx->parent == nullptr) {
+    if (rc->row < 0 || rc->row >= static_cast<int>(ctx->choices.size()) || ctx->parent == nullptr ||
+        ctx->ui == nullptr) {
         return;
     }
+    PickerCtx *parent = ctx->parent;
+    SettingsUI *ui = ctx->ui;
     const int choice = ctx->choices[static_cast<size_t>(rc->row)];
-    const std::string ref = ctx->parent->choices[static_cast<size_t>(choice)].ref;
-    applyPick(ctx->parent, ref, 2); // both pages: a choice returns to the category that opened the picker
+    // Copied, not referenced: the rebuild below replaces parent->choices.
+    const std::string ref = parent->choices[static_cast<size_t>(choice)].ref;
+    if (!applyPick(parent, ref)) {
+        ui->popPages(2); // both pages, which frees both ctxs: nothing below may touch either
+        return;
+    }
+    // Both lists, in this order: the group's rows index into the parent's
+    // choices, and the parent's entries carry the group markers the user
+    // sees on the way back out.
+    rebuildEntries(parent);
+    refreshGroup(ctx);
+    if (ctx->choices.empty()) {
+        // Everything this page listed has gone (the library was emptied from
+        // the web UI). Same answer groupReconcile gives: back to the group
+        // list, which still has something to show.
+        ui->popPages(1); // frees ctx: nothing below may touch it
+        return;
+    }
+    ui->rebuildPage();
 }
 
 int groupRowCount(void *ctx0) { return static_cast<int>(static_cast<GroupCtx *>(ctx0)->choices.size()); }

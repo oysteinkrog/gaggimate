@@ -14,9 +14,10 @@
 // gradients when the library is not empty, then each declared category that
 // has built-ins in it, each with a count. Opening one of those lists its
 // gradients with a name, a swatch and a marker on the one in force. Choosing
-// a gradient returns all the way to the category that opened the picker;
-// the exit chevron pops one level and selects nothing. The header arrows and
-// a horizontal swipe paginate inside a page and do neither.
+// a gradient applies it and leaves the page where it is, with the marker on
+// the tapped row, so trying the next one is one tap (gm-nov3.31); the exit
+// chevron is what pops a level. The header arrows and a horizontal swipe
+// paginate inside a page and neither choose nor leave.
 //
 // This header is the whole contract with CatAnimation.cpp: the picker knows
 // nothing about which setting it is editing, and the caller knows nothing
@@ -74,6 +75,11 @@ struct SettingsGradientPickerSpec {
     // global ref and its legacy mirror) cannot be split either. The guard is
     // recursive, so a callee that takes its own for a read-modify-write is
     // still correct. Keep the callee short and do not block in it.
+    //
+    // It can be called several times in one visit, because the picker stays
+    // open on a pick (gm-nov3.31), so it has to be safe to repeat: the three
+    // callbacks in CatAnimation.cpp each overwrite one draft slot and mark it
+    // touched, and nothing they do grows with the number of picks.
     void (*onPick)(void *user, const char *ref) = nullptr;
 
     // Bring the opening category's retained draft up to date after a web

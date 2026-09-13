@@ -118,9 +118,14 @@ slot of `bgAnimThemeMap`, the override for the animation on screen.
 disabled, showing "Same as main", while the standby screen follows the main
 animation or names the same one.
 
-All three push the same picker and take a ref back through a callback. Four
+All three push the same picker and take a ref back through a callback. Five
 things about that are load bearing:
 
+- **A pick applies and stays on the page** (gm-nov3.31). Applying is live, so
+  the panel is on the tapped gradient at once, the marker moves to the tapped
+  row and trying the next one is one more tap. The chevron is what leaves.
+  The one exception is the slot itself going away, which still closes both
+  levels, from a pick and from the reconcile below alike.
 - **The picker captures the slot it was opened for and never retargets it.**
   A web save that changes `bgAnimId` under an open picker still writes the
   animation the row was opened for. If that slot stops being a thing worth
@@ -130,9 +135,11 @@ things about that are load bearing:
   category's reconcile itself before anything else, the way the schedule
   pages do for the Machine draft. Without it the Animation page would come
   back from the picker showing what was stored when it opened.
-- **A pick is applied before the pop.** `popPages` rebuilds the page
+- **A pick is applied before any pop.** `popPages` rebuilds the page
   underneath from the draft, so writing the draft after the pop would leave
-  the old value on screen until the next refresh.
+  the old value on screen until the next refresh. That is now the chevron's
+  pop rather than the pick's, and the rule is the same: whatever the last
+  pick wrote is what the page underneath shows on the way out.
 - **Choosing Global clears the slot, and it is offered only by the two
   per-animation rows.** "Gradient all" is the global, so "the global" is not
   a value it can take; its picker starts at the groups.
