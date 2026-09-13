@@ -4,11 +4,12 @@ animation gradients.
 
 Before this script there were four copies kept in step by hand: the firmware
 table in BgAnimThemes.cpp, the web mirror in bgAnimations.js, a names-only
-mirror in CatAnimation.cpp for the simulator, which cannot link the firmware
-table, and a second names-only mirror in the settings UI runner, which drives
-the gradient row by the name the display shows. Four copies of eighteen
-gradients is survivable. Four copies of sixty is not, and the drift is silent:
-the web picker would name one gradient while the panel drew another.
+mirror in CatAnimation.cpp written when the simulator could not link the
+firmware table (it can since gm-nov3.3, and that copy is gone), and a second
+names-only mirror in the settings UI runner, which drives the gradient row by
+the name the display shows. Four copies of eighteen gradients is survivable.
+Four copies of sixty is not, and the drift is silent: the web picker would
+name one gradient while the panel drew another.
 
 Outputs are checked in, so neither the firmware build, the web build, the host
 tests nor the settings UI runner need Python at run time:

@@ -794,9 +794,11 @@ the design cannot show and what the runs measured.
   resolves (a deleted library entry) reads as "" on both surfaces, which is
   what the firmware draws. Both surfaces call the same thing Global: the
   display's per-animation row shows "Global (<name>)" at index 0 and the web
-  picker's first choice says the same. Adding a function to
-  BgAnimThemes.cpp needs a matching stub in `sim/platform/bganim_stub.cpp`,
-  which is where the display-sim link breaks first.
+  picker's first choice says the same. BgAnimThemes.cpp compiles into the
+  simulator as well (gm-nov3.3), so a function added there needs no stub;
+  what breaks the display-sim link is a device-only dependency added to that
+  file. `sim/platform/bganim_stub.cpp` holds nothing but the animation
+  allocation counters now.
 - **A built-in gradient is added in `data/gradients.json` and nowhere else**
   (gm-nov3.1, 2026-09-12). `scripts/gen_gradients.py` writes
   `src/display/ui/default/bganim/BgAnimThemeTable.h` (what BgAnimThemes.cpp's
@@ -806,10 +808,13 @@ the design cannot show and what the runs measured.
   `make check`. Before it the same 18 gradients were written out three times
   and synced by hand, the third copy being `kSimThemeNames[]` in
   CatAnimation.cpp, which existed because the simulator did not link
-  BgAnimThemes.cpp; since gm-nov3.3 it does, so the display reads the same
-  table everywhere and only the host model test includes the generated
-  header directly (through `ThemeProviderTable.h`). A device build must not
-  include it, because it would pull the stops in twice. The
+  BgAnimThemes.cpp; since gm-nov3.3 it does, so both builds read the table
+  through `bg_theme_*` and BgAnimThemes.cpp is the only firmware file that
+  includes the generated header. Nothing else may include it: a second copy
+  of every stop lands in the image. The host model test
+  (`test/test_settings_model`) includes it because it links that file, and it
+  reads the six accessors rather than a second provider of its own
+  (gm-nov3.19). The
   list is append only and the generator does not enforce that: an entry's
   position is its stored id, in `bgAnimGradientRef` and in every slot of
   `bgAnimThemeMap`, so reordering or removing one changes what a device

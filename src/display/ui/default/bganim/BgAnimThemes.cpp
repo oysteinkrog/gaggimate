@@ -26,14 +26,22 @@ namespace {
 using Theme = bganim_gen::ThemeDef;
 
 #ifdef GM_BGANIM_TEST_TABLE
-// Host tests swap this for a longer table (bg_test_set_theme_table), which is
-// how the frozen legacy sentinel is checked against a table this build does
-// not ship. Firmware never defines the macro and keeps the constants.
+// Host tests swap these for a fixture (bg_test_set_theme_table): a longer
+// gradient table, which is how the frozen legacy sentinel is checked against
+// a table this build does not ship, and a short category list the gradients
+// disagree with, which is how the declared-order and empty-category rules are
+// checked through the accessors below rather than through a second reading of
+// the generated table. Firmware never defines the macro and keeps the
+// constants.
 const Theme *THEMES = bganim_gen::THEME_DEFS;
 int THEME_COUNT = bganim_gen::THEME_DEF_COUNT;
+const char *const *THEME_CATEGORIES = bganim_gen::THEME_CATEGORIES;
+int THEME_CATEGORY_COUNT = bganim_gen::THEME_CATEGORY_COUNT;
 #else
 constexpr const Theme *THEMES = bganim_gen::THEME_DEFS;
 constexpr int THEME_COUNT = bganim_gen::THEME_DEF_COUNT;
+constexpr const char *const *THEME_CATEGORIES = bganim_gen::THEME_CATEGORIES;
+constexpr int THEME_CATEGORY_COUNT = bganim_gen::THEME_CATEGORY_COUNT;
 #endif
 
 int hexNibble(char c) {
@@ -246,11 +254,14 @@ const char *bg_theme_name(int i) { return THEMES[(i >= 0 && i < THEME_COUNT) ? i
 
 const char *bg_theme_category(int i) { return THEMES[(i >= 0 && i < THEME_COUNT) ? i : 0].category; }
 
-int bg_theme_category_count() { return bganim_gen::THEME_CATEGORY_COUNT; }
+// The declared list, in the order data/gradients.json declares it, including
+// a category no gradient uses: it is the owner's group order, and a picker
+// decides for itself what to do with an empty group.
+int bg_theme_category_count() { return THEME_CATEGORY_COUNT; }
 
 const char *bg_theme_category_name(int i) {
-    const int n = bganim_gen::THEME_CATEGORY_COUNT;
-    return bganim_gen::THEME_CATEGORIES[(i >= 0 && i < n) ? i : 0];
+    const int n = THEME_CATEGORY_COUNT;
+    return n > 0 ? THEME_CATEGORIES[(i >= 0 && i < n) ? i : 0] : nullptr;
 }
 
 const uint8_t (*bg_theme_stops(int i))[3] { return THEMES[(i >= 0 && i < THEME_COUNT) ? i : 0].stops; }
@@ -428,9 +439,12 @@ void bg_resolve_anim_theme(int animId, const char *map, const char *library, con
 }
 
 #ifdef GM_BGANIM_TEST_TABLE
-void bg_test_set_theme_table(const bganim_gen::ThemeDef *defs, int count) {
+void bg_test_set_theme_table(const bganim_gen::ThemeDef *defs, int count, const char *const *categories,
+                             int categoryCount) {
     THEMES = defs != nullptr ? defs : bganim_gen::THEME_DEFS;
     THEME_COUNT = defs != nullptr ? count : bganim_gen::THEME_DEF_COUNT;
+    THEME_CATEGORIES = categories != nullptr ? categories : bganim_gen::THEME_CATEGORIES;
+    THEME_CATEGORY_COUNT = categories != nullptr ? categoryCount : bganim_gen::THEME_CATEGORY_COUNT;
 }
 #endif
 

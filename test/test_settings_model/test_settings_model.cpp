@@ -10,10 +10,12 @@
 // (see the provider comment at the top of SettingsModel.h) -- it lets group
 // D check the model's gradient-map writer against the real bg_map_valid()
 // and read real built-in theme names, without the model depending on it.
-// Because it is linked here, group D also builds the simulator's provider
-// (ThemeProviderTable.h) explicitly: on the device the two paths read the
-// same generated table through different code, and only checking both shows
-// they agree.
+// Because it is linked here, group D builds its provider out of the same
+// bg_theme_* functions CatAnimation.cpp wires up, on the device and on the
+// simulator alike (gm-nov3.3 removed the simulator's separate reading of the
+// generated table). A fixture table goes in through bg_test_set_theme_table,
+// so a case about category order exercises those accessors rather than a
+// second implementation written for the test.
 //
 // Groups:
 //   A -- numeric spec: clamp, wrap, off-grid snap, fast step
@@ -50,10 +52,10 @@
 // Header-only and free of Arduino, LVGL and controller: group K instantiates
 // the production pick transaction against a fake Settings (gm-nov3.17).
 #include "display/ui/default/settings/GradientPickTransaction.h"
-// The provider the simulator builds, so group D checks that path too and not
-// just the bg_theme_* functions this file happens to link (see the header).
+// The generated table, which group D reads directly to say what the
+// bg_theme_* accessors above it should return, and whose ThemeDef is the
+// shape of the fixture tables it swaps in.
 #include "display/ui/default/bganim/BgAnimThemeTable.h"
-#include "display/ui/default/settings/ThemeProviderTable.h"
 
 using namespace settingsui;
 
@@ -205,10 +207,16 @@ static void test_gradient_choices_real_themes() {
     TEST_ASSERT_EQUAL(0, gradientChoiceIndexForRef(choices, "c99"));
 }
 
-// The device's provider: the same six firmware lookups CatAnimation.cpp
-// wires up when GAGGIMATE_SIM is not defined. Built here rather than in the
-// header because on the device it is three lines of CatAnimation.cpp, which
-// this test cannot link (LVGL).
+// The tables the bg_theme_* accessors read, back as shipped. tearDown() calls
+// it after every case, so a fixture table cannot leak into the next one even
+// when an assertion aborts the case before its own restore.
+static void useShippedTable() { bg_test_set_theme_table(nullptr, 0); }
+
+// The production provider, function for function with the six lines of
+// CatAnimation.cpp: both builds read the built-in gradients through these
+// accessors (gm-nov3.3), so there is no second production reading to check
+// against. Built here rather than taken from CatAnimation.cpp, which this
+// test cannot link (LVGL).
 static ThemeNameProvider firmwareThemeProvider() {
     ThemeNameProvider p;
     p.count = bg_theme_count;
@@ -282,31 +290,9 @@ static void test_theme_provider_device_path_matches_table() {
     }
 }
 
-static void test_theme_provider_simulator_path_matches_table() {
-    // The provider CatAnimation.cpp builds under GAGGIMATE_SIM. This test
-    // links the real bg_theme_* functions, so without this case the
-    // simulator's path, which is where the picker bead is tested, would be
-    // unproved.
-    check_provider_against_table("generated", generatedThemeProvider());
-    // The two paths are the same data, which is the point of having both.
-    const ThemeNameProvider sim = generatedThemeProvider();
-    const ThemeNameProvider dev = firmwareThemeProvider();
-    TEST_ASSERT_EQUAL(dev.count(), sim.count());
-    TEST_ASSERT_EQUAL(dev.categoryCount(), sim.categoryCount());
-    for (int i = 0; i < dev.count(); i++) {
-        TEST_ASSERT_EQUAL_STRING(dev.name(i), sim.name(i));
-        TEST_ASSERT_EQUAL_STRING(dev.category(i), sim.category(i));
-        TEST_ASSERT_EQUAL_UINT8_ARRAY(reinterpret_cast<const uint8_t *>(dev.stops(i)),
-                                      reinterpret_cast<const uint8_t *>(sim.stops(i)), 6 * 3);
-    }
-    for (int c = 0; c < dev.categoryCount(); c++) {
-        TEST_ASSERT_EQUAL_STRING(dev.categoryName(c), sim.categoryName(c));
-    }
-}
-
 static void test_gradient_choices_carry_categories() {
     const std::string library = "3|Custom Sky|ff0000,0000ff;4|Second|00ff00,ffffff";
-    const std::vector<GradientChoice> choices = gradientChoices(generatedThemeProvider(), library);
+    const std::vector<GradientChoice> choices = gradientChoices(firmwareThemeProvider(), library);
     TEST_ASSERT_EQUAL(static_cast<size_t>(1 + bganim_gen::THEME_DEF_COUNT + 2), choices.size());
 
     // The default entry: no ref, and no category, because it is not a
@@ -349,11 +335,11 @@ static void test_gradient_choices_without_category_accessor() {
 static void test_theme_category_order_is_declared_not_encountered() {
     // A fixture table whose first gradient sits in the second declared
     // category, and whose third declared category has no gradient at all,
-    // read through the same factory that builds the simulator's provider
-    // (ThemeProviderTable.h, tableThemeProvider). The generated table cannot
-    // be reordered for a test, because an entry's index is its stored id, so
-    // a fixture table is the only way to see what that factory does with a
-    // declared order the gradients disagree with.
+    // swapped under the bg_theme_* accessors themselves so this case reads
+    // the production provider both builds use. The shipped table cannot be
+    // reordered for a test, because an entry's index is its stored id, and it
+    // has no empty category, so a fixture is the only way to see what those
+    // accessors do with a declared order the gradients disagree with.
     //
     // The declared list is the picker's group order, so it must come back in
     // its declared order, empty category included, whatever the gradients
@@ -381,7 +367,8 @@ static void test_theme_category_order_is_declared_not_encountered() {
         TEST_ASSERT_TRUE_MESSAGE(strcmp(kDefs[i].category, "Pastel") != 0, "Pastel must stay empty");
     }
 
-    const ThemeNameProvider themes = tableThemeProvider(kDefs, 3, kCategories, 3);
+    bg_test_set_theme_table(kDefs, 3, kCategories, 3);
+    const ThemeNameProvider themes = firmwareThemeProvider();
 
     // Declared order, straight off the provider. Encounter order would have
     // put Neon first and dropped Pastel entirely.
@@ -461,7 +448,8 @@ static void test_gradient_groups_follow_declared_order_and_drop_empties() {
           {0xff, 0xff, 0xff}}},
     };
     static const char *const kCategories[3] = {"Coffee", "Neon", "Pastel"};
-    const ThemeNameProvider themes = tableThemeProvider(kDefs, 3, kCategories, 3);
+    bg_test_set_theme_table(kDefs, 3, kCategories, 3);
+    const ThemeNameProvider themes = firmwareThemeProvider();
     const std::string library = "3|Custom Sky|ff0000,0000ff;4|Second|00ff00,ffffff";
     const std::vector<GradientChoice> choices = gradientChoices(themes, library);
 
@@ -511,7 +499,8 @@ static void test_gradient_groups_keep_every_builtin_reachable() {
           {0xff, 0xff, 0xff}}},
     };
     static const char *const kCategories[1] = {"Coffee"};
-    const ThemeNameProvider themes = tableThemeProvider(kDefs, 2, kCategories, 1);
+    bg_test_set_theme_table(kDefs, 2, kCategories, 1);
+    const ThemeNameProvider themes = firmwareThemeProvider();
     const std::vector<GradientChoice> choices = gradientChoices(themes, "");
     const std::vector<GradientGroup> groups = gradientBuiltinGroups(themes, choices);
 
@@ -954,8 +943,6 @@ static void useBigTable() {
     const bganim_gen::ThemeDef *defs = bigTable(n);
     bg_test_set_theme_table(defs, n);
 }
-
-static void useShippedTable() { bg_test_set_theme_table(nullptr, 0); }
 
 // The custom gradient every fixture below uses, and its canonical uniform
 // form (what a library copy of it has to be).
@@ -2087,7 +2074,10 @@ static void test_gradient_pick_null_ref_is_global() {
 // ---------------------------------------------------------------------------
 
 void setUp(void) { /* no framework-level setup needed */ }
-void tearDown(void) { /* no framework-level teardown needed */ }
+// Group D, I and J swap a fixture table under the bg_theme_* accessors; put
+// the shipped one back whatever the case did, including aborting on a failed
+// assertion.
+void tearDown(void) { useShippedTable(); }
 
 int main(int argc, char **argv) {
     UNITY_BEGIN();
@@ -2108,7 +2098,6 @@ int main(int argc, char **argv) {
 
     RUN_TEST(test_gradient_choices_real_themes);
     RUN_TEST(test_theme_provider_device_path_matches_table);
-    RUN_TEST(test_theme_provider_simulator_path_matches_table);
     RUN_TEST(test_gradient_choices_carry_categories);
     RUN_TEST(test_gradient_choices_without_category_accessor);
     RUN_TEST(test_theme_category_order_is_declared_not_encountered);

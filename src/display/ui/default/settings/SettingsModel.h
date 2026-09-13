@@ -119,10 +119,10 @@ const char *animationLabel(const AnimationNameProvider &provider, int index);
 using ThemeStops = const uint8_t (*)[3];
 
 // Everything a picker needs about the built-in gradients, so that neither the
-// model nor a picker has to link BgAnimThemes.cpp (which the simulator
-// cannot). A device build wires these to bg_theme_*; the simulator and the
-// host tests wire them to the generated table through
-// settingsui::generatedThemeProvider() (ThemeProviderTable.h).
+// model nor a picker has to link BgAnimThemes.cpp. Both builds wire these to
+// bg_theme_*: that file has no device dependency, so the simulator compiles
+// it too (gm-nov3.3), and the host test wires the same six functions and
+// swaps a fixture table under them (bg_test_set_theme_table).
 //
 // Every accessor but count and name is optional: unset category reads empty,
 // unset categoryCount reads zero, unset stops reads null. That is what an

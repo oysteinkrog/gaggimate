@@ -325,14 +325,19 @@ enum class BgMigrateResult {
 BgMigrateResult bg_run_gradient_migration(const BgGradientStore &store, const BgGradientMigration &plan);
 
 #ifdef GM_BGANIM_TEST_TABLE
-// Host tests only (test/test_settings_model). Swaps the built-in table so the
-// stored-index rules can be checked against a table longer than the one this
-// build ships, which is the whole point of freezing the legacy sentinel.
+// Host tests only (test/test_settings_model). Swaps the built-in tables the
+// bg_theme_* accessors read, so the stored-index rules can be checked against
+// a gradient table longer than the one this build ships (the whole point of
+// freezing the legacy sentinel) and the category rules against a declared
+// list the gradients disagree with, which the shipped list cannot be: an
+// entry's index there is its stored id. A null pointer restores the shipped
+// table, and the two arguments are independent.
 // Never compiled into firmware; nothing but the test defines the macro.
 namespace bganim_gen {
 struct ThemeDef;
 }
-void bg_test_set_theme_table(const bganim_gen::ThemeDef *defs, int count);
+void bg_test_set_theme_table(const bganim_gen::ThemeDef *defs, int count, const char *const *categories = nullptr,
+                             int categoryCount = 0);
 #endif
 
 #endif // BGANIM_H
