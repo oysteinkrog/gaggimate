@@ -992,10 +992,19 @@ Three test commands, and what each proves:
 
 What the device runs taught, beyond the numbers:
 
-- **The bench board stores pixel-clock divider 8**, not the build default 6,
+- **The bench board stores pixel-clock divider 7**, not the build default 6,
   so its rates are not comparable with a run at the default. The runner reads
   `/api/debug/pclk` and warns. This is the stored-settings trap from the
-  hardware invariants above, hit again.
+  hardware invariants above, hit again. **It stored 8 until some time between
+  2026-09-10 22:54Z and 2026-09-11**, and every measurement in this file dated
+  on or before 2026-09-10 that says "divider 8" was taken at 8 and is correct
+  as written. Nothing in the rig writes the setting and nobody has owned up to
+  changing it, so read the value rather than assuming either number. Confirmed
+  stored on 2026-09-13 by reading `panelClockDiv` from the settings twice an
+  hour apart, with `/api/debug/pclk` reporting `div 7, live true` both times
+  and the serial `GM_SCANOUT` frame rate agreeing independently at 43.5 a
+  second, which is the divider 7 row in `rig_soak.py`'s own table.
+  `panelclock::MIN_USER_DIV` floors a user setting at 6, so 7 passes.
 - **The Animation scenario cannot run on that board as it stands.** Its stored
   `elementTintColor` is `#FEC4A4`, which is not one of the twelve palette
   colours the tint row cycles through, so the preflight reports an unsupported
