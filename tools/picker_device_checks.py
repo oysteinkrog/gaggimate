@@ -1,22 +1,22 @@
-# The gradient picker checks that only a board can answer, and the two the
-# shared harness cannot answer correctly on one (gm-nov3.11).
+# The gradient picker checks that only a board can answer (gm-nov3.11).
 #
-# tools/settings_ui_tests/test_animation.py covers the picker on both venues,
-# but two of its helpers are written for the simulator:
+# tools/settings_ui_tests/test_animation.py covers the picker on both venues.
+# It could not answer two of these questions on a board when this script was
+# written, and both causes are fixed now:
 #
-#   * rows_across_pages() drops a repeated row name, so a library holding two
-#     gradients with the same name reads as one. The bench board's library does
-#     (two entries both called "Custom"), and the check that every saved
-#     gradient is reachable failed there for that reason alone.
-#   * swatch_strip() reads /api/debug/fb?step=1. This board answers that with a
-#     480x480 header and 4,800 of the 460,800 bytes, every time, on a board one
-#     minute out of reset, so the read runs off the end of the buffer and the
-#     check raises instead of failing. step=2 is whole (gm-6ivh; CLAUDE.md's
-#     settings section already recorded that the device only delivers step 2).
+#   * Rig.rows_on_page() keyed a page's rows by name, so a library holding two
+#     gradients with the same name read as one row. The bench board's library
+#     does hold that pair (two entries both called "Custom"), and the check
+#     that every saved gradient is reachable failed there for that reason
+#     alone. gm-xiu6 keeps the repeats, so this script uses it rather than
+#     walking the tagged objects itself.
+#   * swatch_strip() reads /api/debug/fb?step=1, which used to come back as
+#     4,800 of 460,800 bytes with a 200 and no error. That was the response
+#     filler, not the heap and not the request count (gm-6ivh, 28cec8ec), and
+#     every step is whole now, so the reads here are at step 1.
 #
-# This script asks both questions in a way that works on the board, so the
-# device answer is on record without editing the shared harness (which another
-# agent is changing at the same time).
+# What is left is the part that still needs a board: a real stored library,
+# with the names its owner gave it, listed through the real panel.
 #
 # Usage (loadtest device only):
 #
@@ -27,7 +27,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from tools.settings_ui_tests.rig import ROW_CONTAINER_ROLES, Rig, tag_role, tag_row  # noqa: E402
+from tools.settings_ui_tests.rig import Rig  # noqa: E402
 
 ANIMATION_CAT = 2
 
@@ -58,19 +58,12 @@ def goto_page(rig, page):
 
 def rows_with_repeats(rig):
     """Every row on the page on top, across all its pages, top to bottom,
-    keeping repeats, and the page each one landed on.
-
-    Rig.rows_on_page() cannot be used here: it collects rows into a dict keyed
-    by row name, so two rows with the same name on one page come back as one.
-    This walks the tagged objects instead, which is the same rule without the
-    dict."""
+    keeping repeats, and the page each one landed on. Rig.rows_on_page()
+    keeps repeats since gm-xiu6, so this is only the walk over the pages."""
     pages = int(rig.settingsui_state().get("pages", 1))
     out = []
     for page in range(pages):
-        dump = goto_page(rig, page)
-        rows = [(o.get("y1", 0), tag_row(o)) for o in dump["objects"]
-                if tag_role(o) in ROW_CONTAINER_ROLES]
-        out.extend((page, name) for _y, name in sorted(rows))
+        out.extend((page, name) for name in Rig.rows_on_page(goto_page(rig, page)))
     return out
 
 
@@ -122,20 +115,17 @@ def rgb565_pixel(data, x, y, w):
     return ((r5 * 255) // 31, (g6 * 255) // 63, (b5 * 255) // 31)
 
 
-def swatch_strip_step2(rig, dump, row):
+def swatch_strip(rig, dump, row):
     """The row's swatch as RGB triples along the middle of its canvas, read
-    from the half-resolution framebuffer the device can actually deliver. The
-    tag's coordinates are full-panel, so they are halved here."""
+    from the full-resolution framebuffer. Rig.fb() raises on a body shorter
+    than the X-FB-Size header promised, so a short read is a failure with
+    both byte counts and never a narrower sample."""
     obj = rig.find_tag(dump, row, "swatch")
     if obj is None or obj.get("h"):
         return None
-    data = rig.get_bytes("/api/debug/fb?step=2")
-    w = 240
-    if len(data) < w * w * 2:
-        raise AssertionError("/api/debug/fb?step=2 returned %d of %d bytes" % (len(data), w * w * 2))
-    y = ((obj["y1"] + obj["y2"]) // 2) // 2
-    x0, x1 = obj["x1"] // 2, obj["x2"] // 2
-    return [rgb565_pixel(data, x, y, w) for x in range(x0, x1 + 1)]
+    w, _h, data = rig.fb(step=1)
+    y = (obj["y1"] + obj["y2"]) // 2
+    return [rgb565_pixel(data, x, y, w) for x in range(obj["x1"], obj["x2"] + 1)]
 
 
 def main(argv=None):
@@ -167,24 +157,24 @@ def main(argv=None):
     rig.settingsui(pop=1)
     rig.wait_until(lambda: depth(rig) == 2, timeout=10)
 
-    # 2. A picker row's swatch really is a ramp, read at the step the device
-    #    delivers whole.
+    # 2. A picker row's swatch really is a ramp.
     dump = goto_page(rig, 0)
     try:
-        strip = swatch_strip_step2(rig, dump, "Global")
+        strip = swatch_strip(rig, dump, "Global")
         check("global_row_draws_a_ramp", strip is not None and len(set(strip)) > 4,
               "distinct colours: %r" % (None if strip is None else len(set(strip))))
         if strip:
             print("  swatch ends: %r ... %r, %d distinct" % (strip[0], strip[-1], len(set(strip))), flush=True)
-    except AssertionError as e:
-        check("global_row_draws_a_ramp", False, str(e))
+    except Exception as e:  # noqa: BLE001 -- a short or missing dump is this check's failure
+        check("global_row_draws_a_ramp", False, "%s: %s" % (type(e).__name__, e))
 
-    # 3. What the harness's own step tries to read, recorded rather than
-    #    assumed, so the reason the shared check raises is on the record.
+    # 3. The whole dump at step 1, recorded rather than assumed. This is the
+    #    step the shared harness reads, and it returned 4,800 of 460,800
+    #    bytes on this board until gm-6ivh.
+    want = 480 * 480 * 2
     raw = rig.get_bytes("/api/debug/fb?step=1")
-    check("fb_step1_is_truncated_on_this_board", len(raw) < 480 * 480 * 2,
-          "%d bytes, expected the endpoint to be short" % len(raw))
-    print("  /api/debug/fb?step=1 delivered %d of %d bytes" % (len(raw), 480 * 480 * 2), flush=True)
+    check("fb_step1_is_whole", len(raw) == want, "%d of %d bytes" % (len(raw), want))
+    print("  /api/debug/fb?step=1 delivered %d of %d bytes" % (len(raw), want), flush=True)
 
     rig.settingsui(pop=1)
     rig.wait_until(lambda: depth(rig) == 1, timeout=10)

@@ -99,6 +99,7 @@ CHECKBOX_KEYS = {
 }
 
 FAILURES = []
+SKIPPED = []
 TOTAL = 0
 
 
@@ -109,6 +110,14 @@ def check(rig, name, cond, detail=""):
     if not cond:
         FAILURES.append((name, detail))
     return cond
+
+
+def skip(rig, name, reason):
+    """Records a check that refused to run, by name and reason. Same shape
+    as test_temps.py's. A check that quietly does nothing reads as a pass
+    in the counts, so every refusal here is counted and printed."""
+    rig.log("skip", name=name, reason=reason)
+    SKIPPED.append((name, reason))
 
 
 def run_check(rig, name, fn):
@@ -262,6 +271,16 @@ def hex_to_int(hex_str):
     return int(hex_str.lstrip("#"), 16)
 
 
+def web_save_available(rig):
+    """Whether web_save() can run against this venue: it POSTs
+    /api/settings, and that is the simulator's stand-in for a browser and
+    is never done by hand against the bench board (CLAUDE.md: the response
+    carries the WiFi password in clear text and the web UI is its only
+    safe writer)."""
+    host = rig.host
+    return host == "127.0.0.1" or host.startswith("127.0.0.1:")
+
+
 def web_save(rig, overrides):
     """Emulates a web UI save on the simulator only: GET the current
     settings, apply overrides, and POST the whole thing back in the form
@@ -275,10 +294,13 @@ def web_save(rig, overrides):
     that /api/settings is never POSTed by hand against the real device, and
     this is the one place in this package that does POST it, on the
     simulator only, standing in for the browser that does not exist here.
+
+    A check that needs this asks web_save_available() before it changes
+    anything, so the refusal cannot arrive half way through a fixture that
+    the check then has no way to put back.
     """
-    host = rig.host
-    if not (host == "127.0.0.1" or host.startswith("127.0.0.1:")):
-        raise RuntimeError("web_save needs the web UI on this host (%r is not the simulator's loopback)" % host)
+    if not web_save_available(rig):
+        raise RuntimeError("web_save needs the web UI on this host (%r is not the simulator's loopback)" % rig.host)
     current = rig.settings()
     current.update(overrides)
     form = {}
@@ -375,15 +397,17 @@ def depth(rig):
 
 
 def rows_across_pages(rig):
-    """Every row name on the page currently on top, across all its pages, in
-    page order. The picker's group and gradient lists run past five rows."""
+    """Every row on the page currently on top, across all its pages, in page
+    order. The picker's group and gradient lists run past five rows.
+
+    Repeated names are kept, one entry per row, the way Rig.rows_on_page
+    reports them. This used to drop a name it had already seen, which on
+    the library list meant two saved gradients called "Custom" read as one
+    row and the list read one entry short."""
     pages = int(rig.settingsui_state().get("pages", 1))
     names = []
     for page in range(pages):
-        dump = goto_page(rig, page)
-        for name in rig.rows_on_page(dump):
-            if name not in names:
-                names.append(name)
+        names.extend(rig.rows_on_page(goto_page(rig, page)))
     return names
 
 
@@ -449,13 +473,20 @@ def picker_selected_rows(rig):
 
 def swatch_strip(rig, dump, row, data=None):
     """The row's swatch as a list of RGB triples, read straight out of the
-    framebuffer along the middle of the canvas. None when the row has no
-    visible swatch. `data` reuses a framebuffer already read."""
+    full-resolution framebuffer along the middle of the canvas. None when
+    the row has no visible swatch. `data` reuses a framebuffer already read.
+
+    Rig.fb() is what reads it, so a body shorter than the X-FB-Size header
+    promised raises with both byte counts instead of being sampled. That
+    used to matter on a device: /api/debug/fb returned 4,800 of 460,800
+    bytes at step 1 (gm-6ivh, fixed in 28cec8ec), and reading a swatch out
+    of the five rows that arrived would have been a narrower sample with
+    nothing to say so."""
     obj = rig.find_tag(dump, row, "swatch")
     if obj is None or obj.get("h"):
         return None
     if data is None:
-        data = rig.get_bytes("/api/debug/fb?step=1")
+        _w, _h, data = rig.fb(step=1)
     y = (obj["y1"] + obj["y2"]) // 2
     return [rgb565_pixel(data, x, y) for x in range(obj["x1"], obj["x2"] + 1)]
 
@@ -665,7 +696,7 @@ def check_frame_rate_live_and_precedence(rig):
     d0b = rig.touchmap(screen=0)
     check(rig, "frame_rate_row_value", rig.row_value(d0b, "Frame rate") == "%d fps" % fps1, rig.row_value(d0b, "Frame rate"))
 
-    try:
+    if web_save_available(rig):
         fps_web = next(c for c in (40, 45, 50, 55, 20, 25, 15, 10) if c not in (fps0, fps1))
         web_save(rig, {"bgAnimFps": fps_web})
         check(rig, "web_save_landed", int(rig.settings()["bgAnimFps"]) == fps_web,
@@ -674,8 +705,9 @@ def check_frame_rate_live_and_precedence(rig):
         rig.settingsui(pop=1)
         ok = rig.wait_until(lambda: int(rig.settings()["bgAnimFps"]) == fps1, timeout=6)
         check(rig, "touched_field_precedence", bool(ok), "expected %d after pop, got %r" % (fps1, rig.settings()["bgAnimFps"]))
-    except RuntimeError as e:
-        rig.log("touched_field_precedence_skipped", reason=str(e))
+    else:
+        skip(rig, "touched_field_precedence",
+             "the interfering save is a web save, and web_save runs on the simulator only")
         rig.settingsui(pop=1)
 
     # Restore fps0 through the UI, never by POST.
@@ -716,15 +748,17 @@ def check_theme_recolor(rig):
     x1, y1, x2, y2 = row["hit"]
     points = [(x1 + int((x2 - x1) * f), (y1 + y2) // 2) for f in (0.3, 0.5, 0.7)]
 
-    # step=2 (240x240): the device delivers the framebuffer only at step 2.
-    fb_before = rig.get_bytes("/api/debug/fb?step=2")
+    # step=2 (240x240) by choice, not by necessity: three pixels are read
+    # out of it, and every step is whole since gm-6ivh. A quarter of the
+    # bytes for the same three samples, with the coordinates halved.
+    _w, _h, fb_before = rig.fb(step=2)
     colors_before = [rgb565_pixel(fb_before, x // 2, y // 2, w=240) for x, y in points]
 
     next_btn = rig.find_tag(d, "Theme", "next")
     rig.tap_target(next_btn)
     rig.wait_until(lambda: int(rig.settings()["themeMode"]) != mode0, timeout=2)
     time.sleep(0.5)  # one more rerender pass for applyTheme()'s change_color_theme + the page's own rebuildPage
-    fb_after = rig.get_bytes("/api/debug/fb?step=2")
+    _w, _h, fb_after = rig.fb(step=2)
     colors_after = [rgb565_pixel(fb_after, x // 2, y // 2, w=240) for x, y in points]
 
     check(rig, "theme_mode_flipped", int(rig.settings()["themeMode"]) == (1 - mode0))
@@ -780,6 +814,26 @@ def restore_fields_exactly(rig, name, fields):
     now = rig.settings()
     check(rig, name, all(str(now.get(k, "")) == str(v) for k, v in fields.items()),
           "want %r got %r" % (fields, {k: now.get(k) for k in fields}))
+
+
+def category_for_ref(ref, preferred):
+    """A gradient category that holds a built-in other than `ref`: the
+    preferred one when it does, else the first in table order that does.
+
+    Every check that picks "another built-in, from this category" needs the
+    category to hold two entries in the worst case, the case where `ref` is
+    one of its own. Naming a category and assuming is a flake waiting on
+    the table: Coffee held one entry on the 18 entry table, so
+    check_gradient_precedence_across_animations failed on a board whose
+    stored ref was in Coffee. The table is 60 entries now and Coffee holds
+    seven, which hid the assumption rather than removing it, so the
+    category is chosen from what the table actually contains and the
+    preferred name is a preference."""
+    order = [preferred] + [c for c in GRADIENT_CATEGORIES if c != preferred]
+    for cat in order:
+        if any(str(idx) != str(ref) and GRADIENT_CATEGORY_OF[idx] == cat for idx in range(len(THEME_NAMES))):
+            return cat
+    raise AssertionError("no gradient category holds a built-in other than %r" % (ref,))
 
 
 def builtin_ref_other_than(ref, category=None):
@@ -844,9 +898,10 @@ def check_gradient_picker_navigation(rig):
           "distinct colours across the swatch: %r" % (None if strip is None else len(set(strip))))
 
     # A built-in, from a category that is not the first row on the page.
-    want_ref = builtin_ref_other_than(ref0, category="Fire and Heat")
+    cat = category_for_ref(ref0, "Fire and Heat")
+    want_ref = builtin_ref_other_than(ref0, category=cat)
     want_name = THEME_NAMES[int(want_ref)]
-    picker_choose(rig, "Fire and Heat", want_name)
+    picker_choose(rig, cat, want_name)
     check(rig, "picker_returns_to_animation", depth(rig) == 1, depth(rig))
     d = page_with_row(rig, "Gradient")
     check(rig, "picker_builtin_row_text", rig.row_value(d, "Gradient") == want_name, rig.row_value(d, "Gradient"))
@@ -926,9 +981,10 @@ def check_gradient_all_and_standby_pickers(rig):
     groups = rows_across_pages(rig)
     check(rig, "all_picker_has_no_global", "Global" not in groups, groups)
 
-    want_ref = builtin_ref_other_than(ref0, category="Water and Ice")
+    cat = category_for_ref(ref0, "Water and Ice")
+    want_ref = builtin_ref_other_than(ref0, category=cat)
     want_name = THEME_NAMES[int(want_ref)]
-    picker_choose(rig, "Water and Ice", want_name)
+    picker_choose(rig, cat, want_name)
     s1 = rig.settings()
     check(rig, "all_picker_writes_global_ref", s1["bgAnimGradientRef"] == want_ref, s1["bgAnimGradientRef"])
     check(rig, "all_picker_mirrors_builtin", str(s1["bgAnimTheme"]) == want_ref,
@@ -986,8 +1042,10 @@ def check_gradient_all_and_standby_pickers(rig):
     separate = int(rig.settings()["bgAnimStandbyId"]) == standby_target
     check(rig, "standby_anim_set_for_picker", separate, rig.settings()["bgAnimStandbyId"])
     if separate:
-        want2 = builtin_ref_other_than(map_ref(rig.settings()["bgAnimThemeMap"], standby_target), category="Nature")
-        picker_choose_from_row(rig, "Standby grad", "Nature", THEME_NAMES[int(want2)])
+        standby_ref0 = map_ref(rig.settings()["bgAnimThemeMap"], standby_target)
+        cat2 = category_for_ref(standby_ref0, "Nature")
+        want2 = builtin_ref_other_than(standby_ref0, category=cat2)
+        picker_choose_from_row(rig, "Standby grad", cat2, THEME_NAMES[int(want2)])
         s3 = rig.settings()
         check(rig, "standby_grad_writes_standby_slot", map_ref(s3["bgAnimThemeMap"], standby_target) == want2,
               map_ref(s3["bgAnimThemeMap"], standby_target))
@@ -1045,7 +1103,12 @@ def check_gradient_picker_high_library_ids(rig):
     swatch, and tapping it closed the picker without writing anything.
 
     The library is set up through the web save the simulator provides, so
-    this reports and returns on a device."""
+    this refuses to run on a device and says why, before it changes
+    anything."""
+    if not web_save_available(rig):
+        skip(rig, "gradient_picker_high_library_ids",
+             "the high-id library is a web save fixture, and web_save runs on the simulator only")
+        return
     s0 = rig.settings()
     lib0 = s0["bgAnimGradients"]
     map0 = s0["bgAnimThemeMap"]
@@ -1057,11 +1120,7 @@ def check_gradient_picker_high_library_ids(rig):
     # 14 is the first id the old resolver refused; 99999 is the largest the
     # ref grammar accepts.
     high_lib, high = library_renumbered(lib0, [14, 99999])
-    try:
-        web_save(rig, {"bgAnimGradients": high_lib})
-    except RuntimeError as e:
-        rig.log("high_library_ids_skipped", reason=str(e))
-        return
+    web_save(rig, {"bgAnimGradients": high_lib})
     landed = rig.wait_until(lambda: rig.settings()["bgAnimGradients"] == high_lib, timeout=5)
     check(rig, "high_id_library_write_landed", bool(landed), rig.settings()["bgAnimGradients"])
     if not landed:
@@ -1181,13 +1240,15 @@ def check_gradient_picker_reachability(rig):
     picker_cancel(rig)
 
     # An empty library hides the group. The POST has to land for this to
-    # mean anything, so read it back before believing the UI.
-    try:
-        web_save(rig, {"bgAnimGradients": ""})
-    except RuntimeError as e:
-        rig.log("picker_empty_library_skipped", reason=str(e))
+    # mean anything, so read it back before believing the UI. Only this half
+    # needs the web save: everything above is navigation, so a device runs
+    # that and refuses here, with the library it arrived with untouched.
+    if not web_save_available(rig):
+        skip(rig, "picker_empty_library_hides_group",
+             "emptying the library is a web save, and web_save runs on the simulator only")
         close_animation(rig)
         return
+    web_save(rig, {"bgAnimGradients": ""})
     landed = rig.wait_until(lambda: rig.settings()["bgAnimGradients"] == "", timeout=5)
     check(rig, "picker_empty_library_write_landed", bool(landed), rig.settings()["bgAnimGradients"])
     open_picker(rig, "Gradient all")
@@ -1199,6 +1260,76 @@ def check_gradient_picker_reachability(rig):
     back = rig.wait_until(lambda: rig.settings()["bgAnimGradients"] == lib0, timeout=5)
     check(rig, "picker_library_restored", bool(back))
     close_animation(rig)
+
+
+def check_gradient_picker_repeated_names(rig):
+    """Regression for gm-xiu6: two saved gradients with the same name are
+    two rows on the list, not one.
+
+    Rig.rows_on_page collected a page's rows into a dict keyed by the row's
+    visible name, and rows_across_pages dropped a name it had already seen,
+    so a library of twelve entries with two called "Custom" listed as
+    eleven rows. Saved gradient names are whatever the user typed and
+    repeat easily; the bench board's own library held that pair, and the
+    reachability check above failed on it for that reason alone
+    (gm-nov3.11). A count is the thing to assert, because the names on
+    their own cannot tell the two readings apart.
+
+    Simulator only: the twelve-entry library is written through a web
+    save."""
+    if not web_save_available(rig):
+        skip(rig, "gradient_picker_repeated_names",
+             "the twelve entry library is a web save fixture, and web_save runs on the simulator only")
+        return
+    s0 = rig.settings()
+    lib0 = s0["bgAnimGradients"]
+    map0 = s0["bgAnimThemeMap"]
+    ref0 = s0["bgAnimGradientRef"]
+
+    # Twelve entries, five to a page, so three pages, and the last one
+    # partial: the same shape the board's library had. Two are called
+    # "Custom" and they are not adjacent, so a reading that keeps only the
+    # first of a name loses the twelfth row rather than the second.
+    names = ["Custom", "Sunrise", "Custom"] + ["Saved %d" % n for n in range(4, 13)]
+    stops = "202020,f0f0f0"
+    packed = ";".join("%d|%s|%s" % (i + 1, name, stops) for i, name in enumerate(names))
+    web_save(rig, {"bgAnimGradients": packed})
+    landed = rig.wait_until(lambda: rig.settings()["bgAnimGradients"] == packed, timeout=5)
+    check(rig, "repeated_names_library_landed", bool(landed), rig.settings()["bgAnimGradients"])
+    if not landed:
+        restore_fields_exactly(rig, "repeated_names_restored",
+                               {"bgAnimGradients": lib0, "bgAnimThemeMap": map0, "bgAnimGradientRef": ref0})
+        return
+
+    open_animation(rig)
+    open_picker(rig, "Gradient")
+    picker_tap(rig, "My gradients")
+    rig.wait_until(lambda: depth(rig) == 3, timeout=5)
+    listed = rows_across_pages(rig)
+    check(rig, "repeated_names_row_count", len(listed) == len(names),
+          "%d rows listed for %d library entries: %r" % (len(listed), len(names), listed))
+    check(rig, "repeated_names_rows_in_stored_order", listed == names,
+          "got %r want %r" % (listed, names))
+    check(rig, "repeated_names_both_customs_listed", listed.count("Custom") == 2,
+          "%d rows named Custom in %r" % (listed.count("Custom"), listed))
+
+    # The same count, read one page at a time, so the fix is in
+    # Rig.rows_on_page and not only in this file's walk over the pages.
+    first_page = rig.rows_on_page(goto_page(rig, 0))
+    check(rig, "repeated_names_first_page_full", len(first_page) == 5,
+          "%d rows on page 0: %r" % (len(first_page), first_page))
+    check(rig, "repeated_names_first_page_keeps_repeat", first_page == names[:5],
+          "got %r want %r" % (first_page, names[:5]))
+
+    picker_cancel(rig)
+    picker_cancel(rig)
+    close_animation(rig)
+
+    restore_fields_exactly(rig, "repeated_names_restored", {
+        "bgAnimGradients": lib0,
+        "bgAnimThemeMap": map0,
+        "bgAnimGradientRef": ref0,
+    })
 
 
 def check_gradient_picker_pagination_and_cancel(rig):
@@ -1262,7 +1393,14 @@ def check_gradient_picker_web_interference(rig):
     library entry cannot be selected, and a web change of the edited
     animation does not retarget an open picker. Every step reads the POST
     back before judging the UI, so nothing here can pass by the write
-    being rejected."""
+    being rejected.
+
+    Every step is a web save, so this refuses to run on a device up front
+    rather than setting up half a fixture it cannot put back."""
+    if not web_save_available(rig):
+        skip(rig, "gradient_picker_web_interference",
+             "every step here is a web save, and web_save runs on the simulator only")
+        return
     s0 = rig.settings()
     anim_a = int(s0["bgAnimId"])
     anim_b = (anim_a + 1) % len(ANIM_NAMES)
@@ -1277,12 +1415,7 @@ def check_gradient_picker_web_interference(rig):
 
     # 1. An untouched parent field changes under an open picker.
     new_fps = 45 if fps0 != 45 else 50
-    try:
-        web_save(rig, {"bgAnimFps": new_fps})
-    except RuntimeError as e:
-        rig.log("picker_web_interference_skipped", reason=str(e))
-        close_animation(rig)
-        return
+    web_save(rig, {"bgAnimFps": new_fps})
     landed = rig.wait_until(lambda: int(rig.settings()["bgAnimFps"]) == new_fps, timeout=5)
     check(rig, "picker_web_fps_landed", bool(landed), rig.settings()["bgAnimFps"])
     picker_cancel(rig)
@@ -1331,8 +1464,10 @@ def check_gradient_picker_web_interference(rig):
     web_save(rig, {"bgAnimId": anim_b})
     landed = rig.wait_until(lambda: int(rig.settings()["bgAnimId"]) == anim_b, timeout=5)
     check(rig, "picker_web_anim_change_landed", bool(landed), rig.settings()["bgAnimId"])
-    want_ref = builtin_ref_other_than(map_ref(rig.settings()["bgAnimThemeMap"], anim_a), category="Night Sky")
-    picker_choose(rig, "Night Sky", THEME_NAMES[int(want_ref)])
+    ref_a_now = map_ref(rig.settings()["bgAnimThemeMap"], anim_a)
+    cat = category_for_ref(ref_a_now, "Night Sky")
+    want_ref = builtin_ref_other_than(ref_a_now, category=cat)
+    picker_choose(rig, cat, THEME_NAMES[int(want_ref)])
     s1 = rig.settings()
     check(rig, "picker_writes_captured_slot", map_ref(s1["bgAnimThemeMap"], anim_a) == want_ref,
           "anim %d got %r want %r" % (anim_a, map_ref(s1["bgAnimThemeMap"], anim_a), want_ref))
@@ -1388,10 +1523,11 @@ def check_gradient_picker_teardown(rig):
     anim0 = int(s0["bgAnimId"])
     map0 = s0["bgAnimThemeMap"]
     ref0 = map_ref(map0, anim0)
-    want_ref = builtin_ref_other_than(ref0, category="Coffee")
+    cat = category_for_ref(ref0, "Coffee")
+    want_ref = builtin_ref_other_than(ref0, category=cat)
 
     open_animation(rig)
-    picker_choose_from_row(rig, "Gradient", "Coffee", THEME_NAMES[int(want_ref)])
+    picker_choose_from_row(rig, "Gradient", cat, THEME_NAMES[int(want_ref)])
     open_picker(rig, "Gradient")
     picker_tap(rig, "Water and Ice")
     rig.wait_until(lambda: depth(rig) == 3, timeout=5)
@@ -1460,7 +1596,11 @@ def check_gradient_precedence_across_animations(rig):
     did not touch keeps the web's.
 
     The rows are the gm-nov3.3 picker rather than the old prev/next
-    arrows, so each touch here is a walk into the picker and a choice."""
+    arrows, so each touch here is a walk into the picker and a choice.
+
+    The four categories it walks are preferences, not assumptions: each one
+    has to offer a built-in other than the ref it replaces, so
+    category_for_ref picks another when the preferred one cannot."""
     s0 = rig.settings()
     anim_a = int(s0["bgAnimId"])
     anim_b = (anim_a + 1) % len(ANIM_NAMES)
@@ -1471,31 +1611,32 @@ def check_gradient_precedence_across_animations(rig):
     ref0_c = map_ref(map0, anim_c)
 
     open_animation(rig)
-    ref_a = builtin_ref_other_than(ref0_a, category="Coffee")
-    picker_choose_from_row(rig, "Gradient", "Coffee", THEME_NAMES[int(ref_a)])
+    cat_a = category_for_ref(ref0_a, "Coffee")
+    ref_a = builtin_ref_other_than(ref0_a, category=cat_a)
+    picker_choose_from_row(rig, "Gradient", cat_a, THEME_NAMES[int(ref_a)])
     check(rig, "precedence_setup_touch_a", map_ref(rig.settings()["bgAnimThemeMap"], anim_a) == ref_a,
           map_ref(rig.settings()["bgAnimThemeMap"], anim_a))
 
     tap_row(rig, "Animation", "next")
     check(rig, "precedence_moved_to_b", int(rig.settings()["bgAnimId"]) == anim_b, rig.settings()["bgAnimId"])
 
-    ref_b = builtin_ref_other_than(ref0_b, category="Neon")
-    picker_choose_from_row(rig, "Gradient", "Neon", THEME_NAMES[int(ref_b)])
+    cat_b = category_for_ref(ref0_b, "Neon")
+    ref_b = builtin_ref_other_than(ref0_b, category=cat_b)
+    picker_choose_from_row(rig, "Gradient", cat_b, THEME_NAMES[int(ref_b)])
     map_after_b = rig.settings()["bgAnimThemeMap"]
     check(rig, "precedence_setup_touch_b", map_ref(map_after_b, anim_b) == ref_b, map_ref(map_after_b, anim_b))
 
     # The review's interference step: one web save replacing the whole map,
     # with a different value in A's touched slot and in C's untouched one.
-    web_ref_a = builtin_ref_other_than(ref_a, category="Pastel")
-    web_ref_c = builtin_ref_other_than(ref0_c, category="Metal and Stone")
+    web_ref_a = builtin_ref_other_than(ref_a, category=category_for_ref(ref_a, "Pastel"))
+    web_ref_c = builtin_ref_other_than(ref0_c, category=category_for_ref(ref0_c, "Metal and Stone"))
     web_map = map_write_ref(map_write_ref(map_after_b, anim_a, web_ref_a), anim_c, web_ref_c)
-    interference = True
-    try:
-        web_save(rig, {"bgAnimThemeMap": web_map})
-    except RuntimeError as e:
-        interference = False
-        rig.log("gradient_precedence_web_save_unavailable", reason=str(e))
+    interference = web_save_available(rig)
+    if not interference:
+        skip(rig, "precedence_web_interference",
+             "replacing the whole map is a web save, and web_save runs on the simulator only")
     if interference:
+        web_save(rig, {"bgAnimThemeMap": web_map})
         landed = rig.wait_until(lambda: rig.settings()["bgAnimThemeMap"] == web_map, timeout=5)
         check(rig, "precedence_web_map_landed", bool(landed),
               "the web save has to reach Settings before its effect can be judged: %r" %
@@ -1803,12 +1944,18 @@ def check_parameters_web_precedence(rig):
     Unlike bgAnimThemeMap, bgAnimParams is not gated behind a validity check
     in WebUIPlugin.cpp, so the simulator can run this whole criterion: the
     POST lands. Simulator only all the same, because web_save refuses any
-    host but loopback."""
+    host but loopback, and that refusal is taken here rather than after the
+    parameter row has been stepped: the step is the fixture, and the reset
+    that puts it back sits below the web save."""
+    if not web_save_available(rig):
+        skip(rig, "parameters_web_precedence",
+             "the interfering save is a web save, and web_save runs on the simulator only")
+        return
     s0 = rig.settings()
     anim0 = int(s0["bgAnimId"])
     packed0 = s0.get("bgAnimParams", "")
     if params_group(packed0, anim0) != "":
-        rig.log("params_web_precedence_skipped", reason="animation %d has stored parameters" % anim0)
+        skip(rig, "parameters_web_precedence", "animation %d has stored parameters" % anim0)
         return
 
     d0 = open_animation(rig)
@@ -1826,7 +1973,7 @@ def check_parameters_web_precedence(rig):
     names = rig.rows_on_page(rig.touchmap(screen=0))
     param_names = [n for n in names if n != "Reset to defaults"]
     if len(param_names) < 2:
-        rig.log("params_web_precedence_skipped", reason="animation %d defines fewer than two parameters" % anim0)
+        skip(rig, "parameters_web_precedence", "animation %d defines fewer than two parameters" % anim0)
         rig.settingsui(pop=1)
         close_animation(rig)
         return
@@ -1845,13 +1992,7 @@ def check_parameters_web_precedence(rig):
     web_touched = "5" if expected != 5 else "10"
     web_untouched = "15" if slots[1] != "15" else "20"
     slots[0], slots[1] = web_touched, web_untouched
-    try:
-        web_save(rig, {"bgAnimParams": params_set_group(packed1, anim0, ",".join(slots))})
-    except RuntimeError as e:
-        rig.log("params_web_precedence_unavailable", reason=str(e))
-        rig.settingsui(pop=1)
-        close_animation(rig)
-        return
+    web_save(rig, {"bgAnimParams": params_set_group(packed1, anim0, ",".join(slots))})
 
     def untouched_shows_web():
         dump = page_with_row(rig, untouched_row)
@@ -1903,6 +2044,7 @@ CHECKS = [
     ("gradient_all_and_standby_pickers", check_gradient_all_and_standby_pickers),
     ("gradient_picker_high_library_ids", check_gradient_picker_high_library_ids),
     ("gradient_picker_reachability", check_gradient_picker_reachability),
+    ("gradient_picker_repeated_names", check_gradient_picker_repeated_names),
     ("gradient_picker_pagination_and_cancel", check_gradient_picker_pagination_and_cancel),
     ("gradient_picker_web_interference", check_gradient_picker_web_interference),
     ("gradient_picker_teardown", check_gradient_picker_teardown),
@@ -1921,11 +2063,13 @@ def run(rig, report, venue):
     simulator cannot reach (a library gradient, an external write to the
     theme map) already assert the simulator's own refusal internally."""
     del venue  # nothing here restarts the process or reads the log file
-    first_fail, first_total = len(FAILURES), TOTAL
+    first_fail, first_total, first_skip = len(FAILURES), TOTAL, len(SKIPPED)
     for name, fn in CHECKS:
         run_check(rig, name, fn)
     report.step("scenario_checks", scenario="animation", checks=TOTAL - first_total,
-                failed=len(FAILURES) - first_fail)
+                failed=len(FAILURES) - first_fail, skipped=len(SKIPPED) - first_skip)
+    for name, reason in SKIPPED[first_skip:]:
+        report.step("scenario_skip", scenario="animation", name=name, reason=reason)
     new_failures = FAILURES[first_fail:]
     if new_failures:
         raise AssertionError("; ".join("%s: %s" % (n, d) for n, d in new_failures))
@@ -1959,6 +2103,10 @@ def main():
                 run_check(rig, name, fn)
 
     print()
+    if SKIPPED:
+        print("SKIPPED (%d):" % len(SKIPPED))
+        for name, reason in SKIPPED:
+            print("  %s: %s" % (name, reason))
     if FAILURES:
         print("FAIL (%d/%d checks failed):" % (len(FAILURES), TOTAL))
         for name, detail in FAILURES:

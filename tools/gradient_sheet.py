@@ -47,10 +47,12 @@ push, so no overlay, layer, element or scrim reaches them. Column x carries
 ramp index ((x + xoff) * 255) / (w - 1), clamped to 255. Interlacing is vetoed
 while it is armed, so both framebuffers carry the strip rather than one.
 
-Why xoff exists: /api/debug/fb only delivers the framebuffer subsampled, so a
-host sees even columns only and would never read column 479, where index 255
-sits. The fixture is read twice, at xoff 0 and 1, and the two passes together
-cover the index of every column. Measured coverage: 256 of 256 indices.
+Why xoff exists: at the default --step 2 the endpoint hands back even columns
+only, so a host would never read column 479, where index 255 sits. The fixture
+is read twice, at xoff 0 and 1, and the two passes together cover the index of
+every column. Measured coverage: 256 of 256 indices. --step 1 reads every
+column in one pass and needs no second offset; the recorded runs below predate
+that being usable (gm-6ivh) and were taken at step 2.
 
 The settings are read from the fixture's own report, not assumed and not read
 from /api/settings, which returns the WiFi password in clear text. The report
@@ -80,11 +82,15 @@ armed strip compared against a ramp sampled at 50/50 gives 4,800 mismatches,
 and the correct ramp compared against the region with the fixture off gives
 4,724. A check that cannot fail is not evidence.
 
-One thing to expect on a board that has been up a while: /api/debug/fb is a
-chunked response and the board starts dropping it partway after a few hundred
-requests (internal free fell from 30.9 kB at boot to 26.2 kB, largest block
-20.5 kB to 15.9). The tool retries, and keeps a short read when it still
-reaches the strip's rows, so a run finishes either way. A reboot restores it.
+This note used to warn that /api/debug/fb starts dropping its response partway
+on a board that has been up a while, and that the tool keeps a short read as
+long as it reaches the strip's rows. Both are gone. The dropped responses were
+the filler returning 0 when the send budget could not hold one more output row,
+which the web server reads as the end of the body, and the heap drift blamed
+for it was a leak in the same filler that only aborted requests could reach, so
+the retry loop written to cope with the short reads was causing it (gm-6ivh,
+28cec8ec, 2026-09-13). The endpoint delivers every step whole, and the tool
+now fails on a short read instead of sampling it.
 
 """
 

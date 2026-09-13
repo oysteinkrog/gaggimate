@@ -150,15 +150,26 @@ def rows_on_page(dump):
     "action", "confirm"); the shell's five slot containers are role "slot"
     and never listed. Row widgets are 320x56, five to a page, so this is at
     most 5 entries for a settings category page; for a generated screen (no
-    rows tagged) it is empty."""
-    by_y = {}
+    rows tagged) it is empty.
+
+    Repeated names are kept, one entry per row. This used to collect the
+    rows into a dict keyed by name, which silently dropped every row after
+    the first of a name: row names are user supplied on the gradient picker
+    (a saved gradient is listed under whatever the user called it) and a
+    library holding two entries both called "Custom" read as one. Anything
+    that counts rows, or that zips this against what it expected the page
+    to hold, was wrong on exactly the page the gradient work cares about.
+
+    A caller that wants the distinct names asks for them: the name of a row
+    is not a key here."""
+    rows = []
     for o in dump["objects"]:
         if tag_role(o) not in ROW_CONTAINER_ROLES:
             continue
-        row = tag_row(o)
         y = o["hit"][1] if "hit" in o else o["y1"]
-        by_y.setdefault(row, y)
-    return [row for row, _ in sorted(by_y.items(), key=lambda kv: kv[1])]
+        rows.append((y, tag_row(o)))
+    rows.sort(key=lambda ry: ry[0])
+    return [row for _y, row in rows]
 
 
 def targets(dump, include_hidden=False):
@@ -510,6 +521,31 @@ class Rig:
         if brew is not None:
             path += "?brew=%d" % (1 if brew else 0)
         return self.get_json(path)
+
+    def fb(self, step=1, timeout=60):
+        """/api/debug/fb as (width, height, raw RGB565 bytes), at 1/step
+        resolution. Raises when the body is not exactly the dump the
+        X-FB-Size header promised, so a short read is a failure with both
+        byte counts in it and never a narrower sample read on quietly.
+
+        Step 1 is the whole panel and is the default. It used to be
+        unusable on a device: the response filler wrote whole output rows
+        and returned 0 when the send budget could not hold one more, which
+        the web server reads as the end of the body, so a step 1 request
+        returned 4,800 of 460,800 bytes with a 200 and no error. That is
+        gm-6ivh, fixed in 28cec8ec on 2026-09-13, and every step is whole
+        now.
+        """
+        with self._open("/api/debug/fb?step=%d" % step, timeout) as resp:
+            size = resp.headers.get("X-FB-Size", "")
+            data = resp.read()
+        if "x" not in size:
+            raise RigHTTPError("/api/debug/fb: missing X-FB-Size header")
+        w, h = (int(v) for v in size.split("x"))
+        if len(data) != w * h * 2:
+            raise RigHTTPError("/api/debug/fb?step=%d: %d of %d bytes for %s"
+                               % (step, len(data), w * h * 2, size))
+        return w, h, data
 
     def fb_png(self, path, step=2, hit_rects=None):
         """Writes /api/debug/fb (RGB565) to path as a PNG, at 1/step
