@@ -49,19 +49,35 @@ summary; the KB carries the sources and the measurements behind it.
   The Windows and WSL PlatformIO installs share `~/.platformio`; a
   Windows-side build can clobber the patched sources, and the patch scripts
   re-apply on the next WSL build; if a display fault appears out of nowhere,
-  check the patches applied in the build log first. **One PlatformIO
-  install per checkout: the `pio` on PATH (`~/.local/bin/pio`, pipx, core
-  6.1.19), never `~/.platformio/penv/bin/pio` (6.1.18).** PlatformIO deletes
-  the whole `.pio/build` tree whenever the project checksum changes, and the
-  checksum includes the core version, so two installs used on one checkout
-  wipe each other's env trees on every build: on 2026-09-05 that happened
-  twice under four running rig workers, and each rebuilt kdev ELF has a new
-  sha (build metadata), so the board had to be reflashed before kb.py worked
-  again. `pio run -t compiledb` for kdev must follow the same rule. One patch targets the
+  check the patches applied in the build log first. One patch targets the
   LVGL libdep rather than the framework: `scripts/patch_lvgl_meter_inv.py`
   (per-env, into `.pio/libdeps/<env>/lvgl`) gives lv_meter scale-lines
   indicators sector invalidation. If dial updates ever get slow again, check
   it applied for that env.
+- **One PlatformIO binary per checkout, and the build tree is volatile until
+  everyone obeys that.** Use the `pio` on PATH by absolute path
+  (`~/.local/bin/pio`, pipx, core 6.1.19), never
+  `~/.platformio/penv/bin/pio` (6.1.18), and never a Windows-side PlatformIO,
+  which shares the same `~/.platformio`. PlatformIO deletes the whole
+  `.pio/build` tree whenever the project checksum changes, the checksum
+  includes the core version, so two installs used on one checkout wipe each
+  other's env trees on every build, for every env and every agent working
+  there. **Adding or removing an env in platformio.ini changes the checksum
+  too**, so never edit the env list while a runner is on the board (2026-09-07:
+  one throwaway env cost a 7 minute loadtest rebuild before the board could be
+  restored). The failure does not look like a build problem: on 2026-09-05 it
+  hit twice under four rig workers, and each rebuilt kdev ELF has a new sha
+  (build metadata), so the board had to be reflashed before kb.py worked
+  again; on 2026-09-13 `display-sim` and `display-loadtest` vanished in the
+  middle of a finished test run and the runner reported that it could not
+  launch the simulator, which reads as a test failure and is not one (nobody
+  watched that build happen, and platformio.ini was clean, so the second
+  install is the remaining fit rather than an observation). So check that the
+  binary you need still exists immediately before a long run, and rebuild if
+  it is gone. On an intact tree `pio run -e display-sim` takes
+  about five seconds. `pio run -t compiledb` follows the same rule and also
+  recreates an env's build tree, so run it before the build you need, not
+  after, and not for another env in between.
 - **The flash runs in QIO, and the LVGL draw cost per widget is the flash
   bus, not pixels** (gm-2cl.19, 2026-09-08). `boards/LilyGo-T-RGB.json` has
   said qio at 80 MHz all along, the flash is a Winbond W25Q128 with the
@@ -1142,13 +1158,9 @@ survived, and what the device taught:
   protection off (sdkconfig.kdev.defaults), so it is a bench env and never
   a production knob, and it idles 16 KB lower on internal free than
   production. `pio run -t compiledb` recreates the env's build tree (ELF
-  included) and writes the one project-wide compile_commands.json, so run
-  it before the build, not after, and never for another env in between.
-  **Adding or removing an env in platformio.ini also changes the checksum**
-  and wipes every env's build tree (2026-09-07: one POC env cost a 7 minute
-  loadtest rebuild before the board could be restored). Never edit the env
-  list while a runner is on the board; rebuild what you flash next after
-  the edit.
+  included) and writes the one project-wide compile_commands.json; the
+  build-tree rules for it, and for editing the env list, are in the
+  PlatformIO bullet under the hardware invariants above.
   Three things the first evening on it taught: never reflash the board
   while a round is running (the `band` rows become a snapshot of whatever
   the tree held at build time, and one worker spent an hour comparing
