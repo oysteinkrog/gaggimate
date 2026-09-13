@@ -627,6 +627,33 @@ export const BG_ANIMATIONS = [
 
 export { BG_THEMES, BG_THEME_CATEGORIES };
 
+// The built-ins grouped for a picker: every declared category that holds
+// gradients, in the declared order, each holding its gradients in table order
+// with the table index, which is the stored id and the option value.
+//
+// A category with nothing in it is dropped rather than shown empty. A gradient
+// whose category is not in the declared list would otherwise vanish, so it
+// falls into a last group instead: the generator rejects that case, and this is
+// the belt for a hand-edited file.
+//
+// One function, because the select and the browse dialog must group the same
+// way. tools/gradient_groups_check.mjs reads the select's markup and
+// tools/gradient_browse_check.mjs the dialog's, both against this order.
+export function builtinThemeGroups() {
+  const byCategory = new Map(BG_THEME_CATEGORIES.map(c => [c, []]));
+  const strays = [];
+  BG_THEMES.forEach((t, index) => {
+    const bucket = byCategory.get(t.category);
+    (bucket ?? strays).push({ name: t.name, index });
+  });
+  const groups = BG_THEME_CATEGORIES.filter(c => byCategory.get(c).length > 0).map(c => ({
+    category: c,
+    items: byCategory.get(c),
+  }));
+  if (strays.length > 0) groups.push({ category: 'Other', items: strays });
+  return groups;
+}
+
 // The legacy bgAnimTheme namespace, frozen at 18 to match BG_THEME_LEGACY_CUSTOM
 // in src/display/ui/default/bganim/BgAnim.h. Before the gradient library
 // existed, bgAnimTheme was an index into an 18-entry built-in table, and 18

@@ -4,14 +4,15 @@ import { HexColorInput, HexColorPicker } from 'react-colorful';
 import 'react-linear-gradient-picker/dist/index.css';
 import './GradientEditor.css';
 import { ApiServiceContext } from '../services/ApiService.js';
+import { GradientBrowser } from './GradientBrowser.jsx';
 import {
   BG_ANIMATIONS,
   BG_GRADIENT_LIB_MAX,
   BG_GRADIENT_NAME_MAX,
   BG_LEGACY_CUSTOM_REF,
-  BG_THEMES,
-  BG_THEME_CATEGORIES,
   BG_THEME_MAX_STOPS,
+  builtinGradient,
+  builtinThemeGroups,
   globalAssignFields,
   globalGradientRef,
   gradientCss,
@@ -134,7 +135,8 @@ export function GradientEditor({ scope, formData, setField, previewAnimIdx }) {
     formData.bgAnimTheme,
     formData.bgAnimCustomTheme,
   );
-  const globalName = gradientForRef(globalRef, library, formData.bgAnimCustomTheme).name;
+  const customTheme = formData.bgAnimCustomTheme;
+  const globalName = gradientForRef(globalRef, library, customTheme).name;
   const globalIsLegacy = globalRef === BG_LEGACY_CUSTOM_REF;
   // What the picker shows. In animation scope '' means "same as global", and
   // an override naming a deleted library entry reads as '' too, because that
@@ -322,28 +324,95 @@ export function GradientEditor({ scope, formData, setField, previewAnimIdx }) {
     };
   }, [owns, sendPreview]);
 
-  // The built-ins, grouped for the picker. Category order is the generated
-  // list's order, and a category with nothing in it is dropped rather than
-  // shown empty. A gradient whose category is not in the list would otherwise
-  // vanish from the picker, so it falls into a last group instead: the
-  // generator rejects that case, and this is the belt for a hand-edited file.
-  const builtinGroups = useMemo(() => {
-    const byCategory = new Map(BG_THEME_CATEGORIES.map(c => [c, []]));
-    const strays = [];
-    BG_THEMES.forEach((t, index) => {
-      const bucket = byCategory.get(t.category);
-      (bucket ?? strays).push({ name: t.name, index });
-    });
-    const groups = BG_THEME_CATEGORIES.filter(c => byCategory.get(c).length > 0).map(c => ({
-      category: c,
-      items: byCategory.get(c),
-    }));
-    if (strays.length > 0) groups.push({ category: 'Other', items: strays });
-    return groups;
-  }, []);
+  // The built-ins, grouped for the picker, in the declared category order. The
+  // browse dialog below is handed the same groups, so the two controls cannot
+  // drift apart.
+  const builtinGroups = useMemo(() => builtinThemeGroups(), []);
 
   const libraryFull = library.length >= BG_GRADIENT_LIB_MAX;
   const selectId = isGlobal ? 'bgAnimGradientRef' : `bgAnimGradientRef-${animIdx}`;
+
+  // ---- the browse dialog --------------------------------------------------
+  // Same choices as the select, as swatches. It never writes anything itself:
+  // a chosen ref goes through assign(), the select's own path.
+  const [browseOpen, setBrowseOpen] = useState(false);
+  const browseBtnRef = useRef(null);
+  const closeBrowse = useCallback(() => {
+    setBrowseOpen(false);
+    // Focus goes back where it came from, which is what a keyboard user needs
+    // whether the dialog was cancelled or a gradient was chosen.
+    browseBtnRef.current?.focus();
+  }, []);
+  const chooseFromBrowse = nextRef => {
+    assign(nextRef);
+    closeBrowse();
+  };
+  const browseGroups = useMemo(() => {
+    const out = [];
+    // An animation can be put back on the global gradient from here too, the
+    // same '' the select's first option writes.
+    if (!isGlobal) {
+      const g = gradientForRef(globalRef, library, customTheme);
+      out.push({
+        label: 'Global',
+        items: [{ ref: '', name: `Global (${g.name})`, stops: g.stops }],
+      });
+    }
+    if (library.length > 0) {
+      out.push({
+        label: 'My gradients',
+        items: library.map(g => ({ ref: `c${g.id}`, name: g.name, stops: g.stops })),
+      });
+    }
+    for (const group of builtinGroups) {
+      out.push({
+        label: group.category,
+        items: group.items.map(t => ({
+          ref: String(t.index),
+          name: t.name,
+          stops: builtinGradient(t.index).stops,
+        })),
+      });
+    }
+    return out;
+  }, [isGlobal, globalRef, customTheme, library, builtinGroups]);
+
+  const browseButton = (
+    <button
+      type='button'
+      ref={browseBtnRef}
+      className='btn btn-sm'
+      aria-haspopup='dialog'
+      onClick={() => setBrowseOpen(true)}
+    >
+      Browse
+    </button>
+  );
+
+  // Mounted whether it is open or closed (it renders nothing when closed), so
+  // it stays inside the editor's preview-ownership capture handlers: opening it
+  // claims the preview for this editor exactly as clicking the select does, and
+  // closing it neither takes nor drops ownership.
+  const browser = (
+    <GradientBrowser
+      isOpen={browseOpen}
+      titleId={`gradient-browse-title-${editorId}`}
+      title={
+        isGlobal
+          ? 'Choose a gradient for all animations'
+          : `Choose a gradient for ${BG_ANIMATIONS[animIdx]?.name ?? 'this animation'}`
+      }
+      notice={
+        isGlobal && globalIsLegacy
+          ? `The gradient in use is ${globalName}, saved before gradients had names, so nothing below is marked as current. Choosing one replaces it.`
+          : undefined
+      }
+      groups={browseGroups}
+      currentRef={ref}
+      onChoose={chooseFromBrowse}
+      onClose={closeBrowse}
+    />
+  );
 
   if (!isGlobal && ref === '') {
     return (
@@ -382,6 +451,7 @@ export function GradientEditor({ scope, formData, setField, previewAnimIdx }) {
               </optgroup>
             ))}
           </select>
+          {browseButton}
           <div
             className='h-8 min-w-40 flex-1 rounded-md border border-black/20'
             style={{ background: gradientCss(stops) }}
@@ -392,6 +462,7 @@ export function GradientEditor({ scope, formData, setField, previewAnimIdx }) {
           This animation uses the global gradient set above. Pick another here to give it one of its
           own.
         </p>
+        {browser}
       </div>
     );
   }
@@ -409,41 +480,44 @@ export function GradientEditor({ scope, formData, setField, previewAnimIdx }) {
               ? 'Gradient for all animations'
               : `Gradient for ${BG_ANIMATIONS[animIdx]?.name ?? 'this animation'}`}
           </label>
-          <select
-            id={selectId}
-            className='select select-bordered w-full'
-            value={ref}
-            onChange={e => assign(e.target.value)}
-          >
-            {!isGlobal && <option value=''>Global ({globalName})</option>}
-            {/* The pre-library custom gradient, while the firmware has had to
+          <div className='flex items-center gap-2'>
+            <select
+              id={selectId}
+              className='select select-bordered w-full'
+              value={ref}
+              onChange={e => assign(e.target.value)}
+            >
+              {!isGlobal && <option value=''>Global ({globalName})</option>}
+              {/* The pre-library custom gradient, while the firmware has had to
                 leave it where it is. Shown so the current value reads
                 truthfully; it is not a choice, and picking anything else
                 replaces it. */}
-            {isGlobal && globalIsLegacy && (
-              <option value={BG_LEGACY_CUSTOM_REF} disabled>
-                {globalName}
-              </option>
-            )}
-            {library.length > 0 && (
-              <optgroup label='My gradients'>
-                {library.map(g => (
-                  <option key={g.id} value={`c${g.id}`}>
-                    {g.name}
-                  </option>
-                ))}
-              </optgroup>
-            )}
-            {builtinGroups.map(group => (
-              <optgroup key={group.category} label={group.category}>
-                {group.items.map(t => (
-                  <option key={t.name} value={String(t.index)}>
-                    {t.name}
-                  </option>
-                ))}
-              </optgroup>
-            ))}
-          </select>
+              {isGlobal && globalIsLegacy && (
+                <option value={BG_LEGACY_CUSTOM_REF} disabled>
+                  {globalName}
+                </option>
+              )}
+              {library.length > 0 && (
+                <optgroup label='My gradients'>
+                  {library.map(g => (
+                    <option key={g.id} value={`c${g.id}`}>
+                      {g.name}
+                    </option>
+                  ))}
+                </optgroup>
+              )}
+              {builtinGroups.map(group => (
+                <optgroup key={group.category} label={group.category}>
+                  {group.items.map(t => (
+                    <option key={t.name} value={String(t.index)}>
+                      {t.name}
+                    </option>
+                  ))}
+                </optgroup>
+              ))}
+            </select>
+            {browseButton}
+          </div>
           {!isGlobal && (
             <p className='text-base-content/60 mt-2 text-sm'>
               {BG_ANIMATIONS[animIdx]?.name ?? 'This animation'} has its own gradient and ignores
@@ -605,6 +679,7 @@ export function GradientEditor({ scope, formData, setField, previewAnimIdx }) {
         Stops run dark to bright. The panel shows {anim?.name ?? 'the animation'} with this gradient
         while you edit; save to keep it.
       </p>
+      {browser}
     </div>
   );
 }
