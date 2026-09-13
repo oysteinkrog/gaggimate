@@ -1656,12 +1656,22 @@ void WebUIPlugin::setupDebugEndpoints() {
     // /api/debug/gradfix[?on=0|1|2|3][&y0=&y1=][&xoff=0|1][&btone=&ktone=]
     // [&stops=<wire>[&anim=N]]: the gradient framebuffer fixture (gm-nov3.10).
     //
-    // The question it answers is whether the panel really stores the colours
-    // web/src/config/gradientRamp.js says it will. tools/animbench's
+    // The question it answers is whether the framebuffer really holds the
+    // colours web/src/config/gradientRamp.js says it will. tools/animbench's
     // ramp_parity.js already proves that module equal to the firmware's C++,
-    // entry by entry, but a host-to-host proof cannot see the panel: a stored
-    // brightness, a stored rolloff, a gradient reference that resolves to
-    // something else, or a driver that drops bits would all pass it.
+    // entry by entry, but a host-to-host proof cannot see the device: a
+    // stored brightness, a stored rolloff, a gradient reference that resolves
+    // to something else, or a compositor that drops bits would all pass it.
+    //
+    // What it cannot answer (gm-nov3.22). The reads go to framebuffer memory
+    // in PSRAM, which is where the render task leaves its pixels, so the
+    // result is evidence about the compositor and about nothing downstream of
+    // it. It says nothing about RGB scan-out, the bounce buffers, the DMA or
+    // the LCD_CAM peripheral, nothing about panel timing (the pixel-clock
+    // divider is not in this path and does not qualify the result either
+    // way), nothing about the ribbon or the wiring, nothing about the
+    // controller board, and nothing about what the glass shows. A panel could
+    // be dark, torn or miswired with every sample here still matching.
     //
     // Comparing an arbitrary animated frame is not an option. An animation
     // maps the palette through its own pattern and its own gain, so a moving
@@ -1734,13 +1744,23 @@ void WebUIPlugin::setupDebugEndpoints() {
         // POSTing /api/settings, which would need the WiFi password echoed
         // back at it. The tone the render task ended up with is in the report
         // below, so a caller checks the override took rather than assuming it.
-        if (request->hasArg("btone")) {
-            const int v = request->arg("btone").toInt();
-            g_animToneBrightnessPct = (v < 0 || v > 100) ? -1 : v;
-        }
-        if (request->hasArg("ktone")) {
-            const int v = request->arg("ktone").toInt();
-            g_animToneKneePct = (v < 0 || v > 100) ? -1 : v;
+        //
+        // Both percentages go out in one atomic store (gm-nov3.22), so a
+        // request that carries both can never be seen half applied by the UI
+        // task. An argument that is absent keeps whatever is held now, which
+        // is why the current pair is read back first. Every request runs on
+        // the async_tcp task, so this is the only writer and the
+        // read-modify-write needs no compare-exchange.
+        if (request->hasArg("btone") || request->hasArg("ktone")) {
+            int btone = -1, ktone = -1;
+            gm_tone_unpack(g_animToneOverride.load(std::memory_order_relaxed), btone, ktone);
+            if (request->hasArg("btone")) {
+                btone = request->arg("btone").toInt();
+            }
+            if (request->hasArg("ktone")) {
+                ktone = request->arg("ktone").toInt();
+            }
+            g_animToneOverride.store(gm_tone_pack(btone, ktone), std::memory_order_release);
         }
         AsyncResponseStream *response = request->beginResponseStream("application/json");
         JsonDocument doc(&psramAllocator);
@@ -1763,6 +1783,17 @@ void WebUIPlugin::setupDebugEndpoints() {
         // animation's extra gain is a property of that animation, and the
         // fixture represents the theme.
         doc["gain256"] = 256;
+        // The percentages the render task's tone should come from, read in one
+        // atomic load, and read BEFORE the integers below. A UI pass applies
+        // the pair a moment after the store lands, so integers read first
+        // could be older than the percentages beside them and the host would
+        // see a conversion that never happened. This way the integers are
+        // never staler than the percentages, and a host that waits for the two
+        // to agree is waiting for the render task to pick the tone up.
+        int overrideB = -1, overrideK = -1;
+        gm_tone_unpack(g_animToneOverride.load(std::memory_order_acquire), overrideB, overrideK);
+        const int brightnessPct = overrideB >= 0 ? overrideB : controller->getSettings().getBgAnimBrightness();
+        const int kneePct = overrideK >= 0 ? overrideK : controller->getSettings().getBgAnimHighlightKnee();
         int bright256 = 256, knee = 255;
         bganim::themeToneState(&bright256, &knee);
         doc["brightness256"] = bright256;
@@ -1770,9 +1801,9 @@ void WebUIPlugin::setupDebugEndpoints() {
         // The two settings the render task's tone came from, so the host can
         // run the same percent-to-integer conversion and check it landed on
         // the values above.
-        doc["brightnessPct"] = g_animToneBrightnessPct >= 0 ? g_animToneBrightnessPct : controller->getSettings().getBgAnimBrightness();
-        doc["kneePct"] = g_animToneKneePct >= 0 ? g_animToneKneePct : controller->getSettings().getBgAnimHighlightKnee();
-        doc["toneOverride"] = g_animToneBrightnessPct >= 0 || g_animToneKneePct >= 0;
+        doc["brightnessPct"] = brightnessPct;
+        doc["kneePct"] = kneePct;
+        doc["toneOverride"] = overrideB >= 0 || overrideK >= 0;
         uint8_t stops[BG_THEME_MAX_STOPS][3];
         uint8_t pos[BG_THEME_MAX_STOPS];
         bool uniform = true;

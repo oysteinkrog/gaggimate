@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Compares the panel's own pixels against the gradient sampler (gm-nov3.10).
+"""Compares the device's framebuffer against the gradient sampler (gm-nov3.10).
 
     python3 tools/gradient_fb_check.py --host 192.168.1.121
     python3 tools/gradient_fb_check.py --host 192.168.1.121 --tone 60,65
     python3 tools/gradient_fb_check.py --host 192.168.1.121 --json out.json
+    python3 tools/gradient_fb_check.py --host-test        (no device needed)
 
 Exits 0 when every compared sample matches and non-zero on any mismatch, on a
 fixture that will not arm, or on a device whose reported tone is not the tone
@@ -14,12 +15,37 @@ WHAT THIS CHECKS THAT NOTHING ELSE DOES
 
 tools/animbench/web/ramp_parity.js proves web/src/config/gradientRamp.js equal
 to the firmware's C++ palette arithmetic, entry by entry, on the host. It
-cannot see the panel. A stored brightness, a stored highlight rolloff, a
+cannot see the device. A stored brightness, a stored highlight rolloff, a
 gradient reference resolving to something other than the entry under review,
-or a driver dropping bits on the way to the framebuffer would all leave that
-proof passing and the panel wrong.
+or a compositor dropping bits on the way to the framebuffer would all leave
+that proof passing and the framebuffer wrong.
 
 This reads the framebuffer.
+
+WHAT THIS CANNOT ESTABLISH
+==========================
+
+It reads framebuffer memory in PSRAM through /api/debug/fb. That is where the
+render task leaves its pixels, so every result here is evidence about the
+compositor and about nothing downstream of it (gm-nov3.22). A match says the
+right colours were written. It does not say they were shown.
+
+Specifically, it is silent about:
+
+  - RGB scan-out: the bounce buffers, the DMA refill and the LCD_CAM
+    peripheral that carry those bytes to the panel.
+  - panel timing. The pixel-clock divider is not in this path at all, so the
+    divider a board happens to store neither qualifies a pass nor explains a
+    failure. The bench board reads 7; the result would be the same at 6.
+  - the ribbon and the wiring.
+  - the controller board, which is a separate device over BLE.
+  - the glass. A panel that is dark, torn, mirrored or miswired can still
+    give every sample below a match.
+
+Photographs and the scan-out counters (/api/debug/scanout) are the instruments
+for those. This one answers a narrower question, and answering it exactly is
+the point: when a picture looks wrong, this says whether the compositor put it
+there, which is the fork the two families of fix hang off.
 
 WHY IT NEEDS A FIXTURE
 ======================
@@ -60,10 +86,10 @@ and the report names it.
 WHAT A MISMATCH MEANS
 =====================
 
-Both sides are integer arithmetic over the same stops and the panel stores
-RGB565, so the expected result is exact equality, not a tolerance. A non-zero
-mismatch count means the firmware and gradientRamp.js have diverged, or
-something is writing the strip after the fixture does.
+Both sides are integer arithmetic over the same stops and the framebuffer
+holds RGB565, so the expected result is exact equality, not a tolerance. A
+non-zero mismatch count means the firmware and gradientRamp.js have diverged,
+or something is writing the strip after the fixture does.
 """
 
 import argparse
@@ -135,7 +161,7 @@ def get_fb(host, step, n=0, timeout=90):
 
 
 def sample_ramp(wire, brightness_pct, knee_pct, gain256, mode, node='node'):
-    """The 256 RGB565 entries gradientRamp.js says the panel will store."""
+    """The 256 RGB565 entries gradientRamp.js says the framebuffer will hold."""
     req = {
         'brightnessPct': brightness_pct,
         'kneePct': knee_pct,
@@ -151,32 +177,55 @@ def sample_ramp(wire, brightness_pct, knee_pct, gain256, mode, node='node'):
     return ramps[0]
 
 
-def arm(host, mode, y0, y1, xoff, btone, ktone, settle_frames, stops=None, timeout_s=15.0):
+def arm(host, mode, y0, y1, xoff, btone, ktone, settle_frames, stops=None, timeout_s=15.0,
+        getter=None, sleep=time.sleep, now=time.time):
     """Arms the fixture and waits until it has actually painted frames.
 
-    stops, when given, is a gradient wire string held on the panel through the
+    stops, when given, is a gradient wire string held on the device through the
     editor's live-preview path for as long as this pass needs it. Waiting for
     the device to report those same stops is what makes a batch safe: the
     preview lapses on a timer, and a pass that sampled after it lapsed would
     otherwise be compared against the gradient that was asked for rather than
-    the one that was drawn."""
+    the one that was drawn.
+
+    The tone is waited for the same way, and on both halves of it (gm-nov3.22).
+    The HTTP task only publishes the requested percentages; the UI task picks
+    them up on its next pass and converts them to the brightness256 and knee
+    the render task draws with. Between those two moments the device reports
+    the new percentages beside the old integers. So this waits for the
+    percentages to be the ones that were asked for AND for the integers to be
+    the conversion of those percentages, and only then lets a sample be taken.
+    Without that second half a pass could sample the previous tone and the
+    mismatch would be read as a pixel fault. Measured on the bench board
+    (2026-09-13, three tone changes): the device reported the new percentages
+    beside the previous integers for 4 to 6 consecutive reads, 230 to 394 ms.
+    The frames gate covers part of that by accident, six frames at about 22
+    fps being roughly 270 ms, which is why the old gate usually got away with
+    it; 394 ms is longer than that, so usually is not always.
+
+    getter, sleep and now are injected so host_test() can drive this loop
+    against a scripted device with no board and no waiting.
+    """
+    get = getter or (lambda path: get_json(host, path))
     q = '/api/debug/gradfix?on=%d&y0=%d&y1=%d&xoff=%d' % (MODES[mode], y0, y1, xoff)
     if btone is not None:
         q += '&btone=%d&ktone=%d' % (btone, ktone)
     if stops is not None:
         q += '&stops=' + stops
-    st = get_json(host, q)
+    st = get(q)
     if not st['armed']:
         raise RuntimeError('the fixture refused to arm: %s' % json.dumps(st))
-    deadline = time.time() + timeout_s
-    while time.time() < deadline:
-        st = get_json(host, '/api/debug/gradfix')
-        tone_ok = btone is None or (st['brightnessPct'] == btone and st['kneePct'] == ktone)
+    deadline = now() + timeout_s
+    problems = ['no reading yet']
+    while now() < deadline:
+        st = get('/api/debug/gradfix')
+        problems = tone_problems(st, btone, ktone)
         stops_ok = stops is None or st['stops'] == stops
-        if st['frames'] >= settle_frames and tone_ok and stops_ok:
+        if st['frames'] >= settle_frames and not problems and stops_ok:
             return st
-        time.sleep(0.25)
-    raise RuntimeError('the fixture did not settle in %.0f s: %s' % (timeout_s, json.dumps(st)))
+        sleep(0.25)
+    raise RuntimeError('the fixture did not settle in %.0f s (%s): %s'
+                       % (timeout_s, '; '.join(problems) or 'frames or stops', json.dumps(st)))
 
 
 def check_tone_conversion(st):
@@ -184,7 +233,7 @@ def check_tone_conversion(st):
 
     The device reports both the percentages and the integers its render task
     ended up with. If they disagree the host is about to sample a tone the
-    panel is not drawing, so this is a stop rather than a note."""
+    render task is not drawing, so this is a stop rather than a note."""
     want_b = (st['brightnessPct'] * 256) // 100
     want_k = (st['kneePct'] * 255) // 100
     problems = []
@@ -195,6 +244,22 @@ def check_tone_conversion(st):
         problems.append('rolloff %d%% converts to %d, device reports %d'
                         % (st['kneePct'], want_k, st['knee']))
     return problems
+
+
+def tone_problems(st, btone, ktone):
+    """Everything still standing between the requested tone and a sample.
+
+    Two conditions, and the second is the one the fixture used to skip: the
+    device must report the percentages that were asked for, and the integers
+    it reports must be the conversion of the percentages it reports. When
+    nothing was asked for (btone None) only the conversion is checked, because
+    the stored setting is then whatever it is."""
+    problems = []
+    if btone is not None and st['brightnessPct'] != btone:
+        problems.append('asked for brightness %d%%, device reports %d%%' % (btone, st['brightnessPct']))
+    if ktone is not None and st['kneePct'] != ktone:
+        problems.append('asked for rolloff %d%%, device reports %d%%' % (ktone, st['kneePct']))
+    return problems + check_tone_conversion(st)
 
 
 def compare(st, ramp, px, fbw, step):
@@ -272,6 +337,142 @@ def run_pass_once(host, args, mode, xoff, btone, ktone, stops=None):
     return st, results
 
 
+class FakeDevice:
+    """A scripted /api/debug/gradfix with the real device's lag written into it.
+
+    The firmware publishes the requested percentages from the HTTP task and
+    converts them to brightness256 and knee on the UI task's next pass, so for
+    a pass or two it reports new percentages beside the integers the render
+    task is still drawing with. lag_polls is how many polls that takes here.
+    apply=False is a device that never picks the request up at all, which is
+    what a lost or half-published override looks like from the host."""
+
+    def __init__(self, lag_polls=0, apply=True, stored=(70, 80), frames_per_poll=4,
+                 ignore_request=False):
+        self.lag = 0
+        self.lag_polls = lag_polls
+        self.apply = apply
+        self.ignore_request = ignore_request
+        self.req = None                 # the percentages the HTTP task holds
+        self.live = stored              # the percentages the render task drew with
+        self.stored = stored
+        self.frames = 0
+        self.frames_per_poll = frames_per_poll
+        self.polls = 0
+        self.states = []
+
+    def _state(self):
+        pct = self.req if self.req is not None else self.stored
+        return {'armed': True, 'frames': self.frames, 'stops': 'aabbcc,ddeeff', 'xoff': 0,
+                'w': 480, 'h': 480, 'y0': 200, 'y1': 240, 'gain256': 256,
+                'brightnessPct': pct[0], 'kneePct': pct[1],
+                'brightness256': (self.live[0] * 256) // 100, 'knee': (self.live[1] * 255) // 100}
+
+    def get(self, path):
+        if 'on=' in path:
+            self.frames = 0
+            if 'btone=' in path and not self.ignore_request:
+                q = path.split('?', 1)[1]
+                args = dict(p.split('=', 1) for p in q.split('&'))
+                self.req = (int(args['btone']), int(args['ktone']))
+                self.lag = self.lag_polls
+            return self._state()
+        self.polls += 1
+        self.frames += self.frames_per_poll
+        if self.req is not None and self.apply:
+            if self.lag <= 0:
+                self.live = self.req
+            else:
+                self.lag -= 1
+        st = self._state()
+        self.states.append(st)
+        return st
+
+
+def host_test():
+    """The settle gate, on the host, with no board (gm-nov3.22).
+
+    What it has to prove is that a requested tone has reached the integers the
+    render task draws with before any sample is accepted. Returns a list of
+    problems, empty when every case held."""
+    problems = []
+
+    # 1. The gate waits out the UI task's lag, and what it returns is a device
+    #    whose integers are the conversion of the percentages that were asked
+    #    for. Three polls of lag, so the percentages are right long before the
+    #    integers are.
+    dev = FakeDevice(lag_polls=3)
+    st = arm('fake', 'ramp', 200, 240, 0, 60, 65, settle_frames=4,
+             getter=dev.get, sleep=lambda _s: None)
+    if st['brightnessPct'] != 60 or st['kneePct'] != 65:
+        problems.append('the gate returned a state at the wrong percentages: %s' % json.dumps(st))
+    if st['brightness256'] != (60 * 256) // 100 or st['knee'] != (65 * 255) // 100:
+        problems.append('the gate returned before the integers matched: %s' % json.dumps(st))
+    if tone_problems(st, 60, 65):
+        problems.append('the state the gate returned still has problems: %s'
+                        % '; '.join(tone_problems(st, 60, 65)))
+    print('host test, gate waits for the conversion: settled after %d polls' % dev.polls)
+
+    # 2. The teeth. On that same device the old condition (frames painted and
+    #    the percentages reported back) was already true on the first poll,
+    #    while the integers were still the previous tone. If this ever stops
+    #    holding, case 1 is passing for the wrong reason.
+    early = dev.states[0]
+    old_gate_ok = early['frames'] >= 4 and early['brightnessPct'] == 60 and early['kneePct'] == 65
+    if not old_gate_ok:
+        problems.append('the first poll did not reproduce the old gate, so case 1 proves nothing')
+    if not check_tone_conversion(early):
+        problems.append('the first poll already had the right integers, so there was no lag to wait out')
+
+    # 3. A device that never applies the request is a failure, not a wait
+    #    forever and not a silent sample at the wrong tone.
+    dev2 = FakeDevice(lag_polls=0, apply=False)
+    clock = [0.0]
+
+    def tick(_s):
+        clock[0] += 0.25
+
+    try:
+        arm('fake', 'ramp', 200, 240, 0, 60, 65, settle_frames=4, timeout_s=2.0,
+            getter=dev2.get, sleep=tick, now=lambda: clock[0])
+        problems.append('a device that never applied the tone was accepted')
+    except RuntimeError as exc:
+        if 'converts to' not in str(exc):
+            problems.append('the timeout did not name the conversion: %s' % exc)
+        print('host test, a tone that never lands is refused: %s' % str(exc).split(':')[0])
+
+    # 4. The percentages themselves are still checked: a device holding a tone
+    #    other than the one asked for never gets sampled, however consistent
+    #    its own integers are. This is the override that went missing.
+    dev3 = FakeDevice(lag_polls=0, ignore_request=True)
+    dev3.req = (100, 100)
+    dev3.live = (100, 100)
+    clock2 = [0.0]
+
+    def tick2(_s):
+        clock2[0] += 0.25
+
+    try:
+        arm('fake', 'ramp', 200, 240, 0, 60, 65, settle_frames=4, timeout_s=2.0,
+            getter=dev3.get, sleep=tick2, now=lambda: clock2[0])
+        problems.append('a device reporting the wrong percentages was accepted')
+    except RuntimeError as exc:
+        if 'asked for brightness' not in str(exc):
+            problems.append('the timeout did not name the percentages: %s' % exc)
+
+    # 5. With no lag the gate costs one poll, so the wait is a gate and not a
+    #    fixed delay.
+    dev4 = FakeDevice(lag_polls=0)
+    arm('fake', 'ramp', 200, 240, 0, 60, 65, settle_frames=4, getter=dev4.get, sleep=lambda _s: None)
+    if dev4.polls != 1:
+        problems.append('a device that was already settled took %d polls' % dev4.polls)
+
+    for pr in problems:
+        print('host test FAILED: %s' % pr)
+    print('host test: %s' % ('FAIL' if problems else 'PASS'))
+    return problems
+
+
 def load_gradients(path):
     """data/gradients.json as the firmware's parser reads it: bare hex stops,
     comma separated, no positions, so the uniform path."""
@@ -285,10 +486,10 @@ def load_gradients(path):
 
 
 def run_batch(host, args, btone, ktone, record):
-    """Every built-in in data/gradients.json, on the panel, one at a time.
+    """Every built-in in data/gradients.json, drawn on the device, one at a time.
 
     This is what gm-nov3.5's appended batch needs: the entries are put on the
-    panel through the preview path, so nothing stored is written and nothing
+    device through the preview path, so nothing stored is written and nothing
     has to be put back."""
     failed = False
     for index, name, wire in load_gradients(args.source)[:args.limit]:
@@ -337,7 +538,7 @@ def self_test(host, args):
 
 
 def main(argv=None):
-    ap = argparse.ArgumentParser(description='Compare the panel against the gradient sampler')
+    ap = argparse.ArgumentParser(description="Compare the device's framebuffer against the gradient sampler")
     ap.add_argument('--host', default='192.168.1.121')
     ap.add_argument('--mode', default='ramp', choices=sorted(MODES))
     ap.add_argument('--y0', type=int, default=200, help='first fixture row (default 200)')
@@ -359,7 +560,11 @@ def main(argv=None):
     ap.add_argument('--limit', type=int, default=None, help='with --batch, stop after this many gradients')
     ap.add_argument('--selftest', action='store_true',
                     help='also run the two negative controls that prove the comparison can fail')
+    ap.add_argument('--host-test', action='store_true',
+                    help='run the settle-gate tests against a scripted device and exit; needs no board')
     args = ap.parse_args(argv)
+    if args.host_test:
+        return 1 if host_test() else 0
     args.buffers = [int(v) for v in args.buffers.split(',')]
 
     tones = []
@@ -375,7 +580,7 @@ def main(argv=None):
 
     before = get_json(args.host, '/api/debug/gradfix')
     print('firmware %s built %s' % (before['fw'], before['built']))
-    print('panel %dx%d, fixture rows %d..%d, fb step %d'
+    print('framebuffer %dx%d, fixture rows %d..%d, fb step %d'
           % (before['w'], before['h'], args.y0, args.y1, args.step))
 
     record = {'host': args.host, 'fw': before['fw'], 'built': before['built'],
@@ -406,7 +611,7 @@ def main(argv=None):
                                          'map': st['map'], 'results': results})
     finally:
         # Disarm and release the tone override whatever happened above, so a
-        # failed run does not leave the panel showing a strip.
+        # failed run does not leave the device drawing a strip.
         off = get_json(args.host, '/api/debug/gradfix?on=0&btone=-1&ktone=-1&stops=')
         print('fixture off (armed=%s, tone %d/%d)' % (off['armed'], off['brightnessPct'], off['kneePct']))
         record['after'] = off

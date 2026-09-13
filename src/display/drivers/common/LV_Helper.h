@@ -9,6 +9,7 @@
 #pragma once
 #include "Display.h"
 #include <Arduino.h>
+#include <atomic>
 #include <lvgl.h>
 
 // Planar overlay pixel format (gm-2cl.16). The animation's overlay is two
@@ -187,8 +188,31 @@ extern volatile uint8_t g_animFpsOverride;
 // tone on every UI pass, so a set would last one pass: the scrim knob was
 // silently reverted the same way and cost an evening of measurements. Not
 // persisted, cleared by a reboot.
-extern volatile int g_animToneBrightnessPct;
-extern volatile int g_animToneKneePct;
+//
+// The two percentages live in one atomic word, not in two volatile ints
+// (gm-nov3.22). The HTTP task writes them and the UI task reads them, and
+// volatile orders nothing between tasks on this chip: with two separate words
+// the UI task could apply a new brightness against the previous rolloff, and
+// the host comparison would record that skew as a pixel mismatch. Packed, the
+// pair is published in one store and read in one load, so a UI pass always
+// applies a tone that was actually asked for. One byte each, 0 to 100, with
+// GM_TONE_PCT_NONE meaning "use the stored setting". Only the HTTP task
+// writes it, so its read-modify-write needs no compare-exchange.
+inline constexpr uint32_t GM_TONE_PCT_NONE = 0xFFu;
+extern std::atomic<uint32_t> g_animToneOverride;
+// -1, or anything outside 0 to 100, packs as "no override".
+inline uint32_t gm_tone_pack(int brightnessPct, int kneePct) {
+    const uint32_t b =
+        (brightnessPct < 0 || brightnessPct > 100) ? GM_TONE_PCT_NONE : static_cast<uint32_t>(brightnessPct);
+    const uint32_t k = (kneePct < 0 || kneePct > 100) ? GM_TONE_PCT_NONE : static_cast<uint32_t>(kneePct);
+    return (b << 8) | k;
+}
+inline void gm_tone_unpack(uint32_t packed, int &brightnessPct, int &kneePct) {
+    const uint32_t b = (packed >> 8) & 0xFFu;
+    const uint32_t k = packed & 0xFFu;
+    brightnessPct = b == GM_TONE_PCT_NONE ? -1 : static_cast<int>(b);
+    kneePct = k == GM_TONE_PCT_NONE ? -1 : static_cast<int>(k);
+}
 // Foreground motion test (uianim= on /api/debug/anim, applied by
 // DefaultUI::loop on the UI task, since LVGL is single-threaded): 0 removes
 // the test widget, 1 slides an opaque 120x120 rounded plate with a label

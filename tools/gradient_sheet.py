@@ -24,11 +24,18 @@ metadata, because a sheet saved at 60/65 and one saved at 100/100 are
 different documents and only the file says which is which.
 
 
-COMPARING THIS AGAINST THE PANEL
-================================
+COMPARING THIS AGAINST THE DEVICE'S FRAMEBUFFER
+===============================================
 
 Done, on the bench board, 2026-09-13 (gm-nov3.10). The strips above are what
-the panel stores.
+the compositor writes into framebuffer memory.
+
+That is the whole claim (gm-nov3.22). The comparison reads framebuffer memory
+through /api/debug/fb, so it is silent about RGB scan-out, panel timing, the
+wiring, the controller board and the glass: a match says the right colours were
+written, not that they were shown. The pixel-clock divider is not in this path
+at all, so the divider a board stores neither qualifies a pass nor explains a
+failure.
 
 The command is tools/gradient_fb_check.py:
 
@@ -66,7 +73,7 @@ The recorded runs, in tools/gradient_fb_check/:
   report.json, the device's own theme at two tones
 
     firmware    v1.9.8-sleep9-644-g265501e0, built 2026-09-13T10:09:56Z
-    board       192.168.1.121, pixel clock divider 7, whole-frame path
+    board       192.168.1.121 (the divider it stores, 7, is not in this path)
     gradient    Aurora, the six-stop built-in the board had stored
     tone        100/100 and 60/65, four passes (two tones x xoff 0 and 1)
     samples     38,400 compared, 0 mismatches

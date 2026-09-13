@@ -4668,10 +4668,14 @@ void DefaultUI::updateState() {
     // has dimmed the animation does not get full brightness back the moment
     // they try a different theme. setThemeTone is a no-op when neither value
     // moved, which keeps this off the generation counter on ordinary ticks.
-    // The two override globals are -1 in every build that has not been told
-    // otherwise over /api/debug/gradfix, so this is the stored setting.
-    const int tonePctB = g_animToneBrightnessPct >= 0 ? g_animToneBrightnessPct : settings.getBgAnimBrightness();
-    const int tonePctK = g_animToneKneePct >= 0 ? g_animToneKneePct : settings.getBgAnimHighlightKnee();
+    // Both overrides are -1 in every build that has not been told otherwise
+    // over /api/debug/gradfix, so this is the stored setting. They are read in
+    // one atomic load (gm-nov3.22) because the HTTP task publishes the pair in
+    // one store: two loads could pair a new brightness with an old rolloff.
+    int overrideB = -1, overrideK = -1;
+    gm_tone_unpack(g_animToneOverride.load(std::memory_order_acquire), overrideB, overrideK);
+    const int tonePctB = overrideB >= 0 ? overrideB : settings.getBgAnimBrightness();
+    const int tonePctK = overrideK >= 0 ? overrideK : settings.getBgAnimHighlightKnee();
     bganim::setThemeTone(tonePctB * 256 / 100, tonePctK * 255 / 100);
     sleepAnimation.setScrim(settings.getBgAnimScrim());
 #endif
