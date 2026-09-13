@@ -1954,7 +1954,14 @@ def check_gradient_precedence_across_animations(rig):
         # rides in the same request instead, and WebUIPlugin::handleSettings
         # applies the whole document in one batchUpdate, so the witness
         # arriving is the map arriving. Same shape as store_over_draft in
-        # test_gradientdraft.py.
+        # test_gradientdraft.py, whose other_fps cannot be imported here
+        # because that module imports this one.
+        #
+        # A witness cannot say whether the map in the same document was stored
+        # or dropped by bg_map_valid, and the README says such a check needs
+        # its own preflight for that. This one does not: it asserts the
+        # untouched slot holds the ref the web wrote, and no page writes that
+        # slot, so a dropped map fails precedence_live_untouched_keeps_web.
         fps_witness = 35 if int(s0["bgAnimFps"]) != 35 else 40
         web_save(rig, {"bgAnimThemeMap": web_map, "bgAnimFps": fps_witness})
         try:
