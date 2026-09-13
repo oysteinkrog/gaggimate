@@ -1859,24 +1859,58 @@ void WebUIPlugin::setupDebugEndpoints() {
         const int ow = w / step;
         const int oh = h / step;
         // Chunked, because a full 480x480 buffer is 460,800 bytes and this
-        // board has no business allocating that to answer a debug request. The
-        // callback is handed a row budget and fills whole output rows only, so
-        // it never has to carry a partial pixel across chunks.
-        auto *state = new int(0);
+        // board has no business allocating that to answer a debug request.
+        //
+        // Two rules this callback has to obey, both learned the hard way
+        // (gm-6ivh). Returning 0 while rows remain ends the response: the
+        // library reads 0 as "no more data", writes the terminating chunk and
+        // closes, so the client gets a well formed but short dump rather than
+        // an error. A row-at-a-time filler returns 0 exactly when the budget
+        // is smaller than one row, and at step 1 a row is 960 bytes, which is
+        // what the remaining TCP window always falls below on the first send
+        // round: 2 rows, 2 rows, 1 row and then a 928 byte budget, so every
+        // step=1 request delivered 4,800 of 460,800 bytes and said it was
+        // complete. So fill whole pixels rather than whole rows, and say
+        // RESPONSE_TRY_AGAIN when even two bytes do not fit, which parks the
+        // response until the next ack instead of ending it.
+        //
+        // The position comes from index (the bytes already filled) rather than
+        // from a heap cell the callback owns. The old cell was deleted only on
+        // the final call, so a client that disconnected part way through never
+        // freed it: 300 aborted requests cost 6,420 bytes of internal heap on
+        // the bench board and none of it came back. Deriving the position
+        // costs two divisions per call and cannot leak. The simulator branch
+        // below already did it this way.
         AsyncWebServerResponse *response = request->beginChunkedResponse(
-            "application/octet-stream", [fb, w, step, ow, oh, state](uint8_t *out, size_t maxLen, size_t) -> size_t {
+            "application/octet-stream", [fb, w, step, ow, oh](uint8_t *out, size_t maxLen, size_t index) -> size_t {
                 const size_t rowBytes = static_cast<size_t>(ow) * 2;
+                int oy = static_cast<int>(index / rowBytes);
+                int ox = static_cast<int>((index % rowBytes) / 2);
                 size_t written = 0;
-                while (*state < oh && written + rowBytes <= maxLen) {
-                    const uint16_t *src = fb + static_cast<size_t>(*state) * step * w;
-                    uint16_t *dst = reinterpret_cast<uint16_t *>(out + written);
-                    for (int x = 0; x < ow; x++)
-                        dst[x] = src[x * step];
-                    written += rowBytes;
-                    (*state)++;
+                while (oy < oh && written + 2 <= maxLen) {
+                    const uint16_t *src = fb + static_cast<size_t>(oy) * step * w;
+                    int run = static_cast<int>((maxLen - written) / 2);
+                    if (run > ow - ox)
+                        run = ow - ox;
+                    for (int i = 0; i < run; i++) {
+                        // Byte stores, because where a chunk starts inside
+                        // the library's send buffer is the library's business
+                        // (six bytes in, to leave room for the chunk header,
+                        // today) and a pixel no longer lands on a row
+                        // boundary.
+                        const uint16_t c = src[static_cast<size_t>(ox + i) * step];
+                        out[written + static_cast<size_t>(i) * 2] = static_cast<uint8_t>(c);
+                        out[written + static_cast<size_t>(i) * 2 + 1] = static_cast<uint8_t>(c >> 8);
+                    }
+                    written += static_cast<size_t>(run) * 2;
+                    ox += run;
+                    if (ox >= ow) {
+                        ox = 0;
+                        oy++;
+                    }
                 }
-                if (written == 0)
-                    delete state;
+                if (written == 0 && oy < oh)
+                    return RESPONSE_TRY_AGAIN;
                 return written;
             });
         char disposition[64];
@@ -1908,15 +1942,19 @@ void WebUIPlugin::setupDebugEndpoints() {
         // Pixel granular, not row granular like the framebuffer dump: a
         // 3-byte row of 480 pixels is 1440 bytes, and a later chunk's budget
         // can be just under that, which would end the response after the
-        // first chunk. state counts output pixels.
-        auto *state = new int(0);
+        // first chunk. The position comes from index (the bytes already
+        // filled), so nothing is allocated for it and a client that
+        // disconnects part way through leaves nothing behind, which is the
+        // leak the framebuffer dump above had (gm-6ivh). Three bytes a pixel
+        // and only whole pixels written, so index is always a multiple of 3.
         AsyncWebServerResponse *response = request->beginChunkedResponse(
-            "application/octet-stream", [buf, planePx, w, step, ow, oh, state](uint8_t *out, size_t maxLen, size_t) -> size_t {
+            "application/octet-stream", [buf, planePx, w, step, ow, oh](uint8_t *out, size_t maxLen, size_t index) -> size_t {
                 const int total = ow * oh;
+                int pix = static_cast<int>(index / 3);
                 size_t written = 0;
-                while (*state < total && written + 3 <= maxLen) {
-                    const int oy = *state / ow;
-                    const int ox = *state - oy * ow;
+                while (pix < total && written + 3 <= maxLen) {
+                    const int oy = pix / ow;
+                    const int ox = pix - oy * ow;
                     const size_t at = static_cast<size_t>(oy) * step * w + static_cast<size_t>(ox) * step;
                     const uint16_t c = buf[at];
                     const uint16_t a16 = buf[planePx + at];
@@ -1924,10 +1962,10 @@ void WebUIPlugin::setupDebugEndpoints() {
                     out[written + 1] = static_cast<uint8_t>(c >> 8);
                     out[written + 2] = a16 > 255 ? 255 : static_cast<uint8_t>(a16);
                     written += 3;
-                    (*state)++;
+                    pix++;
                 }
-                if (written == 0)
-                    delete state;
+                if (written == 0 && pix < total)
+                    return RESPONSE_TRY_AGAIN;
                 return written;
             });
         char disposition[64];

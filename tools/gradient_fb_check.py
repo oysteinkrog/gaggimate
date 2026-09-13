@@ -47,10 +47,9 @@ Column x of a fixture row carries ramp index
 
 with w = 480, so at xoff 0 index 0 is column 0 and index 255 is column 479.
 
-/api/debug/fb delivers the framebuffer subsampled: step 2 is what this panel
-answers reliably (step 1 truncates after five rows, measured 2026-09-13), and
-step 2 hands back even columns and even rows only. Even columns alone never
-include 479, so the fixture is read twice, at xoff 0 and xoff 1, and the
+/api/debug/fb delivers the framebuffer subsampled, and this check reads it at
+step 2, which hands back even columns and even rows only. Even columns alone
+never include 479, so the fixture is read twice, at xoff 0 and xoff 1, and the
 second pass puts the index that sat on column 479 onto column 478. The two
 passes together cover the index of every column, ramp index 255 included.
 
@@ -68,7 +67,6 @@ something is writing the strip after the fixture does.
 """
 
 import argparse
-import http.client
 import json
 import os
 import subprocess
@@ -83,11 +81,13 @@ SAMPLER = os.path.join(ROOT, 'tools', 'gradient_samples.js')
 MODES = {'ramp': 1, 'reversed': 2, 'wheel': 3}
 
 
-# The board drops a chunked response now and then under the render task's own
-# load: a request times out, or a 115 kB framebuffer arrives short with a 200
-# and no error on the wire. Both are transport faults, not findings, so every
-# read is retried. A short read that survives the retries IS reported, because
-# comparing a truncated framebuffer would pass on five rows.
+# A request can still time out under the render task's own load, which is a
+# transport fault and not a finding, so every read is retried. A short frame is
+# no longer among the faults worth tolerating: the endpoint used to end a
+# chunked response early whenever the remaining TCP window was smaller than one
+# output row, and this check used to accept whatever arrived as long as it
+# reached the fixture rows. That is fixed in the firmware (gm-6ivh), so a short
+# frame now means something is wrong and the read is retried and then reported.
 RETRIES = 8
 
 
@@ -110,32 +110,23 @@ def get_json(host, path, timeout=20):
     return _retry('GET ' + path, once)
 
 
-def get_fb(host, step, n=0, need_rows=0, timeout=90):
-    """The framebuffer dump, accepted short as long as it reaches need_rows.
+def get_fb(host, step, n=0, timeout=90):
+    """The whole framebuffer dump, or an error.
 
-    /api/debug/fb is a chunked response and the board drops it partway often
-    enough that insisting on the whole frame fails more runs than it saves. The
-    rows that do arrive are the top of the frame in order, and they are real;
-    what is not allowed is comparing a frame that stopped before the strip. So
-    a read is retried until it covers need_rows output rows, and the number of
-    rows it actually delivered is carried back and recorded."""
+    The rows arrive top of frame first, so a short read is a prefix of the real
+    frame, which is why this check used to accept one that reached the fixture
+    rows. It does not any more: the endpoint delivers the whole frame, and a
+    frame that arrives short says the transport or the firmware has a problem
+    the comparison below would hide."""
 
     def once():
         with urllib.request.urlopen('http://%s/api/debug/fb?n=%d&step=%d' % (host, n, step), timeout=timeout) as resp:
             size = resp.headers.get('X-FB-Size', '')
-            try:
-                data = resp.read()
-            except http.client.IncompleteRead as exc:
-                # A dropped chunked response raises, but the bytes that did
-                # arrive are on the exception, and they are the top of the
-                # frame in order. Keeping them is what lets a run finish on a
-                # board whose async server has stopped delivering whole frames.
-                data = exc.partial
+            data = resp.read()
         w, h = (int(v) for v in size.split('x'))
         rows = len(data) // (w * 2)
-        if rows < need_rows:
-            raise RuntimeError('fb step %d: %d of %d rows, short of the %d the strip needs'
-                               % (step, rows, h, need_rows))
+        if rows != h:
+            raise RuntimeError('fb step %d: %d of %d rows' % (step, rows, h))
         return w, h, rows, data
 
     w, h, rows, data = _retry('GET /api/debug/fb?n=%d&step=%d' % (n, step), once)
@@ -265,12 +256,11 @@ def run_pass_once(host, args, mode, xoff, btone, ktone, stops=None):
         raise RuntimeError('the device\'s tone does not match its own percentages: ' + '; '.join(problems))
     ramp = sample_ramp(st['stops'], st['brightnessPct'], st['kneePct'], st['gain256'], mode, node=args.node)
     results = []
-    need = (st['y1'] + args.step - 1) // args.step
     for n in args.buffers:
         # Both framebuffers, because the fixture vetoes interlacing precisely so
         # that both carry the strip; a stale second buffer would say the veto is
         # not working.
-        fbw, fbrows, px = get_fb(host, args.step, n, need_rows=need)
+        fbw, fbrows, px = get_fb(host, args.step, n)
         compared, rows, indices, bad, examples = compare(st, ramp, px, fbw, args.step)
         results.append({'buffer': n, 'compared': compared, 'rows': rows, 'fb_rows': fbrows,
                         'indices': len(indices), 'index_max': indices[-1] if indices else None,
@@ -327,8 +317,7 @@ def self_test(host, args):
     st = arm(host, args.mode, args.y0, args.y1, 0, 100, 100, args.settle)
     right = sample_ramp(st['stops'], 100, 100, st['gain256'], args.mode, node=args.node)
     wrong = sample_ramp(st['stops'], 50, 50, st['gain256'], args.mode, node=args.node)
-    need = (args.y1 + args.step - 1) // args.step
-    fbw, _, px = get_fb(host, args.step, 0, need_rows=need)
+    fbw, _, px = get_fb(host, args.step, 0)
     _, _, _, bad_right, _ = compare(st, right, px, fbw, args.step)
     _, _, _, bad_wrong, _ = compare(st, wrong, px, fbw, args.step)
     print('self test, armed strip against its own ramp: %d mismatches' % bad_right)
@@ -339,7 +328,7 @@ def self_test(host, args):
         problems.append('a deliberately wrong tone still matched, so the comparison proves nothing')
     get_json(host, '/api/debug/gradfix?on=0&btone=-1&ktone=-1')
     time.sleep(2.0)
-    fbw, _, px = get_fb(host, args.step, 0, need_rows=need)
+    fbw, _, px = get_fb(host, args.step, 0)
     _, _, _, bad_off, _ = compare(st, right, px, fbw, args.step)
     print('self test, fixture off against the ramp:     %d mismatches' % bad_off)
     if bad_off == 0:
@@ -354,7 +343,8 @@ def main(argv=None):
     ap.add_argument('--y0', type=int, default=200, help='first fixture row (default 200)')
     ap.add_argument('--y1', type=int, default=240, help='one past the last fixture row (default 240)')
     ap.add_argument('--step', type=int, default=2,
-                    help='the /api/debug/fb subsampling step (default 2; step 1 truncates on this panel)')
+                    help='the /api/debug/fb subsampling step (default 2, which needs the two xoff passes '
+                         'to cover every column; step 1 reads every column in one pass)')
     ap.add_argument('--tone', action='append', default=None,
                     help='a brightness,rolloff percentage pair to hold while sampling; '
                          'repeatable. Omitted, the device keeps its stored tone.')
