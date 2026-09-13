@@ -136,6 +136,7 @@ import json
 import os
 import re
 import sys
+import textwrap
 import time
 import urllib.error
 import urllib.request
@@ -1300,6 +1301,58 @@ def _hex(v):
 ROW = '%-3s %-13s %-9s %-7s %-7s %-9s %-9s %-6s %s'
 
 
+def conventional_switch(name):
+    """The switch name the old scan would have guessed from an animation's id.
+
+    Nothing decides anything by this any more. It is here so a run can say
+    when the macro it measured is not the one a reader would guess."""
+    return 'GM_BGANIM_%s_ASM' % name.upper()
+
+
+def isolated_switches(inv):
+    """{id: [macro]} for every animation one -D of its own can turn off.
+
+    The fleet-wide pair is set aside, the same way the noncoverage line sets
+    it aside, so what is left is the flag someone would actually pass."""
+    out = {}
+    for name in inv.names:
+        macros = [m for m in inv.switches.get(name, []) if m not in FLEET_MACROS]
+        if macros:
+            out[name] = macros
+    return out
+
+
+def print_switches(inv, out=None):
+    """The counterpart of the noncoverage line: which -D turns each kernel off.
+
+    The eleven with no switch of their own are quoted as a finding, and the
+    first thing anyone does with that line is go looking for the flag for one
+    of the others. The tool has measured it, so it says it rather than leaving
+    the reader to guess GM_BGANIM_<ID>_ASM, which is the convention it has just
+    stopped trusting."""
+    out = sys.stdout if out is None else out
+    switched = isolated_switches(inv)
+    if not switched:
+        return
+    # One token per animation, so a wrap never puts a name on one line and its
+    # macro on the next.
+    entries = ['%s=%s' % (name, '+'.join(macros)) for name, macros in sorted(switched.items())]
+    print('a -D of its own turns each of these kernels off, read at the guard (%d):'
+          % len(switched), file=out, flush=True)
+    for line in textwrap.wrap(', '.join(entries), 76, initial_indent='  ', subsequent_indent='  '):
+        print(line, file=out, flush=True)
+    odd = {n: m for n, m in switched.items() if conventional_switch(n) not in m}
+    if odd:
+        named = ', '.join('%s is %s, not %s' % (n, '+'.join(m), conventional_switch(n))
+                          for n, m in sorted(odd.items()))
+        print('  %s not named after the animation, so the flag its id suggests is '
+              'the wrong one to pass:'
+              % ('1 of those is' if len(odd) == 1 else '%d of those are' % len(odd)),
+              file=out, flush=True)
+        for line in textwrap.wrap(named, 76, initial_indent='    ', subsequent_indent='    '):
+            print(line, file=out, flush=True)
+
+
 def check_fleet(get, inv, ids, frames, out=None, deadline_s=120.0,
                 sleep=None, now=None):
     """Drives the board over `ids` and returns the list of problems.
@@ -1341,6 +1394,7 @@ def check_fleet(get, inv, ids, frames, out=None, deadline_s=120.0,
             compared.append(name)
 
     print('', file=out, flush=True)
+    print_switches(inv, out=out)
     if inv.unswitched:
         print('no macro of their own selects the kernel, so no isolated '
               'build-time A/B (%d): %s'
@@ -1812,6 +1866,19 @@ def host_test(out=None):
                                 % (name, sorted(after.dormant)))
             else:
                 print('host test, %s: found anyway, and the run passes' % name, file=out)
+            # And the run says so, rather than leaving a reader to guess the
+            # flag from the id. The eleven are read as a finding, so the line
+            # that answers "then what is the flag for the other 33" has to
+            # carry the macro the tool measured, and has to mark the one that
+            # is not what the id suggests.
+            said = io.StringIO()
+            print_switches(after, out=said)
+            said = said.getvalue()
+            for want in ('tide=TIDE_WANTS_THE_KERNEL',
+                         'tide is TIDE_WANTS_THE_KERNEL, not GM_BGANIM_TIDE_ASM'):
+                if want not in said:
+                    problems.append('%s: the switch summary does not say %r: %r'
+                                    % (name, want, said))
         odd.edit('AnimTide.cpp', '#define TIDE_WANTS_THE_KERNEL 1',
                  '#define TIDE_WANTS_THE_KERNEL 0')
         expect_abort('mutation 5f, a switch named against the convention, turned off',
@@ -1830,6 +1897,26 @@ def host_test(out=None):
     for want in ('[env:display]', 'not visible from any source'):
         if want not in banner.getvalue():
             problems.append('the build banner does not say %r: %r' % (want, banner.getvalue()))
+
+    # 4g. The shipped sources, whose switches all do follow the convention:
+    #     every switched animation is named with its macro and nothing is
+    #     flagged as named against the id.
+    said = io.StringIO()
+    print_switches(inv, out=said)
+    said = said.getvalue()
+    switched = isolated_switches(inv)
+    if len(switched) + len(inv.unswitched) != len(inv.names):
+        problems.append('the switched and unswitched sets do not cover the fleet: %d + %d of %d'
+                        % (len(switched), len(inv.unswitched), len(inv.names)))
+    for name, macros in switched.items():
+        if '%s=%s' % (name, '+'.join(macros)) not in said:
+            problems.append('the switch summary does not name %s\'s macro: %r' % (name, said))
+    if 'not named after the animation' in said:
+        problems.append('the shipped sources are reported as naming a switch against '
+                        'the convention: %r' % said)
+    print('host test, the switch summary: %d animations named with the macro that '
+          'turns their kernel off, %d with none of their own'
+          % (len(switched), len(inv.unswitched)), file=out)
 
     # 5. The three cases that already aborted, which must keep aborting.
     inv_get = make_getter('fake', tries=2, sleep=lambda _s: None)
