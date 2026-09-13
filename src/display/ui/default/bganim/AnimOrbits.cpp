@@ -84,9 +84,19 @@
 // reports no fallback to PSRAM.
 //
 // The device band has not been measured: the board was held by another
-// agent when this landed (gm-pciz). That is the one open item on this file,
-// together with the band() against bandRef() run at /api/debug/animtest,
-// which gm-4bd.11's fleet sweep passed at affbc12f, before this change.
+// agent when this landed (gm-pciz). That is the open item on this file for
+// a future board session.
+//
+// The kernel parity sweep is not an open item, and this paragraph is here
+// so nobody re-runs it blind. gm-4bd.11 ran the fleet's band() against
+// bandRef() check on the board at affbc12f, which is before this change,
+// so its orbits row looks stale. It is not. Everything this rewrite touched
+// is in the shared code both paths call: bandRef() is the same drawOverlay
+// walk band() uses, so the two cannot have diverged by construction. The
+// one hand-written kernel in this file, fillBgPie, was not touched, and the
+// QEMU check still reports it bit exact over 40 cases. Re-running the sweep
+// for orbits is cheap and is worth doing once on the next board session for
+// the record, but it is a confirmation, not a risk being carried.
 
 #include "BgAnim.h"
 #include "BgAnimCommon.h"

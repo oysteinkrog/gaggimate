@@ -42,6 +42,16 @@
 // free: it is one sine per row against about 100,000 ring pixels a frame.
 // The two alternatives are exactness at about 2.1x, or this file.
 //
+// The third variant, the row swell alone on libm and the distance left on
+// its tracker, was measured first and reported as 2.3x for 543 pixels,
+// which read as a bad trade. That multiple was against the same stale
+// baseline and should be disregarded: 2.3 times 0.118 is 0.271, which is
+// the shipped path's own time today, and the interleaved run says the same
+// thing directly, since the exact variant that carries the double swell
+// (0.546) is no slower than the partial one that keeps the table (0.562).
+// The row swell is free. It is only worth 3% of the gap, so it is not a fix
+// on its own, but nothing here is being declined on its account.
+//
 // (An earlier note here said 0.118 to 0.541, about 4.6x. The 0.118 was a
 // stale baseline read off a fleet run from 2026-09-10, before something
 // outside this file changed what ripples does per frame; the same binary
