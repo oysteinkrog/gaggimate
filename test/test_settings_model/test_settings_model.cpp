@@ -340,38 +340,99 @@ static void test_gradient_choices_without_category_accessor() {
 }
 
 static void test_theme_category_order_is_declared_not_encountered() {
-    // A fixture whose first gradient sits in the second declared category,
-    // and whose third declared category has no gradient at all. The declared
-    // list is the picker's group order, so it must come back untouched by
-    // what the gradients happen to mention first.
-    static const char *const kCategories[3] = {"Coffee", "Neon", "Pastel"};
-    struct Def {
-        const char *name;
-        const char *category;
+    // A fixture table whose first gradient sits in the second declared
+    // category, and whose third declared category has no gradient at all,
+    // read through the same factory that builds the simulator's provider
+    // (ThemeProviderTable.h, tableThemeProvider). The generated table cannot
+    // be reordered for a test, because an entry's index is its stored id, so
+    // a fixture table is the only way to see what that factory does with a
+    // declared order the gradients disagree with.
+    //
+    // The declared list is the picker's group order, so it must come back in
+    // its declared order, empty category included, whatever the gradients
+    // mention first.
+    static const bganim_gen::ThemeDef kDefs[3] = {
+        {"Cyber",
+         "Neon",
+         {{0x05, 0x00, 0x08}, {0x24, 0x04, 0x48}, {0x50, 0x10, 0x90}, {0x90, 0x18, 0xd8}, {0xe0, 0x30, 0xf8},
+          {0xff, 0x9c, 0xf0}}},
+        {"Espresso",
+         "Coffee",
+         {{0x08, 0x04, 0x02}, {0x2a, 0x12, 0x06}, {0x6b, 0x34, 0x13}, {0xb8, 0x70, 0x3a}, {0xe8, 0xb2, 0x68},
+          {0xf8, 0xe6, 0xc8}}},
+        {"Glow",
+         "Neon",
+         {{0x00, 0x00, 0x00}, {0x20, 0x20, 0x20}, {0x40, 0x40, 0x40}, {0x80, 0x80, 0x80}, {0xc0, 0xc0, 0xc0},
+          {0xff, 0xff, 0xff}}},
     };
-    static const Def kDefs[3] = {{"Cyber", "Neon"}, {"Espresso", "Coffee"}, {"Glow", "Neon"}};
+    static const char *const kCategories[3] = {"Coffee", "Neon", "Pastel"};
 
-    ThemeNameProvider themes;
-    themes.count = []() { return 3; };
-    themes.name = [](int i) { return kDefs[(i >= 0 && i < 3) ? i : 0].name; };
-    themes.category = [](int i) { return kDefs[(i >= 0 && i < 3) ? i : 0].category; };
-    themes.categoryCount = []() { return 3; };
-    themes.categoryName = [](int i) { return kCategories[(i >= 0 && i < 3) ? i : 0]; };
+    // The fixture is only difficult while these two things hold, so check
+    // them rather than trusting the table above to stay that way.
+    TEST_ASSERT_EQUAL_STRING_MESSAGE("Neon", kDefs[0].category, "first gradient must not be in the first category");
+    for (int i = 0; i < 3; i++) {
+        TEST_ASSERT_TRUE_MESSAGE(strcmp(kDefs[i].category, "Pastel") != 0, "Pastel must stay empty");
+    }
 
+    const ThemeNameProvider themes = tableThemeProvider(kDefs, 3, kCategories, 3);
+
+    // Declared order, straight off the provider. Encounter order would have
+    // put Neon first and dropped Pastel entirely.
     TEST_ASSERT_EQUAL(3, themes.categoryCount());
     TEST_ASSERT_EQUAL_STRING("Coffee", themes.categoryName(0));
     TEST_ASSERT_EQUAL_STRING("Neon", themes.categoryName(1));
     TEST_ASSERT_EQUAL_STRING("Pastel", themes.categoryName(2));
-    // Encounter order would have put Neon first.
-    TEST_ASSERT_EQUAL_STRING("Neon", themes.category(0));
+    // Out of range reads as index 0, the rule the rest of the table lookups
+    // follow.
+    TEST_ASSERT_EQUAL_STRING("Coffee", themes.categoryName(-1));
+    TEST_ASSERT_EQUAL_STRING("Coffee", themes.categoryName(3));
 
+    // The gradients keep table order, which is stored-id order, and each one
+    // still reports its own category.
+    TEST_ASSERT_EQUAL(3, themes.count());
+    TEST_ASSERT_EQUAL_STRING("Cyber", themes.name(0));
+    TEST_ASSERT_EQUAL_STRING("Espresso", themes.name(1));
+    TEST_ASSERT_EQUAL_STRING("Glow", themes.name(2));
+    TEST_ASSERT_EQUAL_STRING("Neon", themes.category(0));
+    TEST_ASSERT_EQUAL_STRING("Coffee", themes.category(1));
+    TEST_ASSERT_EQUAL_STRING("Neon", themes.category(2));
+    // The swatch path reads the same fixture rows.
+    TEST_ASSERT_EQUAL_UINT8_ARRAY(reinterpret_cast<const uint8_t *>(kDefs[2].stops),
+                                  reinterpret_cast<const uint8_t *>(themes.stops(2)), 6 * 3);
+
+    // And the choice list a picker lands on: index order, decimal refs and
+    // per-gradient categories, with Default carrying neither.
     const std::vector<GradientChoice> choices = gradientChoices(themes, "");
-    TEST_ASSERT_EQUAL_STRING("Neon", choices[1].category.c_str());
-    TEST_ASSERT_EQUAL_STRING("Coffee", choices[2].category.c_str());
-    TEST_ASSERT_EQUAL_STRING("Neon", choices[3].category.c_str());
-    // Refs are the stored indices whatever the grouping does with them.
+    TEST_ASSERT_EQUAL(static_cast<size_t>(4), choices.size());
+    TEST_ASSERT_EQUAL_STRING("Default", choices[0].label.c_str());
+    TEST_ASSERT_EQUAL_STRING("", choices[0].ref.c_str());
+    TEST_ASSERT_EQUAL_STRING("", choices[0].category.c_str());
+    TEST_ASSERT_EQUAL_STRING("Cyber", choices[1].label.c_str());
     TEST_ASSERT_EQUAL_STRING("0", choices[1].ref.c_str());
+    TEST_ASSERT_EQUAL_STRING("Neon", choices[1].category.c_str());
+    TEST_ASSERT_EQUAL_STRING("Espresso", choices[2].label.c_str());
+    TEST_ASSERT_EQUAL_STRING("1", choices[2].ref.c_str());
+    TEST_ASSERT_EQUAL_STRING("Coffee", choices[2].category.c_str());
+    TEST_ASSERT_EQUAL_STRING("Glow", choices[3].label.c_str());
     TEST_ASSERT_EQUAL_STRING("2", choices[3].ref.c_str());
+    TEST_ASSERT_EQUAL_STRING("Neon", choices[3].category.c_str());
+
+    // Grouping those choices the way a picker does, by walking the declared
+    // list in order: Coffee first with Espresso in it, then Neon with two,
+    // then Pastel with none. Every gradient lands in exactly one group.
+    int grouped = 0;
+    const int expectedPerCategory[3] = {1, 2, 0};
+    for (int c = 0; c < themes.categoryCount(); c++) {
+        int inThisCategory = 0;
+        for (size_t i = 1; i < choices.size(); i++) {
+            if (choices[i].category == themes.categoryName(c)) {
+                inThisCategory++;
+                grouped++;
+            }
+        }
+        TEST_ASSERT_EQUAL_INT_MESSAGE(expectedPerCategory[c], inThisCategory, themes.categoryName(c));
+    }
+    TEST_ASSERT_EQUAL(3, grouped);
 }
 
 static void test_gradient_map_read_write_empty() {
