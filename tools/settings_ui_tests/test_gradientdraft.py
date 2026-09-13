@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""Scenario for the global gradient's draft during a web save (gm-nov3.16,
-gm-nov3.23).
+"""Scenario for a gradient's draft during a web save (gm-nov3.16, gm-nov3.23,
+gm-nov3.36).
 
 CLAUDE.md's rule for the on-display settings is that a web save landing while
 a category is open is per-field last writer wins: every row the user has not
@@ -16,6 +16,13 @@ until the exit, so the page named one gradient while another was on screen.
 gm-nov3.23 closed that: reconciliation puts the touched value back into the
 stored field the panel resolves from, so there is one gradient everywhere for
 the whole visit. check_touched_global_agrees_with_panel is that case.
+
+The three per-animation rows write bgAnimThemeMap the same way, one slot per
+animation, and had the same gap for the rest of the visit rather than for one
+update pass. gm-nov3.36 closed it for every slot the visit touched, including
+one whose animation is not the one on screen, while a slot the visit did not
+touch still adopts whatever the web posted. The three checks named
+touched_..._agrees_with_panel are those cases.
 
 The checks here drive the simulator's own web save route and read the row's
 value text, the row's swatch pixels, the picker's marker and the field the
@@ -81,6 +88,7 @@ from tools.settings_ui_tests.test_animation import (  # noqa: E402
     restore_fields_exactly,
     rows_across_pages,
     swatch_strip,
+    tap_row,
     web_save,
 )
 
@@ -101,8 +109,11 @@ GROUND = {}
 
 # What the venue held before the first check, so the last one can put it back.
 # The scenarios run in one process against one NVS, and this one deliberately
-# leaves the legacy custom fixture and a stepped frame rate behind.
+# leaves the legacy custom fixture and a stepped frame rate behind. The
+# per-animation checks (gm-nov3.36) also step the Animation row and set a
+# standby animation, so those two ids are captured here as well.
 STARTING = {}
+STARTING_FIELDS = GRADIENT_FIELDS + ["bgAnimFps", "bgAnimId", "bgAnimStandbyId"]
 
 # The simulator's NVS file, sim_data/nvs/controller.json under the venue's
 # working directory (preferences_shim.cpp hard-codes the relative path). Set
@@ -138,7 +149,7 @@ def close_shell(rig):
 def run_check(rig, name, fn):
     if not STARTING:
         s = rig.settings()
-        STARTING.update({k: str(s.get(k, "")) for k in GRADIENT_FIELDS + ["bgAnimFps"]})
+        STARTING.update({k: str(s.get(k, "")) for k in STARTING_FIELDS})
     try:
         fn(rig)
     except Exception as e:  # noqa: BLE001 -- one check's crash must not hide the rest
@@ -221,6 +232,35 @@ def live_global(rig):
     the Animation page nothing but the global gradient row writes them."""
     s = rig.settings()
     return str(s.get("bgAnimGradientRef", "")), str(s.get("bgAnimTheme", ""))
+
+
+def anim_slot(rig, anim_id):
+    """The gradient ref bgAnimThemeMap holds for one animation.
+
+    This is the live rendered gradient for that animation in the same sense
+    live_global is for the global row: DefaultUI::updateState hands the stored
+    map to bg_resolve_anim_theme, whose first step is this slot, and the
+    simulator has no render loop to sample instead."""
+    return map_ref(str(rig.settings().get("bgAnimThemeMap", "")), anim_id)
+
+
+def anim_row_ground(rig, anim_id, base_map, refs):
+    """The swatch the per-animation "Gradient" row draws for each of `refs`,
+    captured while that ref is the stored value and the visit has touched
+    nothing.
+
+    Captured here rather than reused from GROUND because GROUND is the
+    "Gradient all" row's swatch, and a comparison has to be one widget
+    against itself. What it buys is a swatch check that says which gradient
+    the row drew, not that it drew something."""
+    ground = {}
+    for ref in refs:
+        if not store(rig, "anim_ground_ref_%s" % ref, {"bgAnimThemeMap": map_write_ref(base_map, anim_id, ref)}):
+            continue
+        open_animation(rig)
+        ground[ref] = swatch_strip(rig, page_with_row(rig, "Gradient"), "Gradient")
+        close_animation(rig)
+    return ground
 
 
 def global_row(rig):
@@ -626,6 +666,248 @@ def check_touched_global_agrees_with_panel(rig):
     check(rig, "agree_reopen_swatch_draws_it", strip == GROUND[a["ref"]],
           swatch_detail(strip, GROUND[a["ref"]], GROUND.get(c["ref"])))
     close_animation(rig)
+
+
+# ---------------------------------------------------------------------------
+# The per-animation gradient slots during a web save (gm-nov3.36)
+#
+# bgAnimThemeMap is one gradient ref per animation, and picking one writes the
+# animation's slot at once (CatAnimation.cpp animGradientAssign), exactly as
+# the global row writes bgAnimGradientRef at once. So the same rule applies to
+# it: the panel resolves from the stored map, a web save replaces the whole
+# string, and without reconciliation putting the touched slots back the row
+# named this visit's gradient while the panel drew the web's, from the save
+# until the exit. The global row's window was one update pass; this one was
+# the rest of the visit.
+#
+# The checks below therefore read the stored slot, not only the row, and they
+# read it before the category is popped. The existing precedence check in
+# test_animation.py (check_gradient_precedence_across_animations) posts a
+# conflicting map and then judges only after rig.settingsui(pop=1), so it
+# passes either way.
+
+
+def check_touched_anim_gradient_agrees_with_panel(rig):
+    """Acceptance (gm-nov3.36): while the "Gradient" row names this visit's
+    choice for the current animation, the map the panel resolves from holds it
+    too, from the web save onwards rather than from the exit onwards.
+
+    Driven three times, once with the category's own page on top and once at
+    each level of the picker, because the shell reconciles only the top page
+    and the picker's own reconcile is the only thing that reaches the category
+    underneath it (gm-nov3.3)."""
+    a, b, c = three_builtins()
+    s0 = rig.settings()
+    anim = int(s0["bgAnimId"])
+    map0 = str(s0["bgAnimThemeMap"])
+
+    # Preflight against a closed shell: a map string carrying these refs is
+    # one WebUIPlugin's bg_map_valid accepts rather than one it drops. It has
+    # to be proved here, because inside the visit the display overwrites the
+    # slot by design and a dropped save would look exactly the same.
+    if not store(rig, "anim_agree_web_map_is_accepted", {"bgAnimThemeMap": map_write_ref(map0, anim, c["ref"])}):
+        return
+    ground = anim_row_ground(rig, anim, map0, [a["ref"], c["ref"]])
+    if not store(rig, "anim_agree_setup", {"bgAnimThemeMap": map_write_ref(map0, anim, b["ref"])}):
+        return
+
+    open_animation(rig)
+    open_picker(rig, "Gradient")
+    picker_choose(rig, a["cat"], a["name"])
+    live = settled(rig, lambda: anim_slot(rig, anim) == a["ref"], timeout=6)
+    check(rig, "anim_agree_pick_writes_live", live, anim_slot(rig, anim))
+
+    # 1. The save with the category's own page on top. The frame rate moves
+    # with it, so waiting for that row proves the category reconciled and
+    # rebuilt: a slot that had simply not been reconciled yet would otherwise
+    # read as a pass.
+    fps_sentinel = other_fps(rig.settings()["bgAnimFps"])
+    web_map = map_write_ref(str(rig.settings()["bgAnimThemeMap"]), anim, c["ref"])
+    if not store_over_draft(rig, "anim_agree_row_web_save_landed",
+                            {"bgAnimThemeMap": web_map, "bgAnimFps": fps_sentinel}, ["bgAnimFps"]):
+        close_animation(rig)
+        return
+    rebuilt = settled(rig, lambda: rig.row_value(page_with_row(rig, "Frame rate"), "Frame rate")
+                      == "%d fps" % fps_sentinel)
+    check(rig, "anim_agree_row_page_rebuilt", rebuilt,
+          rig.row_value(page_with_row(rig, "Frame rate"), "Frame rate"))
+    restored = settled(rig, lambda: anim_slot(rig, anim) == a["ref"])
+    check(rig, "anim_agree_row_panel_back_to_draft", restored, "%r want %r" % (anim_slot(rig, anim), a["ref"]))
+    dump = page_with_row(rig, "Gradient")
+    value = rig.row_value(dump, "Gradient")
+    check(rig, "anim_agree_row_names_draft", value == a["name"], "%r want %r" % (value, a["name"]))
+    if a["ref"] in ground:
+        strip = swatch_strip(rig, dump, "Gradient")
+        check(rig, "anim_agree_row_swatch_draws_draft", strip == ground[a["ref"]],
+              swatch_detail(strip, ground[a["ref"]], ground.get(c["ref"])))
+
+    # 2. The save with the picker's group page on top. A library entry in the
+    # same form is what proves the picker rebuilt: "My gradients" appears only
+    # after it did.
+    lib0 = rig.settings()["bgAnimGradients"]
+    open_picker(rig, "Gradient")
+    probe_lib = "|".join(("92", "Anim Probe", "000000,ffffff"))
+    web_map = map_write_ref(str(rig.settings()["bgAnimThemeMap"]), anim, c["ref"])
+    if store_over_draft(rig, "anim_agree_group_web_save_landed",
+                        {"bgAnimThemeMap": web_map, "bgAnimGradients": probe_lib}, ["bgAnimGradients"]):
+        rebuilt = settled(rig, lambda: "My gradients" in rows_across_pages(rig))
+        check(rig, "anim_agree_group_picker_rebuilt", rebuilt, rows_across_pages(rig))
+        restored = settled(rig, lambda: anim_slot(rig, anim) == a["ref"])
+        check(rig, "anim_agree_group_panel_back_to_draft", restored, "%r want %r" % (anim_slot(rig, anim), a["ref"]))
+        marked = picker_selected_rows(rig)
+        check(rig, "anim_agree_group_marker_keeps_draft", marked == [a["cat"]], "%r want [%r]" % (marked, a["cat"]))
+
+    # 3. The save with one group's gradient list on top, which reaches the
+    # category through two levels (groupReconcile, then the parent's).
+    picker_tap(rig, a["cat"])
+    rig.wait_until(lambda: depth(rig) == 3, timeout=5)
+    fps_sentinel = other_fps(rig.settings()["bgAnimFps"])
+    web_map = map_write_ref(str(rig.settings()["bgAnimThemeMap"]), anim, c["ref"])
+    if store_over_draft(rig, "anim_agree_list_web_save_landed",
+                        {"bgAnimThemeMap": web_map, "bgAnimFps": fps_sentinel}, ["bgAnimFps"]):
+        restored = settled(rig, lambda: anim_slot(rig, anim) == a["ref"])
+        check(rig, "anim_agree_list_panel_back_to_draft", restored, "%r want %r" % (anim_slot(rig, anim), a["ref"]))
+        marked = picker_selected_rows(rig)
+        check(rig, "anim_agree_list_marker_keeps_draft", marked == [a["name"]], "%r want [%r]" % (marked, a["name"]))
+    picker_cancel(rig)
+    picker_cancel(rig)
+
+    close_animation(rig)
+    store(rig, "anim_agree_library_restored", {"bgAnimGradients": lib0})
+    check(rig, "anim_agree_exit_saves_the_named_value", anim_slot(rig, anim) == a["ref"],
+          "%r want %r" % (anim_slot(rig, anim), a["ref"]))
+    restore_fields_exactly(rig, "anim_agree_map_restored", {"bgAnimThemeMap": map0})
+
+
+def check_touched_noncurrent_slot_agrees_with_panel(rig):
+    """Acceptance (gm-nov3.36): a slot this visit touched for an animation
+    that is no longer the one on screen is restored too, and an untouched slot
+    in the same posted map keeps the web's value.
+
+    Touching a slot and then stepping the Animation row away from it is the
+    ordinary way to reach this state, and the animation can come back: the
+    last part of the check steps back to it and asserts the row and the map
+    still hold this visit's choice, because that is the moment a slot left at
+    the web's value would start being drawn."""
+    a, b, c = three_builtins()
+    s0 = rig.settings()
+    anim_a = int(s0["bgAnimId"])
+    anim_b = (anim_a + 1) % len(ANIM_NAMES)
+    anim_c = (anim_a + 2) % len(ANIM_NAMES)
+    map0 = str(s0["bgAnimThemeMap"])
+
+    open_animation(rig)
+    open_picker(rig, "Gradient")
+    picker_choose(rig, a["cat"], a["name"])
+    touched_a = settled(rig, lambda: anim_slot(rig, anim_a) == a["ref"], timeout=6)
+    check(rig, "noncurrent_touched_a", touched_a, anim_slot(rig, anim_a))
+
+    tap_row(rig, "Animation", "next")
+    moved = settled(rig, lambda: int(rig.settings()["bgAnimId"]) == anim_b)
+    check(rig, "noncurrent_moved_to_b", moved, rig.settings()["bgAnimId"])
+    open_picker(rig, "Gradient")
+    picker_choose(rig, b["cat"], b["name"])
+    touched_b = settled(rig, lambda: anim_slot(rig, anim_b) == b["ref"], timeout=6)
+    check(rig, "noncurrent_touched_b", touched_b, anim_slot(rig, anim_b))
+
+    # One save replacing all three slots: two this visit touched and one it
+    # did not. Both touched slots must come back, and the untouched one must
+    # not, so a fix that simply wrote the draft over the whole map fails here.
+    fps_sentinel = other_fps(rig.settings()["bgAnimFps"])
+    web_map = str(rig.settings()["bgAnimThemeMap"])
+    for slot in (anim_a, anim_b, anim_c):
+        web_map = map_write_ref(web_map, slot, c["ref"])
+    if not store_over_draft(rig, "noncurrent_web_save_landed",
+                            {"bgAnimThemeMap": web_map, "bgAnimFps": fps_sentinel}, ["bgAnimFps"]):
+        close_animation(rig)
+        return
+    rebuilt = settled(rig, lambda: rig.row_value(page_with_row(rig, "Frame rate"), "Frame rate")
+                      == "%d fps" % fps_sentinel)
+    check(rig, "noncurrent_page_rebuilt", rebuilt,
+          rig.row_value(page_with_row(rig, "Frame rate"), "Frame rate"))
+    back_a = settled(rig, lambda: anim_slot(rig, anim_a) == a["ref"])
+    check(rig, "noncurrent_offscreen_slot_back_to_draft", back_a,
+          "anim %d got %r want %r" % (anim_a, anim_slot(rig, anim_a), a["ref"]))
+    check(rig, "noncurrent_onscreen_slot_back_to_draft", anim_slot(rig, anim_b) == b["ref"],
+          "anim %d got %r want %r" % (anim_b, anim_slot(rig, anim_b), b["ref"]))
+    check(rig, "noncurrent_untouched_slot_keeps_web", anim_slot(rig, anim_c) == c["ref"],
+          "anim %d got %r want the web's %r" % (anim_c, anim_slot(rig, anim_c), c["ref"]))
+
+    # The touched animation becomes the one on screen again, inside the same
+    # visit.
+    tap_row(rig, "Animation", "prev")
+    returned = settled(rig, lambda: int(rig.settings()["bgAnimId"]) == anim_a)
+    check(rig, "noncurrent_returned_to_a", returned, rig.settings()["bgAnimId"])
+    value = rig.row_value(page_with_row(rig, "Gradient"), "Gradient")
+    check(rig, "noncurrent_row_names_draft_when_current", value == a["name"], "%r want %r" % (value, a["name"]))
+    check(rig, "noncurrent_slot_is_draft_when_current", anim_slot(rig, anim_a) == a["ref"],
+          "anim %d got %r want %r" % (anim_a, anim_slot(rig, anim_a), a["ref"]))
+
+    close_animation(rig)
+    restore_fields_exactly(rig, "noncurrent_restored", {"bgAnimThemeMap": map0, "bgAnimId": anim_a})
+
+
+def check_touched_standby_slot_agrees_with_panel(rig):
+    """Acceptance (gm-nov3.36): the standby animation's own slot, edited
+    through the "Standby grad" row, is restored on the same terms, and stays
+    restored across a second save once that animation becomes the one on
+    screen."""
+    a, b, c = three_builtins()
+    s0 = rig.settings()
+    anim_a = int(s0["bgAnimId"])
+    standby_target = (anim_a + 1) % len(ANIM_NAMES)
+    map0 = str(s0["bgAnimThemeMap"])
+
+    # The row is disabled while Standby anim follows the main animation, so
+    # the fixture has to name a different one before the visit starts.
+    if not store(rig, "standby_slot_setup", {"bgAnimStandbyId": standby_target,
+                                             "bgAnimThemeMap": map_write_ref(map0, standby_target, b["ref"])}):
+        return
+
+    open_animation(rig)
+    open_picker(rig, "Standby grad")
+    picker_choose(rig, a["cat"], a["name"])
+    live = settled(rig, lambda: anim_slot(rig, standby_target) == a["ref"], timeout=6)
+    check(rig, "standby_slot_pick_writes_live", live, anim_slot(rig, standby_target))
+
+    fps_sentinel = other_fps(rig.settings()["bgAnimFps"])
+    web_map = map_write_ref(str(rig.settings()["bgAnimThemeMap"]), standby_target, c["ref"])
+    if not store_over_draft(rig, "standby_slot_web_save_landed",
+                            {"bgAnimThemeMap": web_map, "bgAnimFps": fps_sentinel}, ["bgAnimFps"]):
+        close_animation(rig)
+        return
+    rebuilt = settled(rig, lambda: rig.row_value(page_with_row(rig, "Frame rate"), "Frame rate")
+                      == "%d fps" % fps_sentinel)
+    check(rig, "standby_slot_page_rebuilt", rebuilt,
+          rig.row_value(page_with_row(rig, "Frame rate"), "Frame rate"))
+    restored = settled(rig, lambda: anim_slot(rig, standby_target) == a["ref"])
+    check(rig, "standby_slot_back_to_draft", restored,
+          "anim %d got %r want %r" % (standby_target, anim_slot(rig, standby_target), a["ref"]))
+    value = rig.row_value(page_with_row(rig, "Standby grad"), "Standby grad")
+    check(rig, "standby_slot_row_names_draft", value == a["name"], "%r want %r" % (value, a["name"]))
+
+    # The standby animation becomes the main one, inside the same visit, and
+    # another save lands on its slot. This is the case the bead names: the
+    # animation whose slot was touched off screen is now the one being drawn.
+    tap_row(rig, "Animation", "next")
+    became = settled(rig, lambda: int(rig.settings()["bgAnimId"]) == standby_target)
+    check(rig, "standby_slot_became_current", became, rig.settings()["bgAnimId"])
+    fps_sentinel = other_fps(rig.settings()["bgAnimFps"])
+    web_map = map_write_ref(str(rig.settings()["bgAnimThemeMap"]), standby_target, c["ref"])
+    if store_over_draft(rig, "standby_slot_second_web_save_landed",
+                        {"bgAnimThemeMap": web_map, "bgAnimFps": fps_sentinel}, ["bgAnimFps"]):
+        restored = settled(rig, lambda: anim_slot(rig, standby_target) == a["ref"])
+        check(rig, "standby_slot_back_to_draft_as_current", restored,
+              "anim %d got %r want %r" % (standby_target, anim_slot(rig, standby_target), a["ref"]))
+        value = rig.row_value(page_with_row(rig, "Gradient"), "Gradient")
+        check(rig, "standby_slot_gradient_row_names_draft", value == a["name"], "%r want %r" % (value, a["name"]))
+
+    close_animation(rig)
+    check(rig, "standby_slot_exit_saves_the_named_value", anim_slot(rig, standby_target) == a["ref"],
+          "%r want %r" % (anim_slot(rig, standby_target), a["ref"]))
+    restore_fields_exactly(rig, "standby_slot_restored",
+                           {"bgAnimThemeMap": map0, "bgAnimId": anim_a,
+                            "bgAnimStandbyId": int(s0["bgAnimStandbyId"])})
 
 
 # The retained legacy gradient the checks below drive, in three readings of
@@ -1250,6 +1532,9 @@ CHECKS = [
     ("untouched_global_follows_web_save", check_untouched_global_follows_web_save),
     ("touched_global_keeps_draft", check_touched_global_keeps_draft),
     ("touched_global_agrees_with_panel", check_touched_global_agrees_with_panel),
+    ("touched_anim_gradient_agrees_with_panel", check_touched_anim_gradient_agrees_with_panel),
+    ("touched_noncurrent_slot_agrees_with_panel", check_touched_noncurrent_slot_agrees_with_panel),
+    ("touched_standby_slot_agrees_with_panel", check_touched_standby_slot_agrees_with_panel),
     ("legacy_fallback_named_and_inert", check_legacy_fallback_named_and_inert),
     ("legacy_unparsable_custom_falls_back", check_legacy_unparsable_custom_falls_back),
     ("pick_keeps_the_picker_open", check_pick_keeps_the_picker_open),

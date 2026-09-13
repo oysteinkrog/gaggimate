@@ -1410,6 +1410,33 @@ void animEnter(void *ctx0) {
     ctx->interlaceTouched = false;
 }
 
+// Every touched animation's draft ref merged into `map`, with every untouched
+// slot left exactly as the string holds it. Returns true when the string
+// changed, and names each slot it changed in `log` when one is given.
+//
+// Shared by animReconcile and animCommit so the rule that decides which slots
+// survive a web save cannot drift between them: bgAnimThemeMap is one field
+// per animation, a web save replaces the whole string in one write, and this
+// visit owns only the slots it has touched.
+bool mergeTouchedGradientSlots(const CatAnimationCtx *ctx, std::string &map, char *log, size_t logCap, int *used) {
+    bool wrote = false;
+    for (size_t animId = 0; animId < ctx->gradientTouched.size(); ++animId) {
+        if (!ctx->gradientTouched[animId]) {
+            continue;
+        }
+        const std::string &wanted = ctx->gradientLastRef[animId];
+        if (settingsui::gradientMapReadRef(map, static_cast<int>(animId)) == wanted) {
+            continue;
+        }
+        map = settingsui::gradientMapWriteRef(map, static_cast<int>(animId), wanted);
+        if (log != nullptr && used != nullptr) {
+            settingsLogAppend(log, logCap, *used, " gradient[%d]=%s", static_cast<int>(animId), wanted.c_str());
+        }
+        wrote = true;
+    }
+    return wrote;
+}
+
 // After a settings:changed event: refreshes only the fields this visit has
 // not edited. service() rebuilds the page unconditionally right after
 // calling this, so the redraw (including row enable/disable) is the shell's
@@ -1466,6 +1493,36 @@ void animReconcile(void *ctx0) {
     }
     if (!ctx->interlaceTouched) {
         ctx->interlace = settings.getBgAnimInterlace() != 0;
+    }
+
+    // The per-animation gradient rows are live fields, exactly as the global
+    // row below is: animGradientAssign writes the animation's slot of
+    // bgAnimThemeMap the moment a pick or an arrow lands, and the panel
+    // resolves the palette from that stored map (DefaultUI::updateState). A
+    // web save replaces the whole string, so without this the row went on
+    // naming this visit's gradient while the panel drew the web's, with
+    // nothing on screen to say so, until commit() moved it back at the exit
+    // (gm-nov3.36). That window is the whole rest of the visit, where the
+    // global row's is one update pass.
+    //
+    // Every touched slot goes back, not only the current animation's: a
+    // touched standby or off-screen animation can become the current one
+    // later in the same visit, and its slot would be the web's for that
+    // stretch. An untouched slot keeps whatever the web posted, which is the
+    // ordinary per-field rule.
+    //
+    // This is the same write the row itself makes, so it restores a live
+    // field rather than changing the commit-time precedence the rest of the
+    // category depends on (gm-nov3.16): commit() still writes exactly what
+    // the rows said. The read-modify-write of the whole string is already
+    // inside the shell's Settings::Guard, which SettingsUI::service() holds
+    // around every reconcile call, so a web save's batchUpdate cannot
+    // interleave with it the way gradientOnCycle has to guard against.
+    {
+        std::string map(settings.getBgAnimThemeMap().c_str());
+        if (mergeTouchedGradientSlots(ctx, map, nullptr, 0, nullptr)) {
+            settings.setBgAnimThemeMap(map.c_str());
+        }
     }
 
     // Gradient row on screen: shows this visit's touched choice for
@@ -1560,23 +1617,12 @@ void animCommit(void *ctx0) {
         // touched value at commit (gm-flw.9 review). Already inside the
         // shell's Settings::Guard (SettingsUI::popPage/teardownAll wrap the
         // whole commit() call), so no separate guard is needed here the way
-        // gradientOnCycle needs its own.
+        // gradientOnCycle needs its own. Since gm-nov3.36 reconcile() has
+        // usually put these slots back already, so this most often finds
+        // nothing to write; it stays because a web save can land between the
+        // last reconcile and this call.
         std::string map(settings.getBgAnimThemeMap().c_str());
-        bool gradientWrote = false;
-        for (size_t animId = 0; animId < ctx->gradientTouched.size(); ++animId) {
-            if (!ctx->gradientTouched[animId]) {
-                continue;
-            }
-            const std::string &wanted = ctx->gradientLastRef[animId];
-            if (settingsui::gradientMapReadRef(map, static_cast<int>(animId)) == wanted) {
-                continue;
-            }
-            map = settingsui::gradientMapWriteRef(map, static_cast<int>(animId), wanted);
-            settingsLogAppend(log, sizeof(log), used, " gradient[%d]=%s", static_cast<int>(animId),
-                                   wanted.c_str());
-            gradientWrote = true;
-        }
-        if (gradientWrote) {
+        if (mergeTouchedGradientSlots(ctx, map, log, sizeof(log), &used)) {
             settings.setBgAnimThemeMap(map.c_str());
             wrote = true;
         }
