@@ -38,6 +38,7 @@ constexpr int PAL_PAD = 32, PAL_N = PAL_PAD + 320;
 int32_t *radCol = nullptr, *radRow = nullptr;
 int16_t *bgRow = nullptr, *spanPx = nullptr, *dith = nullptr;
 int16_t *ozHalf = nullptr, *osHalf = nullptr;
+int16_t *czLoRow = nullptr, *czHiRow = nullptr, *csLoRow = nullptr, *csHiRow = nullptr;
 uint32_t *paletteStorage = nullptr, *palette = nullptr;
 uint16_t *smooth = nullptr, *weights = nullptr;
 const int16_t *sine = nullptr; // borrowed shared table
@@ -71,6 +72,21 @@ inline int isqrtCeil(int v) {
 inline int floorDiv16(int v) { return v >= 0 ? (v >> 4) : -((-v + 15) >> 4); }
 inline int ceilDiv16(int v) { return -floorDiv16(-v); }
 
+// The cut circle's two soft-edge memberships, as predicates on a whole pixel.
+// X is the Q4 distance from the cut centre along the row.
+inline bool cutZeroAt(int x, int c16, int t) {
+    const int X = x * 16 - c16;
+    return X * X <= t;
+}
+inline bool cutSatRightAt(int x, int c16, int t) {
+    const int X = x * 16 - c16;
+    return X >= 0 && X * X >= t;
+}
+inline bool cutSatLeftAt(int x, int c16, int t) {
+    const int X = x * 16 - c16;
+    return X <= 0 && X * X >= t;
+}
+
 void release();
 bool init(int w, int h) {
     // The largest supported panel bounds the slab allocation below.
@@ -97,8 +113,12 @@ bool init(int w, int h) {
     // moves with the theme and the parameters, not with time.
     ozHalf = static_cast<int16_t *>(alloc(h * sizeof(int16_t)));
     osHalf = static_cast<int16_t *>(alloc(h * sizeof(int16_t)));
+    czLoRow = static_cast<int16_t *>(alloc(h * sizeof(int16_t)));
+    czHiRow = static_cast<int16_t *>(alloc(h * sizeof(int16_t)));
+    csLoRow = static_cast<int16_t *>(alloc(h * sizeof(int16_t)));
+    csHiRow = static_cast<int16_t *>(alloc(h * sizeof(int16_t)));
     if (!radCol || !radRow || !bgRow || !spanPx || !dith || !paletteStorage || !smooth || !weights ||
-        !ozHalf || !osHalf) {
+        !ozHalf || !osHalf || !czLoRow || !czHiRow || !csLoRow || !csHiRow) {
         release();
         return false;
     }
@@ -197,6 +217,44 @@ void frame(uint32_t tMs, int w, int h, const uint8_t p[BG_ANIM_PARAMS]) {
     // Contrast sets 74..120 palette positions, with a +-150 Q4 pulse.
     bodyBase = (BODY_LO + static_cast<int>(p[3]) * 46 / 100) * 16 +
                ((sine[phBr & (SIN_N - 1)] * 150) >> 9);
+    // Where the cut circle's soft edge falls on each row, in whole pixels.
+    // band() reads four numbers a row instead of taking two square roots, and
+    // sqrtf is a library call from flash that cost 156 cycles each. Walking
+    // from the previous row costs a comparison or two, because the edge moves
+    // by about a pixel a row, and each walk is bounded by the centre pixel on
+    // one side and by the ray it is looking for on the other, so a jump in the
+    // centre costs steps and never correctness.
+    {
+        const int rr2 = discR * discR;
+        const int zBase = 256 * (rr2 + qzThr) + 255, aBase = 256 * (rr2 + qaThr);
+        const int xc = (icx16 + 8) >> 4, xr = ceilDiv16(icx16), xl = floorDiv16(icx16);
+        int lo = xc, hi = xc, sLo = xl, sHi = xr;
+        for (int y = 0; y < h; ++y) {
+            const int dyi = y * 16 - icy16, dyi2 = dyi * dyi;
+            const int t1 = zBase - dyi2, t2 = aBase - dyi2;
+            if (t1 < 0 || !cutZeroAt(xc, icx16, t1)) {
+                czLoRow[y] = 1;
+                czHiRow[y] = 0;
+            } else {
+                if (hi < xc) hi = xc;
+                while (cutZeroAt(hi + 1, icx16, t1)) ++hi;
+                while (hi > xc && !cutZeroAt(hi, icx16, t1)) --hi;
+                if (lo > xc) lo = xc;
+                while (cutZeroAt(lo - 1, icx16, t1)) --lo;
+                while (lo < xc && !cutZeroAt(lo, icx16, t1)) ++lo;
+                czLoRow[y] = static_cast<int16_t>(lo);
+                czHiRow[y] = static_cast<int16_t>(hi);
+            }
+            if (sHi < xr) sHi = xr;
+            while (sHi > xr && cutSatRightAt(sHi - 1, icx16, t2)) --sHi;
+            while (!cutSatRightAt(sHi, icx16, t2)) ++sHi;
+            if (sLo > xl) sLo = xl;
+            while (sLo < xl && cutSatLeftAt(sLo + 1, icx16, t2)) ++sLo;
+            while (!cutSatLeftAt(sLo, icx16, t2)) --sLo;
+            csLoRow[y] = static_cast<int16_t>(sLo);
+            csHiRow[y] = static_cast<int16_t>(sHi);
+        }
+    }
 }
 
 // Exact square recurrences: qOuter=R^2-dx^2-dy^2, dOuter=-(2*dx+1);
@@ -616,21 +674,8 @@ GM_ANIM_IRAM void band(uint16_t *dst, int y0, int rows, int w, uint32_t tMs, con
         const int nzR = ozHalf[y], satR = osHalf[y];
         const int oz0 = cx - nzR, oz1 = cx + nzR;   // empty when nzR < 0
         const int os0 = cx - satR, os1 = cx + satR; // empty when satR < 0
-        // uc == 0 while X*X <= t1; uc == 256 while X*X >= t2, X = 16x - icx16.
-        const int t1 = 256 * (r2 + qzThr) + 255 - dyi2;
-        const int t2 = 256 * (r2 + qaThr) - dyi2;
-        int cz0 = 1, cz1 = 0;
-        if (t1 >= 0) {
-            const int u1 = isqrtFloor(t1);
-            cz0 = ceilDiv16(icx16 - u1);
-            cz1 = floorDiv16(icx16 + u1);
-        }
-        int csLo = w + 8, csHi = -8; // uc == 256 everywhere when t2 <= 0
-        if (t2 > 0) {
-            const int u2 = isqrtCeil(t2);
-            csLo = floorDiv16(icx16 - u2);
-            csHi = ceilDiv16(icx16 + u2);
-        }
+        const int cz0 = czLoRow[y], cz1 = czHiRow[y];
+        const int csLo = csLoRow[y], csHi = csHiRow[y];
         int bp[8], nb = 0;
         const int cand[8] = {oz0, oz1 + 1, os0, os1 + 1, cz0, cz1 + 1, csLo + 1, csHi};
         for (int i = 0; i < 8; ++i) {
@@ -705,6 +750,10 @@ void release() {
     releaseTable(weights, static_cast<size_t>(allocW) * sizeof(uint16_t));
     releaseTable(ozHalf, static_cast<size_t>(allocH) * sizeof(int16_t));
     releaseTable(osHalf, static_cast<size_t>(allocH) * sizeof(int16_t));
+    releaseTable(czLoRow, static_cast<size_t>(allocH) * sizeof(int16_t));
+    releaseTable(czHiRow, static_cast<size_t>(allocH) * sizeof(int16_t));
+    releaseTable(csLoRow, static_cast<size_t>(allocH) * sizeof(int16_t));
+    releaseTable(csHiRow, static_cast<size_t>(allocH) * sizeof(int16_t));
     palette = nullptr; sine = nullptr;
     allocW = allocH = discR = icx16 = icy16 = bodyBase = 0;
     invK = 1;
