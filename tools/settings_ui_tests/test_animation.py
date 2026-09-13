@@ -22,6 +22,7 @@ file for the exact list and the device-side commands that check them.
 """
 import argparse
 import os
+import re
 import sys
 import tempfile
 import time
@@ -176,14 +177,54 @@ def gradient_name_for_ref(settings, ref):
     return THEME_NAMES[idx] if 0 <= idx < len(THEME_NAMES) else None
 
 
+# The legacy bgAnimTheme namespace, frozen at 18 to match
+# BG_THEME_LEGACY_CUSTOM in src/display/ui/default/bganim/BgAnim.h. It is not
+# len(THEME_NAMES): the built-in table grows, and a device that stored 18 means
+# the custom gradient, not whatever gradient is appended at index 18.
+BG_THEME_LEGACY_CUSTOM = 18
+
+
+def custom_theme_valid(custom):
+    """Whether bgAnimCustomTheme is a gradient the firmware's parser accepts.
+    Python mirror of bg_custom_valid (BgAnimThemes.cpp, parseGradient): two to
+    sixteen six-digit colours separated by commas or spaces, each with an
+    optional @position of one to four digits that may not exceed 255. A leading
+    # is tolerated on each colour, as the parser tolerates it."""
+    parts = [p for p in re.split(r"[\s,]+", str(custom or "")) if p]
+    if not 2 <= len(parts) <= 16:
+        return False
+    for part in parts:
+        m = re.fullmatch(r"#?[0-9a-fA-F]{6}(?:@(\d{1,4}))?", part)
+        if m is None:
+            return False
+        if m.group(1) is not None and int(m.group(1)) > 255:
+            return False
+    return True
+
+
+def legacy_builtin(theme_id, custom_valid):
+    """Python mirror of bg_legacy_builtin (BgAnim.h): the built-in the legacy
+    pair resolves to, or -1 when the custom gradient is what it draws."""
+    if theme_id == BG_THEME_LEGACY_CUSTOM:
+        return -1 if custom_valid else 0
+    return theme_id if 0 <= theme_id < BG_THEME_LEGACY_CUSTOM else 0
+
+
 def expected_global_gradient_text(settings):
-    """The Gradient all row's value: bgAnimGradientRef when it names
-    something that exists, else the built-in bgAnimTheme names."""
+    """The Gradient all row's value: bgAnimGradientRef when it names something
+    that exists, else what the legacy pair resolves to. The legacy integer goes
+    through the frozen namespace rather than indexing THEME_NAMES directly, so
+    a stored 18 reads as the retained custom gradient the way the display reads
+    it (CatAnimation.cpp, globalGradientLabel) instead of naming the built-in
+    that lands at index 18."""
     name = gradient_name_for_ref(settings, settings.get("bgAnimGradientRef", ""))
     if name is not None:
         return name
-    theme_idx = int(settings["bgAnimTheme"])
-    return THEME_NAMES[theme_idx] if 0 <= theme_idx < len(THEME_NAMES) else THEME_NAMES[0]
+    builtin = legacy_builtin(int(settings["bgAnimTheme"]),
+                             custom_theme_valid(settings.get("bgAnimCustomTheme", "")))
+    if builtin < 0:
+        return "Custom (legacy)"
+    return THEME_NAMES[builtin] if 0 <= builtin < len(THEME_NAMES) else THEME_NAMES[0]
 
 
 def expected_gradient_text(settings, anim_id=None):

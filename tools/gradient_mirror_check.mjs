@@ -21,6 +21,7 @@ import {
   gradientForRef,
   legacyBuiltin,
   legacyThemeMirror,
+  serializeGradient,
 } from '../web/src/config/bgAnimations.js';
 
 const failures = [];
@@ -110,6 +111,60 @@ check('a negative legacy integer reads as built-in 0', legacyBuiltin(-1, CUSTOM)
   // Nothing above wrote a field. Opening the editor calls exactly these
   // functions, and cancelling calls none of them.
   check('showing it writes nothing', globalAssignFields(ref, BIG), {});
+}
+// ---- a legacy custom string that carries positions ------------------------
+// The firmware's last fallback throws the stored positions away: it parses the
+// colours out of bgAnimCustomTheme and then spaces them evenly on the uniform
+// path, whatever the string said (BgAnimThemes.cpp, bg_resolve_anim_theme step
+// three). The web has to show that gradient, not the positioned one the string
+// spells, or the panel draws something the page never displayed.
+//
+// Every fixture above is written without positions, so the positions the web
+// returned were even by accident and the whole path went unchecked (gm-nov3.18).
+const POSITIONED = 'ff0000@0,00ff00@10,0000ff@255';
+{
+  const ref = globalGradientRef('', [], 18, POSITIONED);
+  check('a positioned legacy custom still reads as the stand-in', ref, BG_LEGACY_CUSTOM_REF);
+  const shown = gradientForRef(ref, [], POSITIONED);
+  check('it keeps the stored colours', shown.stops.map(s => s.color), [
+    '#ff0000',
+    '#00ff00',
+    '#0000ff',
+  ]);
+  check('the stored positions are dropped, as the firmware drops them', shown.stops.map(s => s.pos), [
+    0, 127, 255,
+  ]);
+  // The editor sends exactly this string to the panel as a live preview, so a
+  // positioned serialization would make the panel draw the wrong gradient for
+  // as long as the editor is open. No @pos at all is what puts the firmware's
+  // parser back on the uniform path.
+  check(
+    'it serializes for the preview with no positions',
+    serializeGradient({ stops: shown.stops }),
+    'ff0000,00ff00,0000ff',
+  );
+  check('showing a positioned one writes nothing too', globalAssignFields(ref, BIG), {});
+}
+{
+  // Only the legacy representation is normalized. A library gradient is drawn
+  // by the positional path and keeps every position it was saved with.
+  const library = [
+    { id: 1, name: 'Mine', stops: [
+      { color: '#ff0000', pos: 0 },
+      { color: '#00ff00', pos: 10 },
+      { color: '#0000ff', pos: 255 },
+    ] },
+  ];
+  const shown = gradientForRef('c1', library, POSITIONED);
+  check('a library gradient keeps its own positions', shown.stops.map(s => s.pos), [0, 10, 255]);
+  check('and serializes with them', serializeGradient({ stops: shown.stops }), 'ff0000@0,00ff00@10,0000ff@255');
+}
+{
+  // A legacy custom string the firmware's parser rejects is not the stand-in at
+  // all: bg_resolve_theme sends it to built-in 0, and so does the web.
+  check('an empty positioned-era string falls back to a built-in', globalGradientRef('', [], 18, ''), '0');
+  check('a malformed one falls back to a built-in', globalGradientRef('', [], 18, 'ff0000@300,00ff00'), '0');
+  check('a one-stop one falls back to a built-in', globalGradientRef('', [], 18, 'ff0000@10'), '0');
 }
 {
   // A resolving ref wins over the legacy pair, and an empty legacy custom

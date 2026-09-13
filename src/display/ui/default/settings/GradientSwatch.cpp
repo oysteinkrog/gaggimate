@@ -99,6 +99,17 @@ bool swatchFromWire(const char *wire, SwatchGradient &out) {
     return true;
 }
 
+bool swatchFromLegacyCustom(const char *custom, SwatchGradient &out) {
+    SwatchGradient parsed;
+    if (!swatchFromWire(custom, parsed)) {
+        return false;
+    }
+    parsed.uniform = true;
+    fillUniformPositions(parsed.pos, parsed.count);
+    out = parsed;
+    return true;
+}
+
 bool swatchResolveRef(const char *ref, const char *library, SwatchGradient &out) {
     if (ref == nullptr || *ref == '\0') {
         return false; // "" is "no gradient of its own", not a gradient

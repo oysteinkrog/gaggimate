@@ -178,6 +178,19 @@ def swatch_detail(strip, draft, web):
     return "swatch is neither the draft's nor the web's"
 
 
+def legacy_swatch_detail(strip, ground):
+    """What a legacy swatch comparison saw. The interesting failure is the one
+    the bead describes: the stored positions passed straight through, so the
+    row drew the positional reading of a gradient the panel draws uniformly."""
+    if strip == ground["uniform"]:
+        return ""
+    if strip is None:
+        return "no swatch at all"
+    if strip == ground["positioned"]:
+        return "the stored positions were kept: this is the positional reading"
+    return "neither the uniform nor the positional reading"
+
+
 # ---------------------------------------------------------------------------
 # Checks
 
@@ -315,26 +328,85 @@ def check_touched_global_keeps_draft(rig):
           "%r want %s" % (s1["bgAnimTheme"], a["ref"]))
 
 
+# The retained legacy gradient the checks below drive, in three readings of
+# the same three colours. The firmware's last fallback keeps the colours of
+# bgAnimCustomTheme and throws its positions away, spacing them evenly on the
+# uniform path (BgAnimThemes.cpp, bg_resolve_anim_theme step three). So the
+# positioned string and the uniform library entry are the same gradient to the
+# panel, and the positioned library entry is a different one: that is what lets
+# the swatch checks below tell a correct preview from the passthrough that
+# shipped (gm-nov3.18).
+LEGACY_COLORS = "101828,3a4048,f5f7ff"
+LEGACY_POSITIONED = "101828@0,3a4048@10,f5f7ff@255"
+LEGACY_LIBRARY = "1|Uniform|%s;2|Positioned|%s" % (LEGACY_COLORS, LEGACY_POSITIONED)
+
+
+def legacy_ground_truth(rig):
+    """The two swatches the legacy checks compare against: the same colours
+    drawn through the uniform path and through the positional one, both read
+    off the "Gradient all" row so the comparison is one widget with itself."""
+    out = {}
+    for ref, key in (("c1", "uniform"), ("c2", "positioned")):
+        if not store(rig, "legacy_ground_%s" % key, {
+                "bgAnimGradients": LEGACY_LIBRARY,
+                "bgAnimGradientRef": ref}):
+            return None
+        open_animation(rig)
+        _value, strip = global_row(rig)
+        close_animation(rig)
+        if not check(rig, "legacy_ground_%s_has_swatch" % key, strip is not None and len(set(strip)) > 1,
+                     "%r distinct colours" % (None if strip is None else len(set(strip)))):
+            return None
+        out[key] = strip
+    ok = check(rig, "legacy_ground_truths_differ", out["uniform"] != out["positioned"],
+               "the uniform and positional readings drew the same pixels, so the next checks prove nothing")
+    return out if ok else None
+
+
 def check_legacy_fallback_named_and_inert(rig):
     """Acceptance: with the pre-library custom gradient still the fallback,
-    the row names it for what it is on both readings, the picker marks
-    nothing, and opening and cancelling writes no gradient setting."""
+    the row names it for what it is on both readings, every surface that
+    follows the fallback samples the gradient the panel will actually draw,
+    the picker marks nothing, and opening and cancelling writes no gradient
+    setting."""
+    ground = legacy_ground_truth(rig)
+    if ground is None:
+        return
     if not store(rig, "legacy_setup", {
             "bgAnimGradientRef": "",
+            "bgAnimThemeMap": "",
             "bgAnimTheme": 18,
-            "bgAnimCustomTheme": "101828,3a4048,f5f7ff"}):
+            "bgAnimCustomTheme": LEGACY_POSITIONED}):
         return
     before = gradient_fields(rig)
 
     open_animation(rig)
     value, strip = global_row(rig)
     check(rig, "legacy_row_named", value == "Custom (legacy)", "%r want 'Custom (legacy)'" % value)
-    # No ref names the retained gradient, so there is nothing to sample and
-    # the row draws no ramp (CatAnimation.cpp, applyRowSwatch).
-    check(rig, "legacy_row_has_no_swatch", strip is None, strip)
-    per_anim = rig.row_value(page_with_row(rig, "Gradient"), "Gradient")
+    # No ref names the retained gradient, but the panel still draws it, so the
+    # row samples it directly (CatAnimation.cpp, settingsGlobalGradientSwatch).
+    check(rig, "legacy_row_has_swatch", strip is not None, strip)
+    check(rig, "legacy_row_swatch_is_uniform", strip == ground["uniform"],
+          legacy_swatch_detail(strip, ground))
+
+    d = page_with_row(rig, "Gradient")
+    per_anim = rig.row_value(d, "Gradient")
     check(rig, "legacy_per_anim_row_named", per_anim == "Global (Custom (legacy))",
           "%r want 'Global (Custom (legacy))'" % per_anim)
+    per_anim_strip = swatch_strip(rig, d, "Gradient")
+    check(rig, "legacy_per_anim_row_swatch_is_uniform", per_anim_strip == ground["uniform"],
+          legacy_swatch_detail(per_anim_strip, ground))
+
+    # The picker's Global entry, which only a per-animation picker offers: it
+    # says what "follow the global" would draw.
+    open_picker(rig, "Gradient")
+    dump = page_with_row(rig, "Global")
+    check(rig, "legacy_picker_global_named", rig.row_value(dump, "Global") == "Custom (legacy)",
+          rig.row_value(dump, "Global"))
+    picker_strip = swatch_strip(rig, dump, "Global")
+    check(rig, "legacy_picker_global_swatch_is_uniform", picker_strip == ground["uniform"],
+          legacy_swatch_detail(picker_strip, ground))
+    picker_cancel(rig)
 
     open_picker(rig, "Gradient all")
     marked = picker_selected_rows(rig)
@@ -344,6 +416,31 @@ def check_legacy_fallback_named_and_inert(rig):
 
     after = gradient_fields(rig)
     check(rig, "legacy_visit_writes_nothing", after == before, "%r want %r" % (after, before))
+
+
+def check_legacy_unparsable_custom_falls_back(rig):
+    """Acceptance: bgAnimTheme 18 with a custom string the firmware's parser
+    rejects is not the legacy stand-in at all. bg_resolve_theme sends an empty
+    or malformed one to built-in 0, so the row names that built-in and draws
+    its ramp, and nothing says "Custom (legacy)"."""
+    builtin_zero = THEME_NAMES[0]
+    for name, custom in (("empty", ""), ("malformed", "zzz"), ("one_stop", "101828")):
+        if not store(rig, "legacy_%s_setup" % name, {
+                "bgAnimGradientRef": "",
+                "bgAnimThemeMap": "",
+                "bgAnimTheme": 18,
+                "bgAnimCustomTheme": custom}):
+            continue
+        before = gradient_fields(rig)
+        open_animation(rig)
+        value, strip = global_row(rig)
+        check(rig, "legacy_%s_names_builtin_zero" % name, value == builtin_zero,
+              "%r want %r" % (value, builtin_zero))
+        check(rig, "legacy_%s_draws_a_ramp" % name, strip is not None and len(set(strip)) > 1,
+              "%r distinct colours" % (None if strip is None else len(set(strip))))
+        close_animation(rig)
+        after = gradient_fields(rig)
+        check(rig, "legacy_%s_visit_writes_nothing" % name, after == before, "%r want %r" % (after, before))
 
 
 def check_starting_state_restored(rig):
@@ -357,6 +454,7 @@ CHECKS = [
     ("untouched_global_follows_web_save", check_untouched_global_follows_web_save),
     ("touched_global_keeps_draft", check_touched_global_keeps_draft),
     ("legacy_fallback_named_and_inert", check_legacy_fallback_named_and_inert),
+    ("legacy_unparsable_custom_falls_back", check_legacy_unparsable_custom_falls_back),
     ("starting_state_restored", check_starting_state_restored),
 ]
 

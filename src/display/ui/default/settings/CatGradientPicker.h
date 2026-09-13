@@ -21,6 +21,7 @@
 // This header is the whole contract with CatAnimation.cpp: the picker knows
 // nothing about which setting it is editing, and the caller knows nothing
 // about how the pages are built.
+#include "GradientSwatch.h"
 #include "SettingsModel.h"
 #include "SettingsUI.h"
 
@@ -32,10 +33,14 @@
 // stored gradient fields; the picker shows them and never re-derives them.
 // settingsGlobalGradientRef returns "" while a retained pre-library custom
 // gradient is what the global draws, which is a state no ref names and no
-// picker offers (gm-nov3.7).
+// picker offers (gm-nov3.7). That is why the swatch has a reading of its own:
+// a row can draw the gradient the global falls back to even when there is no
+// ref to hand it, and false from it means there is genuinely nothing to draw
+// (gm-nov3.18).
 const settingsui::ThemeNameProvider &settingsThemeProvider();
 std::string settingsGlobalGradientLabel();
 std::string settingsGlobalGradientRef();
+bool settingsGlobalGradientSwatch(settingsui::SwatchGradient &out);
 
 // What the picker does with a choice, and how it keeps the page that opened
 // it honest while it is open. Every function pointer is called on the UI

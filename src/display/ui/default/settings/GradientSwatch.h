@@ -80,6 +80,16 @@ bool swatchFromThemeStops(const uint8_t (*stops)[3], SwatchGradient &out);
 // already has one.
 bool swatchFromWire(const char *wire, SwatchGradient &out);
 
+// The retained pre-library custom gradient (bgAnimCustomTheme) as the panel
+// draws it. Not the same as swatchFromWire on the same string: the resolver's
+// last fallback keeps the colours and throws the positions away, spacing them
+// evenly on the uniform path whatever the string carries
+// (BgAnimThemes.cpp, bg_resolve_anim_theme step three). A swatch that kept the
+// stored positions would be a picture of a gradient the machine will not draw.
+// False when the string is not one bg_parse_gradient accepts, which is the
+// case the resolver sends to built-in 0 instead.
+bool swatchFromLegacyCustom(const char *custom, SwatchGradient &out);
+
 // publishStops(): the highlight shoulder acts on the gradient's own values,
 // then brightness scales whatever shape came out, in that order. The two
 // arguments are the stored percentages (bgAnimBrightness, bgAnimHighlightKnee),

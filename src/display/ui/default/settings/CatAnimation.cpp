@@ -521,19 +521,21 @@ std::string draftRefForAnim(const CatAnimationCtx *ctx, int animId) {
 }
 
 // Paints an entry row's swatch with the ramp the panel would build for `ref`,
-// at the stored tone. An empty ref is a per-animation row on "Global", which
-// draws whatever the global draws, so it shows the global's own gradient. A
-// ref that resolves to nothing (a deleted library entry, or the retained
-// legacy custom gradient, which no ref names) leaves the swatch hidden.
+// at the stored tone. An empty ref means "whatever the global draws", which is
+// what a per-animation row on "Global" shows and what the global row itself
+// asks for; settingsGlobalGradientSwatch answers it, legacy fallback included.
+// A ref that resolves to nothing (a deleted library entry, an index from a
+// longer table) leaves the swatch hidden rather than drawing a wrong one.
 void applyRowSwatch(lv_obj_t *row, const std::string &ref) {
     if (row == nullptr) {
         return;
     }
-    const std::string effective = ref.empty() ? settingsGlobalGradientRef() : ref;
     Settings &settings = controller.getSettings();
     settingsui::SwatchGradient gradient;
-    if (effective.empty() ||
-        !settingsui::swatchResolveRef(effective.c_str(), settings.getBgAnimGradients().c_str(), gradient)) {
+    const bool resolved =
+        ref.empty() ? settingsGlobalGradientSwatch(gradient)
+                    : settingsui::swatchResolveRef(ref.c_str(), settings.getBgAnimGradients().c_str(), gradient);
+    if (!resolved) {
         settingsRowSetSwatch(row, nullptr);
         return;
     }
@@ -1026,7 +1028,10 @@ void animBuildRow(void *ctx0, int index, lv_obj_t *parent, SettingsUI &ui) {
         // legacy custom gradient is still the fallback there is no choice
         // that stands for it, and naming a built-in there would be a lie.
         settingsRowSetValue(row, globalGradientLabel(choices).c_str());
-        applyRowSwatch(row, settingsGlobalGradientRef());
+        // "" rather than the ref: the global's swatch and a per-animation
+        // row on Global are the same question, and a retained legacy custom
+        // gradient has no ref to pass (settingsGlobalGradientSwatch).
+        applyRowSwatch(row, std::string());
         break;
     }
     case 3: { // Parameters (pushes CatAnimParams.cpp's page)
@@ -1505,6 +1510,22 @@ std::string settingsGlobalGradientRef() {
         return std::string(); // no ref names the retained legacy gradient
     }
     return choices[static_cast<size_t>(globalGradientChoiceIndex(choices))].ref;
+}
+
+// The gradient behind that ref, which a row can draw even when no ref names
+// it. The retained legacy custom gradient is exactly that case: it is not a
+// built-in and not in the library, so settingsGlobalGradientRef returns "",
+// and until gm-nov3.18 every surface that asked for the global by ref drew no
+// swatch at all. It is read through swatchFromLegacyCustom rather than
+// swatchFromWire, because the resolver's last fallback drops the stored
+// positions (GradientSwatch.h says why that changes the picture).
+bool settingsGlobalGradientSwatch(settingsui::SwatchGradient &out) {
+    Settings &settings = controller.getSettings();
+    const std::string ref = settingsGlobalGradientRef();
+    if (!ref.empty()) {
+        return settingsui::swatchResolveRef(ref.c_str(), settings.getBgAnimGradients().c_str(), out);
+    }
+    return settingsui::swatchFromLegacyCustom(settings.getBgAnimCustomTheme().c_str(), out);
 }
 
 int settingsAnimCount() { return animCountFn(); }

@@ -908,9 +908,27 @@ export function effectiveRef(refs, animIdx, library, globalThemeId, globalRef, c
   return globalGradientRef(globalRef, library, globalThemeId, customTheme);
 }
 
+// The retained pre-library custom gradient as the panel actually draws it.
+// bgAnimCustomTheme may carry explicit positions, and the firmware's last
+// fallback throws them away: bg_resolve_anim_theme's step three parses the
+// colours and then spaces them evenly on the uniform path, which is different
+// arithmetic from the positional one (config/gradientRamp.js says how much).
+// So the positions are replaced here rather than passed through, or the page
+// would preview a gradient the panel will not draw, and the editor's live
+// preview would serialize those positions straight back to the device.
+//
+// Null when the string is not one the firmware's parser accepts; the fallback
+// is then built-in 0, which is what legacyBuiltin already reports.
+export function legacyCustomGradient(customTheme) {
+  const gradient = parseGradient(customTheme);
+  if (!gradient) return null;
+  const uni = uniformPositions(gradient.stops.length);
+  return { stops: gradient.stops.map((s, i) => ({ color: s.color, pos: uni[i] })) };
+}
+
 export function gradientForRef(ref, library, customTheme) {
   if (ref === BG_LEGACY_CUSTOM_REF) {
-    const gradient = parseGradient(customTheme);
+    const gradient = legacyCustomGradient(customTheme);
     // Read only: it is not in the library, so there is nothing to edit or
     // rename, and the editor must not write it anywhere.
     if (gradient) return { name: BG_LEGACY_CUSTOM_NAME, stops: gradient.stops, editable: false };

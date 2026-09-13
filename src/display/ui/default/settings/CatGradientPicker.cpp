@@ -71,10 +71,13 @@ struct PickerEntry {
     static constexpr int kLibraryGroup = -1;
     static constexpr int kGlobalEntry = -2;
     int group = kGlobalEntry;
-    // The choice whose ramp this row draws, or -1 for no swatch. Only the
-    // Global row has one: a group row stands for several gradients and a
-    // swatch of one of them would misreport the rest.
-    int swatchChoice = -1;
+    // The gradient this row draws, untoned, or an invalid one for no swatch.
+    // Only the Global row has one: a group row stands for several gradients
+    // and a swatch of one of them would misreport the rest. Held as the
+    // resolved gradient rather than as a choice index because the global can
+    // be the retained legacy custom gradient, which is in no choice list
+    // (gm-nov3.18).
+    settingsui::SwatchGradient swatch;
     bool selected = false;
 };
 
@@ -134,10 +137,9 @@ void rebuildEntries(PickerCtx *ctx) {
         e.value = settingsGlobalGradientLabel();
         e.group = PickerEntry::kGlobalEntry;
         // The global's own gradient, so the row shows what "follow the
-        // global" will actually draw. Empty while a retained legacy custom
-        // gradient is the fallback: it is not in the library and not a
-        // built-in, so no ref names it and there is nothing to sample.
-        e.swatchChoice = choiceIndexOrNone(ctx->choices, settingsGlobalGradientRef());
+        // global" will actually draw, including a retained legacy custom
+        // gradient: it is in no choice list, but it is what the panel draws.
+        settingsGlobalGradientSwatch(e.swatch);
         e.selected = ctx->currentRef.empty();
         ctx->entries.push_back(std::move(e));
     }
@@ -279,8 +281,12 @@ void pickerBuildRow(void *ctx0, int index, lv_obj_t *parent, SettingsUI &ui) {
         row, [](lv_event_t *e) { delete static_cast<RowCtx *>(lv_event_get_user_data(e)); }, LV_EVENT_DELETE, rc);
     settingsRowSetValue(row, entry.value.c_str());
     settingsRowSetSelected(row, entry.selected);
-    uint16_t ramp[kSettingsRowSwatchSamples];
-    if (rampForChoice(ctx, entry.swatchChoice, ramp)) {
+    if (entry.swatch.valid()) {
+        settingsui::SwatchGradient gradient = entry.swatch;
+        Settings &settings = controller.getSettings();
+        settingsui::swatchApplyTone(gradient, settings.getBgAnimBrightness(), settings.getBgAnimHighlightKnee());
+        uint16_t ramp[kSettingsRowSwatchSamples];
+        settingsui::swatchBuildRamp565(gradient, ramp, kSettingsRowSwatchSamples);
         settingsRowSetSwatch(row, ramp);
     }
 }
