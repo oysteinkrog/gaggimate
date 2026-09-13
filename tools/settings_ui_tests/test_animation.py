@@ -21,6 +21,7 @@ memory figures) is not run here; see "Not verified" at the bottom of this
 file for the exact list and the device-side commands that check them.
 """
 import argparse
+import json
 import os
 import re
 import sys
@@ -473,14 +474,25 @@ def picker_cancel(rig):
 
 def picker_selected_rows(rig):
     """The picker rows whose marker dot is showing, across all pages of the
-    page on top."""
+    page on top, named in page order.
+
+    Walked by position rather than looked up by name (gm-nov3.33). Every tag
+    on a page is built from the row's name, so find_tag handed back the first
+    row of a repeated name whichever row was asked for: with two entries both
+    called "Custom" and the second one selected, this reported no marked row
+    at all, and reported the first one as marked when the second was. Rig
+    keeps rows_on_page and row_slots in the same order, so zipping them names
+    the row a slot belongs to.
+
+    What comes back is still names, so on a repeated name it says one row of
+    that name is marked and not which one. A check that needs that reads the
+    slots directly, the way check_gradient_picker_repeated_names does."""
     pages = int(rig.settingsui_state().get("pages", 1))
     marked = []
     for page in range(pages):
         dump = goto_page(rig, page)
-        for name in rig.rows_on_page(dump):
-            obj = rig.find_tag(dump, name, "selected")
-            if obj is not None and not obj.get("h"):
+        for name, slot in zip(rig.rows_on_page(dump), rig.row_slots(dump)):
+            if slot_marked(rig, dump, slot):
                 marked.append(name)
     return marked
 
@@ -503,6 +515,138 @@ def swatch_strip(rig, dump, row, data=None):
         _w, _h, data = rig.fb(step=1)
     y = (obj["y1"] + obj["y2"]) // 2
     return [rgb565_pixel(data, x, y) for x in range(obj["x1"], obj["x2"] + 1)]
+
+
+def hex_rgb(s):
+    n = int(s, 16)
+    return ((n >> 16) & 0xFF, (n >> 8) & 0xFF, n & 0xFF)
+
+
+def swatch_matches_stops(strip, stops, tol=20):
+    """Whether a swatch strip is the ramp `stops` describes, judged at its
+    two ends. Returns (ok, detail).
+
+    The ends are the whole oracle on purpose. A swatch is drawn by
+    GradientSwatch.cpp, which is a separate transcription of the palette
+    arithmetic and is held to the real one on the host by
+    tools/animbench/swatch_parity.cpp; re-deriving the interior here would
+    be a third transcription with nothing checking it. What this has to
+    tell apart is which entry a row drew, and the ends do that. The
+    tolerance covers RGB565 quantisation (8 per channel at the ends) and
+    the ramp not sampling its last stop exactly; measured on the simulator,
+    "ff0000,ff2000" reads (255,0,0) to (255,28,0) against a nominal
+    (255,32,0).
+
+    A stop's @position does not change either end: swatchSampleRgb clamps,
+    so the pixel at x0 is the first stop's colour however far in that stop
+    sits, and the pixel at x1 is the last stop's. That is what lets the
+    fixture's "Wide Ends" entry be read this way.
+
+    Every check that asks which gradient a row drew goes through this
+    (gm-nov3.33). Counting distinct colours does not: all twelve entries of
+    the fixture library draw between 46 and 80 of them, so a row drawing
+    any other entry passed a count."""
+    want_first = hex_rgb(stops.split(",")[0].split("@")[0])
+    want_last = hex_rgb(stops.split(",")[-1].split("@")[0])
+    got_first, got_last = tuple(strip[0]), tuple(strip[-1])
+    ok = (max(abs(a - b) for a, b in zip(got_first, want_first)) <= tol
+          and max(abs(a - b) for a, b in zip(got_last, want_last)) <= tol)
+    return ok, "%r..%r against %s (%r..%r)" % (got_first, got_last, stops, want_first, want_last)
+
+
+def check_swatch(rig, name, strip, stops):
+    """One swatch identity check: the strip is there and it is the ramp
+    `stops` describes. A missing swatch fails with that as the detail rather
+    than raising, because a ref the resolver refuses is drawn as no canvas at
+    all (gm-nov3.15) and that is a result worth reporting, not a crash."""
+    if strip is None:
+        check(rig, name, False, "no swatch on the row")
+        return False
+    ok, detail = swatch_matches_stops(strip, stops)
+    check(rig, name, ok, detail)
+    return ok
+
+
+_BUILTIN_STOPS = []
+
+
+def builtin_stops(index):
+    """The stop string of one built-in gradient, in the form a stored
+    gradient carries it.
+
+    Read from data/gradients.json, which is the one place the built-ins are
+    written: scripts/gen_gradients.py turns that file into the firmware
+    table, the web mirror and gradients_gen.py beside this script, so a
+    reading taken from the source cannot drift from what the display draws.
+    gradients_gen.py carries the names and the categories but not the stops,
+    and it is generated, so this reads the source rather than asking for a
+    fourth generated table."""
+    if not _BUILTIN_STOPS:
+        with open(os.path.join(REPO_ROOT, "data", "gradients.json"), encoding="utf-8") as fh:
+            doc = json.load(fh)
+        _BUILTIN_STOPS.extend(",".join(s.lstrip("#") for s in g["stops"]) for g in doc["gradients"])
+    return _BUILTIN_STOPS[index] if 0 <= index < len(_BUILTIN_STOPS) else None
+
+
+def stops_for_ref(settings, ref):
+    """The stops the display draws for one ref, or None when the ref names
+    nothing that exists. The same three-way reading gradient_name_for_ref
+    does, returning the gradient instead of the name."""
+    ref = str(ref or "")
+    if ref == "":
+        return None
+    if ref.startswith("c"):
+        if not ref[1:].isdigit():
+            return None
+        wanted = int(ref[1:])
+        for entry_id, _name, gradient in library_entries(settings.get("bgAnimGradients", "")):
+            if entry_id == wanted:
+                return gradient
+        return None
+    if not ref.isdigit():
+        return None
+    return builtin_stops(int(ref))
+
+
+def global_stops(settings):
+    """The stops behind expected_global_gradient_text: the global ref when it
+    resolves, else what the legacy pair resolves to, which is either a
+    built-in or the retained custom gradient."""
+    stops = stops_for_ref(settings, settings.get("bgAnimGradientRef", ""))
+    if stops is not None:
+        return stops
+    custom = str(settings.get("bgAnimCustomTheme", ""))
+    builtin = legacy_builtin(int(settings["bgAnimTheme"]), custom_theme_valid(custom))
+    if builtin < 0:
+        # bg_parse_gradient takes commas or spaces; swatch_matches_stops
+        # splits on commas only, so the separator is normalised here.
+        return ",".join(p.lstrip("#") for p in re.split(r"[\s,]+", custom) if p)
+    return builtin_stops(builtin) or builtin_stops(0)
+
+
+def toned_stops(settings, stops):
+    """`stops` after the tone the swatch is drawn with. Python mirror of
+    GradientSwatch.cpp's swatchApplyTone, including the two integer
+    conversions DefaultUI::updateState does on the way in.
+
+    The stored tone is 100/100 by default, which is the identity, and no
+    scenario here changes it; this exists so a device whose owner has moved
+    either slider is read correctly rather than failing as if it drew the
+    wrong gradient."""
+    bright256 = int(settings.get("bgAnimBrightness", 100)) * 256 // 100
+    knee = int(settings.get("bgAnimHighlightKnee", 100)) * 255 // 100
+    bright256 = max(0, min(256, bright256))
+    knee = max(0, min(255, knee))
+    out = []
+    for part in str(stops or "").split(","):
+        colour = part.split("@")[0]
+        chans = []
+        for v in hex_rgb(colour):
+            if v > knee:
+                v = knee + ((v - knee) >> 2)
+            chans.append(max(0, min(255, (v * bright256) >> 8)))
+        out.append("%02x%02x%02x" % tuple(chans))
+    return ",".join(out)
 
 
 # ---------------------------------------------------------------------------
@@ -909,9 +1053,11 @@ def check_gradient_picker_navigation(rig):
             rig.log("picker_group_count_mismatch", group=cat, got=rig.row_value(dump, cat), want=want)
     check(rig, "picker_group_counts", counts_ok)
 
+    # The Global row draws the global gradient, so its swatch is read against
+    # the stops that gradient carries. Counting distinct colours here said
+    # only that some ramp was drawn (gm-nov3.33).
     strip = swatch_strip(rig, goto_page(rig, 0), "Global")
-    check(rig, "picker_row_draws_a_ramp", strip is not None and len(set(strip)) > 4,
-          "distinct colours across the swatch: %r" % (None if strip is None else len(set(strip))))
+    check_swatch(rig, "picker_global_row_draws_the_global_ramp", strip, toned_stops(s0, global_stops(s0)))
 
     # A built-in, from a category that is not the first row on the page.
     cat = category_for_ref(ref0, "Fire and Heat")
@@ -1153,8 +1299,8 @@ def check_gradient_picker_high_library_ids(rig):
     if not landed:
         restore_fields_exactly(rig, "high_id_library_restored", {"bgAnimGradients": lib0})
         return
-    high_id, high_name, _hg = high[0]
-    top_id, top_name, _tg = high[1]
+    high_id, high_name, high_stops = high[0]
+    top_id, top_name, top_stops = high[1]
 
     # 1. The per-animation row. The swatch is read inside the picker as well
     #    as on the row, because a refused ref showed there first: the entry
@@ -1166,8 +1312,8 @@ def check_gradient_picker_high_library_ids(rig):
     rig.wait_until(lambda: depth(rig) == 3, timeout=5)
     d = page_with_row(rig, high_name)
     picker_strip = swatch_strip(rig, d, high_name)
-    check(rig, "high_id_picker_row_draws_a_ramp", picker_strip is not None and len(set(picker_strip)) > 4,
-          "distinct colours across the swatch: %r" % (None if picker_strip is None else len(set(picker_strip))))
+    check_swatch(rig, "high_id_picker_row_draws_its_own_ramp", picker_strip,
+                 toned_stops(s0, high_stops))
     picker_tap(rig, high_name)
     # The pick stays on the page (gm-nov3.31), so the marker is what says it
     # landed; the two chevrons are what return to the Animation page.
@@ -1202,8 +1348,7 @@ def check_gradient_picker_high_library_ids(rig):
     check(rig, "high_id_all_row_text", rig.row_value(d, "Gradient all") == top_name,
           rig.row_value(d, "Gradient all"))
     all_strip = swatch_strip(rig, d, "Gradient all")
-    check(rig, "high_id_all_row_draws_a_ramp", all_strip is not None and len(set(all_strip)) > 4,
-          "distinct colours across the swatch: %r" % (None if all_strip is None else len(set(all_strip))))
+    check_swatch(rig, "high_id_all_row_draws_the_chosen_ramp", all_strip, toned_stops(s0, top_stops))
 
     # 3. Standby grad, which edits the standby animation's own slot. The
     #    standby animation is set from outside the visit for the reason the
@@ -1227,8 +1372,8 @@ def check_gradient_picker_high_library_ids(rig):
         check(rig, "high_id_standby_row_text", rig.row_value(d, "Standby grad") == top_name,
               rig.row_value(d, "Standby grad"))
         standby_strip = swatch_strip(rig, d, "Standby grad")
-        check(rig, "high_id_standby_row_draws_a_ramp", standby_strip is not None and len(set(standby_strip)) > 4,
-              "distinct colours across the swatch: %r" % (None if standby_strip is None else len(set(standby_strip))))
+        check_swatch(rig, "high_id_standby_row_draws_the_chosen_ramp", standby_strip,
+                     toned_stops(s0, top_stops))
         close_animation(rig)
 
     restore_fields_exactly(rig, "high_id_restored", {
@@ -1321,33 +1466,6 @@ def repeated_names_library():
     packed = ";".join("%d|%s|%s" % (i + 1, name, s)
                       for i, (name, s) in enumerate(zip(REPEATED_NAMES, stops)))
     return packed, {i + 1: s for i, s in enumerate(stops)}
-
-
-def hex_rgb(s):
-    n = int(s, 16)
-    return ((n >> 16) & 0xFF, (n >> 8) & 0xFF, n & 0xFF)
-
-
-def swatch_matches_stops(strip, stops, tol=20):
-    """Whether a swatch strip is the ramp `stops` describes, judged at its
-    two ends. Returns (ok, detail).
-
-    The ends are the whole oracle on purpose. A swatch is drawn by
-    GradientSwatch.cpp, which is a separate transcription of the palette
-    arithmetic and is held to the real one on the host by
-    tools/animbench/swatch_parity.cpp; re-deriving the interior here would
-    be a third transcription with nothing checking it. What this has to
-    tell apart is which entry a row drew, and the ends do that. The
-    tolerance covers RGB565 quantisation (8 per channel at the ends) and
-    the ramp not sampling its last stop exactly; measured on the simulator,
-    "ff0000,ff2000" reads (255,0,0) to (255,28,0) against a nominal
-    (255,32,0)."""
-    want_first = hex_rgb(stops.split(",")[0].split("@")[0])
-    want_last = hex_rgb(stops.split(",")[-1].split("@")[0])
-    got_first, got_last = tuple(strip[0]), tuple(strip[-1])
-    ok = (max(abs(a - b) for a, b in zip(got_first, want_first)) <= tol
-          and max(abs(a - b) for a, b in zip(got_last, want_last)) <= tol)
-    return ok, "%r..%r against %s (%r..%r)" % (got_first, got_last, stops, want_first, want_last)
 
 
 def slot_marked(rig, dump, slot):
@@ -2342,12 +2460,15 @@ if __name__ == "__main__":
 #   UI, so a future change that starts rejecting these POSTs fails the run
 #   instead of quietly passing it.
 # - How a swatch looks next to the panel. The picker checks read the
-#   framebuffer only far enough to prove a row draws a ramp and not a flat
-#   block; that the ramp is the one the animation would paint is proved on
-#   the host instead, by tools/animbench/swatch_parity.cpp, which compares
-#   all 256 entries against the production palette code for every built-in
-#   and for library strings with 2 to 16 stops, repeated positions and flat
-#   endpoint runs, at seven tone settings.
+#   framebuffer far enough to prove which gradient a row drew: the strip's
+#   two ends against that row's own stops (swatch_matches_stops, gm-nov3.28,
+#   pointed at the four remaining count-only checks by gm-nov3.33). What
+#   they do not establish is that the interior between those ends is the
+#   ramp the animation would paint. That is proved on the host instead, by
+#   tools/animbench/swatch_parity.cpp, which compares all 256 entries
+#   against the production palette code for every built-in and for library
+#   strings with 2 to 16 stops, repeated positions and flat endpoint runs,
+#   at seven tone settings.
 # - Picker frame rates. Whether a picker page costs the animation more than
 #   an ordinary settings page is a device question (the simulator has no
 #   renderer and no /api/debug/anim). Command for the leader: the runner's
