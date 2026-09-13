@@ -1024,9 +1024,14 @@ def check_gradient_picker_navigation(rig):
 
     open_animation(rig)
     d = page_with_row(rig, "Gradient")
-    check(rig, "gradient_row_has_no_arrows",
-          rig.find_tag(d, "Gradient", "next") is None and rig.find_tag(d, "Gradient", "prev") is None,
-          "the row must be a whole-row target, not arrows under a cover")
+    # gm-nov3.3 removed the arrows and this asserted their absence. gm-nov3.32
+    # put them back beside the whole-row target, so the row now carries three
+    # targets. What the arrows do with them is checked in test_gradientdraft.py
+    # (the picker's order, the wrap at both ends, the marker after a step, the
+    # hold repeat and the registry clamp); this only says they are on the row.
+    check(rig, "gradient_row_has_both_arrows",
+          rig.find_tag(d, "Gradient", "next") is not None and rig.find_tag(d, "Gradient", "prev") is not None,
+          "the row carries a prev and a next arrow beside the whole-row target")
 
     open_picker(rig, "Gradient")
     st = rig.settingsui_state()
