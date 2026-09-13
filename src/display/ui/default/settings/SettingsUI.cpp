@@ -348,7 +348,7 @@ void SettingsUI::buildTile(lv_obj_t *parent, int index, const SettingsCategoryDe
     // there passes for five.
     static constexpr int kRadius = 145;
     static constexpr int kSize = 96;
-    // The 40x40 source icons drawn at 56x56 (256 is 1:1). LV_IMG_SIZE_MODE_REAL
+    // The 40x40 source icons drawn at 55x55 (256 is 1:1). LV_IMG_SIZE_MODE_REAL
     // is what makes the flex layout see the drawn size rather than the source
     // size, so the caption still sits under the icon.
     static constexpr uint16_t kIconZoom = 320;
@@ -368,7 +368,11 @@ void SettingsUI::buildTile(lv_obj_t *parent, int index, const SettingsCategoryDe
     const int y = static_cast<int>(lround(-cos(angleRad) * kRadius));
     lv_obj_align(tileObj, LV_ALIGN_CENTER, x, y);
     lv_obj_clear_flag(tileObj, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(tileObj, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_EVENT_BUBBLE);
+    // The caption is wider than the tile (see below) and LVGL clips children
+    // to the parent's box unless told otherwise, which took the first letter
+    // off "Temperatures". The hit box stays 96x96, which is what the geometry
+    // audit measures; only the drawn caption reaches past it.
+    lv_obj_add_flag(tileObj, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_EVENT_BUBBLE | LV_OBJ_FLAG_OVERFLOW_VISIBLE);
     lv_obj_set_style_bg_opa(tileObj, LV_OPA_TRANSP, LV_PART_MAIN);
     lv_obj_set_flex_flow(tileObj, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_flex_align(tileObj, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
@@ -386,10 +390,19 @@ void SettingsUI::buildTile(lv_obj_t *parent, int index, const SettingsCategoryDe
 
     lv_obj_t *caption = lv_label_create(tileObj);
     lv_label_set_text(caption, def->title);
-    lv_obj_set_width(caption, kSize - 4);
+    // Wider than the tile on purpose. At 92 px "Temperatures" does not fit on
+    // a line of its own, and LVGL breaks a word that cannot fit rather than
+    // moving it to the next line, so the top caption read "Temperatur / es &
+    // timing". The caption box reaches 11 px past the tile on each side; the
+    // text is centred, so a short caption draws nowhere near those edges.
+    // Measured on the five-tile ring: no two caption boxes touch and the
+    // closest pair is 64 px apart, which is Temperatures against Display.
+    // Two lines at 16 px is also what fits inside the 96 px tile under the
+    // 55x55 icon, which is why the font went back up from 14 px.
+    lv_obj_set_width(caption, kSize + 22);
     lv_label_set_long_mode(caption, LV_LABEL_LONG_DOT);
     lv_obj_set_style_text_align(caption, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
-    lv_obj_set_style_text_font(caption, &lv_font_montserrat_14, LV_PART_MAIN);
+    lv_obj_set_style_text_font(caption, &lv_font_montserrat_16, LV_PART_MAIN);
     lv_obj_set_style_text_color(caption, fg, LV_PART_MAIN);
 
     tileClickCtx[index] = {this, index};

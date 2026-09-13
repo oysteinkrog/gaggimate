@@ -804,10 +804,18 @@ the design cannot show and what the runs measured.
   tiles is 39 px apart and the furthest corner is 212.8 px from the centre.
   The tile icons are the 40x40 sources drawn at 55x55 (`kIconZoom` 320, and
   `LV_IMG_SIZE_MODE_REAL` plus `lv_obj_refresh_self_size` is what makes the
-  flex layout reserve the drawn size rather than the source size), which cost
-  the caption its 16 px font: at 16 px "Temperatures & timing" wraps to three
-  lines and 40 px was already all the icon that tile had room for, so tile
-  captions are 14 px. Every tappable target except the exit chevron needs an
+  flex layout reserve the drawn size rather than the source size). **A tile
+  caption is wider than its tile and the tile lets it overflow.** At the
+  tile's own 92 px, "Temperatures" does not fit on a line of its own, and
+  LVGL breaks a word that cannot fit rather than moving it to the next line,
+  so the top caption read "Temperatur / es & timing"; at 118 px it wraps
+  after the word and fits two lines of 16 px under the icon. The caption box
+  reaches 11 px past the tile on each side, which needs
+  `LV_OBJ_FLAG_OVERFLOW_VISIBLE` on the tile (LVGL clips children to the
+  parent box, and without the flag the leading "T" was cut off). The hit box
+  stays 96x96, so the geometry audit is unaffected, and on the five-tile ring
+  no two caption boxes touch, the closest pair being Temperatures against
+  Display at 64 px. Every tappable target except the exit chevron needs an
   effective hit rectangle of at least 56x56 px, no overlap with another on
   the same page, and 12 px of clearance from the panel's edge circle. The
   chevron is exempt from the size and edge rules and its ext click pad is
