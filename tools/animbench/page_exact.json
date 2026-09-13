@@ -14,6 +14,26 @@
  "default": 0,
  "recorded": "2026-09-12",
  "bead": "gm-pciz",
+ "accepted": {
+  "date": "2026-09-13",
+  "by": "owner",
+  "what": [
+   "Both remaining entries below are accepted as permanent debt. The owner",
+   "was shown what each one costs to see, what closing it would cost, and",
+   "two alternatives, and chose to keep both allowances and keep the check",
+   "independent of the page.",
+   "Rejected alternative one: fix ripples and accept only cube. Rejected on",
+   "the measured cost in the ripples note.",
+   "Rejected alternative two: edit the page entries so both read exact.",
+   "Rejected because the page is an approved design held apart from the",
+   "firmware, and that separation is what caught Mandala drawing rings",
+   "instead of petals, Ember shipping darker than its design, Nebula's",
+   "speed depending on the frame rate, and Orbits drawing four rings.",
+   "This acceptance changes none of the standing rules above. A new port is",
+   "still held to zero, an allowance is still never raised to pass a check,",
+   "and either of these two is lowered the moment someone closes it."
+  ]
+ },
  "animations": {
   "ripples": 18369,
   "cube": 33
