@@ -1,0 +1,89 @@
+{
+  "host": "192.168.1.121",
+  "fw": "v1.9.8-sleep9-658-g6a2e910c",
+  "built": "2026-09-13T12:05:55Z",
+  "mode": "ramp",
+  "step": 2,
+  "passes": [
+    {
+      "brightnessPct": 100,
+      "kneePct": 100,
+      "brightness256": 256,
+      "knee": 255,
+      "gain256": 256,
+      "stops": "07070c,22232a,444654,6a6c7e,848595,d0d1d9",
+      "uniform": true,
+      "themeGen": 122,
+      "xoff": 0,
+      "y0": 200,
+      "y1": 240,
+      "map": "index = ((x + xoff) * 255) / (w - 1), clamped to 255, every row of [y0,y1) alike",
+      "results": [
+        {
+          "buffer": 0,
+          "compared": 4800,
+          "rows": 20,
+          "fb_rows": 240,
+          "indices": 240,
+          "index_max": 254,
+          "mismatches": 0,
+          "first": []
+        }
+      ]
+    },
+    {
+      "brightnessPct": 100,
+      "kneePct": 100,
+      "brightness256": 256,
+      "knee": 255,
+      "gain256": 256,
+      "stops": "07070c,22232a,444654,6a6c7e,848595,d0d1d9",
+      "uniform": true,
+      "themeGen": 122,
+      "xoff": 1,
+      "y0": 200,
+      "y1": 240,
+      "map": "index = ((x + xoff) * 255) / (w - 1), clamped to 255, every row of [y0,y1) alike",
+      "results": [
+        {
+          "buffer": 0,
+          "compared": 4800,
+          "rows": 20,
+          "fb_rows": 240,
+          "indices": 240,
+          "index_max": 255,
+          "mismatches": 0,
+          "first": []
+        }
+      ]
+    }
+  ],
+  "after": {
+    "fw": "v1.9.8-sleep9-658-g6a2e910c",
+    "built": "2026-09-13T12:05:55Z",
+    "armed": false,
+    "mode": "off",
+    "frames": 0,
+    "y0": 200,
+    "y1": 240,
+    "x0": 0,
+    "x1": 480,
+    "w": 480,
+    "h": 480,
+    "xoff": 0,
+    "map": "index = ((x + xoff) * 255) / (w - 1), clamped to 255, every row of [y0,y1) alike",
+    "gain256": 256,
+    "brightness256": 256,
+    "knee": 255,
+    "brightnessPct": 100,
+    "kneePct": 100,
+    "toneOverride": false,
+    "stopCount": 6,
+    "uniform": true,
+    "themeGen": 122,
+    "stops": "07070c,22232a,444654,6a6c7e,848595,d0d1d9"
+  },
+  "selftest": [],
+  "mismatches": 0,
+  "compared": 9600
+}
