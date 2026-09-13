@@ -330,21 +330,40 @@ void SettingsUI::buildTilePage() {
 }
 
 void SettingsUI::buildTile(lv_obj_t *parent, int index, const SettingsCategoryDef *def, lv_color_t fg) {
-    // Six slots around the panel, avoiding the status icons at the top and
-    // the exit chevron's clipped hit box at the bottom: hand-verified against
-    // the 96x96/12px-edge/56x56-arrow rules in the epic's shared contract
-    // (kTileRadius=145, kSize=96 keeps every corner inside radius 228 with
-    // 15-30 px to spare, and every pair of adjacent tiles at least a few px
-    // apart). Every firmware build uses the first five; the simulator's
-    // Fixture tile takes the sixth.
-    static constexpr int16_t kAngles[6] = {45, 90, 135, 225, 270, 315};
+    // One ring, evenly spaced, symmetric about the vertical axis, with the
+    // outermost pair at 135 degrees so the bottom keeps a 90 degree gap for
+    // the exit chevron's clipped hit box. The step is 270/(N-1) degrees and
+    // the index order runs clockwise from the top, so five tiles step 67.5
+    // and put one at the top, six step 54 and leave the top clear. There is
+    // no arrangement of five that is both even and clear of the top, because
+    // an odd count symmetric about the axis must put one tile on it and the
+    // bottom is taken; the owner chose the top on 2026-09-13.
+    //
+    // Measured on the simulator against the 96x96/12px-edge rules in the
+    // epic's shared contract. Five tiles: the top tile clears the status
+    // icons (y 20 to 39) by 8 px, the two lower tiles clear the chevron's
+    // 34 px click pad by 5 px, the nearest pair of tiles is 38 px apart and
+    // the furthest corner is 213 px from the centre against the 228 px edge
+    // rule. Six tiles are a tighter packing of the same ring, so what passes
+    // there passes for five.
     static constexpr int kRadius = 145;
     static constexpr int kSize = 96;
+    // The 40x40 source icons drawn at 56x56 (256 is 1:1). LV_IMG_SIZE_MODE_REAL
+    // is what makes the flex layout see the drawn size rather than the source
+    // size, so the caption still sits under the icon.
+    static constexpr uint16_t kIconZoom = 320;
 
     lv_obj_t *tileObj = lv_obj_create(parent);
     lv_obj_remove_style_all(tileObj);
     lv_obj_set_size(tileObj, kSize, kSize);
-    const double angleRad = kAngles[index % 6] * M_PI / 180.0;
+    // (N+1)/2 positions run clockwise from the top and the rest run back up
+    // the other side; the half step for an even count is what keeps the top
+    // clear when there is no tile to put on the axis.
+    constexpr int kN = kSettingsCategoryCount;
+    constexpr double kStep = 270.0 / (kN - 1);
+    constexpr double kHalfStep = (kN % 2 == 1) ? 0.0 : 0.5;
+    const double slot = (index < (kN + 1) / 2) ? index + kHalfStep : index + kHalfStep - kN;
+    const double angleRad = slot * kStep * M_PI / 180.0;
     const int x = static_cast<int>(lround(sin(angleRad) * kRadius));
     const int y = static_cast<int>(lround(-cos(angleRad) * kRadius));
     lv_obj_align(tileObj, LV_ALIGN_CENTER, x, y);
@@ -356,6 +375,12 @@ void SettingsUI::buildTile(lv_obj_t *parent, int index, const SettingsCategoryDe
 
     lv_obj_t *icon = lv_img_create(tileObj);
     lv_img_set_src(icon, def->icon);
+    lv_img_set_size_mode(icon, LV_IMG_SIZE_MODE_REAL);
+    lv_img_set_zoom(icon, kIconZoom);
+    // Neither setter refreshes the object's own size, and the icon is sized by
+    // its content, so without this the flex layout goes on reserving 40x40 and
+    // the drawn image spills over the caption.
+    lv_obj_refresh_self_size(icon);
     lv_obj_set_style_img_recolor(icon, fg, LV_PART_MAIN);
     lv_obj_set_style_img_recolor_opa(icon, LV_OPA_COVER, LV_PART_MAIN);
 
@@ -364,7 +389,7 @@ void SettingsUI::buildTile(lv_obj_t *parent, int index, const SettingsCategoryDe
     lv_obj_set_width(caption, kSize - 4);
     lv_label_set_long_mode(caption, LV_LABEL_LONG_DOT);
     lv_obj_set_style_text_align(caption, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
-    lv_obj_set_style_text_font(caption, &lv_font_montserrat_16, LV_PART_MAIN);
+    lv_obj_set_style_text_font(caption, &lv_font_montserrat_14, LV_PART_MAIN);
     lv_obj_set_style_text_color(caption, fg, LV_PART_MAIN);
 
     tileClickCtx[index] = {this, index};

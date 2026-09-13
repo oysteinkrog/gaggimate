@@ -790,7 +790,24 @@ the design cannot show and what the runs measured.
   left. Confirm rows act after a 2 s hold (`kSettingsRowConfirmHoldMs`).
 - **Geometry: 320x56 rows, five per page** (`SettingsUI::kRowW`, `kRowH`,
   `kRowsPerPage`), 96x96 tiles on a 145 px ring (`SettingsUI.cpp`,
-  `buildTile`). Every tappable target except the exit chevron needs an
+  `buildTile`). The tiles are evenly spaced and symmetric about the vertical
+  axis, with the outermost pair at 135 degrees so the bottom keeps a 90 degree
+  gap for the exit chevron: the step is 270/(N-1) degrees and the index order
+  runs clockwise from the top, so the five real categories step 67.5 and put
+  Temperatures at the top, and the simulator's six step 54 and leave the top
+  clear. There is no arrangement of five that is both even and clear of the
+  top, because an odd count symmetric about the axis must put one tile on the
+  axis and the bottom is taken; the owner chose the top on 2026-09-13. What
+  the five-tile ring measures (simulator, tiles temporarily forced to five):
+  the top tile clears the status icons (y 20 to 39) by 8 px, the two lower
+  tiles clear the chevron's 34 px click pad by 6 px, the closest pair of
+  tiles is 39 px apart and the furthest corner is 212.8 px from the centre.
+  The tile icons are the 40x40 sources drawn at 55x55 (`kIconZoom` 320, and
+  `LV_IMG_SIZE_MODE_REAL` plus `lv_obj_refresh_self_size` is what makes the
+  flex layout reserve the drawn size rather than the source size), which cost
+  the caption its 16 px font: at 16 px "Temperatures & timing" wraps to three
+  lines and 40 px was already all the icon that tile had room for, so tile
+  captions are 14 px. Every tappable target except the exit chevron needs an
   effective hit rectangle of at least 56x56 px, no overlap with another on
   the same page, and 12 px of clearance from the panel's edge circle. The
   chevron is exempt from the size and edge rules and its ext click pad is
