@@ -88,10 +88,75 @@ GM_ANIM_IRAM __attribute__((noinline)) void crescentWeightsAsm(uint16_t *out, in
 // in [0,256]: bg in [-304,609], body in [846,4878], the Q4 blend in [-304,4878].
 // Thus idx in [-19,304], covered by palette[-32..319]. No signed saturation
 // occurs. Padding repeats palette[3] below 3 and palette[255] above 255.
+/* Matches AnimCrescent.cpp's padded palette. */
+#define PAL_PAD 32
+
 GM_ANIM_IRAM __attribute__((noinline)) void crescentShadeAsm(uint16_t *out, const int32_t *col,
                                                              const uint16_t *weight, const int16_t *rowRad,
-                                                             const uint16_t *pal, int bgBase, int body,
+                                                             const uint32_t *pal, int bgBase, int body,
                                                              int n) {
+    if (((uintptr_t)out & 15u) == 0) {
+        // EE.LDXQ.32 reads eight palette entries with eight indexed loads and
+        // one unzip, where the scalar gather below needs eleven instructions
+        // for two pixels. The palette is 32-bit because the instruction scales
+        // its index by four. Biasing both blend constants by 512 turns the
+        // arithmetic shift by four into the padded palette's index directly:
+        // floor((v+512)/16) is floor(v/16)+32, and 32 is PAL_PAD.
+        const uint32_t coeffs[5] = {20u, 78u, (uint32_t)(bgBase + 512), (uint32_t)(body + 512), 1u};
+        const uint32_t *coeff = coeffs;
+        // The +512 bias makes the index count from the padded start, so the
+        // gather's base is the storage base, not the zero entry.
+        const uint32_t *palBase = pal - PAL_PAD;
+        const int vblocks = n >> 3;
+        uint16_t *vout = out;
+        const int32_t *vcol = col;
+        const uint16_t *vweight = weight;
+        asm volatile("ee.vldbc.16.ip q3, %[coeff], 4\n"
+                     "ee.vldbc.16.ip q4, %[coeff], 4\n"
+                     "ee.vldbc.16.ip q5, %[coeff], 4\n"
+                     "ee.vldbc.16.ip q6, %[coeff], 4\n"
+                     "ee.vldbc.16.ip q2, %[coeff], 0\n"
+                     "loopnez %[n], 1f\n"
+                     "ssai 8\n"
+                     "ee.vld.128.ip q0, %[col], 16\n"
+                     "ee.vld.128.ip q1, %[col], 16\n"
+                     "ee.vld.128.ip q7, %[weight], 16\n"
+                     "ee.vunzip.16 q0, q1\n"
+                     "ee.vld.128.ip q1, %[rr], 0\n"
+                     "ee.vadds.s16 q0, q0, q1\n"
+                     "ee.vmul.s16 q1, q0, q3\n"
+                     "ee.vmul.s16 q0, q0, q4\n"
+                     "ee.vsubs.s16 q1, q5, q1\n"
+                     "ee.vadds.s16 q0, q0, q6\n"
+                     "ee.vsubs.s16 q0, q0, q1\n"
+                     "ee.vmul.s16 q0, q0, q7\n"
+                     "ee.vadds.s16 q0, q0, q1\n"
+                     "ssai 4\n"
+                     "ee.vmul.s16 q0, q0, q2\n"
+                     "ee.ldxq.32 q1, q0, %[pal], 0, 0\n"
+                     "ee.ldxq.32 q1, q0, %[pal], 1, 1\n"
+                     "ee.ldxq.32 q1, q0, %[pal], 2, 2\n"
+                     "ee.ldxq.32 q1, q0, %[pal], 3, 3\n"
+                     "ee.ldxq.32 q7, q0, %[pal], 0, 4\n"
+                     "ee.ldxq.32 q7, q0, %[pal], 1, 5\n"
+                     "ee.ldxq.32 q7, q0, %[pal], 2, 6\n"
+                     "ee.ldxq.32 q7, q0, %[pal], 3, 7\n"
+                     "ee.vunzip.16 q1, q7\n"
+                     "ee.vst.128.ip q1, %[out], 16\n"
+                     "1:\n"
+                     : [out] "+&r"(vout), [col] "+&r"(vcol), [weight] "+&r"(vweight),
+                       [coeff] "+&r"(coeff)
+                     : [rr] "r"(rowRad), [pal] "r"(palBase), [n] "r"(vblocks)
+                     : "memory");
+        const int done = vblocks * 8;
+        for (int x = done; x < n; ++x) {
+            const int rad = col[x] + rowRad[x & 7];
+            const int bg = bgBase - ((rad * 20) >> 8);
+            const int lit = body + ((rad * 78) >> 8);
+            out[x] = (uint16_t)pal[(bg + (((lit - bg) * weight[x]) >> 8)) >> 4];
+        }
+        return;
+    }
     const uint32_t coeffs[4] = {20u, 78u, (uint32_t)bgBase, (uint32_t)body};
     const uint32_t *coeff = coeffs;
     const int blocks = n >> 3;
@@ -121,10 +186,10 @@ GM_ANIM_IRAM __attribute__((noinline)) void crescentShadeAsm(uint16_t *out, cons
                  "sext %[low], %[high], 15\n"
                  "srai %[high], %[high], 20\n"
                  "srai %[low], %[low], 4\n"
-                 "addx2 %[high], %[high], %[pal]\n"
-                 "addx2 %[low], %[low], %[pal]\n"
-                 "l16ui %[high], %[high], 0\n"
-                 "l16ui %[low], %[low], 0\n"
+                 "addx4 %[high], %[high], %[pal]\n"
+                 "addx4 %[low], %[low], %[pal]\n"
+                 "l32i %[high], %[high], 0\n"
+                 "l32i %[low], %[low], 0\n"
                  "slli %[high], %[high], 16\n"
                  "or %[high], %[high], %[low]\n"
                  "s32i %[high], %[out], 0\n"
@@ -132,10 +197,10 @@ GM_ANIM_IRAM __attribute__((noinline)) void crescentShadeAsm(uint16_t *out, cons
                  "sext %[low], %[high], 15\n"
                  "srai %[high], %[high], 20\n"
                  "srai %[low], %[low], 4\n"
-                 "addx2 %[high], %[high], %[pal]\n"
-                 "addx2 %[low], %[low], %[pal]\n"
-                 "l16ui %[high], %[high], 0\n"
-                 "l16ui %[low], %[low], 0\n"
+                 "addx4 %[high], %[high], %[pal]\n"
+                 "addx4 %[low], %[low], %[pal]\n"
+                 "l32i %[high], %[high], 0\n"
+                 "l32i %[low], %[low], 0\n"
                  "slli %[high], %[high], 16\n"
                  "or %[high], %[high], %[low]\n"
                  "s32i %[high], %[out], 4\n"
@@ -143,10 +208,10 @@ GM_ANIM_IRAM __attribute__((noinline)) void crescentShadeAsm(uint16_t *out, cons
                  "sext %[low], %[high], 15\n"
                  "srai %[high], %[high], 20\n"
                  "srai %[low], %[low], 4\n"
-                 "addx2 %[high], %[high], %[pal]\n"
-                 "addx2 %[low], %[low], %[pal]\n"
-                 "l16ui %[high], %[high], 0\n"
-                 "l16ui %[low], %[low], 0\n"
+                 "addx4 %[high], %[high], %[pal]\n"
+                 "addx4 %[low], %[low], %[pal]\n"
+                 "l32i %[high], %[high], 0\n"
+                 "l32i %[low], %[low], 0\n"
                  "slli %[high], %[high], 16\n"
                  "or %[high], %[high], %[low]\n"
                  "s32i %[high], %[out], 8\n"
@@ -154,10 +219,10 @@ GM_ANIM_IRAM __attribute__((noinline)) void crescentShadeAsm(uint16_t *out, cons
                  "sext %[low], %[high], 15\n"
                  "srai %[high], %[high], 20\n"
                  "srai %[low], %[low], 4\n"
-                 "addx2 %[high], %[high], %[pal]\n"
-                 "addx2 %[low], %[low], %[pal]\n"
-                 "l16ui %[high], %[high], 0\n"
-                 "l16ui %[low], %[low], 0\n"
+                 "addx4 %[high], %[high], %[pal]\n"
+                 "addx4 %[low], %[low], %[pal]\n"
+                 "l32i %[high], %[high], 0\n"
+                 "l32i %[low], %[low], 0\n"
                  "slli %[high], %[high], 16\n"
                  "or %[high], %[high], %[low]\n"
                  "s32i %[high], %[out], 12\n"
@@ -171,8 +236,81 @@ GM_ANIM_IRAM __attribute__((noinline)) void crescentShadeAsm(uint16_t *out, cons
         const int rad = col[x] + rowRad[x];
         const int bg = bgBase - ((rad * 20) >> 8);
         const int lit = body + ((rad * 78) >> 8);
-        out[x] = pal[(bg + (((lit - bg) * weight[x]) >> 8)) >> 4];
+        out[x] = (uint16_t)pal[(bg + (((lit - bg) * weight[x]) >> 8)) >> 4];
     }
+}
+
+GM_ANIM_IRAM __attribute__((noinline)) void crescentOuterAsm(uint16_t *out, int qOuter, int dOuter,
+                                                             int inv, const uint16_t *sm, int n) {
+    sm += 128;
+    int uo, lo, hi;
+    asm volatile("movi %[lo], -128\n"
+                 "movi %[hi], 128\n"
+                 "loopnez %[n], 1f\n"
+                 "mull %[uo], %[qo], %[inv]\n"
+                 "srai %[uo], %[uo], 16\n"
+                 "min %[uo], %[uo], %[hi]\n"
+                 "max %[uo], %[uo], %[lo]\n"
+                 "addx2 %[uo], %[uo], %[sm]\n"
+                 "add %[qo], %[qo], %[dqo]\n"
+                 "l16ui %[uo], %[uo], 0\n"
+                 "addi %[dqo], %[dqo], -2\n"
+                 "s16i %[uo], %[out], 0\n"
+                 "addi %[out], %[out], 2\n"
+                 "1:\n"
+                 : [out] "+&r"(out), [qo] "+&r"(qOuter), [dqo] "+&r"(dOuter),
+                   [uo] "=&r"(uo), [lo] "=&r"(lo), [hi] "=&r"(hi)
+                 : [inv] "r"(inv), [sm] "r"(sm), [n] "r"(n)
+                 : "memory");
+}
+
+GM_ANIM_IRAM __attribute__((noinline)) void crescentCutAsm(uint16_t *out, int qCut, int dCut, int r2,
+                                                           int inv, const uint16_t *sm, int n) {
+    sm += 128;
+    int uc, lo, hi;
+    asm volatile("movi %[lo], -128\n"
+                 "movi %[hi], 128\n"
+                 "loopnez %[n], 1f\n"
+                 "srai %[uc], %[qc], 8\n"
+                 "sub %[uc], %[uc], %[r2]\n"
+                 "mull %[uc], %[uc], %[inv]\n"
+                 "srai %[uc], %[uc], 16\n"
+                 "min %[uc], %[uc], %[hi]\n"
+                 "max %[uc], %[uc], %[lo]\n"
+                 "addx2 %[uc], %[uc], %[sm]\n"
+                 "add %[qc], %[qc], %[dqc]\n"
+                 "l16ui %[uc], %[uc], 0\n"
+                 "addmi %[dqc], %[dqc], 512\n"
+                 "s16i %[uc], %[out], 0\n"
+                 "addi %[out], %[out], 2\n"
+                 "1:\n"
+                 : [out] "+&r"(out), [qc] "+&r"(qCut), [dqc] "+&r"(dCut),
+                   [uc] "=&r"(uc), [lo] "=&r"(lo), [hi] "=&r"(hi)
+                 : [r2] "r"(r2), [inv] "r"(inv), [sm] "r"(sm), [n] "r"(n)
+                 : "memory");
+}
+
+GM_ANIM_IRAM __attribute__((noinline)) void crescentFillAsm(uint16_t *out, uint16_t v, int n) {
+    if (n <= 0) return;
+    // Eight pixels a store once the cursor is aligned. EE.VST.128.IP clears
+    // the low four address bits, so the prefix is walked one pixel at a time.
+    while (n > 0 && (((uintptr_t)out & 15u) != 0)) { *out++ = v; --n; }
+    const int blocks = n >> 3;
+    if (blocks > 0) {
+        const uint16_t vv = v;
+        const uint16_t *vp = &vv;
+        uint16_t *q = out;
+        asm volatile("ee.vldbc.16.ip q0, %[vp], 0\n"
+                     "loopnez %[n], 1f\n"
+                     "ee.vst.128.ip q0, %[q], 16\n"
+                     "1:\n"
+                     : [q] "+&r"(q), [vp] "+&r"(vp)
+                     : [n] "r"(blocks)
+                     : "memory");
+        out += blocks * 8;
+        n -= blocks * 8;
+    }
+    while (n-- > 0) *out++ = v;
 }
 /* END VERBATIM PRODUCTION KERNELS */
 #define CAP 512
@@ -180,12 +318,22 @@ static uint16_t got[CAP] __attribute__((aligned(16)));
 static uint16_t baseline[CAP] __attribute__((aligned(16)));
 static uint16_t want[CAP] __attribute__((aligned(16)));
 static uint16_t smStorage[260] __attribute__((aligned(16)));
-static uint16_t palStorage[352] __attribute__((aligned(16)));
+static uint32_t palStorage[352] __attribute__((aligned(16)));
 static int32_t columns[CAP] __attribute__((aligned(16)));
 static uint16_t coverage[CAP] __attribute__((aligned(16)));
 static int16_t rowRad[8] __attribute__((aligned(16)));
 static uint16_t *sm = smStorage + 1; /* only 2-byte aligned: scalar gather */
-static uint16_t *pal = palStorage + 32;
+static uint32_t *pal = palStorage + 32;
+
+/* This QEMU fork computes ee.ldxq.32's indexed address four bytes too low
+ * (espressif/qemu issue #162, reproduced on its own by tests/probe_ldxq32).
+ * The shade pass gathers the palette through that instruction whenever its
+ * output is 16-byte aligned, so an aligned case runs twice here: once with a
+ * base one word high, which cancels the emulator's error exactly and checks
+ * every lane the vector body wrote, and once true, which checks the scalar
+ * tail. The gather address itself is checked on silicon, by
+ * /api/debug/animtest and by the kblob rig hashing band() against band(). */
+#define QEMU_LDXQ_BIAS 1
 
 static int cubic(int u) {
     if (u < 0) u = 0;
@@ -225,10 +373,62 @@ static void shadeCase(int n, int offset, int bgBase, int body) {
         int idx = (bg + (((lit - bg) * coverage[x]) >> 8)) >> 4;
         if (idx < 3) idx = 3;
         if (idx > 255) idx = 255;
-        want[offset + x] = pal[idx];
+        want[offset + x] = (uint16_t)pal[idx];
     }
-    crescentShadeAsm(got + offset, columns, coverage, rowRad, pal, bgBase, body, n);
-    for (int i = 0; i < CAP; ++i) check(3, i, got[i], want[i]);
+    /* The kernel takes its vector path only when the output is 16-byte
+     * aligned, and then leaves the last n&7 pixels to the scalar tail. */
+    const int vec = ((((uintptr_t)(got + offset)) & 15u) == 0) ? (n >> 3) * 8 : 0;
+    if (vec > 0) {
+        crescentShadeAsm(got + offset, columns, coverage, rowRad, pal + QEMU_LDXQ_BIAS,
+                         bgBase, body, n);
+        for (int i = 0; i < CAP; ++i) {
+            const int x = i - offset;
+            if (x >= 0 && x < n && x >= vec) continue;
+            check(3, i, got[i], want[i]);
+        }
+        for (int i = 0; i < CAP; ++i) got[i] = 0xa55a;
+    }
+    if (vec < n) {
+        crescentShadeAsm(got + offset, columns, coverage, rowRad, pal, bgBase, body, n);
+        for (int i = 0; i < CAP; ++i) {
+            const int x = i - offset;
+            if (x >= 0 && x < n && x < vec) continue;
+            check(3, i, got[i], want[i]);
+        }
+    }
+}
+
+/* Where one coverage factor is saturated the product is the other factor, and
+ * the kernels below are the runs band() sends there. Closed forms again, never
+ * a second copy of the recurrence. */
+static void outerCase(int qo, int dq, int inv, int n, int offset) {
+    ++calls; lanes += n;
+    for (int i = 0; i < CAP; ++i) got[i] = want[i] = 0xa55a;
+    for (int x = 0; x < n; ++x) {
+        const int outer = qo + dq * x - x * (x - 1);
+        want[offset + x] = (uint16_t)cubic(128 + ((outer * inv) >> 16));
+    }
+    crescentOuterAsm(got + offset, qo, dq, inv, sm, n);
+    for (int i = 0; i < CAP; ++i) check(4, i, got[i], want[i]);
+}
+
+static void cutCase(int qi, int di, int r2, int inv, int n, int offset) {
+    ++calls; lanes += n;
+    for (int i = 0; i < CAP; ++i) got[i] = want[i] = 0xa55a;
+    for (int x = 0; x < n; ++x) {
+        const int cut = qi + di * x + 256 * x * (x - 1);
+        want[offset + x] = (uint16_t)cubic(128 + ((((cut >> 8) - r2) * inv) >> 16));
+    }
+    crescentCutAsm(got + offset, qi, di, r2, inv, sm, n);
+    for (int i = 0; i < CAP; ++i) check(5, i, got[i], want[i]);
+}
+
+static void fillCase(uint16_t v, int n, int offset) {
+    ++calls; lanes += n;
+    for (int i = 0; i < CAP; ++i) got[i] = want[i] = 0xa55a;
+    for (int x = 0; x < n; ++x) want[offset + x] = v;
+    crescentFillAsm(got + offset, v, n);
+    for (int i = 0; i < CAP; ++i) check(6, i, got[i], want[i]);
 }
 int main(void) {
     uint32_t cp = 8;
@@ -289,13 +489,36 @@ int main(void) {
         }
     /* Exercise every RGB565 word independently of the field arithmetic. */
     for (uint32_t value = 0; value < 65536; ++value) {
-        for (int i = 0; i < 352; ++i) palStorage[i] = (uint16_t)value;
+        for (int i = 0; i < 352; ++i) palStorage[i] = value;
         shadeCase(8, 8, 416, 1034);
+    }
+    /* The single-factor runs over the same radii, reciprocals and lengths the
+     * two-factor kernel sees, plus every fill length and start alignment. */
+    for (int r = 75; r <= 232; ++r) {
+        const int inv = 16777216 / (52 * r);
+        for (int variant = 0; variant < 8; ++variant) {
+            const int dy = variant < 4 ? -240 + variant * 80 : 239 - (variant - 4) * 80;
+            const int shift = variant % 3 == 0 ? -r * 16 : (variant % 3 == 1 ? r * 16 : 0);
+            const int dxi = -240 * 16 - shift - variant * 2;
+            const int dyi = dy * 16 + shift + variant;
+            outerCase(r * r - 240 * 240 - dy * dy, 479, inv, 480, variant);
+            cutCase(dxi * dxi + dyi * dyi, 32 * dxi + 256, r * r, inv, 480, variant);
+        }
+    }
+    for (int u = -129; u <= 129; ++u) {
+        outerCase(u, 0, 65536, 1, (u + 129) & 7);
+        cutCase((u + 256) * 256, 0, 256, 65536, 1, (u + 129) & 7);
+    }
+    for (int n = 0; n <= 480; ++n) {
+        outerCase(-12400, 479, 1543, n, n & 7);
+        cutCase(37000000, -190000, 45200, 1543, n, n & 7);
+        fillCase((uint16_t)(n & 1 ? 256 : 0), n, n & 15);
+        fillCase((uint16_t)(n * 137u), n, (n >> 1) & 15);
     }
     if (!mismatches) {
         puts0("GM_QEMUBENCH_PIE: PASS crescent calls="); dec(calls);
         puts0(" lanes="); dec(lanes);
-        puts0(" mismatches=0 (PIE probes, GCC baseline, masks, radii, reciprocals, Q4 centres, all weights/radii, tails, alignment, guards, RGB565)\n");
+        puts0(" mismatches=0 (PIE probes, GCC baseline, masks, radii, reciprocals, Q4 centres, all weights/radii, tails, alignment, guards, RGB565, single-factor runs, fills); gather addresses proved on silicon, not here\n");
     }
     puts0("GM_QEMUBENCH_PIE_DONE\n");
     for (;;) {}

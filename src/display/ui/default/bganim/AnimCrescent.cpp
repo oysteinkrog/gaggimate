@@ -37,20 +37,40 @@ constexpr int RAD_SCALE = 4080; // 255 palette positions in Q4
 constexpr int PAL_PAD = 32, PAL_N = PAL_PAD + 320;
 int32_t *radCol = nullptr, *radRow = nullptr;
 int16_t *bgRow = nullptr, *spanPx = nullptr, *dith = nullptr;
-uint16_t *paletteStorage = nullptr, *palette = nullptr;
+int16_t *ozHalf = nullptr, *osHalf = nullptr;
+uint32_t *paletteStorage = nullptr, *palette = nullptr;
 uint16_t *smooth = nullptr, *weights = nullptr;
 const int16_t *sine = nullptr; // borrowed shared table
 int allocW = 0, allocH = 0;
 int discR = 0, invK = 1, icx16 = 0, icy16 = 0, bodyBase = 0;
+int qaThr = 0, qzThr = 0;
 bool tablesValid = false, laneSafe = false;
 uint32_t lastThemeGen = 0xFFFFFFFF;
 uint8_t lastP[4] = {255, 255, 255, 255};
 
 // At 480x480, all tables are allocHot: radCol 1920, radRow 1920, bgRow 960,
-// spanPx 960, dith 128, paletteStorage 704, smooth 514 (528 aligned), weights
-// 960. Payload 8066 B, slab 8080 B of 9216 B. No private PSRAM tables.
+// spanPx 960, dith 128, paletteStorage 1408, smooth 514 (528 aligned), weights
+// 960. Payload 8770 B, slab 8784 B of 9216 B. The palette is 32-bit because
+// EE.LDXQ.32 scales its index by four. ozHalf and osHalf are read once a row,
+// so they are PSRAM, 960 B each.
 // The borrowed sine is 2048 B in the existing shared reservation. The palette
 // has 256 real theme entries plus clamped ends for the device's plain gather.
+// Exact integer roots. The float root is within one of the true value over
+// this range (under 6e7), and the two loops settle it.
+inline int isqrtFloor(int v) {
+    if (v <= 0) return 0;
+    int r = static_cast<int>(sqrtf(static_cast<float>(v)));
+    while (r > 0 && r * r > v) --r;
+    while ((r + 1) * (r + 1) <= v) ++r;
+    return r;
+}
+inline int isqrtCeil(int v) {
+    const int r = isqrtFloor(v);
+    return r * r == v ? r : r + 1;
+}
+inline int floorDiv16(int v) { return v >= 0 ? (v >> 4) : -((-v + 15) >> 4); }
+inline int ceilDiv16(int v) { return -floorDiv16(-v); }
+
 void release();
 bool init(int w, int h) {
     // The largest supported panel bounds the slab allocation below.
@@ -70,10 +90,15 @@ bool init(int w, int h) {
     bgRow = static_cast<int16_t *>(allocHot(h * sizeof(int16_t)));
     spanPx = static_cast<int16_t *>(allocHot(h * sizeof(int16_t)));
     dith = static_cast<int16_t *>(allocHot(64 * sizeof(int16_t)));
-    paletteStorage = static_cast<uint16_t *>(allocHot(PAL_N * sizeof(uint16_t)));
+    paletteStorage = static_cast<uint32_t *>(allocHot(PAL_N * sizeof(uint32_t)));
     smooth = static_cast<uint16_t *>(allocHot(257 * sizeof(uint16_t)));
     weights = static_cast<uint16_t *>(allocHot(w * sizeof(uint16_t)));
-    if (!radCol || !radRow || !bgRow || !spanPx || !dith || !paletteStorage || !smooth || !weights) {
+    // Read once a row, so PSRAM. Both depend only on the disc radius, which
+    // moves with the theme and the parameters, not with time.
+    ozHalf = static_cast<int16_t *>(alloc(h * sizeof(int16_t)));
+    osHalf = static_cast<int16_t *>(alloc(h * sizeof(int16_t)));
+    if (!radCol || !radRow || !bgRow || !spanPx || !dith || !paletteStorage || !smooth || !weights ||
+        !ozHalf || !osHalf) {
         release();
         return false;
     }
@@ -87,10 +112,12 @@ void frame(uint32_t tMs, int w, int h, const uint8_t p[BG_ANIM_PARAMS]) {
     const int cx = w / 2, cy = h / 2;
     const uint32_t gen = themeGen();
     if (!tablesValid || gen != lastThemeGen || memcmp(p, lastP, 4) != 0) {
-        buildThemeRamp(palette, 256);
+        uint16_t ramp[256];
+        buildThemeRamp(ramp, 256);
         // Page: 0.6*ditherAmp, rounded in Q4, then *4 in squared radius.
         // Moving this to the final palette index would change the picture.
-        const float amp = ditherAmp(palette, 256) * 0.6f;
+        const float amp = ditherAmp(ramp, 256) * 0.6f;
+        for (int i = 0; i < 256; ++i) palette[i] = ramp[i];
         for (int k = 0; k < 64; ++k)
             dith[k] = static_cast<int16_t>(lroundf((BAYER8[k] - 31.5f) * (amp * 16.0f / 31.5f)));
         for (int i = -PAL_PAD; i < FLOOR; ++i) palette[i] = palette[FLOOR];
@@ -100,6 +127,13 @@ void frame(uint32_t tMs, int w, int h, const uint8_t p[BG_ANIM_PARAMS]) {
         discR = rMax * (65 + static_cast<int>(p[1]) * 32 / 100) / 100;
         if (discR < 16) discR = 16;
         invK = 65536 * 256 / (2 * discR * SOFT_PX);
+        // Exact thresholds on the coverage numerators. The kernel computes
+        // u = 128 + ((q * invK) >> 16) and clamps it to [0,256], so u is 256
+        // exactly when q >= ceil(8388608/invK) and 0 exactly when
+        // q <= floor(-8323073/invK). Both ends are constant over a run, which
+        // is what lets band() fill instead of compute.
+        qaThr = (8388608 + invK - 1) / invK;
+        qzThr = -((8323073 + invK - 1) / invK);
         const int outer = discR + SOFT_PX;
         // Vignette radius is one pixel inside half the panel, as on the page.
         const int R = rMax - 1, R2 = R * R > 0 ? R * R : 1;
@@ -117,6 +151,11 @@ void frame(uint32_t tMs, int w, int h, const uint8_t p[BG_ANIM_PARAMS]) {
             bgRow[y] = static_cast<int16_t>(y * 9 * 16 / (h > 1 ? h - 1 : 1));
             const int inside = outer * outer - dy * dy;
             spanPx[y] = static_cast<int16_t>(inside > 0 ? static_cast<int>(sqrtf(static_cast<float>(inside))) : -1);
+            // uo > 0 while dx*dx < sNz, uo == 256 while dx*dx <= s256.
+            const int r2d = discR * discR;
+            const int sNz = r2d - dy * dy - qzThr, s256 = r2d - dy * dy - qaThr;
+            ozHalf[y] = static_cast<int16_t>(sNz > 0 ? isqrtCeil(sNz) - 1 : -1);
+            osHalf[y] = static_cast<int16_t>(s256 >= 0 ? isqrtFloor(s256) : -1);
         }
         // All supported square panels (233/240/466/480) satisfy this bound.
         // Unusual aspect ratios use the portable path if signed PIE lanes or
@@ -176,6 +215,36 @@ GM_ANIM_IRAM __attribute__((noinline)) void crescentWeightsRef(uint16_t *out, in
     }
 }
 
+// Exact integer roots. The float root is within one of the true value over
+// this range (under 6e7), and the two loops settle it.
+
+// One coverage factor at a time. Where the other factor is saturated at 256
+// the product (a*256)>>8 is a, so a run that crosses only one edge costs one
+// gather instead of two.
+GM_ANIM_IRAM __attribute__((noinline)) void crescentOuterRef(uint16_t *out, int qOuter, int dOuter,
+                                                             int inv, const uint16_t *sm, int n) {
+    for (int x = 0; x < n; ++x) {
+        int uo = 128 + ((qOuter * inv) >> 16);
+        uo = uo < 0 ? 0 : (uo > 256 ? 256 : uo);
+        out[x] = sm[uo];
+        qOuter += dOuter; dOuter -= 2;
+    }
+}
+
+GM_ANIM_IRAM __attribute__((noinline)) void crescentCutRef(uint16_t *out, int qCut, int dCut, int r2,
+                                                           int inv, const uint16_t *sm, int n) {
+    for (int x = 0; x < n; ++x) {
+        int uc = 128 + ((((qCut >> 8) - r2) * inv) >> 16);
+        uc = uc < 0 ? 0 : (uc > 256 ? 256 : uc);
+        out[x] = sm[uc];
+        qCut += dCut; dCut += 512;
+    }
+}
+
+GM_ANIM_IRAM __attribute__((noinline)) void crescentFillRef(uint16_t *out, uint16_t v, int n) {
+    for (int x = 0; x < n; ++x) out[x] = v;
+}
+
 GM_ANIM_IRAM void bandRef(uint16_t *__restrict dst, int y0, int rows, int w, uint32_t, const uint8_t *) {
     const int cx = allocW / 2, cy = allocH / 2, r2 = discR * discR;
     for (int row = 0; row < rows; ++row) {
@@ -203,7 +272,7 @@ GM_ANIM_IRAM void bandRef(uint16_t *__restrict dst, int y0, int rows, int w, uin
             const int body = litBase + (static_cast<int32_t>(static_cast<uint32_t>(rad) * LIMB) >> 8);
             int idx = (bg + (static_cast<int32_t>(static_cast<uint32_t>(body - bg) * weights[x]) >> 8)) >> 4;
             idx = idx < FLOOR ? FLOOR : (idx > 255 ? 255 : idx);
-            dst[row * w + x] = palette[idx];
+            dst[row * w + x] = static_cast<uint16_t>(palette[idx]);
         }
     }
 }
@@ -281,8 +350,70 @@ GM_ANIM_IRAM __attribute__((noinline)) void crescentWeightsAsm(uint16_t *out, in
 // occurs. Padding repeats palette[3] below 3 and palette[255] above 255.
 GM_ANIM_IRAM __attribute__((noinline)) void crescentShadeAsm(uint16_t *out, const int32_t *col,
                                                              const uint16_t *weight, const int16_t *rowRad,
-                                                             const uint16_t *pal, int bgBase, int body,
+                                                             const uint32_t *pal, int bgBase, int body,
                                                              int n) {
+    if (((uintptr_t)out & 15u) == 0) {
+        // EE.LDXQ.32 reads eight palette entries with eight indexed loads and
+        // one unzip, where the scalar gather below needs eleven instructions
+        // for two pixels. The palette is 32-bit because the instruction scales
+        // its index by four. Biasing both blend constants by 512 turns the
+        // arithmetic shift by four into the padded palette's index directly:
+        // floor((v+512)/16) is floor(v/16)+32, and 32 is PAL_PAD.
+        const uint32_t coeffs[5] = {20u, 78u, (uint32_t)(bgBase + 512), (uint32_t)(body + 512), 1u};
+        const uint32_t *coeff = coeffs;
+        // The +512 bias makes the index count from the padded start, so the
+        // gather's base is the storage base, not the zero entry.
+        const uint32_t *palBase = pal - PAL_PAD;
+        const int vblocks = n >> 3;
+        uint16_t *vout = out;
+        const int32_t *vcol = col;
+        const uint16_t *vweight = weight;
+        asm volatile("ee.vldbc.16.ip q3, %[coeff], 4\n"
+                     "ee.vldbc.16.ip q4, %[coeff], 4\n"
+                     "ee.vldbc.16.ip q5, %[coeff], 4\n"
+                     "ee.vldbc.16.ip q6, %[coeff], 4\n"
+                     "ee.vldbc.16.ip q2, %[coeff], 0\n"
+                     "loopnez %[n], 1f\n"
+                     "ssai 8\n"
+                     "ee.vld.128.ip q0, %[col], 16\n"
+                     "ee.vld.128.ip q1, %[col], 16\n"
+                     "ee.vld.128.ip q7, %[weight], 16\n"
+                     "ee.vunzip.16 q0, q1\n"
+                     "ee.vld.128.ip q1, %[rr], 0\n"
+                     "ee.vadds.s16 q0, q0, q1\n"
+                     "ee.vmul.s16 q1, q0, q3\n"
+                     "ee.vmul.s16 q0, q0, q4\n"
+                     "ee.vsubs.s16 q1, q5, q1\n"
+                     "ee.vadds.s16 q0, q0, q6\n"
+                     "ee.vsubs.s16 q0, q0, q1\n"
+                     "ee.vmul.s16 q0, q0, q7\n"
+                     "ee.vadds.s16 q0, q0, q1\n"
+                     "ssai 4\n"
+                     "ee.vmul.s16 q0, q0, q2\n"
+                     "ee.ldxq.32 q1, q0, %[pal], 0, 0\n"
+                     "ee.ldxq.32 q1, q0, %[pal], 1, 1\n"
+                     "ee.ldxq.32 q1, q0, %[pal], 2, 2\n"
+                     "ee.ldxq.32 q1, q0, %[pal], 3, 3\n"
+                     "ee.ldxq.32 q7, q0, %[pal], 0, 4\n"
+                     "ee.ldxq.32 q7, q0, %[pal], 1, 5\n"
+                     "ee.ldxq.32 q7, q0, %[pal], 2, 6\n"
+                     "ee.ldxq.32 q7, q0, %[pal], 3, 7\n"
+                     "ee.vunzip.16 q1, q7\n"
+                     "ee.vst.128.ip q1, %[out], 16\n"
+                     "1:\n"
+                     : [out] "+&r"(vout), [col] "+&r"(vcol), [weight] "+&r"(vweight),
+                       [coeff] "+&r"(coeff)
+                     : [rr] "r"(rowRad), [pal] "r"(palBase), [n] "r"(vblocks)
+                     : "memory");
+        const int done = vblocks * 8;
+        for (int x = done; x < n; ++x) {
+            const int rad = col[x] + rowRad[x & 7];
+            const int bg = bgBase - ((rad * 20) >> 8);
+            const int lit = body + ((rad * 78) >> 8);
+            out[x] = (uint16_t)pal[(bg + (((lit - bg) * weight[x]) >> 8)) >> 4];
+        }
+        return;
+    }
     const uint32_t coeffs[4] = {20u, 78u, (uint32_t)bgBase, (uint32_t)body};
     const uint32_t *coeff = coeffs;
     const int blocks = n >> 3;
@@ -312,10 +443,10 @@ GM_ANIM_IRAM __attribute__((noinline)) void crescentShadeAsm(uint16_t *out, cons
                  "sext %[low], %[high], 15\n"
                  "srai %[high], %[high], 20\n"
                  "srai %[low], %[low], 4\n"
-                 "addx2 %[high], %[high], %[pal]\n"
-                 "addx2 %[low], %[low], %[pal]\n"
-                 "l16ui %[high], %[high], 0\n"
-                 "l16ui %[low], %[low], 0\n"
+                 "addx4 %[high], %[high], %[pal]\n"
+                 "addx4 %[low], %[low], %[pal]\n"
+                 "l32i %[high], %[high], 0\n"
+                 "l32i %[low], %[low], 0\n"
                  "slli %[high], %[high], 16\n"
                  "or %[high], %[high], %[low]\n"
                  "s32i %[high], %[out], 0\n"
@@ -323,10 +454,10 @@ GM_ANIM_IRAM __attribute__((noinline)) void crescentShadeAsm(uint16_t *out, cons
                  "sext %[low], %[high], 15\n"
                  "srai %[high], %[high], 20\n"
                  "srai %[low], %[low], 4\n"
-                 "addx2 %[high], %[high], %[pal]\n"
-                 "addx2 %[low], %[low], %[pal]\n"
-                 "l16ui %[high], %[high], 0\n"
-                 "l16ui %[low], %[low], 0\n"
+                 "addx4 %[high], %[high], %[pal]\n"
+                 "addx4 %[low], %[low], %[pal]\n"
+                 "l32i %[high], %[high], 0\n"
+                 "l32i %[low], %[low], 0\n"
                  "slli %[high], %[high], 16\n"
                  "or %[high], %[high], %[low]\n"
                  "s32i %[high], %[out], 4\n"
@@ -334,10 +465,10 @@ GM_ANIM_IRAM __attribute__((noinline)) void crescentShadeAsm(uint16_t *out, cons
                  "sext %[low], %[high], 15\n"
                  "srai %[high], %[high], 20\n"
                  "srai %[low], %[low], 4\n"
-                 "addx2 %[high], %[high], %[pal]\n"
-                 "addx2 %[low], %[low], %[pal]\n"
-                 "l16ui %[high], %[high], 0\n"
-                 "l16ui %[low], %[low], 0\n"
+                 "addx4 %[high], %[high], %[pal]\n"
+                 "addx4 %[low], %[low], %[pal]\n"
+                 "l32i %[high], %[high], 0\n"
+                 "l32i %[low], %[low], 0\n"
                  "slli %[high], %[high], 16\n"
                  "or %[high], %[high], %[low]\n"
                  "s32i %[high], %[out], 8\n"
@@ -345,10 +476,10 @@ GM_ANIM_IRAM __attribute__((noinline)) void crescentShadeAsm(uint16_t *out, cons
                  "sext %[low], %[high], 15\n"
                  "srai %[high], %[high], 20\n"
                  "srai %[low], %[low], 4\n"
-                 "addx2 %[high], %[high], %[pal]\n"
-                 "addx2 %[low], %[low], %[pal]\n"
-                 "l16ui %[high], %[high], 0\n"
-                 "l16ui %[low], %[low], 0\n"
+                 "addx4 %[high], %[high], %[pal]\n"
+                 "addx4 %[low], %[low], %[pal]\n"
+                 "l32i %[high], %[high], 0\n"
+                 "l32i %[low], %[low], 0\n"
                  "slli %[high], %[high], 16\n"
                  "or %[high], %[high], %[low]\n"
                  "s32i %[high], %[out], 12\n"
@@ -362,14 +493,113 @@ GM_ANIM_IRAM __attribute__((noinline)) void crescentShadeAsm(uint16_t *out, cons
         const int rad = col[x] + rowRad[x];
         const int bg = bgBase - ((rad * 20) >> 8);
         const int lit = body + ((rad * 78) >> 8);
-        out[x] = pal[(bg + (((lit - bg) * weight[x]) >> 8)) >> 4];
+        out[x] = (uint16_t)pal[(bg + (((lit - bg) * weight[x]) >> 8)) >> 4];
     }
+}
+
+// Ten instructions a pixel against the two-factor loop's twenty-two. Same
+// bias-by-128 trick: the table pointer carries the +128 and the clamp is to
+// [-128,128], which removes two adds.
+GM_ANIM_IRAM __attribute__((noinline)) void crescentOuterAsm(uint16_t *out, int qOuter, int dOuter,
+                                                             int inv, const uint16_t *sm, int n) {
+    sm += 128;
+    int uo, lo, hi;
+    asm volatile("movi %[lo], -128\n"
+                 "movi %[hi], 128\n"
+                 "loopnez %[n], 1f\n"
+                 "mull %[uo], %[qo], %[inv]\n"
+                 "srai %[uo], %[uo], 16\n"
+                 "min %[uo], %[uo], %[hi]\n"
+                 "max %[uo], %[uo], %[lo]\n"
+                 "addx2 %[uo], %[uo], %[sm]\n"
+                 "add %[qo], %[qo], %[dqo]\n"
+                 "l16ui %[uo], %[uo], 0\n"
+                 "addi %[dqo], %[dqo], -2\n"
+                 "s16i %[uo], %[out], 0\n"
+                 "addi %[out], %[out], 2\n"
+                 "1:\n"
+                 : [out] "+&r"(out), [qo] "+&r"(qOuter), [dqo] "+&r"(dOuter),
+                   [uo] "=&r"(uo), [lo] "=&r"(lo), [hi] "=&r"(hi)
+                 : [inv] "r"(inv), [sm] "r"(sm), [n] "r"(n)
+                 : "memory");
+}
+
+GM_ANIM_IRAM __attribute__((noinline)) void crescentCutAsm(uint16_t *out, int qCut, int dCut, int r2,
+                                                           int inv, const uint16_t *sm, int n) {
+    sm += 128;
+    int uc, lo, hi;
+    asm volatile("movi %[lo], -128\n"
+                 "movi %[hi], 128\n"
+                 "loopnez %[n], 1f\n"
+                 "srai %[uc], %[qc], 8\n"
+                 "sub %[uc], %[uc], %[r2]\n"
+                 "mull %[uc], %[uc], %[inv]\n"
+                 "srai %[uc], %[uc], 16\n"
+                 "min %[uc], %[uc], %[hi]\n"
+                 "max %[uc], %[uc], %[lo]\n"
+                 "addx2 %[uc], %[uc], %[sm]\n"
+                 "add %[qc], %[qc], %[dqc]\n"
+                 "l16ui %[uc], %[uc], 0\n"
+                 "addmi %[dqc], %[dqc], 512\n"
+                 "s16i %[uc], %[out], 0\n"
+                 "addi %[out], %[out], 2\n"
+                 "1:\n"
+                 : [out] "+&r"(out), [qc] "+&r"(qCut), [dqc] "+&r"(dCut),
+                   [uc] "=&r"(uc), [lo] "=&r"(lo), [hi] "=&r"(hi)
+                 : [r2] "r"(r2), [inv] "r"(inv), [sm] "r"(sm), [n] "r"(n)
+                 : "memory");
+}
+
+// Two pixels a store. The run lengths here are whole constant stretches of a
+// row, so this is where most of the old kernel's pixels went.
+GM_ANIM_IRAM __attribute__((noinline)) void crescentFillAsm(uint16_t *out, uint16_t v, int n) {
+    if (n <= 0) return;
+    // Eight pixels a store once the cursor is aligned. EE.VST.128.IP clears
+    // the low four address bits, so the prefix is walked one pixel at a time.
+    while (n > 0 && (((uintptr_t)out & 15u) != 0)) { *out++ = v; --n; }
+    const int blocks = n >> 3;
+    if (blocks > 0) {
+        const uint16_t vv = v;
+        const uint16_t *vp = &vv;
+        uint16_t *q = out;
+        asm volatile("ee.vldbc.16.ip q0, %[vp], 0\n"
+                     "loopnez %[n], 1f\n"
+                     "ee.vst.128.ip q0, %[q], 16\n"
+                     "1:\n"
+                     : [q] "+&r"(q), [vp] "+&r"(vp)
+                     : [n] "r"(blocks)
+                     : "memory");
+        out += blocks * 8;
+        n -= blocks * 8;
+    }
+    while (n-- > 0) *out++ = v;
 }
 #endif
 
+// A row's coverage is mostly constant. uo is 256 across the body of the disc
+// and 0 outside its soft edge; uc is 0 inside the cut disc and 256 outside its
+// soft edge. Both edges are 26 pixels wide, so on a full row only about a
+// third of the pixels sit on an edge and the rest are a fill of 0 or 256.
+// The thresholds above turn "is this run constant" into exact integer
+// comparisons on the same numerators the kernel uses, and the run ends come
+// from exact integer roots, so the picture does not change.
+//
+// Where exactly one factor is on its edge the other is 256, and (a*256)>>8 is
+// a, so those runs take a one-gather kernel. Only where the two edges overlap
+// does the two-gather kernel run.
 GM_ANIM_IRAM void band(uint16_t *dst, int y0, int rows, int w, uint32_t tMs, const uint8_t *p) {
 #if defined(__XTENSA__) && !defined(GM_BGANIM_NO_ASM) && GM_BGANIM_CRESCENT_ASM
     if (!laneSafe) { bandRef(dst, y0, rows, w, tMs, p); return; }
+#define CR_OUTER crescentOuterAsm
+#define CR_CUT crescentCutAsm
+#define CR_BOTH crescentWeightsAsm
+#define CR_FILL crescentFillAsm
+#else
+#define CR_OUTER crescentOuterRef
+#define CR_CUT crescentCutRef
+#define CR_BOTH crescentWeightsRef
+#define CR_FILL crescentFillRef
+#endif
     const int cx = allocW / 2, cy = allocH / 2, r2 = discR * discR;
     for (int row = 0; row < rows; ++row) {
         const int y = y0 + row, span = spanPx[y];
@@ -379,21 +609,89 @@ GM_ANIM_IRAM void band(uint16_t *dst, int y0, int rows, int w, uint32_t tMs, con
             if (a < 0) a = 0;
             if (b > w) b = w;
         }
-        for (int x = 0; x < a; ++x) weights[x] = 0;
-        for (int x = b; x < w; ++x) weights[x] = 0;
-        const int dx = a - cx, dy = y - cy;
-        const int dxi = a * 16 - icx16, dyi = y * 16 - icy16;
-        crescentWeightsAsm(weights + a, r2 - dx * dx - dy * dy, -2 * dx - 1,
-                           dxi * dxi + dyi * dyi, 32 * dxi + 256, r2, invK, smooth, b - a);
+        if (a > 0) CR_FILL(weights, 0, a);
+        if (b < w) CR_FILL(weights + b, 0, w - b);
+        const int dy = y - cy, dy2 = dy * dy;
+        const int dyi = y * 16 - icy16, dyi2 = dyi * dyi;
+        const int nzR = ozHalf[y], satR = osHalf[y];
+        const int oz0 = cx - nzR, oz1 = cx + nzR;   // empty when nzR < 0
+        const int os0 = cx - satR, os1 = cx + satR; // empty when satR < 0
+        // uc == 0 while X*X <= t1; uc == 256 while X*X >= t2, X = 16x - icx16.
+        const int t1 = 256 * (r2 + qzThr) + 255 - dyi2;
+        const int t2 = 256 * (r2 + qaThr) - dyi2;
+        int cz0 = 1, cz1 = 0;
+        if (t1 >= 0) {
+            const int u1 = isqrtFloor(t1);
+            cz0 = ceilDiv16(icx16 - u1);
+            cz1 = floorDiv16(icx16 + u1);
+        }
+        int csLo = w + 8, csHi = -8; // uc == 256 everywhere when t2 <= 0
+        if (t2 > 0) {
+            const int u2 = isqrtCeil(t2);
+            csLo = floorDiv16(icx16 - u2);
+            csHi = ceilDiv16(icx16 + u2);
+        }
+        int bp[8], nb = 0;
+        const int cand[8] = {oz0, oz1 + 1, os0, os1 + 1, cz0, cz1 + 1, csLo + 1, csHi};
+        for (int i = 0; i < 8; ++i) {
+            const int v = cand[i];
+            if (v > a && v < b) bp[nb++] = v;
+        }
+        for (int i = 1; i < nb; ++i) { // insertion sort, at most eight entries
+            const int v = bp[i];
+            int j = i - 1;
+            while (j >= 0 && bp[j] > v) { bp[j + 1] = bp[j]; --j; }
+            bp[j + 1] = v;
+        }
+        int l = a;
+        for (int i = 0; i <= nb; ++i) {
+            const int r = i < nb ? bp[i] : b;
+            if (r <= l) continue;
+            const int len = r - l;
+            const bool uoPos = l >= oz0 && l <= oz1;
+            const bool ucZero = l >= cz0 && l <= cz1;
+            const bool uoSat = l >= os0 && l <= os1;
+            const bool ucSat = l <= csLo || l >= csHi;
+            if (!uoPos || ucZero) {
+                CR_FILL(weights + l, 0, len);
+            } else if (uoSat && ucSat) {
+                CR_FILL(weights + l, 256, len);
+            } else {
+                const int dx = l - cx, xi = l * 16 - icx16;
+                if (uoSat) {
+                    CR_CUT(weights + l, xi * xi + dyi2, 32 * xi + 256, r2, invK, smooth, len);
+                } else if (ucSat) {
+                    CR_OUTER(weights + l, r2 - dx * dx - dy2, -2 * dx - 1, invK, smooth, len);
+                } else {
+                    CR_BOTH(weights + l, r2 - dx * dx - dy2, -2 * dx - 1, xi * xi + dyi2,
+                            32 * xi + 256, r2, invK, smooth, len);
+                }
+            }
+            l = r;
+        }
+#if defined(__XTENSA__) && !defined(GM_BGANIM_NO_ASM) && GM_BGANIM_CRESCENT_ASM
         alignas(16) int16_t rowRad[8];
         for (int k = 0; k < 8; ++k)
             rowRad[k] = static_cast<int16_t>(radRow[y] + dith[(y & 7) * 8 + k] * 4);
         crescentShadeAsm(dst + row * w, radCol, weights, rowRad, palette,
                          BG_HI * 16 + bgRow[y], bodyBase, w);
-    }
 #else
-    bandRef(dst, y0, rows, w, tMs, p);
+        const int16_t *off = dith + (y & 7) * 8;
+        const int rr = radRow[y], bgBase = BG_HI * 16 + bgRow[y], litBase = bodyBase;
+        for (int x = 0; x < w; ++x) {
+            const int rad = radCol[x] + off[x & 7] * 4 + rr;
+            const int bg = bgBase - (static_cast<int32_t>(static_cast<uint32_t>(rad) * BGF) >> 8);
+            const int body = litBase + (static_cast<int32_t>(static_cast<uint32_t>(rad) * LIMB) >> 8);
+            int idx = (bg + (static_cast<int32_t>(static_cast<uint32_t>(body - bg) * weights[x]) >> 8)) >> 4;
+            idx = idx < FLOOR ? FLOOR : (idx > 255 ? 255 : idx);
+            dst[row * w + x] = static_cast<uint16_t>(palette[idx]);
+        }
 #endif
+    }
+#undef CR_OUTER
+#undef CR_CUT
+#undef CR_BOTH
+#undef CR_FILL
 }
 
 void release() {
@@ -402,9 +700,11 @@ void release() {
     releaseTable(bgRow, static_cast<size_t>(allocH) * sizeof(int16_t));
     releaseTable(spanPx, static_cast<size_t>(allocH) * sizeof(int16_t));
     releaseTable(dith, 64 * sizeof(int16_t));
-    releaseTable(paletteStorage, PAL_N * sizeof(uint16_t));
+    releaseTable(paletteStorage, PAL_N * sizeof(uint32_t));
     releaseTable(smooth, 257 * sizeof(uint16_t));
     releaseTable(weights, static_cast<size_t>(allocW) * sizeof(uint16_t));
+    releaseTable(ozHalf, static_cast<size_t>(allocH) * sizeof(int16_t));
+    releaseTable(osHalf, static_cast<size_t>(allocH) * sizeof(int16_t));
     palette = nullptr; sine = nullptr;
     allocW = allocH = discR = icx16 = icy16 = bodyBase = 0;
     invK = 1;
