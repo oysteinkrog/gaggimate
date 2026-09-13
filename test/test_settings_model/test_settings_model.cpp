@@ -535,6 +535,58 @@ static void test_gradient_map_read_write_shorter_than_n() {
     TEST_ASSERT_EQUAL_STRING("1", gradientMapReadRef(written, 0).c_str());
 }
 
+// The id boundary, on the firmware side of the mirror. parseId reads at most
+// five decimal digits, so BG_GRADIENT_ID_MAX is not a policy number, it is the
+// largest id the grammar can express: 100000 is not a big id here, it is a
+// malformed one, and so is anything with a character left over after the
+// digits. The web mirror is held to these same answers by
+// tools/gradient_mirror_check.mjs, because the settings handler drops a field
+// its parser rejects and keeps the previous stored value, with no error on
+// either side (gm-nov3.21).
+static void test_gradient_id_boundary_ref_and_library() {
+    TEST_ASSERT_EQUAL_INT(99999, BG_GRADIENT_ID_MAX);
+
+    TEST_ASSERT_TRUE(bg_ref_valid(""));
+    TEST_ASSERT_TRUE(bg_ref_valid("99999"));
+    TEST_ASSERT_TRUE(bg_ref_valid("c99999"));
+    TEST_ASSERT_FALSE(bg_ref_valid("100000"));
+    TEST_ASSERT_FALSE(bg_ref_valid("c100000"));
+    // A library id of zero is no id at all, and neither is a bare 'c'.
+    TEST_ASSERT_FALSE(bg_ref_valid("c0"));
+    TEST_ASSERT_FALSE(bg_ref_valid("c"));
+    // Trailing characters fail the ref rather than being ignored.
+    TEST_ASSERT_FALSE(bg_ref_valid("5x"));
+    TEST_ASSERT_FALSE(bg_ref_valid("c5x"));
+    TEST_ASSERT_FALSE(bg_ref_valid("c 5"));
+    // Six digits fail even when the value would fit: the parser stops at five
+    // and the sixth is then a trailing character.
+    TEST_ASSERT_FALSE(bg_ref_valid("099999"));
+
+    TEST_ASSERT_TRUE(bg_map_valid("c99999"));
+    TEST_ASSERT_TRUE(bg_map_valid(";;c99999;"));
+    TEST_ASSERT_FALSE(bg_map_valid("c100000"));
+    TEST_ASSERT_FALSE(bg_map_valid("c0"));
+    TEST_ASSERT_FALSE(bg_map_valid("5x"));
+
+    TEST_ASSERT_TRUE(bg_library_valid(""));
+    TEST_ASSERT_TRUE(bg_library_valid("99999|A|010203,040506"));
+    TEST_ASSERT_FALSE(bg_library_valid("100000|A|010203,040506"));
+    TEST_ASSERT_FALSE(bg_library_valid("0|A|010203,040506"));
+    TEST_ASSERT_FALSE(bg_library_valid("99999x|A|010203,040506"));
+    TEST_ASSERT_FALSE(bg_library_valid("1||010203,040506"));
+    // One malformed entry fails the whole library, so the page cannot show a
+    // gradient that sits after it.
+    TEST_ASSERT_FALSE(bg_library_valid("1|A|010203,040506;bad;2|B|010203,040506"));
+
+    // An id at the ceiling is a working entry, not just an accepted string.
+    uint8_t stops[BG_THEME_MAX_STOPS][3];
+    uint8_t pos[BG_THEME_MAX_STOPS];
+    int nStops = 0;
+    bool uniform = true;
+    TEST_ASSERT_TRUE(bg_library_lookup("99999|Top|010203,040506", 99999, stops, pos, nStops, uniform));
+    TEST_ASSERT_EQUAL_INT(2, nStops);
+}
+
 static void test_gradient_map_write_trims_trailing_empty_slots() {
     // Clearing the only set ref returns the map to "", the web UI's own
     // representation of an all-default map, instead of ";" or ";;".
@@ -2115,6 +2167,7 @@ int main(int argc, char **argv) {
     RUN_TEST(test_theme_category_order_is_declared_not_encountered);
     RUN_TEST(test_gradient_groups_follow_declared_order_and_drop_empties);
     RUN_TEST(test_gradient_groups_keep_every_builtin_reachable);
+    RUN_TEST(test_gradient_id_boundary_ref_and_library);
     RUN_TEST(test_gradient_map_read_write_empty);
     RUN_TEST(test_gradient_map_read_write_shorter_than_n);
     RUN_TEST(test_gradient_map_write_trims_trailing_empty_slots);

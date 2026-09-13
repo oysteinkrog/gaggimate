@@ -665,6 +665,12 @@ export const BG_THEME_CUSTOM = 18;
 export const BG_THEME_MAX_STOPS = 16;
 export const BG_GRADIENT_LIB_MAX = 12;
 export const BG_GRADIENT_NAME_MAX = 24;
+export const BG_GRADIENT_LIB_MAX_LEN = 3800;
+// The largest id the firmware can read, mirroring BG_GRADIENT_ID_MAX in
+// src/display/ui/default/bganim/BgAnim.h. Its parseId stops after five decimal
+// digits, so 100000 is not a large id to the firmware, it is a malformed one:
+// the parser takes 10000 and the sixth digit then fails the entry or the ref.
+export const BG_GRADIENT_ID_MAX = 99999;
 
 // ---- gradients ---------------------------------------------------------
 // A gradient is { stops: [{ color: '#rrggbb', pos: 0..255 }] } with stops in
@@ -785,19 +791,109 @@ export function wheelCss(stops, tone) {
   return `linear-gradient(to right, ${parts.join(', ')})`;
 }
 
+// ---- the id and ref grammar --------------------------------------------
+// These mirror parseId and parseRef in BgAnimThemes.cpp exactly. They are the
+// reason the page and the panel agree on what a stored string means: the
+// firmware's settings handler drops a library, a map or a ref its parsers
+// reject and keeps the previous stored value, with no error on either side, so
+// a page that accepts a string the firmware does not silently loses the save.
+
+// Reads an id at the start of s, at most five digits, as parseId does.
+// Returns [id, rest]; id is -1 when there is no digit. The five-digit stop is
+// what leaves a '0' behind on "100000", and that leftover is what rejects it.
+function readId(s) {
+  const m = /^[0-9]{1,5}/.exec(s);
+  if (m === null) return [-1, s];
+  return [parseInt(m[0], 10), s.slice(m[0].length)];
+}
+
+// One ref: '' | digits | 'c' digits, as parseRef reads it. Returns
+// { builtin, libId } with the one that is set >= 0 (builtin) or > 0 (libId)
+// and the other -1, or null when the string is not a ref at all. A ';' ends a
+// ref, because parseRef is also how the firmware reads one slot of a map.
+export function parseRefParts(ref) {
+  const r = String(ref ?? '');
+  if (r === '') return { builtin: -1, libId: -1 };
+  let rest = r;
+  let builtin = -1;
+  let libId = -1;
+  if (rest.startsWith('c')) {
+    [libId, rest] = readId(rest.slice(1));
+    if (libId <= 0) return null;
+  } else {
+    [builtin, rest] = readId(rest);
+    if (builtin < 0) return null;
+  }
+  if (rest !== '' && !rest.startsWith(';')) return null;
+  return { builtin, libId };
+}
+
+// Mirrors bg_ref_valid: an empty ref is valid and means "no override".
+export function gradientRefValid(ref) {
+  return parseRefParts(ref) !== null;
+}
+
+// Mirrors bg_map_valid, including its 256 character cap.
+export function themeMapValid(map) {
+  const m = String(map ?? '');
+  if (m.length > 256) return false;
+  return m.split(';').every(part => part === '' || parseRefParts(part) !== null);
+}
+
+// UTF-8 bytes, which is what the firmware's name cap counts.
+function utf8Length(s) {
+  return new TextEncoder().encode(s).length;
+}
+
 // ---- library "id|name|gradient;..." ------------------------------------
 
-export function parseGradientLibrary(str) {
-  const out = [];
-  for (const entry of String(str ?? '').split(';')) {
-    if (!entry) continue;
-    const [idStr, name, gradientStr] = entry.split('|');
-    const id = parseInt(idStr, 10);
+// Walks the library the way walkLibrary does: a stray ';' is skipped, the
+// entry count is capped at BG_GRADIENT_LIB_MAX, and the walk stops at the
+// first malformed entry rather than stepping over it. Returns the entries it
+// read and whether it reached the end, which is the difference between what
+// the firmware can look up and what it calls a valid library.
+function walkGradientLibrary(str) {
+  const entries = [];
+  let s = String(str ?? '');
+  while (s !== '') {
+    if (s.startsWith(';')) {
+      s = s.slice(1);
+      continue;
+    }
+    if (entries.length >= BG_GRADIENT_LIB_MAX) return { entries, ok: false };
+    const [id, afterId] = readId(s);
+    if (id <= 0 || !afterId.startsWith('|')) return { entries, ok: false };
+    const afterBar = afterId.slice(1);
+    const nameEnd = afterBar.search(/[|;]/);
+    if (nameEnd < 0 || afterBar[nameEnd] !== '|') return { entries, ok: false };
+    const name = afterBar.slice(0, nameEnd);
+    if (name === '' || utf8Length(name) > BG_GRADIENT_NAME_MAX * 4) return { entries, ok: false };
+    const afterName = afterBar.slice(nameEnd + 1);
+    const gradientEnd = afterName.indexOf(';');
+    const gradientStr = gradientEnd < 0 ? afterName : afterName.slice(0, gradientEnd);
     const gradient = parseGradient(gradientStr);
-    if (!(id > 0) || !name || !gradient) continue;
-    out.push({ id, name, stops: gradient.stops });
+    if (!gradient) return { entries, ok: false };
+    entries.push({ id, name, stops: gradient.stops });
+    s = gradientEnd < 0 ? '' : afterName.slice(gradientEnd + 1);
   }
-  return out;
+  return { entries, ok: true };
+}
+
+// The entries the firmware can look up. Stopping at the first malformed entry
+// rather than stepping over it matters: the firmware's lookup sees the entries
+// before the bad one and nothing after, so a page that skipped it would list
+// gradients the panel cannot find.
+export function parseGradientLibrary(str) {
+  return walkGradientLibrary(str).entries;
+}
+
+// Mirrors bg_library_valid: the whole string, not a prefix of it, and the
+// length cap NVS forces. The page checks it before a save, because a library
+// the firmware rejects is one the firmware drops without telling anyone.
+export function gradientLibraryValid(str) {
+  const s = String(str ?? '');
+  if (s.length > BG_GRADIENT_LIB_MAX_LEN) return false;
+  return walkGradientLibrary(s).ok;
 }
 
 export function serializeGradientLibrary(library) {
@@ -815,8 +911,46 @@ export function sanitizeGradientName(name) {
   return clean || 'Gradient';
 }
 
-export function nextGradientId(library) {
-  return library.reduce((m, g) => Math.max(m, g.id), 0) + 1;
+// Every id a new gradient may not take: the ids library entries carry, plus
+// every library id a stored ref names, whether or not it resolves today.
+// The second half is the dangerous one. Deleting entry 7 can leave a "c7"
+// behind in bgAnimGradientRef or in a slot of bgAnimThemeMap, and handing 7 to
+// the next gradient would make that ref resolve again, silently repointing a
+// selection the user made at a different picture. Mirrors ReservedIds in
+// BgAnimThemes.cpp, which the firmware's own migration allocates through.
+//
+// refStrings are the raw stored strings, bgAnimThemeMap and
+// bgAnimGradientRef, not the parsed arrays. Parsing drops exactly the refs
+// that matter here: one that no longer resolves, and one in a slot past the
+// end of this build's animation list.
+export function reservedGradientIds(library, refStrings = []) {
+  const ids = new Set();
+  for (const g of library ?? []) {
+    if (g.id > 0 && g.id <= BG_GRADIENT_ID_MAX) ids.add(g.id);
+  }
+  for (const refs of refStrings) {
+    for (const part of String(refs ?? '').split(';')) {
+      if (part === '') continue;
+      const parsed = parseRefParts(part);
+      if (parsed && parsed.libId > 0 && parsed.libId <= BG_GRADIENT_ID_MAX) ids.add(parsed.libId);
+    }
+  }
+  return ids;
+}
+
+// The lowest id in 1 to BG_GRADIENT_ID_MAX that nothing reserves, or null when
+// the range is exhausted. Not the largest id plus one: that allocator walks
+// off the end of the firmware's five-digit grammar as soon as one entry
+// carries 99999, and both the new entry and its "c100000" ref become strings
+// the firmware rejects and silently drops. Reusing a gap is what keeps the
+// allocation inside the range, and reserving the refs is what makes reuse
+// safe.
+export function nextGradientId(library, refStrings = []) {
+  const taken = reservedGradientIds(library, refStrings);
+  for (let id = 1; id <= BG_GRADIENT_ID_MAX; id++) {
+    if (!taken.has(id)) return id;
+  }
+  return null;
 }
 
 // ---- per-animation map "ref;ref;..." -----------------------------------
@@ -826,7 +960,9 @@ export function parseThemeMap(str) {
   const parts = String(str ?? '').split(';');
   return BG_ANIMATIONS.map((_, i) => {
     const ref = parts[i] ?? '';
-    return /^(\d+|c\d+)$/.test(ref) ? ref : '';
+    // The firmware's grammar, not a looser one: "c100000" and "5x" are refs
+    // the panel cannot read, so the page must not show them as selections.
+    return ref !== '' && gradientRefValid(ref) ? ref : '';
   });
 }
 
@@ -840,11 +976,10 @@ export function serializeThemeMap(refs) {
 // Whether a ref names something that exists right now: a built-in index in
 // this build's table, or a library entry that has not been deleted.
 export function refResolves(ref, library) {
-  const r = String(ref ?? '');
-  if (r.startsWith('c')) return library.some(g => g.id === parseInt(r.slice(1), 10));
-  if (r === '') return false;
-  const idx = parseInt(r, 10);
-  return idx >= 0 && idx < BG_THEMES.length;
+  const parts = parseRefParts(ref);
+  if (parts === null) return false;
+  if (parts.libId > 0) return library.some(g => g.id === parts.libId);
+  return parts.builtin >= 0 && parts.builtin < BG_THEMES.length;
 }
 
 // A ref the picker shows but never stores: the pre-library custom gradient is
@@ -870,11 +1005,10 @@ export function legacyBuiltin(globalThemeId, customTheme) {
 // gradient nobody chose to an older build), a library ref and a ref that does
 // not resolve leave the legacy fallback where it is.
 export function legacyThemeMirror(ref, themeCount = BG_THEMES.length) {
-  const r = String(ref ?? '');
-  if (r === '' || r.startsWith('c') || !/^\d+$/.test(r)) return null;
-  const idx = parseInt(r, 10);
-  if (idx < 0 || idx >= themeCount) return null;
-  return idx < BG_THEME_CUSTOM ? idx : 0;
+  const parts = parseRefParts(ref);
+  if (parts === null || parts.builtin < 0) return null;
+  if (parts.builtin >= themeCount) return null;
+  return parts.builtin < BG_THEME_CUSTOM ? parts.builtin : 0;
 }
 
 // The form fields a global gradient selection writes, and nothing else. The

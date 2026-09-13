@@ -7,6 +7,7 @@ import { ApiServiceContext } from '../services/ApiService.js';
 import { GradientBrowser } from './GradientBrowser.jsx';
 import {
   BG_ANIMATIONS,
+  BG_GRADIENT_ID_MAX,
   BG_GRADIENT_LIB_MAX,
   BG_GRADIENT_NAME_MAX,
   BG_LEGACY_CUSTOM_REF,
@@ -158,6 +159,31 @@ export function GradientEditor({ scope, formData, setField, previewAnimIdx }) {
   const anim = BG_ANIMATIONS[previewIdx];
   const wraps = anim?.id === 'plasma';
   const overrideCount = refs.filter(r => r !== '' && refResolves(r, library)).length;
+  // The id a copy would take: the lowest one no entry carries and no stored ref
+  // names, including a ref left dangling by a delete. Reserving the dangling
+  // ones is what keeps reuse safe; handing out an id one of them still names
+  // would make that ref resolve again, pointing a saved selection at a
+  // gradient the user never chose there.
+  //
+  // The raw stored strings go in, not the parsed arrays, because parsing drops
+  // exactly the refs that matter: a ref that no longer resolves, and a slot
+  // past the end of this build's animation list.
+  const freeId = useMemo(
+    () => nextGradientId(library, [formData.bgAnimThemeMap, formData.bgAnimGradientRef]),
+    [library, formData.bgAnimThemeMap, formData.bgAnimGradientRef],
+  );
+  const libraryFull = library.length >= BG_GRADIENT_LIB_MAX;
+  // Out of ids is not reachable from a device: at most BG_GRADIENT_LIB_MAX
+  // entries and one ref per animation reserve a few dozen ids out of 99999, so
+  // the scan always finds one low down. It is handled anyway, because the
+  // alternative is allocating an id the firmware's five-digit parser cannot
+  // read, which it drops in silence.
+  const canCopy = !libraryFull && freeId !== null;
+  const copyBlockedReason = libraryFull
+    ? `Up to ${BG_GRADIENT_LIB_MAX} gradients can be saved`
+    : freeId === null
+      ? `Every number up to ${BG_GRADIENT_ID_MAX} is already taken by a saved gradient, or is still named by a selection that points at a deleted one`
+      : undefined;
   // Clearing every override is not undoable in one step, so it asks first.
   const [confirmClear, setConfirmClear] = useState(false);
   const tone = {
@@ -211,8 +237,8 @@ export function GradientEditor({ scope, formData, setField, previewAnimIdx }) {
   };
 
   const copyToLibrary = () => {
-    if (library.length >= BG_GRADIENT_LIB_MAX) return;
-    const id = nextGradientId(library);
+    if (!canCopy) return;
+    const id = freeId;
     const base = editable ? `${current.name} copy` : current.name;
     const name = sanitizeGradientName(base);
     writeLibrary([...library, { id, name, stops: stops.map(s => ({ ...s })) }]);
@@ -329,7 +355,6 @@ export function GradientEditor({ scope, formData, setField, previewAnimIdx }) {
   // drift apart.
   const builtinGroups = useMemo(() => builtinThemeGroups(), []);
 
-  const libraryFull = library.length >= BG_GRADIENT_LIB_MAX;
   const selectId = isGlobal ? 'bgAnimGradientRef' : `bgAnimGradientRef-${animIdx}`;
 
   // ---- the browse dialog --------------------------------------------------
@@ -529,12 +554,20 @@ export function GradientEditor({ scope, formData, setField, previewAnimIdx }) {
           <button
             type='button'
             className='btn btn-sm'
-            disabled={libraryFull}
-            title={libraryFull ? `Up to ${BG_GRADIENT_LIB_MAX} gradients can be saved` : undefined}
+            disabled={!canCopy}
+            title={copyBlockedReason}
             onClick={copyToLibrary}
           >
             {editable ? 'Duplicate' : 'Copy to my gradients'}
           </button>
+          {freeId === null && !libraryFull && (
+            <p className='text-warning w-full text-sm'>
+              A copy cannot be saved right now: every gradient number up to {BG_GRADIENT_ID_MAX} is
+              taken by a saved gradient, or is still named by a selection pointing at a deleted one.
+              Delete a saved gradient, or put the animations that point at a missing one back on the
+              global gradient, to free a number.
+            </p>
+          )}
           {isGlobal && (
             <button
               type='button'
