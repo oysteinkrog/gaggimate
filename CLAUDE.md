@@ -1285,24 +1285,36 @@ survived, and what the device taught:
   built once a frame. There is no fixed factor to correct by. A blob win that
   does not appear on the board is code volume, not pixels, and the gap is the
   number to watch.
-- **A band time ratio holds only within one run and one board state, and the
-  state moves it a long way** (2026-09-13). The same binaries read sundial 1.21
-  and glint 1.09 of plasma on a fresh boot, and 1.52 and 1.21 later the same
-  evening; crescent read 1.48 by animtest on a fresh boot, 1.61 by whole frame
-  sweep in the same session, and 1.42 to 1.83 by interlaced sweep in a third.
-  Plasma is the least affected because its kernel is the smallest and has the
-  least to lose from a cold instruction cache, which is what makes the ratio
-  move rather than both numbers together. A 1.00 reading taken before the
-  method was pinned down was simply false. The states differed in at least four
-  ways at once (uptime of hours against minutes, the synthetic brew cycling the
-  two heaviest screens, the web preview path instead of animtest, and the
-  interlaced path pinned on), and nobody has run the experiment that says which
-  one matters. **The repeatable method, and the one to quote:** hard reset,
-  `/api/debug/synth?brew=0`, settle 40 s, then `/api/debug/animtest` with
-  plasma measured in the same run, three times. Three runs of that agreed
-  within 3% for four animations; nothing else tried agreed that well. Quote a
-  ratio only with the plasma it was measured against and the state it was taken
-  in.
+- **A band time ratio means nothing except against a plasma measured in the
+  same run, in a stated board state** (2026-09-13). Plasma is the animation
+  least affected by the board's state, because its kernel is the smallest and
+  has the least to lose from a cold instruction cache, so the state moves the
+  ratio rather than moving both numbers together. Two `/api/debug/animtest`
+  fleet runs of the same binaries, before any of the speed work, on the same
+  board:
+
+                  plasma    sundial          crescent          glint
+      run A       194584    473440 (2.43x)   661116 (3.40x)    239499 (1.23x)
+      run B       241123    458098 (1.90x)   659998 (2.74x)    242821 (1.01x)
+      moved         24%       3.2%             0.2%              1.4%
+
+  Plasma moved 24% and nothing else moved more than 3.2%, so every ratio moved
+  by about the same 22 to 24%. Read run B alone and glint is inside the 1.25
+  budget at 1.01 with no work done at all, where its bead had recorded 1.37 to
+  1.54. That is the mistake to recognise, and it is not a mistake about the
+  animation under test: it is a plasma reading taken in a state that slowed
+  plasma down. **The method that held:** hard reset through esptool,
+  `/api/debug/synth?brew=0` to stop the loadtest build's synthetic brew, settle
+  40 s, then `/api/debug/animtest` with plasma in the same run, three times.
+  Three runs of that agreed within 3% for four animations, better than anything
+  else tried. The states that produced the higher readings differed in at least
+  four ways at once (uptime of hours against minutes, the synthetic brew
+  cycling the two heaviest screens, `framefn_sweep.py` through the web preview
+  instead of animtest, and the interlaced path pinned on), and which of the four
+  moves it is an experiment nobody has run. Two loaded-state figures quoted in
+  the gm-4bd.6 and gm-4bd.9 notes, sundial 1.52 and glint 1.21, are unsourced:
+  the lane could not find the raw output afterwards and withdrew them. Use run A
+  and run B, which are recorded in full.
 - **`EE.LDXQ.32` is the PIE unit's only gather, and this QEMU fork gets it
   wrong** (gm-4bd.6 and .7, 2026-09-13). The instruction takes a 16-bit lane of
   a vector, scales it by four, adds a base and loads 32 bits into one lane, so
