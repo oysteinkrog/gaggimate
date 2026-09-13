@@ -217,8 +217,10 @@ int gradientIndexForAnim(int animId, const std::vector<settingsui::GradientChoic
 // if it made one, else the stored field. Both readings below go through it,
 // so the row, the swatches and the picker all describe the value commit will
 // write rather than a web save that landed mid-visit (the touched-field
-// precedence rule, CLAUDE.md). Defined under CatAnimationCtx, which holds the
-// draft.
+// precedence rule, CLAUDE.md). animReconcile puts that same value back into
+// the stored field the panel draws from, so the page never describes one
+// gradient while another is on screen (gm-nov3.23). Defined under
+// CatAnimationCtx, which holds the draft.
 std::string globalRefInEffect();
 
 // True while the pre-library custom gradient is still what the global
@@ -1341,6 +1343,28 @@ void animReconcile(void *ctx0) {
     if (!ctx->globalGradientTouched) {
         ctx->globalGradientIndex = globalGradientChoiceIndex(choices);
         ctx->globalGradientRef = choices[static_cast<size_t>(ctx->globalGradientIndex)].ref;
+    } else if (std::string(settings.getBgAnimGradientRef().c_str()) != ctx->globalGradientRef) {
+        // The global gradient row is a live field: globalGradientPicked writes
+        // the stored ref the moment the picker returns, and the panel draws
+        // from that stored ref (DefaultUI::updateState). A web save that lands
+        // mid-visit overwrites it, so without this the row, the swatch and the
+        // picker's marker named this visit's choice while the panel drew the
+        // web's, and the exit changed the panel back (gm-nov3.23).
+        //
+        // Putting the touched value back is the same thing the row's own write
+        // does, so it restores the live field rather than introducing a new
+        // rule: the value shown and the value drawn are the same again, and
+        // commit still writes exactly what the row said it would. It is
+        // deliberately only this field. Re-asserting every touched field here
+        // would change the commit-time precedence the rest of the category
+        // relies on, which is what gm-nov3.16 rejected.
+        //
+        // service() runs this before updateState() in the same UI pass, and
+        // updateState only re-resolves the palette when the stored ref changes
+        // under it, so in the ordinary case the render task never sees the
+        // web's ref at all.
+        settings.setBgAnimGradientRef(ctx->globalGradientRef.c_str());
+        mirrorGlobalRefIntoLegacyTheme(settings, ctx->globalGradientRef);
     }
 }
 

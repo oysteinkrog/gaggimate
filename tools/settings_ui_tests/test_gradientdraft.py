@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Scenario for the global gradient's draft during a web save (gm-nov3.16).
+"""Scenario for the global gradient's draft during a web save (gm-nov3.16,
+gm-nov3.23).
 
 CLAUDE.md's rule for the on-display settings is that a web save landing while
 a category is open is per-field last writer wins: every row the user has not
@@ -10,12 +11,20 @@ from the stored field, so between a web save and the exit the display named
 one gradient, drew that gradient's ramp, marked it in the picker, and then
 saved a different one.
 
+gm-nov3.16 fixed the display side and left the panel on the web's gradient
+until the exit, so the page named one gradient while another was on screen.
+gm-nov3.23 closed that: reconciliation puts the touched value back into the
+stored field the panel resolves from, so there is one gradient everywhere for
+the whole visit. check_touched_global_agrees_with_panel is that case.
+
 The checks here drive the simulator's own web save route and read the row's
 value text, the row's swatch pixels, the picker's marker and the field the
 category commits, so a fix that corrects only one of the four is caught by
 the rest. Every web save is read back from GET /api/settings before any
 judgement is made about the UI, so no check here can pass by the POST being
-rejected.
+rejected. The saves that the open category is expected to overwrite are read
+back on a field of the same form that the display never writes, because their
+own gradient field is the thing under test (store_over_draft).
 
 Usage:
     python3 tools/settings_ui_tests/test_gradientdraft.py
@@ -146,6 +155,51 @@ def store(rig, name, fields):
     return check(rig, name, bool(landed), "want %r got %r" % (fields, {k: now.get(k) for k in fields}))
 
 
+def settled(rig, pred, timeout=8):
+    """Rig.wait_until, returning False on a timeout instead of raising.
+
+    A check that waits for several independent things has to report each of
+    them: with the raising form the first one that never happens ends the
+    check, and the rest of its assertions are never made at all, so a run
+    against broken code says one thing failed when four did."""
+    try:
+        return bool(rig.wait_until(pred, timeout=timeout))
+    except TimeoutError:
+        return False
+
+
+def store_over_draft(rig, name, fields, witness):
+    """One web save whose gradient fields the open category is expected to
+    overwrite within a UI pass, so those fields cannot be the proof that the
+    POST landed.
+
+    `witness` names the fields of the same form that the display never writes.
+    The whole document goes in one request and WebUIPlugin::handleSettings
+    applies it in one batchUpdate, so a witness arriving proves the request was
+    accepted and applied. That the gradient ref carried with it is one the
+    handler accepts rather than one bg_ref_valid drops is proved separately,
+    against a closed shell, by the preflight in
+    check_touched_global_agrees_with_panel."""
+    web_save(rig, fields)
+    landed = settled(rig, lambda: all(str(rig.settings().get(k, "")) == str(fields[k]) for k in witness), timeout=6)
+    now = rig.settings()
+    return check(rig, name, bool(landed), "witness %r got %r" % (
+        {k: fields[k] for k in witness}, {k: now.get(k) for k in witness}))
+
+
+def live_global(rig):
+    """The two stored fields DefaultUI::updateState resolves the global
+    gradient from and hands to the render task: bgAnimGradientRef and its
+    legacy mirror bgAnimTheme.
+
+    This is what "the live rendered gradient" means here. The simulator has no
+    render loop at all (sim/platform/bganim_stub.cpp), so the panel cannot be
+    sampled on this venue; these are the inputs it would be drawn from, and on
+    the Animation page nothing but the global gradient row writes them."""
+    s = rig.settings()
+    return str(s.get("bgAnimGradientRef", "")), str(s.get("bgAnimTheme", ""))
+
+
 def global_row(rig):
     """The "Gradient all" row's value text and its swatch pixels."""
     dump = page_with_row(rig, "Gradient all")
@@ -222,6 +276,12 @@ def check_untouched_global_follows_web_save(rig):
     GROUND[b["ref"]] = strip_b
     moved = strip_b is not None and strip_b != strip_a
     check(rig, "untouched_swatch_follows_web", moved, "" if moved else "swatch did not move off %s" % a["name"])
+    # And the panel keeps it: an untouched field is adopted, so nothing in the
+    # category may put the old value back (gm-nov3.23 must not reach a field
+    # this visit has not touched).
+    live_ref, live_theme = live_global(rig)
+    check(rig, "untouched_panel_keeps_web", (live_ref, live_theme) == (b["ref"], str(int(b["ref"]))),
+          "%r want %r" % ((live_ref, live_theme), (b["ref"], str(int(b["ref"])))))
 
     open_picker(rig, "Gradient all")
     marked = picker_selected_rows(rig)
@@ -243,10 +303,15 @@ def check_untouched_global_follows_web_save(rig):
 
 
 def check_touched_global_keeps_draft(rig):
-    """Acceptance: the display picks A, the web saves B, B is confirmed in
-    Settings, and the row, the swatch, the per-animation row's "Global (...)"
-    text and the picker's marker all keep naming A until the exit, which
-    commits A and its legacy mirror."""
+    """Acceptance: the display picks A, the web saves B, the save is confirmed
+    to have landed, and the row, the swatch, the per-animation row's
+    "Global (...)" text and the picker's marker all keep naming A until the
+    exit, which commits A and its legacy mirror.
+
+    The confirmation is a witness field of the same form rather than B itself,
+    because since gm-nov3.23 the category puts A back into the stored gradient
+    field within a UI pass. That the gradient ref in the form is one the POST
+    handler accepts is proved by the preflight in the check below."""
     a, b, c = three_builtins()
     if a["ref"] not in GROUND:
         check(rig, "touched_ground_truth_available", False, "the untouched check captured no swatch")
@@ -275,8 +340,9 @@ def check_touched_global_keeps_draft(rig):
     # row to move proves the category reconciled and rebuilt. Without it a
     # gradient row that had simply not been redrawn yet would read as a pass.
     fps_sentinel = other_fps(rig.settings()["bgAnimFps"])
-    if not store(rig, "touched_web_save_landed", {
-            "bgAnimGradientRef": b["ref"], "bgAnimTheme": int(b["ref"]), "bgAnimFps": fps_sentinel}):
+    if not store_over_draft(rig, "touched_web_save_landed", {
+            "bgAnimGradientRef": b["ref"], "bgAnimTheme": int(b["ref"]), "bgAnimFps": fps_sentinel},
+            ["bgAnimFps"]):
         close_animation(rig)
         return
     rebuilt = wait_row(rig, "Frame rate", "%d fps" % fps_sentinel)
@@ -300,8 +366,9 @@ def check_touched_global_keeps_draft(rig):
     marked = picker_selected_rows(rig)
     check(rig, "touched_picker_group_marks_draft", marked == [a["cat"]], "%r want [%r]" % (marked, a["cat"]))
     probe_lib = "|".join(("90", "Draft Probe", "000000,ffffff"))
-    if store(rig, "touched_web_save_under_picker_landed", {
-            "bgAnimGradientRef": c["ref"], "bgAnimTheme": int(c["ref"]), "bgAnimGradients": probe_lib}):
+    if store_over_draft(rig, "touched_web_save_under_picker_landed", {
+            "bgAnimGradientRef": c["ref"], "bgAnimTheme": int(c["ref"]), "bgAnimGradients": probe_lib},
+            ["bgAnimGradients"]):
         rebuilt = rig.wait_until(lambda: "My gradients" in rows_across_pages(rig), timeout=8)
         check(rig, "touched_picker_rebuilt", bool(rebuilt), rows_across_pages(rig))
         marked = picker_selected_rows(rig)
@@ -326,6 +393,119 @@ def check_touched_global_keeps_draft(rig):
     # so a build without bgAnimGradientRef draws the same gradient.
     check(rig, "touched_exit_mirrors_draft", int(s1["bgAnimTheme"]) == int(a["ref"]),
           "%r want %s" % (s1["bgAnimTheme"], a["ref"]))
+
+
+def check_touched_global_agrees_with_panel(rig):
+    """Acceptance (gm-nov3.23): while the page names this visit's choice, the
+    panel draws it too.
+
+    gm-nov3.16 made the row, the swatch and the picker's marker describe the
+    value the exit will commit. It left the panel resolving from the stored
+    field, so a web save mid-visit made the page name gradient A while the
+    panel drew gradient B, with nothing on screen to say so, and the exit then
+    moved the panel back to A. What is pinned here is that reconciliation puts
+    A back into the stored field: one gradient, in the row and on the panel,
+    for every moment of the visit.
+
+    The case is driven three times, once with the row on screen and once at
+    each level of the picker, because the shell reconciles only the top page
+    and the picker's own reconcile is the only thing that reaches the category
+    underneath it."""
+    a, b, c = three_builtins()
+    if a["ref"] not in GROUND:
+        check(rig, "agree_ground_truth_available", False, "the untouched check captured no swatch")
+        return
+
+    s0 = rig.settings()
+    anim = int(s0["bgAnimId"])
+    # Preflight: the ref the saves below carry is one the POST handler stores
+    # rather than one bg_ref_valid drops. It has to be proved here, against a
+    # closed shell, because inside the visit the display overwrites it by
+    # design and a dropped ref would look exactly the same.
+    if not store(rig, "agree_web_ref_is_accepted", {
+            "bgAnimGradientRef": c["ref"], "bgAnimTheme": int(c["ref"])}):
+        return
+    if not store(rig, "agree_setup", {
+            "bgAnimGradientRef": b["ref"],
+            "bgAnimTheme": int(b["ref"]),
+            "bgAnimThemeMap": map_write_ref(s0["bgAnimThemeMap"], anim, "")}):
+        return
+
+    open_animation(rig)
+    open_picker(rig, "Gradient all")
+    picker_choose(rig, a["cat"], a["name"])
+    live = settled(rig, lambda: live_global(rig)[0] == a["ref"], timeout=6)
+    check(rig, "agree_pick_writes_live", live, live_global(rig)[0])
+
+    # 1. The save with the category's own page on top.
+    fps_sentinel = other_fps(rig.settings()["bgAnimFps"])
+    if not store_over_draft(rig, "agree_row_web_save_landed", {
+            "bgAnimGradientRef": c["ref"], "bgAnimTheme": int(c["ref"]), "bgAnimFps": fps_sentinel},
+            ["bgAnimFps"]):
+        close_animation(rig)
+        return
+    rebuilt = settled(rig, lambda: rig.row_value(page_with_row(rig, "Frame rate"), "Frame rate")
+                      == "%d fps" % fps_sentinel)
+    check(rig, "agree_row_page_rebuilt", rebuilt, rig.row_value(page_with_row(rig, "Frame rate"), "Frame rate"))
+    restored = settled(rig, lambda: live_global(rig)[0] == a["ref"])
+    live_ref, live_theme = live_global(rig)
+    check(rig, "agree_row_panel_back_to_draft", restored, "%r want %r" % (live_ref, a["ref"]))
+    check(rig, "agree_row_mirror_back_to_draft", live_theme == str(int(a["ref"])),
+          "%r want %s" % (live_theme, a["ref"]))
+    value, strip = global_row(rig)
+    check(rig, "agree_row_names_draft", value == a["name"], "%r want %r" % (value, a["name"]))
+    check(rig, "agree_row_swatch_draws_draft", strip == GROUND[a["ref"]],
+          swatch_detail(strip, GROUND[a["ref"]], GROUND.get(c["ref"])))
+
+    # 2. The save with the picker's group page on top. The library entry in
+    # the same form is what proves the picker rebuilt: "My gradients" appears
+    # only after it did, so a marker that had simply not been redrawn yet
+    # cannot read as a pass.
+    lib0 = rig.settings()["bgAnimGradients"]
+    open_picker(rig, "Gradient all")
+    probe_lib = "|".join(("91", "Agree Probe", "000000,ffffff"))
+    if store_over_draft(rig, "agree_group_web_save_landed", {
+            "bgAnimGradientRef": c["ref"], "bgAnimTheme": int(c["ref"]), "bgAnimGradients": probe_lib},
+            ["bgAnimGradients"]):
+        rebuilt = settled(rig, lambda: "My gradients" in rows_across_pages(rig))
+        check(rig, "agree_group_picker_rebuilt", rebuilt, rows_across_pages(rig))
+        restored = settled(rig, lambda: live_global(rig)[0] == a["ref"])
+        check(rig, "agree_group_panel_back_to_draft", restored,
+              "%r want %r" % (live_global(rig)[0], a["ref"]))
+        marked = picker_selected_rows(rig)
+        check(rig, "agree_group_marker_keeps_draft", marked == [a["cat"]], "%r want [%r]" % (marked, a["cat"]))
+
+    # 3. The save with one group's gradient list on top, which reconciles the
+    # category through two levels (groupReconcile, then the parent's). The
+    # restored ref is itself the proof that the reconcile ran: without one it
+    # stays at the web's value for the rest of the visit.
+    picker_tap(rig, a["cat"])
+    rig.wait_until(lambda: depth(rig) == 3, timeout=5)
+    fps_sentinel = other_fps(rig.settings()["bgAnimFps"])
+    if store_over_draft(rig, "agree_list_web_save_landed", {
+            "bgAnimGradientRef": c["ref"], "bgAnimTheme": int(c["ref"]), "bgAnimFps": fps_sentinel},
+            ["bgAnimFps"]):
+        restored = settled(rig, lambda: live_global(rig)[0] == a["ref"])
+        check(rig, "agree_list_panel_back_to_draft", restored,
+              "%r want %r" % (live_global(rig)[0], a["ref"]))
+        marked = picker_selected_rows(rig)
+        check(rig, "agree_list_marker_keeps_draft", marked == [a["name"]], "%r want [%r]" % (marked, a["name"]))
+    picker_cancel(rig)
+    picker_cancel(rig)
+
+    close_animation(rig)
+    store(rig, "agree_library_restored", {"bgAnimGradients": lib0})
+    live_ref, live_theme = live_global(rig)
+    check(rig, "agree_exit_saves_the_named_value", live_ref == a["ref"], "%r want %r" % (live_ref, a["ref"]))
+    check(rig, "agree_exit_mirrors_the_named_value", live_theme == str(int(a["ref"])),
+          "%r want %s" % (live_theme, a["ref"]))
+
+    open_animation(rig)
+    value, strip = global_row(rig)
+    check(rig, "agree_reopen_names_the_same_value", value == a["name"], "%r want %r" % (value, a["name"]))
+    check(rig, "agree_reopen_swatch_draws_it", strip == GROUND[a["ref"]],
+          swatch_detail(strip, GROUND[a["ref"]], GROUND.get(c["ref"])))
+    close_animation(rig)
 
 
 # The retained legacy gradient the checks below drive, in three readings of
@@ -453,6 +633,7 @@ def check_starting_state_restored(rig):
 CHECKS = [
     ("untouched_global_follows_web_save", check_untouched_global_follows_web_save),
     ("touched_global_keeps_draft", check_touched_global_keeps_draft),
+    ("touched_global_agrees_with_panel", check_touched_global_agrees_with_panel),
     ("legacy_fallback_named_and_inert", check_legacy_fallback_named_and_inert),
     ("legacy_unparsable_custom_falls_back", check_legacy_unparsable_custom_falls_back),
     ("starting_state_restored", check_starting_state_restored),
