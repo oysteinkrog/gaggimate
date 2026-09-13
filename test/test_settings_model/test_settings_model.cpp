@@ -1576,10 +1576,11 @@ static void test_migrate_never_reuses_an_ambiguous_duplicate_id() {
 }
 
 static void test_migrate_allocates_past_the_first_thirteen_ids() {
-    // Thirteen dangling map refs and an empty library. Ids 1..13 are all
-    // spoken for, and 14 is a perfectly good id: the accepted range runs to
-    // BG_GRADIENT_ID_MAX, and the web editor allocates by incrementing the
-    // largest id in use, so ids above the entry limit arise in normal use.
+    // Thirteen dangling map refs and an empty library. The allocator takes the
+    // lowest id in 1..BG_GRADIENT_ID_MAX that no library entry holds and no
+    // stored ref names, so these thirteen dangling refs are what force it past
+    // the entry limit to 14. That is the point of the case: an id above the
+    // library's own capacity arises in normal use, from refs alone.
     {
         FakeNvs nvs;
         nvs.map = "c1;c2;c3;c4;c5;c6;c7;c8;c9;c10;c11;c12;c13";

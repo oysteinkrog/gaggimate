@@ -1309,11 +1309,14 @@ survived, and what the device taught:
   proves the firmware draws what it drew yesterday. `make pagecheck`
   (`web/page_vs_golden.js`, third stage of `make check`) plays the page entry
   the way `bench.cpp` plays the firmware, captures golden frames 30, 120 and
-  210, quantises both sides to RGB565 and counts differing pixels. Forty of
-  the 44 are exact, which is the rule a new port is held to; the other four
-  are debt recorded in `page_exact.json`: ripples 18369, steam 16724, orbits
-  5535 and cube 33. It was 24 exact and 20 in debt when the check was
-  written, and every one of the sixteen closed since had a different cause,
+  210, quantises both sides to RGB565 and counts differing pixels. Forty-two
+  of the 44 are exact, which is the rule a new port is held to; the other two
+  are debt recorded in `page_exact.json`: ripples 18369 and cube 33, both
+  accepted by the owner on 2026-09-13 with the reason in each animation's own
+  header and in that file's `accepted` block. Steam (e536caf1) and orbits
+  (dac4c7e1) were debt until that day and are exact now.
+  It was 24 exact and 20 in debt when the check was
+  written, and every one of the eighteen closed since had a different cause,
   three of them user-visible defects that had shipped (Mandala drew
   concentric rings where the page draws petals, Ember was materially darker
   than the design, and Nebula's drift speed depended on the frame rate).
