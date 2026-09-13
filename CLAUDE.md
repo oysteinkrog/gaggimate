@@ -1382,6 +1382,30 @@ Debugging methodology that this codebase has already paid for:
   `s = serial.Serial(); s.port = "COM3"; s.dtr = False; s.rts = False;
   s.open()`, which leaves the board running (checked the same way). The
   flash step resets on purpose.
+- **The board's radio link degrades in place, minutes into a boot, and only a
+  reboot clears it** (gm-t9ld, reproduced and placed 2026-09-13). The symptom
+  is that every HTTP response stalls or truncates: small JSON GETs taking 4 to
+  27 seconds or failing, whole framebuffer reads taking nine minutes. It looks
+  exactly like a firmware fault and it is not one. What places it is a ping
+  with a control, back to back from the same host: 55% loss to the board, 0%
+  loss to the gateway, 53% loss to the board again. The board's own counters
+  stay healthy throughout (`egress ok`, zero LogicLoop overruns, 21.7 fps,
+  `int_free`, `int_largest` and `dma_free` unchanged), the serial log carries
+  no WiFi driver event at all, no roam, no disconnect, no reassociation, and
+  the association never drops. A reset with no flash cures it completely: same
+  BSSID, same rssi, 0% loss and 0.18 s GETs for eight rounds afterwards. So it
+  is the board's own radio state, not the air, and it is not the esptool reset
+  that starts every session (the same command an hour earlier gave 15 clean
+  minutes). **Two earlier explanations are dead**: gm-nov3.10's internal DRAM
+  starvation (the heap numbers in the broken window match a healthy one), and
+  the framebuffer endpoint itself (ICMP never reaches a handler). Why it
+  degrades is not established and is gm-bzu.26.
+  **How to tell a sick board from a slow one before you measure anything**:
+  time three small GETs of `/api/debug/anim` and stop if any one exceeds a
+  second. In the bad window 11 of 15 were over a second or failed, so one
+  sample misses it about a quarter of the time; three catch it about 98 times
+  in 100 and cost under a second on a healthy board. Ten pings is the other
+  cheap test and it was unambiguous in both states.
 - Windows tooling runs Python 3.10 (`GM_RIG_PY` env var to override):
   Python313 silently lacks esptool and pyserial.
 - Camera verification: `C:\work\camshots\grab.bat <file>` (one frame),
