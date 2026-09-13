@@ -321,3 +321,77 @@ its pages to `CATEGORY_PAGES` in `audit_pages.py`. Read `venue.sim` before
 restarting anything and `venue.can_restart` before doing it, `venue.log_path`
 before reading the simulator's log, and skip with a logged reason rather
 than silently when the venue cannot support a check.
+
+### Writing a check that can fail
+
+Six defects in the gm-nov3 epic were the same mistake: a check whose name
+claimed one thing and whose assertion established something much weaker,
+so it passed on the fault it was written to catch. None of them were found
+by running the suite, because all of them passed. They were found by
+reading. The recurring shapes, with the instance that taught each one:
+
+- **A failure stood in for a specific failure.** `Rig._open` folds every
+  HTTP status error and every socket error into one `RigHTTPError`, and
+  four checks read that exception as proof that the device restarted, or
+  that a route was absent. An HTTP 500 with the simulator still running
+  passed as both (gm-nov3.29). Establish the thing itself:
+  `Sim.wait_exited` for a restart, `Rig.route_absent` for an absent route.
+  `Rig.fetch` exists for checks that need to tell one status from another.
+- **A name stood in for a row.** `find_tag` returns the first object with
+  a matching tag, and two library entries the user called the same thing
+  carry identical tags, so every check past the row count read the first
+  of them twice (gm-nov3.28). `Rig.row_slots` and `Rig.find_in_row`
+  address a row by its position, which is unique where its name is not.
+  `picker_selected_rows` still reads the marker by name and is the last
+  known instance.
+- **Existence stood in for identity.** `len(set(strip)) > 4` over a swatch
+  says a ramp was drawn, not which one. Every entry in the fixture library
+  clears that threshold by a factor of ten (measured: 46 to 80 distinct
+  colours across all twelve), so a row drawing the wrong gradient passes.
+  `swatch_matches_stops` in `test_animation.py` compares the strip's two
+  ends against that row's own stored stops instead. The ends are enough
+  and the interior is deliberately not re-derived here: `GradientSwatch.cpp`
+  is already a transcription of the palette arithmetic, and
+  `tools/animbench/swatch_parity.cpp` is what holds it to the real one.
+  Measured on the simulator, `ff0000,ff2000` draws `(255,0,0)` to
+  `(255,28,0)` against a nominal `(255,32,0)`, which is where the tolerance
+  of 20 comes from.
+- **A side effect stood in for the act.** `picker_choose` asserted that the
+  page stack shrank, which happened whether or not anything was selected;
+  ten checks leaned on it (gm-nov3.31).
+
+The test for a new check is the one the beads above ask for: name the fault
+it is meant to catch, build that fault, and watch the check fail. A check
+that has never been seen to fail has not been tested.
+
+### Proving a check fails, without breaking the shared checkout
+
+Several agents work in this checkout at once, so the broken version must
+never exist here, even briefly: another lane's pathspec commit can capture
+it. Two ways, both used for the beads above.
+
+For a fault in the harness itself, inject at `urllib.request.urlopen`
+inside the `rig` module. It sits under both `Rig._open` and `Rig.fetch`, so
+one patch covers every request, and the archived copy of the harness and
+the fixed one see the same fault:
+
+    git archive HEAD tools/settings_ui_tests src/version.h | tar -x -C <scratch>
+
+(`src/version.h` is generated and untracked, so copy it; without it the
+status scenario cannot read the build version.)
+
+For a fault in the firmware, copy the worktree and build there. The copy
+carries the built tree, so the simulator relinks in about eight seconds
+rather than needing its own libdeps:
+
+    tar -C <worktree> --exclude=.pio --exclude=.git -cf - . | tar -C <scratch> -xf -
+    cp -a <worktree>/.pio/libdeps/display-sim <scratch>/.pio/libdeps/
+    cp -a <worktree>/.pio/build/display-sim  <scratch>/.pio/build/
+    cp <worktree>/src/version.h <scratch>/src/version.h
+    cp -a <worktree>/src/display/webassets/. <scratch>/src/display/webassets/
+
+Then `/mnt/c/Users/Oystein/.local/bin/pio run -e display-sim` in the copy,
+by absolute path, as CLAUDE.md requires everywhere. The copy is not a git
+repository, so its build writes an empty `BUILD_GIT_VERSION` and the two
+version checks in the status scenario fail there for that reason alone.
+Everything else runs normally.
