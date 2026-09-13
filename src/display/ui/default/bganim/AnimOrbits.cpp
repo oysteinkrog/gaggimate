@@ -71,10 +71,22 @@
 // including the whole-frame call that interlace_check.cpp's header records
 // as broken for this animation.
 //
-// The host bench band is 0.076 ms a frame against the old port's 0.043, all
-// of it the wider path layer, the per-pixel float stamp work and packing the
-// touched pixels back to 5-6-5. The device band has not been measured: the
-// board was held by another agent when this landed (gm-pciz).
+// What drawing the page costs, so the next person does not have to measure
+// it again. The host bench band is 0.076 ms a frame against the old port's
+// 0.043, all of it the wider path layer, the per-pixel float stamp work and
+// packing the touched pixels back to 5-6-5. In the same fleet run that is
+// 1.12x plasma, the reference animation BASELINE.md lists first (0.075
+// against 0.067 ms). PSRAM goes from about 32 KB to about 160 KB,
+// nearly all of it the path layer (11,520 PathPx at 8 B, 92 KB) and the
+// 2,880 double ellipse samples it is built from (46 KB); both are built
+// once per parameter or theme change, not per frame. The hot slab holds
+// about 6 KB of the 9,216 B an animation gets, and the lifecycle check
+// reports no fallback to PSRAM.
+//
+// The device band has not been measured: the board was held by another
+// agent when this landed (gm-pciz). That is the one open item on this file,
+// together with the band() against bandRef() run at /api/debug/animtest,
+// which gm-4bd.11's fleet sweep passed at affbc12f, before this change.
 
 #include "BgAnim.h"
 #include "BgAnimCommon.h"
