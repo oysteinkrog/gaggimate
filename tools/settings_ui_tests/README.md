@@ -387,14 +387,27 @@ accepted and applied. Carry a witness of the same form in the same POST and
 wait on that. In `test_gradientdraft.py`, `store()` is the read-back form,
 for a field no open page owns, and `store_over_draft()` is the witness form.
 
-The fields that need the witness form today are `bgAnimGradientRef` and
-`bgAnimTheme` (gm-nov3.23) and every slot of `bgAnimThemeMap` (gm-nov3.36).
-Ask the question first rather than treating it as a special case: before
-waiting on a field, ask whether the open page writes it. The list grows
-whenever a row becomes a live field, and a check written before that happens
-goes red when it does. `check_gradient_precedence_across_animations` in
-`test_animation.py` is the worked example: it waited on `bgAnimThemeMap`
-itself, and gm-nov3.36 made that field one the display restores.
+Which fields need the witness form is a test, not a list. Before waiting on a
+field, ask whether the open page writes it; if it does, carry a witness. The
+list went stale twice in one day, which is why it is written as a test here.
+
+Applying that test to the Animation category: since gm-nov3.39 it writes back
+every field it has touched that the display reads during the visit, which is
+every value row it has except the standby animation id. So the animation id,
+frame rate, all-screens, theme, `bgAnimGradientRef` and its `bgAnimTheme`
+mirror, every slot of `bgAnimThemeMap`, plates, plate colour, plate opacity,
+element tint, tint colour, the text scrim, both fade lengths, the fade curve,
+interlace, and every slot of `bgAnimParams` on the Parameters page. The
+standby animation id is the exception because the display reads it only on the
+standby screen and the settings cover sits on the menu screen.
+`bgAnimBrightness` is the witness the checks here carry, because no row of the
+category writes it.
+
+Two checks in `test_animation.py` were written before their own field became
+one the display restores, and each went red when it did:
+`check_gradient_precedence_across_animations` waited on `bgAnimThemeMap`
+itself (gm-nov3.36), and `check_frame_rate_live_and_precedence` waited on
+`bgAnimFps` (gm-nov3.39).
 
 Whether the ref or map in the form is one the POST handler stores, rather
 than one `bg_ref_valid` or `bg_map_valid` drops, is a separate question and

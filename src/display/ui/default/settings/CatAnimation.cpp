@@ -17,9 +17,12 @@
 // is live (SettingsUI.h): a row writes Settings and calls markDirty() the
 // moment it changes, rather than waiting for commit, so
 // DefaultUI::updateState applies it on the next rerender pass (CLAUDE.md,
-// UI-pipeline invariants). commit()'s only remaining job is the
+// UI-pipeline invariants). What is left for commit() and reconcile() is the
 // touched-field precedence rule: if a web save landed on a touched field
-// while this page was open, re-assert this visit's value (gm-flw.9).
+// while this page was open, re-assert this visit's value (gm-flw.9). Both go
+// through reassertTouchedLiveFields below, because a field the display reads
+// during the visit cannot wait for the exit (gm-nov3.39); the standby
+// animation id, which it cannot read, is written by commit() alone.
 #include "CatAnimParams.h"
 #include "CatGradientPicker.h"
 #include "GradientSwatch.h"
@@ -1437,6 +1440,113 @@ bool mergeTouchedGradientSlots(const CatAnimationCtx *ctx, std::string &map, cha
     return wrote;
 }
 
+// Every touched field this page writes that the display reads back while the
+// page is still open, written over whatever a web save left in storage.
+//
+// This is the live-field rule (CLAUDE.md, "On-display settings"). A row here
+// writes Settings the moment it changes and DefaultUI resolves the panel from
+// the stored value on its next pass, so a web save landing mid-visit put the
+// web's value on the panel while the row went on naming this visit's, with
+// nothing on screen to say so, until commit moved it back at the exit. Fields
+// the display cannot read during the visit are not in here: the standby
+// animation id is the one this page writes that is not live (animCommit writes
+// it on its own), because DefaultUI takes it only on the standby screen and
+// the settings cover sits on the menu screen.
+//
+// Shared by animReconcile and animCommit so the two cannot disagree about
+// which fields this visit owns, the same reason mergeTouchedGradientSlots is
+// shared. Reconcile passes no log; commit names each field it wrote.
+bool reassertTouchedLiveFields(CatAnimationCtx *ctx, Settings &settings, char *log, size_t logCap, int *used) {
+    bool wrote = false;
+    auto note = [&](const char *fmt, auto value) {
+        if (log != nullptr && used != nullptr) {
+            settingsLogAppend(log, logCap, *used, fmt, value);
+        }
+        wrote = true;
+    };
+
+    if (ctx->animIdTouched && settings.getBgAnimId() != ctx->animId) {
+        settings.setBgAnimId(ctx->animId);
+        note(" anim=%d", ctx->animId);
+    }
+    if (ctx->fpsTouched && settings.getBgAnimFps() != static_cast<int>(ctx->fps)) {
+        settings.setBgAnimFps(static_cast<int>(ctx->fps));
+        note(" fps=%ld", ctx->fps);
+    }
+    if (ctx->allScreensTouched && settings.isBgAnimAllScreens() != ctx->allScreens) {
+        settings.setBgAnimAllScreens(ctx->allScreens);
+        note(" allScreens=%d", ctx->allScreens ? 1 : 0);
+    }
+    if (ctx->themeModeTouched && settings.getThemeMode() != ctx->themeMode) {
+        settings.setThemeMode(ctx->themeMode);
+        note(" theme=%d", ctx->themeMode);
+    }
+    {
+        // Every touched animation's gradient ref, not just the last one
+        // touched: the map is one field per animation and a web save replaces
+        // the whole string, so a save landing on animation A while this
+        // visit's last edit was to B must not cost A its touched value
+        // (gm-flw.9 review). The read-modify-write is already inside the
+        // shell's Settings::Guard, which wraps both callers, so it takes none
+        // of its own the way gradientOnCycle has to.
+        std::string map(settings.getBgAnimThemeMap().c_str());
+        if (mergeTouchedGradientSlots(ctx, map, log, logCap, used)) {
+            settings.setBgAnimThemeMap(map.c_str());
+            wrote = true;
+        }
+    }
+    if (ctx->globalGradientTouched &&
+        std::string(settings.getBgAnimGradientRef().c_str()) != ctx->globalGradientRef) {
+        settings.setBgAnimGradientRef(ctx->globalGradientRef.c_str());
+        mirrorGlobalRefIntoLegacyTheme(settings, ctx->globalGradientRef);
+        note(" gradientAll=%s", ctx->globalGradientRef.c_str());
+    }
+    if (ctx->platesTouched && settings.getBgAnimClearPlates() != ctx->plates) {
+        settings.setBgAnimClearPlates(ctx->plates);
+        note(" plates=%d", ctx->plates);
+    }
+    if (ctx->plateColorTouched && settings.getBgAnimPlateColor() != ctx->plateColor) {
+        settings.setBgAnimPlateColor(ctx->plateColor);
+        note(" plateColor=%06x", ctx->plateColor);
+    }
+    if (ctx->plateOpacityTouched && settings.getBgAnimPlateOpacity() != static_cast<int>(ctx->plateOpacity)) {
+        settings.setBgAnimPlateOpacity(static_cast<int>(ctx->plateOpacity));
+        note(" plateOpacity=%ld", ctx->plateOpacity);
+    }
+    if (ctx->tintEnabledTouched && settings.getElementTintEnabled() != ctx->tintEnabled) {
+        settings.setElementTintEnabled(ctx->tintEnabled);
+        note(" tintEnabled=%d", ctx->tintEnabled ? 1 : 0);
+    }
+    if (ctx->tintColorTouched && settings.getElementTintColor() != ctx->tintColor) {
+        settings.setElementTintColor(ctx->tintColor);
+        note(" tintColor=%06x", ctx->tintColor);
+    }
+    if (ctx->scrimTouched && settings.getBgAnimScrim() != static_cast<int>(ctx->scrim)) {
+        settings.setBgAnimScrim(static_cast<int>(ctx->scrim));
+        note(" scrim=%ld", ctx->scrim);
+    }
+    // The two fade lengths are read at the start of every overlay transition
+    // (DefaultUI::beginOverlayTransition), and pushing or popping a child page
+    // of this category is one, so they are live during the visit like the rest.
+    if (ctx->fadeOutTouched && settings.getBgFadeOutMs() != static_cast<int>(ctx->fadeOut)) {
+        settings.setBgFadeOutMs(static_cast<int>(ctx->fadeOut));
+        note(" fadeOut=%ld", ctx->fadeOut);
+    }
+    if (ctx->fadeInTouched && settings.getBgFadeInMs() != static_cast<int>(ctx->fadeIn)) {
+        settings.setBgFadeInMs(static_cast<int>(ctx->fadeIn));
+        note(" fadeIn=%ld", ctx->fadeIn);
+    }
+    if (ctx->fadeCurveTouched && settings.getBgFadeCurve() != ctx->fadeCurve) {
+        settings.setBgFadeCurve(ctx->fadeCurve);
+        note(" fadeCurve=%d", ctx->fadeCurve);
+    }
+    if (ctx->interlaceTouched && (settings.getBgAnimInterlace() != 0) != ctx->interlace) {
+        settings.setBgAnimInterlace(ctx->interlace ? 1 : 0);
+        note(" interlace=%d", ctx->interlace ? 1 : 0);
+    }
+    return wrote;
+}
+
 // After a settings:changed event: refreshes only the fields this visit has
 // not edited. service() rebuilds the page unconditionally right after
 // calling this, so the redraw (including row enable/disable) is the shell's
@@ -1495,35 +1605,18 @@ void animReconcile(void *ctx0) {
         ctx->interlace = settings.getBgAnimInterlace() != 0;
     }
 
-    // The per-animation gradient rows are live fields, exactly as the global
-    // row below is: animGradientAssign writes the animation's slot of
-    // bgAnimThemeMap the moment a pick or an arrow lands, and the panel
-    // resolves the palette from that stored map (DefaultUI::updateState). A
-    // web save replaces the whole string, so without this the row went on
-    // naming this visit's gradient while the panel drew the web's, with
-    // nothing on screen to say so, until commit() moved it back at the exit
-    // (gm-nov3.36). That window is the whole rest of the visit, where the
-    // global row's is one update pass.
+    // Every touched field the display reads while this page is open goes back
+    // into storage here, not only at commit: the row writes Settings live and
+    // the panel resolves from the stored value, so a web save that landed
+    // mid-visit otherwise drew its own value behind a row still naming this
+    // visit's, from the save until the exit (gm-nov3.23 for the global
+    // gradient, gm-nov3.36 for the map slots, gm-nov3.39 for the rest).
     //
-    // Every touched slot goes back, not only the current animation's: a
-    // touched standby or off-screen animation can become the current one
-    // later in the same visit, and its slot would be the web's for that
-    // stretch. An untouched slot keeps whatever the web posted, which is the
-    // ordinary per-field rule.
-    //
-    // This is the same write the row itself makes, so it restores a live
-    // field rather than changing the commit-time precedence the rest of the
-    // category depends on (gm-nov3.16): commit() still writes exactly what
-    // the rows said. The read-modify-write of the whole string is already
-    // inside the shell's Settings::Guard, which SettingsUI::service() holds
-    // around every reconcile call, so a web save's batchUpdate cannot
-    // interleave with it the way gradientOnCycle has to guard against.
-    {
-        std::string map(settings.getBgAnimThemeMap().c_str());
-        if (mergeTouchedGradientSlots(ctx, map, nullptr, 0, nullptr)) {
-            settings.setBgAnimThemeMap(map.c_str());
-        }
-    }
+    // These are the same writes the rows themselves make, so this restores
+    // live fields rather than changing the commit-time precedence the
+    // category depends on (gm-nov3.16): commit still writes exactly what the
+    // rows said, and an untouched field still adopts whatever the web posted.
+    reassertTouchedLiveFields(ctx, settings, nullptr, 0, nullptr);
 
     // Gradient row on screen: shows this visit's touched choice for
     // ctx->animId if there is one, otherwise re-derives fresh from the map
@@ -1549,31 +1642,15 @@ void animReconcile(void *ctx0) {
     }
     ctx->standbyGradientRef = choices[static_cast<size_t>(ctx->standbyGradientIndex)].ref;
 
+    // The touched case needs nothing here: the row already holds this visit's
+    // choice and reassertTouchedLiveFields above has put it back into the
+    // stored field the panel draws from. service() runs this before
+    // updateState() in the same UI pass, and updateState re-resolves the
+    // palette only when the stored ref changes under it, so in the ordinary
+    // case the render task never sees the web's ref at all.
     if (!ctx->globalGradientTouched) {
         ctx->globalGradientIndex = globalGradientChoiceIndex(choices);
         ctx->globalGradientRef = choices[static_cast<size_t>(ctx->globalGradientIndex)].ref;
-    } else if (std::string(settings.getBgAnimGradientRef().c_str()) != ctx->globalGradientRef) {
-        // The global gradient row is a live field: globalGradientPicked writes
-        // the stored ref the moment the picker returns, and the panel draws
-        // from that stored ref (DefaultUI::updateState). A web save that lands
-        // mid-visit overwrites it, so without this the row, the swatch and the
-        // picker's marker named this visit's choice while the panel drew the
-        // web's, and the exit changed the panel back (gm-nov3.23).
-        //
-        // Putting the touched value back is the same thing the row's own write
-        // does, so it restores the live field rather than introducing a new
-        // rule: the value shown and the value drawn are the same again, and
-        // commit still writes exactly what the row said it would. It is
-        // deliberately only this field. Re-asserting every touched field here
-        // would change the commit-time precedence the rest of the category
-        // relies on, which is what gm-nov3.16 rejected.
-        //
-        // service() runs this before updateState() in the same UI pass, and
-        // updateState only re-resolves the palette when the stored ref changes
-        // under it, so in the ordinary case the render task never sees the
-        // web's ref at all.
-        settings.setBgAnimGradientRef(ctx->globalGradientRef.c_str());
-        mirrorGlobalRefIntoLegacyTheme(settings, ctx->globalGradientRef);
     }
 }
 
@@ -1582,106 +1659,21 @@ void animCommit(void *ctx0) {
     Settings &settings = controller.getSettings();
     char log[256];
     int used = std::snprintf(log, sizeof(log), "SettingsAnimation: committed");
-    bool wrote = false;
 
-    if (ctx->animIdTouched && settings.getBgAnimId() != ctx->animId) {
-        settings.setBgAnimId(ctx->animId);
-        settingsLogAppend(log, sizeof(log), used, " anim=%d", ctx->animId);
-        wrote = true;
-    }
+    // Since gm-nov3.39 reconcile has usually written every live field back
+    // already, so in the ordinary case this finds nothing to do. It stays
+    // because a web save can land between the last reconcile and this call,
+    // and because a visit with no web save in it never reconciles at all.
+    bool wrote = reassertTouchedLiveFields(ctx, settings, log, sizeof(log), &used);
+
+    // The standby animation id is the one touched field of this page that the
+    // display cannot read while the cover is up: DefaultUI takes it only on
+    // the standby screen (updateState), and the cover sits on the menu screen.
+    // So it is not a live field, it is not re-asserted at reconcile, and it is
+    // written here, at the exit, like an ordinary drafted field.
     if (ctx->standbyAnimIdTouched && settings.getBgAnimStandbyId() != ctx->standbyAnimId) {
         settings.setBgAnimStandbyId(ctx->standbyAnimId);
         settingsLogAppend(log, sizeof(log), used, " standbyAnim=%d", ctx->standbyAnimId);
-        wrote = true;
-    }
-    if (ctx->fpsTouched && settings.getBgAnimFps() != static_cast<int>(ctx->fps)) {
-        settings.setBgAnimFps(static_cast<int>(ctx->fps));
-        settingsLogAppend(log, sizeof(log), used, " fps=%ld", ctx->fps);
-        wrote = true;
-    }
-    if (ctx->allScreensTouched && settings.isBgAnimAllScreens() != ctx->allScreens) {
-        settings.setBgAnimAllScreens(ctx->allScreens);
-        settingsLogAppend(log, sizeof(log), used, " allScreens=%d", ctx->allScreens ? 1 : 0);
-        wrote = true;
-    }
-    if (ctx->themeModeTouched && settings.getThemeMode() != ctx->themeMode) {
-        settings.setThemeMode(ctx->themeMode);
-        settingsLogAppend(log, sizeof(log), used, " theme=%d", ctx->themeMode);
-        wrote = true;
-    }
-    {
-        // Re-assert every touched animation's gradient ref, not just the
-        // last one touched: the map is one field per animation, and a web
-        // save replaces the whole string, so a web save landing on animId A
-        // while this visit's last edit was to animId B must not cost A its
-        // touched value at commit (gm-flw.9 review). Already inside the
-        // shell's Settings::Guard (SettingsUI::popPage/teardownAll wrap the
-        // whole commit() call), so no separate guard is needed here the way
-        // gradientOnCycle needs its own. Since gm-nov3.36 reconcile() has
-        // usually put these slots back already, so this most often finds
-        // nothing to write; it stays because a web save can land between the
-        // last reconcile and this call.
-        std::string map(settings.getBgAnimThemeMap().c_str());
-        if (mergeTouchedGradientSlots(ctx, map, log, sizeof(log), &used)) {
-            settings.setBgAnimThemeMap(map.c_str());
-            wrote = true;
-        }
-    }
-    if (ctx->globalGradientTouched &&
-        std::string(settings.getBgAnimGradientRef().c_str()) != ctx->globalGradientRef) {
-        settings.setBgAnimGradientRef(ctx->globalGradientRef.c_str());
-        mirrorGlobalRefIntoLegacyTheme(settings, ctx->globalGradientRef);
-        settingsLogAppend(log, sizeof(log), used, " gradientAll=%s", ctx->globalGradientRef.c_str());
-        wrote = true;
-    }
-    if (ctx->platesTouched && settings.getBgAnimClearPlates() != ctx->plates) {
-        settings.setBgAnimClearPlates(ctx->plates);
-        settingsLogAppend(log, sizeof(log), used, " plates=%d", ctx->plates);
-        wrote = true;
-    }
-    if (ctx->plateColorTouched && settings.getBgAnimPlateColor() != ctx->plateColor) {
-        settings.setBgAnimPlateColor(ctx->plateColor);
-        settingsLogAppend(log, sizeof(log), used, " plateColor=%06x", ctx->plateColor);
-        wrote = true;
-    }
-    if (ctx->plateOpacityTouched && settings.getBgAnimPlateOpacity() != static_cast<int>(ctx->plateOpacity)) {
-        settings.setBgAnimPlateOpacity(static_cast<int>(ctx->plateOpacity));
-        settingsLogAppend(log, sizeof(log), used, " plateOpacity=%ld", ctx->plateOpacity);
-        wrote = true;
-    }
-    if (ctx->tintEnabledTouched && settings.getElementTintEnabled() != ctx->tintEnabled) {
-        settings.setElementTintEnabled(ctx->tintEnabled);
-        settingsLogAppend(log, sizeof(log), used, " tintEnabled=%d", ctx->tintEnabled ? 1 : 0);
-        wrote = true;
-    }
-    if (ctx->tintColorTouched && settings.getElementTintColor() != ctx->tintColor) {
-        settings.setElementTintColor(ctx->tintColor);
-        settingsLogAppend(log, sizeof(log), used, " tintColor=%06x", ctx->tintColor);
-        wrote = true;
-    }
-    if (ctx->scrimTouched && settings.getBgAnimScrim() != static_cast<int>(ctx->scrim)) {
-        settings.setBgAnimScrim(static_cast<int>(ctx->scrim));
-        settingsLogAppend(log, sizeof(log), used, " scrim=%ld", ctx->scrim);
-        wrote = true;
-    }
-    if (ctx->fadeOutTouched && settings.getBgFadeOutMs() != static_cast<int>(ctx->fadeOut)) {
-        settings.setBgFadeOutMs(static_cast<int>(ctx->fadeOut));
-        settingsLogAppend(log, sizeof(log), used, " fadeOut=%ld", ctx->fadeOut);
-        wrote = true;
-    }
-    if (ctx->fadeInTouched && settings.getBgFadeInMs() != static_cast<int>(ctx->fadeIn)) {
-        settings.setBgFadeInMs(static_cast<int>(ctx->fadeIn));
-        settingsLogAppend(log, sizeof(log), used, " fadeIn=%ld", ctx->fadeIn);
-        wrote = true;
-    }
-    if (ctx->fadeCurveTouched && settings.getBgFadeCurve() != ctx->fadeCurve) {
-        settings.setBgFadeCurve(ctx->fadeCurve);
-        settingsLogAppend(log, sizeof(log), used, " fadeCurve=%d", ctx->fadeCurve);
-        wrote = true;
-    }
-    if (ctx->interlaceTouched && (settings.getBgAnimInterlace() != 0) != ctx->interlace) {
-        settings.setBgAnimInterlace(ctx->interlace ? 1 : 0);
-        settingsLogAppend(log, sizeof(log), used, " interlace=%d", ctx->interlace ? 1 : 0);
         wrote = true;
     }
     (void)used;

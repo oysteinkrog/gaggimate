@@ -126,6 +126,38 @@ void storeGroup(AnimParamsCtx *ctx) {
     settings.setBgAnimParams(settingsui::bgParamsWriteGroup(packed, ctx->animId, ctx->values).c_str());
 }
 
+// Every slot this visit has touched merged into `packed`, with every slot it
+// has not left exactly as the string holds it. Returns true when the string
+// changed.
+//
+// Shared by animParamsReconcile and animParamsCommit so the rule that decides
+// which slots survive a web save cannot drift between them, the way
+// CatAnimation.cpp's mergeTouchedGradientSlots is shared: bgAnimParams is one
+// group per animation, a web save replaces the whole string in one write, and
+// this visit owns only the slots it has stepped.
+bool mergeTouchedSlots(const AnimParamsCtx *ctx, std::string &packed) {
+    uint8_t defs[settingsui::kBgAnimParamSlots];
+    defaultsFor(ctx, defs);
+    uint8_t stored[settingsui::kBgAnimParamSlots];
+    settingsui::bgParamsRead(packed, ctx->animId, defs, stored);
+    bool differs = false;
+    for (int i = 0; i < settingsui::kBgAnimParamSlots; i++) {
+        if (ctx->touched[i] && stored[i] != ctx->values[i]) {
+            differs = true;
+            break;
+        }
+    }
+    if (!differs) {
+        return false;
+    }
+    uint8_t merged[settingsui::kBgAnimParamSlots];
+    for (int i = 0; i < settingsui::kBgAnimParamSlots; i++) {
+        merged[i] = ctx->touched[i] ? ctx->values[i] : stored[i];
+    }
+    packed = settingsui::bgParamsWriteGroup(packed, ctx->animId, merged);
+    return true;
+}
+
 void paramOnStep(void *user, int dir, bool fast) {
     auto *rc = static_cast<ParamRowCtx *>(user);
     AnimParamsCtx *ctx = rc->page;
@@ -219,14 +251,28 @@ void animParamsBuildRow(void *ctx0, int index, lv_obj_t *parent, SettingsUI &ui)
 }
 
 // Refreshes every slot this visit has not edited from the stored string, the
-// shared reconcile contract. The shell rebuilds the page right after this
-// call, so the row values come from the draft on that pass and nothing here
-// has to touch a row.
+// shared reconcile contract, and writes every slot it has edited back over
+// the web's. The shell rebuilds the page right after this call, so the row
+// values come from the draft on that pass and nothing here has to touch a
+// row.
+//
+// Every slot here is a live field: a step writes the whole string at once and
+// DefaultUI::updateState re-parses it and hands the eight bytes to the render
+// task on its next pass. So a web save that replaced the string left the
+// panel drawing the web's value for a slot this visit had stepped, while the
+// row went on showing the visit's, from the save until the pop. Putting the
+// touched slots back is the same write the step itself makes, so it restores
+// the live field rather than changing commit-time precedence (gm-nov3.39);
+// commit still writes exactly what the rows said, and an untouched slot still
+// adopts whatever the web posted. Runs under the shell's Settings::Guard
+// (SettingsUI::service wraps every reconcile call), so it takes none of its
+// own the way storeGroup has to.
 void animParamsReconcile(void *ctx0) {
     auto *ctx = static_cast<AnimParamsCtx *>(ctx0);
+    Settings &settings = controller.getSettings();
     uint8_t defs[settingsui::kBgAnimParamSlots];
     defaultsFor(ctx, defs);
-    const std::string packed(controller.getSettings().getBgAnimParams().c_str());
+    std::string packed(settings.getBgAnimParams().c_str());
     uint8_t stored[settingsui::kBgAnimParamSlots];
     settingsui::bgParamsRead(packed, ctx->animId, defs, stored);
     for (int i = 0; i < settingsui::kBgAnimParamSlots; i++) {
@@ -234,37 +280,26 @@ void animParamsReconcile(void *ctx0) {
             ctx->values[i] = stored[i];
         }
     }
+    if (mergeTouchedSlots(ctx, packed)) {
+        settings.setBgAnimParams(packed.c_str());
+    }
 }
 
-// Every step already wrote the string, so in the ordinary case this writes
-// nothing. What it is for is the precedence rule: if a web save replaced the
-// whole string while this page was open, the slots this visit touched are
-// re-asserted here, the way CatAnimation.cpp's commit re-asserts a touched
-// gradient ref. Runs under the shell's Settings::Guard (popPage/teardownAll
-// wrap the whole call), so it takes none of its own.
+// Every step already wrote the string and reconcile has usually written the
+// touched slots back over a web save too, so in the ordinary case this writes
+// nothing. It stays because a web save can land between the last reconcile
+// and this call, and because a visit with no web save in it never reconciles
+// at all. Through the same merge as reconcile, so the two cannot disagree
+// about which slots this visit owns. Runs under the shell's Settings::Guard
+// (popPage/teardownAll wrap the whole call), so it takes none of its own.
 void animParamsCommit(void *ctx0) {
     auto *ctx = static_cast<AnimParamsCtx *>(ctx0);
     Settings &settings = controller.getSettings();
-    uint8_t defs[settingsui::kBgAnimParamSlots];
-    defaultsFor(ctx, defs);
-    const std::string packed(settings.getBgAnimParams().c_str());
-    uint8_t stored[settingsui::kBgAnimParamSlots];
-    settingsui::bgParamsRead(packed, ctx->animId, defs, stored);
-    bool differs = false;
-    for (int i = 0; i < settingsui::kBgAnimParamSlots; i++) {
-        if (ctx->touched[i] && stored[i] != ctx->values[i]) {
-            differs = true;
-            break;
-        }
-    }
-    if (!differs) {
+    std::string packed(settings.getBgAnimParams().c_str());
+    if (!mergeTouchedSlots(ctx, packed)) {
         return;
     }
-    uint8_t merged[settingsui::kBgAnimParamSlots];
-    for (int i = 0; i < settingsui::kBgAnimParamSlots; i++) {
-        merged[i] = ctx->touched[i] ? ctx->values[i] : stored[i];
-    }
-    settings.setBgAnimParams(settingsui::bgParamsWriteGroup(packed, ctx->animId, merged).c_str());
+    settings.setBgAnimParams(packed.c_str());
     ESP_LOGI("SettingsUI", "SettingsAnimParams: re-asserted anim=%d over a web save", ctx->animId);
     if (ctx->ui != nullptr) {
         ctx->ui->ui().markDirty();

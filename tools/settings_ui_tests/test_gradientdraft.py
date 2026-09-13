@@ -81,6 +81,8 @@ from tools.settings_ui_tests.test_animation import (  # noqa: E402
     open_animation,
     open_picker,
     page_with_row,
+    params_group,
+    params_set_group,
     picker_cancel,
     picker_choose,
     picker_selected_rows,
@@ -89,6 +91,7 @@ from tools.settings_ui_tests.test_animation import (  # noqa: E402
     rows_across_pages,
     swatch_strip,
     tap_row,
+    wait_depth,
     web_save,
 )
 
@@ -1521,6 +1524,223 @@ def check_the_band_still_opens_the_picker(rig):
     restore_fields_exactly(rig, "band_restored", {"bgAnimStandbyId": standby0})
 
 
+# ---------------------------------------------------------------------------
+# The rest of the live fields during a web save (gm-nov3.39)
+#
+# The gradient rows above are not special. Every value row of the Animation
+# category writes Settings the moment it changes, and DefaultUI reads most of
+# those stored values back on its next pass: the animation id, frame rate,
+# all-screens, theme, plates and their colour and opacity, the element tint,
+# the text scrim, both fade lengths, the fade curve and interlace. Each one had
+# the gap gm-nov3.23 and gm-nov3.36 closed for gradients: a web save landing
+# mid-visit put the web's value on the panel while the row went on naming this
+# visit's, and only the exit moved it back.
+#
+# The standby animation id is the one field this page writes that is not live:
+# DefaultUI takes it only on the standby screen, and the settings cover sits on
+# the menu screen. It is committed at the exit and is deliberately not part of
+# what the checks below pin.
+#
+# The witness rule matters more here than anywhere: bgAnimFps and bgAnimScrim
+# are now fields the open page restores, so neither can prove its own POST
+# landed. bgAnimBrightness is the witness instead, a field of the same form
+# that no row of this category writes.
+
+
+# The one live scalar the Animation category never touches in these checks, so
+# it can be the untouched half of the same web save.
+SCALAR_UNTOUCHED_ROW = "Fade out"
+
+
+def other_in_range(current, lo, hi, step, avoid=()):
+    """A value of the row's own grid that is none of `avoid`, for a web save
+    that has to land somewhere the visit has not been."""
+    seen = {int(current)} | {int(v) for v in avoid}
+    for value in range(lo, hi + 1, step):
+        if value not in seen:
+            return value
+    raise AssertionError("no free value in %d..%d step %d avoiding %r" % (lo, hi, step, avoid))
+
+
+def check_touched_scalars_agree_with_panel(rig):
+    """Acceptance (gm-nov3.39): while a stepped row names this visit's value,
+    the stored field the panel reads holds it too, from the web save onwards
+    rather than from the exit onwards. A row the visit did not step still takes
+    the web's value.
+
+    Two touched fields rather than one, because the fix is a rule and not a
+    patch to frame rate: bgAnimFps is read by DefaultUI::updateState on every
+    pass (sleepAnimation.setMaxFps) and bgAnimScrim two lines below it
+    (setScrim). bgFadeOutMs is the untouched one, read at the start of every
+    overlay transition (beginOverlayTransition), which pushing or popping a
+    page of this category is.
+
+    Every assertion about the touched fields is made before the pop. After the
+    pop commit has written the draft, so a version that reconciled nothing at
+    all would pass."""
+    s0 = rig.settings()
+    fps0, scrim0 = int(s0["bgAnimFps"]), int(s0["bgAnimScrim"])
+    fade0, bright0 = int(s0["bgFadeOutMs"]), int(s0["bgAnimBrightness"])
+
+    open_animation(rig)
+    fps_dir = "minus" if fps0 >= 60 else "plus"
+    tap_row(rig, "Frame rate", fps_dir)
+    scrim_dir = "minus" if scrim0 >= 100 else "plus"
+    tap_row(rig, "Text scrim", scrim_dir)
+    fps_draft = int(rig.settings()["bgAnimFps"])
+    scrim_draft = int(rig.settings()["bgAnimScrim"])
+    check(rig, "scalars_fps_step_writes_live", fps_draft == fps0 + (-5 if fps_dir == "minus" else 5),
+          "%d from %d" % (fps_draft, fps0))
+    check(rig, "scalars_scrim_step_writes_live", scrim_draft == scrim0 + (-5 if scrim_dir == "minus" else 5),
+          "%d from %d" % (scrim_draft, scrim0))
+
+    fps_web = other_in_range(fps0, 5, 60, 5, avoid=(fps_draft,))
+    scrim_web = other_in_range(scrim0, 0, 100, 5, avoid=(scrim_draft,))
+    fade_web = other_in_range(fade0, 0, 1000, 20)
+    bright_web = other_in_range(bright0, 10, 100, 5)
+    if not store_over_draft(rig, "scalars_web_save_landed", {
+            "bgAnimFps": fps_web, "bgAnimScrim": scrim_web,
+            "bgFadeOutMs": fade_web, "bgAnimBrightness": bright_web},
+            ["bgAnimBrightness"]):
+        close_animation(rig)
+        restore_fields_exactly(rig, "scalars_restored_after_failed_save", {
+            "bgAnimFps": fps0, "bgAnimScrim": scrim0, "bgFadeOutMs": fade0, "bgAnimBrightness": bright0})
+        return
+
+    # The untouched row moving is what proves the category reconciled and
+    # rebuilt: an assertion about a row that had simply not been redrawn yet
+    # would pass whatever the code does.
+    rebuilt = settled(rig, lambda: rig.row_value(page_with_row(rig, SCALAR_UNTOUCHED_ROW),
+                                                 SCALAR_UNTOUCHED_ROW) == "%d ms" % fade_web)
+    check(rig, "scalars_page_rebuilt", rebuilt,
+          rig.row_value(page_with_row(rig, SCALAR_UNTOUCHED_ROW), SCALAR_UNTOUCHED_ROW))
+
+    back = settled(rig, lambda: int(rig.settings()["bgAnimFps"]) == fps_draft
+                   and int(rig.settings()["bgAnimScrim"]) == scrim_draft)
+    now = rig.settings()
+    check(rig, "scalars_fps_back_to_draft_before_pop", int(now["bgAnimFps"]) == fps_draft,
+          "%r want %d (web posted %d)" % (now["bgAnimFps"], fps_draft, fps_web))
+    check(rig, "scalars_scrim_back_to_draft_before_pop", int(now["bgAnimScrim"]) == scrim_draft,
+          "%r want %d (web posted %d)" % (now["bgAnimScrim"], scrim_draft, scrim_web))
+    check(rig, "scalars_settled_before_pop", back, "fps %r scrim %r" % (now["bgAnimFps"], now["bgAnimScrim"]))
+    check(rig, "scalars_untouched_takes_web_value", int(now["bgFadeOutMs"]) == fade_web,
+          "%r want %d" % (now["bgFadeOutMs"], fade_web))
+
+    fps_row = rig.row_value(page_with_row(rig, "Frame rate"), "Frame rate")
+    scrim_row = rig.row_value(page_with_row(rig, "Text scrim"), "Text scrim")
+    check(rig, "scalars_fps_row_names_draft", fps_row == "%d fps" % fps_draft, "%r" % fps_row)
+    check(rig, "scalars_scrim_row_names_draft", scrim_row == "%d %%" % scrim_draft, "%r" % scrim_row)
+
+    close_animation(rig)
+    after = rig.settings()
+    check(rig, "scalars_exit_saves_the_named_values",
+          int(after["bgAnimFps"]) == fps_draft and int(after["bgAnimScrim"]) == scrim_draft,
+          "fps %r scrim %r want %d %d" % (after["bgAnimFps"], after["bgAnimScrim"], fps_draft, scrim_draft))
+    check(rig, "scalars_exit_keeps_the_web_value", int(after["bgFadeOutMs"]) == fade_web,
+          "%r want %d" % (after["bgFadeOutMs"], fade_web))
+    restore_fields_exactly(rig, "scalars_restored", {
+        "bgAnimFps": fps0, "bgAnimScrim": scrim0, "bgFadeOutMs": fade0, "bgAnimBrightness": bright0})
+
+
+def check_touched_param_slot_agrees_with_panel(rig):
+    """Acceptance (gm-nov3.39): the Parameters page's slots are live fields
+    too. A step writes the whole bgAnimParams string and
+    DefaultUI::updateState re-parses it every pass, so a slot this visit
+    stepped has to be back in the stored string before the page is popped,
+    while a slot it did not step keeps the web's value.
+
+    The existing check in test_animation.py reads the rows before the pop and
+    the stored string only after it, which passes while reconciliation does
+    nothing and commit puts the value back at the exit."""
+    s0 = rig.settings()
+    anim = int(s0["bgAnimId"])
+    packed0 = str(s0.get("bgAnimParams", ""))
+    bright0 = int(s0["bgAnimBrightness"])
+
+    open_animation(rig)
+    row = rig.find_tag(rig.touchmap(screen=0), "Parameters", "action")
+    if row is None:
+        check(rig, "param_slot_row_found", False)
+        close_animation(rig)
+        return
+    rig.tap_target(row)
+    if wait_depth(rig, 2) is None:
+        check(rig, "param_slot_page_pushed", False, repr(rig.settingsui_state()))
+        close_animation(rig)
+        return
+
+    names = [n for n in rig.rows_on_page(rig.touchmap(screen=0)) if n != "Reset to defaults"]
+    if len(names) < 2:
+        check(rig, "param_slot_two_rows", False, "animation %d defines %d parameters" % (anim, len(names)))
+        rig.settingsui(pop=1)
+        close_animation(rig)
+        return
+    touched_row, untouched_row = names[0], names[1]
+
+    at_open = int(rig.row_value(page_with_row(rig, touched_row), touched_row))
+    direction = "minus" if at_open >= 100 else "plus"
+    draft = at_open + (-5 if direction == "minus" else 5)
+    tap_row(rig, touched_row, direction)
+
+    # The step wrote every slot of this animation's group, so the string is
+    # fully populated from here on and both slots can be addressed by index.
+    packed1 = str(rig.settings().get("bgAnimParams", ""))
+    slots = params_group(packed1, anim).split(",")
+    check(rig, "param_slot_step_writes_live", len(slots) > 1 and slots[0] == str(draft),
+          "group %r want slot 0 = %d" % (params_group(packed1, anim), draft))
+    if len(slots) < 2:
+        rig.settingsui(pop=1)
+        close_animation(rig)
+        restore_fields_exactly(rig, "param_slot_restored_early", {"bgAnimParams": packed0})
+        return
+    web_touched = other_in_range(int(slots[0]), 0, 100, 5, avoid=(draft,))
+    web_untouched = other_in_range(int(slots[1]), 0, 100, 5)
+    slots[0], slots[1] = str(web_touched), str(web_untouched)
+    bright_web = other_in_range(bright0, 10, 100, 5)
+    if not store_over_draft(rig, "param_slot_web_save_landed", {
+            "bgAnimParams": params_set_group(packed1, anim, ",".join(slots)),
+            "bgAnimBrightness": bright_web},
+            ["bgAnimBrightness"]):
+        rig.settingsui(pop=1)
+        close_animation(rig)
+        restore_fields_exactly(rig, "param_slot_restored_after_failed_save", {
+            "bgAnimParams": packed0, "bgAnimBrightness": bright0})
+        return
+
+    def stored_slots():
+        return params_group(str(rig.settings().get("bgAnimParams", "")), anim).split(",")
+
+    # The untouched slot arriving on its row proves the page reconciled and
+    # rebuilt, so what follows is read off a page that has been redrawn.
+    rebuilt = settled(rig, lambda: rig.row_value(page_with_row(rig, untouched_row),
+                                                 untouched_row) == str(web_untouched))
+    check(rig, "param_slot_page_rebuilt", rebuilt,
+          rig.row_value(page_with_row(rig, untouched_row), untouched_row))
+
+    back = settled(rig, lambda: stored_slots()[0] == str(draft))
+    stored = stored_slots()
+    check(rig, "param_slot_touched_back_to_draft_before_pop", stored[0] == str(draft),
+          "slot 0 is %r, want %r (web posted %d)" % (stored[0], str(draft), web_touched))
+    check(rig, "param_slot_settled_before_pop", back, "group %r" % ",".join(stored))
+    check(rig, "param_slot_untouched_keeps_web_before_pop",
+          len(stored) > 1 and stored[1] == str(web_untouched),
+          "slot 1 is %r, want %r" % (stored[1] if len(stored) > 1 else None, str(web_untouched)))
+    check(rig, "param_slot_touched_row_names_draft",
+          rig.row_value(page_with_row(rig, touched_row), touched_row) == str(draft),
+          rig.row_value(page_with_row(rig, touched_row), touched_row))
+
+    rig.settingsui(pop=1)
+    wait_depth(rig, 1)
+    stored = stored_slots()
+    check(rig, "param_slot_exit_saves_the_named_value", stored[0] == str(draft),
+          "slot 0 is %r, want %r" % (stored[0], str(draft)))
+    check(rig, "param_slot_exit_keeps_the_web_value", len(stored) > 1 and stored[1] == str(web_untouched),
+          "slot 1 is %r, want %r" % (stored[1] if len(stored) > 1 else None, str(web_untouched)))
+    close_animation(rig)
+    restore_fields_exactly(rig, "param_slot_restored", {
+        "bgAnimParams": packed0, "bgAnimBrightness": bright0})
+
+
 def check_starting_state_restored(rig):
     """Not an acceptance criterion: the scenarios share one NVS, and this one
     ends on the legacy custom fixture and a stepped frame rate, neither of
@@ -1535,6 +1755,8 @@ CHECKS = [
     ("touched_anim_gradient_agrees_with_panel", check_touched_anim_gradient_agrees_with_panel),
     ("touched_noncurrent_slot_agrees_with_panel", check_touched_noncurrent_slot_agrees_with_panel),
     ("touched_standby_slot_agrees_with_panel", check_touched_standby_slot_agrees_with_panel),
+    ("touched_scalars_agree_with_panel", check_touched_scalars_agree_with_panel),
+    ("touched_param_slot_agrees_with_panel", check_touched_param_slot_agrees_with_panel),
     ("legacy_fallback_named_and_inert", check_legacy_fallback_named_and_inert),
     ("legacy_unparsable_custom_falls_back", check_legacy_unparsable_custom_falls_back),
     ("pick_keeps_the_picker_open", check_pick_keeps_the_picker_open),
