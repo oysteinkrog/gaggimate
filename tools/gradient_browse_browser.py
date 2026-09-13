@@ -50,6 +50,47 @@ def focused(page):
     )
 
 
+THEMES = ["light", "dark", "coffee", "nord"]
+
+# The heading colour and the panel colour, both as the browser resolved them,
+# composited on a canvas rather than parsed. The class is an opacity modifier,
+# so the computed colour is a color-mix() whose serialisation is Chrome's
+# business; painting it over the panel colour and reading the pixel back gives
+# the sRGB the eye gets, whatever the string said.
+PAINT = """
+(sel) => {
+  const el = document.querySelector(sel);
+  const panel = document.querySelector("[role='dialog']");
+  const c = document.createElement('canvas');
+  c.width = c.height = 1;
+  const x = c.getContext('2d', { willReadFrequently: true });
+  const paint = v => {
+    x.clearRect(0, 0, 1, 1);
+    x.fillStyle = getComputedStyle(panel).backgroundColor;
+    x.fillRect(0, 0, 1, 1);
+    if (v) { x.fillStyle = v; x.fillRect(0, 0, 1, 1); }
+    return Array.from(x.getImageData(0, 0, 1, 1).data).slice(0, 3);
+  };
+  return [paint(null), paint(getComputedStyle(el).color)];
+}
+"""
+
+
+def luminance(rgb):
+    def ch(v):
+        v /= 255.0
+        return v / 12.92 if v <= 0.04045 else ((v + 0.055) / 1.055) ** 2.4
+
+    r, g, b = (ch(v) for v in rgb)
+    return 0.2126 * r + 0.7152 * g + 0.0722 * b
+
+
+def contrast(page, selector):
+    bg, fg = page.evaluate(PAINT, selector)
+    hi, lo = sorted((luminance(bg), luminance(fg)), reverse=True)
+    return (hi + 0.05) / (lo + 0.05)
+
+
 with sync_playwright() as p:
     browser = p.chromium.launch(channel="chrome", headless=True)
     for label, w, h in WIDTHS:
@@ -81,6 +122,27 @@ with sync_playwright() as p:
             ".gridTemplateColumns.split(' ').length"
         )
         check("swatches per row", cols, 4 if w >= 1024 else 2)
+
+        # The category headings, in every theme the WebUI ships. Small text, so
+        # the floor is 4.5:1. At text-base-content/60 three of the four were
+        # under it (gm-nov3.20).
+        heading = "[role='dialog'] [role='group'] > div:first-child"
+        for theme in THEMES:
+            page.evaluate("t => document.documentElement.setAttribute('data-theme', t)", theme)
+            ratio = contrast(page, heading)
+            ok("category headings reach 4.5:1 on %s (%.2f:1)" % (theme, ratio), ratio >= 4.5)
+        page.evaluate("() => document.documentElement.removeAttribute('data-theme')")
+        # And the heading belongs to its group: one line, inside the group box.
+        fit = page.evaluate(
+            "sel => { const h = document.querySelector(sel);"
+            " const g = h.parentElement; const a = h.getBoundingClientRect();"
+            " const b = g.getBoundingClientRect();"
+            " return [h.scrollWidth <= h.clientWidth + 1,"
+            " a.left >= b.left - 1 && a.right <= b.right + 1]; }",
+            heading,
+        )
+        ok("a heading fits on one line", fit[0])
+        ok("and sits inside its group", fit[1])
 
         # Every swatch is a real target, and the last one can be reached.
         swatches = page.locator("[role='dialog'] button[data-ref]")

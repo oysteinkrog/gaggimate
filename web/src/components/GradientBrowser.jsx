@@ -14,12 +14,14 @@ import { gradientCss } from '../config/bgAnimations.js';
 //
 // A swatch is drawn with gradientCss(), which is what the editor's own bar
 // uses. The firmware-exact sampler in config/gradientRamp.js is the better
-// oracle for what the panel stores, and it is deliberately not used here: a
-// swatch sits next to the bar that appears once the gradient is chosen, so the
-// two must agree with each other above all. The two paths differ by a few
-// least significant bits of RGB565 on a handful of ramp entries, which no
-// 40 px swatch can show, and drawing one of them differently would be a
-// difference the user can see.
+// oracle for what the panel stores, and it is deliberately not used here: the
+// swatch a user picks sits beside the bar the editor then draws for it, so
+// those two have to agree with each other. They do not agree with the sampler,
+// and the gap is wider than the last bits of RGB565: for a gradient whose
+// stops carry no positions the firmware's uniform path reaches only 251/256 of
+// the way to the final stop, so the right-hand end of the ramp differs.
+// Sampling the swatches and not the bar would put that difference between two
+// controls the user sees at the same time.
 //
 // Rendered by the editor whether it is open or not (it returns null when
 // closed, like VisualizerUploadModal), so the editor's preview-ownership
@@ -117,7 +119,13 @@ export function GradientBrowser({
         <div className='grow overflow-y-auto p-3'>
           {groups.map(group => (
             <div key={group.label} role='group' aria-label={group.label} className='mb-4 last:mb-0'>
-              <div className='text-base-content/60 mb-2 text-xs font-medium tracking-wide uppercase'>
+              {/* 80% of base-content, not the 60% the rest of the app uses for
+                  quiet text. Measured in Chrome against the dialog's own
+                  base-100: at 60% this heading is 3.05:1 on light, 3.25:1 on
+                  coffee and 3.49:1 on nord, all under the 4.5:1 floor for text
+                  this small. At 80% it is 4.97, 4.76 and 6.03, and 7.35 on
+                  dark. tools/gradient_browse_browser.py measures all four. */}
+              <div className='text-base-content/80 mb-2 text-xs font-medium tracking-wide uppercase'>
                 {group.label}
               </div>
               <div className='grid grid-cols-2 gap-2 sm:grid-cols-3 md:grid-cols-4'>
