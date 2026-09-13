@@ -419,9 +419,15 @@ def open_picker(rig, row):
     """Taps one of the three gradient rows and waits for the picker's first
     page. Returns its dump."""
     dump = page_with_row(rig, row)
-    target = rig.find_tag(dump, row, "action")
+    # The band gm-nov3.32 left as the picker's own target, or the whole-row
+    # target for a row that is still plain. Not the row container: its centre
+    # is x 239, which is inside the band only while the band spans x 80 to
+    # 279 (SettingsRows.cpp says so in as many words). Narrow the band and the
+    # tap lands in the gap or on an arrow, and the failure would be a timeout
+    # waiting for a page that never opened, saying nothing about why.
+    target = rig.find_tag(dump, row, "open") or rig.find_tag(dump, row, "action")
     if target is None:
-        raise AssertionError("row %r is not a whole-row target" % row)
+        raise AssertionError("row %r offers neither an open band nor a whole-row target" % row)
     before = depth(rig)
     rig.tap_target(target)
     rig.wait_until(lambda: depth(rig) == before + 1, timeout=5)
