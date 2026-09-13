@@ -71,12 +71,17 @@ bool geometryValid = false;
 int faceBase = 0, beamQ4 = 0;
 int d0x = 0, d0y = 0, d1x = 0, d1y = 0;
 
-// At 480x480, all per-pixel and per-row tables fit the resident 9,216 B slab:
-// colSurface, rowQ4, surfRow, halfPx, field: 960 B each, 4,800 B total.
-// dith: 128 B; palette: 512 B; smooth: 514 B (528 aligned);
-// radialAmp: 1,176 B (1,184 aligned). work: 64 B. Total: 7,216 B including alignment.
+// At 480x480 the per-pixel tables fit the resident 9,216 B slab, 8,128 B of it:
+// colSurface, rowQ4, field: 960 B each; dith 128 B; palette 512 B;
+// palette32 1,024 B; smooth32 1,028 B (1,040 aligned); radialAmp32 2,352 B;
+// work 192 B.
+// The three 32-bit tables exist for EE.LDXQ.32, which scales its index by four
+// and so can only gather from a 32-bit table. They cost 2,832 B more than the
+// 16-bit versions, and surfRow and halfPx (960 B each) moved to PSRAM to pay
+// for it: both are read once per row rather than per pixel, which is the rule
+// for what may leave the slab.
 // colFace: 1,920 B in PSRAM, read only in the sequential frame() column pass.
-// smooth/radialAmp are exact tabulations of bandRef's integer polynomials.
+// smooth32/radialAmp32 are exact tabulations of bandRef's integer polynomials.
 // field is one reusable row, overwritten from the absolute y on every call.
 void release();
 

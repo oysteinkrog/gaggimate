@@ -1498,8 +1498,10 @@ Debugging methodology that this codebase has already paid for:
   `s = serial.Serial(); s.port = "COM3"; s.dtr = False; s.rts = False;
   s.open()`, which leaves the board running (checked the same way). The
   flash step resets on purpose.
-- **The board's radio link degrades in place, minutes into a boot, and only a
-  reboot clears it** (gm-t9ld, reproduced and placed 2026-09-13). The symptom
+- **The board's radio link degrades in place, minutes into a boot, and a
+  reset cleared it** (gm-t9ld, reproduced and placed 2026-09-13). A reset is
+  the only recovery tried, so it is the one that is known to work, not the
+  only one that can. The symptom
   is that every HTTP response stalls or truncates: small JSON GETs taking 4 to
   27 seconds or failing, whole framebuffer reads taking nine minutes. It looks
   exactly like a firmware fault and it is not one. What places it is a ping
@@ -1518,10 +1520,13 @@ Debugging methodology that this codebase has already paid for:
   degrades is not established and is gm-bzu.26.
   **How to tell a sick board from a slow one before you measure anything**:
   time three small GETs of `/api/debug/anim` and stop if any one exceeds a
-  second. In the bad window 11 of 15 were over a second or failed, so one
-  sample misses it about a quarter of the time; three catch it about 98 times
-  in 100 and cost under a second on a healthy board. Ten pings is the other
-  cheap test and it was unambiguous in both states.
+  second. In the bad window 11 of 15 single GETs were over a second or
+  failed, so one sample misses a sick board about a quarter of the time and
+  three are better than one. How much better is not measured: treating the
+  three as independent gives 98 in 100, and nothing establishes independence,
+  which a board failing in bursts would break. Three GETs cost under a second
+  on a healthy board, so run them. Ten pings is the other cheap test and it
+  was unambiguous in both states.
 - Windows tooling runs Python 3.10 (`GM_RIG_PY` env var to override):
   Python313 silently lacks esptool and pyserial.
 - Camera verification: `C:\work\camshots\grab.bat <file>` (one frame),
