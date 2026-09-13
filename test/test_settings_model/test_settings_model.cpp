@@ -737,11 +737,14 @@ static void test_schedule_toggle_day_and_step_time() {
     TEST_ASSERT_EQUAL_STRING("08:59", s.time.c_str());
 }
 
-// The web handler stores any time string the browser sends, so a stored
-// entry's time can be empty or otherwise malformed; the editor rows read it
-// through scheduleTimeParts, which must answer 00:00 for those rather than
-// let the caller slice the string (substr past the end throws, and the
-// firmware is built without exceptions).
+// A stored entry's time can be empty or otherwise malformed. The web handler
+// used to store any time string the browser sent; since 2026-09-09 its
+// isScheduleTime drops an entry whose time is not HH:MM in range, so no live
+// writer makes one any more. The old ones survive, because the NVS codec keeps
+// any entry containing a "|", so a device that stored one before that change
+// still carries it. The editor rows read it through scheduleTimeParts, which
+// must answer 00:00 for those rather than let the caller slice the string
+// (substr past the end throws, and the firmware is built without exceptions).
 static void test_schedule_time_parts_reads_malformed_as_midnight() {
     int hour = -1;
     int minute = -1;
