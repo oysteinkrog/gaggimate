@@ -132,13 +132,23 @@ int main() {
 
     // A ref resolves to the same gradient the wire string does, which is what
     // the picker rows actually call.
+    //
+    // The library ids here are 1, 14 and 99999 on purpose (gm-nov3.15). The
+    // number of entries a library may hold is twelve; the ids they carry run
+    // to 99999, because the web allocates a new entry as the largest existing
+    // id plus one, so a library of three entries can hold c14 after a few
+    // rounds of copying and deleting. A resolver that stopped at c13 left
+    // every saved gradient above it listed, drawn by the panel, and
+    // unselectable, since CatGradientPicker.cpp gates a selection on this.
     {
         char library[BG_GRADIENT_LIB_MAX_LEN];
-        std::snprintf(library, sizeof(library), "1|Two|%s;2|Sixteen|%s", kWires[0], kWires[7]);
+        std::snprintf(library, sizeof(library), "1|Two|%s;14|Wide|%s;99999|Sixteen|%s", kWires[0], kWires[2],
+                      kWires[7]);
         struct Case {
             const char *ref;
+            int libId;    // 0 for a built-in ref
             const char *wire;
-        } cases[] = {{"1", nullptr}, {"c1", kWires[0]}, {"c2", kWires[7]}};
+        } cases[] = {{"1", 0, nullptr}, {"c1", 1, kWires[0]}, {"c14", 14, kWires[2]}, {"c99999", 99999, kWires[7]}};
         for (const Case &c : cases) {
             settingsui::SwatchGradient viaRef;
             if (!settingsui::swatchResolveRef(c.ref, library, viaRef)) {
@@ -152,17 +162,76 @@ int main() {
             if (!ok || std::memcmp(&viaRef, &wanted, sizeof(wanted)) != 0) {
                 std::printf("MISMATCH ref %s: resolved to a different gradient than its source\n", c.ref);
                 g_failures++;
+                continue;
             }
+            if (c.libId > 0) {
+                // The production library resolution, both entry points: the
+                // lookup the renderer's resolver calls, and the resolver
+                // itself with the ref in a map slot. The wires above are not
+                // built-in 0's stops, so a ref that fell through to the
+                // legacy fallback would be caught here rather than passing.
+                settingsui::SwatchGradient viaLookup;
+                int n = 0;
+                if (!bg_library_lookup(library, c.libId, viaLookup.stops, viaLookup.pos, n, viaLookup.uniform) ||
+                    n < 2) {
+                    std::printf("MISMATCH ref %s: bg_library_lookup refused id %d\n", c.ref, c.libId);
+                    g_failures++;
+                    continue;
+                }
+                viaLookup.count = n;
+                if (std::memcmp(&viaRef, &viaLookup, sizeof(viaLookup)) != 0) {
+                    std::printf("MISMATCH ref %s: swatch and bg_library_lookup disagree\n", c.ref);
+                    g_failures++;
+                    continue;
+                }
+                settingsui::SwatchGradient viaResolve;
+                int rn = 0;
+                bg_resolve_anim_theme(0, c.ref, library, nullptr, 0, nullptr, viaResolve.stops, viaResolve.pos, rn,
+                                      viaResolve.uniform);
+                viaResolve.count = rn;
+                if (std::memcmp(&viaRef, &viaResolve, sizeof(viaResolve)) != 0) {
+                    std::printf("MISMATCH ref %s: swatch and bg_resolve_anim_theme disagree\n", c.ref);
+                    g_failures++;
+                    continue;
+                }
+            }
+            // All 256 ramp entries at every tone, against the firmware's own
+            // globals: a ref the resolver accepts has to draw what the panel
+            // draws, not merely resolve.
+            checkGradient(c.ref, viaRef);
         }
         // "" is not a gradient, and a ref naming an entry that is not there
-        // resolves to nothing rather than to the wrong gradient.
+        // resolves to nothing rather than to the wrong gradient. The rest are
+        // the grammar's refusals: a zero id, an id past the accepted range, a
+        // sixth digit, trailing junk, and a digit run long enough to overflow
+        // an int if the parser had no digit limit (it stops at five, so the
+        // accumulator never passes 99999).
         settingsui::SwatchGradient unused;
-        const char *refusals[] = {"", "c9", "c", "1x", "99999"};
+        const char *refusals[] = {
+            "",                      // not a gradient
+            "c9", "c13",             // ids the library does not carry
+            "99999",                 // a built-in index past this build's table
+            "c0", "c00",             // zero is no id: the library starts at 1
+            "c100000", "c123456",    // past the range, by a sixth digit
+            "0000001", "c0000001",   // the same, padded with leading zeros
+            "1x", "014x", "c14x", "c99999x", "c1c", "cc1", "x", "c",  // trailing or leading junk
+            "c 14", "c+14", "c-1",   // nothing the grammar has a place for
+            "99999999999999999999",  // long enough to overflow an int if the
+            "c99999999999999999999", // parser had no digit limit
+        };
         for (const char *ref : refusals) {
             if (settingsui::swatchResolveRef(ref, library, unused)) {
                 std::printf("MISMATCH ref %s: resolved, should not have\n", ref);
                 g_failures++;
             }
+        }
+        // The ';' a map slot ends with is part of the grammar, not junk: the
+        // renderer's own parser reads a ref out of bgAnimThemeMap with it
+        // there, so a swatch must resolve what the panel draws from.
+        settingsui::SwatchGradient viaSlot;
+        if (!settingsui::swatchResolveRef("c14;", library, viaSlot)) {
+            std::printf("MISMATCH ref c14;: refused a ref the renderer resolves\n");
+            g_failures++;
         }
     }
 

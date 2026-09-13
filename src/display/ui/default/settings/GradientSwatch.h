@@ -62,6 +62,13 @@ struct SwatchGradient {
 // 16 stops, its own positions when it carries them), and "" resolves to
 // nothing because it is not a gradient. False leaves `out` untouched, which
 // is a row with no swatch rather than a wrong one.
+//
+// The grammar is production's, digit limit included: one to five digits, so
+// library ids run 1 to 99999, and a ref may end at a ';' because production
+// parses map slots with the same parser. An id is not bounded by the number
+// of entries a library may hold; see the note above swatchResolveRef's
+// parser in GradientSwatch.cpp. A built-in index past this build's table
+// resolves to nothing, the way the renderer falls through it.
 bool swatchResolveRef(const char *ref, const char *library, SwatchGradient &out);
 
 // A built-in's six stops as the resolver reads them (evenly spaced, uniform).

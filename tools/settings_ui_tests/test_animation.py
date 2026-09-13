@@ -972,6 +972,143 @@ def check_gradient_all_and_standby_pickers(rig):
                            {"bgAnimGradientRef": ref0, "bgAnimTheme": theme0, "bgAnimThemeMap": map0})
 
 
+def library_renumbered(lib, new_ids):
+    """The stored library with its last entries renumbered to `new_ids`, in
+    order, plus the (id, name, gradient) triples that came out.
+
+    How many entries a library may hold (twelve) is not what bounds the ids
+    they carry: the web allocates a new entry as the largest existing id plus
+    one, so a few rounds of copying and deleting leave a small library whose
+    ids are large. That is the state this builds, without adding an entry."""
+    entries = library_entries(lib)
+    if len(entries) < len(new_ids):
+        raise AssertionError("the stored library has %d entries, %d are needed" % (len(entries), len(new_ids)))
+    head = entries[:len(entries) - len(new_ids)]
+    kept = [e[0] for e in head]
+    clash = [i for i in new_ids if i in kept]
+    if clash:
+        raise AssertionError("ids %r are already in the library" % clash)
+    tail = [(new_id, name, gradient) for new_id, (_old, name, gradient) in zip(new_ids, entries[len(head):])]
+    return ";".join("%d|%s|%s" % e for e in head + tail), tail
+
+
+def check_gradient_picker_high_library_ids(rig):
+    """Regression for gm-nov3.15: a saved gradient whose id is above 13 can
+    be chosen through all three gradient rows, and the choice lands as the
+    exact ref.
+
+    The picker validates a tap by re-resolving the ref (CatGradientPicker.cpp,
+    applyPick), and the resolver behind it refused every library id above
+    BG_GRADIENT_LIB_MAX + 1, which confused the library's capacity with the
+    range of the ids in it. Such an entry was listed in My gradients with no
+    swatch, and tapping it closed the picker without writing anything.
+
+    The library is set up through the web save the simulator provides, so
+    this reports and returns on a device."""
+    s0 = rig.settings()
+    lib0 = s0["bgAnimGradients"]
+    map0 = s0["bgAnimThemeMap"]
+    ref0 = s0["bgAnimGradientRef"]
+    theme0 = s0["bgAnimTheme"]
+    standby0 = int(s0["bgAnimStandbyId"])
+    anim0 = int(s0["bgAnimId"])
+
+    # 14 is the first id the old resolver refused; 99999 is the largest the
+    # ref grammar accepts.
+    high_lib, high = library_renumbered(lib0, [14, 99999])
+    try:
+        web_save(rig, {"bgAnimGradients": high_lib})
+    except RuntimeError as e:
+        rig.log("high_library_ids_skipped", reason=str(e))
+        return
+    landed = rig.wait_until(lambda: rig.settings()["bgAnimGradients"] == high_lib, timeout=5)
+    check(rig, "high_id_library_write_landed", bool(landed), rig.settings()["bgAnimGradients"])
+    if not landed:
+        restore_fields_exactly(rig, "high_id_library_restored", {"bgAnimGradients": lib0})
+        return
+    high_id, high_name, _hg = high[0]
+    top_id, top_name, _tg = high[1]
+
+    # 1. The per-animation row. The swatch is read inside the picker as well
+    #    as on the row, because a refused ref showed there first: the entry
+    #    was listed with the canvas still hidden.
+    open_animation(rig)
+    theme_before = rig.settings()["bgAnimTheme"]
+    open_picker(rig, "Gradient")
+    picker_tap(rig, "My gradients")
+    rig.wait_until(lambda: depth(rig) == 3, timeout=5)
+    d = page_with_row(rig, high_name)
+    picker_strip = swatch_strip(rig, d, high_name)
+    check(rig, "high_id_picker_row_draws_a_ramp", picker_strip is not None and len(set(picker_strip)) > 4,
+          "distinct colours across the swatch: %r" % (None if picker_strip is None else len(set(picker_strip))))
+    picker_tap(rig, high_name)
+    chosen = rig.wait_until(lambda: depth(rig) == 1, timeout=5)
+    check(rig, "high_id_pick_returns_to_animation", bool(chosen), depth(rig))
+    s1 = rig.settings()
+    check(rig, "high_id_writes_exact_ref", map_ref(s1["bgAnimThemeMap"], anim0) == "c%d" % high_id,
+          "got %r want %r" % (map_ref(s1["bgAnimThemeMap"], anim0), "c%d" % high_id))
+    check(rig, "high_id_writes_only_current_anim",
+          all(map_ref(s1["bgAnimThemeMap"], i) == map_ref(map0, i) for i in range(len(ANIM_NAMES)) if i != anim0))
+    check(rig, "high_id_no_legacy_mirror", s1["bgAnimTheme"] == theme_before,
+          "bgAnimTheme %r -> %r" % (theme_before, s1["bgAnimTheme"]))
+    d = page_with_row(rig, "Gradient")
+    check(rig, "high_id_row_text", rig.row_value(d, "Gradient") == high_name, rig.row_value(d, "Gradient"))
+    row_strip = swatch_strip(rig, d, "Gradient")
+    check(rig, "high_id_row_draws_the_chosen_ramp", row_strip is not None and row_strip == picker_strip,
+          "row %r picker %r" % (None if row_strip is None else row_strip[:4],
+                                None if picker_strip is None else picker_strip[:4]))
+
+    # 2. Gradient all, at the top of the id range. A saved gradient is not
+    #    mirrored into bgAnimTheme, which is the rollback policy for a ref
+    #    no older build could read (gm-nov3.7).
+    theme_before = rig.settings()["bgAnimTheme"]
+    picker_choose_from_row(rig, "Gradient all", "My gradients", top_name)
+    s2 = rig.settings()
+    check(rig, "high_id_all_writes_exact_ref", s2["bgAnimGradientRef"] == "c%d" % top_id, s2["bgAnimGradientRef"])
+    check(rig, "high_id_all_no_legacy_mirror", s2["bgAnimTheme"] == theme_before,
+          "bgAnimTheme %r -> %r" % (theme_before, s2["bgAnimTheme"]))
+    d = page_with_row(rig, "Gradient all")
+    check(rig, "high_id_all_row_text", rig.row_value(d, "Gradient all") == top_name,
+          rig.row_value(d, "Gradient all"))
+    all_strip = swatch_strip(rig, d, "Gradient all")
+    check(rig, "high_id_all_row_draws_a_ramp", all_strip is not None and len(set(all_strip)) > 4,
+          "distinct colours across the swatch: %r" % (None if all_strip is None else len(set(all_strip))))
+
+    # 3. Standby grad, which edits the standby animation's own slot. The
+    #    standby animation is set from outside the visit for the reason the
+    #    web-interference check gives: a field this visit stepped keeps its
+    #    draft against a web save.
+    close_animation(rig)
+    standby_target = (anim0 + 1) % len(ANIM_NAMES)
+    web_save(rig, {"bgAnimStandbyId": standby_target})
+    ready = rig.wait_until(lambda: int(rig.settings()["bgAnimStandbyId"]) == standby_target, timeout=5)
+    check(rig, "high_id_standby_setup_landed", bool(ready), rig.settings()["bgAnimStandbyId"])
+    if ready:
+        open_animation(rig)
+        picker_choose_from_row(rig, "Standby grad", "My gradients", top_name)
+        s3 = rig.settings()
+        check(rig, "high_id_standby_writes_standby_slot",
+              map_ref(s3["bgAnimThemeMap"], standby_target) == "c%d" % top_id,
+              map_ref(s3["bgAnimThemeMap"], standby_target))
+        check(rig, "high_id_standby_leaves_main_slot",
+              map_ref(s3["bgAnimThemeMap"], anim0) == "c%d" % high_id, map_ref(s3["bgAnimThemeMap"], anim0))
+        d = page_with_row(rig, "Standby grad")
+        check(rig, "high_id_standby_row_text", rig.row_value(d, "Standby grad") == top_name,
+              rig.row_value(d, "Standby grad"))
+        standby_strip = swatch_strip(rig, d, "Standby grad")
+        check(rig, "high_id_standby_row_draws_a_ramp", standby_strip is not None and len(set(standby_strip)) > 4,
+              "distinct colours across the swatch: %r" % (None if standby_strip is None else len(set(standby_strip))))
+        close_animation(rig)
+
+    restore_fields_exactly(rig, "high_id_restored", {
+        "bgAnimGradients": lib0,
+        "bgAnimThemeMap": map0,
+        "bgAnimGradientRef": ref0,
+        "bgAnimTheme": theme0,
+        "bgAnimStandbyId": standby0,
+    })
+
+
 def check_gradient_picker_reachability(rig):
     """Acceptance: every built-in is reachable through its category,
     including the last partial page; every library entry is reachable; an
@@ -1723,6 +1860,7 @@ CHECKS = [
     ("theme_recolor", check_theme_recolor),
     ("gradient_picker_navigation", check_gradient_picker_navigation),
     ("gradient_all_and_standby_pickers", check_gradient_all_and_standby_pickers),
+    ("gradient_picker_high_library_ids", check_gradient_picker_high_library_ids),
     ("gradient_picker_reachability", check_gradient_picker_reachability),
     ("gradient_picker_pagination_and_cancel", check_gradient_picker_pagination_and_cancel),
     ("gradient_picker_web_interference", check_gradient_picker_web_interference),

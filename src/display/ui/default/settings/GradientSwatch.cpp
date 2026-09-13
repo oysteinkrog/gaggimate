@@ -24,6 +24,57 @@ uint16_t rgb565(uint8_t r, uint8_t g, uint8_t b) {
     return static_cast<uint16_t>(((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3));
 }
 
+// ---- the ref grammar ---------------------------------------------------------
+//
+// Transcribed from BgAnimThemes.cpp's parseId() and parseRef(), for the reason
+// the palette arithmetic above is transcribed: that file's parser is in an
+// anonymous namespace and the file itself does not compile into the simulator.
+// The rules, in full:
+//
+//   * a ref is "" (no gradient), a decimal built-in index, or 'c' then a
+//     decimal library id,
+//   * a decimal is one to five digits, so the widest id is 99999, and a sixth
+//     digit is trailing junk rather than part of the number, which is also
+//     what keeps the accumulator inside an int whatever a stored string holds,
+//   * a ref ends at the terminator or at the ';' that separates one slot of
+//     bgAnimThemeMap from the next; production parses refs both standalone and
+//     inside a map, so a swatch that refused the second reading would show no
+//     swatch for a ref the panel draws from.
+//
+// The library's id range is not its capacity. The first version of this
+// resolver rejected any id above BG_GRADIENT_LIB_MAX + 1 (gm-nov3.15), which
+// confused the twelve entries a library may hold at one time with the ids
+// those entries carry: the web allocates a new entry as the largest existing
+// id plus one (web/src/config/bgAnimations.js), so a user who copies and
+// deletes a few gradients reaches c14 with three entries saved. Since the
+// picker gates a selection on this resolver (CatGradientPicker.cpp,
+// applyPick), every saved gradient above c13 was listed in My gradients, drawn
+// by the panel, and silently unselectable.
+constexpr int kRefMaxDigits = 5;
+
+// Reads the decimal at s, advancing it past the digits. False when there is
+// no digit, or when one more follows the fifth.
+bool parseRefDigits(const char *&s, int &value) {
+    int v = 0;
+    int digits = 0;
+    while (*s >= '0' && *s <= '9') {
+        if (digits == kRefMaxDigits) {
+            return false; // production's parseId stops counting here and its
+                          // parseRef then rejects the leftover digit
+        }
+        v = v * 10 + (*s - '0');
+        s++;
+        digits++;
+    }
+    if (digits == 0) {
+        return false;
+    }
+    value = v;
+    return true;
+}
+
+bool refEnd(const char *s) { return *s == '\0' || *s == ';'; }
+
 } // namespace
 
 bool swatchFromThemeStops(const uint8_t (*stops)[3], SwatchGradient &out) {
@@ -52,20 +103,18 @@ bool swatchResolveRef(const char *ref, const char *library, SwatchGradient &out)
     if (ref == nullptr || *ref == '\0') {
         return false; // "" is "no gradient of its own", not a gradient
     }
-    if (ref[0] == 'c') {
-        int id = 0;
-        const char *s = ref + 1;
-        if (*s == '\0') {
-            return false;
-        }
-        for (; *s != '\0'; s++) {
-            if (*s < '0' || *s > '9') {
-                return false;
-            }
-            id = id * 10 + (*s - '0');
-            if (id > BG_GRADIENT_LIB_MAX + 1) {
-                return false; // no library id reaches this, so the ref is junk
-            }
+    const char *s = ref;
+    const bool libraryRef = *s == 'c';
+    if (libraryRef) {
+        s++;
+    }
+    int id = 0;
+    if (!parseRefDigits(s, id) || !refEnd(s)) {
+        return false;
+    }
+    if (libraryRef) {
+        if (id <= 0) {
+            return false; // "c0" names no entry: library ids start at 1
         }
         SwatchGradient found;
         int n = 0;
@@ -76,21 +125,11 @@ bool swatchResolveRef(const char *ref, const char *library, SwatchGradient &out)
         out = found;
         return true;
     }
-    int index = 0;
-    for (const char *s = ref; *s != '\0'; s++) {
-        if (*s < '0' || *s > '9') {
-            return false;
-        }
-        index = index * 10 + (*s - '0');
-        if (index > bg_theme_count()) {
-            return false;
-        }
-    }
-    if (index < 0 || index >= bg_theme_count()) {
+    if (id >= bg_theme_count()) {
         return false; // an index from a longer table: no swatch rather than
                       // the wrong one, since bg_theme_stops would clamp to 0
     }
-    return swatchFromThemeStops(bg_theme_stops(index), out);
+    return swatchFromThemeStops(bg_theme_stops(id), out);
 }
 
 void swatchApplyTone(SwatchGradient &gradient, int brightnessPct, int kneePct) {
