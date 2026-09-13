@@ -1,4 +1,12 @@
-#ifndef GAGGIMATE_SIM
+// The one bganim translation unit that compiles on the host as well as on
+// the device. Everything here is plain C++ over BgAnim.h and the generated
+// table: the gradient parser, the library reader, the ref validators and the
+// three-step resolver, with no Arduino, ESP-IDF or render kernel behind any
+// of it. The rest of this directory is wrapped in #ifndef GAGGIMATE_SIM
+// because it carries the kernels; this file is not, so the simulator and the
+// host test both run the real rules rather than a stub that answers "no" to
+// every question (gm-nov3.3). Keep it that way: a device-only dependency
+// added here silently takes the simulator's gradient tests back to the stub.
 
 #include "BgAnim.h"
 #include "BgAnimThemeTable.h"
@@ -659,4 +667,3 @@ BgMigrateResult bg_run_gradient_migration(const BgGradientStore &store, const Bg
     return BgMigrateResult::Done;
 }
 
-#endif // GAGGIMATE_SIM

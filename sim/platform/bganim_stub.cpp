@@ -1,9 +1,17 @@
 // Host stubs for the background-animation allocation counters. Every bganim
-// translation unit is wrapped in #ifndef GAGGIMATE_SIM, so on the host they
-// compile to nothing, but WebUIPlugin's heap diagnostics read these
-// unconditionally. Zero is the truthful answer throughout: with no animation
-// tables allocated (the render loop itself is a later bead), no pool has
+// translation unit except BgAnimThemes.cpp is wrapped in #ifndef GAGGIMATE_SIM,
+// so on the host they compile to nothing, but WebUIPlugin's heap diagnostics
+// read these unconditionally. Zero is the truthful answer throughout: with no
+// animation tables allocated (the render loop is device-only), no pool has
 // handed anything out and nothing has ever overflowed to PSRAM.
+//
+// The gradient functions that used to be stubbed here are gone (gm-nov3.3).
+// BgAnimThemes.cpp now compiles on the host, so bg_theme_*, bg_custom_valid,
+// bg_library_valid, bg_map_valid and bg_ref_valid are the real rules on the
+// simulator too. The stubs answered "no theme table" and "every write is
+// invalid", which made the simulator's gradient tests unable to fail: a web
+// save the firmware would have accepted was rejected by the host build, and a
+// test that checked what happened afterwards passed for the wrong reason.
 #include <display/ui/default/bganim/BgAnim.h>
 #include <display/ui/default/bganim/BgAnimCommon.h>
 
@@ -18,29 +26,3 @@ size_t hotPeak() { return 0; }
 uint32_t hotFailCount() { return 0; }
 
 } // namespace bganim
-
-// The settings writer's gate for the two theme-library fields (WebUIPlugin.cpp).
-// No theme library is loaded on the host (BgAnimThemes.cpp is excluded the same
-// way), so there is nothing a name could validate against; false leaves the
-// stored setting unchanged rather than accepting an unchecked string.
-bool bg_library_valid(const char *) { return false; }
-bool bg_map_valid(const char *) { return false; }
-bool bg_ref_valid(const char *) { return false; }
-const char *bg_theme_category(int) { return ""; }
-int bg_theme_category_count() { return 0; }
-const char *bg_theme_category_name(int) { return ""; }
-
-// The built-in theme table lives in BgAnimThemes.cpp, which is excluded here
-// too. The settings writer only reads the count to range-check a built-in
-// index before mirroring it into bgAnimTheme, and zero makes every index fail
-// that check, which is the same "leave the stored setting alone" answer the
-// two validators above give.
-int bg_theme_count() { return 0; }
-
-// The gradient parser lives in the same excluded file. The simulator has no
-// pre-library custom gradient to carry over (it never ran a firmware that
-// wrote one), and false is the answer that keeps the display's Animation
-// category reading a legacy 18 as built-in 0, which is what it did before
-// the sentinel was frozen. bg_legacy_builtin and bg_legacy_mirror_for_ref
-// are inline in BgAnim.h and need no stub.
-bool bg_custom_valid(const char *) { return false; }

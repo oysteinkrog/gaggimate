@@ -55,6 +55,24 @@ $(RDBIN): $(RD_SRCS) $(BASE_DEPS)
 	g++ $(CXXFLAGS) $(RD_SRCS) -o $(RDBIN) -lm
 	$(call depgen,$(RDBIN),$(RD_SRCS))
 
+# The settings picker's gradient swatch against the panel's own palette. The
+# swatch sampler is a transcription (it must not publish a theme, and it has to
+# run on the simulator, where BgAnimCommon.cpp does not compile), so it is
+# proved equal rather than assumed equal.
+SPBIN ?= build/swatch_parity
+SP_SRCS := swatch_parity.cpp mathcount.cpp ../../src/display/ui/default/settings/GradientSwatch.cpp \
+	$(wildcard $(ANIM_DIR)/*.cpp)
+
+# GradientSwatch.h includes its neighbours the way the firmware does
+# (<display/...>), so this one target needs src on the include path. A
+# target-specific variable, so the dependency generator below sees it too.
+$(SPBIN): CXXFLAGS += -I../../src
+
+$(SPBIN): $(SP_SRCS) $(BASE_DEPS)
+	@mkdir -p $(dir $(SPBIN))
+	g++ $(CXXFLAGS) $(SP_SRCS) -o $(SPBIN) -lm
+	$(call depgen,$(SPBIN),$(SP_SRCS))
+
 # Does the firmware still draw what the page designed? The goldens come from
 # the firmware, so --compare can only prove the firmware has not changed since
 # yesterday. This is the only check that sees a port drifting away from the
@@ -65,14 +83,15 @@ pagecheck:
 
 # What CI runs. Every part exits non-zero on failure.
 #
-# The three gradient steps are in order on purpose: the generated tables must
-# match data/gradients.json, the JS sampler must match the firmware's own
-# palette arithmetic, and only then does the set check mean anything, because
-# it measures through that sampler.
-check: $(BIN) $(ICBIN) $(RDBIN)
+# The four gradient steps are in order on purpose: the generated tables must
+# match data/gradients.json, the JS sampler and the settings picker's swatch
+# sampler must each match the firmware's own palette arithmetic, and only then
+# does the set check mean anything, because it measures through the JS one.
+check: $(BIN) $(ICBIN) $(RDBIN) $(SPBIN)
 	bash dep_check.sh
 	python3 ../../scripts/gen_gradients.py --check
 	node web/ramp_parity.js
+	./$(SPBIN)
 	python3 ../gradient_check.py
 	python3 ../gradient_check_test.py
 	./$(BIN) --compare golden --frames 240
@@ -86,4 +105,4 @@ clean:
 # Last, after the default goal, so nothing read from a generated file can
 # become the target a bare `make` builds. A .d that is not there yet is not an
 # error: the first build writes it.
--include $(BIN).d $(ICBIN).d $(RDBIN).d
+-include $(BIN).d $(ICBIN).d $(RDBIN).d $(SPBIN).d

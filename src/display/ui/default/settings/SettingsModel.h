@@ -159,6 +159,25 @@ struct GradientChoice {
 };
 
 std::vector<GradientChoice> gradientChoices(const ThemeNameProvider &themes, const std::string &library);
+
+// One group of a gradient picker's first page: a name to show and the
+// entries it opens, as indices into the gradientChoices() list above.
+struct GradientGroup {
+    std::string name;
+    std::vector<int> choices;
+};
+
+// The built-in groups a picker lists, in the provider's declared category
+// order. A declared category with no built-ins in it is dropped, because an
+// empty group is a row that opens onto nothing; a built-in whose category is
+// not declared (or is empty) lands in a trailing "Other" group, so every
+// built-in is reachable whatever the table says.
+std::vector<GradientGroup> gradientBuiltinGroups(const ThemeNameProvider &themes,
+                                                 const std::vector<GradientChoice> &choices);
+
+// The saved gradients in the same list, in stored order. Empty when the
+// library is, which is what hides a picker's "My gradients" row.
+std::vector<int> gradientLibraryChoices(const ThemeNameProvider &themes, const std::vector<GradientChoice> &choices);
 // The index in `choices` whose ref matches; 0 (Default) when nothing does,
 // e.g. a map ref naming a library entry that was since deleted.
 int gradientChoiceIndexForRef(const std::vector<GradientChoice> &choices, const std::string &ref);

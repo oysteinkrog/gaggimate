@@ -5,17 +5,18 @@
 // table (BgAnimThemeTable.h, written by scripts/gen_gradients.py from
 // data/gradients.json).
 //
-// Two builds use it. The simulator cannot link BgAnimThemes.cpp, so
-// CatAnimation.cpp builds its provider here. The host test
-// (test/test_settings_model) uses it to exercise the same path the simulator
-// runs: that test links the real bg_theme_* functions, so without this it
-// would only ever prove the device path.
+// The host test (test/test_settings_model) is the only caller. It links the
+// real bg_theme_* functions, and building a second provider straight from the
+// table is how it checks that the two readings of the same generated data
+// agree. The fixture provider below is also how the test exercises a table it
+// can reorder, which the generated one cannot be: reordering that would change
+// stored ids.
 //
-// A device build must not include this header. It reaches the same data
-// through bg_theme_count(), bg_theme_name(), bg_theme_category(),
-// bg_theme_category_count(), bg_theme_category_name() and bg_theme_stops(),
-// and including the table again would put a second copy of every stop in
-// flash.
+// No firmware build includes this header. Both the device and the simulator
+// reach the same data through bg_theme_count(), bg_theme_name(),
+// bg_theme_category(), bg_theme_category_count(), bg_theme_category_name()
+// and bg_theme_stops(), and including the table again would put a second copy
+// of every stop in flash.
 
 #include "SettingsModel.h"
 
@@ -41,10 +42,9 @@ inline int clampIndex(int i, int n) { return (i >= 0 && i < n) ? i : 0; }
 // owner's group order and a picker decides for itself what to do with an
 // empty group.
 //
-// generatedThemeProvider() below passes the generated table, and that is the
-// only table a build ever passes. The host test passes a small fixture table
-// so these rules are exercised on a table it can reorder, which the generated
-// one cannot be: reordering it would change stored ids.
+// generatedThemeProvider() below passes the generated table, which is what
+// bg_theme_* reads; the host test also passes a small fixture table of its
+// own.
 inline ThemeNameProvider tableThemeProvider(const bganim_gen::ThemeDef *defs, int defCount,
                                             const char *const *categories, int categoryCount) {
     ThemeNameProvider p;

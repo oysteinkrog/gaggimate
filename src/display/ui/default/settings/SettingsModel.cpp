@@ -235,6 +235,69 @@ std::vector<GradientChoice> gradientChoices(const ThemeNameProvider &themes, con
     return out;
 }
 
+std::vector<GradientGroup> gradientBuiltinGroups(const ThemeNameProvider &themes,
+                                                 const std::vector<GradientChoice> &choices) {
+    std::vector<GradientGroup> out;
+    const int themeCount = themes.count ? themes.count() : 0;
+    const int categoryCount = themes.categoryCount ? themes.categoryCount() : 0;
+    // gradientChoices' layout: [0] is Default, [1 .. themeCount] the
+    // built-ins in table order, the rest the library. Only the middle band is
+    // grouped here.
+    const int last = themeCount < static_cast<int>(choices.size()) - 1 ? themeCount
+                                                                       : static_cast<int>(choices.size()) - 1;
+    for (int c = 0; c < categoryCount; c++) {
+        const char *name = themes.categoryName ? themes.categoryName(c) : nullptr;
+        if (name == nullptr || *name == '\0') {
+            continue;
+        }
+        GradientGroup group;
+        group.name = name;
+        for (int i = 1; i <= last; i++) {
+            if (choices[static_cast<size_t>(i)].category == group.name) {
+                group.choices.push_back(i);
+            }
+        }
+        if (!group.choices.empty()) {
+            out.push_back(std::move(group));
+        }
+    }
+    // Anything the declared list did not claim. Nothing in the shipped table
+    // lands here; a built-in added with a category nobody declared would, and
+    // a picker that dropped it would make it unreachable.
+    GradientGroup other;
+    other.name = "Other";
+    for (int i = 1; i <= last; i++) {
+        bool claimed = false;
+        for (const GradientGroup &group : out) {
+            for (int idx : group.choices) {
+                if (idx == i) {
+                    claimed = true;
+                    break;
+                }
+            }
+            if (claimed) {
+                break;
+            }
+        }
+        if (!claimed) {
+            other.choices.push_back(i);
+        }
+    }
+    if (!other.choices.empty()) {
+        out.push_back(std::move(other));
+    }
+    return out;
+}
+
+std::vector<int> gradientLibraryChoices(const ThemeNameProvider &themes, const std::vector<GradientChoice> &choices) {
+    std::vector<int> out;
+    const int themeCount = themes.count ? themes.count() : 0;
+    for (int i = themeCount + 1; i < static_cast<int>(choices.size()); i++) {
+        out.push_back(i);
+    }
+    return out;
+}
+
 int gradientChoiceIndexForRef(const std::vector<GradientChoice> &choices, const std::string &ref) {
     for (size_t i = 0; i < choices.size(); i++) {
         if (choices[i].ref == ref) {

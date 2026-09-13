@@ -435,6 +435,93 @@ static void test_theme_category_order_is_declared_not_encountered() {
     TEST_ASSERT_EQUAL(3, grouped);
 }
 
+static void test_gradient_groups_follow_declared_order_and_drop_empties() {
+    // The picker's first page is built from these two calls
+    // (CatGradientPicker.cpp): the built-in groups in declared order, and
+    // the saved gradients as one group of their own.
+    static const bganim_gen::ThemeDef kDefs[3] = {
+        {"Cyber",
+         "Neon",
+         {{0x05, 0x00, 0x08}, {0x24, 0x04, 0x48}, {0x50, 0x10, 0x90}, {0x90, 0x18, 0xd8}, {0xe0, 0x30, 0xf8},
+          {0xff, 0x9c, 0xf0}}},
+        {"Espresso",
+         "Coffee",
+         {{0x08, 0x04, 0x02}, {0x2a, 0x12, 0x06}, {0x6b, 0x34, 0x13}, {0xb8, 0x70, 0x3a}, {0xe8, 0xb2, 0x68},
+          {0xf8, 0xe6, 0xc8}}},
+        {"Glow",
+         "Neon",
+         {{0x00, 0x00, 0x00}, {0x20, 0x20, 0x20}, {0x40, 0x40, 0x40}, {0x80, 0x80, 0x80}, {0xc0, 0xc0, 0xc0},
+          {0xff, 0xff, 0xff}}},
+    };
+    static const char *const kCategories[3] = {"Coffee", "Neon", "Pastel"};
+    const ThemeNameProvider themes = tableThemeProvider(kDefs, 3, kCategories, 3);
+    const std::string library = "3|Custom Sky|ff0000,0000ff;4|Second|00ff00,ffffff";
+    const std::vector<GradientChoice> choices = gradientChoices(themes, library);
+
+    const std::vector<GradientGroup> groups = gradientBuiltinGroups(themes, choices);
+    // Pastel has no gradient in it, so it is not a group: a page of nothing
+    // is worse than one row fewer.
+    TEST_ASSERT_EQUAL(static_cast<size_t>(2), groups.size());
+    TEST_ASSERT_EQUAL_STRING("Coffee", groups[0].name.c_str());
+    TEST_ASSERT_EQUAL_STRING("Neon", groups[1].name.c_str());
+    TEST_ASSERT_EQUAL(static_cast<size_t>(1), groups[0].choices.size());
+    TEST_ASSERT_EQUAL(static_cast<size_t>(2), groups[1].choices.size());
+    // The entries are indices into `choices`, in table order within a group.
+    TEST_ASSERT_EQUAL_STRING("Espresso", choices[groups[0].choices[0]].label.c_str());
+    TEST_ASSERT_EQUAL_STRING("Cyber", choices[groups[1].choices[0]].label.c_str());
+    TEST_ASSERT_EQUAL_STRING("Glow", choices[groups[1].choices[1]].label.c_str());
+
+    // Saved gradients are their own group and never land in a built-in one.
+    const std::vector<int> saved = gradientLibraryChoices(themes, choices);
+    TEST_ASSERT_EQUAL(static_cast<size_t>(2), saved.size());
+    TEST_ASSERT_EQUAL_STRING("c3", choices[saved[0]].ref.c_str());
+    TEST_ASSERT_EQUAL_STRING("c4", choices[saved[1]].ref.c_str());
+
+    // Default (choices[0]) belongs to neither: the picker offers it as
+    // Global, above the groups, and only for a per-animation row.
+    for (const GradientGroup &g : groups) {
+        for (int index : g.choices) {
+            TEST_ASSERT_TRUE(index != 0);
+        }
+    }
+    for (int index : saved) {
+        TEST_ASSERT_TRUE(index != 0);
+    }
+}
+
+static void test_gradient_groups_keep_every_builtin_reachable() {
+    // A gradient whose category is not one of the declared ones would
+    // otherwise be in no group at all, and so unreachable from the picker.
+    // It goes in a trailing "Other" group instead.
+    static const bganim_gen::ThemeDef kDefs[2] = {
+        {"Espresso",
+         "Coffee",
+         {{0x08, 0x04, 0x02}, {0x2a, 0x12, 0x06}, {0x6b, 0x34, 0x13}, {0xb8, 0x70, 0x3a}, {0xe8, 0xb2, 0x68},
+          {0xf8, 0xe6, 0xc8}}},
+        {"Stray",
+         "Nowhere",
+         {{0x00, 0x00, 0x00}, {0x20, 0x20, 0x20}, {0x40, 0x40, 0x40}, {0x80, 0x80, 0x80}, {0xc0, 0xc0, 0xc0},
+          {0xff, 0xff, 0xff}}},
+    };
+    static const char *const kCategories[1] = {"Coffee"};
+    const ThemeNameProvider themes = tableThemeProvider(kDefs, 2, kCategories, 1);
+    const std::vector<GradientChoice> choices = gradientChoices(themes, "");
+    const std::vector<GradientGroup> groups = gradientBuiltinGroups(themes, choices);
+
+    TEST_ASSERT_EQUAL(static_cast<size_t>(2), groups.size());
+    TEST_ASSERT_EQUAL_STRING("Coffee", groups[0].name.c_str());
+    TEST_ASSERT_EQUAL_STRING("Other", groups[1].name.c_str());
+    TEST_ASSERT_EQUAL_STRING("Stray", choices[groups[1].choices[0]].label.c_str());
+
+    // Every built-in is in exactly one group, which is what "reachable"
+    // means for the picker.
+    int seen = 0;
+    for (const GradientGroup &g : groups) {
+        seen += static_cast<int>(g.choices.size());
+    }
+    TEST_ASSERT_EQUAL(themes.count(), seen);
+}
+
 static void test_gradient_map_read_write_empty() {
     TEST_ASSERT_EQUAL_STRING("", gradientMapReadRef("", 0).c_str());
     const std::string written = gradientMapWriteRef("", 0, "c3");
@@ -1596,6 +1683,8 @@ int main(int argc, char **argv) {
     RUN_TEST(test_gradient_choices_carry_categories);
     RUN_TEST(test_gradient_choices_without_category_accessor);
     RUN_TEST(test_theme_category_order_is_declared_not_encountered);
+    RUN_TEST(test_gradient_groups_follow_declared_order_and_drop_empties);
+    RUN_TEST(test_gradient_groups_keep_every_builtin_reachable);
     RUN_TEST(test_gradient_map_read_write_empty);
     RUN_TEST(test_gradient_map_read_write_shorter_than_n);
     RUN_TEST(test_gradient_map_write_trims_trailing_empty_slots);

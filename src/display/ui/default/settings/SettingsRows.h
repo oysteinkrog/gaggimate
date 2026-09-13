@@ -122,4 +122,35 @@ lv_obj_t *settingsRowConfirmCreate(SettingsUI &ui, lv_obj_t *parent, const char 
 // Label and value only; not clickable, no controls.
 lv_obj_t *settingsRowInfoCreate(SettingsUI &ui, lv_obj_t *parent, const char *rowName, const char *label);
 
+// ---- swatch ------------------------------------------------------------------
+
+// The colour ramp a swatch row draws is handed to it as samples, left to
+// right, so this file knows nothing about gradients: what a sample means is
+// the caller's business (settingsui::swatchBuildRamp565, GradientSwatch.h,
+// builds the ones the gradient picker uses). One sample per pixel column of
+// the swatch.
+constexpr int kSettingsRowSwatchSamples = 96;
+
+// An action row (whole row is the target, same onActivate protocol) with a
+// colour ramp at its right and a marker dot that says this is the entry
+// currently in force. Built for the gradient picker (gm-nov3.3): a list of
+// sixty gradient names carries no meaning without the colours next to it.
+//
+// The swatch is an lv_canvas over a row-owned RGB565 buffer from LVGL's heap
+// (PSRAM on the device), released with the row. Until
+// settingsRowSetSwatch() is called the swatch is hidden, which is also what a
+// disabled row wants: applyEnabledRecurse dims labels and images by exact
+// class and a canvas is neither, so a row that has no gradient to show hides
+// the swatch rather than dimming it.
+lv_obj_t *settingsRowSwatchCreate(SettingsUI &ui, lv_obj_t *parent, const char *rowName, const char *label,
+                                   SettingsRowActivateFn onActivate, void *user);
+
+// Paints the row's swatch from kSettingsRowSwatchSamples RGB565 samples, or
+// hides it when `ramp` is null. No-op on a row that is not a swatch row.
+void settingsRowSetSwatch(lv_obj_t *row, const uint16_t *ramp);
+
+// Shows or hides the row's marker dot (tagged role "selected", so a test can
+// read which entry a picker page says is in force).
+void settingsRowSetSelected(lv_obj_t *row, bool selected);
+
 #endif // GM_SETTINGS_ROWS_H

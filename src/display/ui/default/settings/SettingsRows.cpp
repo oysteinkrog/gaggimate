@@ -848,3 +848,185 @@ lv_obj_t *settingsRowInfoCreate(SettingsUI &ui, lv_obj_t *parent, const char *ro
         row, [](lv_event_t *e) { delete[] static_cast<char *>(lv_event_get_user_data(e)); }, LV_EVENT_DELETE, buf);
     return row;
 }
+
+// ---- swatch ------------------------------------------------------------------
+
+namespace {
+
+// The swatch's own geometry inside the 320x56 slot: one pixel column per
+// sample, tall enough to read at arm's length, with the text column narrowed
+// to make room. A marker dot sits between the two and is hidden unless the
+// row is the entry currently in force.
+constexpr lv_coord_t kSwatchW = kSettingsRowSwatchSamples;
+constexpr lv_coord_t kSwatchH = 30;
+constexpr lv_coord_t kMarkerSize = 14;
+constexpr lv_coord_t kSwatchTextColW = SettingsUI::kRowW - kSwatchW - kMarkerSize - 20;
+
+struct SwatchCtx {
+    char value[kSettingsRowValueCap] = {0};
+    PressDim pd;
+    SettingsRowActivateFn onActivate = nullptr;
+    void *user = nullptr;
+    lv_obj_t *canvas = nullptr;
+    lv_obj_t *marker = nullptr;
+    lv_color_t *buf = nullptr;
+};
+
+void swatchEvent(lv_event_t *e) {
+    auto *ctx = static_cast<SwatchCtx *>(lv_event_get_user_data(e));
+    switch (lv_event_get_code(e)) {
+    case LV_EVENT_PRESSED:
+        applyPressDim(ctx->pd, true);
+        break;
+    case LV_EVENT_RELEASED:
+    case LV_EVENT_PRESS_LOST:
+        applyPressDim(ctx->pd, false);
+        break;
+    case LV_EVENT_CLICKED:
+        if (ctx->onActivate != nullptr) {
+            ctx->onActivate(ctx->user);
+        }
+        break;
+    default:
+        break;
+    }
+}
+
+// The event codes the two setters below travel on, allocated once. Same
+// mechanism settingsRowSetLocked uses: a setter that reaches a row through
+// its own event queue needs no pointer into this file's per-kind context.
+lv_event_code_t swatchSetEventCode() {
+    static const lv_event_code_t code = static_cast<lv_event_code_t>(lv_event_register_id());
+    return code;
+}
+
+lv_event_code_t swatchSelectEventCode() {
+    static const lv_event_code_t code = static_cast<lv_event_code_t>(lv_event_register_id());
+    return code;
+}
+
+void swatchApply(SwatchCtx *ctx, const uint16_t *ramp) {
+    if (ctx->canvas == nullptr || ctx->buf == nullptr) {
+        return;
+    }
+    if (ramp == nullptr) {
+        lv_obj_add_flag(ctx->canvas, LV_OBJ_FLAG_HIDDEN);
+        return;
+    }
+    // One sample per column, copied down the rows. lv_color_t is a union over
+    // a 16-bit `full` at LV_COLOR_DEPTH 16, which is the format the samples
+    // already are, so nothing is converted here.
+    for (int x = 0; x < kSwatchW; x++) {
+        lv_color_t c;
+        c.full = ramp[x];
+        ctx->buf[x] = c;
+    }
+    for (int y = 1; y < kSwatchH; y++) {
+        memcpy(&ctx->buf[y * kSwatchW], ctx->buf, kSwatchW * sizeof(lv_color_t));
+    }
+    lv_obj_clear_flag(ctx->canvas, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_invalidate(ctx->canvas);
+}
+
+} // namespace
+
+lv_obj_t *settingsRowSwatchCreate(SettingsUI &ui, lv_obj_t *parent, const char *rowName, const char *label,
+                                   SettingsRowActivateFn onActivate, void *user) {
+    const lv_color_t fg = themeFg();
+    const lv_color_t dim = touchDimColor(ui);
+
+    lv_obj_t *row = createRowContainer(parent);
+    lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(row, 6, LV_PART_MAIN);
+
+    auto *ctx = new SwatchCtx();
+    ctx->onActivate = onActivate;
+    ctx->user = user;
+
+    TextCol col = buildTextCol(row, label, kSwatchTextColW);
+    ctx->pd = makePressDim(col, fg, dim);
+    ui.tag(col.value, rowName, "value", ctx->value);
+
+    ctx->marker = lv_obj_create(row);
+    lv_obj_remove_style_all(ctx->marker);
+    lv_obj_set_size(ctx->marker, kMarkerSize, kMarkerSize);
+    lv_obj_clear_flag(ctx->marker, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_clear_flag(ctx->marker, LV_OBJ_FLAG_CLICKABLE); // see createRowContainer
+    lv_obj_add_flag(ctx->marker, LV_OBJ_FLAG_EVENT_BUBBLE);
+    lv_obj_add_flag(ctx->marker, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_set_style_radius(ctx->marker, LV_RADIUS_CIRCLE, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(ctx->marker, fg, LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(ctx->marker, LV_OPA_COVER, LV_PART_MAIN);
+    ui.tag(ctx->marker, rowName, "selected");
+
+    // LVGL's heap, which is PSRAM on the device (gm_lv_mem.cpp): 5.6 kB per
+    // visible row, and at most five rows are built at a time. A failed
+    // allocation leaves the row without a swatch rather than without a row.
+    ctx->buf = static_cast<lv_color_t *>(lv_mem_alloc(kSwatchW * kSwatchH * sizeof(lv_color_t)));
+    if (ctx->buf != nullptr) {
+        ctx->canvas = lv_canvas_create(row);
+        lv_canvas_set_buffer(ctx->canvas, ctx->buf, kSwatchW, kSwatchH, LV_IMG_CF_TRUE_COLOR);
+        lv_obj_clear_flag(ctx->canvas, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_flag(ctx->canvas, LV_OBJ_FLAG_EVENT_BUBBLE);
+        lv_obj_add_flag(ctx->canvas, LV_OBJ_FLAG_HIDDEN);
+        lv_canvas_fill_bg(ctx->canvas, fg, LV_OPA_COVER);
+        ui.tag(ctx->canvas, rowName, "swatch");
+    }
+
+    lv_obj_add_event_cb(row, swatchEvent, LV_EVENT_ALL, ctx);
+    lv_obj_add_event_cb(
+        row,
+        [](lv_event_t *e) {
+            auto *c = static_cast<SwatchCtx *>(lv_event_get_user_data(e));
+            swatchApply(c, static_cast<const uint16_t *>(lv_event_get_param(e)));
+        },
+        swatchSetEventCode(), ctx);
+    lv_obj_add_event_cb(
+        row,
+        [](lv_event_t *e) {
+            auto *c = static_cast<SwatchCtx *>(lv_event_get_user_data(e));
+            if (c->marker == nullptr) {
+                return;
+            }
+            if (*static_cast<const bool *>(lv_event_get_param(e))) {
+                lv_obj_clear_flag(c->marker, LV_OBJ_FLAG_HIDDEN);
+            } else {
+                lv_obj_add_flag(c->marker, LV_OBJ_FLAG_HIDDEN);
+            }
+        },
+        swatchSelectEventCode(), ctx);
+    lv_obj_add_event_cb(
+        row,
+        [](lv_event_t *e) {
+            auto *c = static_cast<SwatchCtx *>(lv_event_get_user_data(e));
+            // obj_del_core sends this before it deletes the row's children
+            // (lv_obj_tree.c), so the canvas still points at this buffer for
+            // the rest of the deletion. Nothing draws in between: the whole
+            // deletion runs inside one lv_obj_del call on the UI task.
+            c->canvas = nullptr;
+            c->marker = nullptr;
+            lv_mem_free(c->buf);
+            delete c;
+        },
+        LV_EVENT_DELETE, ctx);
+    // Role "action", like every other whole-row target, so rows_on_page() and
+    // the geometry audit see one 320x56 target here and not a second kind.
+    ui.tag(row, rowName, "action");
+    return row;
+}
+
+void settingsRowSetSwatch(lv_obj_t *row, const uint16_t *ramp) {
+    if (row == nullptr) {
+        return;
+    }
+    lv_event_send(row, swatchSetEventCode(), const_cast<uint16_t *>(ramp));
+}
+
+void settingsRowSetSelected(lv_obj_t *row, bool selected) {
+    if (row == nullptr) {
+        return;
+    }
+    lv_event_send(row, swatchSelectEventCode(), &selected);
+}
