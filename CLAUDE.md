@@ -1053,19 +1053,36 @@ Three test commands, and what each proves:
 
 What the device runs taught, beyond the numbers:
 
-- **The bench board stores pixel-clock divider 7**, not the build default 6,
-  so its rates are not comparable with a run at the default. The runner reads
-  `/api/debug/pclk` and warns. This is the stored-settings trap from the
-  hardware invariants above, hit again. **It stored 8 until some time between
-  2026-09-10 22:54Z and 2026-09-11**, and every measurement in this file dated
-  on or before 2026-09-10 that says "divider 8" was taken at 8 and is correct
-  as written. Nothing in the rig writes the setting and nobody has owned up to
-  changing it, so read the value rather than assuming either number. Confirmed
-  stored on 2026-09-13 by reading `panelClockDiv` from the settings twice an
-  hour apart, with `/api/debug/pclk` reporting `div 7, live true` both times
-  and the serial `GM_SCANOUT` frame rate agreeing independently at 43.5 a
-  second, which is the divider 7 row in `rig_soak.py`'s own table.
-  `panelclock::MIN_USER_DIV` floors a user setting at 6, so 7 passes.
+- **The bench board's stored pixel-clock divider changes on its own, so read
+  it before every measurement and say what it read.** It has been 8, then 7,
+  then 6, and nobody has owned up to writing any of them. It stored 8 until
+  some time between 2026-09-10 22:54Z and 2026-09-11, so every measurement in
+  this file dated on or before 2026-09-10 that says "divider 8" was taken at 8
+  and is correct as written. It stored 7 on 2026-09-13, confirmed twice an hour
+  apart by reading `panelClockDiv` from the settings, with `/api/debug/pclk`
+  reporting `div 7, live true` both times and the serial `GM_SCANOUT` frame
+  rate agreeing independently at 43.5 a second, which is the divider 7 row in
+  `rig_soak.py`'s own table. It stored 6 two hours later, inside a window whose
+  only activity was a gradient preview, three `synth?brew=0` calls and several
+  app-partition flashes, none of which writes a stored setting. The runner
+  reads `/api/debug/pclk` and warns. `panelclock::MIN_USER_DIV` floors a user
+  setting at 6, so every value seen so far passes. This is the stored-settings
+  trap from the hardware invariants above, hit three times now.
+- **A band time ratio is a divider figure, and the divider is the bigger term
+  for a fetch-bound kernel** (gm-4bd.7, 2026-09-13). Same binaries, same
+  protocol, crescent against plasma:
+
+                          divider 7        divider 6
+      HEAD                1.519, 1.533     1.947, 2.134
+      six kernels in IRAM 1.270, 1.296     1.300, 1.345
+
+  So crescent is inside the 1.25 budget at divider 7 with the kernels pinned
+  and 2.0 times plasma at divider 6, which is the clock production ships. The
+  pinned build barely moves between the two clocks and HEAD moves 30%, which
+  is what "fetch-bound" means here: it is contention for the shared
+  instruction cache, not the kernel's own work. A 27% spread between two
+  protocols that was recorded earlier that day was the divider changing under
+  the session, not the protocols.
 - **The Animation scenario cannot run on that board as it stands.** Its stored
   `elementTintColor` is `#FEC4A4`, which is not one of the twelve palette
   colours the tint row cycles through, so the preflight reports an unsupported
