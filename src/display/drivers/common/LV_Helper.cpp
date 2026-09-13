@@ -411,6 +411,8 @@ char *g_touchMapBuf = nullptr;
 volatile uint32_t g_touchMapLen = 0;
 volatile int64_t g_overlayMinRefreshUs = 250000; // DefaultUI's constructor sets OVERLAY_MIN_REFRESH_US
 volatile uint8_t g_animFpsOverride = 0;
+volatile int g_animToneBrightnessPct = -1;
+volatile int g_animToneKneePct = -1;
 
 /*Read the touchpad*/
 static void touchpad_read(lv_indev_drv_t *indev_driver, lv_indev_data_t *data) {

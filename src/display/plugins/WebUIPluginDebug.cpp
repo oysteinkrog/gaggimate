@@ -1652,6 +1652,155 @@ void WebUIPlugin::setupDebugEndpoints() {
         heap_caps_free(buf);
     });
 
+#ifdef GM_TOUCH_PROBE
+    // /api/debug/gradfix[?on=0|1|2|3][&y0=&y1=][&xoff=0|1][&btone=&ktone=]
+    // [&stops=<wire>[&anim=N]]: the gradient framebuffer fixture (gm-nov3.10).
+    //
+    // The question it answers is whether the panel really stores the colours
+    // web/src/config/gradientRamp.js says it will. tools/animbench's
+    // ramp_parity.js already proves that module equal to the firmware's C++,
+    // entry by entry, but a host-to-host proof cannot see the panel: a stored
+    // brightness, a stored rolloff, a gradient reference that resolves to
+    // something else, or a driver that drops bits would all pass it.
+    //
+    // Comparing an arbitrary animated frame is not an option. An animation
+    // maps the palette through its own pattern and its own gain, so a moving
+    // frame has no known relation to a ramp. So this paints a known one: rows
+    // [y0, y1) of the framebuffer carry the active theme's 256-entry ramp,
+    // column x holding index ((x + xoff) * 255) / (w - 1), written after every
+    // compositing stage so no overlay, layer, element or scrim can reach it.
+    // xoff is there because /api/debug/fb only delivers the framebuffer
+    // subsampled, so a host reads even columns and would never see the index
+    // on column 479; at xoff 1 that index lands on column 478 instead.
+    //
+    // The JSON is what makes the comparison possible rather than merely
+    // repeatable: it reports the stops BEFORE tone, the interpolation mode,
+    // both tone percentages with the integer values they converted to, the
+    // palette gain and the exact sampled region. A host feeds those back into
+    // the sampler and compares. Reading them here rather than from
+    // /api/settings is deliberate: that endpoint returns the WiFi password in
+    // clear text, and it would report what is stored rather than what the
+    // render task actually used.
+    //
+    // Bench builds only, never persisted, cleared by a reboot.
+    // tools/gradient_fb_check.py drives it.
+    server.on("/api/debug/gradfix", [this](AsyncWebServerRequest *request) {
+        SleepAnimation *a = sleep_animation_bench_instance();
+        if (a == nullptr) {
+            request->send(409, "application/json", "{\"error\":\"animation not running\"}");
+            return;
+        }
+        LilyGoDriver *drv = LilyGoDriver::peekInstance();
+        Display *disp = drv != nullptr ? drv->getDisplay() : nullptr;
+        if (disp == nullptr) {
+            request->send(404, "application/json", "{\"error\":\"not a LilyGo panel\"}");
+            return;
+        }
+        if (request->hasArg("on")) {
+            const int mode = request->arg("on").toInt();
+            const int h = disp->height();
+            int y0 = request->hasArg("y0") ? request->arg("y0").toInt() : a->rampFixtureY0();
+            int y1 = request->hasArg("y1") ? request->arg("y1").toInt() : a->rampFixtureY1();
+            y0 = y0 < 0 ? 0 : (y0 > h ? h : y0);
+            y1 = y1 < 0 ? 0 : (y1 > h ? h : y1);
+            const int xoff = request->hasArg("xoff") ? request->arg("xoff").toInt() : 0;
+            a->setRampFixture(mode, y0, y1, xoff);
+        }
+        // stops=<wire>[&anim=N]: hold an arbitrary gradient on the panel through
+        // the gradient editor's own live-preview path, which is what makes this
+        // usable for a whole batch: every entry in data/gradients.json can be
+        // put on the panel in turn without writing one stored setting. An empty
+        // value ends the preview and the stored theme comes back on the next UI
+        // pass. The preview lapses on its own after BGANIM_PREVIEW_HOLD_MS, so a
+        // caller re-sends it per pass; the report below says which stops the
+        // render task actually resolved, so a lapsed preview reads as the wrong
+        // gradient rather than as a silent pass.
+        if (request->hasArg("stops")) {
+            const String wire = request->arg("stops");
+            if (wire.length() == 0) {
+                pluginManager->trigger("bganim:preview-end");
+            } else {
+                Event ev;
+                ev.id = "bganim:preview";
+                ev.setInt("anim", request->hasArg("anim") ? request->arg("anim").toInt() : a->currentAnimId());
+                ev.setString("stops", wire);
+                pluginManager->trigger(ev);
+            }
+        }
+        // btone=/ktone=: the animation brightness and highlight rolloff in
+        // percent, held against DefaultUI's per-pass re-apply of the stored
+        // values until -1 releases them. This is how the fixture is run at a
+        // tone other than the device's own without writing NVS, and without
+        // POSTing /api/settings, which would need the WiFi password echoed
+        // back at it. The tone the render task ended up with is in the report
+        // below, so a caller checks the override took rather than assuming it.
+        if (request->hasArg("btone")) {
+            const int v = request->arg("btone").toInt();
+            g_animToneBrightnessPct = (v < 0 || v > 100) ? -1 : v;
+        }
+        if (request->hasArg("ktone")) {
+            const int v = request->arg("ktone").toInt();
+            g_animToneKneePct = (v < 0 || v > 100) ? -1 : v;
+        }
+        AsyncResponseStream *response = request->beginResponseStream("application/json");
+        JsonDocument doc(&psramAllocator);
+        doc["fw"] = BUILD_GIT_VERSION;
+        doc["built"] = BUILD_TIMESTAMP;
+        const int mode = a->rampFixtureMode();
+        doc["armed"] = mode != 0;
+        doc["mode"] = mode == 3 ? "wheel" : (mode == 2 ? "reversed" : (mode == 1 ? "ramp" : "off"));
+        doc["frames"] = a->rampFixtureFrames();
+        doc["y0"] = a->rampFixtureY0();
+        doc["y1"] = a->rampFixtureY1();
+        doc["x0"] = 0;
+        doc["x1"] = disp->width();
+        doc["w"] = disp->width();
+        doc["h"] = disp->height();
+        doc["xoff"] = a->rampFixtureXoff();
+        // Spelled out so a reader of the report never has to find this file.
+        doc["map"] = "index = ((x + xoff) * 255) / (w - 1), clamped to 255, every row of [y0,y1) alike";
+        // The gain buildThemeRamp is called with. Fixed at 256 (none): an
+        // animation's extra gain is a property of that animation, and the
+        // fixture represents the theme.
+        doc["gain256"] = 256;
+        int bright256 = 256, knee = 255;
+        bganim::themeToneState(&bright256, &knee);
+        doc["brightness256"] = bright256;
+        doc["knee"] = knee;
+        // The two settings the render task's tone came from, so the host can
+        // run the same percent-to-integer conversion and check it landed on
+        // the values above.
+        doc["brightnessPct"] = g_animToneBrightnessPct >= 0 ? g_animToneBrightnessPct : controller->getSettings().getBgAnimBrightness();
+        doc["kneePct"] = g_animToneKneePct >= 0 ? g_animToneKneePct : controller->getSettings().getBgAnimHighlightKnee();
+        doc["toneOverride"] = g_animToneBrightnessPct >= 0 || g_animToneKneePct >= 0;
+        uint8_t stops[BG_THEME_MAX_STOPS][3];
+        uint8_t pos[BG_THEME_MAX_STOPS];
+        bool uniform = true;
+        const int n = bganim::themeRawStops(stops, pos, BG_THEME_MAX_STOPS, &uniform);
+        doc["stopCount"] = n;
+        doc["uniform"] = uniform;
+        doc["themeGen"] = bganim::themeGen();
+        // The wire format the firmware's own parser reads, so the host can
+        // hand it straight to parseGradientWire without reassembling it: bare
+        // hex for a uniform theme, hex@pos for a positional one.
+        String wire;
+        for (int i = 0; i < n; i++) {
+            char part[16];
+            if (uniform) {
+                snprintf(part, sizeof(part), "%s%02x%02x%02x", i == 0 ? "" : ",", stops[i][0], stops[i][1], stops[i][2]);
+            } else {
+                snprintf(part, sizeof(part), "%s%02x%02x%02x@%u", i == 0 ? "" : ",", stops[i][0], stops[i][1], stops[i][2],
+                         static_cast<unsigned>(pos[i]));
+            }
+            wire += part;
+        }
+        doc["stops"] = wire;
+        serializeJson(doc, *response);
+        request->send(response);
+    });
+
+#endif // GM_TOUCH_PROBE
+
     // /api/debug/fb?n=0|1[&step=2] streams one panel framebuffer as raw
     // RGB565, little-endian, row-major, step**2 decimated.
     //

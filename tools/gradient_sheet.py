@@ -27,35 +27,65 @@ different documents and only the file says which is which.
 COMPARING THIS AGAINST THE PANEL
 ================================
 
-Not done, and the design is written down here so the next person does not
-invent a worse one. As of 2026-09-12 nothing has compared these strips against
-a real panel.
+Done, on the bench board, 2026-09-13 (gm-nov3.10). The strips above are what
+the panel stores.
 
-What will not work: grabbing /api/debug/fb while an animation runs and holding
-it next to a strip. An animation maps the palette through its own pattern, its
-own gain and, for Plasma, a wheel rather than a ramp, so an arbitrary moving
-frame has no known relation to a horizontal ramp. A comparison that does not
-say which ramp index each pixel came from is not a comparison.
+The command is tools/gradient_fb_check.py:
 
-What will work is a controlled fixture, on a bench build only:
+    python3 tools/gradient_fb_check.py --host 192.168.1.121 \
+        --tone 100,100 --tone 60,65 --selftest --json report.json
 
-  - a probe on /api/debug/anim, under GM_TOUCH_PROBE, that stops the animation
-    (the existing animoff=1 path), paints rows 200 to 239 of the framebuffer
-    with the currently resolved theme's buildThemeRamp output, column x taking
-    ramp index (x * 255) / 479, and reports in its JSON the stops it resolved,
-    the two tone percentages and the gain it used;
-  - read the region back with /api/debug/fb, average each column over the 40
-    rows (they are identical, so a disagreement is itself a finding), and
-    compare against this tool's samples generated at the settings the probe
-    reported, not at this tool's defaults;
-  - pass is every column equal, since both sides are the same integer
-    arithmetic on the same stops and the panel stores RGB565.
+It arms a bench-only fixture on the device (/api/debug/gradfix, GM_TOUCH_PROBE
+builds), reads the framebuffer back through /api/debug/fb, and compares
+individual RGB565 samples against this file's own sampler. It exits non-zero on
+any mismatch. --batch walks every entry in data/gradients.json instead of the
+device's own theme, which is the form gm-nov3.5 needs for an appended set.
 
-The matched settings are the whole point: the device applies its own stored
-brightness, rolloff and gradient, so the host side has to be told what those
-were rather than assuming the defaults. Reading them from the probe's own
-report keeps the check away from /api/settings, which returns the WiFi
-password in clear text.
+What the fixture does: rows 200 to 239 of every band are overwritten with the
+active theme's 256-entry ramp, after every compositing stage and before the
+push, so no overlay, layer, element or scrim reaches them. Column x carries
+ramp index ((x + xoff) * 255) / (w - 1), clamped to 255. Interlacing is vetoed
+while it is armed, so both framebuffers carry the strip rather than one.
+
+Why xoff exists: /api/debug/fb only delivers the framebuffer subsampled, so a
+host sees even columns only and would never read column 479, where index 255
+sits. The fixture is read twice, at xoff 0 and 1, and the two passes together
+cover the index of every column. Measured coverage: 256 of 256 indices.
+
+The settings are read from the fixture's own report, not assumed and not read
+from /api/settings, which returns the WiFi password in clear text. The report
+carries the stops before tone, whether they are uniform or positional, both
+tone percentages with the integer values they converted to, the palette gain
+and the sampled region. btone=/ktone= hold a tone against DefaultUI's per-pass
+re-apply of the stored one, so a run at 60/65 writes nothing to NVS.
+
+The recorded runs, in tools/gradient_fb_check/:
+
+  report.json, the device's own theme at two tones
+
+    firmware    v1.9.8-sleep9-644-g265501e0, built 2026-09-13T10:09:56Z
+    board       192.168.1.121, pixel clock divider 7, whole-frame path
+    gradient    Aurora, the six-stop built-in the board had stored
+    tone        100/100 and 60/65, four passes (two tones x xoff 0 and 1)
+    samples     38,400 compared, 0 mismatches
+    coverage    ramp indices 0 to 255, every one of the 256
+
+  batch_report.json, every built-in through the preview path
+
+    same firmware and board, tone 100/100, 18 gradients x xoff 0 and 1
+    samples     172,800 compared, 0 mismatches
+
+The same run's self test is what makes that zero mean something: the same
+armed strip compared against a ramp sampled at 50/50 gives 4,800 mismatches,
+and the correct ramp compared against the region with the fixture off gives
+4,724. A check that cannot fail is not evidence.
+
+One thing to expect on a board that has been up a while: /api/debug/fb is a
+chunked response and the board starts dropping it partway after a few hundred
+requests (internal free fell from 30.9 kB at boot to 26.2 kB, largest block
+20.5 kB to 15.9). The tool retries, and keeps a short read when it still
+reaches the strip's rows, so a run finishes either way. A reboot restores it.
+
 """
 
 import argparse

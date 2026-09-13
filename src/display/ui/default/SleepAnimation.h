@@ -288,6 +288,39 @@ class SleepAnimation {
     // with nobody in front of it. See the comment at the write site.
     void setTestPattern(bool on) { testPattern.store(on); }
     bool testPatternOn() const { return testPattern.load(); }
+#ifdef GM_TOUCH_PROBE
+    // Gradient framebuffer fixture (gm-nov3.10). While armed, the render task
+    // overwrites rows [y0, y1) of every band, after the composite and before
+    // the push, with the active theme's own 256-entry ramp: column x carries
+    // ramp index (x * 255) / (w - 1), so index 255 lands on the last column
+    // and every index appears. Nothing runs after it, so no overlay, layer,
+    // element or scrim can reach the sampled rows, which is what makes the
+    // region comparable against a host sampler at all.
+    //
+    // Interlacing is vetoed while armed. An interlaced frame pushes half the
+    // rows and skips the buffer flip, so only one of the two framebuffers
+    // ever carries a complete strip and /api/debug/fb?n=1 would report a
+    // stale one. Whole frames put the same strip in both.
+    //
+    // Volatile: never stored, cleared by a reboot, and compiled only into the
+    // bench builds that define GM_TOUCH_PROBE.
+    //   mode 0 off, 1 forward ramp, 2 reversed, 3 wheel (Plasma's cyclic one)
+    //
+    // xoff shifts the mapping one column left: index = ((x + xoff) * 255) /
+    // (w - 1). It exists because /api/debug/fb only delivers the framebuffer
+    // subsampled (step 2 on this panel; step 1 truncates after five rows), so
+    // a host reads even columns only and would never see the index that sits
+    // on column 479. At xoff 1 that index lands on column 478 instead, and
+    // the two passes together cover every column's index.
+    void setRampFixture(int mode, int y0, int y1, int xoff);
+    int rampFixtureXoff() const { return rampFixXoff.load(); }
+    int rampFixtureMode() const { return rampFixMode.load(); }
+    int rampFixtureY0() const { return rampFixY0.load(); }
+    int rampFixtureY1() const { return rampFixY1.load(); }
+    // Frames painted since the last arm, so a host can tell a strip that is
+    // on screen from one that was only just requested.
+    uint32_t rampFixtureFrames() const { return rampFixFrames.load(); }
+#endif
     uint8_t fpsOverrideValue() const { return fpsOverride.load(); }
     // Tearing: live writes over frames actually checked. The denominator is
     // exposed so a zero cannot be read as clean when the check never ran.
@@ -1593,6 +1626,19 @@ class SleepAnimation {
     std::atomic<uint8_t> fpsOverride{0};
 #endif
     std::atomic<bool> testPattern{false};
+#ifdef GM_TOUCH_PROBE
+    // Gradient fixture state. The three atomics are written by the HTTP task
+    // and read by the render task; the LUT and its cache keys are touched only
+    // by the render task, which is the only writer of the band buffers.
+    std::atomic<int> rampFixMode{0};
+    std::atomic<int> rampFixY0{200};
+    std::atomic<int> rampFixY1{240};
+    std::atomic<uint32_t> rampFixFrames{0};
+    std::atomic<int> rampFixXoff{0};
+    uint16_t rampFixLut[256] = {0};
+    uint32_t rampFixLutGen = 0;
+    int rampFixLutMode = 0;
+#endif
     int initializedAnimId = -1; // last id whose init() ran on the render task
     // Which animation currently holds allocated tables, or -1 for none. Kept
     // apart from initializedAnimId because start() clears that one to force an

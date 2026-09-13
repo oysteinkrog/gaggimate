@@ -500,6 +500,34 @@ const uint8_t (*themeStops())[3] { return g_themeBuf[g_themeGen & 1]; }
 const uint8_t *themeStopPositions() { return g_themePos[g_themeGen & 1]; }
 bool themeUniform() { return g_themeUniform[g_themeGen & 1]; }
 
+int themeRawStops(uint8_t (*outStops)[3], uint8_t *outPos, int cap, bool *outUniform) {
+    int n = g_rawCount < cap ? g_rawCount : cap;
+    if (n < 0) {
+        n = 0;
+    }
+    for (int i = 0; i < n; i++) {
+        for (int c = 0; c < 3; c++) {
+            outStops[i][c] = g_rawStops[i][c];
+        }
+        if (outPos != nullptr) {
+            outPos[i] = g_rawPos[i];
+        }
+    }
+    if (outUniform != nullptr) {
+        *outUniform = g_rawUniform;
+    }
+    return n;
+}
+
+void themeToneState(int *brightness256, int *knee) {
+    if (brightness256 != nullptr) {
+        *brightness256 = g_brightness256;
+    }
+    if (knee != nullptr) {
+        *knee = g_knee;
+    }
+}
+
 void themeRGB(int pos, uint8_t out[3]) {
     const int gen = g_themeGen & 1;
     const uint8_t(*st)[3] = g_themeBuf[gen];

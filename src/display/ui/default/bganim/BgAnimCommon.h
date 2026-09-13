@@ -342,6 +342,21 @@ const uint8_t (*themeStops())[3];
 const uint8_t *themeStopPositions();
 bool themeUniform(); // equal spacing: the original arithmetic is in use
 
+// The stops as the theme defines them, BEFORE tone, plus the tone in force.
+// themeStops() reports the toned result, which is what the animations draw
+// with but not what a host can rebuild the same ramp from: a host that is
+// handed toned stops has to be told the tone was already applied, and then it
+// is no longer checking the tone arithmetic at all. These two report the
+// inputs instead, so the gradient framebuffer fixture (gm-nov3.10) can say
+// "these stops at this brightness and this knee" and the host can run the
+// whole transform itself.
+//
+// themeRawStops() copies at most `cap` stops into outStops (and their
+// positions into outPos when it is not null), sets *outUniform, and returns
+// the number copied. Reporting only; not on any render path.
+int themeRawStops(uint8_t (*outStops)[3], uint8_t *outPos, int cap, bool *outUniform);
+void themeToneState(int *brightness256, int *knee);
+
 // Tone controls, applied to the stops before any animation sees them.
 //
 // Overlaid text is unreadable on a bright background, and measurement (see

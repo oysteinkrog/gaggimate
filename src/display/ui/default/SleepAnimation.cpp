@@ -1650,6 +1650,33 @@ int SleepAnimation::renderPrioValue() const {
     return h != nullptr ? static_cast<int>(uxTaskPriorityGet(h)) : -1;
 }
 
+#ifdef GM_TOUCH_PROBE
+void SleepAnimation::setRampFixture(int mode, int y0, int y1, int xoff) {
+    if (mode < 0 || mode > 3) {
+        mode = 0;
+    }
+    if (y0 < 0) {
+        y0 = 0;
+    }
+    // A safety cap only; the endpoint clamps to the live panel height, which
+    // this cannot read because it may be called while nothing is running.
+    if (y1 > MAX_BANDS * BAND_H) {
+        y1 = MAX_BANDS * BAND_H;
+    }
+    if (y1 <= y0) {
+        // An empty strip would arm the fixture, veto interlacing and paint
+        // nothing, which reads on the host as "the panel drew the animation".
+        // Refusing the range and staying off is the honest answer.
+        mode = 0;
+    }
+    rampFixXoff.store(xoff != 0 ? 1 : 0);
+    rampFixY0.store(y0);
+    rampFixY1.store(y1);
+    rampFixFrames.store(0);
+    rampFixMode.store(mode);
+}
+#endif
+
 bool SleepAnimation::stop() {
     if (!running) {
         return stopConfirmed();
@@ -4158,6 +4185,11 @@ void IRAM_ATTR SleepAnimation::renderLoop() {
         }
         fpsFrames++;
         animFrames.fetch_add(1);
+#ifdef GM_TOUCH_PROBE
+        if (rampFixMode.load() != 0) {
+            rampFixFrames.fetch_add(1);
+        }
+#endif
 #ifdef GM_ANIM_BENCH
         const uint32_t frameUs = static_cast<uint32_t>(esp_timer_get_time() - frameStart);
         accTotalUs += frameUs;
@@ -4622,7 +4654,15 @@ void IRAM_ATTR SleepAnimation::renderFrame() {
         // outcome" instead of just "is bandWarm nonzero", since a nonzero
         // countdown on a band that would never have interlaced anyway (half
         // res, or the global warmup already covering it) forces nothing.
-        const bool wouldInterlace = interlace.load() && warmupFrames.load() == 0 && !(half && oddBand) && !half;
+#ifdef GM_TOUCH_PROBE
+        // The gradient fixture's strip has to land in both framebuffers (see
+        // setRampFixture), and an interlaced frame writes only one of them.
+        const int rampFix = rampFixMode.load();
+#else
+        constexpr int rampFix = 0;
+#endif
+        const bool wouldInterlace =
+            interlace.load() && warmupFrames.load() == 0 && !(half && oddBand) && !half && rampFix == 0;
         const bool bandInterlaced = wouldInterlace && bandWarm == 0;
         if (half && interlace.load() && warmupFrames.load() == 0) {
             halfInterlaceVeto++;
@@ -5126,6 +5166,43 @@ void IRAM_ATTR SleepAnimation::renderFrame() {
 #endif
 #ifdef GM_BLEND_PROBE
         probeSink += probeAcc;
+#endif
+#ifdef GM_TOUCH_PROBE
+        // The gradient framebuffer fixture, painted last on purpose: every
+        // compositing stage has already run, so the rows below carry the ramp
+        // and nothing else. The LUT is rebuilt when the theme generation moves
+        // or the mode changes, which is once per settings write, not per band.
+        if (rampFix != 0) {
+            const uint32_t gen = bganim::themeGen();
+            if (gen != rampFixLutGen || rampFix != rampFixLutMode) {
+                if (rampFix == 3) {
+                    bganim::buildThemeWheel(rampFixLut, 256);
+                } else {
+                    bganim::buildThemeRamp(rampFixLut, 256, rampFix == 2);
+                }
+                rampFixLutGen = gen;
+                rampFixLutMode = rampFix;
+            }
+            const int fy0 = rampFixY0.load();
+            const int fy1 = rampFixY1.load();
+            const int r0 = fy0 > y0 ? fy0 : y0;
+            const int r1 = fy1 < y0 + rows ? fy1 : y0 + rows;
+            // Every row of the band inside the strip, whatever any row-skipping
+            // above decided: a row the frame does not push keeps what it held,
+            // and while armed that is the same ramp, but a row this frame DOES
+            // push has to carry it.
+            const int xoff = rampFixXoff.load();
+            for (int y = r0; y < r1; y++) {
+                uint16_t *const prow = band + static_cast<size_t>(y - y0) * w;
+                for (int x = 0; x < w; x++) {
+                    int idx = ((x + xoff) * 255) / (w - 1);
+                    if (idx > 255) {
+                        idx = 255;
+                    }
+                    prow[x] = rampFixLut[idx];
+                }
+            }
+        }
 #endif
 
         // Compact the band to just the columns the round panel actually shows.

@@ -180,6 +180,15 @@ extern volatile int64_t g_overlayMinRefreshUs;
 // (0 = the stored setting). DefaultUI applies it where it re-applies the
 // stored cap each pass. Not persisted.
 extern volatile uint8_t g_animFpsOverride;
+// btone=/ktone= on /api/debug/gradfix: a temporary animation brightness and
+// highlight rolloff, in percent, for the gradient framebuffer fixture
+// (gm-nov3.10). -1 leaves the stored setting alone. An override rather than a
+// direct bganim::setThemeTone() call, because DefaultUI re-applies the stored
+// tone on every UI pass, so a set would last one pass: the scrim knob was
+// silently reverted the same way and cost an evening of measurements. Not
+// persisted, cleared by a reboot.
+extern volatile int g_animToneBrightnessPct;
+extern volatile int g_animToneKneePct;
 // Foreground motion test (uianim= on /api/debug/anim, applied by
 // DefaultUI::loop on the UI task, since LVGL is single-threaded): 0 removes
 // the test widget, 1 slides an opaque 120x120 rounded plate with a label
