@@ -438,3 +438,9 @@ by absolute path, as CLAUDE.md requires everywhere. The copy is not a git
 repository, so its build writes an empty `BUILD_GIT_VERSION` and the two
 version checks in the status scenario fail there for that reason alone.
 Everything else runs normally.
+
+A scratch copy runs the same runner, so it wants the same port. Two lanes
+running at once produce `127.0.0.1:8181 is already answering connections`,
+which the runner reports as a scenario error and is not a defect in
+anything. Pass a free port to the copy's run, and read that message as
+another lane's simulator rather than as a result.
