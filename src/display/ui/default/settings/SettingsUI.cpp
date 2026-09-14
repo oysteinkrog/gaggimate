@@ -340,18 +340,27 @@ void SettingsUI::buildTile(lv_obj_t *parent, int index, const SettingsCategoryDe
     // bottom is taken; the owner chose the top on 2026-09-13.
     //
     // Measured on the simulator against the 96x96/12px-edge rules in the
-    // epic's shared contract. Five tiles: the top tile clears the status
-    // icons (y 20 to 39) by 8 px, the two lower tiles clear the chevron's
-    // 34 px click pad by 5 px, the nearest pair of tiles is 38 px apart and
-    // the furthest corner is 213 px from the centre against the 228 px edge
-    // rule. Six tiles are a tighter packing of the same ring, so what passes
-    // there passes for five.
-    static constexpr int kRadius = 145;
+    // epic's shared contract, with the tiles temporarily forced to five: the
+    // top tile's icon clears the status icons (y 20 to 39) by 10 px, the two
+    // lower tiles' captions clear the chevron's 34 px click pad by 15 px, the
+    // nearest pair of tiles is 30 px apart, the nearest pair of caption boxes
+    // 57 px, and the furthest tile corner is 208.8 px from the centre against
+    // the 228 px edge rule. Six tiles pack the same ring tighter, and their
+    // nearest caption boxes are 15 px apart.
+    // The ring is a little tighter when a tile sits on the vertical axis,
+    // because that tile is the one that has to clear the status icons at the
+    // top: pulling it in is what pays for the bigger icons. The even count
+    // leaves the top clear and spends the radius on keeping its tiles apart.
+    static constexpr int kRadius = (kSettingsCategoryCount % 2 == 1) ? 135 : 145;
     static constexpr int kSize = 96;
-    // The 40x40 source icons drawn at 55x55 (256 is 1:1). LV_IMG_SIZE_MODE_REAL
+    // The 40x40 source icons drawn at 76x76 (256 is 1:1). LV_IMG_SIZE_MODE_REAL
     // is what makes the flex layout see the drawn size rather than the source
-    // size, so the caption still sits under the icon.
-    static constexpr uint16_t kIconZoom = 320;
+    // size, so the caption still sits under the icon. The icon is taller than
+    // the room the 96 px tile has under a two-line caption, so it overflows
+    // the tile at both ends, and what limits it is the tile on the axis: at
+    // 76 px its icon clears the status icons by 10 px and the lower tiles'
+    // captions clear the exit chevron's click pad by 15.
+    static constexpr uint16_t kIconZoom = 454;
 
     lv_obj_t *tileObj = lv_obj_create(parent);
     lv_obj_remove_style_all(tileObj);

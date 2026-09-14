@@ -789,22 +789,29 @@ the design cannot show and what the runs measured.
   a 1 s press (`kSettingsRowUnlockHoldMs`) and relock when the category is
   left. Confirm rows act after a 2 s hold (`kSettingsRowConfirmHoldMs`).
 - **Geometry: 320x56 rows, five per page** (`SettingsUI::kRowW`, `kRowH`,
-  `kRowsPerPage`), 96x96 tiles on a 145 px ring (`SettingsUI.cpp`,
-  `buildTile`). The tiles are evenly spaced and symmetric about the vertical
+  `kRowsPerPage`), 96x96 tiles on a ring (`SettingsUI.cpp`, `buildTile`). The tiles are evenly spaced and symmetric about the vertical
   axis, with the outermost pair at 135 degrees so the bottom keeps a 90 degree
   gap for the exit chevron: the step is 270/(N-1) degrees and the index order
   runs clockwise from the top, so the five real categories step 67.5 and put
   Temperatures at the top, and the simulator's six step 54 and leave the top
   clear. There is no arrangement of five that is both even and clear of the
   top, because an odd count symmetric about the axis must put one tile on the
-  axis and the bottom is taken; the owner chose the top on 2026-09-13. What
-  the five-tile ring measures (simulator, tiles temporarily forced to five):
-  the top tile clears the status icons (y 20 to 39) by 8 px, the two lower
-  tiles clear the chevron's 34 px click pad by 6 px, the closest pair of
-  tiles is 39 px apart and the furthest corner is 212.8 px from the centre.
-  The tile icons are the 40x40 sources drawn at 55x55 (`kIconZoom` 320, and
-  `LV_IMG_SIZE_MODE_REAL` plus `lv_obj_refresh_self_size` is what makes the
-  flex layout reserve the drawn size rather than the source size). **A tile
+  axis and the bottom is taken; the owner chose the top on 2026-09-13.
+  **The ring's radius depends on whether a tile sits on the vertical axis**:
+  135 px for an odd count, 145 for an even one. The tile on the axis is the
+  one that has to clear the status icons, so pulling the odd ring in is what
+  pays for the icon size; the even ring leaves the top clear and spends the
+  radius on keeping six tiles apart. The tile icons are the 40x40 sources
+  drawn at 76x76 (`kIconZoom` 454, and `LV_IMG_SIZE_MODE_REAL` plus
+  `lv_obj_refresh_self_size` is what makes the flex layout reserve the drawn
+  size rather than the source size). At 76 px the icon is taller than the
+  room a 96 px tile has under a two-line caption, so it overflows the tile at
+  both ends, and the five-tile ring is what limits it: measured on the
+  simulator with the tiles temporarily forced to five, the top tile's icon
+  clears the status icons (y 20 to 39) by 10 px, the lower tiles' captions
+  clear the chevron's 34 px click pad by 15 px, the closest pair of tiles is
+  30 px apart, the closest pair of caption boxes 57 px, and the furthest tile
+  corner is 208.8 px from the centre against the 228 px edge rule. **A tile
   caption is wider than its tile and the tile lets it overflow.** At the
   tile's own 92 px, "Temperatures" does not fit on a line of its own, and
   LVGL breaks a word that cannot fit rather than moving it to the next line,
@@ -813,9 +820,9 @@ the design cannot show and what the runs measured.
   reaches 11 px past the tile on each side, which needs
   `LV_OBJ_FLAG_OVERFLOW_VISIBLE` on the tile (LVGL clips children to the
   parent box, and without the flag the leading "T" was cut off). The hit box
-  stays 96x96, so the geometry audit is unaffected, and on the five-tile ring
-  no two caption boxes touch, the closest pair being Temperatures against
-  Display at 64 px. Every tappable target except the exit chevron needs an
+  stays 96x96, so the geometry audit is unaffected, and no two caption boxes
+  touch on either ring (the closest pair is Temperatures against Display on
+  the five-tile ring, and Temperatures against Fixture at 15 px on the six). Every tappable target except the exit chevron needs an
   effective hit rectangle of at least 56x56 px, no overlap with another on
   the same page, and 12 px of clearance from the panel's edge circle. The
   chevron is exempt from the size and edge rules and its ext click pad is
