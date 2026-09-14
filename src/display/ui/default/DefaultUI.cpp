@@ -1746,6 +1746,7 @@ void DefaultUI::init() {
     g_touchHitHook = &DefaultUI::touchHitHook;
     profileManager = controller->getProfileManager();
     g_overlayMinRefreshUs = OVERLAY_MIN_REFRESH_US;
+    g_uiMinRenderMs = RERENDER_MIN_INTERVAL;
     auto triggerRender = [this](Event const &) { rerender = true; };
     pluginManager->on("boiler:currentTemperature:change", [this](Event const &event) {
         int newTemp = static_cast<int>(event.getFloat("value"));
@@ -1934,6 +1935,15 @@ void DefaultUI::loop() {
     // too, and the settings shell needs its web-save reconciliation, refresh
     // tick and theme restyle checks there regardless of venue.
     serviceTouchMap();
+    if (g_scaleScreenReq >= 0) {
+        const int req = g_scaleScreenReq;
+        g_scaleScreenReq = -1;
+        if (req != 0) {
+            openScaleScreen();
+        } else {
+            scaleScreenRequested = false;
+        }
+    }
     settingsUI.service();
 #if defined(GM_TOUCH_PROBE) || defined(GAGGIMATE_SIM)
     serviceSettingsUi();
@@ -1958,7 +1968,8 @@ void DefaultUI::loop() {
     // only get applied on the pass AFTER the edge — run immediately.
     // ui_tick() and the maintain calls below still run on a held pass.
     const bool spacerHold =
-        rerender && diff < RERENDER_MIN_INTERVAL && esp_timer_get_time() - g_touchEdgeAtUs >= GM_TOUCH_GRACE_US;
+        rerender && diff < static_cast<unsigned long>(g_uiMinRenderMs < 0 ? 0 : g_uiMinRenderMs) &&
+        esp_timer_get_time() - g_touchEdgeAtUs >= GM_TOUCH_GRACE_US;
 
     if (rerender && !spacerHold) {
         rerender = false;
@@ -2941,6 +2952,28 @@ bool DefaultUI::layerMoveInFlight(const lv_obj_t *obj) const {
     return false;
 }
 
+namespace {
+// LVGL's lv_obj_add_flag and lv_obj_clear_flag invalidate the whole object for
+// LV_OBJ_FLAG_HIDDEN whether or not the flag actually changed (lv_obj.c, the
+// two LV_OBJ_FLAG_HIDDEN branches), and a whole-object invalidation of a
+// full-screen cover is a whole-page snapshot: on the bench board a median of
+// 147 ms of the UI task, during which the render task gets a fraction of the
+// PSRAM bus and the compositor-owned readouts stop easing. maintainScaleScreen
+// re-asserted the scale cover's visible state every pass, so the scale screen
+// invalidated all 480x480 about fourteen times a second and the weight readout
+// advanced in visible steps. Write the flag only when it moves.
+void setHiddenIfChanged(lv_obj_t *obj, bool hidden) {
+    if (obj == nullptr || lv_obj_has_flag(obj, LV_OBJ_FLAG_HIDDEN) == hidden) {
+        return;
+    }
+    if (hidden) {
+        lv_obj_add_flag(obj, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        lv_obj_clear_flag(obj, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+} // namespace
+
 void DefaultUI::serviceLayerMoves() {
 #ifndef GAGGIMATE_SIM
     for (LayerMove &m : layerMoves) {
@@ -3560,13 +3593,11 @@ void DefaultUI::applyAnimPlates(int mode, uint32_t color, int opaPct) {
                 }
                 lv_obj_set_style_bg_color(disc, lv_color_hex(color), LV_PART_MAIN);
                 lv_obj_set_style_bg_opa(disc, static_cast<lv_opa_t>((opaPct * 255 + 50) / 100), LV_PART_MAIN);
-                lv_obj_clear_flag(disc, LV_OBJ_FLAG_HIDDEN);
+                setHiddenIfChanged(disc, false);
                 lv_obj_set_style_bg_opa(plates[i], LV_OPA_TRANSP, LV_PART_MAIN);
                 continue;
             }
-            if (disc != nullptr) {
-                lv_obj_add_flag(disc, LV_OBJ_FLAG_HIDDEN);
-            }
+            setHiddenIfChanged(disc, true);
         }
         switch (mode) {
         case 0:
@@ -4219,6 +4250,11 @@ void DefaultUI::refreshSleepOverlay() {
     g_overlayStats.lastAreaPx = static_cast<uint32_t>(probeArea);
     g_overlayStats.lastClips = static_cast<uint32_t>(clipN + copyN);
     g_overlayStats.refreshes = g_overlayStats.refreshes + 1;
+    // Stamped after the publish, which is when the panel can first show it.
+#ifdef GM_TOUCH_PROBE
+    g_pubLog[g_pubLogCount % PUBLOG_N] = static_cast<uint32_t>(esp_timer_get_time() / 1000);
+    g_pubLogCount = g_pubLogCount + 1;
+#endif
 #ifdef GM_TOUCH_PROBE
     {
         const int64_t snapUs = probeSnap1 - probeSnap0;
@@ -4278,7 +4314,7 @@ void DefaultUI::maintainScaleScreen() {
             // Re-asserted every pass: the EEZ tick fights HIDDEN flags on these
             // widgets, but never touches translate, so displacement sticks.
             displaceGrindWidgets(true);
-            lv_obj_clear_flag(scaleScreen, LV_OBJ_FLAG_HIDDEN);
+            setHiddenIfChanged(scaleScreen, false);
             lv_obj_move_foreground(scaleScreen);
             const float w = static_cast<float>(scaleHardwareWeight);
             if (scaleWeightLabel != nullptr && fabsf(w - lastShownScaleWeight) >= 0.05f) {
@@ -4289,7 +4325,7 @@ void DefaultUI::maintainScaleScreen() {
     } else if (scaleScreen != nullptr && !lv_obj_has_flag(scaleScreen, LV_OBJ_FLAG_HIDDEN) &&
                (!scaleScreenRequested || currentScreen != SCREEN_ID_GRIND_SCREEN)) {
         displaceGrindWidgets(false);
-        lv_obj_add_flag(scaleScreen, LV_OBJ_FLAG_HIDDEN);
+        setHiddenIfChanged(scaleScreen, true);
         if (currentScreen != SCREEN_ID_GRIND_SCREEN) {
             scaleScreenRequested = false;
         }

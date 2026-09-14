@@ -957,6 +957,23 @@ void WebUIPlugin::setupDebugEndpoints() {
                 g_overlayMinRefreshUs = v;
             }
         }
+        // uimin=N: the telemetry pass spacing in milliseconds (see
+        // g_uiMinRenderMs). This is the gate upstream of ovmin: it decides how
+        // often the widgets are given new values, so it is what caps a
+        // readout's step rate. Not persisted; the boot value is
+        // RERENDER_MIN_INTERVAL.
+#ifdef GM_TOUCH_PROBE
+        if (request->hasArg("invmin")) {
+            const int v = request->arg("invmin").toInt();
+            g_invalSrcMinPx = v < 1 ? 1 : (v > 480 ? 480 : v);
+        }
+#endif
+        if (request->hasArg("uimin")) {
+            const long v = request->arg("uimin").toInt();
+            if (v >= 0 && v <= 5000) {
+                g_uiMinRenderMs = static_cast<int32_t>(v);
+            }
+        }
         // ovg=N: overlay gain, Q8, 0..256, applied from the next frame; the
         // measurement knob for the composite's fade cost (blend_us at 128
         // against 256). ovramp=ms starts a test ramp to the far end from the
@@ -1278,6 +1295,7 @@ void WebUIPlugin::setupDebugEndpoints() {
         doc["ov_px_rows"] = a->overlayPixelRows();
         doc["ov_clips"] = g_overlayStats.lastClips;
         doc["ov_min_us"] = static_cast<int64_t>(g_overlayMinRefreshUs);
+        doc["ui_min_ms"] = static_cast<int32_t>(g_uiMinRenderMs);
         doc["fps_override"] = g_animFpsOverride;
         doc["ov_gain"] = a->overlayGain();
         doc["elem_us"] = a->lastElementUsValue();
@@ -1322,6 +1340,68 @@ void WebUIPlugin::setupDebugEndpoints() {
                 r.add(nowMs - e.tMs);
             }
             doc["dirty_total"] = n;
+
+#ifdef GM_TOUCH_PROBE
+            // ov_recent: the same "ms ago" encoding for the last publishes.
+            JsonArray pr = doc["ov_recent"].to<JsonArray>();
+            const uint32_t pn = g_pubLogCount;
+            const uint32_t pfrom = pn > static_cast<uint32_t>(PUBLOG_N) ? pn - PUBLOG_N : 0;
+            for (uint32_t i = pfrom; i < pn; i++) {
+                pr.add(nowMs - g_pubLog[i % PUBLOG_N]);
+            }
+            doc["ov_total"] = pn;
+
+            // inval_src: who asked for each near-whole-screen invalidation.
+            // cls is resolved by pointer against the classes these screens
+            // actually use; anything else reports as "?" rather than a
+            // fabricated name.
+            JsonArray isrc = doc["inval_src"].to<JsonArray>();
+            const uint32_t in = g_invalSrcCount;
+            const uint32_t ifrom = in > static_cast<uint32_t>(INVSRC_N) ? in - INVSRC_N : 0;
+            for (uint32_t i = ifrom; i < in; i++) {
+                const InvalSrcEntry &e = g_invalSrc[i % INVSRC_N];
+                JsonObject o = isrc.add<JsonObject>();
+                const char *cls = "?";
+                if (e.cls == &lv_obj_class)
+                    cls = "obj";
+                else if (e.cls == &lv_label_class)
+                    cls = "label";
+                else if (e.cls == &lv_img_class)
+                    cls = "img";
+                else if (e.cls == &lv_btn_class)
+                    cls = "btn";
+                else if (e.cls == &lv_arc_class)
+                    cls = "arc";
+                else if (e.cls == &lv_bar_class)
+                    cls = "bar";
+                else if (e.cls == &lv_meter_class)
+                    cls = "meter";
+                else if (e.cls == &lv_slider_class)
+                    cls = "slider";
+                else if (e.cls == &lv_switch_class)
+                    cls = "switch";
+                o["cls"] = cls;
+                o["obj"] = reinterpret_cast<uint32_t>(e.obj);
+                JsonArray ob = o["box"].to<JsonArray>();
+                ob.add(e.ox1);
+                ob.add(e.oy1);
+                ob.add(e.ox2);
+                ob.add(e.oy2);
+                JsonArray ar = o["area"].to<JsonArray>();
+                ar.add(e.ax1);
+                ar.add(e.ay1);
+                ar.add(e.ax2);
+                ar.add(e.ay2);
+                // Raw as the Xtensa windowed ABI leaves it; the reader strips
+                // the call-size bits and resolves it against the ELF. Absent
+                // for an invalidation of an explicit area, which names its own
+                // caller by the rectangle it asked for.
+                o["caller"] = reinterpret_cast<uint32_t>(e.caller);
+                o["age_ms"] = nowMs - e.tMs;
+            }
+            doc["inval_src_total"] = in;
+            doc["inval_min_px"] = g_invalSrcMinPx;
+#endif
         }
         {
             JsonArray te = doc["text_elems"].to<JsonArray>();
@@ -2204,6 +2284,37 @@ void WebUIPlugin::setupDebugEndpoints() {
         char buf[64];
         snprintf(buf, sizeof(buf), "{\"brew_cycle\":%s,\"brewing\":%s}", controller->synthBrewCycleOn ? "true" : "false",
                  controller->synthBrewingNow ? "true" : "false");
+        request->send(200, "application/json", buf);
+    });
+
+    // /api/debug/scale?ramp=<grams per second>[&tare=1]: a synthetic scale, so
+    // a steadily rising weight can be reproduced with no scale on the bench.
+    // The overlay cadence work needed it: the churn only appears while a
+    // weight is actually moving, and the bench has no scale. ramp=0 stops it.
+    // Queued here and applied by Controller::loop on its own thread, like the
+    // brew handshake above. screen=1 also opens the scale screen (and screen=0
+    // leaves it) on the UI task, because that cover is reachable only from the
+    // menu and a cadence measurement should not need a finger.
+    server.on("/api/debug/scale", [this](AsyncWebServerRequest *request) {
+        if (request->hasArg("tare")) {
+            controller->synthScaleTareRequest = true;
+        }
+        if (request->hasArg("screen")) {
+            g_scaleScreenReq = request->arg("screen").toInt() != 0 ? 1 : 0;
+        }
+        if (request->hasArg("ramp")) {
+            const float gps = request->arg("ramp").toFloat();
+            long mg = lroundf(gps * 1000.0f);
+            if (mg < -100000) {
+                mg = -100000;
+            }
+            if (mg > 100000) {
+                mg = 100000;
+            }
+            controller->synthScaleRateMgPerS = static_cast<int>(mg);
+        }
+        char buf[64];
+        snprintf(buf, sizeof(buf), "{\"ramp_mg_per_s\":%d}", (int)controller->synthScaleRateMgPerS);
         request->send(200, "application/json", buf);
     });
 #endif

@@ -853,6 +853,37 @@ void Controller::loop() {
 
             static unsigned long lastSynthTel = 0;
             const unsigned long telNow = millis();
+            // Synthetic scale (/api/debug/scale). Outside the telemetry tick
+            // because a real scale reports about ten times a second, not four,
+            // and the point of it is to reproduce what a steadily rising
+            // weight does to the UI. Publishes the same two events
+            // onVolumetricMeasurement publishes for a HARDWARE source that is
+            // also the effective one, so nothing downstream can tell the
+            // difference.
+            {
+                static unsigned long lastSynthScale = 0;
+                static float synthScaleG = 0.0f;
+                if (synthScaleTareRequest) {
+                    synthScaleTareRequest = false;
+                    synthScaleG = 0.0f;
+                }
+                const int rateMg = synthScaleRateMgPerS;
+                if (rateMg != 0) {
+                    if (lastSynthScale == 0) {
+                        lastSynthScale = telNow;
+                    }
+                    if (telNow - lastSynthScale >= 100) {
+                        synthScaleG += (static_cast<float>(rateMg) / 1000.0f) *
+                                       (static_cast<float>(telNow - lastSynthScale) / 1000.0f);
+                        lastSynthScale = telNow;
+                        pluginManager->trigger(F("controller:volumetric-measurement:hardware:change"), "value", synthScaleG);
+                        pluginManager->trigger(F("controller:volumetric-measurement:active:change"), "value", synthScaleG);
+                    }
+                } else {
+                    lastSynthScale = 0;
+                }
+            }
+
             if (telNow - lastSynthTel >= GM_SYNTH_TELEMETRY_MS) {
                 lastSynthTel = telNow;
                 // Hold the brew screen. Setting it once at handshake is not

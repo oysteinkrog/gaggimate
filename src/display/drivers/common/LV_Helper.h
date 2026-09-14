@@ -302,6 +302,76 @@ struct DirtyLogEntry {
 extern DirtyLogEntry g_dirtyLog[DIRTYLOG_N];
 extern volatile uint32_t g_dirtyLogCount;
 
+// The last PUBLOG_N overlay publishes (ov_recent on /api/debug/anim). A
+// publish is the only moment LVGL's output reaches the panel, so the interval
+// between two of these is the step the eye sees on a telemetry readout, and
+// the invalidation ring above cannot stand in for it: invalidations arrive in
+// bursts that one publish coalesces. Ring, newest at
+// (g_pubLogCount - 1) % PUBLOG_N. Deeper than the dirty ring because the
+// publishes are what a cadence run samples.
+// The last INVSRC_N invalidations that covered most of the screen, with the
+// object that asked for them (inval_src on /api/debug/anim). dirty_recent says
+// a whole-screen redraw happened; this says who asked. A telemetry readout
+// that steps instead of counting is usually one widget invalidating the whole
+// screen on every value, and nothing else can name it.
+// scripts/patch_lvgl_inval_src.py calls the recorder from
+// lv_obj_invalidate_area, the one place every object-driven invalidation goes
+// through. Screen loads reach _lv_inv_area directly and so are absent here on
+// purpose: an empty ring under a churning screen means the source is not an
+// object.
+// The ring and the publish log below are bench instruments and cost internal
+// DRAM, which is the budget the web UI dies of first, so they exist only where
+// something can read them out. gm_record_inval_src and gm_inval_caller stay
+// defined in every build: the LVGL patch that calls them is applied per
+// libdeps tree for every env, and in a build without a reader the recorder is
+// empty.
+#ifdef GM_TOUCH_PROBE
+constexpr int INVSRC_N = 24;
+struct InvalSrcEntry {
+    const void *obj;
+    const void *cls;
+    int16_t ox1, oy1, ox2, oy2; // the object's own coords
+    int16_t ax1, ay1, ax2, ay2; // the area that actually reached _lv_inv_area
+    const void *caller;         // set only for a whole-object invalidate; see below
+    uint32_t tMs;
+};
+extern InvalSrcEntry g_invalSrc[INVSRC_N];
+extern volatile uint32_t g_invalSrcCount;
+#endif // GM_TOUCH_PROBE
+
+extern "C" void gm_record_inval_src(const void *obj, const void *cls, int ox1, int oy1, int ox2, int oy2, int ax1, int ay1,
+                                    int ax2, int ay2);
+
+// lv_obj_invalidate's own return address, parked here by the patched function
+// for the duration of the call it makes into lv_obj_invalidate_area, and null
+// otherwise. A whole-object invalidation is the expensive kind and the object
+// alone does not say who asked for it: LVGL calls lv_obj_invalidate from a
+// hidden-flag change, a style state change and a dozen widget setters, and all
+// of them look identical in the entry. The address is raw as the Xtensa
+// windowed ABI leaves it, so the reader unwinds the window bits, not the
+// firmware.
+extern "C" const void *gm_inval_caller;
+
+// Smallest invalidation gm_record_inval_src keeps, in pixels on each side. The
+// default keeps the whole-page ones, which are what a stepping readout is
+// usually made of, and drops a readout redrawing its own digits before it can
+// push them out of a 24-deep ring. invmin= on /api/debug/anim lowers it when
+// the whole-page ones are gone and the remaining churn is smaller than a page.
+#ifdef GM_TOUCH_PROBE
+extern volatile int32_t g_invalSrcMinPx;
+
+constexpr int PUBLOG_N = 48;
+extern uint32_t g_pubLog[PUBLOG_N];
+extern volatile uint32_t g_pubLogCount;
+#endif // GM_TOUCH_PROBE
+
+// The telemetry pass spacing DefaultUI::loop applies (DefaultUI.h's
+// RERENDER_MIN_INTERVAL is its boot value), in milliseconds. This is the gate
+// that decides how often the widgets get new values at all, upstream of the
+// overlay's own spacing gate, so it is the one to move when a readout steps
+// rather than counts. uimin= on /api/debug/anim moves it live; not persisted.
+extern volatile int32_t g_uiMinRenderMs;
+
 // /api/debug/touchmap: the UI task walks one screen's object tree and writes
 // every object (class, coords, flags, ext click pad, event count, parent) as
 // a JSON array into g_touchMapBuf, so the hit rectangles LVGL will actually
@@ -316,6 +386,13 @@ extern volatile uint32_t g_dirtyLogCount;
 extern volatile int g_touchMapReq;
 extern volatile bool g_touchMapLoad;
 extern volatile bool g_touchMapPending;
+
+// /api/debug/scale?screen=0|1 parks a request here and DefaultUI::loop opens or
+// closes the scale screen on the UI task, the same way a menu press would. The
+// scale screen is a runtime-built cover over the grind screen, reachable only
+// through the menu, so without this a measurement of the readout's cadence
+// needs a finger. -1 is "nothing asked".
+extern volatile int g_scaleScreenReq;
 extern char *g_touchMapBuf;
 extern volatile uint32_t g_touchMapLen;
 

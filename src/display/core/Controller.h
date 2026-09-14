@@ -185,6 +185,13 @@ class Controller {
     volatile int synthBrewCycleRequest = -1;
     volatile bool synthBrewCycleOn = GM_SYNTH_BREW_CYCLE != 0;
     volatile bool synthBrewingNow = false;
+    // /api/debug/scale: a synthetic scale, in milligrams per second, so a
+    // steadily rising weight can be reproduced with no scale on the bench.
+    // It publishes the same two events a hardware scale does, at the same
+    // 10 Hz, so everything downstream of the scale runs unchanged. A rate of 0
+    // is off; the tare flag zeroes the running weight on the next pass.
+    volatile int synthScaleRateMgPerS = 0;
+    volatile bool synthScaleTareRequest = false;
 #endif
 
   private:

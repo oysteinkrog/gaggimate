@@ -102,8 +102,28 @@ DRAW_NEW = (
     "\n"
 )
 
+# lv_label_set_text_fmt invalidates on its own, before it reaches
+# lv_label_refr_text, so guarding set_text and refr_text is not enough: a caller
+# that formats its value (DefaultUI::maintainScaleScreen writes the scale
+# readout with set_text_fmt) invalidated the owned label's box on every value.
+# On the bench board that was 11.8 invalidations a second on the scale screen,
+# each one an overlay publish the owned element had already made unnecessary.
+SET_FMT_OLD = (
+    "    LV_ASSERT_OBJ(obj, MY_CLASS);\n"
+    "    LV_ASSERT_NULL(fmt);\n"
+    "\n"
+    "    lv_obj_invalidate(obj);\n"
+)
+SET_FMT_NEW = (
+    "    LV_ASSERT_OBJ(obj, MY_CLASS);\n"
+    "    LV_ASSERT_NULL(fmt);\n"
+    "\n"
+    "    if(!" + GUARD + ") lv_obj_invalidate(obj); /* " + MARKER + " */\n"
+)
+
 HUNKS = [
     (SET_TEXT_OLD, SET_TEXT_NEW, 1),
+    (SET_FMT_OLD, SET_FMT_NEW, 1),
     (REFR_OLD, REFR_NEW, 1),
     (DRAW_OLD, DRAW_NEW, 1),
 ]

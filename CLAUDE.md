@@ -236,6 +236,66 @@ telemetry-driven screen from a 650 ms LVGL pass (1.5 Hz widget updates,
   churn was traced to the size refresh and then to the 40x40 scale icon
   the flow blinks (gm-2cl.7).
 
+- **Writing an object's hidden flag is a whole-object invalidation whether
+  or not the flag changes** (gm-61v, 2026-09-14, `lv_obj.c`, the two
+  `LV_OBJ_FLAG_HIDDEN` branches of `lv_obj_add_flag` and `lv_obj_clear_flag`).
+  `maintainScaleScreen` re-asserted the scale cover's visible state on every
+  UI pass, and that cover is the full 480x480, so the scale screen invalidated
+  the whole page 14.65 times a second while a weight was moving. Each
+  invalidation is a whole-page snapshot: 147 ms of the UI task on the bench
+  board, during which the render task gets a fraction of the PSRAM bus and the
+  compositor-owned readouts stop easing, which is what "the weight goes up in
+  jumps" was. `DefaultUI::setHiddenIfChanged` reads the flag first and writes
+  only when it moves; `applyAnimPlates` re-asserts its 280 px disc the same
+  way and goes through it too. The generated `screens.c` tick already guards
+  every hidden-flag write with `if (new_val != cur_val)`, so this rule is only
+  for code we write.
+- **`lv_label_set_text_fmt` invalidates before it reaches
+  `lv_label_refr_text`, so an owned label needs its own guard**
+  (`scripts/patch_lvgl_label_elem.py`, the `SET_FMT` hunk, 2026-09-14). The
+  patch guarded `lv_label_set_text` and `lv_label_refr_text`, and every owned
+  label in the codebase went through the first of those except the scale
+  readout, which formats its value. So a label that was a compositor Text
+  element, drawing nothing and easing at the animation rate, still invalidated
+  its own box on every value: 11.8 a second on the scale screen, each one an
+  overlay publish the element had already made unnecessary. A new LVGL setter
+  that starts with its own `lv_obj_invalidate(obj)` needs the same guard.
+  Together with the hidden-flag fix the scale screen under a 0.5 g/s ramp went
+  from 3.70 overlay publishes a second to 0.11 (bench board, divider 6,
+  whole-frame path, `tools/churn_sweep.py` unchanged at 0.00 on every other
+  screen).
+- **`inval_src` on `/api/debug/anim` names the object and the call site of a
+  large invalidation** (gm-61v, `scripts/patch_lvgl_inval_src.py`,
+  `gm_record_inval_src` in LV_Helper.cpp). `dirty_recent` says a whole-screen
+  redraw happened; it cannot say who asked, and the object alone is not
+  enough either, because LVGL invalidates a whole object from a hidden-flag
+  change, a style state change and a dozen widget setters that all look the
+  same in the entry. The recorder sits on the last line of
+  `lv_obj_invalidate_area`, after LVGL has dropped what costs nothing, and
+  keeps the object, its class, both rectangles and `lv_obj_invalidate`'s own
+  return address. Resolve the address with
+  `xtensa-esp32s3-elf-addr2line -pfiaC -e .pio/build/display-loadtest/firmware.elf`.
+  Two traps it exists to avoid: recording at the head of the function instead
+  reports invalidations of hidden widgets, which cost nothing and read as the
+  culprit (that reading cost a build), and the ring is 24 deep, so `invmin=`
+  (240 px a side by default) is what keeps a readout redrawing its own digits
+  from pushing the interesting entries out. The ring and `ov_recent` are
+  `GM_TOUCH_PROBE` only, because internal DRAM is the budget the web UI dies
+  of first; the recorder itself is empty elsewhere and the simulator stubs it.
+- **`/api/debug/scale?ramp=<g/s>[&tare=1][&screen=0|1]` is the scale-screen
+  repro** (`GM_SYNTH_HANDSHAKE` builds). The churn only appears while a weight
+  is actually moving and the bench has no scale, so the synthetic one
+  publishes the same two events a hardware scale does at the same 10 Hz.
+  `screen=1` opens the scale screen from the UI task, because that cover is
+  reachable only from the menu. The board's 60 s standby timeout closes it
+  again, and a debug route is not a touch, so re-open it right before a
+  measurement rather than at the start of a session.
+- **`uimin=` on `/api/debug/anim` moves the telemetry pass spacing live**
+  (`g_uiMinRenderMs`, boot value `RERENDER_MIN_INTERVAL`). It is the gate
+  upstream of `ovmin=`: it decides how often the widgets are given new values
+  at all. Neither gate was what held the scale readout down. Lifting `ovmin`
+  alone moved publishes from 3.62 to 4.31 a second at an unchanged 12.9 fps,
+  because the whole-page snapshot cost was the limit, not the spacing.
 - **A page change costs one whole-page snapshot, and it is bus traffic,
   not pixels** (gm-2cl.7, 2026-09-08, `tools/snapshot_lat.py`, bench board,
   cap 45, divider 8, Starfield). The UI task gets about 20 to 25 MB/s of
