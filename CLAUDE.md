@@ -282,6 +282,32 @@ telemetry-driven screen from a 650 ms LVGL pass (1.5 Hz widget updates,
   from pushing the interesting entries out. The ring and `ov_recent` are
   `GM_TOUCH_PROBE` only, because internal DRAM is the budget the web UI dies
   of first; the recorder itself is empty elsewhere and the simulator stubs it.
+- **`tools/inval_sweep.py` is the sweep for this class of bug, and as of
+  2026-09-15 the scale screen was the only case** (gm-61v). `churn_sweep.py`
+  answers a different question, what a screen costs at rest, and it read 0.00
+  on nearly every screen while the scale screen was invalidating the whole page
+  fourteen times a second, because the churn only exists while a value is
+  moving. The sweep turns the synthetic brew and the synthetic scale on first,
+  then visits each screen and groups the `inval_src` ring by call site.
+  Standby, status, menu, water and profile read 0.00 large invalidations a
+  second; brew, steam and new_profile read 0.68 to 1.9 over a 20 s window and
+  0.68 over a 60 s one, which is how you tell screen-entry cost from churn: the
+  absolute count does not grow with the window. Every entry left is a page
+  change paying for itself (`lv_obj_refresh_style` applying the theme,
+  `serviceDialElements` and `setGaugeTickLength` taking the rings over) or the
+  one-off handover of the blinking icon to its layer, at 0.05 a second against
+  a blink rate of about 2. The settings shell on a category page, which is the
+  same shape as the scale cover and runs a refresh every second, read 0.00 and
+  0.00 over 30 s, and new_profile read the same over 40 s.
+- **Four `LV_LABEL_LONG_SCROLL` labels on new_profile have no owner, and only
+  their text keeps them quiet** (`screens.c`, obj33, obj36, obj38, obj39).
+  `serviceMarquees` takes `LV_LABEL_LONG_SCROLL_CIRCULAR` only, and
+  `set_ofs_x_anim` in lv_label.c invalidates on every scroll tick with no
+  guard, so a plain-scroll label that overflows would invalidate its own box at
+  the animation rate with nothing owning it. obj33 is `LV_SIZE_CONTENT` and can
+  never overflow; the other three are 85, 85 and 250 px wide and today's text
+  fits, which is why the screen measures 0.00. Widening what goes in them, or
+  a longer profile name, would start it. gm-j38 is the open decision.
 - **`/api/debug/scale?ramp=<g/s>[&tare=1][&screen=0|1]` is the scale-screen
   repro** (`GM_SYNTH_HANDSHAKE` builds). The churn only appears while a weight
   is actually moving and the bench has no scale, so the synthetic one
