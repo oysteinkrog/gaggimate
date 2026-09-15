@@ -98,6 +98,7 @@ extern int64_t gm_ws_arc_us;
 #include <display/ui/default/eez/actions.h>
 #include <display/ui/default/eez/images.h>
 #include <display/ui/default/eez/ui.h>
+#include <display/ui/default/images/UiImages.h>
 
 // Kitchen-scale glyph for the menu's Scale button (img_scale_80x80.c).
 extern const lv_img_dsc_t img_scale_80x80;
@@ -3440,7 +3441,68 @@ static void tuneGeneratedRecurse(lv_obj_t *obj, int zoomFix, int clipMode) {
     }
 }
 
+// The start control is the one action its screen offers, and the studio left it
+// at 40x40 sitting low: measured on the simulator, the band between the last
+// control above it and the bottom icon row (which starts at y420) runs y264 to
+// 419 on brew, y260 to 419 on water and y273 to 419 on grind, so their centres
+// are 341, 340 and 346, and the button's centre sat at 369, 369 and 377. It is
+// also the smallest target on the page at 40 px, against the 56 px floor the
+// settings pages are held to.
+//
+// lv_imgbtn cannot scale its source: lv_obj_init_draw_img_dsc pins zoom to
+// LV_IMG_ZOOM_NONE for every widget that draws through it, so style alone
+// cannot make the button bigger. The 60x60 play and pause beside UiImages.h
+// come from the same icons/*.svg as the 40x40 pair, through
+// tools/icon_to_lvgl.py.
+//
+// The status screen's pause has its own offset, because its band is only y335
+// to 419: the shot readout ends at y334 and kActionButtonY would put the
+// button under it. kPauseButtonY is what keeps the chevron reachable. Every
+// one of these buttons carries a 25 px click pad, so a 60x60 one at
+// kActionButtonY has a hit rect of 110x110, and the dials' menu chevron has a
+// 130x95 one starting at y385; the two overlap and the later sibling wins, so
+// the chevron loses part of its pad. At y+130 the pause's hit rect would have
+// reached y424, 6 px from the chevron's own 40x40 body, where the 40x40 button
+// left 16. At y+118 it reaches y412 and leaves 18.
+//
+// Written on every UI pass rather than once per screen root, because the flow
+// engine deletes and recreates a screen (delete_screen_brew_screen) and a new
+// root can land on the old address. Nothing here invalidates when it changes
+// nothing: lv_obj_set_x, _y, _width and _height each read the local style
+// property first and return when it already holds the value, and the source
+// swap only matches the 40x40 descriptors.
+namespace {
+constexpr int kActionButtonSize = 60;
+constexpr int kActionButtonY = 103;
+constexpr int kPauseButtonY = 118;
+
+void growActionButton(lv_obj_t *btn, int y) {
+    if (btn == nullptr || !lv_obj_check_type(btn, &lv_imgbtn_class)) {
+        return;
+    }
+    for (int i = 0; i < _LV_IMGBTN_STATE_NUM; i++) {
+        const auto state = static_cast<lv_imgbtn_state_t>(i);
+        const void *mid = lv_imgbtn_get_src_middle(btn, state);
+        if (mid == &img_play_40x40) {
+            lv_imgbtn_set_src(btn, state, nullptr, &img_play_60x60, nullptr);
+        } else if (mid == &img_pause_40x40) {
+            lv_imgbtn_set_src(btn, state, nullptr, &img_pause_60x60, nullptr);
+        }
+    }
+    lv_obj_set_size(btn, kActionButtonSize, kActionButtonSize);
+    lv_obj_set_pos(btn, 0, y);
+}
+} // namespace
+
+void DefaultUI::growActionButtons() {
+    growActionButton(objects.start_button, kActionButtonY);
+    growActionButton(objects.water_start_button, kActionButtonY);
+    growActionButton(objects.grind_start_button, kActionButtonY);
+    growActionButton(objects.pause_button, kPauseButtonY);
+}
+
 void DefaultUI::tuneGeneratedScreen() {
+    growActionButtons();
     lv_obj_t *scr = lv_scr_act();
     const int knobs = (g_zoomFixReq ? 1 : 0) | (g_clipCornerReq << 1);
     if (scr == nullptr || (scr == tunedRoot && knobs == tunedKnobs)) {
@@ -4356,6 +4418,16 @@ void DefaultUI::displaceGrindWidgets(bool displaced) {
     }
 }
 
+// The scale cover's layout. The number box is wide enough for "-999.9" in the
+// 48 pt face; the tare pill sits low enough to leave the readout room and still
+// clear the exit chevron's 45 px click pad, whose box starts at y385.
+namespace {
+constexpr lv_coord_t kScaleNumberW = 170;
+constexpr lv_coord_t kScaleReadoutGap = 8;
+constexpr lv_coord_t kScaleReadoutY = -15;
+constexpr lv_coord_t kScaleTareY = 100;
+} // namespace
+
 void DefaultUI::buildScaleScreen() {
     lv_obj_t *scr = objects.grind_screen;
     if (scr == nullptr) {
@@ -4400,12 +4472,12 @@ void DefaultUI::buildScaleScreen() {
     lv_obj_set_style_text_color(title, fg, LV_PART_MAIN);
     lv_obj_align(title, LV_ALIGN_CENTER, 0, -140);
 
-    // Readout as a flex row (number, unit) sized to its content and centred as
-    // a group. A one-shot lv_obj_align_to() of the unit against the number only
-    // holds for the width the number had at build time: "302.2" in a 48 pt face
-    // is ~60 px wider than "0.0", and a centre-aligned number grows both ways,
-    // so its last digits landed on top of the "g". Flex re-lays the pair on
-    // every width change, so the unit follows the number.
+    // Readout as a flex row (number, unit) sized to its content. A one-shot
+    // lv_obj_align_to() of the unit against the number only holds for the width
+    // the number had at build time: "302.2" in a 48 pt face is ~60 px wider
+    // than "0.0", and a centre-aligned number grows both ways, so its last
+    // digits landed on top of the "g". Flex re-lays the pair on every width
+    // change, so the unit follows the number.
     lv_obj_t *readout = lv_obj_create(cover);
     lv_obj_remove_style_all(readout);
     lv_obj_set_size(readout, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
@@ -4413,9 +4485,8 @@ void DefaultUI::buildScaleScreen() {
     // Cross axis END puts both baselines on the row's bottom edge; the unit's
     // bottom padding then lifts its glyph the 6 px the old alignment offset did.
     lv_obj_set_flex_align(readout, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_END, LV_FLEX_ALIGN_CENTER);
-    lv_obj_set_style_pad_column(readout, 8, LV_PART_MAIN);
+    lv_obj_set_style_pad_column(readout, kScaleReadoutGap, LV_PART_MAIN);
     lv_obj_clear_flag(readout, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_align(readout, LV_ALIGN_CENTER, 0, -15);
 
     scaleWeightLabel = lv_label_create(readout);
     lv_label_set_text(scaleWeightLabel, "0.0");
@@ -4426,8 +4497,10 @@ void DefaultUI::buildScaleScreen() {
     // animation's rate, while the flex row above is laid out only when LVGL
     // refreshes. A content-sized number would move the unit only on those
     // refreshes, so the "g" trailed the digits (2026-09-08). "-999.9" in the
-    // 48 pt face is under 170 px.
-    lv_obj_set_width(scaleWeightLabel, 170);
+    // 48 pt face is under 170 px. Right-aligned, so the last digit stays put
+    // and the number grows leftwards as the weight climbs, and so the "g" sits
+    // against the digits instead of drifting away from a short reading.
+    lv_obj_set_width(scaleWeightLabel, kScaleNumberW);
     lv_obj_set_style_text_align(scaleWeightLabel, LV_TEXT_ALIGN_RIGHT, LV_PART_MAIN);
     lastShownScaleWeight = -1000.0f;
 
@@ -4437,13 +4510,32 @@ void DefaultUI::buildScaleScreen() {
     lv_obj_set_style_text_color(unit, fg, LV_PART_MAIN);
     lv_obj_set_style_pad_bottom(unit, 6, LV_PART_MAIN);
 
+    // Centre what is on screen, not the boxes that hold it. Centring the row
+    // put "0.0 g" visibly right of the middle, because the row is as wide as
+    // the widest reading the number box must hold and a right-aligned short
+    // reading sits against that box's right edge, leaving the slack on the
+    // left. Shifting the row left by half the slack a representative reading
+    // leaves centres the ink; the unit drops out of the arithmetic, since it
+    // rides on the box's right edge in both the row's width and the ink's.
+    // A reading wider than the representative one therefore reads a little
+    // left of centre and a shorter one a little right, by half the difference.
+    // Re-aligning per reading is not an option: the number is painted by a
+    // compositor Text element between LVGL refreshes, and moving its container
+    // on every value is the flex re-flow churn of gm-nly by another route. Two
+    // digits and a decimal is the representative shape, since that is a dose
+    // and a shot yield; "0.0" at rest then reads 15 px right of centre, measured
+    // off a simulator framebuffer.
+    lv_point_t typical;
+    lv_txt_get_size(&typical, "88.8", &lv_font_montserrat_48, 0, 0, LV_COORD_MAX, LV_TEXT_FLAG_NONE);
+    lv_obj_align(readout, LV_ALIGN_CENTER, -(kScaleNumberW - typical.x) / 2, kScaleReadoutY);
+
     // Tare as a standard pill (mode_switch1 geometry: 160x50, r10, 2px border).
     // Opaque, and on screen over the animation, so applyAnimPlates drives its
     // background like the generated plates. It is registered below, after its
     // styles are set, so the first capture sees the designed values.
     lv_obj_t *tareBtn = lv_btn_create(cover);
     lv_obj_set_size(tareBtn, 160, 50);
-    lv_obj_align(tareBtn, LV_ALIGN_CENTER, 0, 70);
+    lv_obj_align(tareBtn, LV_ALIGN_CENTER, 0, kScaleTareY);
     lv_obj_set_style_radius(tareBtn, 10, LV_PART_MAIN);
     lv_obj_set_style_bg_color(tareBtn, fill, LV_PART_MAIN);
     lv_obj_set_style_bg_opa(tareBtn, LV_OPA_COVER, LV_PART_MAIN);

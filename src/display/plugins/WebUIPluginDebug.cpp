@@ -2292,9 +2292,10 @@ void WebUIPlugin::setupDebugEndpoints() {
     // The overlay cadence work needed it: the churn only appears while a
     // weight is actually moving, and the bench has no scale. ramp=0 stops it.
     // Queued here and applied by Controller::loop on its own thread, like the
-    // brew handshake above. screen=1 also opens the scale screen (and screen=0
-    // leaves it) on the UI task, because that cover is reachable only from the
-    // menu and a cadence measurement should not need a finger.
+    // brew handshake above. screen=1 still opens the scale screen and screen=0
+    // leaves it, for the scripts written against this route, but that knob is
+    // /api/debug/scalescreen below now, where a build without a synthetic scale
+    // can reach it too.
     server.on("/api/debug/scale", [this](AsyncWebServerRequest *request) {
         if (request->hasArg("tare")) {
             controller->synthScaleTareRequest = true;
@@ -2371,6 +2372,22 @@ void WebUIPlugin::setupDebugEndpoints() {
         request->send(response);
     });
 #endif
+#if defined(GM_TOUCH_PROBE) || defined(GAGGIMATE_SIM)
+    // /api/debug/scalescreen?on=0|1: opens or leaves the runtime-built scale
+    // cover on the UI task. It is reachable only from the menu, so a script
+    // that wants to look at it needs a stand-in for the finger, the same
+    // reason /api/debug/tap exists. Separate from /api/debug/scale because
+    // that route drives the synthetic scale and so only exists on the bench
+    // builds, while the cover is a layout the simulator draws as well as the
+    // board does.
+    server.on("/api/debug/scalescreen", [](AsyncWebServerRequest *request) {
+        if (request->hasArg("on")) {
+            g_scaleScreenReq = request->arg("on").toInt() != 0 ? 1 : 0;
+        }
+        request->send(200, "application/json", "{\"ok\":true}");
+    });
+#endif
+
 #if defined(GM_TOUCH_PROBE) || defined(GAGGIMATE_SIM)
     // /api/debug/settingsui[?open=1|close=1|cat=N|page=N|pop=1]: opens,
     // closes and navigates the on-display settings shell from a script and

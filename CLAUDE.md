@@ -316,6 +316,32 @@ telemetry-driven screen from a 650 ms LVGL pass (1.5 Hz widget updates,
   reachable only from the menu. The board's 60 s standby timeout closes it
   again, and a debug route is not a touch, so re-open it right before a
   measurement rather than at the start of a session.
+- **`/api/debug/scalescreen?on=0|1` opens the same cover on any build that
+  carries the debug routes**, the simulator included (`GM_TOUCH_PROBE` or
+  `GAGGIMATE_SIM`, beside `/api/debug/tap`). The knob used to live only on
+  `/api/debug/scale`, which is `GM_SYNTH_HANDSHAKE`, so the simulator could
+  not reach the screen at all and nothing could photograph its layout.
+  `tools/screen_shots.py --scale` is what does that now.
+- **An lv_imgbtn cannot be scaled by style, so a bigger button needs a bigger
+  image** (`lv_obj_init_draw_img_dsc` in lv_obj_draw.c sets `zoom` to
+  `LV_IMG_ZOOM_NONE` for every widget that draws through it, whatever the
+  object's own zoom says). The four 60x60 start and pause buttons therefore
+  ship their own source: `tools/icon_to_lvgl.py` renders one from the same
+  `icons/*.svg` the studio's icons came from, in the studio's own format, and
+  it reproduces `ui_image_play_40x40.c` byte for byte from that file's own
+  pixels. A hand-added icon goes in `src/display/ui/default/images/` and is
+  declared in `UiImages.h` there, never in `eez/`: the studio rewrites that
+  tree on every export, and its `images[]` table is indexed by asset number,
+  so an extra row in it renumbers every asset after it.
+  **Sizing one is a hit-rect question, not a drawing question**: every target
+  on the generated dial screens carries a 25 px click pad, so a 60x60 button
+  answers to a 110x110 rectangle, and the dials' menu chevron answers to
+  130x95 starting at y385. The two overlap on every one of these screens, the
+  later sibling wins, and the chevron loses part of its pad. That is why the
+  status screen's pause sits at y+118 while brew, water and grind sit at
+  y+103: at y+130 the pause reached y424, 6 px from the chevron's own 40x40
+  body. `tools/settings_ui_tests/rig.py`'s `targets()` reports the rect that
+  decides this (`hit`), and it is not the object's box.
 - **`uimin=` on `/api/debug/anim` moves the telemetry pass spacing live**
   (`g_uiMinRenderMs`, boot value `RERENDER_MIN_INTERVAL`). It is the gate
   upstream of `ovmin=`: it decides how often the widgets are given new values

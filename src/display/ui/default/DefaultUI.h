@@ -464,6 +464,10 @@ class DefaultUI {
     lv_obj_t *tunedRoot = nullptr;
     int tunedKnobs = -1;
     void tuneGeneratedScreen();
+    // The start/pause control on brew, water, grind and status: 60x60 from
+    // UiImages.h and re-centred in its band. Idempotent, run from
+    // tuneGeneratedScreen on every pass.
+    void growActionButtons();
     // Last-applied web-configurable colors, sentinel-initialized so the first
     // pass applies. appliedTintKey packs enabled+color (see applyTheme).
     int appliedDimColor = -1;

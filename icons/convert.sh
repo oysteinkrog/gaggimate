@@ -32,6 +32,8 @@ convert "mug-hot-alt.svg" 80
 convert "mug-hot-alt.svg" 40
 convert "pause.svg" 40
 convert "play.svg" 40
+convert "pause.svg" 60
+convert "play.svg" 60
 convert "plus-small.svg" 40
 convert "power.svg" 40
 convert "raindrops.svg" 80
