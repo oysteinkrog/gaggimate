@@ -298,11 +298,16 @@ void action_on_grind_toggle(lv_event_t *e) {
     controller.isGrindActive() ? controller.deactivateGrind() : controller.activateGrind();
 };
 
-void action_on_simple_process_toggle(lv_event_t *e) {
-    if (controller.getMode() != MODE_STEAM) {
-        controller.isActive() ? controller.deactivate() : controller.activate();
-    }
-};
+// The water screen's generated start button and, since gm-51t, the steam
+// screen's runtime one (DefaultUI::serviceSteamStartButton). Steam used to be
+// excluded: b8e7831d ("Steam Rework and temperature indicator", June 2025)
+// added the auto-start in Controller::loopLogic and guarded the toggle with
+// MODE_STEAM, which left the steam screen's button inert and, after the EEZ
+// rework (2d10acb7), left no button there at all. The auto-start stays; the
+// guard is gone, so the steam screen's control starts and stops a
+// SteamProcess the way the water screen's starts and stops a PumpProcess.
+// Nothing else reaches this: brew has its own action_on_brew_start.
+void action_on_simple_process_toggle(lv_event_t *e) { controller.isActive() ? controller.deactivate() : controller.activate(); };
 
 void action_on_profile_load(lv_event_t *e) { controller.getUI()->onProfileSelect(); };
 

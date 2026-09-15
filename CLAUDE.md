@@ -325,7 +325,7 @@ telemetry-driven screen from a 650 ms LVGL pass (1.5 Hz widget updates,
 - **An lv_imgbtn cannot be scaled by style, so a bigger button needs a bigger
   image** (`lv_obj_init_draw_img_dsc` in lv_obj_draw.c sets `zoom` to
   `LV_IMG_ZOOM_NONE` for every widget that draws through it, whatever the
-  object's own zoom says). The four 60x60 start and pause buttons therefore
+  object's own zoom says). The five 60x60 start and pause buttons therefore
   ship their own source: `tools/icon_to_lvgl.py` renders one from the same
   `icons/*.svg` the studio's icons came from, in the studio's own format, and
   it reproduces `ui_image_play_40x40.c` byte for byte from that file's own
@@ -551,6 +551,34 @@ telemetry-driven screen from a 650 ms LVGL pass (1.5 Hz widget updates,
   three had no LVGL sample of a near phase in the set). The text element
   scan never takes a circular-scroll label (`textLabelEligible`), so the
   two owners do not meet. `MAX_LAYERS` is 7.
+- **The steam screen's start control is built at runtime, and the wind image
+  it replaces is sized to nothing** (gm-51t, 2026-09-15,
+  `DefaultUI::serviceSteamStartButton`). The generated steam screen has no
+  button. It had one until b8e7831d (June 2025), which added the auto-start in
+  `Controller::loopLogic` and guarded `action_on_simple_process_toggle` with
+  `MODE_STEAM`, leaving the button inert; the EEZ rework (2d10acb7) then
+  replaced it with a plain `lv_img` of a wind icon (`objects.obj14`) whose
+  hidden flag the generated tick drives from `!ui_flags.active`. So the screen
+  showed whether it was steaming and offered no way to stop it. The guard is
+  gone and one `lv_imgbtn` does both jobs: play when idle, pause while a
+  `SteamProcess` runs, driven from `controller->isActive()` through
+  `LV_STATE_CHECKED`, which is the pattern the generated water button uses, at
+  the coordinates water's button has. The auto-start is unchanged, and the
+  button stays visible in both states on purpose (owner's request), so the
+  screen says what is happening. The wind image is not deleted, because the
+  generated tick still writes its hidden flag and would reach freed memory; it
+  gets `lv_obj_set_size(obj, 0, 0)`, which suppresses the draw and leaves the
+  tick invalidating an empty rectangle. Three things a runtime-built object
+  does not get for free. `change_color_theme` does not know it, so the accent
+  is re-asserted from a cached value rather than read back off the object: a
+  style read resolves against the state the object is in, so reading back
+  during a press reports the pressed colour and rewrites the default one on
+  every pass for as long as the finger is down. `applyPressedFeedback` walks a
+  screen once per root and runs earlier in the pass than
+  `tuneGeneratedScreen`, so the button styles itself through
+  `applyPressedFeedbackTo` whenever its accent moves. And `scanIcons` now
+  skips a zero-area image, which the sized-away wind would otherwise have
+  become a blinking-icon candidate for on its second hidden-flag toggle.
 - **A flex row re-flows when a content-sized child changes width, and each
   moved child costs two invalidations that no owner patch can reach**
   (gm-nly, 2026-09-15, `lv_flex.c:522-529`). The grind screen's weight row

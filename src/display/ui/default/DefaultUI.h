@@ -468,6 +468,13 @@ class DefaultUI {
     // UiImages.h and re-centred in its band. Idempotent, run from
     // tuneGeneratedScreen on every pass.
     void growActionButtons();
+    // The steam screen's start/pause control, built at runtime because the
+    // generated screen has none. See the definition.
+    void serviceSteamStartButton();
+    lv_obj_t *steamStartBtn = nullptr;
+    // Last accent written to it, sentinel-initialized. Cached rather than read
+    // back off the object: see the definition.
+    int64_t steamStartAccent = -1;
     // Last-applied web-configurable colors, sentinel-initialized so the first
     // pass applies. appliedTintKey packs enabled+color (see applyTheme).
     int appliedDimColor = -1;

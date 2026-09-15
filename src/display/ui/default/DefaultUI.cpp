@@ -1214,7 +1214,14 @@ void DefaultUI::scanIcons(lv_obj_t *obj) {
             }
         }
         if (c == nullptr) {
-            if (iconCandN < kIconCandCap && lv_obj_get_width(obj) * lv_obj_get_height(obj) <= kIconMaxPx) {
+            // An image with no area cannot blink where anyone can see it, and
+            // a sprite of it would be empty. serviceSteamStartButton leaves
+            // one on the steam screen (objects.obj14, sized away because the
+            // button it stood in for now shows the state), and the generated
+            // tick still toggles its hidden flag, so without this it would
+            // qualify on the second toggle and take a layer slot.
+            const int px = lv_obj_get_width(obj) * lv_obj_get_height(obj);
+            if (iconCandN < kIconCandCap && px > 0 && px <= kIconMaxPx) {
                 c = &iconCands[iconCandN++];
                 c->obj = obj;
                 c->hidden = hidden;
@@ -3465,6 +3472,9 @@ static void tuneGeneratedRecurse(lv_obj_t *obj, int zoomFix, int clipMode) {
 // reached y424, 6 px from the chevron's own 40x40 body, where the 40x40 button
 // left 16. At y+118 it reaches y412 and leaves 18.
 //
+// The steam screen is the fifth one of these and has no generated button at
+// all; serviceSteamStartButton below builds it.
+//
 // Written on every UI pass rather than once per screen root, because the flow
 // engine deletes and recreates a screen (delete_screen_brew_screen) and a new
 // root can land on the old address. Nothing here invalidates when it changes
@@ -3499,6 +3509,123 @@ void DefaultUI::growActionButtons() {
     growActionButton(objects.water_start_button, kActionButtonY);
     growActionButton(objects.grind_start_button, kActionButtonY);
     growActionButton(objects.pause_button, kPauseButtonY);
+    serviceSteamStartButton();
+}
+
+// The steam screen's start control (gm-51t), built here because the generated
+// screen has none.
+//
+// It had one until b8e7831d ("Steam Rework and temperature indicator", June
+// 2025): an lv_imgbtn in the same slot the other screens put their start
+// button in. That commit added the auto-start in Controller::loopLogic, which
+// calls activate() once the boiler is within 5 C of the steam target, and
+// guarded action_on_simple_process_toggle with MODE_STEAM, which left the
+// button inert. The EEZ rework (2d10acb7, June 2026) then replaced it with a
+// plain lv_img of a wind icon, screens.c objects.obj14, whose hidden flag the
+// generated tick drives from "!ui_flags.active". So the screen has shown
+// whether it is steaming and offered no way to stop it, and the owner asked
+// for the button back with the auto-start kept.
+//
+// One imgbtn does both jobs: play when idle, pause while a SteamProcess runs,
+// the same pair of sources and the same LV_STATE_CHECKED the generated water
+// button uses. It is visible in both states on purpose, so the screen says
+// what is happening rather than only offering an action. The wind image is
+// redundant once it is there and would draw on top of it, so it is sized away
+// below.
+//
+// Runtime rather than generated because the studio rewrites eez/ on every
+// export. Parented to obj14's own parent so it lands in the same coordinate
+// space as the slot it replaces, and rebuilt whenever a screen delete takes
+// it: delete_screen_steam_screen frees the subtree and the DELETE callback
+// nulls the pointer.
+void DefaultUI::serviceSteamStartButton() {
+    // The identity is checked rather than assumed: obj14 is a studio-assigned
+    // name, and an export that gave it to something else would otherwise get a
+    // start button placed next to it and its own size taken away.
+    lv_obj_t *const slot = objects.obj14;
+    if (slot == nullptr || !lv_obj_check_type(slot, &lv_img_class) || lv_img_get_src(slot) != &img_wind_40x40) {
+        return;
+    }
+    if (steamStartBtn == nullptr) {
+        lv_obj_t *const btn = lv_imgbtn_create(lv_obj_get_parent(slot));
+        steamStartBtn = btn;
+        lv_imgbtn_set_src(btn, LV_IMGBTN_STATE_RELEASED, nullptr, &img_play_60x60, nullptr);
+        lv_imgbtn_set_src(btn, LV_IMGBTN_STATE_CHECKED_RELEASED, nullptr, &img_pause_60x60, nullptr);
+        lv_obj_set_size(btn, kActionButtonSize, kActionButtonSize);
+        lv_obj_set_style_align(btn, LV_ALIGN_CENTER, LV_PART_MAIN | LV_STATE_DEFAULT);
+        lv_obj_set_pos(btn, 0, kActionButtonY);
+        lv_obj_clear_flag(btn, LV_OBJ_FLAG_SCROLL_WITH_ARROW);
+        lv_obj_set_style_img_recolor_opa(btn, 255, LV_PART_MAIN | LV_STATE_DEFAULT);
+        // The 25 px pad every other start button on these screens carries.
+        // Open-coded rather than calling actions.cpp's applyClickArea, which
+        // the generated actions.h does not declare and which must not be
+        // hand-added to it: LVGL only looks inside an ancestor's own coords
+        // for a hit unless the ancestor has LV_OBJ_FLAG_OVERFLOW_VISIBLE, so
+        // the pad needs the flag all the way up to the screen.
+        lv_obj_set_ext_click_area(btn, 25);
+        for (lv_obj_t *a = lv_obj_get_parent(btn); a != nullptr && lv_obj_get_parent(a) != nullptr; a = lv_obj_get_parent(a)) {
+            lv_obj_add_flag(a, LV_OBJ_FLAG_OVERFLOW_VISIBLE);
+        }
+        lv_obj_add_event_cb(
+            btn,
+            [](lv_event_t *e) {
+                switch (lv_event_get_code(e)) {
+                case LV_EVENT_CLICKED:
+                    action_on_simple_process_toggle(e);
+                    break;
+                case LV_EVENT_DELETE: {
+                    auto *ui = static_cast<DefaultUI *>(lv_event_get_user_data(e));
+                    ui->steamStartBtn = nullptr;
+                    ui->steamStartAccent = -1;
+                    break;
+                }
+                default:
+                    break;
+                }
+            },
+            LV_EVENT_ALL, this);
+    }
+    // change_color_theme() is generated and knows nothing about this object, so
+    // the accent is re-asserted here, and only when it moves, because
+    // lv_obj_set_local_style_prop has no no-op guard and invalidates twice.
+    // What is remembered is the value last written, not the value read back:
+    // applyPressedRecurse gives the button a LV_STATE_PRESSED recolour, and a
+    // style read resolves against the state the object is in, so reading back
+    // while a finger is down would report the dim colour and rewrite the
+    // default one on every pass for as long as the press lasted.
+    const int64_t accent = static_cast<int64_t>(theme_colors[eez_flow_get_selected_theme_index()][0]);
+    if (accent != steamStartAccent) {
+        lv_obj_set_style_img_recolor(steamStartBtn, lv_color_hex(static_cast<uint32_t>(accent)),
+                                     LV_PART_MAIN | LV_STATE_DEFAULT);
+        steamStartAccent = accent;
+        // applyPressedFeedback() walks a screen once per root, and it runs
+        // earlier in the pass than this, so the button is created after the
+        // walk that would have styled it and a theme change reaches its rest
+        // colour only after the walk has derived a pressed colour from the old
+        // one. Styling the one object here covers both. A later dim-colour
+        // change or a plate-mode flip re-walks the whole screen and reaches it
+        // like any other child.
+        applyPressedFeedbackTo(steamStartBtn);
+    }
+    // Same source of truth the wind image had, read directly rather than
+    // through the flow. Not LV_OBJ_FLAG_CHECKABLE: the state follows the
+    // controller, and a click asks the controller to change rather than
+    // flipping the button and hoping.
+    const bool active = controller != nullptr && controller->isActive();
+    if (lv_obj_has_state(steamStartBtn, LV_STATE_CHECKED) != active) {
+        if (active) {
+            lv_obj_add_state(steamStartBtn, LV_STATE_CHECKED);
+        } else {
+            lv_obj_clear_state(steamStartBtn, LV_STATE_CHECKED);
+        }
+    }
+    // The wind image is left in place and given no area. lv_img's draw walks
+    // an empty rectangle and emits nothing, lv_obj_set_width and _height read
+    // the local style property first so this costs nothing per pass, and the
+    // generated tick goes on writing its hidden flag against a zero-area
+    // object, which lv_obj_invalidate_area drops. Deleting it instead would
+    // leave that tick dereferencing freed memory.
+    lv_obj_set_size(slot, 0, 0);
 }
 
 void DefaultUI::tuneGeneratedScreen() {
