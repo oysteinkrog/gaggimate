@@ -494,7 +494,9 @@ telemetry-driven screen from a 650 ms LVGL pass (1.5 Hz widget updates,
   moved within noise (28.2 to 29.9 KB across boots). A sweep of every
   screen after this (`tools/churn_sweep.py`, 15 s windows) found standby, brew, status, menu, steam,
   water, profile, grind and new_profile at 0.00 refreshes a second at
-  rest, and only the info screen still refreshing, at 3.75.
+  rest, and only the info screen still refreshing, at 3.75. That sweep
+  did not record whether any value was moving, which the tool now does:
+  see the bullet on reading a per-screen rate below.
 - **A scrolling label is a looping, clipped layer sprite** (gm-2cl.18,
   2026-09-08, `DefaultUI::serviceMarquees`). Four labels in `screens.c`
   are `LV_LABEL_LONG_SCROLL_CIRCULAR` (the info screen's obj27 and obj29,
@@ -523,6 +525,49 @@ telemetry-driven screen from a 650 ms LVGL pass (1.5 Hz widget updates,
   three had no LVGL sample of a near phase in the set). The text element
   scan never takes a circular-scroll label (`textLabelEligible`), so the
   two owners do not meet. `MAX_LAYERS` is 7.
+- **A flex row re-flows when a content-sized child changes width, and each
+  moved child costs two invalidations that no owner patch can reach**
+  (gm-nly, 2026-09-15, `lv_flex.c:522-529`). The grind screen's weight row
+  (`objects.mode_switch1` in `screens.c`: 160x50, `LV_LAYOUT_FLEX`,
+  `LV_FLEX_FLOW_ROW`, `LV_FLEX_ALIGN_SPACE_EVENLY`) holds the tare imgbtn
+  `obj24` and the weight label `obj25`, and `obj25` is `LV_SIZE_CONTENT`
+  wide. Every digit-width change re-centres both children, and
+  `children_repos` invalidates a moved child's old box and then its new
+  box. So the screen publishes 3.4 times a second while a weight moves and
+  0.00 when it does not, with all three of its text elements owned the
+  whole time and zero element refusals: the label is owned, and it is
+  being moved rather than re-texted. The label patches cannot cover this.
+  `scripts/patch_lvgl_label_elem.py` guards lv_label's own invalidations
+  and the size and move ones in lv_obj_pos for a USER_2 label; flex
+  invalidates the item directly, and the imgbtn is not a label at all.
+  The `if(diff_x || diff_y)` guard in lv_flex is correct, so the fix is to
+  stop the row re-flowing by giving the label a fixed width, which is
+  already why the scale cover's readout is 170 px and right-aligned. That
+  one is ours; `obj25` is generated, so its width belongs in
+  `tuneGeneratedScreen`. Measured on the bench board, divider 6,
+  whole-frame path, `/api/debug/scale?ramp=0.5`, three 20 s windows back
+  to back: 0.00, 3.43, 0.00. Every other content-sized label inside a flex
+  container changes on a profile switch rather than on telemetry, and the
+  brew screen's own weight readout measures 0.00 under the same ramp
+  because flex does not lay it out.
+- **A per-screen refresh rate means nothing unless a value was moving
+  during the window** (2026-09-15). The 0.00 a second that
+  `tools/churn_sweep.py` reports for nearly every screen is the design
+  working only when something was changing; a screen whose readouts are
+  frozen publishes nothing for a reason that has nothing to do with the
+  UI. The tool now reads every visible label's text at both ends of the
+  window and prints whether any of them changed, so a 0.00 next to a "no"
+  reads as "not measured". Two sources drive values with no hardware: the
+  temperature and pressure ramp runs even with the synthetic brew
+  lifecycle off (`/api/debug/synth?brew=0`), and a weight needs
+  `/api/debug/scale?ramp=0.5` on top, which only the brew and grind
+  screens carry. The tool also prints `text_dbg` (element takes, refusals,
+  releases) and the glyph atlas figures, because a label the compositor
+  has stopped owning falls back to LVGL and invalidates on every value,
+  which is a rate with no visible cause; a refusal is sticky for the rest
+  of a screen visit, so one failure explains a screen that churns for as
+  long as it is up. The atlas is not the usual reason: after cycling every
+  screen it held 19 glyphs in 3,397 bytes of a 32 KB per-font arena.
 
 - **The render loop lives in IRAM** (`renderLoop`, `renderFrame`,
   `presentFrame`, `pushLoop` and the scrim rows, `SleepAnimation.cpp`). The
