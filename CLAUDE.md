@@ -1721,6 +1721,52 @@ Debugging methodology that this codebase has already paid for:
   after five builds of in-place cycle probes had cleared every instruction
   around it.
 
+## OTA deploys to a board with no USB
+
+`python3 tools/ota_dev.py` builds the web UI, builds `-e display`, serves the
+image from this host, asks the board to pull it, and checks the board came back
+running it. `--no-build` sends what is already built, `--host` picks another
+board, `--env` another build. Rules it encodes, and what the design cost:
+
+- **The board pulls; the host does not push** (gm-thg, `POST /api/ota/dev`,
+  `GitHubOTA::updateFromUrl`). A POST carrying the 6 MB image would have to
+  write flash from the async_tcp callback, and a sector erase blocks for tens
+  of milliseconds every few kilobytes: that stalls the web server answering the
+  request and sits under the task watchdog, which is the same way the shot
+  history handler used to reboot the board. The route only records the URL and
+  `WebUIPlugin::loop()` runs the download on the display task, where the
+  release update already runs. The price is that the board has to reach the
+  developer's host, and a host firewall blocking the inbound connection looks
+  exactly like a dead board from the device end, so `ota_dev.py` waits for the
+  first byte separately and says so.
+- **`esp_app_get_elf_sha256` is the only thing that says the deploy landed.**
+  `BUILD_GIT_VERSION` does not move between two builds of the same dirty tree,
+  and the version on the board is that string. `GET /api/ota/info` reports the
+  sha, the running slot, the next slot, the build date and whether a second app
+  slot exists at all; the script compares the sha across the reboot and fails
+  when it did not move.
+- **The panel goes black for the download and that is deliberate.**
+  `DefaultUI`'s `ota:update:start` handler stops scan-out for any display OTA,
+  because the RGB peripheral streaming a framebuffer out of PSRAM and a 6 MB
+  download into flash contend for the same bus and the download is the one that
+  aborts. The dev path fires the same event with the same component string, so
+  it gets the same treatment.
+- **The endpoint ships on production and is not authenticated.** The machine it
+  is for has no reachable USB port, so a debug-build-only route would be
+  useless. It is the trust boundary this server already assumes: `/api/settings`
+  returns the WiFi password in cleartext over plain http to anyone on the LAN.
+  `-DGM_DEV_OTA=0` compiles both routes out.
+- **Rollback is off** (`BOOTLOADER_APP_ROLLBACK_ENABLE=n`), so an image that
+  boots but is broken stays booted and the only way back is USB. The partition
+  table has two app slots, so a *failed* write is safe: the running app is
+  never the target, and `updateFromUrl` refuses outright on a single-slot
+  build. What is unprotected is a bad image that starts.
+- **The first image carrying the endpoint cannot arrive this way.** A board
+  running an older build has no `/api/ota/dev` and no way to be given an
+  arbitrary URL: every URL `GitHubOTA` uses is built from the compile-time
+  `RELEASE_URL`, and the OTA channel setting is narrowed to "latest" or
+  "nightly" at each use. So the bootstrap is USB or a GitHub release, once.
+
 ## Bench facts
 
 - Device: 192.168.1.121 on the bench, UART on COM3. **Opening COM3 with

@@ -37,6 +37,16 @@ class GitHubOTA {
     bool isUpdateAvailable(bool controller = false) const;
     String getCurrentVersion() const;
     void update(bool controller = true, bool display = true);
+    // Flashes the display from one exact URL, with no version check and no
+    // GitHub release lookup: the dev-deploy path (gm-thg), where the image is
+    // whatever the developer just built and its version string is the same
+    // -dirty string already running. Plain http is expected and takes a plain
+    // client with no CA bundle and no redirect resolution; https falls through
+    // to the same secure path a release download uses. Reports through the
+    // same phase and progress callbacks, so the web UI's progress bar and the
+    // display's panel stop both work unchanged, and reboots on success.
+    // Returns only on failure.
+    HTTPUpdateResult updateFromUrl(const String &url);
     void setReleaseUrl(const String &release_url);
     void setControllerVersion(const String &controller_version);
 
@@ -44,6 +54,11 @@ class GitHubOTA {
     HTTPUpdate Updater;
 
     HTTPUpdateResult update_firmware(const String &url);
+    // False when the partition table has no second app slot, after logging
+    // why. esp_ota_get_next_update_partition hands back the *running*
+    // partition in that case, so beginning an update there erases the app that
+    // is executing.
+    bool haveSecondAppSlot(const char *tag) const;
 
     uint8_t phase = PHASE_IDLE;
     semver_t _version;

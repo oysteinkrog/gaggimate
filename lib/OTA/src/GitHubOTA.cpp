@@ -5,6 +5,7 @@
 #include <HTTPClient.h>
 #include <HTTPUpdate.h>
 #include <Update.h>
+#include <WiFiClient.h>
 #include <WiFiClientSecure.h>
 #include <esp_ota_ops.h>
 
@@ -201,18 +202,7 @@ HTTPUpdateResult GitHubOTA::update_firmware(const String &url) {
     const char *TAG = "update_firmware";
     ESP_LOGI(TAG, "Download URL: %s\n", url.c_str());
 
-    // Same guard the BLE DFU path already has: HTTPUpdate writes to whatever
-    // esp_ota_get_next_update_partition() hands back, and IDF hands back the
-    // *running* partition when the table holds only one OTA slot. Beginning an
-    // update there erases the app that is executing, leaving nothing to roll
-    // back to and no route in except USB. partitions/headless_8mb.csv is
-    // single-slot and its build still shows the update button, so this is
-    // reachable today, not hypothetical.
-    const esp_partition_t *running = esp_ota_get_running_partition();
-    const esp_partition_t *target = esp_ota_get_next_update_partition(nullptr);
-    if (target == nullptr || target == running) {
-        ESP_LOGE(TAG, "Refusing OTA: this build has a single app slot (running=%s); reflash over USB instead",
-                 running != nullptr ? running->label : "?");
+    if (!haveSecondAppSlot(TAG)) {
         return HTTP_UPDATE_FAILED;
     }
 
@@ -230,6 +220,78 @@ HTTPUpdateResult GitHubOTA::update_firmware(const String &url) {
     auto result = Updater.update(_wifi_client, resolved);
 
     print_update_result(Updater, result, TAG);
+    return result;
+}
+
+// Same guard the BLE DFU path already has: HTTPUpdate writes to whatever
+// esp_ota_get_next_update_partition() hands back, and IDF hands back the
+// *running* partition when the table holds only one OTA slot. Beginning an
+// update there erases the app that is executing, leaving nothing to roll back
+// to and no route in except USB. partitions/headless_8mb.csv is single-slot
+// and its build still shows the update button, so this is reachable today, not
+// hypothetical.
+bool GitHubOTA::haveSecondAppSlot(const char *tag) const {
+    const esp_partition_t *running = esp_ota_get_running_partition();
+    const esp_partition_t *target = esp_ota_get_next_update_partition(nullptr);
+    if (target == nullptr || target == running) {
+        ESP_LOGE(tag, "Refusing OTA: this build has a single app slot (running=%s); reflash over USB instead",
+                 running != nullptr ? running->label : "?");
+        return false;
+    }
+    return true;
+}
+
+HTTPUpdateResult GitHubOTA::updateFromUrl(const String &url) {
+    const char *TAG = "updateFromUrl";
+    ESP_LOGI(TAG, "Dev OTA from %s", url.c_str());
+
+    if (!haveSecondAppSlot(TAG)) {
+        this->phase = PHASE_ERROR;
+        this->_phase_callback(PHASE_ERROR);
+        return HTTP_UPDATE_FAILED;
+    }
+
+    // PHASE_DISPLAY_FW before the first byte, because that is what stops the
+    // panel: DefaultUI's ota:update:start handler has already run by the time
+    // this is called, and the web UI reads the phase to draw its progress bar.
+    this->phase = PHASE_DISPLAY_FW;
+    this->_phase_callback(PHASE_DISPLAY_FW);
+
+    HTTPUpdateResult result;
+    if (url.startsWith("https://")) {
+        // A release asset, or any host that needs TLS: the redirect resolution
+        // is what keeps the CA bundle attached across a hop (see
+        // update_firmware).
+        attach_ca_bundle(_wifi_client);
+        const String resolved = resolve_redirect_chain(_wifi_client, url);
+        if (resolved.length() == 0) {
+            ESP_LOGE(TAG, "Could not resolve firmware URL: %s", url.c_str());
+            this->phase = PHASE_ERROR;
+            this->_phase_callback(PHASE_ERROR);
+            return HTTP_UPDATE_FAILED;
+        }
+        attach_ca_bundle(_wifi_client);
+        result = Updater.update(_wifi_client, resolved);
+    } else {
+        // The expected case. A plain client costs none of the ~32 KB the TLS
+        // handshake takes, which matters here because this runs with the panel
+        // stopped but the web server and BLE still up.
+        WiFiClient plain;
+        result = Updater.update(plain, url);
+    }
+
+    print_update_result(Updater, result, TAG);
+    if (result != HTTP_UPDATE_OK) {
+        this->phase = PHASE_ERROR;
+        this->_phase_callback(PHASE_ERROR);
+        return result;
+    }
+
+    this->phase = PHASE_FINISHED;
+    this->_phase_callback(PHASE_FINISHED);
+    ESP_LOGI(TAG, "Dev OTA written. Restarting.");
+    delay(1000);
+    ESP.restart();
     return result;
 }
 

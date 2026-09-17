@@ -4,6 +4,7 @@
 #define ELEGANTOTA_USE_ASYNC_WEBSERVER 1
 
 #include <DNSServer.h>
+#include <atomic>
 #include <deque>
 #include <memory>
 #include <mutex>
@@ -13,6 +14,14 @@
 #include <ESPAsyncWebServer.h>
 #include <display/core/Plugin.h>
 #include <display/util/PsramAllocator.h>
+
+// The dev-deploy endpoints (gm-thg): /api/ota/info and /api/ota/dev. On by
+// default, including on the production build, because the machine they are
+// for is plumbed in and its USB port is not reachable. -DGM_DEV_OTA=0
+// compiles both out; see handleDevOta for what that trades away.
+#ifndef GM_DEV_OTA
+#define GM_DEV_OTA 1
+#endif
 
 constexpr size_t UPDATE_CHECK_INTERVAL = 30 * 60 * 1000;
 constexpr size_t CLEANUP_PERIOD = 1000;
@@ -120,6 +129,17 @@ class WebUIPlugin : public Plugin {
     unsigned long radioOffAtMs = 0;
     unsigned long radioOnAtMs = 0;
     String updateComponent = "";
+    // /api/ota/dev: the URL to pull the next display image from, handed from
+    // the async_tcp task to loop() on the display task, which is where every
+    // other OTA runs. A fixed buffer and a flag rather than a String, because
+    // the two tasks would otherwise share one heap-allocated buffer with no
+    // lock; one producer and one consumer make the flag enough. Written
+    // before the flag is set and read before it is cleared.
+    static constexpr size_t kDevOtaUrlCap = 200;
+    char devOtaUrl[kDevOtaUrlCap] = {};
+    std::atomic<bool> devOtaPending{false};
+    void handleDevOta(AsyncWebServerRequest *request);
+    void handleOtaInfo(AsyncWebServerRequest *request) const;
     float currentWeight = 0.0f;
     // Reused for every 500ms status broadcast. Allocating a fresh JsonDocument
     // each tick was a major contributor to internal-heap fragmentation
