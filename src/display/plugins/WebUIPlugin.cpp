@@ -1506,6 +1506,14 @@ void WebUIPlugin::handleProfileRequest(uint32_t clientId, JsonDocument &request)
 void WebUIPlugin::handleSettings(AsyncWebServerRequest *request) const {
     if (request->method() == HTTP_POST) {
         controller->getSettings().batchUpdate([request](Settings *settings) {
+            // A checkbox is posted as 0 or 1 and read only when present. The
+            // form sends every checkbox; a partial POST (the pump calibration's
+            // postCoefficients sends one field) leaves every flag as it was.
+            // Reading presence as the value used to clear all of them.
+            auto flagArg = [request](const char *name, auto &&set) {
+                if (request->hasArg(name))
+                    set(request->arg(name).toInt() != 0);
+            };
             if (request->hasArg("startupMode"))
                 settings->setStartupMode(request->arg("startupMode") == "brew" ? MODE_BREW : MODE_STANDBY);
             if (request->hasArg("startupProfile"))
@@ -1558,14 +1566,14 @@ void WebUIPlugin::handleSettings(AsyncWebServerRequest *request) const {
                 settings->setWifiPassword(request->arg("wifiPassword"));
             if (request->hasArg("apPassword") && request->arg("apPassword").length() >= WIFI_AP_PASSWORD_MIN_LENGTH)
                 settings->setWifiApPassword(request->arg("apPassword"));
-            settings->setHomekit(request->hasArg("homekit"));
-            settings->setBoilerFillActive(request->hasArg("boilerFillActive"));
+            flagArg("homekit", [settings](bool v) { settings->setHomekit(v); });
+            flagArg("boilerFillActive", [settings](bool v) { settings->setBoilerFillActive(v); });
             if (request->hasArg("startupFillTime"))
                 settings->setStartupFillTime(request->arg("startupFillTime").toInt() * 1000);
             if (request->hasArg("steamFillTime"))
                 settings->setSteamFillTime(request->arg("steamFillTime").toInt() * 1000);
-            settings->setSmartGrindActive(request->hasArg("smartGrindActive"));
-            settings->setScaleMenuButton(request->hasArg("scaleMenuButton"));
+            flagArg("smartGrindActive", [settings](bool v) { settings->setSmartGrindActive(v); });
+            flagArg("scaleMenuButton", [settings](bool v) { settings->setScaleMenuButton(v); });
             if (request->hasArg("bgAnimId"))
                 settings->setBgAnimId(request->arg("bgAnimId").toInt());
             if (request->hasArg("bgAnimParams"))
@@ -1574,9 +1582,9 @@ void WebUIPlugin::handleSettings(AsyncWebServerRequest *request) const {
                 settings->setBgAnimTheme(request->arg("bgAnimTheme").toInt());
             if (request->hasArg("bgAnimFps"))
                 settings->setBgAnimFps(request->arg("bgAnimFps").toInt());
-            // Guarded on hasArg rather than read as a checkbox: a checkbox that
-            // is off is simply not posted, so a partial submit would read as
-            // "full resolution, no interlacing" and drop the panel to ~15 fps.
+            // Guarded on hasArg like the flags above: a partial submit that
+            // read absence as off would drop to "full resolution, no
+            // interlacing" and the panel to ~15 fps.
             if (request->hasArg("bgAnimHalfRes"))
                 settings->setBgAnimHalfRes(request->arg("bgAnimHalfRes").toInt() != 0 ? 1 : 0);
             if (request->hasArg("bgAnimInterlace"))
@@ -1602,9 +1610,7 @@ void WebUIPlugin::handleSettings(AsyncWebServerRequest *request) const {
             }
             if (request->hasArg("bgAnimPlateOpacity"))
                 settings->setBgAnimPlateOpacity(request->arg("bgAnimPlateOpacity").toInt());
-            // Checkbox: the form omits it entirely when unchecked (see
-            // buildSubmitFormData's checkboxKeys), so presence IS the value.
-            settings->setElementTintEnabled(request->hasArg("elementTintEnabled"));
+            flagArg("elementTintEnabled", [settings](bool v) { settings->setElementTintEnabled(v); });
             if (request->hasArg("elementTintColor")) {
                 // Same accepted forms as bgAnimPlateColor: "#rrggbb" from
                 // <input type=color>, plain decimal from scripted clients.
@@ -1660,13 +1666,12 @@ void WebUIPlugin::handleSettings(AsyncWebServerRequest *request) const {
                 settings->setBgAnimGradients(request->arg("bgAnimGradients"));
             if (request->hasArg("bgAnimThemeMap") && bg_map_valid(request->arg("bgAnimThemeMap").c_str()))
                 settings->setBgAnimThemeMap(request->arg("bgAnimThemeMap"));
-            if (request->hasArg("bgAnimId") || request->hasArg("bgAnimParams"))
-                settings->setBgAnimAllScreens(request->hasArg("bgAnimAllScreens"));
+            flagArg("bgAnimAllScreens", [settings](bool v) { settings->setBgAnimAllScreens(v); });
             if (request->hasArg("smartGrindIp"))
                 settings->setSmartGrindIp(request->arg("smartGrindIp"));
             if (request->hasArg("smartGrindMode"))
                 settings->setSmartGrindMode(request->arg("smartGrindMode").toInt());
-            settings->setHomeAssistant(request->hasArg("homeAssistant"));
+            flagArg("homeAssistant", [settings](bool v) { settings->setHomeAssistant(v); });
             if (request->hasArg("haUser"))
                 settings->setHomeAssistantUser(request->arg("haUser"));
             if (request->hasArg("haPassword"))
@@ -1677,15 +1682,15 @@ void WebUIPlugin::handleSettings(AsyncWebServerRequest *request) const {
                 settings->setHomeAssistantPort(request->arg("haPort").toInt());
             if (request->hasArg("haTopic"))
                 settings->setHomeAssistantTopic(request->arg("haTopic"));
-            settings->setMomentaryButtons(request->hasArg("momentaryButtons"));
-            settings->setDelayAdjust(request->hasArg("delayAdjust"));
+            flagArg("momentaryButtons", [settings](bool v) { settings->setMomentaryButtons(v); });
+            flagArg("delayAdjust", [settings](bool v) { settings->setDelayAdjust(v); });
             if (request->hasArg("brewDelay"))
                 settings->setBrewDelay(request->arg("brewDelay").toDouble());
             if (request->hasArg("grindDelay"))
                 settings->setGrindDelay(request->arg("grindDelay").toDouble());
             if (request->hasArg("timezone"))
                 settings->setTimezone(request->arg("timezone"));
-            settings->setClockFormat(request->hasArg("clock24hFormat"));
+            flagArg("clock24hFormat", [settings](bool v) { settings->setClockFormat(v); });
             if (request->hasArg("standbyTimeout"))
                 settings->setStandbyTimeout(request->arg("standbyTimeout").toInt() * 1000);
             if (request->hasArg("mainBrightness"))
@@ -1728,7 +1733,7 @@ void WebUIPlugin::handleSettings(AsyncWebServerRequest *request) const {
                 settings->setMaxPumpPower(request->arg("maxPumpPower").toFloat());
             if (request->hasArg("savedScale"))
                 settings->setSavedScale(request->arg("savedScale"));
-            settings->setAutoWakeupEnabled(request->hasArg("autowakeupEnabled"));
+            flagArg("autowakeupEnabled", [settings](bool v) { settings->setAutoWakeupEnabled(v); });
             if (request->hasArg("autowakeupSchedules")) {
                 // Handle schedule format with days
                 String schedulesStr = request->arg("autowakeupSchedules");

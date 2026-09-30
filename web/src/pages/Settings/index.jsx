@@ -148,32 +148,33 @@ function transformFetchedSettings(fetchedSettings) {
   return settingsWithToggle;
 }
 
+// The device settings that are checkboxes. The form posts each as 0 or 1 and
+// the device reads each only when it is present, so a partial POST leaves the
+// rest as they were. onChange flips these on a click.
+const CHECKBOX_KEYS = [
+  'homekit',
+  'boilerFillActive',
+  'smartGrindActive',
+  'scaleMenuButton',
+  'homeAssistant',
+  'momentaryButtons',
+  'delayAdjust',
+  'clock24hFormat',
+  'autowakeupEnabled',
+  'bgAnimAllScreens',
+  'elementTintEnabled',
+];
+
 function buildSubmitFormData(formData, autowakeupSchedules, restart) {
   const formDataToSubmit = new FormData();
-  const checkboxKeys = [
-    'homekit',
-    'boilerFillActive',
-    'smartGrindActive',
-    'scaleMenuButton',
-    'homeAssistant',
-    'momentaryButtons',
-    'delayAdjust',
-    'clock24hFormat',
-    'autowakeupEnabled',
-    'smartGrindToggle',
-    'bgAnimAllScreens',
-    'elementTintEnabled',
-  ];
 
   for (const [key, value] of Object.entries(formData)) {
     if (value === undefined || value === null) continue;
     // Form-only bookkeeping, not a device setting.
     if (key === 'scaleFactor1Loaded' || key === 'scaleFactor2Loaded') continue;
 
-    if (checkboxKeys.includes(key)) {
-      if (value) {
-        formDataToSubmit.set(key, '1');
-      }
+    if (CHECKBOX_KEYS.includes(key)) {
+      formDataToSubmit.set(key, value ? '1' : '0');
     } else {
       formDataToSubmit.set(key, String(value));
     }
@@ -290,19 +291,7 @@ export function Settings() {
   const onChange = key => {
     return e => {
       let value = e.currentTarget.value;
-      if (
-        [
-          'homekit',
-          'boilerFillActive',
-          'smartGrindActive',
-          'smartGrindToggle',
-          'homeAssistant',
-          'momentaryButtons',
-          'delayAdjust',
-          'clock24hFormat',
-          'autowakeupEnabled',
-        ].includes(key)
-      ) {
+      if (CHECKBOX_KEYS.includes(key)) {
         value = !formData[key];
       }
       if (key === 'clock24hFormat') {
