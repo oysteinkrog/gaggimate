@@ -34,6 +34,19 @@ NAME="${1:?usage: build.sh <source-subdir>}"
 SRC_DIR="$NAME"
 [ -d "$SRC_DIR" ] || { echo "no such source dir: $SRC_DIR"; exit 1; }
 
+# Refuse to compile a test whose hand-copied asm kernel has drifted from the
+# src/ function it claims to transcribe (gm-bzu.35). check_copies.py knows
+# each test's source mapping by test directory name (e.g. "anim_lava"), so
+# strip any "tests/" prefix from $NAME before asking it. A name it has not
+# classified into either its MAPPING table or its declared-exempt set (a new
+# test nobody has triaged yet) is also refused, not silently skipped -- see
+# check_copies.py's own header comment for why.
+CHECK_NAME="$(basename "$NAME")"
+if ! python3 check_copies.py "$CHECK_NAME"; then
+    echo "check_copies.py: refusing to build $NAME -- see the diff above"
+    exit 1
+fi
+
 if [ -f "$SRC_DIR/link.ld" ]; then
     HARNESS_MODE=0
     LINK_LD="$SRC_DIR/link.ld"
