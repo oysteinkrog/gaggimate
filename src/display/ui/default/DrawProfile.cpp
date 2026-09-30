@@ -1,5 +1,6 @@
 #include "DrawProfile.h"
 
+#include <cstring>
 #include <esp_timer.h>
 
 namespace drawprof {
@@ -18,6 +19,12 @@ struct Entry {
     uint32_t postUs;
     uint32_t partUs; // DRAW_PART_BEGIN to DRAW_PART_END, the draw calls themselves
     uint32_t n;
+    // Snapshotted on the UI task inside the object's own draw event, where
+    // the object is guaranteed live. The report handler runs on async_tcp
+    // and must never dereference `obj` itself: a screen change between the
+    // sample and the report can free it out from under that task.
+    uint16_t zoom;      // lv_img only
+    char text[32];      // lv_label only, truncated; empty otherwise
 };
 
 constexpr int kMaxEntries = 128;
@@ -75,6 +82,17 @@ void cb(lv_event_t *e) {
     if (code == LV_EVENT_DRAW_MAIN_END) {
         en->mainUs += dt;
         en->n++;
+        // Snapshot the fields the report used to read live off `obj`. This
+        // runs on the UI task inside the object's own draw event, so the
+        // object is guaranteed alive here even though it may be freed by
+        // the time async_tcp asks for the report.
+        if (en->cls == &lv_img_class) {
+            en->zoom = lv_img_get_zoom(en->obj);
+        } else if (en->cls == &lv_label_class) {
+            const char *t = lv_label_get_text(en->obj);
+            strncpy(en->text, t, sizeof(en->text) - 1);
+            en->text[sizeof(en->text) - 1] = '\0';
+        }
     } else {
         en->postUs += dt;
     }
@@ -87,6 +105,8 @@ void attachRecurse(lv_obj_t *obj) {
         en.cls = lv_obj_get_class(obj);
         lv_obj_get_coords(obj, &en.coords);
         en.mainUs = en.postUs = en.partUs = en.n = 0;
+        en.zoom = 0;
+        en.text[0] = '\0';
         // The flow engine keeps screens alive, so a revisit would stack a
         // second callback and double every count.
         lv_obj_remove_event_cb(obj, cb);
@@ -197,11 +217,13 @@ void report(JsonDocument &doc, const char *key, int maxEntries) {
         o["post_us"] = en.postUs;
         o["part_us"] = en.partUs;
         o["n"] = en.n;
+        // Read only the copies cb() snapshotted on the UI task: `en.obj`
+        // itself may already be dangling by the time async_tcp gets here.
         if (en.cls == &lv_img_class) {
-            o["zoom"] = lv_img_get_zoom(en.obj);
+            o["zoom"] = en.zoom;
         }
         if (en.cls == &lv_label_class) {
-            o["text"] = lv_label_get_text(en.obj);
+            o["text"] = en.text;
         }
     }
 }
