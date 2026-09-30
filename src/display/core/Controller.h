@@ -245,12 +245,21 @@ class Controller {
 
     // Last control values sent to the controller. updateControl() only
     // transmits components that differ from these (the controller is stateful
-    // and delivery is acknowledged). Reset on (re)connect to force a full resend.
+    // and delivery is acknowledged). A (re)connect forces a full resend.
     BoilerCommand lastBoiler{};
     PumpCommand lastPump{};
     RelayCommand lastRelay{};
     bool lastAlt = false;
-    bool controlStateSent = false;
+    // Connection generation. The BLE connection callback (BLE host task)
+    // increments connectionGen on every connect and disconnect;
+    // updateControl() (logic task) reads it once, sends, and records the value
+    // it read in controlSentGen. A full four-part batch goes out whenever the
+    // two differ, so a connect that lands while updateControl() is sending
+    // leaves them unequal and the next pass resends everything on the new link.
+    // A single bool reset by the callback could be set back to true by the
+    // pass already in flight, and the controller then had no setpoint.
+    std::atomic<uint32_t> connectionGen{1};
+    uint32_t controlSentGen = 0;
 
     // BLE connection-interval priority: tight while a process runs, relaxed when
     // idle (frees radio airtime for Wi-Fi). Tracks the last requested state.

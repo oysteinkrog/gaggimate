@@ -393,9 +393,10 @@ void Controller::setupBluetooth() {
 #else
     comms.init("GPBLC");
     comms.onConnectionChanged([this](bool connected) {
-        // Force a full control resend after any (re)connect -- the controller
+        // Force a full control resend after any (re)connect: the controller
         // starts with no state and updateControl() otherwise only sends deltas.
-        controlStateSent = false;
+        // A new generation, not a flag, so a pass already sending cannot undo it.
+        connectionGen.fetch_add(1, std::memory_order_acq_rel);
         if (connected) {
             // Re-assert the connection interval for the fresh link (e.g. tight
             // again if we reconnected mid-shot).
@@ -1461,8 +1462,12 @@ void Controller::updateControl() {
     // Only send components that changed since the last update. The controller is
     // stateful and every message is acknowledged, so re-sending unchanged values
     // each cycle is unnecessary; a periodic ping (see loop()) keeps the watchdog
-    // fed when nothing changes. controlStateSent is reset on (re)connect to force
-    // a full resend.
+    // fed when nothing changes. A (re)connect bumps connectionGen, which forces
+    // a full resend. The generation is read once, before the send, and recorded
+    // after it: a connect during the send leaves a newer generation behind and
+    // the next pass sends the full state again.
+    const uint32_t gen = connectionGen.load(std::memory_order_acquire);
+    const bool controlStateSent = gen == controlSentGen;
     gm::Payload batch[4];
     size_t count = 0;
     if (!controlStateSent || boiler != lastBoiler)
@@ -1481,7 +1486,7 @@ void Controller::updateControl() {
     lastPump = pump;
     lastRelay = relay;
     lastAlt = altRelayActive;
-    controlStateSent = true;
+    controlSentGen = gen;
 }
 
 void Controller::activate() {
