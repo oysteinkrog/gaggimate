@@ -8,6 +8,7 @@ import {
 } from './delayTracking';
 import { getMetricStats } from './metricStats';
 import { analyzeExecutedPhase } from './phaseAnalysis';
+import { backfillActiveScaleConnected, isScaleLostInSamples } from './scaleConnection';
 import { mergeSkippedProfilePhases } from './skippedPhases';
 import {
   buildRecordedExitReasonByPhase,
@@ -131,6 +132,10 @@ export function calculateShotMetrics(shotData, profileData, settings) {
   const { scaleDelayMs, sensorDelayMs, isAutoAdjusted } = settings;
   const debugEnabled = isAnalyzerDebugEnabled();
   const gSamples = shotData.samples;
+  // JSON shots (browser uploads, older exports) never pass through
+  // parseBinaryShot's version < 6 backfill, so do it here too before any
+  // scale-state check reads the field.
+  backfillActiveScaleConnected(gSamples);
   const globalStartTime = gSamples[0].t;
 
   // --- 1. PHASE SEPARATION ---
@@ -151,7 +156,7 @@ export function calculateShotMetrics(shotData, profileData, settings) {
 
   let globalScaleLost = false;
   if (isBrewByWeight) {
-    globalScaleLost = gSamples.some(s => s.systemInfo?.activeScaleConnected === false);
+    globalScaleLost = isScaleLostInSamples(gSamples);
   }
 
   // --- 3. GLOBAL TOTALS ---

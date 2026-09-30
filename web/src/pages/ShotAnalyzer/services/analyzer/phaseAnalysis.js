@@ -10,6 +10,7 @@ import {
   createPhaseDelayTracker,
 } from './delayTracking';
 import { getMetricStats } from './metricStats';
+import { isScaleLostInSamples } from './scaleConnection';
 import {
   buildTargetCalcValues,
   findManualTargetMatch,
@@ -585,8 +586,7 @@ export function analyzeExecutedPhase({
   const displayName = rawName || `Phase ${phaseNum}`;
   const sysInfo = getPhaseEndSample(samples).systemInfo || {};
   const sysAnomalies = getPhaseSysAnomalies(samples, sysInfo);
-  const scaleLostInThisPhase =
-    isBrewByWeight && samples.some(s => s.systemInfo?.activeScaleConnected === false);
+  const scaleLostInThisPhase = isBrewByWeight && isScaleLostInSamples(samples);
   const nextScaleConnectionBroken = scaleConnectionBrokenPermanently || scaleLostInThisPhase;
   const delayTracker = createPhaseDelayTracker(isLastPhase);
   const exitState = createExitState();
