@@ -46,7 +46,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 REPO_ROOT = os.path.abspath(os.path.join(HERE, ".."))
 sys.path.insert(0, REPO_ROOT)
 
-from tools.settings_ui_tests import Rig, RigHTTPError, Sim  # noqa: E402
+from tools.settings_ui_tests import Rig, RigHTTPError, RowMissing, Sim  # noqa: E402
 from tools.settings_ui_tests import audit_pages, fixtures  # noqa: E402
 from tools.settings_ui_tests.fixtures import Venue  # noqa: E402
 
@@ -69,6 +69,9 @@ LEAK_CYCLES = 20
 LEAK_INT_FREE_TOLERANCE = 2048
 RATE_FLOOR_FRACTION = 0.90
 DEVICE_RESTART_TIMEOUT_S = 60.0
+# How long the simulator gets to exit after the Restart hold. ESP.restart()
+# is exit(0) there, and the hold's own release comes back first.
+SIM_EXIT_TIMEOUT_S = 10.0
 EXPECTED_PCLK_DIV = 6
 
 
@@ -455,9 +458,18 @@ def run_scenarios(rig, report, venue, selected, preflight_result):
         module = importlib.import_module("tools.settings_ui_tests.test_%s" % name)
         before = settings_snapshot(rig)
         t0 = time.time()
+        extra_failed = 0
         try:
             module.run(rig, report, venue)
             entry["status"] = "pass"
+        except RowMissing as e:
+            # A row the scenario needed is not on the page: one failed check
+            # naming the row, and the run goes on (gm-agh9).
+            entry["status"] = "fail"
+            entry["detail"] = str(e)
+            extra_failed = 1
+            report.violation("ROW MISSING", scenario=name, row=e.row, role=e.role, detail=str(e),
+                             traceback=traceback.format_exc())
         except AssertionError as e:
             entry["status"] = "fail"
             entry["detail"] = str(e)
@@ -465,12 +477,12 @@ def run_scenarios(rig, report, venue, selected, preflight_result):
         except Exception as e:  # noqa: BLE001 -- one scenario's crash must not end the run
             entry["status"] = "error"
             entry["detail"] = "%s: %s" % (type(e).__name__, e)
-            report.violation("SCENARIO ERROR", scenario=name, detail=entry["detail"])
-            report.note(traceback.format_exc())
+            report.violation("SCENARIO ERROR", scenario=name, detail=entry["detail"],
+                             traceback=traceback.format_exc())
         finally:
             entry["seconds"] = round(time.time() - t0, 1)
             entry["checks"] = getattr(module, "TOTAL", None)
-            entry["failed"] = len(getattr(module, "FAILURES", []))
+            entry["failed"] = len(getattr(module, "FAILURES", [])) + extra_failed
             close_shell(rig)
             report.step("scenario", name=name, status=entry["status"], seconds=entry["seconds"],
                         checks=entry["checks"], failed=entry["failed"])
@@ -483,13 +495,61 @@ def run_scenarios(rig, report, venue, selected, preflight_result):
 
 def restart_round_trip(rig, report, venue):
     """Steps Standby brightness one step through the UI, restarts through
-    the Status page's confirm row, checks the value survived, and puts it
-    back the same way."""
+    the Status page's confirm row, checks that the venue really rebooted
+    and that the value survived, and puts it back the same way. A row the
+    trip needs that is not on its page is one violation naming the row, and
+    the run goes on to its report (gm-agh9)."""
+    try:
+        _restart_round_trip(rig, report, venue)
+    except RowMissing as e:
+        report.violation("RESTART ROW MISSING", row=e.row, role=e.role, detail=str(e))
+        close_shell(rig)
+
+
+def _uptime_ms(rig):
+    return int(rig.heap()["uptime_ms"])
+
+
+def _wait_for_restart(rig, report, venue, uptime_before):
+    """After the Restart hold: waits for the venue to go down and come back,
+    and returns its uptime_ms afterwards, or None when it never answered.
+
+    The simulator is relaunched only once its process has exited on its
+    own, which is what ESP.restart() does there; relaunching it regardless
+    would make a hold that did not restart look like one that did. The
+    device is polled until its uptime is below the one read before the
+    hold, or until the timeout, and then read once more."""
+    if venue.sim is not None:
+        proc = venue.sim.proc
+        t0 = time.time()
+        while time.time() - t0 < SIM_EXIT_TIMEOUT_S and proc.poll() is None:
+            time.sleep(0.2)
+        if proc.poll() is None:
+            report.step("restart_no_exit", waited_s=SIM_EXIT_TIMEOUT_S)
+        else:
+            report.step("restart_exit", code=proc.returncode)
+            venue.sim.restart()
+    else:
+        t0 = time.time()
+        while time.time() - t0 < DEVICE_RESTART_TIMEOUT_S:
+            try:
+                if _uptime_ms(rig) < uptime_before:
+                    break
+            except (RigHTTPError, KeyError, ValueError):
+                pass
+            time.sleep(2.0)
+    try:
+        return _uptime_ms(rig)
+    except (RigHTTPError, KeyError, ValueError):
+        return None
+
+
+def _restart_round_trip(rig, report, venue):
     dump = audit_pages.open_category_page(rig, audit_pages.CAT_DISPLAY, 0)
     current = int(rig.row_value(dump, "Standby brightness"))
     direction = "plus" if current < 16 else "minus"
     expected = current + 1 if direction == "plus" else current - 1
-    rig.tap_target(rig.find_tag(dump, "Standby brightness", direction))
+    rig.tap_target(rig.require_tag(dump, "Standby brightness", direction))
     shown = int(rig.row_value(rig.touchmap(screen=0), "Standby brightness"))
     if shown != expected:
         report.violation("RESTART SETUP", detail="Standby brightness showed %d, wanted %d" % (shown, expected))
@@ -499,41 +559,39 @@ def restart_round_trip(rig, report, venue):
     audit_pages.command(rig, cat=audit_pages.CAT_STATUS)
     audit_pages.command(rig, page=1)
     status_dump = rig.touchmap(screen=0)
-    confirm = rig.find_tag(status_dump, "Restart", "confirm")
-    if confirm is None:
-        report.violation("RESTART SETUP", detail="no Restart confirm row on the Status page")
-        close_shell(rig)
-        return
-    report.step("restart_hold", before=current, bumped_to=expected)
+    confirm = rig.require_tag(status_dump, "Restart", "confirm")
+    uptime_before = _uptime_ms(rig)
+    report.step("restart_hold", before=current, bumped_to=expected, uptime_ms=uptime_before)
     try:
         rig.tap_target(confirm, ms=2500)
     except (RigHTTPError, TimeoutError):
         pass  # the venue went away mid-tap, which is what a restart looks like
 
-    if venue.sim is not None:
-        venue.sim.restart()
-    else:
-        t0 = time.time()
-        while time.time() - t0 < DEVICE_RESTART_TIMEOUT_S:
-            try:
-                rig.heap()
-                break
-            except RigHTTPError:
-                time.sleep(2.0)
-        else:
-            report.violation("RESTART TIMEOUT", seconds=DEVICE_RESTART_TIMEOUT_S)
-            return
-    report.step("restart_back", venue="simulator" if venue.sim is not None else "device")
+    uptime_after = _wait_for_restart(rig, report, venue, uptime_before)
+    report.number("restart_uptime_ms_before", uptime_before)
+    report.number("restart_uptime_ms_after", uptime_after)
+    if uptime_after is None:
+        report.violation("RESTART TIMEOUT", seconds=DEVICE_RESTART_TIMEOUT_S if venue.sim is None else SIM_EXIT_TIMEOUT_S)
+        return
+    report.step("restart_back", venue="simulator" if venue.sim is not None else "device",
+                uptime_ms=uptime_after)
+    restarted = uptime_after < uptime_before
+    if not restarted:
+        # The hold did not reboot the venue (a failed flush shows "Save
+        # failed, hold to retry" and stays up), so the value check below
+        # would prove nothing; the bump is still put back.
+        report.violation("RESTART NOT OBSERVED", uptime_ms_before=uptime_before, uptime_ms_after=uptime_after)
+        close_shell(rig)
 
     after = int(rig.settings_value("standbyBrightness"))
     report.number("restart_standby_brightness_before", current)
     report.number("restart_standby_brightness_after", after)
-    if after != expected:
+    if restarted and after != expected:
         report.violation("RESTART LOST VALUE", key="standbyBrightness", expected=expected, actual=after)
 
     back = _open_after_boot(rig, report, audit_pages.CAT_DISPLAY, 0)
     opposite = "minus" if direction == "plus" else "plus"
-    rig.tap_target(rig.find_tag(back, "Standby brightness", opposite))
+    rig.tap_target(rig.require_tag(back, "Standby brightness", opposite))
     close_shell(rig)
     # The close is queued to the UI task and the field is deferred, so the
     # write lands on the pass that tears the page down, not at the HTTP
@@ -653,6 +711,7 @@ def run(args):
             if not os.path.isfile(args.sim_program):
                 print("simulator binary not found at %r; build it first: pio run -e display-sim" % args.sim_program,
                       file=sys.stderr)
+                report.violation("RUNNER ERROR", detail="simulator binary not found at %r" % args.sim_program)
                 return 2
             workdir = os.path.join(report_dir, "sim")
             data_dir = os.path.join(workdir, "sim_data")
@@ -666,12 +725,47 @@ def run(args):
                           host="127.0.0.1:%d" % args.sim_port, log_path=sim.log_path, is_device=False,
                           skip_restart=args.skip_restart)
             report.step("venue", kind="simulator", port=args.sim_port, workdir=workdir)
-        return drive(rig, report, venue, selected, only, args)
+    except BaseException as e:  # noqa: BLE001 -- a failed launch must not leave a PASS report behind
+        report.violation("RUNNER ERROR", detail="%s: %s" % (type(e).__name__, e), traceback=traceback.format_exc())
+        if sim is not None:
+            sim.stop()
+        path = report.write()
+        print("report: %s" % path, flush=True)
+        if not isinstance(e, Exception):
+            raise
+        return 1
+    try:
+        return drive_guarded(rig, report, venue, selected, only, args)
     finally:
         if sim is not None:
             sim.stop()
         path = report.write()
         print("report: %s" % path, flush=True)
+
+
+def drive_guarded(rig, report, venue, selected, only, args):
+    """drive(), with an exception anywhere in it recorded as a RUNNER ERROR
+    violation carrying the traceback. Without this the report, written in
+    run()'s finally, said PASS for a run that crashed half way: passed is
+    only "no violations", and the crash had recorded none. An interrupt is
+    recorded the same way and then re-raised."""
+    try:
+        return drive(rig, report, venue, selected, only, args)
+    except BaseException as e:  # noqa: BLE001 -- recorded, then re-raised unless it is an ordinary error
+        report.violation("RUNNER ERROR", detail="%s: %s" % (type(e).__name__, e),
+                         traceback=traceback.format_exc())
+        if venue.is_device:
+            try:
+                rig.synth(1)
+            except (RigHTTPError, OSError):
+                pass
+        if not isinstance(e, Exception):
+            raise
+        try:
+            summarise(report, venue)
+        except Exception:  # noqa: BLE001 -- the report file is what matters now
+            pass
+        return 1
 
 
 def drive(rig, report, venue, selected, only, args):

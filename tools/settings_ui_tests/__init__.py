@@ -5,11 +5,12 @@ See rig.py for Rig (HTTP client against the simulator or the device) and Sim
 and doubles as the module's own test.
 """
 
-from .rig import Rig, RigHTTPError, Sim, SimError, color_hex, num, schedules, seconds
+from .rig import Rig, RigHTTPError, RowMissing, Sim, SimError, color_hex, num, schedules, seconds
 
 __all__ = [
     "Rig",
     "RigHTTPError",
+    "RowMissing",
     "Sim",
     "SimError",
     "color_hex",

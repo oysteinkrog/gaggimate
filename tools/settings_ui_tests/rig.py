@@ -108,6 +108,35 @@ def _annotate(dump):
     return dump
 
 
+class RowMissing(AssertionError, ValueError):
+    """A settings row, or one of its parts, that a check needed is not on
+    the dumped page (a row that is absent, named differently, or on a page
+    that is not the one showing). An AssertionError so the runner records
+    it as one failed check for the scenario and carries on (gm-agh9), and a
+    ValueError so a caller written against the older row_value contract
+    still catches it."""
+
+    def __init__(self, row, role, visible):
+        self.row = row
+        self.role = role
+        self.visible = visible
+        super().__init__("row %r has no %r object on this page; visible rows: %s"
+                         % (row, role, ", ".join(visible) if visible else "(none)"))
+
+
+def _visible_rows(dump):
+    return sorted({tag_row(o) for o in dump["objects"] if tag_row(o)})
+
+
+def require_tag(dump, row, role):
+    """find_tag() for a lookup the caller cannot go on without: the object,
+    or RowMissing naming the row and the rows that are on the page."""
+    obj = find_tag(dump, row, role)
+    if obj is None:
+        raise RowMissing(row, role, _visible_rows(dump))
+    return obj
+
+
 def find_tag(dump, row, role):
     """The object tagged "row/role" in dump, or None. Used directly for a
     one-off lookup, and by row_value()/rows_on_page() below."""
@@ -122,9 +151,9 @@ def row_value(dump, row):
     """The canonical value of a settings row: the "val" of its "row/value"
     object (the row-owned string SettingsDebugTag carries; DefaultUI.cpp's
     touchMapNode only ever emits "val" when that pointer is non-null), or
-    the "t" of the same object when "val" was not emitted. Raises with the
-    visible row names when the row has no value object (a typo'd row name,
-    or a row on a page that is not the one showing).
+    the "t" of the same object when "val" was not emitted. Raises
+    RowMissing with the visible row names when the row has no value object
+    (a typo'd row name, or a row on a page that is not the one showing).
 
     Note: the bead text calls this row_value(row); every sibling lookup
     below (rows_on_page, targets, audit) takes dump explicitly, so this does
@@ -132,10 +161,7 @@ def row_value(dump, row):
     Rig. Rig.row_value is a staticmethod, so rig.row_value(dump, row) reads
     the same either way.
     """
-    obj = find_tag(dump, row, "value")
-    if obj is None:
-        rows = sorted({tag_row(o) for o in dump["objects"] if tag_row(o)})
-        raise ValueError("no value object for row %r; visible rows: %s" % (row, ", ".join(rows) if rows else "(none)"))
+    obj = require_tag(dump, row, "value")
     val = obj.get("val")
     return val if val is not None else obj.get("t")
 
@@ -400,7 +426,11 @@ class Rig:
 
     def tap_target(self, target, ms=80):
         """Taps the centre of target's effective hit rect (a dict from
-        touchmap()/targets()/find_tag(), carrying "hit")."""
+        touchmap()/targets()/find_tag(), carrying "hit"). A None target
+        is a row lookup that found nothing; it raises RowMissing rather than
+        a TypeError, so the run records a failed check (gm-agh9)."""
+        if target is None:
+            raise RowMissing("(unknown)", "tap target", [])
         x1, y1, x2, y2 = target["hit"]
         return self.tap((x1 + x2) // 2, (y1 + y2) // 2, ms)
 
@@ -443,6 +473,7 @@ class Rig:
         raise TimeoutError("touchmap seq did not move on from %r within %.1fs" % (prev_seq, timeout))
 
     find_tag = staticmethod(find_tag)
+    require_tag = staticmethod(require_tag)
     row_value = staticmethod(row_value)
     rows_on_page = staticmethod(rows_on_page)
     targets = staticmethod(targets)

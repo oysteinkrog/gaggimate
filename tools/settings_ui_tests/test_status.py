@@ -266,18 +266,37 @@ def check_device_info_row(rig):
     open_to_status_page(rig, page=1)
 
 
+def uptime_ms(rig):
+    """The venue's uptime_ms from /api/debug/heap, or None when it does not
+    answer (a process that restarted, or one that died)."""
+    try:
+        return int(rig.heap()["uptime_ms"])
+    except (RigHTTPError, KeyError, ValueError):
+        return None
+
+
+def check_still_up(rig, name, before):
+    """Uptime probe: the venue answers and its uptime has moved on from
+    `before`, so it neither restarted nor died since that read. Replaces a
+    check that was true whenever the line was reached."""
+    after = uptime_ms(rig)
+    return check(rig, name, before is not None and after is not None and after > before,
+                 "uptime_ms before=%r after=%r" % (before, after))
+
+
 def check_short_hold_noop(rig, d1):
     """A 1500ms hold on Restart is short of kSettingsRowConfirmHoldMs (2000ms
     in SettingsRows.h) and must not fire onConfirm: the row's value is
     unchanged and the process is still answering afterward."""
     before = rig.row_value(d1, "Restart")
-    target = rig.find_tag(d1, "Restart", "confirm")
+    target = rig.require_tag(d1, "Restart", "confirm")
+    up_before = uptime_ms(rig)
     rig.tap_target(target, ms=1500)
     time.sleep(0.3)
     d_after = rig.touchmap(screen=0)
     after = rig.row_value(d_after, "Restart")
     check(rig, "short_hold_does_not_restart", after == before, "%r vs %r" % (before, after))
-    check(rig, "short_hold_process_still_alive", True, "reached here without a connection error")
+    check_still_up(rig, "short_hold_process_still_alive", up_before)
 
 
 def check_restart_persistence_and_relaunch(rig, sim):
@@ -298,7 +317,7 @@ def check_restart_persistence_and_relaunch(rig, sim):
     current = int(rig.row_value(d_disp, "Standby brightness"))
     direction = "plus" if current < 16 else "minus"
     expected = current + 1 if direction == "plus" else current - 1
-    btn = rig.find_tag(d_disp, "Standby brightness", direction)
+    btn = rig.require_tag(d_disp, "Standby brightness", direction)
     rig.tap_target(btn, ms=80)
     time.sleep(0.3)
     d_disp2 = rig.touchmap(screen=0)
@@ -313,7 +332,7 @@ def check_restart_persistence_and_relaunch(rig, sim):
     rig.wait_until(lambda: rig.settingsui_state().get("page") == 1, timeout=8)
     time.sleep(0.3)
     d_status = rig.touchmap(screen=0)
-    target = rig.find_tag(d_status, "Restart", "confirm")
+    target = rig.require_tag(d_status, "Restart", "confirm")
 
     try:
         rig.tap_target(target, ms=2500)
@@ -370,8 +389,9 @@ def check_fail_flush_scenario(program, workdir, port):
             rig.wait_until(lambda: rig.settingsui_state().get("page") == 1, timeout=8)
             time.sleep(0.3)
             d = rig.touchmap(screen=0)
-            target = rig.find_tag(d, "Restart", "confirm")
+            target = rig.require_tag(d, "Restart", "confirm")
 
+            up_before = uptime_ms(rig)
             rig.tap_target(target, ms=2500)
             time.sleep(0.3)
             d2 = rig.touchmap(screen=0)
@@ -382,9 +402,9 @@ def check_fail_flush_scenario(program, workdir, port):
                 after_first == "Save failed, hold to retry",
                 repr(after_first),
             )
-            check(rig, "forced_flush_failure_does_not_restart", True, "reached here without a connection error")
+            check_still_up(rig, "forced_flush_failure_does_not_restart", up_before)
 
-            target2 = rig.find_tag(d2, "Restart", "confirm")
+            target2 = rig.require_tag(d2, "Restart", "confirm")
             try:
                 rig.tap_target(target2, ms=2500)
                 check(rig, "second_hold_restarts_after_forced_failure", False, "tap completed normally; process should have exited")

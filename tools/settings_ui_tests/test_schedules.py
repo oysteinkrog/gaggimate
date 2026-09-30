@@ -640,44 +640,21 @@ def check_web_save_reconcile_editor(rig, s0):
     check(rig, "reconcile_restored", rig.settings_value("autowakeupSchedules") == orig_packed, "")
 
 
-def check_malformed_time_editor(rig, s0):
-    """Regression for the substr crash: the web handler stores whatever
-    autowakeupSchedules string the browser sent (WebUIPlugin.cpp keeps any
-    entry that has a "|" in it), so "|1111111" is a legal stored entry with
-    an empty time. The editor's Hour and Minute rows used to slice that
-    string, and substr(3, 2) on an empty string throws out_of_range, which
-    aborts a firmware built without exceptions. Both rows now read it
-    through the model's scheduleTimeParts, which treats anything malformed
-    as midnight, so the editor must open on 00 and 00 and the venue must
-    still be answering afterwards. Leaving the entry untouched must write
-    nothing."""
+def check_malformed_time_dropped(rig, s0):
+    """A web save drops a schedule entry whose time is not HH:MM in range
+    (isScheduleTime in WebUIPlugin.cpp, afb1c58f) and keeps the rest. This
+    check used to store "|1111111", an entry with an empty time, through the
+    web save and then open it in the editor, the regression for the substr
+    crash in the Hour and Minute rows. The web path can no longer store such
+    an entry, so what is checked here is the drop; the editor still reads a
+    stored time through the model's scheduleTimeParts, which the host tests
+    (pio test -e native_settingsui) cover for malformed input."""
     orig_packed = s0["autowakeupSchedules"]
     broken_packed = "07:00|1111111;|1111111"
     web_save_change(rig, "autowakeupSchedules", broken_packed)
-    got_fixture = rig.settings_value("autowakeupSchedules")
-    if not check(rig, "malformed_fixture_wire", got_fixture == broken_packed, repr(got_fixture)):
-        web_save_change(rig, "autowakeupSchedules", orig_packed)
-        return
-
-    dump = open_schedule_editor(rig, 2)
-    if not check(rig, "malformed_editor_opens", dump is not None, ""):
-        web_save_change(rig, "autowakeupSchedules", orig_packed)
-        return
-    a0 = rig.audit(dump)
-    check(rig, "malformed_editor_page0_audit_clean", not a0["violations"], repr(a0["violations"]))
-    check(rig, "malformed_hour_is_00", row_value(dump, "Hour") == "00", repr(row_value(dump, "Hour")))
-    check(rig, "malformed_minute_is_00", row_value(dump, "Minute") == "00", repr(row_value(dump, "Minute")))
-
-    # A crash would show up as a refused connection here, not as a wrong
-    # value: the state read is what proves the venue is still running.
-    st = rig.settingsui_state()
-    check(rig, "malformed_editor_still_open", st.get("depth") == 3, repr(st))
-
-    do(rig, pop=1)  # editor -> list
-    do(rig, pop=1)  # list -> Machine
-    do(rig, close=1)  # nothing touched, so commit writes no schedules
-    after = rig.settings_value("autowakeupSchedules")
-    check(rig, "malformed_left_byte_identical", after == broken_packed, repr(after))
+    got = rig.settings_value("autowakeupSchedules")
+    check(rig, "malformed_time_dropped_on_web_save",
+          schedules(got) == schedules("07:00|1111111"), repr(got))
 
     web_save_change(rig, "autowakeupSchedules", orig_packed)
     check(rig, "malformed_fixture_restored", rig.settings_value("autowakeupSchedules") == orig_packed, "")
@@ -876,13 +853,13 @@ def _sequence(rig, venue=None):
         run_check(rig, "remove_disabled_at_one", check_remove_disabled_at_one, s0)
         run_check(rig, "eight_and_nine_and_audit", check_eight_and_nine_and_audit, s0)
         run_check(rig, "web_save_reconcile_editor", check_web_save_reconcile_editor, s0)
-        run_check(rig, "malformed_time_editor", check_malformed_time_editor, s0)
+        run_check(rig, "malformed_time_dropped", check_malformed_time_dropped, s0)
         run_check(rig, "web_save_reconciles_machine_row", check_web_save_reconciles_machine_row, s0)
     else:
         rig.log(
             "skip", reason="web-save emulation is simulator-only",
             checks="remove_disabled_at_one,eight_and_nine_and_audit,web_save_reconcile_editor,"
-                   "malformed_time_editor,web_save_reconciles_machine_row",
+                   "malformed_time_dropped,web_save_reconciles_machine_row",
         )
     run_check(rig, "external_leave_persists", check_external_leave_persists, s0)
 
