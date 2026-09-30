@@ -737,7 +737,7 @@ the design cannot show and what the runs measured.
   34 px on settings pages, not the 45 px the generated screens use: at 45 px
   it reached 10x6 px into the two lower tiles (measured by the runner's
   audit, 91cb0ed5). The page header is 240 px wide at y -160: previous and
-  next arrows at x -100 and +100 (hit boxes 82 to 138 px from the centre,
+  next arrows at x -100 and +100 (hit boxes 72 to 128 px from the centre,
   far corner 227.4 px out, under the 228 px edge rule) with the title on
   one line in the 144 px between them, its height fixed to the font's line
   height because LONG_DOT wraps instead of truncating when the height is
@@ -770,9 +770,12 @@ the design cannot show and what the runs measured.
   web save's `batchUpdate`, `doSave`, a category's `enter`, `commit`,
   `refresh` and `reconcile`, `Controller::loopLogic`'s delay auto-adjust
   writes, and since 91cb0ed5 the web settings GET and the auto-wakeup minute
-  tick, both of which copy container-typed properties. `Property::get` still
-  hands out a reference, so any new cross-task reader of a `String` or a
-  vector property must take the guard as well.
+  tick, both of which copy container-typed properties. Since gm-bzu.44
+  every `String` and container getter on `Settings` returns a copy taken
+  under a value lock (`copyOf`), and `getContainerGeneration()` moves on
+  every such write so a hot reader copies only when it changed.
+  `Property::get` itself still hands out a reference, so a new getter for
+  a `String` or vector property must go through `copyOf`, never `get()`.
 - **A failed NVS write is reported, not swallowed.** `Settings::flushNow()`
   returns false and the Restart row shows "Save failed, hold to retry"
   (`CatStatus.cpp`). `GM_SIM_FAIL_FLUSH=1` on the simulator arms one forced
@@ -812,7 +815,7 @@ Instruments, and where each one exists:
 
 Three test commands, and what each proves:
 
-- `pio test -e native_settingsui` runs the value model on the host, 28 cases,
+- `pio test -e native_settingsui` runs the value model on the host, 29 cases,
   no LVGL and no Arduino. It proves ranges, steps, wrap, formats, the zone
   split, the gradient map and schedule parsing.
 - `python3 tools/settings_ui_test.py` builds nothing and launches

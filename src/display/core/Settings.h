@@ -104,10 +104,10 @@ class Settings {
     // periodic flush, a web save's batchUpdate and a settings-UI category's
     // enter/commit the same way doSave() already does. Returns true only when
     // doSave() opened NVS (or had nothing to write) and every property comes
-    // out not dirty afterwards. Known limit: PreferencesCodec<String>::write
-    // treats an empty-string write as success (nvsPutString), so a failed
-    // clear of a string property never re-marks itself dirty and is
-    // invisible to this check, same as it is to doSave() itself.
+    // out not dirty afterwards. An empty-string or empty-list write goes
+    // through nvs_set_str plus nvs_commit (gm-bzu.63), so a failed clear of
+    // a string property stays dirty, is retried, and makes this return
+    // false like any other failed key.
     bool flushNow();
 
 #if defined(GM_TOUCH_PROBE) || defined(GAGGIMATE_SIM)
