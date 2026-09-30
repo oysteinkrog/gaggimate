@@ -103,7 +103,8 @@ def main():
     rig.anim(interlace=-1, texts=1, textease=0)
     rig.synth(brew=1)
     time.sleep(2)
-    print("brew screen loaded:", open_brew(rig))
+    screen_ok = open_brew(rig)
+    print("brew screen loaded:", screen_ok)
     time.sleep(4)  # values change: the labels become live and are owned
     rig.synth(brew=0)
     time.sleep(3)
@@ -114,11 +115,13 @@ def main():
 
     # Part 1: pixels.
     frames = {}
+    elem_text_at_mode = {}
     for mode in (1, 0, 1):
         rig.anim(texts=mode)
         time.sleep(2.5)
         j = rig.anim()
         print("texts=%d elem_text=%s ov_px=%s" % (mode, j.get("elem_text"), j.get("ov_px")))
+        elem_text_at_mode[mode] = j.get("elem_text")
         caps = []
         for _ in range(args.captures):
             w, h, px = get_fb(args.host)
@@ -174,10 +177,23 @@ def main():
                r["elem_text"], r["elem_rings"], r["n"]))
     rig.synth(brew=0)
     rig.anim(texts=1, textease=1, interlace=-1)
-    verdict = diff_stable == 0 and report["churn_texts_1"]["refreshes_per_s"] < 0.5 and (report["owned_at_rest"] or 0) > 0
+    # The knob must have actually taken: at texts=0 the element must have
+    # let go of every label (elem_text == 0, LVGL drawing them again), and at
+    # rest with texts=1 it must own at least one (owned_at_rest > 0). Without
+    # this, a firmware regression that ignores texts=0 would still pass on
+    # pixels (the element and LVGL agree on what a label looks like) and only
+    # the refresh-rate drop would ever have caught it.
+    knob_ok = elem_text_at_mode.get(0) == 0
+    if not knob_ok:
+        print("FAIL: texts=0 never reported elem_text == 0:", elem_text_at_mode)
+    if not screen_ok:
+        print("FAIL: could not hold the brew screen (screen_id 2)")
+    verdict = (diff_stable == 0 and report["churn_texts_1"]["refreshes_per_s"] < 0.5 and
+               (report["owned_at_rest"] or 0) > 0 and knob_ok and screen_ok)
     report["verdict"] = "PASS" if verdict else "CHECK"
     print(json.dumps(report, indent=1))
     print("text_elem_check:", report["verdict"])
+    sys.exit(0 if verdict else 1)
 
 
 if __name__ == "__main__":

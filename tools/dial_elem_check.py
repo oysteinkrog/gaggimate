@@ -94,14 +94,19 @@ def main():
         time.sleep(3)
         d = rig.touchmap()
         print("screen_id", d.get("screen_id"))
+    screen_ok = d.get("screen_id") == 2
+    if not screen_ok:
+        print("FAIL: could not hold the brew screen (screen_id 2), now", d.get("screen_id"))
 
     # Part 1: pixels.
     frames = {}
+    elem_rings_at_mode = {}
     for mode in (1, 0, 1):
         rig.anim(dials=mode)
         time.sleep(2.5)
         j = rig.anim()
         print("dials=%d elem_rings=%s" % (mode, j.get("elem_rings")))
+        elem_rings_at_mode[mode] = j.get("elem_rings")
         caps = []
         for _ in range(args.captures):
             w, h, px = get_fb(args.host)
@@ -149,10 +154,20 @@ def main():
                r["elem_rings"], r["n"]))
     rig.synth(brew=0)
     rig.anim(dials=1)
-    verdict = diff_stable == 0 and report["churn_dials_1"]["refreshes_per_s"] < 0.5
+    # The knob must have actually taken: at dials=1 the element must own at
+    # least one ring. Without this, a firmware regression that ignores
+    # dials=1 (LVGL keeps drawing every ring) would still pass on pixels (the
+    # two paths agree on what a ring looks like) and only the refresh-rate
+    # drop would ever have caught it.
+    knob_ok = (elem_rings_at_mode.get(1) or 0) >= 1
+    if not knob_ok:
+        print("FAIL: dials=1 never reported elem_rings >= 1:", elem_rings_at_mode)
+    verdict = (diff_stable == 0 and report["churn_dials_1"]["refreshes_per_s"] < 0.5 and
+               knob_ok and screen_ok)
     report["verdict"] = "PASS" if verdict else "CHECK"
     print(json.dumps(report, indent=1))
     print("dial_elem_check:", report["verdict"])
+    sys.exit(0 if verdict else 1)
 
 
 if __name__ == "__main__":

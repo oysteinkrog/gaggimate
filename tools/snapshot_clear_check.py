@@ -39,6 +39,10 @@ def load(rig, sid):
     time.sleep(3.0)
 
 
+def screen_id_now(rig):
+    return rig.touchmap().get("screen_id")
+
+
 def compare(a, b, label):
     (wa, ha, da), (wb, hb, db) = a, b
     if (wa, ha) != (wb, hb):
@@ -118,6 +122,7 @@ def main():
     rig.anim(texts=0, dials=0)
     time.sleep(1)
     total = 0
+    held_fail = False
     modes = {}
     for sid, name in ((6, "steam"), (2, "brew"), (3, "status")):
         got = {}
@@ -126,6 +131,10 @@ def main():
             load(rig, 7)      # leave through water: same geometry, so the target's
                               # buffer keeps its run table and the by-runs path runs
             load(rig, sid)
+            actual = screen_id_now(rig)
+            if actual != sid:
+                print("%s: FAIL could not hold screen %d (now %s)" % (name, sid, actual))
+                held_fail = True
             got[mode] = dumps(args.host)
             modes[(name, mode)] = rig.anim().get("ov_whole_clear_by_runs")
         total += compare_stable(got[1], got[0], name)
@@ -134,8 +143,17 @@ def main():
     # geometry, and a buffer last published at another size takes the memset
     # whatever the knob says, so the mode read back is not the knob.
     print("clear mode of the last whole snapshot (1 = by runs):", modes)
-    ok = total == 0
+    # The knob must have actually taken at least once: some screen's whole
+    # snapshot, taken with clrruns=1, must have been cleared by runs. Without
+    # this a firmware regression that always memsets (clrruns has no effect)
+    # would still report total == 0, since by-runs and memset clear the same
+    # bytes; it is the knob readback, not the pixel diff, that catches that.
+    knob_ok = any(v == 1 for (_, mode), v in modes.items() if mode == 1)
+    if not knob_ok:
+        print("FAIL: clrruns=1 never reported ov_whole_clear_by_runs == 1 on any screen:", modes)
+    ok = total == 0 and knob_ok and not held_fail
     print("snapshot_clear_check:", "PASS" if ok else "CHECK")
+    sys.exit(0 if ok else 1)
 
 
 if __name__ == "__main__":
