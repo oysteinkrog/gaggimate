@@ -244,9 +244,11 @@ void bandRef(uint16_t *dst, int y0, int rows, int w, uint32_t, const uint8_t *) 
 //
 // dst and ct need only their natural 4-byte/2-byte alignment (S32I/L16SI
 // have no wider requirement) -- unlike round 1's PIE kernel, nothing here
-// depends on allocHot()'s 16-byte-aligned return. w must be a multiple of 4
-// for nQuad = w/4 to be exact; w is always a multiple of 16 on this panel
-// (see CLAUDE.md), so band() never has a remainder to special-case.
+// depends on allocHot()'s 16-byte-aligned return. The S32I stores need a
+// 4-byte-aligned dst and cover four pixels each, so band() below writes a
+// pixel before the kernel when a row starts 2 mod 4 and the w & 3 pixels
+// after it in scalar (gm-bzu.49): at 466 px the old w >> 2 call left the
+// last two columns unwritten, at 233 the last one.
 //
 // Register budget: ctp, dstp, rt, pal, n (5, live for the whole loop) +
 // t1..t4 (4, reused in place for ct value then address then palette value,
@@ -301,8 +303,21 @@ void band(uint16_t *dst, int y0, int rows, int w, uint32_t tMs, const uint8_t *p
 #if defined(__XTENSA__) && !defined(GM_BGANIM_NO_ASM)
     for (int r = 0; r < rows; r++) {
         const int y = y0 + r;
+        const int rt = rowTerm[y];
         const int16_t *ct = colTermPh + static_cast<size_t>(y & 7) * w;
-        plasmaRowAsm(dst + static_cast<size_t>(r) * w, ct, rowTerm[y], rotPalette, w >> 2);
+        uint16_t *row = dst + static_cast<size_t>(r) * w;
+        // Same per-pixel formula as bandRef, one pixel at a time.
+        auto px = [&](int x) { row[x] = rotPalette[((ct[x] + rt) >> 4) & 255]; };
+        int x = 0;
+        if ((reinterpret_cast<uintptr_t>(row) & 3) != 0 && w > 0) {
+            px(0);
+            x = 1;
+        }
+        const int nQuad = (w - x) >> 2;
+        plasmaRowAsm(row + x, ct + x, rt, rotPalette, nQuad);
+        for (x += nQuad * 4; x < w; x++) {
+            px(x);
+        }
     }
 #else
     bandRef(dst, y0, rows, w, tMs, p);

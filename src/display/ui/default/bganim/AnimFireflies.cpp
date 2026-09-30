@@ -331,10 +331,13 @@ void bandRef(uint16_t *dst, int y0, int rows, int w, uint32_t, const uint8_t *) 
 // rows here are one flat color end to end (bgLUT[y]), so there is no
 // per-pixel work at all, only bytes to move.
 //
-// dst must be 16-byte aligned and nOct*8 == w; both hold in production
-// (ASM_BRIEF.md: band() dst rows are 16-byte aligned, w is always 480 or
-// 240, both multiples of 16 and so of 8). band() below checks and falls
-// back to fillBgRowScalar otherwise.
+// dst must be 16-byte aligned: ee.vst.128.ip clears the low four address
+// bits without a fault, so a misaligned dst writes up to 12 bytes before
+// the row. Only fillBgRow() below calls this, and it hands over the
+// 16-byte-aligned interior of the row with a scalar prefix and tail around
+// it (gm-bzu.49): BgAnim.h promises only a 4-byte-aligned dst, halfBuf used
+// to be 4 mod 16 on some boots, and at w = 466 every other row of a band
+// starts 4 mod 16.
 //
 // LOOPNEZ rather than the manual addi/bnez SleepAnimation.cpp's
 // scale565Oct and AnimNebula.cpp's lerpRowPie use for their own PIE loops:
@@ -343,6 +346,9 @@ void bandRef(uint16_t *dst, int y0, int rows, int w, uint32_t, const uint8_t *) 
 // AnimStarfield.cpp's vignette kernel documents for its own loop, and those
 // two PIE loops' few-iteration call sites are not.
 __attribute__((noinline)) static void fillRowPie(uint16_t *__restrict dstIn, uint16_t color, int nOct) {
+    if (nOct <= 0) {
+        return; // loopnez would skip the loop anyway; this also skips the broadcast
+    }
     alignas(16) static uint16_t bcast[8];
     for (int i = 0; i < 8; i++) {
         bcast[i] = color;
@@ -443,17 +449,55 @@ __attribute__((noinline)) static void drawGlowSpanAsm(uint16_t *__restrict rowIn
           [bc] "r"(static_cast<int32_t>(bCol)), [a8v] "r"(static_cast<int32_t>(a8v)), [alut] "r"(alut), [n] "r"(count)
         : "memory");
 }
+#else
+// Host twins: same names and signatures. fillRowPie stores the way
+// ee.vst.128.ip does, to the address with its low four bits cleared, so a
+// caller that hands it a misaligned row writes before the row on the host
+// too, where ASan and tools/animbench's alignment check see it. With
+// fillBgRow()'s prefix the cleared bits are already zero and this is a
+// plain fill. drawGlowSpanAsm is drawGlowSpanScalar, which the asm is
+// pixel-exact with.
+static void fillRowPie(uint16_t *__restrict dstIn, uint16_t color, int nOct) {
+    if (nOct <= 0) {
+        return;
+    }
+    uint16_t *wr = reinterpret_cast<uint16_t *>(reinterpret_cast<uintptr_t>(dstIn) & ~static_cast<uintptr_t>(15));
+    for (int i = 0; i < nOct * 8; i++) {
+        wr[i] = color;
+    }
+}
+
+static void drawGlowSpanAsm(uint16_t *__restrict rowIn, int32_t dxQ8_0, int32_t dy2Q4, int32_t invR2Fixed, uint8_t rCol,
+                            uint8_t gCol, uint8_t bCol, uint8_t a8v, int count) {
+    drawGlowSpanScalar(rowIn, dxQ8_0, dy2Q4, invR2Fixed, rCol, gCol, bCol, a8v, count);
+}
 #endif
 
-void band(uint16_t *dst, int y0, int rows, int w, uint32_t tMs, const uint8_t *p) {
-#if defined(__XTENSA__) && !defined(GM_BGANIM_NO_ASM)
+// One background row: scalar stores until the address is a multiple of 16,
+// the vector fill over the whole groups of eight after that, scalar stores
+// for the remainder. The prefix is by address, not by pixel index
+// (gm-bzu.49). The row is one colour, so the split has no pattern to keep
+// in phase.
+static void fillBgRow(uint16_t *row, uint16_t c, int w) {
+    while (w > 0 && (reinterpret_cast<uintptr_t>(row) & 15) != 0) {
+        *row++ = c;
+        w--;
+    }
+    const int nOct = w >> 3;
+    fillRowPie(row, c, nOct);
+    row += static_cast<size_t>(nOct) * 8;
+    for (int i = 0; i < (w & 7); i++) {
+        row[i] = c;
+    }
+}
+
+// Every build runs this glue: on the device with the asm kernels, on the
+// host with their twins above, so the goldens, the interlace check and the
+// fuzz all exercise fillBgRow()'s prefix and tail. bandRef() stays the
+// plain scalar spec.
+void band(uint16_t *dst, int y0, int rows, int w, uint32_t, const uint8_t *) {
     for (int r = 0; r < rows; r++) {
-        uint16_t *row = dst + static_cast<size_t>(r) * w;
-        if ((w & 7) == 0) {
-            fillRowPie(row, bgLUT[y0 + r], w >> 3);
-        } else { // never hit in production: w is always 480 or 240
-            fillBgRowScalar(row, bgLUT[y0 + r], w);
-        }
+        fillBgRow(dst + static_cast<size_t>(r) * w, bgLUT[y0 + r], w);
     }
     for (int i = 0; i < ffCount; i++) {
         const FfDraw &d = draws[i];
@@ -469,9 +513,6 @@ void band(uint16_t *dst, int y0, int rows, int w, uint32_t tMs, const uint8_t *p
             drawGlowSpanAsm(row, dxQ8_0, dy2Q4, d.invR2Fixed, d.r, d.g, d.b, d.a8, b.xx1 - b.xx0 + 1);
         }
     }
-#else
-    bandRef(dst, y0, rows, w, tMs, p);
-#endif
 }
 
 void release() {

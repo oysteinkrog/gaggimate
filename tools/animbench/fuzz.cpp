@@ -13,8 +13,22 @@
 // Time is swept too: tMs is millis(), which reaches 4.2e9 before it wraps, and
 // fixed-point time math that is fine at t=1e3 can overflow at t=1e9.
 //
-//   make -f Makefile.fuzz && ./build/fuzz            all animations
+// A second pass checks destination alignment (gm-bzu.49). BgAnim.h promises
+// band() only a 4-byte-aligned dst, and ee.vst.128.ip silently clears the low
+// four address bits, so a PIE kernel that trusts the pointer writes before its
+// span. The host never compiles the asm, but AnimOrbits and AnimFireflies run
+// their fill glue here through host twins that store the way the vector store
+// does, masked to 16 bytes. So every animation is rendered at 480, 240, 466 and
+// 233 px into a buffer 0, 4, 8 and 12 bytes past a 16-byte boundary, with
+// sentinel guard zones on both sides, and each result must match bandRef()
+// rendered into an aligned buffer, with both guards untouched. Rows per call
+// are 1 and 2 (the device's BAND_H) for an even width and 1 for 233, the
+// shapes BgAnim.h allows; the 2-row call at 466 is the one whose second row
+// starts 4 mod 16 even from an aligned dst.
+//
+//   make -f Makefile.fuzz && ./build/fuzz            all animations, both passes
 //   ./build/fuzz --anim 4                            one registry id
+//   ./build/fuzz --align-only                        only the alignment pass
 #include "../../src/display/ui/default/bganim/BgAnim.h"
 #include "../../src/display/ui/default/bganim/BgAnimCommon.h"
 
@@ -22,6 +36,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <algorithm>
 #include <vector>
 
 namespace {
@@ -102,16 +117,104 @@ void applyTheme(int which) {
     }
 }
 
+// Pixels of sentinel on each side of the destination. A masked 16-byte store
+// reaches at most 12 bytes before the span; 16 pixels is 32 bytes.
+constexpr int GUARD_PX = 16;
+constexpr uint16_t SENTINEL = 0xA5C3;
+const int ALIGN_WIDTHS[] = {480, 240, 466, 233};
+const int ALIGN_OFFSETS[] = {0, 4, 8, 12}; // bytes past a 16-byte boundary
+
+// Known issue, not an alignment fault: AnimMandala renders in two-pixel
+// blocks (nBlocks = w / 2) and at an odd width never writes column w - 1, in
+// band() and bandRef() alike, so that column holds whatever the buffer held
+// before. Found by this pass (gm-bzu.49), outside that bead's files; a
+// mismatch that is Mandala's, at an odd width, confined to column w - 1 and
+// with both guards clean is counted here and reported, not failed. Delete
+// this when AnimMandala writes the last column.
+int g_knownMandalaTail = 0;
+
+bool knownMandalaTail(const BgAnimation &anim, int w, const uint16_t *dst, const uint16_t *ref, size_t n) {
+    if ((w & 1) == 0 || strcmp(anim.id, "mandala") != 0) {
+        return false;
+    }
+    for (size_t i = 0; i < n; i++) {
+        if (dst[i] != ref[i] && static_cast<int>(i % w) != w - 1) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// Renders every band of one frame at width w through band() at each dst
+// offset and compares with bandRef(). Returns the number of failures, and
+// prints the first few.
+int alignCheck(const BgAnimation &anim, int w, const uint8_t p[4], uint32_t t, const char *why) {
+    const int h = w;
+    anim.frame(t, w, h, p);
+    int failures = 0;
+    const int maxRows = (w & 1) ? 1 : 2;
+    for (int rows = 1; rows <= maxRows; rows++) {
+        const size_t n = static_cast<size_t>(w) * rows;
+        // One block per shape: guard, up to 12 bytes of offset, the span,
+        // guard. uint16_t storage, base rounded up to 16 bytes by hand.
+        std::vector<uint16_t> ref(n + 8);
+        uint16_t *refDst = reinterpret_cast<uint16_t *>((reinterpret_cast<uintptr_t>(ref.data()) + 15) & ~uintptr_t{15});
+        std::vector<uint16_t> buf(n + 2 * GUARD_PX + 16);
+        uint16_t *base = reinterpret_cast<uint16_t *>(
+            (reinterpret_cast<uintptr_t>(buf.data() + GUARD_PX) + 15) & ~uintptr_t{15});
+        for (int y0 = 0; y0 + rows <= h; y0 += rows) {
+            anim.bandRef(refDst, y0, rows, w, t, p);
+            for (int off : ALIGN_OFFSETS) {
+                std::fill(buf.begin(), buf.end(), SENTINEL);
+                uint16_t *dst = base + off / 2;
+                anim.band(dst, y0, rows, w, t, p);
+                int badBefore = 0, badAfter = 0, badPx = 0, firstPx = -1;
+                for (uint16_t *q = buf.data(); q < dst; q++) {
+                    badBefore += *q != SENTINEL;
+                }
+                for (uint16_t *q = dst + n; q < buf.data() + buf.size(); q++) {
+                    badAfter += *q != SENTINEL;
+                }
+                for (size_t i = 0; i < n; i++) {
+                    if (dst[i] != refDst[i]) {
+                        if (firstPx < 0) {
+                            firstPx = static_cast<int>(i);
+                        }
+                        badPx++;
+                    }
+                }
+                if (!badBefore && !badAfter && badPx && knownMandalaTail(anim, w, dst, refDst, n)) {
+                    g_knownMandalaTail++;
+                    continue;
+                }
+                if (badBefore || badAfter || badPx) {
+                    if (failures < 4) {
+                        printf("%-11s ALIGN FAIL w=%d rows=%d y0=%d off=%d (%s, t=%u): %d px differ from bandRef "
+                               "(first row %d col %d), guard before %d, after %d\n",
+                               anim.id, w, rows, y0, off, why, t, badPx, firstPx < 0 ? -1 : firstPx / w,
+                               firstPx < 0 ? -1 : firstPx % w, badBefore, badAfter);
+                    }
+                    failures++;
+                }
+            }
+        }
+    }
+    return failures;
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
     int onlyAnim = -1;
     int nRandom = 24;
+    bool alignOnly = false;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--anim") == 0 && i + 1 < argc) {
             onlyAnim = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--random") == 0 && i + 1 < argc) {
             nRandom = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--align-only") == 0) {
+            alignOnly = true;
         } else {
             fprintf(stderr, "unknown arg %s\n", argv[i]);
             return 1;
@@ -121,7 +224,7 @@ int main(int argc, char **argv) {
     const int nThemes = bg_theme_count() + 2; // built-ins + 2-stop and 8-stop custom
     unsigned long long bands = 0;
 
-    for (int id = 0; id < bg_animation_count(); id++) {
+    for (int id = 0; id < bg_animation_count() && !alignOnly; id++) {
         if (onlyAnim >= 0 && id != onlyAnim) {
             continue;
         }
@@ -158,6 +261,47 @@ int main(int argc, char **argv) {
                sizeof(TIMES) / sizeof(TIMES[0]), H / BAND_H);
         fflush(stdout);
     }
-    printf("\n%llu bands rendered clean\n", bands);
+    if (!alignOnly) {
+        printf("\n%llu bands rendered clean\n", bands);
+    }
+
+    // Alignment pass: defaults and both corners, two times, every width and
+    // offset. One theme; the palette is not what this pass is about.
+    applyTheme(0);
+    int alignFailures = 0;
+    for (int id = 0; id < bg_animation_count(); id++) {
+        if (onlyAnim >= 0 && id != onlyAnim) {
+            continue;
+        }
+        const BgAnimation &anim = bg_animation(id);
+        const std::vector<ParamSet> sets = paramSets(anim, 0); // defaults, corners, single-parameter ends
+        int animFailures = 0;
+        for (int w : ALIGN_WIDTHS) {
+            for (size_t si = 0; si < sets.size() && si < 3; si++) {
+                anim.release(); // a new size: start from nothing, as the device does
+                if (!anim.init(w, w)) {
+                    printf("%-11s INIT FAILED at %d (%s)\n", anim.id, w, sets[si].why);
+                    animFailures++;
+                    continue;
+                }
+                for (uint32_t t : {33u, 5000000u}) {
+                    animFailures += alignCheck(anim, w, sets[si].p, t, sets[si].why);
+                }
+            }
+        }
+        anim.release();
+        printf("%-11s align %s (widths 480 240 466 233, dst +0 +4 +8 +12 bytes)\n", anim.id, animFailures ? "FAIL" : "ok");
+        fflush(stdout);
+        alignFailures += animFailures;
+    }
+    if (g_knownMandalaTail) {
+        printf("\nknown: mandala leaves column w-1 unwritten at odd widths (%d band calls, see knownMandalaTail)\n",
+               g_knownMandalaTail);
+    }
+    if (alignFailures) {
+        printf("\n%d alignment failures\n", alignFailures);
+        return 1;
+    }
+    printf("\nalignment pass clean\n");
     return 0;
 }

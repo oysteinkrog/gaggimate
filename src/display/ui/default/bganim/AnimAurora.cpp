@@ -424,6 +424,27 @@ RowState computeRowState(int y, float t, const float *ct, uint16_t rowLUT[ROWLUT
 // the device equivalence test (/api/debug/animtest) is checking two
 // separately-written implementations of the same math, not one path calling
 // the other.
+// The last pixel of an odd-width row (233 px, the 466 panel's half
+// resolution), which no pair covers (gm-bzu.49). It is the grid's next
+// sample, at x = w - 1: ph1 and ph2 advanced by (w - 1) steps from the
+// row's start, clamped, squared and row-scaled like every other sample,
+// with column w - 1's dither. The pair loops leave scur at exactly this
+// sample; recomputing it here lets the asm path, whose kernel keeps scur
+// in a register, share one tail with bandRef.
+void auroraOddTail(uint16_t *__restrict row, uint32_t ph1, uint32_t ph2, int32_t rowScale, const int32_t *rowDf,
+                   const int32_t *__restrict w1, const int32_t *__restrict w2, const uint16_t *rowLUT, int w) {
+    if ((w & 1) == 0) {
+        return;
+    }
+    const uint32_t steps = static_cast<uint32_t>(w - 1);
+    const uint32_t p1 = ph1 + steps * STEP1;
+    const uint32_t p2 = ph2 + steps * STEP2;
+    const int32_t v = w1[(p1 >> 8) & 1023] + w2[(p2 >> 8) & 1023];
+    const int32_t vc = v > 0 ? v : 0;
+    const int32_t s = (((vc * vc) >> 12) * rowScale) >> 12;
+    row[w - 1] = rowLUT[s + rowDf[(w - 1) & 7]];
+}
+
 // Renders one row's full pixel content: computeRowState plus the coarse-
 // column-grid pair loop, unchanged per-pixel math. Takes ySrc, not the row
 // being written, because the caller always derives ySrc from y before
@@ -448,9 +469,9 @@ void renderAuroraRowRef(uint16_t *__restrict row, int ySrc, float t, const int32
 
     // Coarse column grid, spacing 2: sample the field (and its downstream
     // clamp/square/scale) at x=0,2,4,... and linearly interpolate the
-    // ROWLUT INDEX for the odd pixel in between. w is always even (480 or
-    // 240), so every pixel is covered by exactly one pair, no remainder
-    // loop.
+    // ROWLUT INDEX for the odd pixel in between. An odd w leaves the last
+    // pixel outside every pair; auroraOddTail after the loop writes it.
+    const uint32_t ph1Row = ph1, ph2Row = ph2;
     int32_t scur = sampleScaledSq();
     for (int x = 0; x + 2 <= w; x += 2) {
         ph1 += STEP1;
@@ -465,6 +486,7 @@ void renderAuroraRowRef(uint16_t *__restrict row, int ySrc, float t, const int32
         row[x + 1] = rowLUT[sodd + rowDf[(x + 1) & 7]];
         scur = snext;
     }
+    auroraOddTail(row, ph1Row, ph2Row, rowScale, rowDf, w1, w2, rowLUT, w);
 }
 
 // A row's content and dither phase are always derived from ySrc = y & ~1
@@ -674,6 +696,7 @@ void renderAuroraRowAsm(uint16_t *row, int ySrc, float t, const int32_t *__restr
     const int32_t vc0 = v0 > 0 ? v0 : 0;
     const int32_t scur0 = (((vc0 * vc0) >> 12) * st.rowScale) >> 12;
     auroraPixelsAsm(row, w1, w2, rowLUT, ditherFold + st.dbase, st.ph1, st.ph2, st.rowScale, scur0, w >> 1);
+    auroraOddTail(row, st.ph1, st.ph2, st.rowScale, ditherFold + st.dbase, w1, w2, rowLUT, w);
 }
 
 // Device path. Same ySrc/row-stride structure as bandRef above, so the two

@@ -1183,13 +1183,26 @@ void SleepAnimation::start(Display *d) {
         // need. 15,360 B of band buffers in internal SRAM provably kills the
         // WPA handshake; 1,920 B is eight times smaller, so it gets its own
         // reserve rather than the band buffers'.
+        //
+        // 16-byte aligned in both places (gm-bzu.49). The heap's own
+        // alignment is 4, so a plain malloc lands at 0, 4, 8 or 12 mod 16,
+        // and the PIE fills in AnimFireflies and AnimOrbits used to store
+        // from the row start: ee.vst.128.ip clears the low four address
+        // bits, so the first store overwrote the heap block header in front
+        // of the buffer. The kernels now take a scalar prefix by address,
+        // so this is not what keeps them in bounds any more; it keeps the
+        // half-resolution rows on the vector path from the first pixel.
+        // Never freed, so no aligned-free pairing to keep.
         constexpr size_t HALFBUF_RESERVE = 32 * 1024;
         const size_t halfBytes = static_cast<size_t>(w / 2) * (BAND_H / 2) * sizeof(uint16_t);
         if (heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA | MALLOC_CAP_8BIT) >= halfBytes + HALFBUF_RESERVE) {
-            halfBuf = static_cast<uint16_t *>(heap_caps_malloc(halfBytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+            halfBuf = static_cast<uint16_t *>(heap_caps_aligned_alloc(16, halfBytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
         }
         if (halfBuf == nullptr) {
-            halfBuf = static_cast<uint16_t *>(allocPreferInternal(halfBytes));
+            halfBuf = static_cast<uint16_t *>(heap_caps_aligned_alloc(16, halfBytes, MALLOC_CAP_SPIRAM));
+        }
+        if (halfBuf == nullptr) {
+            halfBuf = static_cast<uint16_t *>(allocPreferInternal(halfBytes)); // last resort, 4-byte aligned
         }
         log_i("SleepAnimation: halfBuf %u B at %p (%s)", static_cast<unsigned>(halfBytes), halfBuf,
               halfBuf == nullptr ? "FAILED" : (esp_ptr_external_ram(halfBuf) ? "PSRAM" : "internal"));

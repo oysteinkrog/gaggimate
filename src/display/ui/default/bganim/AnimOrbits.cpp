@@ -360,10 +360,13 @@ void bandRef(uint16_t *dst, int y0, int rows, int w, uint32_t, const uint8_t *) 
 // this file's per-pixel work otherwise has none of (path points and orbit
 // bodies are sparse scatter, a few hundred writes a frame combined).
 //
-// dst must be 16-byte aligned and nOct*8 must equal rows*w exactly: both
-// hold for every caller here (band buffer rows are 16-byte aligned per
-// CLAUDE.md; w is 480 or 240 and rows is 1, 2 or 8 on every real caller, so
-// rows*w is always a multiple of 8).
+// dst must be 16-byte aligned: ee.vst.128.ip clears the low four address
+// bits without a fault, so a misaligned dst writes up to 12 bytes before
+// the span and leaves as many unwritten at its end. Only fillBg() below
+// calls this, and it hands over the 16-byte-aligned interior of the span
+// with a scalar prefix and tail around it (gm-bzu.49): BgAnim.h promises
+// only a 4-byte-aligned dst, halfBuf used to be 4 mod 16 on some boots,
+// and rows*w is not a multiple of 8 at 233 px.
 //
 // PIE has no scalar-broadcast-into-lanes instruction (ASM_BRIEF's
 // ee.movi.32.q sets one 32-bit lane pair at a time, four instructions to
@@ -378,6 +381,9 @@ void bandRef(uint16_t *dst, int y0, int rows, int w, uint32_t, const uint8_t *) 
 // note above SleepAnimation.cpp's scale565Oct). The compiler never touches
 // q registers, so no clobber list entry exists for them.
 __attribute__((noinline)) static void fillBgPie(uint16_t *dst, int nOct, uint16_t bg) {
+    if (nOct <= 0) {
+        return; // the loop below is a do-while: nOct == 0 would run 2^32 times
+    }
     alignas(16) uint16_t bcast[8] = {bg, bg, bg, bg, bg, bg, bg, bg};
     uint16_t *wr = dst;
     const uint16_t *src = bcast;
@@ -391,7 +397,42 @@ __attribute__((noinline)) static void fillBgPie(uint16_t *dst, int nOct, uint16_
                  :
                  : "memory");
 }
+#else
+// Host twin of fillBgPie: same name, same signature, and it stores the way
+// ee.vst.128.ip does, to the address with its low four bits cleared. A
+// caller that hands it a misaligned dst therefore writes before the span on
+// the host too, where ASan and tools/animbench's alignment check see it,
+// instead of only on the device. With fillBg()'s prefix the cleared bits
+// are already zero and this is a plain fill.
+static void fillBgPie(uint16_t *dst, int nOct, uint16_t bg) {
+    if (nOct <= 0) {
+        return;
+    }
+    uint16_t *wr = reinterpret_cast<uint16_t *>(reinterpret_cast<uintptr_t>(dst) & ~static_cast<uintptr_t>(15));
+    for (int i = 0; i < nOct * 8; i++) {
+        wr[i] = bg;
+    }
+}
 #endif
+
+// Fills n pixels from dst with bg: scalar stores until the address is a
+// multiple of 16, the vector fill over the whole groups of eight after
+// that, scalar stores for the remainder. The prefix is by address, not by
+// pixel index, because a row inside a band starts at dst + r*w and at
+// w = 466 that is 4 mod 16 on every other row (gm-bzu.49). Every pixel gets
+// the same value, so the split has no pattern to keep in phase.
+static void fillBg(uint16_t *dst, int n, uint16_t bg) {
+    while (n > 0 && (reinterpret_cast<uintptr_t>(dst) & 15) != 0) {
+        *dst++ = bg;
+        n--;
+    }
+    const int nOct = n >> 3;
+    fillBgPie(dst, nOct, bg);
+    dst += static_cast<size_t>(nOct) * 8;
+    for (int i = 0; i < (n & 7); i++) {
+        dst[i] = bg;
+    }
+}
 
 // Device path: PIE-fill the background, then the shared scalar overlay pass
 // (sparse scatter -- path points and orbit-body stamps -- stays scalar; see
@@ -401,15 +442,12 @@ __attribute__((noinline)) static void fillBgPie(uint16_t *dst, int nOct, uint16_
 // pixel-exactness holds by construction rather than by a separately
 // maintained duplicate.
 //
-// Host / non-Xtensa builds: band() IS bandRef(), not merely equivalent to
-// it -- there is no second scalar fill to keep in sync.
-void band(uint16_t *dst, int y0, int rows, int w, uint32_t tMs, const uint8_t *p) {
-#if defined(__XTENSA__) && !defined(GM_BGANIM_NO_ASM)
-    fillBgPie(dst, (rows * w) >> 3, g_bg);
+// Host / non-Xtensa builds run the same glue with fillBgPie's host twin,
+// so the goldens, the interlace check and the fuzz all exercise fillBg()'s
+// prefix and tail; bandRef() stays the plain scalar spec.
+void band(uint16_t *dst, int y0, int rows, int w, uint32_t, const uint8_t *) {
+    fillBg(dst, rows * w, g_bg);
     drawOverlays(dst, y0, rows, w);
-#else
-    bandRef(dst, y0, rows, w, tMs, p);
-#endif
 }
 
 void release() {
