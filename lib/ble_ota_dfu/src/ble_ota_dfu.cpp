@@ -29,121 +29,133 @@ static inline void logTxPacket(BLECharacteristic *pChar) {
 #endif
 }
 
+// Sends the install report (0x0F + text) for an install that stopped before
+// Update.begin(), and hands the watchdog back. The display has its 0xF2 ack
+// by now and is waiting for this report (GitHubOTA::update).
+static void report_install_abort(BLE_OTA_DFU *ota, const char *text) {
+    ESP_LOGE(TAG, "%s", text);
+    FLASH.remove("/update.bin");
+    if (ota->connected()) {
+        ota->send_OTA_DFU((String) static_cast<char>(OTA_SIGNAL_REPORT) + text);
+        delay(10);
+    }
+    ota->setInstalling(false);
+    ota->setUpdating(false);
+}
+
 void task_install_update(void *parameters) {
-    FS file_system = FLASH;
     const char path[] = "/update.bin";
-    uint8_t data = 0;
     BLE_OTA_DFU *OTA_DFU_BLE;
     OTA_DFU_BLE = reinterpret_cast<BLE_OTA_DFU *>(parameters);
     delay(100);
 
-    // Wait for the upload to be completed
-    bool start_update = false;
-    xQueuePeek(start_update_queue, &start_update, portMAX_DELAY);
-    while (!start_update) {
-        delay(500);
+    for (;;) {
+        // Wait for the upload to be completed
+        bool start_update = false;
         xQueuePeek(start_update_queue, &start_update, portMAX_DELAY);
-    }
-
-    ESP_LOGE(TAG, "Starting OTA update");
-
-    // Open update.bin file.
-    File update_binary = FLASH.open(path);
-
-    // If the file cannot be loaded, return.
-    if (!update_binary) {
-        ESP_LOGE(TAG, "Could not load update.bin from spiffs root");
-        vTaskDelete(NULL);
-    }
-
-    // Verify that the file is not a directory
-    if (update_binary.isDirectory()) {
-        ESP_LOGE(TAG, "Error, update.bin is not a file");
-        update_binary.close();
-        vTaskDelete(NULL);
-    }
-
-    // Get binary file size
-    size_t update_size = update_binary.size();
-
-    // Proceed to the update if the file is not empty
-    if (update_size <= 0) {
-        ESP_LOGE(TAG, "Error, update file is empty");
-        update_binary.close();
-        vTaskDelete(NULL);
-    }
-
-    ESP_LOGI(TAG, "Starting the update");
-    // perform_update(update_binary, update_size);
-    String result = (String) static_cast<char>(0x0F);
-
-    // Init update
-    //
-    // Arduino's UpdateClass writes to whatever esp_ota_get_next_update_partition()
-    // returns, and IDF returns the *running* partition when the table has only one
-    // OTA slot. Beginning an update there erases the app currently executing, with
-    // nothing to fall back to and no way in to reflash except USB. Refuse instead.
-    // Every table a release ships has two slots, so this only trips on
-    // single-slot development builds (see partitions/headless_8mb.csv).
-    const esp_partition_t *running = esp_ota_get_running_partition();
-    const esp_partition_t *target = esp_ota_get_next_update_partition(nullptr);
-    if (target == nullptr || target == running) {
-        ESP_LOGE(TAG, "Refusing OTA: no spare app slot (running=%s)", running != nullptr ? running->label : "?");
-        result += "Refusing OTA: this build has a single app slot, reflash over USB instead";
-    } else if (Update.begin(update_size)) {
-        // Perform the update
-        size_t written = Update.writeStream(update_binary);
-
-        ESP_LOGI(TAG, "Written: %d/%d. %s", written, update_size, written == update_size ? "Success!" : "Retry?");
-        result +=
-            "Written : " + String(written) + "/" + String(update_size) + " [" + String((written / update_size) * 100) + " %] \n";
-
-        // Check update
-        if (Update.end()) {
-            ESP_LOGI(TAG, "OTA done!");
-            result += "OTA Done: ";
-
-            if (Update.isFinished()) {
-                ESP_LOGI(TAG, "Update successfully completed. Rebooting...");
-            } else {
-                ESP_LOGE(TAG, "Update not finished? Something went wrong!");
-            }
-
-            result += Update.isFinished() ? "Success!\n" : "Failed!\n";
-        } else {
-            ESP_LOGE(TAG, "Error Occurred. Error #: %d", Update.getError());
-            result += "Error #: " + String(Update.getError());
+        while (!start_update) {
+            delay(500);
+            xQueuePeek(start_update_queue, &start_update, portMAX_DELAY);
         }
-    } else {
-        ESP_LOGE(TAG, "Not enough space to begin BLE OTA DFU");
-        result += "Not enough space to begin BLE OTA DFU";
-    }
+        // Consume the request. The early failures below go back to waiting
+        // instead of deleting this task, so a later transfer can still install.
+        start_update = false;
+        xQueueOverwrite(start_update_queue, &start_update);
 
-    update_binary.close();
+        ESP_LOGE(TAG, "Starting OTA update");
 
-    // When finished remove the binary from spiffs
-    // to indicate the end of the process
-    ESP_LOGI(TAG, "Removing update file");
-    FLASH.remove(path);
+        // Open update.bin file.
+        File update_binary = FLASH.open(path);
 
-    if (OTA_DFU_BLE->connected()) {
-        // Return the result to the client (tells the client if the update was a
-        // successfull or not)
-        ESP_LOGI(TAG, "Sending result to client");
-        OTA_DFU_BLE->send_OTA_DFU(result);
-        // OTA_DFU_BLE->pCharacteristic_BLE_OTA_DFU_TX->setValue(result);
-        // OTA_DFU_BLE->pCharacteristic_BLE_OTA_DFU_TX->notify();
-        ESP_LOGE(TAG, "%s", result.c_str());
-        ESP_LOGI(TAG, "Result sent to client");
+        // If the file cannot be loaded, report it and wait for the next one.
+        if (!update_binary) {
+            report_install_abort(OTA_DFU_BLE, "Refusing OTA: could not open update.bin");
+            continue;
+        }
+
+        // Verify that the file is not a directory
+        if (update_binary.isDirectory()) {
+            update_binary.close();
+            report_install_abort(OTA_DFU_BLE, "Refusing OTA: update.bin is not a file");
+            continue;
+        }
+
+        // Get binary file size
+        size_t update_size = update_binary.size();
+
+        // Proceed to the update if the file is not empty
+        if (update_size == 0) {
+            update_binary.close();
+            report_install_abort(OTA_DFU_BLE, "Refusing OTA: update.bin is empty");
+            continue;
+        }
+
+        ESP_LOGI(TAG, "Starting the update");
+        String result = (String) static_cast<char>(OTA_SIGNAL_REPORT);
+
+        // Init update
+        //
+        // Arduino's UpdateClass writes to whatever esp_ota_get_next_update_partition()
+        // returns, and IDF returns the *running* partition when the table has only one
+        // OTA slot. Beginning an update there erases the app currently executing, with
+        // nothing to fall back to and no way in to reflash except USB. Refuse instead.
+        // Every table a release ships has two slots, so this only trips on
+        // single-slot development builds (see partitions/headless_8mb.csv).
+        const esp_partition_t *running = esp_ota_get_running_partition();
+        const esp_partition_t *target = esp_ota_get_next_update_partition(nullptr);
+        if (target == nullptr || target == running) {
+            ESP_LOGE(TAG, "Refusing OTA: no spare app slot (running=%s)", running != nullptr ? running->label : "?");
+            result += "Refusing OTA: this build has a single app slot, reflash over USB instead";
+        } else if (Update.begin(update_size)) {
+            // Perform the update
+            size_t written = Update.writeStream(update_binary);
+
+            ESP_LOGI(TAG, "Written: %d/%d. %s", written, update_size, written == update_size ? "Success!" : "Retry?");
+            result += "Written : " + String(written) + "/" + String(update_size) + " [" +
+                      String((written / update_size) * 100) + " %] \n";
+
+            // Check update
+            if (Update.end()) {
+                ESP_LOGI(TAG, "OTA done!");
+                result += "OTA Done: ";
+
+                if (Update.isFinished()) {
+                    ESP_LOGI(TAG, "Update successfully completed. Rebooting...");
+                } else {
+                    ESP_LOGE(TAG, "Update not finished? Something went wrong!");
+                }
+
+                result += Update.isFinished() ? "Success!\n" : "Failed!\n";
+            } else {
+                ESP_LOGE(TAG, "Error Occurred. Error #: %d", Update.getError());
+                result += "Error #: " + String(Update.getError());
+            }
+        } else {
+            ESP_LOGE(TAG, "Not enough space to begin BLE OTA DFU");
+            result += "Not enough space to begin BLE OTA DFU";
+        }
+
+        update_binary.close();
+
+        // When finished remove the binary from spiffs
+        // to indicate the end of the process
+        ESP_LOGI(TAG, "Removing update file");
+        FLASH.remove(path);
+
+        if (OTA_DFU_BLE->connected()) {
+            // Return the result to the client (tells the client if the update was a
+            // successfull or not)
+            ESP_LOGI(TAG, "Sending result to client");
+            OTA_DFU_BLE->send_OTA_DFU(result);
+            ESP_LOGE(TAG, "%s", result.c_str());
+            ESP_LOGI(TAG, "Result sent to client");
+            delay(5000);
+        }
+
+        ESP_LOGE(TAG, "Rebooting ESP32: complete OTA update");
         delay(5000);
+        ESP.restart();
     }
-
-    ESP_LOGE(TAG, "Rebooting ESP32: complete OTA update");
-    delay(5000);
-    ESP.restart();
-
-    // ESP_LOGI(TAG, "Installation is complete");
-    vTaskDelete(NULL);
 }
 
 //    void onStatus(BLECharacteristic* pCharacteristic, Status s, uint32_t
@@ -187,8 +199,8 @@ uint16_t BLEOverTheAirDeviceFirmwareUpdate::write_binary(fs::FS *file_system, co
             // requested length after a short write let received_file_size reach
             // expected_file_size over a truncated update.bin, which was then
             // flashed as a complete image. Returning what landed keeps the total
-            // short, so the install never starts and the display's OTA signal
-            // timeout reports the failure.
+            // short, so the size check on the last part refuses the image and
+            // reports it (gm-bzu.55).
             ESP_LOGE(TAG, "Short write to %s: %u of %u bytes", path, written, length);
         }
     }
@@ -202,6 +214,37 @@ uint16_t BLEOverTheAirDeviceFirmwareUpdate::write_binary(fs::FS *file_system, co
     }
 }
 
+void BLEOverTheAirDeviceFirmwareUpdate::resetTransferState() {
+    if (file_open) {
+        write_binary(&FLASH, "/update.bin", nullptr, 0, false);
+    }
+    received_file_size = 0;
+    expected_file_size = 0;
+    current_progression = 0;
+    parts = 0;
+    MTU = 0;
+}
+
+void BLEOverTheAirDeviceFirmwareUpdate::abortTransfer(const char *report, size_t len) {
+    ESP_LOGE(TAG, "OTA transfer aborted: %.*s", static_cast<int>(len), report);
+    resetTransferState();
+    if (FLASH.exists("/update.bin")) {
+        FLASH.remove("/update.bin");
+    }
+    // Report first, refusal second: the display keeps only the latest signal
+    // byte, and a report landing after the 0xFF could overwrite it before its
+    // transfer loop read it (see ota_image_size.h).
+    uint8_t out[1 + 96];
+    out[0] = OTA_SIGNAL_REPORT;
+    const size_t n = len < sizeof(out) - 1 ? len : sizeof(out) - 1;
+    memcpy(out + 1, report, n);
+    OTA_DFU_BLE->send_OTA_DFU(out, n + 1);
+    delay(10);
+    OTA_DFU_BLE->send_OTA_DFU(OTA_SIGNAL_REFUSED);
+    delay(10);
+    OTA_DFU_BLE->setUpdating(false);
+}
+
 void BLEOverTheAirDeviceFirmwareUpdate::onWrite(BLECharacteristic *pCharacteristic, NimBLEConnInfo & /*connInfo*/) {
     // uint8_t *pData;
     std::string value = pCharacteristic->getValue();
@@ -212,6 +255,7 @@ void BLEOverTheAirDeviceFirmwareUpdate::onWrite(BLECharacteristic *pCharacterist
     // Check that data have been received. A zero-length write is legal on the
     // wire and the switch below dereferences pData[0] unconditionally.
     if (pData != NULL && len > 0) {
+        OTA_DFU_BLE->noteActivity();
 // #define DEBUG_BLE_OTA_DFU_RX
 #ifdef DEBUG_BLE_OTA_DFU_RX
         ESP_LOGD(TAG, "Write callback for characteristic %s of data length %d", pCharacteristic->getUUID().toString().c_str(),
@@ -294,6 +338,15 @@ void BLEOverTheAirDeviceFirmwareUpdate::onWrite(BLECharacteristic *pCharacterist
 
             received_file_size += write_binary(&FLASH, "/update.bin", updater[selected_updater], write_len[selected_updater]);
 
+            // More bytes than the 0xFE packet declared can never become a
+            // valid image, so stop now rather than after the last part.
+            if (expected_file_size != 0 && received_file_size > expected_file_size) {
+                char report[96];
+                const size_t n = formatOtaImageSizeReport(report, sizeof(report), received_file_size, expected_file_size);
+                abortTransfer(report, n);
+                break;
+            }
+
             if ((current_progression < parts - 1) && !FASTMODE) {
                 uint8_t progression[] = {0xF1, (uint8_t)((current_progression + 1) / 256),
                                          (uint8_t)((current_progression + 1) % 256)};
@@ -305,7 +358,24 @@ void BLEOverTheAirDeviceFirmwareUpdate::onWrite(BLECharacteristic *pCharacterist
 
             ESP_LOGI(TAG, "Upload progress: %d/%d", current_progression + 1, parts);
             if (current_progression + 1 == parts) {
-                // If all the file has been received, send the progression
+                // Check the size before acknowledging anything. The ack used
+                // to go out first and a short image then sat in update.bin
+                // without being installed or reported, while the display took
+                // the ack as success and updated itself (gm-bzu.55). A short
+                // write in write_binary() lands here too, since it keeps
+                // received_file_size short.
+                char report[96];
+                const size_t n = formatOtaImageSizeReport(report, sizeof(report), received_file_size, expected_file_size);
+                if (n > 0) {
+                    abortTransfer(report, n);
+                    break;
+                }
+
+                ESP_LOGI(TAG, "Installing update");
+                write_binary(&FLASH, "/update.bin", nullptr, 0, false);
+                OTA_DFU_BLE->setInstalling(true);
+
+                // The whole image is in update.bin: acknowledge it.
                 uint8_t progression[] = {0xF2, (uint8_t)((current_progression + 1) / 256),
                                          (uint8_t)((current_progression + 1) % 256)};
                 OTA_DFU_BLE->pCharacteristic_BLE_OTA_DFU_TX->setValue(progression, 3);
@@ -313,28 +383,22 @@ void BLEOverTheAirDeviceFirmwareUpdate::onWrite(BLECharacteristic *pCharacterist
                 OTA_DFU_BLE->pCharacteristic_BLE_OTA_DFU_TX->notify();
                 delay(10);
 
-                if (received_file_size != expected_file_size) {
-                    // received_file_size += (pData[1] * 256) + pData[2];
-                    received_file_size +=
-                        write_binary(&FLASH, "/update.bin", updater[selected_updater], write_len[selected_updater]);
-
-                    if (received_file_size > expected_file_size) {
-                        ESP_LOGW(TAG, "Unexpected size:\n Expected: %d\nReceived: %d", expected_file_size, received_file_size);
-                    }
-
-                } else {
-                    ESP_LOGI(TAG, "Installing update");
-
-                    // Start the installation
-                    write_binary(&FLASH, "/update.bin", nullptr, 0, false);
-                    bool start_update = true;
-                    xQueueOverwrite(start_update_queue, &start_update);
-                }
+                // Start the installation
+                bool start_update = true;
+                xQueueOverwrite(start_update_queue, &start_update);
             }
         } break;
 
             // Remove previous file and send transfer mode
         case 0xFD: {
+            // A new transfer. The display sends 0xFE and 0xFF before this, so
+            // keep the declared size, parts and MTU; drop only what a previous
+            // transfer left behind.
+            if (file_open) {
+                write_binary(&FLASH, "/update.bin", nullptr, 0, false);
+            }
+            received_file_size = 0;
+            current_progression = 0;
             // Remove previous (failed?) update
             if (FLASH.exists("/update.bin")) {
                 ESP_LOGI(TAG, "Removing previous update");
@@ -488,9 +552,23 @@ bool BLE_OTA_DFU::connected() {
     return pServer->getConnectedCount() > 0;
 }
 
-bool BLE_OTA_DFU::isUpdating() const { return updating; }
+bool BLE_OTA_DFU::isUpdating() const {
+    if (installing) {
+        return true;
+    }
+    return updating && (millis() - last_activity_ms) < OTA_TRANSFER_STALL_MS;
+}
 
-void BLE_OTA_DFU::setUpdating(bool updating) { this->updating = updating; }
+void BLE_OTA_DFU::setUpdating(bool updating) {
+    if (updating) {
+        noteActivity();
+    }
+    this->updating = updating;
+}
+
+void BLE_OTA_DFU::noteActivity() { last_activity_ms = millis(); }
+
+void BLE_OTA_DFU::setInstalling(bool installing) { this->installing = installing; }
 
 void BLE_OTA_DFU::send_OTA_DFU(uint8_t value) {
     uint8_t _value = value;

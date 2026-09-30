@@ -5,6 +5,7 @@
 #define SRC_BLE_OTA_DFU_HPP_
 
 #include "./freertos_utils.hpp"
+#include "./ota_image_size.h"
 #include <Arduino.h>
 #include <FS.h>
 #include <NimBLEDevice.h>
@@ -35,6 +36,12 @@ constexpr char CHARACTERISTIC_OTA_BL_UUID_TX[] =
 
 constexpr bool FORMAT_FLASH_IF_MOUNT_FAILED = true;
 constexpr uint32_t UPDATER_SIZE = 20000;
+// How long a transfer may go without a write from the display before
+// isUpdating() stops holding off the ping watchdog. Matches the display's own
+// silence bound (SIGNAL_TIMEOUT_MS in lib/OTA/src/ControllerOTA.h): a display
+// that has given up, or a link that dropped mid-transfer, must not leave the
+// watchdog's forced disconnect disabled until the next reboot.
+constexpr uint32_t OTA_TRANSFER_STALL_MS = 60000;
 
 /* Dummy class */
 class BLE_OTA_DFU;
@@ -56,6 +63,11 @@ public:
 
   uint16_t write_binary(fs::FS *file_system, const char *path, uint8_t *data,
                         uint16_t length, bool keep_open = true);
+  // Every way a transfer ends without an install goes through here: close and
+  // delete update.bin, forget the transfer state, tell the display (0x0F
+  // report, then the 0xFF refusal) and clear the updating flag.
+  void abortTransfer(const char *report, size_t len);
+  void resetTransferState();
   void onWrite(BLECharacteristic *pCharacteristic, NimBLEConnInfo &connInfo) override;
 };
 
@@ -65,7 +77,14 @@ private:
   BLEService *pServiceOTA = nullptr;
   BLECharacteristic *pCharacteristic_BLE_OTA_DFU_TX = nullptr;
   friend class BLEOverTheAirDeviceFirmwareUpdate;
-  bool updating = false;
+  // Written from the NimBLE host task and the install task, read from the
+  // controller loop.
+  volatile bool updating = false;
+  // Set from the 0xF2 ack until the install task reboots or gives up. Holds
+  // off the ping watchdog without the stall bound, because the display sends
+  // nothing while the image is being flashed.
+  volatile bool installing = false;
+  volatile uint32_t last_activity_ms = 0;
 
 public:
   BLE_OTA_DFU() = default;
@@ -79,6 +98,8 @@ public:
   bool connected();
   bool isUpdating() const;
   void setUpdating(bool updating);
+  void noteActivity();
+  void setInstalling(bool installing);
 
   void send_OTA_DFU(uint8_t value);
   void send_OTA_DFU(uint8_t *value, size_t size);

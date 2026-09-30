@@ -64,6 +64,9 @@ class GaggiMateController {
 
     String _version;
     unsigned long lastPingTime = 0;
+    // Set on the ping-timeout transition, cleared once the link has been
+    // dropped or a ping arrives. See handlePingTimeout().
+    bool timeoutDisconnectPending = false;
     size_t errorState = ERROR_CODE_NONE;
 
     const char *LOG_TAG = "GaggiMateController";

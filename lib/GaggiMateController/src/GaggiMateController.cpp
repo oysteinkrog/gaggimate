@@ -329,6 +329,7 @@ void GaggiMateController::handlePing() {
         errorState = ERROR_CODE_NONE;
     }
     lastPingTime = millis();
+    timeoutDisconnectPending = false;
     ESP_LOGV(LOG_TAG, "Ping received, system is alive");
 }
 
@@ -347,8 +348,17 @@ void GaggiMateController::handlePingTimeout() {
     // the log.
     if (errorState != ERROR_CODE_TIMEOUT) {
         ESP_LOGE(LOG_TAG, "Ping timeout detected. Turning off heater and pump for safety.");
-        if (!_comms.isUpdating())
-            _comms.disconnect();
+        timeoutDisconnectPending = true;
+    }
+    // An OTA transfer holds the disconnect off, since the display sends no
+    // pings while it streams the image. The hold used to be checked only on
+    // the transition, so a timeout that began during a transfer never dropped
+    // the link at all. Keep it pending until the OTA side lets go: an aborted
+    // transfer clears its flag, and a stalled one expires after
+    // OTA_TRANSFER_STALL_MS (gm-bzu.55).
+    if (timeoutDisconnectPending && !_comms.isUpdating()) {
+        timeoutDisconnectPending = false;
+        _comms.disconnect();
     }
     errorState = ERROR_CODE_TIMEOUT;
 }
