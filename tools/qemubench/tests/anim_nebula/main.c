@@ -466,7 +466,7 @@ int main(void) {
         /* Also emit the PIE-prefixed marker run.sh's exit-code grep actually
          * looks for (see tools/qemubench/run.sh) -- ASM_BRIEF.md's own
          * "GM_QEMUBENCH_ANIM: PASS" wording predates that grep (see
-         * anim_fireflies/main.c's identical note), so both are printed
+         * anim_fireflies/main.cpp's identical note), so both are printed
          * rather than picking one and breaking the other. */
         uart_puts("GM_QEMUBENCH_PIE: PASS nebulaFieldPie+nebulaGatherScalar bit-exact vs reference\n");
     } else {

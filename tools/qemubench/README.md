@@ -115,41 +115,21 @@ cp tests/anim_lava/main.cpp "$REPRO/tools/qemubench/tests/anim_lava/"
 python3 check_copies.py --repo-root "$REPRO" anim_lava   # now fails with a diff
 ```
 
-## Current findings (2026-09-30, gm-bzu.35)
+## Findings (2026-09-30, gm-bzu.35 and gm-bzu.78)
 
-Running `check_copies.py` against this checkout for the first time found
-that **15 of 19 test directories match their source verbatim** and **4 do
-not** -- real drift this check exists to catch, not tool bugs (each was
-read side by side with its source to confirm). `build.sh` now refuses to
-build these four until they are corrected; that refusal is the intended
-effect of landing this bead, not a regression it introduced. None of these
-are fixed here: this bead's file scope is `check_copies.py`, `build.sh`,
-and this README, not the test or source files themselves.
+The first run of `check_copies.py` found four test copies that no longer
+matched their source: `anim_caustics` (the test held the old 4-pixel
+kernel; source has the 8-pixel unrolled one), `anim_aurora` (a `movi`/`max`
+pair reordered and a temp register renamed), and `anim_fireflies` and
+`anim_steam` (cast style and operand names). gm-bzu.78 re-transcribed all
+four from source (commit 0ae7c68e); each passes under QEMU and the check
+reports every function matching. `anim_fireflies/main.c` became `main.cpp`
+because the source operand list uses `static_cast`.
 
-- **`anim_caustics`**: the most significant one. `AnimCaustics.cpp`'s
-  `causticsRowKernel` carries its own comment, `"GRID==8, was 2 at
-  GRID==4"` -- the kernel was widened to an 8-pixel unrolled loop and the
-  test's copy was never updated past the old 4-pixel version (different
-  shift immediate, half the unrolled body, different step-table names).
-  The test currently proves the *old* kernel's instructions are self
-  consistent, not anything about the kernel that ships.
-- **`anim_aurora`**: `auroraPixelsAsm`'s `movi %[t3], 0` / `max %[t1],
-  %[t1], %[t3]` pair in `src/` is `movi %[t2], 0` / `max %[t1], %[t1],
-  %[t2]` in the test, with the `movi` moved one instruction later. Whether
-  this is a harmless register-reuse rewrite or a real behavioural
-  difference was not investigated further here -- flagging it precisely is
-  this bead's job, not adjudicating it.
-- **`anim_fireflies`** (`drawGlowSpanAsm`) and **`anim_steam`**
-  (`fillRowPie`): cosmetic-looking differences only -- a cast style
-  (`static_cast<int32_t>(x)` vs `(int32_t)x`) in fireflies' operand list,
-  and steam's local variables `dst`/`wr` bound to the opposite operand
-  names in source vs test (source parameter `wr` copied to local `dst`;
-  test parameter `dst` copied to local `wr` -- the same register slot,
-  named the other way around). The instruction template itself is
-  identical in both. These still fail under the "normalise only
-  whitespace" rule this script deliberately applies (see "What counts as a
-  difference" above): a looser rule that waved these through is the same
-  kind of looseness that let `anim_caustics` go stale.
+Still open: building with the firmware toolchain (GCC 14, -O2) gives
+bit-exact results for 13 of 14 kernels, and `anim_ripples` differs by 1 ULP
+in 6 lanes. That is gm-bzu.79; `build.sh` keeps the 2021r2 toolchain until
+it is settled.
 
 ## On Astra's note: building with the production toolchain
 

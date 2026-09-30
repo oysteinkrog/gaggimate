@@ -85,6 +85,8 @@ extern uint32_t nebula_lerp_self_test(uint32_t *firstBad);
 using PsramString = std::basic_string<char, std::char_traits<char>, PsramStlAllocator<char>>;
 static std::unordered_map<uint32_t, PsramString> rxBuffers;
 static WebUIPlugin *g_webUIPlugin = nullptr;
+// HistoryJob::deliverWs, set by setupServer (the job type is defined below loop()).
+static void (*g_historyWsDeliver)(WebUIPlugin *) = nullptr;
 
 // Serialize a JsonDocument straight into a PSRAM-backed WebSocket message
 // buffer — one exact-sized allocation, off the internal heap. [GM-139]
@@ -242,7 +244,11 @@ void WebUIPlugin::loop() {
 #ifdef GAGGIMATE_SIM
     serviceHistoryQueue(); // the simulator spawns no tasks
 #endif
-    HistoryJob::deliverWs(this);
+    // HistoryJob is defined further down, so the websocket history answers
+    // are sent through a pointer that setupServer sets.
+    if (g_historyWsDeliver != nullptr) {
+        g_historyWsDeliver(this);
+    }
     const unsigned long now = millis();
     // Skip the (blocking, TLS) update check while a process is active: a brew/steam/grind
     // must not have the control loop stalled for the duration of the handshake, nor compete
@@ -670,9 +676,9 @@ struct WebUIPlugin::HistoryJob {
     // Worker state shared by every job. The plugin is a singleton.
     static std::atomic<bool> workerUp;
     static TaskHandle_t worker;
-    static std::mutex auxLock;                                   // guards the two lists below
-    static std::deque<FILE *> toClose;                           // handles to close on the worker
-    static std::deque<std::shared_ptr<HistoryJob>> wsDone;       // answers for the plugin loop
+    static std::mutex auxLock;                             // guards the two lists below
+    static std::deque<FILE *> toClose;                     // handles to close on the worker
+    static std::deque<std::shared_ptr<HistoryJob>> wsDone; // answers for the plugin loop
 
     static void wakeWorker() {
 #ifndef GAGGIMATE_SIM
@@ -1177,6 +1183,7 @@ void WebUIPlugin::setupServer() {
     // request on the async_tcp task and tripped the task watchdog.
     historyFs = fs;
     server.addHandler(new HistoryHandler(this));
+    g_historyWsDeliver = &HistoryJob::deliverWs;
 #ifndef GAGGIMATE_SIM
     {
         // The worker only reads through the filesystem. On an SD card that

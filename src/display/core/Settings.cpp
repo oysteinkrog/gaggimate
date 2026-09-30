@@ -316,7 +316,7 @@ void Settings::addFavoritedProfile(String profile) {
     }
     profiles.emplace_back(std::move(profile));
     if (favoritedProfiles.set(profiles)) {
-        containerGeneration.fetch_add(1, std::memory_order_release);
+        __atomic_add_fetch(&containerGeneration, 1, __ATOMIC_RELEASE);
     }
 }
 
@@ -325,7 +325,7 @@ void Settings::removeFavoritedProfile(String profile) {
     std::vector<String> profiles = favoritedProfiles.get();
     profiles.erase(std::remove(profiles.begin(), profiles.end(), profile), profiles.end());
     if (favoritedProfiles.set(profiles)) {
-        containerGeneration.fetch_add(1, std::memory_order_release);
+        __atomic_add_fetch(&containerGeneration, 1, __ATOMIC_RELEASE);
     }
 }
 
@@ -397,7 +397,7 @@ void Settings::setButtonBehavior(int index, String behavior) {
     }
     behaviors[index] = std::move(behavior);
     if (buttonBehavior.set(behaviors)) {
-        containerGeneration.fetch_add(1, std::memory_order_release);
+        __atomic_add_fetch(&containerGeneration, 1, __ATOMIC_RELEASE);
     }
 }
 

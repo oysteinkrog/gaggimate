@@ -4,7 +4,6 @@
 
 #include <Arduino.h>
 #include <Preferences.h>
-#include <atomic>
 #include <display/core/Property.h>
 #include <display/core/constants.h>
 #include <display/core/utils.h>
@@ -144,7 +143,7 @@ class Settings {
     // when it moved. The bump happens under the value lock after the new
     // value is in place, so a reader that sees the new number and then
     // copies gets the new value.
-    uint32_t getContainerGeneration() const { return containerGeneration.load(std::memory_order_acquire); }
+    uint32_t getContainerGeneration() const { return __atomic_load_n(&containerGeneration, __ATOMIC_ACQUIRE); }
 
     // Getters and setters. Every String and container getter returns a copy
     // taken under the value lock: Property::get hands out a reference, and a
@@ -608,11 +607,14 @@ class Settings {
     template <typename T> void assign(Property<T> &property, const T &value) {
         ValueLock valueLock(*this);
         if (property.set(value)) {
-            containerGeneration.fetch_add(1, std::memory_order_release);
+            __atomic_add_fetch(&containerGeneration, 1, __ATOMIC_RELEASE);
         }
     }
 
-    std::atomic<uint32_t> containerGeneration{0};
+    // A plain word with GCC atomic builtins rather than std::atomic, which
+    // would make Settings non-copyable before gm-bzu.45 fixes the two
+    // plugins that still copy it.
+    uint32_t containerGeneration = 0;
 #ifndef GAGGIMATE_SIM
     SemaphoreHandle_t mutex = nullptr;
     SemaphoreHandle_t valueMutex = nullptr;
