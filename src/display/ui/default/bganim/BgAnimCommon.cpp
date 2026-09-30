@@ -334,27 +334,89 @@ const uint8_t *noiseTex256() {
 // ---- active color theme --------------------------------------------------
 
 namespace {
-// Double buffer behind an atomic generation counter: the writer fills the
-// inactive buffer then increments the generation (buffer index = gen & 1).
-// A torn read would need two settings writes inside one frame — harmless.
-uint8_t g_themeBuf[2][BG_THEME_MAX_STOPS][3] = {
-    {{0x08, 0x04, 0x02}, {0x2a, 0x12, 0x06}, {0x6b, 0x34, 0x13}, {0xb8, 0x70, 0x3a}, {0xe8, 0xb2, 0x68}, {0xf8, 0xe6, 0xc8}},
-    {{0x08, 0x04, 0x02}, {0x2a, 0x12, 0x06}, {0x6b, 0x34, 0x13}, {0xb8, 0x70, 0x3a}, {0xe8, 0xb2, 0x68}, {0xf8, 0xe6, 0xc8}},
+// One published theme: the toned stops, their positions and the generation
+// that produced them. Everything a palette build reads comes from one of
+// these, so a build that reads one buffer throughout sees one generation.
+struct ThemeBuf {
+    uint8_t stops[BG_THEME_MAX_STOPS][3];
+    // Stop positions, 0..255, ascending, first 0 and last 255. Only consulted
+    // when uniform is false: uniform themes (every built-in, and any custom
+    // string without positions) keep the original equal-spacing arithmetic
+    // bit for bit, which is what tools/animbench's goldens encode.
+    uint8_t pos[BG_THEME_MAX_STOPS];
+    int count;
+    bool uniform;
+    uint32_t gen;
 };
-// Stop positions, 0..255, ascending, first 0 and last 255. Only consulted
-// when g_themeUniform is false: uniform themes (every built-in, and any
-// custom string without positions) keep the original equal-spacing
-// arithmetic bit for bit, which is what tools/animbench's goldens encode.
-uint8_t g_themePos[2][BG_THEME_MAX_STOPS] = {{0}, {0}};
-bool g_themeUniform[2] = {true, true};
-int g_themeCount[2] = {6, 6};
-volatile uint32_t g_themeGen = 0;
+
+#define GM_THEME_DEFAULT_BUF                                                                                          \
+    {{{0x08, 0x04, 0x02}, {0x2a, 0x12, 0x06}, {0x6b, 0x34, 0x13}, {0xb8, 0x70, 0x3a}, {0xe8, 0xb2, 0x68}, {0xf8, 0xe6, 0xc8}}, \
+     {0},                                                                                                              \
+     6,                                                                                                                \
+     true,                                                                                                             \
+     0}
+
+// Triple buffer between one writer (the UI task, on a settings change) and
+// one reader (whichever task runs the animation: the render task, or the
+// task that calls init() while the render task is parked). Each buffer is
+// owned by exactly one side at a time:
+//
+//   front  the reader's. The writer never touches it.
+//   back   the writer's. It fills this one, then swaps it into the middle.
+//   middle in between, held in g_themeMid with kThemeFresh set when the
+//          writer has put a newer theme there than the reader has taken.
+//
+// The swaps are atomic exchanges (release on the writer's, acquire on the
+// reader's), so the reader sees a buffer only after the writer finished it,
+// and the writer can publish any number of times in a row without ever
+// writing the buffer the reader is reading. Before this there were two
+// buffers behind a volatile counter, themeRGB() re-read the counter on every
+// call, and two publishes in a row rewrote the buffer the render task was
+// still reading (gm-bzu.71).
+ThemeBuf g_themeBuf[3] = {GM_THEME_DEFAULT_BUF, GM_THEME_DEFAULT_BUF, GM_THEME_DEFAULT_BUF};
+#undef GM_THEME_DEFAULT_BUF
+constexpr uint32_t kThemeFresh = 4; // above the buffer index (0..2)
+std::atomic<uint32_t> g_themeMid{1};
+
+// Writer side (the task that calls setThemeStops/setThemeTone).
+int g_themeBack = 2;
+uint32_t g_themeNextGen = 0;
+
+// Reader side (the animation's task).
+int g_themeFront = 0;
+// True from the first read after a themeGen() call until the next themeGen()
+// call. While it is set the reader does not take a newer buffer, so every
+// themeRGB() call in one palette build reads the same generation. It is
+// released at themeGen(), which every animation calls in frame() before it
+// decides whether to rebuild, so a hold never outlives one frame.
+bool g_themeHeld = false;
+
+// Takes the newest published buffer if there is one. Returns true if the
+// front buffer changed.
+bool themeAdopt() {
+    if ((g_themeMid.load(std::memory_order_relaxed) & kThemeFresh) == 0) {
+        return false;
+    }
+    const uint32_t prev = g_themeMid.exchange(static_cast<uint32_t>(g_themeFront), std::memory_order_acq_rel);
+    g_themeFront = static_cast<int>(prev & 3);
+    return true;
+}
+
+// The buffer every read goes through. The first read after a themeGen() call
+// takes the newest theme and holds it; later reads use the held one.
+const ThemeBuf &themeRead() {
+    if (!g_themeHeld) {
+        themeAdopt();
+        g_themeHeld = true;
+    }
+    return g_themeBuf[g_themeFront];
+}
 
 // The stops as the theme (or the user's hex string) defines them, before tone.
 // Kept separately because brightness and knee have to be re-appliable without
 // the caller re-resolving the theme, and applying them in place would compound:
 // two brightness writes would multiply, and a knee would clamp against the
-// already-kneed values rather than the original ones.
+// already-kneed values rather than the original ones. Writer side only.
 uint8_t g_rawStops[BG_THEME_MAX_STOPS][3] = {
     {0x08, 0x04, 0x02}, {0x2a, 0x12, 0x06}, {0x6b, 0x34, 0x13}, {0xb8, 0x70, 0x3a}, {0xe8, 0xb2, 0x68}, {0xf8, 0xe6, 0xc8},
 };
@@ -368,8 +430,7 @@ int g_knee = 255;          // 255 = shoulder off
 // this runs on a settings write, but the same arithmetic has to be describable
 // to the preview UI, and exact integer steps make the two agree.
 void publishStops() {
-    const uint32_t next = g_themeGen + 1;
-    const int buf = next & 1;
+    ThemeBuf &b = g_themeBuf[g_themeBack];
     const int knee = g_knee;
     const int bright = g_brightness256;
     for (int i = 0; i < g_rawCount; i++) {
@@ -389,15 +450,22 @@ void publishStops() {
             } else if (v > 255) {
                 v = 255;
             }
-            g_themeBuf[buf][i][c] = static_cast<uint8_t>(v);
+            b.stops[i][c] = static_cast<uint8_t>(v);
         }
     }
     for (int i = 0; i < g_rawCount; i++) {
-        g_themePos[buf][i] = g_rawPos[i];
+        b.pos[i] = g_rawPos[i];
     }
-    g_themeUniform[buf] = g_rawUniform;
-    g_themeCount[buf] = g_rawCount;
-    g_themeGen = next;
+    b.uniform = g_rawUniform;
+    b.count = g_rawCount;
+    // Generations stay below the top bit, which themeGen() uses to mark a
+    // value no publish can produce, and below 0x7FFFFFFF so that value is
+    // never 0xFFFFFFFF, the "never built" mark several animations start from.
+    g_themeNextGen = g_themeNextGen >= 0x7FFFFFFEu ? 1 : g_themeNextGen + 1;
+    b.gen = g_themeNextGen;
+    const uint32_t prev =
+        g_themeMid.exchange(static_cast<uint32_t>(g_themeBack) | kThemeFresh, std::memory_order_acq_rel);
+    g_themeBack = static_cast<int>(prev & 3);
 }
 
 // Positions as a positional theme would carry them: p_i = i * 255 / (n - 1).
@@ -405,6 +473,50 @@ void publishStops() {
 void fillUniformPositions(uint8_t *pos, int n) {
     for (int i = 0; i < n; i++) {
         pos[i] = static_cast<uint8_t>((i * 255) / (n - 1));
+    }
+}
+
+void themeRGBFrom(const ThemeBuf &tb, int pos, uint8_t out[3]) {
+    const uint8_t(*st)[3] = tb.stops;
+    const int n = tb.count;
+    if (pos < 0) {
+        pos = 0;
+    } else if (pos > 255) {
+        pos = 255;
+    }
+    if (tb.uniform) {
+        const int scaled = pos * (n - 1); // 0 .. 255*(n-1)
+        const int seg = scaled >> 8;      // stop index
+        const int f = scaled & 255;       // blend within segment
+        for (int c = 0; c < 3; c++) {
+            out[c] = static_cast<uint8_t>(st[seg][c] + (((st[seg + 1][c] - st[seg][c]) * f) >> 8));
+        }
+        return;
+    }
+    // Positional: find the segment holding pos. n is at most 16 and this runs
+    // at palette-build time, so a linear scan is the right tool. Before the
+    // first stop and after the last the end colour holds, as in CSS.
+    const uint8_t *p = tb.pos;
+    if (pos <= p[0]) {
+        for (int c = 0; c < 3; c++) {
+            out[c] = st[0][c];
+        }
+        return;
+    }
+    if (pos >= p[n - 1]) {
+        for (int c = 0; c < 3; c++) {
+            out[c] = st[n - 1][c];
+        }
+        return;
+    }
+    int seg = 0;
+    while (seg < n - 2 && pos >= p[seg + 1]) {
+        seg++;
+    }
+    const int width = p[seg + 1] - p[seg];
+    const int f = width > 0 ? ((pos - p[seg]) * 256) / width : 0; // 0..256
+    for (int c = 0; c < 3; c++) {
+        out[c] = static_cast<uint8_t>(st[seg][c] + (((st[seg + 1][c] - st[seg][c]) * f) >> 8));
     }
 }
 } // namespace
@@ -477,61 +589,37 @@ void setThemeTone(int brightness256, int knee) {
     publishStops();
 }
 
-uint32_t themeGen() { return g_themeGen; }
-int themeStopCount() { return g_themeCount[g_themeGen & 1]; }
-const uint8_t (*themeStops())[3] { return g_themeBuf[g_themeGen & 1]; }
-const uint8_t *themeStopPositions() { return g_themePos[g_themeGen & 1]; }
-bool themeUniform() { return g_themeUniform[g_themeGen & 1]; }
-
-void themeRGB(int pos, uint8_t out[3]) {
-    const int gen = g_themeGen & 1;
-    const uint8_t(*st)[3] = g_themeBuf[gen];
-    const int n = g_themeCount[gen];
-    if (pos < 0) {
-        pos = 0;
-    } else if (pos > 255) {
-        pos = 255;
+uint32_t themeGen() {
+    const bool wasHeld = g_themeHeld;
+    const uint32_t heldGen = g_themeBuf[g_themeFront].gen;
+    g_themeHeld = false;
+    if (themeAdopt() && wasHeld) {
+        // The reads since the last call came from an older theme than the one
+        // just taken. That happens when a publish lands inside a palette
+        // build (the call after the build would otherwise report the new
+        // generation over a palette built from the old one) and when a
+        // publish lands between two frames of an animation that reads the
+        // theme every frame (the next check would otherwise report the old
+        // generation and skip the rebuild). Neither the held generation nor
+        // the new one is safe to report, so report a value no publish
+        // produces: the caller rebuilds now, and if it stores this value the
+        // next call differs from it and it rebuilds once more.
+        return heldGen | 0x80000000u;
     }
-    if (g_themeUniform[gen]) {
-        const int scaled = pos * (n - 1); // 0 .. 255*(n-1)
-        const int seg = scaled >> 8;      // stop index
-        const int f = scaled & 255;       // blend within segment
-        for (int c = 0; c < 3; c++) {
-            out[c] = static_cast<uint8_t>(st[seg][c] + (((st[seg + 1][c] - st[seg][c]) * f) >> 8));
-        }
-        return;
-    }
-    // Positional: find the segment holding pos. n is at most 16 and this runs
-    // at palette-build time, so a linear scan is the right tool. Before the
-    // first stop and after the last the end colour holds, as in CSS.
-    const uint8_t *p = g_themePos[gen];
-    if (pos <= p[0]) {
-        for (int c = 0; c < 3; c++) {
-            out[c] = st[0][c];
-        }
-        return;
-    }
-    if (pos >= p[n - 1]) {
-        for (int c = 0; c < 3; c++) {
-            out[c] = st[n - 1][c];
-        }
-        return;
-    }
-    int seg = 0;
-    while (seg < n - 2 && pos >= p[seg + 1]) {
-        seg++;
-    }
-    const int width = p[seg + 1] - p[seg];
-    const int f = width > 0 ? ((pos - p[seg]) * 256) / width : 0; // 0..256
-    for (int c = 0; c < 3; c++) {
-        out[c] = static_cast<uint8_t>(st[seg][c] + (((st[seg + 1][c] - st[seg][c]) * f) >> 8));
-    }
+    return g_themeBuf[g_themeFront].gen;
 }
+int themeStopCount() { return themeRead().count; }
+const uint8_t (*themeStops())[3] { return themeRead().stops; }
+const uint8_t *themeStopPositions() { return themeRead().pos; }
+bool themeUniform() { return themeRead().uniform; }
+
+void themeRGB(int pos, uint8_t out[3]) { themeRGBFrom(themeRead(), pos, out); }
 
 void buildThemeRamp(uint16_t *out, uint16_t brightness256, bool reversed) {
+    const ThemeBuf &tb = themeRead(); // one snapshot for the whole ramp
     for (int i = 0; i < 256; i++) {
         uint8_t c[3];
-        themeRGB(reversed ? 255 - i : i, c);
+        themeRGBFrom(tb, reversed ? 255 - i : i, c);
         const uint32_t r = (c[0] * brightness256) >> 8;
         const uint32_t g = (c[1] * brightness256) >> 8;
         const uint32_t b = (c[2] * brightness256) >> 8;
@@ -541,9 +629,10 @@ void buildThemeRamp(uint16_t *out, uint16_t brightness256, bool reversed) {
 }
 
 void buildThemeWheel(uint16_t *out, uint16_t brightness256) {
-    const uint8_t(*st)[3] = themeStops();
-    const int n = themeStopCount();
-    if (!themeUniform()) {
+    const ThemeBuf &tb = themeRead(); // one snapshot for the whole wheel
+    const uint8_t(*st)[3] = tb.stops;
+    const int n = tb.count;
+    if (!tb.uniform) {
         // Positional theme: the ramp keeps its shape over the first
         // 256 - W entries and the remaining W blend the last stop back into
         // the first, W being one uniform segment's width so the wrap costs the
@@ -553,7 +642,7 @@ void buildThemeWheel(uint16_t *out, uint16_t brightness256) {
         for (int i = 0; i < 256; i++) {
             uint8_t c[3];
             if (i < rampLen) {
-                themeRGB((i * 255) / (rampLen - 1), c);
+                themeRGBFrom(tb, (i * 255) / (rampLen - 1), c);
             } else {
                 const int f = ((i - rampLen) * 256) / wrap;
                 for (int ch = 0; ch < 3; ch++) {

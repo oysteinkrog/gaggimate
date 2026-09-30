@@ -294,8 +294,16 @@ const uint8_t *noiseTex256();
 
 // ---- active color theme (see BgAnim.h for the theme model) ---------------
 // Written by the UI task on settings change, read by the render task. Writes
-// are double-buffered behind an atomic generation counter; animations poll
-// themeGen() in frame() and rebuild their palettes when it changes.
+// go through a triple buffer, so a publish never touches the buffer the reader
+// holds. Animations poll themeGen() in frame() and rebuild their palettes when
+// it changes. The first read after a themeGen() call (themeRGB, themeStops and
+// the rest, or a buildTheme* call) takes the newest theme, and every read
+// until the next themeGen() call uses that same theme, so a palette build made
+// of many themeRGB() calls never mixes two themes. The pointers themeStops()
+// and themeStopPositions() return stay valid until the next themeGen() call.
+// themeGen() can return a value no publish produces (top bit set) when a
+// theme arrived while reads were held; it differs from every stored value, so
+// the caller rebuilds, and the next call returns a real generation.
 void setThemeStops(const uint8_t (*stops)[3], int nStops);
 // Same, with a position per stop (0..255, ascending; before the first and
 // after the last stop the end colour holds). pos == nullptr behaves as
