@@ -70,6 +70,12 @@ void beginLvglHelper(Display &board, bool debug = false);
 // widget updates can't race the plasma frames on screen.
 void lvgl_helper_suppress_flush(bool suppress);
 
+// Call before the panel is deleted (the display OTA's stopPanel). LVGL gives
+// up the panel's framebuffers for good, renders into its scratch buffer,
+// drops every flush and parks its refresh timer, so nothing writes the PSRAM
+// esp_lcd_panel_del frees. There is no way back; the device restarts after.
+void lvgl_helper_release_panel();
+
 // The areas LVGL re-rendered while flushing was suppressed, in screen
 // coordinates, as a list of disjoint rectangles rather than one bounding box.
 // The box turned two small widgets at opposite screen corners into a

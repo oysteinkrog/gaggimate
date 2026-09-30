@@ -798,6 +798,10 @@ void LilyGo_RGBPanel::presentFrameBuffer(int index, int dirtyY0, int dirtyY1) {
     }
     esp_lcd_panel_draw_bitmap(_panelDrv, 0, dirtyY0, width(), dirtyY1, _fbDirect[index]);
     _fbCurrent = index;
+    // After the request, so a refill counted from here on is one that took
+    // this index (gm-bzu.39). _fbCurrent is only the request; LVGL's takeback
+    // pairs the index with the refill sequence to know when it is on scan.
+    panelclock::notePresent(index);
 }
 
 void LilyGo_RGBPanel::lockFrameBuffer() {

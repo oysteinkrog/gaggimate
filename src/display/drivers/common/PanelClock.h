@@ -105,6 +105,28 @@ bool hasLiveControl();
 // Any argument may be null. All three are zero before attach().
 void scanoutStats(uint32_t *frames, uint32_t *refills, uint32_t *slips);
 
+// Flip bookkeeping (gm-bzu.39), separate from the counters above.
+//
+// refillSeq() counts on_frame_buf_complete like `refills`, but nothing ever
+// zeroes it: not scanoutReset(), not setDiv(), not attach(). The flip waits
+// compare it for inequality against a value captured at a present, and a
+// counter a divider change can zero reads as "the flip happened" when it did
+// not. Compare only with == or !=, never < or >, so a wrap is harmless.
+uint32_t refillSeq();
+
+// Called by the panel driver right after it hands esp_lcd a framebuffer to
+// scan. The refill sequence is captured after the request, so a later change
+// in refillSeq() proves the panel has taken `index`; the unchanged case is
+// ambiguous, and a caller that has to know waits for the change.
+void notePresent(int index);
+
+// The framebuffer last requested and refillSeq() as of that request. This is
+// the REQUESTED buffer, not a confirmed one: it is what the panel scans once
+// refillSeq() differs from `seqAtPresent`. attach() records index 0, which is
+// where esp_lcd starts. Returns false before any attach(); both outputs are
+// then -1 and 0.
+bool lastPresent(int *index, uint32_t *seqAtPresent);
+
 // Refill headroom, which is the measurement `slips` cannot make.
 //
 // There is no public per-EOF callback to replicate esp_lcd's own condition with
@@ -142,7 +164,8 @@ void scanoutStats(uint32_t *frames, uint32_t *refills, uint32_t *slips);
 enum { SCANOUT_MARGIN_BUCKETS = 32, SCANOUT_MARGIN_BUCKET_US = 128 };
 void scanoutMargin(uint32_t *lastUs, uint32_t *minUs, uint32_t *maxUs, uint32_t *buckets);
 
-// Zeroes every scan-out counter, including the margin calibration.
+// Zeroes every scan-out counter, including the margin calibration. refillSeq()
+// and the present record are not counters in this sense and are left alone.
 //
 // Comparing two configurations means comparing rates, and counters that have
 // been accumulating since boot bury a change in whatever came before it.

@@ -47,6 +47,14 @@ volatile uint32_t g_refills = 0; // on_frame_buf_complete, one per refill pass
 volatile uint32_t g_slips = 0;   // count of frames that completed no refill pass
 volatile uint32_t g_refillsAtVsync = 0; // g_refills as of the previous VSYNC
 volatile uint32_t g_maxDrift = 0;
+// Never reset; see refillSeq() in PanelClock.h.
+volatile uint32_t g_refillSeq = 0;
+// Last present (notePresent). Written by whichever task presents, read by the
+// UI task at a takeback; the pair goes under one spinlock so a reader never
+// sees an index with another present's sequence.
+portMUX_TYPE g_presentMux = portMUX_INITIALIZER_UNLOCKED;
+int g_presentIdx = -1;
+uint32_t g_presentSeq = 0;
 
 // Refill headroom in microseconds: how long before VSYNC the refill pass
 // finished copying the frame's last bounce buffer. See PanelClock.h for why
@@ -76,6 +84,7 @@ volatile uint32_t g_slipWrite = 0;
 // turn a diagnostic into a way to crash during an NVS write.
 IRAM_ATTR bool onRefillDone(esp_lcd_panel_handle_t, const esp_lcd_rgb_panel_event_data_t *, void *) {
     g_refills++;
+    g_refillSeq++;
     g_fbcUs = static_cast<uint32_t>(esp_timer_get_time());
     return false;
 }
@@ -262,6 +271,11 @@ void attach(void *panelHandle, uint32_t bootPclkHz) {
     // shares an anonymous union with a deprecated alias, and naming a union
     // member in a braced list makes the initialiser order-dependent in a way
     // g++ rejects outright.
+    // esp_lcd starts a new panel scanning framebuffer 0.
+    taskENTER_CRITICAL(&g_presentMux);
+    g_presentIdx = 0;
+    g_presentSeq = g_refillSeq;
+    taskEXIT_CRITICAL(&g_presentMux);
     esp_lcd_rgb_panel_event_callbacks_t cbs = {};
     cbs.on_vsync = onVsync;
     cbs.on_frame_buf_complete = onRefillDone;
@@ -361,6 +375,30 @@ void scanoutMargin(uint32_t *lastUs, uint32_t *minUs, uint32_t *maxUs, uint32_t 
 
 void setLagThresholdUs(uint32_t us) { g_lagThreshUs = us; }
 
+uint32_t refillSeq() { return g_refillSeq; }
+
+void notePresent(int index) {
+    const uint32_t seq = g_refillSeq;
+    taskENTER_CRITICAL(&g_presentMux);
+    g_presentIdx = index;
+    g_presentSeq = seq;
+    taskEXIT_CRITICAL(&g_presentMux);
+}
+
+bool lastPresent(int *index, uint32_t *seqAtPresent) {
+    taskENTER_CRITICAL(&g_presentMux);
+    const int idx = g_presentIdx;
+    const uint32_t seq = g_presentSeq;
+    taskEXIT_CRITICAL(&g_presentMux);
+    if (index != nullptr) {
+        *index = idx;
+    }
+    if (seqAtPresent != nullptr) {
+        *seqAtPresent = seq;
+    }
+    return idx >= 0;
+}
+
 void scanoutReset() {
     // Order matters a little: clear the derived counters before the phase
     // reference, so the VSYNC ISR cannot land between them and log a slip
@@ -412,6 +450,17 @@ void scanoutMark(int) {}
 size_t scanoutSlipLog(ScanoutSlip *, size_t) { return 0; }
 void scanoutReset() {}
 void setLagThresholdUs(uint32_t) {}
+uint32_t refillSeq() { return 0; }
+void notePresent(int) {}
+bool lastPresent(int *index, uint32_t *seqAtPresent) {
+    if (index != nullptr) {
+        *index = -1;
+    }
+    if (seqAtPresent != nullptr) {
+        *seqAtPresent = 0;
+    }
+    return false;
+}
 void scanoutMargin(uint32_t *lastUs, uint32_t *minUs, uint32_t *maxUs, uint32_t *buckets) {
     if (lastUs != nullptr) {
         *lastUs = 0;

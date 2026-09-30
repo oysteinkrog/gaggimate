@@ -63,8 +63,15 @@ static bool s_fbActive = false;  // ...and LVGL holds them right now
 // has to come before the refresh runs, not after the flush. The refresh timer
 // is paused after every run and resumed by the next invalidation, so a
 // wrapped timer callback is the one place before those writes.
+//
+// s_flipRefills is panelclock::refillSeq(), which nothing zeroes (gm-bzu.39):
+// the scan-out `refills` counter it replaced was reset by every divider
+// change, and a reset between a present and its wait read as the flip.
 static volatile bool s_flipPending = false;
 static uint32_t s_flipRefills = 0;
+// Set once the panel is gone (display OTA, lvgl_helper_release_panel): LVGL
+// renders into the scratch buffer and every flush is dropped.
+static bool s_panelReleased = false;
 static lv_timer_cb_t s_refrOrigCb = nullptr;
 LvFlipStats g_lvFlipStats;
 
@@ -77,11 +84,15 @@ static void waitPendingFlip() {
     }
     s_flipPending = false;
     const int64_t t0 = esp_timer_get_time();
-    constexpr int kMaxMs = 60; // over two panel periods at divider 8
+    // About three panel periods at the live divider, never under 60 ms. One
+    // period is about 3.3 ms per divider step (19.7 ms at 6), so a fixed 60 ms
+    // was only 1.14 periods at 16, which setDiv accepts.
+    const int div = panelclock::currentDiv();
+    const int kMaxMs = (10 * div > 60) ? 10 * div : 60;
     for (int waited = 0; waited < kMaxMs; waited++) {
-        uint32_t r = 0;
-        panelclock::scanoutStats(nullptr, &r, nullptr);
-        if (r != s_flipRefills) {
+        // Inequality only: the sequence wraps and a wrap must not read as a
+        // flip or hide one.
+        if (panelclock::refillSeq() != s_flipRefills) {
             const uint32_t us = static_cast<uint32_t>(esp_timer_get_time() - t0);
             if (waited > 0) {
                 g_lvFlipStats.waits++;
@@ -204,40 +215,60 @@ void lvgl_helper_suppress_flush(bool suppress) {
     // callers in DefaultUI are all isActive()-guarded pairs).
     dirtyReset();
 
-    if (!s_fbOwned || suppress == !s_fbActive) {
-        return;
-    }
-    // Suppressing flushes is not enough once LVGL renders into the panel's own
-    // framebuffers: dropping the flush stops the flip, but the rendering itself
-    // would still be writing the memory the animation is drawing plasma into.
-    // So hand the buffers over properly. LVGL spends the takeover rendering
-    // into a small scratch buffer it never shows, which is what it was already
-    // doing before, only into a screen-sized buffer instead of this one. The
-    // areas it reports are the point: the overlay compositor needs to know what
-    // the widgets did while it owned the screen.
     lv_disp_t *disp = lv_disp_get_default();
-    if (disp == nullptr) {
+    if (disp == nullptr || s_panelReleased) {
+        // Released: the refresh timer stays parked and the scratch buffer
+        // stays LVGL's (lvgl_helper_release_panel).
         return;
     }
-    if (suppress) {
-        // The animation's beginDirectPath settles which buffer the panel scans
-        // before it writes either; a present LVGL left pending is its to wait
-        // for, and a stale one must not make the first pass after the
-        // takeback wait for a wrap that already happened.
-        s_flipPending = false;
-        s_fbActive = false;
-        lv_disp_draw_buf_init(&draw_buf, s_scratch, NULL, s_scratchPx);
-        disp_drv.direct_mode = 0;
-    } else {
-        s_fbActive = true;
-        lv_disp_draw_buf_init(&draw_buf, s_fb[0], s_fb[1], static_cast<uint32_t>(disp_drv.hor_res) * disp_drv.ver_res);
-        disp_drv.direct_mode = 1;
+    if (s_fbOwned && suppress == s_fbActive) {
+        // Suppressing flushes is not enough once LVGL renders into the panel's
+        // own framebuffers: dropping the flush stops the flip, but the
+        // rendering itself would still be writing the memory the animation is
+        // drawing plasma into. So hand the buffers over properly. LVGL spends
+        // the takeover rendering into a small scratch buffer it never shows,
+        // which is what it was already doing before, only into a screen-sized
+        // buffer instead of this one. The areas it reports are the point: the
+        // overlay compositor needs to know what the widgets did while it owned
+        // the screen.
+        if (suppress) {
+            // The animation's beginDirectPath settles which buffer the panel
+            // scans before it writes either; a present LVGL left pending is
+            // its to wait for.
+            s_flipPending = false;
+            s_fbActive = false;
+            lv_disp_draw_buf_init(&draw_buf, s_scratch, NULL, s_scratchPx);
+            disp_drv.direct_mode = 0;
+        } else {
+            // Start in the buffer the panel will NOT be scanning (gm-bzu.39).
+            // lv_disp_draw_buf_init makes its first argument the active
+            // buffer, and the animation can stop with either one on scan: with
+            // interlacing on, its back buffer converges on the scanned one.
+            // The animation's last present is the buffer the panel scans once
+            // that present is taken, and it may not be taken yet (the stop can
+            // land inside the present's frame), so the other buffer is the
+            // safe first target, and the first refresh waits for one refill
+            // from now before it writes anything. The requested index is
+            // PanelClock's present record, not the driver's _fbCurrent, and
+            // the wait is what turns the request into a confirmed scan: after
+            // a refill counted from here, the request has been taken.
+            int scanIdx = -1;
+            panelclock::lastPresent(&scanIdx, nullptr);
+            const int first = (scanIdx == 0) ? 1 : 0;
+            s_fbActive = true;
+            lv_disp_draw_buf_init(&draw_buf, s_fb[first], s_fb[1 - first],
+                                  static_cast<uint32_t>(disp_drv.hor_res) * disp_drv.ver_res);
+            disp_drv.direct_mode = 1;
+            s_flipRefills = panelclock::refillSeq();
+            s_flipPending = true;
+        }
+        // Resets inv_areas and invalidates the active screen, which is exactly
+        // what taking the framebuffers back needs: both of them hold plasma,
+        // and the full repaint this schedules is what LVGL then feeds to
+        // refr_sync_areas so the second buffer is brought up to date before it
+        // is ever presented.
+        lv_disp_drv_update(disp, &disp_drv);
     }
-    // Resets inv_areas and invalidates the active screen, which is exactly what
-    // taking the framebuffers back needs: both of them hold plasma, and the
-    // full repaint this schedules is what LVGL then feeds to refr_sync_areas so
-    // the second buffer is brought up to date before it is ever presented.
-    lv_disp_drv_update(disp, &disp_drv);
 
     // While suppressed, LVGL's refresh would render every invalid area through
     // the scratch buffer only for disp_flush to drop the pixels and keep the
@@ -246,6 +277,10 @@ void lvgl_helper_suppress_flush(bool suppress) {
     // pending areas straight from disp->inv_areas. A plain lv_timer_pause does
     // not survive: _lv_inv_area resumes the timer on every invalidation, but
     // resuming a timer whose period is an hour still never fires it.
+    //
+    // On every panel, not only the ones whose framebuffers LVGL owns
+    // (gm-bzu.39): a panel with its own draw buffer (Waveshare, AMOLED) would
+    // otherwise render each invalidation twice, once for disp_flush to drop.
     lv_timer_t *refr = _lv_disp_get_refr_timer(disp);
     if (refr != nullptr) {
         if (suppress) {
@@ -258,6 +293,36 @@ void lvgl_helper_suppress_flush(bool suppress) {
             s_refrPeriodSaved = 0;
             lv_timer_resume(refr);
         }
+    }
+}
+
+void lvgl_helper_release_panel() {
+    lv_disp_t *disp = lv_disp_get_default();
+    if (disp == nullptr || s_panelReleased) {
+        return;
+    }
+    // Before the panel is deleted: esp_lcd_panel_del frees both framebuffers,
+    // and the OTA's own allocations then land in that PSRAM while LVGL keeps
+    // running for the progress screen. So LVGL gives the pair up for good and
+    // renders into the scratch buffer (or its own draw buffer on a panel that
+    // never lent it the pair), every flush is dropped, and the refresh timer
+    // is parked. No pixel reaches a panel that no longer exists either way.
+    s_panelReleased = true;
+    s_flipPending = false;
+    if (s_fbOwned) {
+        s_fbActive = false;
+        s_fbOwned = false;
+        s_fb[0] = s_fb[1] = nullptr;
+        lv_disp_draw_buf_init(&draw_buf, s_scratch, NULL, s_scratchPx);
+        disp_drv.direct_mode = 0;
+        lv_disp_drv_update(disp, &disp_drv);
+    }
+    lv_timer_t *refr = _lv_disp_get_refr_timer(disp);
+    if (refr != nullptr) {
+        if (s_refrPeriodSaved == 0) {
+            s_refrPeriodSaved = refr->period;
+        }
+        lv_timer_set_period(refr, 3600000);
     }
 }
 
@@ -315,6 +380,12 @@ volatile int64_t g_statPubScrimUs = 0;
 
 /* Display flushing */
 static void disp_flush(lv_disp_drv_t *disp_drv, const lv_area_t *area, lv_color_t *color_p) {
+    if (s_panelReleased) {
+        // The panel is gone (lvgl_helper_release_panel); the pixels went into
+        // the scratch buffer and stay there.
+        lv_disp_flush_ready(disp_drv);
+        return;
+    }
     if (s_suppressFlush) {
         // Sleep animation owns the panel; keep LVGL rendering into the draw
         // buffer (so the content is current when flushing resumes) but don't
@@ -363,7 +434,7 @@ static void disp_flush(lv_disp_drv_t *disp_drv, const lv_area_t *area, lv_color_
             static_cast<Display *>(disp_drv->user_data)->presentFrameBuffer(index, 0, disp_drv->ver_res);
             // The refill count as of this present; refrTimerGuarded waits for
             // it to move before LVGL writes the other buffer (gm-bzu.5).
-            panelclock::scanoutStats(nullptr, &s_flipRefills, nullptr);
+            s_flipRefills = panelclock::refillSeq();
             s_flipPending = true;
             g_lvFlipStats.presents++;
 #ifdef GM_TOUCH_PROBE

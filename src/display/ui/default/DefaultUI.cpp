@@ -1874,6 +1874,9 @@ void DefaultUI::loop() {
         panelStopped = true;
         stopSleepAnimation();
         waitAnimStopPending(3000);
+        // LVGL off the framebuffers before stopPanel frees them: the OTA
+        // progress screen keeps rerendering after this (gm-bzu.39).
+        lvgl_helper_release_panel();
         if (panelDriver != nullptr) {
             panelDriver->stopPanel();
         }
