@@ -201,13 +201,18 @@ void Controller::setup() {
     // Stack in PSRAM (CONFIG_FREERTOS_TASK_CREATE_ALLOW_EXT_MEM=y). loopLogic
     // never runs with the flash cache disabled: Settings setters only mark a
     // property dirty (Settings::loop, a separate task with an internal
-    // stack, does the actual NVS write), and the three events this task can
-    // dispatch -- controller:brew:end, controller:grind:end,
-    // controller:process:end -- resolve to handlers that touch no
-    // filesystem (ShotHistoryPlugin::endRecording only clears flags and
-    // fires an in-memory stats event; BLEScalePlugin/MQTTPlugin/
-    // SmartGrindPlugin/DefaultUI's handlers are BLE, MQTT, HTTP and a render
-    // flag). comms sends from this task are also just enqueued --
+    // stack, does the actual NVS write), and the events this task
+    // dispatches resolve to handlers that touch no filesystem. They are the
+    // process ends (controller:brew:end, controller:grind:end,
+    // controller:process:end), controller:process:start from the
+    // steam-ready activation, controller:brew:clear from the clears that
+    // activation and the grind timeout run, and controller:mode:change
+    // from the standby timeout. ShotHistoryPlugin's handlers only clear
+    // flags and fire an in-memory stats event; the others are BLE, MQTT,
+    // a process start, a screen change or a render flag. SmartGrindPlugin
+    // only posts to its own worker, which does the HTTP request, so no
+    // network wait runs here ahead of loopControl. comms sends from this
+    // task are also just enqueued --
     // Controller::loop pumps comms.loop() on a different task -- so no BLE
     // transport code runs on this stack either. The TCB stays internal:
     // xTaskCreateStaticPinnedToCore asserts esp_ptr_internal() on it even
