@@ -60,7 +60,7 @@ DEFAULT_PROGRAM = os.path.join(REPO_ROOT, ".pio", "build", "display-sim", "progr
 # at a deliberately odd 555 s, which is not on the Machine page's one
 # minute grid; running it earlier would leave the Machine and Schedules
 # scenarios starting from a value their own steppers cannot return to.
-SCENARIO_ORDER = ("temps", "display", "animation", "machine", "schedules", "status", "rig")
+SCENARIO_ORDER = ("temps", "display", "animation", "machine", "schedules", "press", "status", "rig")
 
 WARMUP_UPTIME_MS = 90_000
 BASELINE_WINDOW_S = 10.0
