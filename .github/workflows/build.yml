@@ -4,8 +4,66 @@ on:
       - "*"
 
 name: Build
+
+# actions: read is what the gate job needs to list this commit's Checks runs.
+# With an explicit permissions block every scope not named here is none; the
+# release job asks for contents: write itself.
+permissions:
+  contents: read
+  actions: read
+
 jobs:
+  # A tag publishes the release every device on the stable channel can OTA
+  # to, so it gets the same gate the nightly has (gm-bzu.17, gm-bzu.36):
+  # nothing is built or released for a commit whose Checks run did not pass.
+  # The tag push itself starts a Checks run on the tagged commit (check.yml
+  # runs on every push, tags included), and a run from the branch push of
+  # the same commit counts too, since the gate matches on head_sha. The job
+  # below is a copy of build-nightly.yml's; keep the two in step.
+  gate:
+    name: Wait for Checks on this commit
+    runs-on: ubuntu-latest
+    steps:
+      - name: Wait for the Checks workflow to pass on this commit
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+        run: |
+          # The Checks run is created by the same push event, so it exists
+          # within seconds; ten minutes with no run at all means it is not
+          # coming (workflow disabled, or the push did not trigger it) and
+          # the commit is not published. A run in progress is waited for up
+          # to two hours, well past the longest Checks run seen (about 45
+          # minutes for the full build job).
+          deadline_none=$((SECONDS + 600))
+          deadline_all=$((SECONDS + 7200))
+          while true; do
+            runs=$(gh api "repos/$REPO/actions/workflows/check.yml/runs?head_sha=$SHA&per_page=20" --jq '.workflow_runs[] | "\(.id) \(.status) \(.conclusion)"')
+            if [[ -z "$runs" ]]; then
+              if (( SECONDS > deadline_none )); then
+                echo "::error::No Checks run exists for $SHA after 10 minutes; not publishing."
+                exit 1
+              fi
+              echo "No Checks run for $SHA yet; waiting."
+            elif grep -q ' completed success$' <<<"$runs"; then
+              echo "Checks passed on $SHA:"; echo "$runs"
+              exit 0
+            elif grep -qE ' (queued|in_progress|waiting|pending|requested) ' <<<"$runs"; then
+              if (( SECONDS > deadline_all )); then
+                echo "::error::Checks on $SHA still running after two hours; not publishing."
+                exit 1
+              fi
+              echo "Checks still running on $SHA:"; echo "$runs"
+            else
+              echo "::error::Checks did not pass on $SHA; not publishing."
+              echo "$runs"
+              exit 1
+            fi
+            sleep 60
+          done
   build:
+    needs: gate
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repo
@@ -19,12 +77,14 @@ jobs:
           path: |
             ~/.cache/pip
             ~/.platformio/.cache
-          key: ${{ runner.os }}-pio
+          key: ${{ runner.os }}-pio-${{ hashFiles('platformio.ini', 'sdkconfig*.defaults') }}
+          restore-keys: ${{ runner.os }}-pio-
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+      # Pinned to the core the project is built with; check.yml has why.
       - name: Install PlatformIO Core
-        run: pip install --upgrade platformio
+        run: pip install "platformio==6.1.19"
       - uses: actions/setup-node@v4
         with:
           node-version: 22

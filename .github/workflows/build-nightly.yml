@@ -106,12 +106,14 @@ jobs:
           path: |
             ~/.cache/pip
             ~/.platformio/.cache
-          key: ${{ runner.os }}-pio
+          key: ${{ runner.os }}-pio-${{ hashFiles('platformio.ini', 'sdkconfig*.defaults') }}
+          restore-keys: ${{ runner.os }}-pio-
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+      # Pinned to the core the project is built with; check.yml has why.
       - name: Install PlatformIO Core
-        run: pip install --upgrade platformio
+        run: pip install "platformio==6.1.19"
       - uses: actions/setup-node@v4
         with:
           node-version: 22

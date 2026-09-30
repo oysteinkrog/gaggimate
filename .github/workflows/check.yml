@@ -23,17 +23,27 @@ jobs:
         uses: actions/checkout@v3
         with:
           submodules: 'recursive'
+      # The cache key hashes the files that decide what PlatformIO fetches.
+      # A constant key restored the first cache ever saved and never saved
+      # another one (actions/cache skips the save on an exact key hit).
       - uses: actions/cache@v4
         with:
           path: |
             ~/.cache/pip
             ~/.platformio/.cache
-          key: ${{ runner.os }}-pio
+          key: ${{ runner.os }}-pio-${{ hashFiles('platformio.ini', 'sdkconfig*.defaults') }}
+          restore-keys: ${{ runner.os }}-pio-
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+      # PlatformIO is pinned to 6.1.19, the one core this project is built
+      # with (CLAUDE.md). check_skip_packages in platformio.ini depends on the
+      # cppcheck that 6.1.19 bundles, and the -O2 override depends on its
+      # flag order, so a newer core can turn these checks red, or the
+      # override silently inert, with no source change. Every workflow pins
+      # the same version; change them together.
       - name: Install PlatformIO Core
-        run: pip install --upgrade platformio
+        run: pip install "platformio==6.1.19"
       # Only the generated EEZ Studio tree is excluded. A full run over
       # src/display/ui reports 1 high, 15 medium and 2110 low, and eez/ owns
       # 1/15/2107 of that: the high and every medium are in eez-flow.cpp, the
@@ -71,12 +81,13 @@ jobs:
           path: |
             ~/.cache/pip
             ~/.platformio/.cache
-          key: ${{ runner.os }}-pio
+          key: ${{ runner.os }}-pio-${{ hashFiles('platformio.ini', 'sdkconfig*.defaults') }}
+          restore-keys: ${{ runner.os }}-pio-
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
       - name: Install PlatformIO Core
-        run: pip install --upgrade platformio
+        run: pip install "platformio==6.1.19"
       - uses: actions/setup-node@v4
         with:
           node-version: 22
@@ -121,6 +132,18 @@ jobs:
       # compiles, which is exactly how display-sim rotted.
       - name: Build display-bench
         run: pio run -e display-bench
+      # The two envs the bench depends on (gm-bzu.36). display-loadtest
+      # compiles GM_TOUCH_PROBE, GM_SYNTH_HANDSHAKE and GM_DMA_BALLAST: the
+      # touch probe, /api/debug/tap and the settings debug routes the device
+      # runner needs. display-kdev compiles GM_KBLOB (SleepAnimationKBlob.cpp
+      # and KBlob.cpp) with its own sdkconfig chain. Neither was built by any
+      # workflow, and the gm-bzu.19 hook move broke the flag builds' link
+      # without anything going red. Each also runs the build guard
+      # (scripts/assert_sdkconfig.py) against its own chain.
+      - name: Build display-loadtest
+        run: pio run -e display-loadtest
+      - name: Build display-kdev
+        run: pio run -e display-kdev
 
   simulator:
     name: Build simulator
@@ -139,12 +162,13 @@ jobs:
           path: |
             ~/.cache/pip
             ~/.platformio/.cache
-          key: ${{ runner.os }}-pio-native
+          key: ${{ runner.os }}-pio-native-${{ hashFiles('platformio.ini', 'sdkconfig*.defaults') }}
+          restore-keys: ${{ runner.os }}-pio-native-
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
       - name: Install PlatformIO Core
-        run: pip install --upgrade platformio
+        run: pip install "platformio==6.1.19"
       - name: Install SDL2
         run: sudo apt-get update && sudo apt-get install -y libsdl2-dev
       # display-sim compiles the real display sources against the host shims in
@@ -217,15 +241,36 @@ jobs:
           path: |
             ~/.cache/pip
             ~/.platformio/.cache
-          key: ${{ runner.os }}-pio-native
+          key: ${{ runner.os }}-pio-native-${{ hashFiles('platformio.ini', 'sdkconfig*.defaults') }}
+          restore-keys: ${{ runner.os }}-pio-native-
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
       - name: Install PlatformIO Core
-        run: pip install --upgrade platformio
+        run: pip install "platformio==6.1.19"
+      # One step per native_* env in platformio.ini. A new native env needs
+      # a step here too, or it never runs.
+      #
       # Host-side SIMC autotune tests. No workflow ran these before.
       - name: Run autotune unit tests
         run: pio test -e native_autotune
+      # The on-display settings value model: ranges, steps, wrap, formats,
+      # the zone split, the gradient map and schedule parsing.
+      - name: Run settings model unit tests
+        run: pio test -e native_settingsui
+      # The env's test_filter names only test_ota_result, so the vendored
+      # semver test (gm-bzu.57: a prerelease ranks below its release, which
+      # is what keeps OTA from offering an rc as an update over the release)
+      # has to be named here as well. -f on the command line replaces the
+      # ini filter, so both are listed.
+      - name: Run OTA result and semver unit tests
+        run: pio test -e native_otaresult -f test_ota_result -f test_semver_prerelease
+      # The build guard's own test (gm-bzu.29): scripts/assert_sdkconfig.py
+      # run against the tracked sdkconfigs, which must pass, and against
+      # copies with one forbidden line injected each, which must fail. Plain
+      # Python, no PlatformIO.
+      - name: Build guard host test
+        run: python tools/sdkconfig_guard_test.py
 
   animations:
     name: Animation goldens
@@ -253,3 +298,39 @@ jobs:
       # turns the first sanitizer report into a failing step.
       - name: Animation lifecycle and allocation faults
         run: make -C tools/animbench -f Makefile.lifecycle check
+      # The steps below build with ASan and UBSan. UBSan only reports and
+      # carries on by default, so halt_on_error is what makes a report fail
+      # the step; ASan already aborts on its first error.
+      #
+      # Parameter and time sweep of every animation under the sanitizers
+      # (tools/animbench/fuzz.cpp): each band in its own exactly sized heap
+      # block, every parameter at both ends, millis() up to the wrap. About
+      # 85k bands and a few seconds. Without the sanitizers it is not a
+      # fuzzer, which is why it runs as built by Makefile.fuzz.
+      - name: Animation fuzz
+        env:
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+        run: |
+          make -C tools/animbench -f Makefile.fuzz
+          tools/animbench/build/fuzz
+      # The dial ring compositor element (gm-2cl.6): the real
+      # TickRingElement.cpp against a reference of LVGL's masked fill plus
+      # the overlay blend, under ASan and UBSan.
+      - name: Tick ring element
+        env:
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+        run: make -C tools/tickringbench check
+      # Overlay pipeline kernels (span scan, scrim build, overlay blend,
+      # half-res expand) against their goldens.
+      - name: Overlay kernel goldens
+        run: make -C tools/overlaybench check
+      # Palette builds under concurrent theme publishes (gm-bzu.71).
+      - name: Theme publication
+        run: make -C tools/animbench -f Makefile.theme check
+      # Each QEMU test's hand-copied asm kernel against the asm block it
+      # claims to transcribe in src/ (gm-bzu.35). Plain Python, so it runs
+      # here. Building and running those tests under QEMU is left out: that
+      # needs the Xtensa toolchain and Espressif's QEMU, which the runner
+      # does not have (tools/qemubench/README.md).
+      - name: QEMU kernel copies match src
+        run: python3 tools/qemubench/check_copies.py
