@@ -30,6 +30,42 @@ const SettingsCategoryDef *const kCategories[] = {
 };
 constexpr int kCategoryCount = sizeof(kCategories) / sizeof(kCategories[0]);
 
+// Keeps a press with the page it started on. Deleting the object under a
+// finger that is still down makes lv_obj_del reset the indev (act_obj goes
+// to NULL) without waiting for the release, so the next poll searches again,
+// sends PRESSED to whatever the new page has under that point, and the
+// release then CLICKs it (lv_indev.c, indev_proc_press and
+// indev_proc_release). A confirm row that pops its page mid-hold, or a
+// theme or web-save rebuild under a held stepper, would click a row the
+// user never touched. So every page change calls this before it deletes a
+// page: while a pointer is pressed, LVGL drops the rest of that press
+// (lv_indev_wait_release) and the next press starts clean. The delete
+// itself stays synchronous, so deleting a page from inside one of its own
+// row callbacks keeps working as before. A CLICKED handler runs while the
+// indev already reads released, so this does nothing there and cannot
+// swallow the next tap.
+void dropHeldPress() {
+    for (lv_indev_t *indev = lv_indev_get_next(nullptr); indev != nullptr; indev = lv_indev_get_next(indev)) {
+        if (lv_indev_get_type(indev) == LV_INDEV_TYPE_POINTER && indev->proc.state == LV_INDEV_STATE_PRESSED) {
+            lv_indev_wait_release(indev);
+        }
+    }
+}
+
+// A header arrow that has no page to go to stays in the flex row, since a
+// hidden child drops out of the layout and the title would move 24 px
+// sideways on the first and last page. It is made invisible and
+// unclickable instead.
+void setArrowAvailable(lv_obj_t *arrow, bool available) {
+    if (available) {
+        lv_obj_add_flag(arrow, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_set_style_opa(arrow, LV_OPA_COVER, LV_PART_MAIN);
+    } else {
+        lv_obj_clear_flag(arrow, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_set_style_opa(arrow, LV_OPA_TRANSP, LV_PART_MAIN);
+    }
+}
+
 } // namespace
 
 SettingsUI::SettingsUI(Controller &controller, DefaultUI &ui, PluginManager &plugins)
@@ -120,6 +156,7 @@ void SettingsUI::onExternalLeave() {
 }
 
 void SettingsUI::teardownAll() {
+    dropHeldPress();
     while (!pageStack.empty()) {
         const SettingsCategoryDef *def = pageStack.back().def;
         void *ctx = pageStack.back().ctx;
@@ -223,6 +260,7 @@ void SettingsUI::openCategory(int index) {
 
 void SettingsUI::pushPage(const SettingsCategoryDef *def, void *ctx) {
     ui_.beginOverlayTransition("settings_push");
+    dropHeldPress();
     if (pageStack.empty()) {
         if (tilePageObj) {
             lv_obj_del(tilePageObj);
@@ -251,6 +289,7 @@ void SettingsUI::popPage() {
         return;
     }
     ui_.beginOverlayTransition("settings_pop");
+    dropHeldPress();
     const SettingsCategoryDef *def = pageStack.back().def;
     void *ctx = pageStack.back().ctx;
     lv_obj_t *root = pageStack.back().root;
@@ -300,6 +339,7 @@ void SettingsUI::rebuildPage() {
 
 void SettingsUI::buildTilePage() {
     if (tilePageObj != nullptr) {
+        dropHeldPress();
         lv_obj_del(tilePageObj);
         tilePageObj = nullptr;
     }
@@ -441,6 +481,7 @@ void SettingsUI::buildExitChevron(lv_obj_t *parent, lv_color_t fg, bool topLevel
 
 void SettingsUI::buildCategoryPage(PageEntry &entry) {
     if (entry.root != nullptr) {
+        dropHeldPress();
         lv_obj_del(entry.root);
         entry.root = nullptr;
     }
@@ -455,18 +496,25 @@ void SettingsUI::buildCategoryPage(PageEntry &entry) {
     lv_obj_set_size(root, LV_PCT(100), LV_PCT(100));
     lv_obj_set_pos(root, 0, 0);
     lv_obj_clear_flag(root, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(root, LV_OBJ_FLAG_EVENT_BUBBLE);
+    // Full screen, so the touch task never plates it (DefaultUI's hit map
+    // skips anything over a third of the panel); it is what catches a press
+    // outside every target and receives the swipe below.
+    lv_obj_add_flag(root, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_EVENT_BUBBLE);
     lv_obj_set_style_bg_opa(root, LV_OPA_TRANSP, LV_PART_MAIN);
 
     // Swipe between pages: a horizontal gesture anywhere on the page, the
     // finger moving left for the next page. LVGL delivers a gesture to the
     // first ancestor of the pressed object that does not bubble gestures,
     // so the root clears the flag and everything under it keeps it. The
-    // rest of the press is dropped (lv_indev_wait_release) so the row the
-    // swipe started on gets no CLICKED at the release: LVGL 8.4 gates
-    // CLICKED on scrolling, not on a gesture, and a swipe across a toggle
-    // row would otherwise flip it. A stepper still steps once on the
-    // PRESSED it already had if the swipe began on its 40 px button.
+    // rest of the press is dropped (lv_indev_wait_release) for every
+    // horizontal swipe, including one at the first or last page that turns
+    // nothing, so the row the swipe started on gets no CLICKED at the
+    // release: LVGL 8.4 gates CLICKED on scrolling, not on a gesture, and a
+    // swipe across a toggle row would otherwise flip it. A stepper still
+    // steps once on the PRESSED it already had if the swipe began on its
+    // 40 px button. The root is the one clickable container on the page
+    // (the slots, header and title column are not), so a press on a row's
+    // text or on empty space lands on it and its swipe still arrives here.
     lv_obj_clear_flag(root, LV_OBJ_FLAG_GESTURE_BUBBLE);
     lv_obj_add_event_cb(
         root,
@@ -480,14 +528,14 @@ void SettingsUI::buildCategoryPage(PageEntry &entry) {
             if (dir != LV_DIR_LEFT && dir != LV_DIR_RIGHT) {
                 return;
             }
+            lv_indev_wait_release(indev);
             PageEntry &top = self->pageStack.back();
             const int rows = top.def->rowCount ? top.def->rowCount(top.ctx) : 0;
             const int pages = rows > 0 ? (rows + kRowsPerPage - 1) / kRowsPerPage : 1;
             const int target = top.page + (dir == LV_DIR_LEFT ? 1 : -1);
             if (target < 0 || target >= pages) {
-                return; // at an edge: nothing to show, keep the press alive
+                return; // at an edge: nothing to show, the press is already dropped
             }
-            lv_indev_wait_release(indev);
             self->gotoPage(target);
         },
         LV_EVENT_GESTURE, this);
@@ -505,7 +553,7 @@ void SettingsUI::buildCategoryPage(PageEntry &entry) {
     // all centred on one row so the arrows' 56x56 hit pad never has to
     // compete with a stacked title band for the ~68 px available between
     // the status icons and the row block. 240 px wide: the arrows' hit
-    // boxes then span x 82..138 at y -188..-132, and the far corner sits
+    // boxes then span x 72..128 at y -188..-132, and the far corner sits
     // 227.4 px from the centre, inside the 228 px edge rule; the title gets
     // the 144 px between them on one line ("Animation" in montserrat 24 is
     // about 125 px; the old 96 px column broke it as "Animatio" / "n").
@@ -518,13 +566,17 @@ void SettingsUI::buildCategoryPage(PageEntry &entry) {
     lv_obj_set_size(header, 240, 56);
     lv_obj_align(header, LV_ALIGN_CENTER, 0, -160);
     lv_obj_clear_flag(header, LV_OBJ_FLAG_SCROLLABLE);
+    // lv_obj_create makes it clickable. Left on, a press between the
+    // arrows or on the title would land on the header and the touch task
+    // would draw a press plate over a target that does nothing.
+    lv_obj_clear_flag(header, LV_OBJ_FLAG_CLICKABLE);
     // Every container between a clickable and the cover must bubble, or the
     // cover's PRESSED handler (the standby timer's only view of settings
     // activity) never sees the arrow presses.
     lv_obj_add_flag(header, LV_OBJ_FLAG_EVENT_BUBBLE);
     // Same clipping the row slots below need the flag for (see the loop
     // building kRowY): the arrows' 8 px ext click pad has to reach
-    // past this container's own 200 px width to make their 56x56 hit box,
+    // past this container's own 240 px width to make their 56x56 hit box,
     // and with no spare margin between them and the title column there was
     // nowhere for that pad to go (measured: both arrows audited at 48x56).
     lv_obj_add_flag(header, LV_OBJ_FLAG_OVERFLOW_VISIBLE);
@@ -548,15 +600,13 @@ void SettingsUI::buildCategoryPage(PageEntry &entry) {
             }
         },
         LV_EVENT_CLICKED, this);
-    if (entry.page == 0) {
-        lv_obj_add_flag(upArrow, LV_OBJ_FLAG_HIDDEN);
-    }
+    setArrowAvailable(upArrow, entry.page > 0);
     tag(upArrow, "page_prev", "page_prev");
 
     lv_obj_t *mid = lv_obj_create(header);
     lv_obj_remove_style_all(mid);
     lv_obj_set_size(mid, 144, LV_SIZE_CONTENT);
-    lv_obj_clear_flag(mid, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_clear_flag(mid, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE); // see the header above
     lv_obj_set_style_bg_opa(mid, LV_OPA_TRANSP, LV_PART_MAIN);
     lv_obj_set_flex_flow(mid, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_flex_align(mid, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
@@ -593,9 +643,7 @@ void SettingsUI::buildCategoryPage(PageEntry &entry) {
             }
         },
         LV_EVENT_CLICKED, this);
-    if (entry.page >= totalPages - 1) {
-        lv_obj_add_flag(downArrow, LV_OBJ_FLAG_HIDDEN);
-    }
+    setArrowAvailable(downArrow, entry.page < totalPages - 1);
     tag(downArrow, "page_next", "page_next");
 
     // Five 320x56 row slots, contiguous and centred (matches the epic's
@@ -609,7 +657,10 @@ void SettingsUI::buildCategoryPage(PageEntry &entry) {
         lv_obj_remove_style_all(slot);
         lv_obj_set_size(slot, kRowW, kRowH);
         lv_obj_align(slot, LV_ALIGN_CENTER, 0, kRowY[i]);
-        lv_obj_clear_flag(slot, LV_OBJ_FLAG_SCROLLABLE);
+        // Not clickable, for the same reason as the header: a press on an
+        // info row or on a row's text column would otherwise plate the
+        // whole 320x56 slot. Such a press lands on the page root instead.
+        lv_obj_clear_flag(slot, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
         lv_obj_add_flag(slot, LV_OBJ_FLAG_EVENT_BUBBLE);
         // A row widget's rightmost control can sit flush against this
         // slot's own edge (no spare margin, by design: label column + gaps
