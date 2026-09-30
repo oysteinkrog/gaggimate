@@ -18,6 +18,8 @@
 class Controller;
 
 constexpr int RERENDER_INTERVAL_IDLE = 2500;
+constexpr unsigned long TARE_FAILED_SHOW_MS = 5000;
+constexpr int TARE_FAILED_LABEL_Y = 80; // brew screen, centre-relative, between the controls and the start button
 // Freshness floor: force a pass at least this often during an active
 // process even if no change event fired. Was 100, which against the old
 // ~650 ms pipeline merely throttled; raising it alone measured marginal
@@ -322,6 +324,14 @@ class DefaultUI {
     bool scaleScreenRequested = false;
     bool scaleMenuSwap = false; // settings.isScaleMenuButton(), cached per render
     float lastShownScaleWeight = -1000.0f;
+    // Tare failure message on the brew screen (gm-bzu.82). The controller
+    // fires controller:tare:failed from whatever task ran activate(); the
+    // listener only stamps the time and the UI task shows or hides the label.
+    // A runtime label with fixed text, so the flow never writes it and the
+    // text element scan never sees it change.
+    void serviceTareFailedMessage();
+    lv_obj_t *tareFailedLabel = nullptr;
+    std::atomic<unsigned long> tareFailedAt{0}; // millis() of the last failure, 0 when none is shown
     SleepAnimation sleepAnimation;
     unsigned long lastSleepAnimAttempt = 0;
     // A stop() that could not confirm its workers and transfers had retired.

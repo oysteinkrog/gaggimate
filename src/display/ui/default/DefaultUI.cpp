@@ -1716,7 +1716,10 @@ void DefaultUI::init() {
     pluginManager->on("controller:grindDuration:change", [this](Event const &event) { rerender = true; });
     pluginManager->on("controller:grindVolume:change", [this](Event const &event) { rerender = true; });
     pluginManager->on("controller:process:end", triggerRender);
-    pluginManager->on("controller:process:start", triggerRender);
+    pluginManager->on("controller:process:start", [this](Event const &) {
+        tareFailedAt = 0;
+        rerender = true;
+    });
     pluginManager->on("controller:mode:change", [this](Event const &event) {
         mode = event.getInt("value");
         switch (mode) {
@@ -1739,7 +1742,18 @@ void DefaultUI::init() {
             break;
         };
     });
-    pluginManager->on("controller:brew:start", [this](Event const &event) { changeScreen(SCREEN_ID_STATUS_SCREEN); });
+    pluginManager->on("controller:brew:start", [this](Event const &event) {
+        tareFailedAt = 0;
+        changeScreen(SCREEN_ID_STATUS_SCREEN);
+    });
+    // Fired when the hardware scale did not tare before a brew; for a
+    // weight-targeted profile the brew is refused. Shown on the brew screen
+    // until TARE_FAILED_SHOW_MS pass or the next process starts.
+    pluginManager->on("controller:tare:failed", [this](Event const &) {
+        const unsigned long now = ::millis();
+        tareFailedAt = now != 0 ? now : 1;
+        markDirty();
+    });
     pluginManager->on("controller:brew:clear", [this](Event const &event) {
         if (eez_flow_get_current_screen() == SCREEN_ID_STATUS_SCREEN) {
             changeScreen(SCREEN_ID_BREW_SCREEN);
@@ -1968,6 +1982,7 @@ void DefaultUI::loop() {
     // grind screen publishes it bare - one refresh of naked grind widgets -
     // before the scale cover is up.
     maintainScaleScreen();
+    serviceTareFailedMessage();
     // Input before the snapshot (gm-qo3.2): lv_task_handler() is where the
     // touch controller is polled, and it used to run after
     // maintainSleepAnimation() took the pass's snapshot, so a tap read here
@@ -4236,6 +4251,48 @@ void DefaultUI::maintainScaleScreen() {
         if (currentScreen != SCREEN_ID_GRIND_SCREEN) {
             scaleScreenRequested = false;
         }
+    }
+}
+
+// Shows "Scale tare failed, brew not started" on the brew screen for
+// TARE_FAILED_SHOW_MS after controller:tare:failed, or until a process
+// starts. Runs every loop, not only on a rerender pass, so the label hides on
+// time. The label is ours, not the flow's: only this function writes its
+// hidden flag, and its text is set once at creation, so it never becomes a
+// live label for the text elements.
+void DefaultUI::serviceTareFailedMessage() {
+    const unsigned long at = tareFailedAt.load();
+    bool show = at != 0 && ::millis() - at < TARE_FAILED_SHOW_MS;
+    if (at != 0 && !show) {
+        unsigned long expected = at; // a newer failure stamped meanwhile stays
+        tareFailedAt.compare_exchange_strong(expected, 0);
+    }
+    show = show && currentScreen == SCREEN_ID_BREW_SCREEN && objects.brew_screen != nullptr;
+    if (show && tareFailedLabel == nullptr) {
+        const uint32_t themeIdx = eez_flow_get_selected_theme_index();
+        lv_obj_t *l = lv_label_create(objects.brew_screen);
+        tareFailedLabel = l;
+        lv_label_set_text_static(l, "Scale tare failed\nBrew not started");
+        lv_obj_set_style_text_font(l, &lv_font_montserrat_18, LV_PART_MAIN);
+        lv_obj_set_style_text_color(l, lv_color_hex(theme_colors[themeIdx][0]), LV_PART_MAIN);
+        lv_obj_set_style_text_align(l, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
+        lv_obj_clear_flag(l, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_align(l, LV_ALIGN_CENTER, 0, TARE_FAILED_LABEL_Y);
+        lv_obj_add_flag(l, LV_OBJ_FLAG_HIDDEN);
+        // The flow can delete the brew screen; the label dies with it.
+        lv_obj_add_event_cb(
+            l, [](lv_event_t *e) { static_cast<DefaultUI *>(lv_event_get_user_data(e))->tareFailedLabel = nullptr; },
+            LV_EVENT_DELETE, this);
+    }
+    if (tareFailedLabel == nullptr) {
+        return;
+    }
+    const bool hidden = lv_obj_has_flag(tareFailedLabel, LV_OBJ_FLAG_HIDDEN);
+    if (show && hidden) {
+        lv_obj_move_foreground(tareFailedLabel);
+        lv_obj_clear_flag(tareFailedLabel, LV_OBJ_FLAG_HIDDEN);
+    } else if (!show && !hidden) {
+        lv_obj_add_flag(tareFailedLabel, LV_OBJ_FLAG_HIDDEN);
     }
 }
 
