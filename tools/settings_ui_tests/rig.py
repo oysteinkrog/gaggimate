@@ -225,7 +225,11 @@ def audit(dump, exempt_roles=("exit",), exempt_names=("standby_btn",)):
     by EEZ name) are known exceptions to the size and edge rules by design
     (the shared contract calls both out by name); they are reported under
     "exempt", never counted as violations. Overlap has no named exemption:
-    it applies to every target regardless of role or name.
+    it applies to every target regardless of role or name, including the
+    chevron. (audit_pages.audit_page used to move a chevron overlap into
+    the exempt bucket on top of this; that was removed once the chevron's
+    ext click pad shrank to 34 px and every page stopped overlapping it, so
+    this function's result is now what audit_page reports unchanged.)
 
     Returns {"violations": [...], "exempt": [...]}, each entry
     {"target", "tag", "reason", "detail"} ("reason" is "size", "edge" or

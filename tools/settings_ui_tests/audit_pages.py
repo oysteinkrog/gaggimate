@@ -27,7 +27,7 @@ import os
 import re
 import time
 
-from .rig import (PANEL_SIZE, ROW_CONTAINER_ROLES, RigHTTPError, find_tag, object_name, rows_on_page,
+from .rig import (PANEL_SIZE, ROW_CONTAINER_ROLES, RigHTTPError, find_tag, rows_on_page,
                   tag_role, tag_row, targets)
 
 # Category indices, in kCategories order (SettingsUI.cpp). Fixture is the
@@ -179,38 +179,24 @@ def row_violations(dump, expected):
     return out
 
 
-def _split_chevron_overlaps(dump, violations, exempt):
-    """Moves an overlap between a target and the exit chevron out of the
-    violations and into the exempt bucket, where it is still reported.
-
-    The chevron is a 40x40 image with a 45 px ext click pad, which the
-    screen then clips (the shared contract calls this out and exempts the
-    chevron from the size and edge rules for it). On the tile page that
-    padded rectangle reaches up into two of the six tiles: measured
-    2026-09-06 on the simulator, the chevron's body is (220,430)-(259,469)
-    and its padded rectangle (175,385)-(304,479), which clips 10x6 px off
-    the bottom corner of the Animation and Machine tiles. The overlapping
-    pixels are 40 px from anything the chevron draws, so the ambiguity the
-    no-overlap rule exists to prevent is not there; every other overlap,
-    between two real targets, still fails."""
-    chevrons = {object_name(o) for o in dump["objects"] if tag_role(o) == "exit"}
-    chevron_tags = {o.get("tag") for o in dump["objects"] if tag_role(o) == "exit"}
-    kept = []
-    for v in violations:
-        if v.get("reason") == "overlap" and (v.get("other") in chevrons or v.get("tag") in chevron_tags
-                                             or v.get("target") in chevrons):
-            exempt.append(v)
-            continue
-        kept.append(v)
-    return kept
-
-
 def audit_page(rig, dump, expected_rows, is_tile_page=False):
     """Every rule for one dumped page. Returns
-    {"violations": [...], "exempt": [...], "targets": n, "smallest": (w, h)}."""
+    {"violations": [...], "exempt": [...], "targets": n, "smallest": (w, h)}.
+
+    An overlap that touches the exit chevron used to be moved into the
+    exempt bucket by hand here: at the old 45 px ext click pad the chevron's
+    padded rectangle clipped into the tile page's two lower tiles, and the
+    exemption hid that rather than fixing it. The pad is 34 px now
+    (CLAUDE.md, "On-display settings"; `DefaultUI.cpp`) and no page's
+    chevron overlaps anything, so `rig.audit`'s own result is used as is:
+    the exempt bucket it returns holds only its own named exceptions to the
+    size/edge rules (the chevron and the generated screens' standby button),
+    and an overlap is never exempt, for the chevron or anyone else. A pad
+    that regresses back toward 45 px now fails the tile page instead of
+    being hidden."""
     result = rig.audit(dump)
+    violations = list(result["violations"])
     exempt = list(result["exempt"])
-    violations = _split_chevron_overlaps(dump, list(result["violations"]), exempt)
     violations += value_violations(dump)
     violations += row_violations(dump, expected_rows)
     if is_tile_page:
