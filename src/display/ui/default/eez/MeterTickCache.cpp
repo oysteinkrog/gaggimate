@@ -35,7 +35,11 @@ struct Slot {
     uint16_t maskRows = 0;
     bool maskBuilt = false;
     uint64_t built = 0;
-    bool pinned = false; // read by the render task through a ring element
+    // Reference count of holds from dial elements; read by the render task
+    // through a ring element. Two DialElement slots can own the same key
+    // (the status screen's two rings), so a release from one must not drop
+    // a slot the other still reads. Never evicted while > 0.
+    uint32_t pinCount = 0;
 };
 static_assert(sizeof(tickring::Box) == sizeof(lv_area_t), "tickring::Box mirrors lv_area_t");
 
@@ -65,14 +69,14 @@ Slot *findOrCreate(const Key &key) {
     // Never a pinned slot: the render task is reading it.
     Slot *victim = nullptr;
     for (Slot &s : g_slots) {
-        if (s.inUse && !s.pinned && s.key.obj == key.obj) {
+        if (s.inUse && s.pinCount == 0 && s.key.obj == key.obj) {
             victim = &s;
             break;
         }
     }
     if (victim == nullptr) {
         for (Slot &s : g_slots) {
-            if (!s.inUse && !s.pinned) {
+            if (!s.inUse && s.pinCount == 0) {
                 victim = &s;
                 break;
             }
@@ -81,7 +85,7 @@ Slot *findOrCreate(const Key &key) {
     for (int tries = 0; victim == nullptr && tries < kSlots; tries++) {
         Slot &s = g_slots[g_nextEvict];
         g_nextEvict = (g_nextEvict + 1) % kSlots;
-        if (!s.pinned) {
+        if (s.pinCount == 0) {
             victim = &s;
         }
     }
@@ -287,7 +291,11 @@ bool ring(const Key &key, tickring::Sprites &out) {
 void pin(const Key &key, bool on) {
     for (Slot &s : g_slots) {
         if (s.inUse && s.key == key) {
-            s.pinned = on;
+            if (on) {
+                s.pinCount++;
+            } else if (s.pinCount > 0) {
+                s.pinCount--;
+            }
         }
     }
 }

@@ -80,8 +80,13 @@ bool keyFor(lv_obj_t *obj, Key &key);
 bool ring(const Key &key, tickring::Sprites &out);
 
 // A pinned slot is never evicted, rebuilt or freed; the render task reads
-// it from another core. Pin before handing the ring to an element, unpin
-// once the element is cleared and the render task has moved past it.
+// it from another core. Pinning is reference-counted: pin(key, true) adds
+// one hold, pin(key, false) releases one. The slot stays pinned as long as
+// any hold remains, so two dial elements that share one key (the same
+// meter owned by two DialElement slots) can retire independently without
+// one release unpinning a slot the other element still reads. Call pin
+// before handing the ring to an element, and release once the element is
+// cleared and the render task has moved past it.
 void pin(const Key &key, bool on);
 
 } // namespace meterticks
