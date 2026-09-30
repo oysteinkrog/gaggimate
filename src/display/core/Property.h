@@ -7,15 +7,42 @@
 #include <display/core/utils.h>
 #include <vector>
 
-// Preferences::putString returns strlen(value), so a successful write of an
-// empty string is indistinguishable from a failure by the return value alone.
-// Empty is a legitimate value here -- a cleared list serializes to "" -- so
-// treat 0 as success when there was nothing to write, rather than retrying and
-// logging forever on a save that actually worked. The cost is that a genuinely
-// failed empty write still passes unnoticed, which is what every write did
-// before; the API gives us no way to tell those two apart.
+#ifndef GAGGIMATE_SIM
+#include <nvs.h>
+
+namespace property_detail {
+// Preferences reports a string write only as a byte count, strlen(value) on
+// success and 0 on failure, so for an empty value the two look the same.
+// Preferences keeps its NVS handle protected; naming the members through a
+// derived class yields ordinary member pointers into the base, which is legal
+// C++ and lets nvsPutString make the status-returning calls itself.
+struct PreferencesAccess : Preferences {
+    static uint32_t Preferences::*handle() { return &PreferencesAccess::_handle; }
+    static bool Preferences::*started() { return &PreferencesAccess::_started; }
+};
+} // namespace property_detail
+#endif
+
+// Writes a string and reports whether both the set and the commit succeeded.
+// An empty string is a real value here (a cleared list serialises to ""), so
+// success cannot be read from the byte count: a failed write of "" used to
+// pass, the property stopped retrying, and the old value came back on the
+// next boot. No log line per key: doSave() logs one line for the whole flush.
 inline bool nvsPutString(Preferences &prefs, const char *key, const String &value) {
-    return prefs.putString(key, value) != 0 || value.isEmpty();
+#ifndef GAGGIMATE_SIM
+    if (!(prefs.*property_detail::PreferencesAccess::started()))
+        return false;
+    const nvs_handle_t handle = prefs.*property_detail::PreferencesAccess::handle();
+    if (nvs_set_str(handle, key, value.c_str()) != ESP_OK)
+        return false;
+    return nvs_commit(handle) == ESP_OK;
+#else
+    // The simulator's shim has no handle and no status. Its write lands in
+    // memory at once, so reading the key back tells a stored "" from a
+    // refused one (the shim refuses every write on a read-only namespace).
+    prefs.putString(key, value);
+    return prefs.isKey(key) && prefs.getString(key, String()) == value;
+#endif
 }
 
 // Type-specific NVS access used by Property<T>; add a specialization to support a new type.
@@ -100,7 +127,10 @@ template <typename T> class Property : public PropertyBase {
     bool store(Preferences &prefs) override {
         if (!dirty)
             return true;
-        // Clear before writing so a concurrent set() is not lost, only deferred to the next flush.
+        // Clear before writing so a concurrent set() is not lost, only deferred
+        // to the next flush. The flag is set again below unless the write and
+        // its commit both succeeded, so a dirty property stays dirty until the
+        // value is really in NVS.
         dirty = false;
         if (PreferencesCodec<T>::write(prefs, key, value)) {
             return true;

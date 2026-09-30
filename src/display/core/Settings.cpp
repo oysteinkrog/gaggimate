@@ -45,6 +45,12 @@ PreferencesCodec<std::vector<AutoWakeupSchedule>>::read(Preferences &prefs, cons
         }
     }
 
+    // An empty list reads back as the default on purpose, unlike the other
+    // string codecs, which keep a stored "" distinct from a missing key.
+    // Firmware before the Property refactor wrote this key on every save,
+    // as "" on a device that never set a schedule, and filled in the 07:00
+    // default at load; treating "" as cleared would take that default away
+    // from every such device after an upgrade.
     return schedules.empty() ? def : schedules;
 }
 
@@ -504,10 +510,9 @@ bool Settings::flushNow() {
     }
 #endif
     const bool saved = doSave();
-    // PreferencesCodec<String>::write treats an empty-string write as
-    // success (nvsPutString), so a failed clear of a string property never
-    // re-marks itself dirty and is invisible to this scan, same as it is to
-    // doSave()'s own accounting.
+    // Anything still dirty did not reach NVS: Property::store keeps a
+    // property dirty when its write or commit fails, and that includes a
+    // string or list being cleared to "".
     bool stillDirty = false;
     for (auto *property : registry) {
         if (property->isDirty()) {
