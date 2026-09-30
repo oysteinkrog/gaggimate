@@ -156,6 +156,17 @@ def targets():
         ("patch_flash_cache_flag", [os.path.join(idf_root(), "components", "spi_flash", "cache_utils.c")]),
         ("patch_lvgl_meter_inv", sorted(glob.glob(os.path.join(
             ROOT, ".pio", "libdeps", "*", "lvgl", "src", "extra", "widgets", "meter", "lv_meter.c")))),
+        # AsyncTCP is installed twice per env at two releases (v3.4.10 by git
+        # pin, 3.5.0 from the registry); find_pristine takes one baseline per
+        # entry, so each release directory is its own entry.
+        ("patch_asynctcp_backlog", sorted(glob.glob(os.path.join(
+            ROOT, ".pio", "libdeps", "*", "AsyncTCP@src-*", "src", "AsyncTCP.cpp")))),
+        ("patch_asynctcp_backlog", sorted(glob.glob(os.path.join(
+            ROOT, ".pio", "libdeps", "*", "AsyncTCP", "src", "AsyncTCP.cpp")))),
+        ("patch_asyncws_erase_safe", sorted(glob.glob(os.path.join(
+            ROOT, ".pio", "libdeps", "*", "ESPAsyncWebServer", "src", "AsyncWebSocket.cpp")))),
+        ("patch_ble_scan_duty", sorted(glob.glob(os.path.join(
+            ROOT, ".pio", "libdeps", "*", "esp-arduino-ble-scales", "src", "remote_scales.cpp")))),
     ]
 
 
