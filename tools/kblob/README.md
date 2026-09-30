@@ -90,6 +90,15 @@ Two things the equality column cannot see through:
   first evening: every bench after the first leak ran with its tables in
   PSRAM until the next reboot).
 
+## Exit status
+
+`bench` and `run` exit non-zero, with a `kb: FAIL: ...` summary line on
+stderr, if any variant's `init()` rejected the start, if a band's hash
+mismatched the one it is checked against, or if a `kb: LEAK: ...` line was
+printed. A clean run (every requested variant ran, matched, and released its
+hot-slab tables) exits 0. This makes the CLI usable from a script or CI step
+without parsing the table: check the exit code, read stderr on failure.
+
 ## Visual check and production A/B
 
     tools/kblob/kb.py useblob 1        # live render loop uses the blob

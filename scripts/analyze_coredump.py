@@ -32,7 +32,91 @@ import tempfile
 import shutil
 import json
 import base64
+import re
 from pathlib import Path
+
+# scripts/auto_firmware_version.py writes `#define BUILD_GIT_VERSION "<git
+# describe output>"` at build time (e.g. "v1.9.8-sleep9-523-g506f6630-dirty"),
+# and WebUIPlugin.cpp reports that same string back as the support bundle's
+# `versions.displayVersion` (WebUIPlugin.cpp:2030, "SystemTab's support bundle
+# ... serializes this whole document as `versions`"). The "-g<hash>" segment
+# is git-describe's own signature and is what tells this apart from an
+# ordinary version-looking string elsewhere in the binary.
+GIT_VERSION_RE = re.compile(rb"v\d+\.\d+\.\d+(?:-[0-9A-Za-z.]+)*-g[0-9a-f]{6,}(?:-dirty)?")
+
+
+def extract_ascii_runs(data, min_len=8):
+    """Printable-ASCII substrings of at least min_len bytes: what the
+    `strings` utility finds, done in pure Python so this script carries no
+    dependency on it beyond GDB itself."""
+    runs = []
+    start = None
+    for i, b in enumerate(data):
+        if 0x20 <= b < 0x7F:
+            if start is None:
+                start = i
+        else:
+            if start is not None and i - start >= min_len:
+                runs.append(data[start:i])
+            start = None
+    if start is not None and len(data) - start >= min_len:
+        runs.append(data[start:])
+    return runs
+
+
+def elf_embedded_git_versions(elf_path):
+    """The distinct BUILD_GIT_VERSION-shaped strings embedded in an ELF's
+    read-only data. Normally exactly one (the identical literal is used in
+    several translation units); more than one is reported as ambiguous rather
+    than picking one, because guessing which is the real one would defeat the
+    point of the check."""
+    with open(elf_path, "rb") as f:
+        data = f.read()
+    versions = set()
+    for run in extract_ascii_runs(data):
+        for m in GIT_VERSION_RE.finditer(run):
+            versions.add(m.group().decode("ascii"))
+    return versions
+
+
+def check_elf_matches_dump(firmware_elf, support_data, force):
+    """Refuse to symbolise a core dump against the wrong firmware.elf.
+    GDB's backtrace, `info locals` and disassembly are only meaningful when
+    the ELF it reads debug info from is the exact binary that crashed (tools
+    F16: this script never used to check that at all). Compares the crashed
+    device's own reported build (the support bundle's `versions.
+    displayVersion`, i.e. its BUILD_GIT_VERSION) against the same string
+    embedded in the candidate firmware.elf. Returns True if the analysis
+    should proceed, False if it should stop."""
+    crash_version = (support_data.get("versions") or {}).get("displayVersion")
+    if not crash_version or crash_version == "unknown":
+        print("⚠️  Support bundle carries no build version (old bundle format?): cannot verify the ELF matches the dump.")
+        return True
+    elf_versions = elf_embedded_git_versions(str(firmware_elf))
+    if len(elf_versions) == 0:
+        print(f"⚠️  No BUILD_GIT_VERSION-shaped string found in {firmware_elf}: cannot verify it matches the crashed build ({crash_version}).")
+        return True
+    if len(elf_versions) > 1:
+        print(
+            f"⚠️  {firmware_elf} carries {len(elf_versions)} different BUILD_GIT_VERSION-shaped strings "
+            f"({sorted(elf_versions)}): cannot tell which is its own build, so cannot verify it matches "
+            f"the crashed build ({crash_version})."
+        )
+        return True
+    (elf_version,) = elf_versions
+    if elf_version == crash_version:
+        print(f"✅ ELF build matches the crashed device: {elf_version}")
+        return True
+    print("❌ REFUSING: this ELF does not match the build that crashed.")
+    print(f"   Crashed device reported: {crash_version}")
+    print(f"   Candidate ELF is:        {elf_version}")
+    print("   Symbolising a dump against the wrong ELF gives a backtrace, locals and")
+    print("   disassembly that look plausible and are wrong. Rebuild/flash the matching")
+    print("   binary, or pass --force if you understand the mismatch and want it anyway.")
+    if force:
+        print("   --force given: proceeding anyway.")
+        return True
+    return False
 
 def find_pio_build_dir(environment="display"):
     """Find the PlatformIO build directory for the given environment."""
@@ -200,12 +284,19 @@ def print_crash_summary(coredump_file):
     print(f"   (gdb) info locals")
 
 def main():
-    if len(sys.argv) < 2:
-        print("Usage: python3 scripts/analyze_coredump.py <coredump_file> [environment_or_elf_file] [elf_file]")
+    # --force (skip the build-match refusal below) can appear anywhere in the
+    # argument list; strip it out first so the positional parsing below is
+    # unaffected by where the caller put it.
+    argv = sys.argv[1:]
+    force = "--force" in argv
+    argv = [a for a in argv if a != "--force"]
+
+    if len(argv) < 1:
+        print("Usage: python3 scripts/analyze_coredump.py <coredump_file> [environment_or_elf_file] [elf_file] [--force]")
         print("")
         print("Available environments:")
         print("  display           - Main display controller (default)")
-        print("  controller        - Gaggia controller")  
+        print("  controller        - Gaggia controller")
         print("  display-headless  - Headless display mode")
         print("")
         print("Examples:")
@@ -214,9 +305,12 @@ def main():
         print("  python3 scripts/analyze_coredump.py ~/Downloads/coredump.bin controller")
         print("  python3 scripts/analyze_coredump.py ~/Downloads/coredump.bin /path/to/firmware.elf")
         print("  python3 scripts/analyze_coredump.py ~/Downloads/coredump.bin display /path/to/firmware.elf")
+        print("")
+        print("--force: symbolise even when the ELF's own BUILD_GIT_VERSION does not match")
+        print("         the crashed device's (versions.displayVersion in the support bundle).")
         sys.exit(1)
-    
-    support_file = sys.argv[1]
+
+    support_file = argv[0]
     support_data = {
         'versions': {
             'displayVersion': 'unknown'
@@ -236,18 +330,18 @@ def main():
     # Parse arguments - support both environment and direct ELF file specification
     environment = "display"  # default
     custom_elf_file = None
-    
-    if len(sys.argv) >= 3:
-        second_arg = sys.argv[2]
+
+    if len(argv) >= 2:
+        second_arg = argv[1]
         # Check if second argument is an ELF file (has .elf extension or is an absolute/relative path)
         if second_arg.endswith('.elf') or '/' in second_arg or '\\' in second_arg:
             custom_elf_file = second_arg
         else:
             environment = second_arg
-    
-    if len(sys.argv) >= 4:
-        custom_elf_file = sys.argv[3]
-    
+
+    if len(argv) >= 3:
+        custom_elf_file = argv[2]
+
     print("🚀 ESP32 Core Dump Analyzer")
     print("="*50)
     displayVersion = 'unknown'
@@ -283,7 +377,13 @@ def main():
         firmware_elf = find_firmware_elf(build_dir)
         if not firmware_elf:
             sys.exit(1)
-    
+
+    # Refuse to symbolise against the wrong build (tools F16) before doing
+    # any GDB work: a mismatch here makes every later result look plausible
+    # and be wrong.
+    if not check_elf_matches_dump(firmware_elf, support_data, force):
+        sys.exit(1)
+
     # Find GDB
     gdb_path = find_gdb_executable()
     if not gdb_path:

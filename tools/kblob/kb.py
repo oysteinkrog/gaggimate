@@ -435,42 +435,60 @@ def bench(args, hold_lock=True):
             r = go()
     else:
         r = go()
-    print_bench(r)
+    problems = print_bench(r)
+    if problems:
+        print("kb: FAIL: %s" % "; ".join(problems), file=sys.stderr)
+        sys.exit(1)
     return r
 
 
 def print_bench(r):
+    """Print the bench table and return a list of problem descriptions (empty
+    if the run was clean). A caller that wants a passing process to fail on a
+    rejected init(), a pixel mismatch or a hot-slab leak must check this
+    return value: printing MISMATCH/LEAK here does not by itself stop the
+    process."""
     mhz = r.get("cpu_mhz") or 240
     frames = max(1, r.get("frames", 1))
     print("kbench %s (anim %d) n=%d frames=%d, ms per frame at %d MHz" % (r.get("id"), r["anim"], r["n"], frames, mhz))
     print("%-8s %9s %9s %9s %6s %s" % ("variant", "min_ms", "first_ms", "mean_ms", "bands", "vs band()"))
     base = r["band"]["min_cyc"] if r["band"]["ran"] and r["band"]["min_cyc"] else None
+    problems = []
     for k in ("band", "ref", "blob", "blobref"):
         v = r[k]
         if not v["ran"]:
             continue
         if v["init_failed"]:
             print("%-8s init failed" % k)
+            problems.append("%s: init() rejected the start" % k)
             continue
         ms = lambda c: c / (mhz * 1000.0) / frames
         rel = "%.2fx" % (base / v["min_cyc"]) if base and v["min_cyc"] else ""
         mm = ""
         if k != "band" and v["mismatch_bands"]:
             mm = "  MISMATCH %d bands vs band() (first frame %d y %d)" % (v["mismatch_bands"], v["first_mismatch_frame"], v["first_mismatch_y"])
+            problems.append("%s: %d bands mismatched vs band()" % (k, v["mismatch_bands"]))
         elif k != "band" and base:
             mm = "  same pixels as band()"
         if k == "blobref" and r["blob"]["ran"] and not r["blob"]["init_failed"]:
-            mm += "; MISMATCH %d bands vs blob" % v["mismatch_vs_blob"] if v.get("mismatch_vs_blob") else "; same pixels as blob"
+            if v.get("mismatch_vs_blob"):
+                mm += "; MISMATCH %d bands vs blob" % v["mismatch_vs_blob"]
+                problems.append("blobref: %d bands mismatched vs blob" % v["mismatch_vs_blob"])
+            else:
+                mm += "; same pixels as blob"
         print("%-8s %9.2f %9.2f %9.2f %6d %s%s" % (k, ms(v["min_cyc"]), ms(v["first_cyc"]), ms(v["mean_cyc"]), v["bands"], rel, mm))
     # Hot-slab hygiene. A table without a matching release() pins the slab's
     # live count above zero, and until the bench reset every later init() on
     # the board would have landed in PSRAM.
     if r.get("hot_leak_fw"):
         print("kb: LEAK: the firmware's %s left %d B in the hot slab after release() (bench reset the slab)" % (r.get("id"), r["hot_leak_fw"]))
+        problems.append("firmware %s leaked %d B" % (r.get("id"), r["hot_leak_fw"]))
     if r.get("hot_leak_blob"):
         print("kb: LEAK: the blob left %d B in the hot slab after release(): a table allocated in init() has no release() (bench reset the slab)" % r["hot_leak_blob"])
+        problems.append("blob leaked %d B" % r["hot_leak_blob"])
     if r.get("hot_leak_before"):
         print("kb: note: %d B of hot slab were still allocated before this bench (leaked by an earlier run on this boot); reset" % r["hot_leak_before"])
+    return problems
 
 
 def info(args):
