@@ -76,6 +76,13 @@ class Settings {
   public:
     Settings();
 
+    // One Settings object exists (Controller owns it). It holds the mutex
+    // handles and the Preferences store, so a copy would share both and read
+    // every field without the value lock. A reader that needs several values
+    // takes them through the copying getters under a Guard instead.
+    Settings(const Settings &) = delete;
+    Settings &operator=(const Settings &) = delete;
+
     // Read NVS into the property registry and start the async-save task.
     // Deliberately not the constructor's job: main.cpp defines `Controller
     // controller;` at file scope, so this object is built during C++ global

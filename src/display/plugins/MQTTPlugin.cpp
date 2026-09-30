@@ -8,12 +8,21 @@
 static constexpr const char *LOG_TAG = "MQTTPlugin";
 
 bool MQTTPlugin::connect(Controller *controller) {
-    const Settings settings = controller->getSettings();
-    const String ip = settings.getHomeAssistantIP();
-    const int haPort = settings.getHomeAssistantPort();
+    // Snapshot the connection fields under the guard, so a web save cannot
+    // land between two reads and pair a new host with an old password.
+    String ip;
+    int haPort;
+    String haUser;
+    String haPassword;
+    {
+        Settings &settings = controller->getSettings();
+        Settings::Guard guard(settings);
+        ip = settings.getHomeAssistantIP();
+        haPort = settings.getHomeAssistantPort();
+        haUser = settings.getHomeAssistantUser();
+        haPassword = settings.getHomeAssistantPassword();
+    }
     const String clientId = "GaggiMate";
-    const String haUser = settings.getHomeAssistantUser();
-    const String haPassword = settings.getHomeAssistantPassword();
 
     client.begin(ip.c_str(), haPort, net);
     client.setKeepAlive(10);
@@ -33,8 +42,7 @@ bool MQTTPlugin::connect(Controller *controller) {
 void MQTTPlugin::publishDiscovery(Controller *controller) {
     if (!client.connected())
         return;
-    const Settings settings = controller->getSettings();
-    const String haTopic = settings.getHomeAssistantTopic();
+    const String haTopic = controller->getSettings().getHomeAssistantTopic();
     String mac = WiFi.macAddress();
     mac.replace(":", "_");
     const char *cmac = mac.c_str();

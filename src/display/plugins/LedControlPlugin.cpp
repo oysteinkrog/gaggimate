@@ -19,14 +19,29 @@ void LedControlPlugin::loop() {
 }
 
 void LedControlPlugin::updateControl() {
-    Settings settings = this->controller->getSettings();
+    // Snapshot the colours under the guard: a web save replaces them on
+    // async_tcp, and the guard keeps the set from one save.
+    String active;
+    String finished;
+    String error;
+    String idle;
+    int ext;
+    {
+        Settings &settings = this->controller->getSettings();
+        Settings::Guard guard(settings);
+        active = settings.getSunriseActive();
+        finished = settings.getSunriseFinished();
+        error = settings.getSunriseError();
+        idle = settings.getSunriseIdle();
+        ext = settings.getSunriseExtBrightness();
+    }
     int mode = this->controller->getMode();
     if (mode == MODE_STANDBY) {
         sendControl(0, 0, 0, 0, 0);
         return;
     }
     if (this->controller->isActive() && mode == MODE_BREW) {
-        sendControl(settings.getSunriseActive(), settings.getSunriseExtBrightness());
+        sendControl(active, ext);
         return;
     }
     bool lastWasBrew;
@@ -37,14 +52,14 @@ void LedControlPlugin::updateControl() {
         lastWasBrew = last != nullptr && last->getType() == MODE_BREW;
     }
     if (lastWasBrew && mode == MODE_BREW) {
-        sendControl(settings.getSunriseFinished(), settings.getSunriseExtBrightness());
+        sendControl(finished, ext);
         return;
     }
     if (this->controller->isLowWaterLevel() || this->controller->isErrorState()) {
-        sendControl(settings.getSunriseError(), settings.getSunriseExtBrightness());
+        sendControl(error, ext);
         return;
     }
-    sendControl(settings.getSunriseIdle(), settings.getSunriseExtBrightness());
+    sendControl(idle, ext);
 }
 
 void LedControlPlugin::sendControl(String hexColor, uint8_t ext) {
