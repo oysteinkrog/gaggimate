@@ -4,6 +4,7 @@ import { FontAwesomeIcon } from '@fortawesome/react-fontawesome';
 import { faMagnifyingGlassChart } from '@fortawesome/free-solid-svg-icons/faMagnifyingGlassChart';
 import { parseBinaryIndex, indexToShotList } from '../../ShotHistory/parseBinaryIndex.js';
 import { ApiServiceContext } from '../../../services/ApiService.js';
+import { fetchHistoryWithRetry } from '../../../services/historyFetch.js';
 import { cleanName } from '../../ShotAnalyzer/utils/analyzerUtils.js';
 import {
   shotMetricSlotsSignal,
@@ -41,7 +42,7 @@ function formatShotDateTime(timestamp, hour12) {
 
 async function loadRecentShots(recentShotCount) {
   // Same binary format as index.bin, truncated server-side to the newest entries.
-  const resp = await fetch(`/api/history/recent.bin?limit=${recentShotCount}`);
+  const resp = await fetchHistoryWithRetry(`/api/history/recent.bin?limit=${recentShotCount}`);
   if (!resp.ok) return [];
   const buf = await resp.arrayBuffer();
   return indexToShotList(parseBinaryIndex(buf)).slice(0, recentShotCount);

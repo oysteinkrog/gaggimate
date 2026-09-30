@@ -9,6 +9,7 @@ import { profileChartHeightSignal } from '../../../utils/dashboardManager.js';
 import { SkeletonBlock } from '../../../components/SkeletonBlock.jsx';
 import { fmtElapsed, fmtPhaseTarget, getPhaseLabel } from '../utils.js';
 import { parseBinaryIndex, indexToShotList } from '../../ShotHistory/parseBinaryIndex.js';
+import { fetchHistoryWithRetry } from '../../../services/historyFetch.js';
 
 function ProgressCard({ processInfo, isBrewing, isGrinding, selectedProfile }) {
   const p = processInfo;
@@ -146,7 +147,7 @@ export function ProfileCard({
   useEffect(() => {
     if (!isFinished || !isBrewing || finishedStats !== null) return;
     let cancelled = false;
-    fetch('/api/history/recent.bin?limit=1')
+    fetchHistoryWithRetry('/api/history/recent.bin?limit=1')
       .then(resp => (resp.ok ? resp.arrayBuffer() : null))
       .then(buf => {
         if (cancelled || !buf) return;

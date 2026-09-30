@@ -3,6 +3,7 @@
 
 import { parseBinaryIndex } from '../../pages/ShotHistory/parseBinaryIndex.js';
 import { parseBinaryShot } from '../../pages/ShotHistory/parseBinaryShot.js';
+import { fetchHistoryWithRetry } from '../../services/historyFetch.js';
 import { SLOG_FETCH_DELAY_MS, SLOG_FETCH_RETRIES } from './constants.js';
 
 const SHOT_FLAG_DELETED = 0x02;
@@ -21,7 +22,7 @@ function isSlogReady(buf) {
 }
 
 export async function fetchShotIndex() {
-  const r = await fetch('/api/history/index.bin', { cache: 'no-store' });
+  const r = await fetchHistoryWithRetry('/api/history/index.bin', { cache: 'no-store' });
   if (r.status === 404) return [];
   if (!r.ok) throw new Error(`GET index.bin ${r.status}`);
   const buf = await r.arrayBuffer();
@@ -34,7 +35,7 @@ export async function fetchShotIndex() {
 async function fetchShotReady(id, onWait) {
   const padded = String(id).padStart(6, '0');
   for (let attempt = 1; attempt <= SLOG_FETCH_RETRIES; attempt++) {
-    const r = await fetch(`/api/history/${padded}.slog`, { cache: 'no-store' });
+    const r = await fetchHistoryWithRetry(`/api/history/${padded}.slog`, { cache: 'no-store' });
     if (r.ok) {
       const buf = await r.arrayBuffer();
       if (isSlogReady(buf)) return buf;
