@@ -36,8 +36,11 @@
 
 /*****************************************************  Operation register REG
  * ****************************************************/
-uint8_t I2C_Read_EXIO(uint8_t REG);               // Read the value of the TCA9554PWR register REG
-uint8_t I2C_Read_EXIO(uint8_t REG, uint8_t Data); // Write Data to the REG register of the TCA9554PWR
+// Callers hold the panel's bus lock (WavesharePanel::BusGuard); these
+// functions do not take it themselves.
+uint8_t I2C_Read_EXIO(uint8_t REG);                // Read the value of the TCA9554PWR register REG (0 on failure)
+bool I2C_Read_EXIO(uint8_t REG, uint8_t &Data);    // Read REG into Data; false when the bus did not return one byte
+uint8_t I2C_Write_EXIO(uint8_t REG, uint8_t Data); // Write Data to the REG register of the TCA9554PWR; 0 on success
 /********************************************************** Set EXIO mode
  * **********************************************************/
 void Mode_EXIO(uint8_t Pin, uint8_t State); // Set the mode of the TCA9554PWR Pin. The default is Output mode (output mode or

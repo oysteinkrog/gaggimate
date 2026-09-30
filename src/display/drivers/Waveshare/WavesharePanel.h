@@ -15,6 +15,8 @@
 #include <display/drivers/common/Display.h>
 #include <display/drivers/common/ext.h>
 #include <driver/spi_master.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
 
 enum WavesharePanelType {
     WS_UNKNOWN,
@@ -115,4 +117,29 @@ class WavesharePanel : public Display {
     uint64_t _sleepTimeUs;
 
     WS_RGBPanel_TouchType _touchType;
+
+    // One lock for every user of the I2C bus: the touch controller read
+    // (getPoint, on the touch task, TouchTask.h) and the TCA9554 expander
+    // (panel init, the SD power pin, the touch reset line). Wire serialises
+    // single transactions, but a register read is two and its receive
+    // buffer is shared, so two tasks reading at once hand each other the
+    // wrong bytes; on the T-RGB that left the touch controller NACKing every
+    // poll until reboot (CLAUDE.md, the I2C bus mutex under "Touch is read by
+    // its own task"). Created in begin(), which runs before the touch task
+    // starts and before the SD mount. Recursive: the touch driver's expander
+    // callbacks nest under getPoint and initTouch.
+    SemaphoreHandle_t _busLock = nullptr;
+    struct BusGuard {
+        SemaphoreHandle_t m;
+        explicit BusGuard(SemaphoreHandle_t mm) : m(mm) {
+            if (m != nullptr) {
+                xSemaphoreTakeRecursive(m, portMAX_DELAY);
+            }
+        }
+        ~BusGuard() {
+            if (m != nullptr) {
+                xSemaphoreGiveRecursive(m);
+            }
+        }
+    };
 };

@@ -43,9 +43,13 @@ WavesharePanel::~WavesharePanel() {
 }
 
 bool WavesharePanel::begin(WS_RGBPanel_Color_Order order) {
+    if (_busLock == nullptr) {
+        _busLock = xSemaphoreCreateRecursiveMutex();
+    }
     if (_panelDrv) {
         return true;
     }
+    BusGuard busGuard(_busLock);
 
     _order = order;
 
@@ -75,6 +79,9 @@ void WavesharePanel::initExtension() {
 }
 
 bool WavesharePanel::installSD() {
+    // The SD power pin is on the expander, and the touch task is already
+    // polling when the card is mounted (Controller::setup).
+    BusGuard busGuard(_busLock);
     initExtension();
     Mode_EXIO(EXIO_PIN4, TCA9554_OUTPUT_REG);
     Set_EXIO(EXIO_PIN4, High);
@@ -105,6 +112,7 @@ bool WavesharePanel::installSD() {
 }
 
 void WavesharePanel::uninstallSD() {
+    BusGuard busGuard(_busLock);
     SD_MMC.end();
     Set_EXIO(EXIO_PIN4, Low);
     Mode_EXIO(EXIO_PIN4, TCA9554_INPUT_REG);
@@ -160,6 +168,8 @@ void WavesharePanel::sleep() {
         setBrightness(i);
         delay(30);
     }
+    // Held to deep sleep: the touch controller and Wire go down below.
+    BusGuard busGuard(_busLock);
 
     if (WS_T_RGB_WAKEUP_FORM_TOUCH != _wakeupMethod) {
         if (_touchDrv) {
@@ -231,6 +241,7 @@ uint16_t WavesharePanel::height() { return WS_BOARD_TFT_HEIGHT; }
 
 uint8_t WavesharePanel::getPoint(int16_t *x_array, int16_t *y_array, uint8_t get_point) {
     if (_touchDrv) {
+        BusGuard busGuard(_busLock);
 
         // The FT3267 type touch reading INT level is to read the coordinates
         // after pressing The CST820 interrupt level is not continuous, so the
@@ -248,6 +259,7 @@ uint8_t WavesharePanel::getPoint(int16_t *x_array, int16_t *y_array, uint8_t get
 
 bool WavesharePanel::isPressed() const {
     if (_touchDrv) {
+        BusGuard busGuard(_busLock);
         return _touchDrv->isPressed();
     }
     return 0;

@@ -2,16 +2,26 @@
 
 /*****************************************************  Operation register REG
  * ****************************************************/
-uint8_t I2C_Read_EXIO(uint8_t REG) // Read the value of the TCA9554PWR register REG
-{
+bool I2C_Read_EXIO(uint8_t REG, uint8_t &Data) {
     Wire.beginTransmission(TCA9554_ADDRESS);
     Wire.write(REG);
-    uint8_t result = Wire.endTransmission();
-    if (result != 0) {
+    if (Wire.endTransmission() != 0) {
         printf("Data Transfer Failure !!!\r\n");
+        return false;
     }
-    Wire.requestFrom(TCA9554_ADDRESS, 1);
-    uint8_t bitsStatus = Wire.read();
+    // One byte asked for, one byte or nothing: a short read must not hand a
+    // stale or foreign byte to a read-modify-write below.
+    if (Wire.requestFrom(TCA9554_ADDRESS, 1) != 1 || Wire.available() < 1) {
+        printf("Data Read Failure !!!\r\n");
+        return false;
+    }
+    Data = Wire.read();
+    return true;
+}
+uint8_t I2C_Read_EXIO(uint8_t REG) // Read the value of the TCA9554PWR register REG
+{
+    uint8_t bitsStatus = 0;
+    I2C_Read_EXIO(REG, bitsStatus);
     return bitsStatus;
 }
 uint8_t I2C_Write_EXIO(uint8_t REG, uint8_t Data) // Write Data to the REG register of the TCA9554PWR
@@ -22,7 +32,7 @@ uint8_t I2C_Write_EXIO(uint8_t REG, uint8_t Data) // Write Data to the REG regis
     uint8_t result = Wire.endTransmission();
     if (result != 0) {
         printf("Data write failure!!!\r\n");
-        return -1;
+        return 1;
     }
     return 0;
 }
@@ -31,7 +41,11 @@ uint8_t I2C_Write_EXIO(uint8_t REG, uint8_t Data) // Write Data to the REG regis
 void Mode_EXIO(uint8_t Pin, uint8_t State) // Set the mode of the TCA9554PWR Pin. The default is Output mode (output mode or input
                                            // mode). State: 0= Output mode 1= input mode
 {
-    uint8_t bitsStatus = I2C_Read_EXIO(TCA9554_CONFIG_REG);
+    uint8_t bitsStatus;
+    if (!I2C_Read_EXIO(TCA9554_CONFIG_REG, bitsStatus)) {
+        printf("I/O Configuration Failure !!!\r\n");
+        return; // never write back a byte the bus did not return
+    }
     uint8_t Data = (0x01 << (Pin - 1)) | bitsStatus;
     uint8_t result = I2C_Write_EXIO(TCA9554_CONFIG_REG, Data);
     if (result != 0) {
@@ -67,7 +81,11 @@ void Set_EXIO(uint8_t Pin, uint8_t State) // Sets the level state of the Pin wit
 {
     uint8_t Data;
     if (State < 2 && Pin < 9 && Pin > 0) {
-        uint8_t bitsStatus = Read_EXIOS(TCA9554_OUTPUT_REG);
+        uint8_t bitsStatus;
+        if (!I2C_Read_EXIO(TCA9554_OUTPUT_REG, bitsStatus)) {
+            printf("Failed to set GPIO!!!\r\n");
+            return; // never write back a byte the bus did not return
+        }
         if (State == 1)
             Data = (0x01 << (Pin - 1)) | bitsStatus;
         else if (State == 0)

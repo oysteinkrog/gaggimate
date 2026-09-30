@@ -32,15 +32,17 @@ struct Sample {
     uint8_t synthetic = 0; // from /api/debug/tap, not the controller
     uint32_t seq = 0;      // increments per sample
     int64_t tUs = 0;       // esp_timer time the sample was read
-    // The last press edge, so a press that begins and ends between two
-    // LVGL reads (a quick tap during a long UI pass; every injected tap is
-    // 80 ms) is still delivered: latest() hands the press point back once
-    // as a pressed sample before reporting the release. pressId moves on
-    // every press edge.
-    uint32_t pressId = 0;
-    int16_t pressX = 0;
-    int16_t pressY = 0;
-    int64_t pressTUs = 0;
+};
+
+// latest() does not only hand back the live state. Every press and release
+// edge the task sees is also queued (kMaxTransitions deep), and latest()
+// returns the oldest queued edge before the live state, so taps that begin
+// and end between two LVGL reads (a quick tap during a long UI pass; every
+// injected tap is 80 ms) still reach LVGL as press, release, press,
+// release. When the queue is full the oldest complete press and release
+// pair is dropped and counted (transitionsDropped), so the queue always
+// ends with the newest edge and a lifted finger always ends released.
+constexpr int kMaxTransitions = 4;
 };
 
 struct HitRect {
@@ -69,6 +71,8 @@ void publishHitMap(const HitRect *rects, int n, bool plateOn, uint16_t plateColo
 uint32_t hitMapGeneration();
 int hitMapCount();
 uint32_t sampleCount();
+// Press and release pairs dropped because the edge queue was full.
+uint32_t transitionsDropped();
 uint32_t stackHighWaterBytes();
 #else
 // The simulator reads its mouse from LVGL's own callback; there is no task.
@@ -81,6 +85,7 @@ inline void publishHitMap(const HitRect *, int, bool, uint16_t, int) {}
 inline uint32_t hitMapGeneration() { return 0; }
 inline int hitMapCount() { return 0; }
 inline uint32_t sampleCount() { return 0; }
+inline uint32_t transitionsDropped() { return 0; }
 inline uint32_t stackHighWaterBytes() { return 0; }
 #endif
 

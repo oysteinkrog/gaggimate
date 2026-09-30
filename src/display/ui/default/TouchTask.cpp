@@ -32,6 +32,69 @@ std::atomic<uint32_t> s_sampleSeq{0};
 Sample s_sample;
 std::atomic<uint32_t> s_sampleCount{0};
 
+// The edge queue (TouchTask.h, kMaxTransitions): the task appends, the UI
+// task (latest()) takes from the front. Both run on core 1; a spinlock
+// covers the few instructions either side needs. The task writes the
+// sample before it queues the edge, so once the queue is empty the live
+// sample is never older than the last edge LVGL was given; at worst it is
+// the edge still being queued, which LVGL then sees twice in a row and
+// ignores as no change.
+struct Transition {
+    int16_t x;
+    int16_t y;
+    uint8_t pressed;
+    uint8_t synthetic;
+    int64_t tUs;
+};
+portMUX_TYPE s_queueMux = portMUX_INITIALIZER_UNLOCKED;
+Transition s_queue[kMaxTransitions];
+int s_queueCount = 0;
+std::atomic<uint32_t> s_queueDropped{0};
+
+void queueEdge(const Transition &t) {
+    taskENTER_CRITICAL(&s_queueMux);
+    if (s_queueCount == kMaxTransitions) {
+        // Edges alternate, so a press followed by its release is always
+        // present in a full queue. Removing the oldest such pair keeps the
+        // alternation and what LVGL has already been told consistent.
+        int drop = 0;
+        for (int i = 0; i + 1 < s_queueCount; i++) {
+            if (s_queue[i].pressed && !s_queue[i + 1].pressed) {
+                drop = i;
+                break;
+            }
+        }
+        for (int i = drop; i + 2 < s_queueCount; i++) {
+            s_queue[i] = s_queue[i + 2];
+        }
+        s_queueCount -= 2;
+        s_queueDropped.fetch_add(1);
+    }
+    s_queue[s_queueCount++] = t;
+    taskEXIT_CRITICAL(&s_queueMux);
+}
+
+bool takeEdge(Transition &t) {
+    bool got = false;
+    taskENTER_CRITICAL(&s_queueMux);
+    if (s_queueCount > 0) {
+        t = s_queue[0];
+        for (int i = 1; i < s_queueCount; i++) {
+            s_queue[i - 1] = s_queue[i];
+        }
+        s_queueCount--;
+        got = true;
+    }
+    taskEXIT_CRITICAL(&s_queueMux);
+    return got;
+}
+
+void clearEdges() {
+    taskENTER_CRITICAL(&s_queueMux);
+    s_queueCount = 0;
+    taskEXIT_CRITICAL(&s_queueMux);
+}
+
 // The hit map: two PSRAM buffers, the header names the live one. The writer
 // (UI task) fills the other buffer, then publishes index and generation in
 // one store; the reader retries when the generation moved under it.
@@ -177,16 +240,12 @@ void taskMain(void *) {
         s_sample.synthetic = synthetic ? 1 : 0;
         s_sample.seq = seq;
         s_sample.tUs = now;
-        if (pressed && !wasPressed) {
-            s_sample.pressId++;
-            s_sample.pressX = x;
-            s_sample.pressY = y;
-            s_sample.pressTUs = now;
-        }
         s_sampleSeq.fetch_add(1);
         s_sampleCount.fetch_add(1);
 
         if (pressed != wasPressed) {
+            // After the sample, never before: see the queue's comment.
+            queueEdge(Transition{x, y, static_cast<uint8_t>(pressed ? 1 : 0), static_cast<uint8_t>(synthetic ? 1 : 0), now});
             wasPressed = pressed;
             g_touchEdgeAtUs = now;
             if (pressed) {
@@ -247,7 +306,14 @@ bool start(Display *display, SleepAnimation *anim, int plateElement) {
 
 bool running() { return s_running.load(); }
 
-void setPollEnabled(bool on) { s_pollEnabled.store(on); }
+void setPollEnabled(bool on) {
+    if (on && !s_pollEnabled.load()) {
+        // Edges queued before the pause are stale; LVGL read the controller
+        // itself in between.
+        clearEdges();
+    }
+    s_pollEnabled.store(on);
+}
 bool pollEnabled() { return s_pollEnabled.load(); }
 
 bool latest(Sample &out) {
@@ -264,19 +330,17 @@ bool latest(Sample &out) {
             break;
         }
     }
-    // UI task only (LVGL's read callback). A press edge the reader has not
-    // seen yet is reported as pressed at its point, whatever the finger is
-    // doing now; the next read returns the live state, so a tap shorter
-    // than one UI pass still becomes PRESSED then RELEASED in LVGL.
-    static uint32_t seenPressId = 0;
-    if (out.pressId != seenPressId) {
-        seenPressId = out.pressId;
-        if (!out.pressed) {
-            out.pressed = 1;
-            out.x = out.pressX;
-            out.y = out.pressY;
-            out.tUs = out.pressTUs;
-        }
+    // UI task only (LVGL's read callback). A queued edge comes first, in
+    // order, whatever the finger is doing now; the live state only once the
+    // queue is empty. So a tap shorter than one UI pass still becomes
+    // PRESSED then RELEASED in LVGL, and so do two or more of them.
+    Transition t;
+    if (takeEdge(t)) {
+        out.x = t.x;
+        out.y = t.y;
+        out.pressed = t.pressed;
+        out.synthetic = t.synthetic;
+        out.tUs = t.tUs;
     }
     return true;
 }
@@ -318,6 +382,7 @@ void publishHitMap(const HitRect *rects, int n, bool plateOn, uint16_t plateColo
 uint32_t hitMapGeneration() { return unpack(s_header.load()).gen; }
 int hitMapCount() { return unpack(s_header.load()).n; }
 uint32_t sampleCount() { return s_sampleCount.load(); }
+uint32_t transitionsDropped() { return s_queueDropped.load(); }
 uint32_t stackHighWaterBytes() {
     return s_task != nullptr ? static_cast<uint32_t>(uxTaskGetStackHighWaterMark(s_task)) * sizeof(StackType_t) : 0;
 }
