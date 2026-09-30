@@ -34,13 +34,34 @@ a bounce buffer skipped while the cache was actually fine, which costs a few
 stale scanlines on one frame. The flag lives in internal DRAM, which is not
 behind the cache, and both cores see a plain 32-bit store immediately.
 
-Idempotent: guarded by a marker string. Anchored on exact upstream text so an
-IDF bump that rewrites these functions fails the build loudly here rather than
+Applied through scripts/gm_patch.py: the patched file is always derived from
+a hash-verified pristine cache_utils.c (kept beside it as cache_utils.c.gm-orig)
+and carries a gm-patch-vN stamp, so a file patched by an older version of this
+script is brought up to date. Anchored on exact upstream text so an IDF bump
+that rewrites these functions fails the build loudly here rather than
 silently shipping without the flag.
+
+Versions
+--------
+v1 (2026-09-30, the first stamped version): the flag, its raise and its clear.
+Bump VERSION whenever a hunk below changes.
 """
 
 import os
 import sys
+
+try:
+    Import("env")  # noqa: F821 -- provided by SCons
+except NameError:  # imported by scripts/test_gm_patch.py
+    env = None
+if env is not None:
+    sys.path.insert(0, os.path.join(env.subst("$PROJECT_DIR"), "scripts"))
+import gm_patch  # noqa: E402
+
+OWNER = "patch_flash_cache_flag"
+VERSION = 1
+# sha256 of upstream ESP-IDF v5.5.1's components/spi_flash/cache_utils.c.
+PRISTINE_SHA256 = {"82ced66b0757bfb57163b6a351421b572b966c87b9d8dd7d3a8a617319031112"}
 
 MARKER = "GM_FLASH_CACHE_FLAG_PATCH"
 
@@ -65,6 +86,7 @@ HUNKS = [
         "\n"
         "    spi_flash_op_lock();\n"
         "    gm_flash_cache_down = true; // " + MARKER + "\n",
+        1,
     ),
     # The clear, after the cache is restored and before the other core is
     # released. Everything after this point runs with a working cache.
@@ -83,54 +105,18 @@ HUNKS = [
         "    spi_flash_restore_cache(other_cpuid, s_flash_op_cache_state[other_cpuid]);\n"
         "#endif\n"
         "    gm_flash_cache_down = false; // " + MARKER + "\n",
+        1,
     ),
 ]
 
 
-def find_driver():
-    # __file__ is undefined when SCons execs a pre-script, so locate the
-    # framework relative to the PlatformIO home the same way the esp_lcd
-    # patch does.
-    home = os.environ.get("PLATFORMIO_HOME_DIR") or os.path.expanduser("~/.platformio")
-    path = os.path.join(home, "packages", "framework-espidf", "components",
-                        "spi_flash", "cache_utils.c")
-    return path if os.path.isfile(path) else None
-
-
-def apply(path):
-    with open(path, encoding="utf-8") as f:
-        text = f.read()
-    if MARKER in text:
-        print("patch_flash_cache_flag: already patched (%s)" % path)
-        return
-    orig = path + ".gm-orig"
-    if not os.path.exists(orig):
-        with open(orig, "w", encoding="utf-8") as f:
-            f.write(text)
-    for old, new in HUNKS:
-        if old not in text:
-            sys.stderr.write(
-                "patch_flash_cache_flag: anchor not found in %s; the IDF was "
-                "updated and this patch needs review. Anchor begins: %r\n"
-                % (path, old[:80]))
-            sys.exit(1)
-        if text.count(old) != 1:
-            sys.stderr.write(
-                "patch_flash_cache_flag: anchor not unique in %s: %r\n"
-                % (path, old[:80]))
-            sys.exit(1)
-        text = text.replace(old, new)
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(text)
-    print("patch_flash_cache_flag: patched %s" % path)
+PATCHES = [gm_patch.Patch(MARKER, VERSION, HUNKS)]
 
 
 def main():
-    path = find_driver()
-    if path is None:
-        print("patch_flash_cache_flag: cache_utils.c not found; skipping")
-        return
-    apply(path)
+    path = gm_patch.idf_file(env, "components", "spi_flash", "cache_utils.c")  # noqa: F821
+    gm_patch.run(OWNER, path, PRISTINE_SHA256, PATCHES)
 
 
-main()
+if env is not None:
+    main()

@@ -34,19 +34,36 @@ bounding box at the old and the new angle, computed the way lv_draw_img
 computes it (_lv_img_buf_get_transformed_area about the pivot placed on the
 scale centre), plus one pixel of margin.
 
-Idempotent: guarded by a marker string. Anchored on exact upstream text so an
-LVGL bump that rewrites these functions fails the build loudly here rather
-than silently shipping full-screen invalidation again.
+Applied through scripts/gm_patch.py: the patched file is always derived from
+a hash-verified pristine lv_meter.c (kept beside it as lv_meter.c.gm-orig) and
+carries a gm-patch-vN stamp, so a tree patched by an older version of this
+script is brought up to date instead of being taken as done. Anchored on exact
+upstream text so an LVGL bump that rewrites these functions fails the build
+loudly here rather than silently shipping full-screen invalidation again. The
+library lives in .pio/libdeps/<env>/lvgl, so the path comes from the SCons env.
 
-The library lives in .pio/libdeps/<env>/lvgl, so unlike the framework patches
-this one resolves the path through the SCons env. A pristine copy is kept at
-lv_meter.c.gm-orig beside the patched file.
+Versions
+--------
+v1 (2026-09-30, the first stamped version): scale-lines sector invalidation,
+needle-image box invalidation, and the element-ownership guard (gm-2cl.6).
+Bump VERSION whenever a hunk below changes.
 """
 
 import os
 import sys
 
-Import("env")  # noqa: F821 -- provided by SCons
+try:
+    Import("env")  # noqa: F821 -- provided by SCons
+except NameError:  # imported by scripts/test_gm_patch.py
+    env = None
+if env is not None:
+    sys.path.insert(0, os.path.join(env.subst("$PROJECT_DIR"), "scripts"))
+import gm_patch  # noqa: E402
+
+OWNER = "patch_lvgl_meter_inv"
+VERSION = 1
+# sha256 of upstream LVGL 8.4's src/extra/widgets/meter/lv_meter.c.
+PRISTINE_SHA256 = {"a59ebdf418c7fc16896283f5624667d10b0b7293113238df0a30cd5a6cc98121"}
 
 MARKER = "GM_METER_INV_PATCH"
 ELEM_MARKER = "GM_METER_ELEM_PATCH"
@@ -230,52 +247,18 @@ HUNKS = [
 # LVGL draw, a snapshot and an overlay publish. Only the ring is owned: the
 # needle image on the same meter is still LVGL's, so its invalidation must
 # still happen (a first version returned from the setter before any branch
-# and the owned dials' needles froze, 2026-09-08). ELEM_MARKER is what an
-# already-patched tree is recognised by.
-ELEM_HUNKS = []
-
-
-def apply_hunks(path, marker, hunks, text):
-    if marker in text:
-        print("patch_lvgl_meter_inv: %s already applied (%s)" % (marker, path))
-        return text, False
-    for old, new, count in hunks:
-        found = text.count(old)
-        if found != count:
-            sys.stderr.write(
-                "patch_lvgl_meter_inv: %s anchor found %d times (want %d) in %s; "
-                "LVGL was updated and this patch needs review. Anchor begins: %r\n"
-                % (marker, found, count, path, old[:80]))
-            sys.exit(1)
-        text = text.replace(old, new)
-    return text, True
-
-
-def apply(path):
-    with open(path, encoding="utf-8") as f:
-        text = f.read()
-    orig = path + ".gm-orig"
-    if not os.path.exists(orig):
-        with open(orig, "w", encoding="utf-8") as f:
-            f.write(text)
-    text, a = apply_hunks(path, MARKER, HUNKS, text)
-    text, b = apply_hunks(path, ELEM_MARKER, ELEM_HUNKS, text)
-    if not (a or b):
-        return
-    tmp = path + ".gm-tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        f.write(text)
-    os.replace(tmp, path)
-    print("patch_lvgl_meter_inv: patched %s" % path)
+# and the owned dials' needles froze, 2026-09-08).
+PATCHES = [gm_patch.Patch(MARKER, VERSION, HUNKS)]
 
 
 def main():
     path = os.path.join(env.subst("$PROJECT_LIBDEPS_DIR"), env.subst("$PIOENV"),  # noqa: F821
                         "lvgl", "src", "extra", "widgets", "meter", "lv_meter.c")
     if not os.path.isfile(path):
-        print("patch_lvgl_meter_inv: lv_meter.c not found for this env; skipping")
+        print("gm-patch: %s: lv_meter.c not found for this env; skipping" % OWNER)
         return
-    apply(path)
+    gm_patch.run(OWNER, path, PRISTINE_SHA256, PATCHES)
 
 
-main()
+if env is not None:
+    main()

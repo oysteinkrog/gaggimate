@@ -43,13 +43,38 @@ The fix, in three parts
    that from three quarters to seven eighths, at twice the interrupt rate.
 
 The patch is applied to the framework package in place, because PlatformIO
-builds ESP-IDF components from the shared package directory.  It is idempotent
-and every hunk is anchored on exact upstream text, so an IDF upgrade that moves
-this code fails the build loudly rather than silently reverting the fix.
+builds ESP-IDF components from the shared package directory.  It goes through
+scripts/gm_patch.py: the patched file is always derived from a hash-verified
+pristine esp_lcd_panel_rgb.c (kept beside it as esp_lcd_panel_rgb.c.gm-orig)
+and carries one gm-patch-vN stamp per patch set, so a driver patched by an
+older version of this script, or clobbered by a Windows-side build, is brought
+up to date.  Every hunk is anchored on exact upstream text, so an IDF upgrade
+that moves this code fails the build loudly rather than silently reverting the
+fix.
+
+Versions
+--------
+GM_RGB_CATCHUP_PATCH v1 and GM_RGB_GAPLOG_PATCH v1 (2026-09-30, the first
+stamped versions): the hunks below as they stood then.  Bump the matching
+version whenever a hunk changes.
 """
 
 import os
 import sys
+
+try:
+    Import("env")  # noqa: F821 -- provided by SCons
+except NameError:  # imported by scripts/test_gm_patch.py
+    env = None
+if env is not None:
+    sys.path.insert(0, os.path.join(env.subst("$PROJECT_DIR"), "scripts"))
+import gm_patch  # noqa: E402
+
+OWNER = "patch_esp_lcd_rgb"
+CATCHUP_VERSION = 1
+GAPLOG_VERSION = 1
+# sha256 of upstream ESP-IDF v5.5.1's components/esp_lcd/rgb/esp_lcd_panel_rgb.c.
+PRISTINE_SHA256 = {"baa5a951284d9ef8cae4cdcded85ac17ac77f025e58c66bcd4ff33cbbfd0b72f"}
 
 # Eight buffers of GM_LCD_BOUNCE_LINES scanlines each. Keep lines x buffers at
 # 15,360 bytes: platformio.ini documents the WiFi cliff that budget sits above,
@@ -565,9 +590,8 @@ HUNKS = [
 # entry, the interrupted task and its saved PC (_frxt_int_enter stores the
 # frame pointer in TCB.pxTopOfStack at nesting 0->1; XT_STK_PC=4, XT_STK_PS=8),
 # and the task on the other core (the bus competitor). Read it through
-# /api/debug/scanout ("gaplog", "chunk_hist"). Applied independently of the
-# catch-up patch so it lands on a driver that is already patched; both are
-# re-applied after a Windows-side clobber.
+# /api/debug/scanout ("gaplog", "chunk_hist"). A separate patch set with its
+# own stamp, applied after the catch-up hunks it anchors on.
 # ---------------------------------------------------------------------------
 GAPLOG_MARKER = "GM_RGB_GAPLOG_PATCH"
 GL = GAPLOG_MARKER
@@ -756,89 +780,17 @@ GAPLOG_HUNKS = [
 ]
 
 
-def apply_gaplog(path):
-    with open(path, "r", encoding="utf-8", newline="") as handle:
-        text = handle.read()
-    if GAPLOG_MARKER in text:
-        return "gaplog already patched"
-    for index, (old, new) in enumerate(GAPLOG_HUNKS, start=1):
-        count = text.count(old)
-        if count != 1:
-            raise SystemExit(
-                "patch_esp_lcd_rgb: gaplog hunk %d matched %d times in %s, expected exactly 1."
-                % (index, count, path)
-            )
-        text = text.replace(old, new)
-    with open(path, "w", encoding="utf-8", newline="") as handle:
-        handle.write(text)
-    return "gaplog patched"
-
-
-def find_driver():
-    """Locate esp_lcd_panel_rgb.c in the framework package PlatformIO is using."""
-    candidates = []
-    env_root = os.environ.get("IDF_PATH")
-    if env_root:
-        candidates.append(os.path.join(env_root, "components", "esp_lcd", "rgb", "esp_lcd_panel_rgb.c"))
-    home = os.path.expanduser("~")
-    for base in (os.environ.get("PLATFORMIO_CORE_DIR"), os.path.join(home, ".platformio")):
-        if not base:
-            continue
-        candidates.append(os.path.join(base, "packages", "framework-espidf", "components",
-                                       "esp_lcd", "rgb", "esp_lcd_panel_rgb.c"))
-    for path in candidates:
-        if os.path.isfile(path):
-            return path
-    return None
-
-
-def apply(path):
-    with open(path, "r", encoding="utf-8", newline="") as handle:
-        text = handle.read()
-
-    if MARKER in text:
-        return "already patched"
-
-    for index, (old, new) in enumerate(HUNKS, start=1):
-        count = text.count(old)
-        if count != 1:
-            raise SystemExit(
-                "patch_esp_lcd_rgb: hunk %d matched %d times in %s, expected exactly 1.\n"
-                "The driver has changed upstream. Re-derive the patch against the new "
-                "source rather than loosening this check: a silently skipped hunk brings "
-                "back the display displacement it exists to fix." % (index, count, path)
-            )
-        text = text.replace(old, new)
-
-    with open(path, "w", encoding="utf-8", newline="") as handle:
-        handle.write(text)
-    return "patched"
-
-
-def revert_gaplog(path):
-    """Reverse GAPLOG_HUNKS (new -> old) so a re-derived hunk set can be applied."""
-    with open(path, "r", encoding="utf-8", newline="") as handle:
-        text = handle.read()
-    if GAPLOG_MARKER not in text:
-        return "gaplog not present"
-    for index, (old, new) in enumerate(GAPLOG_HUNKS, start=1):
-        if text.count(new) != 1:
-            raise SystemExit("patch_esp_lcd_rgb: cannot revert gaplog hunk %d (text changed)" % index)
-        text = text.replace(new, old)
-    with open(path, "w", encoding="utf-8", newline="") as handle:
-        handle.write(text)
-    return "gaplog reverted"
+# Every hunk in both sets must match exactly once.
+PATCHES = [
+    gm_patch.Patch(MARKER, CATCHUP_VERSION, [(old, new, 1) for old, new in HUNKS]),
+    gm_patch.Patch(GAPLOG_MARKER, GAPLOG_VERSION, [(old, new, 1) for old, new in GAPLOG_HUNKS]),
+]
 
 
 def main():
-    path = find_driver()
-    if path is None:
-        raise SystemExit("patch_esp_lcd_rgb: could not find esp_lcd_panel_rgb.c")
-    if "--revert-gaplog" in sys.argv:
-        print("patch_esp_lcd_rgb: %s (%s)" % (revert_gaplog(path), path))
-        return
-    print("patch_esp_lcd_rgb: %s (%s)" % (apply(path), path))
-    print("patch_esp_lcd_rgb: %s (%s)" % (apply_gaplog(path), path))
+    path = gm_patch.idf_file(env, "components", "esp_lcd", "rgb", "esp_lcd_panel_rgb.c")  # noqa: F821
+    gm_patch.run(OWNER, path, PRISTINE_SHA256, PATCHES)
 
 
-main()
+if env is not None:
+    main()
