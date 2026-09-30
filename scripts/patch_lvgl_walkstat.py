@@ -29,16 +29,32 @@ Everything is inside #ifdef GM_TOUCH_PROBE, so only loadtest builds compile
 the counters even though the patch is applied to every env's libdep copy.
 Consumed and reset by the GM_UISTAT logger in DefaultUI.cpp.
 
-Idempotent: guarded by a marker string. Anchored on exact upstream text so an
-LVGL bump that rewrites these functions fails the build loudly. Pristine
-copies are kept at <file>.gm-orig beside each patched file.
+Applied through scripts/gm_patch.py, like patch_lvgl_meter_inv.py: each file
+is derived from a hash-verified pristine copy (kept beside it as
+<file>.gm-orig) and carries a gm-patch-vN stamp, so a file patched by an
+older version of this script is brought up to date instead of being taken as
+done. Anchored on exact upstream text so an LVGL bump that rewrites these
+functions fails the build loudly.
+
+Versions
+--------
+v1 (2026-10-01, the first stamped version): the event, style, image, rect,
+label, line and arc wraps. Bump VERSION whenever a hunk changes.
 """
 
 import os
 import sys
 
-Import("env")  # noqa: F821 -- provided by SCons
+try:
+    Import("env")  # noqa: F821 -- provided by SCons
+except NameError:  # imported by scripts/test_gm_patch.py
+    env = None
+if env is not None:
+    sys.path.insert(0, os.path.join(env.subst("$PROJECT_DIR"), "scripts"))
+import gm_patch  # noqa: E402
 
+OWNER = "patch_lvgl_walkstat"
+VERSION = 1
 MARKER = "GM_WALKSTAT_PATCH"
 
 EVENT_OLD = (
@@ -279,55 +295,39 @@ ARC_OLD, ARC_NEW = leaf_wrap(
     "gm_ws_arc_us", "gm_ws_arc_calls",
     "    if(dsc->opa <= LV_OPA_MIN) return;\n")
 
-# path components (under the env's lvgl libdep), hunks as (old, new, count)
-FILES = [
-    (("src", "core", "lv_event.c"), [(EVENT_OLD, EVENT_NEW, 1)]),
-    (("src", "core", "lv_obj_style.c"), [(STYLE_OLD, STYLE_NEW, 1)]),
-    (("src", "draw", "lv_draw_img.c"), [(IMG_OLD, IMG_NEW, 1)]),
-    (("src", "draw", "lv_draw_rect.c"), [(RECT_OLD, RECT_NEW, 1)]),
-    (("src", "draw", "lv_draw_label.c"), [(LABEL_OLD, LABEL_NEW, 1)]),
-    (("src", "draw", "lv_draw_line.c"), [(LINE_OLD, LINE_NEW, 1)]),
-    (("src", "draw", "lv_draw_arc.c"), [(ARC_OLD, ARC_NEW, 1)]),
+# (path under the env's lvgl libdep, sha256 of the upstream LVGL 8.4.0 file,
+# patch sets in order)
+TARGETS = [
+    (("src", "core", "lv_event.c"),
+     {"ff8f0e0c00b52a1c5ed2072ae4c2ad28e5205a65cc862483e4dcf2d1eb940281"}, [(EVENT_OLD, EVENT_NEW, 1)]),
+    (("src", "core", "lv_obj_style.c"),
+     {"2ad29ac7530ebda0d5802c89cbafd3ea08ab68788badf197c92e615c8197caf7"}, [(STYLE_OLD, STYLE_NEW, 1)]),
+    (("src", "draw", "lv_draw_img.c"),
+     {"dd7bd04aa2dd18ec6db7da2785d59acba0a0e3839b4ab0c23150321b21db95d1"}, [(IMG_OLD, IMG_NEW, 1)]),
+    (("src", "draw", "lv_draw_rect.c"),
+     {"6bcb01c108b62424ad50fbcb8d8630050f03941b76a5f0b75b2e72d8d7181c66"}, [(RECT_OLD, RECT_NEW, 1)]),
+    (("src", "draw", "lv_draw_label.c"),
+     {"94a36626981552d2984603c56efb35711e8115700a77abadd3debd32c3da1c29"}, [(LABEL_OLD, LABEL_NEW, 1)]),
+    (("src", "draw", "lv_draw_line.c"),
+     {"0555f0036c21e63a2c1d30d680292d0b4cfe3a560c8d2dc71185ee33cf60addf"}, [(LINE_OLD, LINE_NEW, 1)]),
+    (("src", "draw", "lv_draw_arc.c"),
+     {"112e6f8081cb993fc1dfa505de08b00e802f12e0c3bdd04ac382af14ffbf31ce"}, [(ARC_OLD, ARC_NEW, 1)]),
 ]
-
-
-def apply(path, hunks):
-    with open(path, encoding="utf-8") as f:
-        text = f.read()
-    if MARKER in text:
-        print("patch_lvgl_walkstat: already patched (%s)" % path)
-        return
-    orig = path + ".gm-orig"
-    if not os.path.exists(orig):
-        with open(orig, "w", encoding="utf-8") as f:
-            f.write(text)
-    for old, new, count in hunks:
-        found = text.count(old)
-        if found != count:
-            sys.stderr.write(
-                "patch_lvgl_walkstat: anchor found %d times (want %d) in %s; "
-                "LVGL was updated and this patch needs review. Anchor begins: %r\n"
-                % (found, count, path, old[:80]))
-            sys.exit(1)
-        text = text.replace(old, new)
-    tmp = path + ".gm-tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        f.write(text)
-    os.replace(tmp, path)
-    print("patch_lvgl_walkstat: patched %s" % path)
+TARGETS = [(rel, sha, [gm_patch.Patch(MARKER, VERSION, hunks)]) for rel, sha, hunks in TARGETS]
 
 
 def main():
     base = os.path.join(env.subst("$PROJECT_LIBDEPS_DIR"), env.subst("$PIOENV"), "lvgl")  # noqa: F821
     if not os.path.isdir(base):
-        print("patch_lvgl_walkstat: lvgl libdep not found for this env; skipping")
+        print("gm-patch: %s: lvgl libdep not found for this env; skipping" % OWNER)
         return
-    for parts, hunks in FILES:
-        path = os.path.join(base, *parts)
+    for rel, sha, patches in TARGETS:
+        path = os.path.join(base, *rel)
         if not os.path.isfile(path):
-            sys.stderr.write("patch_lvgl_walkstat: %s missing; LVGL layout changed\n" % path)
+            sys.stderr.write("gm-patch: ERROR: %s: %s missing; LVGL layout changed\n" % (OWNER, path))
             sys.exit(1)
-        apply(path, hunks)
+        gm_patch.run(OWNER, path, sha, patches)
 
 
-main()
+if env is not None:
+    main()

@@ -159,6 +159,33 @@ def targets():
     ]
 
 
+# Scripts that own several files declare TARGETS: (path under the env's lvgl
+# libdep, pristine sha256 set, patch sets). One entry per script and file.
+LVGL_SCRIPTS = ["patch_lvgl_setpx_fast", "patch_lvgl_label_elem", "patch_lvgl_walkstat"]
+
+
+def lvgl_targets():
+    """(script, module, file label, [candidate paths], pristine sha256, patches)."""
+    out = []
+    for name in LVGL_SCRIPTS:
+        module = load_script(name)
+        for rel, sha, patches in module.TARGETS:
+            paths = sorted(glob.glob(os.path.join(ROOT, ".pio", "libdeps", "*", "lvgl", *rel)))
+            out.append((name, module, rel[-1], paths, sha, patches))
+    return out
+
+
+def find_pristine_sha(sha, paths):
+    for path in paths:
+        for candidate in (path + ".gm-orig", path):
+            if os.path.isfile(candidate):
+                with open(candidate, "rb") as f:
+                    data = f.read()
+                if hashlib.sha256(data).hexdigest() in sha:
+                    return data.decode("utf-8")
+    return None
+
+
 def find_pristine(module, paths):
     for path in paths:
         for candidate in (path + ".gm-orig", path):
@@ -190,6 +217,60 @@ class ScriptTests(unittest.TestCase):
         self.assertIn("gm_inv_needle_img", text)
 
 
+class LvglScriptTests(unittest.TestCase):
+    def test_lvgl_scripts_render_against_upstream(self):
+        for name, module, label, paths, sha, patches in lvgl_targets():
+            with self.subTest(script=name, file=label):
+                pristine = find_pristine_sha(sha, paths)
+                if pristine is None:
+                    self.skipTest("no pristine copy of %s on this machine" % label)
+                out = gm_patch.render(pristine, module.OWNER, patches)
+                self.assertEqual(out.count(gm_patch.STAMP_TAG), len(patches))
+                for patch in patches:
+                    self.assertIn(patch.name, out[out.index("\n"):])
+
+    def test_setpx_writers_land_at_end_in_order(self):
+        module = load_script("patch_lvgl_setpx_fast")
+        rel, sha, patches = module.TARGETS[1]
+        pristine = find_pristine_sha(sha, sorted(glob.glob(os.path.join(ROOT, ".pio", "libdeps", "*", "lvgl", *rel))))
+        if pristine is None:
+            self.skipTest("no pristine lv_draw_sw_blend.c on this machine")
+        out = gm_patch.render(pristine, module.OWNER, patches)
+        self.assertTrue(out.endswith(module.BLEND_TAIL + module.BLEND_IMPL + module.PLANAR_IMPL))
+        # Row tracking and the opaque fill, which the stale loadtest tree lacked.
+        self.assertIn("gm_snap_row_note", out)
+        self.assertIn("Opaque fill", out)
+
+    def test_label_keeps_every_hunk_under_one_version(self):
+        module = load_script("patch_lvgl_label_elem")
+        files = {rel[-1]: patches for rel, _sha, patches in module.TARGETS}
+        self.assertEqual(sorted(files), ["lv_img.c", "lv_label.c", "lv_obj_pos.c"])
+        pos = "".join(new for _o, new, _n in files["lv_obj_pos.c"][0].hunks)
+        self.assertIn("LV_OBJ_FLAG_USER_2", pos)
+        self.assertIn("LV_OBJ_FLAG_USER_3", pos)
+        self.assertEqual({p.version for ps in files.values() for p in ps}, {module.VERSION})
+
+    def test_label_drops_a_hand_applied_hunk(self):
+        # The bench display tree carried a GM_INVAL_SRC_PATCH hunk no script
+        # writes; re-deriving from the pristine copy removes it.
+        module = load_script("patch_lvgl_label_elem")
+        rel, sha, patches = [t for t in module.TARGETS if t[0][-1] == "lv_obj_pos.c"][0]
+        pristine = find_pristine_sha(sha, sorted(glob.glob(os.path.join(ROOT, ".pio", "libdeps", "*", "lvgl", *rel))))
+        if pristine is None:
+            self.skipTest("no pristine lv_obj_pos.c on this machine")
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "lv_obj_pos.c")
+            with open(path + ".gm-orig", "w", encoding="utf-8", newline="") as f:
+                f.write(pristine)
+            with open(path, "w", encoding="utf-8", newline="") as f:
+                f.write("/* GM_INVAL_SRC_PATCH */\n" + pristine)
+            gm_patch.ensure(module.OWNER, path, sha, patches, log=quiet)
+            with open(path, encoding="utf-8", newline="") as f:
+                text = f.read()
+        self.assertNotIn("GM_INVAL_SRC_PATCH", text)
+        self.assertEqual(text, gm_patch.render(pristine, module.OWNER, patches))
+
+
 def report_installed():
     """Print, per installed target, whether it equals the scripts' derivation."""
     status = 0
@@ -215,6 +296,24 @@ def report_installed():
                 state = "STALE   "
                 status = 1
             print("%s %s stamps=%d want=%d %s" % (state, name, stamps, len(module.PATCHES), path))
+    for name, module, label, paths, sha, patches in lvgl_targets():
+        pristine = find_pristine_sha(sha, paths)
+        for path in paths:
+            with open(path, encoding="utf-8", newline="") as f:
+                cur = f.read()
+            if pristine is None:
+                print("UNKNOWN  %s (no pristine copy found)" % path)
+                status = 1
+                continue
+            want = gm_patch.render(pristine, module.OWNER, patches)
+            if cur == want:
+                state = "CURRENT "
+            elif hashlib.sha256(cur.encode()).hexdigest() in sha:
+                state = "PRISTINE"
+            else:
+                state = "STALE   "
+                status = 1
+            print("%s %s stamps=%d want=%d %s" % (state, name, cur.count(gm_patch.STAMP_TAG), len(patches), path))
     return status
 
 

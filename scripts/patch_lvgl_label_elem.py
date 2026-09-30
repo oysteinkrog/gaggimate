@@ -29,24 +29,40 @@ boxes at the status bar, every value change). The coordinates still
 update; only the invalidation is skipped, and the area holds no label
 pixels either way.
 
-Idempotent: guarded by a marker string. Anchored on exact upstream text so
-an LVGL bump that rewrites these functions fails the build loudly here
-rather than silently drawing owned labels twice. Same mechanics as
-scripts/patch_lvgl_meter_inv.py: the library lives in
-.pio/libdeps/<env>/lvgl, resolved through the SCons env, and a pristine
-copy is kept at lv_label.c.gm-orig beside the patched file.
+Applied through scripts/gm_patch.py, like scripts/patch_lvgl_meter_inv.py:
+each file is derived from a hash-verified pristine copy (kept beside it as
+<file>.gm-orig) and carries a gm-patch-vN stamp, so a file patched by an
+older version of this script, or edited by hand, is brought back to exactly
+what the hunks below produce. Anchored on exact upstream text so an LVGL bump
+that rewrites these functions fails the build loudly here rather than
+silently drawing owned labels twice. The library lives in
+.pio/libdeps/<env>/lvgl, resolved through the SCons env.
 
 Since gm-2cl.17 LV_OBJ_FLAG_USER_3 on an lv_img means "owned by a layer":
 the image draws nothing (lv_img.c) and none of its invalidations reach the
 display (lv_obj_pos.c); DefaultUI::serviceIconLayers mirrors its state and
 hidden flag into layer sprites instead.
+
+Versions
+--------
+v1 (2026-10-01, the first stamped version): the lv_label.c hunks (gm-2cl.5),
+the lv_obj_pos.c size and move hunks, and the USER_3 layer hunks in
+lv_obj_pos.c and lv_img.c (gm-2cl.17). Bump VERSION whenever a hunk changes.
 """
 
 import os
 import sys
 
-Import("env")  # noqa: F821 -- provided by SCons
+try:
+    Import("env")  # noqa: F821 -- provided by SCons
+except NameError:  # imported by scripts/test_gm_patch.py
+    env = None
+if env is not None:
+    sys.path.insert(0, os.path.join(env.subst("$PROJECT_DIR"), "scripts"))
+import gm_patch  # noqa: E402
 
+OWNER = "patch_lvgl_label_elem"
+VERSION = 1
 MARKER = "GM_LABEL_ELEM_PATCH"
 GUARD = "lv_obj_has_flag(obj, LV_OBJ_FLAG_USER_2)"
 
@@ -171,47 +187,34 @@ IMG_HUNKS = [
 ]
 
 
-def apply(path, hunks):
-    with open(path, encoding="utf-8") as f:
-        text = f.read()
-    orig = path + ".gm-orig"
-    if not os.path.exists(orig):
-        with open(orig, "w", encoding="utf-8") as f:
-            f.write(text)
-    # Per hunk, so a hunk added later still lands in a file the marker is
-    # already in.
-    changed = 0
-    for old, new, count in hunks:
-        if new in text:
-            continue
-        found = text.count(old)
-        if found != count:
-            sys.stderr.write(
-                "patch_lvgl_label_elem: anchor found %d times (want %d) in %s; "
-                "LVGL was updated and this patch needs review. Anchor begins: %r\n"
-                % (found, count, path, old[:80]))
-            sys.exit(1)
-        text = text.replace(old, new)
-        changed += 1
-    if changed == 0:
-        print("patch_lvgl_label_elem: already applied (%s)" % path)
-        return
-    tmp = path + ".gm-tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        f.write(text)
-    os.replace(tmp, path)
-    print("patch_lvgl_label_elem: patched %s (%d hunks)" % (path, changed))
+# One patch set per file under the same name and version. The old script
+# applied per hunk so a hunk added later (the gm-2cl.17 USER_3 hunks) still
+# landed in a file that already carried the marker; deriving every file from
+# its pristine copy makes that unnecessary.
+# (path under the env's lvgl libdep, sha256 of the upstream LVGL 8.4.0 file,
+# patch sets in order)
+TARGETS = [
+    (("src", "widgets", "lv_label.c"),
+     {"37f320495ab4f3eef494d0fa58fcdaf0b9b80ccf3e019937851fd22055bffd2a"},
+     [gm_patch.Patch(MARKER, VERSION, HUNKS)]),
+    (("src", "core", "lv_obj_pos.c"),
+     {"b2bf1a8eecf90a699b6acc05a8e7c1a7ffa94a81c67f5867a3b62df9d662a82c"},
+     [gm_patch.Patch(MARKER, VERSION, POS_HUNKS)]),
+    (("src", "widgets", "lv_img.c"),
+     {"1811f38b3e94a14ed7e76ddf3f52dc0047e6a3ba4539fbacba6e4799e5ca3d60"},
+     [gm_patch.Patch(MARKER, VERSION, IMG_HUNKS)]),
+]
 
 
 def main():
-    root = os.path.join(env.subst("$PROJECT_LIBDEPS_DIR"), env.subst("$PIOENV"), "lvgl", "src")  # noqa: F821
-    for rel, hunks in ((("widgets", "lv_label.c"), HUNKS), (("core", "lv_obj_pos.c"), POS_HUNKS),
-                       (("widgets", "lv_img.c"), IMG_HUNKS)):
-        path = os.path.join(root, *rel)
+    base = os.path.join(env.subst("$PROJECT_LIBDEPS_DIR"), env.subst("$PIOENV"), "lvgl")  # noqa: F821
+    for rel, sha, patches in TARGETS:
+        path = os.path.join(base, *rel)
         if not os.path.isfile(path):
-            print("patch_lvgl_label_elem: %s not found for this env; skipping" % rel[-1])
+            print("gm-patch: %s: %s not found for this env; skipping" % (OWNER, rel[-1]))
             continue
-        apply(path, hunks)
+        gm_patch.run(OWNER, path, sha, patches)
 
 
-main()
+if env is not None:
+    main()

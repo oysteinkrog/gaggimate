@@ -23,17 +23,36 @@ The dispatch in lv_draw_sw_blend_basic recognizes the generic callback by
 pointer identity (helper appended to lv_hal_disp.c, where the static function
 is visible) so any OTHER custom set_px_cb still takes the generic path.
 
-Idempotent (marker-guarded), anchored on exact upstream text so an LVGL bump
-fails loudly. Pristine copies kept beside the files as .gm-orig. The library
-lives in .pio/libdeps/<env>/lvgl, resolved through the SCons env like
-patch_lvgl_meter_inv.py.
+Applied through scripts/gm_patch.py, like patch_lvgl_meter_inv.py: each
+patched file is derived from a hash-verified pristine copy (kept beside it as
+<file>.gm-orig) and carries one gm-patch-vN stamp per patch set, so a tree
+patched by an older version of this script is brought up to date instead of
+being taken as done. The old marker test left the loadtest
+lv_draw_sw_blend.c without the planar writer's row tracking and opaque fill.
+Anchored on exact upstream text so an LVGL bump fails loudly. The library
+lives in .pio/libdeps/<env>/lvgl, resolved through the SCons env.
+
+Versions
+--------
+v1 (2026-10-01, the first stamped version) of both patch sets:
+GM_SETPX_FASTPATH (lv_hal_disp.c recognizer, RGB565+A8 writers in
+lv_draw_sw_blend.c) and GM_SETPX_PLANAR (planar overlay writers with row
+extent tracking and the opaque fill). Bump VERSION whenever a hunk changes.
 """
 
 import os
 import sys
 
-Import("env")  # noqa: F821 -- provided by SCons
+try:
+    Import("env")  # noqa: F821 -- provided by SCons
+except NameError:  # imported by scripts/test_gm_patch.py
+    env = None
+if env is not None:
+    sys.path.insert(0, os.path.join(env.subst("$PROJECT_DIR"), "scripts"))
+import gm_patch  # noqa: E402
 
+OWNER = "patch_lvgl_setpx_fast"
+VERSION = 1
 MARKER = "GM_SETPX_FASTPATH"
 
 # --- lv_hal_disp.c: pointer-identity recognizer ------------------------------
@@ -422,46 +441,51 @@ PLANAR_IMPL = (
     "}\n"
     "#endif /*LV_COLOR_DEPTH == 16*/\n"
 )
-def apply_one(path, hunks, append=None, marker=MARKER):
-    with open(path, encoding="utf-8") as f:
-        text = f.read()
-    if marker in text:
-        print("patch_lvgl_setpx_fast: already patched (%s, %s)" % (path, marker))
-        return
-    orig = path + ".gm-orig"
-    if not os.path.exists(orig):
-        with open(orig, "w", encoding="utf-8") as f:
-            f.write(text)
-    for old, new in hunks:
-        found = text.count(old)
-        if found != 1:
-            sys.stderr.write(
-                "patch_lvgl_setpx_fast: anchor found %d times (want 1) in %s; "
-                "LVGL was updated and this patch needs review. Anchor begins: %r\n"
-                % (found, path, old[:80]))
-            sys.exit(1)
-        text = text.replace(old, new)
-    if append is not None:
-        text += append
-    tmp = path + ".gm-tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        f.write(text)
-    os.replace(tmp, path)
-    print("patch_lvgl_setpx_fast: patched %s" % path)
+# The two writer blocks go at the end of the file. gm_patch only replaces
+# anchored text, so the fast-path block anchors on upstream's last lines and
+# the planar block anchors on the fast-path block, which keeps the order the
+# old appending script produced.
+BLEND_TAIL = """    if(opa == LV_OPA_COVER) return fg;
+
+    return lv_color_mix(fg, bg, opa);
+}
+
+#endif
+"""
+
+HAL_PATCH = gm_patch.Patch(MARKER, VERSION, [(HAL_ANCHOR, HAL_ADD, 1)])
+BLEND_PATCHES = [
+    gm_patch.Patch(MARKER, VERSION, [
+        (BLEND_PROTO_ANCHOR, BLEND_PROTO_ADD, 1),
+        (BLEND_DISPATCH_OLD, BLEND_DISPATCH_NEW, 1),
+        (BLEND_TAIL, BLEND_TAIL + BLEND_IMPL, 1),
+    ]),
+    gm_patch.Patch(MARKER2, VERSION, [
+        (PLANAR_PROTO_ANCHOR, PLANAR_PROTO_ADD, 1),
+        (PLANAR_DISPATCH_OLD, PLANAR_DISPATCH_NEW, 1),
+        (BLEND_IMPL, BLEND_IMPL + PLANAR_IMPL, 1),
+    ]),
+]
+
+# (path under the env's lvgl libdep, sha256 of the upstream LVGL 8.4.0 file,
+# patch sets in order)
+TARGETS = [
+    (("src", "hal", "lv_hal_disp.c"),
+     {"042607aab514f55fc69e54bb6c02187ead284cd8bb13e686fe11635c7b14c0d5"}, [HAL_PATCH]),
+    (("src", "draw", "sw", "lv_draw_sw_blend.c"),
+     {"fca53b473937735d0d1af866eb149b105c6f241d67e3f06c3f1fcfdf1352ca7d"}, BLEND_PATCHES),
+]
 
 
 def main():
-    base = os.path.join(env.subst("$PROJECT_LIBDEPS_DIR"), env.subst("$PIOENV"), "lvgl", "src")  # noqa: F821
-    hal = os.path.join(base, "hal", "lv_hal_disp.c")
-    blend = os.path.join(base, "draw", "sw", "lv_draw_sw_blend.c")
-    if not os.path.isfile(hal) or not os.path.isfile(blend):
-        print("patch_lvgl_setpx_fast: lvgl not found for this env; skipping")
+    base = os.path.join(env.subst("$PROJECT_LIBDEPS_DIR"), env.subst("$PIOENV"), "lvgl")  # noqa: F821
+    paths = [(os.path.join(base, *rel), sha, patches) for rel, sha, patches in TARGETS]
+    if not all(os.path.isfile(path) for path, _sha, _patches in paths):
+        print("gm-patch: %s: lvgl not found for this env; skipping" % OWNER)
         return
-    apply_one(hal, [(HAL_ANCHOR, HAL_ADD)])
-    apply_one(blend, [(BLEND_PROTO_ANCHOR, BLEND_PROTO_ADD),
-                      (BLEND_DISPATCH_OLD, BLEND_DISPATCH_NEW)], append=BLEND_IMPL)
-    apply_one(blend, [(PLANAR_PROTO_ANCHOR, PLANAR_PROTO_ADD),
-                      (PLANAR_DISPATCH_OLD, PLANAR_DISPATCH_NEW)], append=PLANAR_IMPL, marker=MARKER2)
+    for path, sha, patches in paths:
+        gm_patch.run(OWNER, path, sha, patches)
 
 
-main()
+if env is not None:
+    main()
