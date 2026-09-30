@@ -25,7 +25,7 @@ inline size_t saturatingSubtract(size_t value, size_t delta) { return value > de
 
 } // namespace
 
-ESPMemoryMonitor *gPanicInstance = nullptr;
+ESPMemoryMonitor *gShutdownInstance = nullptr;
 ESPMemoryMonitor *ESPMemoryMonitor::_failedAllocInstance = nullptr;
 
 ESPMemoryMonitor::ESPMemoryMonitor()
@@ -151,7 +151,7 @@ void ESPMemoryMonitor::deinit() {
     }
 
     unregisterFailedAllocCallback();
-    unregisterPanicHandler();
+    unregisterShutdownHandler();
 
     // The hook is unregistered, so nobody writes the ring now; reset it.
     for (auto &seq : _allocRingSeq) {
@@ -161,6 +161,7 @@ void ESPMemoryMonitor::deinit() {
     _allocTail.store(0, std::memory_order_relaxed);
     _allocFailCount.store(0, std::memory_order_relaxed);
     _allocDropped.store(0, std::memory_order_relaxed);
+    _allocDraining.store(false, std::memory_order_relaxed);
 
     {
         LockGuard guard(_mutex);
@@ -174,7 +175,7 @@ void ESPMemoryMonitor::deinit() {
         _tagThresholdCallback = nullptr;
         _taskStackCallback = nullptr;
         _leakCallback = nullptr;
-        _panicCallback = nullptr;
+        _shutdownCallback = nullptr;
     }
 
     if (_mutex != nullptr) {
@@ -182,7 +183,7 @@ void ESPMemoryMonitor::deinit() {
         _mutex = nullptr;
     }
     _initialized = false;
-    _panicHookInstalled = false;
+    _shutdownHookInstalled = false;
     _running = false;
     _config = MemoryMonitorConfig{};
     _usePSRAMBuffers = false;
@@ -216,8 +217,15 @@ MemorySnapshot ESPMemoryMonitor::sampleNow() {
     }
 
     // Deliver the failed-allocation events the heap hook recorded since the
-    // last pass, outside the lock (the callback may take its own).
-    drainAllocEvents(allocCb);
+    // last pass, outside the lock (the callback may take its own). Only the
+    // sampler delivers while it runs; a sampleNow() from another task would
+    // otherwise race it for the same slots. Before the sampler has stored its
+    // handle, or with no sampler, any caller may drain, and the drain's own
+    // guard keeps two of them from reading one slot.
+    const TaskHandle_t sampler = _samplerTask;
+    if (sampler == nullptr || sampler == xTaskGetCurrentTaskHandle()) {
+        drainAllocEvents(allocCb);
+    }
 
     for (const auto &evt : events) {
         if (thresholdCb) {
@@ -236,6 +244,17 @@ MemorySnapshot ESPMemoryMonitor::sampleNow() {
     }
 
     return publicSnapshot;
+}
+
+MemorySnapshot ESPMemoryMonitor::snapshotNow() const {
+    if (!_initialized) {
+        return {};
+    }
+
+    InternalMemorySnapshot snapshot = captureSnapshot();
+    LockGuard guard(_mutex);
+    enrichSnapshotLocked(snapshot);
+    return toPublicSnapshot(snapshot);
 }
 
 std::vector<MemorySnapshot> ESPMemoryMonitor::history() const {
@@ -371,30 +390,30 @@ bool ESPMemoryMonitor::setTaskStackThreshold(const std::string &taskName, const 
     return true;
 }
 
-bool ESPMemoryMonitor::installPanicHook(PanicCallback callback) {
+bool ESPMemoryMonitor::installShutdownHook(ShutdownCallback callback) {
     if (!_initialized) {
         return false;
     }
 
     LockGuard guard(_mutex);
-    _panicCallback = std::move(callback);
-    if (_panicHookInstalled) {
+    _shutdownCallback = std::move(callback);
+    if (_shutdownHookInstalled) {
         return true;
     }
 
-    if (!registerPanicHandler()) {
+    if (!registerShutdownHandler()) {
         return false;
     }
 
-    _panicHookInstalled = true;
+    _shutdownHookInstalled = true;
     return true;
 }
 
-void ESPMemoryMonitor::uninstallPanicHook() {
+void ESPMemoryMonitor::uninstallShutdownHook() {
     LockGuard guard(_mutex);
-    _panicCallback = nullptr;
-    unregisterPanicHandler();
-    _panicHookInstalled = false;
+    _shutdownCallback = nullptr;
+    unregisterShutdownHandler();
+    _shutdownHookInstalled = false;
 }
 
 void ESPMemoryMonitor::samplerTaskThunk(void *arg) {
@@ -702,14 +721,20 @@ void ESPMemoryMonitor::handleAllocEvent(size_t requestedBytes, uint32_t caps, co
 }
 
 void ESPMemoryMonitor::drainAllocEvents(const FailedAllocCallback &cb) {
-    // Single consumer (the sampler, or whoever calls sampleNow). Slots are
+    // Single consumer. The tail is read, the slot copied and the tail moved
+    // without a CAS, so two drains at once could both deliver one slot or
+    // lose one; the flag makes a second caller skip this pass instead. It
+    // loses nothing: the events stay in the ring for the next drain. Slots are
     // consumed in ticket order; a claimed slot that is not yet published
     // stops the drain until the next pass.
+    if (_allocDraining.exchange(true, std::memory_order_acquire)) {
+        return;
+    }
     for (;;) {
         uint32_t tail = _allocTail.load(std::memory_order_relaxed);
         uint32_t idx = tail % kAllocRingSize;
         if (_allocRingSeq[idx].load(std::memory_order_acquire) != tail + 1) {
-            return;
+            break;
         }
         FailedAllocEvent event = _allocRing[idx];
         _allocRingSeq[idx].store(0, std::memory_order_relaxed);
@@ -718,6 +743,7 @@ void ESPMemoryMonitor::drainAllocEvents(const FailedAllocCallback &cb) {
             cb(event);
         }
     }
+    _allocDraining.store(false, std::memory_order_release);
 }
 
 void ESPMemoryMonitor::allocFailedHook(size_t requestedBytes, uint32_t caps, const char *functionName) {
@@ -1112,18 +1138,18 @@ ESPMemoryMonitor::InternalLeakCheckResult ESPMemoryMonitor::buildLeakCheckLocked
     return result;
 }
 
-void ESPMemoryMonitor::runPanicHook() {
+void ESPMemoryMonitor::runShutdownHook() {
     InternalMemorySnapshot internal = captureSnapshot();
     MemorySnapshot snapshot = toPublicSnapshot(internal);
-    PanicCallback cb;
+    ShutdownCallback cb;
     {
         LockGuard guard(_mutex);
-        cb = _panicCallback;
+        cb = _shutdownCallback;
     }
 
     for (const auto &region : snapshot.regions) {
         const char *name = region.region == MemoryRegion::Psram ? "PSRAM" : "DRAM";
-        ESP_EARLY_LOGE(kLogTag, "panic snapshot %s free=%uB min=%uB largest=%uB frag=%.03f", name,
+        ESP_EARLY_LOGE(kLogTag, "shutdown snapshot %s free=%uB min=%uB largest=%uB frag=%.03f", name,
                        static_cast<unsigned>(region.freeBytes), static_cast<unsigned>(region.minimumFreeBytes),
                        static_cast<unsigned>(region.largestFreeBlock), region.fragmentation);
     }
@@ -1133,26 +1159,26 @@ void ESPMemoryMonitor::runPanicHook() {
     }
 }
 
-bool ESPMemoryMonitor::registerPanicHandler() {
-    gPanicInstance = this;
-    const esp_err_t err = esp_register_shutdown_handler(&ESPMemoryMonitor::panicShutdownThunk);
+bool ESPMemoryMonitor::registerShutdownHandler() {
+    gShutdownInstance = this;
+    const esp_err_t err = esp_register_shutdown_handler(&ESPMemoryMonitor::shutdownThunk);
     if (err != ESP_OK) {
-        gPanicInstance = nullptr;
+        gShutdownInstance = nullptr;
         return false;
     }
     return true;
 }
 
-void ESPMemoryMonitor::unregisterPanicHandler() {
-    esp_unregister_shutdown_handler(&ESPMemoryMonitor::panicShutdownThunk);
-    if (gPanicInstance == this) {
-        gPanicInstance = nullptr;
+void ESPMemoryMonitor::unregisterShutdownHandler() {
+    esp_unregister_shutdown_handler(&ESPMemoryMonitor::shutdownThunk);
+    if (gShutdownInstance == this) {
+        gShutdownInstance = nullptr;
     }
 }
 
-void ESPMemoryMonitor::panicShutdownThunk() {
-    if (gPanicInstance != nullptr) {
-        gPanicInstance->runPanicHook();
+void ESPMemoryMonitor::shutdownThunk() {
+    if (gShutdownInstance != nullptr) {
+        gShutdownInstance->runShutdownHook();
     }
 }
 

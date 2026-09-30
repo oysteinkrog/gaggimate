@@ -228,7 +228,7 @@ using ScopeCallback = std::function<void(const ScopeStats &)>;
 using TagThresholdCallback = std::function<void(const TagThresholdEvent &)>;
 using TaskStackThresholdCallback = std::function<void(const TaskStackEvent &)>;
 using LeakCheckCallback = std::function<void(const LeakCheckResult &)>;
-using PanicCallback = std::function<void(const MemorySnapshot &)>;
+using ShutdownCallback = std::function<void(const MemorySnapshot &)>;
 
 class MemoryScope;
 class ESPMemoryMonitor;
@@ -270,7 +270,19 @@ class ESPMemoryMonitor {
     void deinit();
     bool isInitialized() const { return _initialized; }
 
+    // Take a sample and run everything a sample drives: history, threshold
+    // and stack callbacks, the sample callback, and delivery of the failed
+    // allocations the heap hook recorded. The sampler task calls this; with
+    // the sampler disabled, the application calls it instead. While the
+    // sampler runs, a call from any other task still samples but leaves the
+    // failed-allocation ring to the sampler, so each event is delivered once.
     MemorySnapshot sampleNow();
+    // A current reading for display, safe from any task: regions (with window
+    // statistics from the history) and stacks, as a copy. It appends nothing
+    // to the history, fires no callback and delivers no failed-allocation
+    // event, so a web request polling it cannot reorder or steal what the
+    // sampler reports.
+    MemorySnapshot snapshotNow() const;
     std::vector<MemorySnapshot> history() const;
     MemoryMonitorConfig currentConfig() const;
 
@@ -298,8 +310,13 @@ class ESPMemoryMonitor {
 
     bool setTaskStackThreshold(const std::string &taskName, const TaskStackThreshold &threshold);
 
-    bool installPanicHook(PanicCallback callback = nullptr);
-    void uninstallPanicHook();
+    // Registers with esp_register_shutdown_handler, so the callback runs on
+    // esp_restart() (a requested restart, an OTA reboot) and never on a panic,
+    // an abort or a watchdog reset: the panic handler does not call shutdown
+    // handlers. It is a last snapshot before a planned reboot, not a crash
+    // report; for a crash, read the core dump.
+    bool installShutdownHook(ShutdownCallback callback = nullptr);
+    void uninstallShutdownHook();
 
   private:
     enum class AllocHookType {
@@ -419,13 +436,13 @@ class ESPMemoryMonitor {
     StackState computeStackState(const InternalTaskStackUsage &usage) const;
     void trackTasksLocked(const InternalMemorySnapshot &snapshot, MemoryMonitorVector<TaskStackEvent> &events);
     InternalLeakCheckResult buildLeakCheckLocked(const std::string &label);
-    void runPanicHook();
-    static void panicShutdownThunk();
+    void runShutdownHook();
+    static void shutdownThunk();
 
     bool registerFailedAllocCallback();
     void unregisterFailedAllocCallback();
-    bool registerPanicHandler();
-    void unregisterPanicHandler();
+    bool registerShutdownHandler();
+    void unregisterShutdownHandler();
     void resetOwnedContainers();
 
     MemoryMonitorConfig _config{};
@@ -446,7 +463,9 @@ class ESPMemoryMonitor {
     // _mutex (the sampler holds it while it grows its own containers, and an
     // allocation failing there would deadlock the task against itself) and
     // must not allocate. Multi-producer: a slot is claimed with a CAS on the
-    // head, filled, then published through its sequence word.
+    // head, filled, then published through its sequence word. Single
+    // consumer: drainAllocEvents holds _allocDraining for the whole drain, so
+    // a second caller skips instead of reading a slot twice.
     static constexpr uint32_t kAllocRingSize = 8;
     FailedAllocEvent _allocRing[kAllocRingSize]{};
     std::atomic<uint32_t> _allocRingSeq[kAllocRingSize]{};
@@ -454,11 +473,12 @@ class ESPMemoryMonitor {
     std::atomic<uint32_t> _allocTail{0};
     std::atomic<uint32_t> _allocFailCount{0};
     std::atomic<uint32_t> _allocDropped{0};
+    std::atomic<bool> _allocDraining{false};
     ScopeCallback _scopeCallback;
     TagThresholdCallback _tagThresholdCallback;
     TaskStackThresholdCallback _taskStackCallback;
     LeakCheckCallback _leakCallback;
-    PanicCallback _panicCallback;
+    ShutdownCallback _shutdownCallback;
     MemoryMonitorDeque<InternalScopeStats> _scopeHistory;
     MemoryMonitorVector<InternalTagUsage> _tagUsage;
     MemoryMonitorVector<TagBudget> _tagBudgets;
@@ -466,7 +486,7 @@ class ESPMemoryMonitor {
     MemoryMonitorUnorderedMap<TaskHandle_t, InternalTaskStackUsage> _knownTasks;
     MemoryMonitorDeque<InternalLeakCheckResult> _leakHistory;
     MemoryMonitorDeque<uint64_t> _leakCheckpoints;
-    bool _panicHookInstalled = false;
+    bool _shutdownHookInstalled = false;
 };
 
 #if ESPMM_HAS_ARDUINOJSON

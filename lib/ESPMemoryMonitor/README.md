@@ -16,7 +16,7 @@ ESPMemoryMonitor is a tiny C++17 helper that wraps ESP-IDF heap/stack inspection
 - Leak suspicion helpers: mark checkpoints for steady-state phases; the monitor compares averages and flags downward free-memory drift or rising fragmentation via `onLeakCheck`, with bounded checkpoint/result retention.
 - Derived insights: windowed min/avg/max, slope-based bytes/second, and time-to-warn/critical estimates per region.
 - Task visibility: stack state transitions (`Safe/Warn/Critical`), optional new/vanished task detection, and per-task thresholds.
-- Export/panic helpers: convert snapshots to ArduinoJson for telemetry and install a shutdown/panic hook that captures a final snapshot before abort/restart.
+- Export and shutdown helpers: convert snapshots to ArduinoJson for telemetry and install a shutdown hook that captures a final snapshot before `esp_restart()`. A panic, an abort or a watchdog reset does not run shutdown handlers, so the hook does not cover crashes.
 - Optional PSRAM-backed monitor-owned buffers via `usePSRAMBuffers` (through `ESPBufferManager`) with automatic fallback to normal heap on non-PSRAM boards, including long-lived state, hot-path transient scratch containers, and internal storage models that are converted to public API structs at boundaries.
 - Thread-safe with FreeRTOS mutexes; destructor tears down the sampler worker and unregisters callbacks.
 
@@ -129,11 +129,12 @@ When you need richer stack info or failed-allocation events, flip `enablePerTask
 - `examples/basic_monitor`: background sampler with threshold callbacks, scopes, and per-task stack visibility.
 - `examples/scopes_and_leakcheck`: tag budgets, leak checkpoints, and JSON export when ArduinoJson is present.
 - `examples/manual_sampling`: sampler task disabled; calls `sampleNow()` from `loop()` while still tracking scopes and tag budgets.
-- `examples/panic_hook`: per-task stack thresholds, failed-allocation hook, optional JSON export, and a panic hook that dumps a final snapshot (send `p` over serial to try it).
+- `examples/panic_hook` (upstream name, not in this vendored copy): per-task stack thresholds, failed-allocation hook, optional JSON export, and a shutdown hook that dumps a final snapshot on `esp_restart()`. A panic does not run it.
 
 ## API Reference
 - `bool init(const MemoryMonitorConfig &cfg = {})` / `void deinit()` / `bool isInitialized() const` – start/stop and inspect runtime monitor state. When `enableSamplerTask` is `false`, call `sampleNow()` manually.
-- `MemorySnapshot sampleNow()` – collect a snapshot immediately; triggers callbacks and updates the ring buffer.
+- `MemorySnapshot sampleNow()` – collect a snapshot immediately; triggers callbacks and updates the ring buffer. While the sampler task runs, only the sampler delivers failed-allocation events; a call from another task leaves them for the sampler.
+- `MemorySnapshot snapshotNow() const` – a read-only copy of the current regions and stacks for display from any task. No history entry, no callbacks, no failed-allocation delivery.
 - `std::vector<MemorySnapshot> history()` – copy the stored snapshots (size capped by `historySize`).
 - `MemoryMonitorConfig currentConfig() const` – inspect live settings.
 - `void onSample(SampleCallback cb)` – receive every snapshot (from the sampler task or manual calls).
@@ -143,7 +144,7 @@ When you need richer stack info or failed-allocation events, flip `enablePerTask
 - `MemoryTag registerTag(const std::string &name)` / `bool setTagBudget(MemoryTag, TagBudget)` / `onTagThreshold(TagThresholdCallback cb)` – maintain soft budgets per module/tag.
 - `LeakCheckResult markLeakCheckPoint(const std::string &label)` / `onLeakCheck(LeakCheckCallback cb)` – compare steady-state phases for leak suspicion.
 - `void onTaskStackThreshold(TaskStackThresholdCallback cb)` / `setTaskStackThreshold(const std::string&, TaskStackThreshold)` – task stack state transitions and lifecycle detection (`enablePerTaskStacks + enableTaskTracking`).
-- `bool installPanicHook(PanicCallback cb = {})` / `void uninstallPanicHook()` – capture a pre-abort snapshot via the shutdown hook.
+- `bool installShutdownHook(ShutdownCallback cb = {})` / `void uninstallShutdownHook()` – capture a snapshot from `esp_register_shutdown_handler`, which runs on `esp_restart()` only, never on a panic.
 - `void toJson(const MemorySnapshot&, JsonDocument &doc)` – serialize a snapshot via ArduinoJson for HTTP/MQTT/telemetry (enabled when ArduinoJson is available).
 
 ### ArduinoJson 7 export

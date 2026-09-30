@@ -111,9 +111,11 @@ void init() {
                  evt.functionName ? evt.functionName : "?");
     });
 
-    g_monitor.installPanicHook([](const MemorySnapshot &snap) {
+    // Runs on esp_restart() only (web restart, OTA): a panic or a watchdog
+    // reset never calls shutdown handlers, and the core dump covers those.
+    g_monitor.installShutdownHook([](const MemorySnapshot &snap) {
         for (const auto &r : snap.regions) {
-            ESP_LOGE(TAG, "PANIC %s free=%u min=%u largest=%u frag=%.2f", regionName(r.region), (unsigned)r.freeBytes,
+            ESP_LOGE(TAG, "SHUTDOWN %s free=%u min=%u largest=%u frag=%.2f", regionName(r.region), (unsigned)r.freeBytes,
                      (unsigned)r.minimumFreeBytes, (unsigned)r.largestFreeBlock, r.fragmentation);
         }
     });

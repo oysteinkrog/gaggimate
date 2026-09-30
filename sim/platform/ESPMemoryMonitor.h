@@ -10,7 +10,7 @@
 // Every type shape below is copied from the real header so the production code
 // compiles unchanged; the behaviour is inert. On a desktop with gigabytes of
 // heap there is nothing for the production thresholds (warn at 40 KB internal)
-// to say. sampleNow() returns an empty snapshot, and the callers all already
+// to say. sampleNow() and snapshotNow() return an empty snapshot, and the callers all already
 // handle that -- WebUIPlugin's /api/debug/heap falls back to heap_caps_* when
 // it finds no matching region, which is the path this takes.
 //
@@ -122,7 +122,7 @@ struct MemorySnapshot {
 using ThresholdCallback = std::function<void(const ThresholdEvent &)>;
 using SampleCallback = std::function<void(const MemorySnapshot &)>;
 using FailedAllocCallback = std::function<void(const FailedAllocEvent &)>;
-using PanicCallback = std::function<void(const MemorySnapshot &)>;
+using ShutdownCallback = std::function<void(const MemorySnapshot &)>;
 
 class ESPMemoryMonitor {
   public:
@@ -137,6 +137,7 @@ class ESPMemoryMonitor {
     // Empty regions on purpose: callers fall back to a live heap_caps_* read
     // when a region is absent, which is the right answer on a host.
     MemorySnapshot sampleNow() { return MemorySnapshot{}; }
+    MemorySnapshot snapshotNow() const { return MemorySnapshot{}; }
     std::vector<MemorySnapshot> history() const { return {}; }
     MemoryMonitorConfig currentConfig() const { return _config; }
 
@@ -146,7 +147,7 @@ class ESPMemoryMonitor {
     void onSample(SampleCallback cb) { _onSample = std::move(cb); }
     void onThreshold(ThresholdCallback cb) { _onThreshold = std::move(cb); }
     void onFailedAlloc(FailedAllocCallback cb) { _onFailedAlloc = std::move(cb); }
-    void installPanicHook(PanicCallback cb) { _onPanic = std::move(cb); }
+    void installShutdownHook(ShutdownCallback cb) { _onShutdown = std::move(cb); }
 
   private:
     MemoryMonitorConfig _config{};
@@ -154,5 +155,5 @@ class ESPMemoryMonitor {
     SampleCallback _onSample;
     ThresholdCallback _onThreshold;
     FailedAllocCallback _onFailedAlloc;
-    PanicCallback _onPanic;
+    ShutdownCallback _onShutdown;
 };

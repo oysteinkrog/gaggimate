@@ -40,7 +40,7 @@ extern const char *boot_reset_reason();
 // there, rather than after the next crash has overwritten it.
 extern size_t boot_coredump_size();
 
-// Runtime heap observability (60 s sampler, onFailedAlloc, panic hook) lives
+// Runtime heap observability (60 s sampler, onFailedAlloc, shutdown hook) lives
 // in src/display/core/MemoryMonitor.* and is always compiled.
 //
 // The helpers below are debug-only boot/trace profilers, compiled to no-ops

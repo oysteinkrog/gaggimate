@@ -2021,7 +2021,7 @@ void WebUIPlugin::handleDebugHeap(AsyncWebServerRequest *request) {
     JsonDocument doc;
     MemorySnapshot snap;
     if (gaggimate::memmon::isReady()) {
-        snap = gaggimate::memmon::instance().sampleNow();
+        snap = gaggimate::memmon::instance().snapshotNow();
     }
     const RegionStats *ri = nullptr;
     const RegionStats *rp = nullptr;
@@ -2093,7 +2093,7 @@ void WebUIPlugin::updateOTAStatus(const String &version) {
         const RegionStats *ri = nullptr;
         MemorySnapshot snap;
         if (gaggimate::memmon::isReady()) {
-            snap = gaggimate::memmon::instance().sampleNow();
+            snap = gaggimate::memmon::instance().snapshotNow();
             for (const auto &rs : snap.regions) {
                 if (rs.region == MemoryRegion::Internal) {
                     ri = &rs;
