@@ -3900,7 +3900,7 @@ void IRAM_ATTR SleepAnimation::renderLoop() {
 // is taken from DRAM one for one). The animation kernels are not pinned
 // here: all of them would cost another 11 KB, and the loop is the code
 // every animation shares.
-void IRAM_ATTR SleepAnimation::renderFrame() {
+bool IRAM_ATTR SleepAnimation::renderFrame() {
     // Per-frame cost breakdown, always on. Half resolution turned out to save
     // only ~13 ms of a ~102 ms frame, which means the per-pixel field work is
     // a minority of the cost and the rest was unaccounted for. Guessing at it
