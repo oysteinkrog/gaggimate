@@ -2179,6 +2179,18 @@ void DefaultUI::maintainSleepAnimation() {
         serviceAnimStopPending();
         return;
     }
+    if (!sleepAnimation.isActive() && sleepAnimation.selfStopped()) {
+        // The render task stopped itself: an animation's init() failed
+        // (gm-bzu.38). Nothing else would hand the panel back: the stop
+        // branch below only runs for an active animation, and a restart
+        // would suppress LVGL again. stop() waits for both workers through
+        // finishStop(), and the usual quarantine covers a stop it cannot
+        // confirm. The retry below then waits its 2 s like a failed start.
+        log_w("DefaultUI: animation stopped itself, handing the panel back to LVGL");
+        stopSleepAnimation();
+        lastSleepAnimAttempt = ::millis();
+        return;
+    }
     if (wantAnimation) {
         if (!sleepAnimation.isActive()) {
             const unsigned long now = ::millis();
