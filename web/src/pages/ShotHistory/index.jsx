@@ -26,6 +26,7 @@ import { Spinner } from '../../components/Spinner.jsx';
 import HistoryCard from './HistoryCard.jsx';
 import { parseBinaryShot } from './parseBinaryShot.js';
 import { parseBinaryIndex, indexToShotList } from './parseBinaryIndex.js';
+import { fetchHistoryWithRetry } from '../../services/historyFetch.js';
 import { FontAwesomeIcon } from '@fortawesome/react-fontawesome';
 import { faSearch } from '@fortawesome/free-solid-svg-icons/faSearch';
 import { faSort } from '@fortawesome/free-solid-svg-icons/faSort';
@@ -52,7 +53,9 @@ export function ShotHistory() {
 
     try {
       // Fetch binary index instead of websocket request
-      const response = await fetch('/api/history/index.bin', { signal: controller.signal });
+      const response = await fetchHistoryWithRetry('/api/history/index.bin', {
+        signal: controller.signal,
+      });
       if (!response.ok) {
         if (response.status === 404) {
           // Index doesn't exist, show empty list with option to rebuild
@@ -287,7 +290,7 @@ export function ShotHistory() {
               try {
                 // Pad ID to 6 digits with zeros to match backend filename format
                 const paddedId = id.padStart(6, '0');
-                const resp = await fetch(`/api/history/${paddedId}.slog`);
+                const resp = await fetchHistoryWithRetry(`/api/history/${paddedId}.slog`);
                 if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
                 const buf = await resp.arrayBuffer();
                 const parsed = parseBinaryShot(buf, id);

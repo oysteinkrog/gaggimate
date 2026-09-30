@@ -8,6 +8,7 @@
 
 import { parseBinaryIndex, indexToShotList } from '../../ShotHistory/parseBinaryIndex';
 import { parseBinaryShot } from '../../ShotHistory/parseBinaryShot';
+import { fetchHistoryWithRetry } from '../../../services/historyFetch';
 import { indexedDBService } from './IndexedDBService';
 import { notesService } from './NotesService';
 import { getProfileDisplayLabel, getShotStorageKey } from '../utils/analyzerUtils';
@@ -168,7 +169,7 @@ class LibraryService {
    */
   async getGaggiMateShots() {
     try {
-      const response = await fetch('/api/history/index.bin');
+      const response = await fetchHistoryWithRetry('/api/history/index.bin');
 
       if (!response.ok) {
         if (response.status === 404) {
@@ -313,7 +314,7 @@ class LibraryService {
 
     if (source === 'gaggimate') {
       const paddedId = idStr.padStart(6, '0');
-      const response = await fetch(`/api/history/${paddedId}.slog`);
+      const response = await fetchHistoryWithRetry(`/api/history/${paddedId}.slog`);
 
       if (!response.ok) {
         throw new Error(`Failed to load shot ${idStr}: HTTP ${response.status}`);
