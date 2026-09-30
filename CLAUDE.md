@@ -877,11 +877,13 @@ DMA-capable, largest block 7.7 kB) and two browser tabs killed it. After the
 - **Service task stacks go in PSRAM when the task never runs with the flash
   cache disabled** (`xTaskCreatePinnedToCoreWithCaps` with
   `MALLOC_CAP_SPIRAM`): SleepAnim, SleepPush, Controller::loopLogic,
-  ESPMemoryMonitor, mdns. Anything that touches NVS, LittleFS, SD or
-  `esp_flash` stays internal (Settings::loop, ShotHistory, DefaultUI::loop,
-  async_tcp). A WithCaps task must never delete itself: that spawns a helper
-  task that needs internal heap and aborts without it. Finished tasks park
-  and the owner reaps them (`SleepAnimation::reapTasks`).
+  ESPMemoryMonitor, mdns, and the SD-backed history worker (reads go through
+  FatFs over SPI, which never disables the flash cache). Anything that
+  touches NVS, LittleFS or `esp_flash` stays internal (Settings::loop, the
+  LittleFS-backed history worker, DefaultUI::loop, async_tcp). A WithCaps
+  task must never delete itself: that spawns a helper task that needs
+  internal heap and aborts without it. Finished tasks park and the owner
+  reaps them (`SleepAnimation::reapTasks`).
 - **`/api/debug/heapmap` is the instrument**: internal regions, block-size
   histogram, and every task's stack size and high-water mark. Size stacks
   from the measured `hwm`, not from guesses. `/api/debug/heap` carries
