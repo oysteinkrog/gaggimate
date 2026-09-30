@@ -5,10 +5,28 @@
 // GM_SYNTH_HANDSHAKE, GAGGIMATE_SIM). It was the middle 2,400 lines of
 // WebUIPlugin.cpp's setupServer(), between the captive-portal routes and the
 // scale, history and OTA routes, so a new experiment landed next to the code
-// that serves the machine. The routes, their guards and their comments are
-// unchanged; only the file moved. setupServer() calls setupDebugEndpoints()
-// where the block used to be.
+// that serves the machine. setupServer() calls setupDebugEndpoints() where
+// the block used to be.
+//
+// Which routes a production build carries (gm-bzu.43, pending the owner's
+// call under gm-3hnq): every read-only diagnostic stays, and anything a GET
+// can use to change what the device does (take the radio down, move the
+// pixel clock, write flash, queue a kernel test, poke a panel register,
+// flip a render knob, load a screen) is compiled only where
+// GM_DEBUG_WRITE_ROUTES is set. That is every bench env (GM_TOUCH_PROBE,
+// GM_KBLOB, GM_BLEND_PROBE, GM_ANIM_BENCH, GM_SYNTH_HANDSHAKE) and the
+// simulator; `display`, `display-demo`, `display-noradio` and the headless
+// envs set none of them. A route that reports and also takes a setter keeps
+// the report in production and drops only the setter, so the same query
+// still answers there, with the argument ignored.
 #include "WebUIPlugin.h"
+
+#if defined(GM_TOUCH_PROBE) || defined(GAGGIMATE_SIM) || defined(GM_KBLOB) || defined(GM_BLEND_PROBE) ||                   \
+    defined(GM_ANIM_BENCH) || defined(GM_SYNTH_HANDSHAKE)
+#define GM_DEBUG_WRITE_ROUTES 1
+#else
+#define GM_DEBUG_WRITE_ROUTES 0
+#endif
 
 #ifndef GAGGIMATE_HEADLESS
 #include <display/ui/default/DrawProfile.h> // /api/debug/drawprof; the header pulls in lvgl.h
@@ -33,6 +51,7 @@ extern uint32_t nebula_lerp_self_test(uint32_t *firstBad);
 #endif
 #include <SD_MMC.h>
 #include <algorithm>
+#include <memory> // std::make_shared, the dump routes' row counters
 #include <display/core/Controller.h>
 #include <display/core/MemoryMonitor.h>
 #include <display/core/ProfileManager.h>
@@ -641,6 +660,7 @@ void WebUIPlugin::setupDebugEndpoints() {
     // is only re-applied when its value changes, so a poke from here would sit
     // on top of it invisibly and the slider would appear to do nothing on the
     // way back to the value it already held.
+#if GM_DEBUG_WRITE_ROUTES
     server.on("/api/debug/panelreg", [](AsyncWebServerRequest *request) {
         LilyGoDriver *drv = LilyGoDriver::peekInstance();
         if (drv == nullptr) {
@@ -674,17 +694,28 @@ void WebUIPlugin::setupDebugEndpoints() {
             kb = request->arg("kb").toInt();
         }
         kb = std::min(std::max(kb, 4), 512);
-        // Static because this runs on the async_tcp task, whose stack is not
-        // sized for a 4 KB buffer. The endpoint is a bench tool; one caller
-        // at a time is its contract.
-        static uint8_t chunk[4096];
-        for (size_t i = 0; i < sizeof(chunk); i++) {
+        // On the heap for the length of the job, not on the async_tcp
+        // stack (not sized for 4 KB) and not static: a static chunk was 4 KB
+        // of internal BSS on every boot for a route called a few times a
+        // year. PSRAM first; LittleFS copies it into its own cache before
+        // any flash program, so the source never has to be internal.
+        constexpr size_t kChunk = 4096;
+        uint8_t *chunk = static_cast<uint8_t *>(heap_caps_malloc(kChunk, MALLOC_CAP_SPIRAM));
+        if (chunk == nullptr) {
+            chunk = static_cast<uint8_t *>(malloc(kChunk));
+        }
+        if (chunk == nullptr) {
+            request->send(503, "application/json", "{\"error\":\"no memory\"}");
+            return;
+        }
+        for (size_t i = 0; i < kChunk; i++) {
             chunk[i] = static_cast<uint8_t>(i * 31 + kb);
         }
         const char *path = "/gm_flashchurn.tmp";
         const int64_t t0 = esp_timer_get_time();
         File f = LittleFS.open(path, FILE_WRITE);
         if (!f) {
+            free(chunk);
             request->send(500, "application/json", "{\"error\":\"littlefs open failed\"}");
             return;
         }
@@ -693,16 +724,18 @@ void WebUIPlugin::setupDebugEndpoints() {
             // Same marker the shot recorder sets, so the slip attribution log
             // blames these windows on flash rather than on a bystander.
             panelclock::scanoutMark(panelclock::SCANOUT_ACT_FLASH);
-            written += f.write(chunk, sizeof(chunk));
+            written += f.write(chunk, kChunk);
             f.flush();
         }
         f.close();
+        free(chunk);
         LittleFS.remove(path);
         const int dtMs = static_cast<int>((esp_timer_get_time() - t0) / 1000);
         char buf[96];
         snprintf(buf, sizeof(buf), "{\"written\":%u,\"ms\":%d}", static_cast<unsigned>(written), dtMs);
         request->send(200, "application/json", buf);
     });
+#endif // GM_DEBUG_WRITE_ROUTES
 
 #ifdef GM_TOUCH_PROBE
     // Synthetic core-1 PSRAM load: the falsification test for the planned
@@ -744,6 +777,7 @@ void WebUIPlugin::setupDebugEndpoints() {
     // plain GET returns the last completed result, with `pending` true while a
     // run is still queued. bandRef is BgAnim.h's portable band(); an animation
     // without one reports has_ref=false and nothing else.
+#if GM_DEBUG_WRITE_ROUTES
     server.on("/api/debug/animtest", [](AsyncWebServerRequest *request) {
         SleepAnimation *a = sleep_animation_bench_instance();
         if (a == nullptr) {
@@ -771,6 +805,7 @@ void WebUIPlugin::setupDebugEndpoints() {
                  static_cast<unsigned>(r.firstWant), static_cast<unsigned>(r.bandUs), static_cast<unsigned>(r.refUs));
         request->send(200, "application/json", buf);
     });
+#endif // GM_DEBUG_WRITE_ROUTES
 #ifdef GM_KBLOB
     // Hot-loaded kernel blob (bganim/KBlob.h, tools/kblob/kb.py).
     //
@@ -941,6 +976,9 @@ void WebUIPlugin::setupDebugEndpoints() {
             request->send(409, "application/json", "{\"error\":\"animation not running\"}");
             return;
         }
+        // Every knob below changes what the render or UI task does, so a
+        // production build compiles none of them and this route only reports.
+#if GM_DEBUG_WRITE_ROUTES
         if (request->hasArg("direct")) {
             a->setDirectPush(request->arg("direct").toInt() != 0);
         }
@@ -993,7 +1031,15 @@ void WebUIPlugin::setupDebugEndpoints() {
             a->setScrimOverride(request->arg("scrim").toInt());
         }
         // elemtest=1 shows a 120x120 test plate at the centre through element
-        // slot 7 (the press highlight's cost, measured on elem_us); 0 clears.
+        // slot 3 (the press highlight's cost, measured on elem_us); 0 clears.
+        // Slot 3 because it is the last one DefaultUI leaves free: 0 is the
+        // press plate, 4 the brew bar, 5 to 7 the dial rings
+        // (DIAL_ELEMENT_BASE) and 8 to 13 the live text labels
+        // (TEXT_ELEMENT_BASE). The old MAX_ELEMENTS - 1 was the sixth text
+        // label's slot, which the UI task overwrote or which cleared it.
+        constexpr int kElemTestSlot = 3;
+        static_assert(kElemTestSlot < SleepAnimation::MAX_ELEMENTS - SleepAnimation::kTextElements,
+                      "elemtest must stay under the text element slots");
         if (request->hasArg("elemtest")) {
             SleepAnimation::ElementDesc e;
             if (request->arg("elemtest").toInt() != 0) {
@@ -1006,7 +1052,7 @@ void WebUIPlugin::setupDebugEndpoints() {
                 e.h = 120;
                 e.radius = 16;
             }
-            a->setElement(SleepAnimation::MAX_ELEMENTS - 1, e);
+            a->setElement(kElemTestSlot, e);
         }
         // fps=N: temporary animation frame cap, 5..60, 0 restores the stored
         // setting. For the contention A/B (how much of a UI pass is the
@@ -1182,6 +1228,7 @@ void WebUIPlugin::setupDebugEndpoints() {
         if (request->hasArg("forcehalf")) {
             a->setHalfForce(static_cast<int8_t>(request->arg("forcehalf").toInt()));
         }
+#endif // GM_DEBUG_WRITE_ROUTES
         AsyncResponseStream *response = request->beginResponseStream("application/json");
         // PSRAM-backed like every other JsonDocument in this file that
         // carries more than a couple of fields (lines 146/157/167/1148):
@@ -1286,6 +1333,9 @@ void WebUIPlugin::setupDebugEndpoints() {
         doc["touch_task"] = touchtask::running();
         doc["touch_samples"] = touchtask::sampleCount();
         doc["touch_hwm"] = touchtask::stackHighWaterBytes();
+        // Press and release edges the task could not queue for LVGL
+        // (gm-bzu.47); non-zero means a tap was lost between the two tasks.
+        doc["touch_dropped"] = touchtask::transitionsDropped();
         doc["hitmap_n"] = touchtask::hitMapCount();
         doc["hitmap_gen"] = touchtask::hitMapGeneration();
         doc["textease"] = g_textEaseReq;
@@ -1498,6 +1548,7 @@ void WebUIPlugin::setupDebugEndpoints() {
     // WiFi goes down 1.5 s after the reply so the response gets out. SECS is
     // clamped to 20..180: below the STA watchdog's 20 s grace nothing new is
     // learned, above three minutes the reboot rung starts to matter.
+#if GM_DEBUG_WRITE_ROUTES
     server.on("/api/debug/radio", [this](AsyncWebServerRequest *request) {
         long secs = 0;
         if (request->hasParam("wifioff")) {
@@ -1515,6 +1566,7 @@ void WebUIPlugin::setupDebugEndpoints() {
                          radioOffAtMs != 0, radioOnAtMs != 0, static_cast<int>(WiFi.getMode()), static_cast<int>(WiFi.status()));
         request->send(response);
     });
+#endif // GM_DEBUG_WRITE_ROUTES
     // /api/debug/coex[?idlemin=N&idlemax=M] reads and live-sets the IDLE BLE
     // connection interval (1.25ms units: 24 == 30ms), then reports the state.
     //
@@ -1534,6 +1586,7 @@ void WebUIPlugin::setupDebugEndpoints() {
             request->send(409, "application/json", "{\"error\":\"no client\"}");
             return;
         }
+#if GM_DEBUG_WRITE_ROUTES
         if (request->hasArg("idlemin")) {
             long mn = request->arg("idlemin").toInt();
             // idlemax defaults to idlemin when omitted (a single fixed interval).
@@ -1550,6 +1603,7 @@ void WebUIPlugin::setupDebugEndpoints() {
                 mx = 3200;
             client->setIdleInterval(static_cast<uint16_t>(mn), static_cast<uint16_t>(mx));
         }
+#endif // GM_DEBUG_WRITE_ROUTES
         AsyncResponseStream *response = request->beginResponseStream("application/json");
         JsonDocument doc(&psramAllocator);
         doc["connected"] = client->isConnected();
@@ -1583,6 +1637,7 @@ void WebUIPlugin::setupDebugEndpoints() {
     // difference between two reads of this endpoint, which keeps the reset
     // logic out of the ISR-side counters entirely.
     server.on("/api/debug/pclk", [](AsyncWebServerRequest *request) {
+#if GM_DEBUG_WRITE_ROUTES
         if (request->hasArg("div")) {
             const int div = request->arg("div").toInt();
             if (div < 2 || div > 16) {
@@ -1591,6 +1646,7 @@ void WebUIPlugin::setupDebugEndpoints() {
             }
             panelclock::setDiv(div);
         }
+#endif // GM_DEBUG_WRITE_ROUTES
         uint32_t frames = 0, refills = 0, slips = 0;
         panelclock::scanoutStats(&frames, &refills, &slips);
         char buf[192];
@@ -1702,7 +1758,11 @@ void WebUIPlugin::setupDebugEndpoints() {
         // board has no business allocating that to answer a debug request. The
         // callback is handed a row budget and fills whole output rows only, so
         // it never has to carry a partial pixel across chunks.
-        auto *state = new int(0);
+        // The row counter is owned by the filler: it goes when the response
+        // does, which the library deletes with the request on every path,
+        // a completed dump or a client that hung up halfway. It used to be
+        // freed on the final empty chunk, which an aborted dump never reaches.
+        auto state = std::make_shared<int>(0);
         AsyncWebServerResponse *response = request->beginChunkedResponse(
             "application/octet-stream", [fb, w, step, ow, oh, state](uint8_t *out, size_t maxLen, size_t) -> size_t {
                 const size_t rowBytes = static_cast<size_t>(ow) * 2;
@@ -1715,8 +1775,6 @@ void WebUIPlugin::setupDebugEndpoints() {
                     written += rowBytes;
                     (*state)++;
                 }
-                if (written == 0)
-                    delete state;
                 return written;
             });
         char disposition[64];
@@ -1749,7 +1807,8 @@ void WebUIPlugin::setupDebugEndpoints() {
         // 3-byte row of 480 pixels is 1440 bytes, and a later chunk's budget
         // can be just under that, which would end the response after the
         // first chunk. state counts output pixels.
-        auto *state = new int(0);
+        // Owned by the filler, like the framebuffer dump's row counter.
+        auto state = std::make_shared<int>(0);
         AsyncWebServerResponse *response = request->beginChunkedResponse(
             "application/octet-stream", [buf, planePx, w, step, ow, oh, state](uint8_t *out, size_t maxLen, size_t) -> size_t {
                 const int total = ow * oh;
@@ -1766,8 +1825,6 @@ void WebUIPlugin::setupDebugEndpoints() {
                     written += 3;
                     (*state)++;
                 }
-                if (written == 0)
-                    delete state;
                 return written;
             });
         char disposition[64];
@@ -1857,7 +1914,9 @@ void WebUIPlugin::setupDebugEndpoints() {
                 return;
             }
             g_touchMapLen = 0;
-            g_touchMapLoad = id != 0 && request->hasArg("load") && request->arg("load").toInt() != 0;
+            // load=1 switches the UI to that screen first, so production
+            // ignores it and only dumps.
+            g_touchMapLoad = GM_DEBUG_WRITE_ROUTES && id != 0 && request->hasArg("load") && request->arg("load").toInt() != 0;
             g_touchMapReq = id;
             g_touchMapPending = true;
             request->send(200, "application/json", "{\"queued\":true}");
