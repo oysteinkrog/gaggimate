@@ -42,6 +42,10 @@
 //       mathcount.cpp ../../src/display/ui/default/bganim/*.cpp
 //       -o build/interlace_check -lm
 // Usage: ./build/interlace_check [width] [height]
+//
+// `make check` runs it at 480, 240, 466 and 233: full resolution and the
+// half-resolution path's width on both panels (gm-bzu.34). The half path hands
+// band() rw = w / 2 wide rows, one source row per call.
 #include "../../src/display/ui/default/bganim/BgAnim.h"
 #include <cstdio>
 #include <cstdlib>
@@ -61,16 +65,18 @@ struct Shape {
 // half path does the same by handing each call its own aligned row buffer.
 int rowStride(int w) { return (w + 1) & ~1; }
 
-void renderShape(const BgAnimation &anim, const Shape &s, int W, int H, const uint8_t p[4], uint16_t *fb) {
+// tMs is the time the frame was advanced to, as production passes it: a
+// row cache keyed on tMs would look pure if every call got the same constant.
+void renderShape(const BgAnimation &anim, const Shape &s, int W, int H, uint32_t tMs, const uint8_t p[4], uint16_t *fb) {
     if (s.parity < 0) {
         const int bandH = (s.bandH > H) ? H : s.bandH;
         for (int y = 0; y < H; y += bandH) {
             const int rows = (y + bandH <= H) ? bandH : (H - y);
-            anim.band(fb + static_cast<size_t>(y) * rowStride(W), y, rows, W, 0, p);
+            anim.band(fb + static_cast<size_t>(y) * rowStride(W), y, rows, W, tMs, p);
         }
     } else {
         for (int y = s.parity; y < H; y += 2) {
-            anim.band(fb + static_cast<size_t>(y) * rowStride(W), y, 1, W, 0, p);
+            anim.band(fb + static_cast<size_t>(y) * rowStride(W), y, 1, W, tMs, p);
         }
     }
 }
@@ -136,8 +142,14 @@ int main(int argc, char **argv) {
         if (anim.release != nullptr) {
             anim.release();
         }
+        // An init failure is a failure, not a skip: CI would otherwise go
+        // green on an animation it never rendered.
         if (!anim.init(W, H)) {
-            printf("%-10s SKIP (init failed)\n", anim.id);
+            printf("%-10s FAIL     init(%d, %d) failed\n", anim.id, W, H);
+            failures++;
+            if (anim.release != nullptr) {
+                anim.release();
+            }
             continue;
         }
 
@@ -148,7 +160,7 @@ int main(int argc, char **argv) {
         for (int f = 0; f < nTimes; f++) {
             anim.frame(times[f], W, H, p); // one advance; every shape renders THIS state
             for (int s = 0; s < nS; s++) {
-                renderShape(anim, shapes[s], W, H, p, bufs.data() + frameSz * s);
+                renderShape(anim, shapes[s], W, H, times[f], p, bufs.data() + frameSz * s);
             }
             for (int s = 1; s < nS; s++) {
                 const long bad = compare(bufs.data(), bufs.data() + frameSz * s, shapes[s], W, H);
@@ -160,6 +172,13 @@ int main(int argc, char **argv) {
                     worstShape = shapes[s].name;
                 }
             }
+        }
+        // Release before the next animation, as production does when it
+        // switches: otherwise every earlier animation's hot tables stay in the
+        // 12 KB slab and the later ones run with theirs in PSRAM, which is not
+        // a placement the device ever uses.
+        if (anim.release != nullptr) {
+            anim.release();
         }
         // A nonzero control means band() itself is not pure -- it advanced or
         // consumed state -- which invalidates every other column, so say that

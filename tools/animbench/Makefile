@@ -19,10 +19,20 @@ $(ICBIN): $(IC_SRCS) mathcount.h shim/Arduino.h shim/esp_heap_caps.h shim/esp_me
 	@mkdir -p $(dir $(ICBIN))
 	g++ $(CXXFLAGS) $(IC_SRCS) -o $(ICBIN) -lm
 
+# Widths the call-shape check runs at: full resolution and the half path's
+# rw = w / 2 on both panels (480 and 466), since the half path hands band()
+# 240- and 233-wide rows (SleepAnimation.cpp, gm-bzu.34). Every width runs even
+# after one fails, so one CI log names every failing animation and width.
+IC_WIDTHS ?= 480 240 466 233
+
 # What CI runs. Both halves exit non-zero on failure.
 check: $(BIN) $(ICBIN)
 	./$(BIN) --compare golden --frames 240
-	./$(ICBIN)
+	@fail=""; for w in $(IC_WIDTHS); do \
+		echo "== interlace_check $$w x $$w"; \
+		./$(ICBIN) $$w $$w || fail="$$fail $$w"; \
+	done; \
+	if [ -n "$$fail" ]; then echo "interlace_check failed at:$$fail"; exit 1; fi
 
 clean:
 	rm -rf build
