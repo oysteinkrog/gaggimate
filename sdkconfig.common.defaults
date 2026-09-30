@@ -28,11 +28,17 @@ CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
 CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ=240
 
 # --- Compiler optimization ---
-# Optimize for size (-Os), matching arduino-esp32. IDF's default is -Og (debug),
-# which is slower across the board. SIZE (not PERF/-O2) keeps flash/IRAM in
-# budget while restoring baseline performance. PERF was measured on the display
-# board and is a 2.2% frame-rate regression there; see the note in
-# sdkconfig.gaggimate.defaults.
+# SIZE makes IDF's CMake emit -Os for its components, where IDF's default
+# would be -Og (debug). It sets the level only where nothing strips that flag.
+# In this dual-framework build PlatformIO compiles every IDF component itself,
+# with the env's build_flags and build_unflags applied on top of the flags
+# CMake emits. The display envs add -O2 and strip -Os (platformio.ini,
+# [display_common] and [env:display]), so every display source, IDF included,
+# compiles at -O2 whatever this line says: the compile database shows -O2 and
+# no -Os on 1,160 IDF sources of the kdev env, which has display's flags
+# (review finding build F1, 2026-09-27). The controller strips nothing and
+# compiles at -Os. scripts/assert_sdkconfig.py checks the level in the env's
+# real flags, not this symbol (gm-bzu.29).
 CONFIG_COMPILER_OPTIMIZATION_SIZE=y
 
 # PSRAM config lives in sdkconfig.gaggimate.defaults — only the display-class
