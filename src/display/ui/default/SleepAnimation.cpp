@@ -999,6 +999,22 @@ static
 // there would be a jump into flash.
 static SemaphoreHandle_t g_sleepAnimFbGate = nullptr;
 
+// Stop diagnostics (gm-bzu.37). File statics rather than members so the
+// production class layout does not move; there is one SleepAnimation.
+// Written by the render task (gives, aborted frames) and by the owner's
+// task in finishStop (wait, timeouts); read by the debug endpoint.
+static std::atomic<uint32_t> s_gateEarlyGives{0};
+static std::atomic<uint32_t> s_framesAborted{0};
+static std::atomic<uint32_t> s_stopWaitUsLast{0};
+static std::atomic<uint32_t> s_stopWaitUsMax{0};
+static std::atomic<uint32_t> s_stopTimeouts{0};
+
+uint32_t SleepAnimation::stopGateEarlyGives() const { return s_gateEarlyGives.load(); }
+uint32_t SleepAnimation::stopFramesAborted() const { return s_framesAborted.load(); }
+uint32_t SleepAnimation::stopWaitUsLast() const { return s_stopWaitUsLast.load(); }
+uint32_t SleepAnimation::stopWaitUsMax() const { return s_stopWaitUsMax.load(); }
+uint32_t SleepAnimation::stopTimeouts() const { return s_stopTimeouts.load(); }
+
 static bool IRAM_ATTR sleepAnimBandRetire(void *arg);
 
 void SleepAnimation::freeOverlayBuffers() {
@@ -1033,9 +1049,10 @@ void SleepAnimation::freeOverlayBuffers() {
 }
 
 void SleepAnimation::start(Display *d) {
-    // !stopped: a previous task timed out its stop() and hasn't exited yet —
-    // refuse to start rather than run two renderers against the same buffers.
-    if (running || !stopped || d == nullptr) {
+    // !stopped or !pushStopped: a previous task timed out its stop() and
+    // hasn't exited yet. Refuse to start rather than run two renderers, or two
+    // push tasks, against the same band slots and framebuffers (gm-bzu.37).
+    if (running || !stopped || !pushStopped || d == nullptr) {
         return;
     }
     g_benchInstance = this;
@@ -1369,29 +1386,57 @@ bool SleepAnimation::stop() {
 }
 
 bool SleepAnimation::finishStop() {
-    const unsigned long deadline = millis() + 500;
+    // The render task does its own teardown (gm-bzu.37): it notices !running
+    // at the next band or frame boundary, drains its band transfers, gives
+    // the framebuffer gate back, takes the direct path down on the core that
+    // owns its interrupt, and only then reports stopped. So the normal wait
+    // here is about one band or one frame, and 500 ms is the error bound.
+    //
+    // A timeout authorises nothing. This used to call endDirectPath() from
+    // this task after the fixed wait whether the render task had parked or
+    // not: that gave the gate the render task was blocked on, the render task
+    // woke inside presentFrame() and flipped a partial frame, and it did so
+    // after the direct path had been declared down underneath it. Now a
+    // worker that misses the bound keeps every resource it holds, stop()
+    // returns false, and the caller quarantines the framebuffers
+    // (animStopPending) until stopConfirmed() says the workers and the
+    // transfers are done.
+    constexpr unsigned long STOP_BOUND_MS = 500;
+    const int64_t t0 = esp_timer_get_time();
+    const unsigned long deadline = millis() + STOP_BOUND_MS;
     while (!stopped && millis() < deadline) {
-        vTaskDelay(pdMS_TO_TICKS(5));
+        vTaskDelay(pdMS_TO_TICKS(1));
     }
     // The push task blocks on bandReady, so it needs a wakeup to observe
     // !running. Give both slots: whichever it is waiting on releases it.
+    // After the render task, not before: on the ordinary push path the render
+    // task may still be waiting for push to free a slot. A spurious give is
+    // harmless, because push re-checks running after every take.
     for (int i = 0; i < NUM_SLOTS; i++) {
         if (bandReady[i] != nullptr) {
             xSemaphoreGive(static_cast<SemaphoreHandle_t>(bandReady[i]));
         }
     }
-    const unsigned long pushDeadline = millis() + 500;
+    const unsigned long pushDeadline = millis() + STOP_BOUND_MS;
     while (!pushStopped && millis() < pushDeadline) {
-        vTaskDelay(pdMS_TO_TICKS(5));
+        vTaskDelay(pdMS_TO_TICKS(1));
     }
-    const bool drained = endDirectPath();
-    // Whichever task has reported done is freed now; one that missed its
-    // deadline is still running and gets reaped by the next start().
+    const uint32_t waitedUs = static_cast<uint32_t>(esp_timer_get_time() - t0);
+    s_stopWaitUsLast.store(waitedUs);
+    if (waitedUs > s_stopWaitUsMax.load()) {
+        s_stopWaitUsMax.store(waitedUs);
+    }
+    // Frees only tasks that have listed themselves as parked; a task that
+    // missed its bound is still running and is reaped later.
     reapTasks();
-    const bool confirmed = stopped && pushStopped && drained;
+    const bool confirmed = stopConfirmed();
     if (!confirmed) {
-        log_w("SleepAnimation: stop unconfirmed (render=%d push=%d dma=%d)", stopped ? 1 : 0, pushStopped ? 1 : 0,
-              drained ? 1 : 0);
+        if (!stopped || !pushStopped) {
+            s_stopTimeouts.fetch_add(1);
+        }
+        log_w("SleepAnimation: stop unconfirmed (render=%d push=%d dma=%d issued=%u done=%u), resources kept",
+              stopped ? 1 : 0, pushStopped ? 1 : 0, dmaActive ? 1 : 0, static_cast<unsigned>(dmaIssued.load()),
+              static_cast<unsigned>(g_sleepAnimDmaDone));
     }
     return confirmed;
 }
@@ -3734,17 +3779,29 @@ void IRAM_ATTR SleepAnimation::renderLoop() {
         }
         probeFrameBoundary();
         const int64_t frameStart = esp_timer_get_time();
-        renderFrame();
+        bool whole = renderFrame();
         // First frame of the direct path: fill the other buffer too, so the
         // one the panel is really scanning holds a good frame whichever it is.
         // See primePending -- esp_lcd exports no way to read cur_fb_index, so
         // beginDirectPath() can only guess which buffer it started on.
-        if (primePending && dmaActive && directPushOn.load() && fbCount > 1) {
+        if (whole && primePending && dmaActive && directPushOn.load() && fbCount > 1) {
             primePending = false;
             fbBack ^= 1;
-            renderFrame();
+            whole = renderFrame();
         }
-        presentFrame();
+        if (!whole) {
+            // A frame left part way is never presented (gm-bzu.37): flipping
+            // it would show the top of this frame over the bottom of an older
+            // one. renderFrame() has already given the gate back. fbBack is
+            // not flipped, so the next frame renders into the same buffer.
+            s_framesAborted.fetch_add(1);
+            lastFlipWaitUs = 0;
+            if (!running) {
+                break; // stopping: skip the pacing sleep, park now
+            }
+        } else {
+            presentFrame();
+        }
         probeFramePresented();
         // Once per frame, not once per band: every band of a frame must push
         // the same parity or the two halves of the picture drift apart.
@@ -3821,6 +3878,16 @@ void IRAM_ATTR SleepAnimation::renderLoop() {
             vTaskDelay(ticks > 0 ? ticks : 1);
         }
     }
+    // Take the direct path down here, on the task that brought it up and
+    // whose core its completion interrupt is bound to, before taskEntry
+    // reports stopped (gm-bzu.37). finishStop() no longer touches it: when
+    // this task has parked the path is already down, and when it has not,
+    // tearing it down from the other task is exactly the race to avoid.
+    // endDirectPath() drains the band transfers first (200 ms bound) and
+    // leaves the drain result to stopConfirmed(), which compares the same
+    // counters, so a transfer that outlives the drain still keeps LVGL off
+    // the framebuffers.
+    endDirectPath();
 }
 
 // IRAM, with renderLoop, presentFrame, pushLoop and the scrim rows: the two
@@ -3929,7 +3996,7 @@ void IRAM_ATTR SleepAnimation::renderFrame() {
         if (!anim.init(rw, rh)) {
             log_e("SleepAnimation: init failed for animation %d (%s)", id, anim.id);
             running = false;
-            return;
+            return false; // before the first band: the gate was never taken
         }
         initializedAnimId = id;
         initializedHalf = half;
@@ -3964,7 +4031,10 @@ void IRAM_ATTR SleepAnimation::renderFrame() {
     // per band re-expanded the same 120 cells on every interlaced row,
     // about 2.5 ms a frame on the brew screen (2026-09-08).
     int expandedCy = -1;
-    for (int y0 = 0; y0 < h && running; y0 += BAND_H) {
+    // Outside the loop so the exit below can tell a whole frame from one that
+    // a stop cut short.
+    int y0 = 0;
+    for (; y0 < h && running; y0 += BAND_H) {
         const int rows = (y0 + BAND_H <= h) ? BAND_H : (h - y0);
         // Wait for the push task to finish with this slot. On the first band
         // of a frame this is normally already free; mid-frame it is where the
@@ -3986,17 +4056,18 @@ void IRAM_ATTR SleepAnimation::renderFrame() {
             // is the only band that carries a release in its BandDone. Leaving
             // here skips every remaining band, so no band is ever the last one,
             // so no interrupt is coming: frameGateHeld stays true and the gate
-            // stays taken forever. presentFrame() runs unconditionally after
-            // renderFrame() returns and takes the same gate with
-            // portMAX_DELAY, so the render task blocks with nothing left that
-            // could wake it. Only a reset recovers, and the display simply
-            // freezes on its last frame while the web server keeps answering,
-            // which is why this never showed up as anything but a hang.
+            // stays taken forever. The next frame's first band, or any
+            // pushColors, takes the same gate with portMAX_DELAY, so the
+            // render task blocks with nothing left that could wake it. Only a
+            // reset recovers, and the display simply freezes on its last
+            // frame while the web server keeps answering, which is why this
+            // never showed up as anything but a hang.
             //
             // Drain first, for the same reason the DMA submit failure below
             // does: earlier bands of this frame may still be reading their
-            // slots and writing the framebuffer, and presentFrame() is about to
-            // invalidate that buffer's cache and flip it.
+            // slots and writing the framebuffer, and the next frame is about
+            // to reuse both. The false return keeps renderLoop from
+            // presenting this partial frame (gm-bzu.37).
             if (frameGateHeld) {
                 const unsigned long bailDrain = millis() + 50;
                 while (dmaIssued.load() != g_sleepAnimDmaDone && millis() < bailDrain) {
@@ -4004,8 +4075,9 @@ void IRAM_ATTR SleepAnimation::renderFrame() {
                 }
                 display->unlockFrameBuffer();
                 frameGateHeld = false;
+                s_gateEarlyGives.fetch_add(1);
             }
-            return;
+            return false;
         }
         uint16_t *const band = bandBuf[renderSlot];
         // EE.VLD.128/EE.VST.128 mask the low four address bits off rather
@@ -4856,6 +4928,27 @@ void IRAM_ATTR SleepAnimation::renderFrame() {
         }
         renderSlot = (renderSlot + 1) % NUM_SLOTS;
     }
+    if (y0 >= h) {
+        return true;
+    }
+    // Left part way: running went false between two bands (gm-bzu.37). On the
+    // direct path the first band took the framebuffer gate and only the last
+    // band's completion interrupt gives it back, so no interrupt is coming for
+    // it. Left held, presentFrame() blocked on it for good and only
+    // finishStop()'s old forced give woke it, into a flip of this partial
+    // frame. Let the bands already submitted retire first, as the stall exit
+    // above does, then give it here. The give does not authorise anything: a
+    // transfer that outlives the drain still holds stopConfirmed() false.
+    if (frameGateHeld) {
+        const unsigned long abortDrain = millis() + 200;
+        while (dmaIssued.load() != g_sleepAnimDmaDone && millis() < abortDrain) {
+            vTaskDelay(1);
+        }
+        display->unlockFrameBuffer();
+        frameGateHeld = false;
+        s_gateEarlyGives.fetch_add(1);
+    }
+    return false;
 }
 
 // Renders `frames` frames of one animation through band() and bandRef() into

@@ -25,6 +25,11 @@ class SleepAnimation {
     void start(Display *) {}
     bool stop() { return true; }
     bool stopConfirmed() const { return true; }
+    uint32_t stopGateEarlyGives() const { return 0; }
+    uint32_t stopFramesAborted() const { return 0; }
+    uint32_t stopWaitUsLast() const { return 0; }
+    uint32_t stopWaitUsMax() const { return 0; }
+    uint32_t stopTimeouts() const { return 0; }
     bool isActive() const { return false; }
     void configure(uint8_t, const uint8_t *) {}
     void setMaxFps(uint8_t) {}
@@ -131,17 +136,33 @@ class SleepAnimation {
     SleepAnimation() = default;
     ~SleepAnimation();
 
-    // Starts the render task. No-op if already running or display is null.
+    // Starts the render task. No-op if already running, if a worker from an
+    // earlier run has not parked yet, or if display is null.
     void start(Display *display);
-    // Signals the workers to exit and blocks briefly (500 ms each, 200 ms
-    // for the DMA drain) until they have. Returns true when both workers
-    // have parked and every band transfer has retired, which is what makes
-    // the framebuffers safe to hand back to LVGL. False means a worker or a
-    // transfer outlived the deadlines: the caller must keep LVGL off the
-    // framebuffers and poll stopConfirmed() (gm-bzu.16).
+    // Signals the workers to exit and waits until they have parked. The
+    // render task drains its band transfers, gives the framebuffer gate
+    // back and takes the direct path down itself before it parks, so the
+    // normal wait is one band or one frame. 500 ms per worker is the error
+    // bound, not the expected path (gm-bzu.37). Returns true when both
+    // workers have parked and every band transfer has retired, which is
+    // what makes the framebuffers safe to hand back to LVGL. False means a
+    // worker or a transfer outlived the bound: nothing has been torn down
+    // or freed, and the caller must keep LVGL off the framebuffers and poll
+    // stopConfirmed() (gm-bzu.16).
     bool stop();
     // True once no worker is running and no band transfer is outstanding.
     bool stopConfirmed() const;
+    // Stop diagnostics (gm-bzu.37), kept outside the class so the layout
+    // does not move. Early gives: the render task left a frame part way
+    // (a stop, a push stall) holding the framebuffer gate and gave it back
+    // itself. Frames aborted: frames that were left part way and so were
+    // not presented. Wait: how long stop() waited for both workers to
+    // park, last and maximum. Timeouts: stops that hit the 500 ms bound.
+    uint32_t stopGateEarlyGives() const;
+    uint32_t stopFramesAborted() const;
+    uint32_t stopWaitUsLast() const;
+    uint32_t stopWaitUsMax() const;
+    uint32_t stopTimeouts() const;
     bool isActive() const { return running; }
 
     // Selects which registry animation renders and its 4 params (0-100 each).
@@ -1024,7 +1045,11 @@ class SleepAnimation {
     static void taskEntry(void *arg);
     void reapTasks(); // frees finished render/push tasks; owner side only
     void renderLoop();
-    void renderFrame();
+    // Composes one frame. False when it was left part way (the animation
+    // stopped, its init failed, or the push stage stalled): the frame is not
+    // whole and must not be presented. On every false return the
+    // framebuffer gate is no longer held by this frame.
+    bool renderFrame();
     // Chooses the render resolution for the running animation by measuring it.
     // See the definition for why this is a probe rather than a setting.
     void autoResolution(int id, int fps, int64_t frameUs, int64_t budgetUs);
