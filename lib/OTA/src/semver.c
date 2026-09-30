@@ -221,10 +221,14 @@ int semver_parse_version(const char *str, semver_t *ver) {
 static int compare_prerelease(char *x, char *y) {
     if (x == NULL && y == NULL)
         return 0;
+    // A version with no prerelease (e.g. 1.2.0) always outranks a
+    // prerelease of the same major.minor.patch (e.g. 1.2.0-rc1): semver
+    // 2.0 spec item 11. `y == NULL` means the *other* version has no
+    // prerelease, so `x` (which does) ranks below it.
     if (y == NULL && x)
-        return 1;
-    if (x == NULL && y)
         return -1;
+    if (x == NULL && y)
+        return 1;
 
     while (*x && *y) {
         // If both start with digits, compare numbers
