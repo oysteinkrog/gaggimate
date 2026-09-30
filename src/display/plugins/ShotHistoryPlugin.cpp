@@ -2,7 +2,10 @@
 
 #include <LittleFS.h>
 #include <SD_MMC.h>
+#include <algorithm>
+#include <cerrno>
 #include <cmath>
+#include <cstdio>
 #include <display/core/Controller.h>
 #include <display/core/ProfileManager.h>
 #include <display/core/process/BrewProcess.h>
@@ -11,6 +14,11 @@
 #include <display/models/shot_log_format.h>
 #include <display/util/PsramAllocator.h>
 #include <display/util/SafeReplace.h>
+#ifndef GAGGIMATE_SIM
+#include <dirent.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
 
 namespace {
 constexpr float TEMP_SCALE = 10.0f;
@@ -74,6 +82,84 @@ String padId(String id, int length = 6) {
         id = "0" + id;
     }
     return id;
+}
+
+// A shot id as the web client sends it: digits only, at most 12 of them. The
+// id becomes part of a path under /h, so anything else is refused.
+bool validShotId(const String &id) {
+    if (id.length() == 0 || id.length() > 12) {
+        return false;
+    }
+    for (size_t i = 0; i < id.length(); i++) {
+        if (id[i] < '0' || id[i] > '9') {
+            return false;
+        }
+    }
+    return true;
+}
+
+// Lists the names in /h without opening the entries. File::openNextFile()
+// opens every entry it returns, and on FAT each open is a linear scan of the
+// directory, so a walk that way is quadratic in the shot count (the boot sat
+// in one for eight minutes on the bench card, see CLAUDE.md). readdir() reads
+// the names straight out of the directory clusters. The simulator's FS shim
+// has no mount point and keeps the File walk.
+void listHistoryNames(fs::FS &fs, std::vector<String> &names) {
+#ifndef GAGGIMATE_SIM
+    const char *mount = fs.mountpoint();
+    if (mount != nullptr) {
+        const String path = String(mount) + "/h";
+        DIR *d = opendir(path.c_str());
+        if (d == nullptr) {
+            if (errno != ENOENT) {
+                ESP_LOGW("ShotHistoryPlugin", "opendir %s: %d", path.c_str(), errno);
+            }
+            return;
+        }
+        while (const dirent *e = readdir(d)) {
+            names.emplace_back(e->d_name);
+        }
+        closedir(d);
+        return;
+    }
+#endif
+    File directory = fs.open("/h");
+    if (!directory || !directory.isDirectory()) {
+        if (directory) {
+            directory.close();
+        }
+        return;
+    }
+    File file = directory.openNextFile();
+    while (file) {
+        names.emplace_back(file.name());
+        file.close();
+        file = directory.openNextFile();
+    }
+    directory.close();
+}
+
+// Size of a file under /h, or -1. One lookup; the caller asks only for the
+// oldest shots, whose entries sit at the start of the directory.
+long historyFileSize(fs::FS &fs, const String &name) {
+#ifndef GAGGIMATE_SIM
+    const char *mount = fs.mountpoint();
+    if (mount != nullptr) {
+        struct stat st {};
+        const String path = String(mount) + "/h/" + name;
+        if (stat(path.c_str(), &st) != 0) {
+            return -1;
+        }
+        return static_cast<long>(st.st_size);
+    }
+#endif
+    File f = fs.open("/h/" + name, "r");
+    if (!f) {
+        return -1;
+    }
+    const long size = static_cast<long>(f.size());
+    f.close();
+    return size;
 }
 } // namespace
 
@@ -533,54 +619,58 @@ void ShotHistoryPlugin::cleanupHistory() {
         return; // Enough space, nothing to do
     }
 
-    // Collect .slog files and their sizes in one directory walk. openNextFile()
-    // already stats each entry to open it, so File::size() below is free; that
-    // lets the removal loop track freed space by arithmetic instead of calling
-    // getFreeSpace() again per file. getFreeSpace() (LittleFS/SD usedBytes())
-    // walks every allocated block, so re-querying it per removed file used to
-    // turn an N-shot cleanup into N full filesystem scans.
-    File directory = fs->open("/h");
-    std::vector<std::pair<String, size_t>> slogFiles;
-    if (directory) {
-        File file = directory.openNextFile();
-        while (file) {
-            String fname = String(file.name());
-            if (fname.endsWith(".slog")) {
-                slogFiles.emplace_back(fname, file.size());
-            }
-            file.close();
-            file = directory.openNextFile();
+    // One directory walk for the names (listHistoryNames: readdir, never
+    // openNextFile). Sizes are looked up only for the shots actually removed,
+    // and the running estimate below replaces a getFreeSpace() per file:
+    // usedBytes() walks every allocated block on LittleFS. A notes file is
+    // removed only when the walk saw it, because removing a name that is not
+    // there is a full walk of /h for nothing on FAT.
+    std::vector<String> names;
+    listHistoryNames(*fs, names);
+    std::vector<String> slogFiles;
+    std::vector<String> jsonFiles;
+    for (const String &name : names) {
+        if (name.endsWith(".slog")) {
+            slogFiles.push_back(name);
+        } else if (name.endsWith(".json")) {
+            jsonFiles.push_back(name);
         }
-        directory.close();
     }
+    names.clear();
 
     if (slogFiles.empty()) {
         return;
     }
 
-    sort(slogFiles.begin(), slogFiles.end(),
-         [](const std::pair<String, size_t> &a, const std::pair<String, size_t> &b) { return a.first < b.first; });
+    std::sort(slogFiles.begin(), slogFiles.end());
+    std::sort(jsonFiles.begin(), jsonFiles.end());
 
     // Remove oldest files until the running estimate clears the threshold.
     // freeSpace is exact for the first comparison and an estimate thereafter
     // (it does not account for LittleFS block/wear-leveling overhead), so this
     // can stop a shot or two early or late versus a live re-query; it cannot
-    // misreport or corrupt a shot.
+    // misreport or corrupt a shot. A size that cannot be read falls back to a
+    // live re-query so the loop cannot run away.
     size_t removed = 0;
     for (size_t i = 0; i < slogFiles.size() && freeSpace <= MIN_FREE_SPACE_BYTES; i++) {
-        String fname = "/h/" + slogFiles[i].first;
-        int start = fname.lastIndexOf('/') + 1;
-        int end = fname.lastIndexOf('.');
-        if (end > start) {
-            uint32_t shotId = fname.substring(start, end).toInt();
-            markIndexDeleted(shotId);
+        const String &name = slogFiles[i];
+        const String base = name.substring(0, name.lastIndexOf('.'));
+        if (base.length() > 0) {
+            markIndexDeleted(base.toInt());
         }
+        const long size = historyFileSize(*fs, name);
 
         // Remove .slog and associated .json notes file
-        fs->remove(fname);
-        String notesPath = fname.substring(0, fname.lastIndexOf('.')) + ".json";
-        fs->remove(notesPath);
-        freeSpace += slogFiles[i].second;
+        fs->remove("/h/" + name);
+        const String notesName = base + ".json";
+        if (std::binary_search(jsonFiles.begin(), jsonFiles.end(), notesName)) {
+            fs->remove("/h/" + notesName);
+        }
+        if (size >= 0) {
+            freeSpace += static_cast<size_t>(size);
+        } else {
+            freeSpace = getFreeSpace();
+        }
         removed++;
     }
 
@@ -607,12 +697,15 @@ void ShotHistoryPlugin::handleRequest(JsonDocument &request, JsonDocument &respo
     response["tp"] = String("res:") + type.substring(4);
     response["rid"] = request["rid"].as<String>();
 
+    auto id = request["id"].as<String>();
+    if ((type == "req:history:delete" || type == "req:history:notes:get" || type == "req:history:notes:save") &&
+        !validShotId(id)) {
+        response["error"] = F("Invalid shot id");
+        return;
+    }
+
     if (type == "req:history:delete") {
-        auto id = request["id"].as<String>();
-        String paddedId = id;
-        while (paddedId.length() < 6) {
-            paddedId = "0" + paddedId;
-        }
+        String paddedId = padId(id);
         fs->remove("/h/" + paddedId + ".slog");
         fs->remove("/h/" + paddedId + ".json");
 
@@ -621,17 +714,22 @@ void ShotHistoryPlugin::handleRequest(JsonDocument &request, JsonDocument &respo
 
         response["msg"] = "Ok";
     } else if (type == "req:history:notes:get") {
-        auto id = request["id"].as<String>();
         JsonDocument notes(&psramAllocator);
         loadNotes(id, notes);
         response["notes"] = notes;
     } else if (type == "req:history:notes:save") {
-        auto id = request["id"].as<String>();
         JsonDocument notes; // explicit document: variant->const JsonDocument& is ambiguous on clang
         notes.set(request["notes"]);
-        const bool notesSaved = saveNotes(id, notes);
+        if (!saveNotes(id, notes)) {
+            // Same key the profile handlers use for a failed write. Reporting "Ok"
+            // here told the user their notes were saved when the file was left
+            // untouched. The index keeps its old rating and volume too, so it
+            // never shows a rating the notes file does not hold.
+            response["error"] = F("Notes save failed");
+            return;
+        }
 
-        // Update rating and volume in index
+        // The notes file is confirmed written: update rating and volume in the index.
         uint8_t rating = notes["rating"].as<uint8_t>();
 
         // Check if user provided a doseOut value to override volume
@@ -645,15 +743,7 @@ void ShotHistoryPlugin::handleRequest(JsonDocument &request, JsonDocument &respo
 
         // Always use updateIndexMetadata - it handles both rating and optional volume
         updateIndexMetadata(id.toInt(), rating, volume);
-
-        if (notesSaved) {
-            response["msg"] = "Ok";
-        } else {
-            // Same key the profile handlers use for a failed write. Reporting "Ok"
-            // here told the user their notes were saved when the file was left
-            // untouched.
-            response["error"] = F("Notes save failed");
-        }
+        response["msg"] = "Ok";
     } else if (type == "req:history:rebuild") {
         // Rebuild is now handled asynchronously by WebUIPlugin
         // This path shouldn't be reached, but handle it just in case
@@ -668,13 +758,39 @@ bool ShotHistoryPlugin::saveNotes(const String &id, const JsonDocument &notes) {
     // destroy the notes that were there and report nothing. Write beside it and
     // move it in only once the whole document is down.
     const String tmpPath = target + ".tmp";
+    String notesStr;
+    serializeJson(notes, notesStr);
+#ifndef GAGGIMATE_SIM
+    // Through the POSIX layer, so the close is checked: File::close() returns
+    // nothing, and on FAT the close is where the directory entry and the last
+    // cluster are written. A failed close used to count as a saved file.
+    if (const char *mount = fs->mountpoint()) {
+        const String full = String(mount) + tmpPath;
+        FILE *fp = fopen(full.c_str(), "w");
+        if (fp == nullptr) {
+            ESP_LOGE("ShotHistoryPlugin", "Could not open notes file for shot %s: %d", id.c_str(), errno);
+            return false;
+        }
+        const size_t written = fwrite(notesStr.c_str(), 1, notesStr.length(), fp);
+        const bool flushed = fflush(fp) == 0 && fsync(fileno(fp)) == 0;
+        const bool closed = fclose(fp) == 0;
+        if (written != notesStr.length() || !flushed || !closed) {
+            ESP_LOGE("ShotHistoryPlugin",
+                     "Notes for shot %s not written (%u of %u bytes, flush %d, close %d); keeping the previous version",
+                     id.c_str(), written, notesStr.length(), flushed, closed);
+            fs->remove(tmpPath);
+            return false;
+        }
+        // Old notes are kept as .json.bak until the new file is in place, and
+        // rolled back if it is not (SafeReplace.h).
+        return saferep::commitReplace(*fs, tmpPath, target, "ShotHistoryPlugin");
+    }
+#endif
     File file = fs->open(tmpPath, FILE_WRITE);
     if (!file) {
         ESP_LOGE("ShotHistoryPlugin", "Could not open notes file for shot %s", id.c_str());
         return false;
     }
-    String notesStr;
-    serializeJson(notes, notesStr);
     const size_t written = file.print(notesStr);
     file.close();
     if (written != notesStr.length()) {
@@ -1001,38 +1117,26 @@ void ShotHistoryPlugin::rebuildIndex() {
         return;
     }
 
-    File directory = fs->open("/h");
-    if (!directory || !directory.isDirectory()) {
-        ESP_LOGW("ShotHistoryPlugin", "No history directory found");
-        if (directory)
-            directory.close();
-        // Emit completion event even if no directory exists
-        if (pluginManager) {
-            Event completedEvent;
-            completedEvent.id = "evt:history-rebuild-progress";
-            completedEvent.setInt("total", 0);
-            completedEvent.setInt("current", 0);
-            completedEvent.setString("status", "completed");
-            pluginManager->trigger(completedEvent);
-        }
-        return;
-    }
-
-    // Collect all .slog files
+    // Collect all .slog names with readdir (listHistoryNames); only the files
+    // whose headers are read below are opened.
+    std::vector<String> names;
+    listHistoryNames(*fs, names);
+    // The notes names come from the same walk: an exists() per shot was one
+    // more full walk of /h for every shot without notes.
     std::vector<String> slogFiles;
-    File file = directory.openNextFile();
-    while (file) {
-        String fname = String(file.name());
-        if (fname.endsWith(".slog")) {
-            slogFiles.push_back(fname);
+    std::vector<String> jsonFiles;
+    for (const String &name : names) {
+        if (name.endsWith(".slog")) {
+            slogFiles.push_back(name);
+        } else if (name.endsWith(".json")) {
+            jsonFiles.push_back(name);
         }
-        file.close();
-        file = directory.openNextFile();
     }
-    directory.close();
+    names.clear();
 
     // Sort files to maintain order
     std::sort(slogFiles.begin(), slogFiles.end());
+    std::sort(jsonFiles.begin(), jsonFiles.end());
 
     ESP_LOGI("ShotHistoryPlugin", "Rebuilding index from %d shot files", slogFiles.size());
 
@@ -1116,8 +1220,9 @@ void ShotHistoryPlugin::rebuildIndex() {
         }
 
         // Check for notes and extract rating and volume override
-        String notesPath = "/h/" + String(shotId, 10) + ".json";
-        if (fs->exists(notesPath)) {
+        const String notesName = String(shotId, 10) + ".json";
+        const String notesPath = "/h/" + notesName;
+        if (std::binary_search(jsonFiles.begin(), jsonFiles.end(), notesName)) {
             entry.flags |= SHOT_FLAG_HAS_NOTES;
 
             File notesFile = fs->open(notesPath, "r");

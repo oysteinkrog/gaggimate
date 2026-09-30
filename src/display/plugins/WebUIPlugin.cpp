@@ -242,6 +242,7 @@ void WebUIPlugin::loop() {
 #ifdef GAGGIMATE_SIM
     serviceHistoryQueue(); // the simulator spawns no tasks
 #endif
+    HistoryJob::deliverWs(this);
     const unsigned long now = millis();
     // Skip the (blocking, TLS) update check while a process is active: a brew/steam/grind
     // must not have the control loop stalled for the duration of the handshake, nor compete
@@ -549,6 +550,16 @@ void WebUIPlugin::drainAssetQueue() {
 // ack path finished the response underneath the worker, deleted the client
 // and faulted in write_send_buffs (LoadProhibited, 2026-09-09). One file at
 // a time, so a burst queues rather than piling walks on the card.
+//
+// Nothing that touches the card runs on async_tcp, because the card's volume
+// lock is held by whichever task is inside a walk: a read or a close on
+// async_tcp waits for the worker's walk to finish. So the worker also reads
+// the file, in 16 KB chunks into a PSRAM buffer of two slots (the next chunk
+// is read while the filler copies out of the current one), and closes it
+// (a handle released on another task is handed back to the worker). The
+// filler only copies. The websocket's history requests (notes load, notes
+// save, shot delete) are jobs on the same queue; their answers are sent from
+// the plugin loop, the task that sends the other websocket messages.
 
 namespace {
 
@@ -568,8 +579,9 @@ bool isScheduleTime(const String &t) {
     return hour <= 23 && minute <= 59;
 }
 
-enum HistoryKind : uint8_t { kHistFile = 0, kHistRecent = 1 };
+enum HistoryKind : uint8_t { kHistFile = 0, kHistRecent = 1, kHistWs = 2 };
 constexpr size_t kHistoryQueueCap = 8;
+constexpr size_t kHistoryChunk = 16 * 1024;
 constexpr long kRecentLimitMax = 50;
 
 // index.bin, recent.bin, or up to 12 digits followed by .slog or .json.
@@ -629,21 +641,165 @@ struct WebUIPlugin::HistoryJob {
     File file;                         // kHistFile on the simulator: the opened file, or none
     FILE *fp = nullptr;                // kHistFile on the device: the opened file, or null
     size_t size = 0;                   // its length
-    size_t pos = 0;                    // read position, for the response filler
     ShotIndexEntry *entries = nullptr; // kHistRecent: ps_malloc'd, `count` valid
     size_t count = 0;
+
+    // kHistFile on the device: the file in chunks of kHistoryChunk, read by the
+    // worker into two PSRAM slots. Chunk k lives in slot k & 1. `chunk` is the
+    // chunk a slot holds (-1: none), written by the worker only; `want` is the
+    // chunk the filler asked for, written by the filler only. The filler reads
+    // a slot only while `chunk` says it holds the chunk it needs, and asks for
+    // the next chunk into the other slot, so the worker never writes the slot
+    // being copied from (the library's filler index only moves forward).
+    struct Slot {
+        std::atomic<int32_t> chunk{-1};
+        std::atomic<int32_t> want{-1};
+        size_t len = 0;
+    };
+    uint8_t *chunkBuf = nullptr;
+    Slot slots[2];
+    bool opened = false;       // the first read is done; a queued entry is a refill
+    bool oom = false;          // no PSRAM for the chunk buffer
+    bool refillQueued = false; // under historyLock
+
+    // kHistWs: the websocket request and its answer.
+    uint32_t wsClient = 0;
+    JsonDocument wsRequest{&psramAllocator};
+    JsonDocument wsResponse{&psramAllocator};
+
+    // Worker state shared by every job. The plugin is a singleton.
+    static std::atomic<bool> workerUp;
+    static TaskHandle_t worker;
+    static std::mutex auxLock;                                   // guards the two lists below
+    static std::deque<FILE *> toClose;                           // handles to close on the worker
+    static std::deque<std::shared_ptr<HistoryJob>> wsDone;       // answers for the plugin loop
+
+    static void wakeWorker() {
+#ifndef GAGGIMATE_SIM
+        if (worker != nullptr) {
+            xTaskNotifyGive(worker);
+        }
+#endif
+    }
+    static void closeDeferred() {
+        for (;;) {
+            FILE *f = nullptr;
+            {
+                std::lock_guard<std::mutex> guard(auxLock);
+                if (toClose.empty()) {
+                    return;
+                }
+                f = toClose.front();
+                toClose.pop_front();
+            }
+            fclose(f);
+        }
+    }
+
+    // Reads chunk `k` into its slot. Worker only.
+    void readChunk(int32_t k) {
+        Slot &slot = slots[k & 1];
+        const size_t off = static_cast<size_t>(k) * kHistoryChunk;
+        size_t len = 0;
+        if (fp != nullptr && off < size && fseek(fp, static_cast<long>(off), SEEK_SET) == 0) {
+            const size_t want = std::min(kHistoryChunk, size - off);
+            len = fread(chunkBuf + (k & 1) * kHistoryChunk, 1, want, fp);
+        }
+        slot.len = len;
+        slot.chunk.store(k, std::memory_order_release);
+    }
+
+    // Filler side (async_tcp): ask the worker for chunk `k`.
+    void requestChunk(int32_t k) {
+        if (static_cast<size_t>(k) * kHistoryChunk >= size) {
+            return;
+        }
+        Slot &slot = slots[k & 1];
+        if (slot.chunk.load(std::memory_order_acquire) == k || slot.want.load(std::memory_order_relaxed) == k) {
+            return;
+        }
+        slot.want.store(k, std::memory_order_release);
+        std::shared_ptr<HistoryJob> self = selfRef.lock();
+        if (!self) {
+            return;
+        }
+        {
+            std::lock_guard<std::mutex> guard(plugin->historyLock);
+            if (refillQueued) {
+                return;
+            }
+            refillQueued = true;
+            // A refill goes ahead of the new requests: the handle is open, so
+            // it is sector reads, not a directory walk.
+            plugin->historyQueue.push_front(std::move(self));
+        }
+        wakeWorker();
+    }
+    std::weak_ptr<HistoryJob> selfRef;
+
+    // A websocket history request (notes load, notes save, shot delete). Each
+    // is one or more walks of /h, seconds on a big card, so it goes to the
+    // worker like a file request. False when it could not be queued, with the
+    // answer to send at once in `errorResponse`. Runs on async_tcp.
+    static bool enqueueWs(WebUIPlugin *plugin, uint32_t clientId, JsonDocument &request, JsonDocument &errorResponse);
+    // Sends the finished websocket answers. Runs on the plugin loop.
+    static void deliverWs(WebUIPlugin *plugin);
+
     ~HistoryJob() {
         if (file) {
             file.close();
         }
         if (fp != nullptr) {
+#ifdef GAGGIMATE_SIM
             fclose(fp);
+#else
+            if (xTaskGetCurrentTaskHandle() == worker || !workerUp.load()) {
+                fclose(fp);
+            } else {
+                // Released on async_tcp (the request's disconnect closure):
+                // the close waits on the volume lock, so the worker does it.
+                std::lock_guard<std::mutex> guard(auxLock);
+                toClose.push_back(fp);
+            }
+#endif
+            fp = nullptr;
+            wakeWorker();
+        }
+        if (chunkBuf != nullptr) {
+            free(chunkBuf);
         }
         if (entries != nullptr) {
             free(entries);
         }
     }
 };
+
+std::atomic<bool> WebUIPlugin::HistoryJob::workerUp{false};
+TaskHandle_t WebUIPlugin::HistoryJob::worker = nullptr;
+std::mutex WebUIPlugin::HistoryJob::auxLock;
+std::deque<FILE *> WebUIPlugin::HistoryJob::toClose;
+std::deque<std::shared_ptr<WebUIPlugin::HistoryJob>> WebUIPlugin::HistoryJob::wsDone;
+
+namespace {
+// Counts the queued jobs that are new requests; refills do not take a place.
+template <typename Q> size_t newJobCount(const Q &queue) {
+    size_t n = 0;
+    for (const auto &j : queue) {
+        if (!j->opened) {
+            n++;
+        }
+    }
+    return n;
+}
+
+// The answer to a websocket history request that never reached the worker.
+void historyWsError(JsonDocument &request, JsonDocument &response, const char *error) {
+    const String type = request["tp"].as<String>();
+    response["tp"] = String("res:") + type.substring(4);
+    response["rid"] = request["rid"].as<String>();
+    response["error"] = error;
+}
+} // namespace
 
 void WebUIPlugin::handleHistoryRequest(AsyncWebServerRequest *request) {
     const String name = request->url().substring(strlen("/api/history/"));
@@ -656,13 +812,19 @@ void WebUIPlugin::handleHistoryRequest(AsyncWebServerRequest *request) {
     if (kind == kHistRecent && request->hasArg("limit")) {
         limit = constrain(request->arg("limit").toInt(), 1L, kRecentLimitMax);
     }
+    if (!HistoryJob::workerUp.load()) {
+        // No worker was created (see setupServer): nothing would ever take the job.
+        request->send(503, "text/plain", "History unavailable");
+        return;
+    }
     std::lock_guard<std::mutex> guard(historyLock);
-    if (historyQueue.size() >= kHistoryQueueCap) {
+    if (newJobCount(historyQueue) >= kHistoryQueueCap) {
         histDropped++;
         request->send(503, "text/plain", "History busy, retry");
         return;
     }
     auto job = std::make_shared<HistoryJob>();
+    job->selfRef = job;
     job->plugin = this;
     job->name = name;
     job->kind = kind;
@@ -680,6 +842,7 @@ void WebUIPlugin::handleHistoryRequest(AsyncWebServerRequest *request) {
     if (historyQueue.size() > histQueueMax) {
         histQueueMax = historyQueue.size();
     }
+    HistoryJob::wakeWorker();
 }
 
 // Worker side: the filesystem work, and nothing that touches the request.
@@ -697,7 +860,43 @@ void WebUIPlugin::serviceHistoryQueue() {
             historyQueue.pop_front();
         }
         const unsigned long t0 = micros();
-        if (historyFs != nullptr && job->request.lock()) {
+        if (job->kind == kHistWs) {
+            ShotHistory.handleRequest(job->wsRequest, job->wsResponse);
+            job->wsRequest.clear();
+        } else if (job->opened) {
+#ifndef GAGGIMATE_SIM
+            // A refill: read every chunk the filler has asked for. Checked
+            // again under the lock before the flag drops, so a request made
+            // while the reads ran is not lost (requestChunk sets `want` first,
+            // then looks at the flag under the same lock).
+            for (;;) {
+                const bool live = static_cast<bool>(job->request.lock());
+                if (live) {
+                    for (auto &slot : job->slots) {
+                        const int32_t want = slot.want.load(std::memory_order_acquire);
+                        if (want >= 0 && want != slot.chunk.load(std::memory_order_relaxed)) {
+                            job->readChunk(want);
+                        }
+                    }
+                }
+                std::lock_guard<std::mutex> guard(historyLock);
+                bool settled = true;
+                if (live) {
+                    for (auto &slot : job->slots) {
+                        const int32_t want = slot.want.load(std::memory_order_acquire);
+                        if (want >= 0 && want != slot.chunk.load(std::memory_order_relaxed)) {
+                            settled = false;
+                        }
+                    }
+                }
+                if (settled) {
+                    job->refillQueued = false;
+                    break;
+                }
+            }
+#endif
+            continue; // a refill is not a request: no timing, no second completion
+        } else if (historyFs != nullptr && job->request.lock()) {
             if (job->kind == kHistRecent) {
                 job->entries = static_cast<ShotIndexEntry *>(ps_malloc(job->limit * sizeof(ShotIndexEntry)));
                 if (job->entries != nullptr) {
@@ -725,6 +924,25 @@ void WebUIPlugin::serviceHistoryQueue() {
                             job->fp = nullptr;
                         }
                     }
+                    // The first two chunks, so the response starts from memory
+                    // and the filler never reads the card. A file of one chunk
+                    // or less gets a buffer of its own size.
+                    if (job->fp != nullptr) {
+                        const size_t bufLen = std::min(job->size, 2 * kHistoryChunk);
+                        job->chunkBuf = static_cast<uint8_t *>(ps_malloc(bufLen > 0 ? bufLen : 1));
+                        if (job->chunkBuf == nullptr) {
+                            fclose(job->fp);
+                            job->fp = nullptr;
+                            job->size = 0;
+                            job->oom = true;
+                        } else {
+                            job->readChunk(0);
+                            if (job->size > kHistoryChunk) {
+                                job->readChunk(1);
+                            }
+                        }
+                    }
+                    job->opened = true;
                 }
 #endif
             }
@@ -734,12 +952,62 @@ void WebUIPlugin::serviceHistoryQueue() {
             histOpenUsMax = us;
         }
         job->done.store(true, std::memory_order_release);
+        if (job->kind == kHistWs) {
+            std::lock_guard<std::mutex> guard(HistoryJob::auxLock);
+            HistoryJob::wsDone.push_back(std::move(job));
+            continue;
+        }
 #ifdef GAGGIMATE_SIM
         if (auto req = job->request.lock()) {
             job->sent = true;
             completeHistoryJob(*job, req.get());
         }
 #endif
+    }
+}
+
+bool WebUIPlugin::HistoryJob::enqueueWs(WebUIPlugin *plugin, uint32_t clientId, JsonDocument &request,
+                                        JsonDocument &errorResponse) {
+    if (!workerUp.load()) {
+        historyWsError(request, errorResponse, "History unavailable");
+        return false;
+    }
+    auto job = std::make_shared<HistoryJob>();
+    job->selfRef = job;
+    job->plugin = plugin;
+    job->kind = kHistWs;
+    job->wsClient = clientId;
+    job->wsRequest.set(request);
+    {
+        std::lock_guard<std::mutex> guard(plugin->historyLock);
+        if (newJobCount(plugin->historyQueue) >= kHistoryQueueCap) {
+            plugin->histDropped++;
+            historyWsError(request, errorResponse, "History busy, retry");
+            return false;
+        }
+        plugin->historyQueue.push_back(std::move(job));
+        if (plugin->historyQueue.size() > plugin->histQueueMax) {
+            plugin->histQueueMax = plugin->historyQueue.size();
+        }
+    }
+    wakeWorker();
+    return true;
+}
+
+void WebUIPlugin::HistoryJob::deliverWs(WebUIPlugin *plugin) {
+    for (;;) {
+        std::shared_ptr<HistoryJob> job;
+        {
+            std::lock_guard<std::mutex> guard(auxLock);
+            if (wsDone.empty()) {
+                return;
+            }
+            job = std::move(wsDone.front());
+            wsDone.pop_front();
+        }
+        // A client that left while its job ran is simply not found.
+        plugin->ws.text(job->wsClient, toWsBuffer(job->wsResponse));
+        plugin->histServed++;
     }
 }
 
@@ -788,25 +1056,37 @@ void WebUIPlugin::completeHistoryJob(HistoryJob &job, AsyncWebServerRequest *req
         request->send(404, "text/plain", "Not found");
         return;
     }
-    // The filler runs on async_tcp as the client acks, reading the open
-    // handle in order (sector reads, no directory walk). The job outlives the
-    // response: the request's disconnect closure holds it, and its destructor
-    // closes the handle whether the transfer finished or the browser left.
+    if (job.oom) {
+        request->send(500, "text/plain", "Out of memory");
+        return;
+    }
+    // The filler runs on async_tcp as the client acks and only copies out of
+    // the chunk slots the worker filled; it never touches the card. When the
+    // chunk it needs is not in yet it asks for it and returns TRY_AGAIN; the
+    // library tries again on the next ack or on historyPollCb. The job
+    // outlives the response: the request's disconnect closure holds it, and
+    // its destructor hands the handle to the worker to close.
     HistoryJob *jobp = &job;
     AsyncWebServerResponse *response = request->beginResponse(
         historyContentType(job.name), job.size, [jobp](uint8_t *buffer, size_t maxLen, size_t index) -> size_t {
-            if (jobp->fp == nullptr || index >= jobp->size) {
+            if (index >= jobp->size) {
                 return 0;
             }
-            if (index != jobp->pos) {
-                if (fseek(jobp->fp, static_cast<long>(index), SEEK_SET) != 0) {
-                    return 0;
-                }
-                jobp->pos = index;
+            const int32_t k = static_cast<int32_t>(index / kHistoryChunk);
+            HistoryJob::Slot &slot = jobp->slots[k & 1];
+            if (slot.chunk.load(std::memory_order_acquire) != k) {
+                jobp->requestChunk(k);
+                return RESPONSE_TRY_AGAIN;
             }
-            const size_t want = std::min(maxLen, jobp->size - index);
-            const size_t got = fread(buffer, 1, want, jobp->fp);
-            jobp->pos += got;
+            // Read ahead: the next chunk goes into the slot this one's
+            // predecessor used, which the filler has finished with.
+            jobp->requestChunk(k + 1);
+            const size_t inChunk = index - static_cast<size_t>(k) * kHistoryChunk;
+            if (inChunk >= slot.len) {
+                return 0; // the read came up short: end the body here
+            }
+            const size_t got = std::min(maxLen, slot.len - inChunk);
+            memcpy(buffer, jobp->chunkBuf + (k & 1) * kHistoryChunk + inChunk, got);
             return got;
         });
     response->addHeader("Cache-Control", "no-store");
@@ -842,8 +1122,15 @@ void WebUIPlugin::historyPollCb(void *arg, AsyncClient *client) {
 void WebUIPlugin::historyTaskFn(void *param) {
     auto *self = static_cast<WebUIPlugin *>(param);
     for (;;) {
+        HistoryJob::closeDeferred();
         self->serviceHistoryQueue();
+#ifdef GAGGIMATE_SIM
         vTaskDelay(pdMS_TO_TICKS(10));
+#else
+        // Woken at once by a new job, a refill request or a handle to close;
+        // the timeout is only a backstop.
+        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(50));
+#endif
     }
 }
 
@@ -897,7 +1184,9 @@ void WebUIPlugin::setupServer() {
         // internal pool is what the web UI dies of, see CLAUDE.md); on
         // LittleFS a read is a flash operation, which runs with the cache
         // off and needs an internal stack. The task never deletes itself.
-        constexpr uint32_t kHistoryStack = 4096;
+        // 6 KB: besides the opens, the worker runs the notes save (JSON
+        // serialisation, the .tmp write and the rename) and the index updates.
+        constexpr uint32_t kHistoryStack = 6144;
         TaskHandle_t handle = nullptr;
         if (controller->isSDCard()) {
             xTaskCreatePinnedToCoreWithCaps(historyTaskFn, "HistServe", kHistoryStack, this, 1, &handle, 0,
@@ -907,9 +1196,15 @@ void WebUIPlugin::setupServer() {
             xTaskCreatePinnedToCore(historyTaskFn, "HistServe", kHistoryStack, this, 1, &handle, 0);
         }
         if (handle == nullptr) {
-            ESP_LOGE("WebUIPlugin", "history worker not created; /api/history/* will answer 503");
+            ESP_LOGE("WebUIPlugin", "history worker not created; /api/history/* and the websocket history requests will "
+                                    "answer 503 (History unavailable)");
+        } else {
+            HistoryJob::worker = handle;
+            HistoryJob::workerUp.store(true);
         }
     }
+#else
+    HistoryJob::workerUp.store(true); // the simulator's plugin loop is the worker
 #endif
     server.on("/api/core-dump", HTTP_GET, [this](AsyncWebServerRequest *request) { handleCoreDumpDownload(request); });
     // The web UI is embedded in firmware flash and served from the memory-mapped blob (see serveWebAsset). It is no
@@ -1072,9 +1367,12 @@ void WebUIPlugin::handleWebSocketData(AsyncWebSocket *server, AsyncWebSocketClie
                     client->text(toWsBuffer(resp));
                     ShotHistory.startAsyncRebuild();
                 } else if (msgType.startsWith("req:history")) {
+                    // Answered from the plugin loop once the worker has done
+                    // the filesystem work (HistoryJob::enqueueWs).
                     JsonDocument resp(&psramAllocator);
-                    ShotHistory.handleRequest(doc, resp);
-                    client->text(toWsBuffer(resp));
+                    if (!HistoryJob::enqueueWs(this, client->id(), doc, resp)) {
+                        client->text(toWsBuffer(resp));
+                    }
                 } else if (msgType == "req:flush:start") {
                     handleFlushStart(client->id(), doc);
                 } else if (msgType == "req:scale:tare") {
