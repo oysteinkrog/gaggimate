@@ -36,8 +36,25 @@ import time
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "settings_ui_tests"))
 from rig import Rig  # noqa: E402
 
+
+def _repo_root():
+    """Repo root, derived from this script's own location (tools/..), so the
+    tool works from any worktree instead of a hard-coded checkout path."""
+    return os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+
+
+def _win_path(path):
+    """Windows-side spelling of a WSL path, via wslpath -w. rig_serial.py
+    runs under cmd.exe on Windows Python and needs a C:\\... path."""
+    out = subprocess.run(["wslpath", "-w", path], capture_output=True, text=True)
+    if out.returncode != 0 or not out.stdout.strip():
+        sys.exit(f"wslpath -w {path} failed (rc={out.returncode}): {out.stderr.strip()}")
+    return out.stdout.strip()
+
+
 WIN_PY = os.environ.get("GM_RIG_PY", r"C:\Users\oystein\AppData\Local\Programs\Python\Python310\python.exe")
-REPO_WIN = r"C:\work\gaggimate\.claude\worktrees\gm-2cl-6-dials"
+REPO_ROOT = _repo_root()
+REPO_WIN = _win_path(REPO_ROOT)
 LAT = re.compile(r"GM_TOUCHLAT: (press|release)->([a-z_]+)(\([a-z]+\))? (-?\d+) us")
 
 
@@ -120,6 +137,14 @@ def main():
             if m:
                 kind = m.group(1) + "->" + m.group(2) + (m.group(3) or "")
                 lat.setdefault(kind, []).append(int(m.group(4)) / 1000.0)
+    if not lat:
+        print(
+            "error: no GM_TOUCHLAT line captured in %s -- is the device running a "
+            "GM_TOUCH_PROBE build (display-loadtest), and did the serial capture "
+            "actually reach it? (repo path used: %s)" % (args.out, REPO_WIN),
+            file=sys.stderr,
+        )
+        return 1
     report = {"target": name, "x": x, "y": y, "screen": args.screen, "busy": args.busy, "uianim": args.uianim,
               "taps": args.taps,
               "fps": (j1["anim_frames"] - j0["anim_frames"]) / max(1e-3, (j1["uptime_ms"] - j0["uptime_ms"]) / 1000.0),
@@ -132,7 +157,8 @@ def main():
                                  "p90_ms": round(vals[min(len(vals) - 1, int(len(vals) * 0.9))], 1),
                                  "max_ms": round(vals[-1], 1)}
     print(json.dumps(report, indent=1))
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
