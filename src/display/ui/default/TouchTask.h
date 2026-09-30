@@ -43,7 +43,6 @@ struct Sample {
 // pair is dropped and counted (transitionsDropped), so the queue always
 // ends with the newest edge and a lifted finger always ends released.
 constexpr int kMaxTransitions = 4;
-};
 
 struct HitRect {
     int16_t x1, y1, x2, y2;     // effective hit area: click area clipped by every ancestor's
