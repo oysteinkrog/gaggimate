@@ -30,6 +30,11 @@ class SleepAnimation {
     uint32_t stopWaitUsLast() const { return 0; }
     uint32_t stopWaitUsMax() const { return 0; }
     uint32_t stopTimeouts() const { return 0; }
+    bool selfStopped() const { return false; }
+    uint32_t selfStopCount() const { return 0; }
+    uint32_t scanUnknownFrames() const { return 0; }
+    static void debugForceInitFail() {}
+    static void debugForceFlipTimeout() {}
     bool isActive() const { return false; }
     void configure(uint8_t, const uint8_t *) {}
     void setMaxFps(uint8_t) {}
@@ -163,6 +168,23 @@ class SleepAnimation {
     uint32_t stopWaitUsLast() const;
     uint32_t stopWaitUsMax() const;
     uint32_t stopTimeouts() const;
+    // The render task stopped itself (an animation's init() failed) and the
+    // owner has not called stop() since (gm-bzu.38). The owner treats it as
+    // a stop: call stop(), which waits for the push task through
+    // finishStop(), and hand the panel back to LVGL. start() and stop()
+    // clear it. Count: every self-stop since boot.
+    bool selfStopped() const;
+    uint32_t selfStopCount() const;
+    // Frames rendered whole and flipped because no flip had been confirmed
+    // since the last flip timeout, so which buffer the panel scans was not
+    // known (gm-bzu.38). Interlacing resumes only after one is confirmed.
+    uint32_t scanUnknownFrames() const;
+    // Fault injection for the bench (gm-bzu.38): the next frame fails as if
+    // the animation's init() had failed, or the next flip is recorded as
+    // timed out without waiting. One-shot each. No-ops in builds without
+    // the debug write routes.
+    static void debugForceInitFail();
+    static void debugForceFlipTimeout();
     bool isActive() const { return running; }
 
     // Selects which registry animation renders and its 4 params (0-100 each).
@@ -446,7 +468,14 @@ class SleepAnimation {
     // animation (it moves smoothly and has no hard edges) but very visible on
     // UI widgets, which change in discrete steps and are full of them. So the
     // rule is: interlace the animation, never interlace a widget update.
-    void requestWholeFrames() { warmupFrames.store(2); }
+    //
+    // A request sets kWarmReq and nothing else; the render task acknowledges
+    // it at the top of its next frame by clearing the bit and raising the
+    // countdown to 2 (gm-bzu.38). The UI task used to store 2 while the
+    // render task loaded, decremented and stored, so a request landing in
+    // between was overwritten. Setting a bit cannot be lost that way, and a
+    // second request before the acknowledgement is covered by the same one.
+    void requestWholeFrames() { warmupFrames.fetch_or(kWarmReq); }
     // Global overlay alpha, Q8: 256 composites the overlay as drawn, 0 shows
     // the bare animation. The composite multiplies every overlay pixel's
     // coverage and the scrim's strength by it, so a fade costs nothing per
@@ -694,8 +723,15 @@ class SleepAnimation {
     bool bpie() const { return bpieOn.load(); }
     int probeMismatchValue() const { return probeMismatch.load(); }
     // Front overlay's non-transparent pixel count and row count (gm-2cl.15).
-    uint32_t overlayPixels() const { return overlays[overlayFront.load()].px; }
-    int overlayPixelRows() const { return overlays[overlayFront.load()].pxRows; }
+    // overlayFront is -1 until the first publish.
+    uint32_t overlayPixels() const {
+        const int f = overlayFront.load();
+        return f >= 0 ? overlays[f].px : 0;
+    }
+    int overlayPixelRows() const {
+        const int f = overlayFront.load();
+        return f >= 0 ? overlays[f].pxRows : 0;
+    }
     // Whether the band buffers landed in internal SRAM (they fall back to PSRAM).
     bool bandBufInternal() const;
 
@@ -1106,9 +1142,9 @@ class SleepAnimation {
     // coordinates, not extents.
     struct PushJob {
         int16_t x0, y0, x1, y1;
-        // 0 = whole band in one call, 1 = every other absolute row, 2 = every
-        // other row PAIR (half resolution, where a pair is one source row and
-        // must never be split). parity picks which half goes out this frame.
+        // 0 = whole band in one call, 1 = every other absolute row. parity
+        // picks which half goes out this frame. (Mode 2, row pairs at half
+        // resolution, was unreachable and went in gm-bzu.38.)
         uint8_t mode;
         uint8_t parity;
     };
@@ -1149,8 +1185,14 @@ class SleepAnimation {
     uint32_t frameParity = 0;
     // Frames after a start that push whole bands regardless of parity. Until
     // the animation has covered the screen once, the rows an interlaced frame
-    // skips still hold the previous screen's pixels.
+    // skips still hold the previous screen's pixels. The low bits are the
+    // countdown, which only the render task changes while it runs; kWarmReq
+    // is a pending requestWholeFrames(). Any non-zero value forces whole bands.
+    static constexpr uint32_t kWarmReq = 0x80000000u;
     std::atomic<uint32_t> warmupFrames{0};
+    // bandWarmup[] below uses the same shape in a byte: kBandWarmReq is a
+    // pending requestBandWarmup(), the low bits the render task's countdown.
+    static constexpr uint8_t kBandWarmReq = 0x80;
     // Render at 240x240 and double on the way out. On this panel 40+ fps and
     // full resolution are mutually exclusive: full res reaches 40 on only 5 of
     // the 13 animations (nebula 15.1, mandala 16.6, silk 18.0), half res on all
@@ -1397,8 +1439,8 @@ class SleepAnimation {
     // separately from liveWrites, which stays reserved for catching this
     // happening somewhere it was NOT supposed to.
     //
-    // When this goes false (warmupFrames just got set, or ilace was turned
-    // off), renderLoop's wasDirectInterlacedFrame check un-converges fbBack
+    // When this goes false (warmupFrames just got set, ilace was turned
+    // off, or a flip timed out and scanFb is unknown, gm-bzu.38), renderLoop's wasDirectInterlacedFrame check un-converges fbBack
     // back to the off-screen buffer, because the ordinary flip machinery
     // below is about to render a full frame into it and flip as it always
     // has -- fbBack has to mean "not on screen" again for that to be correct.
@@ -1475,10 +1517,9 @@ class SleepAnimation {
     // for why this used to be misrouted through dmaErrors/the CPU-fallback
     // path instead: fixed now, but this counter is what proves it, and
     // what dma_row_fallbacks could not (it only ever counted a genuine
-    // submitRows() failure, which this never was). At half resolution
-    // (pairMode) expect this to climb by roughly half of h/BAND_H per
-    // frame; at full resolution it should never move at all, since the
-    // two-candidate-per-band loop there always finds one of each parity.
+    // submitRows() failure, which this never was). Half resolution no
+    // longer interlaces, and at full resolution this should never move,
+    // since the loop there always finds one row of each parity.
     std::atomic<uint32_t> interlaceBandSkips{0};
     // See bandsForcedFullCount()'s own comment. Incremented at the same
     // per-band decision point as halfInterlaceVeto/interlaceBandSkips above,
@@ -1768,6 +1809,11 @@ class SleepAnimation {
     // Once per frame on the render task: positions for this frame and warmup
     // for the rows any layer entered or left.
     void evaluateLayers(int64_t nowUs, uint32_t ovGen);
+    // Frees a layer whose release is pending. Called by the render task at
+    // the start of a frame, and by the owner's task while the render task is
+    // parked (gm-bzu.38), since evaluateLayers() does not run then.
+    void freeReleasedLayer(int i);
+    void sweepReleasedLayers();
     // The motion record's time for wall clock nowUs (see Layer::shownAtUs).
     static int64_t layerClock(const Layer &L, const LayerMotion &m, int64_t nowUs);
     // Per panel row, after the overlay blend: every visible layer whose

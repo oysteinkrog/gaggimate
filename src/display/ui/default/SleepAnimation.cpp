@@ -1015,6 +1015,32 @@ uint32_t SleepAnimation::stopWaitUsLast() const { return s_stopWaitUsLast.load()
 uint32_t SleepAnimation::stopWaitUsMax() const { return s_stopWaitUsMax.load(); }
 uint32_t SleepAnimation::stopTimeouts() const { return s_stopTimeouts.load(); }
 
+// Self-stop and scan-ownership recovery (gm-bzu.38), file statics for the
+// same layout reason. s_selfStop is set by the render task when it stops
+// itself and cleared by start() and stop(); the owner polls it.
+static std::atomic<bool> s_selfStop{false};
+static std::atomic<uint32_t> s_selfStops{0};
+static std::atomic<uint32_t> s_scanUnknownFrames{0};
+
+bool SleepAnimation::selfStopped() const { return s_selfStop.load(); }
+uint32_t SleepAnimation::selfStopCount() const { return s_selfStops.load(); }
+uint32_t SleepAnimation::scanUnknownFrames() const { return s_scanUnknownFrames.load(); }
+
+// Fault injection for the bench (gm-bzu.38), compiled where the debug write
+// routes are (WebUIPluginDebug.cpp, GM_DEBUG_WRITE_ROUTES). Production has
+// neither the flags nor the per-frame test.
+#if defined(GM_TOUCH_PROBE) || defined(GM_KBLOB) || defined(GM_BLEND_PROBE) || defined(GM_ANIM_BENCH) ||                    \
+    defined(GM_SYNTH_HANDSHAKE)
+#define GM_ANIM_FAULT_KNOBS 1
+static std::atomic<bool> s_forceInitFail{false};
+static std::atomic<bool> s_forceFlipTimeout{false};
+void SleepAnimation::debugForceInitFail() { s_forceInitFail.store(true); }
+void SleepAnimation::debugForceFlipTimeout() { s_forceFlipTimeout.store(true); }
+#else
+void SleepAnimation::debugForceInitFail() {}
+void SleepAnimation::debugForceFlipTimeout() {}
+#endif
+
 static bool IRAM_ATTR sleepAnimBandRetire(void *arg);
 
 void SleepAnimation::freeOverlayBuffers() {
@@ -1057,10 +1083,16 @@ void SleepAnimation::start(Display *d) {
     }
     g_benchInstance = this;
     display = d;
+    s_selfStop.store(false);
     // Until the animation has covered the screen once, the rows an interlaced
     // frame skips still hold the previous screen's pixels, so the first frames
-    // go out whole.
+    // go out whole. The render task is parked, so a plain store is safe; it
+    // also drops any request bit left from the last run.
     warmupFrames.store(3);
+    // Nothing has been confirmed on screen for this run yet; beginDirectPath
+    // has to guess the starting buffer, and interlacing waits for the first
+    // confirmed flip (gm-bzu.38).
+    scanFb.store(-1);
     const int w = display->width();
     const int h = display->height();
     for (int i = 0; i < NUM_SLOTS; i++) {
@@ -1378,8 +1410,14 @@ int SleepAnimation::renderPrioValue() const {
 }
 
 bool SleepAnimation::stop() {
+    const bool selfStop = s_selfStop.exchange(false);
     if (!running) {
-        return stopConfirmed();
+        // A self-stop (gm-bzu.38): the render task left on its own, so the
+        // push task may still be waiting on bandReady and the render task may
+        // still be taking the direct path down. finishStop() waits for both,
+        // as it does for a stop requested here. Any other !running state is
+        // an earlier stop, confirmed or quarantined, and is only read back.
+        return selfStop ? finishStop() : stopConfirmed();
     }
     running = false;
     return finishStop();
@@ -1429,6 +1467,12 @@ bool SleepAnimation::finishStop() {
     // Frees only tasks that have listed themselves as parked; a task that
     // missed its bound is still running and is reaped later.
     reapTasks();
+    if (stopped) {
+        // The render task has parked, so evaluateLayers() will not run until
+        // the next start: free what was released during the run's last frame
+        // (gm-bzu.38).
+        sweepReleasedLayers();
+    }
     const bool confirmed = stopConfirmed();
     if (!confirmed) {
         if (!stopped || !pushStopped) {
@@ -1783,17 +1827,14 @@ void IRAM_ATTR SleepAnimation::pushLoop() {
         BENCH_T0(tPush);
         if (job.mode != 0) {
             // esp_lcd takes a rectangle and no stride, so the rows that go out
-            // cannot be one call. Mode 2 sends them two at a time -- at half
-            // resolution a pair is one source row, contiguous in the
-            // framebuffer -- which is half the calls of mode 1 for the same
-            // bytes. The rows left alone keep the previous frame.
-            const int step = job.mode == 2 ? 2 : 1;
+            // cannot be one call: one row each, this frame's parity only. The
+            // rows left alone keep the previous frame.
             const int stride = job.x1 - job.x0;
-            for (int y = job.y0; y + step <= job.y1; y += step) {
-                if ((((job.mode == 2 ? (y >> 1) : y) ^ job.parity) & 1) != 0) {
+            for (int y = job.y0; y < job.y1; y++) {
+                if (((y ^ job.parity) & 1) != 0) {
                     continue;
                 }
-                display->pushColors(job.x0, static_cast<int16_t>(y), job.x1, static_cast<int16_t>(y + step),
+                display->pushColors(job.x0, static_cast<int16_t>(y), job.x1, static_cast<int16_t>(y + 1),
                                     bandBuf[slot] + static_cast<size_t>(y - job.y0) * stride);
             }
         } else {
@@ -2253,11 +2294,11 @@ void SleepAnimation::requestBandWarmup(const int (*ranges)[2], int n) {
         const int b0 = y0 / BAND_H;
         const int b1 = (y1 - 1) / BAND_H; // inclusive: y1 is exclusive of the last covered row
         for (int bi = b0; bi <= b1 && bi < nBands; bi++) {
-            // Not a max-with-existing: a fresh publish means this band's
-            // pixels just changed again, so its own 2-frame window starts
-            // over from here regardless of how far the last one had counted
-            // down. Only ever grows the window, never shrinks it early.
-            bandWarmup[bi].store(2);
+            // A request bit, not a count (gm-bzu.38): the render task turns
+            // it into a fresh 2-frame window at this band's next visit. A
+            // store of 2 here used to land between the render task's load
+            // and its decrement and be overwritten.
+            bandWarmup[bi].fetch_or(kBandWarmReq);
         }
     }
 }
@@ -2321,6 +2362,39 @@ void SleepAnimation::layerRelease(int id) {
     // reading them, and the UI task never has to wait on the render task.
     // The slot reads as used until then, so an acquire cannot take it early.
     L.releasePending.store(true);
+    // With the render task parked there is no next frame, and the buffers
+    // stayed allocated until the next start (gm-bzu.38). Nothing reads them
+    // then, so free them here. start() runs on this same task, so the render
+    // task cannot come back between the test and the free.
+    if (!running && stopped) {
+        freeReleasedLayer(id);
+    }
+}
+
+void SleepAnimation::freeReleasedLayer(int i) {
+    Layer &L = layers[i];
+    if (!L.releasePending.load()) {
+        return;
+    }
+    heap_caps_free(L.buf);
+    heap_caps_free(L.runs);
+    heap_caps_free(L.runN);
+    L.buf = nullptr;
+    L.runs = nullptr;
+    L.runN = nullptr;
+    L.w = L.h = 0;
+    L.visible.store(false);
+    L.releasePending.store(false);
+    L.showGen.store(0);
+    L.hideGen.store(0);
+    L.shownAtUs.store(0);
+    L.used.store(false);
+}
+
+void SleepAnimation::sweepReleasedLayers() {
+    for (int i = 0; i < MAX_LAYERS; i++) {
+        freeReleasedLayer(i);
+    }
 }
 
 uint8_t *SleepAnimation::layerBuffer(int id) {
@@ -2597,19 +2671,7 @@ void SleepAnimation::evaluateLayers(int64_t nowUs, uint32_t ovGen) {
     for (int i = 0; i < MAX_LAYERS; i++) {
         Layer &L = layers[i];
         if (L.releasePending.load()) {
-            heap_caps_free(L.buf);
-            heap_caps_free(L.runs);
-            heap_caps_free(L.runN);
-            L.buf = nullptr;
-            L.runs = nullptr;
-            L.runN = nullptr;
-            L.w = L.h = 0;
-            L.visible.store(false);
-            L.releasePending.store(false);
-            L.showGen.store(0);
-            L.hideGen.store(0);
-            L.shownAtUs.store(0);
-            L.used.store(false);
+            freeReleasedLayer(i);
         }
         const uint32_t showGen = L.showGen.load();
         const uint32_t hideGen = L.hideGen.load();
@@ -3556,7 +3618,13 @@ void IRAM_ATTR SleepAnimation::presentFrame() {
     uint32_t f0 = 0, r0 = 0, s0 = 0;
     panelclock::scanoutStats(&f0, &r0, &s0);
     const int64_t waitStart = esp_timer_get_time();
-    for (int waited = 0; waited < FLIP_WAIT_MAX_MS; waited++) {
+    int waitLimitMs = FLIP_WAIT_MAX_MS;
+#ifdef GM_ANIM_FAULT_KNOBS
+    if (s_forceFlipTimeout.load() && s_forceFlipTimeout.exchange(false)) {
+        waitLimitMs = 0; // bench: record this flip as unconfirmed (gm-bzu.38)
+    }
+#endif
+    for (int waited = 0; waited < waitLimitMs; waited++) {
         uint32_t f = 0, r = 0, sl = 0;
         panelclock::scanoutStats(&f, &r, &sl);
         if (r != r0) {
@@ -3571,8 +3639,18 @@ void IRAM_ATTR SleepAnimation::presentFrame() {
     // scanned is genuinely unknown. Say so rather than carrying a stale belief
     // forward: -1 makes the live-write check abstain instead of reporting a
     // reassuring zero it cannot justify.
+    //
+    // It also stops interlacing (gm-bzu.38). An interlaced frame writes the
+    // buffer it believes is on screen and never flips, so with the belief
+    // gone it wrote whichever buffer fbBack named, possibly the hidden one,
+    // for as long as interlacing ran: the panel froze on its last whole
+    // frame. renderLoop runs whole, flipping frames while scanFb is -1, and
+    // the first confirmed flip grounds it again. The whole-frame request on
+    // top makes the two frames after the timeout whole even when the next
+    // flip confirms at once, the same window a page change gets.
     flipTimeouts++;
     scanFb.store(-1);
+    requestWholeFrames();
 }
 
 // Pick the render resolution for the running animation, once, by measuring it.
@@ -3716,13 +3794,40 @@ void IRAM_ATTR SleepAnimation::renderLoop() {
         // the previous presentFrame() took the gate, which is how it learned
         // the last transfer had landed, so nothing is in flight right now.
         directPushOn.store(directPushWanted.load());
+        // Acknowledge a requestWholeFrames() (gm-bzu.38): clear the request
+        // bit and start a 2-frame window, or keep a longer one already
+        // counting (the 3 frames after a start). The UI task only ever sets
+        // the bit, so a failed exchange means it set it again and the retry
+        // covers that request too.
+        {
+            uint32_t warm = warmupFrames.load();
+            while ((warm & kWarmReq) != 0) {
+                const uint32_t count = warm & ~kWarmReq;
+                if (warmupFrames.compare_exchange_weak(warm, count > 2 ? count : 2)) {
+                    break;
+                }
+            }
+        }
         // Latched alongside directPushOn and for the same reason: renderFrame()
         // and presentFrame() both need to agree on whether this frame is an
         // interlaced direct-DMA pass, and each reads this exactly once rather
         // than re-deriving it from the underlying atomics at a slightly
         // different moment. See the member's declaration in the header for
         // what this buys and what it costs.
-        directInterlacedFrame = dmaActive && directPushOn.load() && interlace.load() && warmupFrames.load() == 0;
+        //
+        // Not while scanFb is unknown (gm-bzu.38): an interlaced frame writes
+        // the buffer it believes is on screen and never flips, so without a
+        // confirmed flip it could be writing the hidden one indefinitely.
+        // Such a frame renders whole and flips instead, and the flip's
+        // confirmation is what lets interlacing resume. With one framebuffer
+        // there is no flip and nothing to confirm (scanFb stays -1), and the
+        // one buffer is always the scanned one.
+        const bool scanKnown = fbCount < 2 || scanFb.load() >= 0;
+        const bool wantInterlaced = dmaActive && directPushOn.load() && interlace.load() && warmupFrames.load() == 0;
+        directInterlacedFrame = wantInterlaced && scanKnown;
+        if (wantInterlaced && !scanKnown) {
+            s_scanUnknownFrames.fetch_add(1);
+        }
         // fbBack reconciliation for the mode this frame is about to run in.
         // Interlacing writes into whichever buffer is ALREADY on screen (see
         // directInterlacedFrame's declaration for why), so entering or
@@ -3806,9 +3911,13 @@ void IRAM_ATTR SleepAnimation::renderLoop() {
         // Once per frame, not once per band: every band of a frame must push
         // the same parity or the two halves of the picture drift apart.
         frameParity++;
-        const uint32_t warm = warmupFrames.load();
-        if (warm > 0) {
-            warmupFrames.store(warm - 1);
+        // Count the window down without losing a request bit the UI task
+        // sets meanwhile: the exchange fails, and the retry keeps the bit for
+        // the next frame's acknowledgement (gm-bzu.38).
+        {
+            uint32_t warm = warmupFrames.load();
+            while ((warm & ~kWarmReq) != 0 && !warmupFrames.compare_exchange_weak(warm, warm - 1)) {
+            }
         }
         fpsFrames++;
         animFrames.fetch_add(1);
@@ -3888,6 +3997,14 @@ void IRAM_ATTR SleepAnimation::renderLoop() {
     // counters, so a transfer that outlives the drain still keeps LVGL off
     // the framebuffers.
     endDirectPath();
+    // On a self-stop nobody else wakes the push task, which would otherwise
+    // sit out its 200 ms take timeout before it saw !running (gm-bzu.38).
+    // A spurious give is harmless: push re-checks running after every take.
+    for (int i = 0; i < NUM_SLOTS; i++) {
+        if (bandReady[i] != nullptr) {
+            xSemaphoreGive(static_cast<SemaphoreHandle_t>(bandReady[i]));
+        }
+    }
 }
 
 // IRAM, with renderLoop, presentFrame, pushLoop and the scrim rows: the two
@@ -3957,7 +4074,11 @@ bool IRAM_ATTR SleepAnimation::renderFrame() {
     // The band kernel this frame renders with: band() normally, bandRef()
     // when the A/B knob is set and the animation carries one (setUseBandRef).
     const auto bandFn = (useBandRef.load(std::memory_order_relaxed) && anim.bandRef != nullptr) ? anim.bandRef : anim.band;
-    if (id != initializedAnimId || half != initializedHalf) {
+    bool forceReinit = false;
+#ifdef GM_ANIM_FAULT_KNOBS
+    forceReinit = s_forceInitFail.load();
+#endif
+    if (forceReinit || id != initializedAnimId || half != initializedHalf) {
         // Hand back the outgoing animation's tables before the incoming one
         // asks for its own. Two reasons, and the second is a correctness one.
         //
@@ -3993,8 +4114,25 @@ bool IRAM_ATTR SleepAnimation::renderFrame() {
             residentAnimId = id;
             probeResidentSet(id);
         }
-        if (!anim.init(rw, rh)) {
-            log_e("SleepAnimation: init failed for animation %d (%s)", id, anim.id);
+        bool initOk;
+#ifdef GM_ANIM_FAULT_KNOBS
+        // Bench: fail as init() would, after the release above, so the whole
+        // self-stop path runs (gm-bzu.38). renderLoop re-enters this branch
+        // only on an id or resolution change, so the knob forces it below.
+        if (s_forceInitFail.load() && s_forceInitFail.exchange(false)) {
+            initOk = false;
+        } else
+#endif
+        {
+            initOk = anim.init(rw, rh);
+        }
+        if (!initOk) {
+            log_e("SleepAnimation: init failed for animation %d (%s), stopping", id, anim.id);
+            // A self-stop (gm-bzu.38): the loop parks, the direct path comes
+            // down on this task, and the owner sees selfStopped() and hands
+            // the panel back through stop().
+            s_selfStops.fetch_add(1);
+            s_selfStop.store(true);
             running = false;
             return false; // before the first band: the gate was never taken
         }
@@ -4031,6 +4169,15 @@ bool IRAM_ATTR SleepAnimation::renderFrame() {
     // per band re-expanded the same 120 cells on every interlaced row,
     // about 2.5 ms a frame on the brew screen (2026-09-08).
     int expandedCy = -1;
+    // Whether any band of this frame may interlace, decided once per frame
+    // (gm-bzu.38) so a whole-frame request lands between frames, never
+    // between two bands. A frame that will flip never interlaces: a flip
+    // shows the whole back buffer, and the rows an interlaced pass skips
+    // there hold the frame before last. renderLoop makes a frame flip when
+    // it could not confirm which buffer is scanned (directInterlacedFrame).
+    const bool frameWarm = warmupFrames.load() != 0;
+    const bool flipFrame = dmaActive && directPushOn.load() && fbCount > 1 && !directInterlacedFrame;
+    const bool frameMayInterlace = interlace.load() && !frameWarm && !flipFrame;
     // Outside the loop so the exit below can tell a whole frame from one that
     // a stop cut short.
     int y0 = 0;
@@ -4119,14 +4266,7 @@ bool IRAM_ATTR SleepAnimation::renderFrame() {
         // while the render and blend were still skipping them, which pushes
         // stale pixels: the opposite of what the warm-up is for.
         //
-        // An odd row count -- a pair cannot be half a row. The expand loop
-        // truncates at rows >> 1 and the push loop stops at y + 2 <= y1, so the
-        // odd row would be neither written nor sent. 480/8 leaves no partial
-        // band today, so this is a guard rather than a live case. Moot now
-        // that half also vetoes outright (below), since this only ever fired
-        // when half was true, but kept as documentation of why pairMode's
-        // row-pair rounding is safe on the rare geometry where the two might
-        // someday be decoupled again.
+        // A flipping frame -- see frameMayInterlace above the loop.
         //
         // half -- rig soak measured push_us at ~5,982,000 (fps 0.2, a 6 second
         // frame) with forcehalf=1 and interlace both active; forcehalf=-1
@@ -4145,8 +4285,10 @@ bool IRAM_ATTR SleepAnimation::renderFrame() {
         // Revisit if the geometry theory above is ever actually confirmed on
         // the rig; halfInterlaceVeto below counts how often this fires, so a
         // soak with forcehalf left on can distinguish "never got the chance
-        // to wedge" from "opted out every time".
-        const bool oddBand = (rows & 1) != 0;
+        // to wedge" from "opted out every time". The half-resolution interlace
+        // path (row pairs, push mode 2) was removed in gm-bzu.38 because this
+        // veto made it unreachable; bringing it back means writing it again
+        // against the rig, not re-enabling it.
         // Regional counterpart to warmupFrames: requestBandWarmup() (see its
         // own comment) counts this band down from 2 whenever a widget change
         // inside it was just published, so this ONE band skips interlacing
@@ -4156,41 +4298,38 @@ bool IRAM_ATTR SleepAnimation::renderFrame() {
         // separate because the two are used for unrelated things many lines
         // apart and merging them would just make both harder to follow.
         const int bandIdx = y0 / BAND_H;
-        const uint8_t bandWarm = (bandIdx >= 0 && bandIdx < MAX_BANDS) ? bandWarmup[bandIdx].load() : 0;
+        // A request bit starts a fresh window, this frame and the next;
+        // otherwise count down. The UI task only ever sets the bit, so a
+        // failed exchange means a new request, which the retry takes
+        // (gm-bzu.38). Once per band per renderFrame() call.
+        uint8_t bandWarm = 0;
+        if (bandIdx >= 0 && bandIdx < MAX_BANDS) {
+            bandWarm = bandWarmup[bandIdx].load();
+            while (bandWarm != 0) {
+                const uint8_t next = (bandWarm & kBandWarmReq) != 0 ? 1 : static_cast<uint8_t>(bandWarm - 1);
+                if (bandWarmup[bandIdx].compare_exchange_weak(bandWarm, next)) {
+                    break;
+                }
+            }
+        }
         // What this band would do on the global/half-res rules alone, before
         // the regional gate below has a say -- named so the forced-full
         // counter can ask "did the regional mechanism actually change the
         // outcome" instead of just "is bandWarm nonzero", since a nonzero
         // countdown on a band that would never have interlaced anyway (half
         // res, or the global warmup already covering it) forces nothing.
-        const bool wouldInterlace = interlace.load() && warmupFrames.load() == 0 && !(half && oddBand) && !half;
+        const bool wouldInterlace = frameMayInterlace && !half;
         const bool bandInterlaced = wouldInterlace && bandWarm == 0;
-        if (half && interlace.load() && warmupFrames.load() == 0) {
+        if (half && interlace.load() && !frameWarm) {
             halfInterlaceVeto++;
         }
-        if (bandWarm != 0) {
-            if (wouldInterlace) {
-                bandsForcedFull++;
-            }
-            // Once per frame, not once per read: this band is visited exactly
-            // once per renderFrame() call, same reasoning as warmupFrames'
-            // own once-per-frame decrement below.
-            bandWarmup[bandIdx].store(bandWarm - 1);
+        if (bandWarm != 0 && wouldInterlace) {
+            bandsForcedFull++;
         }
         const int parityNow = static_cast<int>(frameParity & 1u);
-        // At half resolution the unit is a row pair, one source row expanded;
-        // anywhere else it is a single row.
-        const bool pairMode = bandInterlaced && half;
-        // Render only the rows this frame will push. Used to require pairMode
-        // (half resolution) because that was the only path that could ever
-        // reach here with bandInterlaced true and half false was impossible
-        // to arrange -- the direct path's veto above made bandInterlaced
-        // imply pairMode's own half check would have been redundant either
-        // way. With that veto gone, bandInterlaced can be true at full
-        // resolution too, and the same reasoning applies unchanged: a row
-        // this frame will not push is a row this frame will not show, so
-        // computing it is wasted work. See the full-resolution render branch
-        // below for where this now also fires.
+        // Render only the rows this frame will push: a row this frame will
+        // not push is a row this frame will not show. Full resolution only,
+        // since half resolution never interlaces (above).
         const bool renderSkip = bandInterlaced && renderHalf.load();
         // Bench builds render ONE band per frame with the scheduler suspended
         // on this core. Aurora measures ~82 CPU cycles/pixel for a loop body
@@ -4217,45 +4356,26 @@ bool IRAM_ATTR SleepAnimation::renderFrame() {
         PROF_T0(cBand);
         if (half) {
             // Render rows/2 half-width rows, then expand 2x in both axes.
+            // Half resolution never interlaces (bandInterlaced above), so
+            // every source row is rendered and expanded.
             const int hrows = rows >> 1;
             const int srcBase = y0 >> 1;
-            // One band() call per source row instead of one for the whole band,
-            // so the rows this frame will not push are never computed. The
-            // contract takes a row count (BgAnim.h) and the last band of the
-            // screen already passes a short one, so this is within it; what it
-            // relies on is that no animation carries state from one call to the
-            // next, which is true of every animation (BgAnim.h's contract, and
-            // tools/animbench's interlace_check enforces it) -- each derives
-            // its row terms from the absolute y it is handed.
-            const bool splitRender = renderSkip && hrows > 0;
             if (lockThisBand) {
                 vTaskSuspendAll();
             }
-            if (splitRender) {
-                for (int sr = 0; sr < hrows; sr++) {
-                    if (((srcBase + sr) & 1) != parityNow) {
-                        continue;
-                    }
-                    bandFn(halfBuf + static_cast<size_t>(sr) * rw, srcBase + sr, 1, rw, tMs, p);
-                }
-            } else {
-                // One source row per band (BAND_H is 2), so this call never
-                // hands a kernel more than one row. That is what keeps the
-                // 466 px panel's odd half width (233) inside band()'s
-                // alignment precondition (BgAnim.h): with two rows the second
-                // would begin 466 bytes in, off the 4-byte boundary the
-                // pixel-pair stores assume (gm-bzu.21).
-                static_assert(BAND_H / 2 == 1, "the half path relies on one source row per band; see BgAnim.h");
-                bandFn(halfBuf, srcBase, hrows, rw, tMs, p);
-            }
+            // One source row per band (BAND_H is 2), so this call never
+            // hands a kernel more than one row. That is what keeps the
+            // 466 px panel's odd half width (233) inside band()'s
+            // alignment precondition (BgAnim.h): with two rows the second
+            // would begin 466 bytes in, off the 4-byte boundary the
+            // pixel-pair stores assume (gm-bzu.21).
+            static_assert(BAND_H / 2 == 1, "the half path relies on one source row per band; see BgAnim.h");
+            bandFn(halfBuf, srcBase, hrows, rw, tMs, p);
             if (lockThisBand) {
                 xTaskResumeAll();
             }
             PROF_T0(tExpand);
             for (int sr = 0; sr < hrows; sr++) {
-                if (splitRender && ((srcBase + sr) & 1) != parityNow) {
-                    continue; // its pair is not going out, so do not expand it
-                }
                 const uint16_t *__restrict src = halfBuf + static_cast<size_t>(sr) * rw;
                 uint16_t *const row0 = band + static_cast<size_t>(sr * 2) * w;
                 uint16_t *const row1 = row0 + w;
@@ -4294,17 +4414,14 @@ bool IRAM_ATTR SleepAnimation::renderFrame() {
             }
             PROF_ACC(profExpandUs, tExpand);
         } else {
-            // Row-level interlace at full resolution: the same trade
-            // splitRender makes above for half resolution (skip anim.band()
-            // for a row this frame will not push), at single-row granularity
-            // since there is no 2x expansion here to make pairs necessary --
-            // pairMode is false whenever half is, so this only ever fires at
-            // unit size 1. The per-row call is within BgAnim.h's contract:
-            // splitRender's comment above already established that every
-            // animation derives its row terms from the absolute y it is
-            // handed, which is exactly what makes a stride-2 walk over
-            // y0..y0+rows as legal as the contiguous call it replaces.
-            const bool splitRenderFull = renderSkip && !pairMode;
+            // Row-level interlace at full resolution: skip anim.band() for a
+            // row this frame will not push. The per-row call is within
+            // BgAnim.h's contract: no animation carries state from one call
+            // to the next, each derives its row terms from the absolute y it
+            // is handed (tools/animbench's interlace_check enforces it), so a
+            // stride-2 walk over y0..y0+rows is as legal as the contiguous
+            // call it replaces.
+            const bool splitRenderFull = renderSkip;
             if (lockThisBand) {
                 vTaskSuspendAll();
             }
@@ -4382,7 +4499,7 @@ bool IRAM_ATTR SleepAnimation::renderFrame() {
         // widgets into them is wasted. Both rows of a pushed pair still need it.
         // At gain 0 the overlay is invisible and the pass is skipped whole.
         for (int y = y0; y < y0 + rows && ov != nullptr && !patternMode && ovGain != 0; y++) {
-            if (bandInterlaced && ((((pairMode ? (y >> 1) : y) ^ parityNow) & 1) != 0)) {
+            if (bandInterlaced && (((y ^ parityNow) & 1) != 0)) {
                 continue;
             }
             uint16_t *const drow = band + static_cast<size_t>(y - y0) * w;
@@ -4476,7 +4593,7 @@ bool IRAM_ATTR SleepAnimation::renderFrame() {
             if (hit) {
                 PROF_T0(tLayer);
                 for (int y = y0; y < y0 + rows; y++) {
-                    if (bandInterlaced && ((((pairMode ? (y >> 1) : y) ^ parityNow) & 1) != 0)) {
+                    if (bandInterlaced && (((y ^ parityNow) & 1) != 0)) {
                         continue;
                     }
                     compositeLayersRow(band + static_cast<size_t>(y - y0) * w, y, w, pieBlend);
@@ -4497,7 +4614,7 @@ bool IRAM_ATTR SleepAnimation::renderFrame() {
             if (hit) {
                 PROF_T0(tElem);
                 for (int y = y0; y < y0 + rows; y++) {
-                    if (bandInterlaced && ((((pairMode ? (y >> 1) : y) ^ parityNow) & 1) != 0)) {
+                    if (bandInterlaced && (((y ^ parityNow) & 1) != 0)) {
                         continue;
                     }
                     compositeElementsRow(band + static_cast<size_t>(y - y0) * w, y, w);
@@ -4633,9 +4750,9 @@ bool IRAM_ATTR SleepAnimation::renderFrame() {
             // bandSig update, so the three cannot disagree about which bytes
             // are real this frame -- the same absolute-row parity test the
             // blend loop above already applies row by row
-            // ((pairMode ? y>>1 : y) ^ parityNow). A non-interlaced band
-            // (bandInterlaced false: warmup, ilace off, or an odd band at
-            // half res) never populates this and takes the plain contiguous
+            // ((y ^ parityNow) & 1). A non-interlaced band
+            // (bandInterlaced false: warmup, ilace off, half res, a flipping
+            // frame) never populates this and takes the plain contiguous
             // path a few lines down, unchanged from before this feature.
             int rowGroupRow[BandDma::MAX_ROW_GROUPS];
             uint32_t rowGroupOffsets[BandDma::MAX_ROW_GROUPS];
@@ -4661,14 +4778,12 @@ bool IRAM_ATTR SleepAnimation::renderFrame() {
             const bool dmaCrop = dmaCropOn.load() && bi >= 0 && bi < MAX_BANDS && (bandX1[bi] - bandX0[bi]) < w;
             const int dmaX0 = dmaCrop ? bandX0[bi] : 0;
             const int dmaCw = dmaCrop ? (bandX1[bi] - bandX0[bi]) : w;
-            // Rows per group: an uncropped interlaced pair goes out as one
-            // 2-row descriptor; every other shape is single rows.
-            const int groupRows = (bandInterlaced && pairMode && !dmaCrop) ? 2 : 1;
+            // One row per group.
             if (bandInterlaced || dmaCrop) {
-                rowGroupBytes = static_cast<size_t>(dmaCw) * groupRows * 2;
-                for (int r = 0; r < rows && nRowGroups < BandDma::MAX_ROW_GROUPS; r += groupRows) {
+                rowGroupBytes = static_cast<size_t>(dmaCw) * 2;
+                for (int r = 0; r < rows && nRowGroups < BandDma::MAX_ROW_GROUPS; r++) {
                     const int y = y0 + r;
-                    if (bandInterlaced && (((pairMode ? (y >> 1) : y) ^ parityNow) & 1) != 0) {
+                    if (bandInterlaced && ((y ^ parityNow) & 1) != 0) {
                         continue;
                     }
                     rowGroupRow[nRowGroups] = r;
@@ -4758,7 +4873,7 @@ bool IRAM_ATTR SleepAnimation::renderFrame() {
             // reason that has nothing to do with placement -- so it is left
             // alone here, and the still-accurate signature from the owning
             // phase keeps standing until that phase runs again.
-            const bool row0Owned = !bandInterlaced || ((((pairMode ? (y0 >> 1) : y0) ^ parityNow) & 1) == 0);
+            const bool row0Owned = !bandInterlaced || (((y0 ^ parityNow) & 1) == 0);
             if (row0Owned && bi >= 0 && bi < MAX_BANDS) {
                 bandSig[bi] = bandSignature(band, w);
             }
@@ -4781,14 +4896,13 @@ bool IRAM_ATTR SleepAnimation::renderFrame() {
             // written INTO the skipped rows here, this transfer simply has no
             // descriptor that points at them.
             esp_err_t err = ESP_OK;
-            // bandInterlaced with nRowGroups==0 means this band's row-pair
-            // belongs to the OTHER phase this frame -- not a failure. At
-            // full resolution the loop above always finds one row of each
-            // parity (y0 and y0+1, always opposite), so nRowGroups is never
-            // zero there; at half resolution (pairMode, unit=2) BAND_H's
-            // current tuning gives only ONE candidate per band, and on
-            // roughly half of all frames it is the wrong parity. The
-            // previous shape of this code (nRowGroups > 0 ? submitRows(...)
+            // bandInterlaced with nRowGroups==0 means this band has no row of
+            // this frame's phase -- not a failure. At full resolution the
+            // loop above always finds one row of each parity (y0 and y0+1),
+            // so this is a guard now: it was live on the half-resolution
+            // interlace path (row pairs, one candidate per band), removed in
+            // gm-bzu.38, where on roughly half of all frames the one
+            // candidate was the wrong parity. The previous shape of this code (nRowGroups > 0 ? submitRows(...)
             // : ESP_ERR_INVALID_SIZE, on the belief that "unit divides rows"
             // made an empty table impossible) treated that as a failure and
             // fell into the CPU-fallback branch below, which pushes the
@@ -4863,7 +4977,7 @@ bool IRAM_ATTR SleepAnimation::renderFrame() {
                     dmaRowFallbacks++;
                     for (int i = 0; i < nRowGroups; i++) {
                         const int16_t ry0 = static_cast<int16_t>(y0 + rowGroupRow[i]);
-                        display->pushColors(0, ry0, w, static_cast<int16_t>(ry0 + groupRows),
+                        display->pushColors(0, ry0, w, static_cast<int16_t>(ry0 + 1),
                                             band + static_cast<size_t>(rowGroupRow[i]) * w);
                     }
                 } else {
@@ -4917,7 +5031,7 @@ bool IRAM_ATTR SleepAnimation::renderFrame() {
             // unusually late, not to implicate the push by proximity.
             panelclock::scanoutMark(panelclock::SCANOUT_ACT_BANDPUSH);
         } else {
-            const uint8_t pushMode = !bandInterlaced ? 0 : (pairMode ? 2 : 1);
+            const uint8_t pushMode = bandInterlaced ? 1 : 0;
             pushJob[renderSlot] = {static_cast<int16_t>(cx0),
                                    static_cast<int16_t>(y0),
                                    static_cast<int16_t>(cx1),

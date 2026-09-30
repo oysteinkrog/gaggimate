@@ -1088,6 +1088,19 @@ void WebUIPlugin::setupDebugEndpoints() {
         if (request->hasArg("animoff")) {
             g_animOffReq = request->arg("animoff").toInt() != 0 ? 1 : 0;
         }
+        // Fault injection (gm-bzu.38), one-shot each. failinit=1: the next
+        // frame fails as if the animation's init() had failed, so the render
+        // task stops itself and DefaultUI must hand the panel back
+        // (self_stops climbs, anim_active goes false). fliptimeout=1: the
+        // next flip is recorded as unconfirmed without waiting (flip_timeouts
+        // climbs by one) and the frames after it must run whole until a flip
+        // is confirmed (scan_unknown_frames).
+        if (request->hasArg("failinit") && request->arg("failinit").toInt() != 0) {
+            SleepAnimation::debugForceInitFail();
+        }
+        if (request->hasArg("fliptimeout") && request->arg("fliptimeout").toInt() != 0) {
+            SleepAnimation::debugForceFlipTimeout();
+        }
         if (request->hasArg("marquees")) {
             g_marqueeLayersReq = request->arg("marquees").toInt() != 0 ? 1 : 0;
         }
@@ -1276,6 +1289,22 @@ void WebUIPlugin::setupDebugEndpoints() {
         // and a nonzero tear_live stays a bug report the whole time.
         doc["interlaced_live_writes"] = a->interlacedLiveWriteCount();
         doc["flip_timeouts"] = a->flipTimeoutCount();
+        // Frames that wanted to interlace but ran whole and flipped because
+        // no flip had been confirmed since the last timeout (gm-bzu.38).
+        doc["scan_unknown_frames"] = a->scanUnknownFrames();
+        // Render-task self-stops (an animation's init() failed) and whether
+        // one is waiting for DefaultUI to hand the panel back (gm-bzu.38).
+        doc["anim_active"] = a->isActive();
+        doc["self_stops"] = a->selfStopCount();
+        doc["self_stop_pending"] = a->selfStopped();
+        // Stop diagnostics (gm-bzu.37): gate gives by the render task on a
+        // frame left part way, frames not presented, stop() wait last and
+        // max in us, and stops that hit the 500 ms bound.
+        doc["stop_gate_gives"] = a->stopGateEarlyGives();
+        doc["stop_frames_aborted"] = a->stopFramesAborted();
+        doc["stop_wait_us"] = a->stopWaitUsLast();
+        doc["stop_wait_us_max"] = a->stopWaitUsMax();
+        doc["stop_timeouts"] = a->stopTimeouts();
         doc["anim_frames"] = a->animFrameCount();
         doc["fps_cap"] = a->maxFpsValue();
         doc["frame_us"] = a->lastFrameUsValue();
