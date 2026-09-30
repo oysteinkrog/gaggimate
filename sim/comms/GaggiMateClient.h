@@ -49,6 +49,7 @@ class GaggiMateClient {
         std::function<void(float weight, float cell1Weight, float cell2Weight, bool cell1Valid, bool cell2Valid)>;
     using TofCallback = std::function<void(uint32_t distance)>;
     using ErrorCallback = std::function<void(int code)>;
+    using TareResultCallback = std::function<void(bool success)>;
 
     GaggiMateClient();
 
@@ -109,6 +110,8 @@ class GaggiMateClient {
     void onScaleMeasurement(ScaleCallback cb) { _scaleCb = std::move(cb); }
     void onTofMeasurement(TofCallback cb) { _tofCb = std::move(cb); }
     void onError(ErrorCallback cb) { _errorCb = std::move(cb); }
+    // The mock scale never answers a tare; the callback is stored so the display's path compiles.
+    void onTareResult(TareResultCallback cb) { _tareResultCb = std::move(cb); }
 
   private:
     MockController _mock;
@@ -130,4 +133,5 @@ class GaggiMateClient {
     ScaleCallback _scaleCb;
     TofCallback _tofCb;
     ErrorCallback _errorCb;
+    TareResultCallback _tareResultCb;
 };

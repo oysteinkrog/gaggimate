@@ -14,6 +14,7 @@
 #include <display/models/shot_log_format.h>
 #include <display/util/PsramAllocator.h>
 #include <display/util/SafeReplace.h>
+#include <esp32-hal-psram.h>
 #ifndef GAGGIMATE_SIM
 #include <dirent.h>
 #include <sys/stat.h>

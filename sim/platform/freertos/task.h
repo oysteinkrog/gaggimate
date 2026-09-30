@@ -70,3 +70,9 @@ static inline eTaskState eTaskGetState(TaskHandle_t handle) {
 static inline TaskHandle_t xTaskGetCurrentTaskHandle(void) { return GM_SIM_TASK_HANDLE; }
 static inline TickType_t xTaskGetTickCount(void) { return (TickType_t)millis(); }
 static inline void taskYIELD(void) {}
+
+// No task runs on the host, so there is no stack to measure; report "plenty".
+static inline UBaseType_t uxTaskGetStackHighWaterMark(TaskHandle_t handle) {
+    (void)handle;
+    return 4096;
+}
