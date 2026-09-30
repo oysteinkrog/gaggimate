@@ -38,11 +38,14 @@ import {
 // with react-colorful as the colour picker for the active stop. The picker
 // works in offsets 0..1 over a pixel width; positions here are 0..255.
 //
-// Whatever is selected is mirrored to the panel over the web socket while the
-// editor is mounted (req:bganim:preview), so the device shows the animation
-// being configured with the gradient being edited before anything is saved.
-// The firmware holds a preview for 15 s per message; the editor re-sends on
-// every change and every 5 s, and ends the preview when it unmounts.
+// Whatever is being edited is mirrored to the panel over the web socket
+// (req:bganim:preview), so the device shows the gradient being edited before
+// anything is saved. Nothing is sent just for opening the tab or looking at
+// a gradient: only an actual edit (a stop moved, a colour changed, a
+// different gradient assigned) starts the preview. The firmware holds a
+// preview for 15 s per message; once an edit has started the preview, the
+// editor re-sends every 5 s to keep it alive, and ends it when the editor
+// unmounts (leaving the tab).
 
 const PREVIEW_DEBOUNCE_MS = 80;
 const PREVIEW_KEEPALIVE_MS = 5000;
@@ -102,18 +105,30 @@ export function GradientEditor({ animIdx, formData, setField }) {
   const writeLibrary = next => setField('bgAnimGradients', serializeGradientLibrary(next));
   const writeRefs = next => setField('bgAnimThemeMap', serializeThemeMap(next));
 
+  // Bumped by every function below that is a real user edit (as opposed to
+  // just viewing a gradient). The preview effects below key on this, not on
+  // the gradient's own value, so switching to look at a different
+  // animation's gradient never sends anything by itself.
+  const [editTick, setEditTick] = useState(0);
+  const markEdited = () => setEditTick(t => t + 1);
+
   const assign = nextRef => {
     const next = refs.slice();
     next[animIdx] = nextRef;
     writeRefs(next);
+    markEdited();
   };
 
-  const assignAll = () => writeRefs(refs.map(() => ref));
+  const assignAll = () => {
+    writeRefs(refs.map(() => ref));
+    markEdited();
+  };
 
   const updateStops = nextStops => {
     if (!current.editable) return;
     const sorted = nextStops.slice().sort((a, b) => a.pos - b.pos);
     writeLibrary(library.map(g => (g.id === current.id ? { ...g, stops: sorted } : g)));
+    markEdited();
   };
 
   const rename = name => {
@@ -136,6 +151,7 @@ export function GradientEditor({ animIdx, formData, setField }) {
     // Animations that used it fall back to the global theme, which is what
     // the firmware does with a dangling reference anyway.
     writeRefs(refs.map(r => (r === ref ? '' : r)));
+    markEdited();
   };
 
   const reverse = () => {
@@ -189,7 +205,8 @@ export function GradientEditor({ animIdx, formData, setField }) {
 
   // ---- live preview on the panel -----------------------------------------
   // The timers read the latest values through a ref so neither effect has to
-  // re-arm on every edit; only the debounce keys on the gradient itself.
+  // re-arm on every edit; only editTick (set by the edit functions above)
+  // decides whether anything is sent at all.
   const serialized = serializeGradient({ stops });
   const latestRef = useRef({ apiService, animIdx, serialized });
   latestRef.current = { apiService, animIdx, serialized };
@@ -210,12 +227,20 @@ export function GradientEditor({ animIdx, formData, setField }) {
     }
   }, []);
 
+  // Debounced send, gated on editTick so a re-render that only changes which
+  // gradient is being looked at (mount, switching animations) never sends.
   useEffect(() => {
+    if (editTick === 0) return undefined;
     const t = setTimeout(sendPreview, PREVIEW_DEBOUNCE_MS);
     return () => clearTimeout(t);
-  }, [animIdx, serialized, sendPreview]);
+  }, [editTick, sendPreview]);
 
+  // The keepalive (and the preview-end on unmount) only starts once editing
+  // has actually begun; opening the tab and never touching anything holds
+  // nothing on the panel to end.
+  const hasEdited = editTick > 0;
   useEffect(() => {
+    if (!hasEdited) return undefined;
     const t = setInterval(sendPreview, PREVIEW_KEEPALIVE_MS);
     return () => {
       clearInterval(t);
@@ -227,7 +252,7 @@ export function GradientEditor({ animIdx, formData, setField }) {
         // Already disconnected; the firmware lapses the preview on its own.
       }
     };
-  }, [sendPreview]);
+  }, [hasEdited, sendPreview]);
 
   const libraryFull = library.length >= BG_GRADIENT_LIB_MAX;
 
