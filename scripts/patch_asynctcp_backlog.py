@@ -19,17 +19,46 @@ memory is reserved by the backlog number itself.
 
 PlatformIO copies the library into .pio/libdeps/<env>/ twice (plain and
 @src-<hash>); the Library Dependency Finder compiles one of them, which
-one has changed across pio versions, so both copies are patched. A
-pristine copy is kept at AsyncTCP.cpp.gm-orig beside each patched file.
-Idempotent; anchored on the exact upstream line so an AsyncTCP update that
-moves it fails the build loudly here.
+one has changed across pio versions, so both copies are patched. The two
+are different releases: AsyncTCP@src-<hash> is the v3.4.10 platformio.ini
+pins by git tag (the one the display build compiles, lib7da on 2026-10-01),
+and the plain AsyncTCP is 3.5.0 from the registry, pulled in by
+ESPAsyncWebServer's own dependency. Both upstream hashes are pinned below.
+
+Applied through scripts/gm_patch.py: the patched file is always derived from
+a hash-verified pristine AsyncTCP.cpp (kept beside it as AsyncTCP.cpp.gm-orig)
+and carries a gm-patch-vN stamp, so a tree patched by an older version of
+this script is brought up to date instead of being taken as done. Anchored
+on the exact upstream line so an AsyncTCP update that moves it fails the
+build loudly here.
+
+Versions
+--------
+v1 (2026-10-01, the first stamped version): backlog 5 to 16.
+Bump VERSION whenever the hunk below changes.
 """
 
 import glob
 import os
 import sys
 
-Import("env")  # noqa: F821 -- provided by SCons
+try:
+    Import("env")  # noqa: F821 -- provided by SCons
+except NameError:  # imported by scripts/test_gm_patch.py
+    env = None
+if env is not None:
+    sys.path.insert(0, os.path.join(env.subst("$PROJECT_DIR"), "scripts"))
+import gm_patch  # noqa: E402
+
+OWNER = "patch_asynctcp_backlog"
+VERSION = 1
+# sha256 of upstream src/AsyncTCP.cpp at ESP32Async/AsyncTCP tags v3.4.10 (the
+# git pin in platformio.ini) and v3.5.0 (the registry copy), checked against
+# raw.githubusercontent.com on 2026-10-01.
+PRISTINE_SHA256 = {
+    "10b7124eea6b9b0b8734d058d480219f81e2663ddfd958eb6be27241bac048da",  # v3.4.10
+    "27e3e22a6030cc5c9c9f32f28d0a3a36189b1ea6a5fa270777b2d2790a89c365",  # v3.5.0
+}
 
 MARKER = "GM_ASYNCTCP_BACKLOG_PATCH"
 
@@ -42,39 +71,18 @@ NEW = (
     "  static uint8_t backlog = 16;\n"
 )
 
-
-def apply(path):
-    with open(path, encoding="utf-8") as f:
-        text = f.read()
-    if MARKER in text:
-        print("patch_asynctcp_backlog: already patched (%s)" % path)
-        return
-    found = text.count(OLD)
-    if found != 1:
-        sys.stderr.write(
-            "patch_asynctcp_backlog: anchor found %d times (want 1) in %s; "
-            "AsyncTCP was updated and this patch needs review.\n" % (found, path))
-        sys.exit(1)
-    orig = path + ".gm-orig"
-    if not os.path.exists(orig):
-        with open(orig, "w", encoding="utf-8") as f:
-            f.write(text)
-    text = text.replace(OLD, NEW)
-    tmp = path + ".gm-tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        f.write(text)
-    os.replace(tmp, path)
-    print("patch_asynctcp_backlog: patched %s" % path)
+PATCHES = [gm_patch.Patch(MARKER, VERSION, [(OLD, NEW, 1)])]
 
 
 def main():
     root = os.path.join(env.subst("$PROJECT_LIBDEPS_DIR"), env.subst("$PIOENV"))  # noqa: F821
-    paths = glob.glob(os.path.join(root, "AsyncTCP*", "src", "AsyncTCP.cpp"))
+    paths = sorted(glob.glob(os.path.join(root, "AsyncTCP*", "src", "AsyncTCP.cpp")))
     if not paths:
-        print("patch_asynctcp_backlog: AsyncTCP not present for this env; skipping")
+        print("gm-patch: %s: AsyncTCP not present for this env; skipping" % OWNER)
         return
     for path in paths:
-        apply(path)
+        gm_patch.run(OWNER, path, PRISTINE_SHA256, PATCHES)
 
 
-main()
+if env is not None:
+    main()

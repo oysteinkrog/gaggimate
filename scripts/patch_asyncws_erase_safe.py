@@ -43,19 +43,41 @@ Two changes, both in AsyncWebSocket.cpp:
    freed memory; it does not crash on its own, which is why the loop bug
    surfaced first).
 
-Idempotent: guarded by a marker string. Anchored on the exact upstream
-text (v3.10.3, our fork) so a library bump that rewrites these functions
-fails the build here instead of silently shipping the crash again. A
-pristine copy is kept at AsyncWebSocket.cpp.gm-orig beside the patched
-file. Upstream fixed the same class of bug for cleanupClients only (the
-`break` after erase); the broadcast loops are still range-for at 3.10.x.
+Applied through scripts/gm_patch.py: the patched file is always derived
+from a hash-verified pristine AsyncWebSocket.cpp (kept beside it as
+AsyncWebSocket.cpp.gm-orig) and carries a gm-patch-vN stamp, so a tree
+patched by an older version of this script is brought up to date instead
+of being taken as done. Anchored on the exact upstream text (v3.10.3, our
+fork) so a library bump that rewrites these functions fails the build here
+instead of silently shipping the crash again. Upstream fixed the same class
+of bug for cleanupClients only (the `break` after erase); the broadcast
+loops are still range-for at 3.10.x.
+
+Versions
+--------
+v1 (2026-10-01, the first stamped version): the four broadcast loops and
+the log-before-close in _queueMessage. Bump VERSION whenever a hunk below
+changes.
 """
 
 import glob
 import os
 import sys
 
-Import("env")  # noqa: F821 -- provided by SCons
+try:
+    Import("env")  # noqa: F821 -- provided by SCons
+except NameError:  # imported by scripts/test_gm_patch.py
+    env = None
+if env is not None:
+    sys.path.insert(0, os.path.join(env.subst("$PROJECT_DIR"), "scripts"))
+import gm_patch  # noqa: E402
+
+OWNER = "patch_asyncws_erase_safe"
+VERSION = 1
+# sha256 of src/AsyncWebSocket.cpp at the commit platformio.ini pins
+# (oysteinkrog/ESPAsyncWebServer 1dc278b9a7915b7d97baa79e0a5449b2eb72b8d4),
+# checked against raw.githubusercontent.com on 2026-10-01.
+PRISTINE_SHA256 = {"ce6192141fe8d51c0579370a30cc9599c8d06ac598440b60349ca8f93fa05cdb"}
 
 MARKER = "GM_ASYNCWS_ERASE_SAFE_PATCH"
 
@@ -169,40 +191,18 @@ HUNKS = [
 ]
 
 
-def apply(path):
-    with open(path, encoding="utf-8") as f:
-        text = f.read()
-    if MARKER in text:
-        print("patch_asyncws_erase_safe: already patched (%s)" % path)
-        return
-    orig = path + ".gm-orig"
-    if not os.path.exists(orig):
-        with open(orig, "w", encoding="utf-8") as f:
-            f.write(text)
-    for old, new, count in HUNKS:
-        found = text.count(old)
-        if found != count:
-            sys.stderr.write(
-                "patch_asyncws_erase_safe: anchor found %d times (want %d) in %s; "
-                "ESPAsyncWebServer was updated and this patch needs review. "
-                "Anchor begins: %r\n" % (found, count, path, old[:80]))
-            sys.exit(1)
-        text = text.replace(old, new)
-    tmp = path + ".gm-tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        f.write(text)
-    os.replace(tmp, path)
-    print("patch_asyncws_erase_safe: patched %s" % path)
+PATCHES = [gm_patch.Patch(MARKER, VERSION, HUNKS)]
 
 
 def main():
     root = os.path.join(env.subst("$PROJECT_LIBDEPS_DIR"), env.subst("$PIOENV"))  # noqa: F821
-    paths = glob.glob(os.path.join(root, "ESPAsyncWebServer*", "src", "AsyncWebSocket.cpp"))
+    paths = sorted(glob.glob(os.path.join(root, "ESPAsyncWebServer*", "src", "AsyncWebSocket.cpp")))
     if not paths:
-        print("patch_asyncws_erase_safe: ESPAsyncWebServer not present for this env; skipping")
+        print("gm-patch: %s: ESPAsyncWebServer not present for this env; skipping" % OWNER)
         return
     for path in paths:
-        apply(path)
+        gm_patch.run(OWNER, path, PRISTINE_SHA256, PATCHES)
 
 
-main()
+if env is not None:
+    main()

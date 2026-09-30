@@ -42,15 +42,55 @@ which cadence runs when, and the measurements above that justify it. The
 library keeps deciding WHEN to scan; the firmware decides HOW.
 
 Why a patch rather than a fork: it is a few lines in a library we do not
-otherwise touch. The patch is idempotent and anchored on exact upstream text, so
-a library bump fails the build loudly rather than silently reverting.
+otherwise touch. Anchored on exact upstream text, so a library bump fails the
+build loudly rather than silently reverting.
+
+Applied through scripts/gm_patch.py: the patched file is always derived from a
+hash-verified pristine remote_scales.cpp (kept beside it as
+remote_scales.cpp.gm-orig) and carries a gm-patch-vN stamp, so a tree patched
+by an older version of this script is brought up to date instead of being
+taken as done.
+
+Only the env being built is patched, like every other patch script. The first
+version walked every env's libdeps from one build, which rewrote files another
+env's build might be compiling at that moment; an env that has not been built
+since this change is patched by its own next build.
+
+The marker-based version of this script wrote no .gm-orig, so a tree it
+patched has no pristine copy on disk. recover_gm_orig() rebuilds one by
+reversing that version's hunks, and keeps it only if the result has the pinned
+upstream hash; otherwise gm_patch fails the build as for any unknown baseline.
+
+Versions
+--------
+v1 (2026-10-01, the first stamped version): the extern declarations and the
+two setters reading the firmware's globals, text unchanged from the
+marker-based version. Bump VERSION whenever a hunk below changes; leave
+LEGACY_HUNKS alone, it describes what old trees on disk contain.
 """
 
 import os
+import sys
+
+try:
+    Import("env")  # noqa: F821 -- provided by SCons
+except NameError:  # imported by scripts/test_gm_patch.py
+    env = None
+if env is not None:
+    sys.path.insert(0, os.path.join(env.subst("$PROJECT_DIR"), "scripts"))
+import gm_patch  # noqa: E402
+
+OWNER = "patch_ble_scan_duty"
+VERSION = 1
+# sha256 of src/remote_scales.cpp at gaggimate/esp-arduino-ble-scales tag v2.0.0
+# (the git pin in platformio.ini), checked against raw.githubusercontent.com on
+# 2026-10-01.
+PRISTINE_SHA256 = {"272e1d41d6565531b7b05302d3ff62ba3e961e49829e9c36746d9605de9c745e"}
 
 MARKER = "GM_BLE_SCAN_DUTY_PATCH"
 
-HUNKS = [
+# The hunks as the marker-based version applied them, (anchor, replacement).
+LEGACY_HUNKS = [
     (
         '#include "remote_scales.h"\n'
         '#include "remote_scales_plugin_registry.h"\n',
@@ -76,56 +116,55 @@ HUNKS = [
     ),
 ]
 
+# (anchor, replacement, expected occurrence count)
+HUNKS = [(old, new, 1) for old, new in LEGACY_HUNKS]
 
-def find_sources():
-    """Every checked-out copy of remote_scales.cpp, one per PlatformIO env.
-
-    Located from the working directory rather than from __file__, which SCons
-    does not define for a script it exec()s as a pre-action.
-    """
-    root = os.path.join(os.getcwd(), ".pio", "libdeps")
-    found = []
-    if not os.path.isdir(root):
-        return found
-    for env in sorted(os.listdir(root)):
-        path = os.path.join(root, env, "esp-arduino-ble-scales", "src", "remote_scales.cpp")
-        if os.path.isfile(path):
-            found.append(path)
-    return found
+PATCHES = [gm_patch.Patch(MARKER, VERSION, HUNKS)]
 
 
-def apply(path):
-    with open(path, "r", encoding="utf-8", newline="") as handle:
-        text = handle.read()
+def unpatch_legacy(text):
+    """The pristine text under a marker-based patch, or None if it is not one."""
+    if MARKER not in text or gm_patch.stamps_in(text):
+        return None
+    for old, new in reversed(LEGACY_HUNKS):
+        if text.count(new) != 1:
+            return None
+        text = text.replace(new, old)
+    return text
 
-    if MARKER in text:
-        return "already patched"
 
-    for index, (old, new) in enumerate(HUNKS, start=1):
-        count = text.count(old)
-        if count != 1:
-            raise SystemExit(
-                "patch_ble_scan_duty: hunk %d matched %d times in %s, expected exactly 1.\n"
-                "The library has changed upstream. Re-derive the patch against the new "
-                "source rather than loosening this check: a silently skipped hunk brings "
-                "back the scan-out disturbance it exists to fix." % (index, count, path)
-            )
-        text = text.replace(old, new)
-
-    with open(path, "w", encoding="utf-8", newline="") as handle:
-        handle.write(text)
-    return "patched"
+def recover_gm_orig(path, log=print):
+    """Write path.gm-orig from a marker-patched path if it reverses to upstream."""
+    orig = path + ".gm-orig"
+    if os.path.exists(orig):
+        return False
+    with open(path, "rb") as handle:
+        text = handle.read().decode("utf-8")
+    pristine = unpatch_legacy(text)
+    if pristine is None:
+        return False
+    data = pristine.encode("utf-8")
+    if gm_patch.sha256(data) not in PRISTINE_SHA256:
+        return False
+    tmp = orig + ".gm-tmp"
+    with open(tmp, "wb") as handle:
+        handle.write(data)
+    os.replace(tmp, orig)
+    log("gm-patch: %s: recovered .gm-orig from a marker-patched file (%s)" % (OWNER, orig))
+    return True
 
 
 def main():
-    paths = find_sources()
-    if not paths:
+    path = os.path.join(env.subst("$PROJECT_LIBDEPS_DIR"), env.subst("$PIOENV"),  # noqa: F821
+                        "esp-arduino-ble-scales", "src", "remote_scales.cpp")
+    if not os.path.isfile(path):
         # The library is fetched on first build, after pre-scripts run. There is
         # nothing to patch yet and the next build will catch it.
-        print("patch_ble_scan_duty: remote_scales.cpp not checked out yet, skipping")
+        print("gm-patch: %s: remote_scales.cpp not present for this env; skipping" % OWNER)
         return
-    for path in paths:
-        print("patch_ble_scan_duty: %s (%s)" % (apply(path), path))
+    recover_gm_orig(path)
+    gm_patch.run(OWNER, path, PRISTINE_SHA256, PATCHES)
 
 
-main()
+if env is not None:
+    main()
