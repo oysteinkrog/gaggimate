@@ -195,7 +195,7 @@ void BLEScalePlugin::setup(Controller *controller, PluginManager *manager) {
 void BLEScalePlugin::loop() {
     if (doConnect && scale == nullptr) {
         const unsigned long now = millis();
-        if (lastConnectAttempt == 0 || now - lastConnectAttempt >= CONNECT_RETRY_INTERVAL_MS) {
+        if (lastConnectAttempt == 0 || now - lastConnectAttempt >= connectRetryIntervalMs) {
             lastConnectAttempt = now;
             establishConnection();
         }
@@ -300,6 +300,11 @@ void BLEScalePlugin::connect(const std::string &uuid) {
 
     doConnect = true;
     this->uuid = uuid;
+    // Start this attempt at the fast base cadence, even if a previous
+    // attempt for a different (or the same, now-reappeared) scale had
+    // backed off toward CONNECT_RETRY_MAX_INTERVAL_MS.
+    connectRetryIntervalMs = CONNECT_RETRY_INTERVAL_MS;
+    lastConnectAttempt = 0;
     controller->getSettings().setSavedScale(uuid.data());
 }
 
@@ -359,6 +364,7 @@ void BLEScalePlugin::disconnect() {
         uuid = "";
         doConnect = false;
         reconnectionTries = 0;
+        connectRetryIntervalMs = CONNECT_RETRY_INTERVAL_MS;
         // Reset metadata caches so we re-emit change events when a new scale
         // connects (possibly a different model with different capabilities).
         lastBatteryLevel = REMOTE_SCALES_BATTERY_UNKNOWN;
@@ -430,6 +436,13 @@ void BLEScalePlugin::establishConnection() {
             scale = factory->create(d);
             if (!scale) {
                 ESP_LOGE("BLEScalePlugin", "Connection to device %s failed", d.getName().c_str());
+                // A factory that refuses to build a driver for this device
+                // will refuse again on a straight retry. Give up on this
+                // attempt instead of leaving doConnect set, which used to
+                // make loop() call establishConnection() again every
+                // CONNECT_RETRY_INTERVAL_MS forever.
+                doConnect = false;
+                connectRetryIntervalMs = CONNECT_RETRY_INTERVAL_MS;
                 return;
             }
 
@@ -463,7 +476,23 @@ void BLEScalePlugin::establishConnection() {
 
     if (!deviceFound) {
         ESP_LOGW("BLEScalePlugin", "Device %s not found in discovered scales", uuid.c_str());
-        scan();
+        if (connectRetryIntervalMs >= CONNECT_RETRY_MAX_INTERVAL_MS) {
+            // Backed off all the way to the burst cadence with the device
+            // still absent: stop re-arming a fresh boost here and hand
+            // scanning back to the scan-phase scheduler in update() (which
+            // runs once doConnect is clear), instead of polling in parallel
+            // with it forever.
+            doConnect = false;
+            connectRetryIntervalMs = CONNECT_RETRY_INTERVAL_MS;
+        } else {
+            // Still ramping: keep the boost alive for this attempt (a scale
+            // switched back on nearby should still be found quickly), but
+            // grow the wait before the next attempt instead of retrying at
+            // a fixed 2 s forever.
+            const unsigned long doubled = connectRetryIntervalMs * 2;
+            connectRetryIntervalMs = doubled < CONNECT_RETRY_MAX_INTERVAL_MS ? doubled : CONNECT_RETRY_MAX_INTERVAL_MS;
+            scan();
+        }
     }
 }
 

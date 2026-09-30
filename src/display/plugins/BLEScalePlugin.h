@@ -95,6 +95,24 @@ class BLEScalePlugin : public Plugin {
     static constexpr unsigned long SCAN_BOOST_MS = 60000;
     static constexpr unsigned long SCAN_BURST_LEN_MS = 15000;
     static constexpr unsigned long SCAN_BURST_PERIOD_MS = 90000;
+
+    // How long loop() waits between establishConnection() attempts while
+    // doConnect is set. A device that is not in the scanner's discovered
+    // list, or whose driver the factory refuses to build, will not connect
+    // on a straight retry either, so this backs off exponentially from
+    // CONNECT_RETRY_INTERVAL_MS instead of hammering a scan restart every
+    // 2 s forever (gm-bzu.53: that used to re-arm a fresh boost on every
+    // failed attempt, so a scale that is off or out of range kept the
+    // scanner running continuously, including through standby). It caps at
+    // the burst period above -- the same low-duty cadence update()'s scan
+    // phase scheduler already falls back to once a scale is judged absent --
+    // and establishConnection() clears doConnect once it reaches that cap,
+    // handing scanning back to that scheduler rather than polling forever in
+    // parallel with it. connect() resets it, so a fresh attempt (an explicit
+    // pairing, or the saved scale reappearing in a scan) always starts at
+    // the fast cadence.
+    static constexpr unsigned long CONNECT_RETRY_MAX_INTERVAL_MS = SCAN_BURST_PERIOD_MS;
+    unsigned long connectRetryIntervalMs = CONNECT_RETRY_INTERVAL_MS;
     mutable unsigned long scanBoostUntil = 0;
     mutable unsigned long scanBurstStopAt = 0;
     mutable unsigned long scanNextBurstAt = 0;
