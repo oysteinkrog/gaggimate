@@ -193,29 +193,23 @@ bool ProfileManager::saveProfile(Profile &profile) {
     // Serialized to a temporary file and moved into place only once the whole
     // document is on disk. Opening the real path with "w" truncates it up front,
     // so a filesystem that fills up mid-serialize left a half-written JSON file
-    // where a valid profile had been: the old profile was destroyed and the new
-    // one would not parse on the next load. serializeJson()'s return was only
-    // compared against 0, so a short write reported success and the UI said the
-    // profile had saved.
+    // where a valid profile had been. Comparing serializeJson()'s count was not
+    // enough either: the 4 KB stdio buffer accepts every byte of a profile, the
+    // ENOSPC only shows in the flush inside fclose, and File::close() drops that
+    // result, so a save onto a full LittleFS reported success and committed a
+    // short file. saferep::writeJson checks the flush, the sync and the close
+    // and reads the file back before this commits it (gm-bzu.52).
     const String target = profilePath(profile.id);
     // listProfiles() only picks up names ending in .json, so a leftover .tmp
     // from a power cut is inert rather than a profile that fails to parse.
     const String tmpPath = target + ".tmp";
-    File file = _fs->open(tmpPath, "w");
-    if (!file)
-        return false;
 
     JsonDocument doc(&psramAllocator);
     JsonObject obj = doc.to<JsonObject>();
     writeProfile(obj, profile);
 
-    const size_t expected = measureJson(doc);
-    const size_t written = serializeJson(doc, file);
-    file.close();
-    if (written != expected) {
-        ESP_LOGE("ProfileManager", "Wrote %u of %u bytes for profile %s; keeping the previous version", written, expected,
-                 profile.id.c_str());
-        _fs->remove(tmpPath);
+    if (!saferep::writeJson(*_fs, tmpPath, doc, "ProfileManager")) {
+        ESP_LOGE("ProfileManager", "Could not write profile %s; keeping the previous version", profile.id.c_str());
         return false;
     }
     // FAT (SD_MMC) refuses to rename onto a name that already exists, so the
