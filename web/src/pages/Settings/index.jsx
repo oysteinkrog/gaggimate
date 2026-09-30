@@ -219,6 +219,10 @@ export function Settings() {
 
   const [profiles, setProfiles] = useState([]);
   const [submitting, setSubmitting] = useState(false);
+  // Set when the last save did not reach the device's flash (or did not
+  // reach the device at all). The form keeps the edits so a retry resends
+  // them. `restart` remembers which button was used, so the retry repeats it.
+  const [saveError, setSaveError] = useState(null);
   const [formData, setFormData] = useState({});
   const [currentTheme, setCurrentTheme] = useState('light');
   const [showWifiPassword, setShowWifiPassword] = useState(false);
@@ -364,23 +368,30 @@ export function Settings() {
           method: 'post',
           body: formDataToSubmit,
         });
-        const data = await response.json();
+        const data = await response.json().catch(() => null);
+        if (!response.ok || !data) {
+          // The device answers {error, code} when it could not persist the
+          // save. Keep formData as it is: those are the unsaved edits.
+          const message =
+            (data && data.error) || `The device answered with HTTP status ${response.status}.`;
+          setSaveError({ message, restart });
+          return;
+        }
 
-        const splitPid = data.pid ? splitPidString(data.pid) : null;
-        const buttonFields = data.buttonBehavior ? splitButtons(data.buttonBehavior) : {};
-
-        const updatedData = {
-          ...data,
-          ...(splitPid !== null ? { pid: splitPid.pid, kf: splitPid.kf } : {}),
-          ...buttonFields,
-          standbyDisplayEnabled:
-            data.standbyBrightness > 0 ? formData.standbyDisplayEnabled : false,
-        };
-
+        // The same normalisation as a fresh load, so the form shows what a
+        // reload would show (split pid and buttons, the loaded scale factors,
+        // the filter defaults, the parsed schedules).
         updateSettingsCache(data);
-        setFormData(updatedData);
+        setFormData(transformFetchedSettings(data));
+        setAutoWakeupSchedules(parseAutoWakeupSchedules(data.autowakeupSchedules));
+        setClock24h(!!data.clock24hFormat);
+        setSaveError(null);
       } catch (error) {
         console.error('Failed to save settings:', error);
+        setSaveError({
+          message: 'The settings could not be sent to the device. Check the connection.',
+          restart,
+        });
       } finally {
         setSubmitting(false);
       }
@@ -528,6 +539,21 @@ export function Settings() {
             />
           ))}
 
+        {isFormTab && saveError && (
+          <div role='alert' className='alert alert-error mt-6'>
+            <span>
+              <strong>Not saved.</strong> {saveError.message} Your changes are still in the form.
+            </span>
+            <button
+              type='button'
+              className='btn btn-sm'
+              disabled={submitting}
+              onClick={e => onSubmit(e, saveError.restart)}
+            >
+              Retry
+            </button>
+          </div>
+        )}
         {isFormTab && (
           <StickyFormFooter submitting={submitting} onRestart={e => onSubmit(e, true)} />
         )}

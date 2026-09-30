@@ -1505,7 +1505,8 @@ void WebUIPlugin::handleProfileRequest(uint32_t clientId, JsonDocument &request)
 
 void WebUIPlugin::handleSettings(AsyncWebServerRequest *request) const {
     if (request->method() == HTTP_POST) {
-        controller->getSettings().batchUpdate([request](Settings *settings) {
+        bool persisted = true;
+        controller->getSettings().batchUpdate([request, &persisted](Settings *settings) {
             // A checkbox is posted as 0 or 1 and read only when present. The
             // form sends every checkbox; a partial POST (the pump calibration's
             // postCoefficients sends one field) leaves every flag as it was.
@@ -1780,7 +1781,10 @@ void WebUIPlugin::handleSettings(AsyncWebServerRequest *request) const {
                 }
                 settings->setAutoWakeupSchedules(schedules);
             }
-            settings->save(true);
+            // flushNow() reports whether every change reached NVS. save(true)
+            // did not, so a failed write answered success and the browser
+            // showed values that were gone after the next reboot.
+            persisted = settings->flushNow();
         });
         pluginManager->trigger("settings:changed");
         // A save supersedes the editor's live preview. The preview holds the
@@ -1797,6 +1801,25 @@ void WebUIPlugin::handleSettings(AsyncWebServerRequest *request) const {
         controller->setTargetTemp(controller->getTargetTemp());
         controller->setScaleFactors();
         controller->setPumpModelCoeffs();
+
+        // The new values are live in memory and still marked dirty, so the
+        // periodic flush keeps retrying, but they are not on flash yet. Tell
+        // the browser so it keeps its edits and offers a retry, and do not
+        // honour a restart: rebooting now would drop them. The body is
+        // {"error": <text>, "code": <id>}, the shape a rejected field should
+        // use too (gm-nov3.26).
+        if (!persisted) {
+            ESP_LOGE("WebUIPlugin", "settings save: NVS write failed, answering 500");
+            AsyncResponseStream *response = request->beginResponseStream("application/json");
+            response->setCode(500);
+            JsonDocument doc(&psramAllocator);
+            doc["error"] = "The settings could not be written to flash. They are in use now, "
+                           "but a restart before a successful save loses them.";
+            doc["code"] = "persist_failed";
+            serializeJson(doc, *response);
+            request->send(response);
+            return;
+        }
     }
 
     AsyncResponseStream *response = request->beginResponseStream("application/json");
