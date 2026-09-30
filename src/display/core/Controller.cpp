@@ -340,11 +340,52 @@ void Controller::setupPanel() {
             xTaskNotifyGive(c->waiter);
             vTaskDelete(nullptr);
         };
-        TaskHandle_t initTask = nullptr;
-        if (xTaskCreatePinnedToCore(initFn, "panel_init", 8192, &ctx, 5, &initTask, 1) == pdPASS) {
+        // Never fall back to driver->init() on the caller's task: the caller
+        // runs on core 0, and an in-place init would put LCD_CAM and the
+        // bounce-refill DMA interrupt next to RWBLE again, without the
+        // "panel init on core" tripwire line. The only way creation fails is
+        // an internal heap too small for an 8 KB stack, so retry a few times
+        // in case a boot-time allocation is released, then log and reboot.
+        // Carrying on without a panel is not an option: DefaultUI::init and
+        // the web handlers dereference the UI, and a heap that cannot give
+        // 8 KB cannot start WiFi or BLE either, so the web UI would not come
+        // up to diagnose it. The error line and the software-restart reset
+        // reason on the next boot are what make the failure visible.
+        static constexpr int PANEL_INIT_TASK_ATTEMPTS = 5;
+        static constexpr uint32_t PANEL_INIT_RETRY_MS = 100;
+        bool started = false;
+        for (int attempt = 1; attempt <= PANEL_INIT_TASK_ATTEMPTS && !started; attempt++) {
+            TaskHandle_t initTask = nullptr;
+#if defined(GM_TOUCH_PROBE) && defined(GM_INJECT_PANEL_TASK_FAIL)
+            // Bench-only failure injection (gm-bzu.68): build a loadtest env
+            // with PLATFORMIO_BUILD_FLAGS=-DGM_INJECT_PANEL_TASK_FAIL.
+            (void)initTask;
+            (void)initFn;
+            started = false;
+#else
+            started = xTaskCreatePinnedToCore(initFn, "panel_init", 8192, &ctx, 5, &initTask, 1) == pdPASS;
+#endif
+            if (!started) {
+                ESP_LOGE("Controller", "panel_init task create failed (attempt %d/%d, internal free %u, largest %u)", attempt,
+                         PANEL_INIT_TASK_ATTEMPTS, static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL)),
+                         static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL)));
+                if (attempt < PANEL_INIT_TASK_ATTEMPTS)
+                    vTaskDelay(pdMS_TO_TICKS(PANEL_INIT_RETRY_MS));
+            }
+        }
+        if (started) {
             ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
         } else {
-            driver->init(); // out of memory for the helper task; init in place
+            ESP_LOGE("Controller",
+                     "panel NOT initialised: no core 1 task after %d attempts; refusing to init on caller core %d; "
+                     "restarting in 5 s",
+                     PANEL_INIT_TASK_ATTEMPTS, xPortGetCoreID());
+            // Detection itself succeeded, so keep the cached model and skip
+            // the multi-second probe chain on the next boot.
+            panelPrefs.putUChar("driver", model);
+            panelPrefs.end();
+            delay(5000);
+            ESP.restart();
         }
     }
     panelPrefs.putUChar("driver", model);
