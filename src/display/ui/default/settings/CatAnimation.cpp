@@ -98,6 +98,11 @@ int clampAnimId(int id) {
     return id >= count ? count - 1 : id;
 }
 
+// Settings::setThemeMode clamps on store, but a value stored before it did
+// (or loaded from NVS as is) still reaches this page, which indexes
+// kThemeModeLabels with it. Anything outside the table shows as Dark.
+int clampThemeMode(int mode) { return (mode >= 0 && mode < kThemeModeCount) ? mode : 0; }
+
 // The choice index bgAnimThemeMap's stored ref resolves to for animId, 0
 // (Default) when the map has no entry there or the entry names a library
 // gradient that has since been deleted (SettingsModel.h,
@@ -607,7 +612,7 @@ void animEnter(void *ctx0) {
     ctx->animId = clampAnimId(settings.getBgAnimId());
     ctx->fps = settings.getBgAnimFps();
     ctx->allScreens = settings.isBgAnimAllScreens();
-    ctx->themeMode = settings.getThemeMode();
+    ctx->themeMode = clampThemeMode(settings.getThemeMode());
     ctx->plates = settings.getBgAnimClearPlates();
     ctx->plateColorAnchor = settings.getBgAnimPlateColor();
     ctx->plateColorIndex = settingsui::paletteCurrentIndex(ctx->plateColorAnchor);
@@ -663,7 +668,7 @@ void animReconcile(void *ctx0) {
         ctx->allScreens = settings.isBgAnimAllScreens();
     }
     if (!ctx->themeModeTouched) {
-        ctx->themeMode = settings.getThemeMode();
+        ctx->themeMode = clampThemeMode(settings.getThemeMode());
     }
     if (!ctx->platesTouched) {
         ctx->plates = settings.getBgAnimClearPlates();

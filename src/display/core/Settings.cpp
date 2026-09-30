@@ -129,6 +129,13 @@ void Settings::load() {
     for (auto *property : registry) {
         property->load(preferences);
     }
+    // Before setThemeMode clamped, the web handler stored any integer, and
+    // DefaultUI::applyTheme and the Animation page both index tables with it
+    // (a stored -1 crashed the simulator at boot). Repair it once here; set()
+    // marks it dirty so the corrected value is written back.
+    if (themeMode.get() != 0 && themeMode.get() != 1) {
+        themeMode.set(0);
+    }
 
     // Legacy migrations: derive defaults for keys that were never persisted
     if (!preferences.isKey("sg_m")) {
@@ -363,7 +370,10 @@ void Settings::setSteamPumpPercentage(float steam_pump_percentage) { steamPumpPe
 
 void Settings::setSteamPumpCutoff(float steam_pump_cutoff) { steamPumpCutoff.set(steam_pump_cutoff); }
 
-void Settings::setThemeMode(int theme_mode) { themeMode.set(theme_mode); }
+// 0 Dark, 1 Light. The web handler passes toInt() of whatever arrives, and
+// the on-display Animation page indexes its label table with the stored
+// value, so anything else is stored as Dark.
+void Settings::setThemeMode(int theme_mode) { themeMode.set(theme_mode == 1 ? 1 : 0); }
 
 void Settings::setHistoryIndex(int history_index) { historyIndex.set(history_index); }
 
