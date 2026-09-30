@@ -4,6 +4,7 @@
 
 #include <Arduino.h>
 #include <Preferences.h>
+#include <atomic>
 #include <display/core/Property.h>
 #include <display/core/constants.h>
 #include <display/core/utils.h>
@@ -122,8 +123,9 @@ class Settings {
     // itself calls batchUpdate (the periodic save calling doSave from inside
     // a web save's batchUpdate) does not deadlock itself. A no-op under
     // GAGGIMATE_SIM: the simulator's FreeRTOS shim has no semaphores and
-    // everything runs on one cooperative thread. Property::get/set stay
-    // lock-free; this only orders whole transactions against each other.
+    // everything runs on one cooperative thread. This only orders whole
+    // transactions against each other; a single String or container read or
+    // write is made safe by the value lock below, not by this one.
     class Guard {
       public:
         explicit Guard(Settings &settings);
@@ -135,7 +137,19 @@ class Settings {
         Settings &settings;
     };
 
-    // Getters and setters
+    // Moves whenever a String or container setting changes (every setter of
+    // one goes through assign()). Numeric settings do not move it; they are
+    // single words and are read directly. A reader that copies strings on a
+    // hot path (DefaultUI::updateState) compares this first and copies only
+    // when it moved. The bump happens under the value lock after the new
+    // value is in place, so a reader that sees the new number and then
+    // copies gets the new value.
+    uint32_t getContainerGeneration() const { return containerGeneration.load(std::memory_order_acquire); }
+
+    // Getters and setters. Every String and container getter returns a copy
+    // taken under the value lock: Property::get hands out a reference, and a
+    // web save on async_tcp replaces the value while the UI task, a settings
+    // category or a plugin reads it.
     int getTargetSteamTemp() const { return targetSteamTemp.get(); }
     int getTargetWaterTemp() const { return targetWaterTemp.get(); }
     int getTemperatureOffset() const { return temperatureOffset.get(); }
@@ -145,7 +159,7 @@ class Settings {
     uint16_t getHardwareScaleSampleRateSps() const { return static_cast<uint16_t>(hardwareScaleSampleRateSps.get()); }
     float getHardwareScaleIdleAlpha() const { return hardwareScaleIdleAlpha.get(); }
     float getHardwareScaleActiveAlpha() const { return hardwareScaleActiveAlpha.get(); }
-    String getPreferredScaleSource() const { return preferredScaleSource.get(); }
+    String getPreferredScaleSource() const { return copyOf(preferredScaleSource); }
     double getTargetGrindVolume() const { return targetGrindVolume.get(); }
     int getTargetGrindDuration() const { return targetGrindDuration.get(); }
     int getStartupMode() const { return startupMode.get(); }
@@ -153,30 +167,30 @@ class Settings {
     double getBrewDelay() const { return brewDelay.get(); }
     double getGrindDelay() const { return grindDelay.get(); }
     bool isDelayAdjust() const { return delayAdjust.get(); }
-    String getPid() const { return pid.get(); }
-    String getPumpModelCoeffs() const { return pumpModelCoeffs.get(); }
-    String getPumpSlipCoeffs() const { return pumpSlipCoeffs.get(); }
-    String getWifiSsid() const { return wifiSsid.get(); }
-    String getWifiPassword() const { return wifiPassword.get(); }
-    String getWifiApPassword() const { return wifiApPassword.get(); }
-    String getMdnsName() const { return mdnsName.get(); }
+    String getPid() const { return copyOf(pid); }
+    String getPumpModelCoeffs() const { return copyOf(pumpModelCoeffs); }
+    String getPumpSlipCoeffs() const { return copyOf(pumpSlipCoeffs); }
+    String getWifiSsid() const { return copyOf(wifiSsid); }
+    String getWifiPassword() const { return copyOf(wifiPassword); }
+    String getWifiApPassword() const { return copyOf(wifiApPassword); }
+    String getMdnsName() const { return copyOf(mdnsName); }
     bool isHomekit() const { return homekit.get(); }
     bool isVolumetricTarget() const { return volumetricTarget.get(); }
-    String getOTAChannel() const { return otaChannel.get(); }
-    String getSavedScale() const { return savedScale.get(); }
+    String getOTAChannel() const { return copyOf(otaChannel); }
+    String getSavedScale() const { return copyOf(savedScale); }
     bool isBoilerFillActive() const { return boilerFillActive.get(); }
     int getStartupFillTime() const { return startupFillTime.get(); }
     int getSteamFillTime() const { return steamFillTime.get(); }
     bool isSmartGrindActive() const { return smartGrindActive.get(); }
     bool isScaleMenuButton() const { return scaleMenuButton.get(); }
     int getBgAnimId() const { return bgAnimId.get(); }
-    String getBgAnimParams() const { return bgAnimParams.get(); }
+    String getBgAnimParams() const { return copyOf(bgAnimParams); }
     bool isBgAnimAllScreens() const { return bgAnimAllScreens.get(); }
     int getBgAnimTheme() const { return bgAnimTheme.get(); }
-    String getBgAnimCustomTheme() const { return bgAnimCustomTheme.get(); }
+    String getBgAnimCustomTheme() const { return copyOf(bgAnimCustomTheme); }
     // By reference: the UI task compares these (up to a few KB) every pass.
-    const String &getBgAnimGradients() const { return bgAnimGradients.get(); }
-    const String &getBgAnimThemeMap() const { return bgAnimThemeMap.get(); }
+    String getBgAnimGradients() const { return copyOf(bgAnimGradients); }
+    String getBgAnimThemeMap() const { return copyOf(bgAnimThemeMap); }
     int getBgAnimFps() const { return bgAnimFps.get(); }
     int getBgAnimHalfRes() const { return bgAnimHalfRes.get(); }
     int getBgAnimInterlace() const { return bgAnimInterlace.get(); }
@@ -195,20 +209,20 @@ class Settings {
     int getPanelClockDiv() const { return panelClockDiv.get(); }
     int getPanelVcom() const { return panelVcom.get(); }
     int getSmartGrindMode() const { return smartGrindMode.get(); }
-    String getSmartGrindIp() const { return smartGrindIp.get(); }
+    String getSmartGrindIp() const { return copyOf(smartGrindIp); }
     bool isHomeAssistant() const { return homeAssistant.get(); }
-    String getHomeAssistantIP() const { return homeAssistantIP.get(); }
-    String getHomeAssistantUser() const { return homeAssistantUser.get(); }
-    String getHomeAssistantPassword() const { return homeAssistantPassword.get(); }
+    String getHomeAssistantIP() const { return copyOf(homeAssistantIP); }
+    String getHomeAssistantUser() const { return copyOf(homeAssistantUser); }
+    String getHomeAssistantPassword() const { return copyOf(homeAssistantPassword); }
     int getHomeAssistantPort() const { return homeAssistantPort.get(); }
-    String getHomeAssistantTopic() const { return homeAssistantTopic.get(); }
+    String getHomeAssistantTopic() const { return copyOf(homeAssistantTopic); }
     bool isMomentaryButtons() const { return momentaryButtons.get(); }
-    String getTimezone() const { return timezone.get(); }
+    String getTimezone() const { return copyOf(timezone); }
     bool isClock24hFormat() const { return clock24hFormat.get(); }
-    String getSelectedProfile() const { return selectedProfile.get(); }
-    String getStartupProfile() const { return startupProfile.get(); }
-    const std::vector<String> &getFavoritedProfiles() const { return favoritedProfiles.get(); }
-    std::vector<String> getProfileOrder() const { return profileOrder.get(); }
+    String getSelectedProfile() const { return copyOf(selectedProfile); }
+    String getStartupProfile() const { return copyOf(startupProfile); }
+    std::vector<String> getFavoritedProfiles() const { return copyOf(favoritedProfiles); }
+    std::vector<String> getProfileOrder() const { return copyOf(profileOrder); }
     int getMainBrightness() const { return mainBrightness.get(); }
     int getStandbyBrightness() const { return standbyBrightness.get(); }
     int getStandbyBrightnessTimeout() const { return standbyBrightnessTimeout.get(); }
@@ -222,22 +236,24 @@ class Settings {
     [[deprecated]] int getSunriseG() const { return sunriseG; }
     [[deprecated]] int getSunriseB() const { return sunriseB; }
     [[deprecated]] int getSunriseW() const { return sunriseW; }
-    String getSunriseIdle() const { return sunriseIdle.get(); }
-    String getSunriseActive() const { return sunriseActive.get(); }
-    String getSunriseFinished() const { return sunriseFinished.get(); }
-    String getSunriseError() const { return sunriseError.get(); }
+    String getSunriseIdle() const { return copyOf(sunriseIdle); }
+    String getSunriseActive() const { return copyOf(sunriseActive); }
+    String getSunriseFinished() const { return copyOf(sunriseFinished); }
+    String getSunriseError() const { return copyOf(sunriseError); }
     int getSunriseExtBrightness() const { return sunriseExtBrightness.get(); }
     int getEmptyTankDistance() const { return emptyTankDistance.get(); }
     int getFullTankDistance() const { return fullTankDistance.get(); }
     int getAltRelayFunction() const { return altRelayFunction.get(); }
     bool isAutoWakeupEnabled() const { return autowakeupEnabled.get(); }
-    std::vector<AutoWakeupSchedule> getAutoWakeupSchedules() const { return autowakeupSchedules.get(); }
+    std::vector<AutoWakeupSchedule> getAutoWakeupSchedules() const { return copyOf(autowakeupSchedules); }
     String getButtonBehavior(int index) const {
-        if (index >= 0 && index < buttonBehavior.get().size())
-            return buttonBehavior.get()[index];
+        ValueLock valueLock(*this);
+        const std::vector<String> &behaviors = buttonBehavior.get();
+        if (index >= 0 && static_cast<size_t>(index) < behaviors.size())
+            return behaviors[index];
         return "";
     };
-    std::vector<String> getButtonBehaviorList() const { return buttonBehavior.get(); }
+    std::vector<String> getButtonBehaviorList() const { return copyOf(buttonBehavior); }
     float getCommutationGain() const { return commutationGain.get(); }
     float getConvergenceGain() const { return convergenceGain.get(); }
     float getIntegralGain() const { return integralGain.get(); }
@@ -563,8 +579,43 @@ class Settings {
     bool doSave();
     void lock();
     void unlock();
+
+    // The value lock guards the storage of the String and container
+    // properties: every getter copies under it, every setter assigns under
+    // it, and doSave() holds it while the values are written to NVS. It is a
+    // leaf lock: nothing that holds it takes another lock or calls out of
+    // this class. That is why it is separate from the transaction lock
+    // (Guard): the Status category's refresh holds the transaction lock and
+    // calls Controller::getEffectiveScaleSource, which takes the process
+    // mutex, while other code holds the process mutex and reads settings, so
+    // a getter that took the transaction lock could deadlock against it.
+    class ValueLock {
+      public:
+        explicit ValueLock(const Settings &settings);
+        ~ValueLock();
+        ValueLock(const ValueLock &) = delete;
+        ValueLock &operator=(const ValueLock &) = delete;
+
+      private:
+        const Settings &settings;
+    };
+
+    template <typename T> T copyOf(const Property<T> &property) const {
+        ValueLock valueLock(*this);
+        return property.get();
+    }
+
+    template <typename T> void assign(Property<T> &property, const T &value) {
+        ValueLock valueLock(*this);
+        if (property.set(value)) {
+            containerGeneration.fetch_add(1, std::memory_order_release);
+        }
+    }
+
+    std::atomic<uint32_t> containerGeneration{0};
 #ifndef GAGGIMATE_SIM
     SemaphoreHandle_t mutex = nullptr;
+    SemaphoreHandle_t valueMutex = nullptr;
 #endif
 #if defined(GM_TOUCH_PROBE) || defined(GAGGIMATE_SIM)
     bool debugFailNextFlush_ = false;

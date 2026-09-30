@@ -24,7 +24,9 @@ void AutoWakeupPlugin::setup(Controller *controller, PluginManager *pluginManage
 }
 
 void AutoWakeupPlugin::loop() {
-    if (!settings->isAutoWakeupEnabled() || settings->getAutoWakeupSchedules().empty()) {
+    // The schedule list is read only when a check is due: the getter returns
+    // a copy taken under the settings value lock, and this runs every loop.
+    if (!settings->isAutoWakeupEnabled()) {
         return;
     }
 
@@ -55,15 +57,10 @@ void AutoWakeupPlugin::checkAutoWakeup() {
     }
     lastCheckedTime = currentTime;
 
-    // Check if current time and day matches any of the schedules. The copy
-    // is taken under the settings transaction lock: the display's Machine
-    // category replaces the vector from the UI task on commit, and a copy
-    // overlapping that replacement would read freed storage.
-    std::vector<AutoWakeupSchedule> schedules;
-    {
-        Settings::Guard guard(*settings);
-        schedules = settings->getAutoWakeupSchedules();
-    }
+    // Check if current time and day matches any of the schedules. The getter
+    // copies under the settings value lock, so a commit from the display's
+    // Machine category or a web save replacing the vector cannot overlap it.
+    const std::vector<AutoWakeupSchedule> schedules = settings->getAutoWakeupSchedules();
     for (const AutoWakeupSchedule &schedule : schedules) {
         if (schedule.time == currentTime && schedule.isDayEnabled(currentDayOfWeek)) {
             ESP_LOGI(LOG_TAG, "Auto-wakeup schedule matched (time: %s, day: %d), switching to brew mode", schedule.time.c_str(),

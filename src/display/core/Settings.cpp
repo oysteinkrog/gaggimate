@@ -64,7 +64,7 @@ bool PreferencesCodec<std::vector<AutoWakeupSchedule>>::write(Preferences &prefs
 
 Settings::Settings()
 #ifndef GAGGIMATE_SIM
-    : mutex(xSemaphoreCreateRecursiveMutex())
+    : mutex(xSemaphoreCreateRecursiveMutex()), valueMutex(xSemaphoreCreateMutex())
 #endif
 {
 }
@@ -88,6 +88,25 @@ void Settings::unlock() {
 Settings::Guard::Guard(Settings &settings) : settings(settings) { settings.lock(); }
 
 Settings::Guard::~Guard() { settings.unlock(); }
+
+// Not recursive: nothing that holds it calls a getter or a setter (the
+// compound setters below read the property directly), so a second take on
+// the same task is a bug, and a deadlock shows it at once.
+Settings::ValueLock::ValueLock(const Settings &settings) : settings(settings) {
+#ifndef GAGGIMATE_SIM
+    if (settings.valueMutex != nullptr) {
+        xSemaphoreTake(settings.valueMutex, portMAX_DELAY);
+    }
+#endif
+}
+
+Settings::ValueLock::~ValueLock() {
+#ifndef GAGGIMATE_SIM
+    if (settings.valueMutex != nullptr) {
+        xSemaphoreGive(settings.valueMutex);
+    }
+#endif
+}
 
 void Settings::load() {
     if (taskHandle != nullptr) {
@@ -165,7 +184,7 @@ void Settings::setHardwareScaleConfiguration(uint16_t sample_rate_sps, float idl
 
 void Settings::setPreferredScaleSource(const String &scaleSource) {
     if (scaleSource == "hardware" || scaleSource == "bluetooth" || scaleSource == "auto") {
-        preferredScaleSource.set(scaleSource);
+        assign(this->preferredScaleSource, scaleSource);
     }
 }
 
@@ -183,27 +202,27 @@ void Settings::setStartupMode(const int startup_mode) { startupMode.set(startup_
 
 void Settings::setStandbyTimeout(int standby_timeout) { standbyTimeout.set(standby_timeout); }
 
-void Settings::setPid(const String &pid) { this->pid.set(pid); }
+void Settings::setPid(const String &pid) { assign(this->pid, pid); }
 
-void Settings::setPumpModelCoeffs(const String &pumpModelCoeffs) { this->pumpModelCoeffs.set(pumpModelCoeffs); }
+void Settings::setPumpModelCoeffs(const String &pumpModelCoeffs) { assign(this->pumpModelCoeffs, pumpModelCoeffs); }
 
-void Settings::setPumpSlipCoeffs(const String &pumpSlipCoeffs) { this->pumpSlipCoeffs.set(pumpSlipCoeffs); }
+void Settings::setPumpSlipCoeffs(const String &pumpSlipCoeffs) { assign(this->pumpSlipCoeffs, pumpSlipCoeffs); }
 
-void Settings::setWifiSsid(const String &wifiSsid) { this->wifiSsid.set(wifiSsid); }
+void Settings::setWifiSsid(const String &wifiSsid) { assign(this->wifiSsid, wifiSsid); }
 
-void Settings::setWifiPassword(const String &wifiPassword) { this->wifiPassword.set(wifiPassword); }
+void Settings::setWifiPassword(const String &wifiPassword) { assign(this->wifiPassword, wifiPassword); }
 
-void Settings::setWifiApPassword(const String &wifiApPassword) { this->wifiApPassword.set(wifiApPassword); }
+void Settings::setWifiApPassword(const String &wifiApPassword) { assign(this->wifiApPassword, wifiApPassword); }
 
-void Settings::setMdnsName(const String &mdnsName) { this->mdnsName.set(mdnsName); }
+void Settings::setMdnsName(const String &mdnsName) { assign(this->mdnsName, mdnsName); }
 
 void Settings::setHomekit(const bool homekit) { this->homekit.set(homekit); }
 
 void Settings::setVolumetricTarget(bool volumetric_target) { volumetricTarget.set(volumetric_target); }
 
-void Settings::setOTAChannel(const String &otaChannel) { this->otaChannel.set(otaChannel); }
+void Settings::setOTAChannel(const String &otaChannel) { assign(this->otaChannel, otaChannel); }
 
-void Settings::setSavedScale(const String &savedScale) { this->savedScale.set(savedScale); }
+void Settings::setSavedScale(const String &savedScale) { assign(this->savedScale, savedScale); }
 
 void Settings::setBoilerFillActive(bool boiler_fill_active) { boilerFillActive.set(boiler_fill_active); }
 
@@ -214,7 +233,7 @@ void Settings::setSteamFillTime(int steam_fill_time) { steamFillTime.set(steam_f
 void Settings::setSmartGrindActive(bool smart_grind_active) { smartGrindActive.set(smart_grind_active); }
 void Settings::setScaleMenuButton(bool scale_menu_button) { scaleMenuButton.set(scale_menu_button); }
 void Settings::setBgAnimId(int bg_anim_id) { bgAnimId.set(bg_anim_id); }
-void Settings::setBgAnimParams(const String &bg_anim_params) { bgAnimParams.set(bg_anim_params); }
+void Settings::setBgAnimParams(const String &bg_anim_params) { assign(this->bgAnimParams, bg_anim_params); }
 void Settings::setBgAnimAllScreens(bool bg_anim_all_screens) { bgAnimAllScreens.set(bg_anim_all_screens); }
 void Settings::setBgAnimTheme(int bg_anim_theme) { bgAnimTheme.set(bg_anim_theme); }
 void Settings::setBgAnimFps(int bg_anim_fps) { bgAnimFps.set(bg_anim_fps); }
@@ -255,53 +274,59 @@ void Settings::setBgFadeInMs(int bg_fade_in_ms) {
 void Settings::setBgFadeCurve(int bg_fade_curve) { bgFadeCurve.set(bg_fade_curve != 0 ? 1 : 0); }
 void Settings::setPanelClockDiv(int panel_clock_div) { panelClockDiv.set(panel_clock_div); }
 void Settings::setPanelVcom(int panel_vcom) { panelVcom.set(panel_vcom < 0 ? 0 : (panel_vcom > 127 ? 127 : panel_vcom)); }
-void Settings::setBgAnimCustomTheme(const String &bg_anim_custom_theme) { bgAnimCustomTheme.set(bg_anim_custom_theme); }
-void Settings::setBgAnimGradients(const String &bg_anim_gradients) { bgAnimGradients.set(bg_anim_gradients); }
-void Settings::setBgAnimThemeMap(const String &bg_anim_theme_map) { bgAnimThemeMap.set(bg_anim_theme_map); }
+void Settings::setBgAnimCustomTheme(const String &bg_anim_custom_theme) { assign(this->bgAnimCustomTheme, bg_anim_custom_theme); }
+void Settings::setBgAnimGradients(const String &bg_anim_gradients) { assign(this->bgAnimGradients, bg_anim_gradients); }
+void Settings::setBgAnimThemeMap(const String &bg_anim_theme_map) { assign(this->bgAnimThemeMap, bg_anim_theme_map); }
 
-void Settings::setSmartGrindIp(String smart_grind_ip) { smartGrindIp.set(smart_grind_ip); }
+void Settings::setSmartGrindIp(String smart_grind_ip) { assign(this->smartGrindIp, smart_grind_ip); }
 
 void Settings::setSmartGrindMode(int smart_grind_mode) { smartGrindMode.set(smart_grind_mode); }
 
 void Settings::setHomeAssistant(const bool homeAssistant) { this->homeAssistant.set(homeAssistant); }
 
-void Settings::setHomeAssistantIP(const String &homeAssistantIP) { this->homeAssistantIP.set(homeAssistantIP); }
+void Settings::setHomeAssistantIP(const String &homeAssistantIP) { assign(this->homeAssistantIP, homeAssistantIP); }
 
 void Settings::setHomeAssistantPort(const int homeAssistantPort) { this->homeAssistantPort.set(homeAssistantPort); }
 
-void Settings::setHomeAssistantTopic(const String &homeAssistantTopic) { this->homeAssistantTopic.set(homeAssistantTopic); }
+void Settings::setHomeAssistantTopic(const String &homeAssistantTopic) { assign(this->homeAssistantTopic, homeAssistantTopic); }
 
-void Settings::setHomeAssistantUser(const String &homeAssistantUser) { this->homeAssistantUser.set(homeAssistantUser); }
+void Settings::setHomeAssistantUser(const String &homeAssistantUser) { assign(this->homeAssistantUser, homeAssistantUser); }
 
 void Settings::setHomeAssistantPassword(const String &homeAssistantPassword) {
-    this->homeAssistantPassword.set(homeAssistantPassword);
+    assign(this->homeAssistantPassword, homeAssistantPassword);
 }
 
 void Settings::setMomentaryButtons(bool momentary_buttons) { momentaryButtons.set(momentary_buttons); }
 
-void Settings::setTimezone(String timezone) { this->timezone.set(timezone); }
+void Settings::setTimezone(String timezone) { assign(this->timezone, timezone); }
 
 void Settings::setClockFormat(bool clock_24h_format) { clock24hFormat.set(clock_24h_format); }
 
-void Settings::setSelectedProfile(String selected_profile) { selectedProfile.set(selected_profile); }
+void Settings::setSelectedProfile(String selected_profile) { assign(this->selectedProfile, selected_profile); }
 
-void Settings::setStartupProfile(String startup_profile) { startupProfile.set(startup_profile); }
+void Settings::setStartupProfile(String startup_profile) { assign(this->startupProfile, startup_profile); }
 
-void Settings::setFavoritedProfiles(std::vector<String> favorited_profiles) { favoritedProfiles.set(favorited_profiles); }
+void Settings::setFavoritedProfiles(std::vector<String> favorited_profiles) { assign(this->favoritedProfiles, favorited_profiles); }
 
 void Settings::addFavoritedProfile(String profile) {
+    ValueLock valueLock(*this);
     std::vector<String> profiles = favoritedProfiles.get();
     if (std::find(profiles.begin(), profiles.end(), profile) != profiles.end()) {
         return;
     }
     profiles.emplace_back(std::move(profile));
-    favoritedProfiles.set(profiles);
+    if (favoritedProfiles.set(profiles)) {
+        containerGeneration.fetch_add(1, std::memory_order_release);
+    }
 }
 
 void Settings::removeFavoritedProfile(String profile) {
+    ValueLock valueLock(*this);
     std::vector<String> profiles = favoritedProfiles.get();
     profiles.erase(std::remove(profiles.begin(), profiles.end(), profile), profiles.end());
-    favoritedProfiles.set(profiles);
+    if (favoritedProfiles.set(profiles)) {
+        containerGeneration.fetch_add(1, std::memory_order_release);
+    }
 }
 
 void Settings::setProfileOrder(std::vector<String> profile_order) {
@@ -315,7 +340,7 @@ void Settings::setProfileOrder(std::vector<String> profile_order) {
         }
     }
 
-    profileOrder.set(cleaned);
+    assign(this->profileOrder, cleaned);
 }
 
 void Settings::setMainBrightness(int main_brightness) { mainBrightness.set(main_brightness); }
@@ -344,13 +369,13 @@ void Settings::setSunriseB(int sunrise_b) { sunriseB = sunrise_b; }
 
 void Settings::setSunriseW(int sunrise_w) { sunriseW = sunrise_w; }
 
-void Settings::setSunriseIdle(String hexColor) { sunriseIdle.set(hexColor); }
+void Settings::setSunriseIdle(String hexColor) { assign(this->sunriseIdle, hexColor); }
 
-void Settings::setSunriseActive(String hexColor) { sunriseActive.set(hexColor); }
+void Settings::setSunriseActive(String hexColor) { assign(this->sunriseActive, hexColor); }
 
-void Settings::setSunriseFinished(String hexColor) { sunriseFinished.set(hexColor); }
+void Settings::setSunriseFinished(String hexColor) { assign(this->sunriseFinished, hexColor); }
 
-void Settings::setSunriseError(String hexColor) { sunriseError.set(hexColor); }
+void Settings::setSunriseError(String hexColor) { assign(this->sunriseError, hexColor); }
 
 void Settings::setSunriseExtBrightness(int sunrise_ext_brightness) { sunriseExtBrightness.set(sunrise_ext_brightness); }
 
@@ -362,18 +387,21 @@ void Settings::setAltRelayFunction(int alt_relay_function) { altRelayFunction.se
 
 void Settings::setAutoWakeupEnabled(bool enabled) { autowakeupEnabled.set(enabled); }
 
-void Settings::setAutoWakeupSchedules(const std::vector<AutoWakeupSchedule> &schedules) { autowakeupSchedules.set(schedules); }
+void Settings::setAutoWakeupSchedules(const std::vector<AutoWakeupSchedule> &schedules) { assign(this->autowakeupSchedules, schedules); }
 
 void Settings::setButtonBehavior(int index, String behavior) {
+    ValueLock valueLock(*this);
     std::vector<String> behaviors = buttonBehavior.get();
-    if (index < 0 || index >= behaviors.size()) {
+    if (index < 0 || static_cast<size_t>(index) >= behaviors.size()) {
         return;
     }
     behaviors[index] = std::move(behavior);
-    buttonBehavior.set(behaviors);
+    if (buttonBehavior.set(behaviors)) {
+        containerGeneration.fetch_add(1, std::memory_order_release);
+    }
 }
 
-void Settings::setButtonBehaviorList(const std::vector<String> &behavior_list) { buttonBehavior.set(behavior_list); }
+void Settings::setButtonBehaviorList(const std::vector<String> &behavior_list) { assign(this->buttonBehavior, behavior_list); }
 
 void Settings::setCommutationGain(float commutation_gain) { commutationGain.set(commutation_gain); }
 
@@ -425,12 +453,20 @@ bool Settings::doSave() {
     // bury the rest of the log at one line per setting every 5 s.
     size_t failed = 0;
     const char *firstFailed = nullptr;
-    for (auto *property : registry) {
-        if (!property->store(preferences)) {
-            if (failed == 0) {
-                firstFailed = property->name();
+    {
+        // store() reads each value and clears its dirty flag; the value lock
+        // keeps a String or container setter on another task (setPid from the
+        // autotune callback, for one) from replacing a value mid-write. The
+        // getters wait out the NVS writes, which happen only when something
+        // is dirty.
+        ValueLock valueLock(*this);
+        for (auto *property : registry) {
+            if (!property->store(preferences)) {
+                if (failed == 0) {
+                    firstFailed = property->name();
+                }
+                failed++;
             }
-            failed++;
         }
     }
     preferences.end();

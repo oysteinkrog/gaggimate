@@ -4503,8 +4503,34 @@ void DefaultUI::updateState() {
             }
         }
     }
+    // The String settings this pass reads (params, custom theme, theme map,
+    // gradient library) are copies taken under the settings value lock, so
+    // they are re-read only when the container generation moved: an integer
+    // compare on an ordinary pass instead of four copies.
+    static bool containerCacheValid = false;
+    static uint32_t lastContainerGen = 0;
+    static String cachedParams;
+    static String lastCustom;
+    static String lastMap;
+    static String lastLibrary;
+    bool themeStringsChanged = false;
+    const uint32_t containerGen = settings.getContainerGeneration();
+    if (!containerCacheValid || containerGen != lastContainerGen) {
+        containerCacheValid = true;
+        lastContainerGen = containerGen;
+        cachedParams = settings.getBgAnimParams();
+        String custom = settings.getBgAnimCustomTheme();
+        String map = settings.getBgAnimThemeMap();
+        String library = settings.getBgAnimGradients();
+        if (custom != lastCustom || map != lastMap || library != lastLibrary) {
+            themeStringsChanged = true;
+            lastCustom = std::move(custom);
+            lastMap = std::move(map);
+            lastLibrary = std::move(library);
+        }
+    }
     uint8_t animP[4];
-    bg_parse_params(settings.getBgAnimParams().c_str(), animId, animP);
+    bg_parse_params(cachedParams.c_str(), animId, animP);
     sleepAnimation.configure(static_cast<uint8_t>(animId), animP);
     // fps= on /api/debug/anim overrides the stored cap for a measurement
     // (0 = stored). Applied here because this line re-applies the cap every
@@ -4535,14 +4561,10 @@ void DefaultUI::updateState() {
     }
     // Publish the color theme only on change — setThemeStops bumps a
     // generation counter that makes every animation rebuild its palettes.
-    // The key covers everything the resolution depends on; the map and
-    // library strings are a few KB at most, read by reference, and equal on
-    // every ordinary tick, so the comparison is a length check plus memcmp.
+    // The key covers everything the resolution depends on: the animation,
+    // the theme id and the three strings cached above.
     static int lastThemeAnim = -1;
     static int lastThemeId = -1;
-    static String lastCustom;
-    static String lastMap;
-    static String lastLibrary;
     if (previewActive) {
         lastThemeAnim = -1; // force a re-resolve once the preview lapses
         if (previewApply) {
@@ -4560,22 +4582,15 @@ void DefaultUI::updateState() {
         }
     } else {
         const int themeId = settings.getBgAnimTheme();
-        const String custom = settings.getBgAnimCustomTheme();
-        const String &map = settings.getBgAnimThemeMap();
-        const String &library = settings.getBgAnimGradients();
-        if (animId != lastThemeAnim || themeId != lastThemeId || custom != lastCustom || map != lastMap ||
-            library != lastLibrary) {
+        if (animId != lastThemeAnim || themeId != lastThemeId || themeStringsChanged) {
             lastThemeAnim = animId;
             lastThemeId = themeId;
-            lastCustom = custom;
-            lastMap = map;
-            lastLibrary = library;
             uint8_t stops[BG_THEME_MAX_STOPS][3];
             uint8_t pos[BG_THEME_MAX_STOPS];
             int nStops = 0;
             bool uniform = true;
-            bg_resolve_anim_theme(animId, map.c_str(), library.c_str(), themeId, custom.c_str(), stops, pos, nStops,
-                                  uniform);
+            bg_resolve_anim_theme(animId, lastMap.c_str(), lastLibrary.c_str(), themeId, lastCustom.c_str(), stops, pos,
+                                  nStops, uniform);
             if (uniform) {
                 bganim::setThemeStops(stops, nStops);
             } else {

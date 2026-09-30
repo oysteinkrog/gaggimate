@@ -295,10 +295,10 @@ void gradientOnCycle(void *user, int dir) {
     {
         // Read-modify-write of the whole map string: guarded so a web save's
         // batchUpdate touching a different animation's slot in the same
-        // string cannot interleave with this and lose one side's edit
-        // (Settings.h: "Property::get/set stay lock-free; this only orders
-        // whole transactions" -- every other row here is a single
-        // Property::set, but this one reads the string before it writes it).
+        // string cannot interleave with this and lose one side's edit. Each
+        // get and set is atomic on its own (Settings.h, the value lock), but
+        // this row reads the string before it writes it, and only the
+        // transaction lock keeps the pair together.
         Settings::Guard guard(settings);
         const std::string map(settings.getBgAnimThemeMap().c_str());
         settings.setBgAnimThemeMap(settingsui::gradientMapWriteRef(map, ctx->animId, ctx->gradientRef).c_str());
