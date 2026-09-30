@@ -116,6 +116,13 @@ gm::Payload GaggiMateServer::buildTofMeasurement(uint32_t distance) {
     return p;
 }
 
+gm::Payload GaggiMateServer::buildTareResult(bool success) {
+    gm::Payload p = gaggimate_Payload_init_zero;
+    p.which_content = gaggimate_Payload_tare_result_tag;
+    p.content.tare_result.success = success;
+    return p;
+}
+
 gm::Payload GaggiMateServer::buildError(int code) {
     gm::Payload p = gaggimate_Payload_init_zero;
     p.which_content = gaggimate_Payload_error_tag;
@@ -145,6 +152,8 @@ void GaggiMateServer::sendScaleMeasurement(float weight, float cell1Weight, floa
 }
 
 void GaggiMateServer::sendTofMeasurement(uint32_t distance) { _endpoint.sendUnreliable(buildTofMeasurement(distance)); }
+
+void GaggiMateServer::sendTareResult(bool success) { _endpoint.send(buildTareResult(success)); }
 
 void GaggiMateServer::sendError(int code) { _endpoint.send(buildError(code)); }
 

@@ -4,6 +4,7 @@
 #include <Arduino.h>
 #include <algorithm>
 #include <cmath>
+#include <esp_timer.h>
 
 #define HX711_GAIN 128
 #define MAX_SCALE_GRAMS 2000.0f
@@ -19,6 +20,11 @@ constexpr unsigned long READ_FAULT_DELAY_MS = 750;
 // Slightly below 100 ms so a nominal 10-SPS converter whose millis() spacing
 // occasionally rounds to 99 ms is not accidentally published at only 5 SPS.
 constexpr unsigned long SCALE_PUBLICATION_INTERVAL_MS = 90;
+// Outside a brew the published weight is quantised to 0.1 g, so a resting scale
+// repeats the same value. It is sent when it changes, and otherwise at this
+// interval so the display can still tell the scale is alive (its health grace
+// period is 1.5 s). During a brew every conversion is sent, as before.
+constexpr unsigned long SCALE_IDLE_HEARTBEAT_MS = 500;
 constexpr unsigned long ZERO_TRACKING_OBSERVATION_INTERVAL_MS = 100;
 constexpr unsigned long INTERVAL_DIAGNOSTIC_PERIOD_MS = 5000;
 constexpr unsigned long ACTIVE_FILTER_LINGER_MS = 5000;
@@ -101,7 +107,9 @@ void HardwareScale::setup() {
     delay(500);
 
     // Create task with lower priority (0 instead of 1) to not interfere with Bluetooth
-    if (xTaskCreate(loopTask, "HardwareScale::loop", configMINIMAL_STACK_SIZE * 3, this, 0, &taskHandle) != pdPASS) {
+    // 4 KB: the task now runs tare (sample arrays, float logging) and the
+    // tare-result send through the Endpoint, not only the reading callback.
+    if (xTaskCreate(loopTask, "HardwareScale::loop", 4096, this, 0, &taskHandle) != pdPASS) {
         ESP_LOGE(LOG_TAG, "Unable to create hardware scale task");
         is_initialized = false;
         taskHandle = nullptr;
@@ -186,11 +194,19 @@ bool HardwareScale::convertRawToWeight(const RawReading &raw, float &weight, flo
     return true;
 }
 
-bool HardwareScale::isResponsive() const { return static_cast<int32_t>(_responsive_until.load() - millis()) > 0; }
+bool HardwareScale::isResponsive() const {
+    portENTER_CRITICAL(&_request_mux);
+    const int64_t until = _responsive_until_us;
+    portEXIT_CRITICAL(&_request_mux);
+    return esp_timer_get_time() < until;
+}
 
 void HardwareScale::setBrewingActive(bool active) {
     if (active) {
-        _responsive_until.store(millis() + ACTIVE_FILTER_LINGER_MS);
+        const int64_t until = esp_timer_get_time() + static_cast<int64_t>(ACTIVE_FILTER_LINGER_MS) * 1000;
+        portENTER_CRITICAL(&_request_mux);
+        _responsive_until_us = until;
+        portEXIT_CRITICAL(&_request_mux);
     }
 }
 
@@ -306,6 +322,8 @@ void HardwareScale::loop() {
         return;
     }
 
+    serviceRequests();
+
     // Wait for scale factors to be properly set before starting weight calculations
     // Use a reasonable timeout to prevent indefinite waiting
     unsigned long startWait = millis();
@@ -314,6 +332,12 @@ void HardwareScale::loop() {
     ESP_LOGV(LOG_TAG, "Waiting for scale factors from display controller...");
 
     while (!_scale_factors_ready) {
+        // A queued configuration sets _scale_factors_ready; a queued tare is
+        // answered here rather than after the timeout.
+        serviceRequests();
+        if (_scale_factors_ready) {
+            break;
+        }
         if (millis() - startWait > SCALE_FACTOR_TIMEOUT_MS) {
             ESP_LOGW(
                 LOG_TAG,
@@ -336,6 +360,7 @@ void HardwareScale::loop() {
             ESP_LOGE(LOG_TAG, "HX711 runtime timeout (%d, %d); marking scale unavailable until readings recover",
                      digitalRead(_data_pin1), digitalRead(_data_pin2));
             _read_fault_reported = true;
+            _has_published = false;
             _reading_callback(HARDWARE_SCALE_UNAVAILABLE, 0.0f, 0.0f, false, false);
         }
         return;
@@ -355,6 +380,7 @@ void HardwareScale::loop() {
         }
         if (millis() - _read_failure_started_ms >= READ_FAULT_DELAY_MS && !_read_fault_reported) {
             _read_fault_reported = true;
+            _has_published = false;
             _reading_callback(HARDWARE_SCALE_UNAVAILABLE, 0.0f, 0.0f, false, false);
         }
         return;
@@ -449,10 +475,57 @@ void HardwareScale::loop() {
 
     ESP_LOGV(LOG_TAG, "Scale Reading: %0.2f, Corrected: %0.2f, Filtered: %0.2f, Published: %0.2f, alpha: %.2f", reading,
              corrected, filtered_weight, output_weight, alpha);
+    // A tare queued while this conversion was in progress would make this the
+    // last pre-tare weight; the display must not see it after asking for zero.
+    if (_tare_requested.load()) {
+        return;
+    }
     const unsigned long now = millis();
-    if (_last_publish_ms == 0 || now - _last_publish_ms >= SCALE_PUBLICATION_INTERVAL_MS) {
+    const unsigned long sinceLast = now - _last_publish_ms;
+    bool publish;
+    if (!_has_published) {
+        publish = true;
+    } else if (sinceLast < SCALE_PUBLICATION_INTERVAL_MS) {
+        publish = false;
+    } else if (responsive) {
+        publish = true;
+    } else {
+        publish = output_weight != _last_published_output || sinceLast >= SCALE_IDLE_HEARTBEAT_MS;
+    }
+    if (publish) {
+        _has_published = true;
         _last_publish_ms = now;
+        _last_published_output = output_weight;
         _reading_callback(output_weight, cell1Weight, cell2Weight, true, true);
+    }
+}
+
+void HardwareScale::serviceRequests() {
+    bool haveConfig = false;
+    float factor1 = 0.0f;
+    float factor2 = 0.0f;
+    HardwareScaleConfig config;
+    portENTER_CRITICAL(&_request_mux);
+    if (_config_pending) {
+        haveConfig = true;
+        factor1 = _pending_scale_factor1;
+        factor2 = _pending_scale_factor2;
+        config = _pending_config;
+        _config_pending = false;
+    }
+    portEXIT_CRITICAL(&_request_mux);
+    if (haveConfig) {
+        applyConfiguration(factor1, factor2, config);
+    }
+
+    if (_tare_requested.exchange(false)) {
+        const bool ok = tareInternal(false);
+        if (ok) {
+            _has_published = false; // send the new zero at the next conversion
+        }
+        if (_tare_result_callback) {
+            _tare_result_callback(ok);
+        }
     }
 }
 
@@ -484,10 +557,22 @@ void HardwareScale::setConfiguration(float scale_factor1, float scale_factor2, u
                  HARDWARE_SCALE_DEFAULT_FILTER_ALPHA_ACTIVE);
         active_alpha = HARDWARE_SCALE_DEFAULT_FILTER_ALPHA_ACTIVE;
     }
+    // The scale task holds _operation_mutex for a whole tare (up to about
+    // 1.2 s), and this is called from the BLE dispatch task, which must never
+    // wait on it. Queue the values and let the task apply them.
+    portENTER_CRITICAL(&_request_mux);
+    _pending_scale_factor1 = scale_factor1;
+    _pending_scale_factor2 = scale_factor2;
+    _pending_config = {sample_rate_sps, idle_alpha, active_alpha};
+    _config_pending = true;
+    portEXIT_CRITICAL(&_request_mux);
+}
+
+void HardwareScale::applyConfiguration(float scale_factor1, float scale_factor2, const HardwareScaleConfig &config) {
     xSemaphoreTake(_operation_mutex, portMAX_DELAY);
     _scale_factor1 = scale_factor1;
     _scale_factor2 = scale_factor2;
-    _config = {sample_rate_sps, idle_alpha, active_alpha};
+    _config = config;
     _last_conversion_us = 0;
     _interval_log_started_ms = 0;
     _interval_count = 0;
@@ -505,7 +590,7 @@ void HardwareScale::setConfiguration(float scale_factor1, float scale_factor2, u
              _config.sampleRateSps, _config.idleAlpha, _config.activeAlpha, _scale_factor1, _scale_factor2);
 }
 
-bool HardwareScale::tare() { return tareInternal(false); }
+void HardwareScale::requestTare() { _tare_requested.store(true); }
 
 bool HardwareScale::tareInternal(bool allowUnstableFallback) {
     xSemaphoreTake(_operation_mutex, portMAX_DELAY);

@@ -294,6 +294,11 @@ class Controller {
     VolumetricMeasurementSource currentVolumetricSource = VolumetricMeasurementSource::INACTIVE;
     std::atomic<unsigned long> lastBluetoothMeasurement{0};
     std::atomic<unsigned long> lastHardwareMeasurement{0};
+    // Hardware-scale tare answers from the controller: the count moves on every
+    // TareResult and hardwareTareOk holds the latest outcome (set first).
+    std::atomic<uint32_t> hardwareTareResults{0};
+    std::atomic<bool> hardwareTareOk{false};
+    static constexpr unsigned long HARDWARE_TARE_WAIT_MS = 2000;
 #ifdef NIGHTLY_BUILD
     // The virtual scale runs in parallel with a physical scale. If the selected
     // physical source stops reporting, preserve continuity by applying the

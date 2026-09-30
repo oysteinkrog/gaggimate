@@ -39,6 +39,7 @@ using ButtonState = gaggimate_ButtonState;
 using AutotuneResult = gaggimate_AutotuneResult;
 using VolumetricMeasurement = gaggimate_VolumetricMeasurement;
 using ScaleMeasurement = gaggimate_ScaleMeasurement;
+using TareResult = gaggimate_TareResult;
 using TofMeasurement = gaggimate_TofMeasurement;
 using Error = gaggimate_Error;
 

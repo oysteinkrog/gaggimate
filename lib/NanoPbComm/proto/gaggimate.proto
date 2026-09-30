@@ -55,6 +55,7 @@ message Payload {
         TofMeasurement tof = 25;
         Error error = 26;
         ScaleMeasurement scale = 27;
+        TareResult tare_result = 28;
     }
 }
 
@@ -229,6 +230,14 @@ message ScaleMeasurement {
     float cell2_weight = 3;
     bool cell1_valid = 4;
     bool cell2_valid = 5;
+}
+
+// Outcome of a Tare command, sent once the hardware scale has finished. A
+// controller without a hardware scale does not send one. success is false when
+// the scale is unavailable, timed out, or never settled; the previous offsets
+// are kept in that case.
+message TareResult {
+    bool success = 1;
 }
 
 message TofMeasurement {

@@ -67,7 +67,10 @@ class Endpoint {
     void sendUnreliable(const gm::Payload *payloads, size_t count);
 
     // Register a handler for a oneof tag (e.g. Payload_sensor_tag). Replaces any
-    // previously registered handler for that tag.
+    // previously registered handler for that tag. Handlers run one at a time on
+    // the single dispatch task, so a handler must not block: every later
+    // command, including a stop, waits behind it. Queue slow work (a scale tare)
+    // to its own task and answer with a message.
     void on(pb_size_t which, Handler handler);
 
     // Invoked (with the mutex released) whenever the link connects/disconnects,

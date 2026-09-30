@@ -48,6 +48,7 @@ class GaggiMateServer {
     gm::Payload buildScaleMeasurement(float weight, float cell1Weight = 0.0f, float cell2Weight = 0.0f, bool cell1Valid = false,
                                       bool cell2Valid = false);
     gm::Payload buildTofMeasurement(uint32_t distance);
+    gm::Payload buildTareResult(bool success);
     gm::Payload buildError(int code);
 
     // Responses (controller -> display)
@@ -59,6 +60,8 @@ class GaggiMateServer {
     void sendScaleMeasurement(float weight, float cell1Weight = 0.0f, float cell2Weight = 0.0f, bool cell1Valid = false,
                               bool cell2Valid = false);
     void sendTofMeasurement(uint32_t distance);
+    // Reliable: the display waits for this before it starts a scale-driven brew.
+    void sendTareResult(bool success);
     void sendError(int code);
 
     // Drop the current BLE link. The ping watchdog calls this so the display

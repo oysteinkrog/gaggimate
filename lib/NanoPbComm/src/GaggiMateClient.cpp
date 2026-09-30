@@ -205,6 +205,10 @@ void GaggiMateClient::registerHandlers() {
         if (_tofCb)
             _tofCb(p.content.tof.distance);
     });
+    _endpoint.on(gaggimate_Payload_tare_result_tag, [this](const gm::Payload &p) {
+        if (_tareResultCb)
+            _tareResultCb(p.content.tare_result.success);
+    });
     _endpoint.on(gaggimate_Payload_error_tag, [this](const gm::Payload &p) {
         if (_errorCb)
             _errorCb(static_cast<int>(p.content.error.code));

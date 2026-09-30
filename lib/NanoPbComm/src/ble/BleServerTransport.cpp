@@ -46,8 +46,10 @@ void BleServerTransport::setInfo(const String &info) {
 bool BleServerTransport::send(const uint8_t *data, size_t length) {
     if (!_connected || _txChar == nullptr)
         return false;
+    xSemaphoreTake(_txLock, portMAX_DELAY);
     _txChar->setValue(data, length);
     _txChar->notify(); // 2.x notify() returns bool; fire-and-forget here
+    xSemaphoreGive(_txLock);
     return true;
 }
 

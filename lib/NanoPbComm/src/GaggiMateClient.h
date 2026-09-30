@@ -32,6 +32,7 @@ class GaggiMateClient {
     using ScaleCallback =
         std::function<void(float weight, float cell1Weight, float cell2Weight, bool cell1Valid, bool cell2Valid)>;
     using TofCallback = std::function<void(uint32_t distance)>;
+    using TareResultCallback = std::function<void(bool success)>;
     using ErrorCallback = std::function<void(int code)>;
 
     GaggiMateClient();
@@ -129,6 +130,8 @@ class GaggiMateClient {
     void onVolumetricMeasurement(VolumetricCallback cb) { _volumetricCb = std::move(cb); }
     void onScaleMeasurement(ScaleCallback cb) { _scaleCb = std::move(cb); }
     void onTofMeasurement(TofCallback cb) { _tofCb = std::move(cb); }
+    // The hardware scale's answer to tare(); a controller without one never sends it.
+    void onTareResult(TareResultCallback cb) { _tareResultCb = std::move(cb); }
     void onError(ErrorCallback cb) { _errorCb = std::move(cb); }
 
   private:
@@ -144,6 +147,7 @@ class GaggiMateClient {
     VolumetricCallback _volumetricCb;
     ScaleCallback _scaleCb;
     TofCallback _tofCb;
+    TareResultCallback _tareResultCb;
     ErrorCallback _errorCb;
 
     void registerHandlers();

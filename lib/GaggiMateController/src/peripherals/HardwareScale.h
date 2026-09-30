@@ -34,6 +34,7 @@ constexpr float SCALE_ZERO_TRACK_MAX_BIAS_GRAMS = 1.0f;
 using scale_reading_callback_t =
     std::function<void(float weight, float cell1Weight, float cell2Weight, bool cell1Valid, bool cell2Valid)>;
 using scale_configuration_callback_t = std::function<void(float scaleFactor1, float scaleFactor2)>;
+using tare_result_callback_t = std::function<void(bool success)>;
 using void_callback_t = std::function<void()>;
 
 class HardwareScale {
@@ -52,13 +53,19 @@ class HardwareScale {
     float getWeight() const;
     inline RawReading getRawWeight() const { return _raw_weight; }
     void setScaleFactors(float scale_factor1, float scale_factor2);
+    // Validates and queues the configuration; the scale task applies it before
+    // its next conversion. Never blocks, so it is safe from the BLE dispatch task.
     void setConfiguration(float scale_factor1, float scale_factor2, uint16_t sample_rate_sps, float idle_alpha,
                           float active_alpha);
     void calibrateScale(uint8_t scale, float calibrationWeight);
     void setBrewingActive(bool active);
     bool isReady();
     bool isAvailable() const { return is_initialized; }
-    bool tare();
+    // Queues a tare for the scale task and returns at once. The task runs it
+    // before its next published reading (0.5 to about 1.2 s at 10 SPS) and then
+    // calls the tare result callback on the scale task with the outcome.
+    void requestTare();
+    void onTareResult(tare_result_callback_t callback) { _tare_result_callback = std::move(callback); }
 
   private:
     std::atomic<bool> is_initialized;
@@ -79,7 +86,17 @@ class HardwareScale {
     float _pending_outlier = 0.0f;
     unsigned long _read_failure_started_ms = 0;
     bool _read_fault_reported = false;
-    std::atomic<unsigned long> _responsive_until{0};
+    // esp_timer microseconds, so a deadline left over from a brew weeks ago can
+    // never look like a future one (a 32-bit millis() deadline did after 24.8
+    // days). Guarded by _request_mux because a 64-bit store is not atomic here.
+    int64_t _responsive_until_us = 0;
+    std::atomic<bool> _tare_requested{false};
+    bool _config_pending = false;       // guarded by _request_mux
+    HardwareScaleConfig _pending_config; // guarded by _request_mux
+    float _pending_scale_factor1 = 0.0f; // guarded by _request_mux
+    float _pending_scale_factor2 = 0.0f; // guarded by _request_mux
+    bool _has_published = false;
+    float _last_published_output = 0.0f;
     float _published_weight = 0.0f;
     float _zero_bias = 0.0f;
     float _zero_median_samples[SCALE_ZERO_TRACK_MEDIAN_SAMPLES]{};
@@ -99,9 +116,13 @@ class HardwareScale {
     HardwareScaleConfig _config;
     scale_reading_callback_t _reading_callback;
     scale_configuration_callback_t _configuration_callback;
+    tare_result_callback_t _tare_result_callback;
     TaskHandle_t taskHandle;
     SemaphoreHandle_t _operation_mutex;
     portMUX_TYPE _read_mux = portMUX_INITIALIZER_UNLOCKED;
+    // Short critical sections for requests from other tasks (tare, config,
+    // brewing deadline). Never held across an HX711 read.
+    mutable portMUX_TYPE _request_mux = portMUX_INITIALIZER_UNLOCKED;
 
     const char *LOG_TAG = "HardwareScale";
     [[noreturn]] static void loopTask(void *arg);
@@ -116,6 +137,8 @@ class HardwareScale {
     uint8_t calibrationSampleCount() const;
     void recordConversionInterval();
     bool tareInternal(bool allowUnstableFallback);
+    void serviceRequests();
+    void applyConfiguration(float scale_factor1, float scale_factor2, const HardwareScaleConfig &config);
     void resetFilterState();
     void resetZeroTrackingHistory();
 };

@@ -5,6 +5,8 @@
 #include "../Transport.h"
 #include <NimBLEDevice.h>
 #include <ble_ota_dfu.hpp>
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
 
 /**
  * BLE peripheral (server) transport for the controller.
@@ -45,6 +47,14 @@ class BleServerTransport : public Transport, public NimBLEServerCallbacks, publi
     NimBLECharacteristic *_infoChar = nullptr; // legacy read-only system info
     String _info;
     BLE_OTA_DFU _otaDfu;
+
+    // send() has several callers on different tasks: the Endpoint's send pump,
+    // its ACKs on the BLE host task, and fire-and-forget telemetry from the
+    // scale and control loops. The TX characteristic holds one value, so
+    // setValue and notify run as one step under this lock; without it one
+    // caller's notify could carry another caller's frame.
+    StaticSemaphore_t _txLockBuf;
+    SemaphoreHandle_t _txLock = xSemaphoreCreateMutexStatic(&_txLockBuf);
 
     void onConnect(NimBLEServer *server, NimBLEConnInfo &connInfo) override;
     void onDisconnect(NimBLEServer *server, NimBLEConnInfo &connInfo, int reason) override;

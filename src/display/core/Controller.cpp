@@ -540,6 +540,13 @@ void Controller::setupBluetooth() {
             onVolumetricMeasurement(value, VolumetricMeasurementSource::HARDWARE);
         }
     });
+    comms.onTareResult([this](bool success) {
+        hardwareTareOk.store(success);
+        hardwareTareResults.fetch_add(1);
+        if (!success) {
+            ESP_LOGW(LOG_TAG, "Controller reports the hardware scale tare failed");
+        }
+    });
     comms.onTofMeasurement([this](uint32_t value) {
         tofDistance = static_cast<int>(value);
         ESP_LOGV(LOG_TAG, "Received new TOF distance: %d", tofDistance);
@@ -1481,7 +1488,9 @@ void Controller::activate() {
     if (isActive())
         return;
     clear();
+    const uint32_t tareResultsBefore = hardwareTareResults.load();
     comms.tare();
+    bool hardwareTare = false;
     if (isVolumetricAvailable()) {
         const auto source = getActiveScaleSource();
         {
@@ -1489,10 +1498,37 @@ void Controller::activate() {
             currentVolumetricSource = source;
         }
         if (mode == MODE_BREW) {
+            hardwareTare = source == VolumetricMeasurementSource::HARDWARE;
             pluginManager->trigger("controller:brew:prestart");
         }
     }
-    delay(200);
+    if (hardwareTare) {
+        // The controller tares on its scale task and answers with a TareResult
+        // (0.5 to about 1.2 s at 10 SPS), so the pump starts on a zeroed scale
+        // and a failed tare stops the brew instead of running it untared. No
+        // answer within the bound (a controller build without TareResult, or a
+        // lost link) keeps the old behaviour and starts anyway.
+        const unsigned long started = millis();
+        while (hardwareTareResults.load() == tareResultsBefore && millis() - started < HARDWARE_TARE_WAIT_MS) {
+            delay(10);
+        }
+        if (hardwareTareResults.load() == tareResultsBefore) {
+            ESP_LOGW(LOG_TAG, "No tare result from the controller after %lu ms; starting the brew anyway",
+                     HARDWARE_TARE_WAIT_MS);
+        } else if (!hardwareTareOk.load() && profileManager->getSelectedProfile().isVolumetric()) {
+            ESP_LOGE(LOG_TAG, "Hardware scale tare failed; not starting a weight-targeted brew");
+            pluginManager->trigger("controller:tare:failed");
+            return;
+        } else if (!hardwareTareOk.load()) {
+            pluginManager->trigger("controller:tare:failed");
+        }
+        const unsigned long waited = millis() - started;
+        if (waited < 200) {
+            delay(200 - waited);
+        }
+    } else {
+        delay(200);
+    }
     switch (mode) {
     case MODE_BREW:
         startProcess(new BrewProcess(profileManager->getSelectedProfile(),

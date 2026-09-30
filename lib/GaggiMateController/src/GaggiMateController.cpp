@@ -55,6 +55,15 @@ void GaggiMateController::setup() {
             }
         },
         [](float, float) {});
+    // Called on the scale task once a requested tare has finished.
+    this->hardwareScale->onTareResult([this](bool success) {
+        if (!success) {
+            ESP_LOGW(LOG_TAG, "Tare failed; reporting it to the display");
+        }
+        if (_comms.isConnected()) {
+            _comms.sendTareResult(success);
+        }
+    });
 
     // 4-Pin peripheral port
     albaComms = new SoftWire(_config.sunriseSdaPin, _config.sunriseSclPin);
@@ -235,8 +244,12 @@ void GaggiMateController::setup() {
         this->heater->autotune(static_cast<int>(testTimeSec), static_cast<int>(windowSize), static_cast<int>(heaterWattage));
     });
     _comms.onTare([this]() {
+        // This runs on the Endpoint's only inbound dispatch task. The tare
+        // itself takes 0.5 to about 1.2 s of HX711 samples, so it runs on the
+        // scale task and answers with a TareResult; blocking here held every
+        // later command, including a pump or valve stop, behind it.
         if (hardwareScale != nullptr && hardwareScale->isAvailable()) {
-            hardwareScale->tare();
+            hardwareScale->requestTare();
         }
         if (!_config.capabilites.dimming) {
             return;
