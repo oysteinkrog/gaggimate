@@ -2,7 +2,7 @@
 #
 # The display-class defaults pin 16 MB for the LilyGo T-RGB. display-headless-8m
 # builds the same firmware for a seeed_xiao_esp32s3 (8 MB) with
-# partitions/default_8mb.csv, so it appends this file to bring the size back
+# partitions/headless_8mb.csv, so it appends this file to bring the size back
 # down. Order matters: SDKCONFIG_DEFAULTS is applied left to right and the last
 # assignment wins, so this must come after sdkconfig.gaggimate.defaults.
 #

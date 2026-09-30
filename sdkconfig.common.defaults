@@ -2,13 +2,19 @@
 # Applied as the first entry in SDKCONFIG_DEFAULTS; env-specific files follow
 # and override only what differs (MAX_CONNECTIONS, LWIP, nano-newlib).
 #
-# Workflow: pioarduino caches a merged sdkconfig.<env> at project root (it is
-# gitignored). ESP-IDF applies these .defaults ONLY when generating a fresh
-# sdkconfig.<env>; if the cache already exists it is reused verbatim and your
-# .defaults edits are silently ignored. `-t fullclean` does NOT regenerate it.
-# After editing any .defaults file you MUST delete the cache, then rebuild:
+# Workflow: pioarduino caches a merged sdkconfig.<env> at project root.
+# `.gitignore` ignores sdkconfig.*, but two of them are force-tracked:
+# sdkconfig.display and sdkconfig.display-loadtest, so a review can see what
+# production and the bench actually build with. ESP-IDF applies these
+# .defaults ONLY when generating a fresh sdkconfig.<env>; if the cache already
+# exists it is reused verbatim and your .defaults edits are silently ignored.
+# `-t fullclean` does NOT regenerate it. After editing any .defaults file,
+# delete the cache and rebuild:
 #   rm -f sdkconfig.<env> && pio run -e <env>
-# else the build ignores your change and you will chase ghosts.
+# For the two tracked files, commit the regenerated file with the .defaults
+# change. Every setting either of them needs must live in a .defaults file in
+# its env's chain (platformio.ini, SDKCONFIG_DEFAULTS), never as a hand edit
+# in the generated file: the rm above drops a hand edit without an error.
 
 CONFIG_IDF_TARGET="esp32s3"
 

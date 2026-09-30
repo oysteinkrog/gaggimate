@@ -1,0 +1,19 @@
+# Bench instrumentation for display-loadtest and display-loadtest-xip only
+# (gm-bzu.28). Chained after sdkconfig.qio.defaults in both envs, and before
+# sdkconfig.xip.defaults in the xip one, so the two bench builds carry the
+# same scheduler instrumentation and their numbers compare.
+#
+# These lines used to exist only in the tracked sdkconfig.display-loadtest,
+# edited in by hand (d952939c). Deleting that file to pick up a defaults
+# change dropped them without an error, and display-loadtest-xip never had
+# them. /api/debug/tasks (WebUIPluginDebug.cpp) needs them for its per-task
+# CPU time.
+#
+# Cost: the run-time counter reads esp_timer on every context switch. That
+# is a difference from production, declared here, not a production setting.
+CONFIG_FREERTOS_USE_TRACE_FACILITY=y
+CONFIG_FREERTOS_USE_STATS_FORMATTING_FUNCTIONS=y
+CONFIG_FREERTOS_VTASKLIST_INCLUDE_COREID=y
+CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS=y
+CONFIG_FREERTOS_RUN_TIME_COUNTER_TYPE_U64=y
+CONFIG_FREERTOS_RUN_TIME_STATS_USING_ESP_TIMER=y

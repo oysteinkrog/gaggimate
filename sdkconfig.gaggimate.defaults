@@ -57,10 +57,13 @@ CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y
 #   1024                    8,347     6,303           7,668               0
 #
 # The largest free block does not move, so the fragmentation that killed 512
-# does not reproduce here. What the 5.8 KB buys is the bounce buffers going
-# from ten scanlines to twelve, which is worth roughly half the remaining
-# scan-out slips. Re-measure both columns before touching this again: the
-# largest-block figure is the one that decides whether the web UI answers.
+# does not reproduce here. When this was measured, the 5.8 KB let the bounce
+# buffers go from ten scanlines to twelve. The pool is now fixed at 16
+# scanlines (GM_LCD_BOUNCE_LINES in platformio.ini, the patched driver's
+# 8 buffers of 2 lines), so what the 5.8 KB buys today is DMA-capable
+# headroom for the WiFi TX copies. Re-measure both columns before touching
+# this again: the largest-block figure is the one that decides whether the
+# web UI answers.
 CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=1024
 # RESERVE_INTERNAL was raised to 32768 and measured worse, so 16384 stays.
 # esp_psram_extram_reserve_dma_pool carves the reserve out of the largest
@@ -117,7 +120,7 @@ CONFIG_ESP32S3_DATA_CACHE_LINE_64B=y
 #
 # So the whole-project -Os from sdkconfig.common.defaults stands.
 
-# Not enabling CONFIG_SPIRAM_XIP_FROM_PSRAM (and so not
+# Production does not enable CONFIG_SPIRAM_XIP_FROM_PSRAM (and so not
 # SPIRAM_FETCH_INSTRUCTIONS / SPIRAM_RODATA), even though Espressif's LCD FAQ
 # lists them among the prerequisites for RGB bounce-buffer mode. Their argument
 # is sound on both counts: flash and PSRAM share the MSPI controller and octal
@@ -136,6 +139,12 @@ CONFIG_ESP32S3_DATA_CACHE_LINE_64B=y
 #
 # So the brief corruption during an NVS write stands as a known defect. It is
 # bounded by the write and it is what upstream ships.
+#
+# The instruction half alone does fit: sdkconfig.xip.defaults turns on
+# SPIRAM_FETCH_INSTRUCTIONS (3.0 MB of .flash.text, PSRAM free 4.55 to
+# 1.55 MB) for the display-loadtest-xip bench env only, and SPIRAM_RODATA
+# stays off there too. Production stays off by the owner's decision of
+# 2026-09-09; that file has the measurements.
 
 # Route NimBLE host + mbedTLS allocations to PSRAM (reclaims ~40 KB internal).
 CONFIG_BT_NIMBLE_MEM_ALLOC_MODE_INTERNAL=n
