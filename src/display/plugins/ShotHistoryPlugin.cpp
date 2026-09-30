@@ -438,6 +438,9 @@ void ShotHistoryPlugin::startRecording() {
             currentBrewDelay = brewProcess->brewDelay;
         }
     }
+    // A no-op once the loop task has done it; a brew started in the first
+    // seconds after boot waits for it here rather than taking a stale id.
+    syncNextIdWithIndex();
     currentId = padId(String(controller->getSettings().getHistoryIndex()));
     shotStart = millis();
     lastWeightChangeTime = 0;
@@ -815,6 +818,9 @@ void ShotHistoryPlugin::loadNotes(const String &id, JsonDocument &notes) {
 
 void ShotHistoryPlugin::loopTask(void *arg) {
     auto *plugin = static_cast<ShotHistoryPlugin *>(arg);
+    // Before any shot is recorded, and off the setup task: opening index.bin
+    // on the SD card walks /h, which takes seconds on a large history.
+    plugin->syncNextIdWithIndex();
     while (true) {
         plugin->record();
         // Use canonical interval from shot log format to avoid divergence.
@@ -849,6 +855,7 @@ void ShotHistoryPlugin::flushBuffer() {
 
 // Index management methods
 bool ShotHistoryPlugin::ensureIndexExists() {
+    std::lock_guard<std::recursive_mutex> guard(indexLock);
     if (fs->exists("/h/index.bin")) {
         // Validate existing index header
         File indexFile = fs->open("/h/index.bin", "r");
@@ -895,6 +902,7 @@ bool ShotHistoryPlugin::ensureIndexExists() {
 }
 
 bool ShotHistoryPlugin::appendToIndex(const ShotIndexEntry &entry) {
+    std::lock_guard<std::recursive_mutex> guard(indexLock);
     if (!ensureIndexExists()) {
         return false;
     }
@@ -924,6 +932,19 @@ bool ShotHistoryPlugin::appendToIndex(const ShotIndexEntry &entry) {
         return false;
     }
 
+    // An id below the last entry's breaks the order the binary search needs.
+    // Refusing it would lose the shot, so it is appended and the index is
+    // marked for the linear fallback until the next rebuild sorts it.
+    if (header.entryCount > 0) {
+        ShotIndexEntry last{};
+        const size_t lastPos = sizeof(ShotIndexHeader) + static_cast<size_t>(header.entryCount - 1) * sizeof(ShotIndexEntry);
+        if (readEntryAtPosition(indexFile, lastPos, last) && entry.id < last.id) {
+            ESP_LOGW("ShotHistoryPlugin", "Shot %u is out of id order (last entry is %u); lookups fall back to a linear scan",
+                     entry.id, last.id);
+            indexOrderBroken = true;
+        }
+    }
+
     // Append entry
     indexFile.seek(0, SeekEnd);
     size_t written = indexFile.write(reinterpret_cast<const uint8_t *>(&entry), sizeof(entry));
@@ -941,7 +962,9 @@ bool ShotHistoryPlugin::appendToIndex(const ShotIndexEntry &entry) {
     // shot reuses this one's id. Returning true here reported all of that as a
     // successful append.
     header.entryCount++;
-    header.nextId = entry.id + 1;
+    if (entry.id + 1 > header.nextId) {
+        header.nextId = entry.id + 1;
+    }
     if (!writeIndexHeader(indexFile, header)) {
         ESP_LOGE("ShotHistoryPlugin", "Wrote index entry for shot %u but could not update the header", entry.id);
         indexFile.close();
@@ -954,6 +977,7 @@ bool ShotHistoryPlugin::appendToIndex(const ShotIndexEntry &entry) {
 }
 
 void ShotHistoryPlugin::updateIndexMetadata(uint32_t shotId, uint8_t rating, uint16_t volume) {
+    std::lock_guard<std::recursive_mutex> guard(indexLock);
     File indexFile = fs->open("/h/index.bin", "r+");
     if (!indexFile) {
         ESP_LOGE("ShotHistoryPlugin", "Failed to open index file for metadata update");
@@ -990,6 +1014,7 @@ void ShotHistoryPlugin::updateIndexMetadata(uint32_t shotId, uint8_t rating, uin
 }
 
 void ShotHistoryPlugin::markIndexDeleted(uint32_t shotId) {
+    std::lock_guard<std::recursive_mutex> guard(indexLock);
     File indexFile = fs->open("/h/index.bin", "r+");
     if (!indexFile) {
         ESP_LOGE("ShotHistoryPlugin", "Failed to open index file for deletion marking");
@@ -1032,6 +1057,7 @@ void ShotHistoryPlugin::markIndexDeleted(uint32_t shotId) {
 }
 
 size_t ShotHistoryPlugin::readRecentEntries(ShotIndexEntry *outEntries, size_t maxCount) {
+    std::lock_guard<std::recursive_mutex> guard(indexLock);
     File indexFile = fs->open("/h/index.bin", "r");
     if (!indexFile) {
         return 0;
@@ -1059,6 +1085,101 @@ size_t ShotHistoryPlugin::readRecentEntries(ShotIndexEntry *outEntries, size_t m
 
     indexFile.close();
     return found;
+}
+
+bool ShotHistoryPlugin::snapshotIndex(uint8_t **outBuf, size_t *outLen) {
+    *outBuf = nullptr;
+    *outLen = 0;
+    std::lock_guard<std::recursive_mutex> guard(indexLock);
+    File indexFile = fs->open("/h/index.bin", "r");
+    if (!indexFile) {
+        return false;
+    }
+    ShotIndexHeader header{};
+    if (!readIndexHeader(indexFile, header)) {
+        indexFile.close();
+        return false;
+    }
+    const size_t wanted = sizeof(ShotIndexHeader) + static_cast<size_t>(header.entryCount) * sizeof(ShotIndexEntry);
+    auto *buf = static_cast<uint8_t *>(ps_malloc(wanted));
+    if (buf == nullptr) {
+        ESP_LOGE("ShotHistoryPlugin", "No memory for a %u byte index snapshot", static_cast<unsigned>(wanted));
+        indexFile.close();
+        return false;
+    }
+    const size_t got = indexFile.read(buf + sizeof(ShotIndexHeader), wanted - sizeof(ShotIndexHeader));
+    indexFile.close();
+    // A file shorter than its header claims (an append whose header write
+    // landed but whose entry did not) is served as the entries it holds.
+    const uint32_t entries = static_cast<uint32_t>(got / sizeof(ShotIndexEntry));
+    if (entries != header.entryCount) {
+        ESP_LOGW("ShotHistoryPlugin", "index.bin header says %u entries, file holds %u", header.entryCount, entries);
+        header.entryCount = entries;
+    }
+    memcpy(buf, &header, sizeof(header));
+    *outBuf = buf;
+    *outLen = sizeof(ShotIndexHeader) + static_cast<size_t>(entries) * sizeof(ShotIndexEntry);
+    return true;
+}
+
+void ShotHistoryPlugin::syncNextIdWithIndex() {
+    std::lock_guard<std::recursive_mutex> guard(indexLock);
+    if (nextIdSynced) {
+        return;
+    }
+    nextIdSynced = true;
+    File indexFile = fs->open("/h/index.bin", "r");
+    if (!indexFile) {
+        return;
+    }
+    ShotIndexHeader header{};
+    if (!readIndexHeader(indexFile, header)) {
+        indexFile.close();
+        return;
+    }
+    // One sequential read of the whole index, eight entries at a time (1 KB
+    // of this task's stack), for the highest id and whether the ids ascend.
+    ShotIndexEntry batch[8];
+    uint32_t maxId = 0;
+    uint32_t prevId = 0;
+    bool any = false;
+    bool sorted = true;
+    uint32_t read = 0;
+    while (read < header.entryCount) {
+        const uint32_t want = std::min<uint32_t>(8, header.entryCount - read);
+        const size_t got = indexFile.read(reinterpret_cast<uint8_t *>(batch), want * sizeof(ShotIndexEntry));
+        const uint32_t n = static_cast<uint32_t>(got / sizeof(ShotIndexEntry));
+        for (uint32_t k = 0; k < n; k++) {
+            const uint32_t id = batch[k].id;
+            if (any && id < prevId) {
+                sorted = false;
+            }
+            if (!any || id > maxId) {
+                maxId = id;
+            }
+            prevId = id;
+            any = true;
+        }
+        read += n;
+        if (n < want) {
+            break;
+        }
+    }
+    indexFile.close();
+
+    if (!sorted) {
+        ESP_LOGW("ShotHistoryPlugin", "index.bin is not in id order; lookups fall back to a linear scan until a rebuild");
+        indexOrderBroken = true;
+    }
+    uint32_t next = header.nextId;
+    if (any && maxId + 1 > next) {
+        next = maxId + 1;
+    }
+    const int current = controller->getSettings().getHistoryIndex();
+    if (current < 0 || static_cast<uint32_t>(current) < next) {
+        ESP_LOGW("ShotHistoryPlugin", "Shot counter %d is at or below ids already in the index; raising it to %u", current, next);
+        controller->getSettings().setHistoryIndex(static_cast<int>(next));
+    }
 }
 
 void ShotHistoryPlugin::startAsyncRebuild() {
@@ -1099,11 +1220,16 @@ void ShotHistoryPlugin::rebuildIndex() {
         pluginManager->trigger(startEvent);
     }
 
-    // Delete existing index
-    fs->remove("/h/index.bin");
-
-    // Create new empty index
-    if (!ensureIndexExists()) {
+    // Delete existing index and create a new empty one. The entries below
+    // are replayed in id order, so the fallback flag no longer applies.
+    bool created;
+    {
+        std::lock_guard<std::recursive_mutex> guard(indexLock);
+        fs->remove("/h/index.bin");
+        created = ensureIndexExists();
+        indexOrderBroken = false;
+    }
+    if (!created) {
         ESP_LOGE("ShotHistoryPlugin", "Failed to create index during rebuild");
         // Emit error event
         if (pluginManager) {
@@ -1151,7 +1277,9 @@ void ShotHistoryPlugin::rebuildIndex() {
     }
 
     int currentIndex = 0;
-    uint32_t maxId = controller->getSettings().getHistoryIndex();
+    // historyIndex is the id the next shot takes, so it must end above the
+    // highest id on the card, not equal to it.
+    uint32_t nextId = controller->getSettings().getHistoryIndex();
     for (const String &fileName : slogFiles) {
         currentIndex++;
         File shotFile = fs->open("/h/" + fileName, "r");
@@ -1171,8 +1299,8 @@ void ShotHistoryPlugin::rebuildIndex() {
         int start = fileName.lastIndexOf('/') + 1;
         int end = fileName.lastIndexOf('.');
         uint32_t shotId = fileName.substring(start, end).toInt();
-        if (shotId > maxId) {
-            maxId = shotId;
+        if (shotId + 1 > nextId) {
+            nextId = shotId + 1;
         }
 
         // Create index entry
@@ -1267,8 +1395,8 @@ void ShotHistoryPlugin::rebuildIndex() {
         }
     }
 
-    if (maxId > controller->getSettings().getHistoryIndex()) {
-        controller->getSettings().setHistoryIndex(maxId);
+    if (nextId > static_cast<uint32_t>(controller->getSettings().getHistoryIndex())) {
+        controller->getSettings().setHistoryIndex(static_cast<int>(nextId));
     }
 
     // Emit completion event
@@ -1310,13 +1438,15 @@ bool ShotHistoryPlugin::writeIndexHeader(File &indexFile, const ShotIndexHeader 
 }
 
 int ShotHistoryPlugin::findEntryPosition(File &indexFile, const ShotIndexHeader &header, uint32_t shotId) {
-    // Entries are appended in strictly increasing shot-ID order and never reordered:
-    // nextId/Settings::historyIndex only ever advances (see appendToIndex, startRecording),
-    // upserts rewrite an existing slot in place rather than moving it, and rebuildIndex()
-    // replays .slog files sorted by the same numeric ID embedded in their filename.
-    // readRecentEntries() already depends on this same ordering to walk newest-first.
-    // That makes the index a sorted array by construction, so a binary search finds any
-    // shot in O(log entryCount) instead of scanning every historical entry on every call.
+    // Entries are appended in increasing shot-ID order and never reordered:
+    // Settings::historyIndex only advances (see appendToIndex, startRecording), it is
+    // raised above every id in the index at boot (syncNextIdWithIndex), upserts rewrite
+    // an existing slot in place, and rebuildIndex() replays .slog files sorted by the
+    // numeric ID in their filename. readRecentEntries() depends on the same order to walk
+    // newest-first. So the index is a sorted array and a binary search finds any shot in
+    // O(log entryCount). If an out-of-order entry was seen anyway (indexOrderBroken), a
+    // miss falls back to a linear scan so a present shot is still found.
+    std::lock_guard<std::recursive_mutex> guard(indexLock);
     int32_t lo = 0;
     int32_t hi = static_cast<int32_t>(header.entryCount) - 1;
     while (lo <= hi) {
@@ -1336,6 +1466,20 @@ int ShotHistoryPlugin::findEntryPosition(File &indexFile, const ShotIndexHeader 
             lo = mid + 1;
         } else {
             hi = mid - 1;
+        }
+    }
+    if (!indexOrderBroken) {
+        return -1;
+    }
+    for (uint32_t i = 0; i < header.entryCount; i++) {
+        size_t entryPos = sizeof(ShotIndexHeader) + static_cast<size_t>(i) * sizeof(ShotIndexEntry);
+        ShotIndexEntry entry{};
+        if (!readEntryAtPosition(indexFile, entryPos, entry)) {
+            return -1;
+        }
+        if (entry.id == shotId) {
+            ESP_LOGD("ShotHistoryPlugin", "Shot %u found by linear scan at %u", shotId, i);
+            return static_cast<int>(entryPos);
         }
     }
     return -1;

@@ -6,6 +6,7 @@
 #include <display/core/Plugin.h>
 #include <display/core/utils.h>
 #include <display/models/shot_log_format.h>
+#include <mutex>
 
 constexpr size_t SHOT_HISTORY_INTERVAL = 100;
 constexpr size_t MIN_FREE_SPACE_BYTES = 500 * 1024;         // 500 KB reserved free space
@@ -35,6 +36,20 @@ class ShotHistoryPlugin : public Plugin {
     // Read up to maxCount most recent non-deleted index entries, newest first.
     // Returns the number of entries written to outEntries.
     size_t readRecentEntries(ShotIndexEntry *outEntries, size_t maxCount);
+
+    // Copies index.bin into one PSRAM buffer under the index lock, so the
+    // header and the entries in the copy agree: entryCount is clamped to the
+    // whole entries actually read, and *outLen is the header plus exactly
+    // those entries. A shot appended while the copy is taken is either wholly
+    // in it or wholly out of it. False when there is no readable index or the
+    // buffer cannot be allocated. The caller frees *outBuf with free().
+    bool snapshotIndex(uint8_t **outBuf, size_t *outLen);
+
+    // Raises Settings::historyIndex above every id in index.bin, once per
+    // boot. After an NVS reset that kept the SD history, the counter would
+    // otherwise restart at 0 and new shots would take ids below the ones on
+    // the card, which breaks the id order findEntryPosition relies on.
+    void syncNextIdWithIndex();
 
   private:
     // Index helper functions
@@ -112,6 +127,18 @@ class ShotHistoryPlugin : public Plugin {
 
     // Async rebuild state
     bool rebuildInProgress = false;
+
+    // Serialises every read and write of index.bin across the recording
+    // task, the history worker and the rebuild task. Recursive because
+    // appendToIndex calls ensureIndexExists and rebuildIndex calls both.
+    std::recursive_mutex indexLock;
+    // Set once syncNextIdWithIndex has run (under indexLock).
+    bool nextIdSynced = false;
+    // Set when index.bin holds an entry whose id is below the one before it.
+    // The binary search in findEntryPosition can then miss a present shot,
+    // so a miss falls back to a linear scan. Cleared by a rebuild, which
+    // writes the entries in id order. Under indexLock.
+    bool indexOrderBroken = false;
 
     TaskHandle_t taskHandle;
     void flushBuffer();
