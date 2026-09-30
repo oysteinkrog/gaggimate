@@ -1,6 +1,7 @@
 #!/bin/bash
 # Build a bare-metal PIE test image for direct QEMU `-kernel` boot. Standalone:
-# does not touch .pio/, platformio.ini, or CMake -- a raw compile+link with the
+# does not touch .pio/, platformio.ini, or CMake -- a raw compile+link. The
+# rest of this paragraph is about the 2021r2 path below: the
 # same Windows-hosted device toolchain tools/animbench/xtensa-asm.sh already
 # established works from WSL only when invoked through cmd.exe with a Windows
 # argv[0] (a WSL-path invocation fails to spawn cc1plus/collect2). Like that
@@ -8,6 +9,15 @@
 # to Windows paths: WSL's interop resolves cwd correctly for a process
 # launched from a /mnt/c-rooted directory, which is what xtensa-asm.sh already
 # relies on and this repo's builds always run from.
+#
+# Toolchain (gm-bzu.79): the default is the firmware's own compiler,
+# toolchain-xtensa-esp-elf (GCC 14.2) at -O2, the same compiler and -O level
+# the display envs ship with (platformio.ini, display_common.build_flags).
+# Its native Linux binaries run straight from WSL, so no cmd.exe is needed.
+# GM_QEMUBENCH_TOOLCHAIN=2021r2 selects the older toolchain-xtensa-esp32s3
+# (GCC 8.4) at -O1 through cmd.exe, which is what this script used before.
+#
+#   GM_QEMUBENCH_TOOLCHAIN=2021r2 ./build.sh tests/anim_lava
 #
 #   ./build.sh pie_smoke              # standalone: pie_smoke/{start.S,main.c,link.ld} -> build/pie_smoke.elf
 #   ./build.sh tests/pie_smoke_full   # harness mode: tests/pie_smoke_full/main.c (a `main()`
@@ -58,8 +68,32 @@ else
     echo "harness mode: linking against harness/{start.S,vectors.S,link.ld}"
 fi
 
-CC_WIN='C:\Users\Oystein\.platformio\packages\toolchain-xtensa-esp32s3\bin\xtensa-esp32s3-elf-gcc.exe'
-CXX_WIN='C:\Users\Oystein\.platformio\packages\toolchain-xtensa-esp32s3\bin\xtensa-esp32s3-elf-g++.exe'
+TOOLCHAIN="${GM_QEMUBENCH_TOOLCHAIN:-firmware}"
+case "$TOOLCHAIN" in
+    firmware)
+        TC_BIN="$HOME/.platformio/packages/toolchain-xtensa-esp-elf/bin"
+        CC="$TC_BIN/xtensa-esp32s3-elf-gcc"
+        CXX="$TC_BIN/xtensa-esp32s3-elf-g++"
+        OPT="-O2"
+        CXXSTD="-std=gnu++20"
+        run_tool() { "$@"; }
+        ;;
+    2021r2)
+        CC='C:\Users\Oystein\.platformio\packages\toolchain-xtensa-esp32s3\bin\xtensa-esp32s3-elf-gcc.exe'
+        CXX='C:\Users\Oystein\.platformio\packages\toolchain-xtensa-esp32s3\bin\xtensa-esp32s3-elf-g++.exe'
+        OPT="-O1"
+        # This toolchain's g++ predates the "gnu++20" spelling (it errors
+        # and suggests "gnu++2a"): same standard, older alias.
+        CXXSTD="-std=gnu++2a"
+        run_tool() { cmd.exe /c "$*"; }
+        ;;
+    *)
+        echo "GM_QEMUBENCH_TOOLCHAIN must be firmware or 2021r2, not: $TOOLCHAIN"
+        exit 1
+        ;;
+esac
+echo "toolchain: $TOOLCHAIN ($OPT)"
+
 # C++-only extras, for a test driver that #includes a kernel's own .cpp
 # (e.g. tools/animbench/kernels-blend/blend_pie_kernel.cpp) directly rather
 # than duplicating it -- matches that directory's own build_and_report.sh
@@ -71,12 +105,8 @@ CXX_WIN='C:\Users\Oystein\.platformio\packages\toolchain-xtensa-esp32s3\bin\xten
 # build; overkill for this harness's small IRAM image (everything is well
 # within direct-call range) but not wrong, and keeps the object closer to
 # what was already verified rather than introducing a difference.
-# This toolchain's g++ predates the "gnu++20" spelling (errors, suggests
-# "gnu++2a" instead) -- same standard, older alias. blend-asm-lead's
-# build_and_report.sh uses "gnu++20" against a different toolchain
-# (toolchain-xtensa-esp-elf, not this repo's toolchain-xtensa-esp32s3); no
-# semantic difference for code that doesn't probe __cplusplus's exact value.
-CXXFLAGS_EXTRA="-std=gnu++2a -fno-exceptions -fno-rtti -mlongcalls"
+# The C++ standard spelling ($CXXSTD) is set per toolchain above.
+CXXFLAGS_EXTRA="$CXXSTD -fno-exceptions -fno-rtti -mlongcalls"
 # This toolchain build has no call0 multilib (`-print-multi-lib` shows a
 # single "." variant; --abi-call0 is accepted by --target-help as a generic
 # xtensa-backend option but rejected at compile time -- not actually wired
@@ -98,7 +128,16 @@ CXXFLAGS_EXTRA="-std=gnu++2a -fno-exceptions -fno-rtti -mlongcalls"
 # linker script (no ESP-IDF default script to lean on) placed AFTER all
 # .text -- which broke every l32r with "literal placed after use" (l32r's
 # PC-relative encoding can only reach backward).
-FLAGS="-mtext-section-literals -ffreestanding -nostdlib -nostartfiles -fno-builtin -Wall -Wextra -O1 -g"
+# -ffp-contract=off (gm-bzu.79): the C references must round the way the
+# portable spec does, one rounding per operation. GCC defaults to
+# -ffp-contract=fast, and from -O2 up it fuses "acc += a * b" into one
+# madd.s with a single rounding. The hand-written kernels use separate
+# mul.s and add.s, so a fused reference differs from them by 1 ULP:
+# anim_ripples showed 6 such lanes under GCC 14 at -O2. GCC 8 at -O1 never
+# fused (the pass needs -fexpensive-optimizations, an -O2 flag), which is
+# why the old default passed. The flag changes only compiled C, never the
+# bytes of an asm block, so the kernels under test are unaffected.
+FLAGS="-mtext-section-literals -ffreestanding -nostdlib -nostartfiles -fno-builtin -ffp-contract=off -Wall -Wextra $OPT -g"
 
 mkdir -p build
 rm -f "build/${NAME}.elf" "build/$SRC_DIR"/*.o
@@ -114,18 +153,18 @@ for src in "${EXTRA_SRCS[@]}" "$SRC_DIR"/*.S "$SRC_DIR"/*.c "$SRC_DIR"/*.cpp; do
     case "$src" in
         *.cpp)
             HAVE_CPP=1
-            cmd.exe /c "$CXX_WIN $FLAGS $CXXFLAGS_EXTRA -c $src -o $obj"
+            run_tool "$CXX" $FLAGS $CXXFLAGS_EXTRA -c "$src" -o "$obj"
             ;;
         *)
-            cmd.exe /c "$CC_WIN $FLAGS -c $src -o $obj"
+            run_tool "$CC" $FLAGS -c "$src" -o "$obj"
             ;;
     esac
     OBJS+=("$obj")
 done
 
 echo "linking -> build/${NAME}.elf"
-LINKER="$CC_WIN"
-[ "$HAVE_CPP" = 1 ] && LINKER="$CXX_WIN"
-cmd.exe /c "$LINKER -nostdlib -Wl,-T,${LINK_LD} -Wl,--build-id=none ${OBJS[*]} -o build/${NAME}.elf"
+LINKER="$CC"
+[ "$HAVE_CPP" = 1 ] && LINKER="$CXX"
+run_tool "$LINKER" -nostdlib -Wl,-T,"${LINK_LD}" -Wl,--build-id=none "${OBJS[@]}" -o "build/${NAME}.elf"
 
 echo "OK: build/${NAME}.elf"

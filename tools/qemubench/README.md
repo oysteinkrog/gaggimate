@@ -126,16 +126,14 @@ four from source (commit 0ae7c68e); each passes under QEMU and the check
 reports every function matching. `anim_fireflies/main.c` became `main.cpp`
 because the source operand list uses `static_cast`.
 
-Still open: building with the firmware toolchain (GCC 14, -O2) gives
-bit-exact results for 13 of 14 kernels, and `anim_ripples` differs by 1 ULP
-in 6 lanes. That is gm-bzu.79; `build.sh` keeps the 2021r2 toolchain until
-it is settled.
+`build.sh` now builds with the firmware toolchain by default and all 14
+anim tests plus `blend_row` pass under it. The next section says how.
 
 ## On Astra's note: building with the production toolchain
 
 The bead's second-oracle note (Astra, 2026-09-30) is right that a source
 diff alone does not prove a kernel behaves the same under the toolchain
-that actually ships it: `build.sh` compiles with the 2021r2 toolchain
+that actually ships it: `build.sh` compiled with the 2021r2 toolchain
 (`toolchain-xtensa-esp32s3`, GCC 8.4.0) at `-O1`, while the production
 `display`/`display-loadtest` envs build with GCC 14.2.0
 (`toolchain-xtensa-esp-elf`, the same one `xtensa-asm14.sh` uses) at `-O2`
@@ -150,17 +148,54 @@ comment for why that dance exists at all) at `-O2` and re-run under QEMU.
 did not: `anim_ripples`'s `accumulateBandAsm` check showed 6 lane
 mismatches, every one a 1-ULP float difference** (e.g. asm result
 `0x3ef8649e` vs the C++ reference's `0x3ef8649f`) that do not appear under
-the current toolchain. This is evidence for exactly the risk Astra named:
+the 2021r2 toolchain. This is evidence for exactly the risk Astra named:
 the diff-only check in this bead cannot see a toolchain-dependent
 behaviour change, because both sides of the diff are unaffected by which
 compiler builds the test binary.
 
-This was not chased further or fixed here -- it needs its own
-investigation (most likely the float reference's own codegen shifting
-under `-O2`/GCC 14, e.g. FP-contraction or a different libm `sqrtf`
-lowering, rather than the hand-written kernel itself, since the kernel's
-instructions are unchanged bytes either way) and is not a `tools/qemubench`
-text-and-wiring change. Recorded here as a concrete, reproduced finding
-for whoever picks up production-toolchain QEMU builds next, rather than
-switching `build.sh`'s default toolchain in this bead and silently
-breaking a fifth, currently-passing test.
+## Toolchain and FP contraction (gm-bzu.79)
+
+`build.sh` now defaults to the firmware toolchain: GCC 14.2 from
+`toolchain-xtensa-esp-elf` at `-O2`, run as native Linux binaries.
+`GM_QEMUBENCH_TOOLCHAIN=2021r2` selects the old GCC 8.4 at `-O1` through
+`cmd.exe`.
+
+```
+./build.sh tests/anim_ripples                                 # firmware toolchain
+GM_QEMUBENCH_TOOLCHAIN=2021r2 ./build.sh tests/anim_ripples   # old toolchain
+```
+
+The ripples mismatch was in the C reference, not the kernel. GCC defaults
+to `-ffp-contract=fast`. From `-O2` up it fuses the reference's
+`hAccBuf[x] += amp * cos * env` into one `madd.s`, which rounds once. The
+asm kernel does `mul.s` then `add.s`, which rounds twice. GCC 8 at `-O1`
+never fused, because the pass needs `-fexpensive-optimizations`, an `-O2`
+flag. That is why the old default passed.
+
+How it was shown:
+
+- Compiling the test to assembly under GCC 14 `-O2` gives one `madd.s` in
+  the inlined reference loop. With `-ffp-contract=off` it gives none.
+- Built without the flag, the test fails with 6 mismatched lanes, 3 in
+  case 0 and 3 in case 3, each 1 ULP apart in either direction
+  (`0x3ef8649e` against `0x3ef8649f`, `0x3e95092c` against `0x3e95092b`).
+- Built with the flag, it passes.
+
+`build.sh` therefore passes `-ffp-contract=off` for every test. The flag
+changes only compiled C. It cannot change the bytes of an asm block, so
+the kernels under test are the same. Unfused rounding is also what the
+host goldens use (x86 without FMA) and what every test passed under
+before.
+
+Results on 2026-10-01, firmware toolchain, `-O2`, `-ffp-contract=off`:
+PASS for `anim_aurora`, `anim_caustics`, `anim_ember`, `anim_fireflies`,
+`anim_lava`, `anim_mandala`, `anim_nebula`, `anim_orbits`, `anim_plasma`,
+`anim_ripples`, `anim_silk`, `anim_silk2`, `anim_starfield`, `anim_steam`
+and `blend_row`. The 2021r2 path still passes (`anim_ripples`,
+`anim_fireflies` and `blend_row` checked).
+
+The same fusion is in the shipped firmware. The `display` ELF's ripples
+`bandRef` has a `madd.s` in its accumulate, while `accumulateBandAsm` does
+not. So on the device `band()` and `bandRef()` can differ by 1 ULP per
+ring sample before RGB565 packing. That is a `src/` change and is
+gm-bzu.83.
