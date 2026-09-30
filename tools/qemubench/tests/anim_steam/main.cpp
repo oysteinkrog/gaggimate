@@ -71,15 +71,15 @@ static void uart_put_udec(uint32_t v) {
 }
 
 /* ---- fillRowPie: verbatim from AnimSteam.cpp ---- */
-__attribute__((noinline)) static void fillRowPie(uint16_t *dst, const uint16_t *bc, int w8) {
-    uint16_t *wr = dst;
+__attribute__((noinline)) static void fillRowPie(uint16_t *__restrict wr, const uint16_t *__restrict bc, int w8) {
+    uint16_t *dst = wr;
     const uint16_t *bcp = bc;
     int n = w8;
     asm volatile("ee.vld.128.ip q0, %[bc], 0\n"
                  "loop %[n], 1f\n"
                  "ee.vst.128.ip q0, %[dst], 16\n"
                  "1:\n"
-                 : [dst] "+r"(wr), [n] "+r"(n)
+                 : [dst] "+r"(dst), [n] "+r"(n)
                  : [bc] "r"(bcp)
                  : "memory");
 }

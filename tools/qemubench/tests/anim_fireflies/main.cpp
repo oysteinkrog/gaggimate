@@ -163,8 +163,8 @@ __attribute__((noinline)) static void drawGlowSpanAsm(uint16_t *rowIn, int32_t d
                       "3:\n"
                       : [row] "+r"(row), [dxQ8] "+r"(dxQ8), [a] "=&r"(a), [dst] "=&r"(dst), [res] "=&r"(res),
                         [base2] "=&r"(base2)
-                      : [dy2Q4] "r"(dy2Q4), [invR2] "r"(invR2Fixed), [rc] "r"((int32_t)rCol),
-                        [gc] "r"((int32_t)gCol), [bc] "r"((int32_t)bCol), [a8v] "r"((int32_t)a8v), [alut] "r"(alut),
+                      : [dy2Q4] "r"(dy2Q4), [invR2] "r"(invR2Fixed), [rc] "r"(static_cast<int32_t>(rCol)),
+                        [gc] "r"(static_cast<int32_t>(gCol)), [bc] "r"(static_cast<int32_t>(bCol)), [a8v] "r"(static_cast<int32_t>(a8v)), [alut] "r"(alut),
                         [n] "r"(count)
                       : "memory");
 }

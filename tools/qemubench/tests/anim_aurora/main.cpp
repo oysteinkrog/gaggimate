@@ -139,9 +139,9 @@ __attribute__((noinline)) static void auroraPixelsAsm(uint16_t *__restrict dst, 
         "extui   %[t2], %[p2], 8, 10\n"
         "addx4   %[t2], %[t2], %[w2]\n"
         "l32i    %[t2], %[t2], 0\n"
+        "movi    %[t3], 0\n" /* zero into idle t3, fills t2's load-use slot */
         "add     %[t1], %[t1], %[t2]\n"
-        "movi    %[t2], 0\n"
-        "max     %[t1], %[t1], %[t2]\n"
+        "max     %[t1], %[t1], %[t3]\n"
         "mull    %[t1], %[t1], %[t1]\n"
         "extui   %[t2], %[dfi], 0, 5\n"
         "add     %[t2], %[df], %[t2]\n"

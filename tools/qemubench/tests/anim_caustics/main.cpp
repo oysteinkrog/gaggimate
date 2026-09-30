@@ -1,6 +1,7 @@
 /* QEMU self-test for causticsRowKernel, the Xtensa kernel AnimCaustics.cpp's
  * device band() dispatches to for every row (asm-caustics pass, 2026-09-04):
- * a scalar, hand-scheduled 4-wide span loop (three DDS sine-wave gathers,
+ * a scalar, hand-scheduled 8-wide span loop (GRID=8, round 3; the 4-wide
+ * GRID=4 kernel this test first copied is gone) (three DDS sine-wave gathers,
  * coarse-grid interpolation, branchless abs, then the two-stage
  * shapeLUT -> palette gather) using every one of the 14 usable Xtensa
  * registers with zero spills -- see the kernel's own header comment in
@@ -78,8 +79,8 @@ static void uart_put_dec(int v) {
  * ------------------------------------------------------------------------ */
 __attribute__((noinline)) static void causticsRowKernel(uint16_t *row, const int16_t *lut, const uint8_t *shapeLUT,
                                                          const uint16_t *rgbRowBase, uint32_t phase0, uint32_t phase1,
-                                                         uint32_t phase2, uint32_t step0x4, uint32_t step1x4,
-                                                         uint32_t step2x4, int32_t sumCur0, int nSpans) {
+                                                         uint32_t phase2, uint32_t step0x8, uint32_t step1x8,
+                                                         uint32_t step2x8, int32_t sumCur0, int nSpans) {
     int32_t val = sumCur0;
     int32_t cnt = nSpans; // loop trip count first, then reused as sumNext
     int32_t stepI, t;     // pure scratch, no meaningful value on entry
@@ -96,11 +97,11 @@ __attribute__((noinline)) static void causticsRowKernel(uint16_t *row, const int
                  "add %[phase2], %[phase2], %[step2]\n" // filler: val1's load-use gap
                  "extui %[t], %[phase2], 22, 10\n"
                  "addx2 %[t], %[t], %[lut]\n"
-                 "l16si %[t], %[t], 0\n"                  // t = val2 (no filler slot; see AnimCaustics.cpp)
+                 "l16si %[t], %[t], 0\n"                  // t = val2 (no filler slot; see header)
                  "add %[cnt], %[cnt], %[stepI]\n"         // cnt = val0+val1 (both loaded long enough ago)
                  "add %[cnt], %[cnt], %[t]\n"             // cnt = sumNext (pays val2's stall)
                  "sub %[stepI], %[cnt], %[val]\n"         // stepI = sumNext - sumCur (ALU->ALU, no stall)
-                 "srai %[stepI], %[stepI], 2\n"           // stepI = stepInterp
+                 "srai %[stepI], %[stepI], 3\n"           // stepI = stepInterp, GRID==8 (was 2 at GRID==4)
                  // --- pixel 0 (val == sumCur, unmodified so far) ---
                  "abs %[t], %[val]\n"
                  "add %[t], %[t], %[shapeLUT]\n"
@@ -108,7 +109,7 @@ __attribute__((noinline)) static void causticsRowKernel(uint16_t *row, const int
                  "add %[val], %[val], %[stepI]\n" // val = val_p1, filler for shading0's load-use gap
                  "addx8 %[t], %[t], %[rgbBase]\n"
                  "l16ui %[t], %[t], 0\n" // t = pixel0 color
-                 "s16i %[t], %[row], 0\n"
+                 "s16i %[t], %[row], 0\n" // no spare register for a filler here (see header)
                  // --- pixel 1 (val == val_p1) ---
                  "abs %[t], %[val]\n"
                  "add %[t], %[t], %[shapeLUT]\n"
@@ -129,41 +130,74 @@ __attribute__((noinline)) static void causticsRowKernel(uint16_t *row, const int
                  "abs %[t], %[val]\n"
                  "add %[t], %[t], %[shapeLUT]\n"
                  "l8ui %[t], %[t], 0\n"
-                 "or %[val], %[cnt], %[cnt]\n" // val = sumNext for the next span, filler
+                 "add %[val], %[val], %[stepI]\n" // val = val_p4
                  "addx8 %[t], %[t], %[rgbBase]\n"
                  "l16ui %[t], %[t], 6\n"
                  "s16i %[t], %[row], 6\n"
-                 "addi %[row], %[row], 8\n"
+                 // --- pixel 4 (val == val_p4; colSlot wraps 3->0, same dither cycle) ---
+                 "abs %[t], %[val]\n"
+                 "add %[t], %[t], %[shapeLUT]\n"
+                 "l8ui %[t], %[t], 0\n"
+                 "add %[val], %[val], %[stepI]\n" // val = val_p5
+                 "addx8 %[t], %[t], %[rgbBase]\n"
+                 "l16ui %[t], %[t], 0\n"
+                 "s16i %[t], %[row], 8\n"
+                 // --- pixel 5 (val == val_p5) ---
+                 "abs %[t], %[val]\n"
+                 "add %[t], %[t], %[shapeLUT]\n"
+                 "l8ui %[t], %[t], 0\n"
+                 "add %[val], %[val], %[stepI]\n" // val = val_p6
+                 "addx8 %[t], %[t], %[rgbBase]\n"
+                 "l16ui %[t], %[t], 2\n"
+                 "s16i %[t], %[row], 10\n"
+                 // --- pixel 6 (val == val_p6) ---
+                 "abs %[t], %[val]\n"
+                 "add %[t], %[t], %[shapeLUT]\n"
+                 "l8ui %[t], %[t], 0\n"
+                 "add %[val], %[val], %[stepI]\n" // val = val_p7
+                 "addx8 %[t], %[t], %[rgbBase]\n"
+                 "l16ui %[t], %[t], 4\n"
+                 "s16i %[t], %[row], 12\n"
+                 // --- pixel 7 (val == val_p7, last of span) ---
+                 "abs %[t], %[val]\n"
+                 "add %[t], %[t], %[shapeLUT]\n"
+                 "l8ui %[t], %[t], 0\n"
+                 "or %[val], %[cnt], %[cnt]\n" // val = sumNext for the next span, filler
+                 "addx8 %[t], %[t], %[rgbBase]\n"
+                 "l16ui %[t], %[t], 6\n"
+                 "s16i %[t], %[row], 14\n"
+                 "addi %[row], %[row], 16\n"
                  "2:\n"
                  : [row] "+r"(row), [phase0] "+r"(phase0), [phase1] "+r"(phase1), [phase2] "+r"(phase2),
                    [val] "+r"(val), [cnt] "+r"(cnt), [stepI] "=&r"(stepI), [t] "=&r"(t)
-                 : [lut] "r"(lut), [shapeLUT] "r"(shapeLUT), [rgbBase] "r"(rgbRowBase), [step0] "r"(step0x4),
-                   [step1] "r"(step1x4), [step2] "r"(step2x4)
+                 : [lut] "r"(lut), [shapeLUT] "r"(shapeLUT), [rgbBase] "r"(rgbRowBase), [step0] "r"(step0x8),
+                   [step1] "r"(step1x8), [step2] "r"(step2x8)
                  : "memory");
 }
 
 /* ------------------------------------------------------------------------
  * Independent scalar C++ reference, matching AnimCaustics.cpp's bandRef span
- * loop (PHASE_SHIFT=22, SIN_N=1024, GRID=4, rgbLUT stride 4). Written fresh
+ * loop (PHASE_SHIFT=22, SIN_N=1024, GRID=8, rgbLUT stride 4: an 8-pixel span
+ * walks the 4-entry colSlot cycle twice). Written fresh
  * from the algorithm, not derived from the asm above.
  * ------------------------------------------------------------------------ */
 static void causticsRowRef(uint16_t *row, const int16_t *lut, const uint8_t *shapeLUT, const uint16_t *rgbRowBase,
-                            uint32_t phase0, uint32_t phase1, uint32_t phase2, uint32_t step0x4, uint32_t step1x4,
-                            uint32_t step2x4, int32_t sumCur0, int nSpans) {
+                            uint32_t phase0, uint32_t phase1, uint32_t phase2, uint32_t step0x8, uint32_t step1x8,
+                            uint32_t step2x8, int32_t sumCur0, int nSpans) {
     uint32_t p0 = phase0, p1 = phase1, p2 = phase2;
     int32_t sumCur = sumCur0;
     for (int span = 0; span < nSpans; span++) {
-        const uint32_t np0 = p0 + step0x4;
-        const uint32_t np1 = p1 + step1x4;
-        const uint32_t np2 = p2 + step2x4;
+        const uint32_t np0 = p0 + step0x8;
+        const uint32_t np1 = p1 + step1x8;
+        const uint32_t np2 = p2 + step2x8;
         const int32_t sumNext = lut[(np0 >> 22) & 1023] + lut[(np1 >> 22) & 1023] + lut[(np2 >> 22) & 1023];
-        const int32_t stepInterp = (sumNext - sumCur) >> 2;
+        const int32_t stepInterp = (sumNext - sumCur) >> 3; // GRID==8
 
         int32_t val = sumCur;
-        for (int k = 0; k < 4; k++) {
+        for (int k = 0; k < 8; k++) {
             const int32_t m = val >> 31;
             const int32_t mag = (val ^ m) - m;
-            row[span * 4 + k] = rgbRowBase[shapeLUT[mag] * 4 + k];
+            row[span * 8 + k] = rgbRowBase[shapeLUT[mag] * 4 + (k & 3)];
             val += stepInterp;
         }
 
@@ -216,7 +250,7 @@ static void buildFixtures() {
 struct Case {
     const char *name;
     uint32_t phase0, phase1, phase2;
-    uint32_t step0x4, step1x4, step2x4;
+    uint32_t step0x8, step1x8, step2x8; // per 8-pixel span
     int nSpans;
 };
 
@@ -240,31 +274,31 @@ int main(void) {
     // no-libc reasoning as everywhere else in this harness). static places
     // it directly in .rodata with no runtime copy.
     static const Case cases[] = {
-        // Defaults-like: moderate steps, mid-range phase, w=480 (120 spans).
-        {"defaults_w480", 0x10000000u, 0x40000000u, 0x80000000u, 0x00300000u, 0x00200000u, 0x00500000u, 120},
-        // Half resolution, w=240 (60 spans), different phase/step mix.
-        {"halfres_w240", 0x00000000u, 0xC0000000u, 0x7FFF0000u, 0x00080000u, 0x00600000u, 0x00010000u, 60},
+        // Defaults-like: moderate steps, mid-range phase, w=480 (60 spans).
+        {"defaults_w480", 0x10000000u, 0x40000000u, 0x80000000u, 0x00600000u, 0x00400000u, 0x00A00000u, 60},
+        // Half resolution, w=240 (30 spans), different phase/step mix.
+        {"halfres_w240", 0x00000000u, 0xC0000000u, 0x7FFF0000u, 0x00100000u, 0x00C00000u, 0x00020000u, 30},
         // p=0 speed/scale-like: tiny steps (near-stationary field), single span.
         {"tiny_step_n1", 0x3F800000u, 0x9F800000u, 0x00800000u, 0x00000001u, 0x00000000u, 0x00000002u, 1},
         // p=100 speed/scale-like: phase starts within one step of the uint32
         // wrap boundary and the step magnitude (~0x14000000) matches the
         // fastest realistic per-span rotation (freq up to ~0.116 rad/px at
-        // freqScale=1.9, times GRID=4, in DDS units) -- exercises the wrap in
+        // freqScale=1.9, times GRID=8, in DDS units; doubled from the GRID=4 values) -- exercises the wrap in
         // the phase adds and extui's handling of the wrapped bit pattern
         // without the pathological lut-table-wraparound jump a much larger,
         // physically-unreachable step would add on top of this synthetic
         // ramp lut (real sin1024 has no such discontinuity; this ramp does,
         // at index 1023->0, so step magnitude is kept realistic here rather
         // than adversarial).
-        {"wrap_realistic_step", 0xFFFF0000u, 0x00010000u, 0x80000000u, 0x14000000u, 0x0F000000u, 0x18000000u, 32},
+        {"wrap_realistic_step", 0xFFFF0000u, 0x00010000u, 0x80000000u, 0x28000000u, 0x1E000000u, 0x30000000u, 16},
         // Phase values chosen to land exactly on the lut extremes (idx 0 and
         // idx 1023, i.e. lut values -512 and 511) so sumCur0/gather magnitude
         // hits close to the full +-1536 range the abs/shapeLUT chain must
         // handle without overflowing the SHAPE_N=1552 table. Step stays small
         // (well under one lut index per span) so the interpolation cannot
         // itself walk back across the 1023->0 ramp discontinuity.
-        {"extreme_mag_pos", 0xFFF00000u, 0xFFF00000u, 0xFFF00000u, 0x00100000u, 0x00100000u, 0x00100000u, 8},
-        {"extreme_mag_neg", 0x00000000u, 0x00000000u, 0x00000000u, 0x00100000u, 0x00100000u, 0x00100000u, 8},
+        {"extreme_mag_pos", 0xFFF00000u, 0xFFF00000u, 0xFFF00000u, 0x00200000u, 0x00200000u, 0x00200000u, 4},
+        {"extreme_mag_neg", 0x00000000u, 0x00000000u, 0x00000000u, 0x00200000u, 0x00200000u, 0x00200000u, 4},
     };
     const int nCases = static_cast<int>(sizeof(cases) / sizeof(cases[0]));
 
@@ -275,12 +309,12 @@ int main(void) {
         // this size, same reasoning as the `static` on `cases` above.
         const Case &cs = cases[c];
         const int32_t sumCur0 = gatherSum(cs.phase0, cs.phase1, cs.phase2);
-        const int n = cs.nSpans * 4;
+        const int n = cs.nSpans * 8;
 
-        causticsRowKernel(gotRow, g_lut, g_shapeLUT, g_rgbRowBase, cs.phase0, cs.phase1, cs.phase2, cs.step0x4,
-                           cs.step1x4, cs.step2x4, sumCur0, cs.nSpans);
-        causticsRowRef(refRow, g_lut, g_shapeLUT, g_rgbRowBase, cs.phase0, cs.phase1, cs.phase2, cs.step0x4,
-                        cs.step1x4, cs.step2x4, sumCur0, cs.nSpans);
+        causticsRowKernel(gotRow, g_lut, g_shapeLUT, g_rgbRowBase, cs.phase0, cs.phase1, cs.phase2, cs.step0x8,
+                           cs.step1x8, cs.step2x8, sumCur0, cs.nSpans);
+        causticsRowRef(refRow, g_lut, g_shapeLUT, g_rgbRowBase, cs.phase0, cs.phase1, cs.phase2, cs.step0x8,
+                        cs.step1x8, cs.step2x8, sumCur0, cs.nSpans);
 
         int mismatch = 0;
         int firstIdx = -1;
