@@ -41,6 +41,26 @@
 // give a different offset. Everything else the page rounds, the normals, the
 // light vector and the ramp scale, goes through Math.round, which rounds a
 // half toward positive infinity, so those use floor(v + 0.5).
+//
+// Parameters. Speed, Relief and Brightness came with the port; the other
+// five were added on 2026-10-01 (gm-3vj.45). Each new one defaults to 50,
+// and at 50 it reproduces the constant this file used to hard-code, so the
+// default picture is the old one bit for bit. All five act in frame(), on
+// the light vector or on the per texel index, so bandRef and the kernel are
+// untouched and the 32..150 window the kernel relies on still holds.
+//   p3 Light height  the light's mean height, 30..130 (80 at 50). Low light
+//                    leaves the flat sheet dark and only the rims that face
+//                    the light lit; high light brightens the whole sheet.
+//   p4 Height swing  how far the height breathes, 0..44 (22 at 50).
+//   p5 Base tone     the flat surface's index offset, 20..60 (40 at 50), so
+//                    the whole sheet darkens or lightens under the shading.
+//   p6 Contrast      the shading's distance from the flat surface's lit
+//                    level, scaled by 1/8 at 0, 1 at 50 and 3 at 100. At 0
+//                    the dimples nearly vanish; at 100 the rims clip to the
+//                    window's ends.
+//   p7 Orbit shape   the light's path, a line along x at 0, the circle at
+//                    50 and an ellipse twice as tall as wide at 100, so the
+//                    top and bottom rims light less or more than the sides.
 
 #include "BgAnim.h"
 #include "BgAnimCommon.h"
@@ -67,8 +87,8 @@ constexpr int TPX = 2;               // texel footprint, 1 << TPX screen pixels
 constexpr int TILE_PX = TS << TPX;   // 256: a row repeats every 256 pixels
 constexpr int DIMPLE_R = 18;         // bell radius in texels, neighbours overlap
 constexpr int DIMPLE_H = 9;          // bell depth in height units
-constexpr int BASE = 40;             // index of the unlit flat surface
-constexpr int LZ = 80, LZ_SWING = 22;
+// The design's constants, now the defaults of Base tone, Light height and
+// Height swing: 40, 80 and 22 at parameter 50.
 constexpr int TURN_MS = 24000;       // the light circles once every 24 s
 constexpr int LZ_PERIOD_MS = 37000;  // the light's height breathes on 37 s
 constexpr int IDX_LO = 32, IDX_HI = 150;
@@ -174,7 +194,7 @@ bool init(int w, int h) {
     return true;
 }
 
-void frame(uint32_t tMs, int, int, const uint8_t p[4]) {
+void frame(uint32_t tMs, int, int, const uint8_t p[BG_ANIM_PARAMS]) {
     const uint32_t gen = themeGen();
     if (lastBright != p[2] || lastThemeGen != gen) {
         // The page's own ramp scale. Integer round(p[2] * 76 / 100) matches its
@@ -201,16 +221,33 @@ void frame(uint32_t tMs, int, int, const uint8_t p[4]) {
     // Relief rides on the light's lateral reach, which is the same thing as
     // scaling the normal's xy and costs nothing per texel. 55..125.
     const int lr = 55 + (static_cast<int>(p[1]) * 70 + 50) / 100;
+    // Integer round(p * k / 100) equals the page's Math.round for every p in
+    // 0..100, since the numerator is never negative. At p = 50 these give
+    // exactly the old constants, and orbit is exactly 1.0, so the products
+    // below are the old ones.
+    const int base = 20 + (static_cast<int>(p[5]) * 40 + 50) / 100;
+    const int lzMid = 30 + static_cast<int>(p[3]);
+    const int lzSwing = (static_cast<int>(p[4]) * 44 + 50) / 100;
+    const int c = p[6] <= 50 ? 4 + (static_cast<int>(p[6]) * 28) / 50 : 32 + ((static_cast<int>(p[6]) - 50) * 64) / 50;
+    const double orbit = static_cast<double>(p[7]) / 50.0;
     const int lx = jsRound(lr * cos(ang));
-    const int ly = jsRound(lr * sin(ang));
-    const int lz = LZ + jsRound(LZ_SWING * sin(lzAng));
+    const int ly = jsRound(lr * orbit * sin(ang));
+    int lz = lzMid + jsRound(lzSwing * sin(lzAng));
+    // Low height plus full swing would put the light under the sheet. The
+    // floor never fires at the defaults, where lz stays inside 58..102.
+    if (lz < 8) lz = 8;
+    // The flat surface's lit level, Nz = 127 times lz, in index units. The
+    // contrast scale works about it in Q5, and at c = 32 the + 16 rounding
+    // leaves the old d unchanged.
+    const int flat = (127 * lz) >> 8;
     // 4,096 dot products, three products each. This stays scalar on purpose:
     // the page's sum is exact in 32 bits before the shift, and the largest
     // term reaches 44,700, so an int16 vector sum would saturate and shifting
     // each product before the sum would not give the same answer.
     const int16_t *n = nrm;
     for (int k = 0; k < TS * TS; k++, n += 3) {
-        int v = BASE + ((n[0] * lx + n[1] * ly + n[2] * lz) >> 8);
+        const int d = (n[0] * lx + n[1] * ly + n[2] * lz) >> 8;
+        int v = base + flat + (((d - flat) * c + 16) >> 5);
         if (v < IDX_LO) {
             v = IDX_LO;
         } else if (v > IDX_HI) {
@@ -400,7 +437,11 @@ const BgAnimation bg_anim_dimples = {
     {{"speed", "Speed", 50},
      {"relief", "Relief", 58},
      {"bright", "Brightness", 62},
-     {nullptr, nullptr, 0}},
+     {"height", "Light height", 50},
+     {"swing", "Height swing", 50},
+     {"tone", "Base tone", 50},
+     {"contrast", "Contrast", 50},
+     {"orbit", "Orbit shape", 50}},
     init,
     frame,
     band,

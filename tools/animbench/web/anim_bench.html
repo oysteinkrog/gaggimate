@@ -6678,7 +6678,7 @@ function pcDither(dst, amp) {
   const TPX = 2;                // texel footprint, 1 << TPX screen pixels
   const DIMPLES = [[8, 8], [40, 8], [24, 40], [56, 40]];   // staggered lattice
   const DR = 18, DH = 9;        // raised-cosine bell, neighbours overlap
-  const BASE = 40, LZ = 80, LZ_SWING = 22, LZ_PERIOD_S = 37;
+  const LZ_PERIOD_S = 37;
   const IDX_LO = 32, IDX_HI = 150;
   const TURN_S = 24;            // light circles once every 24 s
 
@@ -6688,6 +6688,11 @@ function pcDither(dst, amp) {
       { key: 'speed', label: 'Speed', def: 50 },
       { key: 'relief', label: 'Relief', def: 58 },
       { key: 'bright', label: 'Brightness', def: 62 },
+      { key: 'height', label: 'Light height', def: 50 },
+      { key: 'swing', label: 'Height swing', def: 50 },
+      { key: 'tone', label: 'Base tone', def: 50 },
+      { key: 'contrast', label: 'Contrast', def: 50 },
+      { key: 'orbit', label: 'Orbit shape', def: 50 },
     ],
     init(w, h, state) {
       const H = new Float32Array(TS * TS);
@@ -6740,12 +6745,23 @@ function pcDither(dst, amp) {
       // same thing as scaling the normal's xy and costs nothing per texel.
       const lr = 55 + Math.round(p[1] * 70 / 100);
       const ang = 2 * Math.PI * ts / TURN_S;
+      // The five sliders added on 2026-10-01 (gm-3vj.45), mirroring
+      // AnimDimples.cpp. At 50 each gives the old constant (base 40, height
+      // 80, swing 22, contrast 1, round orbit), so the default is unchanged.
+      const base = 20 + Math.round(p[5] * 40 / 100);
+      const lzMid = 30 + p[3];
+      const lzSwing = Math.round(p[4] * 44 / 100);
+      const c = p[6] <= 50 ? 4 + Math.floor(p[6] * 28 / 50) : 32 + Math.floor((p[6] - 50) * 64 / 50);
+      const orbit = p[7] / 50;
       const lx = Math.round(lr * Math.cos(ang));
-      const ly = Math.round(lr * Math.sin(ang));
-      const lz = LZ + Math.round(LZ_SWING * Math.sin(2 * Math.PI * ts / LZ_PERIOD_S));
+      const ly = Math.round(lr * orbit * Math.sin(ang));
+      let lz = lzMid + Math.round(lzSwing * Math.sin(2 * Math.PI * ts / LZ_PERIOD_S));
+      if (lz < 8) lz = 8;
+      const flat = (127 * lz) >> 8;
       const { Nx, Ny, Nz, T, dith, pal } = state;
       for (let k = 0; k < TS * TS; k++) {
-        let v = BASE + ((Nx[k] * lx + Ny[k] * ly + Nz[k] * lz) >> 8);
+        const d = (Nx[k] * lx + Ny[k] * ly + Nz[k] * lz) >> 8;
+        let v = base + flat + ((((d - flat) * c) + 16) >> 5);
         if (v < IDX_LO) v = IDX_LO; else if (v > IDX_HI) v = IDX_HI;
         T[k] = v;
       }
