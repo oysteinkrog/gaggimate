@@ -18,9 +18,12 @@
 // [21,305], 285 distinct values. PAD=64 covers that with margin.
 //
 // radiusLUT is padded the same way on the high side (RPAD entries repeating
-// radiusLUT[255]) so radiusLUT[ridx] needs no >255 clamp either; safe for
-// this animation's fixed 480x480 target (the farthest corner from center
-// gives r^2>>RSHIFT of about 244, inside 255+RPAD with margin to spare).
+// radiusLUT[255]) so radiusLUT[ridx] needs no >255 clamp either. init()
+// picks the bucket shift (g_rshift) as the smallest that keeps the farthest
+// corner's r^2 >> g_rshift at or under 255: 9 at 480 and 466 (about 244 and
+// 230), 7 at 240 and 233 (about 244 and 227). A fixed shift of 9 gave the
+// half-resolution field a quarter of the buckets, so its rings were four
+// times as coarse (bganim F3, gm-bzu.50).
 //
 // Breathe is frame-constant, so instead of subtracting it from every pixel
 // it is folded once per row into a small per-column tile alongside the
@@ -39,7 +42,7 @@
 // since round 4 below replaces every one of them).
 //
 // Round 4 (PIE for the per-row half), 2026-09-05, design-worker (ember
-// lane). The field term (radiusLUT[r2>>RSHIFT]) and the flicker term
+// lane). The field term (radiusLUT[r2>>g_rshift]) and the flicker term
 // (flickerLUT[noise]) both depend only on a row pair's shared even row, so
 // they are now computed once per pair, into fieldRow and flickerRow, by two
 // small scalar kernels (emberFieldRow, emberFlickerFieldRow). Dither is not
@@ -111,6 +114,7 @@
 // avoids by keeping every row's own dither, for a similar production number.
 
 #include "BgAnim.h"
+#include "BgAnimClock.h"
 #include "BgAnimCommon.h"
 #include <math.h>
 #include <string.h>
@@ -133,7 +137,7 @@ constexpr uint32_t STEP2 = static_cast<uint32_t>(4294967296.0 / 17700.0);
 constexpr uint32_t STEP3 = static_cast<uint32_t>(4294967296.0 / 6100.0);
 constexpr uint32_t PHOFF2 = static_cast<uint32_t>(1.7 / 6.2831853 * 4294967296.0);
 constexpr uint32_t PHOFF3 = static_cast<uint32_t>(4.2 / 6.2831853 * 4294967296.0);
-constexpr int RSHIFT = 9; // r^2 -> radiusLUT bucket
+int g_rshift = 9; // r^2 -> radiusLUT bucket; set per render size in init()
 
 constexpr int PAD = 64;
 constexpr int PAL_EXT_N = 256 + 2 * PAD;
@@ -142,7 +146,7 @@ constexpr int RLUT_N = 256 + RPAD;
 
 uint16_t *paletteExt = nullptr; // [PAL_EXT_N]; real ramp lives at paletteExt+PAD
 uint16_t *palette = nullptr;    // = paletteExt + PAD, 256 entries, reversed theme ramp
-int8_t *radiusLUT = nullptr;    // [RLUT_N]; r^2>>RSHIFT -> FIELD_BIAS-centered radius byte (see FIELD_BIAS)
+int8_t *radiusLUT = nullptr;    // [RLUT_N]; r^2>>g_rshift -> FIELD_BIAS-centered radius byte (see FIELD_BIAS)
 int16_t *flickerLUT = nullptr;  // [256]; noise byte -> signed flicker contribution
 const uint8_t *noise = nullptr;
 int8_t *fieldRow = nullptr; // [allocW]; radiusLUT[ridx] for the current row pair, shared by both rows, still FIELD_BIAS-centered
@@ -158,6 +162,9 @@ uint8_t lastFlickerParam = 255;
 int g_cx = 240, g_cy = 260;
 float g_maxR = 353.7f;
 int g_breathe = 0, g_flickerAmp = 0, g_sx = 0, g_sy = 0;
+// Animation time. Not reset by release(), so the full/half switch keeps the
+// breathing where it was.
+AnimClock g_clock;
 
 // Ramp is reversed so index 0 (brightest) lands at the glow's core, which
 // sits at screen center where the UI puts its readouts; starting the ramp
@@ -224,7 +231,7 @@ void buildRadiusLut(uint8_t glow) {
     const float glowGain = 0.55f + 0.014f * glow;
     const float scale = 255.0f / (g_maxR * glowGain);
     for (int i = 0; i < 256; i++) {
-        const float r = sqrtf(static_cast<float>(i << RSHIFT));
+        const float r = sqrtf(static_cast<float>(i << g_rshift));
         radiusLUT[i] = static_cast<int8_t>(clamp8f(CORE_FLOOR + r * scale) - FIELD_BIAS);
     }
     for (int i = 256; i < RLUT_N; i++) {
@@ -300,6 +307,11 @@ bool init(int w, int h) {
     const float dx = static_cast<float>(g_cx);
     const float dy = static_cast<float>(g_cy > h - g_cy ? g_cy : h - g_cy);
     g_maxR = sqrtf(dx * dx + dy * dy);
+    const int maxR2 = g_cx * g_cx + static_cast<int>(dy) * static_cast<int>(dy);
+    g_rshift = 0;
+    while ((maxR2 >> g_rshift) > 255) {
+        g_rshift++;
+    }
     lastThemeGen = 0xFFFFFFFF;
     lastGlow = 255;
     lastFlickerParam = 255;
@@ -316,20 +328,27 @@ void frame(uint32_t tMs, int, int, const uint8_t p[4]) {
         buildRadiusLut(p[1]);
         lastGlow = p[1];
     }
-    const float spd = speedMul(p[0]);
-    const uint32_t vt = static_cast<uint32_t>(static_cast<int64_t>(static_cast<double>(tMs) * spd));
+    // Animation time from the wrapped millis() delta (BgAnimClock.h,
+    // gm-bzu.50). The old vt = tMs * spd went through double, so it kept its
+    // precision, but it jumped on every speed change and, at any speed but
+    // 1, at the millis() wrap. The DDS steps are Q32 turns per millisecond,
+    // so << 16 makes them the clock's Q48 rates.
+    g_clock.advance(tMs, speedMul(p[0]));
     const float pulseGain = p[3] / 100.0f;
-    const float s1 = sin1024((vt * STEP1) >> 22) * (1.0f / SIN_AMP);
-    const float s2 = sin1024(((vt * STEP2) + PHOFF2) >> 22) * (1.0f / SIN_AMP);
-    const float s3 = sin1024(((vt * STEP3) + PHOFF3) >> 22) * (1.0f / SIN_AMP);
+    const float s1 = sin1024(oscTurnQ32(g_clock, static_cast<uint64_t>(STEP1) << 16) >> 22) * (1.0f / SIN_AMP);
+    const float s2 = sin1024((oscTurnQ32(g_clock, static_cast<uint64_t>(STEP2) << 16) + PHOFF2) >> 22) * (1.0f / SIN_AMP);
+    const float s3 = sin1024((oscTurnQ32(g_clock, static_cast<uint64_t>(STEP3) << 16) + PHOFF3) >> 22) * (1.0f / SIN_AMP);
     g_breathe = static_cast<int>(pulseGain * (0.30f * s1 + 0.15f * s2 + 0.05f * s3) * 70.0f);
     g_flickerAmp = (10 * p[2]) / 100;
     if (p[2] != lastFlickerParam) {
         buildFlickerLut(g_flickerAmp);
         lastFlickerParam = p[2];
     }
-    g_sx = static_cast<int>((vt * 6u) >> 10) & 255;
-    g_sy = static_cast<int>((vt * 4u) >> 10) & 255;
+    // Noise scroll, 6/1024 and 4/1024 px per millisecond over the 256 px
+    // texture: a Q32 turn of the texture is 6 << 14 and 4 << 14 per
+    // millisecond, and its top 8 bits are the pixel offset.
+    g_sx = static_cast<int>(oscTurnQ32(g_clock, static_cast<uint64_t>(6u << 14) << 16) >> 24);
+    g_sy = static_cast<int>(oscTurnQ32(g_clock, static_cast<uint64_t>(4u << 14) << 16) >> 24);
 }
 
 // Portable reference for the field/finalize design: the spec this file's own
@@ -397,7 +416,7 @@ void bandRef(uint16_t *dst, int y0, int rows, int w, uint32_t, const uint8_t *) 
             const int dyP2 = dyP * dyP;
             for (int x = 0; x < w; x++) {
                 const int dx = x - g_cx;
-                fieldRow[x] = radiusLUT[(dx * dx + dyP2) >> RSHIFT];
+                fieldRow[x] = radiusLUT[(dx * dx + dyP2) >> g_rshift];
             }
             if (doFlicker) {
                 const uint8_t *noiseRow = noise + ((fieldP + g_sy) & 255) * 256;
@@ -431,7 +450,7 @@ void bandRef(uint16_t *dst, int y0, int rows, int w, uint32_t, const uint8_t *) 
 #if defined(__XTENSA__) && !defined(GM_BGANIM_NO_ASM)
 
 // New this round: single-level scalar gather, fieldRow[x] =
-// radiusLUT[r2>>RSHIFT], two pixels per iteration. Same incremental r^2 walk
+// radiusLUT[r2>>g_rshift], two pixels per iteration. Same incremental r^2 walk
 // as the portable version (two adds per pixel, exact integer identity for
 // (x-cx)^2, no per-pixel multiply) and the same two-pixel interleave shape
 // already proven on this chip (see the round-4 header paragraph above),
@@ -441,10 +460,17 @@ void bandRef(uint16_t *dst, int y0, int rows, int w, uint32_t, const uint8_t *) 
 // 7 cycles/pixel here, against emberGatherRow's 23 / 2px = 11.5) - it does
 // half the memory work of the kernel it is modeled on.
 //
+// The shift is g_rshift, set per render size (gm-bzu.50), so it goes
+// through SAR: one ssr before the loop, then sra in the two slots that held
+// srai with an immediate. Same instruction count and order in the loop.
+// SAR needs no clobber (GCC has no name for it): the compiler emits its own
+// ssr together with every variable shift as one pattern and never assumes
+// SAR survives between instructions, and interrupt entry saves it.
+//
 // Schedule (one iteration, 2 pixels, %[ridx0]/%[ridx1] free after use):
-//   1 srai ridx0 <- r2>>RSHIFT              (r2 for pixel 0)
+//   1 sra  ridx0 <- r2>>SAR                 (r2 for pixel 0)
 //   2 add  r2 += ddx                        3 addi ddx += 2
-//   4 srai ridx1 <- r2>>RSHIFT              (r2 for pixel 1)
+//   4 sra  ridx1 <- r2>>SAR                 (r2 for pixel 1)
 //   5 add  r2 += ddx                        6 addi ddx += 2
 //   7 add  ridx0 = &radiusLUT[ridx0]
 //   8 l8ui ridx0 = radiusLUT[ridx0]         <- load
@@ -476,16 +502,17 @@ void bandRef(uint16_t *dst, int y0, int rows, int w, uint32_t, const uint8_t *) 
 // assumption every other kernel in this file already makes for its own
 // output buffer.
 __attribute__((noinline)) static void GM_ANIM_IRAM emberFieldRow(int8_t *__restrict out, const int8_t *__restrict radiusLUTIn,
-                                                                 int r2_0, int ddx_0, int wPairs) {
+                                                                 int r2_0, int ddx_0, int wPairs, int rshift) {
     int r2 = r2_0;
     int ddx = ddx_0;
     int8_t *wr = out;
     int ridx0, ridx1;
-    asm volatile("loopnez %[n], 2f\n"
-                 "srai   %[ridx0], %[r2], %[rshift]\n"
+    asm volatile("ssr    %[rshift]\n"
+                 "loopnez %[n], 2f\n"
+                 "sra    %[ridx0], %[r2]\n"
                  "add    %[r2], %[r2], %[ddx]\n"
                  "addi   %[ddx], %[ddx], 2\n"
-                 "srai   %[ridx1], %[r2], %[rshift]\n"
+                 "sra    %[ridx1], %[r2]\n"
                  "add    %[r2], %[r2], %[ddx]\n"
                  "addi   %[ddx], %[ddx], 2\n"
                  "add    %[ridx0], %[rlut], %[ridx0]\n"
@@ -499,7 +526,7 @@ __attribute__((noinline)) static void GM_ANIM_IRAM emberFieldRow(int8_t *__restr
                  "addi   %[wr], %[wr], 2\n"
                  "2:\n"
                  : [r2] "+r"(r2), [ddx] "+r"(ddx), [wr] "+r"(wr), [ridx0] "=&r"(ridx0), [ridx1] "=&r"(ridx1)
-                 : [n] "r"(wPairs), [rlut] "r"(radiusLUTIn), [rshift] "i"(RSHIFT)
+                 : [n] "r"(wPairs), [rlut] "r"(radiusLUTIn), [rshift] "r"(rshift)
                  : "memory");
 }
 
@@ -740,7 +767,7 @@ GM_ANIM_IRAM void band(uint16_t *dst, int y0, int rows, int w, uint32_t tMs, con
             const int dyP = fieldP - g_cy;
             const int r2_0 = dxTop0 * dxTop0 + dyP * dyP;
             const int ddx_0 = 2 * dxTop0 + 1;
-            emberFieldRow(fieldRow, radiusLUT, r2_0, ddx_0, wPairs);
+            emberFieldRow(fieldRow, radiusLUT, r2_0, ddx_0, wPairs, g_rshift);
             if (doFlicker) {
                 const uint8_t *noiseRow = noise + ((fieldP + g_sy) & 255) * 256;
                 emberFlickerFieldRow(flickerRow, noiseRow, flickerLUT, g_sx, wPairs);

@@ -6,6 +6,7 @@
 // 2026-08-15.
 
 #include "BgAnim.h"
+#include "BgAnimClock.h"
 #include "BgAnimCommon.h"
 #include <math.h>
 
@@ -16,10 +17,13 @@ constexpr int FF_MAX = 40;
 
 struct Firefly {
     float homeX, homeY;
-    float wx1, wx2, wy1, wy2;
-    float ax1, ax2, ay1, ay2;
+    // Wander and pulse rates as Q48 turns per animation millisecond
+    // (BgAnimClock.h), so each oscillator keeps its own exact phase however
+    // long the device has been up (gm-bzu.50).
+    uint64_t rx1, rx2, ry1, ry2, rPulse;
+    float ax1, ax2, ay1, ay2; // render pixels, already scaled to the render size
     float px1, px2, py1, py2;
-    float pulseFreq, pulsePhase;
+    float pulsePhase;
     float radialNorm;
     float size;
     float hueMix;
@@ -69,9 +73,26 @@ float *expLUT = nullptr;     // EXP_LUT_N entries, expf(-(dr*dr)*61.7f) over |dr
 int ffCount = 0;
 int builtCount = -1;
 int allocH = 0; // height bgLUT was sized for
-uint32_t rng = 0x9e3779b9;
+constexpr uint32_t RNG_SEED = 0x9e3779b9;
+// release() puts the seed back, so init() at the other resolution spawns the
+// same field rather than a new one, and a full/half switch does not swap
+// every mote on screen (gm-bzu.50).
+uint32_t rng = RNG_SEED;
 uint32_t lastThemeGen = 0xFFFFFFFF;
 int g_h = 480;
+// Render size over the 480 px design size. The wander amplitudes and the glow
+// radius are in pixels, so the half-resolution path (240 or 233 px, expanded
+// 2x) would otherwise show every mote twice as big and twice as restless as
+// the full-resolution path does (gm-bzu.50). Exactly 1 at 480.
+float g_scale = 1.0f;
+// Animation time. Not reset by release(), so the full/half switch keeps
+// the motion where it was (BgAnimClock.h).
+AnimClock g_clock;
+// The shimmer ring's phase, a Q32 fraction of its cycle. Its period depends
+// on the shimmer parameter, so it is accumulated rather than computed from
+// the clock: a parameter change bends the ring's speed without moving it.
+uint32_t g_ringQ32 = 0;
+uint64_t g_ringSimQ16 = 0; // the clock's simQ16 when g_ringQ32 was last advanced
 
 // LUT replacement for expf(-(dr*dr)*61.7f), indexed directly by |dr|.
 // dr magnitudes beyond the table domain contribute ~0 anyway.
@@ -106,20 +127,26 @@ void spawnAll(int count, int w, int h) {
         Firefly &f = ff[i];
         f.homeX = cx + cosf(theta) * rr;
         f.homeY = cy + sinf(theta) * rr;
+        // Radians per animation millisecond, same draws in the same order as
+        // before the rates moved to Q48, so the same fireflies spawn.
         const float basePeriod = 9000.0f + nextRandf(rng) * 5000.0f;
-        f.wx1 = 6.2831853f / basePeriod;
-        f.wx2 = f.wx1 * 1.618f * (0.85f + nextRandf(rng) * 0.3f);
-        f.wy1 = f.wx1 * 1.13f * (0.9f + nextRandf(rng) * 0.2f);
-        f.wy2 = f.wx1 * 1.414f * (0.85f + nextRandf(rng) * 0.3f);
-        f.ax1 = 16.0f + nextRandf(rng) * 10.0f;
-        f.ax2 = 7.0f + nextRandf(rng) * 6.0f;
-        f.ay1 = 16.0f + nextRandf(rng) * 10.0f;
-        f.ay2 = 7.0f + nextRandf(rng) * 6.0f;
+        const float wx1 = 6.2831853f / basePeriod;
+        const float wx2 = wx1 * 1.618f * (0.85f + nextRandf(rng) * 0.3f);
+        const float wy1 = wx1 * 1.13f * (0.9f + nextRandf(rng) * 0.2f);
+        const float wy2 = wx1 * 1.414f * (0.85f + nextRandf(rng) * 0.3f);
+        f.rx1 = oscRateQ48(wx1);
+        f.rx2 = oscRateQ48(wx2);
+        f.ry1 = oscRateQ48(wy1);
+        f.ry2 = oscRateQ48(wy2);
+        f.ax1 = (16.0f + nextRandf(rng) * 10.0f) * g_scale;
+        f.ax2 = (7.0f + nextRandf(rng) * 6.0f) * g_scale;
+        f.ay1 = (16.0f + nextRandf(rng) * 10.0f) * g_scale;
+        f.ay2 = (7.0f + nextRandf(rng) * 6.0f) * g_scale;
         f.px1 = nextRandf(rng) * 6.2831853f;
         f.px2 = nextRandf(rng) * 6.2831853f;
         f.py1 = nextRandf(rng) * 6.2831853f;
         f.py2 = nextRandf(rng) * 6.2831853f;
-        f.pulseFreq = 6.2831853f / (2400.0f + nextRandf(rng) * 3600.0f);
+        f.rPulse = oscRateQ48(6.2831853f / (2400.0f + nextRandf(rng) * 3600.0f));
         f.pulsePhase = nextRandf(rng) * 6.2831853f;
         f.radialNorm = rr / rMax;
         f.size = 0.8f + nextRandf(rng) * 0.5f;
@@ -165,6 +192,7 @@ bool init(int w, int h) {
             expLUT[i] = expf(-(dr * dr) * 61.7f);
         }
     }
+    g_scale = static_cast<float>(w < h ? w : h) * (1.0f / 480.0f);
     return true;
 }
 
@@ -184,15 +212,19 @@ void frame(uint32_t tMs, int w, int h, const uint8_t p[4]) {
     const float glow = 0.7f + (p[2] / 100.0f) * 0.8f;
     const float shimAmt = p[3] / 100.0f;
     const float shimPeriod = 14000.0f - shimAmt * 8000.0f;
-    const float t = tMs * speed;
-    const float ringPos = fmodf(t, shimPeriod) / shimPeriod;
+    g_clock.advance(tMs, speed);
+    // One turn of the ring per shimPeriod animation milliseconds.
+    const uint64_t ringRate = oscRateQ48(6.283185307179586 / shimPeriod);
+    g_ringQ32 += static_cast<uint32_t>(((g_clock.simQ16 - g_ringSimQ16) * ringRate) >> 32);
+    g_ringSimQ16 = g_clock.simQ16;
+    const float ringPos = static_cast<float>(g_ringQ32) * (1.0f / 4294967296.0f);
 
     for (int i = 0; i < ffCount; i++) {
         const Firefly &f = ff[i];
         FfDraw &d = draws[i];
-        d.x = f.homeX + f.ax1 * fastSinRad(f.wx1 * t + f.px1) + f.ax2 * fastSinRad(f.wx2 * t + f.px2);
-        d.y = f.homeY + f.ay1 * fastSinRad(f.wy1 * t + f.py1) + f.ay2 * fastSinRad(f.wy2 * t + f.py2);
-        d.R = (6.0f + f.size * 8.0f) * glow;
+        d.x = f.homeX + f.ax1 * fastSinRad(oscRad(g_clock, f.rx1) + f.px1) + f.ax2 * fastSinRad(oscRad(g_clock, f.rx2) + f.px2);
+        d.y = f.homeY + f.ay1 * fastSinRad(oscRad(g_clock, f.ry1) + f.py1) + f.ay2 * fastSinRad(oscRad(g_clock, f.ry2) + f.py2);
+        d.R = (6.0f + f.size * 8.0f) * glow * g_scale;
         d.cxQ8 = static_cast<int32_t>(d.x * 256.0f + 0.5f);
         d.cyQ8 = static_cast<int32_t>(d.y * 256.0f + 0.5f);
         // Q16.16 scaled by the 63-entry alphaLUT span: idx = (dx*dx+dy*dy)*invR2Fixed >> 16.
@@ -201,7 +233,7 @@ void frame(uint32_t tMs, int w, int h, const uint8_t p[4]) {
         // and brighter than the float reference (visible as a systematic,
         // not random, diff against golden).
         d.invR2Fixed = static_cast<int32_t>((63.0f * 65536.0f) / (d.R * d.R) + 0.5f);
-        float pulse = fastSinRad(f.pulseFreq * t + f.pulsePhase);
+        float pulse = fastSinRad(oscRad(g_clock, f.rPulse) + f.pulsePhase);
         pulse = pulse < 0 ? 0 : pulse * pulse;
         float brightness = 0.28f + 0.72f * pulse;
         if (shimAmt > 0) {
@@ -525,6 +557,7 @@ void release() {
     allocH = 0;
     builtCount = -1;
     lastThemeGen = 0xFFFFFFFF;
+    rng = RNG_SEED;
 }
 
 } // namespace

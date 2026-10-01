@@ -6,6 +6,7 @@
 // (Fable), 2026-08-15.
 
 #include "BgAnim.h"
+#include "BgAnimClock.h"
 #include "BgAnimCommon.h"
 #include <math.h>
 
@@ -17,7 +18,8 @@ constexpr int NUM_BANDS = 30; // 480/16
 
 struct Star {
     float x, y;
-    float phase, rate;
+    float phase;
+    uint32_t twinkleQ32; // twinkle rate, Q32 fraction of a turn per millisecond (gm-bzu.50)
     float baseBrightness;
     uint8_t sizeClass;
     float hue;
@@ -74,11 +76,21 @@ struct Shoot {
                       // per-band progress calc is a multiply, not a divide.
 };
 Shoot shoot;
-uint32_t nextShootMs = 6000;
-uint32_t rng = 0xC0FFEE;
-uint32_t lastTMs = 0;
-uint32_t lastDriftMs = 0xFFFFFFFF; // sentinel: no drift step on the very first frame() call
-int allocW = 0, allocH = 0;        // dimensions dx2/dy2 were sized for
+// Animation time (BgAnimClock.h, gm-bzu.50), run at speed 1: the speed
+// setting scales the drift only, as before. Twinkle phases and the shooting
+// star schedule read it, and the drift and the shooting star step by its
+// wrapped delta. Not reset by release(), so a full/half switch carries on.
+AnimClock g_clock;
+uint32_t nextShootMs = 6000; // on g_clock.ms(), compared by signed difference
+constexpr uint32_t RNG_SEED = 0xC0FFEE;
+// release() puts the seed back, so init() at the other resolution spawns the
+// same field rather than a new one, and a full/half switch does not swap
+// every star on screen (gm-bzu.50).
+uint32_t rng = RNG_SEED;
+int allocW = 0, allocH = 0; // dimensions dx2/dy2 were sized for
+// Render size over the 480 px design size, for the motions measured in
+// pixels per second (drift and the shooting star). Exactly 1 at 480.
+float g_scale = 1.0f;
 
 // Hot-slab placement (BgAnimCommon.h's GM_BGANIM_HOT_SLAB): 9,216 B budget.
 // Round 2 ranked by reads/frame and left dx2 in PSRAM on the theory that its
@@ -149,14 +161,23 @@ bool init(int w, int h) {
             release();
             return false;
         }
+        // dx2 and dy2 hold squared distances in 480 px units, so the
+        // vignette's fixed `>> 10` (an immediate in starfieldVigRowAsm) lands
+        // on the same index at the same place on screen at every render
+        // size. They used to be in render pixels, which at 240 px put the
+        // rim at index 14 instead of 56 and made the half-resolution sky
+        // twice as bright at the edge (bganim F3, gm-bzu.50). vigLUT itself
+        // never depended on the size: index i shades 1 - sqrt(i / 127).
         const float cx = w * 0.5f, cy = h * 0.5f;
+        const float s480 = 480.0f / static_cast<float>(w < h ? w : h);
+        const float r2Scale = s480 * s480; // exactly 1 at 480
         for (int x = 0; x < w; x++) {
             const float d = x - cx;
-            dx2[x] = static_cast<int32_t>(d * d);
+            dx2[x] = static_cast<int32_t>(d * d * r2Scale);
         }
         for (int y = 0; y < h; y++) {
             const float d = y - cy;
-            dy2[y] = static_cast<int32_t>(d * d);
+            dy2[y] = static_cast<int32_t>(d * d * r2Scale);
         }
         const float maxR2 = cx * cx + cy * cy;
         for (int i = 0; i < 128; i++) {
@@ -170,7 +191,9 @@ bool init(int w, int h) {
             stars[i].x = nextRandf(rng) * w;
             stars[i].y = nextRandf(rng) * h;
             stars[i].phase = nextRandf(rng) * 6.2831853f;
-            stars[i].rate = 0.3f + nextRandf(rng) * 1.1f;
+            // 0.3 to 1.4 rad/s, as before, now a Q32 turn per millisecond.
+            const float rate = 0.3f + nextRandf(rng) * 1.1f;
+            stars[i].twinkleQ32 = static_cast<uint32_t>(rate * (4294967296.0f / 6283.1853f) + 0.5f);
             stars[i].baseBrightness = layer == 0   ? (0.25f + nextRandf(rng) * 0.25f)
                                       : layer == 1 ? (0.45f + nextRandf(rng) * 0.25f)
                                                    : (0.7f + nextRandf(rng) * 0.3f);
@@ -185,6 +208,7 @@ bool init(int w, int h) {
         rebuildThemeAssets();
         lastThemeGen = themeGen();
     }
+    g_scale = static_cast<float>(w < h ? w : h) * (1.0f / 480.0f);
     return true;
 }
 
@@ -216,7 +240,8 @@ void frame(uint32_t tMs, int w, int h, const uint8_t p[4]) {
         lastThemeGen = themeGen();
     }
     g_nStars = 40 + (p[1] * (MAX_STARS - 40)) / 100;
-    const float t = tMs * 0.001f;
+    const uint32_t stepMs = g_clock.advance(tMs, 1.0f);
+    const uint32_t nowMs = g_clock.ms();
     const float twinkleAmt = p[2] * (1.0f / 100.0f); // reciprocal multiply: dividend isn't a compile-time
                                                      // constant, so the compiler can't fold /100.0f itself
     // Old formula was `scale = 1 - twinkleAmt*(1-twinkle)`, i.e. a depth
@@ -228,17 +253,16 @@ void frame(uint32_t tMs, int w, int h, const uint8_t p[4]) {
     // extinguish) at p[2]=100: 1 - (5/3)*(1-0.4) = 0. Expands only the top of
     // the range; p[2]<=50 is unchanged from before.
     const float twinkleDepth = twinkleAmt * (twinkleAmt * (4.0f / 3.0f) + (1.0f / 3.0f));
-    const float driftPxPerSec = 3.0f * speedMul(p[0]);
+    const float driftPxPerSec = 3.0f * speedMul(p[0]) * g_scale;
 
     // Integer phase-wrap drift: replaces the old fmodf(absolute_position, w) with
     // a per-star Q16.16 accumulator stepped by real elapsed time (dt) and wrapped
     // with a single compare+subtract (no libm, no divide). dt is clamped so a long
-    // pause between frame() calls can't overflow the Q16.16 delta; the very first
-    // call (lastDriftMs sentinel) takes dt=0 so star positions start exactly at
-    // their init()-seeded x, matching the old t=0 closed form exactly.
-    const float rawDt = (tMs - lastDriftMs) * 0.001f;
-    const float driftDt = lastDriftMs == 0xFFFFFFFF ? 0.0f : (rawDt < 2.0f ? rawDt : 2.0f);
-    lastDriftMs = tMs;
+    // pause between frame() calls can't overflow the Q16.16 delta; the clock's
+    // first call takes a zero step so star positions start exactly at their
+    // init()-seeded x, matching the old t=0 closed form exactly.
+    const float rawDt = static_cast<float>(stepMs) * 0.001f;
+    const float driftDt = rawDt < 2.0f ? rawDt : 2.0f;
     const int32_t wQ = w << 16;
 
     // fastSinRad()/fastCosRad() each pay a call8 + load into cosTableF() per
@@ -269,7 +293,8 @@ void frame(uint32_t tMs, int w, int h, const uint8_t p[4]) {
         // no -ffast-math) since the rounding differs -- so do it by hand.
         const float edgeRaw = (x < (w - x) ? x : (w - x)) * 0.05f; // *0.05f == /20.0f
         const float edgeFade = edgeRaw < 1.0f ? edgeRaw : 1.0f;
-        const float twinkleRad = t * s.rate + s.phase - 1.5707963f;
+        const float twinkleRad =
+            static_cast<float>(nowMs * s.twinkleQ32) * (6.2831853f / 4294967296.0f) + s.phase - 1.5707963f;
         const float twinkle = 0.7f + 0.3f * cosTab[static_cast<int>(twinkleRad * RAD_TO_TAB) & 255];
         float bF = s.baseBrightness * (1.0f - twinkleDepth * (1.0f - twinkle)) * edgeFade;
         bF = bF < 0.0f ? 0.0f : (bF > 1.0f ? 1.0f : bF);
@@ -283,13 +308,15 @@ void frame(uint32_t tMs, int w, int h, const uint8_t p[4]) {
         bandHead[bandIdx] = static_cast<int16_t>(i);
     }
 
-    // Shooting star lifecycle (dt from the frame delta; robust to pauses).
-    const float dt = lastTMs != 0 && tMs > lastTMs ? (tMs - lastTMs) * 0.001f : 0.033f;
-    lastTMs = tMs;
+    // Shooting star lifecycle, on the clock's step (clamped like the drift's)
+    // and its wrapping millisecond count, so the schedule survives the
+    // millis() wrap: the old `tMs > nextShootMs` fired every frame once
+    // nextShootMs had wrapped past zero.
+    const float dt = driftDt;
     const uint8_t shootFreq = p[3];
-    if (!shoot.active && shootFreq > 0 && tMs > nextShootMs) {
+    if (!shoot.active && shootFreq > 0 && static_cast<int32_t>(nowMs - nextShootMs) > 0) {
         const float angle = 3.14159265f * 0.15f + nextRandf(rng) * 3.14159265f * 0.2f;
-        const float speed = 260.0f + nextRandf(rng) * 140.0f;
+        const float speed = (260.0f + nextRandf(rng) * 140.0f) * g_scale;
         shoot.active = true;
         shoot.x = nextRandf(rng) * w * 0.6f;
         shoot.y = nextRandf(rng) * w * 0.3f;
@@ -299,7 +326,7 @@ void frame(uint32_t tMs, int w, int h, const uint8_t p[4]) {
         shoot.maxLife = 0.5f + nextRandf(rng) * 0.3f;
         shoot.invMaxLife = 1.0f / shoot.maxLife; // one divide per shoot trigger (rare), not per band()
         const uint32_t interval = 1500 > 30000 - shootFreq * 280 ? 1500 : 30000 - shootFreq * 280;
-        nextShootMs = tMs + interval + static_cast<uint32_t>(nextRandf(rng) * interval * 0.5f);
+        nextShootMs = nowMs + interval + static_cast<uint32_t>(nextRandf(rng) * interval * 0.5f);
     }
     if (shoot.active) {
         shoot.life += dt;
@@ -423,7 +450,7 @@ void vigRowScalar(uint16_t *row, int y, int w) {
     const uint16_t *const p3 = vb + 384;
     int x = 0;
     for (; x + 3 < w; x += 4) {
-        int i0 = (dyv + dx2[x + 0]) >> 10; // 480x480: max r2 ~115200 -> 112
+        int i0 = (dyv + dx2[x + 0]) >> 10; // r2 in 480 px units: max ~115200 -> 112
         int i1 = (dyv + dx2[x + 1]) >> 10;
         int i2 = (dyv + dx2[x + 2]) >> 10;
         int i3 = (dyv + dx2[x + 3]) >> 10;
@@ -583,8 +610,7 @@ void release() {
     releaseTable(vigColor, 128 * VIG_PHASES * sizeof(uint16_t));
     allocW = allocH = 0;
     lastThemeGen = 0xFFFFFFFF;
-    lastTMs = 0;
-    lastDriftMs = 0xFFFFFFFF;
+    rng = RNG_SEED;
 }
 
 } // namespace

@@ -154,6 +154,7 @@
 // touched src/, and again here with tools/animbench/interlace_check.cpp
 // across the whole fleet.
 #include "BgAnim.h"
+#include "BgAnimClock.h"
 #include "BgAnimCommon.h"
 #include <math.h>
 #include <string.h>
@@ -236,8 +237,34 @@ constexpr int32_t INTEN14_MAX = 358;                    // p[1]=100 -> (100/100.
 constexpr int32_t ROWLUT_PAD = 8;                       // covers dither's -8 low excursion
 constexpr int32_t ROWLUT_SIZE = ((SQ_MAX * INTEN14_MAX) >> 12) + 7 + ROWLUT_PAD + 1 + 8;
 
-float g_t = 0, g_A1 = 0, g_A2 = 0;
+float g_A1 = 0, g_A2 = 0;
 int32_t g_inten14 = 0; // intensity * 1.4 in Q8
+
+// Animation time (BgAnimClock.h, gm-bzu.50). Not reset by release(), so the
+// full/half switch keeps the curtains where they were. Each of the four
+// motions below keeps its own phase. The coefficients are the old ones, in
+// radians per second of t, where t was tMs * 0.001 * 0.45 * speed:
+// 0.45e-3 converts them to radians per animation millisecond.
+AnimClock g_clock;
+constexpr double T_PER_MS = 0.45e-3;
+constexpr uint64_t RATE_WARP1 = oscRateQ48(0.5 * T_PER_MS);
+constexpr uint64_t RATE_WARP2 = oscRateQ48(-0.44 * T_PER_MS);
+constexpr uint64_t RATE_BASE1 = oscRateQ48(0.12 * T_PER_MS);
+constexpr uint64_t RATE_BASE2 = oscRateQ48(0.07 * T_PER_MS);
+float g_warpPh1 = 0, g_warpPh2 = 0; // this frame's warp phases, radians in [0, 2*pi]
+
+// Size. The curtains are drawn in render pixels: STEP1/STEP2 per column and
+// 0.021/0.013 rad per row. On the half-resolution path (240 or 233 px,
+// expanded 2x) that would show curtains twice as wide and twice as tall on
+// screen, and y / 480 would put the top half of the envelope and of the sky
+// ramp across the whole screen (bganim F3, gm-bzu.50). g_invH normalises y
+// exactly. g_zoom is the integer spatial scale: 1 at 480 and 466, 2 at the
+// half widths. The asm kernel steps by the fixed STEP1/STEP2, so the column
+// frequency doubles through the tables instead: at zoom 2, wLut1/wLut2 hold
+// sin(2*theta) and each row's phase is halved, which reads the same curve
+// at twice the rate (see computeRowState).
+int g_zoom = 1;
+float g_invH = 1.0f / 480.0f;
 
 // Per-row phase = TICKS*(warp(y) + t*coeff). t*coeff is frame-constant (same
 // for all 480 rows), but t itself is proportional to uptime and unbounded, so
@@ -253,6 +280,10 @@ int32_t g_inten14 = 0; // intensity * 1.4 in Q8
 // wraps identically to converting the combined sum, so long-uptime behavior
 // is unchanged.
 uint32_t g_phBase1 = 0, g_phBase2 = 0;
+// The paragraph above predates the clock: t no longer grows with uptime, and
+// the bases now come from oscTurnQ32 (a full turn is 2^18 Q8 ticks, the top
+// 18 bits of the Q32 turn). The split between a per-frame base and a bounded
+// per-row warp term still holds.
 
 // Curtain color rides the theme's mid-to-bright range; the fade ramp keeps
 // low intensities near-black so the additive blend stays subtle.
@@ -265,7 +296,7 @@ void buildGlowLUT() {
     }
 }
 
-bool init(int, int) {
+bool init(int w, int h) {
     const int16_t *lut = sinLut();
     if (lut == nullptr) {
         return false;
@@ -298,9 +329,13 @@ bool init(int, int) {
     if (glowLUT == nullptr || wLut1 == nullptr || wLut2 == nullptr || g_rowLUT == nullptr) {
         return false;
     }
+    // Half widths (233 to 240) take zoom 2; 466 and 480 take 1.
+    g_zoom = (w < h ? w : h) < 360 ? 2 : 1;
+    g_invH = 1.0f / static_cast<float>(h);
     for (int i = 0; i < SIN_N; i++) {
-        wLut1[i] = (static_cast<int32_t>(lut[i]) * W1) >> 7;
-        wLut2[i] = (static_cast<int32_t>(lut[i]) * W2) >> 7;
+        const int j = (i * g_zoom) & (SIN_N - 1);
+        wLut1[i] = (static_cast<int32_t>(lut[j]) * W1) >> 7;
+        wLut2[i] = (static_cast<int32_t>(lut[j]) * W2) >> 7;
     }
     buildGlowLUT();
     lastThemeGen = themeGen();
@@ -314,14 +349,16 @@ void frame(uint32_t tMs, int, int, const uint8_t p[4]) {
     }
     // One real rebuild per frame at most per background segment: see g_rowLUT.
     g_lastBgIdx = -1;
-    g_t = (tMs * 0.001f) * 0.45f * speedMul(p[0]);
+    g_clock.advance(tMs, speedMul(p[0]));
+    g_warpPh1 = oscRad(g_clock, RATE_WARP1);
+    g_warpPh2 = oscRad(g_clock, RATE_WARP2);
     g_A1 = 0.6f + (p[2] / 100.0f) * 2.4f;
     g_A2 = 0.4f + (p[2] / 100.0f) * 1.6f;
     g_inten14 = static_cast<int32_t>((p[1] / 100.0f) * 1.4f * 256.0f);
-    // Wraparound-safe once/frame (see note by g_phBase1/2 above); replaces the
-    // 960x/frame int64 conversion that used to run per-row inside band().
-    g_phBase1 = static_cast<uint32_t>(static_cast<int64_t>(g_t * 0.12f * TICKS));
-    g_phBase2 = static_cast<uint32_t>(static_cast<int64_t>(g_t * 0.07f * TICKS));
+    // Q8 ticks of the 1024-entry LUT: a full turn is 2^18, the top 18 bits of
+    // the Q32 turn. uint32 wraps whole turns, so the bases stay exact.
+    g_phBase1 = oscTurnQ32(g_clock, RATE_BASE1) >> 14;
+    g_phBase2 = oscTurnQ32(g_clock, RATE_BASE2) >> 14;
 }
 
 // Pure helpers shared by both bandRef and the asm dispatch path below (both
@@ -387,13 +424,14 @@ struct RowState {
     int dbase;
 };
 
-RowState computeRowState(int y, float t, const float *ct, uint16_t rowLUT[ROWLUT_SIZE], int &lastBgIdx) {
+RowState computeRowState(int y, const float *ct, uint16_t rowLUT[ROWLUT_SIZE], int &lastBgIdx) {
     auto rowCos = [ct](float rad) { return ct[static_cast<int>(rad * (256.0f / 6.2831853f)) & 255]; };
     auto rowSin = [&rowCos](float rad) { return rowCos(rad - 1.5707963f); };
 
-    const float warp1 = rowSin(y * 0.021f + t * 0.5f) * g_A1;
-    const float warp2 = rowSin(y * 0.013f - t * 0.44f + 1.7f) * g_A2;
-    const float yn = y * (1.0f / 480.0f); // was a divide (__divsf3 libcall on device)
+    const float yz = static_cast<float>(y * g_zoom);
+    const float warp1 = rowSin(yz * 0.021f + g_warpPh1) * g_A1;
+    const float warp2 = rowSin(yz * 0.013f + g_warpPh2 + 1.7f) * g_A2;
+    const float yn = y * g_invH; // was a divide (__divsf3 libcall on device)
     float env = 1.0f - fabsf(yn - 0.32f) * (1.0f / 0.85f);
     env = env < 0 ? 0 : env * env;
     const int32_t envQ12 = static_cast<int32_t>(env * 4096.0f);
@@ -408,6 +446,15 @@ RowState computeRowState(int y, float t, const float *ct, uint16_t rowLUT[ROWLUT
 
     st.ph1 = g_phBase1 + static_cast<uint32_t>(static_cast<int32_t>(warp1 * TICKS));
     st.ph2 = g_phBase2 + static_cast<uint32_t>(static_cast<int32_t>(warp2 * TICKS));
+    if (g_zoom == 2) {
+        // The zoom-2 tables hold sin(2*theta) and repeat every 512 entries,
+        // so angle theta is read at index theta / 2. A full turn is 2^18 Q8
+        // ticks and 2^18 divides 2^32, so halving the wrapped uint32 is
+        // exact modulo the 512-entry period. The kernel's STEP per column
+        // then advances the angle by 2*STEP.
+        st.ph1 >>= 1;
+        st.ph2 >>= 1;
+    }
     // Dither row phase keyed by the ROW PAIR, y >> 1, not by y itself.
     // Callers always pass ySrc (always even) as y here (see the 2026-09-05
     // redesign note in the file header), so this is really the pair's
@@ -450,10 +497,10 @@ void auroraOddTail(uint16_t *__restrict row, uint32_t ph1, uint32_t ph2, int32_t
 // being written, because the caller always derives ySrc from y before
 // deciding whether to duplicate (see bandRef below and the file header's
 // 2026-09-05 note).
-void renderAuroraRowRef(uint16_t *__restrict row, int ySrc, float t, const int32_t *__restrict w1,
+void renderAuroraRowRef(uint16_t *__restrict row, int ySrc, const int32_t *__restrict w1,
                          const int32_t *__restrict w2, const float *__restrict ct, uint16_t rowLUT[ROWLUT_SIZE],
                          int &lastBgIdx, const int32_t *ditherFold, int w) {
-    const RowState st = computeRowState(ySrc, t, ct, rowLUT, lastBgIdx);
+    const RowState st = computeRowState(ySrc, ct, rowLUT, lastBgIdx);
     uint32_t ph1 = st.ph1, ph2 = st.ph2;
     const int32_t rowScale = st.rowScale;
     const int32_t *rowDf = ditherFold + st.dbase;
@@ -500,7 +547,6 @@ void renderAuroraRowRef(uint16_t *__restrict row, int ySrc, float t, const int32
 // common case is exactly one compute-and-duplicate pair per call. See the
 // file header's 2026-09-05 note for why this matters.
 void bandRef(uint16_t *dst, int y0, int rows, int w, uint32_t, const uint8_t *) {
-    const float t = g_t;
     const int32_t *__restrict w1 = wLut1;
     const int32_t *__restrict w2 = wLut2;
     const float *__restrict ct = cosTableF();
@@ -518,7 +564,7 @@ void bandRef(uint16_t *dst, int y0, int rows, int w, uint32_t, const uint8_t *) 
         if ((y & 1) == 0 && row + 1 < rows) {
             // y starts a pair and y+1 is also in this call: compute once,
             // duplicate. The common case for every real caller.
-            renderAuroraRowRef(out, ySrc, t, w1, w2, ct, rowLUT, lastBgIdx, ditherFold, w);
+            renderAuroraRowRef(out, ySrc, w1, w2, ct, rowLUT, lastBgIdx, ditherFold, w);
             memcpy(out + w, out, static_cast<size_t>(w) * sizeof(uint16_t));
             row += 2;
         } else {
@@ -527,7 +573,7 @@ void bandRef(uint16_t *dst, int y0, int rows, int w, uint32_t, const uint8_t *) 
             // interlace). Either way, render ySrc's content directly so
             // this row matches what it would be as half of a same-call
             // pair.
-            renderAuroraRowRef(out, ySrc, t, w1, w2, ct, rowLUT, lastBgIdx, ditherFold, w);
+            renderAuroraRowRef(out, ySrc, w1, w2, ct, rowLUT, lastBgIdx, ditherFold, w);
             row += 1;
         }
     }
@@ -685,10 +731,10 @@ __attribute__((noinline)) static void auroraPixelsAsm(uint16_t *__restrict dst, 
 
 // Computes ySrc's row state and runs the asm kernel into one row. Same
 // ySrc-derivation contract as renderAuroraRowRef above.
-void renderAuroraRowAsm(uint16_t *row, int ySrc, float t, const int32_t *__restrict w1,
+void renderAuroraRowAsm(uint16_t *row, int ySrc, const int32_t *__restrict w1,
                          const int32_t *__restrict w2, const float *__restrict ct, uint16_t rowLUT[ROWLUT_SIZE],
                          int &lastBgIdx, const int32_t *ditherFold, int w) {
-    const RowState st = computeRowState(ySrc, t, ct, rowLUT, lastBgIdx);
+    const RowState st = computeRowState(ySrc, ct, rowLUT, lastBgIdx);
 
     // Bootstrap sample at x=0, using the row's unadvanced ph1/ph2, matches
     // renderAuroraRowRef's `scur = sampleScaledSq()` before its pair loop.
@@ -706,7 +752,6 @@ void renderAuroraRowAsm(uint16_t *row, int ySrc, float t, const int32_t *__restr
 // safe). No GM_ANIM_IRAM this round: see the file header's perf-pass-4 note
 // for why it was dropped.
 void band(uint16_t *dst, int y0, int rows, int w, uint32_t, const uint8_t *) {
-    const float t = g_t;
     const int32_t *__restrict w1 = wLut1;
     const int32_t *__restrict w2 = wLut2;
     const float *__restrict ct = cosTableF();
@@ -722,11 +767,11 @@ void band(uint16_t *dst, int y0, int rows, int w, uint32_t, const uint8_t *) {
         const int ySrc = y & ~1;
         uint16_t *out = dst + static_cast<size_t>(row) * w;
         if ((y & 1) == 0 && row + 1 < rows) {
-            renderAuroraRowAsm(out, ySrc, t, w1, w2, ct, rowLUT, lastBgIdx, ditherFold, w);
+            renderAuroraRowAsm(out, ySrc, w1, w2, ct, rowLUT, lastBgIdx, ditherFold, w);
             memcpy(out + w, out, static_cast<size_t>(w) * sizeof(uint16_t));
             row += 2;
         } else {
-            renderAuroraRowAsm(out, ySrc, t, w1, w2, ct, rowLUT, lastBgIdx, ditherFold, w);
+            renderAuroraRowAsm(out, ySrc, w1, w2, ct, rowLUT, lastBgIdx, ditherFold, w);
             row += 1;
         }
     }
