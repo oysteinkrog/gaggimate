@@ -248,6 +248,10 @@ export const BG_ANIMATIONS = [
       { key: 'height', label: 'Height', def: 45 },
       { key: 'curvature', label: 'Curvature', def: 35 },
       { key: 'softness', label: 'Softness', def: 60 },
+      { key: 'swell', label: 'Swell', def: 50 },
+      { key: 'drift', label: 'Drift', def: 50 },
+      { key: 'glow', label: 'Glow', def: 50 },
+      { key: 'reflect', label: 'Reflection', def: 50 },
     ],
   },
   {

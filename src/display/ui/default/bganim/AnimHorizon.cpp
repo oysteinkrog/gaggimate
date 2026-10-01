@@ -48,7 +48,7 @@ uint16_t *palette = nullptr;   // 256 RGB565 colours, per-pixel gather: slab
 int16_t *dithOff = nullptr;    // 64 Bayer offsets, frame() only: PSRAM
 
 int allocW = 0, allocH = 0, colStride = 0;
-uint8_t lastP[4] = {255, 255, 255, 255};
+uint8_t lastP[BG_ANIM_PARAMS] = {255, 255, 255, 255, 255, 255, 255, 255};
 uint32_t lastThemeGen = 0xFFFFFFFF;
 
 // At 480x480: colTermPh 7,680 B + rowTerm 960 B + palette 512 B =
@@ -95,10 +95,17 @@ bool init(int w, int h) {
     return true;
 }
 
-void buildHorizonPalette(int softP) {
+// Glow (p[6]) scales the main glow's gain and Reflection (p[7]) sets the
+// reflection's share of it. Both are exact at 50: glow * 50 / 50 is glow,
+// and glow * 50 / 150 is glow / 3 for every non-negative integer glow, so
+// the default palette is the one this file built before them (gm-3vj.18).
+// At 0 the glow, or the reflection, is gone; at 100 the glow is twice the
+// gain (clipped to the ramp's end) and the reflection two thirds of it.
+void buildHorizonPalette(int softP, int glowP, int reflectP) {
     buildThemeRamp(themeRamp, 256);
     const int soft = 22 + softP * 50 / 100; // glow half-width: 22..72 indices
-    const int glow = 100 + softP * 64 / 100; // main glow gain: 100..164
+    const int glow = (100 + softP * 64 / 100) * glowP / 50; // 0..328
+    const int reflect = glow * reflectP / 150;               // 0..2/3 glow
     for (int i = 0; i < 256; i++) {
         const int d = i - 128; // horizon at the middle of the palette
         // Actual page ramp positions: sky 42 down to 12, ground 10 up to
@@ -116,7 +123,7 @@ void buildHorizonPalette(int softP) {
         if (d < 0 && ac < soft) {
             const int k = 256 - ac * 256 / soft;
             const int kk = (k * k) >> 8;
-            v += (((kk * kk) >> 8) * (glow / 3)) >> 8;
+            v += (((kk * kk) >> 8) * reflect) >> 8;
         }
         palette[i] = themeRamp[v < 0 ? 0 : (v > 255 ? 255 : v)];
     }
@@ -131,10 +138,10 @@ void buildHorizonPalette(int softP) {
 
 void frame(uint32_t tMs, int w, int h, const uint8_t p[BG_ANIM_PARAMS]) {
     const uint32_t gen = themeGen();
-    if (memcmp(p, lastP, 4) != 0 || gen != lastThemeGen) {
-        buildHorizonPalette(p[3]);
+    if (memcmp(p, lastP, BG_ANIM_PARAMS) != 0 || gen != lastThemeGen) {
+        buildHorizonPalette(p[3], p[6], p[7]);
         lastThemeGen = gen;
-        memcpy(lastP, p, 4);
+        memcpy(lastP, p, BG_ANIM_PARAMS);
     }
 
     // Exactly the page's >>> 0 after each multiplication, before shifting.
@@ -155,6 +162,11 @@ void frame(uint32_t tMs, int w, int h, const uint8_t p[BG_ANIM_PARAMS]) {
     const int16_t *sl = sinLut();
     const int cx = w / 2, span = cx > 0 ? cx : 1;
     const int k = (static_cast<int>(p[2]) - 50) * CURVE_SPAN / 50;
+    // Swell (p[4]) scales the two travelling waves and Drift (p[5]) the two
+    // vertical drift terms, still at 0 and twice the amplitude at 100. At 50
+    // each product divides back to the old constant exactly.
+    const int sw1 = 150 * p[4] / 50, sw2 = 72 * p[4] / 50;
+    const int dr1 = 240 * p[5] / 50, dr2 = 110 * p[5] / 50;
     int lo = 32767, hi = -32768;
     for (int x = 0; x < w; x++) {
         const int dx = x - cx;
@@ -165,8 +177,8 @@ void frame(uint32_t tMs, int w, int h, const uint8_t p[BG_ANIM_PARAMS]) {
         // 21/16 and 55/16 sine samples/pixel. Subtract phu for rightward
         // travel, add phu2 for leftward travel. Amplitudes are Q4 units.
         const int v = ((k * q) >> 8) +
-                      ((sl[(static_cast<uint32_t>((x * 21) >> 4) - phu) & (SIN_N - 1)] * 150) >> 9) +
-                      ((sl[(static_cast<uint32_t>((x * 55) >> 4) + phu2) & (SIN_N - 1)] * 72) >> 9);
+                      ((sl[(static_cast<uint32_t>((x * 21) >> 4) - phu) & (SIN_N - 1)] * sw1) >> 9) +
+                      ((sl[(static_cast<uint32_t>((x * 55) >> 4) + phu2) & (SIN_N - 1)] * sw2) >> 9);
         colCurve[x] = static_cast<int16_t>(v);
         if (v < lo) lo = v;
         if (v > hi) hi = v;
@@ -178,8 +190,8 @@ void frame(uint32_t tMs, int w, int h, const uint8_t p[BG_ANIM_PARAMS]) {
     // then clamp dither to that range even when its amplitude is larger.
     const int colMax = hi - lo + 40;
     const int mean = HEIGHT_LO + static_cast<int>(p[1]) * (HEIGHT_HI - HEIGHT_LO) / 100;
-    const int offset = mean + ((sl[phd & (SIN_N - 1)] * 240) >> 9) +
-                       ((sl[phd2 & (SIN_N - 1)] * 110) >> 9);
+    const int offset = mean + ((sl[phd & (SIN_N - 1)] * dr1) >> 9) +
+                       ((sl[phd2 & (SIN_N - 1)] * dr2) >> 9);
     const int denom = h > 1 ? h - 1 : 1;
     const int rowHi = INDEX_MAX - colMax;
     for (int y = 0; y < h; y++) {
@@ -199,7 +211,8 @@ void frame(uint32_t tMs, int w, int h, const uint8_t p[BG_ANIM_PARAMS]) {
 // established in frame(): ct is 0..colMax and rt is 0..4095-colMax, hence
 // sum is 0..4095 and the page's final &255 is redundant. No row state or
 // dither phase depends on band size.
-// Even at parameter extremes colMax <= 420 + 2*(150+72) + 40 = 904,
+// Even at parameter extremes (Swell 100 doubles both waves)
+// colMax <= 420 + 2*(300+144) + 40 = 1348,
 // so rowHi stays positive and PIE's signed 16-bit sum cannot saturate.
 GM_ANIM_IRAM void bandRef(uint16_t *__restrict dst, int y0, int rows, int w, uint32_t, const uint8_t *) {
     for (int y = y0; y < y0 + rows; y++) {
@@ -336,7 +349,7 @@ void release() {
     releaseTable(dithOff, 64 * sizeof(int16_t));
     allocW = allocH = colStride = 0;
     lastThemeGen = 0xFFFFFFFF;
-    lastP[0] = lastP[1] = lastP[2] = lastP[3] = 255;
+    memset(lastP, 255, sizeof(lastP));
 }
 
 } // namespace
@@ -345,7 +358,14 @@ extern const BgAnimation bg_anim_horizon;
 const BgAnimation bg_anim_horizon = {
     "horizon",
     "Horizon",
-    {{"speed", "Speed", 50}, {"height", "Height", 45}, {"curvature", "Curvature", 35}, {"softness", "Softness", 60}},
+    {{"speed", "Speed", 50},
+     {"height", "Height", 45},
+     {"curvature", "Curvature", 35},
+     {"softness", "Softness", 60},
+     {"swell", "Swell", 50},
+     {"drift", "Drift", 50},
+     {"glow", "Glow", 50},
+     {"reflect", "Reflection", 50}},
     init,
     frame,
     band,

@@ -2553,7 +2553,11 @@ function bayerOffsets(dithOff, amp, unit) {
       { key: 'speed', label: 'Speed', def: 50 },
       { key: 'height', label: 'Height', def: 45 },
       { key: 'curvature', label: 'Curvature', def: 35 },
-      { key: 'softness', label: 'Softness', def: 60 }],
+      { key: 'softness', label: 'Softness', def: 60 },
+      { key: 'swell', label: 'Swell', def: 50 },
+      { key: 'drift', label: 'Drift', def: 50 },
+      { key: 'glow', label: 'Glow', def: 50 },
+      { key: 'reflect', label: 'Reflection', def: 50 }],
     init(w, h, state) {
       state.curve = new Int16Array(w);
       state.ctPh = new Int16Array(8 * w);
@@ -2569,7 +2573,10 @@ function bayerOffsets(dithOff, amp, unit) {
         state.key = key;
         const ramp = themeRamp(256), pal = state.pal;
         const soft = 22 + Math.floor(p[3] * 50 / 100);
-        const glow = 100 + Math.floor(p[3] * 64 / 100);
+        // Glow and Reflection (gm-3vj.18) are exact at 50, as in
+        // AnimHorizon.cpp: glow * 50 / 50 and glow * 50 / 150 = glow / 3.
+        const glow = Math.floor((100 + Math.floor(p[3] * 64 / 100)) * p[6] / 50);
+        const reflect = Math.floor(glow * p[7] / 150);
         for (let i = 0; i < 256; i++) {
           const d = i - 128;
           let v;
@@ -2584,7 +2591,7 @@ function bayerOffsets(dithOff, amp, unit) {
           c = d + Math.trunc(soft / 2); ac = c < 0 ? -c : c;
           if (d < 0 && ac < soft) {
             const k = 256 - Math.trunc(ac * 256 / soft), kk = (k * k) >> 8;
-            v += (((kk * kk) >> 8) * Math.trunc(glow / 3)) >> 8;
+            v += (((kk * kk) >> 8) * reflect) >> 8;
           }
           const q = (v < 0 ? 0 : (v > 255 ? 255 : v)) * 3;
           pal[i * 3] = ramp[q]; pal[i * 3 + 1] = ramp[q + 1]; pal[i * 3 + 2] = ramp[q + 2];
@@ -2602,6 +2609,9 @@ function bayerOffsets(dithOff, amp, unit) {
       // The horizon profile: curvature plus two travelling swells.
       const cx = Math.floor(w / 2), span = cx > 0 ? cx : 1;
       const k = Math.trunc((p[2] - 50) * CURVE_SPAN / 50);
+      // Swell scales the two swells, Drift the vertical drift; 1x at 50.
+      const sw1 = Math.floor(150 * p[4] / 50), sw2 = Math.floor(72 * p[4] / 50);
+      const dr1 = Math.floor(240 * p[5] / 50), dr2 = Math.floor(110 * p[5] / 50);
       const { curve, rowTerm, ctPh, pal } = state;
       let lo = 32767, hi = -32768;
       for (let x = 0; x < w; x++) {
@@ -2609,8 +2619,8 @@ function bayerOffsets(dithOff, amp, unit) {
         let q = Math.trunc((dx * dx * 256) / (span * span));
         if (q > 256) q = 256;
         const v = ((k * q) >> 8) +
-          ((SIN[(((x * 21) >> 4) - phu) & (SIN_N - 1)] * 150) >> 9) +
-          ((SIN[(((x * 55) >> 4) + phu2) & (SIN_N - 1)] * 72) >> 9);
+          ((SIN[(((x * 21) >> 4) - phu) & (SIN_N - 1)] * sw1) >> 9) +
+          ((SIN[(((x * 55) >> 4) + phu2) & (SIN_N - 1)] * sw2) >> 9);
         curve[x] = v;
         if (v < lo) lo = v;
         if (v > hi) hi = v;
@@ -2618,8 +2628,8 @@ function bayerOffsets(dithOff, amp, unit) {
       for (let x = 0; x < w; x++) curve[x] -= lo;
       const colMax = hi - lo + 40;
       const mean = HEIGHT_LO + Math.floor(p[1] * (HEIGHT_HI - HEIGHT_LO) / 100);
-      const offset = mean + ((SIN[phd & (SIN_N - 1)] * 240) >> 9) +
-        ((SIN[phd2 & (SIN_N - 1)] * 110) >> 9);
+      const offset = mean + ((SIN[phd & (SIN_N - 1)] * dr1) >> 9) +
+        ((SIN[phd2 & (SIN_N - 1)] * dr2) >> 9);
       const denom = h > 1 ? h - 1 : 1;
       const rowHi = INDEX_MAX - colMax;
       for (let y = 0; y < h; y++) {
