@@ -317,6 +317,12 @@ void buildThemePalette() { buildThemeRamp(paletteLUT, 256); }
 // Octant-folded angle (0..64) for a point in the first quadrant (ax,ay >= 0).
 // Same reciprocal-LUT + minimax-poly approximation the old per-pixel path
 // used, but now only ever called (cx+1)^2 times, once, in init().
+//
+// recipLUT[i] is 65536 / (i + 1), so lo * recipLUT[hi - 1] is already lo / hi
+// in Q16 (at most 240 * 65536, inside 32 bits). Until gm-3vj.48 the product
+// was shifted down by 16 as well, which left the integer part of lo / hi:
+// 0 everywhere but the diagonal. Every pixel then got an angle of 0 or 64,
+// the harmonics had no angular term, and Symmetry changed nothing.
 inline uint8_t octantAngle(int ax, int ay) {
     const bool swap = ax < ay;
     const int hi = swap ? ay : ax;
@@ -325,10 +331,10 @@ inline uint8_t octantAngle(int ax, int ay) {
         return 0;
     }
     // hi <= cx (<=240 for the real panel), recipLUT covers that range.
-    const uint32_t ratioQ16 = (static_cast<uint32_t>(lo) * recipLUT[hi - 1]) >> 16;
+    const uint32_t ratioQ16 = static_cast<uint32_t>(lo) * recipLUT[hi - 1];
     const float ratio = ratioQ16 * (1.0f / 65536.0f);
     const float ang = ratio * (0.9817f - 0.1963f * ratio * ratio); // radians, 0..pi/4
-    int oct = static_cast<int>(ang * (128.0f / 3.14159265f));      // 0..32 within octant
+    int oct = static_cast<int>(lroundf(ang * (128.0f / 3.14159265f))); // 0..32 within octant
     if (swap) {
         oct = 64 - oct;
     }
