@@ -6,6 +6,9 @@
 // harmonics make one 512-entry texture; each absolute row translates it by
 // rowOff[y]. Channel width favours the low harmonics, Contrast scales their
 // swing, and the palette's cubic shoulder keeps most of the face dark.
+// Glow wave, Darkness, Ripple and Flow (gm-3vj.23) act in the same table
+// builds: rowAdd's amplitude, the palette map's linear/cubic balance, the
+// fifth harmonic's weight and the scroll rate. No pixel loop reads them.
 //
 // The page deliberately keeps the vertical wave and Bayer dither in Q4:
 //   v = (texQ4[(x + rowOff[y]) & 511] + rowAdd[y] + dith[y&7][x&7]) >> 4;
@@ -47,7 +50,7 @@ uint16_t *ramp = nullptr;
 const int16_t *sl = nullptr; // borrowed boot-lifetime shared sine table
 
 int allocH = 0;
-uint8_t lastP[4] = {255, 255, 255, 255};
+uint8_t lastP[BG_ANIM_PARAMS];
 uint32_t lastThemeGen = 0xFFFFFFFF;
 bool tablesValid = false;
 
@@ -99,15 +102,29 @@ bool init(int, int h) {
 
 void rebuild(const uint8_t *p) {
     buildThemeRamp(ramp, 256);
+    // Darkness (p[5]) moves weight between the terms of the palette map,
+    // keeping their sum at 226: linear, square and cube are 26/54/146 at 50
+    // (the old map), 146/54/26 at 0 (an open, bright face) and 0/0/226 at
+    // 100 (a dark face, light only in the channel crests).
+    const int dk = p[5];
+    const int cLin = dk <= 50 ? 26 + (50 - dk) * 120 / 50 : 26 - (dk - 50) * 26 / 50;
+    const int cSq = dk <= 50 ? 54 : 54 - (dk - 50) * 54 / 50;
+    const int cCube = 226 - cLin - cSq;
     for (int i = 0; i < 256; i++) {
         const int i2 = (i * i) >> 8;
         const int i3 = (i2 * i) >> 8;
-        // Page's exact cubic map: positions 4..226 of the theme ramp.
-        const int q = 4 + ((i * 26) >> 8) + ((i2 * 54) >> 8) + ((i3 * 146) >> 8);
+        // Page's exact cubic map: positions 4..226 of the theme ramp at the
+        // default, never past 227 at any Darkness.
+        const int q = 4 + ((i * cLin) >> 8) + ((i2 * cSq) >> 8) + ((i3 * cCube) >> 8);
         palette[i] = ramp[q];
     }
     const int wLow = 90 + static_cast<int>(p[2]) * 190 / 100;   // 90..280
     const int wHigh = 150 - static_cast<int>(p[2]) * 110 / 100; // 150..40
+    // Ripple (p[6]) weights the fifth harmonic, the fine ripple along each
+    // channel: none at 0, wHigh / 3 at 50 (wHigh * 50 / 150 is the same
+    // floor for wHigh >= 0), and wHigh, as strong as the third, at 100.
+    const int rp = p[6];
+    const int w5 = rp <= 50 ? wHigh * rp / 150 : wHigh / 3 + (rp - 50) * wHigh * 2 / 150;
     const int amp = 280 + static_cast<int>(p[3]) * 380 / 100;   // 280..660
     for (int tx = 0; tx < TEX; tx++) {
         // Shared SIN has 1024 entries and amplitude 512. Steps 2,4,6,10
@@ -118,8 +135,9 @@ void rebuild(const uint8_t *p) {
         const int h3 = sl[(tx * 6 + 700) & (SIN_N - 1)];
         const int h5 = sl[(tx * 10 + 150) & (SIN_N - 1)];
         // Signed division truncates toward zero, matching Math.trunc.
-        // The high fifth harmonic has one third weight, not one half.
-        const int v = (h1 * wLow + h2 * (wLow / 2) + h3 * wHigh + h5 * (wHigh / 3)) / (3 * 512);
+        // The high fifth harmonic has one third weight at the default
+        // Ripple, not one half.
+        const int v = (h1 * wLow + h2 * (wLow / 2) + h3 * wHigh + h5 * w5) / (3 * 512);
         const int idx = 128 + (v * amp) / (256 * 2);
         texQ4[tx] = static_cast<uint16_t>((idx < 0 ? 0 : (idx > 255 ? 255 : idx)) * 16);
     }
@@ -138,9 +156,11 @@ void rebuild(const uint8_t *p) {
 
 void frame(uint32_t tMs, int, int h, const uint8_t p[BG_ANIM_PARAMS]) {
     const uint32_t gen = themeGen();
-    if (!tablesValid || memcmp(p, lastP, 4) != 0 || gen != lastThemeGen) {
+    // The tables read p[2], p[3], p[5] and p[6]; comparing every slot only
+    // rebuilds a little more often than it has to.
+    if (!tablesValid || memcmp(p, lastP, BG_ANIM_PARAMS) != 0 || gen != lastThemeGen) {
         rebuild(p);
-        memcpy(lastP, p, 4);
+        memcpy(lastP, p, BG_ANIM_PARAMS);
         lastThemeGen = gen;
         tablesValid = true;
     }
@@ -157,7 +177,12 @@ void frame(uint32_t tMs, int, int h, const uint8_t p[BG_ANIM_PARAMS]) {
     // device and the page agree.
     const uint32_t speedQ6 = static_cast<uint32_t>(lroundf(1664.0f * speedMul(p[0])));
     const uint32_t base = tMs * speedQ6;
-    const uint32_t scroll = base >> 15;
+    // Flow (p[7]) scales the sideways scroll alone, in sixteenths: still at
+    // 0, 16/16 at 50 and twice as fast at 100. The product wraps before the
+    // shift, and >> 19 of base * 16 reads bits 15..27 of base, the same bits
+    // base >> 15 gives below bit 28; rowOff keeps only nine of them.
+    const uint32_t flowQ4 = static_cast<uint32_t>(p[7]) * 32 / 100;
+    const uint32_t scroll = (base * flowQ4) >> 19;
     const uint32_t bendPh1 = base >> 15;
     const uint32_t bendPh2 = (base * 3u) >> 17;
     const uint32_t bendPh3 = base >> 18;
@@ -173,6 +198,9 @@ void frame(uint32_t tMs, int, int h, const uint8_t p[BG_ANIM_PARAMS]) {
     const int f2Q4 = 560 * 16 / denom;  // nominally 0.546875 cycles
     const int f3Q4 = 240 * 16 / denom;  // nominally 0.234375 cycles
     const int fgQ4 = 16 * 1024 / 600;   // fixed pixel wavelength, not scaled by h
+    // Glow (p[4]) scales the travelling brightness wave: flat at 0, 704 Q4
+    // units (44 palette indices) at 50, 1408 at 100.
+    const int glowA = 704 * static_cast<int>(p[4]) / 50;
     for (int y = 0; y < h; y++) {
         const int b1 = sl[(((y * f1Q4) >> 4) + bendPh1) & (SIN_N - 1)] * amp1 / 256;
         const int b2 = sl[(((y * f2Q4) >> 4) + bendPh2) & (SIN_N - 1)] * amp2 / 256;
@@ -182,8 +210,9 @@ void frame(uint32_t tMs, int, int h, const uint8_t p[BG_ANIM_PARAMS]) {
         rowOff[y] = static_cast<uint16_t>((static_cast<uint32_t>(b1 + b2 + b3 + 4 * TEX) + scroll) & TEX_MASK);
         // Arithmetic shift, not truncating division: JavaScript >> floors
         // negative products too. GCC on both host and Xtensa does the same.
-        // 704 Q4 units is exactly 44 palette indices of brightness swing.
-        rowAdd[y] = static_cast<int16_t>((sl[(((y * fgQ4) >> 4) - glowPh) & (SIN_N - 1)] * 704) >> 9);
+        // 704 Q4 units is exactly 44 palette indices of brightness swing at
+        // the default Glow, and |rowAdd| <= 1408 at any Glow.
+        rowAdd[y] = static_cast<int16_t>((sl[(((y * fgQ4) >> 4) - glowPh) & (SIN_N - 1)] * glowA) >> 9);
     }
 }
 
@@ -221,8 +250,8 @@ void bandRef(uint16_t *dst, int y0, int rows, int w, uint32_t, const uint8_t *) 
 //
 // tex points to TEX_STORAGE entries, with its base 16-byte aligned by
 // allocHot. d and caps are aligned eight-lane slab vectors. off is 0..511,
-// add is -704..704, and each d lane is -205..205. No signed saturation can
-// occur in the sums: tex+d+add is -909..4989. Clamping that sum to 0..4080
+// add is -1408..1408 (Glow at 100), and each d lane is -205..205. No signed
+// saturation can occur in the sums: tex+d+add is -1613..5693. Clamping that sum to 0..4080
 // before extracting bits 4..11 gives exactly bandRef's shift then clamp.
 //
 // EE.LD.128.USAR.IP captures the source's byte offset while loading the
@@ -351,7 +380,7 @@ void release() {
     allocH = 0;
     tablesValid = false;
     lastThemeGen = 0xFFFFFFFF;
-    lastP[0] = lastP[1] = lastP[2] = lastP[3] = 255;
+    memset(lastP, 255, sizeof(lastP));
 }
 
 } // namespace
@@ -360,7 +389,14 @@ extern const BgAnimation bg_anim_refraction;
 const BgAnimation bg_anim_refraction = {
     "refraction",
     "Refraction",
-    {{"speed", "Speed", 50}, {"bend", "Bend", 35}, {"width", "Channel width", 65}, {"contrast", "Contrast", 30}},
+    {{"speed", "Speed", 50},
+     {"bend", "Bend", 35},
+     {"width", "Channel width", 65},
+     {"contrast", "Contrast", 30},
+     {"glow", "Glow wave", 50},
+     {"darkness", "Darkness", 50},
+     {"ripple", "Ripple", 50},
+     {"flow", "Flow", 50}},
     init,
     frame,
     band,

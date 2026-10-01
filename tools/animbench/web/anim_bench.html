@@ -3164,7 +3164,11 @@ function bayerOffsets(dithOff, amp, unit) {
       { key: 'speed', label: 'Speed', def: 50 },
       { key: 'bend', label: 'Bend', def: 35 },
       { key: 'width', label: 'Channel width', def: 65 },
-      { key: 'contrast', label: 'Contrast', def: 30 }],
+      { key: 'contrast', label: 'Contrast', def: 30 },
+      { key: 'glow', label: 'Glow wave', def: 50 },
+      { key: 'darkness', label: 'Darkness', def: 50 },
+      { key: 'ripple', label: 'Ripple', def: 50 },
+      { key: 'flow', label: 'Flow', def: 50 }],
     init(w, h, state) {
       state.texQ4 = new Uint16Array(TEX);   // palette index in sixteenths
       state.rowOff = new Uint16Array(h);
@@ -3179,9 +3183,15 @@ function bayerOffsets(dithOff, amp, unit) {
       if (state.key !== key) {
         state.key = key;
         const ramp = themeRamp(256), pal = state.pal;
+        // Darkness (p[5]) moves weight between the map's terms, 26/54/146
+        // at 50 (gm-3vj.23), as in AnimRefraction.cpp.
+        const dk = p[5];
+        const cLin = dk <= 50 ? 26 + Math.trunc((50 - dk) * 120 / 50) : 26 - Math.trunc((dk - 50) * 26 / 50);
+        const cSq = dk <= 50 ? 54 : 54 - Math.trunc((dk - 50) * 54 / 50);
+        const cCube = 226 - cLin - cSq;
         for (let i = 0; i < 256; i++) {
           const i2 = (i * i) >> 8, i3 = (i2 * i) >> 8;
-          const q = (4 + ((i * 26) >> 8) + ((i2 * 54) >> 8) + ((i3 * 146) >> 8)) * 3;
+          const q = (4 + ((i * cLin) >> 8) + ((i2 * cSq) >> 8) + ((i3 * cCube) >> 8)) * 3;
           pal[i * 3] = ramp[q]; pal[i * 3 + 1] = ramp[q + 1]; pal[i * 3 + 2] = ramp[q + 2];
         }
         // Four harmonics whose periods divide 512, so the wrap at 511 is
@@ -3190,11 +3200,14 @@ function bayerOffsets(dithOff, amp, unit) {
         const wLow = 90 + Math.trunc(p[2] * 190 / 100);
         const wHigh = 150 - Math.trunc(p[2] * 110 / 100);
         const amp = 280 + Math.trunc(p[3] * 380 / 100);
+        // Ripple (p[6]) weights the fifth harmonic: wHigh / 3 at 50.
+        const rp = p[6];
+        const w5 = rp <= 50 ? Math.trunc(wHigh * rp / 150) : Math.floor(wHigh / 3) + Math.trunc((rp - 50) * wHigh * 2 / 150);
         for (let tx = 0; tx < TEX; tx++) {
           const h1 = SIN[(tx * 2) & (SIN_N - 1)], h2 = SIN[(tx * 4 + 300) & (SIN_N - 1)];
           const h3 = SIN[(tx * 6 + 700) & (SIN_N - 1)], h5 = SIN[(tx * 10 + 150) & (SIN_N - 1)];
           const v = Math.trunc((h1 * wLow + h2 * Math.floor(wLow / 2) + h3 * wHigh +
-            h5 * Math.floor(wHigh / 3)) / (3 * 512));
+            h5 * w5) / (3 * 512));
           const idx = 128 + Math.trunc((v * amp) / (256 * 2));
           state.texQ4[tx] = (idx < 0 ? 0 : (idx > 255 ? 255 : idx)) * 16;
         }
@@ -3206,7 +3219,10 @@ function bayerOffsets(dithOff, amp, unit) {
       // affine law read 4 + Math.floor(p[0] * 44 / 100).
       const speedQ6 = Math.round(F(1664 * speedMulF(p[0])));
       const base = ((t * speedQ6) >>> 0);
-      const scroll = base >>> 15;
+      // Flow (p[7]) scales the scroll in sixteenths, 16 at 50; the product
+      // wraps before the shift, as the uint32 product does in the firmware.
+      const flowQ4 = Math.trunc(p[7] * 32 / 100);
+      const scroll = ((base * flowQ4) >>> 0) >>> 19;
       const bendPh1 = base >>> 15, bendPh2 = ((base * 3) >>> 0) >>> 17, bendPh3 = base >>> 18;
       const glowPh = base >>> 14;
       const amp1 = Math.trunc(p[1] * 90 / 100), amp2 = Math.trunc(p[1] * 210 / 100);
@@ -3214,13 +3230,15 @@ function bayerOffsets(dithOff, amp, unit) {
       const denom = h > 0 ? h : 1;
       const f1Q4 = Math.trunc(1536 * 16 / denom), f2Q4 = Math.trunc(560 * 16 / denom);
       const f3Q4 = Math.trunc(240 * 16 / denom), fgQ4 = Math.trunc(16 * 1024 / 600);
+      // Glow wave (p[4]) scales the brightness wave, 704 at 50.
+      const glowA = Math.trunc(704 * p[4] / 50);
       const { rowOff, rowAdd, texQ4, dith, pal } = state;
       for (let y = 0; y < h; y++) {
         const b1 = Math.trunc(SIN[(((y * f1Q4) >> 4) + bendPh1) & (SIN_N - 1)] * amp1 / 256);
         const b2 = Math.trunc(SIN[(((y * f2Q4) >> 4) + bendPh2) & (SIN_N - 1)] * amp2 / 256);
         const b3 = Math.trunc(SIN[(((y * f3Q4) >> 4) - bendPh3) & (SIN_N - 1)] * amp3 / 256);
         rowOff[y] = ((b1 + b2 + b3 + 4 * TEX + scroll) >>> 0) & TEX_MASK;
-        rowAdd[y] = (SIN[(((y * fgQ4) >> 4) - glowPh) & (SIN_N - 1)] * 704) >> 9;
+        rowAdd[y] = (SIN[(((y * fgQ4) >> 4) - glowPh) & (SIN_N - 1)] * glowA) >> 9;
       }
       let o = 0;
       for (let y = 0; y < h; y++) {

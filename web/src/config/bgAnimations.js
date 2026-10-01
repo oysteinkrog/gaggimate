@@ -319,6 +319,10 @@ export const BG_ANIMATIONS = [
       { key: 'bend', label: 'Bend', def: 35 },
       { key: 'width', label: 'Channel width', def: 65 },
       { key: 'contrast', label: 'Contrast', def: 30 },
+      { key: 'glow', label: 'Glow wave', def: 50 },
+      { key: 'darkness', label: 'Darkness', def: 50 },
+      { key: 'ripple', label: 'Ripple', def: 50 },
+      { key: 'flow', label: 'Flow', def: 50 },
     ],
   },
   {
