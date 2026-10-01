@@ -165,6 +165,32 @@ const CHECKBOX_KEYS = [
   'elementTintEnabled',
 ];
 
+// Plain labels for the fields the device can refuse on save (WebUIPlugin.cpp's
+// settings handler answers 422 with {error, code: 'invalid_fields', fields:
+// [...]} naming the posted keys that failed validation; every other field in
+// the same save is still stored). Matches the label the form shows for a key
+// where one exists; a key with no entry here is shown as is.
+const FIELD_LABELS = {
+  apPassword: 'Access Point Password',
+  bgAnimGradients: 'Custom gradients',
+  bgAnimThemeMap: 'Animation colour assignments',
+  autowakeupSchedules: 'Auto Wakeup Schedule',
+};
+
+function describeInvalidFields(fieldKeys) {
+  const labels = fieldKeys.map(key => FIELD_LABELS[key] || key);
+  if (labels.length === 1) {
+    return (
+      `"${labels[0]}" was refused and kept its old value. ` +
+      `Every other change was saved. Fix it and save again.`
+    );
+  }
+  return (
+    `These fields were refused and kept their old values: ${labels.join(', ')}. ` +
+    `Every other change was saved. Fix them and save again.`
+  );
+}
+
 function buildSubmitFormData(formData, autowakeupSchedules, restart) {
   const formDataToSubmit = new FormData();
 
@@ -371,10 +397,18 @@ export function Settings() {
         const data = await response.json().catch(() => null);
         if (!response.ok || !data) {
           // The device answers {error, code} when it could not persist the
-          // save. Keep formData as it is: those are the unsaved edits.
-          const message =
-            (data && data.error) || `The device answered with HTTP status ${response.status}.`;
-          setSaveError({ message, restart });
+          // save. Keep formData as it is: those are the unsaved edits. A
+          // 422 with code 'invalid_fields' means the rest of the save was
+          // stored and only the listed fields were refused; name them.
+          const invalidFields =
+            data && data.code === 'invalid_fields' && Array.isArray(data.fields)
+              ? data.fields
+              : null;
+          const hasInvalidFields = invalidFields && invalidFields.length > 0;
+          const message = hasInvalidFields
+            ? describeInvalidFields(invalidFields)
+            : (data && data.error) || `The device answered with HTTP status ${response.status}.`;
+          setSaveError({ message, restart, invalidFields: hasInvalidFields });
           return;
         }
 
@@ -542,7 +576,9 @@ export function Settings() {
         {isFormTab && saveError && (
           <div role='alert' className='alert alert-error mt-6'>
             <span>
-              <strong>Not saved.</strong> {saveError.message} Your changes are still in the form.
+              <strong>{saveError.invalidFields ? 'Partly saved.' : 'Not saved.'}</strong>{' '}
+              {saveError.message}
+              {!saveError.invalidFields && ' Your changes are still in the form.'}
             </span>
             <button
               type='button'
