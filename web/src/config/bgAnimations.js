@@ -274,6 +274,10 @@ export const BG_ANIMATIONS = [
       { key: 'spacing', label: 'Spacing', def: 65 },
       { key: 'angle', label: 'Angle', def: 50 },
       { key: 'contrast', label: 'Contrast', def: 35 },
+      { key: 'round', label: 'Roundness', def: 50 },
+      { key: 'swell', label: 'Swell depth', def: 50 },
+      { key: 'swellw', label: 'Swell width', def: 50 },
+      { key: 'highlight', label: 'Highlight', def: 50 },
     ],
   },
   {

@@ -42,7 +42,7 @@ uint16_t *palette = nullptr;   // 256, per-pixel gather
 int16_t *dithOff = nullptr;    // 64, frame only
 const int16_t *sine = nullptr; // borrowed shared sinLut, never freed here
 
-uint8_t lastP[4] = {255, 255, 255, 255};
+uint8_t lastP[BG_ANIM_PARAMS] = {255, 255, 255, 255, 255, 255, 255, 255};
 uint32_t lastThemeGen = 0xFFFFFFFFu;
 bool paletteValid = false;
 int allocW = 0, allocH = 0;
@@ -89,9 +89,13 @@ bool init(int w, int h) {
     return true;
 }
 
-void rebuildPalette(int contrastP) {
+void rebuildPalette(int contrastP, int highlightP) {
     buildThemeRamp(themeRamp, 256);
     const int peak = 24 + contrastP * 30 / 100; // 24..54, 34 at default 35
+    // Highlight scales the cubed crest term: 0 at 0 for a plain raised
+    // cosine, 80 at 50 (the constant this file used before the slider),
+    // 160 at 100 for a hot, narrow lit edge on every fold.
+    const int hi = highlightP * 160 / 100;
     for (int i = 0; i < 256; i++) {
         // Four sine slots per entry and +768 start at the trough. Raised
         // cosine s is Q9 in 0..512. Round after each multiply as the page
@@ -99,8 +103,8 @@ void rebuildPalette(int contrastP) {
         const int s = (sine[(i * 4 + 768) & (SIN_N - 1)] + 512) >> 1;
         const int s2 = (s * s) >> 9;
         const int s3 = (s2 * s) >> 9;
-        const int v = 7 + ((s * peak) >> 9) + ((s3 * 80) >> 9);
-        // Floor 7 and cubic highlight 80 bound v to 7..141 over every
+        const int v = 7 + ((s * peak) >> 9) + ((s3 * hi) >> 9);
+        // Floor 7, peak 54 and highlight 160 bound v to 7..221 over every
         // parameter value, so the page's 0..255 clamp is redundant.
         palette[i] = themeRamp[v];
     }
@@ -118,10 +122,10 @@ void rebuildPalette(int contrastP) {
 
 void frame(uint32_t tMs, int w, int h, const uint8_t p[BG_ANIM_PARAMS]) {
     const uint32_t generation = themeGen();
-    if (!paletteValid || memcmp(p, lastP, 4) != 0 || generation != lastThemeGen) {
-        rebuildPalette(p[3]);
+    if (!paletteValid || lastP[3] != p[3] || lastP[7] != p[7] || generation != lastThemeGen) {
+        rebuildPalette(p[3], p[7]);
         lastThemeGen = generation;
-        memcpy(lastP, p, 4);
+        memcpy(lastP, p, BG_ANIM_PARAMS);
         paletteValid = true;
     }
 
@@ -153,8 +157,17 @@ void frame(uint32_t tMs, int w, int h, const uint8_t p[BG_ANIM_PARAMS]) {
     const int wob = 256 + ((sine[phW & (SIN_N - 1)] * 30) >> 9);
     const int colStep = (((rowStep * angleQ8) >> 8) * wob) >> 8;
     const int cx = w / 2;
-    const int round = w * 22 / 100; // apex radius is 22 percent of width
+    // Roundness: the apex radius as a share of width, 0 for a sharp V,
+    // 22 percent at 50 (the old constant), 44 percent at 100.
+    const int roundPct = static_cast<int>(p[4]) * 44 / 100;
+    const int round = w * roundPct / 100;
     const int halfRound = round >> 1;
+    // Swell depth: amplitude of the travelling bright zone in sum units,
+    // flat at 0, 760 at 50 (the old constant), 1520 at 100.
+    const int swellAmp = static_cast<int>(p[5]) * 760 / 50;
+    // Swell width: sine slots per column in sixteenths, 8 at 0 for one
+    // broad zone, 23 at 50 (the old constant), 38 at 100 for tight bands.
+    const int swellK = 8 + static_cast<int>(p[6]) * 30 / 100;
     for (int x = 0; x < w; x++) {
         const int dx = x - cx;
         int adx = dx < 0 ? -dx : dx;
@@ -162,11 +175,12 @@ void frame(uint32_t tMs, int w, int h, const uint8_t p[BG_ANIM_PARAMS]) {
         // widths below five round is zero and the first arm always wins,
         // so division by zero is never evaluated, just as on the page.
         adx = adx >= round ? adx - halfRound : adx * adx / (2 * round);
-        // 23/16 sine slots per column, 760 sum units of swell, unchanged
-        // in pixel units at half resolution. Signed >>9 rounds down on
-        // both supported compilers, matching JavaScript's arithmetic >>.
-        const uint32_t idx = (static_cast<uint32_t>(x * 23) >> 4) - phB;
-        const int swell = (sine[idx & (SIN_N - 1)] * 760) >> 9;
+        // swellK/16 sine slots per column (23/16 at default), swellAmp sum
+        // units of swell (760 at default), unchanged in pixel units at half
+        // resolution. Signed >>9 rounds down on both supported compilers,
+        // matching JavaScript's arithmetic >>.
+        const uint32_t idx = (static_cast<uint32_t>(x * swellK) >> 4) - phB;
+        const int swell = (sine[idx & (SIN_N - 1)] * swellAmp) >> 9;
         colTerm[x] = static_cast<int32_t>(static_cast<uint32_t>(adx * colStep + swell) & (WRAP - 1));
     }
     for (int ph = 0; ph < PHASES; ph++) {
@@ -352,7 +366,7 @@ void release() {
     allocW = allocH = 0;
     paletteValid = false;
     lastThemeGen = 0xFFFFFFFFu;
-    lastP[0] = lastP[1] = lastP[2] = lastP[3] = 255;
+    memset(lastP, 255, sizeof(lastP));
 }
 
 } // namespace
@@ -361,7 +375,14 @@ extern const BgAnimation bg_anim_chevrons;
 const BgAnimation bg_anim_chevrons = {
     "chevrons",
     "Chevrons",
-    {{"speed", "Speed", 50}, {"spacing", "Spacing", 65}, {"angle", "Angle", 50}, {"contrast", "Contrast", 35}},
+    {{"speed", "Speed", 50},
+     {"spacing", "Spacing", 65},
+     {"angle", "Angle", 50},
+     {"contrast", "Contrast", 35},
+     {"round", "Roundness", 50},
+     {"swell", "Swell depth", 50},
+     {"swellw", "Swell width", 50},
+     {"highlight", "Highlight", 50}},
     init,
     frame,
     band,
