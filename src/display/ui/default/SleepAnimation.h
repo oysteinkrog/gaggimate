@@ -38,6 +38,7 @@ class SleepAnimation {
     static void debugForceNativeFail() {}
     const char *dmaEngineName() const { return "none"; }
     uint32_t dmaInstallFails() const { return 0; }
+    static uint32_t stackIntFallbacks() { return 0; }
     bool isActive() const { return false; }
     void configure(uint8_t, const uint8_t *) {}
     void setMaxFps(uint8_t) {}
@@ -199,6 +200,9 @@ class SleepAnimation {
     // failed native installs since boot.
     const char *dmaEngineName() const;
     uint32_t dmaInstallFails() const;
+    // Animation task stacks placed in internal DRAM because PSRAM had no
+    // room, since boot (gm-bzu.61). Static: /api/debug/heap has no instance.
+    static uint32_t stackIntFallbacks();
     bool isActive() const { return running; }
 
     // Selects which registry animation renders and its 4 params (0-100 each).

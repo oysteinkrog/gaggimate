@@ -1707,6 +1707,14 @@ void SleepAnimation::pushTaskEntry(void *arg) {
     parkForReap();
 }
 
+// Stacks that went to internal DRAM because PSRAM had no room, since boot
+// (gm-bzu.61). Each one takes its size from the pool the WiFi TX copies
+// need, so a boot with a low int_free can be explained from
+// /api/debug/heap. Kept outside the class so the layout does not move (the
+// gm-bzu.37 pattern).
+static std::atomic<uint32_t> s_stackIntFallbacks{0};
+uint32_t SleepAnimation::stackIntFallbacks() { return s_stackIntFallbacks.load(); }
+
 // Both animation tasks on core 0 with a PSRAM stack (see start() for why that
 // is safe here), falling back to an internal stack when PSRAM is exhausted.
 // A task created WithCaps cannot free its own stack: vTaskDeleteWithCaps on
@@ -1724,6 +1732,9 @@ static BaseType_t createAnimTask(TaskFunction_t fn, const char *name, uint32_t s
     if (ok != pdPASS) {
         log_w("SleepAnimation: no PSRAM for the %s stack, using internal DRAM", name);
         ok = xTaskCreatePinnedToCoreWithCaps(fn, name, stackBytes, arg, prio, handle, 0, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+        if (ok == pdPASS) {
+            s_stackIntFallbacks.fetch_add(1);
+        }
     }
     return ok;
 }

@@ -87,6 +87,7 @@ extern uint32_t nebula_lerp_self_test(uint32_t *firstBad);
 #include <display/ui/default/eez/MeterTickCache.h> // tick_cache_bytes on /api/debug/anim
 #include <display/ui/default/eez/eez-flow.h>       // eez_flow_object_names
 #include <display/ui/default/eez/screens.h>        // objects, for /api/debug/touchlog
+#include <display/ui/default/SleepAnimation.h>     // stack_int_fallback on /api/debug/heap
 #endif
 #include <display/drivers/common/PanelClock.h>
 #include <display/ui/default/bganim/BgAnim.h> // bg_library_valid / bg_map_valid for the settings writer; headless too
@@ -270,12 +271,15 @@ void WebUIPlugin::setupDebugEndpoints() {
         const size_t animPsram = 0;
         const size_t hotUsed = 0, hotShared = 0, hotPeak = 0, hotSlab = 0;
         const uint32_t hotFail = 0;
+        const uint32_t stackIntFallback = 0;
 #else
         const size_t animSram = bganim::g_allocSram;
         const size_t animPsram = bganim::g_allocPsram;
         const size_t hotUsed = bganim::hotUsed(), hotShared = bganim::hotShared(), hotPeak = bganim::hotPeak(),
                      hotSlab = bganim::HOT_SLAB_BYTES;
         const uint32_t hotFail = bganim::hotFailCount();
+        // Animation task stacks that fell back to internal DRAM since boot.
+        const uint32_t stackIntFallback = SleepAnimation::stackIntFallbacks();
 #endif
         // Scan-out health, from the panel's own interrupts. `slips` is the one
         // to watch: it counts frames whose bounce-buffer refill lost its race
@@ -293,7 +297,7 @@ void WebUIPlugin::setupDebugEndpoints() {
                  "\"sc_frames\":%u,\"sc_refills\":%u,\"sc_slips\":%u,"
                  "\"dma_free\":%u,\"dma_min\":%u,\"asset_streams\":%u,\"asset_queue\":%u,"
                  "\"hist_served\":%u,\"hist_dropped\":%u,\"hist_queue_max\":%u,\"hist_open_us_max\":%u,"
-                 "\"uptime_ms\":%lu}",
+                 "\"stack_int_fallback\":%u,\"uptime_ms\":%lu}",
                  // heap_caps_get_largest_free_block walks every block in the heap,
                  // which costs about 1.3 ms across both regions and starves the
                  // RGB panel's bounce refill for the duration -- one displaced
@@ -317,7 +321,8 @@ void WebUIPlugin::setupDebugEndpoints() {
                  static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_DMA)),
                  static_cast<unsigned>(heap_caps_get_minimum_free_size(MALLOC_CAP_DMA)), static_cast<unsigned>(assetStreams),
                  static_cast<unsigned>(assetQueue.size()), static_cast<unsigned>(histServed), static_cast<unsigned>(histDropped),
-                 static_cast<unsigned>(histQueueMax), static_cast<unsigned>(histOpenUsMax), static_cast<unsigned long>(millis()));
+                 static_cast<unsigned>(histQueueMax), static_cast<unsigned>(histOpenUsMax), static_cast<unsigned>(stackIntFallback),
+                 static_cast<unsigned long>(millis()));
         request->send(200, "application/json", buf);
     });
     // Which slips happened, and how long before each one the suspects last ran.

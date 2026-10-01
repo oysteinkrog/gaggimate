@@ -381,6 +381,35 @@ static void test_schedule_time_parts_reads_malformed_as_midnight() {
     TEST_ASSERT_EQUAL(0, minute);
 }
 
+// Digits in the right places but out of range (gm-bzu.61): a value stored
+// before the web handler bounded it reads as 00:00, and a step from there
+// stays in range instead of starting from hour 25.
+static void test_schedule_time_parts_reads_out_of_range_as_midnight() {
+    int hour = -1;
+    int minute = -1;
+
+    ScheduleDraft bad = scheduleDefault();
+    bad.time = "25:70";
+    scheduleTimeParts(bad, hour, minute);
+    TEST_ASSERT_EQUAL(0, hour);
+    TEST_ASSERT_EQUAL(0, minute);
+
+    ScheduleDraft badMinute = scheduleDefault();
+    badMinute.time = "12:60";
+    scheduleTimeParts(badMinute, hour, minute);
+    TEST_ASSERT_EQUAL(0, hour);
+    TEST_ASSERT_EQUAL(0, minute);
+
+    ScheduleDraft edge = scheduleDefault();
+    edge.time = "23:59";
+    scheduleTimeParts(edge, hour, minute);
+    TEST_ASSERT_EQUAL(23, hour);
+    TEST_ASSERT_EQUAL(59, minute);
+
+    scheduleStepHour(bad, 1, false);
+    TEST_ASSERT_EQUAL_STRING("01:00", bad.time.c_str());
+}
+
 static void test_schedule_summary_strings() {
     ScheduleDraft everyDay = scheduleDefault();
     TEST_ASSERT_EQUAL_STRING("Every day", scheduleDaysSummary(everyDay).c_str());
@@ -472,6 +501,7 @@ int main(int argc, char **argv) {
     RUN_TEST(test_schedule_import_9_entries_kept_whole);
     RUN_TEST(test_schedule_toggle_day_and_step_time);
     RUN_TEST(test_schedule_time_parts_reads_malformed_as_midnight);
+    RUN_TEST(test_schedule_time_parts_reads_out_of_range_as_midnight);
     RUN_TEST(test_schedule_summary_strings);
     RUN_TEST(test_schedule_serialize_parse_round_trip_and_malformed_dropped);
     return UNITY_END();

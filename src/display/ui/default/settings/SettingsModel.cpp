@@ -434,15 +434,22 @@ bool scheduleRemove(std::vector<ScheduleDraft> &schedules, size_t index) {
 namespace {
 
 // "HH:MM" -> (hour, minute); malformed input reads as 00:00 so a caller that
-// skips validation still gets a well-formed schedule rather than garbage.
+// skips validation still gets a well-formed schedule rather than garbage. An
+// hour past 23 or a minute past 59 is malformed too (gm-bzu.61): a value
+// stored before the web handler checked it must not reach the steppers,
+// whose ranges assume it is in range.
 void parseTime(const std::string &time, int &hour, int &minute) {
     hour = 0;
     minute = 0;
     if (time.size() >= 5 && std::isdigit(static_cast<unsigned char>(time[0])) &&
         std::isdigit(static_cast<unsigned char>(time[1])) && time[2] == ':' &&
         std::isdigit(static_cast<unsigned char>(time[3])) && std::isdigit(static_cast<unsigned char>(time[4]))) {
-        hour = (time[0] - '0') * 10 + (time[1] - '0');
-        minute = (time[3] - '0') * 10 + (time[4] - '0');
+        const int h = (time[0] - '0') * 10 + (time[1] - '0');
+        const int m = (time[3] - '0') * 10 + (time[4] - '0');
+        if (h < 24 && m < 60) {
+            hour = h;
+            minute = m;
+        }
     }
 }
 

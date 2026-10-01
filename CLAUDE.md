@@ -853,9 +853,9 @@ What the device runs taught, beyond the numbers:
 
 Known limits, recorded rather than fixed:
 
-- A malformed stored schedule time shows as 00:00 in the editor and as the
-  raw string in the list (`CatSchedules.cpp`, through
-  `settingsui::scheduleTimeParts`). The web handler no longer writes one
+- A malformed stored schedule time, including one out of range such as
+  25:70, shows as 00:00 in the editor and as the raw string in the list
+  (`CatSchedules.cpp`, through `settingsui::scheduleTimeParts`). The web handler no longer writes one
   (2026-09-09, `isScheduleTime` in `WebUIPlugin.cpp` drops an entry whose
   time is not HH:MM in range), so only a value stored before that or
   written by hand can still show this way.
