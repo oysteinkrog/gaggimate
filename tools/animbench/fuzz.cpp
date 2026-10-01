@@ -16,9 +16,9 @@
 // A second pass checks destination alignment (gm-bzu.49). BgAnim.h promises
 // band() only a 4-byte-aligned dst, and ee.vst.128.ip silently clears the low
 // four address bits, so a PIE kernel that trusts the pointer writes before its
-// span. The host never compiles the asm, but AnimOrbits and AnimFireflies run
-// their fill glue here through host twins that store the way the vector store
-// does, masked to 16 bytes. So every animation is rendered at 480, 240, 466 and
+// span. The host never compiles the asm, but AnimOrbits, AnimFireflies,
+// AnimRipples and AnimSteam (gm-1wrm) run their fill glue here through host
+// twins that store the way the vector store does, masked to 16 bytes. So every animation is rendered at 480, 240, 466 and
 // 233 px into a buffer 0, 4, 8 and 12 bytes past a 16-byte boundary, with
 // sentinel guard zones on both sides, and each result must match bandRef()
 // rendered into an aligned buffer, with both guards untouched. Rows per call

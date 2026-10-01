@@ -349,15 +349,19 @@ void bandPortable(uint16_t *dst, int y0, int rows, int w, uint32_t, const uint8_
 // calls x 2 rows x 480px), so that per-pair taken branch was paid 230,400
 // times a frame for a value that never changes within a row. `bc` must
 // point at a 16-byte-aligned buffer holding the fill colour repeated eight
-// times (built once per row by the caller, not per pixel); `wr` must be
-// 16-byte aligned, true for every row of this panel's band buffer (CLAUDE.md
-// "dst rows are 16-byte aligned") -- EE.VST.128.IP masks the low four
-// address bits silently instead of trapping, so a misaligned wr would
-// corrupt neighbouring pixels rather than fault. w8 (w/8) is passed
-// pre-divided and is always > 0: w is always a multiple of 16 on this panel
-// (480 full res, 240 half res), never a multiple of 8 only, so the caller's
-// scalar tail below is defensive and never actually executes in production.
+// times (built once per row by the caller, not per pixel), and `wr` must be
+// 16-byte aligned: EE.VST.128.IP masks the low four address bits silently
+// instead of trapping, so a misaligned wr writes up to 12 bytes before the
+// span and leaves as many unwritten at its end. Only fillRow() below calls
+// this, and it hands over the 16-byte-aligned interior of the row with a
+// scalar prefix and tail around it (gm-1wrm): BgAnim.h promises only a
+// 4-byte-aligned dst, and at w = 466 every other row of a band starts
+// 4 mod 16. w8 <= 0 returns early, because `loop` with a count of 0 runs
+// 2^32 times.
 __attribute__((noinline)) static void fillRowPie(uint16_t *__restrict wr, const uint16_t *__restrict bc, int w8) {
+    if (w8 <= 0) {
+        return;
+    }
     uint16_t *dst = wr;
     const uint16_t *bcp = bc;
     int n = w8;
@@ -368,6 +372,46 @@ __attribute__((noinline)) static void fillRowPie(uint16_t *__restrict wr, const 
                  : [dst] "+r"(dst), [n] "+r"(n)
                  : [bc] "r"(bcp)
                  : "memory");
+}
+#else
+// Host twin of fillRowPie: same name, same signature, and it stores the way
+// ee.vst.128.ip does, to the address with its low four bits cleared. A
+// caller that hands it a misaligned wr therefore writes before the span on
+// the host too, where ASan and tools/animbench's alignment pass see it.
+// With fillRow()'s prefix the cleared bits are already zero and this is a
+// plain fill.
+static void fillRowPie(uint16_t *wr, const uint16_t *bc, int w8) {
+    if (w8 <= 0) {
+        return;
+    }
+    uint16_t *dst = reinterpret_cast<uint16_t *>(reinterpret_cast<uintptr_t>(wr) & ~static_cast<uintptr_t>(15));
+    for (int i = 0; i < w8 * 8; i++) {
+        dst[i] = bc[i & 7];
+    }
+}
+#endif
+
+// Fills n pixels from row with c: scalar stores until the address is a
+// multiple of 16, the vector fill over the whole groups of eight after
+// that, scalar stores for the remainder. Every pixel gets the same value,
+// so the split has no pattern to keep in phase. bc is the 16-byte-aligned
+// eight-copy buffer fillRowPie loads; this fills it.
+static void fillRow(uint16_t *row, int n, uint16_t c, uint16_t *bc) {
+    while (n > 0 && (reinterpret_cast<uintptr_t>(row) & 15) != 0) {
+        *row++ = c;
+        n--;
+    }
+    const int n8 = n >> 3;
+    if (n8 > 0) {
+        for (int k = 0; k < 8; k++) {
+            bc[k] = c;
+        }
+        fillRowPie(row, bc, n8);
+        row += static_cast<size_t>(n8) * 8;
+    }
+    for (int i = 0; i < (n & 7); i++) {
+        row[i] = c;
+    }
 }
 
 // Round 3 note on what did NOT survive here: before this round shipped,
@@ -389,28 +433,17 @@ __attribute__((noinline)) static void fillRowPie(uint16_t *__restrict wr, const 
 // as plain C++ for GCC 14 to compile, unchanged between bandPortable and
 // band() below -- see ASM_BRIEF.md's "ships as a call to bandRef" fallback.
 void band(uint16_t *dst, int y0, int rows, int w, uint32_t, const uint8_t *) {
+#if defined(__XTENSA__) && !defined(GM_BGANIM_NO_ASM)
+    uint16_t *bc = fillBcast;
+#else
+    alignas(16) uint16_t bcLocal[8];
+    uint16_t *bc = bcLocal;
+#endif
     for (int r = 0; r < rows; r++) {
-        const uint16_t c = bgLUT[y0 + r];
-        uint16_t *row = dst + static_cast<size_t>(r) * w;
-        const int w8 = w >> 3;
-        if (w8 > 0) {
-            for (int k = 0; k < 8; k++) {
-                fillBcast[k] = c;
-            }
-            fillRowPie(row, fillBcast, w8);
-        }
-        for (int x = w8 * 8; x < w; x++) { // defensive tail, see fillRowPie comment
-            row[x] = c;
-        }
+        fillRow(dst + static_cast<size_t>(r) * w, w, bgLUT[y0 + r], bc);
     }
     stampBlobs(dst, y0, rows, w);
 }
-
-#else
-
-void band(uint16_t *dst, int y0, int rows, int w, uint32_t tMs, const uint8_t *p) { bandPortable(dst, y0, rows, w, tMs, p); }
-
-#endif
 
 void release() {
     releaseTable(blobs, static_cast<size_t>(BLOBS_MAX) * sizeof(Blob));

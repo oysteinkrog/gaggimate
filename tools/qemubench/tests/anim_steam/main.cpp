@@ -70,8 +70,14 @@ static void uart_put_udec(uint32_t v) {
     }
 }
 
-/* ---- fillRowPie: verbatim from AnimSteam.cpp ---- */
+/* ---- fillRowPie: verbatim from AnimSteam.cpp ----
+ * gm-1wrm added the w8 <= 0 early return. The address prefix and tail live
+ * in the source's fillRow(), not here: this kernel still takes a 16-byte
+ * aligned wr. */
 __attribute__((noinline)) static void fillRowPie(uint16_t *__restrict wr, const uint16_t *__restrict bc, int w8) {
+    if (w8 <= 0) {
+        return;
+    }
     uint16_t *dst = wr;
     const uint16_t *bcp = bc;
     int n = w8;
@@ -123,10 +129,10 @@ int main(void) {
 
     uart_puts("GM_QEMUBENCH_ANIM: AnimSteam fillRowPie vs portable reference\n");
 
-    /* Representative colours, w8 = 1 (minimum trip count -- `loop` with a
-     * zero trip count wraps LCOUNT to ~4 billion instead of skipping, so
-     * this is the smallest value fillRowPie is ever called with) and
-     * w8 = 60 (the real w = 480 full-resolution production case). */
+    /* Representative colours, w8 = 0 (must store nothing: `loop` with a
+     * zero trip count wraps LCOUNT to ~4 billion instead of skipping, which
+     * the early return prevents), w8 = 1 (minimum trip count) and w8 = 60
+     * (the real w = 480 full-resolution production case). */
     static const uint16_t colours[] = {0x0000, 0xFFFF, 0xF800, 0x07E0, 0x001F, 0xF81F, 0x8410, 0x2104};
     static uint16_t bc[8] __attribute__((aligned(16)));
     static uint16_t dst[480] __attribute__((aligned(16)));
@@ -136,6 +142,13 @@ int main(void) {
         for (int k = 0; k < 8; k++) {
             bc[k] = c;
         }
+        /* w8 = 0: nothing written */
+        for (int i = 0; i < 8; i++) {
+            dst[i] = (uint16_t)~c;
+            ref[i] = (uint16_t)~c;
+        }
+        fillRowPie(dst, bc, 0);
+        checkRow("fillRowPie w8=0", dst, ref, 8);
         /* w8 = 1 */
         for (int i = 0; i < 8; i++) {
             dst[i] = (uint16_t)~c;
@@ -156,7 +169,7 @@ int main(void) {
 
     if (g_fails == 0) {
         uart_puts("GM_QEMUBENCH_PIE: PASS AnimSteam fillRowPie bit-exact vs portable reference "
-                   "(8 colours x {w8=1,w8=60})\n");
+                   "(8 colours x {w8=0,w8=1,w8=60})\n");
         uart_puts("GM_QEMUBENCH_ANIM: PASS AnimSteam fillRowPie bit-exact vs portable reference\n");
     } else {
         uart_puts("GM_QEMUBENCH_PIE: FAIL mismatches=");

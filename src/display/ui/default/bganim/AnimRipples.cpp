@@ -571,43 +571,47 @@ void accumulateBandRef(float *hAccBuf, const RowBand &b, const float *cosTable, 
     }
 }
 
-#if defined(__XTENSA__) && !defined(GM_BGANIM_NO_ASM)
-
 // Kernel A: row[x0..x1) = tile[x&3]. PIE vector store of a resident 8-lane
 // pattern for the aligned bulk, scalar for the unaligned edges.
 //
 // Alignment: EE.VLD.128.IP/EE.VST.128.IP mask the low four address bits
 // silently instead of trapping (SleepAnimation.cpp's scale565Oct comment
 // on kPieMasks), so a misaligned store corrupts the pixels either side of
-// it rather than failing loudly. Every row here is 16-byte aligned
-// (960-byte stride off a 64-byte-aligned band buffer, see this repo's
-// CLAUDE.md), but a span's x0 is an arbitrary crossing-window edge, not
-// generally a multiple of 8 pixels (16 bytes = 8 x uint16_t). So this
-// kernel walks a scalar prefix up to the next 8-pixel boundary, vector-
-// stores the aligned middle, then a scalar suffix for what is left
-// (< 8 pixels). Because 8 is a multiple of the tile's period (4), that
-// aligned boundary is ALSO always a multiple of 4, so the 8-lane pattern
-// loaded once before the loop, [t0,t1,t2,t3,t0,t1,t2,t3], is valid at any
-// 8-pixel-aligned start regardless of where x0 itself fell in the x&3
-// cycle -- the scalar prefix (one pixel at a time from x0) keeps the
-// tile[x&3] indexing correct up to that point by construction.
+// it rather than failing loudly. The prefix is therefore by address, not
+// by pixel index (gm-1wrm): BgAnim.h promises only a 4-byte-aligned dst,
+// a row inside a band starts at dst + r*w, and at w = 466 that is 4 mod 16
+// on every other row. So this walks scalar pixels from x0 until row + x is
+// a multiple of 16 bytes, vector-stores the whole groups of eight after
+// that, then a scalar suffix for what is left (< 8 pixels). The aligned x
+// is not always a multiple of 4 (row 4 mod 16 puts it at 6 mod 8), so the
+// 8-lane pattern is built rotated to it, pat[i] = tile[(x + i) & 3]; eight
+// is a multiple of the tile's period, so the same pattern holds for every
+// later group, and every pixel still gets tile[x & 3] of its absolute x.
 //
 // PIE is coprocessor CP3, thread-context only; band() runs on the SleepAnim
 // task, never an ISR, so q0 needs no clobber list (the compiler never
 // allocates q registers -- same citation as scale565Oct).
+//
+// Host / GM_BGANIM_NO_ASM builds compile the same function with a twin of
+// the vector loop that stores the way ee.vst.128.ip does, to the address
+// with its low four bits cleared. A prefix that left the address
+// misaligned would then write before the span on the host too, where ASan
+// and tools/animbench's alignment pass see it.
 __attribute__((noinline)) static void fillTileSpanPie(uint16_t *row, int x0, int x1, const uint16_t tile[4]) {
     int x = x0;
-    const int alignedStart = (x0 + 7) & ~7;
-    const int prefixEnd = alignedStart < x1 ? alignedStart : x1;
-    for (; x < prefixEnd; x++) {
+    for (; x < x1 && (reinterpret_cast<uintptr_t>(row + x) & 15) != 0; x++) {
         row[x] = tile[x & 3];
     }
     const int n8 = (x1 - x) >> 3;
     if (n8 > 0) {
         uint16_t *wr = row + x;
-        alignas(16) uint16_t pat[8] = {tile[0], tile[1], tile[2], tile[3], tile[0], tile[1], tile[2], tile[3]};
+        alignas(16) uint16_t pat[8];
+        for (int i = 0; i < 8; i++) {
+            pat[i] = tile[(x + i) & 3];
+        }
         const uint16_t *patPtr = pat;
         int n = n8;
+#if defined(__XTENSA__) && !defined(GM_BGANIM_NO_ASM)
         asm volatile("ee.vld.128.ip q0, %[pp], 0\n" // q0 = the 8-lane pattern, resident for the loop
                      "1:\n"
                      "ee.vst.128.ip q0, %[wr], 16\n"
@@ -616,12 +620,20 @@ __attribute__((noinline)) static void fillTileSpanPie(uint16_t *row, int x0, int
                      : [wr] "+r"(wr), [n] "+r"(n)
                      : [pp] "r"(patPtr)
                      : "memory");
+#else
+        uint16_t *wa = reinterpret_cast<uint16_t *>(reinterpret_cast<uintptr_t>(wr) & ~static_cast<uintptr_t>(15));
+        for (int i = 0; i < n * 8; i++) {
+            wa[i] = patPtr[i & 7];
+        }
+#endif
         x += n8 << 3;
     }
     for (; x < x1; x++) {
         row[x] = tile[x & 3];
     }
 }
+
+#if defined(__XTENSA__) && !defined(GM_BGANIM_NO_ASM)
 
 // Kernel B: same math as accumulateBandRef above, hand-scheduled scalar
 // Xtensa FPU asm. envLUT/cosTable are gather tables (index computed
@@ -750,7 +762,7 @@ __attribute__((noinline)) static void accumulateBandAsm(float *hAccBuf, const Ro
 #endif // __XTENSA__ && !GM_BGANIM_NO_ASM
 
 // Portable row[x0..x1) = tile[x&3] fill: bandRef()'s version of Kernel A,
-// and band()'s fallback wherever fillTileSpanPie is unavailable.
+// the plain scalar spec fillTileSpanPie is checked against.
 void fillTileSpanRef(uint16_t *row, int x0, int x1, const uint16_t tile[4]) {
     for (int x = x0; x < x1; x++) {
         row[x] = tile[x & 3];
@@ -830,10 +842,14 @@ void bandRef(uint16_t *dst, int y0, int rows, int w, uint32_t, const uint8_t *) 
     }
 }
 
-// Dispatches to the hand-written Xtensa kernels on device; falls back to
-// bandRef() verbatim everywhere else (host bench, GM_BGANIM_NO_ASM builds).
-void band(uint16_t *dst, int y0, int rows, int w, uint32_t tMs, const uint8_t *p) {
-#if defined(__XTENSA__) && !defined(GM_BGANIM_NO_ASM)
+// Device path: the PIE fill and the hand-written accumulate. Host and
+// GM_BGANIM_NO_ASM builds run the same glue with fillTileSpanPie's host
+// twin and accumulateBandRef (gm-1wrm), so the goldens, the interlace
+// check and the fuzz exercise the fill's address prefix; bandRef() stays
+// the plain scalar spec. The float path is unchanged on both sides: on the
+// device bandRef's accumulate is compiled with a fused madd.s and the asm
+// kernel is not, which is gm-bzu.83, not this glue.
+void band(uint16_t *dst, int y0, int rows, int w, uint32_t, const uint8_t *) {
     for (int yy = 0; yy < rows; yy++) {
         const int y = y0 + yy;
         RowState rs;
@@ -845,7 +861,11 @@ void band(uint16_t *dst, int y0, int rows, int w, uint32_t tMs, const uint8_t *p
         }
         memset(g_hAccBuf, 0, sizeof(float) * static_cast<size_t>(w));
         for (int i = 0; i < rs.nrb; i++) {
+#if defined(__XTENSA__) && !defined(GM_BGANIM_NO_ASM)
             accumulateBandAsm(g_hAccBuf, rs.rb[i], g_cosTable, envLUT);
+#else
+            accumulateBandRef(g_hAccBuf, rs.rb[i], g_cosTable, envLUT);
+#endif
         }
         int x = 0;
         for (int s = 0; s < rs.nSpans; s++) {
@@ -855,9 +875,6 @@ void band(uint16_t *dst, int y0, int rows, int w, uint32_t tMs, const uint8_t *p
         }
         fillTileSpanPie(row, x, w, rs.tile);
     }
-#else
-    bandRef(dst, y0, rows, w, tMs, p);
-#endif
 }
 
 void release() {

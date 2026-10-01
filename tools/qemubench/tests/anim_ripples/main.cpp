@@ -98,19 +98,23 @@ static void uart_put_int(int v) {
     }
 }
 
-/* ---- Kernel A: verbatim transcription of fillTileSpanPie ---- */
+/* ---- Kernel A: verbatim transcription of fillTileSpanPie ----
+ * gm-1wrm: the prefix runs until row + x is 16-byte aligned (by address,
+ * not by pixel index) and the 8-lane pattern is rotated to that x, as in
+ * AnimRipples.cpp. The asm block is unchanged. The source's host twin
+ * (#else branch) is not transcribed: this harness is Xtensa only. */
 __attribute__((noinline)) static void fillTileSpanPie(uint16_t *row, int x0, int x1, const uint16_t tile[4]) {
     int x = x0;
-    const int alignedStart = (x0 + 7) & ~7;
-    const int prefixEnd = alignedStart < x1 ? alignedStart : x1;
-    for (; x < prefixEnd; x++) {
+    for (; x < x1 && (reinterpret_cast<uintptr_t>(row + x) & 15) != 0; x++) {
         row[x] = tile[x & 3];
     }
     const int n8 = (x1 - x) >> 3;
     if (n8 > 0) {
         uint16_t *wr = row + x;
-        uint16_t pat[8] __attribute__((aligned(16))) = {tile[0], tile[1], tile[2], tile[3],
-                                                          tile[0], tile[1], tile[2], tile[3]};
+        uint16_t pat[8] __attribute__((aligned(16)));
+        for (int i = 0; i < 8; i++) {
+            pat[i] = tile[(x + i) & 3];
+        }
         const uint16_t *patPtr = pat;
         int n = n8;
         __asm__ volatile("ee.vld.128.ip q0, %[pp], 0\n"
@@ -313,21 +317,26 @@ static const float cosTable[256] __attribute__((aligned(16))) = {
 
 static int g_bad = 0;
 
-static void checkFillTile(int caseId, int x0, int x1, int rowLen) {
+/* rowOff shifts the row start by that many pixels past a 16-byte boundary
+ * (gm-1wrm): 2, 4 and 6 px are the +4, +8 and +12 byte row starts a 4-byte
+ * aligned band buffer or a 466 px stride produces. The whole 64-entry
+ * buffer is compared, so a store the vector unit masked down to before the
+ * row (or before x0) shows up as a mismatch in the guard words. */
+static void checkFillTile(int caseId, int x0, int x1, int rowOff = 0) {
     static uint16_t rowA[64] __attribute__((aligned(16)));
     static uint16_t rowB[64] __attribute__((aligned(16)));
     const uint16_t tile[4] = {0x1111, 0x2222, 0x3333, 0x4444};
     // volatile: defeats GCC's loop-to-memset idiom recognition, which would
     // otherwise emit a real call to `memset` -- a symbol this freestanding,
     // -nostdlib link has no definition for (see the file header).
-    for (int i = 0; i < rowLen; i++) {
+    for (int i = 0; i < 64; i++) {
         (reinterpret_cast<volatile uint16_t *>(rowA))[i] = 0xBEEF;
         (reinterpret_cast<volatile uint16_t *>(rowB))[i] = 0xBEEF;
     }
-    fillTileSpanPie(rowA, x0, x1, tile);
-    fillTileSpanRef(rowB, x0, x1, tile);
+    fillTileSpanPie(rowA + rowOff, x0, x1, tile);
+    fillTileSpanRef(rowB + rowOff, x0, x1, tile);
     int mism = 0;
-    for (int i = 0; i < rowLen; i++) {
+    for (int i = 0; i < 64; i++) {
         if (rowA[i] != rowB[i]) {
             mism++;
         }
@@ -338,6 +347,8 @@ static void checkFillTile(int caseId, int x0, int x1, int rowLen) {
     uart_put_int(x0);
     uart_puts(" x1=");
     uart_put_int(x1);
+    uart_puts(" rowOff=");
+    uart_put_int(rowOff);
     uart_puts(" mismatches=");
     uart_put_int(mism);
     uart_puts("\n");
@@ -426,11 +437,19 @@ int main(void) {
 
     /* ---- Kernel A: exercise prefix-only, prefix+vector+suffix, exactly
      * aligned (no prefix/suffix), and a full 16-wide span. ---- */
-    checkFillTile(0, 5, 7, 16);   /* 2px, scalar prefix only, n8==0 */
-    checkFillTile(1, 3, 29, 32);  /* unaligned x0, prefix + 2 vector groups + suffix */
-    checkFillTile(2, 8, 24, 32);  /* already 8-aligned both ends, pure vector, no scalar */
-    checkFillTile(3, 0, 16, 32);  /* whole aligned span from row start */
-    checkFillTile(4, 0, 4, 16);   /* short span, x0 already aligned, no vector groups */
+    checkFillTile(0, 5, 7);   /* 2px, scalar prefix only, n8==0 */
+    checkFillTile(1, 3, 29);  /* unaligned x0, prefix + 2 vector groups + suffix */
+    checkFillTile(2, 8, 24);  /* already 8-aligned both ends, pure vector, no scalar */
+    checkFillTile(3, 0, 16);  /* whole aligned span from row start */
+    checkFillTile(4, 0, 4);   /* short span, x0 already aligned, no vector groups */
+    /* gm-1wrm: row starts 4, 8 and 12 bytes past a 16-byte boundary. The
+     * vector part starts at x = 6, 4 and 2; at 6 and 2 x is not a multiple
+     * of 4, so the pattern rotation is what keeps tile[x & 3]. */
+    checkFillTile(5, 0, 40, 2);
+    checkFillTile(6, 0, 40, 4);
+    checkFillTile(7, 0, 40, 6);
+    checkFillTile(8, 3, 37, 2);  /* unaligned x0 on an unaligned row */
+    checkFillTile(9, 1, 25, 6);
 
     /* ---- Kernel B: parameter extremes (amp 0 and near-max, r spanning
      * the window on both sides of curR, a tracker seed that forces the
@@ -479,7 +498,7 @@ int main(void) {
 
     if (g_bad == 0) {
         uart_puts("GM_QEMUBENCH_PIE: PASS fillTileSpanPie+accumulateBandAsm bit-exact vs C references "
-                   "(5 fillTile cases, 7 accumulateBand cases, 0/all mismatches)\n");
+                   "(10 fillTile cases, 7 accumulateBand cases, 0/all mismatches)\n");
     } else {
         uart_puts("GM_QEMUBENCH_PIE: FAIL total mismatches=");
         uart_put_int(g_bad);
