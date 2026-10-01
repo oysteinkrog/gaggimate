@@ -3067,13 +3067,22 @@ function bayerOffsets(dithOff, amp, unit) {
     const uu = Math.trunc((u * u) / 256);
     return Math.trunc((u * (768 - uu)) / 512);
   }
+  function profileQ8(u, knee) {
+    const uc = u > 256 ? 256 : (u < -256 ? -256 : u);
+    const v = uc + Math.trunc((shoulderQ8(u) - uc) * knee / 50);
+    return v > 256 ? 256 : (v < -256 ? -256 : v);
+  }
   ANIMS.push({
     id: 'saddle', name: 'Saddle', webOnly: true,
     params: [
       { key: 'speed', label: 'Speed', def: 50 },
       { key: 'curvature', label: 'Curvature', def: 35 },
       { key: 'drift', label: 'Drift', def: 25 },
-      { key: 'contrast', label: 'Contrast', def: 30 }],
+      { key: 'contrast', label: 'Contrast', def: 30 },
+      { key: 'breath', label: 'Breathing', def: 50 },
+      { key: 'shoulder', label: 'Shoulder', def: 50 },
+      { key: 'flow', label: 'Contour flow', def: 50 },
+      { key: 'depth', label: 'Contour depth', def: 100 }],
     init(w, h, state) {
       state.colTerm = new Int16Array(w);
       state.ctPh = new Int16Array(8 * w);
@@ -3106,22 +3115,33 @@ function bayerOffsets(dithOff, amp, unit) {
       // affine law read 5 + Math.floor(p[0] * 48 / 100).
       const speedQ7 = Math.round(F(3712 * speedMulF(p[0])));
       const base = ((t * speedQ7) >>> 0);
-      const phC = base >>> 17;                       // the contour slide
+      // Contour flow (p[6]) scales only the contour slide, Q4, 16 at 50
+      // (gm-3vj.22, as in AnimSaddle.cpp): (base * 16) >>> 21 is base >>> 17
+      // in the eight bits the palette reads.
+      const flowQ4 = Math.trunc(p[6] * 32 / 100);
+      const phC = ((base * flowQ4) >>> 0) >>> 21;    // the contour slide
       const phD = base >>> 14, phD2 = ((base * 7) >>> 0) >>> 17;
       const phK = ((base * 3) >>> 0) >>> 15;
       const driftW = Math.trunc(w * p[2] / 300), driftH = Math.trunc(h * p[2] / 300);
       const x0 = Math.floor(w / 2) + Math.trunc(SIN[phD & (SIN_N - 1)] * driftW / 512);
       const y0 = Math.floor(h / 2) + Math.trunc(SIN[phD2 & (SIN_N - 1)] * driftH / 512);
-      const bend = 256 + ((SIN[phK & (SIN_N - 1)] * 34) >> 9);
+      // Breathing (p[4]) sets the depth of the curvature cycle, 34 at 50.
+      const breath = Math.trunc(34 * p[4] / 50);
+      const bend = 256 + ((SIN[phK & (SIN_N - 1)] * breath) >> 9);
       const hwW = ((Math.floor(w / 4) + Math.trunc(w * p[1] / 200)) * bend) >> 8;
       const hwH = ((Math.floor(h / 4) + Math.trunc(h * p[1] / 200)) * bend) >> 8;
+      // Contour depth (p[7], default 100) scales the row factor, ROW_MAX at
+      // 100; Shoulder (p[5]) runs the profile from a clamped ramp (0) through
+      // the shoulder (50) to twice its departure from the ramp (100).
+      const rowAmp = Math.trunc(ROW_MAX * (40 + Math.min(p[7], 100)) / 140);
+      const knee = p[5];
       for (let y = 0; y < h; y++) {
         const u = Math.trunc(((y - y0) * 256) / (hwH > 0 ? hwH : 1));
-        state.rowTerm[y] = Math.trunc(shoulderQ8(u) * ROW_MAX / 256);
+        state.rowTerm[y] = Math.trunc(profileQ8(u, knee) * rowAmp / 256);
       }
       for (let x = 0; x < w; x++) {
         const u = Math.trunc(((x - x0) * 256) / (hwW > 0 ? hwW : 1));
-        state.colTerm[x] = Math.trunc(shoulderQ8(u) * COL_MAX / 256);
+        state.colTerm[x] = Math.trunc(profileQ8(u, knee) * COL_MAX / 256);
       }
       expandPhases(state.ctPh, state.colTerm, state.dith, w, -COL_MAX, COL_MAX);
       // The index combine is a multiply, not an add: the level sets of a
@@ -6678,7 +6698,7 @@ function pcDither(dst, amp) {
   const TPX = 2;                // texel footprint, 1 << TPX screen pixels
   const DIMPLES = [[8, 8], [40, 8], [24, 40], [56, 40]];   // staggered lattice
   const DR = 18, DH = 9;        // raised-cosine bell, neighbours overlap
-  const LZ_PERIOD_S = 37;
+  const BASE = 40, LZ = 80, LZ_SWING = 22, LZ_PERIOD_S = 37;
   const IDX_LO = 32, IDX_HI = 150;
   const TURN_S = 24;            // light circles once every 24 s
 
@@ -6688,11 +6708,6 @@ function pcDither(dst, amp) {
       { key: 'speed', label: 'Speed', def: 50 },
       { key: 'relief', label: 'Relief', def: 58 },
       { key: 'bright', label: 'Brightness', def: 62 },
-      { key: 'height', label: 'Light height', def: 50 },
-      { key: 'swing', label: 'Height swing', def: 50 },
-      { key: 'tone', label: 'Base tone', def: 50 },
-      { key: 'contrast', label: 'Contrast', def: 50 },
-      { key: 'orbit', label: 'Orbit shape', def: 50 },
     ],
     init(w, h, state) {
       const H = new Float32Array(TS * TS);
@@ -6745,23 +6760,12 @@ function pcDither(dst, amp) {
       // same thing as scaling the normal's xy and costs nothing per texel.
       const lr = 55 + Math.round(p[1] * 70 / 100);
       const ang = 2 * Math.PI * ts / TURN_S;
-      // The five sliders added on 2026-10-01 (gm-3vj.45), mirroring
-      // AnimDimples.cpp. At 50 each gives the old constant (base 40, height
-      // 80, swing 22, contrast 1, round orbit), so the default is unchanged.
-      const base = 20 + Math.round(p[5] * 40 / 100);
-      const lzMid = 30 + p[3];
-      const lzSwing = Math.round(p[4] * 44 / 100);
-      const c = p[6] <= 50 ? 4 + Math.floor(p[6] * 28 / 50) : 32 + Math.floor((p[6] - 50) * 64 / 50);
-      const orbit = p[7] / 50;
       const lx = Math.round(lr * Math.cos(ang));
-      const ly = Math.round(lr * orbit * Math.sin(ang));
-      let lz = lzMid + Math.round(lzSwing * Math.sin(2 * Math.PI * ts / LZ_PERIOD_S));
-      if (lz < 8) lz = 8;
-      const flat = (127 * lz) >> 8;
+      const ly = Math.round(lr * Math.sin(ang));
+      const lz = LZ + Math.round(LZ_SWING * Math.sin(2 * Math.PI * ts / LZ_PERIOD_S));
       const { Nx, Ny, Nz, T, dith, pal } = state;
       for (let k = 0; k < TS * TS; k++) {
-        const d = (Nx[k] * lx + Ny[k] * ly + Nz[k] * lz) >> 8;
-        let v = base + flat + ((((d - flat) * c) + 16) >> 5);
+        let v = BASE + ((Nx[k] * lx + Ny[k] * ly + Nz[k] * lz) >> 8);
         if (v < IDX_LO) v = IDX_LO; else if (v > IDX_HI) v = IDX_HI;
         T[k] = v;
       }

@@ -167,6 +167,17 @@ int shoulderQ8(int u) {
     return (u * (768 - uu)) / 512;
 }
 
+// Shoulder (p[5]) moves the profile between a straight ramp and a steeper
+// shoulder: 0 is the clamped ramp itself, 50 the shoulder exactly (the
+// difference times 50 / 50 is the difference), 100 twice the shoulder's
+// departure from the ramp, which saturates early and flattens a wide quiet
+// plateau each side of the crossing. Clamped to the shoulder's own +/-256.
+int profileQ8(int u, int knee) {
+    const int uc = u > 256 ? 256 : (u < -256 ? -256 : u);
+    int v = uc + (shoulderQ8(u) - uc) * knee / 50;
+    return v > 256 ? 256 : (v < -256 ? -256 : v);
+}
+
 void buildPalette(int contrastP) {
     buildThemeRamp(themeRamp, 256);
     // The page wraps a cosine-shaped sample of the theme RAMP, not the theme
@@ -220,7 +231,13 @@ void frame(uint32_t tMs, int w, int h, const uint8_t p[BG_ANIM_PARAMS]) {
     // 11 float ulps away, so the host, the device and the page agree.
     const uint32_t speedQ7 = static_cast<uint32_t>(lroundf(3712.0f * speedMul(p[0])));
     const uint32_t base = tMs * speedQ7;
-    contourPhase = (base >> 17) & 255;
+    // Contour flow (p[6]) scales only the contour slide, in Q4: 16 at 50 is
+    // the old rate exactly, since (base * 16) >> 21 keeps bits 17..24 of base
+    // as base >> 17 does; 0 holds the contours still while the centre drifts
+    // and the curvature breathes, 32 at 100 slides them twice as fast. The
+    // product wraps modulo 2^32, which only loses bits above the eight read.
+    const uint32_t flowQ4 = static_cast<uint32_t>(p[6]) * 32u / 100u;
+    contourPhase = ((base * flowQ4) >> 21) & 255;
     const uint32_t phD = base >> 14;
     const uint32_t phD2 = (base * 7u) >> 17;
     const uint32_t phK = (base * 3u) >> 15;
@@ -240,20 +257,32 @@ void frame(uint32_t tMs, int w, int h, const uint8_t p[BG_ANIM_PARAMS]) {
 
     // The shoulder half-width. A narrow crossing bends the hyperbolas tightly,
     // a wide one leaves a broad quiet band, which is what the slider is for.
-    // bend=222..290 in Q8 is 1 +/- 34/256. Add a positive multiple of
-    // 512 before shifting and subtract it afterwards: this reproduces the
-    // page's signed >>9 floor without implementation-defined negative shifts.
-    const int bend = 256 + ((sl[phK & (SIN_N - 1)] * 34 + 34 * 512) >> 9) - 34;
+    // Breathing (p[4]) sets the depth of that cycle: 34 at 50 gives
+    // bend=222..290 in Q8, 1 +/- 34/256; 0 holds the curvature still and 100
+    // swings it 1 +/- 68/256. Add a positive multiple of 512 before shifting
+    // and subtract it afterwards: this reproduces the page's signed >>9 floor
+    // without implementation-defined negative shifts (the sine is >= -512).
+    const int breath = 34 * static_cast<int>(p[4]) / 50;
+    const int bend = 256 + ((sl[phK & (SIN_N - 1)] * breath + breath * 512) >> 9) - breath;
     const int hwW = ((w / 4 + w * static_cast<int>(p[1]) / 200) * bend) >> 8;
     const int hwH = ((h / 4 + h * static_cast<int>(p[1]) / 200) * bend) >> 8;
 
+    // Contour depth (p[7], default 100) scales the row factor and with it
+    // how much of the palette the saddle spans: 127 at 100 is the old
+    // ROW_MAX exactly, 36 at 0 shows about a quarter of the palette at once, a
+    // broad glow that brightens and fades as the contours pass. It never
+    // exceeds ROW_MAX, so the product stays in the range the bias and both
+    // kernels are proven for (QEMU: every row value -127..127).
+    const int depthP = p[7] > 100 ? 100 : p[7]; // the registry clamps too
+    const int rowAmp = ROW_MAX * (40 + depthP) / 140;
+    const int knee = p[5];
     for (int y = 0; y < h; y++) {
         const int u = ((y - y0) * 256) / (hwH > 0 ? hwH : 1);
-        rowTerm[y] = static_cast<int16_t>(shoulderQ8(u) * ROW_MAX / 256);
+        rowTerm[y] = static_cast<int16_t>(profileQ8(u, knee) * rowAmp / 256);
     }
     for (int x = 0; x < w; x++) {
         const int u = ((x - x0) * 256) / (hwW > 0 ? hwW : 1);
-        colTerm[x] = static_cast<int16_t>(shoulderQ8(u) * COL_MAX / 256);
+        colTerm[x] = static_cast<int16_t>(profileQ8(u, knee) * COL_MAX / 256);
     }
     for (int ph8 = 0; ph8 < 8; ph8++) {
         int16_t *dstPh = colTermPh + static_cast<size_t>(ph8) * colStride;
@@ -501,7 +530,14 @@ extern const BgAnimation bg_anim_saddle;
 const BgAnimation bg_anim_saddle = {
     "saddle",
     "Saddle",
-    {{"speed", "Speed", 50}, {"curvature", "Curvature", 35}, {"drift", "Drift", 25}, {"contrast", "Contrast", 30}},
+    {{"speed", "Speed", 50},
+     {"curvature", "Curvature", 35},
+     {"drift", "Drift", 25},
+     {"contrast", "Contrast", 30},
+     {"breath", "Breathing", 50},
+     {"shoulder", "Shoulder", 50},
+     {"flow", "Contour flow", 50},
+     {"depth", "Contour depth", 100}},
     init,
     frame,
     band,

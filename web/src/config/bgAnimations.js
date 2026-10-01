@@ -308,6 +308,10 @@ export const BG_ANIMATIONS = [
       { key: 'curvature', label: 'Curvature', def: 35 },
       { key: 'drift', label: 'Drift', def: 25 },
       { key: 'contrast', label: 'Contrast', def: 30 },
+      { key: 'breath', label: 'Breathing', def: 50 },
+      { key: 'shoulder', label: 'Shoulder', def: 50 },
+      { key: 'flow', label: 'Contour flow', def: 50 },
+      { key: 'depth', label: 'Contour depth', def: 100 },
     ],
   },
   {
@@ -639,11 +643,6 @@ export const BG_ANIMATIONS = [
       { key: 'speed', label: 'Speed', def: 50 },
       { key: 'relief', label: 'Relief', def: 58 },
       { key: 'bright', label: 'Brightness', def: 62 },
-      { key: 'height', label: 'Light height', def: 50 },
-      { key: 'swing', label: 'Height swing', def: 50 },
-      { key: 'tone', label: 'Base tone', def: 50 },
-      { key: 'contrast', label: 'Contrast', def: 50 },
-      { key: 'orbit', label: 'Orbit shape', def: 50 },
     ],
   },
   {

@@ -102,7 +102,7 @@ constexpr SimAnim kSimAnims[] = {
     {"Oculus", {{"speed", "Speed", 50}, {"diameter", "Diameter", 65}, {"breath", "Breath", 20}, {"edge", "Edge softness", 55}, {"glow", "Ring glow", 50}, {"halo", "Halo", 50}, {"ripple", "Ripple depth", 50}, {"waves", "Ripple count", 50}}},
     {"Chevrons", {{"speed", "Speed", 50}, {"spacing", "Spacing", 65}, {"angle", "Angle", 50}, {"contrast", "Contrast", 35}, {"round", "Roundness", 50}, {"swell", "Swell depth", 50}, {"swellw", "Swell width", 50}, {"highlight", "Highlight", 50}}},
     {"Mosaic", {{"speed", "Speed", 50}, {"size", "Tile size", 45}, {"contrast", "Contrast", 30}, {"variation", "Variation", 55}, {"bevel", "Bevel", 50}, {"wash", "Wash", 50}, {"brightness", "Brightness", 50}, {"washdensity", "Wash density", 50}}},
-    {"Saddle", {{"speed", "Speed", 50}, {"curvature", "Curvature", 35}, {"drift", "Drift", 25}, {"contrast", "Contrast", 30}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}}},
+    {"Saddle", {{"speed", "Speed", 50}, {"curvature", "Curvature", 35}, {"drift", "Drift", 25}, {"contrast", "Contrast", 30}, {"breath", "Breathing", 50}, {"shoulder", "Shoulder", 50}, {"flow", "Contour flow", 50}, {"depth", "Contour depth", 100}}},
     {"Refraction", {{"speed", "Speed", 50}, {"bend", "Bend", 35}, {"width", "Channel width", 65}, {"contrast", "Contrast", 30}, {"glow", "Glow wave", 50}, {"darkness", "Darkness", 50}, {"ripple", "Ripple", 50}, {"flow", "Flow", 50}}},
     {"Sundial", {{"speed", "Speed", 50}, {"width", "Wedge width", 40}, {"contrast", "Contrast", 25}, {"shading", "Surface shading", 30}, {"breath", "Breath", 50}, {"surface", "Surface", 50}, {"softness", "Edge softness", 50}, {"tone", "Face tone", 50}}},
     {"Crescent", {{"speed", "Speed", 50}, {"size", "Size", 70}, {"phase", "Phase range", 40}, {"contrast", "Contrast", 40}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}}},
@@ -125,7 +125,7 @@ constexpr SimAnim kSimAnims[] = {
     {"Barrel", {{"speed", "Speed", 50}, {"bands", "Bands", 14}, {"shade", "Cylinder shade", 62}, {"tilt", "Band tilt", 50}, {"width", "Barrel width", 50}, {"edge", "Edge fade", 50}, {"light", "Light angle", 50}, {"depth", "Band depth", 50}}},
     {"Grid", {{"speed", "Speed", 50}, {"density", "Grid density", 50}, {"lines", "Line strength", 58}, {"width", "Line width", 50}, {"cross", "Cross lines", 50}, {"reach", "Grid reach", 50}, {"shade", "Floor shade", 50}, {"drift", "Side drift", 50}}},
     {"Cells", {{"speed", "Speed", 50}, {"width", "Channel width", 55}, {"depth", "Contrast", 60}, {"count", "Cell count", 42}, {"halo", "Halo width", 40}, {"tilt", "Drift tilt", 50}, {"grain", "Grain", 50}, {"glow", "Glow", 50}}},
-    {"Dimples", {{"speed", "Speed", 50}, {"relief", "Relief", 58}, {"bright", "Brightness", 62}, {"height", "Light height", 50}, {"swing", "Height swing", 50}, {"tone", "Base tone", 50}, {"contrast", "Contrast", 50}, {"orbit", "Orbit shape", 50}}},
+    {"Dimples", {{"speed", "Speed", 50}, {"relief", "Relief", 58}, {"bright", "Brightness", 62}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}}},
     {"Cube", {{"speed", "Speed", 50}, {"size", "Cube size", 50}, {"glow", "Face glow", 55}, {"tilt", "Tilt", 50}, {"wobble", "Wobble", 50}, {"edge", "Edge softness", 50}, {"backs", "Back faces", 50}, {"background", "Background", 50}}},
 };
 
