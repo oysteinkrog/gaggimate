@@ -543,7 +543,27 @@ void buildRowState(int y, int w, RowState &rs) {
 // pre-restructure code). Used directly by bandRef(), and by band() itself
 // wherever accumulateBandAsm below is unavailable (non-Xtensa, or
 // GM_BGANIM_NO_ASM).
-void accumulateBandRef(float *hAccBuf, const RowBand &b, const float *cosTable, const float *envLUT) {
+//
+// No fused multiply-add here (gm-bzu.83). GCC defaults to
+// -ffp-contract=fast, and from -O2 up it compiled the accumulate below into
+// one madd.s, which rounds once. accumulateBandAsm does mul.s then add.s,
+// which rounds twice, and so do the host goldens (x86 without FMA). The
+// device's bandRef() therefore differed from band() by 1 ULP on some ring
+// samples before the RGB565 pack. The attribute turns contraction off for
+// this function only. It is noinline because fp-contract is applied per
+// function after inlining: inlined into bandRef(), the loop would be
+// compiled under bandRef()'s fast setting again. The rest of the file keeps
+// the default, so blendPackSpan() and buildRowState(), which band() and
+// bandRef() share, compile the same as before. Clang has no optimize
+// attribute, so a Clang build gets only noinline; the host bench builds
+// with GCC for x86 without FMA, where nothing can fuse.
+#if defined(__GNUC__) && !defined(__clang__)
+#define RIPPLES_NO_FP_CONTRACT __attribute__((noinline, optimize("fp-contract=off")))
+#else
+#define RIPPLES_NO_FP_CONTRACT __attribute__((noinline))
+#endif
+RIPPLES_NO_FP_CONTRACT void accumulateBandRef(float *hAccBuf, const RowBand &b, const float *cosTable,
+                                              const float *envLUT) {
     int curDx = b.curDx, curDist2 = b.curDist2, curR = b.curR, curR2 = b.curR2;
     for (int x = b.x0; x <= b.x1; x++) {
         // curR is already the tracked integer distance for this x (seeded
