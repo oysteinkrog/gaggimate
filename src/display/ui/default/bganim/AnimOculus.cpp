@@ -173,6 +173,26 @@ void frame(uint32_t tMs, int w, int h, const uint8_t p[BG_ANIM_PARAMS]) {
     int a = mean + ((sine[phB & 1023] * breath) >> 9) + ((sine[phB2 & 1023] * breath) >> 10);
     a = a < 8 ? 8 : (a > DISC_IDX - 6 ? DISC_IDX - 6 : a);
     const int halo = a + 34 + (edge >> 1); // halo offset grows with edge softness
+    // The four sliders added for gm-3vj.19. Each one replaces a constant
+    // this loop used to hard-code and gives that constant back exactly at
+    // its default of 50, so the default palette, and so every pixel, is the
+    // old one. All four act on the palette alone: the column, row and
+    // dither tables, bandRef and oculusRowAsm do not see them.
+    //   Ring glow     the lit ring's peak theme index: 74 at 0, where the
+    //                 ring is no brighter than the rim of the opening, 132
+    //                 at 50, 190 at 100.
+    //   Halo          the outer halo ring's light: none at 0, 14 indices at
+    //                 50, 60 at 100.
+    //   Ripple depth  the crawling ripple's amplitude: flat at 0, 15
+    //                 indices at 50, 40 at 100.
+    //   Ripple count  sine units per radial index, so how many ripple
+    //                 crests sit across the disc: 5 at 0, 15 at 50, 40 at
+    //                 100. A crest's travel speed scales inversely, since
+    //                 the time term is unchanged.
+    const int ringPeak = 74 + static_cast<int>(p[4]) * 116 / 100;
+    const int haloAmp = p[5] <= 50 ? p[5] * 14 / 50 : 14 + (p[5] - 50) * 46 / 50;
+    const int ripAmp = p[6] <= 50 ? p[6] * 15 / 50 : 15 + (p[6] - 50) * 25 / 50;
+    const int ripStep = p[7] <= 50 ? 5 + p[7] * 10 / 50 : 15 + (p[7] - 50) * 25 / 50;
     const int gain = 232 + ((sine[phGain & 1023] * 22) >> 9); // Q8 gain 210..254
     const int inner = a - edge > 1 ? a - edge : 1;
     const int outerStart = a + edge;
@@ -200,18 +220,19 @@ void frame(uint32_t tMs, int w, int h, const uint8_t p[BG_ANIM_PARAMS]) {
         if (ad < edge) {
             const int u = 256 - ad * 256 / edge;
             const int sm = (u * u * (768 - 2 * u)) >> 16;
-            v += ((132 - v) * (sm < 0 ? 0 : (sm > 256 ? 256 : sm))) >> 8;
+            v += ((ringPeak - v) * (sm < 0 ? 0 : (sm > 256 ? 256 : sm))) >> 8;
         }
         d = i - halo;
         ad = d < 0 ? -d : d;
-        const int hw = edge + 8; // halo is wider, with only 14 indices of light
+        const int hw = edge + 8; // halo is wider, with haloAmp (14 at default) indices of light
         if (ad < hw) {
             const int u = 256 - ad * 256 / hw, kk = (u * u) >> 8;
-            v += (kk * 14) >> 8;
+            v += (kk * haloAmp) >> 8;
         }
-        // 15 sine units per radial index, amplitude 15; the page's "3.5
-        // cycles" describes the field rather than a linear pixel frequency.
-        v += (sine[(static_cast<uint32_t>(i * 15) - phRip) & 1023] * 15) >> 9;
+        // 15 sine units per radial index, amplitude 15, at the defaults; the
+        // page's "3.5 cycles" describes the field rather than a linear pixel
+        // frequency.
+        v += (sine[(static_cast<uint32_t>(i * ripStep) - phRip) & 1023] * ripAmp) >> 9;
         v = (v * gain) >> 8;
         palette[i] = themeRamp[v < 0 ? 0 : (v > 255 ? 255 : v)];
     }
@@ -387,7 +408,8 @@ extern const BgAnimation bg_anim_oculus;
 const BgAnimation bg_anim_oculus = {
     "oculus",
     "Oculus",
-    {{"speed", "Speed", 50}, {"diameter", "Diameter", 65}, {"breath", "Breath", 20}, {"edge", "Edge softness", 55}},
+    {{"speed", "Speed", 50}, {"diameter", "Diameter", 65}, {"breath", "Breath", 20}, {"edge", "Edge softness", 55},
+     {"glow", "Ring glow", 50}, {"halo", "Halo", 50}, {"ripple", "Ripple depth", 50}, {"waves", "Ripple count", 50}},
     init,
     frame,
     band,

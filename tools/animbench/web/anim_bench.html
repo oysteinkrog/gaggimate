@@ -2660,7 +2660,11 @@ function bayerOffsets(dithOff, amp, unit) {
       { key: 'speed', label: 'Speed', def: 50 },
       { key: 'diameter', label: 'Diameter', def: 65 },
       { key: 'breath', label: 'Breath', def: 20 },
-      { key: 'edge', label: 'Edge softness', def: 55 }],
+      { key: 'edge', label: 'Edge softness', def: 55 },
+      { key: 'glow', label: 'Ring glow', def: 50 },
+      { key: 'halo', label: 'Halo', def: 50 },
+      { key: 'ripple', label: 'Ripple depth', def: 50 },
+      { key: 'waves', label: 'Ripple count', def: 50 }],
     init(w, h, state) {
       state.colTerm = new Int16Array(w);
       state.ctPh = new Int16Array(8 * w);
@@ -2714,6 +2718,13 @@ function bayerOffsets(dithOff, amp, unit) {
       if (a < 8) a = 8;
       if (a > DISC_IDX - 6) a = DISC_IDX - 6;
       const halo = a + 34 + (edge >> 1);
+      // The four sliders added for gm-3vj.19, mirroring AnimOculus.cpp: each
+      // gives back the constant it replaces at its default of 50 (ring peak
+      // 132, halo light 14, ripple amplitude 15, 15 sine units per index).
+      const ringPeak = 74 + Math.floor(p[4] * 116 / 100);
+      const haloAmp = p[5] <= 50 ? Math.floor(p[5] * 14 / 50) : 14 + Math.floor((p[5] - 50) * 46 / 50);
+      const ripAmp = p[6] <= 50 ? Math.floor(p[6] * 15 / 50) : 15 + Math.floor((p[6] - 50) * 25 / 50);
+      const ripStep = p[7] <= 50 ? 5 + Math.floor(p[7] * 10 / 50) : 15 + Math.floor((p[7] - 50) * 25 / 50);
       const gain = 232 + ((SIN[phGain & (SIN_N - 1)] * 22) >> 9);
       const ramp = state.ramp, pal = state.pal;
       const inner = a - edge > 1 ? a - edge : 1;
@@ -2742,16 +2753,16 @@ function bayerOffsets(dithOff, amp, unit) {
         if (ad < edge) {
           const u = 256 - Math.trunc(ad * 256 / edge);
           const sm = (u * u * (768 - 2 * u)) >> 16;
-          v += ((132 - v) * (sm < 0 ? 0 : (sm > 256 ? 256 : sm))) >> 8;
+          v += ((ringPeak - v) * (sm < 0 ? 0 : (sm > 256 ? 256 : sm))) >> 8;
         }
         d = i - halo; ad = d < 0 ? -d : d;
         const hw = edge + 8;
         if (ad < hw) {
           const u = 256 - Math.trunc(ad * 256 / hw), kk = (u * u) >> 8;
-          v += (kk * 14) >> 8;
+          v += (kk * haloAmp) >> 8;
         }
         // A low ripple in squared-radius space, crawling outward.
-        v += ((SIN[(((i * 15) - phRip) >> 0) & (SIN_N - 1)] * 15) >> 9);
+        v += ((SIN[(((i * ripStep) - phRip) >> 0) & (SIN_N - 1)] * ripAmp) >> 9);
         v = (v * gain) >> 8;
         const q = (v < 0 ? 0 : (v > 255 ? 255 : v)) * 3;
         pal[i * 3] = ramp[q]; pal[i * 3 + 1] = ramp[q + 1]; pal[i * 3 + 2] = ramp[q + 2];
@@ -2873,11 +2884,11 @@ function bayerOffsets(dithOff, amp, unit) {
    horizontal seam pay for a second table and a lerp, and they are about one row
    in eight. */
 (() => {
-  const MAX_TILES = 20, MID = 560, BEVEL = 190, BLEND_PX = 7;
+  const MAX_TILES = 20, MID = 560, BEVEL = 190, WASH = 210, BLEND_PX = 7;
   // One axis of the grid: uneven tile widths from a fixed seed, a dome of
   // shading per tile that reaches zero at both of its edges, and for every
   // pixel the two tiles it lies between with the weight of the second.
-  function layoutAxis(shade, tA, tB, tW, n, wide0, jitter, seed) {
+  function layoutAxis(shade, tA, tB, tW, n, wide0, jitter, seed, bevel) {
     let s = seed >>> 0, idx = 0, x = 0;
     const start = [], width = [];
     const minW = 3 * BLEND_PX;
@@ -2894,7 +2905,7 @@ function bayerOffsets(dithOff, amp, unit) {
         // sin(pi k / wide) out of the shared table: zero at both tile edges, so
         // the shading carries no step across a seam.
         const u = Math.trunc(k * (SIN_N / 2) / dw);
-        shade[x] = (sign * SIN[u & (SIN_N - 1)] * BEVEL) >> 9;
+        shade[x] = (sign * SIN[u & (SIN_N - 1)] * bevel) >> 9;
       }
       idx++;
     }
@@ -2923,7 +2934,11 @@ function bayerOffsets(dithOff, amp, unit) {
       { key: 'speed', label: 'Speed', def: 50 },
       { key: 'size', label: 'Tile size', def: 45 },
       { key: 'contrast', label: 'Contrast', def: 30 },
-      { key: 'variation', label: 'Variation', def: 55 }],
+      { key: 'variation', label: 'Variation', def: 55 },
+      { key: 'bevel', label: 'Bevel', def: 50 },
+      { key: 'wash', label: 'Wash', def: 50 },
+      { key: 'brightness', label: 'Brightness', def: 50 },
+      { key: 'washdensity', label: 'Wash density', def: 50 }],
     init(w, h, state) {
       state.colShade = new Int16Array(w); state.rowShade = new Int16Array(h);
       state.cA = new Uint8Array(w); state.cB = new Uint8Array(w); state.cW = new Uint16Array(w);
@@ -2936,7 +2951,7 @@ function bayerOffsets(dithOff, amp, unit) {
       state.tRate = new Uint8Array(MAX_TILES * MAX_TILES);
       state.dith = new Int16Array(64);
       state.pal = new Uint8Array(256 * 3);
-      state.key = null; state.lastP1 = -1; state.lastP3 = -1;
+      state.key = null; state.lastP1 = -1; state.lastP3 = -1; state.lastP4 = -1;
       state.nCol = 1; state.nRow = 1;
     },
     render(data, w, h, tMs, p, state) {
@@ -2952,15 +2967,17 @@ function bayerOffsets(dithOff, amp, unit) {
         }
         bayerOffsets(state.dith, ditherAmpJS(pal, 256), 16);
       }
-      if (p[1] !== state.lastP1 || p[3] !== state.lastP3) {
-        state.lastP1 = p[1]; state.lastP3 = p[3];
+      if (p[1] !== state.lastP1 || p[3] !== state.lastP3 || p[4] !== state.lastP4) {
+        state.lastP1 = p[1]; state.lastP3 = p[3]; state.lastP4 = p[4];
+        // Bevel (p[4]) scales the tile domes, 1x at 50 (gm-3vj.21).
+        const bevel = Math.trunc(BEVEL * p[4] / 50);
         const baseW = Math.floor(w / 6) + Math.trunc(p[1] * (Math.floor(w * 2 / 5) - Math.floor(w / 6)) / 100);
         const baseH = Math.floor(h / 6) + Math.trunc(p[1] * (Math.floor(h * 2 / 5) - Math.floor(h / 6)) / 100);
         const jitW = Math.trunc(baseW * p[3] / 250), jitH = Math.trunc(baseH * p[3] / 250);
         state.nCol = layoutAxis(state.colShade, state.cA, state.cB, state.cW, w,
-          baseW, jitW, 0xA5C31D7B);
+          baseW, jitW, 0xA5C31D7B, bevel);
         state.nRow = layoutAxis(state.rowShade, state.rA, state.rB, state.rW, h,
-          baseH, jitH, 0x2F6B49E1);
+          baseH, jitH, 0x2F6B49E1, bevel);
         // One phase and rate per tile of the grid, from a fixed seed, so the
         // pattern of who is bright is the same every boot.
         let s = 0x6C8E9CF7;
@@ -2990,13 +3007,20 @@ function bayerOffsets(dithOff, amp, unit) {
         const u = (SIN[idx] + 512) >> 1, u2 = (u * u) >> 9;
         level[i] = ((((u2 * u) >> 9) * amp) >> 9);
       }
-      for (let x = 0; x < w; x++) washCol[x] = (SIN[(((x * 18) >> 4) - phW1) & (SIN_N - 1)] * 210) >> 9;
-      for (let y = 0; y < h; y++) washRow[y] = (SIN[(((y * 18) >> 4) + phW2) & (SIN_N - 1)] * 210) >> 9;
+      // Wash (p[5]) scales the wash amplitude, Wash density (p[7]) its
+      // spatial step in sixteenths (4 at 0, 18 at 50, 64 at 100) and
+      // Brightness (p[6]) the resting field, each 1x at 50, as in
+      // AnimMosaic.cpp.
+      const washAmp = Math.trunc(WASH * p[5] / 50);
+      const washStep = p[7] <= 50 ? 4 + Math.trunc(p[7] * 14 / 50) : 18 + Math.trunc((p[7] - 50) * 46 / 50);
+      const mid = Math.trunc(MID * p[6] / 50);
+      for (let x = 0; x < w; x++) washCol[x] = (SIN[(((x * washStep) >> 4) - phW1) & (SIN_N - 1)] * washAmp) >> 9;
+      for (let y = 0; y < h; y++) washRow[y] = (SIN[(((y * washStep) >> 4) + phW2) & (SIN_N - 1)] * washAmp) >> 9;
       for (let ri = 0; ri < nRow; ri++) {
         const dst = ri * w, lb = ri * nCol;
         for (let x = 0; x < w; x++) {
           const la = level[lb + cA[x]], lbv = level[lb + cB[x]];
-          comb[dst + x] = MID + la + (((lbv - la) * cW[x]) >> 8) + colShade[x] + washCol[x];
+          comb[dst + x] = mid + la + (((lbv - la) * cW[x]) >> 8) + colShade[x] + washCol[x];
         }
       }
       let o = 0;

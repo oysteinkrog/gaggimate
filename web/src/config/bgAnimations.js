@@ -263,6 +263,10 @@ export const BG_ANIMATIONS = [
       { key: 'diameter', label: 'Diameter', def: 65 },
       { key: 'breath', label: 'Breath', def: 20 },
       { key: 'edge', label: 'Edge softness', def: 55 },
+      { key: 'glow', label: 'Ring glow', def: 50 },
+      { key: 'halo', label: 'Halo', def: 50 },
+      { key: 'ripple', label: 'Ripple depth', def: 50 },
+      { key: 'waves', label: 'Ripple count', def: 50 },
     ],
   },
   {
@@ -289,6 +293,10 @@ export const BG_ANIMATIONS = [
       { key: 'size', label: 'Tile size', def: 45 },
       { key: 'contrast', label: 'Contrast', def: 30 },
       { key: 'variation', label: 'Variation', def: 55 },
+      { key: 'bevel', label: 'Bevel', def: 50 },
+      { key: 'wash', label: 'Wash', def: 50 },
+      { key: 'brightness', label: 'Brightness', def: 50 },
+      { key: 'washdensity', label: 'Wash density', def: 50 },
     ],
   },
   {
