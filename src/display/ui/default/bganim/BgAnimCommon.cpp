@@ -222,10 +222,20 @@ const float *cosTableF() {
     return lut;
 }
 
-const uint8_t BAYER4[16] = {0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5};
-const uint8_t BAYER8[64] = {0,  32, 8,  40, 2,  34, 10, 42, 48, 16, 56, 24, 50, 18, 58, 26, 12, 44, 4,  36, 14, 46,
-                            6,  38, 60, 28, 52, 20, 62, 30, 54, 22, 3,  35, 11, 43, 1,  33, 9,  41, 51, 19, 59, 27,
-                            49, 17, 57, 25, 15, 47, 7,  39, 13, 45, 5,  37, 63, 31, 55, 23, 61, 29, 53, 21};
+// Balanced ordered-dither tables (gm-404a). Each is the standard recursive
+// Bayer matrix with column x rotated by an xor on the row index,
+// table[y][x] = bayer[y ^ ROT[x]][x]: BAYER4 with ROT = 0 2 3 1, BAYER8 with
+// ROT = 0 6 2 4 5 3 7 1. Plain Bayer is balanced by column but not by row
+// (BAYER8 rows summed 168 to 336 against 252, BAYER4 rows 20 to 40 against
+// 30), so on a flat surface every eighth row read brighter than its
+// neighbour. Rotated, every row and every column sums to the ideal (252 and
+// 30) and each table still holds every value once. Of the rotations that
+// balance both axes, these have the least low-frequency power;
+// tools/animbench/bayer_balance.py is the search and the banding report.
+const uint8_t BAYER4[16] = {0, 11, 13, 6, 12, 7, 1, 10, 3, 8, 14, 5, 15, 4, 2, 9};
+const uint8_t BAYER8[64] = {0,  47, 4,  43, 49, 30, 53, 26, 48, 31, 52, 27, 1,  46, 5,  42, 12, 35, 8,  39, 61, 18,
+                            57, 22, 60, 19, 56, 23, 13, 34, 9,  38, 3,  44, 7,  40, 50, 29, 54, 25, 51, 28, 55, 24,
+                            2,  45, 6,  41, 15, 32, 11, 36, 62, 17, 58, 21, 63, 16, 59, 20, 14, 33, 10, 37};
 
 float ditherAmp(const uint16_t *pal, int n) {
     int cr = 0, cg = 0, cb = 0;

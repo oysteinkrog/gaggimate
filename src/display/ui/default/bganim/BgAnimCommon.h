@@ -233,9 +233,11 @@ BGANIM_INLINE float fastCosRad(float rad) {
 }
 BGANIM_INLINE float fastSinRad(float rad) { return fastCosRad(rad - 1.5707963f); }
 
-// 4x4 ordered dither matrix, values 0..15.
+// 4x4 ordered dither matrix, values 0..15, every row and column summing to
+// 30 (Bayer with balanced rows, see BgAnimCommon.cpp).
 extern const uint8_t BAYER4[16];
-// 8x8 ordered dither matrix, values 0..63.
+// 8x8 ordered dither matrix, values 0..63, every row and column summing to
+// 252 (Bayer with balanced rows, see BgAnimCommon.cpp).
 extern const uint8_t BAYER8[64];
 
 // Ordered-dither amplitude for a palette, in palette-index units: half the

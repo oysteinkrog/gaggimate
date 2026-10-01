@@ -76,6 +76,9 @@ make BIN=build/bench_<yourid>                 # monolithic build, ~5 s
 
 - `golden/` holds pre-optimization reference frames (f030/f120/f210). The
   compare line prints mean/max RGB888 diff; "OK" ≈ mean<=3.0 max<=48.
+  Every animation that reads BAYER4 or BAYER8 had its goldens regenerated
+  when those tables were balanced by row (gm-404a); `bayer_balance.py`
+  holds the rotation search and the row/column banding report.
 - The table prints host ms/frame (relative truth), libm calls/frame (device
   truth), and est_dev_ms (soft-float lower bound at 240 MHz).
 - Baseline numbers for your animation are in BASELINE.md. You must beat them
