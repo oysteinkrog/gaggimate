@@ -80,6 +80,7 @@
 // this was checked for banding in dark regions, not assumed safe.
 
 #include "BgAnim.h"
+#include "BgAnimClock.h"
 #include "BgAnimCommon.h"
 #include <math.h>
 
@@ -202,11 +203,11 @@ uint16_t *g_lut2 = nullptr; // [SUM_N], allocHot: the only per-pixel gather that
 // fold pattern's phase drift and the sheen's rotation.
 constexpr float ANGLE_A_BASE = 0.349066f;      // 20 degrees
 constexpr float ANGLE_A_WOBBLE = 0.104720f;    // +-6 degrees: range 14..26 degrees
-constexpr float ANGLE_A_DRIFT_RATE = 6.2831853f / 200000.0f; // one wobble cycle per 200s at speedF==1
+// The A wobble's rate (one cycle per 200 s at speedF == 1) is RATE_ANGLE_A.
 constexpr float ANGLE_A_PHASE = 0.4f;          // arbitrary starting phase
 constexpr float ANGLE_B_BASE = -0.610865f;     // -35 degrees
 constexpr float ANGLE_B_WOBBLE = 0.104720f;    // +-6 degrees: range -41..-29 degrees
-constexpr float ANGLE_B_DRIFT_RATE = 6.2831853f / 260000.0f; // different, non-commensurate period
+// The B wobble's rate (260 s, non-commensurate with A) is RATE_ANGLE_B.
 constexpr float ANGLE_B_PHASE = 2.1f;
 
 // Padding, in columns, so band() can read colFoldA/colFoldB at x+shift(y)
@@ -296,18 +297,41 @@ int16_t *g_sheenLut = nullptr; // [SIN_N], allocHot
 // AnimSilk.cpp uses for its three waves, kept for just one of them here --
 // see the file header for why this is the one wave that still needs a real
 // per-pixel sine gather rather than the linear-shift trick colFoldA/B use.
-// kx/ky/wt are recomputed from tMs every frame() call (not accumulated
-// across calls), so band() stays a pure function of the state frame() last
-// set -- the same contract every other animation in this tree keeps.
+// kx/ky/wt are recomputed every frame() call from the animation clocks
+// below, so band() stays a pure function of the state frame() last set --
+// the same contract every other animation in this tree keeps. The clocks
+// themselves carry state across frame() calls (BgAnimClock.h, gm-yr21).
 constexpr float TURN = 4294967296.0f / 6.2831853f;
 constexpr float SHEEN_A0 = 1.1f;                   // arbitrary starting angle
-constexpr float SHEEN_ROT_MULT = 0.8f;             // rotation rate relative to omega0
-constexpr float SHEEN_W_MULT = 1.0f;               // temporal-phase rate relative to omega0
-constexpr float SHEEN_WK = 6.2831853f / 90000.0f;  // k-wobble rate
+constexpr float SHEEN_ROT_MULT = 0.8f;             // rotation rate relative to SHEEN_BASE
+constexpr float SHEEN_W_MULT = 1.0f;               // temporal-phase rate relative to SHEEN_BASE
+// The k wobble's rate (one cycle per 90 s, wall time) is RATE_SHEEN_K.
 constexpr float SHEEN_PHK = 1.3f;
 int32_t g_sheenStep = 0;    // per-pixel x-phase step, Q32 turns/px
 int32_t g_sheenRowStep = 0; // per-row y-phase step, Q32 turns/row
 uint32_t g_sheenWt = 0;     // temporal phase at y=0, Q32 turns (already mod 2*pi via wraparound)
+
+// Animation time (BgAnimClock.h, gm-yr21). g_clock runs at the speed setting
+// and drives the angle wobbles and the sheen's rotation and temporal phase;
+// g_wall runs at speed 1 and drives the sheen's k wobble and the fold phase,
+// neither of which followed speedMul(). Neither clock is reset by release(),
+// so the full/half switch keeps the motion where it was.
+AnimClock g_clock;
+AnimClock g_wall;
+// The fold phase in 1/16 table steps: the sum of wall step x foldSpeed. The
+// fold speed is its own linear map of p[0], so the phase is accumulated per
+// step, and a speed change bends the drift instead of moving it. The old
+// tMs * foldSpeed was a uint32 product that jumped on every speed change.
+uint64_t g_foldQ4 = 0;
+// Q48 rates, each oscillator with its own phase. The angle wobbles and the
+// sheen's A and wt are per animation millisecond (speed-scaled); the k
+// wobble is per wall millisecond.
+constexpr double SHEEN_BASE = 6.283185307179586 / 70000.0; // rad per animation ms
+constexpr uint64_t RATE_ANGLE_A = oscRateQ48(6.283185307179586 / 200000.0);
+constexpr uint64_t RATE_ANGLE_B = oscRateQ48(6.283185307179586 / 260000.0);
+constexpr uint64_t RATE_SHEEN_ROT = oscRateQ48(SHEEN_BASE * 0.15 * SHEEN_ROT_MULT);
+constexpr uint64_t RATE_SHEEN_WT = oscRateQ48(SHEEN_BASE * SHEEN_W_MULT);
+constexpr uint64_t RATE_SHEEN_K = oscRateQ48(6.283185307179586 / 90000.0);
 
 // Reads g_sheenLut, already scaled to +-AMP_SHEEN -- see its own comment.
 inline int16_t sinFromTurn(uint32_t turn) { return g_sheenLut[turn >> 22]; }
@@ -437,7 +461,12 @@ void frame(uint32_t tMs, int w, int h, const uint8_t p[4]) {
         lastGlow = p[2];
         lastThemeGen = themeGen();
     }
-    const float speedF = speedMul(p[0]);
+    // Animation time from the wrapped millis() delta (BgAnimClock.h,
+    // gm-yr21). The old terms were products of the raw uptime: the float
+    // ones stepped in 32 ms jumps after 3.1 days, and every phase jumped on
+    // a speed change and at the 49.7-day wrap.
+    g_clock.advance(tMs, speedMul(p[0]));
+    const uint32_t wallStep = g_wall.advance(tMs, 1.0f);
 
     // ---- Oblique wave angles: each wobbles on its own slow clock around
     // its own fixed base (see the angle constants' own comment for the
@@ -446,8 +475,8 @@ void frame(uint32_t tMs, int w, int h, const uint8_t p[4]) {
     // these and not tanf) run once per frame() call, not once per row or
     // per pixel -- negligible next to buildSilk2Lut's SUM_N-sized loop
     // above, let alone band()'s w*h loop. ----
-    const float angleA = ANGLE_A_BASE + ANGLE_A_WOBBLE * fastSinRad(ANGLE_A_DRIFT_RATE * tMs * speedF + ANGLE_A_PHASE);
-    const float angleB = ANGLE_B_BASE + ANGLE_B_WOBBLE * fastSinRad(ANGLE_B_DRIFT_RATE * tMs * speedF + ANGLE_B_PHASE);
+    const float angleA = ANGLE_A_BASE + ANGLE_A_WOBBLE * fastSinRad(oscRad(g_clock, RATE_ANGLE_A) + ANGLE_A_PHASE);
+    const float angleB = ANGLE_B_BASE + ANGLE_B_WOBBLE * fastSinRad(oscRad(g_clock, RATE_ANGLE_B) + ANGLE_B_PHASE);
     const float slopeA = fastSinRad(angleA) / fastCosRad(angleA);
     const float slopeB = fastSinRad(angleB) / fastCosRad(angleB);
 
@@ -459,7 +488,11 @@ void frame(uint32_t tMs, int w, int h, const uint8_t p[4]) {
     // distinct from the angle wobbles above and the sheen's clock below, so
     // all three drift out of lockstep with each other. ----
     const uint32_t foldSpeed = 4 + static_cast<uint32_t>(p[0]) * 44 / 100; // 4..48, /16 = 0.25x..3x
-    const uint32_t foldBase = tMs * foldSpeed >> 4;
+    g_foldQ4 += static_cast<uint64_t>(wallStep) * foldSpeed;
+    // The phases below keep only the low 10 bits of foldBase * n >> 8, and
+    // 2^32 * n >> 8 is a multiple of 1024, so the uint32 wrap of foldBase
+    // is continuous.
+    const uint32_t foldBase = static_cast<uint32_t>(g_foldQ4 >> 4);
     const uint32_t phaseA0 = foldBase * 9 >> 8;
     const uint32_t phaseA1 = foldBase * 8 >> 8; // close to phaseA0: a slow beat, not a fixed second grating
     const uint32_t phaseB0 = foldBase * 7 >> 8; // different ratio again: the cells drift, not just scroll
@@ -541,28 +574,22 @@ void frame(uint32_t tMs, int w, int h, const uint8_t p[4]) {
     // technique, kept for just one wave instead of three). Unchanged from
     // round 3 except for the post-gather amplitude scale in band() (see
     // SHEEN_SCALE_NUM/SHIFT's own comment). ----
-    const float omega0 = 6.2831853f / 70000.0f * speedF;
-    const float A = SHEEN_A0 + omega0 * 0.15f * SHEEN_ROT_MULT * tMs;
+    const float A = SHEEN_A0 + oscRad(g_clock, RATE_SHEEN_ROT);
     // Much coarser than the fringe frequencies above -- about 0.7 to 1.9
     // cycles across the whole panel width, so this reads as one broad
     // highlight sweeping across the frame, not another layer of fringes at
     // the same scale.
     const float k0 = 0.0015f + 0.0025f * (p[1] / 100.0f);
-    const float k = k0 * (1.0f + 0.15f * fastSinRad(SHEEN_WK * tMs + SHEEN_PHK));
+    const float k = k0 * (1.0f + 0.15f * fastSinRad(oscRad(g_wall, RATE_SHEEN_K) + SHEEN_PHK));
     const float kx = k * fastCosRad(A);
     const float ky = k * fastSinRad(A);
     g_sheenStep = static_cast<int32_t>(kx * TURN);
     g_sheenRowStep = static_cast<int32_t>(ky * TURN);
-    // Same int64 product AnimSilk.cpp's g_wtTurn uses: wRateQ (turns/ms, Q32)
-    // times tMs (ms) wraps mod 2^32 exactly like mod-one-turn, with none of
-    // the float*unbounded-tMs overflow risk BgAnimCommon.h's fastCosRad
-    // comment warns about (tMs is unbounded across an uptime of days; kx, ky
-    // stay well inside int32 range the same way AnimSilk.cpp's per-wave step
-    // does, since k never exceeds ~0.0184 turns/px here and TURN is a fixed
-    // constant, giving |kx*TURN| a few million at most).
-    const float wRate = omega0 * SHEEN_W_MULT;
-    const int32_t wRateQ = static_cast<int32_t>(wRate * TURN);
-    g_sheenWt = static_cast<uint32_t>(static_cast<int64_t>(wRateQ) * static_cast<int64_t>(tMs));
+    // Temporal phase, Q32 turns, already mod one turn, the same way
+    // AnimSilk.cpp's g_wtTurn is built. kx and ky stay well inside int32
+    // range, since k never exceeds ~0.0184 turns/px here and TURN is a fixed
+    // constant, giving |kx*TURN| a few million at most.
+    g_sheenWt = oscTurnQ32(g_clock, RATE_SHEEN_WT);
 }
 
 #if GM_BGANIM_SILK2_ASM

@@ -11,7 +11,7 @@
 // per-row `fmodf(ky*y + wt, 2*pi)` (1440 fmodf/frame, the whole cost of
 // this animation) with a per-row integer add and a per-band-call integer
 // multiply — zero libm in band(). The only float->int casts left are of
-// small, frame-scoped magnitudes (kx/ky/wRate * TURN, all comfortably
+// small, frame-scoped magnitudes (kx/ky * TURN, all comfortably
 // inside int32 range — see report for the bound), never of an unbounded
 // growing phase, so there's no float->uint32 UB risk.
 //
@@ -212,6 +212,7 @@
 // 2026-09-04.
 
 #include "BgAnim.h"
+#include "BgAnimClock.h"
 #include "BgAnimCommon.h"
 #include <math.h>
 
@@ -266,13 +267,44 @@ unsigned long long g_silkSlowCells = 0;
 namespace {
 using namespace bganim;
 
+// Starting angle, k-wobble phase, and this frame's wave vector. The rates
+// that used to sit here (rotation multiplier, temporal multiplier, wobble
+// rate) are the kRate* tables below.
 struct SilkWave {
-    float A0, rotMult, wMult, wk, phk, kx, ky;
+    float A0, phk, kx, ky;
 };
 SilkWave wave[3] = {
-    {0.20f, 0.6f, 1.00f, 6.2831853f / 71000.0f, 0.4f, 0, 0},
-    {2.15f, -1.0f, 1.37f, 6.2831853f / 95000.0f, 2.1f, 0, 0},
-    {4.35f, 1.4f, 0.71f, 6.2831853f / 123000.0f, 4.0f, 0, 0},
+    {0.20f, 0.4f, 0, 0},
+    {2.15f, 2.1f, 0, 0},
+    {4.35f, 4.0f, 0, 0},
+};
+
+// Animation time (BgAnimClock.h, gm-yr21). g_clock runs at the speed setting
+// and drives each wave's rotation and temporal phase; g_wall runs at speed 1
+// and drives the k wobble, which never followed the speed setting. Neither is
+// reset by release(), so the full/half switch keeps the motion where it was.
+AnimClock g_clock;
+AnimClock g_wall;
+// Rate unit: the 55 s base drift, radians per animation millisecond.
+constexpr double SILK_BASE = 6.283185307179586 / 55000.0;
+// Per-wave Q48 rates, in wave order: rotation of A (0.15 x the multipliers
+// 0.6, -1.0 and 1.4 of the base drift), temporal phase wt (1.00, 1.37 and
+// 0.71 x the base drift) and the k wobble (71, 95 and 123 s periods, wall
+// time). Each oscillator keeps its own phase.
+constexpr uint64_t kRateRot[3] = {
+    oscRateQ48(SILK_BASE * 0.15 * 0.6),
+    oscRateQ48(SILK_BASE * 0.15 * -1.0),
+    oscRateQ48(SILK_BASE * 0.15 * 1.4),
+};
+constexpr uint64_t kRateWt[3] = {
+    oscRateQ48(SILK_BASE * 1.00),
+    oscRateQ48(SILK_BASE * 1.37),
+    oscRateQ48(SILK_BASE * 0.71),
+};
+constexpr uint64_t kRateK[3] = {
+    oscRateQ48(6.283185307179586 / 71000.0),
+    oscRateQ48(6.283185307179586 / 95000.0),
+    oscRateQ48(6.283185307179586 / 123000.0),
 };
 
 // contrastLUT is indexed DIRECTLY by (s + 1536), s being the raw 3-wave sine
@@ -616,7 +648,13 @@ inline int16_t sinFromTurn(uint32_t turn) { return g_sinLut[turn >> 22]; }
 constexpr float TURN = 4294967296.0f / 6.2831853f;
 
 void frame(uint32_t tMs, int, int, const uint8_t p[4]) {
-    const float omega0 = 6.2831853f / 55000.0f * speedMul(p[0]); // 55s base drift at speed 50
+    // Animation time from the wrapped millis() delta (BgAnimClock.h,
+    // gm-yr21). The old A = A0 + omega0 * tMs and the wobble's wk * tMs were
+    // float products of the raw uptime: they stepped in 32 ms jumps after
+    // 3.1 days, and every phase jumped on a speed change and at the 49.7-day
+    // wrap. Speed 50 still gives the 55 s base drift.
+    g_clock.advance(tMs, speedMul(p[0]));
+    g_wall.advance(tMs, 1.0f);
     const float k0 = 0.008f + 0.022f * (p[1] / 100.0f);
     if (themeGen() != lastThemeGen) {
         buildThemeRamp(palette, 256);
@@ -630,21 +668,17 @@ void frame(uint32_t tMs, int, int, const uint8_t p[4]) {
     }
     for (int i = 0; i < 3; i++) {
         SilkWave &wv = wave[i];
-        const float A = wv.A0 + (omega0 * 0.15f * wv.rotMult) * tMs;
-        const float k = k0 * (1.0f + 0.15f * fastSinRad(wv.wk * tMs + wv.phk));
+        const float A = wv.A0 + oscRad(g_clock, kRateRot[i]);
+        const float k = k0 * (1.0f + 0.15f * fastSinRad(oscRad(g_wall, kRateK[i]) + wv.phk));
         wv.kx = k * fastCosRad(A);
         wv.ky = k * fastSinRad(A);
         g_step[i] = static_cast<int32_t>(wv.kx * TURN);
         g_bigStep[i] = g_step[i] * SILK_GRID; // see g_bigStep declaration
         g_rowStep[i] = static_cast<int32_t>(wv.ky * TURN);
-        // Temporal phase as a 64-bit Q32 product: wRateQ (turns/ms) times
-        // tMs (ms) wraps mod 2^32 exactly like mod-one-turn, so the result
-        // is already phase-mod-2*pi with no fmodf and no risk of the old
-        // float->uint32 overflow (wRate*tMs as a float would blow way past
-        // uint32 range once tMs runs into the minutes/hours).
-        const float wRate = omega0 * wv.wMult; // rad/ms
-        const int32_t wRateQ = static_cast<int32_t>(wRate * TURN); // turns/ms, Q32
-        g_wtTurn[i] = static_cast<uint32_t>(static_cast<int64_t>(wRateQ) * static_cast<int64_t>(tMs));
+        // Temporal phase, Q32 turns, already mod one turn. The old int64
+        // product wRateQ * tMs kept its precision but baked the speed into
+        // the rate, so it jumped on a speed change and at the wrap.
+        g_wtTurn[i] = oscTurnQ32(g_clock, kRateWt[i]);
     }
 }
 

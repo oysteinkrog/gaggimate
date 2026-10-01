@@ -330,6 +330,7 @@
 // covered on both bodies, speed is not measured on either.
 
 #include "BgAnim.h"
+#include "BgAnimClock.h"
 #include "BgAnimCommon.h"
 #include <math.h>
 #include <string.h>
@@ -422,7 +423,12 @@ constexpr int LUT_SHIFT = FRAC_BITS - LUT_BITS; // 11
 constexpr int32_t kIndexCap = 255;
 
 struct BlobDef {
-    float fx1, fx2, fy1, fy2, ax1, ax2, ay1, ay2, px1, px2, py1, py2, cx, cy, R0, Rpulse, wR, phR;
+    float ax1, ax2, ay1, ay2, px1, px2, py1, py2, cx, cy, R0, Rpulse, phR;
+    // Oscillator rates as Q48 turns per millisecond (BgAnimClock.h), so each
+    // one keeps its own exact phase however long the device has been up
+    // (gm-yr21). rx1..ry2 run on the speed-scaled clock, rR (the radius
+    // pulse) on wall time, as before.
+    uint64_t rx1, rx2, ry1, ry2, rR;
 };
 struct BlobState {
     float bx, by, R2, invR2;
@@ -440,6 +446,14 @@ int16_t *lavaBase = nullptr; // lavaLUT + LUT_OFFSET, so band() indexes it direc
 uint32_t lastThemeGen = 0xFFFFFFFF;
 bool inited = false;
 int allocW = 0; // width fieldRow was sized for
+// Animation time (BgAnimClock.h, gm-yr21). g_clock runs at the speed
+// setting and drives the blob paths; g_wall runs at speed 1 and drives the
+// radius pulse, which never followed the speed setting. Neither is reset by
+// release(), so the full/half switch keeps the motion where it was.
+AnimClock g_clock;
+AnimClock g_wall;
+// Blob path rate unit: one 45 s base cycle per animation millisecond.
+constexpr double LAVA_BASE = 6.283185307179586 / 45000.0;
 
 // Precomputed "no blob touched this pixel" row, one per Bayer row phase
 // 0..3, rebuilt only when paletteLUT changes (theme change). A pixel no
@@ -541,10 +555,17 @@ bool init(int w, int h) {
         for (int i = 0; i < NUM_BLOBS; i++) {
             const float ga = i * 2.39996323f; // golden angle spreads phases
             BlobDef &d = blobDef[i];
-            d.fx1 = 0.55f + 0.11f * i;
-            d.fx2 = 1.41421356f * (0.35f + 0.05f * i);
-            d.fy1 = 0.63f + 0.09f * ((i * 3) % 5);
-            d.fy2 = 1.73205081f * (0.30f + 0.04f * i);
+            // Same frequency multipliers as before the move to Q48 rates;
+            // the 1.7, 1.13 and 0.9 factors frame() used to apply are folded
+            // in here.
+            const float fx1 = 0.55f + 0.11f * i;
+            const float fx2 = 1.41421356f * (0.35f + 0.05f * i);
+            const float fy1 = 0.63f + 0.09f * ((i * 3) % 5);
+            const float fy2 = 1.73205081f * (0.30f + 0.04f * i);
+            d.rx1 = oscRateQ48(LAVA_BASE * fx1);
+            d.rx2 = oscRateQ48(LAVA_BASE * fx2 * 1.7);
+            d.ry1 = oscRateQ48(LAVA_BASE * fy1 * 1.13);
+            d.ry2 = oscRateQ48(LAVA_BASE * fy2 * 0.9);
             d.ax1 = w * 0.14f;
             d.ax2 = w * 0.07f;
             d.ay1 = h * 0.14f;
@@ -558,7 +579,7 @@ bool init(int w, int h) {
             const float m = (w < h ? w : h);
             d.R0 = m * 0.19f;
             d.Rpulse = m * 0.05f;
-            d.wR = 0.00011f + 0.00003f * i;
+            d.rR = oscRateQ48(0.00011 + 0.00003 * i); // rad per wall millisecond
             d.phR = ga * 2.7f;
         }
         buildThemeRamp(paletteLUT, 256);
@@ -570,7 +591,12 @@ bool init(int w, int h) {
 }
 
 void frame(uint32_t tMs, int w, int, const uint8_t p[4]) {
-    const float omega0 = 6.2831853f / 45000.0f * speedMul(p[0]); // 45s base cycle at speed 50
+    // Animation time from the wrapped millis() delta (BgAnimClock.h,
+    // gm-yr21). The old t = tMs * omega0 was a float product: it stepped in
+    // 32 ms jumps after 3.1 days of uptime, jumped on every speed change and
+    // at the 49.7-day wrap. Speed 50 still gives the 45 s base cycle.
+    g_clock.advance(tMs, speedMul(p[0]));
+    g_wall.advance(tMs, 1.0f);
     const float sizeMul = 0.6f + (p[1] / 100.0f);
     const float intensity = 0.5f + (p[2] / 100.0f) * 1.3f;
     if (themeGen() != lastThemeGen) {
@@ -608,13 +634,12 @@ void frame(uint32_t tMs, int w, int, const uint8_t p[4]) {
         lavaLUT[p2] = static_cast<int16_t>(contribution + 0.5f);
     }
 
-    const float t = tMs * omega0;
     for (int i = 0; i < NUM_BLOBS; i++) {
         const BlobDef &d = blobDef[i];
         BlobState &b = blob[i];
-        b.bx = d.cx + d.ax1 * fastSinRad(t * d.fx1 + d.px1) + d.ax2 * fastSinRad(t * d.fx2 * 1.7f + d.px2);
-        b.by = d.cy + d.ay1 * fastCosRad(t * d.fy1 * 1.13f + d.py1) + d.ay2 * fastSinRad(t * d.fy2 * 0.9f + d.py2);
-        const float R = (d.R0 + d.Rpulse * fastSinRad(tMs * d.wR + d.phR)) * sizeMul;
+        b.bx = d.cx + d.ax1 * fastSinRad(oscRad(g_clock, d.rx1) + d.px1) + d.ax2 * fastSinRad(oscRad(g_clock, d.rx2) + d.px2);
+        b.by = d.cy + d.ay1 * fastCosRad(oscRad(g_clock, d.ry1) + d.py1) + d.ay2 * fastSinRad(oscRad(g_clock, d.ry2) + d.py2);
+        const float R = (d.R0 + d.Rpulse * fastSinRad(oscRad(g_wall, d.rR) + d.phR)) * sizeMul;
         b.R2 = R * R;
         b.invR2 = 1.0f / b.R2;
         // Constant curvature of tt(x) = 1 - invR2*((x-bx)^2 + dy^2): the x^2
