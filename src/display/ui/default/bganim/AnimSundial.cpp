@@ -33,12 +33,18 @@
 namespace {
 using namespace bganim;
 
-constexpr int FACE_HI = 104, FACE_K = 92, FLOOR = 4, SOFT_PX = 94;
+constexpr int FACE_K = 92, FLOOR = 4;
 constexpr int RAD_RIM = (4080 * FACE_K) >> 8; // 1466 Q4 at the inscribed radius
 constexpr int RAD_LO = RAD_RIM * 6 / 10;      // 879; the code uses 60%, not the header's 55%
 constexpr int RAD_SPAN = RAD_RIM - RAD_LO;    // 587, the radial smoothstep's width
-constexpr int SOFT = SOFT_PX * 512, SOFT_HALF = SOFT / 2;
-constexpr int INV_SOFT = 65536 * 256 / SOFT; // 348, exactly the page's truncated reciprocal
+// The beam's edge softness is the Edge softness slider (p[6], gm-3vj.24):
+// 24 + p * 140 / 100 pixels, so 94 px at 50, the old constant, and 24 to
+// 164 px over the range. softHalf and invSoft are set in frame() for that
+// width; at 94 px invSoft is 348, exactly the page's truncated reciprocal.
+// The kernel takes both only through its cursor seeds and steps. At 24 px
+// invSoft is 1365, so |q| stays under 400 million and q >> 16 under 6,000,
+// still inside the 32-bit accumulators and the 16-bit lane after the shift.
+int softHalf = 94 * 512 / 2, invSoft = 65536 * 256 / (94 * 512);
 // The shared Bayer matrix balances its columns (every column sums to 252) but
 // not its rows (168 to 336), and on a face this flat every eighth row came out
 // a third of a dither swing brighter than its neighbour: row to row steps in
@@ -169,6 +175,10 @@ void frame(uint32_t tMs, int w, int h, const uint8_t p[BG_ANIM_PARAMS]) {
         lastShade = p[3];
     }
     beamQ4 = (60 + p[2] * 88 / 100) * 16; // 960..2368 Q4, unchanged by theme tone
+    // Edge softness (p[6]): the soft band either side of each ray, 94 px at 50.
+    const int softPx = 24 + p[6] * 140 / 100;
+    softHalf = softPx * 512 / 2;
+    invSoft = 65536 * 256 / (softPx * 512);
     if (!geometryValid || lastContrast != p[2]) {
         for (int r = 0; r <= RAD_SPAN; r++) {
             const int ur = r * 256 / RAD_SPAN;
@@ -194,19 +204,26 @@ void frame(uint32_t tMs, int w, int h, const uint8_t p[BG_ANIM_PARAMS]) {
     const uint32_t base = tMs * speedQ6;
     const uint32_t angIdx = (base >> 15) & 1023;
     const uint32_t phBr = base >> 13, phBr2 = (base * 5u) >> 16;
-    const int breathQ4 = ((sine[phBr & 1023] * 210) >> 9) + ((sine[phBr2 & 1023] * 120) >> 9);
+    // Breath (p[4]) scales the two breath sines, 210 and 120 at 50: 0 holds
+    // the face's brightness still, 100 doubles the swing.
+    const int br1 = 210 * p[4] / 50, br2 = 120 * p[4] / 50;
+    const int breathQ4 = ((sine[phBr & 1023] * br1) >> 9) + ((sine[phBr2 & 1023] * br2) >> 9);
     // Spatial steps 55/16 and 126/16 give wavelengths 297.891 and 130.032
     // pixels. At Speed 50, the column waves drift -7.386 and +4.836 px/s;
     // the row waves drift +11.079 and -3.224 px/s. Do not scale with w/h:
     // the page holds these wavelengths and the 94-pixel softness fixed.
+    // Surface (p[5]) scales the four surface sines, 70 and 40 at 50: 0 is a
+    // smooth face, 100 doubles the ripple (column plus row at most 440 Q4, so
+    // cp stays well inside the kernel's 16-bit lanes).
+    const int s1 = 70 * p[5] / 50, s2 = 40 * p[5] / 50;
     const uint32_t phS1 = base >> 16, phS2 = (base * 3u) >> 17;
     for (int x = 0; x < w; x++) {
-        const int sc = ((sine[(((x * 55) >> 4) + phS1) & 1023] * 70) >> 9) + ((sine[(((x * 126) >> 4) - phS2) & 1023] * 40) >> 9);
+        const int sc = ((sine[(((x * 55) >> 4) + phS1) & 1023] * s1) >> 9) + ((sine[(((x * 126) >> 4) - phS2) & 1023] * s2) >> 9);
         colSurface[x] = static_cast<int16_t>(colFace[x] + sc);
     }
     for (int y = 0; y < h; y++) {
-        surfRow[y] = static_cast<int16_t>(((sine[(((y * 55) >> 4) - phS2) & 1023] * 70) >> 9) +
-                                          ((sine[(((y * 126) >> 4) + phS1) & 1023] * 40) >> 9));
+        surfRow[y] = static_cast<int16_t>(((sine[(((y * 55) >> 4) - phS2) & 1023] * s1) >> 9) +
+                                          ((sine[(((y * 126) >> 4) + phS1) & 1023] * s2) >> 9));
     }
     const int wIdx = 96 + p[1] * 220 / 100; // 33.75..111.09375 degrees, always convex
     const int a1 = (angIdx + wIdx) & 1023;
@@ -214,7 +231,10 @@ void frame(uint32_t tMs, int w, int h, const uint8_t p[BG_ANIM_PARAMS]) {
     d0y = sine[angIdx];
     d1x = sine[(a1 + 256) & 1023];
     d1y = sine[a1];
-    faceBase = FACE_HI * 16 + breathQ4;
+    // Face tone (p[7]) is the face's centre brightness, ramp index 104 at 50:
+    // 64 (a dark dial) at 0, 144 (a pale one) at 100.
+    const int faceHi = 64 + p[7] * 80 / 100;
+    faceBase = faceHi * 16 + breathQ4;
 }
 
 // floor/ceil rather than C's truncating division, for the page's signed
@@ -236,24 +256,24 @@ void beamSpan(int y, int w, int &a, int &b) {
     a = clampInt(cx - half, 0, w);
     b = clampInt(cx + half + 1, 0, w);
     if (d0y > 0) {
-        const int xb = cx + floorDiv(d0x * dy + SOFT_HALF, d0y);
+        const int xb = cx + floorDiv(d0x * dy + softHalf, d0y);
         if (xb + 1 < b)
             b = xb + 1;
     } else if (d0y < 0) {
-        const int xb = cx + ceilDiv(d0x * dy + SOFT_HALF, d0y);
+        const int xb = cx + ceilDiv(d0x * dy + softHalf, d0y);
         if (xb > a)
             a = xb;
-    } else if (d0x * dy <= -SOFT_HALF)
+    } else if (d0x * dy <= -softHalf)
         b = a;
     if (d1y > 0) {
-        const int xb = cx + ceilDiv(d1x * dy - SOFT_HALF, d1y);
+        const int xb = cx + ceilDiv(d1x * dy - softHalf, d1y);
         if (xb > a)
             a = xb;
     } else if (d1y < 0) {
-        const int xb = cx + floorDiv(d1x * dy - SOFT_HALF, d1y);
+        const int xb = cx + floorDiv(d1x * dy - softHalf, d1y);
         if (xb + 1 < b)
             b = xb + 1;
-    } else if (d1x * dy >= SOFT_HALF)
+    } else if (d1x * dy >= softHalf)
         b = a;
     // A ray nearly parallel to a row can intersect beyond the panel. Empty
     // intersections render only the face, with no out-of-buffer prefix.
@@ -264,8 +284,8 @@ void beamSpan(int y, int w, int &a, int &b) {
 
 BGANIM_INLINE int beamValue(int cp, int rowBase, int rowRad, int g0, int g1) {
     int v = rowBase + cp;
-    const int u0 = clampInt(((g0 + SOFT_HALF) * INV_SOFT) >> 16, 0, 256);
-    const int u1 = clampInt(((g1 + SOFT_HALF) * INV_SOFT) >> 16, 0, 256);
+    const int u0 = clampInt(((g0 + softHalf) * invSoft) >> 16, 0, 256);
+    const int u1 = clampInt(((g1 + softHalf) * invSoft) >> 16, 0, 256);
     if (u0 > 0 && u1 > 0) {
         int ur = (RAD_RIM - (rowRad - cp)) * 256 / RAD_SPAN;
         if (ur > 256)
@@ -344,7 +364,8 @@ GM_ANIM_IRAM __attribute__((noinline)) void sundialColumnsAsm(int16_t *out, cons
 GM_ANIM_IRAM __attribute__((noinline)) void sundialBeamAsm(int16_t *pixels, uint16_t *work, const uint32_t *sm,
                                                            const uint32_t *rad, int g0q, int g1q, int step0, int step1,
                                                            int radialBias, int n) {
-    // q = (g + 24064)*348, exactly the reference before >>16. No reduced
+    // q = (g + softHalf)*invSoft, (g + 24064)*348 at the default softness,
+    // exactly the reference before >>16. No reduced
     // precision in the cursor. radialBias = 1466-rowRad; rad[r] includes the
     // contrast-scaled radial cubic for r clamped to 0..587. Production cp
     // stays within [-2254,264], steps within +/-178176, and |q| stays below
@@ -576,8 +597,8 @@ GM_ANIM_IRAM void band(uint16_t *dst, int y0, int rows, int w, uint32_t tMs, con
         beamSpan(y, w, a, b);
         if (b > a) {
             const int g0 = d0x * dy - d0y * (a - w / 2), g1 = (a - w / 2) * d1y - dy * d1x;
-            sundialBeamAsm(field + a, work, smooth32, radialAmp32, (g0 + SOFT_HALF) * INV_SOFT,
-                           (g1 + SOFT_HALF) * INV_SOFT, -d0y * INV_SOFT, d1y * INV_SOFT, RAD_RIM + rowQ4[y], b - a);
+            sundialBeamAsm(field + a, work, smooth32, radialAmp32, (g0 + softHalf) * invSoft,
+                           (g1 + softHalf) * invSoft, -d0y * invSoft, d1y * invSoft, RAD_RIM + rowQ4[y], b - a);
         }
         sundialPaletteAsm(dst + static_cast<size_t>(r) * w, field, palette, palette32, work,
                           faceBase + rowQ4[y] + surfRow[y], w);
@@ -606,6 +627,8 @@ void release() {
     lastShade = lastContrast = -1;
     geometryValid = false;
     faceBase = beamQ4 = d0x = d0y = d1x = d1y = 0;
+    softHalf = 94 * 512 / 2;
+    invSoft = 65536 * 256 / (94 * 512);
 }
 
 } // namespace
@@ -614,7 +637,8 @@ extern const BgAnimation bg_anim_sundial;
 const BgAnimation bg_anim_sundial = {
     "sundial",
     "Sundial",
-    {{"speed", "Speed", 50}, {"width", "Wedge width", 40}, {"contrast", "Contrast", 25}, {"shading", "Surface shading", 30}},
+    {{"speed", "Speed", 50}, {"width", "Wedge width", 40}, {"contrast", "Contrast", 25}, {"shading", "Surface shading", 30},
+     {"breath", "Breath", 50}, {"surface", "Surface", 50}, {"softness", "Edge softness", 50}, {"tone", "Face tone", 50}},
     init,
     frame,
     band,

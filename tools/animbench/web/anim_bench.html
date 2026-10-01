@@ -3253,7 +3253,7 @@ function bayerOffsets(dithOff, amp, unit) {
    it turns once in about 65 s, which is 23 px/s out there. Two gathers per
    pixel, the column table and the palette. */
 (() => {
-  const FACE_HI = 104, FACE_K = 92, FLOOR = 4, SOFT_PX = 94;
+  const FACE_K = 92, FLOOR = 4;
   // The face's radial term at the panel's inscribed radius, in sixteenths of a
   // palette index. The beam fades to nothing between 55% of that and all of it,
   // so the wedge never ends on the disc's edge.
@@ -3278,7 +3278,11 @@ function bayerOffsets(dithOff, amp, unit) {
       { key: 'speed', label: 'Speed', def: 50 },
       { key: 'width', label: 'Wedge width', def: 40 },
       { key: 'contrast', label: 'Contrast', def: 25 },
-      { key: 'shading', label: 'Surface shading', def: 30 }],
+      { key: 'shading', label: 'Surface shading', def: 30 },
+      { key: 'breath', label: 'Breath', def: 50 },
+      { key: 'surface', label: 'Surface', def: 50 },
+      { key: 'softness', label: 'Edge softness', def: 50 },
+      { key: 'tone', label: 'Face tone', def: 50 }],
     init(w, h, state) {
       state.colQ4 = new Int32Array(w);        // negative: the face darkens outward
       state.colFace = new Int32Array(w);      // plus the light gradient, static
@@ -3321,8 +3325,14 @@ function bayerOffsets(dithOff, amp, unit) {
       const base = ((t * speedQ6) >>> 0);
       const angIdx = (base >>> 15) & (SIN_N - 1);      // one turn in about 20 s
       const phBr = base >>> 13, phBr2 = ((base * 5) >>> 0) >>> 16;
-      const breathQ4 = ((SIN[phBr & (SIN_N - 1)] * 210) >> 9) +
-        ((SIN[phBr2 & (SIN_N - 1)] * 120) >> 9);
+      // Breath, Surface, Edge softness and Face tone (gm-3vj.24) are exact
+      // at 50, as in AnimSundial.cpp: 210 and 120, 70 and 40, 94 px, 104.
+      const br1 = Math.trunc(210 * p[4] / 50), br2 = Math.trunc(120 * p[4] / 50);
+      const s1 = Math.trunc(70 * p[5] / 50), s2 = Math.trunc(40 * p[5] / 50);
+      const softPx = 24 + Math.trunc(p[6] * 140 / 100);
+      const faceHi = 64 + Math.trunc(p[7] * 80 / 100);
+      const breathQ4 = ((SIN[phBr & (SIN_N - 1)] * br1) >> 9) +
+        ((SIN[phBr2 & (SIN_N - 1)] * br2) >> 9);
       // The dial has a surface: two long sines per axis, drifting a few
       // pixels a second, so the face is matte rather than a plain vignette.
       const phS1 = base >>> 16, phS2 = ((base * 3) >>> 0) >>> 17;
@@ -3330,14 +3340,14 @@ function bayerOffsets(dithOff, amp, unit) {
       for (let ph = 0; ph < 8; ph++) {
         const dst = ph * w, off = ph * 8;
         for (let x = 0; x < w; x++) {
-          const sc = ((SIN[(((x * 55) >> 4) + phS1) & (SIN_N - 1)] * 70) >> 9) +
-            ((SIN[(((x * 126) >> 4) - phS2) & (SIN_N - 1)] * 40) >> 9);
+          const sc = ((SIN[(((x * 55) >> 4) + phS1) & (SIN_N - 1)] * s1) >> 9) +
+            ((SIN[(((x * 126) >> 4) - phS2) & (SIN_N - 1)] * s2) >> 9);
           colPh[dst + x] = colFace[x] + sc + dith[off + (x & 7)];
         }
       }
       for (let y = 0; y < h; y++) {
-        surfRow[y] = ((SIN[(((y * 55) >> 4) - phS2) & (SIN_N - 1)] * 70) >> 9) +
-          ((SIN[(((y * 126) >> 4) + phS1) & (SIN_N - 1)] * 40) >> 9);
+        surfRow[y] = ((SIN[(((y * 55) >> 4) - phS2) & (SIN_N - 1)] * s1) >> 9) +
+          ((SIN[(((y * 126) >> 4) + phS1) & (SIN_N - 1)] * s2) >> 9);
       }
       const beamQ4 = (60 + Math.floor(p[2] * 88 / 100)) * 16;
       const wIdx = 96 + Math.floor(p[1] * 220 / 100);
@@ -3347,9 +3357,9 @@ function bayerOffsets(dithOff, amp, unit) {
       // Signed distance to each ray, times 512. Inside the sector both are
       // positive. g0 = d0x*dy - d0y*dx and g1 = dx*d1y - dy*d1x, so along a row
       // g0 steps by -d0y and g1 by +d1y, one add each.
-      const SOFT = SOFT_PX * 512, SOFTh = SOFT >> 1;
+      const SOFT = softPx * 512, SOFTh = SOFT >> 1;
       const invSoft = Math.trunc(65536 * 256 / SOFT);
-      const faceBase = FACE_HI * 16 + breathQ4;
+      const faceBase = faceHi * 16 + breathQ4;
       let o = 0;
       for (let y = 0; y < h; y++) {
         const cb = (y & 7) * w, rowBase = faceBase + rowQ4[y] + surfRow[y];

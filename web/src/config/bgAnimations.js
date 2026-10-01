@@ -330,6 +330,10 @@ export const BG_ANIMATIONS = [
       { key: 'width', label: 'Wedge width', def: 40 },
       { key: 'contrast', label: 'Contrast', def: 25 },
       { key: 'shading', label: 'Surface shading', def: 30 },
+      { key: 'breath', label: 'Breath', def: 50 },
+      { key: 'surface', label: 'Surface', def: 50 },
+      { key: 'softness', label: 'Edge softness', def: 50 },
+      { key: 'tone', label: 'Face tone', def: 50 },
     ],
   },
   {
