@@ -1313,7 +1313,10 @@ void DefaultUI::iconDeleted(lv_event_t *e) {
 void DefaultUI::scanIcons(lv_obj_t *obj) {
     if (lv_obj_check_type(obj, &lv_img_class)) {
         const bool hidden = lv_obj_has_flag(obj, LV_OBJ_FLAG_HIDDEN);
-        const uint16_t state = lv_obj_get_state(obj);
+        // Press and focus are touch feedback, not a blink: counting them
+        // made one press and release two toggles, enough to take a static
+        // clickable icon into a layer.
+        const uint16_t state = lv_obj_get_state(obj) & ~(LV_STATE_PRESSED | LV_STATE_FOCUSED | LV_STATE_FOCUS_KEY);
         IconCand *c = nullptr;
         for (int i = 0; i < iconCandN; i++) {
             if (iconCands[i].obj == obj) {
@@ -5226,6 +5229,14 @@ void DefaultUI::applyTheme() {
         // deliberately kept: mode 0 restores the generated plates by re-running
         // the theme, so a stale captured colour cannot outlive a restore.
         animPlateMode = -1;
+        // Icon and marquee sprites are pictures of the old colours, and an
+        // owned object's own invalidations are dropped, so nothing would
+        // repaint them until their state or text changed. Hand them back to
+        // LVGL (the release invalidates under the new style); a blinking
+        // icon keeps its count and a marquee is always eligible, so both
+        // are taken again on the next pass in the new colours.
+        releaseIconLayers();
+        releaseMarquees();
     }
 }
 
