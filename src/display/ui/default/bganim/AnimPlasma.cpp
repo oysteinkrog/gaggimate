@@ -5,6 +5,7 @@
 // indexed into a rotating 256-entry palette.
 
 #include "BgAnim.h"
+#include "BgAnimClock.h"
 #include "BgAnimCommon.h"
 #include <string.h>
 
@@ -45,6 +46,9 @@ uint32_t phase1 = 0;
 uint32_t phase2 = 0;
 uint32_t phase3 = 0;
 uint32_t cycle = 0;
+// Animation time (BgAnimClock.h, gm-4q9y), at the speed setting. Not reset
+// by release(), so the full/half switch keeps the drift where it was.
+AnimClock g_clock;
 
 // Table placement (round 2, see bganim::allocHot's comment in
 // BgAnimCommon.h): the hot slab is 9,216 B once the shared sinLut/cosTableF
@@ -116,12 +120,21 @@ void frame(uint32_t tMs, int w, int h, const uint8_t p[4]) {
     }
     // Speed 0-100 -> 0.25x..3x of the original drift (which advanced ~60
     // sine-index units per second on the fastest term).
+    // The old `base = tMs * speedMul >> 4` was a uint32 product: it wrapped
+    // after about a day of uptime at full speed (2^32 / 48 ms), and every
+    // phase jumped there, on each speed change and at the millis() wrap.
+    // base now comes from the wrapped-delta clock (gm-4q9y). speedMul / 16
+    // is exact in the clock's Q16 speed, so with a constant speed base is
+    // the same integer as before, counted from the clock's first frame.
+    // The phases are taken from the 64-bit base, so they never overflow;
+    // band() only reads their low bits (& (SIN_N - 1), & 255).
     const uint32_t speedMul = 4 + static_cast<uint32_t>(p[0]) * 44 / 100; // 4..48, /16 = 0.25..3
-    const uint32_t base = tMs * speedMul >> 4;                            // ~= original frame*2 at 50
-    phase1 = base * 30 >> 9; // ratios preserved from the frame-based original
-    phase2 = base * 23 >> 9;
-    phase3 = base * 26 >> 9;
-    cycle = base * 11 >> 9;
+    g_clock.advance(tMs, static_cast<float>(speedMul) * (1.0f / 16.0f));
+    const uint64_t base = g_clock.simQ16 >> 16; // ~= original frame*2 at 50
+    phase1 = static_cast<uint32_t>(base * 30 >> 9); // ratios preserved from the frame-based original
+    phase2 = static_cast<uint32_t>(base * 23 >> 9);
+    phase3 = static_cast<uint32_t>(base * 26 >> 9);
+    cycle = static_cast<uint32_t>(base * 11 >> 9);
 
     // Scale 0-100 -> 0.5x..2x spatial frequency.
     const uint32_t sx = 128 + static_cast<uint32_t>(p[1]) * 384 / 100; // 128..512, /256

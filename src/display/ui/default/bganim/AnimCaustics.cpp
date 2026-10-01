@@ -147,6 +147,7 @@
 // tracked and first_ms is reported for completeness only.
 
 #include "BgAnim.h"
+#include "BgAnimClock.h"
 #include "BgAnimCommon.h"
 #include <math.h>
 
@@ -166,6 +167,25 @@ constexpr float SPEED_MUL[K] = {1.0f, 0.82f, 1.28f};
 // (SIN_N == 1024 == 2^(32-22)).
 constexpr double PHASE_SCALE = 4294967296.0 / 6.283185307179586;
 constexpr int PHASE_SHIFT = 22; // 32 - log2(SIN_N)
+
+// Animation time (BgAnimClock.h, gm-4q9y). g_clock runs at the speed
+// setting and drives each wave's travel phase; g_wall runs at speed 1 and
+// drives the slow angle drift, which never followed the speed setting.
+// Neither is reset by release(), so the full/half switch keeps the motion.
+AnimClock g_clock;
+AnimClock g_wall;
+// The same rates frame() used to apply to t in seconds, per millisecond:
+// the angle drift in rad/s, and the travel phase at 0.8 * SPEED_MUL * 2
+// rad/s per unit of speed.
+constexpr uint64_t ANG_RATE[K] = {oscRateQ48(ANG_DRIFT[0] / 1000.0), oscRateQ48(ANG_DRIFT[1] / 1000.0),
+                                  oscRateQ48(ANG_DRIFT[2] / 1000.0)};
+constexpr uint64_t PHASE_RATE[K] = {oscRateQ48(0.8 * SPEED_MUL[0] * 2.0 / 1000.0),
+                                    oscRateQ48(0.8 * SPEED_MUL[1] * 2.0 / 1000.0),
+                                    oscRateQ48(0.8 * SPEED_MUL[2] * 2.0 / 1000.0)};
+// PHASE0 in DDS units. All three are under 2*pi, so each fits a uint32.
+constexpr uint32_t PHASE0_Q[K] = {static_cast<uint32_t>(PHASE0[0] * PHASE_SCALE + 0.5),
+                                  static_cast<uint32_t>(PHASE0[1] * PHASE_SCALE + 0.5),
+                                  static_cast<uint32_t>(PHASE0[2] * PHASE_SCALE + 0.5)};
 
 // Coarse-grid stride in x: the wave-sum field is evaluated exactly every
 // GRID columns and linearly interpolated in between (see file header). Must
@@ -303,9 +323,10 @@ bool init(int, int) {
 
 // The DDS phase words are deliberately modular — only the low 32 bits are
 // ever used (band() masks with SIN_N-1 after shifting). But the values being
-// converted leave the range of uint32_t almost immediately: the phase
-// intercept grows without bound with uptime, and sinA*freq / cosA*freq are
-// negative for most of the angle sweep. Converting a double that is negative
+// converted leave the range of uint32_t almost immediately: sinA*freq and
+// cosA*freq are negative for most of the angle sweep. (The phase intercept,
+// which used to grow without bound with uptime, now comes from AnimClock as
+// a uint32 directly.) Converting a double that is negative
 // or >= 2^32 directly to uint32_t is undefined behaviour, not a wrap: the
 // platform may saturate instead. x86 happens to wrap, which is exactly why
 // the host harness matched the reference frames while the real target's
@@ -320,20 +341,24 @@ void frame(uint32_t tMs, int, int, const uint8_t p[4]) {
         buildThemePalette();
         lastThemeGen = themeGen();
     }
-    const float t = tMs * 0.001f;
+    // Time from the wrapped millis() delta (BgAnimClock.h, gm-4q9y). The old
+    // t = tMs * 0.001f was a float: it stepped in 32 ms jumps after 3.1 days
+    // of uptime, the phase jumped on every speed change, and every wave
+    // jumped at the 49.7-day wrap.
+    g_clock.advance(tMs, speedMul(p[0]));
+    g_wall.advance(tMs, 1.0f);
     const float freqScale = lerpf(0.55f, 1.9f, p[1] / 100.0f);
-    const float speedScale = 0.8f * speedMul(p[0]);
     const float thresh = 0.14f + 0.55f * (p[2] / 100.0f); // p[2] = "contrast" param
     const float invSpan = 1.0f / fmaxf(1e-3f, 1.0f - thresh);
 
     for (int k = 0; k < K; k++) {
-        const float ang = BASE_ANGLE[k] + ANG_DRIFT[k] * t;
+        const float ang = BASE_ANGLE[k] + oscRad(g_wall, ANG_RATE[k]);
         const float cosA = fastCosRad(ang);
         const float sinA = fastSinRad(ang);
         const float freq = FREQ_BASE[k] * freqScale; // rad/pixel
-        const float phaseRad = PHASE0[k] + t * speedScale * SPEED_MUL[k] * 2.0f;
         g_rowFreqQ[k] = ddsQ(static_cast<double>(sinA * freq) * PHASE_SCALE);
-        g_phaseQ[k] = ddsQ(static_cast<double>(phaseRad) * PHASE_SCALE);
+        // The clock's Q32 turn is already a DDS phase word (2^32 = one turn).
+        g_phaseQ[k] = oscTurnQ32(g_clock, PHASE_RATE[k]) + PHASE0_Q[k];
         g_stepQ[k] = ddsQ(static_cast<double>(cosA * freq) * PHASE_SCALE);
     }
 

@@ -149,6 +149,7 @@
 // check); left as a candidate for a future pass, not attempted here.
 
 #include "BgAnim.h"
+#include "BgAnimClock.h"
 #include "BgAnimCommon.h"
 #include <math.h>
 #include <string.h>
@@ -245,6 +246,12 @@ struct Ripple {
     bool active;
 };
 Ripple ripples[MAX_RIPPLES];
+// Animation time (BgAnimClock.h, gm-4q9y), at speed 1: the speed parameter
+// here is the rings' spread in px/s, not a time scale. Drop times and ring
+// births are on g_clock.ms(), and the schedule compares by signed difference
+// so it survives the clock's 32-bit wrap. Not reset by release(), so the
+// simulation keeps going across the full/half switch.
+AnimClock g_clock;
 uint32_t nextDropMs = 0;
 uint32_t rng = 0xC0FFEE;
 float *envLUT = nullptr;     // 256: 1-(i/255)^2
@@ -259,7 +266,9 @@ int g_n = 0;
 float g_cx[MAX_RIPPLES], g_cy[MAX_RIPPLES], g_r[MAX_RIPPLES], g_amp[MAX_RIPPLES];
 int g_icx[MAX_RIPPLES], g_icy[MAX_RIPPLES]; // centers rounded to nearest pixel, for the integer tracker
 float g_glow = 1.0f;
-uint32_t g_tMs = 0;
+float g_swellRad = 0.0f; // the swell's time phase, from g_clock in frame()
+// The swell's rate: the 0.00014 rad/ms frame() used to apply to tMs.
+constexpr uint64_t SWELL_RATE = oscRateQ48(0.00014);
 
 bool init(int, int) {
     // envLUT, clampU8 and g_hAccBuf are all read (and, for g_hAccBuf,
@@ -312,6 +321,10 @@ bool init(int, int) {
         for (auto &r : ripples) {
             r.active = false;
         }
+        // On g_clock.ms(), which starts at 0 on the first frame, so the first
+        // drop lands 0.6 to 2.6 s after the animation first shows. (On raw
+        // millis() it fired at once whenever the animation was first
+        // selected more than 2.6 s after boot.)
         nextDropMs = 600 + static_cast<uint32_t>(nextRandf(rng) * 2000);
     }
     return true;
@@ -329,20 +342,27 @@ void rebuildThemeAssets() {
 }
 
 void frame(uint32_t tMs, int w, int h, const uint8_t p[4]) {
-    g_tMs = tMs;
+    // Time from the wrapped millis() delta (gm-4q9y). The old code used
+    // tMs directly: the swell's float tMs * 0.00014f stepped in 32 ms jumps
+    // after 3.1 days of uptime, and `tMs >= nextDropMs` stopped dropping
+    // once nextDropMs had wrapped past zero, or dropped every frame once tMs
+    // had.
+    g_clock.advance(tMs, 1.0f);
+    const uint32_t nowMs = g_clock.ms();
+    g_swellRad = oscRad(g_clock, SWELL_RATE);
     if (themeGen() != lastThemeGen) {
         rebuildThemeAssets();
         lastThemeGen = themeGen();
     }
     const float interval = lerpf(14000.0f, 1500.0f, p[1] / 100.0f);
-    if (tMs >= nextDropMs) {
+    if (static_cast<int32_t>(nowMs - nextDropMs) >= 0) {
         for (auto &r : ripples) {
             if (!r.active) {
-                r = {nextRandf(rng) * w, nextRandf(rng) * h, tMs, true};
+                r = {nextRandf(rng) * w, nextRandf(rng) * h, nowMs, true};
                 break;
             }
         }
-        nextDropMs = tMs + static_cast<uint32_t>(interval * (0.55f + 0.9f * nextRandf(rng)));
+        nextDropMs = nowMs + static_cast<uint32_t>(interval * (0.55f + 0.9f * nextRandf(rng)));
     }
     const float speed = lerpf(25.0f, 220.0f, p[0] / 100.0f);
     const float life = lerpf(7.0f, 2.2f, p[2] / 100.0f);
@@ -353,7 +373,7 @@ void frame(uint32_t tMs, int w, int h, const uint8_t p[4]) {
         if (!r.active) {
             continue;
         }
-        const float ageS = (tMs - r.birthMs) * 0.001f;
+        const float ageS = (nowMs - r.birthMs) * 0.001f;
         if (ageS >= life) {
             r.active = false;
             continue;
@@ -385,7 +405,7 @@ void buildRowState(int y, int w, RowState &rs) {
     const float wMinus1 = static_cast<float>(w - 1);
     {
         const float vt = y * INV_ROWMAX;
-        const float swell = sinRadLocal(g_cosTable, g_tMs * 0.00014f + y * 0.014f) * 2.5f;
+        const float swell = sinRadLocal(g_cosTable, g_swellRad + y * 0.014f) * 2.5f;
         int basePos = static_cast<int>(vt * 20.0f + swell + 3.0f);
         if (basePos < 0) {
             basePos = 0;
@@ -912,8 +932,8 @@ void release() {
     // state (active flags and nextDropMs), not any table's content: envLUT and
     // clampU8 are pure functions of compile-time constants, so init() refills
     // them identically whatever `inited` says. Resetting it would re-seed
-    // nextDropMs to a boot-relative 600-2600 ms while tMs is already far past
-    // that, firing a drop the instant the animation is selected. Leaving the
+    // nextDropMs to 600-2600 ms while g_clock.ms() (also kept) is already far
+    // past that, firing a drop the instant the animation is selected. Leaving the
     // simulation intact across a release/init cycle is both correct and the
     // behaviour that existed before this entry point.
 }
