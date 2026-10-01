@@ -118,8 +118,14 @@ class LilyGo_RGBPanel : public Display {
     // reflashing and waiting for the panel to cool down again.
     //
     // setVcom backs the panelVcom setting and is applied from DefaultUI on
-    // every change. setInversion is not persisted and reverts to the init table
-    // on the next boot.
+    // every change, including the UI task's first pass after boot. setInversion
+    // is not persisted and reverts to the init table on the next boot.
+    //
+    // Both hold _busLock for the whole bank-select sequence, so the touch
+    // task's poll cannot land between two of its bit-banged transfers. Each
+    // 9-bit transfer is about 29 read-modify-writes of the XL9555 over I2C,
+    // so one call holds the bus for an estimated 100 ms and the touch task
+    // misses its polls for that long (not measured).
     //
     // The control interface is the 9-bit SPI extender, entirely separate from
     // the RGB data path, so both are safe to write while scan-out is running.
@@ -137,7 +143,13 @@ class LilyGo_RGBPanel : public Display {
 
     void writeCommand(const uint8_t cmd);
 
-    void initBUS();
+    // False when esp_lcd cannot create or initialise the RGB panel.
+    bool initBUS();
+
+    // Marks the panel uninitialised and drops the cached framebuffer
+    // pointers. Called on stopPanel(), sleep(), a failed begin() and in the
+    // destructor.
+    void clearPanelState();
 
     bool initTouch();
 
@@ -149,6 +161,9 @@ class LilyGo_RGBPanel : public Display {
 
     LilyGo_RGBPanel_Color_Order _order;
 
+    // True only between a successful begin() and stopPanel() or sleep().
+    // setVcom and setInversion write only while it is set. Read and written
+    // under _busLock.
     bool _has_init;
     bool _extension_initialized = false;
 

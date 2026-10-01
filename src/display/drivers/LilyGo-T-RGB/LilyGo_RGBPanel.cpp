@@ -37,6 +37,7 @@ LilyGo_RGBPanel::LilyGo_RGBPanel(/* args */)
       _wakeupMethod(LILYGO_T_RGB_WAKEUP_FORM_BUTTON), _sleepTimeUs(0), _touchType(LILYGO_T_RGB_TOUCH_UNKNOWN) {}
 
 LilyGo_RGBPanel::~LilyGo_RGBPanel() {
+    clearPanelState();
     if (_panelDrv) {
         panelclock::detach();
         esp_lcd_panel_del(_panelDrv);
@@ -53,7 +54,7 @@ bool LilyGo_RGBPanel::begin(LilyGo_RGBPanel_Color_Order order) {
         _busLock = xSemaphoreCreateRecursiveMutex();
     }
     if (_panelDrv) {
-        return true;
+        return _has_init;
     }
 
     _order = order;
@@ -67,11 +68,43 @@ bool LilyGo_RGBPanel::begin(LilyGo_RGBPanel_Color_Order order) {
         Serial.println(F("Touch chip not found."));
     }
 
-    initBUS();
+    if (!initBUS()) {
+        clearPanelState();
+        return false;
+    }
 
     getModel();
 
+    // Only now is the ST7701's control interface (the 9-bit SPI bit-banged
+    // through the XL9555) known to work and the init table on the part, so
+    // only now may setVcom and setInversion write to it. Until gm-bzu.40
+    // nothing set this flag and both were silent no-ops on the T-RGB. Set
+    // under the bus lock because setVcom reads it under the same lock.
+    {
+        BusGuard busGuard(_busLock);
+        _has_init = true;
+    }
     return true;
+}
+
+void LilyGo_RGBPanel::clearPanelState() {
+    // The flag first and under the bus lock: a setVcom already inside the
+    // lock finishes its bank-select sequence before this returns, and none
+    // starts after it.
+    {
+        BusGuard busGuard(_busLock);
+        _has_init = false;
+    }
+    // The framebuffer pointers belong to the esp_lcd panel and die with it.
+    // Clearing _fbResolved as well means a later call resolves against
+    // whatever panel exists then (none after stopPanel: count 0) instead of
+    // handing out a pointer into freed PSRAM.
+    for (int i = 0; i < FB_COUNT; i++) {
+        _fbDirect[i] = nullptr;
+    }
+    _fbCount = 0;
+    _fbCurrent = 0;
+    _fbResolved = false;
 }
 
 void LilyGo_RGBPanel::initExtension() {
@@ -252,10 +285,16 @@ void LilyGo_RGBPanel::sleep() {
         break;
     }
 
+    // The bus lock is held for the whole of sleep(), so this cannot wait on
+    // a VCOM write; it only stops one that would otherwise run on a bus
+    // Wire.end() has taken down.
+    clearPanelState();
     if (_panelDrv) {
+        esp_lcd_panel_handle_t handle = _panelDrv;
+        _panelDrv = nullptr;
         panelclock::detach();
-        esp_lcd_panel_disp_on_off(_panelDrv, false);
-        esp_lcd_panel_del(_panelDrv);
+        esp_lcd_panel_disp_on_off(handle, false);
+        esp_lcd_panel_del(handle);
     }
 
     Wire.end();
@@ -316,11 +355,11 @@ uint16_t LilyGo_RGBPanel::getBattVoltage() {
     return (sum / number_of_samples) * 2;
 }
 
-void LilyGo_RGBPanel::initBUS() {
+bool LilyGo_RGBPanel::initBUS() {
     assert(_init_cmd);
 
     if (_panelDrv) {
-        return;
+        return true;
     }
 
     extension.pinMode(reset, OUTPUT);
@@ -492,11 +531,26 @@ void LilyGo_RGBPanel::initBUS() {
         memcpy(panel_config.data_gpio_nums, bus_rbg_order, sizeof(panel_config.data_gpio_nums));
     }
 
-    ESP_ERROR_CHECK(esp_lcd_new_rgb_panel(&panel_config, &_panelDrv));
-    ESP_ERROR_CHECK(esp_lcd_panel_init(_panelDrv));
+    // A failure here is reported to begin(), which clears the panel state
+    // and returns false; LilyGoDriver::init then logs and restarts, as it
+    // always did for a false begin(). Before gm-bzu.40 these aborted.
+    esp_lcd_panel_handle_t handle = nullptr;
+    esp_err_t err = esp_lcd_new_rgb_panel(&panel_config, &handle);
+    if (err != ESP_OK) {
+        log_e("LilyGo_RGBPanel: esp_lcd_new_rgb_panel failed (%s)", esp_err_to_name(err));
+        return false;
+    }
+    err = esp_lcd_panel_init(handle);
+    if (err != ESP_OK) {
+        log_e("LilyGo_RGBPanel: esp_lcd_panel_init failed (%s)", esp_err_to_name(err));
+        esp_lcd_panel_del(handle);
+        return false;
+    }
+    _panelDrv = handle;
     // Live refresh-rate control needs the driver handle: retiming has to go
     // through esp_lcd so its cached timings stay truthful (see PanelClock.h).
     panelclock::attach(_panelDrv, panel_config.timings.pclk_hz);
+    return true;
 }
 
 bool LilyGo_RGBPanel::initTouch() {
@@ -650,6 +704,9 @@ constexpr int BANK_LEN = 5;
 
 void LilyGo_RGBPanel::setVcom(uint8_t vcoms) {
     BusGuard busGuard(_busLock);
+    // _has_init is the transport's validity: set by begin() once the init
+    // table has gone out, cleared by stopPanel(), sleep() and a failed
+    // begin(), always under this lock.
     if (!_has_init) {
         return;
     }
@@ -666,6 +723,9 @@ void LilyGo_RGBPanel::setVcom(uint8_t vcoms) {
 
 void LilyGo_RGBPanel::setInversion(uint8_t invset0) {
     BusGuard busGuard(_busLock);
+    // _has_init is the transport's validity: set by begin() once the init
+    // table has gone out, cleared by stopPanel(), sleep() and a failed
+    // begin(), always under this lock.
     if (!_has_init) {
         return;
     }
@@ -820,6 +880,7 @@ void *LilyGo_RGBPanel::frameBufferGate() { return _fbGate; }
 
 void LilyGo_RGBPanel::stopPanel() {
     setBrightness(0);
+    clearPanelState();
     if (_panelDrv != nullptr) {
         esp_lcd_panel_handle_t handle = _panelDrv;
         _panelDrv = nullptr;
