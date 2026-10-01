@@ -233,6 +233,10 @@ export const BG_ANIMATIONS = [
       { key: 'grain', label: 'Grain', def: 35 },
       { key: 'reflection', label: 'Reflection', def: 45 },
       { key: 'contrast', label: 'Contrast', def: 30 },
+      { key: 'shine', label: 'Shine', def: 50 },
+      { key: 'swell', label: 'Swell', def: 50 },
+      { key: 'tilt', label: 'Tilt', def: 50 },
+      { key: 'tone', label: 'Base tone', def: 50 },
     ],
   },
   {

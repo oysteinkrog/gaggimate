@@ -42,6 +42,7 @@ const int16_t *sl = nullptr; // borrowed shared SIN_N-entry sine table
 
 uint32_t lastThemeGen = 0xFFFFFFFF;
 bool paletteValid = false;
+int lastShine = -1, lastTone = -1; // palette parameters the tables were built for
 int allocW = 0, allocH = 0, colStride = 0;
 
 // Table budget at 480x480, against the 9,216 B animation slab:
@@ -118,18 +119,26 @@ bool init(int w, int h) {
 
 void frame(uint32_t tMs, int w, int h, const uint8_t p[BG_ANIM_PARAMS]) {
     const uint32_t gen = themeGen();
-    if (!paletteValid || gen != lastThemeGen) {
+    // Shine (p[4]) scales the broad highlight shoulder's gain, 132 at 50,
+    // none at 0 and 264 at 100. Base tone (p[7]) scales the dark base
+    // slope 7..46, black at 0 and 14..92 at 100. Both are exact identities
+    // at 50 (x * 50 / 50), so the default palette is the old one.
+    const int shine = p[4];
+    const int tone = p[7];
+    if (!paletteValid || gen != lastThemeGen || shine != lastShine || tone != lastTone) {
         buildThemeRamp(ramp, 256);
+        const int gain1 = 132 * shine / 50;
         for (int i = 0; i < 256; i++) {
             // Page's metal curve in theme-ramp positions: a 7..46 base and
             // squared triangular shoulders, centre/radius/gain 182/56/132
-            // and 238/18/60. Divisions truncate before squaring.
-            int v = 7 + ((i * 40) >> 8);
+            // and 238/18/60 at the defaults. Divisions truncate before
+            // squaring.
+            int v = (7 + ((i * 40) >> 8)) * tone / 50;
             int d = i - 182;
             int ad = d < 0 ? -d : d;
             if (ad < 56) {
                 const int k = 256 - ad * 256 / 56;
-                v += (((k * k) >> 8) * 132) >> 8;
+                v += (((k * k) >> 8) * gain1) >> 8;
             }
             d = i - 238;
             ad = d < 0 ? -d : d;
@@ -150,10 +159,13 @@ void frame(uint32_t tMs, int w, int h, const uint8_t p[BG_ANIM_PARAMS]) {
             dithOff[k] = static_cast<int16_t>(lroundf(d));
         }
         lastThemeGen = gen;
+        lastShine = shine;
+        lastTone = tone;
         paletteValid = true;
     }
-    // The page also keys on params, but palette/dither use no parameter.
-    // Rebuilding only on theme changes therefore produces the same tables.
+    // The page keys its palette on every parameter; this rebuilds only when
+    // the theme, Shine or Base tone moves, which are the only inputs the
+    // palette and dither tables read, so both produce the same tables.
     // Speed follows the fleet's curve, speedMul(): 0.15x at 0, 1x at 50 and
     // 6.7x at 100 of the rate Speed 50 has since gm-33fm (bead gm-kh2s).
     // The multiplier is Q6 and 1664 at 50, the old rate of 26 with six
@@ -176,7 +188,9 @@ void frame(uint32_t tMs, int w, int h, const uint8_t p[BG_ANIM_PARAMS]) {
     // Unsigned products preserve JS wrap at long uptime; computing from
     // tMs also matches the page when the speed parameter changes.
     const int grainQ8 = 16 + static_cast<int>(p[1]) * 68 / 100; // 16..84
-    const int tiltA = 120 + static_cast<int>(p[1]) * 150 / 100; // 120..270
+    // Tilt (p[6]) scales the slow vertical light wave, flat at 0 and twice
+    // the grain-linked amplitude at 100: 120..270 at 50, up to 540.
+    const int tiltA = (120 + static_cast<int>(p[1]) * 150 / 100) * static_cast<int>(p[6]) / 50;
     int rowMax = 0;
     for (int y = 0; y < h; y++) {
         const int g = (grainBase[y] * grainQ8) >> 8;
@@ -196,16 +210,20 @@ void frame(uint32_t tMs, int w, int h, const uint8_t p[BG_ANIM_PARAMS]) {
     const uint32_t f1Q4 = 16 * 1024 / px;
     const uint32_t f2Q4 = 16 * 1024 / (px * 55 / 100);
     const int amp1 = 420 + static_cast<int>(p[3]) * 560 / 100; // 420..980
-    const int amp2 = amp1 >> 2;                             // 105..245
+    // Swell (p[5]) sets the counter-moving swell against the sheen: none at
+    // 0, a quarter of it at 50 (amp1 * 50 / 200 == amp1 >> 2 for amp1 > 0),
+    // half at 100.
+    const int amp2 = amp1 * static_cast<int>(p[5]) / 200; // 105..245 at 50, up to 490
     for (int x = 0; x < w; x++) {
         const uint32_t i1 = ((static_cast<uint32_t>(x) * f1Q4) >> 4) - ph1;
         const uint32_t i2 = ((static_cast<uint32_t>(x) * f2Q4) >> 4) + ph2;
         colTerm[x] = static_cast<int16_t>(MID + ((sl[i1 & (SIN_N - 1)] * amp1) >> 9) +
                                         ((sl[i2 & (SIN_N - 1)] * amp2) >> 9));
     }
-    // |grain| <= 512 and |rowTerm| <= 168 + 270 = 438 at every slider
+    // |grain| <= 512, so |rowTerm| <= 168 + 540 = 708 at every slider
     // extreme. Clamp the dithered columns to [rowMax, 4095-rowMax], proving
-    // the final sum is 0..4095, including ditherAmp's maximum of 16.
+    // the final sum is 0..4095, including ditherAmp's maximum of 16. The
+    // hand-written kernel's VADDS and 12-bit EXTUI rely on that range.
     const int lo = rowMax;
     const int hi = INDEX_MAX - rowMax;
     for (int ph = 0; ph < 8; ph++) {
@@ -375,6 +393,7 @@ void release() {
     sl = nullptr; // borrowed, never release the shared sine table
     allocW = allocH = colStride = 0;
     lastThemeGen = 0xFFFFFFFF;
+    lastShine = lastTone = -1;
     paletteValid = false;
 }
 
@@ -384,7 +403,14 @@ extern const BgAnimation bg_anim_brushed;
 const BgAnimation bg_anim_brushed = {
     "brushed",
     "Brushed",
-    {{"speed", "Speed", 50}, {"grain", "Grain", 35}, {"reflection", "Reflection", 45}, {"contrast", "Contrast", 30}},
+    {{"speed", "Speed", 50},
+     {"grain", "Grain", 35},
+     {"reflection", "Reflection", 45},
+     {"contrast", "Contrast", 30},
+     {"shine", "Shine", 50},
+     {"swell", "Swell", 50},
+     {"tilt", "Tilt", 50},
+     {"tone", "Base tone", 50}},
     init,
     frame,
     band,

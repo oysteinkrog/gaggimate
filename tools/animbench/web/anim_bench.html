@@ -2444,7 +2444,11 @@ function bayerOffsets(dithOff, amp, unit) {
       { key: 'speed', label: 'Speed', def: 50 },
       { key: 'grain', label: 'Grain', def: 35 },
       { key: 'reflection', label: 'Reflection', def: 45 },
-      { key: 'contrast', label: 'Contrast', def: 30 }],
+      { key: 'contrast', label: 'Contrast', def: 30 },
+      { key: 'shine', label: 'Shine', def: 50 },
+      { key: 'swell', label: 'Swell', def: 50 },
+      { key: 'tilt', label: 'Tilt', def: 50 },
+      { key: 'tone', label: 'Base tone', def: 50 }],
     init(w, h, state) {
       state.colTerm = new Int16Array(w);
       state.ctPh = new Int16Array(8 * w);
@@ -2480,10 +2484,14 @@ function bayerOffsets(dithOff, amp, unit) {
       if (state.key !== key) {
         state.key = key;
         const ramp = themeRamp(256), pal = state.pal;
+        // Shine (p[4]) scales the broad shoulder's gain and Base tone (p[7])
+        // the dark base slope; both are 1x at 50 (gm-3vj.17), as in
+        // AnimBrushed.cpp.
+        const gain1 = Math.trunc(132 * p[4] / 50);
         for (let i = 0; i < 256; i++) {
-          let v = 7 + ((i * 40) >> 8);
+          let v = Math.trunc((7 + ((i * 40) >> 8)) * p[7] / 50);
           let d = i - 182, ad = d < 0 ? -d : d;
-          if (ad < 56) { const k = 256 - Math.trunc(ad * 256 / 56); v += (((k * k) >> 8) * 132) >> 8; }
+          if (ad < 56) { const k = 256 - Math.trunc(ad * 256 / 56); v += (((k * k) >> 8) * gain1) >> 8; }
           d = i - 238; ad = d < 0 ? -d : d;
           if (ad < 18) { const k = 256 - Math.trunc(ad * 256 / 18); v += (((k * k) >> 8) * 60) >> 8; }
           const q = (v < 0 ? 0 : (v > 255 ? 255 : v)) * 3;
@@ -2500,7 +2508,8 @@ function bayerOffsets(dithOff, amp, unit) {
       const ph1 = base >>> 14, ph2 = ((base * 3) >>> 0) >>> 16, ph3 = base >>> 17;
       const { colTerm, ctPh, rowTerm, grain, pal } = state;
       const grainQ8 = 16 + Math.floor(p[1] * 68 / 100);
-      const tiltA = 120 + Math.floor(p[1] * 150 / 100);
+      // Tilt (p[6]) scales the vertical light wave, 1x at 50.
+      const tiltA = Math.trunc((120 + Math.floor(p[1] * 150 / 100)) * p[6] / 50);
       let rowMax = 0;
       for (let y = 0; y < h; y++) {
         const g = (grain[y] * grainQ8) >> 8;
@@ -2514,7 +2523,8 @@ function bayerOffsets(dithOff, amp, unit) {
       const px = 380 + Math.floor(p[2] * 520 / 100);
       const f1Q4 = Math.trunc(16 * 1024 / px);
       const f2Q4 = Math.trunc(16 * 1024 / Math.trunc(px * 55 / 100));
-      const amp1 = 420 + Math.floor(p[3] * 560 / 100), amp2 = amp1 >> 2;
+      // Swell (p[5]): the counter swell is a quarter of the sheen at 50.
+      const amp1 = 420 + Math.floor(p[3] * 560 / 100), amp2 = Math.trunc(amp1 * p[5] / 200);
       for (let x = 0; x < w; x++) {
         const i1 = ((x * f1Q4) >> 4) - ph1, i2 = ((x * f2Q4) >> 4) + ph2;
         colTerm[x] = MID + ((SIN[i1 & (SIN_N - 1)] * amp1) >> 9) + ((SIN[i2 & (SIN_N - 1)] * amp2) >> 9);
