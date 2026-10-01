@@ -83,9 +83,19 @@
 // about 6 KB of the 9,216 B an animation gets, and the lifecycle check
 // reports no fallback to PSRAM.
 //
-// The device band has not been measured: the board was held by another
-// agent when this landed (gm-pciz). That is the open item on this file for
-// a future board session.
+// Device numbers (gm-4bd.12, 2026-10-01, bench board, display-loadtest at
+// e35349b7-dirty, pixel clock divider 6 live, interlace pinned on, cap 60,
+// tools/framefn_sweep.py with plasma in the same run, both orders): band
+// 5.6 and 5.9 ms a frame against plasma's 5.2, so 1.08x to 1.13x, which is
+// the host's 1.12x. /api/debug/animtest: 0 differing pixels over 8 frames
+// and 3 parameter sets, hot_fail 0 with Orbits resident. What the host did
+// not predict is frame(): 9.6 and 12.3 ms a frame against plasma's 0.3,
+// and the loop ran 26.0 fps against plasma's 43.6 under the same cap. The
+// sample loop above does, per sample, double cos, sin, pow, floor, ceil
+// and a divide, about 100 samples a frame, and the S3 has no double FPU,
+// so every one is a soft-float libcall. It is the page's arithmetic in the
+// page's precision (gm-pciz), so moving it to float or to a table changes
+// the goldens and is a decision, not a fix: gm-4bd.13 holds it.
 //
 // The kernel parity sweep is not an open item, and this paragraph is here
 // so nobody re-runs it blind. gm-4bd.11 ran the fleet's band() against
