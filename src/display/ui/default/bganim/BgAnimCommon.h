@@ -353,10 +353,54 @@ void buildThemeRamp(uint16_t *out, uint16_t brightness256, bool reversed = false
 void buildThemeWheel(uint16_t *out, uint16_t brightness256);
 
 // Universal speed-curve: maps a 0-100 speed param to a multiplier of the
-// animation's tuned base rate — 0.15x at 0, 1x at 50, ~6.7x at 100.
+// animation's tuned base rate: 2^((sp - 50) / 18.2), 0.15x at 0, exactly 1x
+// at 50, ~6.7x at 100.
+//
+// A table, not exp2f (gm-r5tc): glibc, newlib and a browser's Math.pow give
+// different last bits for 57 of the 101 values, which after an hour away from
+// Speed 50 puts a truncated phase word one tick apart. The table is generated
+// once with exact arithmetic by tools/animbench/gen_speed_table.py, which also
+// documents the rounding any other consumer must reproduce, and
+// `gen_speed_table.py --check` verifies it. It is read once per frame, so it
+// lives in rodata, not in the hot slab.
+// BEGIN gen_speed_table.py: do not edit by hand
+// Speed multiplier, one entry per Speed setting 0..100. Entry sp is the
+// correctly rounded float32 of 2^x, x = float32(sp - 50) * (1.0f / 18.2f)
+// in float32; rounding rules in tools/animbench/gen_speed_table.py.
+inline constexpr float kSpeedMulTable[101] = {
+    0x1.310472p-3F, 0x1.3cdba4p-3F, 0x1.492882p-3F, 0x1.55ef9ep-3F,
+    0x1.6335b4p-3F, 0x1.70ffb8p-3F, 0x1.7f52c2p-3F, 0x1.8e3424p-3F,
+    0x1.9da96cp-3F, 0x1.adb84ep-3F, 0x1.be66c6p-3F, 0x1.cfbb04p-3F,
+    0x1.e1bb7ap-3F, 0x1.f46edap-3F, 0x1.03ee06p-2F, 0x1.0e0526p-2F,
+    0x1.188090p-2F, 0x1.236424p-2F, 0x1.2eb3ecp-2F, 0x1.3a7420p-2F,
+    0x1.46a91ap-2F, 0x1.535764p-2F, 0x1.6083b2p-2F, 0x1.6e32eap-2F,
+    0x1.7c6a20p-2F, 0x1.8b2e9ep-2F, 0x1.9a85dap-2F, 0x1.aa758cp-2F,
+    0x1.bb039ep-2F, 0x1.cc3634p-2F, 0x1.de13b2p-2F, 0x1.f0a2b8p-2F,
+    0x1.01f518p-1F, 0x1.0bf8a0p-1F, 0x1.165facp-1F, 0x1.212e18p-1F,
+    0x1.2c67e8p-1F, 0x1.381148p-1F, 0x1.442e8cp-1F, 0x1.50c434p-1F,
+    0x1.5dd6ecp-1F, 0x1.6b6b8ep-1F, 0x1.798726p-1F, 0x1.882ef2p-1F,
+    0x1.976864p-1F, 0x1.a73920p-1F, 0x1.b7a708p-1F, 0x1.c8b836p-1F,
+    0x1.da7300p-1F, 0x1.ecddfcp-1F, 0x1.000000p+0F, 0x1.09f014p+0F,
+    0x1.1442eap+0F, 0x1.1efc58p+0F, 0x1.2a205ap+0F, 0x1.35b312p+0F,
+    0x1.41b8cep+0F, 0x1.4e3604p+0F, 0x1.5b2f56p+0F, 0x1.68a998p+0F,
+    0x1.76a9c8p+0F, 0x1.85351cp+0F, 0x1.9450fap+0F, 0x1.a402fep+0F,
+    0x1.b450fcp+0F, 0x1.c54102p+0F, 0x1.d6d95cp+0F, 0x1.e92090p+0F,
+    0x1.fc1d6ap+0F, 0x1.07eb7cp+1F, 0x1.122a42p+1F, 0x1.1ccedcp+1F,
+    0x1.27dd3ap+1F, 0x1.335978p+1F, 0x1.3f47d8p+1F, 0x1.4baccap+1F,
+    0x1.588ce8p+1F, 0x1.65ecfcp+1F, 0x1.73d1fap+1F, 0x1.82410cp+1F,
+    0x1.913f92p+1F, 0x1.a0d31ap+1F, 0x1.b1016ap+1F, 0x1.c1d088p+1F,
+    0x1.d346b6p+1F, 0x1.e56a6ap+1F, 0x1.f8425ep+1F, 0x1.05eaccp+2F,
+    0x1.1015b0p+2F, 0x1.1aa59cp+2F, 0x1.259e7ep+2F, 0x1.31046ap+2F,
+    0x1.3cdb9ep+2F, 0x1.492880p+2F, 0x1.55ef9ap+2F, 0x1.6335b0p+2F,
+    0x1.70ffb4p+2F, 0x1.7f52bcp+2F, 0x1.8e3420p+2F, 0x1.9da964p+2F,
+    0x1.adb846p+2F,
+};
+// END gen_speed_table.py
+
 BGANIM_INLINE float speedMul(uint8_t sp) {
-    // exp2f((sp-50)/18.2) => 0.15 .. 6.7, exactly 1.0 at 50
-    return exp2f((static_cast<int>(sp) - 50) * (1.0f / 18.2f));
+    // bg_parse_params clamps to 0..100; the clamp here keeps a raw caller in
+    // bounds.
+    return kSpeedMulTable[sp > 100 ? 100 : sp];
 }
 
 } // namespace bganim
