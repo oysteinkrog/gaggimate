@@ -122,10 +122,9 @@ def map_write_ref(theme_map, anim_id, ref):
 def expected_gradient_text(settings, anim_id=None):
     """Python mirror of gradientChoices()/gradientChoiceIndexForRef() plus
     CatAnimation.cpp's "Default (<name>)" formatting, for the built-in-theme
-    and Default cases only. Returns None for a library ref ("cN"): the
-    simulator's bg_library_valid always returns false (sim/platform/
-    bganim_stub.cpp), so bgAnimGradients can never legitimately hold a
-    library entry here and this script never needs to resolve one."""
+    and Default cases only. Returns None for a library ref ("cN"): this
+    script never creates a library entry, so it never needs to resolve
+    one."""
     if anim_id is None:
         anim_id = int(settings["bgAnimId"])
     ref = map_ref(settings["bgAnimThemeMap"], anim_id)
@@ -390,11 +389,9 @@ def check_gradient_default_and_builtin(rig):
     """Acceptance: choosing a gradient writes bgAnimThemeMap's entry for the
     current animation only; Default clears it. The library half of this
     criterion (a real library entry, created through the web UI first) is
-    not run here: bg_library_valid always returns false on the simulator
-    (sim/platform/bganim_stub.cpp), so no POST can ever put a nonempty
-    library string into Settings there, and this scenario never POSTs by
-    hand except through web_save's documented, narrow use above. The
-    built-in-theme half exercises the same map-write code path."""
+    not run here: this scenario never POSTs a library by hand, only
+    through web_save's documented, narrow use above. The built-in-theme
+    half exercises the same map-write code path."""
     s0 = rig.settings()
     anim0 = int(s0["bgAnimId"])
     map0 = s0["bgAnimThemeMap"]
@@ -435,21 +432,12 @@ def check_gradient_precedence_across_animations(rig):
 
     The review's own scenario adds a web save that replaces the whole map
     with a different value for A's slot while both are touched, then
-    checks the display's value for A wins at pop. That step cannot run
-    here: sim/platform/bganim_stub.cpp's bg_map_valid() always returns
-    false, and WebUIPlugin.cpp gates every POST to bgAnimThemeMap behind
-    it (`if (request->hasArg("bgAnimThemeMap") && bg_map_valid(...))
-    settings->setBgAnimThemeMap(...)`), so no POST -- built-in ref or
-    library ref alike -- can ever change that field on the simulator; the
-    line below confirms this by attempting exactly the review's POST and
-    asserting the sim's own gate holds. This is a wider version of the
-    already-documented library-only gap: the sim cannot exercise an
-    external write to bgAnimThemeMap at all, not just a library one. What
-    is verified here instead: both A's and B's live-written slots survive
-    an ordinary pop with no interference (the commit loop does not drop
-    an earlier touched entry just because a later one was touched too),
-    which is the one piece of this criterion the simulator can observe.
-    The interference half needs the device (POST is not gated there)."""
+    checks the display's value for A wins at pop. That step runs here
+    since gm-nov3.26 gave the simulator the real bg_map_valid() (the stub
+    in sim/platform/bganim_stub.cpp refused every map, so no POST could
+    change the field). The check below asserts the web write landed, and
+    the pop checks after it assert that A's touched draft and B's both
+    win over it."""
     s0 = rig.settings()
     anim_a = int(s0["bgAnimId"])
     anim_b = (anim_a + 1) % len(ANIM_NAMES)
@@ -473,19 +461,16 @@ def check_gradient_precedence_across_animations(rig):
     check(rig, "precedence_setup_touch_b", ref_b != "", "anim %d ref=%r" % (anim_b, ref_b))
 
     # The review's own interference step: a web save replacing the whole
-    # map with a different value for A's slot. Confirmed rejected outright
-    # by the sim's bg_map_valid() gate (see docstring); this asserts that
-    # rejection rather than skipping it, so a future change loosening the
-    # host stub is caught here instead of silently going untested.
+    # map with a different value for A's slot. It must land (a refusal
+    # would mean the precedence below is never tested), and the pop that
+    # follows must put the display's touched draft back over it.
     web_ref_a = "1" if ref_a != "1" else "2"
     web_map = map_write_ref(map_after_b, anim_a, web_ref_a)
     try:
         web_save(rig, {"bgAnimThemeMap": web_map})
         after_post = map_ref(rig.settings()["bgAnimThemeMap"], anim_a)
-        check(rig, "webpost_bgAnimThemeMap_rejected_on_sim", after_post == ref_a,
-              "anim %d ref after the POST attempt: got %r, want unchanged %r (a mismatch means the sim's "
-              "bg_map_valid stub started accepting writes; revisit this test's device-only note)" %
-              (anim_a, after_post, ref_a))
+        check(rig, "webpost_bgAnimThemeMap_lands", after_post == web_ref_a,
+              "anim %d ref after the POST: got %r, want the posted %r" % (anim_a, after_post, web_ref_a))
     except RuntimeError as e:
         rig.log("gradient_precedence_web_save_unavailable", reason=str(e))
 
@@ -705,23 +690,7 @@ if __name__ == "__main__":
 #   plugins().trigger("bganim:preview-end") in both onCycle handlers) but
 #   not independently confirmed by a device test here.
 # - The gradient library half of the Gradient acceptance criterion (a real
-#   library entry created through the web UI, then chosen): the simulator's
-#   bg_library_valid always returns false (sim/platform/bganim_stub.cpp), so
-#   no POST can create one there; needs a browser and the loadtest device.
-# - The touched-field-precedence half of the gradient regression (gm-flw.9
-#   review on eed10a33): a web save landing on a touched animation's slot
-#   while a different animation's slot is also touched, verifying the
-#   display's value wins for both. Not just the library case: bg_map_valid
-#   (sim/platform/bganim_stub.cpp) unconditionally returns false, so
-#   WebUIPlugin.cpp's `hasArg("bgAnimThemeMap") && bg_map_valid(...)` gate
-#   rejects every POST to that field on the simulator, built-in refs
-#   included, not only library ones. check_gradient_precedence_across_
-#   animations asserts that gate holds, then verifies only the interference
-#   -free half (both slots survive an ordinary pop). Command for the
-#   leader against the device: repeat that check's setup (touch Gradient
-#   for animation A, tap Animation once, touch Gradient for B), POST a
-#   third value for A's slot from the web UI while the category is still
-#   open, pop, and confirm /api/settings bgAnimThemeMap holds A's and B's
-#   display-set refs, not the POSTed one.
+#   library entry created through the web UI, then chosen): this scenario
+#   does not create one; needs a browser and the loadtest device.
 # - "the web UI still loads the Display tab" after a gradient change: needs
 #   a real browser.

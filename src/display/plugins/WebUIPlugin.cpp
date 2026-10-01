@@ -1506,7 +1506,11 @@ void WebUIPlugin::handleProfileRequest(uint32_t clientId, JsonDocument &request)
 void WebUIPlugin::handleSettings(AsyncWebServerRequest *request) const {
     if (request->method() == HTTP_POST) {
         bool persisted = true;
-        controller->getSettings().batchUpdate([request, &persisted](Settings *settings) {
+        // Names of posted fields that failed validation and were not stored.
+        // Every other field in the same request is still applied; the
+        // response lists these instead of answering success (gm-nov3.26).
+        std::vector<const char *> rejected;
+        controller->getSettings().batchUpdate([request, &persisted, &rejected](Settings *settings) {
             // A checkbox is posted as 0 or 1 and read only when present. The
             // form sends every checkbox; a partial POST (the pump calibration's
             // postCoefficients sends one field) leaves every flag as it was.
@@ -1565,8 +1569,15 @@ void WebUIPlugin::handleSettings(AsyncWebServerRequest *request) const {
                 settings->setMdnsName(request->arg("mdnsName"));
             if (request->hasArg("wifiPassword") && request->arg("wifiPassword") != "---unchanged---")
                 settings->setWifiPassword(request->arg("wifiPassword"));
-            if (request->hasArg("apPassword") && request->arg("apPassword").length() >= WIFI_AP_PASSWORD_MIN_LENGTH)
-                settings->setWifiApPassword(request->arg("apPassword"));
+            if (request->hasArg("apPassword") && request->arg("apPassword").length() > 0) {
+                // WPA2 needs at least 8 characters; a shorter one is refused
+                // and reported, not stored. Empty is "not set": the form
+                // echoes the stored value, and the simulator stores none.
+                if (request->arg("apPassword").length() >= WIFI_AP_PASSWORD_MIN_LENGTH)
+                    settings->setWifiApPassword(request->arg("apPassword"));
+                else
+                    rejected.push_back("apPassword");
+            }
             flagArg("homekit", [settings](bool v) { settings->setHomekit(v); });
             flagArg("boilerFillActive", [settings](bool v) { settings->setBoilerFillActive(v); });
             if (request->hasArg("startupFillTime"))
@@ -1663,10 +1674,20 @@ void WebUIPlugin::handleSettings(AsyncWebServerRequest *request) const {
             // Structurally validated rather than trusted: a malformed library
             // would make every animation that references it fall back to the
             // global theme, and the strings come straight from the form.
-            if (request->hasArg("bgAnimGradients") && bg_library_valid(request->arg("bgAnimGradients").c_str()))
-                settings->setBgAnimGradients(request->arg("bgAnimGradients"));
-            if (request->hasArg("bgAnimThemeMap") && bg_map_valid(request->arg("bgAnimThemeMap").c_str()))
-                settings->setBgAnimThemeMap(request->arg("bgAnimThemeMap"));
+            // A field that fails is refused and reported, and the stored
+            // value stays as it was.
+            if (request->hasArg("bgAnimGradients")) {
+                if (bg_library_valid(request->arg("bgAnimGradients").c_str()))
+                    settings->setBgAnimGradients(request->arg("bgAnimGradients"));
+                else
+                    rejected.push_back("bgAnimGradients");
+            }
+            if (request->hasArg("bgAnimThemeMap")) {
+                if (bg_map_valid(request->arg("bgAnimThemeMap").c_str()))
+                    settings->setBgAnimThemeMap(request->arg("bgAnimThemeMap"));
+                else
+                    rejected.push_back("bgAnimThemeMap");
+            }
             flagArg("bgAnimAllScreens", [settings](bool v) { settings->setBgAnimAllScreens(v); });
             if (request->hasArg("smartGrindIp"))
                 settings->setSmartGrindIp(request->arg("smartGrindIp"));
@@ -1739,6 +1760,7 @@ void WebUIPlugin::handleSettings(AsyncWebServerRequest *request) const {
                 // Handle schedule format with days
                 String schedulesStr = request->arg("autowakeupSchedules");
                 std::vector<AutoWakeupSchedule> schedules;
+                bool schedulesValid = true;
 
                 if (schedulesStr.length() > 0) {
                     // Split semicolon-separated schedules
@@ -1749,11 +1771,14 @@ void WebUIPlugin::handleSettings(AsyncWebServerRequest *request) const {
                         String scheduleStr = (end != -1) ? schedulesStr.substring(start, end) : schedulesStr.substring(start);
 
                         int pipePos = scheduleStr.indexOf('|');
-                        // A time that is not HH:MM in range is dropped here rather
-                        // than stored: the on-display editor parses the stored
-                        // string and showed 00:00 for anything else, and the
-                        // wakeup tick would never match it.
-                        if (pipePos != -1 && isScheduleTime(scheduleStr.substring(0, pipePos))) {
+                        // A time that is not HH:MM in range is never stored:
+                        // the on-display editor parses the stored string and
+                        // showed 00:00 for anything else, and the wakeup tick
+                        // would never match it. One such entry refuses the
+                        // whole field below, so the stored list stays as it was.
+                        if (pipePos == -1 || !isScheduleTime(scheduleStr.substring(0, pipePos))) {
+                            schedulesValid = false;
+                        } else {
                             String timeStr = scheduleStr.substring(0, pipePos);
                             String daysStr = scheduleStr.substring(pipePos + 1);
 
@@ -1776,10 +1801,14 @@ void WebUIPlugin::handleSettings(AsyncWebServerRequest *request) const {
                     }
                 }
 
-                if (schedules.empty()) {
-                    schedules.push_back(AutoWakeupSchedule("07:00")); // Default fallback
+                if (!schedulesValid) {
+                    rejected.push_back("autowakeupSchedules");
+                } else {
+                    if (schedules.empty()) {
+                        schedules.push_back(AutoWakeupSchedule("07:00")); // Default fallback
+                    }
+                    settings->setAutoWakeupSchedules(schedules);
                 }
-                settings->setAutoWakeupSchedules(schedules);
             }
             // flushNow() reports whether every change reached NVS. save(true)
             // did not, so a failed write answered success and the browser
@@ -1816,6 +1845,23 @@ void WebUIPlugin::handleSettings(AsyncWebServerRequest *request) const {
             doc["error"] = "The settings could not be written to flash. They are in use now, "
                            "but a restart before a successful save loses them.";
             doc["code"] = "persist_failed";
+            serializeJson(doc, *response);
+            request->send(response);
+            return;
+        }
+        // The valid fields are stored and on flash; the refused ones kept
+        // their old values. Say which, and do not honour a restart, so the
+        // browser keeps its edits and the user can correct and retry.
+        if (!rejected.empty()) {
+            ESP_LOGW("WebUIPlugin", "settings save: %u field(s) refused, answering 422", (unsigned)rejected.size());
+            AsyncResponseStream *response = request->beginResponseStream("application/json");
+            response->setCode(422);
+            JsonDocument doc(&psramAllocator);
+            doc["error"] = "invalid fields";
+            doc["code"] = "invalid_fields";
+            JsonArray fields = doc["fields"].to<JsonArray>();
+            for (const char *name : rejected)
+                fields.add(name);
             serializeJson(doc, *response);
             request->send(response);
             return;

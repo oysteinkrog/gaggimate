@@ -23,10 +23,12 @@ emulation, the same mechanism the bead text sanctions for the acceptance
 criteria's 9-entry import), and prints a PASS/FAIL summary at the end.
 """
 import argparse
+import json
 import os
 import sys
 import tempfile
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 
@@ -641,20 +643,31 @@ def check_web_save_reconcile_editor(rig, s0):
 
 
 def check_malformed_time_dropped(rig, s0):
-    """A web save drops a schedule entry whose time is not HH:MM in range
-    (isScheduleTime in WebUIPlugin.cpp, afb1c58f) and keeps the rest. This
-    check used to store "|1111111", an entry with an empty time, through the
-    web save and then open it in the editor, the regression for the substr
-    crash in the Hour and Minute rows. The web path can no longer store such
-    an entry, so what is checked here is the drop; the editor still reads a
-    stored time through the model's scheduleTimeParts, which the host tests
-    (pio test -e native_settingsui) cover for malformed input."""
+    """A web save that carries a schedule entry whose time is not HH:MM in
+    range (isScheduleTime in WebUIPlugin.cpp, afb1c58f) is refused: the
+    answer is 422 naming autowakeupSchedules and the stored list stays as
+    it was (gm-nov3.26; before that the entry was dropped and the rest
+    stored under a 200). This check used to store "|1111111", an entry
+    with an empty time, through the web save and then open it in the
+    editor, the regression for the substr crash in the Hour and Minute
+    rows. The web path can no longer store such an entry; the editor still
+    reads a stored time through the model's scheduleTimeParts, which the
+    host tests (pio test -e native_settingsui) cover for malformed input."""
     orig_packed = s0["autowakeupSchedules"]
     broken_packed = "07:00|1111111;|1111111"
-    web_save_change(rig, "autowakeupSchedules", broken_packed)
+    status, fields = None, None
+    try:
+        status = web_save_change(rig, "autowakeupSchedules", broken_packed)
+    except urllib.error.HTTPError as e:
+        status = e.code
+        try:
+            fields = json.loads(e.read()).get("fields")
+        except ValueError:
+            fields = None
+    check(rig, "malformed_time_refused_422", status == 422 and fields == ["autowakeupSchedules"],
+          "status=%r fields=%r" % (status, fields))
     got = rig.settings_value("autowakeupSchedules")
-    check(rig, "malformed_time_dropped_on_web_save",
-          schedules(got) == schedules("07:00|1111111"), repr(got))
+    check(rig, "malformed_time_keeps_stored_list", got == orig_packed, repr(got))
 
     web_save_change(rig, "autowakeupSchedules", orig_packed)
     check(rig, "malformed_fixture_restored", rig.settings_value("autowakeupSchedules") == orig_packed, "")
