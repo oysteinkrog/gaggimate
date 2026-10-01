@@ -35,6 +35,9 @@ class SleepAnimation {
     uint32_t scanUnknownFrames() const { return 0; }
     static void debugForceInitFail() {}
     static void debugForceFlipTimeout() {}
+    static void debugForceNativeFail() {}
+    const char *dmaEngineName() const { return "none"; }
+    uint32_t dmaInstallFails() const { return 0; }
     bool isActive() const { return false; }
     void configure(uint8_t, const uint8_t *) {}
     void setMaxFps(uint8_t) {}
@@ -185,6 +188,17 @@ class SleepAnimation {
     // the debug write routes.
     static void debugForceInitFail();
     static void debugForceFlipTimeout();
+    // The next native GDMA install fails (gm-bzu.60): a running direct path
+    // is taken down between frames, the engine is freed, and the run stays
+    // on the CPU push until the next start(), which installs it again.
+    // One-shot; a no-op in builds without the debug write routes.
+    static void debugForceNativeFail();
+    // The engine carrying the direct path's bands this run: "native" (the
+    // GDMA engine), "cpu_push" (its install failed; retried at the next
+    // start) or "none" (not asked for yet this run, or dma off). Count:
+    // failed native installs since boot.
+    const char *dmaEngineName() const;
+    uint32_t dmaInstallFails() const;
     bool isActive() const { return running; }
 
     // Selects which registry animation renders and its 4 params (0-100 each).
@@ -1480,6 +1494,8 @@ class SleepAnimation {
     // the engine a mode actually asks for is ever installed.
     BandDma bandDma;
 #endif
+    // Latched per run by installNativeOnIsrCore, cleared by start(), so a
+    // failed install is retried at the next start (gm-bzu.60).
     bool nativeInstallTried = false;
     bool installNativeOnIsrCore();
     bool engineReadyForMode();
@@ -1615,9 +1631,10 @@ class SleepAnimation {
     uint32_t profBlendScrimCyc = 0;
     std::atomic<uint32_t> lastMsyncUs{0};
     std::atomic<uint32_t> lastPushUs{0};
-    // Core the async-memcpy completion interrupt is bound to. Deliberately not
-    // the render core: the RGB panel driver's ISR is on core 1 and must not
-    // queue behind ours.
+    // Core the band DMA completion interrupt is bound to. Not core 1: the RGB
+    // panel driver's interrupts are there and must not queue behind ours. The
+    // render task runs on this core and installs the engine inline
+    // (installNativeOnIsrCore, gm-bzu.60), which checks it.
     static constexpr int DMA_ISR_CORE = 0;
 
     // Per-band horizontal extent of the panel's inscribed circle. The panel is

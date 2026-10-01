@@ -1101,6 +1101,13 @@ void WebUIPlugin::setupDebugEndpoints() {
         if (request->hasArg("fliptimeout") && request->arg("fliptimeout").toInt() != 0) {
             SleepAnimation::debugForceFlipTimeout();
         }
+        // failnative=1 (gm-bzu.60), one-shot: the next native GDMA install
+        // fails. A running direct path is taken down between frames, so
+        // dma_engine reads "cpu_push" within a frame and dma_install_fails
+        // climbs by one; the next start installs again ("native").
+        if (request->hasArg("failnative") && request->arg("failnative").toInt() != 0) {
+            SleepAnimation::debugForceNativeFail();
+        }
         if (request->hasArg("marquees")) {
             g_marqueeLayersReq = request->arg("marquees").toInt() != 0 ? 1 : 0;
         }
@@ -1251,6 +1258,11 @@ void WebUIPlugin::setupDebugEndpoints() {
         JsonDocument doc(&psramAllocator);
         doc["direct"] = a->directPush();
         doc["dma"] = a->dmaPathWanted();
+        // The engine under the direct path this run (gm-bzu.60): "native",
+        // "cpu_push" after a failed install, "none" before the first frame or
+        // with dma off. A failed install is retried at the next start.
+        doc["dma_engine"] = a->dmaEngineName();
+        doc["dma_install_fails"] = a->dmaInstallFails();
         doc["rprio"] = a->renderPrioValue();
         doc["useref"] = a->useBandRefOn();
 #ifdef GM_KBLOB

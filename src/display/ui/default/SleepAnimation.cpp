@@ -1034,12 +1034,37 @@ uint32_t SleepAnimation::scanUnknownFrames() const { return s_scanUnknownFrames.
 #define GM_ANIM_FAULT_KNOBS 1
 static std::atomic<bool> s_forceInitFail{false};
 static std::atomic<bool> s_forceFlipTimeout{false};
+static std::atomic<bool> s_forceNativeFail{false};
 void SleepAnimation::debugForceInitFail() { s_forceInitFail.store(true); }
 void SleepAnimation::debugForceFlipTimeout() { s_forceFlipTimeout.store(true); }
+void SleepAnimation::debugForceNativeFail() { s_forceNativeFail.store(true); }
 #else
 void SleepAnimation::debugForceInitFail() {}
 void SleepAnimation::debugForceFlipTimeout() {}
+void SleepAnimation::debugForceNativeFail() {}
 #endif
+
+// Which engine carries the direct path's bands this run (gm-bzu.60), and how
+// many native installs have failed since boot. File statics, not members, so
+// the production class layout is unchanged. Written by the render task and by
+// start(), read by the web task.
+static constexpr uint8_t kDmaEngineNone = 0;    // not asked for this run (dma off, or before the first frame)
+static constexpr uint8_t kDmaEngineNative = 1;  // BandDma, the native GDMA engine
+static constexpr uint8_t kDmaEngineCpuPush = 2; // install failed: the two-task CPU push
+static std::atomic<uint8_t> s_dmaEngine{kDmaEngineNone};
+static std::atomic<uint32_t> s_dmaInstallFails{0};
+
+const char *SleepAnimation::dmaEngineName() const {
+    switch (s_dmaEngine.load()) {
+    case kDmaEngineNative:
+        return "native";
+    case kDmaEngineCpuPush:
+        return "cpu_push";
+    default:
+        return "none";
+    }
+}
+uint32_t SleepAnimation::dmaInstallFails() const { return s_dmaInstallFails.load(); }
 
 static bool IRAM_ATTR sleepAnimBandRetire(void *arg);
 
@@ -1333,6 +1358,10 @@ void SleepAnimation::start(Display *d) {
     // it. All start() does is clear the latches so a new run re-resolves.
     dmaActive = false;
     dmaInstallTried = false;
+    // A native install that failed in the last run is retried in this one
+    // (gm-bzu.60).
+    nativeInstallTried = false;
+    s_dmaEngine.store(kDmaEngineNone);
     fbDirect[0] = fbDirect[1] = nullptr;
     fbCount = 0;
     fbBack = 0;
@@ -1507,6 +1536,14 @@ bool SleepAnimation::stopConfirmed() const {
 // task that waits on it. Every expensive step latches, so a call that has
 // already failed costs a handful of loads and logs nothing.
 bool SleepAnimation::beginDirectPath() {
+#ifdef GM_ANIM_FAULT_KNOBS
+    if (dmaActive && s_forceNativeFail.load()) {
+        // Forced install failure (gm-bzu.60): take the path down between
+        // frames, the same way dma=0 does, so the install below fails as if
+        // this run had never had the engine.
+        endDirectPath();
+    }
+#endif
     if (dmaActive) {
         engineReadyForMode(); // the mode may have changed under a running path
         return true;
@@ -1773,58 +1810,72 @@ static bool sleepAnimBandRetire(void *arg) {
     return woken == pdTRUE;
 }
 
-namespace {
-// esp_intr_alloc binds the handler to whichever core calls it, and there is no
-// argument to say otherwise -- so the only way to choose is to call from a task
-// already pinned where the interrupt should land. This one-shot task exists for
-// that and nothing else.
-struct NativeInstallReq {
-    BandDma *dma;
-    size_t maxBytes;
-    size_t burst;
-    esp_err_t err;
-    SemaphoreHandle_t done;
-};
-
-void nativeInstallTaskEntry(void *arg) {
-    auto *req = static_cast<NativeInstallReq *>(arg);
-    req->err = req->dma->install(req->maxBytes, req->burst, sleepAnimNativeDone);
-    xSemaphoreGive(req->done);
-    vTaskDelete(nullptr);
-}
-} // namespace
-
+// Installs the native engine from the render task itself (gm-bzu.60).
+// esp_intr_alloc binds the completion handler to whichever core calls it
+// (gdma_register_rx_event_callbacks allocates it lazily, with no core
+// argument), and the render task is created on core 0 (createAnimTask), the
+// same core as DMA_ISR_CORE. So the call is made inline here; the one-shot
+// helper task pinned to DMA_ISR_CORE that used to do it, and its semaphore,
+// are gone. The core is checked rather than assumed: if the render task ever
+// moves, the install refuses instead of putting the handler beside the
+// panel's own interrupts on core 1.
+//
+// A failure latches for the run, not the boot: start() clears
+// nativeInstallTried, so the next start retries. Until then the pipeline runs
+// on the two-task CPU push, and dma_engine on /api/debug/anim says so.
 bool SleepAnimation::installNativeOnIsrCore() {
+#ifdef GM_ANIM_FAULT_KNOBS
+    if (s_forceNativeFail.load() && !dmaActive && s_forceNativeFail.exchange(false)) {
+        // beginDirectPath() has already taken the direct path down, so no
+        // band is submitted until the next install. Free the engine only if
+        // every transfer retired; otherwise keep it installed and still fail
+        // the run, so nothing frees a channel under an in-flight transfer.
+        if (bandDma.ready() && dmaIssued.load() == g_sleepAnimDmaDone) {
+            bandDma.uninstall();
+        }
+        nativeInstallTried = true;
+        s_dmaInstallFails.fetch_add(1);
+        s_dmaEngine.store(kDmaEngineCpuPush);
+        log_w("SleepAnimation: native GDMA install failed (forced), falling back to the CPU push until the next start");
+        return false;
+    }
+#endif
+    if (nativeInstallTried) {
+        // Latched for this run, either way: a failure is retried by the next
+        // start(). Keyed on the recorded engine, not on ready() alone, so a
+        // forced failure that kept the channel (a transfer had not retired)
+        // still keeps this run on the CPU push.
+        return s_dmaEngine.load() == kDmaEngineNative && bandDma.ready();
+    }
     if (bandDma.ready()) {
+        // Installed by an earlier run; the handler is already on this core.
+        s_dmaEngine.store(kDmaEngineNative);
         return true;
     }
-    if (nativeInstallTried) {
-        return false;
-    }
     nativeInstallTried = true;
-    // 32-byte burst: it matches both the data cache line and the octal PSRAM
-    // burst, and the esp32s3 register field documents 16 and 32 as the valid
-    // encodings for this channel.
-    NativeInstallReq req{&bandDma, static_cast<size_t>(BAND_H) * 480 * 2, 32, ESP_FAIL, xSemaphoreCreateBinary()};
-    if (req.done != nullptr) {
-        TaskHandle_t installer = nullptr;
-        // Same reason as the async engine: esp_intr_alloc binds the handler to
-        // the calling core, and the render task shares core 1 with the panel's
-        // own scan-out interrupt.
-        if (xTaskCreatePinnedToCore(nativeInstallTaskEntry, "BandDmaIns", 4096, &req, 3, &installer, DMA_ISR_CORE) == pdPASS) {
-            xSemaphoreTake(req.done, pdMS_TO_TICKS(2000));
-        }
-        vSemaphoreDelete(req.done);
+    esp_err_t err = ESP_ERR_INVALID_STATE;
+    const int core = xPortGetCoreID();
+    if (core == DMA_ISR_CORE) {
+        // 32-byte burst: it matches both the data cache line and the octal
+        // PSRAM burst, and the esp32s3 register field documents 16 and 32 as
+        // the valid encodings for this channel.
+        err = bandDma.install(static_cast<size_t>(BAND_H) * 480 * 2, 32, sleepAnimNativeDone);
+    } else {
+        log_e("SleepAnimation: native GDMA install called on core %d, needs core %d; not installing", core, DMA_ISR_CORE);
     }
     if (!bandDma.ready()) {
-        log_w("SleepAnimation: native GDMA install failed (%s), falling back", esp_err_to_name(req.err));
+        s_dmaInstallFails.fetch_add(1);
+        s_dmaEngine.store(kDmaEngineCpuPush);
+        log_w("SleepAnimation: native GDMA install failed (%s), falling back to the CPU push until the next start",
+              esp_err_to_name(err));
         return false;
     }
+    s_dmaEngine.store(kDmaEngineNative);
     return true;
 }
 
-// Installed on first use, and latched, so the steady-state cost of asking is a
-// load and a branch.
+// Installed on first use, and latched per run, so the steady-state cost of
+// asking is a load and a branch.
 bool SleepAnimation::engineReadyForMode() { return installNativeOnIsrCore(); }
 
 void IRAM_ATTR SleepAnimation::pushLoop() {
