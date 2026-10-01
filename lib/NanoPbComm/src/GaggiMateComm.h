@@ -68,5 +68,11 @@ constexpr int ERROR_CODE_TIMEOUT = 5;
 // controller skips the NVS PID persist; the display surfaces it without a
 // watchdog-disconnect UX. Distinct from the generic TIMEOUT.
 constexpr int ERROR_CODE_AUTOTUNE_TIMEOUT = 6;
+// The controller ended a brew on its own (gm-warz, BrewGuard.h): the brew
+// valve stayed open past the maximum brew duration, or the link to the display
+// dropped while it was open. The display ends its process on this code; it is
+// not a fault and is not latched. A display older than this code reads it as
+// an unknown error, which also ends the process.
+constexpr int ERROR_CODE_BREW_STOPPED = 7;
 
 #endif // GAGGIMATE_COMM_H

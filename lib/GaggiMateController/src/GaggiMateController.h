@@ -1,5 +1,6 @@
 #ifndef GAGGIMATECONTROLLER_H
 #define GAGGIMATECONTROLLER_H
+#include "BrewGuard.h"
 #include "ControllerConfig.h"
 #include "GaggiMateServer.h"
 #include <peripherals/DigitalInput.h>
@@ -13,6 +14,7 @@
 #include <peripherals/Pump.h>
 #include <peripherals/SimpleRelay.h>
 #include <peripherals/addons/GearpumpAddon.h>
+#include <mutex>
 #include <vector>
 
 constexpr double PING_TIMEOUT_SECONDS = 20.0;
@@ -38,6 +40,10 @@ class GaggiMateController {
     void stopPidAutotune(void);
     void sendSensorData(void);
     void handleSerialCommand(char c);
+    // Pump off and brew valve closed, the same outputs a display stop sets.
+    // Caller holds _outputMutex.
+    void stopBrewOutputsLocked(const char *why);
+    void onLinkChange(bool connected);
 
     ControllerConfig _config = ControllerConfig{};
     GaggiMateServer _comms;
@@ -68,6 +74,15 @@ class GaggiMateController {
     // dropped or a ping arrives. See handlePingTimeout().
     bool timeoutDisconnectPending = false;
     size_t errorState = ERROR_CODE_NONE;
+
+    // Bounds a brew the display started (gm-warz, BrewGuard.h). _outputMutex
+    // serialises every guard decision with the pump or valve change it
+    // decides: pump and valve commands arrive on the endpoint's dispatch task,
+    // the link change on the BLE host task, and the time limit on loop(), and
+    // without the lock a pump-on decided just before a stop could land after
+    // it.
+    gm_safety::BrewGuard brewGuard;
+    std::mutex _outputMutex;
 
     const char *LOG_TAG = "GaggiMateController";
 };

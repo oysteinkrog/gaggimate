@@ -103,6 +103,7 @@ void GaggiMateController::setup() {
         addAddon(ADDON_HW_SCALE);
     }
 
+    _comms.onConnectionChange([this](bool connected) { onLinkChange(connected); });
     _comms.init("GPBLS", _config.name.c_str(), _version, capabilities);
 
     if (_config.capabilites.ledControls) {
@@ -169,6 +170,20 @@ void GaggiMateController::setup() {
         if (errorState != ERROR_CODE_NONE) {
             return;
         }
+        std::lock_guard<std::mutex> lock(_outputMutex);
+        const bool nonZero = mode == PumpControlMode::Power ? power > 0.0f : (pressure > 0.0f || flow > 0.0f);
+        if (!brewGuard.allowPumpDemand(nonZero)) {
+            // A brew the controller ended is still running on the display (or
+            // the display resent it after a reconnect). Keep the pump off until
+            // the display closes the valve.
+            ESP_LOGW(LOG_TAG, "Refusing pump demand: brew stopped by the controller (%s)",
+                     gm_safety::brewStopName(brewGuard.latched()));
+            this->pump->setPower(0);
+            if (gearpumpAddon != nullptr) {
+                gearpumpAddon->stop();
+            }
+            return;
+        }
         if (mode == PumpControlMode::Power) {
             this->pump->setPower(power);
             if (power == 0.0f) {
@@ -204,9 +219,15 @@ void GaggiMateController::setup() {
         if (errorState != ERROR_CODE_NONE) {
             return;
         }
-        this->valve->set(open);
+        std::lock_guard<std::mutex> lock(_outputMutex);
+        const bool apply = brewGuard.onValveCommand(open, millis());
+        if (open && !apply) {
+            ESP_LOGW(LOG_TAG, "Refusing brew valve open: brew stopped by the controller (%s)",
+                     gm_safety::brewStopName(brewGuard.latched()));
+        }
+        this->valve->set(apply);
         if (_config.capabilites.dimming) {
-            static_cast<DimmedPump *>(pump)->setValveState(open);
+            static_cast<DimmedPump *>(pump)->setValveState(apply);
         }
     });
     _comms.onPidSettings([this](float Kp, float Ki, float Kd, float Kf) {
@@ -281,6 +302,22 @@ void GaggiMateController::loop() {
     if (lastPingTime < now && (now - lastPingTime) / 1000 > PING_TIMEOUT_SECONDS) {
         handlePingTimeout();
     }
+    gm_safety::BrewStop stopped = gm_safety::BrewStop::None;
+    {
+        std::lock_guard<std::mutex> lock(_outputMutex);
+        if (brewGuard.poll(now)) {
+            stopBrewOutputsLocked("brew passed the maximum duration");
+        }
+        // Reported only while the link is up, so a stop on a link loss
+        // reaches the display after it reconnects.
+        if (_comms.isConnected()) {
+            stopped = brewGuard.takeReport();
+        }
+    }
+    if (stopped != gm_safety::BrewStop::None) {
+        ESP_LOGW(LOG_TAG, "Reporting controller-ended brew to the display (%s)", gm_safety::brewStopName(stopped));
+        _comms.sendError(ERROR_CODE_BREW_STOPPED);
+    }
     sendSensorData();
     if (errorState != ERROR_CODE_NONE) {
         ESP_LOGW("GaggiMateController", "Error state: %d", errorState);
@@ -347,6 +384,12 @@ void GaggiMateController::handlePing() {
 }
 
 void GaggiMateController::handlePingTimeout() {
+    {
+        // A display that stopped pinging cannot stop its brew either: latch
+        // the stop so a reconnect that resends the brew does not restart it.
+        std::lock_guard<std::mutex> lock(_outputMutex);
+        brewGuard.onLinkDown();
+    }
     // Turn off the heater and pump as a safety measure
     this->heater->setSetpoint(0);
     this->pump->setPower(0);
@@ -374,6 +417,42 @@ void GaggiMateController::handlePingTimeout() {
         _comms.disconnect();
     }
     errorState = ERROR_CODE_TIMEOUT;
+}
+
+void GaggiMateController::stopBrewOutputsLocked(const char *why) {
+    ESP_LOGE(LOG_TAG, "Ending the brew: %s. Pump off, brew valve closed.", why);
+    this->pump->setPower(0);
+    if (gearpumpAddon != nullptr) {
+        gearpumpAddon->stop();
+    }
+    this->valve->set(false);
+    if (_config.capabilites.dimming) {
+        static_cast<DimmedPump *>(pump)->setValveState(false);
+    }
+}
+
+void GaggiMateController::onLinkChange(bool connected) {
+    if (connected) {
+        return;
+    }
+    // The display is the only thing that stops the pump, so a link that drops
+    // ends whatever it was running (gm-warz). A brew latches (BrewGuard.h);
+    // steam or hot water just stops, and the display resends it on reconnect
+    // if its own process is still running. The heater stays as it is; the
+    // ping watchdog turns it off if the display does not come back.
+    std::lock_guard<std::mutex> lock(_outputMutex);
+    if (brewGuard.onLinkDown()) {
+        stopBrewOutputsLocked("the display link dropped during a brew");
+    } else if (this->pump != nullptr && this->valve != nullptr) {
+        this->pump->setPower(0);
+        if (gearpumpAddon != nullptr) {
+            gearpumpAddon->stop();
+        }
+        this->valve->set(false);
+        if (_config.capabilites.dimming) {
+            static_cast<DimmedPump *>(pump)->setValveState(false);
+        }
+    }
 }
 
 void GaggiMateController::thermalRunawayShutdown() {

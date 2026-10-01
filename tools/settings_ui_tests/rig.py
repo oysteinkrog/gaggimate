@@ -363,6 +363,20 @@ class RigHTTPError(Exception):
     message."""
 
 
+class RigHalt(BaseException):
+    """The rig refuses to send any more input, and says why (gm-warz).
+
+    Raised when the device reports a real controller linked, or when the
+    settings cover has closed under a run that expected it open. On
+    2026-10-01 a run kept tapping after the cover closed, the taps landed on
+    the brew screen's start control and the bench machine's real pump ran for
+    about 65 minutes. A BaseException rather than an Exception on purpose:
+    the scenarios catch Exception per check so one crash does not hide the
+    rest, and that must not turn a halt into one failed check and carry on
+    tapping. The Rig also latches the halt, so every later tap, swipe or
+    shell command raises again without sending anything."""
+
+
 def _rgb565_to_rgb888(data):
     px = []
     for i in range(0, len(data), 2):
@@ -415,6 +429,15 @@ class Rig:
         self.host = host
         self.base = "http://%s" % host
         self.timeout = timeout
+        # gm-warz guards. guard_cover makes every tap and swipe read the
+        # shell state first and halt when the cover has closed since the rig
+        # last saw it open; the device runner turns it on, the simulator
+        # leaves it off (no pump there, and it costs one request per tap).
+        # _cover_open is the last observed cover state, None when unknown.
+        # halted is the latched RigHalt reason, None while the rig may send.
+        self.guard_cover = False
+        self._cover_open = None
+        self.halted = None
 
     def _url(self, path):
         return self.base + path if path.startswith("/") else self.base + "/" + path
@@ -501,12 +524,64 @@ class Rig:
         with self._open(path, timeout) as resp:
             return resp.read()
 
-    def tap(self, x, y, ms=80):
+    def halt(self, reason):
+        """Latches reason and raises RigHalt. Every later input raises too."""
+        if self.halted is None:
+            self.halted = reason
+        raise RigHalt(self.halted)
+
+    def _check_halted(self):
+        if self.halted is not None:
+            raise RigHalt(self.halted)
+
+    def _observe_state(self, st):
+        """Records what a shell state read says about the two gm-warz
+        conditions; halts on a linked controller."""
+        if isinstance(st, dict):
+            if st.get("controller_linked"):
+                self.halt("the device reports a real controller linked over BLE; refusing to send input (gm-warz)")
+            if "open" in st:
+                self._cover_open = bool(st["open"])
+        return st
+
+    def _send_input(self, path):
+        """GETs an input route (a tap, a swipe or a shell command) and
+        returns the parsed reply. A 409 naming controller_linked halts the
+        rig; any other non-200 raises RigHTTPError as get_json() would."""
+        self._check_halted()
+        status, headers, body = self.fetch(path)
+        if status == 409 and b"controller_linked" in body:
+            self.halt("the device refused %s: a real controller is linked over BLE (gm-warz)" % path.split("?")[0])
+        if status != 200:
+            raise RigHTTPError("%s -> HTTP %d" % (self._url(path), status))
+        try:
+            return json.loads(body)
+        except (ValueError, UnicodeDecodeError) as e:
+            raise RigHTTPError("%s: not JSON: %s" % (self._url(path), e)) from e
+
+    def _guard_before_input(self, allow_closed):
+        """With guard_cover on, reads the shell state before an input and
+        halts when the cover was last seen open and is now closed: the run's
+        next tap would land on whatever screen is underneath. allow_closed
+        is for a caller that knows the cover is meant to be closed (a tap on
+        the menu after an exit it did not read back)."""
+        self._check_halted()
+        if not self.guard_cover:
+            return
+        was_open = self._cover_open
+        st = self._observe_state(self.get_json("/api/debug/settingsui"))
+        if was_open and not st.get("open") and not allow_closed:
+            self.halt("the settings cover closed under the run (it was open at the last read); "
+                      "refusing to tap the screen underneath (gm-warz)")
+
+    def tap(self, x, y, ms=80, allow_closed=False):
         """Queues one synthetic tap (/api/debug/tap) and polls the state GET
         until it reports the release, then waits 150 ms (the same margin
         tools/touchmap.py's do_tap uses) for the UI task to act on it before
-        returning the final state."""
-        self.get_json("/api/debug/tap?x=%d&y=%d&ms=%d" % (x, y, ms))
+        returning the final state. Guarded (gm-warz): see RigHalt and
+        _guard_before_input."""
+        self._guard_before_input(allow_closed)
+        self._send_input("/api/debug/tap?x=%d&y=%d&ms=%d" % (x, y, ms))
         t0 = time.time()
         deadline = t0 + ms / 1000.0 + 10
         state = None
@@ -520,11 +595,12 @@ class Rig:
         time.sleep(0.15)
         return state
 
-    def swipe(self, x, y, x2, y2, ms=200):
+    def swipe(self, x, y, x2, y2, ms=200, allow_closed=False):
         """Queues one synthetic drag from (x, y) to (x2, y2) over ms
         (/api/debug/tap with x2/y2) and waits for its release the way tap()
-        does."""
-        self.get_json("/api/debug/tap?x=%d&y=%d&x2=%d&y2=%d&ms=%d" % (x, y, x2, y2, ms))
+        does. Guarded the same way."""
+        self._guard_before_input(allow_closed)
+        self._send_input("/api/debug/tap?x=%d&y=%d&x2=%d&y2=%d&ms=%d" % (x, y, x2, y2, ms))
         deadline = time.time() + ms / 1000.0 + 10
         state = None
         while time.time() < deadline:
@@ -537,7 +613,7 @@ class Rig:
         time.sleep(0.15)
         return state
 
-    def tap_target(self, target, ms=80):
+    def tap_target(self, target, ms=80, allow_closed=False):
         """Taps the centre of target's effective hit rect (a dict from
         touchmap()/targets()/find_tag(), carrying "hit"). A None target
         is a row lookup that found nothing; it raises RowMissing rather than
@@ -545,7 +621,7 @@ class Rig:
         if target is None:
             raise RowMissing("(unknown)", "tap target", [])
         x1, y1, x2, y2 = target["hit"]
-        return self.tap((x1 + x2) // 2, (y1 + y2) // 2, ms)
+        return self.tap((x1 + x2) // 2, (y1 + y2) // 2, ms, allow_closed=allow_closed)
 
     def touchmap(self, screen=0, load=False, timeout=8):
         """Dumps a screen's object tree (/api/debug/touchmap) and annotates
@@ -622,26 +698,34 @@ class Rig:
         q = "&".join("%s=%s" % (k, v) for k, v in args.items())
         path = "/api/debug/settingsui" + ("?" + q if q else "")
         if not args:
-            return self.get_json(path)
+            return self._observe_state(self.get_json(path))
         # A command while the previous one is still in flight on the UI task
         # answers 409. The state can already show the earlier command's
         # result a pass before the pending flag clears, so the only reliable
         # rule is to retry the command itself for a while (the device needs
         # this; the simulator rarely does).
+        # A 409 naming controller_linked is not "busy": _send_input halts the
+        # rig on it rather than letting this loop retry it (gm-warz).
         deadline = time.time() + 5.0
         while True:
             try:
-                return self.get_json(path)
+                reply = self._send_input(path)
             except RigHTTPError as e:
                 if "409" not in str(e) or time.time() > deadline:
                     raise
                 time.sleep(0.1)
+                continue
+            if "open" in args:
+                self._cover_open = None  # opens over the next UI passes; the next state read says
+            elif "close" in args:
+                self._cover_open = False
+            return reply
 
     def settingsui_state(self):
         """GET /api/debug/settingsui with no arguments: the shell's last
         published State plus the Fixture counters and the last completed
         command's seq. Not yet backed by a route; see settingsui()."""
-        return self.get_json("/api/debug/settingsui")
+        return self._observe_state(self.get_json("/api/debug/settingsui"))
 
     def heap(self):
         return self.get_json("/api/debug/heap")

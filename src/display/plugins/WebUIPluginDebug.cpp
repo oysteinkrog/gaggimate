@@ -119,6 +119,30 @@ extern uint32_t nebula_lerp_self_test(uint32_t *firstBad);
 #include <unordered_map>
 #include <vector>
 #include <version.h>
+#ifndef GAGGIMATE_SIM
+#include <ble/BleScanOwner.h> // g_bleClientConnected, the injected-input gate below (gm-warz)
+#endif
+
+namespace {
+// Whether a real controller is linked over BLE (gm-warz). While one is, the
+// routes that inject input refuse with 409: a scripted tap that lands on a
+// screen the script did not expect can start a brew, and on 2026-10-01 one
+// ran the bench machine's real pump for about 65 minutes. The flag is the BLE
+// client's own state, mirrored by BleClientTransport::maintain, not
+// Controller::isConnected, which the loadtest and demo builds fake. The
+// simulator has no radio and no controller, so it reads false there.
+[[maybe_unused]] bool realControllerLinked() {
+#ifdef GAGGIMATE_SIM
+    return false;
+#else
+    return g_bleClientConnected != 0;
+#endif
+}
+
+[[maybe_unused]] constexpr const char *kControllerLinkedBody =
+    "{\"error\":\"controller_linked\",\"reason\":\"a real controller is connected over BLE; injected input could "
+    "start the pump (gm-warz)\"}";
+} // namespace
 
 // Counters exported by the patched esp_lcd RGB driver (scripts/patch_esp_lcd_rgb.py),
 // which only exists in the real ESP-IDF component tree; the sim has no LCD_CAM
@@ -2365,6 +2389,10 @@ void WebUIPlugin::setupDebugEndpoints() {
     // route too, unlike most of the routes in that block.
     server.on("/api/debug/tap", [](AsyncWebServerRequest *request) {
         if (request->hasArg("x") || request->hasArg("y")) {
+            if (realControllerLinked()) {
+                request->send(409, "application/json", kControllerLinkedBody);
+                return;
+            }
             if (!request->hasArg("x") || !request->hasArg("y")) {
                 request->send(400, "application/json", "{\"error\":\"x and y both required\"}");
                 return;
@@ -2580,6 +2608,13 @@ void WebUIPlugin::setupDebugEndpoints() {
             return;
         }
         if (argCount == 1) {
+            // A command opens or navigates the cover, and the runner taps
+            // into it next; refused with a real controller linked, like the
+            // taps themselves (gm-warz). The state read below still answers.
+            if (realControllerLinked()) {
+                request->send(409, "application/json", kControllerLinkedBody);
+                return;
+            }
             DefaultUI::SettingsUiCmd cmd;
             int arg = 0;
             if (hasOpen) {
@@ -2632,14 +2667,18 @@ void WebUIPlugin::setupDebugEndpoints() {
         // LV_EVENT_PRESSED + slow-repeat count and fast-repeat count
         // respectively (see SettingsFixture.cpp's stepRepeats/stepFastRepeats
         // comment for why a press and a slow repeat are counted together).
-        char buf[320];
+        // controller_linked is the gate above, reported so the runner can
+        // refuse before it sends anything (gm-warz).
+        char buf[352];
         snprintf(buf, sizeof(buf),
                  "{\"seq\":%u,\"open\":%s,\"depth\":%d,\"category\":%d,\"page\":%d,\"pages\":%d,\"title\":\"%s\","
+                 "\"controller_linked\":%s,"
                  "\"fixture\":{\"enter\":%d,\"commit\":%d,\"draft\":%d,\"action\":%d,\"confirm\":%d,\"locked\":%s,"
                  "\"repeats\":%d,\"fast_repeats\":%d}}",
                  static_cast<unsigned>(st.seq), st.open ? "true" : "false", st.depth, st.category, st.page, st.pages, st.title,
-                 st.fixtureEnter, st.fixtureCommit, st.fixtureDraft, st.fixtureAction, st.fixtureConfirm,
-                 st.fixtureLocked ? "true" : "false", st.fixtureRepeats, st.fixtureFastRepeats);
+                 realControllerLinked() ? "true" : "false", st.fixtureEnter, st.fixtureCommit, st.fixtureDraft,
+                 st.fixtureAction, st.fixtureConfirm, st.fixtureLocked ? "true" : "false", st.fixtureRepeats,
+                 st.fixtureFastRepeats);
         request->send(200, "application/json", buf);
     });
 #endif

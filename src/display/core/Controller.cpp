@@ -539,6 +539,17 @@ void Controller::setupBluetooth() {
             pluginManager->trigger("controller:autotune:failed");
             return;
         }
+        // The controller ended the brew itself (gm-warz): the valve stayed
+        // open past its maximum brew duration, or the link dropped mid-brew.
+        // End our process so the next update sends valve closed and pump off,
+        // which is what lets the controller accept the next brew. Not a fault,
+        // so not latched.
+        if (error == ERROR_CODE_BREW_STOPPED) {
+            ESP_LOGW(LOG_TAG, "Controller ended the brew (maximum duration or link loss); ending the process");
+            deactivate();
+            pluginManager->trigger("controller:brew:stopped");
+            return;
+        }
         if (error != ERROR_CODE_TIMEOUT && error != this->error) {
             this->error = error;
             deactivate();

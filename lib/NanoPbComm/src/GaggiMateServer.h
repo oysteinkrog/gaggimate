@@ -28,6 +28,7 @@ class GaggiMateServer {
     using ScaleFactorsCallback = std::function<void(float scaleFactor1, float scaleFactor2, uint16_t sampleRateSps,
                                                     float idleFilterAlpha, float activeFilterAlpha)>;
     using LedCallback = std::function<void(uint8_t channel, uint8_t brightness)>;
+    using ConnectionCallback = std::function<void(bool connected)>;
 
     GaggiMateServer();
 
@@ -88,6 +89,10 @@ class GaggiMateServer {
     void onTare(TareCallback cb) { _tareCb = std::move(cb); }
     void onScaleFactors(ScaleFactorsCallback cb) { _scaleFactorsCb = std::move(cb); }
     void onLedControl(LedCallback cb) { _ledCb = std::move(cb); }
+    // Called on every link change, after SystemInfo is pushed on a connect.
+    // Runs on the BLE host task. The controller ends a running brew from here
+    // when the display's link drops (gm-warz).
+    void onConnectionChange(ConnectionCallback cb) { _connCb = std::move(cb); }
 
   private:
     BleServerTransport _transport;
@@ -105,6 +110,7 @@ class GaggiMateServer {
     TareCallback _tareCb;
     ScaleFactorsCallback _scaleFactorsCb;
     LedCallback _ledCb;
+    ConnectionCallback _connCb;
 
     void registerHandlers();
     void pushSystemInfo();

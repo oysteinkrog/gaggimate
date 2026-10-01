@@ -22,6 +22,12 @@ does not move the UI underneath the taps, and `/api/debug/pclk` is read and
 recorded because the stored pixel-clock divider can differ from the build's
 (CLAUDE.md).
 
+On a device the runner first establishes that no real controller is linked
+over BLE, and refuses to run if one is or if it cannot tell (gm-warz: on
+2026-10-01 taps from a run landed on the brew screen and ran the bench
+machine's real pump for about 65 minutes). Every tap then reads the shell
+state first, and the run ends if the settings cover has closed under it.
+
 Two venues, one instrument set, but not one set of assertions. The
 simulator has no panel and no background animation renderer, and its heap
 figures are shims, so frame rates and memory are recorded there and
@@ -46,7 +52,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 REPO_ROOT = os.path.abspath(os.path.join(HERE, ".."))
 sys.path.insert(0, REPO_ROOT)
 
-from tools.settings_ui_tests import Rig, RigHTTPError, RowMissing, Sim  # noqa: E402
+from tools.settings_ui_tests import Rig, RigHalt, RigHTTPError, RowMissing, Sim  # noqa: E402
 from tools.settings_ui_tests import audit_pages, fixtures  # noqa: E402
 from tools.settings_ui_tests.fixtures import Venue  # noqa: E402
 
@@ -752,6 +758,47 @@ def run(args):
         print("report: %s" % path, flush=True)
 
 
+def controller_link_state(rig):
+    """Whether the device has a real controller linked over BLE, as
+    (linked, source): linked is True, False, or None when no route on this
+    build says. The shell state's controller_linked is the gate the input
+    routes apply (gm-warz); /api/debug/wifi's ble_connected is the same flag
+    on a bench build too old to report it there."""
+    try:
+        st = rig.get_json("/api/debug/settingsui")
+        if "controller_linked" in st:
+            return bool(st["controller_linked"]), "/api/debug/settingsui controller_linked"
+    except RigHTTPError:
+        pass
+    try:
+        wifi = rig.get_json("/api/debug/wifi")
+        if "ble_connected" in wifi:
+            return bool(wifi["ble_connected"]), "/api/debug/wifi ble_connected"
+    except RigHTTPError:
+        pass
+    return None, "neither /api/debug/settingsui nor /api/debug/wifi reports the controller link"
+
+
+def refuse_if_controller_linked(rig, report, venue):
+    """Runs before the runner sends anything to a device. Returns an exit
+    code to stop with, or None to go on."""
+    linked, source = controller_link_state(rig)
+    report.step("controller_link", linked=linked, source=source)
+    if linked is False:
+        return None
+    if linked:
+        msg = ("REFUSING TO RUN: the device reports a real controller linked over BLE (%s). Injected taps can "
+               "start the pump; on 2026-10-01 they ran it for about 65 minutes (gm-warz). Unpair or power off the "
+               "controller first." % source)
+    else:
+        msg = ("REFUSING TO RUN: cannot tell whether a real controller is linked (%s). Flash a build that reports "
+               "controller_linked on /api/debug/settingsui (gm-warz)." % source)
+    print(msg, file=sys.stderr, flush=True)
+    report.violation("CONTROLLER LINKED" if linked else "CONTROLLER LINK UNKNOWN", detail=msg)
+    summarise(report, venue)
+    return 1
+
+
 def drive_guarded(rig, report, venue, selected, only, args):
     """drive(), with an exception anywhere in it recorded as a RUNNER ERROR
     violation carrying the traceback. Without this the report, written in
@@ -760,6 +807,17 @@ def drive_guarded(rig, report, venue, selected, only, args):
     recorded the same way and then re-raised."""
     try:
         return drive(rig, report, venue, selected, only, args)
+    except RigHalt as e:
+        # The rig stopped sending input (gm-warz). Recorded as the reason the
+        # run ended, without the synth restore: that is a request to the
+        # device as well, and nothing more is sent once the rig has halted.
+        print("RUN HALTED: %s" % e, file=sys.stderr, flush=True)
+        report.violation("RIG HALTED", detail=str(e), traceback=traceback.format_exc())
+        try:
+            summarise(report, venue)
+        except Exception:  # noqa: BLE001 -- the report file is what matters now
+            pass
+        return 1
     except BaseException as e:  # noqa: BLE001 -- recorded, then re-raised unless it is an ordinary error
         report.violation("RUNNER ERROR", detail="%s: %s" % (type(e).__name__, e),
                          traceback=traceback.format_exc())
@@ -779,6 +837,11 @@ def drive_guarded(rig, report, venue, selected, only, args):
 
 def drive(rig, report, venue, selected, only, args):
     if venue.is_device:
+        # Before anything is sent to the device (gm-warz).
+        refused = refuse_if_controller_linked(rig, report, venue)
+        if refused is not None:
+            return refused
+        rig.guard_cover = True
         try:
             rig.synth(0)
             report.step("synth", brew=0)
