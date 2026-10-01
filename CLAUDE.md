@@ -307,7 +307,9 @@ telemetry-driven screen from a 650 ms LVGL pass (1.5 Hz widget updates,
   the animation rate with nothing owning it. obj33 is `LV_SIZE_CONTENT` and can
   never overflow; the other three are 85, 85 and 250 px wide and today's text
   fits, which is why the screen measures 0.00. Widening what goes in them, or
-  a longer profile name, would start it. gm-j38 is the open decision.
+  a longer profile name, would start it. gm-j38 decided on 2026-10-01 to
+  leave it so; the fix, if it starts, is to extend `serviceMarquees` to the
+  plain scroll mode.
 - **`/api/debug/scale?ramp=<g/s>[&tare=1][&screen=0|1]` is the scale-screen
   repro** (`GM_SYNTH_HANDSHAKE` builds). The churn only appears while a weight
   is actually moving and the bench has no scale, so the synthetic one
