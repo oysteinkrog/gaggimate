@@ -6791,8 +6791,6 @@ function pcDither(dst, amp) {
    still has something to sit on off the cube. */
 (() => {
   const AX_PERIOD_S = 120, AY_PERIOD_S = 60;
-  const FEATHER = 26;           // px of outer feather contour
-  const BACK_AMP = 0.35;        // translucency: back faces at 35%
   const VERTS = [
     [-1, -1, -1], [1, -1, -1], [1, 1, -1], [-1, 1, -1],
     [-1, -1, 1], [1, -1, 1], [1, 1, 1], [-1, 1, 1]];
@@ -6807,11 +6805,14 @@ function pcDither(dst, amp) {
       { key: 'speed', label: 'Speed', def: 50 },
       { key: 'size', label: 'Cube size', def: 50 },
       { key: 'glow', label: 'Face glow', def: 55 },
-    ],
+      { key: 'tilt', label: 'Tilt', def: 50 },
+      { key: 'wobble', label: 'Wobble', def: 50 },
+      { key: 'edge', label: 'Edge softness', def: 50 },
+      { key: 'backs', label: 'Back faces', def: 50 },
+      { key: 'background', label: 'Background', def: 50 }],
     init(w, h, state) {
       state.acc = new Uint8Array(w * h);
       state.bgRow = new Uint8Array(h);
-      for (let y = 0; y < h; y++) state.bgRow[y] = 56 + Math.round(18 * y / (h - 1));
       state.bg = new Uint8ClampedArray(w * h * 4);
       state.px = new Float64Array(8); state.py = new Float64Array(8);
       state.nz = new Float64Array(6);
@@ -6822,10 +6823,14 @@ function pcDither(dst, amp) {
       state.pal = null; state.key = null;
     },
     render(data, w, h, tMs, p, state) {
-      const key = p[2] + '|' + THEME.gen;
+      const key = p[2] + '|' + p[7] + '|' + THEME.gen;
       if (state.key !== key) {
         state.key = key;
         state.pal = themeRamp(184 + Math.round(p[2] * 72 / 100));
+        // Background (p[7], gm-3vj.46): the ramp's top index, 20..92, 56 at
+        // 50, as in AnimCube.cpp.
+        const bgBase = 20 + Math.floor(p[7] * 72 / 100);
+        for (let y = 0; y < h; y++) state.bgRow[y] = bgBase + Math.round(18 * y / (h - 1));
         bayerOffsets(state.dith, 1.5, 1);
         // A background row is fully determined by its ramp index and its
         // Bayer phase, so only about 150 of the 480 rows are distinct; the
@@ -6858,12 +6863,21 @@ function pcDither(dst, amp) {
       const s = 88 + p[1] * 0.64;                          // half-size, ~88..152 px
       const AMP = 52 + Math.round(p[2] * 34 / 100);        // brightest single face
       const CAP = Math.round(AMP * 1.45);
+      // gm-3vj.46, mirroring AnimCube.cpp: Tilt (p[3]) moves the tilt centre
+      // through 0.37..0.87 rad, Wobble (p[4]) the swing through 0..0.60,
+      // Edge softness (p[5]) the feather through 6..46 px and Back faces
+      // (p[6]) their amplitude through 0..0.70. Each adds exactly zero, or
+      // gives back the old constant, at its default of 50.
+      const tilt = 0.62 + (p[3] - 50) * 0.005;
+      const swing = 0.30 + (p[4] - 50) * 0.006;
+      const FE = 6 + Math.floor(p[5] * 40 / 100);
+      const backAmp = 0.35 + (p[6] - 50) * 0.007;
       // The spin runs continuously on 60 s; the tilt swings on 120 s but
       // stays inside 18 to 53 degrees rather than turning right through.
       // A free second axis puts a face square to the viewer once a cycle,
       // where the cube collapses to a flat quad and stops reading as a cube.
       // The pose still repeats after 120 s and vertices stay under 19 px/s.
-      const ax = 0.62 + 0.30 * Math.sin(2 * Math.PI * ts / AX_PERIOD_S + 0.4);
+      const ax = tilt + swing * Math.sin(2 * Math.PI * ts / AX_PERIOD_S + 0.4);
       const ay = 0.9 + 2 * Math.PI * ts / AY_PERIOD_S;
       const ca = Math.cos(ax), sa = Math.sin(ax);
       const cb = Math.cos(ay), sb = Math.sin(ay);
@@ -6885,16 +6899,16 @@ function pcDither(dst, amp) {
         nz[f] = tmp[2];
       }
       // clear only the cube's box; the background outside it is already set
-      const rad = Math.ceil(s * 1.7321) + FEATHER + 2;
+      const rad = Math.ceil(s * 1.7321) + FE + 2;
       let by0 = Math.max(0, Math.floor(cy - rad)), by1 = Math.min(h - 1, Math.ceil(cy + rad));
       let bx0 = Math.max(0, Math.floor(cx - rad)), bx1 = Math.min(w - 1, Math.ceil(cx + rad));
       for (let y = by0; y <= by1; y++) acc.fill(0, y * w + bx0, y * w + bx1 + 1);
 
-      const invFe = 1 / FEATHER;
+      const invFe = 1 / FE;
       for (let f = 0; f < 6; f++) {
         const front = nz[f] > 0;
         const mag = front ? nz[f] : -nz[f];
-        const amp = AMP * mag * (front ? 1 : BACK_AMP);
+        const amp = AMP * mag * (front ? 1 : backAmp);
         if (amp < 0.6) continue;
         let mnx = 1e9, mxx = -1e9, mny = 1e9, mxy = -1e9;
         for (let i = 0; i < 4; i++) {
@@ -6935,7 +6949,7 @@ function pcDither(dst, amp) {
             if (d2 < m) m = d2;
             if (d3 < m) m = d3;
             if (m > 0) {
-              const c = m >= FEATHER ? amp : amp * m * invFe;
+              const c = m >= FE ? amp : amp * m * invFe;
               const k = row + x;
               let a = acc[k] + c;
               if (a > CAP) a = CAP;

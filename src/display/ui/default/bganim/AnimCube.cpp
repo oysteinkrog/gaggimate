@@ -2,11 +2,15 @@
 
 // "Cube": the translucent orthographic cube in anim_bench.html, entry 43.
 // Six projected squares contribute a constant interior and a 26 px inward
-// feather. Back faces contribute 35% of their facing amplitude. Each face
+// feather (Edge softness, 6..46 px). Back faces contribute 35% of their
+// facing amplitude (Back faces, 0..70%). Each face
 // contribution is truncated before the next is added, as the page's Uint8
 // accumulator does, then the overlap is capped at round(1.45 * AMP).
-// A dithered 56..74 vertical theme ramp remains visible outside the cube.
-// Spin takes 60 s, while tilt swings through 0.32..0.92 radians in 120 s.
+// A dithered 56..74 vertical theme ramp remains visible outside the cube
+// (Background moves its top through 20..92). Spin takes 60 s, while tilt
+// swings through 0.32..0.92 radians in 120 s (Tilt moves the 0.62 centre,
+// Wobble the 0.30 swing). Every parameter added for gm-3vj.46 gives the
+// old constant at its default of 50, so the goldens stay exact.
 // Size is the page's absolute 88..152 px half-size, including at 240 wide.
 //
 // The page walks four floating edge distances. Here frame() folds amp/26
@@ -60,8 +64,6 @@ using namespace bganim;
 
 constexpr int FACE_N = 6;
 constexpr int Q = 65536;       // Q16.16 intensity, not Q16.16 screen position
-constexpr float FEATHER = 26.0f;
-constexpr float BACK_AMP = 0.35f;
 constexpr float TAU = 6.2831853071795864769f;
 
 struct alignas(16) Face {
@@ -87,14 +89,22 @@ static_assert(sizeof(Geometry) == 180, "update the table budget when geometry ch
 int32_t *field = nullptr;     // [w], reused and cleared for every absolute row
 Face *faces = nullptr;        // [6], read once per contributing face per row
 uint16_t *palette = nullptr;  // [256], themeRamp with the page's glow scaling
-uint8_t *bgRow = nullptr;     // [h], the page's 56 + round(18*y/(h-1))
+uint8_t *bgRow = nullptr;     // [h], the page's base + round(18*y/(h-1))
 int32_t *dither = nullptr;    // [64], signed whole palette-index offsets
 Geometry *geometry = nullptr;
 int allocW = 0, allocH = 0, cap = 0;
 int lastGlow = -1;
+int lastBgBase = -1;
 uint32_t lastThemeGen = 0xFFFFFFFF;
 
 void release();
+
+// The page's background ramp, base + round(18*y/(h-1)), in integers.
+void fillBgRow(int base, int h) {
+    for (int y = 0; y < h; ++y) {
+        bgRow[y] = static_cast<uint8_t>(base + (h > 1 ? (36 * y + h - 1) / (2 * (h - 1)) : 0));
+    }
+}
 
 bool init(int w, int h) {
     if (w <= 0 || h <= 0) {
@@ -123,9 +133,8 @@ bool init(int w, int h) {
         release();
         return false;
     }
-    for (int y = 0; y < h; ++y) {
-        bgRow[y] = static_cast<uint8_t>(56 + (h > 1 ? (36 * y + h - 1) / (2 * (h - 1)) : 0));
-    }
+    fillBgRow(56, h);
+    lastBgBase = 56;
     for (int k = 0; k < 64; ++k) {
         // bayerOffsets(..., 1.5, 1) uses lround, including negative ties.
         dither[k] = static_cast<int32_t>(lroundf((BAYER8[k] - 31.5f) * (1.5f / 31.5f)));
@@ -149,6 +158,14 @@ void frame(uint32_t tMs, int w, int h, const uint8_t p[BG_ANIM_PARAMS]) {
         lastGlow = p[2];
         lastThemeGen = gen;
     }
+    // Background (p7, gm-3vj.46): the ramp's top index, 20..92, 56 at 50.
+    // The brightest index is 92 + 18 + cap 125 + dither 2 = 237, inside
+    // the 256-entry palette, and the darkest is 20 - 2.
+    const int bgBase = 20 + (static_cast<int>(p[7]) * 72) / 100;
+    if (bgBase != lastBgBase) {
+        fillBgRow(bgBase, h);
+        lastBgBase = bgBase;
+    }
     // Derive time from tMs, as the page does. Reduce its Q24 millisecond
     // product before converting to float so days of uptime cannot erase
     // the fractional pose or overflow an integer conversion. 120,000 ms
@@ -164,7 +181,12 @@ void frame(uint32_t tMs, int w, int h, const uint8_t p[BG_ANIM_PARAMS]) {
     const float ts = static_cast<float>(timeQ24 % (120000ULL << 24)) * (0.001f / 16777216.0f);
     // The page's pose offsets: tilt centres on 0.62 rad with a 0.30 rad
     // swing and starts 0.4 rad into that swing; spin starts at 0.9 rad.
-    const float ax = 0.62f + 0.30f * sinf(TAU * ts / 120.0f + 0.4f);
+    // Tilt (p3) moves the centre through 0.37..0.87 rad and Wobble (p4)
+    // the swing through 0..0.60 rad (gm-3vj.46). Both add exactly zero at
+    // their default of 50, so the default pose is the old one bit for bit.
+    const float tilt = 0.62f + static_cast<float>(static_cast<int>(p[3]) - 50) * 0.005f;
+    const float swing = 0.30f + static_cast<float>(static_cast<int>(p[4]) - 50) * 0.006f;
+    const float ax = tilt + swing * sinf(TAU * ts / 120.0f + 0.4f);
     const float ay = 0.9f + TAU * ts / 60.0f;
     const float ca = cosf(ax), sa = sinf(ax), cb = cosf(ay), sb = sinf(ay);
     const float s = 88.0f + p[1] * 0.64f;
@@ -172,6 +194,12 @@ void frame(uint32_t tMs, int w, int h, const uint8_t p[BG_ANIM_PARAMS]) {
     // of the channel gain. Overlap caps at 1.45 times that, or 75..125.
     const int ampMax = 52 + (static_cast<int>(p[2]) * 34 + 50) / 100;
     cap = (ampMax * 145 + 50) / 100;
+    // Edge softness (p5): the feather width, 6..46 px, 26 at 50. Back faces
+    // (p6): their share of the facing amplitude, 0..0.70, 0.35 at 50, so 0
+    // culls them and leaves a solid hexagon. Both only change the per-face
+    // coefficients below; the face walk and its kernel are untouched.
+    const float feather = static_cast<float>(6 + (static_cast<int>(p[5]) * 40) / 100);
+    const float backAmp = 0.35f + static_cast<float>(static_cast<int>(p[6]) - 50) * 0.007f;
     Geometry &g = *geometry;
     for (int i = 0; i < 8; ++i) {
         // VERTS winds around z=-1, then z=+1: --, +-, ++, -+.
@@ -191,7 +219,7 @@ void frame(uint32_t tMs, int w, int h, const uint8_t p[BG_ANIM_PARAMS]) {
     for (int f = 0; f < FACE_N; ++f) {
         Face &face = faces[f];
         const float nz = g.nz[f];
-        const float amp = ampMax * (nz > 0.0f ? nz : -nz) * (nz > 0.0f ? 1.0f : BACK_AMP);
+        const float amp = ampMax * (nz > 0.0f ? nz : -nz) * (nz > 0.0f ? 1.0f : backAmp);
         face.y0 = 1;
         face.y1 = 0;
         if (amp < 0.6f) continue;
@@ -212,7 +240,7 @@ void frame(uint32_t tMs, int w, int h, const uint8_t p[BG_ANIM_PARAMS]) {
         if (face.y0 < 0) face.y0 = 0;
         if (face.y1 >= h) face.y1 = h - 1;
         face.amplitude = static_cast<int>(amp);
-        const float intensityQ = (amp / FEATHER) * Q;
+        const float intensityQ = (amp / feather) * Q;
         for (int i = 0; i < 4; ++i) {
             const int j = (i + 1) & 3;
             const float ex = g.vx[j] - g.vx[i], ey = g.vy[j] - g.vy[i];
@@ -241,7 +269,9 @@ void frame(uint32_t tMs, int w, int h, const uint8_t p[BG_ANIM_PARAMS]) {
 // alone decides inclusion. Using the same coefficients for clipping and
 // stepping guarantees every distance in the emitted span is nonnegative.
 // At panel sizes <=480 and size<=100 all intermediate values, including
-// unselected edges and four-pixel advances, fit comfortably in int32.
+// unselected edges and four-pixel advances, fit in int32: the steepest
+// coefficient is glow 100 over a 6 px feather, 86/6 indices or about
+// 0.94M Q16.16 units per pixel, and no visited distance reaches 1,200 px.
 bool faceSpan(const Face &f, int y, int w, int &lo, int &hi, int32_t d[4]) {
     if (y < f.y0 || y > f.y1) return false;
     lo = 0;
@@ -300,7 +330,7 @@ GM_ANIM_IRAM void bandRef(uint16_t *dst, int y0, int rows, int w, uint32_t, cons
         const int32_t *dith = dither + (y & 7) * 8;
         const int background = bgRow[y];
         for (int x = 0; x < w; ++x) {
-            // 56..74 + 0..125 + (-2..2) lies in 54..201. The page's
+            // 20..110 + 0..125 + (-2..2) lies in 18..237. The page's
             // final clamp is therefore redundant for every parameter set.
             dst[x] = palette[background + field[x] + dith[x & 7]];
         }
@@ -495,6 +525,7 @@ void release() {
     releaseTable(field, static_cast<size_t>(allocW) * sizeof(int32_t));
     allocW = allocH = cap = 0;
     lastGlow = -1;
+    lastBgBase = -1;
     lastThemeGen = 0xFFFFFFFF;
 }
 
@@ -507,7 +538,11 @@ const BgAnimation bg_anim_cube = {
     {{"speed", "Speed", 50},
      {"size", "Cube size", 50},
      {"glow", "Face glow", 55},
-     {nullptr, nullptr, 0}},
+     {"tilt", "Tilt", 50},
+     {"wobble", "Wobble", 50},
+     {"edge", "Edge softness", 50},
+     {"backs", "Back faces", 50},
+     {"background", "Background", 50}},
     init,
     frame,
     band,

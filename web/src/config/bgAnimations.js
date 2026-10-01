@@ -649,6 +649,11 @@ export const BG_ANIMATIONS = [
       { key: 'speed', label: 'Speed', def: 50 },
       { key: 'size', label: 'Cube size', def: 50 },
       { key: 'glow', label: 'Face glow', def: 55 },
+      { key: 'tilt', label: 'Tilt', def: 50 },
+      { key: 'wobble', label: 'Wobble', def: 50 },
+      { key: 'edge', label: 'Edge softness', def: 50 },
+      { key: 'backs', label: 'Back faces', def: 50 },
+      { key: 'background', label: 'Background', def: 50 },
     ],
   },
 ];
