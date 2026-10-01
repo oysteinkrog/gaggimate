@@ -89,6 +89,7 @@ extern int64_t gm_ws_arc_us;
 #include <display/drivers/common/LV_Helper.h>
 #include <display/main.h>
 #include <display/ui/utils/effects.h>
+#include <algorithm> // std::rotate, for the hit map ring in publishTouchHitMap
 #include <utility>
 
 #include "esp_sntp.h"
@@ -2182,19 +2183,26 @@ void DefaultUI::loop() {
 // here in tree order, so the last containing rectangle is the one LVGL
 // would return; a disabled object is left out and its parent answers, as
 // in LVGL. The screen itself is not a target.
+//
+// out is a ring of kMaxHitRects: n counts every target found and entry i
+// lands in slot i % kMaxHitRects, so past the cap the lowest targets in z
+// order (the first in tree order) are overwritten and the topmost survive.
+// publishTouchHitMap puts the ring back in order.
 void DefaultUI::collectHitRects(lv_obj_t *obj, const lv_area_t &clip, lv_obj_t *scr, touchtask::HitRect *out, int &n) {
     if (lv_obj_has_flag(obj, LV_OBJ_FLAG_HIDDEN)) {
         return;
     }
     lv_area_t coords;
     lv_obj_get_coords(obj, &coords);
-    if (obj != scr && lv_obj_has_flag(obj, LV_OBJ_FLAG_CLICKABLE) && !lv_obj_has_state(obj, LV_STATE_DISABLED) &&
-        n < touchtask::kMaxHitRects) {
+    if (obj != scr && lv_obj_has_flag(obj, LV_OBJ_FLAG_CLICKABLE) && !lv_obj_has_state(obj, LV_STATE_DISABLED)) {
         lv_area_t click;
         lv_obj_get_click_area(obj, &click);
         lv_area_t hit;
         if (_lv_area_intersect(&hit, &click, &clip)) {
-            touchtask::HitRect &r = out[n++];
+            touchtask::HitRect &r = out[n % touchtask::kMaxHitRects];
+            n++;
+            r.id = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(obj));
+            r.reserved = 0;
             r.x1 = hit.x1;
             r.y1 = hit.y1;
             r.x2 = hit.x2;
@@ -2243,6 +2251,11 @@ void DefaultUI::publishTouchHitMap() {
     int n = 0;
     const lv_area_t whole = {-32767, -32767, 32767, 32767};
     collectHitRects(scr, whole, scr, rects, n);
+    if (n > touchtask::kMaxHitRects) {
+        // The ring wrapped: its oldest surviving entry is at n % cap.
+        std::rotate(rects, rects + (n % touchtask::kMaxHitRects), rects + touchtask::kMaxHitRects);
+        n = touchtask::kMaxHitRects;
+    }
     const lv_color_t dim = lv_color_hex(static_cast<uint32_t>(controller->getSettings().getTouchDimColor()));
     touchtask::publishHitMap(rects, n, pressPlateMode, lv_color_to16(dim), PRESS_PLATE_OUTSET);
 #endif

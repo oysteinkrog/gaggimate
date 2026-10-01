@@ -156,8 +156,8 @@ bool hitTest(int16_t x, int16_t y, Header &hdr, HitRect &out) {
     return false;
 }
 
-// Whether the live map still holds the held target: a rectangle with the
-// same boxes, and presses still get a plate. The generation the answer is
+// Whether the live map still holds the held target: the same object with
+// the same boxes, and presses still get a plate. The generation the answer is
 // for goes to gen. A map that keeps changing under four reads in a row
 // answers yes and is looked at again on the next poll.
 bool heldStillValid(const HitRect &held, uint32_t &gen) {
@@ -166,8 +166,11 @@ bool heldStillValid(const HitRect &held, uint32_t &gen) {
         const HitRect *map = s_maps[hdr.index];
         bool found = false;
         if (map != nullptr && hdr.plateOn) {
-            for (int i = hdr.n - 1; i >= 0 && !found; i--) {
-                found = memcmp(&map[i], &held, sizeof(HitRect)) == 0;
+            for (int i = hdr.n - 1; i >= 0; i--) {
+                if (map[i].id == held.id) {
+                    found = memcmp(&map[i], &held, sizeof(HitRect)) == 0;
+                    break;
+                }
             }
         }
         if (unpack(s_header.load()).gen == hdr.gen) {

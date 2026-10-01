@@ -12,7 +12,7 @@
 // with a generation), and on a press edge the task hit-tests the point
 // against it and writes the press plate element at once. The plate is
 // cleared on release, on press lost, and when a new hit map no longer holds
-// the pressed target with the same box (a screen change, the target moving,
+// the pressed object with the same box (a screen change, the target moving,
 // resizing or going away). Any other change to the map, such as a label
 // elsewhere on the screen changing size, leaves a held plate alone.
 //
@@ -46,12 +46,19 @@ struct Sample {
 // ends with the newest edge and a lifted finger always ends released.
 constexpr int kMaxTransitions = 4;
 
+// No padding anywhere (24 bytes, every field set by the publisher), so the
+// publisher can memcmp two maps.
 struct HitRect {
+    uint32_t id;                // the object's identity (its address); a held plate follows it
     int16_t x1, y1, x2, y2;     // effective hit area: click area clipped by every ancestor's
     int16_t px1, py1, px2, py2; // object coordinates, what the plate covers
-    uint16_t plate;             // 1 when a press here gets a plate (16 bits: no padding, so the
-                                // publisher can memcmp two maps)
+    uint16_t plate;             // 1 when a press here gets a plate
+    uint16_t reserved;          // always 0
 };
+static_assert(sizeof(HitRect) == 24, "HitRect must have no padding: the publisher memcmps maps");
+// At most this many rectangles per map. The publisher keeps the topmost
+// ones: past the cap the lowest targets in z order (the first in tree
+// order) are dropped, never the ones a press is most likely to land on.
 constexpr int kMaxHitRects = 96;
 
 #ifndef GAGGIMATE_SIM
