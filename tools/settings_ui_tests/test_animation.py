@@ -21,9 +21,7 @@ memory figures) is not run here; see "Not verified" at the bottom of this
 file for the exact list and the device-side commands that check them.
 """
 import argparse
-import json
 import os
-import re
 import sys
 import tempfile
 import time
@@ -39,6 +37,21 @@ from tools.settings_ui_tests.gradients_gen import (  # noqa: E402
     GRADIENT_CATEGORIES,
     GRADIENT_CATEGORY_OF,
     GRADIENT_NAMES as THEME_NAMES,
+)
+# The gradient-swatch oracle (gm-nov3.33, gm-nov3.38) lives in its own module
+# so tools/picker_device_checks.py, a standalone device script, can read it
+# without depending on this scenario file. Reused here rather than redefined.
+from tools.settings_ui_tests.swatch import (  # noqa: E402
+    BG_THEME_LEGACY_CUSTOM,
+    builtin_stops,
+    custom_theme_valid,
+    global_stops,
+    hex_rgb,
+    legacy_builtin,
+    library_entries,
+    stops_for_ref,
+    swatch_matches_stops,
+    toned_stops,
 )
 
 DEFAULT_PROGRAM = os.path.join(REPO_ROOT, ".pio", "build", "display-sim", "program")
@@ -149,21 +162,6 @@ def map_write_ref(theme_map, anim_id, ref):
     return ";".join(parts)
 
 
-def library_entries(packed):
-    """Python mirror of SettingsModel.cpp's parseGradientLibrary: the
-    (id, name, gradient) triples of the "id|name|gradient;..." string, in
-    stored order, dropping anything that does not have the three parts."""
-    out = []
-    for entry in str(packed or "").split(";"):
-        if not entry:
-            continue
-        parts = entry.split("|", 2)
-        if len(parts) != 3 or not parts[0].isdigit() or int(parts[0]) <= 0 or not parts[1]:
-            continue
-        out.append((int(parts[0]), parts[1], parts[2]))
-    return out
-
-
 def gradient_name_for_ref(settings, ref):
     """The name the display shows for one ref: a decimal index names a
     built-in, "cN" names a saved gradient, and anything that resolves to
@@ -185,39 +183,6 @@ def gradient_name_for_ref(settings, ref):
         return None
     idx = int(ref)
     return THEME_NAMES[idx] if 0 <= idx < len(THEME_NAMES) else None
-
-
-# The legacy bgAnimTheme namespace, frozen at 18 to match
-# BG_THEME_LEGACY_CUSTOM in src/display/ui/default/bganim/BgAnim.h. It is not
-# len(THEME_NAMES): the built-in table grows, and a device that stored 18 means
-# the custom gradient, not whatever gradient is appended at index 18.
-BG_THEME_LEGACY_CUSTOM = 18
-
-
-def custom_theme_valid(custom):
-    """Whether bgAnimCustomTheme is a gradient the firmware's parser accepts.
-    Python mirror of bg_custom_valid (BgAnimThemes.cpp, parseGradient): two to
-    sixteen six-digit colours separated by commas or spaces, each with an
-    optional @position of one to four digits that may not exceed 255. A leading
-    # is tolerated on each colour, as the parser tolerates it."""
-    parts = [p for p in re.split(r"[\s,]+", str(custom or "")) if p]
-    if not 2 <= len(parts) <= 16:
-        return False
-    for part in parts:
-        m = re.fullmatch(r"#?[0-9a-fA-F]{6}(?:@(\d{1,4}))?", part)
-        if m is None:
-            return False
-        if m.group(1) is not None and int(m.group(1)) > 255:
-            return False
-    return True
-
-
-def legacy_builtin(theme_id, custom_valid):
-    """Python mirror of bg_legacy_builtin (BgAnim.h): the built-in the legacy
-    pair resolves to, or -1 when the custom gradient is what it draws."""
-    if theme_id == BG_THEME_LEGACY_CUSTOM:
-        return -1 if custom_valid else 0
-    return theme_id if 0 <= theme_id < BG_THEME_LEGACY_CUSTOM else 0
 
 
 def expected_global_gradient_text(settings):
@@ -691,43 +656,6 @@ def swatch_strip(rig, dump, row=None, data=None, slot=None):
     return [rgb565_pixel(data, x, y) for x in range(obj["x1"], obj["x2"] + 1)]
 
 
-def hex_rgb(s):
-    n = int(s, 16)
-    return ((n >> 16) & 0xFF, (n >> 8) & 0xFF, n & 0xFF)
-
-
-def swatch_matches_stops(strip, stops, tol=20):
-    """Whether a swatch strip is the ramp `stops` describes, judged at its
-    two ends. Returns (ok, detail).
-
-    The ends are the whole oracle on purpose. A swatch is drawn by
-    GradientSwatch.cpp, which is a separate transcription of the palette
-    arithmetic and is held to the real one on the host by
-    tools/animbench/swatch_parity.cpp; re-deriving the interior here would
-    be a third transcription with nothing checking it. What this has to
-    tell apart is which entry a row drew, and the ends do that. The
-    tolerance covers RGB565 quantisation (8 per channel at the ends) and
-    the ramp not sampling its last stop exactly; measured on the simulator,
-    "ff0000,ff2000" reads (255,0,0) to (255,28,0) against a nominal
-    (255,32,0).
-
-    A stop's @position does not change either end: swatchSampleRgb clamps,
-    so the pixel at x0 is the first stop's colour however far in that stop
-    sits, and the pixel at x1 is the last stop's. That is what lets the
-    fixture's "Wide Ends" entry be read this way.
-
-    Every check that asks which gradient a row drew goes through this
-    (gm-nov3.33). Counting distinct colours does not: all twelve entries of
-    the fixture library draw between 46 and 80 of them, so a row drawing
-    any other entry passed a count."""
-    want_first = hex_rgb(stops.split(",")[0].split("@")[0])
-    want_last = hex_rgb(stops.split(",")[-1].split("@")[0])
-    got_first, got_last = tuple(strip[0]), tuple(strip[-1])
-    ok = (max(abs(a - b) for a, b in zip(got_first, want_first)) <= tol
-          and max(abs(a - b) for a, b in zip(got_last, want_last)) <= tol)
-    return ok, "%r..%r against %s (%r..%r)" % (got_first, got_last, stops, want_first, want_last)
-
-
 def check_swatch(rig, name, strip, stops):
     """One swatch identity check: the strip is there and it is the ramp
     `stops` describes. A missing swatch fails with that as the detail rather
@@ -739,88 +667,6 @@ def check_swatch(rig, name, strip, stops):
     ok, detail = swatch_matches_stops(strip, stops)
     check(rig, name, ok, detail)
     return ok
-
-
-_BUILTIN_STOPS = []
-
-
-def builtin_stops(index):
-    """The stop string of one built-in gradient, in the form a stored
-    gradient carries it.
-
-    Read from data/gradients.json, which is the one place the built-ins are
-    written: scripts/gen_gradients.py turns that file into the firmware
-    table, the web mirror and gradients_gen.py beside this script, so a
-    reading taken from the source cannot drift from what the display draws.
-    gradients_gen.py carries the names and the categories but not the stops,
-    and it is generated, so this reads the source rather than asking for a
-    fourth generated table."""
-    if not _BUILTIN_STOPS:
-        with open(os.path.join(REPO_ROOT, "data", "gradients.json"), encoding="utf-8") as fh:
-            doc = json.load(fh)
-        _BUILTIN_STOPS.extend(",".join(s.lstrip("#") for s in g["stops"]) for g in doc["gradients"])
-    return _BUILTIN_STOPS[index] if 0 <= index < len(_BUILTIN_STOPS) else None
-
-
-def stops_for_ref(settings, ref):
-    """The stops the display draws for one ref, or None when the ref names
-    nothing that exists. The same three-way reading gradient_name_for_ref
-    does, returning the gradient instead of the name."""
-    ref = str(ref or "")
-    if ref == "":
-        return None
-    if ref.startswith("c"):
-        if not ref[1:].isdigit():
-            return None
-        wanted = int(ref[1:])
-        for entry_id, _name, gradient in library_entries(settings.get("bgAnimGradients", "")):
-            if entry_id == wanted:
-                return gradient
-        return None
-    if not ref.isdigit():
-        return None
-    return builtin_stops(int(ref))
-
-
-def global_stops(settings):
-    """The stops behind expected_global_gradient_text: the global ref when it
-    resolves, else what the legacy pair resolves to, which is either a
-    built-in or the retained custom gradient."""
-    stops = stops_for_ref(settings, settings.get("bgAnimGradientRef", ""))
-    if stops is not None:
-        return stops
-    custom = str(settings.get("bgAnimCustomTheme", ""))
-    builtin = legacy_builtin(int(settings["bgAnimTheme"]), custom_theme_valid(custom))
-    if builtin < 0:
-        # bg_parse_gradient takes commas or spaces; swatch_matches_stops
-        # splits on commas only, so the separator is normalised here.
-        return ",".join(p.lstrip("#") for p in re.split(r"[\s,]+", custom) if p)
-    return builtin_stops(builtin) or builtin_stops(0)
-
-
-def toned_stops(settings, stops):
-    """`stops` after the tone the swatch is drawn with. Python mirror of
-    GradientSwatch.cpp's swatchApplyTone, including the two integer
-    conversions DefaultUI::updateState does on the way in.
-
-    The stored tone is 100/100 by default, which is the identity, and no
-    scenario here changes it; this exists so a device whose owner has moved
-    either slider is read correctly rather than failing as if it drew the
-    wrong gradient."""
-    bright256 = int(settings.get("bgAnimBrightness", 100)) * 256 // 100
-    knee = int(settings.get("bgAnimHighlightKnee", 100)) * 255 // 100
-    bright256 = max(0, min(256, bright256))
-    knee = max(0, min(255, knee))
-    out = []
-    for part in str(stops or "").split(","):
-        colour = part.split("@")[0]
-        chans = []
-        for v in hex_rgb(colour):
-            if v > knee:
-                v = knee + ((v - knee) >> 2)
-            chans.append(max(0, min(255, (v * bright256) >> 8)))
-        out.append("%02x%02x%02x" % tuple(chans))
-    return ",".join(out)
 
 
 # ---------------------------------------------------------------------------

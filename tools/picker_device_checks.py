@@ -28,6 +28,11 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from tools.settings_ui_tests.rig import Rig  # noqa: E402
+# The gradient-swatch oracle (gm-nov3.33, gm-nov3.38): this script is a
+# standalone device check that otherwise imports nothing from the scenario
+# files, so the oracle lives in its own module rather than in
+# test_animation.py, which this script does not import.
+from tools.settings_ui_tests.swatch import global_stops, swatch_matches_stops, toned_stops  # noqa: E402
 
 ANIMATION_CAT = 2
 
@@ -157,14 +162,21 @@ def main(argv=None):
     rig.settingsui(pop=1)
     rig.wait_until(lambda: depth(rig) == 2, timeout=10)
 
-    # 2. A picker row's swatch really is a ramp.
+    # 2. A picker row's swatch really is the ramp the Global row is meant to
+    #    show, not merely more than a few colours: gm-nov3.38. A count of
+    #    distinct colours passed any row drawing any other entry, since
+    #    every entry in the fixture library draws 46 to 80 of them.
     dump = goto_page(rig, 0)
     try:
         strip = swatch_strip(rig, dump, "Global")
-        check("global_row_draws_a_ramp", strip is not None and len(set(strip)) > 4,
-              "distinct colours: %r" % (None if strip is None else len(set(strip))))
-        if strip:
-            print("  swatch ends: %r ... %r, %d distinct" % (strip[0], strip[-1], len(set(strip))), flush=True)
+        if strip is None:
+            check("global_row_draws_a_ramp", False, "no swatch on the row")
+        else:
+            s = rig.settings()
+            want_ramp = toned_stops(s, global_stops(s))
+            ok, detail = swatch_matches_stops(strip, want_ramp)
+            check("global_row_draws_a_ramp", ok, detail)
+            print("  swatch ends: %r ... %r against %s" % (strip[0], strip[-1], want_ramp), flush=True)
     except Exception as e:  # noqa: BLE001 -- a short or missing dump is this check's failure
         check("global_row_draws_a_ramp", False, "%s: %s" % (type(e).__name__, e))
 

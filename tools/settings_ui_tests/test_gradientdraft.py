@@ -94,6 +94,11 @@ from tools.settings_ui_tests.test_animation import (  # noqa: E402
     wait_depth,
     web_save,
 )
+# The gradient-swatch oracle (gm-nov3.33, gm-nov3.38) is a separate module
+# from the navigation and reading helpers above: it is the palette reading,
+# not a widget reader, and tools/picker_device_checks.py (a standalone
+# device script) needs it without the rest of this scenario file.
+from tools.settings_ui_tests.swatch import builtin_stops, swatch_matches_stops, toned_stops  # noqa: E402
 
 DEFAULT_PROGRAM = os.path.join(REPO_ROOT, ".pio", "build", "display-sim", "program")
 
@@ -1009,6 +1014,10 @@ def check_legacy_unparsable_custom_falls_back(rig):
     or malformed one to built-in 0, so the row names that built-in and draws
     its ramp, and nothing says "Custom (legacy)"."""
     builtin_zero = THEME_NAMES[0]
+    # The firmware's fallback is built-in 0 whatever the rejected custom
+    # string said, so the ramp every case is held to is the same one,
+    # toned the way this row's swatch draws it (gm-nov3.38).
+    want_ramp = toned_stops(rig.settings(), builtin_stops(0))
     for name, custom in (("empty", ""), ("malformed", "zzz"), ("one_stop", "101828")):
         if not store(rig, "legacy_%s_setup" % name, {
                 "bgAnimGradientRef": "",
@@ -1021,8 +1030,11 @@ def check_legacy_unparsable_custom_falls_back(rig):
         value, strip = global_row(rig)
         check(rig, "legacy_%s_names_builtin_zero" % name, value == builtin_zero,
               "%r want %r" % (value, builtin_zero))
-        check(rig, "legacy_%s_draws_a_ramp" % name, strip is not None and len(set(strip)) > 1,
-              "%r distinct colours" % (None if strip is None else len(set(strip))))
+        if strip is None:
+            check(rig, "legacy_%s_draws_a_ramp" % name, False, "no swatch on the row")
+        else:
+            ok, detail = swatch_matches_stops(strip, want_ramp)
+            check(rig, "legacy_%s_draws_a_ramp" % name, ok, detail)
         close_animation(rig)
         after = gradient_fields(rig)
         check(rig, "legacy_%s_visit_writes_nothing" % name, after == before, "%r want %r" % (after, before))
