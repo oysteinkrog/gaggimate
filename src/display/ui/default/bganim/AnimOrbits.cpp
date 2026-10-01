@@ -6,6 +6,7 @@
 // coverage-AA stamps. Design: anim-geometric (Fable), 2026-08-15.
 
 #include "BgAnim.h"
+#include "BgAnimClock.h"
 #include "BgAnimCommon.h"
 #include <math.h>
 #include <string.h>
@@ -28,6 +29,11 @@ constexpr float GOLDEN = 0.6180339887f;
 
 struct OrbitDef {
     float a, b, phi, T, phase;
+    // The body's angular rate, one turn per T seconds of animation time, as
+    // a Q48 turn per animation millisecond (BgAnimClock.h), so each orbit
+    // keeps its own exact phase however long the device has been up
+    // (gm-f91g).
+    uint64_t rate;
     float cosPhi, sinPhi;
     uint8_t colR, colG, colB;
     uint16_t pathColor565;
@@ -38,6 +44,14 @@ struct PathPt {
 };
 
 OrbitDef orbits[MAX_ORBITS];
+// Animation time. Not reset by release(), so the full/half switch keeps the
+// bodies where they were (BgAnimClock.h, gm-f91g). The old frame() took
+// t = tMs * 0.001 and divided each period by the speed, so float(tMs) lost
+// whole milliseconds after 3.1 days of uptime, every body jumped back to its
+// t = 0 position at the millis() wrap, and a speed change moved every body
+// at once. The clock advances by the wrapped delta scaled by the speed of
+// each step instead.
+AnimClock g_clock;
 int orbitCount = 0;
 PathPt *pathBins = nullptr;      // [orbit][band][pt]
 uint8_t *pathBinCount = nullptr; // [orbit][band]
@@ -100,6 +114,7 @@ void rebuildGeometry(int countP, int eccP, int w, int h) {
         o.cosPhi = cosf(o.phi);
         o.sinPhi = sinf(o.phi);
         o.T = 6.0f * powf(1.0f + GOLDEN, static_cast<float>(i));
+        o.rate = oscRateQ48(6.283185307179586 / (static_cast<double>(o.T) * 1000.0));
         o.phase = i * 1.7f;
         // Bodies sample the theme's upper range, spread so neighbors differ.
         uint8_t col[3];
@@ -185,20 +200,22 @@ void frame(uint32_t tMs, int w, int h, const uint8_t p[4]) {
         lastEccP = p[2];
         lastThemeGen = themeGen();
     }
-    const float spd = speedMul(p[0]);
+    g_clock.advance(tMs, speedMul(p[0]));
     const float trailAmt = p[3] / 100.0f;
     const int K = 6 + static_cast<int>(trailAmt * 10.0f);
-    const float t = tMs * 0.001f;
     const float cx = w * 0.5f, cy = h * 0.5f;
+    // Trail samples sit a fixed 1/90 of a turn apart along the orbit, as
+    // before: the old dt = T / 90 was in time, and T already carried the
+    // speed, so the spacing in angle never depended on it.
+    constexpr float TRAIL_STEP = 6.2831853f / 90.0f;
 
     sampleCount = 0;
     memset(sampleBinCount, 0, NUM_BANDS);
     for (int i = 0; i < orbitCount; i++) {
         const OrbitDef &o = orbits[i];
-        const float T = o.T / spd;
-        const float dt = T / 90.0f;
+        const float u0 = oscRad(g_clock, o.rate) + o.phase;
         for (int k = K; k >= 0; k--) {
-            const float u = (t - k * dt) / T * 6.2831853f + o.phase;
+            const float u = u0 - static_cast<float>(k) * TRAIL_STEP;
             const float cu = fastCosRad(u), su = fastSinRad(u);
             const float ex = cx + o.a * cu * o.cosPhi - o.b * su * o.sinPhi;
             const float ey = cy + o.a * cu * o.sinPhi + o.b * su * o.cosPhi;

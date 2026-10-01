@@ -6,6 +6,7 @@
 // Design: anim-particles (Fable), 2026-08-15.
 
 #include "BgAnim.h"
+#include "BgAnimClock.h"
 #include "BgAnimCommon.h"
 #include <math.h>
 
@@ -18,11 +19,16 @@ constexpr int BLOBS_MAX = WISPS_MAX * BLOBS_PER_WISP;
 
 struct Wisp {
     float x0, y0;
-    float swayPhase1, swayPhase2, swayFreq1, swayFreq2;
+    float swayPhase1, swayPhase2;
+    // Sway rates as Q48 turns per millisecond (BgAnimClock.h), so each wisp
+    // keeps its own exact sway phase however long the device has been up
+    // (gm-f91g).
+    uint64_t swayRate1, swayRate2;
 };
 struct Blob {
     uint8_t wisp;
-    uint32_t birth;
+    uint32_t birth;      // g_clock.ms() at birth; age is the wrapped difference
+    uint64_t riseBirth;  // g_rise.simQ16 at birth; rise is the difference
     float lifetime;
     float seed;
 };
@@ -78,6 +84,26 @@ uint32_t rng = 0x1234abcd;
 int g_active = 0;
 uint32_t lastThemeGen = 0xFFFFFFFF;
 int g_h = 480;
+// Time (BgAnimClock.h, gm-f91g). The old frame() used tMs itself: blob ages
+// were differences of tMs (wrap-safe), but the sway multiplied a float rate
+// by float(tMs), which lost whole milliseconds after 3.1 days of uptime and
+// jumped at the millis() wrap, and the rise was riseSpeed * age, so a speed
+// change moved every blob up or down at once. Two clocks, neither reset by
+// release():
+//   g_clock runs at speed 1 and carries the blob lifecycles and the sway,
+//   which never depended on the speed setting;
+//   g_rise runs at the speed setting, and a blob's rise is the distance it
+//   has gained since its birth, so a speed change bends the rise instead of
+//   moving it. At a constant speed the rise is riseSpeed * age, as before.
+AnimClock g_clock;
+AnimClock g_rise;
+constexpr float RISE_PER_MS = 0.034f; // px per animation millisecond at speed 1, at 480 px
+
+// The clock's own Q16 rounding of a speed, so a back-dated rise birth sits
+// exactly where the clock would have put it at that speed.
+uint64_t speedQ16(float speed) {
+    return speed > 0.0f ? static_cast<uint64_t>(speed * 65536.0f + 0.5f) : 0;
+}
 
 // alphaLUT, draws and bgLUT are all read from band() itself (per pixel, per
 // (blob,row), and per row respectively) rather than only from the once-a-
@@ -105,7 +131,11 @@ void rebuildBg() {
     }
 }
 
-void buildWisps(int count, int w, int h, uint32_t tMs) {
+// Blobs are born with an age already under way, so the rise clock is
+// back-dated by that age at the current speed.
+void buildWisps(int count, int w, int h, float speed) {
+    const uint32_t now = g_clock.ms();
+    const uint64_t spQ16 = speedQ16(speed);
     const float cx = w * 0.5f, cy = h * 0.5f;
     const float rDisp = (w < h ? w : h) * 0.5f;
     const float y0 = h * 0.90f;
@@ -116,15 +146,16 @@ void buildWisps(int count, int w, int h, uint32_t tMs) {
                     y0,
                     nextRandf(rng) * 6.2831853f,
                     nextRandf(rng) * 6.2831853f,
-                    0.00045f + nextRandf(rng) * 0.0003f,
-                    0.0013f + nextRandf(rng) * 0.0007f};
+                    oscRateQ48(0.00045f + nextRandf(rng) * 0.0003f),
+                    oscRateQ48(0.0013f + nextRandf(rng) * 0.0007f)};
     }
     for (int i = 0; i < count; i++) {
         for (int k = 0; k < BLOBS_PER_WISP; k++) {
             const int idx = i * BLOBS_PER_WISP + k;
             const float lifetime = 4200.0f + nextRandf(rng) * 1800.0f;
-            blobs[idx] = {static_cast<uint8_t>(i), tMs - static_cast<uint32_t>(nextRandf(rng) * lifetime), lifetime,
-                          nextRandf(rng) * 6.2831853f};
+            const uint32_t age = static_cast<uint32_t>(nextRandf(rng) * lifetime);
+            blobs[idx] = {static_cast<uint8_t>(i), now - age, g_rise.simQ16 - static_cast<uint64_t>(age) * spQ16,
+                          lifetime, nextRandf(rng) * 6.2831853f};
         }
     }
     builtCount = count;
@@ -196,12 +227,16 @@ void frame(uint32_t tMs, int w, int h, const uint8_t p[4]) {
         rebuildBg();
         lastThemeGen = themeGen();
     }
+    const float speed = speedMul(p[0]);
+    g_clock.advance(tMs, 1.0f);
+    g_rise.advance(tMs, speed);
+    const uint32_t now = g_clock.ms();
+    const uint64_t spQ16 = speedQ16(speed);
     const int count = 2 + (p[1] * 3) / 100;
     if (count != builtCount) {
-        buildWisps(count, w, h, tMs);
+        buildWisps(count, w, h, speed);
     }
     wispCount = count;
-    const float riseSpeed = 0.034f * speedMul(p[0]);
     const float swirl = 0.5f + (p[2] / 100.0f) * 1.7f;
     const float density = 0.5f + (p[3] / 100.0f) * 0.8f;
     const float maxHeight = h * 0.62f;
@@ -218,20 +253,27 @@ void frame(uint32_t tMs, int w, int h, const uint8_t p[4]) {
     for (int i = 0; i < g_active; i++) {
         Blob &b = blobs[i];
         BlobDraw &d = draws[i];
-        float age = static_cast<float>(tMs - b.birth);
+        float age = static_cast<float>(now - b.birth);
         if (age > b.lifetime) {
-            b.birth = tMs - static_cast<uint32_t>(fmodf(age, b.lifetime));
-            age = static_cast<float>(tMs - b.birth);
+            // Reborn at the bottom, invisible (L near 0), so back-dating the
+            // rise at the current speed shows no jump.
+            const uint32_t newAge = static_cast<uint32_t>(fmodf(age, b.lifetime));
+            b.birth = now - newAge;
+            b.riseBirth = g_rise.simQ16 - static_cast<uint64_t>(newAge) * spQ16;
+            age = static_cast<float>(now - b.birth);
         }
         const float L = age / b.lifetime;
         const Wisp &wp = wisps[b.wisp];
-        const float rise = riseSpeed * age;
+        // Animation milliseconds since birth: equal to age at speed 1, and
+        // exact (Q16 by a power of two).
+        const float riseAge = static_cast<float>(g_rise.simQ16 - b.riseBirth) * (1.0f / 65536.0f);
+        const float rise = RISE_PER_MS * riseAge;
         const float heightFrac = fminf(1.0f, rise / maxHeight);
         const float y = wp.y0 - rise;
         const float R = (10.0f + 26.0f * heightFrac) * (0.85f + 0.3f * fastSinRad(b.seed)) * rscale;
         const float swayAmp = (5.0f + 22.0f * heightFrac) * swirl * rscale;
-        const float x = wp.x0 + swayAmp * fastSinRad(wp.swayFreq1 * tMs + wp.swayPhase1 + b.seed) +
-                        swayAmp * 0.35f * fastSinRad(wp.swayFreq2 * tMs + wp.swayPhase2 + b.seed * 1.7f);
+        const float x = wp.x0 + swayAmp * fastSinRad(oscRad(g_clock, wp.swayRate1) + wp.swayPhase1 + b.seed) +
+                        swayAmp * 0.35f * fastSinRad(oscRad(g_clock, wp.swayRate2) + wp.swayPhase2 + b.seed * 1.7f);
         float alpha = density * 0.44f * 4.0f * L * (1.0f - L) * (1.0f - heightFrac * 0.3f);
         if (alpha > 0.4f) {
             alpha = 0.4f; // hard cap: steam stays vapor, never opaque
