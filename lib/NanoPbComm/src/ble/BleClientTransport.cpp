@@ -62,6 +62,16 @@ void BleClientTransport::takeScan(bool resetBoost) {
 void BleClientTransport::maintain() {
     if (_client == nullptr || _scanner == nullptr)
         return; // init() failed to create the client/scanner
+    // Bench hold (gm-bzu.26): keep the controller's scan stopped while held,
+    // and skip the stall restart below, which would start it again.
+    if (bleScanHeld()) {
+        if (_scanner->isScanning() && bleScanOwner() == BleScanOwner::Controller) {
+            _scanner->stop();
+            bleScanRelease(BleScanOwner::Controller);
+            ESP_LOGW(LOG_TAG, "Scan held by the bench knob");
+        }
+        return;
+    }
     if (!_readyForConnection && !_client->isConnected() && !_scanner->isScanning()) {
         // Restart in place, keeping the current interval. Scans stall every
         // minute or two when coexistence aborts them; a stall says nothing

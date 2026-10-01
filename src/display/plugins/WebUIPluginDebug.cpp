@@ -62,6 +62,9 @@ extern uint32_t nebula_lerp_self_test(uint32_t *firstBad);
 #include <display/plugins/ShotHistoryPlugin.h>
 #include <esp_memory_utils.h> // esp_ptr_external_ram, for the band-buffer placement report
 #include <esp_timer.h>        // esp_timer_dump, for /api/debug/timers
+#include <esp_wifi.h>         // esp_wifi_get_ps / sta_get_ap_info, for /api/debug/wifi
+#include <NimBLEDevice.h>     // the scanner state on /api/debug/wifi
+#include <ble/BleScanOwner.h> // the bench scan hold on /api/debug/wifi
 #ifdef GM_ANIM_BENCH
 #include <display/ui/default/SleepAnimation.h>
 #include <display/ui/default/bganim/BgAnim.h>
@@ -1682,6 +1685,44 @@ void WebUIPlugin::setupDebugEndpoints() {
     // The counters are cumulative and there is no reset: a sweep takes the
     // difference between two reads of this endpoint, which keeps the reset
     // logic out of the ISR-side counters entirely.
+    // /api/debug/wifi: the radio's state for the bench (gm-bzu.26). Reports
+    // the power-save mode, the association's rssi, channel and PHY flags, and
+    // whether the controller scan is running or held. On bench builds,
+    // ps=0|1|2 calls esp_wifi_set_ps (NONE, MIN_MODEM, MAX_MODEM) and reports
+    // the call's result, and blescan=0|1 holds or releases the controller's
+    // BLE scan through the transport's maintain loop. Neither is stored.
+    server.on("/api/debug/wifi", [](AsyncWebServerRequest *request) {
+        int psRc = -1;
+#if GM_DEBUG_WRITE_ROUTES
+        if (request->hasArg("ps")) {
+            const int ps = request->arg("ps").toInt();
+            if (ps < 0 || ps > 2) {
+                request->send(400, "application/json", "{\"error\":\"ps out of range 0..2\"}");
+                return;
+            }
+            psRc = static_cast<int>(esp_wifi_set_ps(static_cast<wifi_ps_type_t>(ps)));
+        }
+        if (request->hasArg("blescan")) {
+            bleScanSetHold(request->arg("blescan").toInt() == 0);
+        }
+#endif // GM_DEBUG_WRITE_ROUTES
+        wifi_ps_type_t ps = WIFI_PS_NONE;
+        esp_wifi_get_ps(&ps);
+        wifi_ap_record_t ap = {};
+        const bool assoc = esp_wifi_sta_get_ap_info(&ap) == ESP_OK;
+        NimBLEScan *scan = NimBLEDevice::getScan();
+        char buf[384];
+        snprintf(buf, sizeof(buf),
+                 "{\"ps\":%d,\"ps_rc\":%d,\"assoc\":%s,\"rssi\":%d,\"channel\":%d,\"phy_11b\":%d,\"phy_11g\":%d,"
+                 "\"phy_11n\":%d,\"phy_lr\":%d,\"bssid\":\"%02x:%02x:%02x:%02x:%02x:%02x\",\"status\":%d,"
+                 "\"ble_scanning\":%s,\"ble_scan_owner\":%d,\"ble_scan_hold\":%s}",
+                 static_cast<int>(ps), psRc, assoc ? "true" : "false", assoc ? ap.rssi : 0, assoc ? ap.primary : 0,
+                 assoc ? ap.phy_11b : 0, assoc ? ap.phy_11g : 0, assoc ? ap.phy_11n : 0, assoc ? ap.phy_lr : 0, ap.bssid[0],
+                 ap.bssid[1], ap.bssid[2], ap.bssid[3], ap.bssid[4], ap.bssid[5], static_cast<int>(WiFi.status()),
+                 (scan != nullptr && scan->isScanning()) ? "true" : "false", static_cast<int>(g_bleScanOwner),
+                 bleScanHeld() ? "true" : "false");
+        request->send(200, "application/json", buf);
+    });
     server.on("/api/debug/pclk", [](AsyncWebServerRequest *request) {
 #if GM_DEBUG_WRITE_ROUTES
         if (request->hasArg("div")) {

@@ -36,4 +36,12 @@ inline void bleScanRelease(BleScanOwner who) {
     }
 }
 
+// Bench hold on the controller scan (gm-bzu.26). While set, maintain() stops
+// a scan the controller owns and does not restart it, so a soak can run with
+// the BLE radio quiet and the WiFi link otherwise unchanged. Set only by the
+// /api/debug/wifi route on bench builds; production never writes it.
+inline volatile uint8_t g_bleScanHold = 0;
+inline bool bleScanHeld() { return g_bleScanHold != 0; }
+inline void bleScanSetHold(bool hold) { g_bleScanHold = hold ? 1 : 0; }
+
 #endif // NANOPBCOMM_BLE_SCAN_OWNER_H
