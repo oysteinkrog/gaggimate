@@ -220,6 +220,7 @@
 // user picked the interpolated design's picture over the faster options'
 // streaking.
 #include "BgAnim.h"
+#include "BgAnimClock.h"
 #include "BgAnimCommon.h"
 #include <esp_heap_caps.h>
 #include <math.h>
@@ -551,6 +552,23 @@ int g_sxOffset = 0; // (g_N & 1) ? 128 : 0, see the pass-2 comment at the top
 constexpr int WRAP_GUARD = 24;
 bool g_fineDetail = false;
 
+// Animation time (BgAnimClock.h, gm-f91g). Not reset by release(), so the
+// full/half switch keeps the pattern where it was. The old frame() took
+// t = tMs * 0.001 * 0.35 * speed in float, so the rotation stepped in whole
+// ticks of float(tMs) after 3.1 days of uptime, jumped back to t = 0 at the
+// millis() wrap, and jumped when the speed changed. Each of the three
+// motions keeps its own phase now. The coefficients are the old ones:
+// 1.4 and 0.8 radians per second of t for the two ring offsets (in ticks
+// of 40.74 per radian, 256 ticks a turn) and 0.45 for the breathing.
+// 0.35e-3 converts radians per second of t to radians per animation
+// millisecond.
+AnimClock g_clock;
+constexpr double T_PER_MS = 0.35e-3;
+constexpr double TICK_RAD = 6.283185307179586 / 256.0; // one of the 256 ticks a turn
+constexpr uint64_t RATE_OFF_A = oscRateQ48(1.4 * T_PER_MS * 40.74 * TICK_RAD);
+constexpr uint64_t RATE_OFF_B = oscRateQ48(0.8 * T_PER_MS * 40.74 * TICK_RAD);
+constexpr uint64_t RATE_BREATHE = oscRateQ48(0.45 * T_PER_MS);
+
 void frame(uint32_t tMs, int, int, const uint8_t p[4]) {
     if (themeGen() != lastThemeGen) {
         buildThemePalette();
@@ -558,14 +576,14 @@ void frame(uint32_t tMs, int, int, const uint8_t p[4]) {
     }
     g_N = 4 + (p[1] * 8) / 100;
     g_sxOffset = (g_N & 1) ? 128 : 0;
-    const float t = tMs * 0.001f * 0.35f * speedMul(p[0]);
+    g_clock.advance(tMs, speedMul(p[0]));
     const float turb = 0.25f + (p[2] / 100.0f) * 1.1f;
     g_rOffsetScale = static_cast<int>(turb * 18.0f);
     g_fineDetail = g_rOffsetScale >= WRAP_GUARD;
-    // 40.74 = 256 ticks per 2*pi radians
-    g_tOffA = static_cast<int>(t * 1.4f * 40.74f) & 0xFF;
-    g_tOffB = static_cast<int>(t * 0.8f * 40.74f) & 0xFF;
-    g_breatheQ8 = static_cast<int>((0.82f + 0.18f * fastSinRad(t * 0.45f)) * 256.0f);
+    // 256 ticks a turn: the top 8 bits of the Q32 turn.
+    g_tOffA = static_cast<int>(oscTurnQ32(g_clock, RATE_OFF_A) >> 24);
+    g_tOffB = static_cast<int>(oscTurnQ32(g_clock, RATE_OFF_B) >> 24);
+    g_breatheQ8 = static_cast<int>((0.82f + 0.18f * fastSinRad(oscRad(g_clock, RATE_BREATHE))) * 256.0f);
     // rParams (below) is about to change, which is everything
     // sampleRowIndices reads that varies frame to frame; drop any cached
     // row so the next fetchRow call for it recomputes rather than reusing

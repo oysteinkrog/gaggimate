@@ -40,7 +40,7 @@ constexpr int FRAMES = 40;
 constexpr uint32_t FRAME_MS = 33;
 constexpr int BAND_H = 2; // production band height (BgAnim.h)
 
-const char *const kOnClock[] = {"fireflies", "aurora", "starfield", "ember", "orbits", "steam"};
+const char *const kOnClock[] = {"fireflies", "aurora", "starfield", "ember", "orbits", "steam", "mandala"};
 
 struct Start {
     const char *name;
