@@ -1,6 +1,26 @@
 @import 'tailwindcss';
 @plugin 'daisyui';
 
+/* Secondary text contrast: considered, no floor set (gm-owlz, 2026-10-01).
+   Secondary text has no token of its own. It is --color-base-content below
+   at an opacity modifier (text-base-content/60 and so on), so its contrast
+   is set by base-content and base-100/base-200 in each theme. The owner
+   considered a minimum contrast for it on 2026-10-01 and chose not to set
+   one in this pass: much of it sits under the WCAG AA 4.5:1 small-text
+   floor on light, coffee and nord, and that is a known, accepted state.
+   Measured over base-100 (cards, page body) with tools/web_contrast.mjs,
+   which also prints base-200 and every opacity the source uses:
+
+     opacity  uses   light   dark  coffee   nord
+       /50     22    2.44   3.65    2.70   2.71
+       /55     31    2.72   4.15    2.99   3.08   (CardTitle)
+       /60     66    3.05   4.71    3.28   3.49
+       /70     39    3.86   5.95    3.97   4.57
+       /80      8    4.97   7.42    4.81   6.09   (lowest that clears 4.5 everywhere)
+
+   Lowest for a common level: /60 on light over base-200, 2.95. Lowest of
+   all: /20 on light over base-200, 1.37 (three uses). Changing base-content
+   or these opacities moves every number here; rerun the script. */
 /* https://daisyui.com/theme-generator/#theme=eJx9kutuozAQhV8FIa20K5WRPca3vg2BoUElENmgbbvad18HR8WJs_mHmfP5nBnPn3JqTlS-luPwdlzKl7KqXNMNq688jdQusws17uiUlvqBxi78ZyDvKof5I9X74YvSixigvKntN-2Fw-w62mzPH9uPjs7L8SLaTtM8eLqe2nmcXeXbI931EAuHxlPFGQul-X1sjz_D94-CFezXvQgTkdVQKxV0wDgvUFowiBkhUkIAKhMJVaBC0JJnRDtPC03LN1VzMCb6SBF8ZPCpU2qidXHNuKe3oHgE1AXQoG5trkDmZARYFDEfPgKHqZ93tQGOelMbWSCvQXKZqv3atuT9DjCobb0BWhc8zM-gSIHfjZuG6W2fF17EIYqVoGuVSsm5bVOiUAtgV3F4icv96j521iwP3aGMzeon8XNQBbPrK8onbTxyNCL2z2yhOdQ6aymH6vCY0Q3xQW9nN5wa9_mtlwrisoRF2Z5Q3ph4CgZdCtQIUvJtdioMzyAIYVOkCWNIAoU9t8JuessLISRwzR8kyjqxHITGuMf8WbR8Lw3EhEzg_xPmo-NgTRydMGnSjvpmHYNwcSu9lGdHPTkfrN_L174ZPf39B95wXy4 */
 @plugin "daisyui/theme" {
   name: 'light';
