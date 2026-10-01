@@ -1142,7 +1142,24 @@ Debugging methodology that this codebase has already paid for:
 
 ## Bench facts
 
-- Device: 192.168.1.121 on the bench, UART on COM3.
+- Device: 192.168.1.121 on the bench, UART on COM3 when its USB is on this
+  PC; on 2026-10-01 no COM port existed and the only way in was over the
+  air. The idf5 production and loadtest builds have only the GitHub release
+  OTA (`req:ota-settings` with `update: true` and a `channel`, then
+  `req:ota-start` with `cp: display`, against `RELEASE_URL` on the fork);
+  the local-image route `POST /api/ota/dev?url=` exists only on anims/astra
+  builds (gm-thg). The stored pixel-clock divider is 6 now, not 8.
+- **The bench board is BLE-linked to a real controller (GaggiMate Pro Rev
+  1.1), so a display command reaches a real pump and heater.** On
+  2026-10-01 a scripted settings run (`/api/debug/tap`) kept tapping after
+  the settings cover had closed under it, the taps landed on the brew
+  screen's start control, and the pump ran for about 65 minutes until the
+  owner cut the power (gm-warz). Before any injected tap or any bench
+  build on this board, check `ble_connected` on `/api/debug/wifi` (bench
+  builds) or the controller version in `res:ota-settings`, and treat a
+  linked controller as a reason to stop. The loadtest build's synthetic
+  brew cycle fires only recording and UI events and does not drive the
+  pump; the taps did.
 - Windows tooling runs Python 3.10 (`GM_RIG_PY` env var to override):
   Python313 silently lacks esptool and pyserial.
 - Camera verification: `C:\work\camshots\grab.bat <file>` (one frame),
