@@ -353,6 +353,10 @@ export const BG_ANIMATIONS = [
       { key: 'size', label: 'Size', def: 70 },
       { key: 'phase', label: 'Phase range', def: 40 },
       { key: 'contrast', label: 'Contrast', def: 40 },
+      { key: 'softness', label: 'Edge softness', def: 50 },
+      { key: 'background', label: 'Background', def: 50 },
+      { key: 'gradient', label: 'Gradient', def: 50 },
+      { key: 'breath', label: 'Breath', def: 50 },
     ],
   },
   {

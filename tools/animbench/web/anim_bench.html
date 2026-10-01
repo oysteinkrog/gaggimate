@@ -3495,7 +3495,11 @@ function bayerOffsets(dithOff, amp, unit) {
       { key: 'speed', label: 'Speed', def: 50 },
       { key: 'size', label: 'Size', def: 70 },
       { key: 'phase', label: 'Phase range', def: 40 },
-      { key: 'contrast', label: 'Contrast', def: 40 }],
+      { key: 'contrast', label: 'Contrast', def: 40 },
+      { key: 'softness', label: 'Edge softness', def: 50 },
+      { key: 'background', label: 'Background', def: 50 },
+      { key: 'gradient', label: 'Gradient', def: 50 },
+      { key: 'breath', label: 'Breath', def: 50 }],
     init(w, h, state) {
       state.radCol = new Int32Array(w);
       state.radColPh = new Int32Array(8 * w);
@@ -3505,6 +3509,7 @@ function bayerOffsets(dithOff, amp, unit) {
       state.pal = null;
       state.dith = new Int16Array(64);
       state.key = null; state.discR = 0; state.invK = 1;
+      state.bgHiQ4 = BG_HI * 16; state.breath = 150;
     },
     render(data, w, h, tMs, p, state) {
       const t = tMs >>> 0;
@@ -3514,14 +3519,21 @@ function bayerOffsets(dithOff, amp, unit) {
         state.key = key;
         state.pal = themeRamp(256);
         bayerOffsets(state.dith, ditherAmpJS(state.pal, 256) * 0.6, 16);
+        // The four sliders added for gm-3vj.25, mirroring AnimCrescent.cpp:
+        // each gives back the constant it replaces at its default of 50
+        // (edge 26 px, background 26, lift 9, pulse 150 in Q4).
+        const softPx = p[4] <= 50 ? 8 + Math.trunc(p[4] * 18 / 50) : SOFT_PX + Math.trunc((p[4] - 50) * 34 / 50);
+        state.bgHiQ4 = 16 * (p[5] <= 50 ? 14 + Math.trunc(p[5] * 12 / 50) : BG_HI + Math.trunc((p[5] - 50) * 34 / 50));
+        const lift = p[6] <= 50 ? Math.trunc(p[6] * 9 / 50) : 9 + Math.trunc((p[6] - 50) * 31 / 50);
+        state.breath = p[7] <= 50 ? Math.trunc(p[7] * 150 / 50) : 150 + Math.trunc((p[7] - 50) * 250 / 50);
         const rMax = cx < cy ? cx : cy;
         let discR = Math.trunc(rMax * (65 + Math.trunc(p[1] * 32 / 100)) / 100);
         if (discR < 16) discR = 16;
         state.discR = discR;
         // The soft band is SOFT_PX wide measured across the edge; in squared
         // distance that is 2 * R * SOFT_PX, and the reciprocal is taken once.
-        state.invK = Math.trunc(65536 * 256 / (2 * discR * SOFT_PX));
-        const outer = discR + SOFT_PX, outer2 = outer * outer;
+        state.invK = Math.trunc(65536 * 256 / (2 * discR * softPx));
+        const outer = discR + softPx, outer2 = outer * outer;
         const R = rMax - 1, R2 = R * R > 0 ? R * R : 1;
         for (let x = 0; x < w; x++) {
           const dx = x - cx;
@@ -3534,7 +3546,7 @@ function bayerOffsets(dithOff, amp, unit) {
         for (let y = 0; y < h; y++) {
           const dy = y - cy;
           state.radRow[y] = Math.trunc(dy * dy * 4080 / R2);
-          state.bgRow[y] = Math.trunc(y * 9 * 16 / (h > 1 ? h - 1 : 1));
+          state.bgRow[y] = Math.trunc(y * lift * 16 / (h > 1 ? h - 1 : 1));
           const inside = outer2 - dy * dy;
           state.spanPx[y] = inside > 0 ? Math.floor(Math.sqrt(inside)) : -1;
         }
@@ -3559,7 +3571,8 @@ function bayerOffsets(dithOff, amp, unit) {
       const icx16 = (cx << 4) + ((d * SIN[(angIdx + 256) & (SIN_N - 1)]) >> 5);
       const icy16 = (cy << 4) + ((d * SIN[angIdx]) >> 5);
       const bodyBase = (BODY_LO + Math.trunc(p[3] * 46 / 100)) * 16 +
-        ((SIN[phBr & (SIN_N - 1)] * 150) >> 9);
+        ((SIN[phBr & (SIN_N - 1)] * state.breath) >> 9);
+      const bgHiQ4 = state.bgHiQ4;
       const { radColPh, radRow, bgRow, spanPx, pal } = state;
       let o = 0;
       for (let y = 0; y < h; y++) {
@@ -3574,7 +3587,7 @@ function bayerOffsets(dithOff, amp, unit) {
         }
         for (let x = 0; x < w; x++) {
           const rad = radColPh[cb + x] + rr;
-          const bg = BG_HI * 16 + bgr - ((rad * BGF) >> 8);
+          const bg = bgHiQ4 + bgr - ((rad * BGF) >> 8);
           let idx;
           if (x < a || x >= b) idx = bg >> 4;
           else {

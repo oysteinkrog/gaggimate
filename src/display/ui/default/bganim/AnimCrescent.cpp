@@ -29,10 +29,12 @@ namespace {
 using namespace bganim;
 constexpr int BODY_LO = 74;
 constexpr int LIMB = 78; // radial body gain /256
-constexpr int BG_HI = 26; // background theme position before vignette
+constexpr int BG_HI = 26; // background theme position before vignette, at Background 50
 constexpr int BGF = 20; // radial background loss /256
 constexpr int FLOOR = 3; // darkest theme position
-constexpr int SOFT_PX = 26; // squared-distance edge width = 2*R*SOFT_PX
+constexpr int SOFT_PX = 26; // squared-distance edge width = 2*R*SOFT_PX, at Edge softness 50
+constexpr int LIFT = 9; // palette positions of vertical lift, at Gradient 50
+constexpr int BREATH = 150; // Q4 body pulse amplitude, at Breath 50
 constexpr int RAD_SCALE = 4080; // 255 palette positions in Q4
 constexpr int PAL_PAD = 32, PAL_N = PAL_PAD + 320;
 int32_t *radCol = nullptr, *radRow = nullptr;
@@ -45,9 +47,13 @@ const int16_t *sine = nullptr; // borrowed shared table
 int allocW = 0, allocH = 0;
 int discR = 0, invK = 1, icx16 = 0, icy16 = 0, bodyBase = 0;
 int qaThr = 0, qzThr = 0;
+// Set from p[4]..p[7] when the tables are rebuilt (gm-3vj.25). At their
+// defaults of 50 they are the constants above, so the default picture is
+// the old one bit for bit.
+int softPx = SOFT_PX, bgHiQ4 = BG_HI * 16, breathAmp = BREATH;
 bool tablesValid = false, laneSafe = false;
 uint32_t lastThemeGen = 0xFFFFFFFF;
-uint8_t lastP[4] = {255, 255, 255, 255};
+uint8_t lastP[BG_ANIM_PARAMS] = {255, 255, 255, 255, 255, 255, 255, 255};
 
 // At 480x480 the per-pixel tables take 8,784 B of the resident 9,216 B slab
 // (8,770 B of payload, the rest alignment): radCol 1,920 B, radRow 1,920 B,
@@ -138,7 +144,7 @@ bool init(int w, int h) {
 void frame(uint32_t tMs, int w, int h, const uint8_t p[BG_ANIM_PARAMS]) {
     const int cx = w / 2, cy = h / 2;
     const uint32_t gen = themeGen();
-    if (!tablesValid || gen != lastThemeGen || memcmp(p, lastP, 4) != 0) {
+    if (!tablesValid || gen != lastThemeGen || memcmp(p, lastP, BG_ANIM_PARAMS) != 0) {
         uint16_t ramp[256];
         buildThemeRamp(ramp, 256);
         // Page: 0.6*ditherAmp, rounded in Q4, then *4 in squared radius.
@@ -149,11 +155,28 @@ void frame(uint32_t tMs, int w, int h, const uint8_t p[BG_ANIM_PARAMS]) {
             dith[k] = static_cast<int16_t>(lroundf((BAYER8[k] - 31.5f) * (amp * 16.0f / 31.5f)));
         for (int i = -PAL_PAD; i < FLOOR; ++i) palette[i] = palette[FLOOR];
         for (int i = 256; i < 320; ++i) palette[i] = palette[255];
+        // The four sliders added for gm-3vj.25. Each is piecewise linear with
+        // the old constant at 50, and none of them reaches the pixel loops:
+        // they move invK, the run tables, bgRow, a row base and the per-frame
+        // body pulse, which band() and bandRef() both read.
+        //   Edge softness  width of both soft edges in pixels: 8 at 0 (a
+        //                  crisp silhouette), 26 at 50, 60 at 100.
+        //   Background     background theme position before the vignette:
+        //                  14 at 0, 26 at 50, 60 at 100.
+        //   Gradient       vertical lift from top to bottom in palette
+        //                  positions: flat at 0, 9 at 50, 40 at 100.
+        //   Breath         the body's slow brightness pulse in Q4: none at
+        //                  0, 150 at 50, 400 at 100.
+        const int p4 = p[4], p5 = p[5], p6 = p[6], p7 = p[7];
+        softPx = p4 <= 50 ? 8 + p4 * 18 / 50 : SOFT_PX + (p4 - 50) * 34 / 50;
+        bgHiQ4 = 16 * (p5 <= 50 ? 14 + p5 * 12 / 50 : BG_HI + (p5 - 50) * 34 / 50);
+        const int lift = p6 <= 50 ? p6 * LIFT / 50 : LIFT + (p6 - 50) * 31 / 50;
+        breathAmp = p7 <= 50 ? p7 * BREATH / 50 : BREATH + (p7 - 50) * 250 / 50;
         const int rMax = cx < cy ? cx : cy;
         // Page size: 65..97 percent of half-panel radius, minimum 16 px.
         discR = rMax * (65 + static_cast<int>(p[1]) * 32 / 100) / 100;
         if (discR < 16) discR = 16;
-        invK = 65536 * 256 / (2 * discR * SOFT_PX);
+        invK = 65536 * 256 / (2 * discR * softPx);
         // Exact thresholds on the coverage numerators. The kernel computes
         // u = 128 + ((q * invK) >> 16) and clamps it to [0,256], so u is 256
         // exactly when q >= ceil(8388608/invK) and 0 exactly when
@@ -161,7 +184,7 @@ void frame(uint32_t tMs, int w, int h, const uint8_t p[BG_ANIM_PARAMS]) {
         // is what lets band() fill instead of compute.
         qaThr = (8388608 + invK - 1) / invK;
         qzThr = -((8323073 + invK - 1) / invK);
-        const int outer = discR + SOFT_PX;
+        const int outer = discR + softPx;
         // Vignette radius is one pixel inside half the panel, as on the page.
         const int R = rMax - 1, R2 = R * R > 0 ? R * R : 1;
         int maxCol = 0, maxRow = 0;
@@ -174,8 +197,9 @@ void frame(uint32_t tMs, int w, int h, const uint8_t p[BG_ANIM_PARAMS]) {
             const int dy = y - cy;
             radRow[y] = dy * dy * RAD_SCALE / R2;
             if (radRow[y] > maxRow) maxRow = radRow[y];
-            // Nine palette positions of vertical lift, carried in Q4.
-            bgRow[y] = static_cast<int16_t>(y * 9 * 16 / (h > 1 ? h - 1 : 1));
+            // lift palette positions of vertical lift (nine by default),
+            // carried in Q4.
+            bgRow[y] = static_cast<int16_t>(y * lift * 16 / (h > 1 ? h - 1 : 1));
             const int inside = outer * outer - dy * dy;
             spanPx[y] = static_cast<int16_t>(inside > 0 ? static_cast<int>(sqrtf(static_cast<float>(inside))) : -1);
             // uo > 0 while dx*dx < sNz, uo == 256 while dx*dx <= s256.
@@ -187,9 +211,45 @@ void frame(uint32_t tMs, int w, int h, const uint8_t p[BG_ANIM_PARAMS]) {
         // All supported square panels (233/240/466/480) satisfy this bound.
         // Unusual aspect ratios use the portable path if signed PIE lanes or
         // the padded palette would not suffice. Max dither is round(16*.6*16)*4=616.
-        laneSafe = maxCol + maxRow + 616 <= 9216;
+        //
+        // The shade kernel indexes the padded palette without a clamp, so the
+        // Q4 blend v must stay in [-PAL_PAD*16, (PAL_N-PAL_PAD)*16-1]. v lies
+        // between bg and body, and body only counts where the coverage is
+        // non-zero, inside the outer span, so its bound uses the largest rad
+        // inside the span. With every parameter at its default the bound
+        // holds on all four panels; it can fail only at slider extremes
+        // (Background low, Breath and Contrast high, a large soft disc), and
+        // then band() takes bandRef, which clamps, so the picture is the
+        // same and only the speed changes.
+        int dLo = 0, dHi = 0;
+        for (int k = 0; k < 64; ++k) {
+            const int d4 = dith[k] * 4;
+            if (d4 < dLo) dLo = d4;
+            if (d4 > dHi) dHi = d4;
+        }
+        int radInHi = dLo;
+        for (int y = 0; y < h; ++y) {
+            const int span = spanPx[y];
+            if (span < 0) continue;
+            int a = cx - span, b = cx + span + 1;
+            if (a < 0) a = 0;
+            if (b > w) b = w;
+            if (a >= b) continue;
+            const int c = radCol[a] > radCol[b - 1] ? radCol[a] : radCol[b - 1];
+            if (radRow[y] + c + dHi > radInHi) radInHi = radRow[y] + c + dHi;
+        }
+        const int radHi = maxCol + maxRow + dHi;
+        const int bodyMid = (BODY_LO + static_cast<int>(p[3]) * 46 / 100) * 16;
+        const int bgLo = bgHiQ4 - ((radHi * BGF) >> 8);
+        const int bgHi = bgHiQ4 + bgRow[h - 1] + ((-dLo * BGF + 255) >> 8);
+        const int bodyLo = bodyMid - breathAmp + ((dLo * LIMB) >> 8);
+        const int bodyHi = bodyMid + breathAmp + ((radInHi * LIMB) >> 8);
+        const int vLo = (bgLo < bodyLo ? bgLo : bodyLo) - 1;
+        const int vHi = (bgHi > bodyHi ? bgHi : bodyHi) + 1;
+        laneSafe = maxCol + maxRow + 616 <= 9216 && vLo >= -PAL_PAD * 16 &&
+                   vHi <= (PAL_N - PAL_PAD) * 16 - 1;
         lastThemeGen = gen;
-        memcpy(lastP, p, 4);
+        memcpy(lastP, p, BG_ANIM_PARAMS);
         tablesValid = true;
     }
     // Use the actual page clocks. Its prose says about 13/16.5 seconds, but
@@ -221,9 +281,10 @@ void frame(uint32_t tMs, int w, int h, const uint8_t p[BG_ANIM_PARAMS]) {
     const int d = dMin + (((dMax - dMin) * swell) >> 10);
     icx16 = cx * 16 + ((d * sine[(angIdx + 256) & (SIN_N - 1)]) >> 5);
     icy16 = cy * 16 + ((d * sine[angIdx]) >> 5);
-    // Contrast sets 74..120 palette positions, with a +-150 Q4 pulse.
+    // Contrast sets 74..120 palette positions, with a +-breathAmp Q4 pulse
+    // (150 at the default Breath).
     bodyBase = (BODY_LO + static_cast<int>(p[3]) * 46 / 100) * 16 +
-               ((sine[phBr & (SIN_N - 1)] * 150) >> 9);
+               ((sine[phBr & (SIN_N - 1)] * breathAmp) >> 9);
     // Where the cut circle's soft edge falls on each row, in whole pixels.
     // band() reads four numbers a row instead of taking two square roots, and
     // sqrtf is a library call from flash that cost 156 cycles each. Walking
@@ -327,7 +388,7 @@ GM_ANIM_IRAM void bandRef(uint16_t *__restrict dst, int y0, int rows, int w, uin
         crescentWeightsRef(weights + a, r2 - dx * dx - dy * dy, -2 * dx - 1,
                            dxi * dxi + dyi * dyi, 32 * dxi + 256, r2, invK, smooth, b - a);
         const int16_t *off = dith + (y & 7) * 8;
-        const int rr = radRow[y], bgBase = BG_HI * 16 + bgRow[y], litBase = bodyBase;
+        const int rr = radRow[y], bgBase = bgHiQ4 + bgRow[y], litBase = bodyBase;
         for (int x = 0; x < w; ++x) {
             const int rad = radCol[x] + off[x & 7] * 4 + rr;
             // Unsigned products preserve JS ToInt32 even on tiny rectangular
@@ -351,8 +412,9 @@ GM_ANIM_IRAM void bandRef(uint16_t *__restrict dst, int y0, int rows, int w, uin
 // The loop is 22 instructions/pixel versus GCC's 27. With two MULLs at the
 // brief's nominal two cycles, estimate 24 cycles/pixel plus memory and fetch.
 // Both smoothstep gathers have independent work before their consumers.
-// Full panel/parameter bounds: R=75..232, invK=1390..4301 on the four panel
-// sizes; cut squares and reciprocal products stay in signed 32-bit range.
+// Full panel/parameter bounds: R=75..232, edge 8..60 px, invK=602..13981 on
+// the four panel sizes. The cut product is at most (3R^2+4Rs+s^2)*invK, under
+// 7.7e8, so cut squares and reciprocal products stay in signed 32-bit range.
 GM_ANIM_IRAM __attribute__((noinline)) void crescentWeightsAsm(uint16_t *out, int qOuter, int dOuter,
                                                                int qCut, int dCut, int r2, int inv,
                                                                const uint16_t *sm, int n) {
@@ -409,10 +471,14 @@ GM_ANIM_IRAM __attribute__((noinline)) void crescentWeightsAsm(uint16_t *out, in
 // no unfilled dependency gaps. PIE multiplier resource timing and PSRAM
 // output traffic still need device timing; host speed is not that evidence.
 //
-// rad in [-616,9216], bgBase in [416,560], bodyBase in [1034,2070], weight
-// in [0,256]: bg in [-304,609], body in [846,4878], the Q4 blend in [-304,4878].
-// Thus idx in [-19,304], covered by palette[-32..319]. No signed saturation
-// occurs. Padding repeats palette[3] below 3 and palette[255] above 255.
+// At the default parameters: rad in [-616,9216], bgBase in [416,560],
+// bodyBase in [1034,2070], weight in [0,256]: bg in [-304,609], body in
+// [846,4878], the Q4 blend in [-304,4878]. Thus idx in [-19,304], covered by
+// palette[-32..319]. No signed saturation occurs. Padding repeats palette[3]
+// below 3 and palette[255] above 255. The Background, Gradient and Breath
+// sliders move bgBase and bodyBase; frame() proves the blend stays inside the
+// padding for the current settings (laneSafe) and band() takes bandRef when
+// it does not.
 GM_ANIM_IRAM __attribute__((noinline)) void crescentShadeAsm(uint16_t *out, const int32_t *col,
                                                              const uint16_t *weight, const int16_t *rowRad,
                                                              const uint32_t *pal, int bgBase, int body,
@@ -726,10 +792,10 @@ GM_ANIM_IRAM void band(uint16_t *dst, int y0, int rows, int w, uint32_t tMs, con
         for (int k = 0; k < 8; ++k)
             rowRad[k] = static_cast<int16_t>(radRow[y] + dith[(y & 7) * 8 + k] * 4);
         crescentShadeAsm(dst + row * w, radCol, weights, rowRad, palette,
-                         BG_HI * 16 + bgRow[y], bodyBase, w);
+                         bgHiQ4 + bgRow[y], bodyBase, w);
 #else
         const int16_t *off = dith + (y & 7) * 8;
-        const int rr = radRow[y], bgBase = BG_HI * 16 + bgRow[y], litBase = bodyBase;
+        const int rr = radRow[y], bgBase = bgHiQ4 + bgRow[y], litBase = bodyBase;
         for (int x = 0; x < w; ++x) {
             const int rad = radCol[x] + off[x & 7] * 4 + rr;
             const int bg = bgBase - (static_cast<int32_t>(static_cast<uint32_t>(rad) * BGF) >> 8);
@@ -766,7 +832,8 @@ void release() {
     invK = 1;
     tablesValid = laneSafe = false;
     lastThemeGen = 0xFFFFFFFF;
-    lastP[0] = lastP[1] = lastP[2] = lastP[3] = 255;
+    memset(lastP, 255, sizeof(lastP));
+    softPx = SOFT_PX; bgHiQ4 = BG_HI * 16; breathAmp = BREATH;
 }
 } // namespace
 
@@ -774,7 +841,9 @@ extern const BgAnimation bg_anim_crescent;
 const BgAnimation bg_anim_crescent = {
     "crescent", "Crescent",
     {{"speed", "Speed", 50}, {"size", "Size", 70},
-     {"phase", "Phase range", 40}, {"contrast", "Contrast", 40}},
+     {"phase", "Phase range", 40}, {"contrast", "Contrast", 40},
+     {"softness", "Edge softness", 50}, {"background", "Background", 50},
+     {"gradient", "Gradient", 50}, {"breath", "Breath", 50}},
     init, frame, band, release, bandRef,
 };
 #endif // GAGGIMATE_SIM
