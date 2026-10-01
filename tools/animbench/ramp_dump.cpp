@@ -61,6 +61,12 @@ int main() {
         }
         // The same conversion DefaultUI applies on every UI pass.
         bganim::setThemeTone(brightPct * 256 / 100, kneePct * 255 / 100);
+        // The shape every animation's frame() has: themeGen() releases the
+        // theme held by the previous reads and adopts the newest publish, so
+        // the build below reads this case's stops and not the first case's
+        // (BgAnimCommon.cpp, the held-generation rule; without this call the
+        // dump read one stale theme for all 5,184 cases after the merge).
+        (void)bganim::themeGen();
         uint16_t ramp[256];
         if (strcmp(mode, "wheel") == 0) {
             bganim::buildThemeWheel(ramp, static_cast<uint16_t>(gain));

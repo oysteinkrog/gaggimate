@@ -90,6 +90,10 @@ void firmwareRamp(const settingsui::SwatchGradient &source, const Tone &tone, ui
     }
     // The conversion DefaultUI::updateState applies before calling it.
     bganim::setThemeTone(tone.brightnessPct * 256 / 100, tone.kneePct * 255 / 100);
+    // As frame() does: release the theme the previous reads held and adopt
+    // this publish before building (the held-generation rule in
+    // BgAnimCommon.cpp).
+    (void)bganim::themeGen();
     bganim::buildThemeRamp(out, 256, false); // gain 256: no animation's extra gain
 }
 
@@ -248,6 +252,10 @@ int main() {
         settingsui::swatchFromThemeStops(bg_theme_stops(0), active);
         bganim::setThemeStops(active.stops, active.count);
         bganim::setThemeTone(100 * 256 / 100, 100 * 255 / 100);
+        // Two calls: the first adopts the publish above and, because reads
+        // were held across it, reports the "rebuild now" sentinel rather than
+        // a generation; the second reports the settled generation.
+        (void)bganim::themeGen();
         const uint32_t genBefore = bganim::themeGen();
         uint8_t stopsBefore[BG_THEME_MAX_STOPS][3];
         std::memcpy(stopsBefore, bganim::themeStops(), sizeof(stopsBefore));
