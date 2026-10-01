@@ -161,6 +161,15 @@ in its category. And its ranking predicts a reader only over the crowded end:
 above roughly the closest hundred pairs of the full table, the order stops
 meaning anything about what a person can tell apart.
 
+gm-2tqj decided what to do about the two entries every reader flagged on
+category fit: Abyss (id 29, Water and Ice), which reads as violet and which
+three of four readers would put in Night Sky instead, and Flat White (id 22,
+Coffee), whose dark end reads as green grey rather than coffee, a genuine
+split among readers. On 2026-10-01 the owner accepted the set as it stands:
+neither entry is re-searched, neither id moves, and this paragraph is the
+record that the call was made with the category-fit limit above already
+known, not overlooked.
+
 
 THE FROZEN ORIGINALS
 ====================
