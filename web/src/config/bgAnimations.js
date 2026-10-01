@@ -822,6 +822,41 @@ export function toneColor(hex, brightnessPct, kneePct) {
 }
 
 // CSS gradient for a stop list (optionally toned), for preview bars.
+//
+// It draws the read-only editor bar, the global gradient strip, the "On the
+// panel" toned bar and the browse dialog's swatches. The bar of an editable
+// gradient is drawn by react-linear-gradient-picker itself, also by the
+// browser. The browser interpolates the stops linearly in sRGB, which is not
+// the panel's arithmetic: the firmware builds a 256-entry RGB565 ramp with
+// integer steps, and config/gradientRamp.js reproduces that exactly
+// (tools/animbench/web/ramp_parity.js holds it to the C++).
+//
+// Decision (gm-ryny, 2026-10-01): the difference is accepted and the web keeps
+// drawing gradients the browser's way. Measured with
+// tools/gradient_web_vs_fw.mjs --all-tones (60 built-ins, eight tone settings),
+// per channel in 8-bit units:
+//   - Arithmetic alone (CSS against the firmware's colour before RGB565): at
+//     most 5, on Neon Amber at entry 218 of 256 with no tone, and at most
+//     dE 2.3 (CIE76, about one just-noticeable difference) on any gradient.
+//   - What a user comparing the web with the machine sees (CSS against the
+//     RGB565 entry the panel shows): at most 10, worst dE 7.8. Almost all of
+//     that is the panel's 16-bit colour, which truncates red and blue by up
+//     to 7 and green by up to 3, and it is largest in the dark end of a ramp.
+// The arithmetic gap is not visible at the sizes the web draws: the bar is at
+// least 240 px wide and a swatch about 170, so one ramp entry is about one
+// pixel and the gap is a shift of at most 5 levels over a few pixels. The
+// RGB565 part is the panel's own colour depth; the web could copy it, but a
+// phone or monitor next to the machine differs from the panel's gamma and
+// white point by more than that.
+//
+// The alternative was to draw the bar, the swatches and the toned preview
+// from gradientRamp.js (256 sampled entries, RGB565 expanded), so the page
+// shows the panel's stored colours exactly. It was not taken: the editable
+// bar belongs to the picker library and would stay browser-drawn, so the
+// editor would show two arithmetics for one gradient; and it removes a gap
+// nobody can see at these sizes. wheelCss() below follows the same decision
+// and was not measured. ramp_parity.js keeps guarding gradientRamp.js, which
+// the gradient tools sample through; it guards nothing this function draws.
 export function gradientCss(stops, tone) {
   const parts = stops.map(s => {
     const color = tone ? toneColor(s.color, tone.brightness, tone.knee) : s.color;
