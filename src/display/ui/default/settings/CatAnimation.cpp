@@ -125,7 +125,7 @@ constexpr SimAnim kSimAnims[] = {
     {"Barrel", {{"speed", "Speed", 50}, {"bands", "Bands", 14}, {"shade", "Cylinder shade", 62}, {"tilt", "Band tilt", 50}, {"width", "Barrel width", 50}, {"edge", "Edge fade", 50}, {"light", "Light angle", 50}, {"depth", "Band depth", 50}}},
     {"Grid", {{"speed", "Speed", 50}, {"density", "Grid density", 50}, {"lines", "Line strength", 58}, {"width", "Line width", 50}, {"cross", "Cross lines", 50}, {"reach", "Grid reach", 50}, {"shade", "Floor shade", 50}, {"drift", "Side drift", 50}}},
     {"Cells", {{"speed", "Speed", 50}, {"width", "Channel width", 55}, {"depth", "Contrast", 60}, {"count", "Cell count", 42}, {"halo", "Halo width", 40}, {"tilt", "Drift tilt", 50}, {"grain", "Grain", 50}, {"glow", "Glow", 50}}},
-    {"Dimples", {{"speed", "Speed", 50}, {"relief", "Relief", 58}, {"bright", "Brightness", 62}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}, {nullptr, nullptr, 0}}},
+    {"Dimples", {{"speed", "Speed", 50}, {"relief", "Relief", 58}, {"bright", "Brightness", 62}, {"height", "Light height", 50}, {"swing", "Height swing", 50}, {"tone", "Base tone", 50}, {"contrast", "Contrast", 50}, {"orbit", "Orbit shape", 50}}},
     {"Cube", {{"speed", "Speed", 50}, {"size", "Cube size", 50}, {"glow", "Face glow", 55}, {"tilt", "Tilt", 50}, {"wobble", "Wobble", 50}, {"edge", "Edge softness", 50}, {"backs", "Back faces", 50}, {"background", "Background", 50}}},
 };
 

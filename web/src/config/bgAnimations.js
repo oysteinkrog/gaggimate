@@ -643,6 +643,11 @@ export const BG_ANIMATIONS = [
       { key: 'speed', label: 'Speed', def: 50 },
       { key: 'relief', label: 'Relief', def: 58 },
       { key: 'bright', label: 'Brightness', def: 62 },
+      { key: 'height', label: 'Light height', def: 50 },
+      { key: 'swing', label: 'Height swing', def: 50 },
+      { key: 'tone', label: 'Base tone', def: 50 },
+      { key: 'contrast', label: 'Contrast', def: 50 },
+      { key: 'orbit', label: 'Orbit shape', def: 50 },
     ],
   },
   {
