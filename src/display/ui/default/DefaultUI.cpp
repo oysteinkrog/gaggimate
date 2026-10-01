@@ -188,7 +188,12 @@ void DefaultUI::reloadProfiles() { profileLoaded = 0; }
 
 void DefaultUI::setBrightness(int brightness) {
     // The Display category's tests read this line on both the device and the
-    // simulator (neither has a way to sample backlight PWM directly).
+    // simulator (neither has a way to sample backlight PWM directly). It logs
+    // unconditionally so a row tap, a web save and a reconcile-driven
+    // re-assert always produce it, even when the value does not change. The
+    // standby dim path below is the one caller that runs every UI pass, so it
+    // gates itself on whether the value actually changed instead of relying
+    // on this function to drop repeats (gm-bzu.25).
     ESP_LOGI("DefaultUI", "Display: brightness %d", brightness);
     if (panelDriver) {
         panelDriver->setBrightness(brightness);
@@ -1948,6 +1953,7 @@ void DefaultUI::init() {
                 changeScreen(SCREEN_ID_BREW_SCREEN);
             } else {
                 standbyEnterTime = ::millis();
+                standbyAppliedBrightness = -1;
             }
         }
         pressureAvailable = controller->getSystemInfo().capabilities.pressure;
@@ -2133,7 +2139,16 @@ void DefaultUI::loop() {
                 const Settings &settings = controller->getSettings();
                 const unsigned long now = millis();
                 if (now - standbyEnterTime >= settings.getStandbyBrightnessTimeout()) {
-                    setBrightness(settings.getStandbyBrightness());
+                    // This runs on every UI pass once the dim timeout has
+                    // passed, so gate the call on the applied value actually
+                    // changing (gm-bzu.25): otherwise every pass logged a
+                    // "Display: brightness" line even though the panel driver
+                    // itself no-ops on a repeat and nothing visible happens.
+                    const int dimBrightness = settings.getStandbyBrightness();
+                    if (standbyAppliedBrightness != dimBrightness) {
+                        setBrightness(dimBrightness);
+                        standbyAppliedBrightness = dimBrightness;
+                    }
                 }
             }
         }
@@ -3432,6 +3447,7 @@ void DefaultUI::handleScreenChange() {
         }
         if (targetScreen == SCREEN_ID_STANDBY_SCREEN) {
             standbyEnterTime = ::millis();
+            standbyAppliedBrightness = -1;
         } else if (currentScreen == SCREEN_ID_STANDBY_SCREEN) {
             const ::Settings &settings = controller->getSettings();
             setBrightness(settings.getMainBrightness());

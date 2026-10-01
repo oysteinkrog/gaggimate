@@ -814,6 +814,11 @@ class DefaultUI {
 
     // Standby brightness control
     unsigned long standbyEnterTime = 0;
+    // The standby brightness value last applied by the per-pass dim check in
+    // loop(), or -1 if none has been applied since standbyEnterTime was last
+    // set. Gates that call so it logs (and calls the panel driver) only on an
+    // actual change instead of every UI pass (gm-bzu.25).
+    int standbyAppliedBrightness = -1;
 
     // Requested screen, or -1: written by changeScreen on any task, taken by
     // applyScreenRequest on the UI task.
