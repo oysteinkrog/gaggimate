@@ -11,8 +11,10 @@
 // the clickable rectangles of the active screen (the hit map, tree order,
 // with a generation), and on a press edge the task hit-tests the point
 // against it and writes the press plate element at once. The plate is
-// cleared on release, on press lost, and when the hit map's generation
-// changes under a held press (a screen change).
+// cleared on release, on press lost, and when a new hit map no longer holds
+// the pressed target with the same box (a screen change, the target moving,
+// resizing or going away). Any other change to the map, such as a label
+// elsewhere on the screen changing size, leaves a held plate alone.
 //
 // The task's stack is PSRAM: it never runs with the flash cache disabled
 // (I2C through the driver, no NVS, no flash), the same rule the render tasks
@@ -65,7 +67,8 @@ bool pollEnabled();
 bool latest(Sample &out);
 // UI task only: the active screen's clickable rectangles in tree order
 // (parents before children, siblings first to last), whether presses get a
-// plate now, and the plate's RGB565 colour. Bumps the generation.
+// plate now, and the plate's RGB565 colour. Bumps the generation when
+// anything differs from the live map.
 void publishHitMap(const HitRect *rects, int n, bool plateOn, uint16_t plateColor565, int outset);
 uint32_t hitMapGeneration();
 int hitMapCount();

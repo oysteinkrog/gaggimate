@@ -156,6 +156,28 @@ bool hitTest(int16_t x, int16_t y, Header &hdr, HitRect &out) {
     return false;
 }
 
+// Whether the live map still holds the held target: a rectangle with the
+// same boxes, and presses still get a plate. The generation the answer is
+// for goes to gen. A map that keeps changing under four reads in a row
+// answers yes and is looked at again on the next poll.
+bool heldStillValid(const HitRect &held, uint32_t &gen) {
+    for (int attempt = 0; attempt < 4; attempt++) {
+        const Header hdr = unpack(s_header.load());
+        const HitRect *map = s_maps[hdr.index];
+        bool found = false;
+        if (map != nullptr && hdr.plateOn) {
+            for (int i = hdr.n - 1; i >= 0 && !found; i--) {
+                found = memcmp(&map[i], &held, sizeof(HitRect)) == 0;
+            }
+        }
+        if (unpack(s_header.load()).gen == hdr.gen) {
+            gen = hdr.gen;
+            return found;
+        }
+    }
+    return true;
+}
+
 void writePlate(const HitRect &r, const Header &hdr, int64_t tUs) {
     SleepAnimation::ElementDesc e;
     e.type = SleepAnimation::ElementType::RoundRect;
@@ -182,6 +204,7 @@ void taskMain(void *) {
     int emptyRun = 0;
     bool plateUp = false;
     uint32_t pressGen = 0;
+    HitRect pressRect{};
     uint32_t seq = 0;
     for (;;) {
         if (!s_pollEnabled.load()) {
@@ -226,9 +249,11 @@ void taskMain(void *) {
         } else {
             emptyRun = 0;
         }
-        if (!pressed && wasPressed) {
+        if (!pressed && wasPressed && !synthetic) {
             // Keep the release at the last pressed point, as touchpad_read
-            // did with its static x/y.
+            // did with its static x/y. An injected release keeps its own
+            // point: a scripted drag ends at (x2, y2) (TouchInject.h), and
+            // Rig.swipe relies on that.
             x = s_sample.x;
             y = s_sample.y;
         }
@@ -255,6 +280,7 @@ void taskMain(void *) {
                     writePlate(r, hdr, now);
                     plateUp = true;
                     pressGen = hdr.gen;
+                    pressRect = r;
 #ifdef GM_TOUCH_PROBE
                     g_probeElemEdgeUs = now;
 #endif
@@ -264,10 +290,15 @@ void taskMain(void *) {
                 plateUp = false;
             }
         } else if (pressed && plateUp) {
-            // A screen change under the finger: the plate's object is gone.
+            // The map changed under the finger. The plate stays while its
+            // own target is still there with the same box; a screen change,
+            // or the target moving, resizing or going away, clears it. An
+            // unrelated change (a label elsewhere resizing) does not.
             if (unpack(s_header.load()).gen != pressGen) {
-                s_anim->clearElement(s_plateElement);
-                plateUp = false;
+                if (!heldStillValid(pressRect, pressGen)) {
+                    s_anim->clearElement(s_plateElement);
+                    plateUp = false;
+                }
             }
         }
         vTaskDelay(pdMS_TO_TICKS(kPeriodMs));
@@ -356,10 +387,8 @@ void publishHitMap(const HitRect *rects, int n, bool plateOn, uint16_t plateColo
         n = 0;
     }
     Header hdr = unpack(s_header.load());
-    // The generation is how the task tells a screen change from the same
-    // screen republished: it clears a held plate when the generation moves
-    // under the finger. So an unchanged map must keep its generation, or the
-    // plate would be cleared by the next UI pass, about 25 ms after a press.
+    // An unchanged map keeps its generation, so the task looks up its held
+    // target again only when something actually changed.
     const uint8_t outsetClamped = static_cast<uint8_t>(outset < 0 ? 0 : (outset > 63 ? 63 : outset));
     if (hdr.gen != 0 && hdr.n == n && hdr.plateOn == (plateOn ? 1 : 0) && hdr.color == plateColor565 &&
         hdr.outset == outsetClamped &&
