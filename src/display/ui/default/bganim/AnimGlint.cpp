@@ -68,6 +68,7 @@ const int16_t *sine = nullptr; // borrowed shared 1,024-entry, +/-512 sine table
 int allocW = 0;
 int allocH = 0;
 uint32_t lastThemeGen = 0;
+int lastCore = -1; // Core (p[7]) the profile was built with
 bool tablesValid = false;
 
 void release();
@@ -116,7 +117,7 @@ bool init(int w, int h) {
     return true;
 }
 
-void rebuildTheme() {
+void rebuildTheme(int coreP) {
     buildThemeRamp(ramp, 256);
     for (int i = 0; i < 256; i++) {
         palette[i] = ramp[BG_LO + i * (BG_HI - BG_LO) / 255];
@@ -145,7 +146,12 @@ void rebuildTheme() {
             // 768 = 3*256: tri^2*(3-2*tri) in the page's Q8 smoothstep.
             const int sm = (tri * tri * (768 - 2 * tri)) >> 16;
             // These separate truncations and weights are the approved mix.
-            int v = ((sm * 160) >> 8) + ((bloom * 80) >> 8) + ((core * 30) >> 8);
+            // Core (p[7]) weights the eighth-power core: 0 at 0, the
+            // approved 30 at 50, 60 at 100. The sum can then pass 255, and
+            // the clamp below keeps every entry, and so scaledProf's bound,
+            // where it was.
+            const int coreW = 30 * coreP / 50;
+            int v = ((sm * 160) >> 8) + ((bloom * 80) >> 8) + ((core * coreW) >> 8);
             v += floorShift(dith[ph * 8 + (i & 7)], 4);
             dst[i] = static_cast<uint8_t>(v < 0 ? 0 : (v > 255 ? 255 : v));
         }
@@ -156,9 +162,11 @@ void rebuildTheme() {
 
 void frame(uint32_t tMs, int w, int h, const uint8_t p[BG_ANIM_PARAMS]) {
     const uint32_t gen = themeGen();
-    if (!tablesValid || gen != lastThemeGen) {
-        rebuildTheme();
+    const int coreP = p[7];
+    if (!tablesValid || gen != lastThemeGen || coreP != lastCore) {
+        rebuildTheme(coreP);
         lastThemeGen = gen;
+        lastCore = coreP;
     }
     const int cy = h / 2;
     const int halfH = h > 2 ? h / 2 : 1;
@@ -209,9 +217,16 @@ void frame(uint32_t tMs, int w, int h, const uint8_t p[BG_ANIM_PARAMS]) {
                         (236 + floorShift(sine[phPulse & (SIN_N - 1)] * 40, 9))) >> 8;
     // Integer division before *16 matches the JS bitwise conversion of
     // (w*percentage/100)<<4. Sweep reaches about 44.1 px/s at 480, sp=8.
-    const int sweepQ4 = w * 8 + floorShift(sine[phSweep & (SIN_N - 1)] * ((w * 24 / 100) * 16), 9);
-    const int tiltQ4 = floorShift(sine[phTilt & (SIN_N - 1)] * ((w * 34 / 100) * 16), 9);
-    const int bowQ4 = ((512 + sine[phBow & (SIN_N - 1)]) * ((w * 16 / 100) * 16)) >> 10;
+    // Sweep (p[4]), Tilt (p[5]) and Bow (p[6]) scale the swing, the tilt and
+    // the bow from none at 0 through the old 24, 34 and 16 percent of w at
+    // 50 to twice that at 100. The geometry below already clips any centre,
+    // so a wider swing only moves which rows are empty.
+    const int sweepPct = static_cast<int>(p[4]) * 24 / 50;
+    const int tiltPct = static_cast<int>(p[5]) * 34 / 50;
+    const int bowPct = static_cast<int>(p[6]) * 16 / 50;
+    const int sweepQ4 = w * 8 + floorShift(sine[phSweep & (SIN_N - 1)] * ((w * sweepPct / 100) * 16), 9);
+    const int tiltQ4 = floorShift(sine[phTilt & (SIN_N - 1)] * ((w * tiltPct / 100) * 16), 9);
+    const int bowQ4 = ((512 + sine[phBow & (SIN_N - 1)]) * ((w * bowPct / 100) * 16)) >> 10;
     const int hwMaxQ4 = hwMax * 16;
 
     for (int y = 0; y < h; y++) {
@@ -556,6 +571,7 @@ void release() {
     sine = nullptr;
     allocW = allocH = 0;
     lastThemeGen = 0;
+    lastCore = -1;
     tablesValid = false;
 }
 
@@ -568,7 +584,11 @@ const BgAnimation bg_anim_glint = {
     {{"speed", "Speed", 50},
      {"length", "Length", 35},
      {"width", "Width", 45},
-     {"brightness", "Brightness", 55}},
+     {"brightness", "Brightness", 55},
+     {"sweep", "Sweep", 50},
+     {"tilt", "Tilt", 50},
+     {"bow", "Bow", 50},
+     {"core", "Core", 50}},
     init,
     frame,
     band,

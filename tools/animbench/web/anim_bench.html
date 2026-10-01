@@ -3637,7 +3637,11 @@ function bayerOffsets(dithOff, amp, unit) {
       { key: 'speed', label: 'Speed', def: 50 },
       { key: 'length', label: 'Length', def: 35 },
       { key: 'width', label: 'Width', def: 45 },
-      { key: 'brightness', label: 'Brightness', def: 55 }],
+      { key: 'brightness', label: 'Brightness', def: 55 },
+      { key: 'sweep', label: 'Sweep', def: 50 },
+      { key: 'tilt', label: 'Tilt', def: 50 },
+      { key: 'bow', label: 'Bow', def: 50 },
+      { key: 'core', label: 'Core', def: 50 }],
     init(w, h, state) {
       state.pal = new Uint8Array(256 * 3);
       state.rowRec = new Int32Array(REC * h);
@@ -3675,7 +3679,9 @@ function bayerOffsets(dithOff, amp, unit) {
             const c1 = (bloom * bloom) >> 8;
             const core = (c1 * c1) >> 8;
             const sm = (tri * tri * (768 - 2 * tri)) >> 16;   // smoothstep, flat at both ends
-            let v = ((sm * 160) >> 8) + ((bloom * 80) >> 8) + ((core * 30) >> 8);
+            // Core (p[7]) weights the core: 30 at 50 (gm-3vj.26).
+            const coreW = Math.trunc(30 * p[7] / 50);
+            let v = ((sm * 160) >> 8) + ((bloom * 80) >> 8) + ((core * coreW) >> 8);
             v += state.dith[off + (i & 7)] >> 4;
             state.profPh[dst + i] = v < 0 ? 0 : (v > 255 ? 255 : v);
           }
@@ -3700,9 +3706,13 @@ function bayerOffsets(dithOff, amp, unit) {
         (236 + ((SIN[phPulse & (SIN_N - 1)] * 40) >> 9)) >> 8;
       // A slow swing about the centre rather than a loop across and back. A
       // looping sweep leaves the panel dark for more than half the cycle.
-      const sweepQ4 = ((w << 4) >> 1) + ((SIN[phSweep & (SIN_N - 1)] * ((w * 24 / 100) << 4)) >> 9);
-      const tiltQ4 = (SIN[phTilt & (SIN_N - 1)] * ((w * 34 / 100) << 4)) >> 9;
-      const bowQ4 = (((512 + SIN[phBow & (SIN_N - 1)]) * ((w * 16 / 100) << 4)) >> 10);
+      // Sweep (p[4]), Tilt (p[5]) and Bow (p[6]) scale the swing, tilt and
+      // bow; 1x at 50, as in AnimGlint.cpp.
+      const sweepPct = Math.trunc(p[4] * 24 / 50), tiltPct = Math.trunc(p[5] * 34 / 50);
+      const bowPct = Math.trunc(p[6] * 16 / 50);
+      const sweepQ4 = ((w << 4) >> 1) + ((SIN[phSweep & (SIN_N - 1)] * ((w * sweepPct / 100) << 4)) >> 9);
+      const tiltQ4 = (SIN[phTilt & (SIN_N - 1)] * ((w * tiltPct / 100) << 4)) >> 9;
+      const bowQ4 = (((512 + SIN[phBow & (SIN_N - 1)]) * ((w * bowPct / 100) << 4)) >> 10);
       const hwMaxQ4 = hwMax * 16;
       const rowRec = state.rowRec;
       for (let y = 0; y < h; y++) {

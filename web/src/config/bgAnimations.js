@@ -368,6 +368,10 @@ export const BG_ANIMATIONS = [
       { key: 'length', label: 'Length', def: 35 },
       { key: 'width', label: 'Width', def: 45 },
       { key: 'brightness', label: 'Brightness', def: 55 },
+      { key: 'sweep', label: 'Sweep', def: 50 },
+      { key: 'tilt', label: 'Tilt', def: 50 },
+      { key: 'bow', label: 'Bow', def: 50 },
+      { key: 'core', label: 'Core', def: 50 },
     ],
   },
   {
