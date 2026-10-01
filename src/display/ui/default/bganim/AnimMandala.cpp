@@ -353,10 +353,10 @@ bool init(int w, int) {
     // 2026-09-05 paragraph). Both categories run well into the tens of
     // thousands of reads per frame even outside the center square, the "reads per
     // frame, not size" criterion BgAnimCommon.h's allocHot() comment asks
-    // for. Combined with g_sampleCache (up to g_cx bytes, read by fetchRow's
+    // for. Combined with g_sampleCache (g_cx + 1 bytes, read by fetchRow's
     // cache and by interpPairKernel's block loop) they are 256*4 (rParams) +
     // 256*2 (sin256) + 256*2 (sinHalf256) + RESCALE_N (389, rescaleLUT) +
-    // 256*2 (paletteLUT) + up to 240 (g_sampleCache) = 3,189 B, comfortably
+    // 256*2 (paletteLUT) + up to 241 (g_sampleCache) = 3,190 B, comfortably
     // inside the 9,216 B per-animation slab. sqrtLUT, recipLUT and vigByR
     // below stay on alloc() (PSRAM): all three are read only at
     // init()/frame() time (once per (cx+1)^2 map-fill pass, or once per
@@ -440,11 +440,12 @@ bool init(int w, int) {
     // This file's own per-pixel-adjacent set: read by fetchRow's cache and,
     // via its aliasing pointers, by interpPairKernel's block loop. Sized
     // off g_cx (<=240), not a fixed 256, since it only ever needs one row's
-    // worth of blocks.
+    // worth of blocks: (w + 1) / 2 of them, which is g_cx + 1 at an odd w
+    // (117 at 233, where the last block is column w - 1 alone).
     if (g_sampleCache == nullptr) {
-        g_sampleCache = static_cast<uint8_t *>(allocHot(static_cast<size_t>(g_cx)));
+        g_sampleCache = static_cast<uint8_t *>(allocHot(static_cast<size_t>(g_cx) + 1));
         if (g_sampleCache == nullptr) {
-            g_sampleCache = static_cast<uint8_t *>(alloc(static_cast<size_t>(g_cx)));
+            g_sampleCache = static_cast<uint8_t *>(alloc(static_cast<size_t>(g_cx) + 1));
         }
     }
     g_sampleCacheY = NO_CACHED_ROW;
@@ -650,6 +651,10 @@ void mandalaIndexRun(uint8_t *dstPtr, const uint16_t *mapPtr, int count, int gN_
 // heap size computed from a width not yet known at compile time.
 constexpr int MAX_BLOCKS = 256;
 
+// Samples per row: one per output column pair, plus one for the lone last
+// column at an odd width.
+inline int blockCount(int w) { return (w + 1) / 2; }
+
 // One entry per half-resolution column pair (block), in increasing output
 // column order across the whole row: idx[b] is the magnitude sampled at
 // output column 2b. The left and right halves are walked with opposite
@@ -661,10 +666,17 @@ constexpr int MAX_BLOCKS = 256;
 // line, and blending across it is exactly what linear interpolation
 // should do there. Same geometry as this file's own pre-redesign bandRef:
 // cx/cy come from the w this call was made with (not from g_cx), matching
-// that formula exactly. Assumes cx and w-cx are both even, true for the
-// panel's fixed 480 width; an odd remainder is not handled here, the same
-// "never exercised at 480x480" assumption mandalaRunSingle's own remainder
-// path documents.
+// that formula exactly. The column geometry is exact when cx is even (480,
+// 240, 233); at 466 cx is odd and the sample columns sit one off it, as
+// they always have there.
+//
+// It samples blockCount(w) = (w + 1) / 2 entries. At an odd width (233,
+// the 466 px panel at half resolution) the last entry is the sample at
+// column w - 1, a block with no right-hand pixel: the writers below give
+// it its left pixel only (gm-sveq; before, nBlocks was w / 2 and column
+// w - 1 was never written). The right half's count is what is left after
+// the left half's, so the walk always fills every entry a writer reads;
+// the old (w - cx) / 2 left the last of 233 entries unsampled at 466.
 //
 // Every caller of this function (fetchRow, always) passes an even absolute
 // row, so ay below is always even, and the column walk starts aligned to
@@ -687,7 +699,7 @@ void sampleRowIndices(uint8_t *idxOut, int y, int w) {
 
     const int nBlocksL = cx / 2;
     mandalaIndexRun<-1>(idxOut, mapRow + g_cx / 2, nBlocksL, gN_eff_left, g_sxOffset);
-    const int nBlocksR = (w - cx) / 2;
+    const int nBlocksR = blockCount(w) - nBlocksL;
     mandalaIndexRun<+1>(idxOut + nBlocksL, mapRow, nBlocksR, gN_eff_right, 0);
 }
 
@@ -719,12 +731,20 @@ const uint8_t *fetchRow(int y, int w) {
 // Top-left of each block is the real sample; top-right is the horizontal
 // midpoint against the next block to the right, clamped to itself at the
 // row's last block since there is no further neighbour to blend with.
-void writeInterpTop(uint16_t *row, const uint8_t *a, int nBlocks) {
-    for (int b = 0; b < nBlocks; b++) {
+// Each writer takes the row width w and reads blockCount(w) samples; at an
+// odd width the last sample is column w - 1 alone and gets the block's
+// left-pixel formula (its right neighbour would be column w).
+void writeInterpTop(uint16_t *row, const uint8_t *a, int w) {
+    const int nBlocks = blockCount(w);
+    const int nPairs = w >> 1;
+    for (int b = 0; b < nPairs; b++) {
         const int va = a[b];
         const int vb = (b + 1 < nBlocks) ? a[b + 1] : va;
         row[2 * b] = paletteLUT[va];
         row[2 * b + 1] = paletteLUT[(va + vb) >> 1];
+    }
+    if (w & 1) {
+        row[w - 1] = paletteLUT[a[nPairs]];
     }
 }
 
@@ -736,8 +756,10 @@ void writeInterpTop(uint16_t *row, const uint8_t *a, int nBlocks) {
 // applies to each independently. Used only when a row's pair partner is
 // not available in the same call (see bandRef); writeInterpPair below
 // covers the ordinary contiguous case without recomputing hMidTop twice.
-void writeInterpBottom(uint16_t *row, const uint8_t *a, const uint8_t *c, int nBlocks) {
-    for (int b = 0; b < nBlocks; b++) {
+void writeInterpBottom(uint16_t *row, const uint8_t *a, const uint8_t *c, int w) {
+    const int nBlocks = blockCount(w);
+    const int nPairs = w >> 1;
+    for (int b = 0; b < nPairs; b++) {
         const int va = a[b];
         const int vb = (b + 1 < nBlocks) ? a[b + 1] : va;
         const int vc = c[b];
@@ -747,6 +769,9 @@ void writeInterpBottom(uint16_t *row, const uint8_t *a, const uint8_t *c, int nB
         row[2 * b] = paletteLUT[(va + vc) >> 1];
         row[2 * b + 1] = paletteLUT[(hMidTop + hMidBot) >> 1];
     }
+    if (w & 1) {
+        row[w - 1] = paletteLUT[(a[nPairs] + c[nPairs]) >> 1];
+    }
 }
 
 // Both rows of one block-pair in a single pass: hMidTop (the top row's own
@@ -754,8 +779,13 @@ void writeInterpBottom(uint16_t *row, const uint8_t *a, const uint8_t *c, int nB
 // row's centre pixel, rather than once in writeInterpTop and again in
 // writeInterpBottom. Each store is the pair's own two columns combined
 // into one 32-bit write, the same trick the exact per-pixel paths use.
-void writeInterpPair(uint16_t *rowTop, uint16_t *rowBot, const uint8_t *a, const uint8_t *c, int nBlocks) {
-    for (int b = 0; b < nBlocks; b++) {
+// BgAnim.h allows a two-row call only at an even width, so the odd tail
+// below is never reached through band(); it is here so this writer reads
+// and writes exactly what the two above would for any w.
+void writeInterpPair(uint16_t *rowTop, uint16_t *rowBot, const uint8_t *a, const uint8_t *c, int w) {
+    const int nBlocks = blockCount(w);
+    const int nPairs = w >> 1;
+    for (int b = 0; b < nPairs; b++) {
         const int va = a[b];
         const int vb = (b + 1 < nBlocks) ? a[b + 1] : va;
         const int vc = c[b];
@@ -768,6 +798,10 @@ void writeInterpPair(uint16_t *rowTop, uint16_t *rowBot, const uint8_t *a, const
         const uint16_t pBR = paletteLUT[(hMidTop + hMidBot) >> 1];
         *reinterpret_cast<uint32_t *>(rowTop + 2 * b) = static_cast<uint32_t>(pTL) | (static_cast<uint32_t>(pTR) << 16);
         *reinterpret_cast<uint32_t *>(rowBot + 2 * b) = static_cast<uint32_t>(pBL) | (static_cast<uint32_t>(pBR) << 16);
+    }
+    if (w & 1) {
+        rowTop[w - 1] = paletteLUT[a[nPairs]];
+        rowBot[w - 1] = paletteLUT[(a[nPairs] + c[nPairs]) >> 1];
     }
 }
 
@@ -809,8 +843,10 @@ void writeInterpPair(uint16_t *rowTop, uint16_t *rowBot, const uint8_t *a, const
 //
 // nBlocks < 2 is not handled here: `loop` does not itself check for a zero
 // trip count, and nBlocks-1 == 0 would misread as a huge unsigned count.
-// band() below only calls this kernel when nBlocks >= 2, which is every
-// real call (nBlocks is w/2, 120 or 240 for the panel's fixed widths).
+// band() below only calls this kernel when nBlocks >= 2 and w is even,
+// which is every real two-row call (BgAnim.h allows rows > 1 only at an
+// even width; nBlocks is then w/2: 120, 233 or 240). The kernel writes
+// nBlocks whole pairs and has no odd tail.
 __attribute__((noinline)) static void interpPairKernel(uint16_t *rowTop, uint16_t *rowBot, const uint8_t *a,
                                                          const uint8_t *c, const uint16_t *palette, int nBlocks) {
     int aCur = a[0];
@@ -976,7 +1012,7 @@ void patchCentre(uint16_t *row, int y, int w) {
 // The patch comes after the interpolated write of the same row, never
 // before, since the pair write covers the whole row.
 void bandRef(uint16_t *dst, int y0, int rows, int w, uint32_t, const uint8_t *) {
-    const int nBlocks = w / 2;
+    const int nBlocks = blockCount(w);
     if (g_fineDetail) {
         for (int ry = 0; ry < rows; ry++) {
             computeRowFull(dst + static_cast<size_t>(ry) * w, y0 + ry, w);
@@ -995,7 +1031,7 @@ void bandRef(uint16_t *dst, int y0, int rows, int w, uint32_t, const uint8_t *) 
             uint8_t top[MAX_BLOCKS];
             memcpy(top, fetchRow(y, w), static_cast<size_t>(nBlocks));
             const uint8_t *bottom = fetchRow(y + 2, w);
-            writeInterpPair(row, row + w, top, bottom, nBlocks);
+            writeInterpPair(row, row + w, top, bottom, w);
             patchCentre(row, y, w);
             patchCentre(row + w, y + 1, w);
             ry += 2;
@@ -1005,9 +1041,9 @@ void bandRef(uint16_t *dst, int y0, int rows, int w, uint32_t, const uint8_t *) 
             uint8_t top[MAX_BLOCKS];
             memcpy(top, fetchRow(y - 1, w), static_cast<size_t>(nBlocks));
             const uint8_t *bottom = fetchRow(y + 1, w);
-            writeInterpBottom(row, top, bottom, nBlocks);
+            writeInterpBottom(row, top, bottom, w);
         } else {
-            writeInterpTop(row, fetchRow(y, w), nBlocks);
+            writeInterpTop(row, fetchRow(y, w), w);
         }
         patchCentre(row, y, w);
         ry++;
@@ -1026,17 +1062,18 @@ void bandRef(uint16_t *dst, int y0, int rows, int w, uint32_t, const uint8_t *) 
 // exercises exactly that, and bandRef stays the one place this logic is
 // written, checked by eye against this copy. The only line that changes is
 // the ordinary pair's write: interpPairKernel replaces writeInterpPair with
-// the hand-asm kernel described on its own comment. nBlocks < 2 is defensive only,
-// never taken on device (nBlocks is w/2, 120 or 240 for the panel's fixed
-// widths): the kernel's `loop` needs a trip count of nBlocks-1 and does
-// not itself check for zero, so that case falls back to the C++ path
-// instead, the same shape AnimCaustics.cpp's own precondition check takes.
+// the hand-asm kernel described on its own comment. nBlocks < 2 and an odd
+// w are defensive only, never taken on device (a pair call is always at an
+// even width, nBlocks 120, 233 or 240): the kernel's `loop` needs a trip
+// count of nBlocks-1 and does not itself check for zero, and it has no odd
+// tail, so both cases fall back to the C++ path instead, the same shape
+// AnimCaustics.cpp's own precondition check takes.
 // Non-Xtensa builds (host tests, sanitizers) and any build with
 // GM_BGANIM_NO_ASM route straight to bandRef instead, which contains the
 // identical loop.
 #if defined(__XTENSA__) && !defined(GM_BGANIM_NO_ASM)
 void band(uint16_t *dst, int y0, int rows, int w, uint32_t, const uint8_t *) {
-    const int nBlocks = w / 2;
+    const int nBlocks = blockCount(w);
     if (g_fineDetail) {
         for (int ry = 0; ry < rows; ry++) {
             computeRowFull(dst + static_cast<size_t>(ry) * w, y0 + ry, w);
@@ -1051,8 +1088,8 @@ void band(uint16_t *dst, int y0, int rows, int w, uint32_t, const uint8_t *) {
             uint8_t top[MAX_BLOCKS];
             memcpy(top, fetchRow(y, w), static_cast<size_t>(nBlocks));
             const uint8_t *bottom = fetchRow(y + 2, w);
-            if (nBlocks < 2) {
-                writeInterpPair(row, row + w, top, bottom, nBlocks);
+            if (nBlocks < 2 || (w & 1)) {
+                writeInterpPair(row, row + w, top, bottom, w);
             } else {
                 interpPairKernel(row, row + w, top, bottom, paletteLUT, nBlocks);
             }
@@ -1065,9 +1102,9 @@ void band(uint16_t *dst, int y0, int rows, int w, uint32_t, const uint8_t *) {
             uint8_t top[MAX_BLOCKS];
             memcpy(top, fetchRow(y - 1, w), static_cast<size_t>(nBlocks));
             const uint8_t *bottom = fetchRow(y + 1, w);
-            writeInterpBottom(row, top, bottom, nBlocks);
+            writeInterpBottom(row, top, bottom, w);
         } else {
-            writeInterpTop(row, fetchRow(y, w), nBlocks);
+            writeInterpTop(row, fetchRow(y, w), w);
         }
         patchCentre(row, y, w);
         ry++;
@@ -1105,7 +1142,7 @@ void release() {
         polarMapQuarter = nullptr;
     }
     releaseTable(rParams, 256 * sizeof(uint32_t));
-    releaseTable(g_sampleCache, static_cast<size_t>(g_cx));
+    releaseTable(g_sampleCache, static_cast<size_t>(g_cx) + 1);
     // Three sentinels. tablesBuilt gates the one-time fills, so leaving it
     // set would hand back reallocated tables that nothing ever writes;
     // g_sampleCacheY must not survive into the next init() either, since a

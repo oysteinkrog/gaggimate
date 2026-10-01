@@ -124,27 +124,6 @@ constexpr uint16_t SENTINEL = 0xA5C3;
 const int ALIGN_WIDTHS[] = {480, 240, 466, 233};
 const int ALIGN_OFFSETS[] = {0, 4, 8, 12}; // bytes past a 16-byte boundary
 
-// Known issue, not an alignment fault: AnimMandala renders in two-pixel
-// blocks (nBlocks = w / 2) and at an odd width never writes column w - 1, in
-// band() and bandRef() alike, so that column holds whatever the buffer held
-// before. Found by this pass (gm-bzu.49), outside that bead's files; a
-// mismatch that is Mandala's, at an odd width, confined to column w - 1 and
-// with both guards clean is counted here and reported, not failed. Delete
-// this when AnimMandala writes the last column.
-int g_knownMandalaTail = 0;
-
-bool knownMandalaTail(const BgAnimation &anim, int w, const uint16_t *dst, const uint16_t *ref, size_t n) {
-    if ((w & 1) == 0 || strcmp(anim.id, "mandala") != 0) {
-        return false;
-    }
-    for (size_t i = 0; i < n; i++) {
-        if (dst[i] != ref[i] && static_cast<int>(i % w) != w - 1) {
-            return false;
-        }
-    }
-    return true;
-}
-
 // Renders every band of one frame at width w through band() at each dst
 // offset and compares with bandRef(). Returns the number of failures, and
 // prints the first few.
@@ -182,10 +161,6 @@ int alignCheck(const BgAnimation &anim, int w, const uint8_t p[4], uint32_t t, c
                         }
                         badPx++;
                     }
-                }
-                if (!badBefore && !badAfter && badPx && knownMandalaTail(anim, w, dst, refDst, n)) {
-                    g_knownMandalaTail++;
-                    continue;
                 }
                 if (badBefore || badAfter || badPx) {
                     if (failures < 4) {
@@ -293,10 +268,6 @@ int main(int argc, char **argv) {
         printf("%-11s align %s (widths 480 240 466 233, dst +0 +4 +8 +12 bytes)\n", anim.id, animFailures ? "FAIL" : "ok");
         fflush(stdout);
         alignFailures += animFailures;
-    }
-    if (g_knownMandalaTail) {
-        printf("\nknown: mandala leaves column w-1 unwritten at odd widths (%d band calls, see knownMandalaTail)\n",
-               g_knownMandalaTail);
     }
     if (alignFailures) {
         printf("\n%d alignment failures\n", alignFailures);
