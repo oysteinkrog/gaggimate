@@ -25,8 +25,9 @@ namespace {
 using namespace bganim;
 
 constexpr int MAX_TILES = 20;           // page's limit per axis, also bounds the tile RNG tables
-constexpr int MID = 560;                // resting field, in sixteenths of a palette index
-constexpr int BEVEL = 190;              // signed tile-interior dome amplitude, same units
+constexpr int MID = 560;                // resting field at Brightness 50, in sixteenths of a palette index
+constexpr int BEVEL = 190;              // signed tile-interior dome amplitude at Bevel 50, same units
+constexpr int WASH = 210;               // diagonal wash amplitude at Wash 50, same units
 constexpr int BLEND_PX = 7;             // seven pixels on each side of a seam, fourteen total
 constexpr int MIN_WIDTH = 3 * BLEND_PX; // keeps a tile's two seam regions disjoint
 constexpr int TILE_COUNT = MAX_TILES * MAX_TILES;
@@ -52,7 +53,7 @@ const int16_t *sl = nullptr;    // borrowed shared 1024-entry sine, never releas
 
 int allocW = 0, allocH = 0, combStride = 0, combRows = 0;
 int nCol = 1, nRow = 1;
-int lastSize = -1, lastVariation = -1;
+int lastSize = -1, lastVariation = -1, lastBevel = -1;
 uint32_t lastThemeGen = 0;
 bool paletteValid = false;
 
@@ -183,7 +184,7 @@ bool init(int w, int h) {
 // one byte instead: tile B is always A+1 at a seam, and the fourteen possible
 // smoothstep weights are selected by a nibble. This is lossless compression.
 int layoutAxis(int16_t *shade, uint8_t *a, uint8_t *b, uint16_t *weight, uint8_t *blend, int n, int base, int jitter,
-               uint32_t seed) {
+               uint32_t seed, int bevel) {
     int start[MAX_TILES], width[MAX_TILES];
     int8_t signs[MAX_TILES];
     const int count = axisWidths(start, width, signs, n, base, jitter, seed);
@@ -192,7 +193,7 @@ int layoutAxis(int16_t *shade, uint8_t *a, uint8_t *b, uint16_t *weight, uint8_t
         for (int k = 0; k < wide; ++k) {
             const int x = start[i] + k;
             const int u = k * (SIN_N / 2) / wide; // half sine across the tile
-            shade[x] = static_cast<int16_t>((signs[i] * sl[u & (SIN_N - 1)] * BEVEL) >> 9);
+            shade[x] = static_cast<int16_t>((signs[i] * sl[u & (SIN_N - 1)] * bevel) >> 9);
             int ta = i, tb = i, code = 0;
             const int e = wide - 1 - k;
             if (k < BLEND_PX && i > 0) {
@@ -235,10 +236,13 @@ void frame(uint32_t tMs, int w, int h, const uint8_t p[BG_ANIM_PARAMS]) {
         lastThemeGen = gen;
         paletteValid = true;
     }
-    if (p[1] != lastSize || p[3] != lastVariation) {
+    if (p[1] != lastSize || p[3] != lastVariation || p[4] != lastBevel) {
         const int bw = baseWidth(w, p[1]), bh = baseWidth(h, p[1]);
-        nCol = layoutAxis(colShade, cA, cB, cW, nullptr, w, bw, bw * p[3] / 250, 0xA5C31D7Bu);
-        nRow = layoutAxis(rowShade, nullptr, nullptr, nullptr, rowBlend, h, bh, bh * p[3] / 250, 0x2F6B49E1u);
+        // Bevel (p[4]) scales the tile domes: flat tiles at 0, 190 at 50,
+        // 380 at 100. It changes no tile boundary or tile clock.
+        const int bevel = BEVEL * p[4] / 50;
+        nCol = layoutAxis(colShade, cA, cB, cW, nullptr, w, bw, bw * p[3] / 250, 0xA5C31D7Bu, bevel);
+        nRow = layoutAxis(rowShade, nullptr, nullptr, nullptr, rowBlend, h, bh, bh * p[3] / 250, 0x2F6B49E1u, bevel);
         uint32_t s = 0x6C8E9CF7u;
         for (int i = 0; i < nRow * nCol; ++i) {
             tPhase[i] = static_cast<uint16_t>(nextRand(s) & (SIN_N - 1));
@@ -246,6 +250,7 @@ void frame(uint32_t tMs, int w, int h, const uint8_t p[BG_ANIM_PARAMS]) {
         }
         lastSize = p[1];
         lastVariation = p[3];
+        lastBevel = p[4];
     }
     // Wrapping each multiplication BEFORE shifting matches JavaScript's
     // >>>0 exactly. That is what the old integer ramp was for: it kept
@@ -290,33 +295,46 @@ void frame(uint32_t tMs, int w, int h, const uint8_t p[BG_ANIM_PARAMS]) {
         const int u2 = (u * u) >> 9;
         level[i] = static_cast<int16_t>((((u2 * u) >> 9) * amp) >> 9);
     }
-    // Spatial step 18/16 sine entries per pixel, amplitude 210 field units.
-    // At the default Speed 50 the x wash advances 27.78 px/s and the y wash
-    // 41.67 px/s in opposite directions; periods are 32.768 s and
-    // 21.845333 s respectively.
+    // At the defaults the spatial step is 18/16 sine entries per pixel and
+    // the amplitude 210 field units. At Speed 50 the x wash advances
+    // 27.78 px/s and the y wash 41.67 px/s in opposite directions; periods
+    // are 32.768 s and 21.845333 s respectively.
+    // Wash (p[5]) scales the amplitude: none at 0, 420 at 100. Wash
+    // density (p[7]) sets the step in sixteenths of a sine entry per pixel:
+    // 4 at 0 (a 4,096 px period, a near-uniform pulse), 18 at 50 (910 px)
+    // and 64 at 100 (256 px, about two bands across the panel). The upper
+    // half is steeper so the top of the slider shows distinct bands.
+    const int washAmp = WASH * p[5] / 50;
+    const uint32_t washStep = p[7] <= 50 ? 4u + p[7] * 14u / 50u : 18u + (p[7] - 50u) * 46u / 50u;
     for (int x = 0; x < w; ++x) {
-        washCol[x] = static_cast<int16_t>((sl[(((static_cast<uint32_t>(x) * 18u) >> 4) - phW1) & (SIN_N - 1)] * 210) >> 9);
+        washCol[x] = static_cast<int16_t>((sl[(((static_cast<uint32_t>(x) * washStep) >> 4) - phW1) & (SIN_N - 1)] * washAmp) >> 9);
     }
     for (int y = 0; y < h; ++y) {
-        const int wash = (sl[(((static_cast<uint32_t>(y) * 18u) >> 4) + phW2) & (SIN_N - 1)] * 210) >> 9;
+        const int wash = (sl[(((static_cast<uint32_t>(y) * washStep) >> 4) + phW2) & (SIN_N - 1)] * washAmp) >> 9;
         rowTerm[y] = static_cast<int16_t>(rowShade[y] + wash);
     }
+    // Brightness (p[6]) moves the resting field: 0 at 0 (unlit tiles at
+    // the palette's floor), 560 at 50, 1120 at 100.
+    const int mid = MID * p[6] / 50;
     for (int ri = 0; ri < nRow; ++ri) {
         int16_t *dst = comb + static_cast<size_t>(ri) * combStride;
         const int lb = ri * nCol;
         for (int x = 0; x < w; ++x) {
             const int a = level[lb + cA[x]], b = level[lb + cB[x]];
-            dst[x] = static_cast<int16_t>(MID + a + (((b - a) * cW[x]) >> 8) + colShade[x] + washCol[x]);
+            dst[x] = static_cast<int16_t>(mid + a + (((b - a) * cW[x]) >> 8) + colShade[x] + washCol[x]);
         }
     }
 }
 
 // bandRef is the page's final two loops fused: the scratch assignment is an
-// exact int16 value (160..4560), so its store/reload is unnecessary. Its Q8
+// exact int16 value, so its store/reload is unnecessary. Its Q8
 // interpolation still rounds before adding the row term and ordered dither.
-// Differences are at most 4400, products at most 1,126,400, row terms are
-// -400..400, and dither is at most +/-256 (ditherAmp's cap is 16 indices).
-// The final field is -496..5216, so signed 16-bit PIE arithmetic cannot
+// With every slider in 0..100, a column entry is mid 0..1120 plus a level
+// 0..3600 plus a dome of +/-380 plus a wash of +/-420: -800..5520. Seam
+// differences are level differences only (both rows share the column dome
+// and wash), at most 3600, products at most 921,600; row terms are
+// -800..800, and dither is at most +/-256 (ditherAmp's cap is 16 indices).
+// The final field is -1856..6576, so signed 16-bit PIE arithmetic cannot
 // saturate accidentally. Both ends of the palette still need their clamp.
 BGANIM_INLINE uint16_t mapPixel(int value, int rv, int d) {
     int v = (value + rv + d) >> 4;
@@ -555,7 +573,7 @@ void release() {
     sl = nullptr;
     allocW = allocH = combStride = combRows = 0;
     nCol = nRow = 1;
-    lastSize = lastVariation = -1;
+    lastSize = lastVariation = lastBevel = -1;
     lastThemeGen = 0;
     paletteValid = false;
 }
@@ -566,7 +584,14 @@ extern const BgAnimation bg_anim_mosaic;
 const BgAnimation bg_anim_mosaic = {
     "mosaic",
     "Mosaic",
-    {{"speed", "Speed", 50}, {"size", "Tile size", 45}, {"contrast", "Contrast", 30}, {"variation", "Variation", 55}},
+    {{"speed", "Speed", 50},
+     {"size", "Tile size", 45},
+     {"contrast", "Contrast", 30},
+     {"variation", "Variation", 55},
+     {"bevel", "Bevel", 50},
+     {"wash", "Wash", 50},
+     {"brightness", "Brightness", 50},
+     {"washdensity", "Wash density", 50}},
     init,
     frame,
     band,
