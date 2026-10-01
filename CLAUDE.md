@@ -944,7 +944,22 @@ venv `pwenv`, real Chrome): `pw_gradient_rounds.py <n> [cold|warm] [drag]`
 `pw_run.py` wrapper (required: a Windows Node process started from WSL1 needs
 its stdio redirected). Run them from WSL with `pwenv/Scripts/python.exe`.
 Verify the panel through `/api/debug/fb`, never the camera: the photos are
-too dark to classify.
+too dark to classify. **A framebuffer dump does not displace bands;
+`/api/debug/heap` does** (gm-jjb8, 2026-10-01, bench board, divider 6, 50.7
+fps, loadtest build, 100 requests per arm at one every 2.5 s): 100 whole
+step 1 dumps alone 0 resyncs, 100 `/api/debug/anim` reads alone 0, 100
+`/api/debug/heap` reads alone 4, and the round shape gm-t9ld's probe used
+(heap, dump, anim) 5 at step 1 and 9 at step 8; a 120 s idle control read 0
+and `slips` stayed 0 in every arm. The cost is
+`heap_caps_get_largest_free_block` walking every block under the heap lock
+(the handler's own comment: about 1.3 ms and one displaced frame per call),
+so a probe that polls the heap endpoint beside its reads charges the bands
+to whatever it is measuring; poll `/api/debug/scanout` or `/api/debug/anim`
+instead when the heap figures are not the point. The dump's bytes are the
+bytes written (the gradient checks compared 576,000 samples through it with
+0 mismatches), but a dump is not atomic: the cache flush is one shot at the
+start and the body goes out over many send rounds, so a dump of a moving
+picture is torn in time and only a static picture reads as one instant.
 
 ## Animation kernels (violate these and band time regresses silently)
 
