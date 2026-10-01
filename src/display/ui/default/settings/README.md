@@ -20,7 +20,12 @@ to run the tests, and what never to do here.
   is the contract every category codes against.
 - `SettingsRows.h` / `.cpp`: the seven row widgets (stepper, choice, toggle,
   action, locked, confirm, info). Each fits the shell's 320x56 slot and owns
-  its own hold state.
+  its own hold state. Every target draws a 2 px outline with no fill:
+  stepper and choice controls are separate 56x56 buttons, toggle, action
+  and confirm rows frame the whole row and show a cue at the right, and a
+  locked row's target is a "Hold 1 s" button. `settingsFrameButtonCreate`
+  is the shared button, which the shell also uses for the header arrows and
+  the Back or Close button.
 - `SettingsLog.h`: `settingsLogAppend`, a bounded `snprintf` accumulator for
   the categories' one-line commit logs.
 - `CatTemps.cpp`: temperature offset, pressure sensor rating, brew and grind

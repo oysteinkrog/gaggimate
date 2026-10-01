@@ -48,7 +48,12 @@ void applyEnabledRecurse(lv_obj_t *obj, bool enabled) {
             lv_obj_add_state(obj, LV_STATE_DISABLED);
         }
     }
-    if (obj->class_p == &lv_label_class || obj->class_p == &lv_img_class) {
+    // A clickable frame loses its border through the LV_STATE_DISABLED
+    // selector styleFrame sets. A bordered object that is not a target (the
+    // toggle's switch outline) is a cue, not a frame, and dims with the text
+    // instead; opa multiplies down the tree, so its knob dims with it.
+    const bool cue = !lv_obj_has_flag(obj, LV_OBJ_FLAG_CLICKABLE) && lv_obj_get_style_border_width(obj, LV_PART_MAIN) > 0;
+    if (obj->class_p == &lv_label_class || obj->class_p == &lv_img_class || cue) {
         lv_obj_set_style_opa(obj, enabled ? LV_OPA_COVER : LV_OPA_50, LV_PART_MAIN);
     }
     const uint32_t n = lv_obj_get_child_cnt(obj);
@@ -80,13 +85,13 @@ lv_obj_t *createRowContainer(lv_obj_t *parent) {
     // object, which makes the indev keep the pressed object even when the
     // finger leaves it; a hold could then never be cancelled by PRESS_LOST
     // (sliding off, or the row being disabled mid-hold). Cleared here and in
-    // buildIconButton so every target here re-hit-tests on each poll.
+    // makeFramedTarget so every target here re-hit-tests on each poll.
     lv_obj_clear_flag(row, LV_OBJ_FLAG_PRESS_LOCK);
-    // A button flush against this row's own edge needs its ext click pad to
-    // extend past the row's bounds: several rows fill kRowW exactly (label
-    // column + gaps + two 40 px buttons), leaving no margin inside the row
-    // for the pad to grow into. Without this flag that pad is clipped to
-    // nothing on the outward side (eez/actions.cpp's applyClickArea works
+    // A control's frame sits 2 px inside its 56 px hit box and takes the
+    // difference back as ext click pad (styleFrame), and the outermost
+    // button's box ends exactly on this row's edge; a framed row is itself
+    // 4 px smaller than its slot. Without this flag those pads would be
+    // clipped on the outward side (eez/actions.cpp's applyClickArea works
     // around the same clipping the same way, on every ancestor short of the
     // screen).
     lv_obj_add_flag(row, LV_OBJ_FLAG_OVERFLOW_VISIBLE);
@@ -95,20 +100,49 @@ lv_obj_t *createRowContainer(lv_obj_t *parent) {
     return row;
 }
 
-// Label (Montserrat 18) above value (Montserrat 20), left-aligned, both
-// truncating with dots as a last resort. width is kTextColW when a control
-// cluster shares the row, or nearly the full row when nothing else does.
-constexpr lv_coord_t kTextColW = 200;
+// ---- row geometry (gm-3vj.50) ------------------------------------------
+//
+// Every target draws a 2 px frame with no fill, kFrameInset inside its hit
+// box, and gets the inset back as ext click pad: a 56x56 button is a 52x52
+// object, a framed row a 316x52 object in its 320x56 slot. The slots are
+// stacked with no gap, so the inset is what leaves 4 px between two
+// neighbouring frames. Plain rows (stepper, choice, locked, info) keep no
+// frame of their own; their text column is plain and each control is its
+// own framed button. Cost in overlay pixels, computed from the outlines and
+// not yet measured on the bench: about 400 px per 52x52 frame and 1,450 per
+// framed row.
+constexpr lv_coord_t kFrameInset = 2;
+constexpr lv_coord_t kFrameBorder = 2;
+constexpr lv_coord_t kFrameRadius = 8;
+constexpr lv_coord_t kBtnHit = 56;
+constexpr lv_coord_t kBtnGap = 4;           // between two neighbouring hit boxes
+constexpr lv_coord_t kTextX = 12;           // text column's left edge in the 320 px slot
+// Two buttons at the right of a plain row: plus's box ends on the row edge.
+constexpr lv_coord_t kPlusHitX = SettingsUI::kRowW - kBtnHit;          // 264
+constexpr lv_coord_t kMinusHitX = kPlusHitX - kBtnGap - kBtnHit;       // 204
+constexpr lv_coord_t kTextColW = kMinusHitX - kBtnGap - kTextX;        // 188
+// A framed row's content area starts kFrameInset + kFrameBorder in.
+constexpr lv_coord_t kFramedRowW = SettingsUI::kRowW - 2 * kFrameInset; // 316
+constexpr lv_coord_t kFramedRowH = SettingsUI::kRowH - 2 * kFrameInset; // 52
+constexpr lv_coord_t kFramedContentW = kFramedRowW - 2 * kFrameBorder;  // 312
+constexpr lv_coord_t kFramedContentH = kFramedRowH - 2 * kFrameBorder;  // 48
+constexpr lv_coord_t kFramedTextX = kTextX - kFrameInset - kFrameBorder; // 8, same 12 px on screen
+constexpr lv_coord_t kFramedTextColW = 220;
+constexpr lv_coord_t kCueRightPad = 10;
 
+// Label (Montserrat 18) above value (Montserrat 20), left-aligned, both
+// truncating with dots as a last resort, placed at x in the parent's
+// content area and centred vertically.
 struct TextCol {
     lv_obj_t *label;
     lv_obj_t *value;
 };
 
-TextCol buildTextCol(lv_obj_t *parent, const char *labelText, lv_coord_t width) {
+TextCol buildTextCol(lv_obj_t *parent, const char *labelText, lv_coord_t x, lv_coord_t width, lv_coord_t height) {
     lv_obj_t *col = lv_obj_create(parent);
     lv_obj_remove_style_all(col);
-    lv_obj_set_size(col, width, SettingsUI::kRowH);
+    lv_obj_set_size(col, width, height);
+    lv_obj_align(col, LV_ALIGN_LEFT_MID, x, 0);
     lv_obj_clear_flag(col, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_clear_flag(col, LV_OBJ_FLAG_CLICKABLE); // see createRowContainer: lv_obj_create defaults this on
     lv_obj_add_flag(col, LV_OBJ_FLAG_EVENT_BUBBLE);
@@ -143,63 +177,135 @@ TextCol buildTextCol(lv_obj_t *parent, const char *labelText, lv_coord_t width) 
     return {label, value};
 }
 
-// A 40x40 icon grown to a 56x56 effective hit area (ext click pad 8, the
-// same arithmetic the page header's up/down arrows use), clickable and
-// bubbling; gets its pressed-dim styling for free from
-// DefaultUI::applyPressedFeedbackTo, which the shell runs over the whole
-// page after buildRow returns (a clickable lv_img is one of the two classes
-// that walk recolors).
-lv_obj_t *buildIconButton(lv_obj_t *parent, const lv_img_dsc_t *icon, lv_color_t fg) {
-    lv_obj_t *img = lv_img_create(parent);
-    lv_img_set_src(img, icon);
-    lv_obj_set_style_img_recolor(img, fg, LV_PART_MAIN);
-    lv_obj_set_style_img_recolor_opa(img, LV_OPA_COVER, LV_PART_MAIN);
-    lv_obj_add_flag(img, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_EVENT_BUBBLE);
-    lv_obj_clear_flag(img, LV_OBJ_FLAG_PRESS_LOCK); // see createRowContainer
-    lv_obj_set_ext_click_area(img, 8);
-    return img;
-}
-
-// Whole-row targets (toggle, action, confirm, the locked row's unlock
-// gesture) are plain lv_obj, not lv_btn or a clickable lv_img, so
-// applyPressedFeedbackTo's walk does nothing for them; this is their
-// styling, applied directly rather than through the LV_STATE_PRESSED
-// selector because LVGL only adds that state to the object actually hit
-// (the row), never to its child labels. `dim` here is already the pressed
-// colour (settingsPressedColor), not the raw touch dim colour: with the raw
-// colour the text jumped to black and the row went blank while held.
-struct PressDim {
-    lv_obj_t *label = nullptr;
-    lv_obj_t *value = nullptr;
-    lv_color_t fg{};
-    lv_color_t dim{};
-};
-
-void applyPressDim(const PressDim &pd, bool pressed) {
-    // A release always restores; a press dims only while the compositor's
-    // plate is not doing the job (g_pressPlateActive).
-    const lv_color_t c = (pressed && !g_pressPlateActive) ? pd.dim : pd.fg;
-    if (pd.label != nullptr) {
-        lv_obj_set_style_text_color(pd.label, c, LV_PART_MAIN);
+// Recolours a target and everything drawn inside it: text, icons and
+// borders. The knob of a switch and a progress bar keep their colour.
+void recolorTree(lv_obj_t *obj, lv_color_t c) {
+    if (obj->class_p == &lv_label_class) {
+        lv_obj_set_style_text_color(obj, c, LV_PART_MAIN);
+    } else if (obj->class_p == &lv_img_class) {
+        lv_obj_set_style_img_recolor(obj, c, LV_PART_MAIN);
     }
-    if (pd.value != nullptr) {
-        lv_obj_set_style_text_color(pd.value, c, LV_PART_MAIN);
+    if (lv_obj_get_style_border_width(obj, LV_PART_MAIN) > 0) {
+        lv_obj_set_style_border_color(obj, c, LV_PART_MAIN);
+    }
+    const uint32_t n = lv_obj_get_child_cnt(obj);
+    for (uint32_t i = 0; i < n; i++) {
+        recolorTree(lv_obj_get_child(obj, i), c);
     }
 }
 
-PressDim makePressDim(const TextCol &col, lv_color_t fg, lv_color_t dim) {
-    return {col.label, col.value, fg, settingsPressedColor(fg, dim)};
+// Press feedback for every settings target. They are plain lv_obj, not
+// lv_btn or a clickable lv_img, so DefaultUI::applyPressedFeedbackTo's walk
+// does nothing for them, and LVGL puts PRESSED on the target only, never on
+// its children: the frame and what is inside it are recoloured by hand. The
+// pressed colour (settingsPressedColor, the 40% rule) travels packed in the
+// event's user data, so no allocation outlives the object; the rest colour
+// is the theme colour every frame is built with (a theme change rebuilds
+// the page). A press dims only while the compositor's plate is not doing
+// the job (g_pressPlateActive); a release always restores.
+void framePressEvent(lv_event_t *e) {
+    const lv_event_code_t code = lv_event_get_code(e);
+    if (code != LV_EVENT_PRESSED && code != LV_EVENT_RELEASED && code != LV_EVENT_PRESS_LOST) {
+        return;
+    }
+    lv_obj_t *self = lv_event_get_current_target(e);
+    if (lv_event_get_target(e) != self) {
+        return; // bubbled up from a child target
+    }
+    const auto packed = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(lv_event_get_user_data(e)));
+    const lv_color_t c = (code == LV_EVENT_PRESSED && !g_pressPlateActive) ? lv_color_hex(packed) : themeFg();
+    recolorTree(self, c);
+}
+
+lv_color_t touchDimColor(SettingsUI &ui) {
+    return lv_color_hex(static_cast<uint32_t>(ui.controller().getSettings().getTouchDimColor()));
+}
+
+// Makes obj a framed target: border, ext click pad, clickable, bubbling,
+// pressed recolour. The caller sizes it kFrameInset smaller than its hit
+// box on every side.
+void makeFramedTarget(SettingsUI &ui, lv_obj_t *obj) {
+    const lv_color_t fg = themeFg();
+    settingsStyleFrame(obj, fg);
+    lv_obj_add_flag(obj, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_EVENT_BUBBLE);
+    lv_obj_clear_flag(obj, LV_OBJ_FLAG_PRESS_LOCK); // see createRowContainer
+    const lv_color_t pressed = settingsPressedColor(fg, touchDimColor(ui));
+    lv_obj_add_event_cb(obj, framePressEvent, LV_EVENT_ALL,
+                        reinterpret_cast<void *>(static_cast<uintptr_t>(lv_color_to32(pressed) & 0xFFFFFFu)));
+}
+
+// A right-hand cue on a framed row: Montserrat 16 text, right-aligned.
+lv_obj_t *buildCueText(lv_obj_t *row, const char *text) {
+    lv_obj_t *cue = lv_label_create(row);
+    lv_label_set_text(cue, text);
+    lv_obj_set_style_text_font(cue, &lv_font_montserrat_16, LV_PART_MAIN);
+    lv_obj_set_style_text_color(cue, themeFg(), LV_PART_MAIN);
+    lv_obj_align(cue, LV_ALIGN_RIGHT_MID, -kCueRightPad, 0);
+    return cue;
+}
+
+// The framed row kinds (toggle, action, confirm): the row object is the
+// target and the frame, kFrameInset inside its slot.
+lv_obj_t *createFramedRow(SettingsUI &ui, lv_obj_t *parent) {
+    lv_obj_t *row = createRowContainer(parent);
+    lv_obj_set_size(row, kFramedRowW, kFramedRowH);
+    lv_obj_align(row, LV_ALIGN_CENTER, 0, 0);
+    makeFramedTarget(ui, row);
+    return row;
+}
+
+// A framed control in a plain row, its 56 px tall hit box starting at hitX
+// and filling the row's height.
+lv_obj_t *buildRowButton(SettingsUI &ui, lv_obj_t *row, lv_coord_t hitX, const lv_img_dsc_t *icon,
+                         lv_coord_t hitW = kBtnHit, const char *text = nullptr) {
+    lv_obj_t *btn = settingsFrameButtonCreate(ui, row, hitW, icon, text);
+    lv_obj_set_pos(btn, hitX + kFrameInset, kFrameInset);
+    return btn;
 }
 
 } // namespace
 
 lv_color_t settingsPressedColor(lv_color_t rest, lv_color_t dim) { return lv_color_mix(dim, rest, LV_OPA_40); }
 
-namespace {
-
-lv_color_t touchDimColor(SettingsUI &ui) {
-    return lv_color_hex(static_cast<uint32_t>(ui.controller().getSettings().getTouchDimColor()));
+void settingsStyleFrame(lv_obj_t *obj, lv_color_t fg) {
+    lv_obj_set_style_bg_opa(obj, LV_OPA_TRANSP, LV_PART_MAIN);
+    lv_obj_set_style_border_width(obj, kFrameBorder, LV_PART_MAIN);
+    lv_obj_set_style_border_color(obj, fg, LV_PART_MAIN);
+    lv_obj_set_style_border_opa(obj, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_border_opa(obj, LV_OPA_TRANSP, LV_PART_MAIN | LV_STATE_DISABLED);
+    lv_obj_set_style_radius(obj, kFrameRadius, LV_PART_MAIN);
+    lv_obj_set_ext_click_area(obj, kFrameInset);
 }
+
+lv_obj_t *settingsFrameButtonCreate(SettingsUI &ui, lv_obj_t *parent, lv_coord_t hitW, const lv_img_dsc_t *icon,
+                                    const char *text) {
+    lv_obj_t *btn = lv_obj_create(parent);
+    lv_obj_remove_style_all(btn);
+    lv_obj_set_size(btn, hitW - 2 * kFrameInset, kBtnHit - 2 * kFrameInset);
+    lv_obj_clear_flag(btn, LV_OBJ_FLAG_SCROLLABLE);
+    makeFramedTarget(ui, btn);
+    const lv_color_t fg = themeFg();
+    if (icon != nullptr) {
+        lv_obj_t *img = lv_img_create(btn);
+        lv_img_set_src(img, icon);
+        lv_obj_set_style_img_recolor(img, fg, LV_PART_MAIN);
+        lv_obj_set_style_img_recolor_opa(img, LV_OPA_COVER, LV_PART_MAIN);
+        lv_obj_clear_flag(img, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_flag(img, LV_OBJ_FLAG_EVENT_BUBBLE);
+        lv_obj_center(img);
+    }
+    if (text != nullptr) {
+        lv_obj_t *label = lv_label_create(btn);
+        lv_label_set_text(label, text);
+        lv_obj_set_style_text_font(label, &lv_font_montserrat_16, LV_PART_MAIN);
+        lv_obj_set_style_text_color(label, fg, LV_PART_MAIN);
+        lv_obj_add_flag(label, LV_OBJ_FLAG_EVENT_BUBBLE);
+        lv_obj_center(label);
+    }
+    return btn;
+}
+
+namespace {
 
 // ---- press-and-repeat button (stepper minus/plus, choice prev/next) --------
 
@@ -280,7 +386,7 @@ void settingsRowSetEnabled(lv_obj_t *row, bool enabled) {
     // No separate hold-cancellation step: lv_obj_hit_test refuses a
     // LV_STATE_DISABLED object, and indev_proc_press re-searches for a hit
     // on every poll for objects without LV_OBJ_FLAG_PRESS_LOCK (the LVGL
-    // default is on; createRowContainer and buildIconButton clear it), so
+    // default is on; createRowContainer and makeFramedTarget clear it), so
     // disabling mid-hold sends the held button a PRESS_LOST on the very
     // next poll, same as if the finger had slid off it. Every hold
     // handler in this file resets its own progress on PRESS_LOST, so
@@ -302,24 +408,19 @@ struct StepperCtx {
 
 lv_obj_t *settingsRowStepperCreate(SettingsUI &ui, lv_obj_t *parent, const char *rowName, const char *label,
                                     SettingsRowStepFn onStep, void *user) {
-    const lv_color_t fg = themeFg();
-
     lv_obj_t *row = createRowContainer(parent);
-    lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
-    lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    lv_obj_set_style_pad_column(row, 20, LV_PART_MAIN); // 56x56 hit boxes 4px apart, see buildIconButton
 
     auto *ctx = new StepperCtx();
 
-    TextCol col = buildTextCol(row, label, kTextColW);
+    TextCol col = buildTextCol(row, label, kTextX, kTextColW, SettingsUI::kRowH);
     ui.tag(col.value, rowName, "value", ctx->value);
 
-    lv_obj_t *minusBtn = buildIconButton(row, &img_minus_small_40x40, fg);
+    lv_obj_t *minusBtn = buildRowButton(ui, row, kMinusHitX, &img_minus_small_40x40);
     ctx->minus = {onStep, user, -1, 0};
     wireRepeatBtn(minusBtn, &ctx->minus);
     ui.tag(minusBtn, rowName, "minus");
 
-    lv_obj_t *plusBtn = buildIconButton(row, &img_plus_small_40x40, fg);
+    lv_obj_t *plusBtn = buildRowButton(ui, row, kPlusHitX, &img_plus_small_40x40);
     ctx->plus = {onStep, user, +1, 0};
     wireRepeatBtn(plusBtn, &ctx->plus);
     ui.tag(plusBtn, rowName, "plus");
@@ -355,26 +456,21 @@ void choiceStepAdapter(void *userCtx, int dir, bool /*fast*/) {
 
 lv_obj_t *settingsRowChoiceCreate(SettingsUI &ui, lv_obj_t *parent, const char *rowName, const char *label,
                                    SettingsRowCycleFn onCycle, void *user) {
-    const lv_color_t fg = themeFg();
-
     lv_obj_t *row = createRowContainer(parent);
-    lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
-    lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    lv_obj_set_style_pad_column(row, 20, LV_PART_MAIN);
 
     auto *ctx = new ChoiceCtx();
     ctx->onCycle = onCycle;
     ctx->user = user;
 
-    TextCol col = buildTextCol(row, label, kTextColW);
+    TextCol col = buildTextCol(row, label, kTextX, kTextColW, SettingsUI::kRowH);
     ui.tag(col.value, rowName, "value", ctx->value);
 
-    lv_obj_t *prevBtn = buildIconButton(row, &img_angle_left_40x40, fg);
+    lv_obj_t *prevBtn = buildRowButton(ui, row, kMinusHitX, &img_angle_left_40x40);
     ctx->prev = {choiceStepAdapter, ctx, -1, 0};
     wireRepeatBtn(prevBtn, &ctx->prev);
     ui.tag(prevBtn, rowName, "prev");
 
-    lv_obj_t *nextBtn = buildIconButton(row, &img_angle_right_40x40, fg);
+    lv_obj_t *nextBtn = buildRowButton(ui, row, kPlusHitX, &img_angle_right_40x40);
     ctx->next = {choiceStepAdapter, ctx, +1, 0};
     wireRepeatBtn(nextBtn, &ctx->next);
     ui.tag(nextBtn, rowName, "next");
@@ -392,29 +488,31 @@ namespace {
 struct ToggleCtx {
     char value[kSettingsRowValueCap] = {0};
     lv_obj_t *valueLabel = nullptr;
-    PressDim pd;
+    lv_obj_t *knob = nullptr;
     SettingsRowToggleFn onToggle = nullptr;
     void *user = nullptr;
     bool on = false;
 };
 
+// The switch outline at the right of a toggle row: a 44x24 track with no
+// fill and a 14 px knob that sits left for Off and right for On.
+constexpr lv_coord_t kSwitchW = 44;
+constexpr lv_coord_t kSwitchH = 24;
+constexpr lv_coord_t kKnob = 14;
+constexpr lv_coord_t kKnobPad = 3;
+
 // The toggle widget owns its own "On"/"Off" text (unlike every other kind's
 // value, which the caller formats): the mapping is fixed, not model-specific.
+// The switch knob follows the same state.
 void toggleSetText(ToggleCtx *ctx) {
     snprintf(ctx->value, sizeof(ctx->value), "%s", ctx->on ? "On" : "Off");
     lv_label_set_text(ctx->valueLabel, ctx->value);
+    lv_obj_align(ctx->knob, ctx->on ? LV_ALIGN_RIGHT_MID : LV_ALIGN_LEFT_MID, ctx->on ? -kKnobPad : kKnobPad, 0);
 }
 
 void toggleEvent(lv_event_t *e) {
     auto *ctx = static_cast<ToggleCtx *>(lv_event_get_user_data(e));
     switch (lv_event_get_code(e)) {
-    case LV_EVENT_PRESSED:
-        applyPressDim(ctx->pd, true);
-        break;
-    case LV_EVENT_RELEASED:
-    case LV_EVENT_PRESS_LOST:
-        applyPressDim(ctx->pd, false);
-        break;
     case LV_EVENT_CLICKED:
         ctx->on = !ctx->on;
         toggleSetText(ctx);
@@ -432,21 +530,36 @@ void toggleEvent(lv_event_t *e) {
 lv_obj_t *settingsRowToggleCreate(SettingsUI &ui, lv_obj_t *parent, const char *rowName, const char *label,
                                    bool initial, SettingsRowToggleFn onToggle, void *user) {
     const lv_color_t fg = themeFg();
-    const lv_color_t dim = touchDimColor(ui);
 
-    lv_obj_t *row = createRowContainer(parent);
-    lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
-    lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_t *row = createFramedRow(ui, parent);
 
     auto *ctx = new ToggleCtx();
     ctx->onToggle = onToggle;
     ctx->user = user;
     ctx->on = initial;
 
-    TextCol col = buildTextCol(row, label, SettingsUI::kRowW - 8);
+    TextCol col = buildTextCol(row, label, kFramedTextX, kFramedTextColW, kFramedContentH);
     ctx->valueLabel = col.value;
-    ctx->pd = makePressDim(col, fg, dim);
+
+    lv_obj_t *track = lv_obj_create(row);
+    lv_obj_remove_style_all(track);
+    lv_obj_clear_flag(track, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE); // a cue, not a target
+    lv_obj_add_flag(track, LV_OBJ_FLAG_EVENT_BUBBLE);
+    lv_obj_set_size(track, kSwitchW, kSwitchH);
+    lv_obj_align(track, LV_ALIGN_RIGHT_MID, -kCueRightPad, 0);
+    lv_obj_set_style_border_width(track, kFrameBorder, LV_PART_MAIN);
+    lv_obj_set_style_border_color(track, fg, LV_PART_MAIN);
+    lv_obj_set_style_border_opa(track, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_radius(track, LV_RADIUS_CIRCLE, LV_PART_MAIN);
+    lv_obj_t *knob = lv_obj_create(track);
+    lv_obj_remove_style_all(knob);
+    lv_obj_clear_flag(knob, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(knob, LV_OBJ_FLAG_EVENT_BUBBLE);
+    lv_obj_set_size(knob, kKnob, kKnob);
+    lv_obj_set_style_radius(knob, LV_RADIUS_CIRCLE, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(knob, fg, LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(knob, LV_OPA_COVER, LV_PART_MAIN);
+    ctx->knob = knob;
     toggleSetText(ctx);
     ui.tag(col.value, rowName, "value", ctx->value);
 
@@ -463,7 +576,6 @@ namespace {
 
 struct ActionCtx {
     char value[kSettingsRowValueCap] = {0};
-    PressDim pd;
     SettingsRowActivateFn onActivate = nullptr;
     void *user = nullptr;
 };
@@ -471,13 +583,6 @@ struct ActionCtx {
 void actionEvent(lv_event_t *e) {
     auto *ctx = static_cast<ActionCtx *>(lv_event_get_user_data(e));
     switch (lv_event_get_code(e)) {
-    case LV_EVENT_PRESSED:
-        applyPressDim(ctx->pd, true);
-        break;
-    case LV_EVENT_RELEASED:
-    case LV_EVENT_PRESS_LOST:
-        applyPressDim(ctx->pd, false);
-        break;
     case LV_EVENT_CLICKED:
         if (ctx->onActivate != nullptr) {
             ctx->onActivate(ctx->user);
@@ -492,21 +597,15 @@ void actionEvent(lv_event_t *e) {
 
 lv_obj_t *settingsRowActionCreate(SettingsUI &ui, lv_obj_t *parent, const char *rowName, const char *label,
                                    SettingsRowActivateFn onActivate, void *user) {
-    const lv_color_t fg = themeFg();
-    const lv_color_t dim = touchDimColor(ui);
-
-    lv_obj_t *row = createRowContainer(parent);
-    lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
-    lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_t *row = createFramedRow(ui, parent);
 
     auto *ctx = new ActionCtx();
     ctx->onActivate = onActivate;
     ctx->user = user;
 
-    TextCol col = buildTextCol(row, label, SettingsUI::kRowW - 8);
-    ctx->pd = makePressDim(col, fg, dim);
+    TextCol col = buildTextCol(row, label, kFramedTextX, kFramedTextColW, kFramedContentH);
     ui.tag(col.value, rowName, "value", ctx->value);
+    buildCueText(row, "Tap");
 
     lv_obj_add_event_cb(row, actionEvent, LV_EVENT_ALL, ctx);
     lv_obj_add_event_cb(
@@ -521,7 +620,6 @@ namespace {
 
 struct ConfirmCtx {
     char value[kSettingsRowValueCap] = {0};
-    PressDim pd;
     lv_obj_t *progressBar = nullptr;
     SettingsRowConfirmFn onConfirm = nullptr;
     void *user = nullptr;
@@ -532,7 +630,7 @@ struct ConfirmCtx {
 void confirmSetProgress(ConfirmCtx *ctx, uint32_t elapsed) {
     const uint32_t clamped = elapsed > kSettingsRowConfirmHoldMs ? kSettingsRowConfirmHoldMs : elapsed;
     const lv_coord_t w =
-        static_cast<lv_coord_t>(static_cast<int64_t>(SettingsUI::kRowW) * clamped / kSettingsRowConfirmHoldMs);
+        static_cast<lv_coord_t>(static_cast<int64_t>(kFramedContentW) * clamped / kSettingsRowConfirmHoldMs);
     lv_obj_set_width(ctx->progressBar, w);
 }
 
@@ -542,7 +640,6 @@ void confirmEvent(lv_event_t *e) {
     case LV_EVENT_PRESSED:
         ctx->pressedAtMs = lv_tick_get();
         ctx->fired = false;
-        applyPressDim(ctx->pd, true);
         confirmSetProgress(ctx, 0);
         break;
     case LV_EVENT_LONG_PRESSED_REPEAT: {
@@ -562,7 +659,6 @@ void confirmEvent(lv_event_t *e) {
     }
     case LV_EVENT_RELEASED:
     case LV_EVENT_PRESS_LOST:
-        applyPressDim(ctx->pd, false);
         confirmSetProgress(ctx, 0);
         ctx->fired = false;
         break;
@@ -576,28 +672,26 @@ void confirmEvent(lv_event_t *e) {
 lv_obj_t *settingsRowConfirmCreate(SettingsUI &ui, lv_obj_t *parent, const char *rowName, const char *label,
                                     SettingsRowConfirmFn onConfirm, void *user) {
     const lv_color_t fg = themeFg();
-    const lv_color_t dim = touchDimColor(ui);
 
-    lv_obj_t *row = createRowContainer(parent);
-    lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
-    lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_t *row = createFramedRow(ui, parent);
 
     auto *ctx = new ConfirmCtx();
     ctx->onConfirm = onConfirm;
     ctx->user = user;
 
-    TextCol col = buildTextCol(row, label, SettingsUI::kRowW - 8);
-    ctx->pd = makePressDim(col, fg, dim);
+    TextCol col = buildTextCol(row, label, kFramedTextX, kFramedTextColW, kFramedContentH);
     ui.tag(col.value, rowName, "value", ctx->value);
 
-    // Growing underline: a non-clickable bar excluded from the row's flex
-    // flow (LV_OBJ_FLAG_IGNORE_LAYOUT) so it can sit pinned to the bottom
-    // edge while textCol occupies the flow normally.
+    // The hold time is shown at rest, so the row says how to operate it
+    // before the finger is down.
+    char cue[16];
+    snprintf(cue, sizeof(cue), "Hold %u s", static_cast<unsigned>(kSettingsRowConfirmHoldMs / 1000));
+    buildCueText(row, cue);
+
+    // Growing underline along the inside of the frame's bottom edge.
     lv_obj_t *bar = lv_obj_create(row);
     lv_obj_remove_style_all(bar);
     lv_obj_clear_flag(bar, LV_OBJ_FLAG_CLICKABLE); // see createRowContainer: lv_obj_create defaults this on
-    lv_obj_add_flag(bar, LV_OBJ_FLAG_IGNORE_LAYOUT);
     lv_obj_set_size(bar, 0, 3);
     lv_obj_align(bar, LV_ALIGN_BOTTOM_LEFT, 0, 0);
     lv_obj_set_style_bg_color(bar, fg, LV_PART_MAIN);
@@ -629,7 +723,6 @@ lv_event_code_t lockedSetEventCode() {
 struct LockedCtx {
     char value[kSettingsRowValueCap] = {0};
     lv_obj_t *valueLabel = nullptr;
-    PressDim pd;
     lv_obj_t *row = nullptr;
     lv_obj_t *minusBtn = nullptr;
     lv_obj_t *plusBtn = nullptr;
@@ -643,10 +736,15 @@ struct LockedCtx {
     uint32_t pressedAtMs = 0;
 };
 
+// The Hold button covers the two buttons' boxes and the gap between them,
+// and its progress underline runs along the inside of its bottom edge.
+constexpr lv_coord_t kHoldHitW = SettingsUI::kRowW - kMinusHitX;                 // 116
+constexpr lv_coord_t kHoldBarW = kHoldHitW - 2 * kFrameInset - 2 * kFrameBorder; // 108
+
 void lockedSetProgress(LockedCtx *ctx, uint32_t elapsed) {
     const uint32_t clamped = elapsed > kSettingsRowUnlockHoldMs ? kSettingsRowUnlockHoldMs : elapsed;
     const lv_coord_t w =
-        static_cast<lv_coord_t>(static_cast<int64_t>(SettingsUI::kRowW) * clamped / kSettingsRowUnlockHoldMs);
+        static_cast<lv_coord_t>(static_cast<int64_t>(kHoldBarW) * clamped / kSettingsRowUnlockHoldMs);
     lv_obj_set_width(ctx->progressBar, w);
 }
 
@@ -689,16 +787,10 @@ void lockedRowEvent(lv_event_t *e) {
     }
 }
 
-// The hold-to-unlock gesture: registered on lockBtn, not the row. The
-// row's own hit rect is the full 320x56 slot, and that overlaps the exit
-// chevron's clipped hit box whenever this row lands in a page's last slot
-// (measured: row4's own bounds reach 9-10 px into the chevron's ext-padded
-// reach, independent of what is drawn inside row4; the shell's per-page
-// row positions leave no spare margin against either the header above or
-// the chevron below, only enough for content that does not span the row's
-// full height). lockBtn sits inset from the row's right edge, clear of
-// both the chevron's zone and the panel's edge circle with room to spare
-// (see settingsRowLockedCreate).
+// The hold-to-unlock gesture: registered on lockBtn, the framed Hold
+// button where the minus and plus buttons appear once unlocked, not the
+// row. The button is the target, so the row says where to press and for
+// how long ("Hold 1 s") before the finger is down (gm-3vj.50).
 void lockedBtnEvent(lv_event_t *e) {
     // Registered for LV_EVENT_ALL, so this also runs for lockBtn's own
     // LV_EVENT_DELETE, which LVGL delivers after the row's DELETE handler
@@ -716,7 +808,6 @@ void lockedBtnEvent(lv_event_t *e) {
     switch (code) {
     case LV_EVENT_PRESSED:
         ctx->pressedAtMs = lv_tick_get();
-        applyPressDim(ctx->pd, true);
         lockedSetProgress(ctx, 0);
         break;
     case LV_EVENT_LONG_PRESSED_REPEAT:
@@ -724,7 +815,6 @@ void lockedBtnEvent(lv_event_t *e) {
         break;
     case LV_EVENT_RELEASED: {
         const uint32_t elapsed = lv_tick_elaps(ctx->pressedAtMs);
-        applyPressDim(ctx->pd, false);
         if (elapsed >= kSettingsRowUnlockHoldMs) {
             // Revealing the buttons only now, at release, is what stops the
             // very press that crossed the threshold from landing on one of
@@ -743,7 +833,6 @@ void lockedBtnEvent(lv_event_t *e) {
         break;
     }
     case LV_EVENT_PRESS_LOST:
-        applyPressDim(ctx->pd, false);
         lockedSetProgress(ctx, 0);
         break;
     default:
@@ -756,56 +845,43 @@ void lockedBtnEvent(lv_event_t *e) {
 lv_obj_t *settingsRowLockedCreate(SettingsUI &ui, lv_obj_t *parent, const char *rowName, const char *label,
                                    SettingsRowStepFn onStep, SettingsRowUnlockedFn onUnlocked, void *user) {
     const lv_color_t fg = themeFg();
-    const lv_color_t dim = touchDimColor(ui);
 
     lv_obj_t *row = createRowContainer(parent);
-    lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
-    lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    lv_obj_set_style_pad_column(row, 20, LV_PART_MAIN);
 
     auto *ctx = new LockedCtx();
     ctx->onUnlocked = onUnlocked;
     ctx->user = user;
     ctx->row = row;
 
-    TextCol col = buildTextCol(row, label, kTextColW);
+    TextCol col = buildTextCol(row, label, kTextX, kTextColW, SettingsUI::kRowH);
     ctx->valueLabel = col.value;
-    ctx->pd = makePressDim(col, fg, dim);
     ui.tag(col.value, rowName, "value", ctx->value);
 
-    lv_obj_t *minusBtn = buildIconButton(row, &img_minus_small_40x40, fg);
+    lv_obj_t *minusBtn = buildRowButton(ui, row, kMinusHitX, &img_minus_small_40x40);
     ctx->minus = {onStep, user, -1, 0};
     wireRepeatBtn(minusBtn, &ctx->minus);
     ui.tag(minusBtn, rowName, "minus");
     ctx->minusBtn = minusBtn;
 
-    lv_obj_t *plusBtn = buildIconButton(row, &img_plus_small_40x40, fg);
+    lv_obj_t *plusBtn = buildRowButton(ui, row, kPlusHitX, &img_plus_small_40x40);
     ctx->plus = {onStep, user, +1, 0};
     wireRepeatBtn(plusBtn, &ctx->plus);
     ui.tag(plusBtn, rowName, "plus");
     ctx->plusBtn = plusBtn;
 
-    // Outside the row's flex flow (minus/plus hide while locked and locked
-    // and unlocked never show at once, so there is no layout to share) and
-    // inset from the row's right edge: at x_ofs=0 its ext-padded hit rect
-    // would reach x=407, only 0.8 px inside the panel's 228 px safety
-    // radius; -20 clears both the radius and the exit chevron's clipped
-    // hit box, with roughly 15 px and 28 px of margin respectively (see
-    // lockedBtnEvent's comment for why this needs its own hit rect at all
-    // rather than the whole row). No lock glyph exists among the shared
-    // icon set, so this reuses img_check_40x40; the primary "hold to
-    // unlock" affordance is the value text, this is a secondary, discoverable
-    // tap target sized and placed to pass the geometry audit.
-    lv_obj_t *lockBtn = buildIconButton(row, &img_check_40x40, fg);
-    lv_obj_add_flag(lockBtn, LV_OBJ_FLAG_IGNORE_LAYOUT);
-    lv_obj_align(lockBtn, LV_ALIGN_RIGHT_MID, -20, 0);
+    // Locked and unlocked never show at once, so the Hold button takes the
+    // minus and plus buttons' place: a 116x56 hit box from x 204 to the
+    // row's edge, the same edge clearance the plus button has.
+    char holdText[16];
+    snprintf(holdText, sizeof(holdText), "Hold %u s", static_cast<unsigned>(kSettingsRowUnlockHoldMs / 1000));
+    lv_obj_t *lockBtn = buildRowButton(ui, row, kMinusHitX, nullptr, kHoldHitW, holdText);
     ui.tag(lockBtn, rowName, "unlock");
     ctx->lockBtn = lockBtn;
 
-    lv_obj_t *bar = lv_obj_create(row);
+    lv_obj_t *bar = lv_obj_create(lockBtn);
     lv_obj_remove_style_all(bar);
     lv_obj_clear_flag(bar, LV_OBJ_FLAG_CLICKABLE); // see createRowContainer: lv_obj_create defaults this on
-    lv_obj_add_flag(bar, LV_OBJ_FLAG_IGNORE_LAYOUT);
+    lv_obj_add_flag(bar, LV_OBJ_FLAG_EVENT_BUBBLE);
     lv_obj_set_size(bar, 0, 3);
     lv_obj_align(bar, LV_ALIGN_BOTTOM_LEFT, 0, 0);
     lv_obj_set_style_bg_color(bar, fg, LV_PART_MAIN);
@@ -833,10 +909,8 @@ void settingsRowSetLocked(lv_obj_t *row, bool locked) {
 
 lv_obj_t *settingsRowInfoCreate(SettingsUI &ui, lv_obj_t *parent, const char *rowName, const char *label) {
     lv_obj_t *row = createRowContainer(parent);
-    lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
-    lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
 
-    TextCol col = buildTextCol(row, label, SettingsUI::kRowW - 8);
+    TextCol col = buildTextCol(row, label, kTextX, SettingsUI::kRowW - kTextX - 4, SettingsUI::kRowH);
     // No per-kind ctx (nothing else about an info row is stateful), so the
     // canonical value buffer is its own small heap allocation, freed on this
     // row's own delete same as every other kind's ctx.

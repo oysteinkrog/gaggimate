@@ -3,7 +3,7 @@
 
 // The on-display settings shell: a full-screen cover over the menu screen,
 // a tile page (one tile per category) and a paged list page (title, page
-// arrows, five row slots, exit chevron). This file is the contract the
+// arrows, five row slots, exit button). This file is the contract the
 // category beads code against: the struct shapes and extern symbols below
 // must keep their names; only the categories' own content is out of scope
 // here (see CLAUDE.md, on-display settings epic).
@@ -28,7 +28,7 @@ class SettingsUI;
 // Carried in every tagged settings object's lv_obj_t::user_data so the
 // touchmap dump (a later bead) can identify it without guessing from class
 // or position. `row` is a stable identifier for whatever the object is (a
-// row, a tile, an arrow, the exit chevron, the cover itself), not literally
+// row, a tile, an arrow, the exit button, the cover itself), not literally
 // limited to row objects. `text` is non-null only for role "value": the
 // address of the row-owned canonical string, set once, whose contents
 // settingsRowSetValue (a later bead) rewrites in place: the label's own
@@ -128,7 +128,7 @@ class SettingsUI {
     // Tags an object built by category code (a value label, a stepper's
     // +/- buttons, ...) into the currently-open page's tag set. Only valid
     // while a category page is being built or is open; the shell tags its
-    // own chrome (tiles, arrows, the exit chevron, row slots, the cover)
+    // own chrome (tiles, arrows, the exit button, row slots, the cover)
     // itself.
     void tag(lv_obj_t *obj, const char *row, const char *role, const char *text = nullptr);
 
@@ -186,9 +186,9 @@ class SettingsUI {
 
     void buildTilePage();
     void buildTile(lv_obj_t *parent, int index, const SettingsCategoryDef *def, lv_color_t fg);
-    // topLevel: closes settings outright (tile page's chevron) vs. pops one
-    // page (a category page's chevron).
-    void buildExitChevron(lv_obj_t *parent, lv_color_t fg, bool topLevel);
+    // topLevel: closes settings outright (the tile page's Close) vs. pops one
+    // page (a category page's Back).
+    void buildExitButton(lv_obj_t *parent, lv_color_t fg, bool topLevel);
     void buildCategoryPage(PageEntry &entry);
     void tagTilePage(lv_obj_t *obj, const char *row, const char *role);
 

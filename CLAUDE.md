@@ -660,8 +660,8 @@ the design cannot show and what the runs measured.
   (`DefaultUI::buildScaleScreen`) is the precedent for the construction and
   for the delete-event pointer cleanup.
 - **No translucent plate on a settings page.** The cover sets `bg_opa` to
-  `LV_OPA_TRANSP` and every row is text and icons on the screen background
-  (`SettingsUI.cpp`). Translucent pixels are the render task's budget knob:
+  `LV_OPA_TRANSP` and every row is text, icons and 2 px outlines on the
+  screen background (`SettingsUI.cpp`). Translucent pixels are the render task's budget knob:
   the brew screen's plates were about 106k non-transparent pixels and 12 to
   13 ms of blend a frame before the radius-140 disc, 65k and 7 ms after
   (UI-pipeline invariants above). The bench board
@@ -679,7 +679,7 @@ the design cannot show and what the runs measured.
 - **`handleScreenChange` calls `SettingsUI::onExternalLeave()` before
   `eez_flow_set_screen`** (`DefaultUI.cpp`). A standby timeout, a controller
   mode change or a brew start mid-edit therefore commits and tears down the
-  same way the exit chevron does, instead of leaving a stale cover on a
+  same way the exit button does, instead of leaving a stale cover on a
   screen that has moved underneath it.
 - **A web save while a category is open is per-field last writer wins.** The
   web values land first, `settings:changed` sets the shell's flag,
@@ -709,11 +709,12 @@ the design cannot show and what the runs measured.
 - **Every target presses the same way: 40% toward the touch dim colour.**
   `settingsPressedColor(rest, dim)` (`SettingsRows.h`) is the one rule. The
   generated screens get it from `DefaultUI::applyPressedFeedbackTo`, which
-  walks lv_btn and clickable lv_img objects and so covers the arrows and
-  chevrons; the tiles are plain lv_obj with a non-clickable icon and LVGL
-  puts PRESSED on the tile, never its children, so `buildTile` recolours
-  icon and caption by hand; the whole-row targets (toggle, action, confirm,
-  unlock) dim their text through `PressDim`. Measured 2026-09-06 on the
+  walks lv_btn and clickable lv_img objects; the tiles are plain lv_obj
+  with a non-clickable icon and LVGL puts PRESSED on the tile, never its
+  children, so `buildTile` recolours icon and caption by hand; every framed
+  target (row buttons, framed rows, header arrows, exit) is a plain lv_obj
+  too, and `framePressEvent` (`SettingsRows.cpp`) recolours its border,
+  text and icon. Measured 2026-09-06 on the
   simulator as the mean framebuffer change per pixel inside the hit box
   while held: menu buttons 19 to 29, tiles 0 before the rule and 42 after,
   rows 32 to 49 before (text jumped to the dim colour itself and vanished)
@@ -730,15 +731,20 @@ the design cannot show and what the runs measured.
   left. Confirm rows act after a 2 s hold (`kSettingsRowConfirmHoldMs`).
 - **Geometry: 320x56 rows, five per page** (`SettingsUI::kRowW`, `kRowH`,
   `kRowsPerPage`), 96x96 tiles on a 145 px ring (`SettingsUI.cpp`,
-  `buildTile`). Every tappable target except the exit chevron needs an
-  effective hit rectangle of at least 56x56 px, no overlap with another on
-  the same page, and 12 px of clearance from the panel's edge circle. The
-  chevron is exempt from the size and edge rules and its ext click pad is
-  34 px on settings pages, not the 45 px the generated screens use: at 45 px
-  it reached 10x6 px into the two lower tiles (measured by the runner's
-  audit, 91cb0ed5). The page header is 240 px wide at y -160: previous and
-  next arrows at x -100 and +100 (hit boxes 72 to 128 px from the centre,
-  far corner 227.4 px out, under the 228 px edge rule) with the title on
+  `buildTile`). Every tappable target needs an effective hit rectangle of
+  at least 56x56 px, no overlap with another on the same page, and 12 px
+  of clearance from the panel's edge circle. Every target draws a 2 px
+  outline with no fill, 2 px inside its hit box, and loses it while
+  disabled (gm-3vj.50). Stepper and choice controls are separate 56x56
+  buttons at x 204 and 264 of the row, toggle, action and confirm rows
+  frame the whole row with a cue at the right (a switch outline, "Tap",
+  "Hold 2 s"), and a locked row's target is a 116x56 "Hold 1 s" button in
+  place of the two buttons. The exit is a 56x56 Back or Close button
+  centred at (240, 424), hit box y 396 to 451, 1 px below the fifth row;
+  the audit still exempts role "exit" from the size and edge rules, but it
+  passes both. The page header is 256 px wide at y -160: previous and
+  next arrows are 56x56 buttons at its ends (hit boxes 72 to 128 px from
+  the centre, far corner 227.4 px out, under the 228 px edge rule) with the title on
   one line in the 144 px between them, its height fixed to the font's line
   height because LONG_DOT wraps instead of truncating when the height is
   left to the content (the old 96 px column showed "Animatio" / "n").

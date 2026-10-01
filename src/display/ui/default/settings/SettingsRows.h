@@ -57,12 +57,28 @@ void settingsRowSetEnabled(lv_obj_t *row, bool enabled);
 // The pressed colour every settings target uses: 40% of the way from its
 // rest colour toward the touch dim colour (Settings::getTouchDimColor),
 // the same shift DefaultUI::applyPressedFeedbackTo gives the generated
-// screens' icons and buttons, so a held tile, row, arrow or chevron reads
+// screens' icons and buttons, so a held tile, row, arrow or exit button reads
 // the same as a held menu button. Measured 2026-09-06 on the simulator:
 // the generated menu buttons dim 19 to 29 units per pixel of hit box, the
 // settings tiles dimmed 0 (no feedback at all) and the whole-row targets
 // went fully black; both now use this.
 lv_color_t settingsPressedColor(lv_color_t rest, lv_color_t dim);
+
+// The frame every settings target draws (gm-3vj.50): a 2 px border in fg,
+// radius 8, no fill, and a 2 px ext click pad, so an object 4 px smaller
+// than its hit box on each axis draws its outline 2 px inside that box.
+// Under LV_STATE_DISABLED the border goes transparent: a target that
+// cannot be pressed shows no frame.
+void settingsStyleFrame(lv_obj_t *obj, lv_color_t fg);
+
+// A framed button with a hit box hitW wide and 56 tall: an icon, a short
+// text, or both, centred, in the theme colour. Clickable, bubbling, press
+// lock cleared, and recoloured toward the touch dim colour while pressed
+// (settingsPressedColor) unless the compositor's plate is the feedback.
+// The caller positions it and wires its action. Used by the row controls,
+// the page header's arrows and the exit button.
+lv_obj_t *settingsFrameButtonCreate(SettingsUI &ui, lv_obj_t *parent, lv_coord_t hitW, const lv_img_dsc_t *icon,
+                                    const char *text);
 
 using SettingsRowStepFn = void (*)(void *user, int dir, bool fast);
 using SettingsRowCycleFn = void (*)(void *user, int dir);
@@ -71,25 +87,29 @@ using SettingsRowActivateFn = void (*)(void *user);
 using SettingsRowUnlockedFn = void (*)(void *user);
 using SettingsRowConfirmFn = void (*)(void *user);
 
-// Minus/plus at the right; onStep(user, dir, fast) once on LV_EVENT_PRESSED
+// Plain text column, then minus and plus as two framed 56x56 buttons at the
+// right; onStep(user, dir, fast) once on LV_EVENT_PRESSED
 // (dir -1/+1, fast always false) and once per LV_EVENT_LONG_PRESSED_REPEAT
 // while a button is held (fast true once the hold has run kSettingsRowFastHoldMs).
 // Never called from LV_EVENT_CLICKED.
 lv_obj_t *settingsRowStepperCreate(SettingsUI &ui, lv_obj_t *parent, const char *rowName, const char *label,
                                     SettingsRowStepFn onStep, void *user);
 
-// '<'/'>' arrows either side of the value; onCycle(user, dir) with the same
+// Plain text column, then '<' and '>' as two framed 56x56 buttons at the
+// right; onCycle(user, dir) with the same
 // press-and-repeat protocol as the stepper, minus the fast flag.
 lv_obj_t *settingsRowChoiceCreate(SettingsUI &ui, lv_obj_t *parent, const char *rowName, const char *label,
                                    SettingsRowCycleFn onCycle, void *user);
 
-// Whole row is the target; value is "On"/"Off", managed by the row itself
+// Whole row is the target and draws the frame, with a switch outline at the
+// right whose knob shows the state; value is "On"/"Off", managed by the row itself
 // (initial sets the starting state), so onToggle is a notification only,
 // not the place a caller formats the display text.
 lv_obj_t *settingsRowToggleCreate(SettingsUI &ui, lv_obj_t *parent, const char *rowName, const char *label,
                                    bool initial, SettingsRowToggleFn onToggle, void *user);
 
-// Whole row is the target; onActivate(user) once per completed tap
+// Whole row is the target and draws the frame, with "Tap" at the right;
+// onActivate(user) once per completed tap
 // (LV_EVENT_CLICKED). Value is optional and caller-managed via
 // settingsRowSetValue, left blank if the caller never calls it (a plain
 // navigation row).
@@ -97,11 +117,12 @@ lv_obj_t *settingsRowActionCreate(SettingsUI &ui, lv_obj_t *parent, const char *
                                    SettingsRowActivateFn onActivate, void *user);
 
 // A stepper (same onStep protocol) that starts locked: the minus/plus
-// buttons are hidden and the value line shows "hold to unlock" with a
-// growing progress underline while the whole row is held. The buttons are
-// revealed and the row's own hit area is cleared (so it stops competing with
-// them for the audit's overlap check) only at release, and only if the hold
-// ran kSettingsRowUnlockHoldMs; this is also what stops the press that
+// buttons are hidden, the value line shows "hold to unlock", and a framed
+// "Hold 1 s" button in their place is the target, with a growing progress
+// underline inside it while it is held. The buttons are revealed and the
+// Hold button hidden (so it stops competing with them for the audit's
+// overlap check) only at release, and only if the hold ran
+// kSettingsRowUnlockHoldMs; this is also what stops the press that
 // crossed the threshold from then landing on a freshly-revealed button
 // before the finger lifts. onUnlocked(user) fires once, at that release.
 // Releasing early, or GM_TOUCH_PROBE/GAGGIMATE_SIM builds calling
@@ -110,7 +131,8 @@ lv_obj_t *settingsRowLockedCreate(SettingsUI &ui, lv_obj_t *parent, const char *
                                    SettingsRowStepFn onStep, SettingsRowUnlockedFn onUnlocked, void *user);
 void settingsRowSetLocked(lv_obj_t *row, bool locked);
 
-// Whole row is the target; holding it kSettingsRowConfirmHoldMs with visible
+// Whole row is the target and draws the frame, with "Hold 2 s" at the right;
+// holding it kSettingsRowConfirmHoldMs with visible
 // progress calls onConfirm(user) once (fired the moment the threshold is
 // crossed, not deferred to release: nothing else on the row is revealed
 // mid-press for a continued hold to land on by surprise, unlike the locked

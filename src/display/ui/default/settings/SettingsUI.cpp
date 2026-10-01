@@ -52,10 +52,9 @@ void dropHeldPress() {
     }
 }
 
-// A header arrow that has no page to go to stays in the flex row, since a
-// hidden child drops out of the layout and the title would move 24 px
-// sideways on the first and last page. It is made invisible and
-// unclickable instead.
+// A header arrow that has no page to go to keeps its place and is made
+// invisible and unclickable, frame and icon both (opa multiplies down the
+// tree), so nothing on the page draws a target that does nothing.
 void setArrowAvailable(lv_obj_t *arrow, bool available) {
     if (available) {
         lv_obj_add_flag(arrow, LV_OBJ_FLAG_CLICKABLE);
@@ -360,7 +359,7 @@ void SettingsUI::buildTilePage() {
     for (int i = 0; i < kCategoryCount; i++) {
         buildTile(page, i, kCategories[i], fg);
     }
-    buildExitChevron(page, fg, /*topLevel=*/true);
+    buildExitButton(page, fg, /*topLevel=*/true);
 
     ui_.applyPressedFeedbackTo(page);
     builtThemeIdx = static_cast<int>(themeIdx);
@@ -369,7 +368,7 @@ void SettingsUI::buildTilePage() {
 
 void SettingsUI::buildTile(lv_obj_t *parent, int index, const SettingsCategoryDef *def, lv_color_t fg) {
     // Six slots around the panel, avoiding the status icons at the top and
-    // the exit chevron's clipped hit box at the bottom: hand-verified against
+    // the exit button at the bottom: hand-verified against
     // the 96x96/12px-edge/56x56-arrow rules in the epic's shared contract
     // (kTileRadius=145, kSize=96 keeps every corner inside radius 228 with
     // 15-30 px to spare, and every pair of adjacent tiles at least a few px
@@ -451,21 +450,16 @@ void SettingsUI::buildTile(lv_obj_t *parent, int index, const SettingsCategoryDe
     tagTilePage(tileObj, def->title, "tile");
 }
 
-void SettingsUI::buildExitChevron(lv_obj_t *parent, lv_color_t fg, bool topLevel) {
-    lv_obj_t *exitBtn = lv_img_create(parent);
-    lv_img_set_src(exitBtn, &img_angle_up_40x40);
-    lv_obj_align(exitBtn, LV_ALIGN_CENTER, 0, 210);
-    // Same place as every other screen's exit chevron, but a smaller click
-    // pad: the fifth row slot ends at y 394 and a 45 px pad reaches up to
-    // 385, so a whole-row target in that slot (toggle, action, confirm)
-    // would overlap the chevron's hit rectangle, and on the tile page the
-    // 45 px pad reached 10x6 px into the two lower tiles' hit rectangles
-    // (the runner's audit measured it). 34 keeps the hit box 108x84 px and
-    // clear of both by 2 px or more.
-    lv_obj_set_ext_click_area(exitBtn, 34);
-    lv_obj_set_style_img_recolor(exitBtn, fg, LV_PART_MAIN);
-    lv_obj_set_style_img_recolor_opa(exitBtn, LV_OPA_COVER, LV_PART_MAIN);
-    lv_obj_add_flag(exitBtn, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_EVENT_BUBBLE);
+void SettingsUI::buildExitButton(lv_obj_t *parent, lv_color_t /*fg*/, bool topLevel) {
+    // A framed 56x56 button centred at (240, 424) that says what it does:
+    // "Close" on the tile page, "Back" on a category page (gm-3vj.50). It
+    // replaced an up chevron at (240, 450) with a 34 px click pad. The hit
+    // box is x 212 to 267 and y 396 to 451: 1 px below the fifth row slot
+    // (which ends at y 394), clear of the two lower tiles (their boxes start
+    // at x 295 and end at 185), and its far corner 213 px from the centre,
+    // inside the 228 px edge rule, although the audit still exempts it.
+    lv_obj_t *exitBtn = settingsFrameButtonCreate(*this, parent, 56, nullptr, topLevel ? "Close" : "Back");
+    lv_obj_align(exitBtn, LV_ALIGN_CENTER, 0, 184);
     if (topLevel) {
         lv_obj_add_event_cb(
             exitBtn, [](lv_event_t *e) { static_cast<SettingsUI *>(lv_event_get_user_data(e))->close(); },
@@ -512,7 +506,7 @@ void SettingsUI::buildCategoryPage(PageEntry &entry) {
     // release: LVGL 8.4 gates CLICKED on scrolling, not on a gesture, and a
     // swipe across a toggle row would otherwise flip it. A stepper still
     // steps once on the PRESSED it already had if the swipe began on its
-    // 40 px button. The root is the one clickable container on the page
+    // button. The root is the one clickable container on the page
     // (the slots, header and title column are not), so a press on a row's
     // text or on empty space lands on it and its swipe still arrives here.
     lv_obj_clear_flag(root, LV_OBJ_FLAG_GESTURE_BUBBLE);
@@ -550,20 +544,20 @@ void SettingsUI::buildCategoryPage(PageEntry &entry) {
     }
 
     // Header: previous-page arrow, title+indicator column, next-page arrow,
-    // all centred on one row so the arrows' 56x56 hit pad never has to
-    // compete with a stacked title band for the ~68 px available between
-    // the status icons and the row block. 240 px wide: the arrows' hit
-    // boxes then span x 72..128 at y -188..-132, and the far corner sits
-    // 227.4 px from the centre, inside the 228 px edge rule; the title gets
-    // the 144 px between them on one line ("Animation" in montserrat 24 is
-    // about 125 px; the old 96 px column broke it as "Animatio" / "n").
-    // The pages sit side by side in the reader's mind, so the arrows point
-    // left and right (owner's request, 2026-09-09; they were up and down
-    // chevrons before) and a horizontal swipe on the page does the same,
-    // see the GESTURE handler on the root above.
+    // on one row so the arrows' 56x56 hit boxes never have to compete with a
+    // stacked title band for the ~68 px available between the status icons
+    // and the row block. 256 px wide: each arrow is a framed 56x56 button
+    // (settingsFrameButtonCreate) flush with its end, so the hit boxes span
+    // x 72..128 from the centre at y -188..-132 and the far corner sits
+    // 227.4 px out, inside the 228 px edge rule; the title gets the 144 px
+    // between them on one line ("Animation" in montserrat 24 is about
+    // 125 px). The pages sit side by side in the reader's mind, so the
+    // arrows point left and right (owner's request, 2026-09-09) and a
+    // horizontal swipe on the page does the same, see the GESTURE handler on
+    // the root above.
     lv_obj_t *header = lv_obj_create(root);
     lv_obj_remove_style_all(header);
-    lv_obj_set_size(header, 240, 56);
+    lv_obj_set_size(header, 256, 56);
     lv_obj_align(header, LV_ALIGN_CENTER, 0, -160);
     lv_obj_clear_flag(header, LV_OBJ_FLAG_SCROLLABLE);
     // lv_obj_create makes it clickable. Left on, a press between the
@@ -574,23 +568,14 @@ void SettingsUI::buildCategoryPage(PageEntry &entry) {
     // cover's PRESSED handler (the standby timer's only view of settings
     // activity) never sees the arrow presses.
     lv_obj_add_flag(header, LV_OBJ_FLAG_EVENT_BUBBLE);
-    // Same clipping the row slots below need the flag for (see the loop
-    // building kRowY): the arrows' 8 px ext click pad has to reach
-    // past this container's own 240 px width to make their 56x56 hit box,
-    // and with no spare margin between them and the title column there was
-    // nowhere for that pad to go (measured: both arrows audited at 48x56).
+    // The arrows' hit boxes end exactly on this container's edges; the flag
+    // keeps their 2 px ext click pad from being clipped there, the same as
+    // the row slots below.
     lv_obj_add_flag(header, LV_OBJ_FLAG_OVERFLOW_VISIBLE);
     lv_obj_set_style_bg_opa(header, LV_OPA_TRANSP, LV_PART_MAIN);
-    lv_obj_set_flex_flow(header, LV_FLEX_FLOW_ROW);
-    lv_obj_set_flex_align(header, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    lv_obj_set_style_pad_column(header, 8, LV_PART_MAIN);
 
-    lv_obj_t *upArrow = lv_img_create(header);
-    lv_img_set_src(upArrow, &img_angle_left_40x40);
-    lv_obj_set_style_img_recolor(upArrow, fg, LV_PART_MAIN);
-    lv_obj_set_style_img_recolor_opa(upArrow, LV_OPA_COVER, LV_PART_MAIN);
-    lv_obj_add_flag(upArrow, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_EVENT_BUBBLE);
-    lv_obj_set_ext_click_area(upArrow, 8); // 40x40 visual -> 56x56 hit box
+    lv_obj_t *upArrow = settingsFrameButtonCreate(*this, header, 56, &img_angle_left_40x40, nullptr);
+    lv_obj_align(upArrow, LV_ALIGN_LEFT_MID, 2, 0);
     lv_obj_add_event_cb(
         upArrow,
         [](lv_event_t *e) {
@@ -606,6 +591,7 @@ void SettingsUI::buildCategoryPage(PageEntry &entry) {
     lv_obj_t *mid = lv_obj_create(header);
     lv_obj_remove_style_all(mid);
     lv_obj_set_size(mid, 144, LV_SIZE_CONTENT);
+    lv_obj_align(mid, LV_ALIGN_CENTER, 0, 0);
     lv_obj_clear_flag(mid, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE); // see the header above
     lv_obj_set_style_bg_opa(mid, LV_OPA_TRANSP, LV_PART_MAIN);
     lv_obj_set_flex_flow(mid, LV_FLEX_FLOW_COLUMN);
@@ -628,12 +614,8 @@ void SettingsUI::buildCategoryPage(PageEntry &entry) {
     lv_obj_set_style_text_font(indicator, &lv_font_montserrat_16, LV_PART_MAIN);
     lv_obj_set_style_text_color(indicator, fg, LV_PART_MAIN);
 
-    lv_obj_t *downArrow = lv_img_create(header);
-    lv_img_set_src(downArrow, &img_angle_right_40x40);
-    lv_obj_set_style_img_recolor(downArrow, fg, LV_PART_MAIN);
-    lv_obj_set_style_img_recolor_opa(downArrow, LV_OPA_COVER, LV_PART_MAIN);
-    lv_obj_add_flag(downArrow, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_EVENT_BUBBLE);
-    lv_obj_set_ext_click_area(downArrow, 8);
+    lv_obj_t *downArrow = settingsFrameButtonCreate(*this, header, 56, &img_angle_right_40x40, nullptr);
+    lv_obj_align(downArrow, LV_ALIGN_RIGHT_MID, -2, 0);
     lv_obj_add_event_cb(
         downArrow,
         [](lv_event_t *e) {
@@ -649,7 +631,7 @@ void SettingsUI::buildCategoryPage(PageEntry &entry) {
     // Five 320x56 row slots, contiguous and centred (matches the epic's
     // shared contract); positions hand-verified to keep every corner inside
     // the 228 px safety radius and clear of the header above and the
-    // chevron below.
+    // exit button below.
     static constexpr int kRowY[kRowsPerPage] = {-97, -41, 15, 71, 127};
     static constexpr const char *const kRowNames[kRowsPerPage] = {"row0", "row1", "row2", "row3", "row4"};
     for (int i = 0; i < kRowsPerPage; i++) {
@@ -662,16 +644,16 @@ void SettingsUI::buildCategoryPage(PageEntry &entry) {
         // whole 320x56 slot. Such a press lands on the page root instead.
         lv_obj_clear_flag(slot, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
         lv_obj_add_flag(slot, LV_OBJ_FLAG_EVENT_BUBBLE);
-        // A row widget's rightmost control can sit flush against this
-        // slot's own edge (no spare margin, by design: label column + gaps
-        // + two 40 px controls fill kRowW exactly), so its ext click pad
-        // needs to extend past the slot's bounds for hit-testing. Without
+        // A row widget's controls draw their frames 2 px inside their hit
+        // boxes and take the 2 px back as ext click pad, and the rightmost
+        // box ends exactly on this slot's edge, as does a framed row's, so
+        // the pad needs to extend to the slot's bounds for hit-testing. Without
         // this flag the slot clips that pad a second time at the same
         // boundary its own row container already stopped clipping at
         // (SettingsRows.cpp's createRowContainer sets the same flag on the
         // row itself; both ancestors need it, since lv_indev_search_obj
         // clips at every ancestor lacking it, not just the nearest one).
-        // No row widget draws visible content past its own 320x56 bounds,
+        // No row widget draws visible content past its slot's 320x56 bounds,
         // so this has no visual effect for any category.
         lv_obj_add_flag(slot, LV_OBJ_FLAG_OVERFLOW_VISIBLE);
         lv_obj_set_style_bg_opa(slot, LV_OPA_TRANSP, LV_PART_MAIN);
@@ -685,7 +667,7 @@ void SettingsUI::buildCategoryPage(PageEntry &entry) {
         }
     }
 
-    buildExitChevron(root, fg, /*topLevel=*/false);
+    buildExitButton(root, fg, /*topLevel=*/false);
 
     ui_.applyPressedFeedbackTo(root);
     builtThemeIdx = static_cast<int>(themeIdx);
