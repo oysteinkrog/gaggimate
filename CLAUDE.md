@@ -1260,6 +1260,15 @@ the design cannot show and what the runs measured.
 
 Instruments, and where each one exists:
 
+- **Which debug routes ship is a rule, and the table is at the top of
+  `WebUIPluginDebug.cpp`** (gm-3hnq, owner's decision 2026-10-01). A
+  read-only route that reports state and costs nothing while idle ships on
+  every build that has the hardware it reads. A route that writes device
+  state, injects input, changes a setting or holds a resource is bench-only,
+  behind `GM_DEBUG_WRITE_ROUTES` or its experiment's flag. A route that
+  reports and takes a setter ships the report and drops the setter.
+  `/api/debug/heap` ships but walks the heap under its lock and displaces
+  bands (gm-jjb8), so a polling tool reads scanout or anim instead.
 - `/api/debug/tap?x=&y=[&ms=]` queues one synthetic tap through
   `TouchInject`; compiled where `GM_TOUCH_PROBE` or `GAGGIMATE_SIM` is set.
 - `/api/debug/touchmap?screen=0` dumps the active screen's object tree with

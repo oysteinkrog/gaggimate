@@ -8,17 +8,62 @@
 // that serves the machine. setupServer() calls setupDebugEndpoints() where
 // the block used to be.
 //
-// Which routes a production build carries (gm-bzu.43, pending the owner's
-// call under gm-3hnq): every read-only diagnostic stays, and anything a GET
-// can use to change what the device does (take the radio down, move the
-// pixel clock, write flash, queue a kernel test, poke a panel register,
-// flip a render knob, load a screen) is compiled only where
-// GM_DEBUG_WRITE_ROUTES is set. That is every bench env (GM_TOUCH_PROBE,
-// GM_KBLOB, GM_BLEND_PROBE, GM_ANIM_BENCH, GM_SYNTH_HANDSHAKE) and the
-// simulator; `display`, `display-demo`, `display-noradio` and the headless
-// envs set none of them. A route that reports and also takes a setter keeps
-// the report in production and drops only the setter, so the same query
-// still answers there, with the argument ignored.
+// WHICH ROUTES SHIP, AND THE RULE FOR A NEW ONE (gm-3hnq, owner's decision
+// 2026-10-01; the split itself is gm-bzu.43). Read this before adding a route.
+//
+// 1. A read-only route that reports state and costs nothing while nobody calls
+//    it ships on every build that has the hardware it reads. So it is guarded
+//    only by GAGGIMATE_SIM or GAGGIMATE_HEADLESS where the thing it reads does
+//    not exist there, and by nothing else.
+// 2. A route that writes device state, injects input, changes a stored or live
+//    setting, or holds a resource is bench-only. It sits behind
+//    GM_DEBUG_WRITE_ROUTES (set below for every bench env and the simulator)
+//    or behind the narrower flag of its experiment: GM_TOUCH_PROBE,
+//    GM_SYNTH_HANDSHAKE, GM_ANIM_BENCH, GM_KBLOB or GM_BLEND_PROBE.
+//    `display`, `display-demo`, `display-noradio` and the headless envs set
+//    none of them.
+// 3. A route that reports and also takes a setter keeps the report in
+//    production and drops only the setter, so the same query still answers
+//    there, with the argument ignored.
+//
+// The trust boundary these routes sit inside: the web server has no
+// authentication, and /api/settings already returns the WiFi password in
+// clear text to anyone on the LAN. A read-only route adds little to that.
+// /api/ota/dev is gm-thg's and is not governed here.
+//
+// What `-e display` carries today. Nothing was added or removed by gm-3hnq.
+//
+//   Ships in `display` (read-only; device-only means not SIM, not HEADLESS):
+//   heap, heap/detail (WebUIPlugin.cpp)   every build. Calls
+//       heap_caps_get_largest_free_block, which walks every block under the
+//       heap lock and displaces bands (gm-jjb8). A polling tool reads
+//       /api/debug/scanout or /api/debug/anim instead.
+//   heapwalk, heapmap                     not SIM. Same walk, on purpose.
+//   timers                                not SIM. Dumps to the serial log.
+//   scanout                               not SIM. reset=1 and lagthresh=
+//       write only this instrument's own counters and slip-log threshold,
+//       which is why they were left in.
+//   flashmode                             not SIM.
+//   anim, coex, wifi, pclk                device-only. Reports; every setter
+//       is behind GM_DEBUG_WRITE_ROUTES.
+//   touchlog, fb, ovl                     device-only. fb and ovl stream a
+//       buffer and hold nothing past the response.
+//   touchmap                              not HEADLESS (sim too). load= is
+//       behind GM_DEBUG_WRITE_ROUTES; screen= only queues a dump.
+//
+//   Bench-only (writes, injects input or holds a resource):
+//   panelreg, flashchurn, animtest, radio   GM_DEBUG_WRITE_ROUTES, device-only
+//   tap                                     GM_TOUCH_INJECT (TOUCH_PROBE or SIM)
+//   settingsui, scalescreen                 GM_TOUCH_PROBE or GAGGIMATE_SIM
+//   gradfix                                 GM_TOUCH_PROBE, device-only
+//   synth, scale                            GM_SYNTH_HANDSHAKE
+//   kblob, kbench                           GM_KBLOB, device-only
+//   /api/gdma, fbdump, nebtest, pietest,
+//   membench, animbench                     GM_ANIM_BENCH
+//   drawprof                                GM_DRAW_PROFILE (TOUCH_PROBE or SIM)
+//   tasks                                   sdkconfig run-time stats, which
+//                                           only sdkconfig.loadtest sets
+//   fb (SDL frame source)                   GAGGIMATE_SIM
 #include "WebUIPlugin.h"
 
 #if defined(GM_TOUCH_PROBE) || defined(GAGGIMATE_SIM) || defined(GM_KBLOB) || defined(GM_BLEND_PROBE) ||                   \
