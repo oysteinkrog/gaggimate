@@ -375,6 +375,16 @@ void DefaultUI::serviceDialElements() {
             r.live = false;
         }
     }
+    // A screen change is fading the old page out and its swap has not run
+    // yet: leave every owned element as it is. Releasing here (canOwn is
+    // false while the screens differ) took the rings, the bar, the labels,
+    // the icons and the marquees off the panel at the start of the fade,
+    // while the rest of the page was still at full strength (gm-bzu.46).
+    // The swap retires them instead (retireOwnedElements).
+    if (currentScreen != targetScreen && overlayTrans == OverlayTrans::FadeOut && sleepAnimation.isActive() &&
+        !panelStopRequested) {
+        return;
+    }
     // The tick-length morph (animateGaugeTicks) rewrites the cache key every
     // frame; LVGL draws the ring until it has settled and the cache holds
     // the final geometry.
@@ -412,14 +422,20 @@ void DefaultUI::serviceDialElements() {
             releaseDialElement(d);
         }
         if (!d.owned) {
-            // Re-owning right after a release would rewrite d.ring while
-            // the frame in flight may still read it.
+            // Re-owning right after a release would rewrite the ring record
+            // the frame in flight may still read.
             if (d.releasedRecently && frame - d.releasedFrame < 2) {
                 continue;
             }
-            if (!meterticks::ring(key, d.ring)) {
+            // The take writes the record no element reads: the other one
+            // from the retiring element's, or from the last owner's.
+            const uint8_t nb = static_cast<uint8_t>((d.retireBuf >= 0 ? d.retireBuf : d.cur) ^ 1);
+            tickring::Sprites taken;
+            if (!meterticks::ring(key, taken)) {
                 continue; // LVGL draws the ring until the cache holds all of it
             }
+            d.rings[nb] = taken;
+            d.cur = nb;
             meterticks::pin(key, true);
             d.key = key;
             d.owned = true;
@@ -450,6 +466,12 @@ void DefaultUI::serviceDialElements() {
         }
         const uint16_t lit = lv_color_to16(indic->type_data.scale_lines.color_start);
         const uint16_t unlit = lv_color_to16(scale->tick_color);
+        if (retirePending || d.retireBuf >= 0) {
+            // The new page is not published yet, and the slot may still
+            // draw the old page's ring: write it once finishRetire has run.
+            d.lo = d.hi = -1;
+            continue;
+        }
         if (lo == d.lo && hi == d.hi && lit == d.lit && unlit == d.unlit) {
             continue;
         }
@@ -458,7 +480,7 @@ void DefaultUI::serviceDialElements() {
         d.lit = lit;
         d.unlit = unlit;
         tickring::Box bb;
-        if (!tickring::bounds(d.ring, bb)) {
+        if (!tickring::bounds(d.rings[d.cur], bb)) {
             releaseDialElement(d);
             continue;
         }
@@ -469,7 +491,7 @@ void DefaultUI::serviceDialElements() {
         e.y = bb.y1;
         e.w = static_cast<int16_t>(bb.x2 - bb.x1 + 1);
         e.h = static_cast<int16_t>(bb.y2 - bb.y1 + 1);
-        e.ring.ring = &d.ring;
+        e.ring.ring = &d.rings[d.cur];
         e.ring.litColor = lit;
         e.ring.unlitColor = unlit;
         e.ring.lo = d.lo;
@@ -486,7 +508,11 @@ void DefaultUI::releaseDialElement(DialElement &d) {
         return;
     }
     const int slot = static_cast<int>(&d - dialElems);
-    sleepAnimation.clearElement(DIAL_ELEMENT_BASE + slot);
+    if (d.retireBuf < 0) {
+        // While the slot retires it still draws the old page's ring, and
+        // the new owner never wrote it; finishRetire clears it.
+        sleepAnimation.clearElement(DIAL_ELEMENT_BASE + slot);
+    }
     if (d.meter != nullptr) {
         lv_obj_clear_flag(d.meter, LV_OBJ_FLAG_USER_1);
         lv_obj_invalidate(d.meter);
@@ -535,6 +561,131 @@ void DefaultUI::releaseDialElements() {
     releaseBarElement();
 }
 
+void DefaultUI::retireOwnedElements() {
+#ifndef GAGGIMATE_SIM
+    if (overlayTrans != OverlayTrans::FadeOut || !sleepAnimation.isActive()) {
+        // Nothing fades the old page out: hand everything back at once.
+        finishRetire();
+        releaseDialElements();
+        releaseTextElements();
+        releaseIconLayers();
+        releaseMarquees();
+        return;
+    }
+    const bool again = retirePending; // a second swap inside one fade-out
+    retirePending = true;
+    for (DialElement &d : dialElems) {
+        if (!d.owned) {
+            continue;
+        }
+        if (again || d.retireBuf >= 0) {
+            // Taken on the screen in between and never written to the
+            // slot: nothing of it is on the panel.
+            releaseDialElement(d);
+            continue;
+        }
+        if (d.meter != nullptr) {
+            // No invalidation: the old screen is never snapshotted again.
+            lv_obj_clear_flag(d.meter, LV_OBJ_FLAG_USER_1);
+        }
+        d.retireBuf = static_cast<int8_t>(d.cur);
+        d.retireKey = d.key; // stays pinned until finishRetire
+        d.owned = false;
+        d.meter = nullptr;
+        d.lo = d.hi = -1;
+        retireElems = static_cast<uint16_t>(retireElems | (1u << (DIAL_ELEMENT_BASE + (&d - dialElems))));
+    }
+    if (barElem.owned) {
+        if (barElem.bar != nullptr) {
+            lv_obj_remove_local_style_prop(barElem.bar, LV_STYLE_BG_OPA, LV_PART_INDICATOR);
+        }
+        barElem.owned = false;
+        barElem.bar = nullptr;
+        barElem.lastX2 = -1;
+        retireElems = static_cast<uint16_t>(retireElems | (1u << BAR_ELEMENT));
+    }
+    for (TextElement &t : textElems) {
+        if (!t.owned) {
+            continue;
+        }
+        if (t.label != nullptr) {
+            lv_obj_clear_flag(t.label, LV_OBJ_FLAG_USER_2);
+        }
+        g_textElemDbg[&t - textElems].owned = false;
+        t.label = nullptr;
+        t.owned = false;
+        t.hash = 0;
+        t.numeric = false;
+        retireElems = static_cast<uint16_t>(retireElems | (1u << (TEXT_ELEMENT_BASE + (&t - textElems))));
+    }
+    for (IconLayer &l : iconLayers) {
+        for (int i = 0; i < kIconSprites; i++) {
+            if (l.layer[i] >= 0) {
+                retireLayers = static_cast<uint8_t>(retireLayers | (1u << l.layer[i]));
+                l.layer[i] = -1;
+            }
+        }
+        if (l.obj != nullptr) {
+            lv_obj_clear_flag(l.obj, LV_OBJ_FLAG_USER_3);
+        }
+        g_iconLayerDbg[&l - iconLayers].owned = false;
+        l.obj = nullptr;
+        l.src = nullptr;
+        l.sprites = 0;
+        l.shown = -1;
+    }
+    for (Marquee &m : marquees) {
+        if (m.layer >= 0) {
+            retireLayers = static_cast<uint8_t>(retireLayers | (1u << m.layer));
+            m.layer = -1;
+        }
+        if (m.label != nullptr) {
+            lv_obj_clear_flag(m.label, LV_OBJ_FLAG_USER_2);
+            lv_obj_clear_flag(m.label, LV_OBJ_FLAG_USER_3);
+        }
+        g_marqueeDbg[&m - marquees].owned = false;
+        m.label = nullptr;
+        m.hash = 0;
+        m.period = 0;
+    }
+#endif
+}
+
+void DefaultUI::finishRetire() {
+#ifndef GAGGIMATE_SIM
+    if (!retirePending && retireElems == 0 && retireLayers == 0) {
+        return;
+    }
+    const uint32_t frame = sleepAnimation.animFrameCount();
+    for (DialElement &d : dialElems) {
+        if (d.retireBuf < 0) {
+            continue;
+        }
+        retireDialRing(d.retireKey);
+        d.retireBuf = -1;
+        if (!d.owned) {
+            // The retired record is read until the frame in flight ends;
+            // the next take writes it (see the take's record choice).
+            d.releasedFrame = frame;
+            d.releasedRecently = true;
+        }
+    }
+    for (int slot = 0; slot < SleepAnimation::MAX_ELEMENTS; slot++) {
+        if ((retireElems & (1u << slot)) != 0) {
+            sleepAnimation.clearElement(slot);
+        }
+    }
+    for (int id = 0; id < SleepAnimation::MAX_LAYERS; id++) {
+        if ((retireLayers & (1u << id)) != 0) {
+            sleepAnimation.layerRelease(id);
+        }
+    }
+    retireElems = 0;
+    retireLayers = 0;
+    retirePending = false;
+#endif
+}
+
 void DefaultUI::serviceBarElement(bool canOwn) {
 #ifndef GAGGIMATE_SIM
     lv_obj_t *bar = objects.brew_bar;
@@ -565,6 +716,9 @@ void DefaultUI::serviceBarElement(bool canOwn) {
     const int32_t value = lv_bar_get_value(bar) - lv_bar_get_min_value(bar);
     const float target = static_cast<float>(x1) + static_cast<float>(trackW) * static_cast<float>(value) / range;
     const int64_t now = esp_timer_get_time();
+    if (!barElem.owned && (retirePending || (retireElems & (1u << BAR_ELEMENT)) != 0)) {
+        return; // the new page is not up yet, or the slot still draws the old fill
+    }
     if (!barElem.owned) {
         barElem.owned = true;
         barElem.x2 = target; // no slide in from zero on takeover
@@ -663,7 +817,17 @@ void DefaultUI::textLabelDeleted(lv_event_t *e) {
             // touching the label.
             t.label = nullptr;
             if (t.owned) {
-                ui->sleepAnimation.clearElement(TEXT_ELEMENT_BASE + static_cast<int>(&t - ui->textElems));
+                const int slot = TEXT_ELEMENT_BASE + static_cast<int>(&t - ui->textElems);
+                if (ui->overlayTrans == OverlayTrans::FadeOut && ui->sleepAnimation.isActive()) {
+                    // A settings page turn deletes its rows inside the fade:
+                    // the glyphs stay on the panel and fade with the page,
+                    // and go when the new page is published (gm-bzu.46).
+                    // The glyph list lives in the element's text slot and
+                    // the atlas, never in the label.
+                    ui->retireElems = static_cast<uint16_t>(ui->retireElems | (1u << slot));
+                } else {
+                    ui->sleepAnimation.clearElement(slot);
+                }
                 t.owned = false;
 #ifndef GAGGIMATE_SIM
                 // Without this the debug list kept showing labels of a torn
@@ -983,8 +1147,9 @@ void DefaultUI::serviceTextElements(bool canOwn) {
             releaseTextElement(t);
         }
     }
-    // Take live, eligible labels into free slots.
-    for (int i = 0; i < liveLabelN; i++) {
+    // Take live, eligible labels into free slots, not before a swapped-to
+    // screen's page is published (retirePending).
+    for (int i = 0; i < liveLabelN && !retirePending; i++) {
         LiveLabel &l = liveLabels[i];
         if (!l.live || l.refused || l.obj == nullptr) {
             continue;
@@ -1001,7 +1166,8 @@ void DefaultUI::serviceTextElements(bool canOwn) {
         }
         TextElement *slot = nullptr;
         for (TextElement &t : textElems) {
-            if (!t.owned) {
+            // A retiring slot still draws the old page's label.
+            if (!t.owned && (retireElems & (1u << (TEXT_ELEMENT_BASE + (&t - textElems)))) == 0) {
                 slot = &t;
                 break;
             }
@@ -1381,8 +1547,10 @@ void DefaultUI::serviceIconLayers(bool canOwn) {
             d.toggles = d.toggles + 1;
         }
     }
-    // Take blinking, visible images into free slots.
-    for (int i = 0; i < iconCandN; i++) {
+    // Take blinking, visible images into free slots. Not while the old
+    // page's layers retire: they hold up to six of the seven layers, and a
+    // failed take would refuse the image for the whole visit.
+    for (int i = 0; i < iconCandN && retireLayers == 0 && !retirePending; i++) {
         IconCand &c = iconCands[i];
         if (c.toggles < 2 || c.refused || c.hidden || c.obj == nullptr) {
             continue;
@@ -1644,8 +1812,9 @@ void DefaultUI::serviceMarquees(bool canOwn) {
             releaseMarquee(m);
         }
     }
-    // Take visible, overflowing candidates into free slots.
-    for (int i = 0; i < marqueeCandN; i++) {
+    // Take visible, overflowing candidates into free slots, once the old
+    // page's layers have gone (see the icons above).
+    for (int i = 0; i < marqueeCandN && retireLayers == 0 && !retirePending; i++) {
         lv_obj_t *label = marqueeCands[i];
         bool have = false;
         for (Marquee &m : marquees) {
@@ -1864,6 +2033,9 @@ void DefaultUI::init() {
 }
 
 void DefaultUI::loop() {
+    // Screen requests from other tasks (changeScreen) land here, first, so
+    // this pass's rerender block sees the new target.
+    applyScreenRequest();
 #ifndef GAGGIMATE_SIM
     // Here as well as in pumpSleepOverlay: a UI pass on a busy screen runs
     // longer than UI_PERIOD_MS, so the task loop takes this branch every
@@ -2079,6 +2251,12 @@ void DefaultUI::beginOverlayTransition(const char *why, bool waitSwap) {
         return; // LVGL flushes the panel itself; there is no composite to fade
     }
     if (overlayTrans == OverlayTrans::FadeOut) {
+        if (waitSwap) {
+            // Another screen is coming: a page already rendered and held is
+            // the screen it replaces, and must never be published
+            // (gm-bzu.46).
+            overlayTransHeld = false;
+        }
         overlayTransWaitSwap = overlayTransWaitSwap || waitSwap;
         return;
     }
@@ -2104,6 +2282,11 @@ void DefaultUI::beginOverlayTransition(const char *why, bool waitSwap) {
 
 void DefaultUI::serviceOverlayTransition() {
 #ifndef GAGGIMATE_SIM
+    if (overlayTrans != OverlayTrans::FadeOut && (retirePending || retireElems != 0 || retireLayers != 0)) {
+        // Retirement belongs to a fade-out; whatever ended it without a
+        // publish, the old page's pieces go now.
+        finishRetire();
+    }
     if (overlayTrans == OverlayTrans::Idle) {
         return;
     }
@@ -2127,6 +2310,7 @@ void DefaultUI::serviceOverlayTransition() {
 #endif
         overlayTransWaitSwap = false;
         overlayTransHeld = false;
+        finishRetire();
         if (lost) {
             sleepAnimation.setOverlayGain(256);
             overlayTrans = OverlayTrans::Idle;
@@ -3002,15 +3186,43 @@ void DefaultUI::loopProfiles() {
 }
 
 void DefaultUI::changeScreen(ScreensEnum screen) {
+    // controller:mode:change, controller:brew:start, ota:update:start and
+    // controller:error fire on the web server, MQTT and controller tasks,
+    // and PluginManager runs listeners on the caller's task. The fade state
+    // and the gain ramp have one writer, the UI task, so another task only
+    // records the request (gm-bzu.46). A tap reaches this from
+    // lv_task_handler on the UI task and still starts its fade at once.
+    screenRequest.store(static_cast<int>(screen));
+    rerender = true;
+    if (taskHandle != nullptr && xTaskGetCurrentTaskHandle() == taskHandle) {
+        applyScreenRequest();
+    }
+}
+
+void DefaultUI::applyScreenRequest() {
+    const int req = screenRequest.exchange(-1);
+    if (req < 0) {
+        return;
+    }
+    const ScreensEnum screen = static_cast<ScreensEnum>(req);
     if (screen != targetScreen && screen != currentScreen) {
         // At the request, not at the swap: the swap waits for the next
         // rerender pass, and the fade is the response the finger sees.
         beginOverlayTransition("screen", true);
+    } else if (screen == currentScreen && screen != targetScreen && overlayTrans == OverlayTrans::FadeOut &&
+               overlayTransWaitSwap) {
+        // Back to the screen being shown before the swap ran: there is no
+        // swap to wait for, and the page that faded out is this screen's.
+        // Render it again into the back buffer and let it come back as the
+        // transition's page, instead of a bare screen until the 1.5 s
+        // abandon timeout.
+        overlayTransWaitSwap = false;
+        overlayTransHeld = false;
+        overlayValid[sleepAnimation.overlayBackIndex()] = false;
     }
     targetScreen = screen;
     brewScreenState = BrewScreenState::Brew;
     rerender = true;
-    // Reset some submenus
 }
 
 void DefaultUI::changeBrewScreenMode(BrewScreenState state) {
@@ -3231,6 +3443,11 @@ void DefaultUI::handleScreenChange() {
         overlayTransWaitSwap = false;
         if (bgAnimAllScreens && sleepAnimation.isActive()) {
             releaseAnimHost();
+            // Before eez_flow_set_screen, which can delete the old screen:
+            // the owner flags come off the old objects now, and what the
+            // render task draws for them stays until the new page is
+            // published at gain zero.
+            retireOwnedElements();
         } else {
             stopSleepAnimation();
         }
@@ -3616,16 +3833,28 @@ void DefaultUI::adoptAnimHost(lv_obj_t *host) {
     // snapshots. Making the screen background transparent keeps those
     // snapshots per-pixel alpha (widgets only, no opaque color plate).
     lv_obj_set_style_bg_opa(animHostScreen, LV_OPA_TRANSP, LV_PART_MAIN);
-    // Both overlay buffers describe the screen that just went away.
+    // Both overlay buffers describe the screen that just went away, and so
+    // does a page held for a transition and any copy owed between them.
+    overlayScreenGen++;
+    overlayTransHeld = false;
     overlayValid[0] = overlayValid[1] = false;
     overlayDirtyN[0] = overlayDirtyN[1] = 0;
+    overlayCopyN[0] = overlayCopyN[1] = 0;
     refreshSleepOverlay();
 #endif
 }
 
 void DefaultUI::stopSleepAnimation() {
 #ifndef GAGGIMATE_SIM
+    // Every owner flag comes off before LVGL gets the panel back: the first
+    // loopTask pass after the handback runs lv_task_handler before ui->loop,
+    // and a label, icon or marquee still flagged drew nothing in that whole
+    // repaint (gm-bzu.46).
+    finishRetire();
     releaseDialElements();
+    releaseTextElements();
+    releaseIconLayers();
+    releaseMarquees();
     if (!sleepAnimation.stop()) {
         // A worker or a band transfer outlived stop()'s deadlines. Handing the
         // framebuffers to LVGL now would put its rendering under a writer that
@@ -3796,7 +4025,7 @@ bool DefaultUI::snapshotAreaToOverlay(lv_obj_t *obj, uint8_t *buf, uint32_t bufS
     lv_disp_drv_t driver;
     lv_disp_drv_init(&driver);
     driver.hor_res = lv_disp_get_hor_res(objDisp);
-    driver.ver_res = lv_disp_get_hor_res(objDisp);
+    driver.ver_res = lv_disp_get_ver_res(objDisp);
     // The planar writer (LV_Helper.h); the patched lv_draw_sw_blend.c
     // recognises it by pointer identity and inlines it.
     driver.set_px_cb = gm_set_px_planar;
@@ -3872,6 +4101,9 @@ bool DefaultUI::overlayFadedOut() const {
 // frame that composites it (the gate), and log the hand-over.
 void DefaultUI::finishOverlayTransition() {
 #ifndef GAGGIMATE_SIM
+    // The new page is published and the gain is at zero: the old page's
+    // retired pieces are invisible and go now.
+    finishRetire();
     sleepAnimation.rampOverlayGain(256, overlayFadeInMs(), sleepAnimation.overlayFrontIndex());
     overlayTrans = OverlayTrans::FadeIn;
 #ifdef GM_TOUCH_PROBE
@@ -3939,16 +4171,34 @@ void DefaultUI::refreshSleepOverlay() {
             return;
         }
         overlayTransHeld = false;
-        const int whole[1][2] = {{0, overlayH[back]}};
-        const int64_t pub0 = esp_timer_get_time();
-        sleepAnimation.requestBandWarmup(whole, 1);
-        sleepAnimation.publishOverlayRanges(overlayW[back], overlayH[back], whole, 1);
-        overlayDrawnUnpublished[back] = false;
-        g_overlayStats.lastWholePubUs = static_cast<uint32_t>(esp_timer_get_time() - pub0);
-        g_overlayStats.lastWholeScanUs = g_overlayStats.lastPubScanUs;
-        g_overlayStats.lastWholeScrimUs = g_overlayStats.lastPubScrimUs;
-        finishOverlayTransition();
-        return;
+        if (!overlayValid[back] || overlayHeldGen != overlayScreenGen || overlayBufGen[back] != overlayScreenGen) {
+            // Not this screen's page (adoptAnimHost and a joining screen
+            // request drop the hold, so this is the backstop): render the
+            // buffer again below, which publishes it as the transition's
+            // page now that the gain is at zero.
+            overlayValid[back] = false;
+        } else {
+            const int whole[1][2] = {{0, overlayH[back]}};
+            const int64_t pub0 = esp_timer_get_time();
+            sleepAnimation.requestBandWarmup(whole, 1);
+            sleepAnimation.publishOverlayRanges(overlayW[back], overlayH[back], whole, 1);
+            overlayDrawnUnpublished[back] = false;
+            // The debt harvested during the hold is still listed against
+            // this buffer, unrendered, and was owed to the other buffer as a
+            // copy from this one. This buffer does not hold those rects, so
+            // the copy would carry its pre-change pixels across and leave
+            // the two buffers disagreeing until the area changed again. Owe
+            // them to the other buffer as renders too; a render runs after
+            // the copies and wins (gm-bzu.46).
+            for (int i = 0; i < overlayDirtyN[back]; i++) {
+                lvgl_helper_rect_add(overlayDirty[front], &overlayDirtyN[front], OVERLAY_DIRTY_RECTS, overlayDirty[back][i]);
+            }
+            g_overlayStats.lastWholePubUs = static_cast<uint32_t>(esp_timer_get_time() - pub0);
+            g_overlayStats.lastWholeScanUs = g_overlayStats.lastPubScanUs;
+            g_overlayStats.lastWholeScrimUs = g_overlayStats.lastPubScrimUs;
+            finishOverlayTransition();
+            return;
+        }
     }
 
     // Nothing moved and this buffer is already complete: the whole refresh
@@ -4018,7 +4268,8 @@ void DefaultUI::refreshSleepOverlay() {
         // other debt. Rendered rects go into the first half of clips[] so
         // they merge with the render debt, never with the mid-pass extras.
         const bool canCopy = sleepAnimation.overlayFrontBuffer() != nullptr && overlayValid[front] &&
-                             overlayW[front] == overlayW[back] && overlayH[front] == overlayH[back];
+                             overlayBufGen[front] == overlayBufGen[back] && overlayW[front] == overlayW[back] &&
+                             overlayH[front] == overlayH[back];
         for (int i = 0; i < overlayCopyN[back]; i++) {
             if (canCopy) {
                 copies[copyN++] = overlayCopy[back][i];
@@ -4110,6 +4361,9 @@ void DefaultUI::refreshSleepOverlay() {
     }
     clipN = baseN + extraN;
     const int64_t probeSnap1 = esp_timer_get_time();
+    if (wholeSnap) {
+        overlayBufGen[back] = overlayScreenGen;
+    }
     // Marked here rather than at the call site, and after the snapshot rather
     // than before it, so the slip log measures the thing that actually costs
     // something. Every early return above is a pass that touched no memory --
@@ -4153,6 +4407,7 @@ void DefaultUI::refreshSleepOverlay() {
                  (long long)(probeSnap1 - probeSnap0), (long long)(probeSnap1 - overlayTransT0Us));
 #endif
         overlayTransHeld = true;
+        overlayHeldGen = overlayScreenGen;
         overlayValid[back] = true;
         overlayW[back] = w;
         overlayH[back] = h;

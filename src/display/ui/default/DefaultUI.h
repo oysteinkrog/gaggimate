@@ -77,6 +77,11 @@ class DefaultUI {
     void loopProfiles();
 
     // Interface methods
+    // Any task may call this (the web server, MQTT and the controller task
+    // reach it through controller:mode:change). It only records the request;
+    // the fade and targetScreen change run on the UI task, at once when the
+    // caller is the UI task and otherwise at the top of its next loop()
+    // (gm-bzu.46). The last request before the UI task looks wins.
     void changeScreen(ScreensEnum screen);
 
     void changeBrewScreenMode(BrewScreenState state);
@@ -227,6 +232,13 @@ class DefaultUI {
     OverlayTrans overlayTrans = OverlayTrans::Idle;
     bool overlayTransWaitSwap = false;
     bool overlayTransHeld = false; // a rendered page waits in the back buffer for gain 0
+    // Host screen generation (gm-bzu.46): moves on every adoptAnimHost. A
+    // held page and each buffer's content carry the generation they were
+    // rendered for, so a page or a copy source from the screen that went
+    // away can never be published or copied onto the new one.
+    uint32_t overlayScreenGen = 0;
+    uint32_t overlayHeldGen = 0;
+    uint32_t overlayBufGen[2] = {0, 0};
     int64_t overlayTransT0Us = 0;
     // The fade durations come from the settings (bgFadeOutMs, bgFadeInMs,
     // web "Screen fade" and the Animation category's Fade rows). The
@@ -503,15 +515,24 @@ class DefaultUI {
     // the frame in flight may still read its sprites.
     static constexpr int DIAL_ELEMENT_BASE = 5;
     static constexpr int DIAL_ELEMENTS = 3;
+    //
+    // Two ring records per dial (gm-bzu.46): the element reads its ring
+    // through a pointer, and at a screen change the old page's element keeps
+    // reading one record through the fade-out while the new screen's meter
+    // is taken into the other. retireBuf names the record a retiring element
+    // still reads, or -1.
     struct DialElement {
         lv_obj_t *meter = nullptr;
         meterticks::Key key{};
-        tickring::Sprites ring{};
+        tickring::Sprites rings[2]{};
+        uint8_t cur = 0; // the record the owned element reads
         bool owned = false;
         int16_t lo = -1, hi = -1;
         uint16_t lit = 0, unlit = 0;
         uint32_t releasedFrame = 0;
         bool releasedRecently = false;
+        int8_t retireBuf = -1;
+        meterticks::Key retireKey{};
     };
     DialElement dialElems[DIAL_ELEMENTS];
     struct DialRetire {
@@ -522,6 +543,27 @@ class DefaultUI {
     DialRetire dialRetire[DIAL_ELEMENTS * 2];
     void serviceDialElements();
     void releaseDialElements();
+    // Page-change retirement (gm-bzu.46). At a screen change during a
+    // fade-out, the old page's owned rings, bar, labels, icons and marquees
+    // hand their LVGL objects back at once (the flags are cleared on the UI
+    // task, before the flow engine can delete the screen), but what the
+    // render task draws for them stays until the new page is published at
+    // gain zero, so they fade out with the rest of the page instead of
+    // vanishing at the start. retireElems is a bit per element slot,
+    // retireLayers a bit per layer id. While a slot or any layer is
+    // retiring, the new screen does not take into it (dials take into their
+    // other ring record and wait to write the slot).
+    // retirePending: a screen swapped during this fade-out and its page is
+    // not published yet. Until then the new screen takes nothing it would
+    // have to show (bar, labels, icons, marquees) and writes no dial slot,
+    // so nothing of it appears over the old page while that fades.
+    bool retirePending = false;
+    uint16_t retireElems = 0;
+    uint8_t retireLayers = 0;
+    void retireOwnedElements();
+    void finishRetire();
+    static_assert(SleepAnimation::MAX_ELEMENTS <= 16, "retireElems is 16 bits");
+    static_assert(SleepAnimation::MAX_LAYERS <= 8, "retireLayers is 8 bits");
     void releaseDialElement(DialElement &d);
     void retireDialRing(const meterticks::Key &key);
 
@@ -773,7 +815,12 @@ class DefaultUI {
     // Standby brightness control
     unsigned long standbyEnterTime = 0;
 
-    TaskHandle_t taskHandle;
+    // Requested screen, or -1: written by changeScreen on any task, taken by
+    // applyScreenRequest on the UI task.
+    std::atomic<int> screenRequest{-1};
+    void applyScreenRequest();
+
+    TaskHandle_t taskHandle = nullptr;
     static void loopTask(void *arg);
     TaskHandle_t profileTaskHandle;
     static void profileLoopTask(void *arg);
