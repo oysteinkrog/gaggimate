@@ -36,9 +36,11 @@
 //   it (clamp, round half to even). The result is a list of 8-bit pixels
 //   indexed by row, so a band call writes one store per path pixel and
 //   pays none of that arithmetic.
-// - The bodies and trail dots are the page's: centres from libm's sin and
-//   cos in double, the page's radius, alpha and pow(f, 1.6), and the
-//   page's per-pixel distance, coverage and 8-bit blend. A pixel is
+// - The bodies and trail dots are the page's radius, alpha and
+//   pow(f, 1.6), computed in double when the Trail or Body glow slider
+//   moves, and the page's per-pixel distance, coverage and 8-bit blend.
+//   Their centres are computed in float, not in the page's double; the
+//   device paragraph below says why and what it moved. A pixel is
 //   computed in float and recomputed in double when any channel lands
 //   within 2e-3 of a rounding boundary, which is AnimFireflies.cpp's
 //   scheme and about one pixel in 500.
@@ -90,12 +92,32 @@
 // the host's 1.12x. /api/debug/animtest: 0 differing pixels over 8 frames
 // and 3 parameter sets, hot_fail 0 with Orbits resident. What the host did
 // not predict is frame(): 9.6 and 12.3 ms a frame against plasma's 0.3,
-// and the loop ran 26.0 fps against plasma's 43.6 under the same cap. The
-// sample loop above does, per sample, double cos, sin, pow, floor, ceil
-// and a divide, about 100 samples a frame, and the S3 has no double FPU,
-// so every one is a soft-float libcall. It is the page's arithmetic in the
-// page's precision (gm-pciz), so moving it to float or to a table changes
-// the goldens and is a decision, not a fix: gm-4bd.13 holds it.
+// and the loop ran 26.0 fps against plasma's 43.6 under the same cap. Each
+// of the 100 or so samples a frame did a double cos, sin, pow, floor, ceil
+// and a divide, and the S3 has no double FPU, so every one was a soft-float
+// libcall.
+//
+// What changed (gm-4bd.13, the owner chose float arithmetic on 2026-10-01).
+// frame() now does no double arithmetic per sample. The radius, alpha,
+// 1 / radius and box reach of each trail position depend only on k and the
+// Trail and Body glow sliders, so they are computed in double, pow included,
+// when one of those moves, and read per frame. Per orbit there is one cosf
+// and one sinf of the body angle; trail dot k is that pair rotated by k
+// trail steps from a table built once, one rounding with nothing to
+// accumulate. The ellipse and the floor are single precision. Against the
+// double formula the centres land within 0.00027 px (mean 0.00003 px over
+// 12 million samples at the default parameters). The three golden frames
+// did not move and the page check still reads 0 px for Orbits. Over 300
+// frames at each of five parameter sets, 480x480, against the double
+// version: default 21 px in total, at most 2 in a frame; every slider at
+// 100, 238 px, at most 6; every slider at 0, none; a mixed set, 27; the
+// default 30 hours into the clock, 19. Every differing pixel is one
+// palette step, mean 1.8 to 2.3 per 8-bit channel, at most 9. On the host
+// the libm count per frame went from about 100 double calls to 5 cosf and
+// 5 sinf, and frame() reads 0.001 ms against 0.002, which is the host
+// timer's floor and says nothing about the device. The device frame() and
+// fps are to be remeasured with plasma in the same run; until then the
+// 9.6 to 12.3 ms above is the old figure, not the current one.
 //
 // The kernel parity sweep is not an open item, and this paragraph is here
 // so nobody re-runs it blind. gm-4bd.11 ran the fleet's band() against
@@ -151,6 +173,9 @@ constexpr float HALF = 2e-3f;
 
 struct OrbitDef {
     double a, b, cosPhi, sinPhi, T, phase;
+    // The same four in float for frame()'s per-sample arithmetic, which
+    // runs on the S3's single-precision FPU (gm-4bd.13).
+    float aF, bF, cosPhiF, sinPhiF, phaseF;
     // The body's angular rate, one turn per T seconds of animation time, as
     // a Q48 turn per animation millisecond (BgAnimClock.h), so each orbit
     // keeps its own exact phase however long the device has been up
@@ -195,6 +220,25 @@ struct SampleMeta {
 };
 
 OrbitDef orbits[MAX_ORBITS];
+
+// Most trail dots one ring draws: K = round(6 + trail * 10) is at most 16.
+constexpr int MAX_TRAIL = 16;
+// cos and sin of k trail steps, k = 0..MAX_TRAIL, so a trail dot's angle
+// u0 - k * step is one rotation of the body's (cos u0, sin u0) rather than a
+// cos and a sin of its own. One rounding per dot, nothing accumulates.
+float trailCos[MAX_TRAIL + 1], trailSin[MAX_TRAIL + 1];
+bool trailTabReady = false;
+
+// A stamp's shape depends only on k, K and the trail and glow sliders, so it
+// is computed in double when one of those moves and read per frame.
+struct StampShape {
+    double radiusD, alphaD;
+    float invR, alphaF;
+    int rr;
+};
+StampShape shapes[MAX_TRAIL + 1];
+int shapeK = 0;
+int lastTrailP = -1, lastGlowP = -1;
 // Animation time. Not reset by release(), so the full/half switch keeps the
 // bodies where they were (BgAnimClock.h, gm-f91g). The old frame() took
 // t = tMs * 0.001 and divided each period by the speed, so float(tMs) lost
@@ -263,6 +307,14 @@ BGANIM_INLINE float rsqrtF(float x) {
     y = y * (1.5f - 0.5f * x * y * y);
     y = y * (1.5f - 0.5f * x * y * y);
     return y;
+}
+
+// floor() for a centre coordinate, inline: newlib's floorf is a call into
+// flash on the device. A centre can be negative when the outer ring crosses
+// the rim at large Orbit size, so truncation alone is not enough.
+BGANIM_INLINE int floorToInt(float v) {
+    const int i = static_cast<int>(v);
+    return v < static_cast<float>(i) ? i - 1 : i;
 }
 
 // The page's four slider maps, in double, each exactly 1 at 50 so every
@@ -426,6 +478,11 @@ void rebuildGeometry(int countP, int eccP, int sizeP, int pathP, int tiltP, int 
         o.T = BASE_PERIOD_S * pow(1.0 + GOLDEN, static_cast<double>(i));
         o.rate = oscRateQ48(6.283185307179586 / (o.T * 1000.0));
         o.phase = i * 1.7;
+        o.aF = static_cast<float>(o.a);
+        o.bF = static_cast<float>(o.b);
+        o.cosPhiF = static_cast<float>(o.cosPhi);
+        o.sinPhiF = static_cast<float>(o.sinPhi);
+        o.phaseF = static_cast<float>(o.phase);
         // Bodies sample the theme's upper range, spread so neighbours differ.
         uint8_t col[3];
         themeRGB(140 + (i * 115) / (MAX_ORBITS - 1), col);
@@ -502,55 +559,82 @@ void frame(uint32_t tMs, int w, int h, const uint8_t p[BG_ANIM_PARAMS]) {
         lastTiltP = p[7];
         lastThemeGen = themeGen();
     }
-    const double spd = speedMul(p[0]);
-    g_clock.advance(tMs, static_cast<float>(spd));
-    const double trailAmt = p[3] / 100.0;
-    // Body glow scales both the radius and the opacity of every stamp, the
-    // body and each trail dot alike, which is what makes the slider read as
-    // brightness and not only as size.
-    const double glowMul = glowMulOf(p[6]);
-    const int K = static_cast<int>(floor(6 + trailAmt * 10 + 0.5));
-    const double cx = w / 2.0, cy = h / 2.0;
+    g_clock.advance(tMs, speedMul(p[0]));
     // Trail samples sit a fixed 1/90 of a turn apart along the orbit: the
     // page's dt = T / 90 is in time, and its T already carries the speed, so
     // the spacing in angle never depends on it. The body's own angle comes
     // from the clock (gm-f91g), which equals the page's t * spd / T turns
     // while the speed holds, and bends instead of jumping when it changes.
     constexpr double TRAIL_STEP = 6.283185307179586 / 90.0;
-
-    sampleCount = 0;
-    memset(sampleBinCount, 0, NUM_BANDS);
-    for (int i = 0; i < orbitCount; i++) {
-        const OrbitDef &o = orbits[i];
-        const double u0 = oscTurnQ32(g_clock, o.rate) * (6.283185307179586 / 4294967296.0) + o.phase;
-        for (int k = K; k >= 0; k--) {
-            if (sampleCount >= MAX_SAMPLES) break;
-            const double u = u0 - k * TRAIL_STEP;
-            const double cu = cos(u), su = sin(u);
-            const double ex = cx + o.a * cu * o.cosPhi - o.b * su * o.sinPhi;
-            const double ey = cy + o.a * cu * o.sinPhi + o.b * su * o.cosPhi;
-            const double f = 1 - static_cast<double>(k) / (K + 1);
-            const double radius = ((k == 0) ? 2.6 : 1.2 * f + 0.4) * glowMul;
-            const double alpha = ((k == 0) ? 0.95 : 0.55 * pow(f, 1.6) * (0.4 + trailAmt * 0.8)) * glowMul;
-            if (radius <= 0) continue;
-            const int idx = sampleCount++;
-            Sample &sm = samples[idx];
-            sm.xD = ex;
-            sm.yD = ey;
-            sm.radiusD = radius;
-            sm.alphaD = alpha;
-            sm.xInt = static_cast<int>(floor(ex));
-            sm.yInt = static_cast<int>(floor(ey));
-            sm.xFrac = static_cast<float>(ex - sm.xInt);
-            sm.yFrac = static_cast<float>(ey - sm.yInt);
-            sm.invR = static_cast<float>(1.0 / radius);
-            sm.alphaF = static_cast<float>(alpha);
+    if (!trailTabReady) {
+        for (int k = 0; k <= MAX_TRAIL; k++) {
+            trailCos[k] = static_cast<float>(cos(k * TRAIL_STEP));
+            trailSin[k] = static_cast<float>(sin(k * TRAIL_STEP));
+        }
+        trailTabReady = true;
+    }
+    if (p[3] != lastTrailP || p[6] != lastGlowP) {
+        lastTrailP = p[3];
+        lastGlowP = p[6];
+        const double trailAmt = p[3] / 100.0;
+        // Body glow scales both the radius and the opacity of every stamp,
+        // the body and each trail dot alike, which is what makes the slider
+        // read as brightness and not only as size.
+        const double glowMul = glowMulOf(p[6]);
+        shapeK = static_cast<int>(floor(6 + trailAmt * 10 + 0.5));
+        if (shapeK > MAX_TRAIL) shapeK = MAX_TRAIL;
+        for (int k = 0; k <= shapeK; k++) {
+            const double f = 1 - static_cast<double>(k) / (shapeK + 1);
+            StampShape &sh = shapes[k];
+            sh.radiusD = ((k == 0) ? 2.6 : 1.2 * f + 0.4) * glowMul;
+            sh.alphaD = ((k == 0) ? 0.95 : 0.55 * pow(f, 1.6) * (0.4 + trailAmt * 0.8)) * glowMul;
+            sh.invR = sh.radiusD > 0 ? static_cast<float>(1.0 / sh.radiusD) : 0.0f;
+            sh.alphaF = static_cast<float>(sh.alphaD);
             // The page's own box is ceil(radius * 2.2) wide, but nothing
             // outside |distance| < radius survives its coverage test, so one
             // pixel of slack past ceil(radius) covers the same set: the box
             // from floor(centre) reaches centre - radius on one side and
             // centre + radius on the other for any fraction.
-            const int rr = static_cast<int>(ceil(radius)) + 1;
+            sh.rr = static_cast<int>(ceil(sh.radiusD)) + 1;
+        }
+    }
+    const int K = shapeK;
+    const float cx = w * 0.5f, cy = h * 0.5f;
+
+    // Per sample, single precision only (gm-4bd.13, owner's decision
+    // 2026-10-01): the S3 has no double FPU, and the double version of this
+    // loop cost 9.6 to 12.3 ms a frame in soft-float libcalls. Positions
+    // land within about 1e-4 px of the double ones.
+    sampleCount = 0;
+    memset(sampleBinCount, 0, NUM_BANDS);
+    for (int i = 0; i < orbitCount; i++) {
+        const OrbitDef &o = orbits[i];
+        const float u0 = static_cast<float>(oscTurnQ32(g_clock, o.rate)) * (6.2831853f / 4294967296.0f) + o.phaseF;
+        const float c0 = cosf(u0), s0 = sinf(u0);
+        for (int k = K; k >= 0; k--) {
+            if (sampleCount >= MAX_SAMPLES) break;
+            const StampShape &sh = shapes[k];
+            if (sh.radiusD <= 0) continue;
+            // cos(u0 - k d) and sin(u0 - k d).
+            const float cu = c0 * trailCos[k] + s0 * trailSin[k];
+            const float su = s0 * trailCos[k] - c0 * trailSin[k];
+            const float ex = cx + o.aF * cu * o.cosPhiF - o.bF * su * o.sinPhiF;
+            const float ey = cy + o.aF * cu * o.sinPhiF + o.bF * su * o.cosPhiF;
+            const int idx = sampleCount++;
+            Sample &sm = samples[idx];
+            sm.xInt = floorToInt(ex);
+            sm.yInt = floorToInt(ey);
+            sm.xFrac = ex - static_cast<float>(sm.xInt);
+            sm.yFrac = ey - static_cast<float>(sm.yInt);
+            // The double fallback in stampPixelDouble reads these; they are
+            // the float centre widened, so both paths agree on where it is.
+            sm.xD = static_cast<double>(ex);
+            sm.yD = static_cast<double>(ey);
+            sm.radiusD = sh.radiusD;
+            sm.alphaD = sh.alphaD;
+            sm.invR = sh.invR;
+            sm.alphaF = sh.alphaF;
+            const int rr = sh.rr;
             sm.x0 = sm.xInt - rr < 0 ? 0 : sm.xInt - rr;
             sm.x1 = sm.xInt + rr > w - 1 ? w - 1 : sm.xInt + rr;
             SampleMeta &me = sampleMeta[idx];
@@ -828,6 +912,7 @@ void release() {
     // reallocated tables that nothing refills.
     lastCountP = lastEccP = lastSizeP = lastPathP = lastTiltP = -1;
     lastThemeGen = 0xFFFFFFFF;
+    lastTrailP = lastGlowP = -1;
     geomW = geomH = 0;
     allocW = allocH = 0;
     orbitCount = 0;
