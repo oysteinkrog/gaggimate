@@ -10,13 +10,26 @@ import { computePosition, flip, shift, offset, autoUpdate } from '@floating-ui/d
  * @param {string} props.content - Tooltip text content
  * @param {preact.ComponentChildren} props.children - Trigger element
  * @param {'top'|'bottom'|'left'|'right'} [props.placement='top'] - Preferred placement
+ * @param {boolean} [props.showOnClick=false] - Also show on click or tap, for touch screens
+ *   that have no hover. A tap outside the trigger or Escape closes it again.
  */
-export function Tooltip({ content, children, placement = 'top', disabled = false }) {
+export function Tooltip({
+  content,
+  children,
+  placement = 'top',
+  disabled = false,
+  showOnClick = false,
+}) {
   const [isVisible, setIsVisible] = useState(false);
   const [position, setPosition] = useState({ x: 0, y: 0 });
   const [actualPlacement, setActualPlacement] = useState(placement);
   const triggerRef = useRef(null);
   const tooltipRef = useRef(null);
+  // showOnClick only: whether the last press was a touch, and whether the
+  // tooltip was already open when it began. A tap is followed by emulated
+  // mouse events, including a mouseleave that would hide it again at once.
+  const touchPressRef = useRef(false);
+  const openAtPressRef = useRef(false);
 
   useEffect(() => {
     if (disabled && isVisible) {
@@ -49,10 +62,41 @@ export function Tooltip({ content, children, placement = 'top', disabled = false
     return cleanup;
   }, [disabled, isVisible, placement]);
 
+  useEffect(() => {
+    if (!showOnClick || !isVisible) return;
+    const onPointerDown = e => {
+      if (triggerRef.current && !triggerRef.current.contains(e.target)) setIsVisible(false);
+    };
+    const onKeyDown = e => {
+      if (e.key === 'Escape') setIsVisible(false);
+    };
+    document.addEventListener('pointerdown', onPointerDown);
+    document.addEventListener('keydown', onKeyDown);
+    return () => {
+      document.removeEventListener('pointerdown', onPointerDown);
+      document.removeEventListener('keydown', onKeyDown);
+    };
+  }, [showOnClick, isVisible]);
+
   const show = useCallback(() => {
     if (!disabled) setIsVisible(true);
   }, [disabled]);
   const hide = useCallback(() => setIsVisible(false), []);
+  const onTriggerPointerEnter = e => {
+    if (e.pointerType === 'mouse') touchPressRef.current = false;
+  };
+  const onTriggerPointerDown = e => {
+    touchPressRef.current = e.pointerType !== 'mouse';
+    openAtPressRef.current = isVisible;
+  };
+  const onTriggerMouseLeave = () => {
+    if (!touchPressRef.current) hide();
+  };
+  const onTriggerClick = () => {
+    // A second tap on the trigger closes it.
+    if (touchPressRef.current && openAtPressRef.current) hide();
+    else show();
+  };
 
   const tooltip =
     isVisible &&
@@ -78,9 +122,12 @@ export function Tooltip({ content, children, placement = 'top', disabled = false
       <span
         ref={triggerRef}
         onMouseEnter={show}
-        onMouseLeave={hide}
+        onMouseLeave={showOnClick ? onTriggerMouseLeave : hide}
         onFocus={show}
         onBlur={hide}
+        onPointerEnter={showOnClick ? onTriggerPointerEnter : undefined}
+        onPointerDown={showOnClick ? onTriggerPointerDown : undefined}
+        onClick={showOnClick ? onTriggerClick : undefined}
         className='inline-flex'
       >
         {children}
