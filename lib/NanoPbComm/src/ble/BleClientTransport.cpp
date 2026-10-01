@@ -64,7 +64,12 @@ void BleClientTransport::maintain() {
         return; // init() failed to create the client/scanner
     // Bench hold (gm-bzu.26): keep the controller's scan stopped while held,
     // and skip the stall restart below, which would start it again.
+    g_bleClientConnected = _client->isConnected() ? 1 : 0;
     if (bleScanHeld()) {
+        if (_client->isConnected()) {
+            _client->disconnect(); // onDisconnect rescans; the next tick stops that scan
+            ESP_LOGW(LOG_TAG, "Link dropped by the bench knob");
+        }
         if (_scanner->isScanning() && bleScanOwner() == BleScanOwner::Controller) {
             _scanner->stop();
             bleScanRelease(BleScanOwner::Controller);

@@ -1715,12 +1715,12 @@ void WebUIPlugin::setupDebugEndpoints() {
         snprintf(buf, sizeof(buf),
                  "{\"ps\":%d,\"ps_rc\":%d,\"assoc\":%s,\"rssi\":%d,\"channel\":%d,\"phy_11b\":%d,\"phy_11g\":%d,"
                  "\"phy_11n\":%d,\"phy_lr\":%d,\"bssid\":\"%02x:%02x:%02x:%02x:%02x:%02x\",\"status\":%d,"
-                 "\"ble_scanning\":%s,\"ble_scan_owner\":%d,\"ble_scan_hold\":%s}",
+                 "\"ble_scanning\":%s,\"ble_scan_owner\":%d,\"ble_scan_hold\":%s,\"ble_connected\":%s}",
                  static_cast<int>(ps), psRc, assoc ? "true" : "false", assoc ? ap.rssi : 0, assoc ? ap.primary : 0,
                  assoc ? ap.phy_11b : 0, assoc ? ap.phy_11g : 0, assoc ? ap.phy_11n : 0, assoc ? ap.phy_lr : 0, ap.bssid[0],
                  ap.bssid[1], ap.bssid[2], ap.bssid[3], ap.bssid[4], ap.bssid[5], static_cast<int>(WiFi.status()),
                  (scan != nullptr && scan->isScanning()) ? "true" : "false", static_cast<int>(g_bleScanOwner),
-                 bleScanHeld() ? "true" : "false");
+                 bleScanHeld() ? "true" : "false", g_bleClientConnected ? "true" : "false");
         request->send(200, "application/json", buf);
     });
     server.on("/api/debug/pclk", [](AsyncWebServerRequest *request) {

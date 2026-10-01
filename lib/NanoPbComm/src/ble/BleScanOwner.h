@@ -41,6 +41,9 @@ inline void bleScanRelease(BleScanOwner who) {
 // the BLE radio quiet and the WiFi link otherwise unchanged. Set only by the
 // /api/debug/wifi route on bench builds; production never writes it.
 inline volatile uint8_t g_bleScanHold = 0;
+// Whether the controller client is connected, mirrored by maintain() each
+// tick so the debug route can report it without a handle to the transport.
+inline volatile uint8_t g_bleClientConnected = 0;
 inline bool bleScanHeld() { return g_bleScanHold != 0; }
 inline void bleScanSetHold(bool hold) { g_bleScanHold = hold ? 1 : 0; }
 
