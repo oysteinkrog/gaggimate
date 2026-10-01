@@ -84,16 +84,6 @@
 #include "BgAnimCommon.h"
 #include <math.h>
 
-// Same reasoning as AnimSilk.cpp/AnimEmber.cpp: keep the hot loop out of
-// flash so LVGL's icache churn on the other core can't stall it behind an
-// MSPI refill. No-op on the host bench.
-#if defined(ESP_PLATFORM)
-#include <esp_attr.h>
-#define GM_ANIM_IRAM IRAM_ATTR
-#else
-#define GM_ANIM_IRAM
-#endif
-
 // Master switch for the hand-written Xtensa kernel below (silk2PairRowAsm
 // and band()'s dispatch to it). ON by default: this is Silk 2's first
 // hand-written kernel, transcribed from GCC 14's own compile of bandRef()'s
@@ -166,6 +156,17 @@ using namespace bganim;
 // The vignette terms only ever SUBTRACT (they darken, never brighten), so
 // they widen the negative side of the range without touching the positive
 // side.
+//
+// Two of the user sliders move inside this budget rather than widening it,
+// which is why neither of them costs a byte of the hot slab (the tables here
+// already fill 8,890 of the 9,216 B an animation gets, so there is no room to
+// widen anything). Wave balance shifts amplitude between colFoldA and
+// colFoldB and always leaves AMP_A + AMP_B unchanged, so SUM_MAX and SUM_MIN
+// are the same whatever it is set to. Rim spread changes the shape of the
+// vignette falloff and never its value at the rim, so both vignette terms
+// stay inside 0..VIGN_COL_MAX and 0..VIGN_ROW_MAX. AMP_A and AMP_B below are
+// therefore the DEFAULT split and the fixed total; the per-wave figure a
+// given frame uses is ampA/ampB in frame().
 constexpr int32_t AMP_A = 200;        // colFoldA wave amplitude after build-time scaling
 constexpr int32_t AMP_B = 200;        // colFoldB wave amplitude after build-time scaling
 constexpr int32_t AMP_SHEEN = 200;    // sheen amplitude after its one post-gather scale
@@ -312,26 +313,52 @@ int32_t g_sheenRowStep = 0; // per-row y-phase step, Q32 turns/row
 uint32_t g_sheenWt = 0;     // temporal phase at y=0, Q32 turns (already mod 2*pi via wraparound)
 
 // Animation time (BgAnimClock.h, gm-yr21). g_clock runs at the speed setting
-// and drives the angle wobbles and the sheen's rotation and temporal phase;
-// g_wall runs at speed 1 and drives the sheen's k wobble and the fold phase,
-// neither of which followed speedMul(). Neither clock is reset by release(),
-// so the full/half switch keeps the motion where it was.
+// times the Drift slider (p[7]) and drives the angle wobbles and the sheen's
+// rotation and temporal phase; g_wall runs at speed 1 and drives the sheen's
+// k wobble and steps the fold phase. Neither clock is reset by release(), so
+// the full/half switch keeps the motion where it was.
 AnimClock g_clock;
 AnimClock g_wall;
-// The fold phase in 1/16 table steps: the sum of wall step x foldSpeed. The
-// fold speed is its own linear map of p[0], so the phase is accumulated per
-// step, and a speed change bends the drift instead of moving it. The old
-// tMs * foldSpeed was a uint32 product that jumped on every speed change.
-uint64_t g_foldQ4 = 0;
-// Q48 rates, each oscillator with its own phase. The angle wobbles and the
-// sheen's A and wt are per animation millisecond (speed-scaled); the k
-// wobble is per wall millisecond.
-constexpr double SHEEN_BASE = 6.283185307179586 / 70000.0; // rad per animation ms
-constexpr uint64_t RATE_ANGLE_A = oscRateQ48(6.283185307179586 / 200000.0);
-constexpr uint64_t RATE_ANGLE_B = oscRateQ48(6.283185307179586 / 260000.0);
-constexpr uint64_t RATE_SHEEN_ROT = oscRateQ48(SHEEN_BASE * 0.15 * SHEEN_ROT_MULT);
-constexpr uint64_t RATE_SHEEN_WT = oscRateQ48(SHEEN_BASE * SHEEN_W_MULT);
-constexpr uint64_t RATE_SHEEN_K = oscRateQ48(6.283185307179586 / 90000.0);
+// The fold phase, Q8: the sum of wall step x foldRateQ8, where foldRateQ8 is
+// 1150 x speedMul(p[0]) (frame(), gm-kh2s). Accumulated per step, so a speed
+// change bends the drift instead of moving it. The old tMs * foldSpeed was a
+// uint32 product that jumped on every speed change.
+uint64_t g_foldQ8 = 0;
+// Rates, as the page writes them (anim_bench.html, Silk 2): float32 radians
+// per millisecond, rounded in the page's order. The angle wobbles and the
+// sheen's A and wt are per animation millisecond on g_clock (speed and Drift
+// scaled); the k wobble is per wall millisecond on g_wall. clockPhase and
+// clockTurn multiply them by the clock's time the way the page multiplies
+// them by tMs, so the default picture is the page's exactly (gm-pciz).
+constexpr float RATE_ANGLE_A = 6.2831853f / 200000.0f;
+constexpr float RATE_ANGLE_B = 6.2831853f / 260000.0f;
+constexpr float SHEEN_BASE = 6.2831853f / 70000.0f; // rad per animation ms
+constexpr float RATE_SHEEN_ROT = SHEEN_BASE * 0.15f * SHEEN_ROT_MULT;
+constexpr float RATE_SHEEN_K = 6.2831853f / 90000.0f;
+
+// A float phase, rate x animation time, from the clock (gm-pciz). The page
+// computes f32(rate * f32(tMs)). The clock's time times a float rate,
+// formed in double, is exact while the clock holds whole milliseconds below
+// 2^24 (both factors fit in 48 bits), so rounding it once gives the page's
+// float bit for bit: that is every frame at Speed 50. Past 4096 rad a float
+// would step in whole milliradians and keep losing resolution, so the phase
+// is reduced to one turn first; the handover moves it by under one float ulp
+// of 4096 (0.5 mrad), once. Double time from the 64-bit clock stays exact for
+// four years, so there is no wrap anywhere.
+inline float clockPhase(const AnimClock &c, float rate) {
+    const double ph = static_cast<double>(c.simQ16) * (1.0 / 65536.0) * static_cast<double>(rate);
+    if (ph < 4096.0 && ph > -4096.0)
+        return static_cast<float>(ph);
+    return static_cast<float>(fmod(ph, 6.283185307179586));
+}
+
+// An integer phase in Q32 turns, rateQ32 x animation time mod one turn. At
+// whole milliseconds this is the page's imul(rateQ, tMs) exactly; the 64-bit
+// product wraps modulo 2^64, a whole number of turns, so it stays continuous
+// across every wrap of the clock and of millis().
+inline uint32_t clockTurn(const AnimClock &c, int32_t rateQ32) {
+    return static_cast<uint32_t>((c.simQ16 * static_cast<uint64_t>(static_cast<int64_t>(rateQ32))) >> 16);
+}
 
 // Reads g_sheenLut, already scaled to +-AMP_SHEEN -- see its own comment.
 inline int16_t sinFromTurn(uint32_t turn) { return g_sheenLut[turn >> 22]; }
@@ -455,18 +482,53 @@ bool init(int w, int h) {
     return true;
 }
 
-void frame(uint32_t tMs, int w, int h, const uint8_t p[4]) {
+void frame(uint32_t tMs, int w, int h, const uint8_t p[BG_ANIM_PARAMS]) {
     if (p[2] != lastGlow || themeGen() != lastThemeGen) {
         buildSilk2Lut(p[2]);
         lastGlow = p[2];
         lastThemeGen = themeGen();
     }
+    const float speedF = speedMul(p[0]);
+    // Drift (p[7]): how fast the slow terms move relative to Speed, 0x at 0,
+    // exactly 1x at 50, 2x at 100. "Slow terms" means the two wave angles'
+    // wobble, the sheen's rotation and the sheen's own temporal phase --
+    // everything except the fringe scroll, which stays Speed's alone, so the
+    // two sliders separate "how fast the fabric moves" from "how fast the
+    // light on it turns". The divide by 50.0f is exact at 50 (50/50 is 1.0f
+    // with no rounding), so at the default g_clock runs at exactly Speed's
+    // rate. Nothing here changes an amplitude or an angle range, so the
+    // padding computed at init() still bounds every shift.
+    const float driftF = static_cast<float>(p[7]) / 50.0f;
     // Animation time from the wrapped millis() delta (BgAnimClock.h,
     // gm-yr21). The old terms were products of the raw uptime: the float
     // ones stepped in 32 ms jumps after 3.1 days, and every phase jumped on
-    // a speed change and at the 49.7-day wrap.
-    g_clock.advance(tMs, speedMul(p[0]));
+    // a speed change and at the 49.7-day wrap. Drift multiplies the rate
+    // g_clock advances at rather than its phases, so moving the Drift slider
+    // bends the slow terms the same way a Speed change does instead of
+    // jumping them.
+    g_clock.advance(tMs, speedF * driftF);
     const uint32_t wallStep = g_wall.advance(tMs, 1.0f);
+    // Wave balance (p[3]): moves amplitude between oblique wave A (the
+    // 2-and-3-cycle pair at about 20 degrees) and oblique wave B (the
+    // 4-and-5-cycle pair at about -35 degrees). The two always add up to
+    // AMP_A + AMP_B, so the reachable index range, SUM_BIAS and the LUT size
+    // are all untouched: only which of the two fringe families dominates the
+    // picture changes. 50/350 at slider 0, 200/200 at 50 (exactly the old
+    // constants), 350/50 at 100.
+    const int32_t mixD = (static_cast<int>(p[3]) - 50) * 3; // -150..150
+    const int32_t ampA = AMP_A + mixD;                      // 50..350
+    const int32_t ampB = AMP_B - mixD;                      // 350..50
+    // Rim spread (p[6]): how far in from the edge the vignette reaches. The
+    // strength at the very rim stays VIGN_COL_MAX / VIGN_ROW_MAX whatever
+    // this is set to (again so the range budget above still holds); what
+    // moves is the falloff's shape, from a fourth power (a tight dark edge,
+    // slider 0) through the square this animation always used (slider 50) to
+    // a straight line (a broad shaded frame, slider 100). Written as a blend
+    // away from the old expression rather than as a new one, so at 50 the
+    // added term is exactly 0.0f and every table entry rounds where it did.
+    const float rimS = (static_cast<int>(p[6]) - 50) * (1.0f / 50.0f); // -1..1
+    const bool rimWide = rimS >= 0.0f;
+    const float rimMix = rimWide ? rimS : -rimS; // 0..1
 
     // ---- Oblique wave angles: each wobbles on its own slow clock around
     // its own fixed base (see the angle constants' own comment for the
@@ -475,8 +537,8 @@ void frame(uint32_t tMs, int w, int h, const uint8_t p[4]) {
     // these and not tanf) run once per frame() call, not once per row or
     // per pixel -- negligible next to buildSilk2Lut's SUM_N-sized loop
     // above, let alone band()'s w*h loop. ----
-    const float angleA = ANGLE_A_BASE + ANGLE_A_WOBBLE * fastSinRad(oscRad(g_clock, RATE_ANGLE_A) + ANGLE_A_PHASE);
-    const float angleB = ANGLE_B_BASE + ANGLE_B_WOBBLE * fastSinRad(oscRad(g_clock, RATE_ANGLE_B) + ANGLE_B_PHASE);
+    const float angleA = ANGLE_A_BASE + ANGLE_A_WOBBLE * fastSinRad(clockPhase(g_clock, RATE_ANGLE_A) + ANGLE_A_PHASE);
+    const float angleB = ANGLE_B_BASE + ANGLE_B_WOBBLE * fastSinRad(clockPhase(g_clock, RATE_ANGLE_B) + ANGLE_B_PHASE);
     const float slopeA = fastSinRad(angleA) / fastCosRad(angleA);
     const float slopeB = fastSinRad(angleB) / fastCosRad(angleB);
 
@@ -487,12 +549,34 @@ void frame(uint32_t tMs, int w, int h, const uint8_t p[4]) {
     // the two waves' cells don't lock into a repeating grid. Its own clock,
     // distinct from the angle wobbles above and the sheen's clock below, so
     // all three drift out of lockstep with each other. ----
-    const uint32_t foldSpeed = 4 + static_cast<uint32_t>(p[0]) * 44 / 100; // 4..48, /16 = 0.25x..3x
-    g_foldQ4 += static_cast<uint64_t>(wallStep) * foldSpeed;
-    // The phases below keep only the low 10 bits of foldBase * n >> 8, and
-    // 2^32 * n >> 8 is a multiple of 1024, so the uint32 wrap of foldBase
-    // is continuous.
-    const uint32_t foldBase = static_cast<uint32_t>(g_foldQ4 >> 4);
+    // Speed law (gm-kh2s). The fringe scroll used to read Speed through its
+    // own linear curve, 4 + p0 * 44 / 100 sixteenths (0.25x at 0, 1.625x at
+    // 50, 3x at 100), while the sheen and the angle wobbles read the fleet's
+    // exp2 curve (speedMul: 0.15x, 1x, 6.7x). Between 50 and 75 the scroll
+    // only gained 1.42x where the sheen gained 2.6x, and the measured half
+    // change time went from 3290 ms to 3314 ms: the slider ran backwards.
+    // Now the scroll rides speedMul too. 1150 / 256 = 4.49 sixteenths per
+    // ms at 50, which is 2.77 times the old 26 / 16 and puts the half change
+    // time at 988 ms against the 1200 ms target (motion.js, raw metric,
+    // accept band 950 to 1500), with Speed 0, 25, 75 and 100 at 1.09, 1.04,
+    // 1.20 and 1.51 times their targets and every step of the slider
+    // faster than the last. The sheen and the wobbles keep their rates:
+    // scaling them by the same factor put Speed 50 at 560 ms and made
+    // Speed 100 slower than 75 again, because the sheen's sweep then
+    // dominates the picture and aliases against the metric's 66 ms step.
+    // The reading is sensitive to where in the sheen's 70 s cycle it is
+    // taken: the picture is nearly black from about 33 s to 60 s of every
+    // cycle at Speed 50 (mean luma 5 to 8 against 45 to 63 when lit), so a
+    // window that starts 20 s later reads 1506 ms and one 35 s later reads
+    // nothing at all. Exactly 1150 at 50.
+    const uint32_t foldRateQ8 = static_cast<uint32_t>(lroundf(1150.0f * speedF));
+    // The phase is accumulated per wall step in 64 bits (g_foldQ8), so it
+    // stays continuous across the millis() wrap and a speed change bends the
+    // drift instead of moving it. The phases below keep only the low 10 bits
+    // of foldBase * n >> 8, and 2^32 * n >> 8 is a multiple of 1024, so the
+    // uint32 wrap of foldBase is continuous.
+    g_foldQ8 += static_cast<uint64_t>(wallStep) * foldRateQ8;
+    const uint32_t foldBase = static_cast<uint32_t>(g_foldQ8 >> 8);
     const uint32_t phaseA0 = foldBase * 9 >> 8;
     const uint32_t phaseA1 = foldBase * 8 >> 8; // close to phaseA0: a slow beat, not a fixed second grating
     const uint32_t phaseB0 = foldBase * 7 >> 8; // different ratio again: the cells drift, not just scroll
@@ -503,8 +587,18 @@ void frame(uint32_t tMs, int w, int h, const uint8_t p[4]) {
     const uint32_t sxScale = 128 + static_cast<uint32_t>(p[1]) * 384 / 100; // 128..512
     const uint32_t freqA0 = (2 * sxScale) >> 8;
     const uint32_t freqA1 = (3 * sxScale) >> 8;
-    const uint32_t freqB0 = (4 * sxScale) >> 8;
-    const uint32_t freqB1 = (5 * sxScale) >> 8;
+    // Cross detail (p[4]): wave B's own frequency, as a percentage of wave
+    // A's. Wave A keeps whatever Fringe density says; wave B runs from 0.8x
+    // that at slider 0 to 2x at slider 100, exactly 1x at 50, so the crossing
+    // family goes from cells about the size of A's to cells half the size.
+    // The low end stops at 0.8x rather than lower on purpose: at about 0.6x
+    // and below the >>8 quantisation lands B on A's own 2-and-3 cycle counts
+    // and the two waves lock into one regular lattice, which is the exact
+    // failure the second oblique wave exists to avoid (file header).
+    const uint32_t crossPct = p[4] < 50 ? (80 + static_cast<uint32_t>(p[4]) * 20 / 50)
+                                        : (100 + (static_cast<uint32_t>(p[4]) - 50) * 2); // 80..200
+    const uint32_t freqB0 = (4 * sxScale * crossPct / 100) >> 8;
+    const uint32_t freqB1 = (5 * sxScale * crossPct / 100) >> 8;
     const int16_t *sl = g_sinLut;
     // Build-time amplitude scale: a raw two-sine sum before halving spans
     // +-2*SIN_AMP; the "* 0.5f" halves that the way round 3's ">>1" did, and
@@ -512,8 +606,13 @@ void frame(uint32_t tMs, int w, int h, const uint8_t p[4]) {
     // this round's tighter per-wave budget (see the range-budget comment).
     // Folded into one float multiply per table entry -- frame()-time cost
     // (foldTableWA/foldTableWB reads total), not per-pixel.
-    const float ampScaleA = 0.5f * static_cast<float>(AMP_A) / static_cast<float>(SIN_AMP);
-    const float ampScaleB = 0.5f * static_cast<float>(AMP_B) / static_cast<float>(SIN_AMP);
+    // ampA/ampB come from Wave balance above; at its default they are AMP_A
+    // and AMP_B, so these two scales are the same floats they always were.
+    // Both quotients are exact whatever the balance is (SIN_AMP is 512, so
+    // this is a power-of-two scaling), which is why a wave's table entry
+    // never rounds past its own amplitude and the range budget holds.
+    const float ampScaleA = 0.5f * static_cast<float>(ampA) / static_cast<float>(SIN_AMP);
+    const float ampScaleB = 0.5f * static_cast<float>(ampB) / static_cast<float>(SIN_AMP);
 
     // colFoldA is built padA columns wider than the screen on each side
     // (see padA's own comment): table slot tx represents true spatial
@@ -542,7 +641,16 @@ void frame(uint32_t tMs, int w, int h, const uint8_t p[4]) {
         const int16_t base = static_cast<int16_t>(lroundf(raw * ampScaleA));
         const int clampedX = spatialX < 0 ? 0 : (spatialX >= w ? w - 1 : spatialX);
         const float dxNorm = (static_cast<float>(clampedX) - wHalf) / wHalf; // -1..1
-        const int32_t colVign = static_cast<int32_t>(lroundf(VIGN_COL_MAX * dxNorm * dxNorm)); // 0..VIGN_COL_MAX
+        // Rim spread: colBase is the square this table always used; colAlt is
+        // the shape the slider blends toward (a straight line above 50, the
+        // square of the square below it). Both stay inside 0..VIGN_COL_MAX
+        // because |dxNorm| <= 1, so the blend does too and the range budget is
+        // untouched. rimMix is exactly 0.0f at the default, so the whole added
+        // term vanishes and lroundf sees the old expression unchanged.
+        const float colBase = VIGN_COL_MAX * dxNorm * dxNorm;
+        const float colAlt = rimWide ? (VIGN_COL_MAX * fabsf(dxNorm)) : (colBase * dxNorm * dxNorm);
+        const int32_t colVign =
+            static_cast<int32_t>(lroundf(colBase + rimMix * (colAlt - colBase))); // 0..VIGN_COL_MAX
         colFoldA[tx] = static_cast<int16_t>(base - colVign);
     }
     // colFoldB: same padded-table shape as colFoldA, its own angle's
@@ -567,20 +675,35 @@ void frame(uint32_t tMs, int w, int h, const uint8_t p[4]) {
         shiftTableA[y] = static_cast<int16_t>(lroundf(slopeA * (yf - hHalf)));
         shiftTableB[y] = static_cast<int16_t>(lroundf(slopeB * (yf - hHalf)));
         const float dyNorm = (yf - hHalf) / hHalf; // -1..1
-        rowVign[y] = static_cast<int16_t>(-lroundf(VIGN_ROW_MAX * dyNorm * dyNorm)); // -VIGN_ROW_MAX..0
+        // Same Rim spread blend as colFoldA's, on the row half of the
+        // vignette, so the top and bottom rims and the left and right ones
+        // always shade to the same shape.
+        const float rowBase = VIGN_ROW_MAX * dyNorm * dyNorm;
+        const float rowAlt = rimWide ? (VIGN_ROW_MAX * fabsf(dyNorm)) : (rowBase * dyNorm * dyNorm);
+        rowVign[y] = static_cast<int16_t>(-lroundf(rowBase + rimMix * (rowAlt - rowBase))); // -VIGN_ROW_MAX..0
     }
 
     // ---- Sheen: one rotating oblique wave (AnimSilk.cpp's per-wave
     // technique, kept for just one wave instead of three). Unchanged from
     // round 3 except for the post-gather amplitude scale in band() (see
     // SHEEN_SCALE_NUM/SHIFT's own comment). ----
-    const float A = SHEEN_A0 + oscRad(g_clock, RATE_SHEEN_ROT);
+    const float A = SHEEN_A0 + clockPhase(g_clock, RATE_SHEEN_ROT);
     // Much coarser than the fringe frequencies above -- about 0.7 to 1.9
     // cycles across the whole panel width, so this reads as one broad
     // highlight sweeping across the frame, not another layer of fringes at
     // the same scale.
-    const float k0 = 0.0015f + 0.0025f * (p[1] / 100.0f);
-    const float k = k0 * (1.0f + 0.15f * fastSinRad(oscRad(g_wall, RATE_SHEEN_K) + SHEEN_PHK));
+    // Sheen width (p[5]): how broad the sweeping highlight is. k0 is the
+    // sheen's spatial frequency, so a bigger k0 is a NARROWER highlight; the
+    // slider is subtracted rather than added so that turning it up widens
+    // the highlight, which is what its label promises. About 1.9 cycles
+    // across the panel at slider 0 and about 0.7 at 100. The term used to
+    // read p[1], the Fringe density slider, so the highlight narrowed every
+    // time a person asked for finer fringes; it is its own slider now,
+    // defaulted to 55, which leaves 100 - 55 = 45, the number Fringe
+    // density's own default fed in here before, so the default picture is
+    // the one this animation always drew, down to the last bit.
+    const float k0 = 0.0015f + 0.0025f * ((100 - static_cast<int>(p[5])) / 100.0f);
+    const float k = k0 * (1.0f + 0.15f * fastSinRad(clockPhase(g_wall, RATE_SHEEN_K) + SHEEN_PHK));
     const float kx = k * fastCosRad(A);
     const float ky = k * fastSinRad(A);
     g_sheenStep = static_cast<int32_t>(kx * TURN);
@@ -588,8 +711,11 @@ void frame(uint32_t tMs, int w, int h, const uint8_t p[4]) {
     // Temporal phase, Q32 turns, already mod one turn, the same way
     // AnimSilk.cpp's g_wtTurn is built. kx and ky stay well inside int32
     // range, since k never exceeds ~0.0184 turns/px here and TURN is a fixed
-    // constant, giving |kx*TURN| a few million at most.
-    g_sheenWt = oscTurnQ32(g_clock, RATE_SHEEN_WT);
+    // constant, giving |kx*TURN| a few million at most. Drift reaches it
+    // through g_clock's rate. The rate is truncated to Q32 the way the page
+    // truncates it.
+    const int32_t wRateQ = static_cast<int32_t>((SHEEN_BASE * SHEEN_W_MULT) * TURN);
+    g_sheenWt = clockTurn(g_clock, wRateQ);
 }
 
 #if GM_BGANIM_SILK2_ASM
@@ -888,7 +1014,14 @@ extern const BgAnimation bg_anim_silk2;
 const BgAnimation bg_anim_silk2 = {
     "silk2",
     "Silk 2",
-    {{"speed", "Speed", 50}, {"scale", "Fringe density", 45}, {"glow", "Sheen", 55}, {nullptr, nullptr, 0}},
+    {{"speed", "Speed", 50},
+     {"scale", "Fringe density", 45},
+     {"glow", "Contrast", 55},
+     {"mix", "Wave balance", 50},
+     {"cross", "Cross detail", 50},
+     {"sheenw", "Sheen width", 55},
+     {"rim", "Rim spread", 50},
+     {"drift", "Drift", 50}},
     init,
     frame,
     band,

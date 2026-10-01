@@ -373,7 +373,7 @@ def build(args):
     header = struct.pack(
         "<4sIIIIIII8s16sII",
         b"GMKB",
-        1,
+        2,  # KBlob.cpp kVersion: 2 since the 8 slot BgAnimation (gm-3vj.1)
         text_addr,
         len(text),
         data_addr,

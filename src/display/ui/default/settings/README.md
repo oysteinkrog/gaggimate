@@ -10,7 +10,8 @@ to run the tests, and what never to do here.
 
 - `SettingsModel.h` / `.cpp`: the value model. Ranges, steps, wrap rules,
   display formats, choice lists, the time zone region and city split,
-  gradient map slots, the palette, wake-up schedule editing. Plain C++17
+  gradient map slots, the animation parameter string, the palette, wake-up
+  schedule editing. Plain C++17
   with no LVGL, Arduino or ESP-IDF dependency, so `pio test -e
   native_settingsui` runs it on the host.
 - `SettingsUI.h` / `.cpp`: the shell. The cover object, the tile page, the
@@ -18,24 +19,62 @@ to run the tests, and what never to do here.
   swipe, turn the pages), the page stack, `Settings::Guard` ordering, the
   debug tags, web-save reconciliation and the 1 s refresh tick. The header
   is the contract every category codes against.
-- `SettingsRows.h` / `.cpp`: the seven row widgets (stepper, choice, toggle,
-  action, locked, confirm, info). Each fits the shell's 320x56 slot and owns
-  its own hold state. Every target draws a 2 px outline with no fill:
-  stepper and choice controls are separate 56x56 buttons, toggle, action
-  and confirm rows frame the whole row and show a cue at the right, and a
-  locked row's target is a "Hold 1 s" button. `settingsFrameButtonCreate`
+- `SettingsRows.h` / `.cpp`: the eight row widgets (stepper, choice, toggle,
+  action, locked, confirm, info, swatch). Each fits the shell's 320x56 slot
+  and owns its own hold state. Every target draws a 2 px outline with no
+  fill: stepper and choice controls are separate 56x56 buttons, toggle,
+  action and confirm rows frame the whole row and show a cue at the right,
+  and a locked row's target is a "Hold 1 s" button. `settingsFrameButtonCreate`
   is the shared button, which the shell also uses for the header arrows and
-  the Back or Close button.
+  the Back or Close button. The swatch row is an action row that also draws
+  a 96x30 colour ramp and a selected marker: `settingsRowSetSwatch` takes
+  `kSettingsRowSwatchSamples` RGB565 values, or a null pointer to show no
+  ramp, and the row frees its own canvas buffer on delete. The stepping
+  swatch row is laid out like a choice row: a framed band over x 0 to 200
+  opens the picker and carries the name with a 4 px ramp bar under it, and
+  prev and next are the choice row's two framed buttons.
 - `SettingsLog.h`: `settingsLogAppend`, a bounded `snprintf` accumulator for
   the categories' one-line commit logs.
 - `CatTemps.cpp`: temperature offset, pressure sensor rating, brew and grind
   delay, delay auto-adjust.
 - `CatDisplay.cpp`: main and standby brightness, dim timeout, 24-hour clock,
   time zone region and city.
-- `CatAnimation.cpp`: animation, frame rate, all screens, theme, gradient,
-  plates and plate colour and opacity, element tint and tint colour, text
-  scrim, screen fade out, fade in and fade curve, interlace. Every row here
-  applies live.
+- `CatAnimation.cpp`: animation, the standby screen's own animation, the
+  Parameters row, frame rate, all
+  screens, theme, gradient, plates and plate colour and opacity, element
+  tint and tint colour, text scrim, screen fade out, fade in and fade
+  curve, interlace. Every value row here applies live. It also owns the
+  animation roster the settings screens read, including the simulator's
+  mirror of it, and exports that as the three accessors `CatAnimParams.h`
+  declares.
+- `CatAnimParams.cpp` / `.h`: the Parameters page, pushed from the
+  Animation category's third row. One stepper per parameter the chosen
+  animation defines (0 to 100, step 5, fast step 10), labelled from the
+  animation's own `BgAnimParamDef`, plus a "Reset to defaults" confirm
+  row. Every step writes the whole `bgAnimParams` string back and calls
+  `markDirty()`, so the animation behind the settings cover changes under
+  the finger. The page is fixed to the animation it was opened for, the
+  way the schedule editor is fixed to its position. The string arithmetic
+  (read one group with the defaults behind it, write one group back, clear
+  one group) is in `SettingsModel`, host-tested; the page itself holds no
+  parsing.
+- `CatGradientPicker.cpp` / `.h`: the gradient picker, pushed by all three
+  of the Animation category's gradient rows. Two pages: the groups (Global
+  for a per-animation row, My gradients when the library is not empty, then
+  each declared category with a count) and the gradients in one group, each
+  with its name, a swatch and a marker on the one in force. The header is
+  the whole contract: the caller passes a title, whether Global is offered,
+  and four callbacks (read the current ref, take a pick, reconcile the
+  parent draft, say whether the slot is still worth editing). The picker
+  knows nothing about which setting it edits.
+- `GradientSwatch.cpp` / `.h`: the ramp a swatch shows. A standalone
+  transcription of the production palette arithmetic, because the real one
+  works on the globals the render task draws with, so sampling five
+  gradients to fill five rows would publish each of them in turn as the
+  active theme. `tools/animbench/swatch_parity.cpp` compares all 256 entries
+  against the real code for every built-in and for library strings with 2 to
+  16 stops, repeated positions and flat endpoint runs, at seven tone
+  settings; `make check` runs it.
 - `CatMachine.cpp` / `CatMachine.h`: startup mode, standby timeout, auto
   wake-up, and the `MachineDraft` the schedule pages share. The header is the
   whole contract between this file and the schedule editor, including the
@@ -47,8 +86,75 @@ to run the tests, and what never to do here.
   opens the info screen (the WiFi setup QR code lives there), and the
   Restart confirm row.
 - `SettingsFixture.cpp`: the sixth tile. One of each row widget, and the
-  counters the Fixture scenario asserts on. Compiled only under
-  `GM_TOUCH_PROBE` or `GAGGIMATE_SIM`.
+  counters the fixture checks assert on. Compiled only under
+  `GAGGIMATE_SIM`, so it is a simulator tile and never a device one.
+
+### The Standby anim row
+
+The Animation category's second row picks a background animation for the
+standby screen on its own. It cycles through "Same" and then every animation
+in the roster, and stores `bgAnimStandbyId`: -1 for "Same", otherwise the
+animation's id. -1 is the default, so a device that has never touched this
+plays one animation everywhere, the way it always did.
+
+The rule lives in one place, `DefaultUI::updateState`. On every UI pass it
+reads `bgAnimId`, and when the current screen is the standby screen and
+`bgAnimStandbyId` names an animation in the live registry it pushes that id
+instead. Everything downstream keys off the id it pushed, so the standby
+animation brings its own stored parameters and its own gradient with it.
+Nothing extra happens on a standby entry or exit: the render task sees a new
+id, hands back the outgoing animation's tables and inits the incoming one on
+that frame, which is the same path a live edit of the main animation already
+takes.
+
+A stored id past the end of the registry reads as "Same" rather than as an
+error, in the row, in the web form and in the selection rule. Nothing
+range-checks the value on its way in, and a build rolled back to a shorter
+roster would otherwise index off the end.
+
+One consequence worth knowing before reading a bug report: with "All
+screens" off the animation only ever plays on the standby screen, so a
+Standby anim other than "Same" is then the only animation anyone sees, and
+the Animation row picks the one nothing shows. The web form says as much in
+its help text.
+
+### The three gradient rows
+
+"Gradient all" sets `bgAnimGradientRef`, the global. "Gradient" sets one
+slot of `bgAnimThemeMap`, the override for the animation on screen.
+"Standby grad" sets the slot for the standby screen's own animation, and is
+disabled, showing "Same as main", while the standby screen follows the main
+animation or names the same one.
+
+All three push the same picker and take a ref back through a callback. Five
+things about that are load bearing:
+
+- **A pick applies and stays on the page** (gm-nov3.31). Applying is live, so
+  the panel is on the tapped gradient at once, the marker moves to the tapped
+  row and trying the next one is one more tap. The chevron is what leaves.
+  The one exception is the slot itself going away, which still closes both
+  levels, from a pick and from the reconcile below alike.
+- **The picker captures the slot it was opened for and never retargets it.**
+  A web save that changes `bgAnimId` under an open picker still writes the
+  animation the row was opened for. If that slot stops being a thing worth
+  editing (the standby animation is turned off), the picker closes without
+  selecting rather than writing a slot nothing reads.
+- **Only the top page reconciles**, so each picker level calls the opening
+  category's reconcile itself before anything else, the way the schedule
+  pages do for the Machine draft. Without it the Animation page would come
+  back from the picker showing what was stored when it opened.
+- **A pick is applied before any pop.** `popPages` rebuilds the page
+  underneath from the draft, so writing the draft after the pop would leave
+  the old value on screen until the next refresh. That is now the chevron's
+  pop rather than the pick's, and the rule is the same: whatever the last
+  pick wrote is what the page underneath shows on the way out.
+- **Choosing Global clears the slot, and it is offered only by the two
+  per-animation rows.** "Gradient all" is the global, so "the global" is not
+  a value it can take; its picker starts at the groups.
+
+A ref is validated against the stored library under `Settings::Guard` at the
+moment it is picked, so a library entry deleted from the web UI while the
+list was on screen cannot be selected.
 
 The tests are one directory tree away: the shared rig and the scenarios in
 `tools/settings_ui_tests/` (its own `README.md` documents `Rig` and `Sim`
@@ -78,6 +184,18 @@ host model tests in `test/test_settings_model/`.
    `tools/settings_ui_test.py` and its pages to `CATEGORY_PAGES` in
    `tools/settings_ui_tests/audit_pages.py`. The scenario puts back every
    value it changes.
+
+   Adding a row to a category that already has one is the same edit plus
+   one more: `CATEGORY_PAGES` pins the exact row list of every page, and
+   five rows to a page means one new row shifts every row below it onto
+   the next page and can add a page. Address rows by name in a scenario
+   rather than by page number (`page_with_row` and `tap_row` in
+   `test_animation.py`); the audit table is where the per-page lists
+   belong.
+
+   A pushed page whose row list depends on stored data (the schedule list,
+   the Parameters page) has no fixed entry in `CATEGORY_PAGES`. Audit it
+   from the scenario at visit time with `rig.audit` instead.
 6. A new source file under `src/` needs `touch src/CMakeLists.txt` before the
    ESP-IDF builds pick it up; the glob has no `CONFIGURE_DEPENDS`.
 
@@ -85,10 +203,16 @@ host model tests in `test/test_settings_model/`.
 
 Use the `pio` on PATH, one PlatformIO install per checkout (`CLAUDE.md`).
 
-The value model, on the host, 28 cases, a few seconds:
+The value model, on the host, 59 cases, a few seconds:
 
 ```
 pio test -e native_settingsui
+```
+
+The swatch ramps, on the host, against the real palette code:
+
+```
+cd tools/animbench && make check
 ```
 
 The whole feature on the desktop simulator. This is the venue to use first,

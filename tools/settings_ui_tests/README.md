@@ -321,3 +321,153 @@ its pages to `CATEGORY_PAGES` in `audit_pages.py`. Read `venue.sim` before
 restarting anything and `venue.can_restart` before doing it, `venue.log_path`
 before reading the simulator's log, and skip with a logged reason rather
 than silently when the venue cannot support a check.
+
+### Writing a check that can fail
+
+Six defects in the gm-nov3 epic were the same mistake: a check whose name
+claimed one thing and whose assertion established something much weaker,
+so it passed on the fault it was written to catch. None of them were found
+by running the suite, because all of them passed. They were found by
+reading. The recurring shapes, with the instance that taught each one:
+
+- **A failure stood in for a specific failure.** `Rig._open` folds every
+  HTTP status error and every socket error into one `RigHTTPError`, and
+  four checks read that exception as proof that the device restarted, or
+  that a route was absent. An HTTP 500 with the simulator still running
+  passed as both (gm-nov3.29). Establish the thing itself:
+  `Sim.wait_exited` for a restart, `Rig.route_absent` for an absent route.
+  `Rig.fetch` exists for checks that need to tell one status from another.
+- **A name stood in for a row.** `find_tag` returns the first object with
+  a matching tag, and two library entries the user called the same thing
+  carry identical tags, so every check past the row count read the first
+  of them twice (gm-nov3.28). `Rig.row_slots` and `Rig.find_in_row`
+  address a row by its position, which is unique where its name is not.
+  Five helpers in `test_animation.py` were instances of it and all five
+  are fixed. `picker_selected_rows` walks the slots (gm-nov3.33): with the
+  two "Custom" entries it used to report both rows marked when the first
+  was selected, and no row at all when the second was. `page_with_row`,
+  `picker_tap` and `swatch_strip` take the row from its slot and raise
+  `AmbiguousRowName` when the name is not unique, and `pick_ref` chooses a
+  saved gradient by its place in the library (gm-nov3.34). Before that,
+  `page_with_row` returned the first page carrying the name, so a
+  duplicate on a later page could not be reached at all, and `pick_ref`
+  asked for the second "Custom" and tapped the first.
+  Two rules came out of it. A helper handed an ambiguous name refuses
+  rather than guesses: a loud failure is recoverable and a silent wrong
+  answer is not. And a helper that confirms an act names the row it acted
+  on: `picker_choose` waited on `name in picker_selected_rows(rig)`, which
+  a marker on the wrong duplicate satisfied, so ten checks could confirm a
+  row they had not chosen; it now waits for the marker on the position it
+  tapped and on no other row.
+- **Existence stood in for identity.** `len(set(strip)) > 4` over a swatch
+  says a ramp was drawn, not which one. Every entry in the fixture library
+  clears that threshold by a factor of ten (measured: 46 to 80 distinct
+  colours across all twelve), so a row drawing the wrong gradient passes.
+  `swatch_matches_stops` in `test_animation.py` compares the strip's two
+  ends against that row's own stored stops instead. The ends are enough
+  and the interior is deliberately not re-derived here: `GradientSwatch.cpp`
+  is already a transcription of the palette arithmetic, and
+  `tools/animbench/swatch_parity.cpp` is what holds it to the real one.
+  Measured on the simulator, `ff0000,ff2000` draws `(255,0,0)` to
+  `(255,28,0)` against a nominal `(255,32,0)`, which is where the tolerance
+  of 20 comes from. The four remaining count-only checks were pointed at it
+  by gm-nov3.33, which proved each one against a firmware mutation: a saved
+  gradient resolving to the first library entry, one built-in resolving to
+  the next, and the two high ids resolving to each other.
+- **A side effect stood in for the act.** `picker_choose` asserted that the
+  page stack shrank, which happened whether or not anything was selected;
+  ten checks leaned on it (gm-nov3.31).
+
+The test for a new check is the one the beads above ask for: name the fault
+it is meant to catch, build that fault, and watch the check fail. A check
+that has never been seen to fail has not been tested.
+
+### Confirming a web save landed
+
+A check that drives a web save has to prove the POST was applied before it
+judges anything by it. A rejected POST leaves the UI showing the old value,
+and every assertion after it passes for the wrong reason.
+
+Reading the saved field back is the obvious way, and it is wrong for any
+field the open category writes. The display puts its own value back within a
+UI pass, by design, so the read-back either never matches, and the check
+times out and abandons its remaining assertions and its restore, or it
+matches only by accident.
+
+A field the category never writes is what confirms the save instead. The
+whole document goes in one request and `WebUIPlugin::handleSettings` applies
+it in one `batchUpdate`, so any field arriving proves the request was
+accepted and applied. Carry a witness of the same form in the same POST and
+wait on that. In `test_gradientdraft.py`, `store()` is the read-back form,
+for a field no open page owns, and `store_over_draft()` is the witness form.
+
+Which fields need the witness form is a test, not a list. Before waiting on a
+field, ask whether the open page writes it; if it does, carry a witness. The
+list went stale twice in one day, which is why it is written as a test here.
+
+Applying that test to the Animation category: since gm-nov3.39 it writes back
+every field it has touched that the display reads during the visit, which is
+every value row it has except the standby animation id. So the animation id,
+frame rate, all-screens, theme, `bgAnimGradientRef` and its `bgAnimTheme`
+mirror, every slot of `bgAnimThemeMap`, plates, plate colour, plate opacity,
+element tint, tint colour, the text scrim, both fade lengths, the fade curve,
+interlace, and every slot of `bgAnimParams` on the Parameters page. The
+standby animation id is the exception because the display reads it only on the
+standby screen and the settings cover sits on the menu screen.
+`bgAnimBrightness` is the witness the checks here carry, because no row of the
+category writes it.
+
+Two checks in `test_animation.py` were written before their own field became
+one the display restores, and each went red when it did:
+`check_gradient_precedence_across_animations` waited on `bgAnimThemeMap`
+itself (gm-nov3.36), and `check_frame_rate_live_and_precedence` waited on
+`bgAnimFps` (gm-nov3.39).
+
+Whether the ref or map in the form is one the POST handler stores, rather
+than one `bg_ref_valid` or `bg_map_valid` drops, is a separate question and
+needs its own preflight save against a closed shell. A witness cannot answer
+it: the document is applied in one `batchUpdate` whether or not one of its
+fields is dropped.
+
+And a check about a live field asserts on the stored field before the
+category is popped. After the pop, commit has written the draft, so the
+assertion passes whether or not the row and the panel agreed during the
+visit.
+
+### Proving a check fails, without breaking the shared checkout
+
+Several agents work in this checkout at once, so the broken version must
+never exist here, even briefly: another lane's pathspec commit can capture
+it. Two ways, both used for the beads above.
+
+For a fault in the harness itself, inject at `urllib.request.urlopen`
+inside the `rig` module. It sits under both `Rig._open` and `Rig.fetch`, so
+one patch covers every request, and the archived copy of the harness and
+the fixed one see the same fault:
+
+    git archive HEAD tools/settings_ui_tests src/version.h | tar -x -C <scratch>
+
+(`src/version.h` is generated and untracked, so copy it; without it the
+status scenario cannot read the build version.)
+
+For a fault in the firmware, copy the worktree and build there. The copy
+carries the built tree, so the simulator relinks in about eight seconds
+rather than needing its own libdeps:
+
+    tar -C <worktree> --exclude=.pio --exclude=.git -cf - . | tar -C <scratch> -xf -
+    cp -a <worktree>/.pio/libdeps/display-sim <scratch>/.pio/libdeps/
+    cp -a <worktree>/.pio/build/display-sim  <scratch>/.pio/build/
+    cp <worktree>/src/version.h <scratch>/src/version.h
+    cp -a <worktree>/src/display/webassets/. <scratch>/src/display/webassets/
+
+Then `/mnt/c/Users/Oystein/.local/bin/pio run -e display-sim` in the copy,
+by absolute path, as CLAUDE.md requires everywhere. The copy is not a git
+repository, so its build writes an empty `BUILD_GIT_VERSION` and the two
+version checks in the status scenario fail there for that reason alone.
+Everything else runs normally.
+
+A scratch copy runs the same runner, so it wants the same port. Two lanes
+running at once produce `127.0.0.1:8181 is already answering connections`,
+which the runner reports as a scenario error and is not a defect in
+anything. Pass a free port to the copy's run, and read that message as
+another lane's simulator rather than as a result.

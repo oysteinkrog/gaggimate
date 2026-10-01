@@ -2,9 +2,17 @@
 // src/display/ui/default/bganim/BgAnimRegistry.cpp (same order: the array
 // index is the persisted animation id; append only, never reorder).
 //
-// Params are up to 4 sliders, each 0-100, persisted per animation in the
-// `bgAnimParams` setting as "p0,p1,p2,p3;p0,p1,p2,p3;..." indexed by id.
+// Params are up to 8 sliders (BG_ANIM_PARAMS in BgAnim.h), each 0-100,
+// persisted per animation in the `bgAnimParams` setting as
+// "p0,p1,...;p0,p1,...;..." indexed by id; a shorter stored group keeps the
+// defaults for the slots it does not name.
 // By convention p0 is always Speed.
+
+// The built-in gradients and their categories come from data/gradients.json
+// through scripts/gen_gradients.py, which writes the firmware's table from the
+// same source. Imported here and re-exported below so every importer of
+// BG_THEMES is unaffected.
+import { BG_THEMES, BG_THEME_CATEGORIES } from './bgThemes.js';
 
 export const BG_ANIMATIONS = [
   {
@@ -15,6 +23,11 @@ export const BG_ANIMATIONS = [
       { key: 'speed', label: 'Speed', def: 50 },
       { key: 'scale', label: 'Scale', def: 50 },
       { key: 'brightness', label: 'Brightness', def: 70 },
+      { key: 'contrast', label: 'Contrast', def: 50 },
+      { key: 'cycle', label: 'Colour cycle', def: 50 },
+      { key: 'stretch', label: 'Stretch', def: 50 },
+      { key: 'grain', label: 'Grain', def: 50 },
+      { key: 'shift', label: 'Palette shift', def: 50 },
     ],
   },
   {
@@ -25,6 +38,11 @@ export const BG_ANIMATIONS = [
       { key: 'speed', label: 'Speed', def: 50 },
       { key: 'scale', label: 'Blob size', def: 50 },
       { key: 'glow', label: 'Glow', def: 60 },
+      { key: 'count', label: 'Blob count', def: 67 },
+      { key: 'core', label: 'Hot core', def: 50 },
+      { key: 'falloff', label: 'Falloff', def: 40 },
+      { key: 'contrast', label: 'Contrast', def: 50 },
+      { key: 'wander', label: 'Wander', def: 50 },
     ],
   },
   {
@@ -35,6 +53,11 @@ export const BG_ANIMATIONS = [
       { key: 'speed', label: 'Speed', def: 50 },
       { key: 'scale', label: 'Fringe density', def: 45 },
       { key: 'glow', label: 'Sheen', def: 55 },
+      { key: 'spread', label: 'Wave spread', def: 50 },
+      { key: 'twist', label: 'Twist', def: 50 },
+      { key: 'wobble', label: 'Breathe', def: 50 },
+      { key: 'vignette', label: 'Edge fade', def: 80 },
+      { key: 'grain', label: 'Grain', def: 50 },
     ],
   },
   {
@@ -46,6 +69,10 @@ export const BG_ANIMATIONS = [
       { key: 'density', label: 'Stars', def: 45 },
       { key: 'twinkle', label: 'Twinkle', def: 50 },
       { key: 'shooting', label: 'Shooting stars', def: 30 },
+      { key: 'glow', label: 'Star glow', def: 50 },
+      { key: 'skyglow', label: 'Sky glow', def: 50 },
+      { key: 'falloff', label: 'Sky falloff', def: 50 },
+      { key: 'tint', label: 'Star tint', def: 50 },
     ],
   },
   {
@@ -56,6 +83,10 @@ export const BG_ANIMATIONS = [
       { key: 'speed', label: 'Speed', def: 50 },
       { key: 'intensity', label: 'Intensity', def: 55 },
       { key: 'waviness', label: 'Waviness', def: 50 },
+      { key: 'height', label: 'Height', def: 50 },
+      { key: 'spread', label: 'Spread', def: 50 },
+      { key: 'glow', label: 'Glow', def: 50 },
+      { key: 'drift', label: 'Drift', def: 50 },
     ],
   },
   {
@@ -67,6 +98,10 @@ export const BG_ANIMATIONS = [
       { key: 'rate', label: 'Drop rate', def: 40 },
       { key: 'decay', label: 'Fade', def: 50 },
       { key: 'glow', label: 'Glow', def: 50 },
+      { key: 'spread', label: 'Drop spread', def: 50 },
+      { key: 'width', label: 'Ring width', def: 50 },
+      { key: 'tone', label: 'Water tone', def: 50 },
+      { key: 'trough', label: 'Trough dip', def: 50 },
     ],
   },
   {
@@ -77,6 +112,11 @@ export const BG_ANIMATIONS = [
       { key: 'speed', label: 'Drift speed', def: 50 },
       { key: 'scale', label: 'Cell scale', def: 45 },
       { key: 'contrast', label: 'Contrast', def: 55 },
+      { key: 'glow', label: 'Glow', def: 50 },
+      { key: 'spot', label: 'Spot size', def: 50 },
+      { key: 'spread', label: 'Wave spread', def: 50 },
+      { key: 'tilt', label: 'Pattern tilt', def: 50 },
+      { key: 'turn', label: 'Turn rate', def: 50 },
     ],
   },
   {
@@ -87,6 +127,11 @@ export const BG_ANIMATIONS = [
       { key: 'speed', label: 'Speed', def: 50 },
       { key: 'symmetry', label: 'Symmetry', def: 50 },
       { key: 'complexity', label: 'Complexity', def: 45 },
+      { key: 'drift', label: 'Ring drift', def: 50 },
+      { key: 'vignette', label: 'Vignette', def: 50 },
+      { key: 'breathe', label: 'Breathe', def: 50 },
+      { key: 'contrast', label: 'Contrast', def: 50 },
+      { key: 'rings', label: 'Ring pitch', def: 50 },
     ],
   },
   {
@@ -98,6 +143,10 @@ export const BG_ANIMATIONS = [
       { key: 'orbitCount', label: 'Orbits', def: 55 },
       { key: 'eccentricity', label: 'Eccentricity', def: 55 },
       { key: 'trail', label: 'Trail', def: 50 },
+      { key: 'size', label: 'Orbit size', def: 50 },
+      { key: 'path', label: 'Path glow', def: 50 },
+      { key: 'glow', label: 'Body glow', def: 50 },
+      { key: 'tilt', label: 'Tilt spread', def: 50 },
     ],
   },
   {
@@ -109,6 +158,10 @@ export const BG_ANIMATIONS = [
       { key: 'count', label: 'Count', def: 60 },
       { key: 'glow', label: 'Glow', def: 55 },
       { key: 'shimmer', label: 'Shimmer', def: 40 },
+      { key: 'spread', label: 'Spread', def: 50 },
+      { key: 'drift', label: 'Drift', def: 50 },
+      { key: 'pulse', label: 'Pulse depth', def: 50 },
+      { key: 'halo', label: 'Halo', def: 50 },
     ],
   },
   {
@@ -120,6 +173,10 @@ export const BG_ANIMATIONS = [
       { key: 'count', label: 'Wisps', def: 55 },
       { key: 'swirl', label: 'Swirl', def: 45 },
       { key: 'density', label: 'Density', def: 50 },
+      { key: 'size', label: 'Puff size', def: 50 },
+      { key: 'spread', label: 'Base spread', def: 50 },
+      { key: 'tint', label: 'Steam tint', def: 50 },
+      { key: 'taper', label: 'Top fade', def: 50 },
     ],
   },
   {
@@ -131,6 +188,10 @@ export const BG_ANIMATIONS = [
       { key: 'glow', label: 'Glow size', def: 45 },
       { key: 'flicker', label: 'Flicker', def: 20 },
       { key: 'pulse', label: 'Pulse', def: 50 },
+      { key: 'height', label: 'Height', def: 50 },
+      { key: 'falloff', label: 'Falloff', def: 50 },
+      { key: 'core', label: 'Core heat', def: 50 },
+      { key: 'grain', label: 'Grain', def: 50 },
     ],
   },
   {
@@ -141,6 +202,11 @@ export const BG_ANIMATIONS = [
       { key: 'speed', label: 'Drift speed', def: 50 },
       { key: 'density', label: 'Density', def: 50 },
       { key: 'turbulence', label: 'Turbulence', def: 40 },
+      { key: 'contrast', label: 'Contrast', def: 50 },
+      { key: 'drift', label: 'Drift angle', def: 50 },
+      { key: 'grain', label: 'Grain', def: 50 },
+      { key: 'detail', label: 'Fine detail', def: 50 },
+      { key: 'lspeed', label: 'Layer speed', def: 50 },
     ],
   },
   {
@@ -150,47 +216,511 @@ export const BG_ANIMATIONS = [
     params: [
       { key: 'speed', label: 'Speed', def: 50 },
       { key: 'scale', label: 'Fringe density', def: 45 },
-      { key: 'glow', label: 'Sheen', def: 55 },
+      { key: 'glow', label: 'Contrast', def: 55 },
+      { key: 'mix', label: 'Wave balance', def: 50 },
+      { key: 'cross', label: 'Cross detail', def: 50 },
+      { key: 'sheenw', label: 'Sheen width', def: 55 },
+      { key: 'rim', label: 'Rim spread', def: 50 },
+      { key: 'drift', label: 'Drift', def: 50 },
+    ],
+  },
+  {
+    id: 'brushed',
+    name: 'Brushed',
+    description: 'A dark brushed surface with a wide sheen sliding across it.',
+    params: [
+      { key: 'speed', label: 'Speed', def: 50 },
+      { key: 'grain', label: 'Grain', def: 35 },
+      { key: 'reflection', label: 'Reflection', def: 45 },
+      { key: 'contrast', label: 'Contrast', def: 30 },
+      { key: 'shine', label: 'Shine', def: 50 },
+      { key: 'swell', label: 'Swell', def: 50 },
+      { key: 'tilt', label: 'Tilt', def: 50 },
+      { key: 'tone', label: 'Base tone', def: 50 },
+    ],
+  },
+  {
+    id: 'horizon',
+    name: 'Horizon',
+    description: 'A glowing horizon line between ground and sky, drifting slowly.',
+    params: [
+      { key: 'speed', label: 'Speed', def: 50 },
+      { key: 'height', label: 'Height', def: 45 },
+      { key: 'curvature', label: 'Curvature', def: 35 },
+      { key: 'softness', label: 'Softness', def: 60 },
+      { key: 'swell', label: 'Swell', def: 50 },
+      { key: 'drift', label: 'Drift', def: 50 },
+      { key: 'glow', label: 'Glow', def: 50 },
+      { key: 'reflect', label: 'Reflection', def: 50 },
+    ],
+  },
+  {
+    id: 'oculus',
+    name: 'Oculus',
+    description: 'A dark pupil inside a softly lit ring that breathes.',
+    params: [
+      { key: 'speed', label: 'Speed', def: 50 },
+      { key: 'diameter', label: 'Diameter', def: 65 },
+      { key: 'breath', label: 'Breath', def: 20 },
+      { key: 'edge', label: 'Edge softness', def: 55 },
+      { key: 'glow', label: 'Ring glow', def: 50 },
+      { key: 'halo', label: 'Halo', def: 50 },
+      { key: 'ripple', label: 'Ripple depth', def: 50 },
+      { key: 'waves', label: 'Ripple count', def: 50 },
+    ],
+  },
+  {
+    id: 'chevrons',
+    name: 'Chevrons',
+    description: 'Wide soft folds travelling down the face.',
+    params: [
+      { key: 'speed', label: 'Speed', def: 50 },
+      { key: 'spacing', label: 'Spacing', def: 65 },
+      { key: 'angle', label: 'Angle', def: 50 },
+      { key: 'contrast', label: 'Contrast', def: 35 },
+      { key: 'round', label: 'Roundness', def: 50 },
+      { key: 'swell', label: 'Swell depth', def: 50 },
+      { key: 'swellw', label: 'Swell width', def: 50 },
+      { key: 'highlight', label: 'Highlight', def: 50 },
+    ],
+  },
+  {
+    id: 'mosaic',
+    name: 'Mosaic',
+    description: 'Large soft tiles, each fading on its own clock.',
+    params: [
+      { key: 'speed', label: 'Speed', def: 50 },
+      { key: 'size', label: 'Tile size', def: 45 },
+      { key: 'contrast', label: 'Contrast', def: 30 },
+      { key: 'variation', label: 'Variation', def: 55 },
+      { key: 'bevel', label: 'Bevel', def: 50 },
+      { key: 'wash', label: 'Wash', def: 50 },
+      { key: 'brightness', label: 'Brightness', def: 50 },
+      { key: 'washdensity', label: 'Wash density', def: 50 },
+    ],
+  },
+  {
+    id: 'saddle',
+    name: 'Saddle',
+    description: 'Tonal contours flowing along a drifting saddle surface.',
+    params: [
+      { key: 'speed', label: 'Speed', def: 50 },
+      { key: 'curvature', label: 'Curvature', def: 35 },
+      { key: 'drift', label: 'Drift', def: 25 },
+      { key: 'contrast', label: 'Contrast', def: 30 },
+      { key: 'breath', label: 'Breathing', def: 50 },
+      { key: 'shoulder', label: 'Shoulder', def: 50 },
+      { key: 'flow', label: 'Contour flow', def: 50 },
+      { key: 'depth', label: 'Contour depth', def: 100 },
+    ],
+  },
+  {
+    id: 'refraction',
+    name: 'Refraction',
+    description: 'Broad tonal channels bending as if seen through uneven glass.',
+    params: [
+      { key: 'speed', label: 'Speed', def: 50 },
+      { key: 'bend', label: 'Bend', def: 35 },
+      { key: 'width', label: 'Channel width', def: 65 },
+      { key: 'contrast', label: 'Contrast', def: 30 },
+      { key: 'glow', label: 'Glow wave', def: 50 },
+      { key: 'darkness', label: 'Darkness', def: 50 },
+      { key: 'ripple', label: 'Ripple', def: 50 },
+      { key: 'flow', label: 'Flow', def: 50 },
+    ],
+  },
+  {
+    id: 'sundial',
+    name: 'Sundial',
+    description: 'A soft wedge of light turning slowly around the centre.',
+    params: [
+      { key: 'speed', label: 'Speed', def: 50 },
+      { key: 'width', label: 'Wedge width', def: 40 },
+      { key: 'contrast', label: 'Contrast', def: 25 },
+      { key: 'shading', label: 'Surface shading', def: 30 },
+      { key: 'breath', label: 'Breath', def: 50 },
+      { key: 'surface', label: 'Surface', def: 50 },
+      { key: 'softness', label: 'Edge softness', def: 50 },
+      { key: 'tone', label: 'Face tone', def: 50 },
+    ],
+  },
+  {
+    id: 'crescent',
+    name: 'Crescent',
+    description: 'A pale crescent turning, swelling and thinning.',
+    params: [
+      { key: 'speed', label: 'Speed', def: 50 },
+      { key: 'size', label: 'Size', def: 70 },
+      { key: 'phase', label: 'Phase range', def: 40 },
+      { key: 'contrast', label: 'Contrast', def: 40 },
+      { key: 'softness', label: 'Edge softness', def: 50 },
+      { key: 'background', label: 'Background', def: 50 },
+      { key: 'gradient', label: 'Gradient', def: 50 },
+      { key: 'breath', label: 'Breath', def: 50 },
+    ],
+  },
+  {
+    id: 'glint',
+    name: 'Glint',
+    description: 'A soft curved highlight sweeping across a dark face.',
+    params: [
+      { key: 'speed', label: 'Speed', def: 50 },
+      { key: 'length', label: 'Length', def: 35 },
+      { key: 'width', label: 'Width', def: 45 },
+      { key: 'brightness', label: 'Brightness', def: 55 },
+      { key: 'sweep', label: 'Sweep', def: 50 },
+      { key: 'tilt', label: 'Tilt', def: 50 },
+      { key: 'bow', label: 'Bow', def: 50 },
+      { key: 'core', label: 'Core', def: 50 },
+    ],
+  },
+  {
+    id: 'tunnel',
+    name: 'Tunnel',
+    description: 'A soft walled tunnel with bands gliding toward the viewer.',
+    params: [
+      { key: 'speed', label: 'Speed', def: 50 },
+      { key: 'pitch', label: 'Band pitch', def: 50 },
+      { key: 'brightness', label: 'Brightness', def: 74 },
+      { key: 'mix', label: 'Band share', def: 50 },
+      { key: 'contrast', label: 'Contrast', def: 50 },
+      { key: 'curve', label: 'Depth curve', def: 50 },
+      { key: 'spiral', label: 'Spiral', def: 50 },
+      { key: 'turn', label: 'Turn rate', def: 50 },
+    ],
+  },
+  {
+    id: 'kaleido',
+    name: 'Kaleido',
+    description: 'A six fold flower of soft blotches that keeps reforming.',
+    params: [
+      { key: 'speed', label: 'Speed', def: 50 },
+      { key: 'scale', label: 'Blotch scale', def: 50 },
+      { key: 'brightness', label: 'Brightness', def: 62 },
+      { key: 'contrast', label: 'Contrast', def: 50 },
+      { key: 'rays', label: 'Rays', def: 50 },
+      { key: 'vignette', label: 'Vignette', def: 50 },
+      { key: 'sweep', label: 'Sweep', def: 50 },
+    ],
+  },
+  {
+    id: 'shafts',
+    name: 'Shafts',
+    description: 'Soft shafts of light fanning from above and swaying.',
+    params: [
+      { key: 'speed', label: 'Speed', def: 50 },
+      { key: 'density', label: 'Shaft count', def: 50 },
+      { key: 'brightness', label: 'Brightness', def: 66 },
+      { key: 'contrast', label: 'Contrast', def: 50 },
+      { key: 'falloff', label: 'Falloff', def: 50 },
+      { key: 'reach', label: 'Reach', def: 50 },
+      { key: 'breath', label: 'Breath', def: 50 },
+      { key: 'sway', label: 'Sway', def: 50 },
+    ],
+  },
+  {
+    id: 'weave',
+    name: 'Weave',
+    description: 'A large soft honeycomb cloth turning and breathing.',
+    params: [
+      { key: 'speed', label: 'Speed', def: 50 },
+      { key: 'scale', label: 'Weave scale', def: 50 },
+      { key: 'brightness', label: 'Brightness', def: 62 },
+      { key: 'contrast', label: 'Contrast', def: 50 },
+      { key: 'cross', label: 'Cross weave', def: 50 },
+      { key: 'turn', label: 'Turn rate', def: 50 },
+      { key: 'drift', label: 'Drift', def: 50 },
+      { key: 'breath', label: 'Breath rate', def: 50 },
+    ],
+  },
+  {
+    id: 'lens',
+    name: 'Lens',
+    description: 'A magnifying lens wandering over a dim mottled ground.',
+    params: [
+      { key: 'speed', label: 'Speed', def: 50 },
+      { key: 'size', label: 'Lens size', def: 55 },
+      { key: 'brightness', label: 'Brightness', def: 62 },
+      { key: 'contrast', label: 'Contrast', def: 50 },
+      { key: 'edge', label: 'Edge width', def: 50 },
+      { key: 'rim', label: 'Rim darkness', def: 50 },
+      { key: 'travel', label: 'Lens travel', def: 50 },
+      { key: 'drift', label: 'Ground drift', def: 50 },
+    ],
+  },
+  {
+    id: 'tide',
+    name: 'Tide',
+    description: 'Broad soft bars gliding through each other and brightening where they cross.',
+    params: [
+      { key: 'speed', label: 'Speed', def: 50 },
+      { key: 'width', label: 'Band width', def: 50 },
+      { key: 'glow', label: 'Glow', def: 55 },
+      { key: 'bands', label: 'Band count', def: 50 },
+      { key: 'sway', label: 'Sway', def: 50 },
+      { key: 'edge', label: 'Edge shape', def: 50 },
+      { key: 'floor', label: 'Floor', def: 30 },
+      { key: 'grain', label: 'Grain', def: 50 },
+    ],
+  },
+  {
+    id: 'truchet',
+    name: 'Truchet',
+    description: 'Soft quarter circle arcs linking into meandering loops.',
+    params: [
+      { key: 'speed', label: 'Speed', def: 50 },
+      { key: 'arc', label: 'Arc width', def: 50 },
+      { key: 'glow', label: 'Glow', def: 55 },
+      { key: 'drift', label: 'Drift angle', def: 50 },
+      { key: 'bias', label: 'Tile bias', def: 50 },
+      { key: 'sharp', label: 'Sharpness', def: 50 },
+      { key: 'contrast', label: 'Contrast', def: 50 },
+      { key: 'grain', label: 'Grain', def: 50 },
+    ],
+  },
+  {
+    id: 'quilt',
+    name: 'Quilt',
+    description: 'A grid of soft pillows with the light walking around them.',
+    params: [
+      { key: 'speed', label: 'Speed', def: 50 },
+      { key: 'pitch', label: 'Pillow size', def: 75 },
+      { key: 'relief', label: 'Relief', def: 55 },
+      { key: 'turn', label: 'Light turn', def: 50 },
+      { key: 'drift', label: 'Drift', def: 50 },
+      { key: 'dome', label: 'Puffiness', def: 50 },
+      { key: 'stretch', label: 'Stretch', def: 50 },
+      { key: 'bright', label: 'Brightness', def: 50 },
+    ],
+  },
+  {
+    id: 'rain',
+    name: 'Rain',
+    description: 'Sparse soft streaks falling down a dark face.',
+    params: [
+      { key: 'speed', label: 'Speed', def: 50 },
+      { key: 'tail', label: 'Tail length', def: 50 },
+      { key: 'glow', label: 'Head glow', def: 55 },
+      { key: 'width', label: 'Drop width', def: 50 },
+      { key: 'fade', label: 'Tail fade', def: 50 },
+      { key: 'spread', label: 'Speed spread', def: 50 },
+      { key: 'base', label: 'Base light', def: 50 },
+      { key: 'grain', label: 'Grain', def: 50 },
+    ],
+  },
+  {
+    id: 'stripes',
+    name: 'Stripes',
+    description: 'Broad soft stripes sliding and turning while two gratings beat.',
+    params: [
+      { key: 'speed', label: 'Speed', def: 50 },
+      { key: 'pitch', label: 'Stripe pitch', def: 50 },
+      { key: 'depth', label: 'Depth', def: 55 },
+      { key: 'beat', label: 'Beat depth', def: 75 },
+      { key: 'beats', label: 'Beat count', def: 20 },
+      { key: 'turn', label: 'Turn rate', def: 50 },
+      { key: 'floor', label: 'Black level', def: 39 },
+      { key: 'grain', label: 'Grain', def: 50 },
+    ],
+  },
+  {
+    id: 'ribbon',
+    name: 'Ribbon',
+    description: 'One wide ribbon twisting about its axis down the face.',
+    params: [
+      { key: 'speed', label: 'Speed', def: 50 },
+      { key: 'width', label: 'Ribbon width', def: 50 },
+      { key: 'twist', label: 'Twist', def: 50 },
+      { key: 'bright', label: 'Brightness', def: 62 },
+      { key: 'waist', label: 'Waist', def: 50 },
+      { key: 'glow', label: 'Edge glow', def: 50 },
+      { key: 'shade', label: 'Face shading', def: 50 },
+      { key: 'wash', label: 'Backdrop', def: 50 },
+    ],
+  },
+  {
+    id: 'harmonograph',
+    name: 'Harmonograph',
+    description: 'A luminous Lissajous thread drawing slow loops over a glow.',
+    params: [
+      { key: 'speed', label: 'Speed', def: 50 },
+      { key: 'size', label: 'Figure size', def: 68 },
+      { key: 'glow', label: 'Thread glow', def: 60 },
+      { key: 'bright', label: 'Brightness', def: 60 },
+      { key: 'lobes', label: 'Lobe count', def: 50 },
+      { key: 'turn', label: 'Turn rate', def: 50 },
+      { key: 'trail', label: 'Trail length', def: 50 },
+      { key: 'vign', label: 'Vignette', def: 50 },
+    ],
+  },
+  {
+    id: 'floor',
+    name: 'Floor',
+    description: 'A soft plaid floor running back to a glowing horizon.',
+    params: [
+      { key: 'speed', label: 'Speed', def: 50 },
+      { key: 'yaw', label: 'Yaw sway', def: 50 },
+      { key: 'scale', label: 'Plaid scale', def: 50 },
+      { key: 'bright', label: 'Brightness', def: 60 },
+      { key: 'glide', label: 'Glide rate', def: 50 },
+      { key: 'haze', label: 'Haze depth', def: 50 },
+      { key: 'glow', label: 'Horizon glow', def: 50 },
+      { key: 'tile', label: 'Tile size', def: 50 },
+    ],
+  },
+  {
+    id: 'hills',
+    name: 'Hills',
+    description: 'Three hill layers scrolling at different speeds under drifting stars.',
+    params: [
+      { key: 'speed', label: 'Speed', def: 50 },
+      { key: 'relief', label: 'Ridge relief', def: 50 },
+      { key: 'depth', label: 'Layer contrast', def: 55 },
+      { key: 'bright', label: 'Brightness', def: 60 },
+      { key: 'spread', label: 'Ridge spacing', def: 50 },
+      { key: 'haze', label: 'Ridge haze', def: 50 },
+      { key: 'sky', label: 'Sky tone', def: 50 },
+      { key: 'stars', label: 'Star density', def: 50 },
+    ],
+  },
+  {
+    id: 'gyroid',
+    name: 'Gyroid',
+    description: 'Broad luminous passages through a gyroid section, opening and reconnecting.',
+    params: [
+      { key: 'speed', label: 'Speed', def: 50 },
+      { key: 'scale', label: 'Passage size', def: 50 },
+      { key: 'glow', label: 'Passage width', def: 55 },
+      { key: 'bright', label: 'Brightness', def: 60 },
+      { key: 'aspect', label: 'Aspect', def: 50 },
+      { key: 'morph', label: 'Morph rate', def: 50 },
+      { key: 'floor', label: 'Ground level', def: 50 },
+      { key: 'grain', label: 'Grain', def: 50 },
+    ],
+  },
+  {
+    id: 'barrel',
+    name: 'Barrel',
+    description: 'Satin bands climbing a shaded cylinder.',
+    params: [
+      { key: 'speed', label: 'Speed', def: 50 },
+      { key: 'bands', label: 'Bands', def: 14 },
+      { key: 'shade', label: 'Cylinder shade', def: 62 },
+      { key: 'tilt', label: 'Band tilt', def: 50 },
+      { key: 'width', label: 'Barrel width', def: 50 },
+      { key: 'edge', label: 'Edge fade', def: 50 },
+      { key: 'light', label: 'Light angle', def: 50 },
+      { key: 'depth', label: 'Band depth', def: 50 },
+    ],
+  },
+  {
+    id: 'grid',
+    name: 'Grid',
+    description: 'A soft wire floor receding into the distance, crossings sliding forward.',
+    params: [
+      { key: 'speed', label: 'Speed', def: 50 },
+      { key: 'density', label: 'Grid density', def: 50 },
+      { key: 'lines', label: 'Line strength', def: 58 },
+      { key: 'width', label: 'Line width', def: 50 },
+      { key: 'cross', label: 'Cross lines', def: 50 },
+      { key: 'reach', label: 'Grid reach', def: 50 },
+      { key: 'shade', label: 'Floor shade', def: 50 },
+      { key: 'drift', label: 'Side drift', def: 50 },
+    ],
+  },
+  {
+    id: 'cells',
+    name: 'Cells',
+    description: 'Glowing channels dividing quiet dark cells, drifting slowly.',
+    params: [
+      { key: 'speed', label: 'Speed', def: 50 },
+      { key: 'width', label: 'Channel width', def: 55 },
+      { key: 'depth', label: 'Contrast', def: 60 },
+      { key: 'count', label: 'Cell count', def: 42 },
+      { key: 'halo', label: 'Halo width', def: 40 },
+      { key: 'tilt', label: 'Drift tilt', def: 50 },
+      { key: 'grain', label: 'Grain', def: 50 },
+      { key: 'glow', label: 'Glow', def: 50 },
+    ],
+  },
+  {
+    id: 'dimples',
+    name: 'Dimples',
+    description: 'A hammered relief with the highlight sweeping around it.',
+    params: [
+      { key: 'speed', label: 'Speed', def: 50 },
+      { key: 'relief', label: 'Relief', def: 58 },
+      { key: 'bright', label: 'Brightness', def: 62 },
+      { key: 'height', label: 'Light height', def: 50 },
+      { key: 'swing', label: 'Height swing', def: 50 },
+      { key: 'tone', label: 'Base tone', def: 50 },
+      { key: 'contrast', label: 'Contrast', def: 50 },
+      { key: 'orbit', label: 'Orbit shape', def: 50 },
+    ],
+  },
+  {
+    id: 'cube',
+    name: 'Cube',
+    description: 'A translucent cube with feathered edges turning in a graded field.',
+    params: [
+      { key: 'speed', label: 'Speed', def: 50 },
+      { key: 'size', label: 'Cube size', def: 50 },
+      { key: 'glow', label: 'Face glow', def: 55 },
+      { key: 'tilt', label: 'Tilt', def: 50 },
+      { key: 'wobble', label: 'Wobble', def: 50 },
+      { key: 'edge', label: 'Edge softness', def: 50 },
+      { key: 'backs', label: 'Back faces', def: 50 },
+      { key: 'background', label: 'Background', def: 50 },
     ],
   },
 ];
 
-// Shared color themes — MUST mirror BgAnimThemes.cpp (append only, the theme
-// index is persisted in the bgAnimTheme setting). Stops run dark -> bright.
-export const BG_THEMES = [
-  { name: 'Espresso', stops: ['#080402', '#2a1206', '#6b3413', '#b8703a', '#e8b268', '#f8e6c8'] },
-  { name: 'Ocean', stops: ['#02060c', '#06284a', '#0a5276', '#2596be', '#66d3e8', '#d8f6ff'] },
-  {
-    name: 'Violet Dusk',
-    stops: ['#0a0512', '#2a1050', '#5c2a94', '#9a5ad4', '#d09af0', '#f4e2ff'],
-  },
-  { name: 'Forest', stops: ['#020803', '#0c2c12', '#1e5c28', '#46963c', '#8cd464', '#e6ffc8'] },
-  { name: 'Sunset', stops: ['#0c0410', '#4a1030', '#952038', '#d4542c', '#f89c3c', '#ffe8a0'] },
-  { name: 'Fire', stops: ['#0a0200', '#401004', '#8c2808', '#d85c10', '#f8a428', '#ffe8b0'] },
-  { name: 'Ice', stops: ['#020408', '#10203c', '#2c4a74', '#5486b4', '#9cc8e4', '#eafaff'] },
-  { name: 'Mono', stops: ['#000000', '#202020', '#484848', '#808080', '#c0c0c0', '#ffffff'] },
-  { name: 'Rose', stops: ['#0e0407', '#3c1020', '#7a2440', '#c04868', '#ee8ca4', '#ffdce6'] },
-  { name: 'Gold', stops: ['#060402', '#2e2008', '#6e5014', '#b48c24', '#e8c453', '#fff0b8'] },
-  { name: 'Aurora', stops: ['#010806', '#063020', '#0c6444', '#14a878', '#48e0b0', '#c8ffec'] },
-  { name: 'Cyber', stops: ['#050008', '#240448', '#501090', '#9018d8', '#e030f8', '#ff9cf0'] },
-  { name: 'Ember Coal', stops: ['#0a0604', '#2b0a06', '#6b1a08', '#b8420f', '#e2751f', '#f4a94a'] },
-  { name: 'Deep Space', stops: ['#05050f', '#150a28', '#341840', '#6b2f5e', '#b3477d', '#e6b3d6'] },
-  { name: 'Teal Reef', stops: ['#050a0f', '#0a1c28', '#123a44', '#1f6b6e', '#3fb3a8', '#bdeee0'] },
-  { name: 'Sakura', stops: ['#0c060a', '#341828', '#6e3050', '#b45c80', '#e896b0', '#ffe0ec'] },
-  { name: 'Lime', stops: ['#040802', '#16300a', '#326016', '#5ea024', '#9ee44c', '#eaffc0'] },
-  {
-    name: 'Arctic Night',
-    stops: ['#020206', '#0a1424', '#1a3048', '#34587c', '#6c94bc', '#c4e4f8'],
-  },
-];
+export { BG_THEMES, BG_THEME_CATEGORIES };
 
-// bgAnimTheme == BG_THEMES.length selected the pre-library custom theme
-// (bgAnimCustomTheme); the firmware moves that into the gradient library on
-// boot, so the editor only ever deals in built-ins and library entries.
-export const BG_THEME_CUSTOM = BG_THEMES.length;
+// The built-ins grouped for a picker: every declared category that holds
+// gradients, in the declared order, each holding its gradients in table order
+// with the table index, which is the stored id and the option value.
+//
+// A category with nothing in it is dropped rather than shown empty. A gradient
+// whose category is not in the declared list would otherwise vanish, so it
+// falls into a last group instead: the generator rejects that case, and this is
+// the belt for a hand-edited file.
+//
+// One function, because the select and the browse dialog must group the same
+// way. tools/gradient_groups_check.mjs reads the select's markup and
+// tools/gradient_browse_check.mjs the dialog's, both against this order.
+export function builtinThemeGroups() {
+  const byCategory = new Map(BG_THEME_CATEGORIES.map(c => [c, []]));
+  const strays = [];
+  BG_THEMES.forEach((t, index) => {
+    const bucket = byCategory.get(t.category);
+    (bucket ?? strays).push({ name: t.name, index });
+  });
+  const groups = BG_THEME_CATEGORIES.filter(c => byCategory.get(c).length > 0).map(c => ({
+    category: c,
+    items: byCategory.get(c),
+  }));
+  if (strays.length > 0) groups.push({ category: 'Other', items: strays });
+  return groups;
+}
+
+// The legacy bgAnimTheme namespace, frozen at 18 to match BG_THEME_LEGACY_CUSTOM
+// in src/display/ui/default/bganim/BgAnim.h. Before the gradient library
+// existed, bgAnimTheme was an index into an 18-entry built-in table, and 18
+// meant the single custom gradient in bgAnimCustomTheme. It is NOT
+// BG_THEMES.length: deriving it from the table would hand a device that stored
+// 18 whatever built-in is appended at index 18. Legacy integers outside 0..18
+// read as built-in 0.
+export const BG_THEME_CUSTOM = 18;
 export const BG_THEME_MAX_STOPS = 16;
 export const BG_GRADIENT_LIB_MAX = 12;
 export const BG_GRADIENT_NAME_MAX = 24;
+export const BG_GRADIENT_LIB_MAX_LEN = 3800;
+// The largest id the firmware can read, mirroring BG_GRADIENT_ID_MAX in
+// src/display/ui/default/bganim/BgAnim.h. Its parseId stops after five decimal
+// digits, so 100000 is not a large id to the firmware, it is a malformed one:
+// the parser takes 10000 and the sixth digit then fails the entry or the ref.
+export const BG_GRADIENT_ID_MAX = 99999;
 
 // ---- gradients ---------------------------------------------------------
 // A gradient is { stops: [{ color: '#rrggbb', pos: 0..255 }] } with stops in
@@ -311,19 +841,109 @@ export function wheelCss(stops, tone) {
   return `linear-gradient(to right, ${parts.join(', ')})`;
 }
 
+// ---- the id and ref grammar --------------------------------------------
+// These mirror parseId and parseRef in BgAnimThemes.cpp exactly. They are the
+// reason the page and the panel agree on what a stored string means: the
+// firmware's settings handler drops a library, a map or a ref its parsers
+// reject and keeps the previous stored value, with no error on either side, so
+// a page that accepts a string the firmware does not silently loses the save.
+
+// Reads an id at the start of s, at most five digits, as parseId does.
+// Returns [id, rest]; id is -1 when there is no digit. The five-digit stop is
+// what leaves a '0' behind on "100000", and that leftover is what rejects it.
+function readId(s) {
+  const m = /^[0-9]{1,5}/.exec(s);
+  if (m === null) return [-1, s];
+  return [parseInt(m[0], 10), s.slice(m[0].length)];
+}
+
+// One ref: '' | digits | 'c' digits, as parseRef reads it. Returns
+// { builtin, libId } with the one that is set >= 0 (builtin) or > 0 (libId)
+// and the other -1, or null when the string is not a ref at all. A ';' ends a
+// ref, because parseRef is also how the firmware reads one slot of a map.
+export function parseRefParts(ref) {
+  const r = String(ref ?? '');
+  if (r === '') return { builtin: -1, libId: -1 };
+  let rest = r;
+  let builtin = -1;
+  let libId = -1;
+  if (rest.startsWith('c')) {
+    [libId, rest] = readId(rest.slice(1));
+    if (libId <= 0) return null;
+  } else {
+    [builtin, rest] = readId(rest);
+    if (builtin < 0) return null;
+  }
+  if (rest !== '' && !rest.startsWith(';')) return null;
+  return { builtin, libId };
+}
+
+// Mirrors bg_ref_valid: an empty ref is valid and means "no override".
+export function gradientRefValid(ref) {
+  return parseRefParts(ref) !== null;
+}
+
+// Mirrors bg_map_valid, including its 256 character cap.
+export function themeMapValid(map) {
+  const m = String(map ?? '');
+  if (m.length > 256) return false;
+  return m.split(';').every(part => part === '' || parseRefParts(part) !== null);
+}
+
+// UTF-8 bytes, which is what the firmware's name cap counts.
+function utf8Length(s) {
+  return new TextEncoder().encode(s).length;
+}
+
 // ---- library "id|name|gradient;..." ------------------------------------
 
-export function parseGradientLibrary(str) {
-  const out = [];
-  for (const entry of String(str ?? '').split(';')) {
-    if (!entry) continue;
-    const [idStr, name, gradientStr] = entry.split('|');
-    const id = parseInt(idStr, 10);
+// Walks the library the way walkLibrary does: a stray ';' is skipped, the
+// entry count is capped at BG_GRADIENT_LIB_MAX, and the walk stops at the
+// first malformed entry rather than stepping over it. Returns the entries it
+// read and whether it reached the end, which is the difference between what
+// the firmware can look up and what it calls a valid library.
+function walkGradientLibrary(str) {
+  const entries = [];
+  let s = String(str ?? '');
+  while (s !== '') {
+    if (s.startsWith(';')) {
+      s = s.slice(1);
+      continue;
+    }
+    if (entries.length >= BG_GRADIENT_LIB_MAX) return { entries, ok: false };
+    const [id, afterId] = readId(s);
+    if (id <= 0 || !afterId.startsWith('|')) return { entries, ok: false };
+    const afterBar = afterId.slice(1);
+    const nameEnd = afterBar.search(/[|;]/);
+    if (nameEnd < 0 || afterBar[nameEnd] !== '|') return { entries, ok: false };
+    const name = afterBar.slice(0, nameEnd);
+    if (name === '' || utf8Length(name) > BG_GRADIENT_NAME_MAX * 4) return { entries, ok: false };
+    const afterName = afterBar.slice(nameEnd + 1);
+    const gradientEnd = afterName.indexOf(';');
+    const gradientStr = gradientEnd < 0 ? afterName : afterName.slice(0, gradientEnd);
     const gradient = parseGradient(gradientStr);
-    if (!(id > 0) || !name || !gradient) continue;
-    out.push({ id, name, stops: gradient.stops });
+    if (!gradient) return { entries, ok: false };
+    entries.push({ id, name, stops: gradient.stops });
+    s = gradientEnd < 0 ? '' : afterName.slice(gradientEnd + 1);
   }
-  return out;
+  return { entries, ok: true };
+}
+
+// The entries the firmware can look up. Stopping at the first malformed entry
+// rather than stepping over it matters: the firmware's lookup sees the entries
+// before the bad one and nothing after, so a page that skipped it would list
+// gradients the panel cannot find.
+export function parseGradientLibrary(str) {
+  return walkGradientLibrary(str).entries;
+}
+
+// Mirrors bg_library_valid: the whole string, not a prefix of it, and the
+// length cap NVS forces. The page checks it before a save, because a library
+// the firmware rejects is one the firmware drops without telling anyone.
+export function gradientLibraryValid(str) {
+  const s = String(str ?? '');
+  if (s.length > BG_GRADIENT_LIB_MAX_LEN) return false;
+  return walkGradientLibrary(s).ok;
 }
 
 export function serializeGradientLibrary(library) {
@@ -341,8 +961,46 @@ export function sanitizeGradientName(name) {
   return clean || 'Gradient';
 }
 
-export function nextGradientId(library) {
-  return library.reduce((m, g) => Math.max(m, g.id), 0) + 1;
+// Every id a new gradient may not take: the ids library entries carry, plus
+// every library id a stored ref names, whether or not it resolves today.
+// The second half is the dangerous one. Deleting entry 7 can leave a "c7"
+// behind in bgAnimGradientRef or in a slot of bgAnimThemeMap, and handing 7 to
+// the next gradient would make that ref resolve again, silently repointing a
+// selection the user made at a different picture. Mirrors ReservedIds in
+// BgAnimThemes.cpp, which the firmware's own migration allocates through.
+//
+// refStrings are the raw stored strings, bgAnimThemeMap and
+// bgAnimGradientRef, not the parsed arrays. Parsing drops exactly the refs
+// that matter here: one that no longer resolves, and one in a slot past the
+// end of this build's animation list.
+export function reservedGradientIds(library, refStrings = []) {
+  const ids = new Set();
+  for (const g of library ?? []) {
+    if (g.id > 0 && g.id <= BG_GRADIENT_ID_MAX) ids.add(g.id);
+  }
+  for (const refs of refStrings) {
+    for (const part of String(refs ?? '').split(';')) {
+      if (part === '') continue;
+      const parsed = parseRefParts(part);
+      if (parsed && parsed.libId > 0 && parsed.libId <= BG_GRADIENT_ID_MAX) ids.add(parsed.libId);
+    }
+  }
+  return ids;
+}
+
+// The lowest id in 1 to BG_GRADIENT_ID_MAX that nothing reserves, or null when
+// the range is exhausted. Not the largest id plus one: that allocator walks
+// off the end of the firmware's five-digit grammar as soon as one entry
+// carries 99999, and both the new entry and its "c100000" ref become strings
+// the firmware rejects and silently drops. Reusing a gap is what keeps the
+// allocation inside the range, and reserving the refs is what makes reuse
+// safe.
+export function nextGradientId(library, refStrings = []) {
+  const taken = reservedGradientIds(library, refStrings);
+  for (let id = 1; id <= BG_GRADIENT_ID_MAX; id++) {
+    if (!taken.has(id)) return id;
+  }
+  return null;
 }
 
 // ---- per-animation map "ref;ref;..." -----------------------------------
@@ -352,7 +1010,9 @@ export function parseThemeMap(str) {
   const parts = String(str ?? '').split(';');
   return BG_ANIMATIONS.map((_, i) => {
     const ref = parts[i] ?? '';
-    return /^(\d+|c\d+)$/.test(ref) ? ref : '';
+    // The firmware's grammar, not a looser one: "c100000" and "5x" are refs
+    // the panel cannot read, so the page must not show them as selections.
+    return ref !== '' && gradientRefValid(ref) ? ref : '';
   });
 }
 
@@ -363,21 +1023,100 @@ export function serializeThemeMap(refs) {
   return out.join(';');
 }
 
-// The ref an animation effectively draws with, after the firmware's
-// fallbacks: its map entry when it resolves, else the global theme.
-export function effectiveRef(refs, animIdx, library, globalThemeId) {
-  const ref = refs[animIdx] ?? '';
-  if (ref.startsWith('c')) {
-    if (library.some(g => g.id === parseInt(ref.slice(1), 10))) return ref;
-  } else if (ref !== '') {
-    const idx = parseInt(ref, 10);
-    if (idx >= 0 && idx < BG_THEMES.length) return ref;
-  }
-  const g = parseInt(globalThemeId, 10);
-  return String(g >= 0 && g < BG_THEMES.length ? g : 0);
+// Whether a ref names something that exists right now: a built-in index in
+// this build's table, or a library entry that has not been deleted.
+export function refResolves(ref, library) {
+  const parts = parseRefParts(ref);
+  if (parts === null) return false;
+  if (parts.libId > 0) return library.some(g => g.id === parts.libId);
+  return parts.builtin >= 0 && parts.builtin < BG_THEMES.length;
 }
 
-export function gradientForRef(ref, library) {
+// A ref the picker shows but never stores: the pre-library custom gradient is
+// still what the global fallback draws, because the firmware's one-time
+// migration had to defer. It is read only, and no stored field ever holds it.
+export const BG_LEGACY_CUSTOM_REF = 'legacy';
+export const BG_LEGACY_CUSTOM_NAME = 'Custom (legacy)';
+
+// What the legacy pair (bgAnimTheme, bgAnimCustomTheme) draws: the built-in
+// index, or -1 when the custom string is what draws. Mirrors bg_legacy_builtin
+// in BgAnim.h, including the frozen sentinel, so the form never labels a
+// stored 18 as the built-in that lands at index 18.
+export function legacyBuiltin(globalThemeId, customTheme) {
+  const g = parseInt(globalThemeId, 10);
+  if (g === BG_THEME_CUSTOM) return parseGradient(customTheme) ? -1 : 0;
+  return g >= 0 && g < BG_THEME_CUSTOM ? g : 0;
+}
+
+// The rollback mirror: the bgAnimTheme value that goes with a selected ref, or
+// null to leave bgAnimTheme alone. Mirrors bg_legacy_mirror_for_ref in
+// BgAnim.h. A built-in 0 to 17 mirrors unchanged, an appended built-in mirrors
+// as 0 (never as its own index, which would mean the custom gradient or a
+// gradient nobody chose to an older build), a library ref and a ref that does
+// not resolve leave the legacy fallback where it is.
+export function legacyThemeMirror(ref, themeCount = BG_THEMES.length) {
+  const parts = parseRefParts(ref);
+  if (parts === null || parts.builtin < 0) return null;
+  if (parts.builtin >= themeCount) return null;
+  return parts.builtin < BG_THEME_CUSTOM ? parts.builtin : 0;
+}
+
+// The form fields a global gradient selection writes, and nothing else. The
+// editor applies exactly this map, so the mirror policy can be checked without
+// rendering anything (tools/gradient_mirror_check.mjs). The legacy stand-in is
+// read only and writes nothing at all.
+export function globalAssignFields(nextRef, themeCount = BG_THEMES.length) {
+  if (nextRef === BG_LEGACY_CUSTOM_REF) return {};
+  const fields = { bgAnimGradientRef: nextRef };
+  const mirror = legacyThemeMirror(nextRef, themeCount);
+  if (mirror !== null) fields.bgAnimTheme = String(mirror);
+  return fields;
+}
+
+// The ref the global default resolves to: bgAnimGradientRef when it names
+// something that exists, else the built-in the legacy pair resolves to, or
+// BG_LEGACY_CUSTOM_REF when that pair is still the custom gradient. These are
+// steps two and three of the firmware's bg_resolve_anim_theme, and the result
+// is always a concrete ref, never ''.
+export function globalGradientRef(globalRef, library, globalThemeId, customTheme) {
+  if (refResolves(globalRef, library)) return String(globalRef);
+  const b = legacyBuiltin(globalThemeId, customTheme);
+  return b < 0 ? BG_LEGACY_CUSTOM_REF : String(b);
+}
+
+// The ref an animation effectively draws with, after the firmware's
+// fallbacks: its own map entry when it resolves, else the global default.
+export function effectiveRef(refs, animIdx, library, globalThemeId, globalRef, customTheme) {
+  const ref = refs[animIdx] ?? '';
+  if (refResolves(ref, library)) return ref;
+  return globalGradientRef(globalRef, library, globalThemeId, customTheme);
+}
+
+// The retained pre-library custom gradient as the panel actually draws it.
+// bgAnimCustomTheme may carry explicit positions, and the firmware's last
+// fallback throws them away: bg_resolve_anim_theme's step three parses the
+// colours and then spaces them evenly on the uniform path, which is different
+// arithmetic from the positional one (config/gradientRamp.js says how much).
+// So the positions are replaced here rather than passed through, or the page
+// would preview a gradient the panel will not draw, and the editor's live
+// preview would serialize those positions straight back to the device.
+//
+// Null when the string is not one the firmware's parser accepts; the fallback
+// is then built-in 0, which is what legacyBuiltin already reports.
+export function legacyCustomGradient(customTheme) {
+  const gradient = parseGradient(customTheme);
+  if (!gradient) return null;
+  const uni = uniformPositions(gradient.stops.length);
+  return { stops: gradient.stops.map((s, i) => ({ color: s.color, pos: uni[i] })) };
+}
+
+export function gradientForRef(ref, library, customTheme) {
+  if (ref === BG_LEGACY_CUSTOM_REF) {
+    const gradient = legacyCustomGradient(customTheme);
+    // Read only: it is not in the library, so there is nothing to edit or
+    // rename, and the editor must not write it anywhere.
+    if (gradient) return { name: BG_LEGACY_CUSTOM_NAME, stops: gradient.stops, editable: false };
+  }
   if (ref.startsWith('c')) {
     const entry = library.find(g => g.id === parseInt(ref.slice(1), 10));
     if (entry) return { name: entry.name, stops: entry.stops, editable: true, id: entry.id };
@@ -393,7 +1132,7 @@ export function parseBgAnimParams(packed) {
   const groups = String(packed ?? '').split(';');
   return BG_ANIMATIONS.map((anim, i) => {
     const defs = anim.params.map(p => p.def ?? 0);
-    while (defs.length < 4) defs.push(0);
+    while (defs.length < 8) defs.push(0);
     const parts = (groups[i] ?? '').split(',');
     return defs.map((def, j) => {
       const v = parseInt(parts[j], 10);

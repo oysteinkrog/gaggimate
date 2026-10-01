@@ -2,3 +2,13 @@
 # Windows it writes CRLF. Without this the tracked lockfile would show as
 # modified after every local build while its content was unchanged.
 dependencies.lock text eol=lf
+
+# The animation goldens (tools/animbench/golden) are raw binary PPM, and about
+# one file in sixty ends on a byte that happens to be an ASCII space or tab.
+# Without this line git treats such a file as text with trailing whitespace,
+# the repo's pre-commit hook runs its trailing-whitespace fixer over it, and
+# the file loses its last pixel byte on the way into the commit. That happened
+# to tools/animbench/golden/brushed-030.ppm on 2026-09-09: the committed file
+# was 691,214 bytes instead of 691,215 and the bench reported it as a missing
+# reference rather than as a short file.
+*.ppm binary

@@ -473,15 +473,69 @@ IconLayerDbg g_iconLayerDbg[2];
 MarqueeDbg g_marqueeDbg[2];
 DirtyLogEntry g_dirtyLog[DIRTYLOG_N];
 volatile uint32_t g_dirtyLogCount = 0;
+#ifdef GM_TOUCH_PROBE
+uint32_t g_pubLog[PUBLOG_N];
+volatile uint32_t g_pubLogCount = 0;
+InvalSrcEntry g_invalSrc[INVSRC_N];
+volatile uint32_t g_invalSrcCount = 0;
+volatile int32_t g_invalSrcMinPx = 240;
+#endif // GM_TOUCH_PROBE
+extern "C" const void *gm_inval_caller = nullptr;
+
+// Called from the patched lv_obj_invalidate_area for every object-driven
+// invalidation that survives LVGL's own visibility test, so an invalidation of
+// a hidden widget is not recorded: it costs nothing and would read as a
+// culprit. Only the big ones are kept: a readout that redraws its own digits is
+// working as intended and would push the interesting entries out of a 24-deep
+// ring within a second.
+extern "C" void gm_record_inval_src(const void *obj, const void *cls, int ox1, int oy1, int ox2, int oy2, int ax1, int ay1,
+                                    int ax2, int ay2) {
+#ifdef GM_TOUCH_PROBE
+    const int w = ax2 - ax1 + 1;
+    const int h = ay2 - ay1 + 1;
+    const int floorPx = g_invalSrcMinPx;
+    if (w < floorPx || h < floorPx) {
+        return;
+    }
+    InvalSrcEntry &e = g_invalSrc[g_invalSrcCount % INVSRC_N];
+    e.obj = obj;
+    e.cls = cls;
+    e.ox1 = static_cast<int16_t>(ox1);
+    e.oy1 = static_cast<int16_t>(oy1);
+    e.ox2 = static_cast<int16_t>(ox2);
+    e.oy2 = static_cast<int16_t>(oy2);
+    e.ax1 = static_cast<int16_t>(ax1);
+    e.ay1 = static_cast<int16_t>(ay1);
+    e.ax2 = static_cast<int16_t>(ax2);
+    e.ay2 = static_cast<int16_t>(ay2);
+    e.caller = gm_inval_caller;
+    e.tMs = static_cast<uint32_t>(esp_timer_get_time() / 1000);
+    g_invalSrcCount = g_invalSrcCount + 1;
+#else
+    (void)obj;
+    (void)cls;
+    (void)ox1;
+    (void)oy1;
+    (void)ox2;
+    (void)oy2;
+    (void)ax1;
+    (void)ay1;
+    (void)ax2;
+    (void)ay2;
+#endif
+}
+volatile int32_t g_uiMinRenderMs = 250; // DefaultUI's constructor sets RERENDER_MIN_INTERVAL
 TouchLogEntry g_touchLog[TOUCHLOG_N];
 volatile uint32_t g_touchLogCount = 0;
 volatile int g_touchMapReq = 0;
 volatile bool g_touchMapLoad = false;
 volatile bool g_touchMapPending = false;
+volatile int g_scaleScreenReq = -1;
 char *g_touchMapBuf = nullptr;
 volatile uint32_t g_touchMapLen = 0;
 volatile int64_t g_overlayMinRefreshUs = 250000; // DefaultUI's constructor sets OVERLAY_MIN_REFRESH_US
 volatile uint8_t g_animFpsOverride = 0;
+std::atomic<uint32_t> g_animToneOverride{gm_tone_pack(-1, -1)};
 
 /*Read the touchpad*/
 static void touchpad_read(lv_indev_drv_t *indev_driver, lv_indev_data_t *data) {

@@ -294,10 +294,9 @@ void SleepAnimation::benchTick() {
         accBandLockedRows = accBandRows = 0;
         benchPasses = 0;
         benchDwellStart = now;
-        uint8_t p[4];
+        uint8_t p[BG_ANIM_PARAMS];
         bg_parse_params(nullptr, 0, p);
-        animParams.store(static_cast<uint32_t>(p[0]) | (static_cast<uint32_t>(p[1]) << 8) | (static_cast<uint32_t>(p[2]) << 16) |
-                         (static_cast<uint32_t>(p[3]) << 24));
+        storeParams(p);
         animId.store(0);
         log_i("animbench: results cleared, sweep restarted");
         return;
@@ -359,10 +358,9 @@ void SleepAnimation::benchFinishDwell() {
     }
     // Each animation is measured at its own documented defaults, so a run is
     // reproducible and comparable against the host harness numbers.
-    uint8_t p[4];
+    uint8_t p[BG_ANIM_PARAMS];
     bg_parse_params(nullptr, next, p);
-    animParams.store(static_cast<uint32_t>(p[0]) | (static_cast<uint32_t>(p[1]) << 8) | (static_cast<uint32_t>(p[2]) << 16) |
-                     (static_cast<uint32_t>(p[3]) << 24));
+    storeParams(p);
     animId.store(static_cast<uint8_t>(next));
 }
 

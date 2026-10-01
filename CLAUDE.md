@@ -49,19 +49,35 @@ summary; the KB carries the sources and the measurements behind it.
   The Windows and WSL PlatformIO installs share `~/.platformio`; a
   Windows-side build can clobber the patched sources, and the patch scripts
   re-apply on the next WSL build; if a display fault appears out of nowhere,
-  check the patches applied in the build log first. **One PlatformIO
-  install per checkout: the `pio` on PATH (`~/.local/bin/pio`, pipx, core
-  6.1.19), never `~/.platformio/penv/bin/pio` (6.1.18).** PlatformIO deletes
-  the whole `.pio/build` tree whenever the project checksum changes, and the
-  checksum includes the core version, so two installs used on one checkout
-  wipe each other's env trees on every build: on 2026-09-05 that happened
-  twice under four running rig workers, and each rebuilt kdev ELF has a new
-  sha (build metadata), so the board had to be reflashed before kb.py worked
-  again. `pio run -t compiledb` for kdev must follow the same rule. One patch targets the
+  check the patches applied in the build log first. One patch targets the
   LVGL libdep rather than the framework: `scripts/patch_lvgl_meter_inv.py`
   (per-env, into `.pio/libdeps/<env>/lvgl`) gives lv_meter scale-lines
   indicators sector invalidation. If dial updates ever get slow again, check
   it applied for that env.
+- **One PlatformIO binary per checkout, and the build tree is volatile until
+  everyone obeys that.** Use the `pio` on PATH by absolute path
+  (`~/.local/bin/pio`, pipx, core 6.1.19), never
+  `~/.platformio/penv/bin/pio` (6.1.18), and never a Windows-side PlatformIO,
+  which shares the same `~/.platformio`. PlatformIO deletes the whole
+  `.pio/build` tree whenever the project checksum changes, the checksum
+  includes the core version, so two installs used on one checkout wipe each
+  other's env trees on every build, for every env and every agent working
+  there. **Adding or removing an env in platformio.ini changes the checksum
+  too**, so never edit the env list while a runner is on the board (2026-09-07:
+  one throwaway env cost a 7 minute loadtest rebuild before the board could be
+  restored). The failure does not look like a build problem: on 2026-09-05 it
+  hit twice under four rig workers, and each rebuilt kdev ELF has a new sha
+  (build metadata), so the board had to be reflashed before kb.py worked
+  again; on 2026-09-13 `display-sim` and `display-loadtest` vanished in the
+  middle of a finished test run and the runner reported that it could not
+  launch the simulator, which reads as a test failure and is not one (nobody
+  watched that build happen, and platformio.ini was clean, so the second
+  install is the remaining fit rather than an observation). So check that the
+  binary you need still exists immediately before a long run, and rebuild if
+  it is gone. On an intact tree `pio run -e display-sim` takes
+  about five seconds. `pio run -t compiledb` follows the same rule and also
+  recreates an env's build tree, so run it before the build you need, not
+  after, and not for another env in between.
 - **The flash runs in QIO, and the LVGL draw cost per widget is the flash
   bus, not pixels** (gm-2cl.19, 2026-09-08). `boards/LilyGo-T-RGB.json` has
   said qio at 80 MHz all along, the flash is a Winbond W25Q128 with the
@@ -220,6 +236,118 @@ telemetry-driven screen from a 650 ms LVGL pass (1.5 Hz widget updates,
   churn was traced to the size refresh and then to the 40x40 scale icon
   the flow blinks (gm-2cl.7).
 
+- **Writing an object's hidden flag is a whole-object invalidation whether
+  or not the flag changes** (gm-61v, 2026-09-14, `lv_obj.c`, the two
+  `LV_OBJ_FLAG_HIDDEN` branches of `lv_obj_add_flag` and `lv_obj_clear_flag`).
+  `maintainScaleScreen` re-asserted the scale cover's visible state on every
+  UI pass, and that cover is the full 480x480, so the scale screen invalidated
+  the whole page 14.65 times a second while a weight was moving. Each
+  invalidation is a whole-page snapshot: 147 ms of the UI task on the bench
+  board, during which the render task gets a fraction of the PSRAM bus and the
+  compositor-owned readouts stop easing, which is what "the weight goes up in
+  jumps" was. `DefaultUI::setHiddenIfChanged` reads the flag first and writes
+  only when it moves; `applyAnimPlates` re-asserts its 280 px disc the same
+  way and goes through it too. The generated `screens.c` tick already guards
+  every hidden-flag write with `if (new_val != cur_val)`, so this rule is only
+  for code we write.
+- **`lv_label_set_text_fmt` invalidates before it reaches
+  `lv_label_refr_text`, so an owned label needs its own guard**
+  (`scripts/patch_lvgl_label_elem.py`, the `SET_FMT` hunk, 2026-09-14). The
+  patch guarded `lv_label_set_text` and `lv_label_refr_text`, and every owned
+  label in the codebase went through the first of those except the scale
+  readout, which formats its value. So a label that was a compositor Text
+  element, drawing nothing and easing at the animation rate, still invalidated
+  its own box on every value: 11.8 a second on the scale screen, each one an
+  overlay publish the element had already made unnecessary. A new LVGL setter
+  that starts with its own `lv_obj_invalidate(obj)` needs the same guard.
+  Together with the hidden-flag fix the scale screen under a 0.5 g/s ramp went
+  from 3.70 overlay publishes a second to 0.11 (bench board, divider 6,
+  whole-frame path, `tools/churn_sweep.py` unchanged at 0.00 on every other
+  screen).
+- **`inval_src` on `/api/debug/anim` names the object and the call site of a
+  large invalidation** (gm-61v, `scripts/patch_lvgl_inval_src.py`,
+  `gm_record_inval_src` in LV_Helper.cpp). `dirty_recent` says a whole-screen
+  redraw happened; it cannot say who asked, and the object alone is not
+  enough either, because LVGL invalidates a whole object from a hidden-flag
+  change, a style state change and a dozen widget setters that all look the
+  same in the entry. The recorder sits on the last line of
+  `lv_obj_invalidate_area`, after LVGL has dropped what costs nothing, and
+  keeps the object, its class, both rectangles and `lv_obj_invalidate`'s own
+  return address. Resolve the address with
+  `xtensa-esp32s3-elf-addr2line -pfiaC -e .pio/build/display-loadtest/firmware.elf`.
+  Two traps it exists to avoid: recording at the head of the function instead
+  reports invalidations of hidden widgets, which cost nothing and read as the
+  culprit (that reading cost a build), and the ring is 24 deep, so `invmin=`
+  (240 px a side by default) is what keeps a readout redrawing its own digits
+  from pushing the interesting entries out. The ring and `ov_recent` are
+  `GM_TOUCH_PROBE` only, because internal DRAM is the budget the web UI dies
+  of first; the recorder itself is empty elsewhere and the simulator stubs it.
+- **`tools/inval_sweep.py` is the sweep for this class of bug, and as of
+  2026-09-15 the scale screen was the only case** (gm-61v). `churn_sweep.py`
+  answers a different question, what a screen costs at rest, and it read 0.00
+  on nearly every screen while the scale screen was invalidating the whole page
+  fourteen times a second, because the churn only exists while a value is
+  moving. The sweep turns the synthetic brew and the synthetic scale on first,
+  then visits each screen and groups the `inval_src` ring by call site.
+  Standby, status, menu, water and profile read 0.00 large invalidations a
+  second; brew, steam and new_profile read 0.68 to 1.9 over a 20 s window and
+  0.68 over a 60 s one, which is how you tell screen-entry cost from churn: the
+  absolute count does not grow with the window. Every entry left is a page
+  change paying for itself (`lv_obj_refresh_style` applying the theme,
+  `serviceDialElements` and `setGaugeTickLength` taking the rings over) or the
+  one-off handover of the blinking icon to its layer, at 0.05 a second against
+  a blink rate of about 2. The settings shell on a category page, which is the
+  same shape as the scale cover and runs a refresh every second, read 0.00 and
+  0.00 over 30 s, and new_profile read the same over 40 s.
+- **Four `LV_LABEL_LONG_SCROLL` labels on new_profile have no owner, and only
+  their text keeps them quiet** (`screens.c`, obj33, obj36, obj38, obj39).
+  `serviceMarquees` takes `LV_LABEL_LONG_SCROLL_CIRCULAR` only, and
+  `set_ofs_x_anim` in lv_label.c invalidates on every scroll tick with no
+  guard, so a plain-scroll label that overflows would invalidate its own box at
+  the animation rate with nothing owning it. obj33 is `LV_SIZE_CONTENT` and can
+  never overflow; the other three are 85, 85 and 250 px wide and today's text
+  fits, which is why the screen measures 0.00. Widening what goes in them, or
+  a longer profile name, would start it. gm-j38 is the open decision.
+- **`/api/debug/scale?ramp=<g/s>[&tare=1][&screen=0|1]` is the scale-screen
+  repro** (`GM_SYNTH_HANDSHAKE` builds). The churn only appears while a weight
+  is actually moving and the bench has no scale, so the synthetic one
+  publishes the same two events a hardware scale does at the same 10 Hz.
+  `screen=1` opens the scale screen from the UI task, because that cover is
+  reachable only from the menu. The board's 60 s standby timeout closes it
+  again, and a debug route is not a touch, so re-open it right before a
+  measurement rather than at the start of a session.
+- **`/api/debug/scalescreen?on=0|1` opens the same cover on any build that
+  carries the debug routes**, the simulator included (`GM_TOUCH_PROBE` or
+  `GAGGIMATE_SIM`, beside `/api/debug/tap`). The knob used to live only on
+  `/api/debug/scale`, which is `GM_SYNTH_HANDSHAKE`, so the simulator could
+  not reach the screen at all and nothing could photograph its layout.
+  `tools/screen_shots.py --scale` is what does that now.
+- **An lv_imgbtn cannot be scaled by style, so a bigger button needs a bigger
+  image** (`lv_obj_init_draw_img_dsc` in lv_obj_draw.c sets `zoom` to
+  `LV_IMG_ZOOM_NONE` for every widget that draws through it, whatever the
+  object's own zoom says). The five 60x60 start and pause buttons therefore
+  ship their own source: `tools/icon_to_lvgl.py` renders one from the same
+  `icons/*.svg` the studio's icons came from, in the studio's own format, and
+  it reproduces `ui_image_play_40x40.c` byte for byte from that file's own
+  pixels. A hand-added icon goes in `src/display/ui/default/images/` and is
+  declared in `UiImages.h` there, never in `eez/`: the studio rewrites that
+  tree on every export, and its `images[]` table is indexed by asset number,
+  so an extra row in it renumbers every asset after it.
+  **Sizing one is a hit-rect question, not a drawing question**: every target
+  on the generated dial screens carries a 25 px click pad, so a 60x60 button
+  answers to a 110x110 rectangle, and the dials' menu chevron answers to
+  130x95 starting at y385. The two overlap on every one of these screens, the
+  later sibling wins, and the chevron loses part of its pad. That is why the
+  status screen's pause sits at y+118 while brew, water and grind sit at
+  y+103: at y+130 the pause reached y424, 6 px from the chevron's own 40x40
+  body. `tools/settings_ui_tests/rig.py`'s `targets()` reports the rect that
+  decides this (`hit`), and it is not the object's box.
+- **`uimin=` on `/api/debug/anim` moves the telemetry pass spacing live**
+  (`g_uiMinRenderMs`, boot value `RERENDER_MIN_INTERVAL`). It is the gate
+  upstream of `ovmin=`: it decides how often the widgets are given new values
+  at all. Neither gate was what held the scale readout down. Lifting `ovmin`
+  alone moved publishes from 3.62 to 4.31 a second at an unchanged 12.9 fps,
+  because the whole-page snapshot cost was the limit, not the spacing.
 - **A page change costs one whole-page snapshot, and it is bus traffic,
   not pixels** (gm-2cl.7, 2026-09-08, `tools/snapshot_lat.py`, bench board,
   cap 45, divider 8, Starfield). The UI task gets about 20 to 25 MB/s of
@@ -392,7 +520,9 @@ telemetry-driven screen from a 650 ms LVGL pass (1.5 Hz widget updates,
   moved within noise (28.2 to 29.9 KB across boots). A sweep of every
   screen after this (`tools/churn_sweep.py`, 15 s windows) found standby, brew, status, menu, steam,
   water, profile, grind and new_profile at 0.00 refreshes a second at
-  rest, and only the info screen still refreshing, at 3.75.
+  rest, and only the info screen still refreshing, at 3.75. That sweep
+  did not record whether any value was moving, which the tool now does:
+  see the bullet on reading a per-screen rate below.
 - **A scrolling label is a looping, clipped layer sprite** (gm-2cl.18,
   2026-09-08, `DefaultUI::serviceMarquees`). Four labels in `screens.c`
   are `LV_LABEL_LONG_SCROLL_CIRCULAR` (the info screen's obj27 and obj29,
@@ -421,6 +551,77 @@ telemetry-driven screen from a 650 ms LVGL pass (1.5 Hz widget updates,
   three had no LVGL sample of a near phase in the set). The text element
   scan never takes a circular-scroll label (`textLabelEligible`), so the
   two owners do not meet. `MAX_LAYERS` is 7.
+- **The steam screen's start control is built at runtime, and the wind image
+  it replaces is sized to nothing** (gm-51t, 2026-09-15,
+  `DefaultUI::serviceSteamStartButton`). The generated steam screen has no
+  button. It had one until b8e7831d (June 2025), which added the auto-start in
+  `Controller::loopLogic` and guarded `action_on_simple_process_toggle` with
+  `MODE_STEAM`, leaving the button inert; the EEZ rework (2d10acb7) then
+  replaced it with a plain `lv_img` of a wind icon (`objects.obj14`) whose
+  hidden flag the generated tick drives from `!ui_flags.active`. So the screen
+  showed whether it was steaming and offered no way to stop it. The guard is
+  gone and one `lv_imgbtn` does both jobs: play when idle, pause while a
+  `SteamProcess` runs, driven from `controller->isActive()` through
+  `LV_STATE_CHECKED`, which is the pattern the generated water button uses, at
+  the coordinates water's button has. The auto-start is unchanged, and the
+  button stays visible in both states on purpose (owner's request), so the
+  screen says what is happening. The wind image is not deleted, because the
+  generated tick still writes its hidden flag and would reach freed memory; it
+  gets `lv_obj_set_size(obj, 0, 0)`, which suppresses the draw and leaves the
+  tick invalidating an empty rectangle. Three things a runtime-built object
+  does not get for free. `change_color_theme` does not know it, so the accent
+  is re-asserted from a cached value rather than read back off the object: a
+  style read resolves against the state the object is in, so reading back
+  during a press reports the pressed colour and rewrites the default one on
+  every pass for as long as the finger is down. `applyPressedFeedback` walks a
+  screen once per root and runs earlier in the pass than
+  `tuneGeneratedScreen`, so the button styles itself through
+  `applyPressedFeedbackTo` whenever its accent moves. And `scanIcons` now
+  skips a zero-area image, which the sized-away wind would otherwise have
+  become a blinking-icon candidate for on its second hidden-flag toggle.
+- **A flex row re-flows when a content-sized child changes width, and each
+  moved child costs two invalidations that no owner patch can reach**
+  (gm-nly, 2026-09-15, `lv_flex.c:522-529`). The grind screen's weight row
+  (`objects.mode_switch1` in `screens.c`: 160x50, `LV_LAYOUT_FLEX`,
+  `LV_FLEX_FLOW_ROW`, `LV_FLEX_ALIGN_SPACE_EVENLY`) holds the tare imgbtn
+  `obj24` and the weight label `obj25`, and `obj25` is `LV_SIZE_CONTENT`
+  wide. Every digit-width change re-centres both children, and
+  `children_repos` invalidates a moved child's old box and then its new
+  box. So the screen publishes 3.4 times a second while a weight moves and
+  0.00 when it does not, with all three of its text elements owned the
+  whole time and zero element refusals: the label is owned, and it is
+  being moved rather than re-texted. The label patches cannot cover this.
+  `scripts/patch_lvgl_label_elem.py` guards lv_label's own invalidations
+  and the size and move ones in lv_obj_pos for a USER_2 label; flex
+  invalidates the item directly, and the imgbtn is not a label at all.
+  The `if(diff_x || diff_y)` guard in lv_flex is correct, so the fix is to
+  stop the row re-flowing by giving the label a fixed width, which is
+  already why the scale cover's readout is 170 px and right-aligned. That
+  one is ours; `obj25` is generated, so its width belongs in
+  `tuneGeneratedScreen`. Measured on the bench board, divider 6,
+  whole-frame path, `/api/debug/scale?ramp=0.5`, three 20 s windows back
+  to back: 0.00, 3.43, 0.00. Every other content-sized label inside a flex
+  container changes on a profile switch rather than on telemetry, and the
+  brew screen's own weight readout measures 0.00 under the same ramp
+  because flex does not lay it out.
+- **A per-screen refresh rate means nothing unless a value was moving
+  during the window** (2026-09-15). The 0.00 a second that
+  `tools/churn_sweep.py` reports for nearly every screen is the design
+  working only when something was changing; a screen whose readouts are
+  frozen publishes nothing for a reason that has nothing to do with the
+  UI. The tool now reads every visible label's text at both ends of the
+  window and prints whether any of them changed, so a 0.00 next to a "no"
+  reads as "not measured". Two sources drive values with no hardware: the
+  temperature and pressure ramp runs even with the synthetic brew
+  lifecycle off (`/api/debug/synth?brew=0`), and a weight needs
+  `/api/debug/scale?ramp=0.5` on top, which only the brew and grind
+  screens carry. The tool also prints `text_dbg` (element takes, refusals,
+  releases) and the glyph atlas figures, because a label the compositor
+  has stopped owning falls back to LVGL and invalidates on every value,
+  which is a rate with no visible cause; a refusal is sticky for the rest
+  of a screen visit, so one failure explains a screen that churns for as
+  long as it is up. The atlas is not the usual reason: after cycling every
+  screen it held 19 glyphs in 3,397 bytes of a 32 KB per-font arena.
 
 - **The render loop lives in IRAM** (`renderLoop`, `renderFrame`,
   `presentFrame`, `pushLoop` and the scrim rows, `SleepAnimation.cpp`). The
@@ -488,6 +689,15 @@ telemetry-driven screen from a 650 ms LVGL pass (1.5 Hz widget updates,
   with the same library list (the main checkout's `display`, or
   `display-loadtest` for `display-loadtest-xip`) is what makes that
   build run (2026-09-09).
+  **That build works in a worktree, whatever this file said before**
+  (2026-09-13): `-e display` linked here in 5 min 17 s, 5,895,863 B of a
+  6,553,600 B app partition (90.0%), with the real 505,988 B web blob. The
+  earlier note said the worktree's libdeps would not install on WSL1 (a
+  permission error unpacking Nanopb) and sent the build to the main checkout.
+  The libdeps were already unpacked by then, in the main checkout and in the
+  worktree, and the nanopb generator ran from the main checkout's copy, so a
+  clone with no libdeps at all may still hit the original error. Try the build
+  before believing it cannot run.
 - **The bench and probe code is out of the render unit, behind a hook
   interface** (gm-bzu.19, 2026-09-09). `SleepAnimation.cpp` holds the
   render loop, the kernels and the production paths; `GM_ANIM_BENCH`
@@ -546,10 +756,54 @@ telemetry-driven screen from a 650 ms LVGL pass (1.5 Hz widget updates,
   fixtures say, so a measurement that assumes the interlaced path must pin
   it (`interlace=1` on the debug endpoint, not stored) and say so. Every
   dial-element number above was taken on the whole-frame path (frame 52 to
-  78 ms). The build default is 1 since gm-2cl.9 (2026-09-08, `Settings.h`
-  `bg_ilace`, and the web form already fell back to 1); a stored 0 still
-  wins on a device that has one, which is why the bench board needs the
-  pin.
+  78 ms). **The build default is 0 (whole frame) since 2026-09-11, the
+  owner's decision** (`Settings.h` `bg_ilace` and the web form's fallback;
+  it was 1 from gm-2cl.9 on 2026-09-08 until then). Every row refreshes
+  every frame, at about half the interlaced rate. A stored value still
+  wins on a device that has one, so a measurement states which path it
+  ran on. What the whole-frame path costs on that board (2026-09-11, kernels
+  in flash, cap 40, `tools/framefn_sweep.py` through the web preview;
+  `/api/debug/pclk` read divider 7 after these runs, where every runner
+  log up to 2026-09-10 22:54Z had read 8, and nothing in the rig writes
+  it, so the day's rates are at 7 unless stated): every animation but one
+  ran 20 to 31 fps whole-frame, because
+  a frame's work (18 to 36 ms) is more than one panel period and the flip
+  waits for the next; the same animations interlaced run 34 to 37 fps. A
+  device on the whole-frame path (the default now) runs every animation at
+  about half its interlaced rate, and which path a device is on is the
+  first thing to check when the animation "got slow".
+- **An animation's `frame()` is timed on its own, and `band_us` does not
+  see it** (`framefn_us` on `/api/debug/anim`, 2026-09-11). The stage
+  counters cover the band kernel, the blend and the push; `frame()` runs
+  once per frame before the first band and neither the counters nor the
+  kblob bench (which never calls it) show it. A sweep of all 44 animations
+  put every `frame()` at 0 to 2.3 ms except Harmonograph at 23.8: it
+  rasterises its 2,048-sample curve there, an 11x11 max stamp per sample
+  into a 230 KB coverage buffer in PSRAM, so the loop ran at 14.5 fps with
+  the stored animation and 27 ms of every frame was unaccounted for.
+  Stamping in coverage-row order (a counting sort by stamp row, so each
+  PSRAM line is fetched once a frame instead of once per lap of the
+  curve), clearing only the union of the previous and current curve box,
+  and skipping the zero corners of each stamp took it to about 17 ms and
+  the loop to 18 to 19 fps in the same post-boot window. The stamp pass
+  then went to the PIE (`harmonographStampAsm`: the padded stamp row is
+  loaded with `EE.LD.128.USAR.IP`, which latches the funnel shift from
+  the address's low four bits, scaled with `EE.VMUL.U8` at SAR 8, placed
+  in a 32-byte window by two `EE.SRC.Q`, and max-composited with
+  `EE.VMAX.S8` under an 0x80 bias since the PIE has no unsigned max;
+  the coverage buffer carries 16 bytes of slack on both sides for the
+  window), which took frame() to 11 to 13 ms and the loop to 18.9 fps
+  interlaced against 15.7 in the same state (whole-frame 10.7 to 12.1,
+  quantised at 68 ms). `harmostamp=0|1|2` on the loadtest build's
+  `/api/debug/anim` selects portable, PIE, or both with a byte compare
+  (`harmostamp_checked`, `harmostamp_mismatch`; 71 frames, 0), and
+  `tools/qemubench/tests/anim_harmonograph_stamp` is the bit-exact proof
+  over every window offset, level and a set of stamp shapes, guards
+  included. A pinned-IRAM build (`GM_BGANIM_IRAM_KERNELS=1`, all 21
+  kernels) measured the same 14.5 fps as the flash build on the same
+  serial channel, so IRAM was not the lever there either. A new
+  animation whose `frame()` does per-pixel work belongs on this list, and
+  the sweep is the way to find it.
 - **Rendering straight into the bounce ring without a framebuffer does not
   work on this bus** (gm-2cl.13, killed 2026-09-07). Two rounds, Starfield,
   standby screen, divider 8 (110 us per 2-row band): 36 to 45% of the 9,200
@@ -687,6 +941,36 @@ the design cannot show and what the runs measured.
   not touched, and the touched fields keep their draft and win at commit. A
   web-requested restart reboots from the web task at once and an uncommitted
   draft is lost, the same as a power cut, and that is accepted.
+- **A field is live if the display reads its stored value while the category
+  is open, and every touched live field is re-asserted at reconcile**
+  (gm-nov3.23, gm-nov3.36, gm-nov3.39; `reassertTouchedLiveFields` in
+  `CatAnimation.cpp`, `mergeTouchedSlots` in `CatAnimParams.cpp`). The rule
+  above describes the draft, and for a field nothing reads during the visit
+  the draft is the whole story until commit. A live field is different: the
+  row writes `Settings` the moment it changes and `DefaultUI` resolves the
+  panel from the stored value on its next pass, so a web save landing
+  mid-visit drew the web's value behind a row still naming this visit's, with
+  nothing on screen to say so, until commit moved it back at the exit. Apply
+  the test rather than keeping a list: read the row's write, then find whether
+  `DefaultUI` reads that field on a path the open cover reaches. The list went
+  stale twice on 2026-09-13, once for the global gradient and once for
+  everything that was not a gradient. Today it takes in every value row of the
+  Animation category except the standby animation id, whose read at
+  `DefaultUI.cpp:4561` is gated on the standby screen while the cover sits on
+  the menu screen, plus every slot of `bgAnimParams`. The field by field
+  inventory, with the write and the read line for each, is the comment above
+  `reassertTouchedLiveFields`; keep it true when a row is added. One function
+  writes the set and both reconcile and commit call it, so the two cannot
+  drift about which fields a visit owns; commit still writes exactly what the
+  rows said, and an untouched field still adopts whatever the web posted. One
+  window survives: `SettingsUI::service()` reconciles before
+  `DefaultUI::updateState()` in the same pass, so a POST landing between those
+  two calls shows the web's value for that pass, a few hundred milliseconds.
+  The checks are `check_touched_scalars_agree_with_panel` and
+  `check_touched_param_slot_agrees_with_panel` in
+  `tools/settings_ui_tests/test_gradientdraft.py`, and both assert on the
+  stored value before the page is popped, because after the pop commit has
+  written the draft and a version that reconciled nothing would pass.
 - **`reconcile` reaches only the top page.** A pushed child page (the
   schedule list, the schedule editor) refreshes its parent's draft itself
   through `machineDraftReconcile` (`CatMachine.h`), because `kCatMachine`'s
@@ -719,8 +1003,14 @@ the design cannot show and what the runs measured.
   while held: menu buttons 19 to 29, tiles 0 before the rule and 42 after,
   rows 32 to 49 before (text jumped to the dim colour itself and vanished)
   and 13 to 27 after. The probe is a hold through `/api/debug/tap` with a
-  framebuffer read mid-hold; the device only delivers `/api/debug/fb` at
-  step 2.
+  framebuffer read mid-hold. That note used to add that the device only
+  delivers `/api/debug/fb` at step 2. It delivers every step since gm-6ivh
+  (28cec8ec, 2026-09-13): the filler wrote whole output rows and returned 0
+  when the send budget could not hold one, which the web server reads as the
+  end of the body, so a step 1 request always returned exactly 5 rows, 4,800
+  of 460,800 bytes, with a 200 and no error. It was never heap dependent and
+  never request dependent. Step 2 and above have rows of 480 bytes and under,
+  which always fit, which is why only step 1 ever looked broken.
 - **Holds are driven only by the events LVGL delivers to the row**, never by
   an `lv_timer` that could outlive it. Steppers step once on `PRESSED` and
   once per `LONG_PRESSED_REPEAT` (LVGL default: 400 ms, then every 100 ms)
@@ -730,8 +1020,41 @@ the design cannot show and what the runs measured.
   a 1 s press (`kSettingsRowUnlockHoldMs`) and relock when the category is
   left. Confirm rows act after a 2 s hold (`kSettingsRowConfirmHoldMs`).
 - **Geometry: 320x56 rows, five per page** (`SettingsUI::kRowW`, `kRowH`,
-  `kRowsPerPage`), 96x96 tiles on a 145 px ring (`SettingsUI.cpp`,
-  `buildTile`). Every tappable target needs an effective hit rectangle of
+  `kRowsPerPage`), 96x96 tiles on a ring (`SettingsUI.cpp`, `buildTile`). The tiles are evenly spaced and symmetric about the vertical
+  axis, with the outermost pair at 135 degrees so the bottom keeps a 90 degree
+  gap for the exit chevron: the step is 270/(N-1) degrees and the index order
+  runs clockwise from the top, so the five real categories step 67.5 and put
+  Temperatures at the top, and the simulator's six step 54 and leave the top
+  clear. There is no arrangement of five that is both even and clear of the
+  top, because an odd count symmetric about the axis must put one tile on the
+  axis and the bottom is taken; the owner chose the top on 2026-09-13.
+  **The ring's radius depends on whether a tile sits on the vertical axis**:
+  135 px for an odd count, 145 for an even one. The tile on the axis is the
+  one that has to clear the status icons, so pulling the odd ring in is what
+  pays for the icon size; the even ring leaves the top clear and spends the
+  radius on keeping six tiles apart. The tile icons are the 40x40 sources
+  drawn at 76x76 (`kIconZoom` 454, and `LV_IMG_SIZE_MODE_REAL` plus
+  `lv_obj_refresh_self_size` is what makes the flex layout reserve the drawn
+  size rather than the source size). At 76 px the icon is taller than the
+  room a 96 px tile has under a two-line caption, so it overflows the tile at
+  both ends, and the five-tile ring is what limits it: measured on the
+  simulator with the tiles temporarily forced to five, the top tile's icon
+  clears the status icons (y 20 to 39) by 10 px, the lower tiles' captions
+  clear the chevron's 34 px click pad by 15 px, the closest pair of tiles is
+  30 px apart, the closest pair of caption boxes 57 px, and the furthest tile
+  corner is 208.8 px from the centre against the 228 px edge rule. **A tile
+  caption is wider than its tile and the tile lets it overflow.** At the
+  tile's own 92 px, "Temperatures" does not fit on a line of its own, and
+  LVGL breaks a word that cannot fit rather than moving it to the next line,
+  so the top caption read "Temperatur / es & timing"; at 118 px it wraps
+  after the word and fits two lines of 16 px under the icon. The caption box
+  reaches 11 px past the tile on each side, which needs
+  `LV_OBJ_FLAG_OVERFLOW_VISIBLE` on the tile (LVGL clips children to the
+  parent box, and without the flag the leading "T" was cut off). The hit box
+  stays 96x96, so the geometry audit is unaffected, and no two caption boxes
+  touch on either ring (the closest pair is Temperatures against Display on
+  the five-tile ring, and Temperatures against Fixture at 15 px on the six).
+  Every tappable target needs an effective hit rectangle of
   at least 56x56 px, no overlap with another on the same page, and 12 px
   of clearance from the panel's edge circle. Every target draws a 2 px
   outline with no fill, 2 px inside its hit box, and loses it while
@@ -758,6 +1081,140 @@ the design cannot show and what the runs measured.
   CLICKED on scrolling and not on a gesture, so a swipe across a toggle
   row would otherwise flip it on release. `/api/debug/tap` takes `x2=`
   and `y2=` for a scripted drag and `Rig.swipe()` wraps it.
+- **`bgAnimTheme`'s legacy namespace is frozen at 18 and is never the table
+  length** (gm-nov3.7, 2026-09-12). Before the gradient library existed
+  `bgAnimTheme` was the whole setting: 0 to 17 were the built-ins of an
+  18-entry table and 18 meant the single custom gradient in
+  `bgAnimCustomTheme`. `bg_resolve_theme` used to read that sentinel as
+  `bg_theme_count()`, so growing the table to 60 would have made a device
+  that stored 18 draw whatever new built-in landed at index 18.
+  `BG_THEME_LEGACY_CUSTOM` (BgAnim.h) pins it at 18 for good, mirrored by
+  `BG_THEME_CUSTOM` in `web/src/config/bgAnimations.js`, and a legacy integer
+  outside 0 to 18 reads as built-in 0. An explicit ref is a different
+  namespace over the same digits: `bg_resolve_anim_theme` fills a built-in
+  ref straight from the table and never through the legacy branch, so the ref
+  "18" is the built-in at index 18 while a legacy 18 still means the custom
+  gradient. Four writers apply the rollback mirror and all four go through
+  `bg_legacy_mirror_for_ref` or its JS twin `legacyThemeMirror`: the web
+  form's `globalAssignFields`, the firmware POST handler, and the display's
+  live row and its commit. Built-ins 0 to 17 mirror unchanged, 18 and above
+  mirror as 0 (never as 17, and never as the index itself), a library ref and
+  an unresolvable ref leave the field alone. The carry-over of the custom
+  string into the library is `bg_plan_gradient_migration` (pure) plus
+  `bg_run_gradient_migration` (an abstract store), because
+  `Settings::doSave` writes `bg_th` and `bg_ct` before `bg_gl` and `bg_gref`
+  and carries on past a failed key: one combined save could clear the source
+  before its replacement existed. A clear is never verified, because
+  Preferences reports a failed empty-string write as success (Property.h), so
+  the next boot re-plans from what actually landed. The whole policy is
+  checked by `pio test -e native_settingsui` (groups I, J and K, against a
+  60-entry test table) and `node tools/gradient_mirror_check.mjs`.
+- **A gradient resolves in three steps, and all four writers mirror a built-in
+  into `bgAnimTheme`** (gm-tany, 2026-09-12). `bg_resolve_anim_theme`
+  (BgAnimThemes.cpp) reads this animation's own `bgAnimThemeMap` slot, then
+  the global `bgAnimGradientRef`, then the older `bgAnimTheme` plus
+  `bgAnimCustomTheme`. Step three is what a build without the ref key reads,
+  so an upgrade changes nothing on screen; the mirror is what keeps a
+  rollback showing the same picture, under the frozen rules above. The ref grammar is
+  shared by the map slots and the global: a decimal built-in index, "c<id>"
+  for a library entry, or "" for neither, parsed by `bg_ref_valid` and
+  rejected at the POST handler rather than stored. A ref that no longer
+  resolves (a deleted library entry) reads as "" on both surfaces, which is
+  what the firmware draws. Both surfaces call the same thing Global: the
+  display's per-animation row shows "Global (<name>)" at index 0 and the web
+  picker's first choice says the same. BgAnimThemes.cpp compiles into the
+  simulator as well (gm-nov3.3), so a function added there needs no stub;
+  what breaks the display-sim link is a device-only dependency added to that
+  file. `sim/platform/bganim_stub.cpp` holds nothing but the animation
+  allocation counters now.
+- **A built-in gradient is added in `data/gradients.json` and nowhere else**
+  (gm-nov3.1, 2026-09-12). `scripts/gen_gradients.py` writes
+  `src/display/ui/default/bganim/BgAnimThemeTable.h` (what BgAnimThemes.cpp's
+  `THEMES` now points at) and `web/src/config/bgThemes.js` (what
+  bgAnimations.js re-exports as `BG_THEMES`), both checked in so no build
+  needs Python, and `--check` fails on a stale copy from `tools/animbench`
+  `make check`. Before it the same 18 gradients were written out three times
+  and synced by hand, the third copy being `kSimThemeNames[]` in
+  CatAnimation.cpp, which existed because the simulator did not link
+  BgAnimThemes.cpp; since gm-nov3.3 it does, so both builds read the table
+  through `bg_theme_*` and BgAnimThemes.cpp is the only firmware file that
+  includes the generated header. Nothing else may include it: a second copy
+  of every stop lands in the image. The host model test
+  (`test/test_settings_model`) includes it because it links that file, and it
+  reads the six accessors rather than a second provider of its own
+  (gm-nov3.19). The
+  list is append only and the generator does not enforce that: an entry's
+  position is its stored id, in `bgAnimGradientRef` and in every slot of
+  `bgAnimThemeMap`, so reordering or removing one changes what a device
+  already set. Six stops each, because the palette arithmetic assumes even
+  spacing and `bg_resolve_theme` copies 6 x 3 bytes.
+- **A gradient row carries three targets: a band that opens the picker and
+  two arrows that step, and the picker keeps the slot it was opened for**
+  (gm-nov3.3 and gm-nov3.32, 2026-09-13, `CatGradientPicker.cpp`, the two
+  swatch rows in `SettingsRows.cpp`). gm-nov3.3 made the three gradient rows
+  whole-row targets that push a picker and took the prev/next arrows off,
+  because a row-wide target laid over them is two targets in one place and
+  `Rig.audit()` fails on the overlap. The owner asked for the stepping back,
+  and the overlap came from the target being row wide rather than from the
+  arrows existing: since gm-nov3.32 the picker is opened by a centre band
+  200 px wide (`kTextColW`, the width a choice row's text column has) and the
+  row container is not clickable at all, so the arrows land on the pixels a
+  choice row's arrows already occupy. Measured on the simulator, all four
+  Animation pages: no audit violations, smallest target 56x56, which is the
+  two arrows sitting exactly on the minimum with nothing to spare; the band
+  is 200x56, the closest pair inside a row is prev to next at 4 px, and band
+  to prev is 12 px. There is
+  no room for a wider band: the bottom row's far corner is 227.2 px from the
+  panel centre against the 228 px edge rule. The arrows walk the picker's own
+  flat order (Global where the row offers it, then the saved gradients, then
+  each category's built-ins, wrapping both ways), so stepping and then opening
+  the picker finds the marker where it should be, and a step writes the same
+  field a pick writes, through `animGradientAssign`. Holding an arrow is safe
+  because a step is one `Property::set`, which only raises a dirty flag
+  (`Property.h`), and NVS is written by the periodic flush
+  (`Settings::loopTask`): a five second hold stepped 45 times and left three
+  distinct readings of the stored field. The stepping row's ramp is a bar
+  under the name rather than a block beside it, and it keeps the picker row's
+  96 columns on purpose, because two checks compare a category row's swatch
+  pixels against a picker row's. Six rules the pages cannot show. A pick is
+  written before `popPages`, because the pop rebuilds the page underneath
+  from the draft and a write after it would leave the old value on screen.
+  Each level calls the opening category's reconcile itself, since the shell
+  reconciles only the top page. The picker captures the animation slot it was
+  opened for and never retargets it under a web save; if that slot stops
+  being editable (the standby animation turned off) it closes without
+  selecting, and both reconciles return immediately after the pop that frees
+  their ctx. `clampAnimId` at `enter` and at `reconcile` is load bearing
+  again now the arrows are back: a stored `bgAnimId` from a longer registry
+  wrote past the end of a heap vector on the first Gradient arrow press once
+  (91cb0ed5). An inert row's arrows are inert with it, which
+  `settingsRowSetEnabled` gives for free (`LV_STATE_DISABLED`, which
+  `lv_obj_hit_test` refuses). And a swatch must not publish the gradient it
+  draws: the real palette code works on the globals the render task draws
+  with, so `GradientSwatch.cpp` is a separate transcription, held to the real
+  one by `tools/animbench/swatch_parity.cpp` (all 256 ramp entries, every
+  built-in, library strings of 2 to 16 stops with repeated positions and flat
+  endpoint runs, seven tone settings). The rest is in
+  `src/display/ui/default/settings/README.md`.
+- **The simulator runs the real gradient rules, so a gradient test can
+  fail** (gm-nov3.3). `sim/platform/bganim_stub.cpp` used to stub
+  `bg_map_valid`, `bg_library_valid`, `bg_ref_valid` and the rest as always
+  false, and `WebUIPlugin.cpp` gates every POST to `bgAnimThemeMap`,
+  `bgAnimGradients` and `bgAnimGradientRef` behind them, so on the simulator
+  no web save of any of those fields could land: two runner checks were
+  asserting that the POST bounced and reported a pass for a step that could
+  not fail. BgAnimThemes.cpp turned out to have no device dependency, so it
+  compiles into the simulator and the stubs are gone. Keep it that way: a
+  device-only call added to that file takes the simulator's gradient tests
+  back to a state where they cannot fail. Every web-interference step in
+  `tools/settings_ui_tests/test_animation.py` reads the field back before
+  judging the UI, for the same reason.
+- **The standby animation's parameters and gradient are stored per animation
+  id**, so they already existed before there was any way to edit them. The
+  web tab reaches them through the main and standby selector above the
+  tuning block, the display through the "Standby params" and "Standby grad"
+  rows, and both are inert when `bgAnimStandbyId` is -1 (follow the main
+  animation).
 - **Ranges live in three places that must agree.** `SettingsModel.h` owns the
   display's editing ranges, steps, wrap rules and formats. `Settings` clamps
   a few fields on store (`setBrewDelay` and `setGrindDelay` to 0 to 4000,
@@ -786,10 +1243,20 @@ the design cannot show and what the runs measured.
   returns false and the Restart row shows "Save failed, hold to retry"
   (`CatStatus.cpp`). `GM_SIM_FAIL_FLUSH=1` on the simulator arms one forced
   failure (`Settings::debugFailNextFlush`) so the path is testable.
-- **The Fixture tile (the sixth) exists only under `GM_TOUCH_PROBE` or
-  `GAGGIMATE_SIM`** (`SettingsFixture.cpp`): one of each row widget, so the
-  shell and the widgets stay exercisable whatever the five real categories
-  do. Production links five tiles.
+- **The Fixture tile (the sixth) exists only under `GAGGIMATE_SIM`**
+  (`SettingsFixture.cpp`): one of each row widget, so the shell and the
+  widgets stay exercisable whatever the five real categories do. It was
+  compiled for `GM_TOUCH_PROBE` as well until 2026-09-13, which put a test
+  tile in the settings menu of every bench board; the owner asked for it gone
+  from the display, and every check that reads its counters runs on the
+  simulator anyway. All three firmware builds link five tiles now.
+  `kSettingsCategoryCount` in `SettingsUI.h` follows the same condition and is
+  static_asserted against `kCategories`, so `/api/debug/settingsui?cat=5` on a
+  board is refused rather than indexing past the end of the array. The page
+  audit reads the tile count off the device (`audit_pages.category_pages`), so
+  it needed no change. Two device tools named the tile and now do not:
+  `tools/touch_lat.py --settings-cat 5` needs a real category and an explicit
+  `--x/--y`, and `tools/overlay_footprint.py` sweeps five.
 
 Instruments, and where each one exists:
 
@@ -821,9 +1288,9 @@ Instruments, and where each one exists:
 
 Three test commands, and what each proves:
 
-- `pio test -e native_settingsui` runs the value model on the host, 29 cases,
+- `pio test -e native_settingsui` runs the value model on the host, 69 cases,
   no LVGL and no Arduino. It proves ranges, steps, wrap, formats, the zone
-  split, the gradient map and schedule parsing.
+  split, the gradient map, the picker's grouping and schedule parsing.
 - `python3 tools/settings_ui_test.py` builds nothing and launches
   `.pio/build/display-sim/program` itself, seeded from
   `tools/settings_ui_tests/fixtures/controller.json`. It proves navigation,
@@ -841,10 +1308,36 @@ Three test commands, and what each proves:
 
 What the device runs taught, beyond the numbers:
 
-- **The bench board stores pixel-clock divider 8**, not the build default 6,
-  so its rates are not comparable with a run at the default. The runner reads
-  `/api/debug/pclk` and warns. This is the stored-settings trap from the
-  hardware invariants above, hit again.
+- **The bench board's stored pixel-clock divider changes on its own, so read
+  it before every measurement and say what it read.** It has been 8, then 7,
+  then 6, and nobody has owned up to writing any of them. It stored 8 until
+  some time between 2026-09-10 22:54Z and 2026-09-11, so every measurement in
+  this file dated on or before 2026-09-10 that says "divider 8" was taken at 8
+  and is correct as written. It stored 7 on 2026-09-13, confirmed twice an hour
+  apart by reading `panelClockDiv` from the settings, with `/api/debug/pclk`
+  reporting `div 7, live true` both times and the serial `GM_SCANOUT` frame
+  rate agreeing independently at 43.5 a second, which is the divider 7 row in
+  `rig_soak.py`'s own table. It stored 6 two hours later, inside a window whose
+  only activity was a gradient preview, three `synth?brew=0` calls and several
+  app-partition flashes, none of which writes a stored setting. The runner
+  reads `/api/debug/pclk` and warns. `panelclock::MIN_USER_DIV` floors a user
+  setting at 6, so every value seen so far passes. This is the stored-settings
+  trap from the hardware invariants above, hit three times now.
+- **A band time ratio is a divider figure, and the divider is the bigger term
+  for a fetch-bound kernel** (gm-4bd.7, 2026-09-13). Same binaries, same
+  protocol, crescent against plasma:
+
+                          divider 7        divider 6
+      HEAD                1.519, 1.533     1.947, 2.134
+      six kernels in IRAM 1.270, 1.296     1.300, 1.345
+
+  So crescent is inside the 1.25 budget at divider 7 with the kernels pinned
+  and 2.0 times plasma at divider 6, which is the clock production ships. The
+  pinned build barely moves between the two clocks and HEAD moves 30%, which
+  is what "fetch-bound" means here: it is contention for the shared
+  instruction cache, not the kernel's own work. A 27% spread between two
+  protocols that was recorded earlier that day was the divider changing under
+  the session, not the protocols.
 - **The Animation scenario cannot run on that board as it stands.** Its stored
   `elementTintColor` is `#FEC4A4`, which is not one of the twelve palette
   colours the tint row cycles through, so the preflight reports an unsupported
@@ -897,6 +1390,19 @@ DMA-capable, largest block 7.7 kB) and two browser tabs killed it. After the
   histogram, and every task's stack size and high-water mark. Size stacks
   from the measured `hwm`, not from guesses. `/api/debug/heap` carries
   `dma_free`/`dma_min` and the asset gate counters.
+- **Animation kernels run from flash; only the render loop is pinned in
+  IRAM** (2026-09-10). IRAM text past the first 16 KB is taken from
+  internal DRAM byte for byte. The 21 ported animations each carried a
+  private `#define GM_ANIM_IRAM IRAM_ATTR` and together pinned 21.5 KB of
+  kernels (linker map, `.iram0.text` by object): the boot heap pool shrank
+  from 196 KiB to 170 KiB, the loadtest build idled at 9 KB internal
+  instead of 24 to 35, DMA-capable free sat at 1.4 KB, and WiFi lost every
+  outgoing frame within a minute of connecting (`FAILED ALLOC size=1630`,
+  the NetWatchdog reconnect loop, no web UI). `GM_ANIM_IRAM` is defined
+  once in `BgAnimCommon.h` and is empty unless the build sets
+  `GM_BGANIM_IRAM_KERNELS=1`, which is a bench A/B knob and never ships.
+  The tripwire is the `heap_init: At 3FC... (N KiB): RAM` line at boot:
+  under 190 KiB means something new is static in DRAM or IRAM.
 - **Animation tables come from a fixed 12 KB slab, never from the heap
   pool** (`bganim::allocHot`, BgAnimCommon.h; `bganim::alloc` is PSRAM,
   always). Before the slab, placement was decided at init() against the free
@@ -910,6 +1416,16 @@ DMA-capable, largest block 7.7 kB) and two browser tabs killed it. After the
   animation's static tables are not a way around it: BSS is the same pool.
   With the slab a normal boot idles at ~53 kB internal (45 kB DMA-capable)
   with the boot animation resident.
+- **The web UI reaches the firmware only through `scripts/build_webui.sh`**
+  (2026-09-10). `npm run build` alone writes `web/dist` and nothing reads
+  it: the script gzips the bundle and runs `embed_webui.py`, which writes
+  the git-ignored `src/display/webassets/` (blob, manifest, `.S`). A fresh
+  worktree has a 1-byte `web_ui.bin` stub there, `embed_webui_pre.py` keeps
+  it so a bare build links, and the firmware then answers 404 "Not found"
+  on `/` and every page while `/api/*` works. Three flashes from this
+  worktree shipped that stub before anyone opened the web UI. The tell is
+  `.pio/build/<env>/webassets/web_ui_blob.o` at 864 bytes (the real one is
+  about 500 KB), or `web_ui.bin` at 1 byte.
 - **Big embedded assets stream at most three at a time, and a second or
   third only while `dma_free` is above 20 KB** (`kMaxAssetStreams`,
   `kAssetGateDmaFloor`, `WebUIPlugin::assetSlotFree`). In-flight WiFi copies
@@ -1016,7 +1532,17 @@ survived, and what the device taught:
   float state. The bare-metal QEMU harness sets it once in its own main().
 - **ee.vld/vst.128.ip mask the low four address bits silently**, so a PIE
   kernel aligns its spans with a scalar prefix, never by trusting the
-  pointer; `allocHot` returns 16-byte-aligned tables for this reason.
+  pointer. Both bganim allocators return 16-byte-aligned memory for this
+  reason: `allocHot` always did, and `alloc` does since 2026-09-12, when
+  Truchet's `blendLast` came back 4-byte aligned from `ps_malloc` and every
+  vector store landed up to twelve bytes before the block. That is the heap's
+  head canary, so the next free took the board down inside
+  `/api/debug/animtest` (`multi_heap_free ... head != NULL`, the render task's
+  backtrace ending in the animation's own `release`). **The host cannot show
+  this class of bug**: glibc malloc is 16-byte aligned, so the goldens, the
+  fuzzer, the lifecycle check and QEMU all agreed with a device that was
+  writing outside its allocation. Only `/api/debug/animtest` on the board
+  found it, and only because the free that asserts came after the test.
 - BAND_H is 2 (240 band() calls per frame), so per-call setup is paid 240
   times: a kernel's row-state builder is as hot as its pixel loop.
 - **Iterate on the device, not on predictions**: the `display-kdev` env
@@ -1028,13 +1554,9 @@ survived, and what the device taught:
   protection off (sdkconfig.kdev.defaults), so it is a bench env and never
   a production knob, and it idles 16 KB lower on internal free than
   production. `pio run -t compiledb` recreates the env's build tree (ELF
-  included) and writes the one project-wide compile_commands.json, so run
-  it before the build, not after, and never for another env in between.
-  **Adding or removing an env in platformio.ini also changes the checksum**
-  and wipes every env's build tree (2026-09-07: one POC env cost a 7 minute
-  loadtest rebuild before the board could be restored). Never edit the env
-  list while a runner is on the board; rebuild what you flash next after
-  the edit.
+  included) and writes the one project-wide compile_commands.json; the
+  build-tree rules for it, and for editing the env list, are in the
+  PlatformIO bullet under the hardware invariants above.
   Three things the first evening on it taught: never reflash the board
   while a round is running (the `band` rows become a snapshot of whatever
   the tree held at build time, and one worker spent an hour comparing
@@ -1056,6 +1578,77 @@ survived, and what the device taught:
   stores took it to 8.2 ms with the picture unchanged (goldens moved 2.0 of
   255, all of it the dither grain going 2x1); a redesign for the same speed
   (Silk 2, four rounds) never matched the look.
+- **The kblob rig runs the kernel from IRAM and the board runs it from
+  flash, so the rig under-reports, and by an amount that is a property of the
+  kernel** (gm-4bd.6 and .7, 2026-09-13, bench board, divider 7). Same code,
+  same session: plasma 6.81 ms in the blob against 8.14 on the board, 1.22
+  times; crescent 8.53 against 14.8, 1.73 times. What the board pays on top is
+  fetching the kernel's own code through the 16 KB instruction cache the two
+  cores share, so a tight kernel reads close to the board and one with library
+  calls or a lot of per-row setup reads far better in the blob than it will
+  run. The proof that the gap is the kernel's and not noise: crescent's second
+  commit (98afb42b) left the blob time at 8.53 and took the board time to
+  12.5, changing nothing in the pixel loops, because two `sqrtf` calls a row, a
+  flash resident library function, came out of `band()` and became a table
+  built once a frame. There is no fixed factor to correct by. A blob win that
+  does not appear on the board is code volume, not pixels, and the gap is the
+  number to watch.
+- **A band time ratio means nothing except against a plasma measured in the
+  same run, in a stated board state** (2026-09-13). Plasma is the animation
+  least affected by the board's state, because its kernel is the smallest and
+  has the least to lose from a cold instruction cache, so the state moves the
+  ratio rather than moving both numbers together. Two `/api/debug/animtest`
+  fleet runs of the same binaries, before any of the speed work, on the same
+  board:
+
+                  plasma    sundial          crescent          glint
+      run A       194584    473440 (2.43x)   661116 (3.40x)    239499 (1.23x)
+      run B       241123    458098 (1.90x)   659998 (2.74x)    242821 (1.01x)
+      moved         24%       3.2%             0.2%              1.4%
+
+  Plasma moved 24% and nothing else moved more than 3.2%, so every ratio moved
+  by about the same 22 to 24%. Read run B alone and glint is inside the 1.25
+  budget at 1.01 with no work done at all, where its bead had recorded 1.37 to
+  1.54. That is the mistake to recognise, and it is not a mistake about the
+  animation under test: it is a plasma reading taken in a state that slowed
+  plasma down. **The method that held:** hard reset through esptool,
+  `/api/debug/synth?brew=0` to stop the loadtest build's synthetic brew, settle
+  40 s, then `/api/debug/animtest` with plasma in the same run, three times.
+  Three runs of that agreed within 3% for four animations, better than anything
+  else tried. The states that produced the higher readings differed in at least
+  four ways at once (uptime of hours against minutes, the synthetic brew
+  cycling the two heaviest screens, `framefn_sweep.py` through the web preview
+  instead of animtest, and the interlaced path pinned on), and which of the four
+  moves it is an experiment nobody has run. Two loaded-state figures quoted in
+  the gm-4bd.6 and gm-4bd.9 notes, sundial 1.52 and glint 1.21, are unsourced:
+  the lane could not find the raw output afterwards and withdrew them. Use run A
+  and run B, which are recorded in full.
+- **`EE.LDXQ.32` is the PIE unit's only gather, and this QEMU fork gets it
+  wrong** (gm-4bd.6 and .7, 2026-09-13). The instruction takes a 16-bit lane of
+  a vector, scales it by four, adds a base and loads 32 bits into one lane, so
+  eight of them plus an `EE.VUNZIP.16` fetch eight table entries where a scalar
+  pair loop costs eleven instructions for two. Two consequences in source. The
+  index scales by four, so a gathered table is 32-bit and its entry count is
+  not its byte count: establish the largest index the caller can produce and
+  check it against the allocation, the way glint pads a 512 entry palette for a
+  sum that reaches 384. And paying for 32-bit tables in the 9,216 byte hot slab
+  means moving something out, which is safe only for a table read once a row
+  rather than per pixel (sundial's `halfPx` and `surfRow`). **The emulator
+  returns the entry one 32-bit word below the correct one, every time, for
+  every lane** (espressif/qemu issue 162);
+  `tools/qemubench/tests/probe_ldxq32` is the eleven line reproduction. The
+  sundial and crescent tests hand the vector path a table pointer one word
+  high, marked `QEMU_LDXQ_BIAS`, so the error cancels: every lane of arithmetic
+  is checked (sundial 2,260,707 lanes, crescent 6,024,680, zero mismatches) and
+  only the gather address is left to silicon, where `/api/debug/animtest` and
+  the kblob hash check it. So a QEMU pass on one of those tests says the
+  arithmetic is right, not that the address is. A test that uses the
+  instruction and passes with no bias is either not reaching it or comparing
+  two wrong things. One trap that cost a rebuild: a kernel walks single pixels
+  until its output pointer is 16-byte aligned and only then enters the vector
+  body, so one call uses both paths, and the harness has to split the call the
+  same way the kernel does and run it twice, biased for the vector span and
+  true for the rest.
 - **The fuzzer is only a fuzzer with the sanitizers on**
   (`tools/animbench/Makefile.fuzz`, run with
   `ASAN_OPTIONS=verify_asan_link_order=0` on WSL1). Without ASan a
@@ -1093,6 +1686,66 @@ survived, and what the device taught:
   derive everything from the pair row `y & ~1` and memcpy only when the
   partner is in the same call. `render_one --shapes` runs the same check on
   an unregistered candidate (480 and 240 wide) before it touches `src/`.
+- **Speed 50 is the default on every animation and means the same amount of
+  movement everywhere** (gm-33fm, 2026-09-12). Movement is the half change
+  time: how long the picture takes to change half as much as two unrelated
+  moments of the same animation differ (`tools/animbench/web/motion.js`,
+  guide in `MOTION.md`). Target 1200 ms at Speed 50, accept band 950 to 1500,
+  and above that the slider follows one universal curve,
+  `rate = 2^((sp - 50) / 18.2)`, so 0 gives 8050 ms and 100 gives 179. Before
+  the calibration the fleet spread 144x at Speed 50 and ten of the newest
+  ports shipped a Speed default of 10 to 20, which is what "the animations
+  barely move" was: Glint at its default 10 ran at 0.22 of every number
+  anyone had measured. A new animation is measured before it lands, and its
+  default is 50. Two metrics, and which one applies is a property of the
+  animation: read `thalfLpMs` (8x8 box average before differencing) for
+  Starfield, Orbits, Harmonograph, Nebula and Floor, `thalfMs` for the rest.
+  The half change time does not scale as one over the rate, so the multiplier
+  is a starting point and the measured band is the contract. It is also blind
+  to whole pixel stutter, which is what `grain_ratio.js` is for: read its
+  delta across a change, never its level.
+  **Two questions, two runs, and mixing them up cost a day** (gm-kh2s,
+  2026-09-12). How much an animation moves at Speed 50 next to the others is
+  the run above: a window fixed in wall clock, which is right, because it is a
+  person watching for a fixed time. Whether the Speed slider scales that
+  animation is `motion.js --matched`, which divides every time in the playback
+  by the setting's rate so each Speed sees the same window of animation time,
+  and reports `thalfAdjMs` with the rate multiplied back. **Do not use the
+  first run to answer the second question.** Its window sees 6.7 times more
+  animation time at Speed 100 than at Speed 50, so the level it calls "fully
+  changed" moves with the setting; judging the slider that way failed seven
+  animations whose clocks were correct and passed three that were not.
+  **Where the fleet stands: 44 of 44 inside the band at Speed 50** (median
+  1180 ms, spread 1.5x, down from 144x) and **44 of 44 flat across the
+  slider** under `--matched`, worst 1.017x. Five animations scaled one term
+  and not the rest, and all five are fixed: Steam's rise without the puff
+  lifetime or the sway, Ripples' ring travel without the drop interval or the
+  ring life (so Speed 100 showed less movement than Speed 75), Starfield's
+  drift without the twinkle or the shooting stars, Lava's orbits without the
+  radius pulse, and Silk's travel and rotation without the width wobble. The
+  last three had passed every check the fleet had.
+- **The goldens cannot catch a port drifting from its page design, and for
+  twenty animations it had** (gm-pciz, 2026-09-12). The goldens under
+  `tools/animbench/golden` are rendered by the firmware, so `make check` only
+  proves the firmware draws what it drew yesterday. `make pagecheck`
+  (`web/page_vs_golden.js`, third stage of `make check`) plays the page entry
+  the way `bench.cpp` plays the firmware, captures golden frames 30, 120 and
+  210, quantises both sides to RGB565 and counts differing pixels. Forty-two
+  of the 44 are exact, which is the rule a new port is held to; the other two
+  are debt recorded in `page_exact.json`: ripples 18369 and cube 33, both
+  accepted by the owner on 2026-09-13 with the reason in each animation's own
+  header and in that file's `accepted` block. Steam (e536caf1) and orbits
+  (dac4c7e1) were debt until that day and are exact now.
+  It was 24 exact and 20 in debt when the check was
+  written, and every one of the eighteen closed since had a different cause,
+  three of them user-visible defects that had shipped (Mandala drew
+  concentric rings where the page draws petals, Ember was materially darker
+  than the design, and Nebula's drift speed depended on the frame rate).
+  Lower an allowance when you fix one; never raise one to pass a check. The
+  page entry is the approved design and the firmware is the side to change.
+  `bench.cpp` renders a warm-up frame at t = 0 before its loop, so an
+  animation that accumulates state per frame starts one frame ahead on the
+  firmware side, which is the recorded cause of Nebula's gap.
 
 ## Measuring the display rig
 
@@ -1140,6 +1793,52 @@ Debugging methodology that this codebase has already paid for:
   after five builds of in-place cycle probes had cleared every instruction
   around it.
 
+## OTA deploys to a board with no USB
+
+`python3 tools/ota_dev.py` builds the web UI, builds `-e display`, serves the
+image from this host, asks the board to pull it, and checks the board came back
+running it. `--no-build` sends what is already built, `--host` picks another
+board, `--env` another build. Rules it encodes, and what the design cost:
+
+- **The board pulls; the host does not push** (gm-thg, `POST /api/ota/dev`,
+  `GitHubOTA::updateFromUrl`). A POST carrying the 6 MB image would have to
+  write flash from the async_tcp callback, and a sector erase blocks for tens
+  of milliseconds every few kilobytes: that stalls the web server answering the
+  request and sits under the task watchdog, which is the same way the shot
+  history handler used to reboot the board. The route only records the URL and
+  `WebUIPlugin::loop()` runs the download on the display task, where the
+  release update already runs. The price is that the board has to reach the
+  developer's host, and a host firewall blocking the inbound connection looks
+  exactly like a dead board from the device end, so `ota_dev.py` waits for the
+  first byte separately and says so.
+- **`esp_app_get_elf_sha256` is the only thing that says the deploy landed.**
+  `BUILD_GIT_VERSION` does not move between two builds of the same dirty tree,
+  and the version on the board is that string. `GET /api/ota/info` reports the
+  sha, the running slot, the next slot, the build date and whether a second app
+  slot exists at all; the script compares the sha across the reboot and fails
+  when it did not move.
+- **The panel goes black for the download and that is deliberate.**
+  `DefaultUI`'s `ota:update:start` handler stops scan-out for any display OTA,
+  because the RGB peripheral streaming a framebuffer out of PSRAM and a 6 MB
+  download into flash contend for the same bus and the download is the one that
+  aborts. The dev path fires the same event with the same component string, so
+  it gets the same treatment.
+- **The endpoint ships on production and is not authenticated.** The machine it
+  is for has no reachable USB port, so a debug-build-only route would be
+  useless. It is the trust boundary this server already assumes: `/api/settings`
+  returns the WiFi password in cleartext over plain http to anyone on the LAN.
+  `-DGM_DEV_OTA=0` compiles both routes out.
+- **Rollback is off** (`BOOTLOADER_APP_ROLLBACK_ENABLE=n`), so an image that
+  boots but is broken stays booted and the only way back is USB. The partition
+  table has two app slots, so a *failed* write is safe: the running app is
+  never the target, and `updateFromUrl` refuses outright on a single-slot
+  build. What is unprotected is a bad image that starts.
+- **The first image carrying the endpoint cannot arrive this way.** A board
+  running an older build has no `/api/ota/dev` and no way to be given an
+  arbitrary URL: every URL `GitHubOTA` uses is built from the compile-time
+  `RELEASE_URL`, and the OTA channel setting is narrowed to "latest" or
+  "nightly" at each use. So the bootstrap is USB or a GitHub release, once.
+
 ## Bench facts
 
 - Device: 192.168.1.121 on the bench, UART on COM3 when its USB is on this
@@ -1149,6 +1848,46 @@ Debugging methodology that this codebase has already paid for:
   `req:ota-start` with `cp: display`, against `RELEASE_URL` on the fork);
   the local-image route `POST /api/ota/dev?url=` exists only on anims/astra
   builds (gm-thg). The stored pixel-clock divider is 6 now, not 8.
+- **Opening COM3 with
+  pyserial's defaults resets the board** (reset reason `usb`, confirmed
+  2026-09-11 by opening the port with the board at 353 s of uptime and
+  reading 30 s after): the DTR and RTS pulse on open drives the
+  USB-serial-JTAG reset, so every serial capture taken before this note
+  was a fresh boot, and the reset seen at the end of the 2026-09-11 sweep
+  was this (the two from 2026-09-10 had no serial capture open and stay
+  unexplained). Open with
+  `s = serial.Serial(); s.port = "COM3"; s.dtr = False; s.rts = False;
+  s.open()`, which leaves the board running (checked the same way). The
+  flash step resets on purpose.
+- **The board's radio link degrades in place, minutes into a boot, and a
+  reset cleared it** (gm-t9ld, reproduced and placed 2026-09-13). A reset is
+  the only recovery tried, so it is the one that is known to work, not the
+  only one that can. The symptom
+  is that every HTTP response stalls or truncates: small JSON GETs taking 4 to
+  27 seconds or failing, whole framebuffer reads taking nine minutes. It looks
+  exactly like a firmware fault and it is not one. What places it is a ping
+  with a control, back to back from the same host: 55% loss to the board, 0%
+  loss to the gateway, 53% loss to the board again. The board's own counters
+  stay healthy throughout (`egress ok`, zero LogicLoop overruns, 21.7 fps,
+  `int_free`, `int_largest` and `dma_free` unchanged), the serial log carries
+  no WiFi driver event at all, no roam, no disconnect, no reassociation, and
+  the association never drops. A reset with no flash cures it completely: same
+  BSSID, same rssi, 0% loss and 0.18 s GETs for eight rounds afterwards. So it
+  is the board's own radio state, not the air, and it is not the esptool reset
+  that starts every session (the same command an hour earlier gave 15 clean
+  minutes). **Two earlier explanations are dead**: gm-nov3.10's internal DRAM
+  starvation (the heap numbers in the broken window match a healthy one), and
+  the framebuffer endpoint itself (ICMP never reaches a handler). Why it
+  degrades is not established and is gm-bzu.26.
+  **How to tell a sick board from a slow one before you measure anything**:
+  time three small GETs of `/api/debug/anim` and stop if any one exceeds a
+  second. In the bad window 11 of 15 single GETs were over a second or
+  failed, so one sample misses a sick board about a quarter of the time and
+  three are better than one. How much better is not measured: treating the
+  three as independent gives 98 in 100, and nothing establishes independence,
+  which a board failing in bursts would break. Three GETs cost under a second
+  on a healthy board, so run them. Ten pings is the other cheap test and it
+  was unambiguous in both states.
 - **The bench board is BLE-linked to a real controller (GaggiMate Pro Rev
   1.1), so a display command reaches a real pump and heater.** On
   2026-10-01 a scripted settings run (`/api/debug/tap`) kept tapping after

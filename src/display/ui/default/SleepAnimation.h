@@ -11,6 +11,7 @@
 #include <atomic>
 #include <display/ui/default/TickRingElement.h>
 #include <stdint.h>
+#include <display/ui/default/bganim/BgAnim.h> // BG_ANIM_PARAMS
 #ifndef GAGGIMATE_SIM
 #include <display/drivers/common/BandDma.h>
 #endif
@@ -205,10 +206,10 @@ class SleepAnimation {
     static uint32_t stackIntFallbacks();
     bool isActive() const { return running; }
 
-    // Selects which registry animation renders and its 4 params (0-100 each).
+    // Selects which registry animation renders and its BG_ANIM_PARAMS params (0-100 each).
     // Safe to call while running — params apply on the next frame, an id
     // change triggers the new animation's lazy init on the render task.
-    void configure(uint8_t animId, const uint8_t p[4]);
+    void configure(uint8_t animId, const uint8_t p[BG_ANIM_PARAMS]);
     // The id currently configured (not gated behind GM_ANIM_BENCH like
     // benchCurrentAnim() below, so /api/debug/anim can report it in every
     // build): the same value GET /api/settings reports as bgAnimId once the
@@ -348,6 +349,54 @@ class SleepAnimation {
     // with nobody in front of it. See the comment at the write site.
     void setTestPattern(bool on) { testPattern.store(on); }
     bool testPatternOn() const { return testPattern.load(); }
+#ifdef GM_TOUCH_PROBE
+    // Gradient framebuffer fixture (gm-nov3.10). While armed, the render task
+    // overwrites rows [y0, y1) of every band, after the composite and before
+    // the push, with the active theme's own 256-entry ramp: column x carries
+    // ramp index (x * 255) / (w - 1), so index 255 lands on the last column
+    // and every index appears. Nothing runs after it, so no overlay, layer,
+    // element or scrim can reach the sampled rows, which is what makes the
+    // region comparable against a host sampler at all.
+    //
+    // Interlacing is vetoed while armed. An interlaced frame pushes half the
+    // rows and skips the buffer flip, so only one of the two framebuffers
+    // ever carries a complete strip and /api/debug/fb?n=1 would report a
+    // stale one. Whole frames put the same strip in both.
+    //
+    // Volatile: never stored, cleared by a reboot, and compiled only into the
+    // bench builds that define GM_TOUCH_PROBE.
+    //   mode 0 off, 1 forward ramp, 2 reversed, 3 wheel (Plasma's cyclic one)
+    //
+    // xoff shifts the mapping one column left: index = ((x + xoff) * 255) /
+    // (w - 1). It exists because /api/debug/fb only delivers the framebuffer
+    // subsampled (step 2 on this panel; step 1 truncates after five rows), so
+    // a host reads even columns only and would never see the index that sits
+    // on column 479. At xoff 1 that index lands on column 478 instead, and
+    // the two passes together cover every column's index.
+    void setRampFixture(int mode, int y0, int y1, int xoff);
+    int rampFixtureXoff() const { return rampFixXoff.load(); }
+    int rampFixtureMode() const { return rampFixMode.load(); }
+    int rampFixtureY0() const { return rampFixY0.load(); }
+    int rampFixtureY1() const { return rampFixY1.load(); }
+    // Frames painted since the last arm, so a host can tell a strip that is
+    // on screen from one that was only just requested.
+    uint32_t rampFixtureFrames() const { return rampFixFrames.load(); }
+    // The published palette word (bganim::themeApplied()) the strip in the
+    // framebuffer was drawn from, and how many whole frames have carried it.
+    //
+    // rampFixtureFrames() alone cannot gate a sample: it counts from the arm,
+    // so by the time a tone change reaches the palette it is long past any
+    // threshold, and the frames it counted were painted with the previous
+    // tone. A host compares this word against the one the endpoint reports
+    // for the live palette and waits for the count, which is what makes the
+    // wait a gate on observed frames rather than an assumed delay.
+    //
+    // Zero frames means the fixture was just armed, or that the last frame
+    // rebuilt the LUT part way through, so its strip is half one palette and
+    // half the other and is not evidence about either.
+    uint32_t rampFixtureApplied() const { return rampFixLutApplied.load(); }
+    uint32_t rampFixtureTonedFrames() const { return rampFixTonedFrames.load(); }
+#endif
     uint8_t fpsOverrideValue() const { return fpsOverride.load(); }
     // Tearing: live writes over frames actually checked. The denominator is
     // exposed so a zero cannot be read as clean when the check never ran.
@@ -389,6 +438,7 @@ class SleepAnimation {
     bool objectInternal() const;
     uint32_t lastMsyncUsValue() const { return lastMsyncUs.load(); }
     uint32_t lastPushUsValue() const { return lastPushUs.load(); }
+    uint32_t lastFrameFnUsValue() const { return lastFrameFnUs.load(); }
 
     // Text scrim: how far to dim the animation behind and immediately around
     // overlaid widget pixels, 0-100 percent, where 0 is off and 100 is black.
@@ -1635,6 +1685,8 @@ class SleepAnimation {
     uint32_t profBlendScrimCyc = 0;
     std::atomic<uint32_t> lastMsyncUs{0};
     std::atomic<uint32_t> lastPushUs{0};
+    // The animation's frame() call, per frame (framefn_us). Outside band_us.
+    std::atomic<uint32_t> lastFrameFnUs{0};
     // Core the band DMA completion interrupt is bound to. Not core 1: the RGB
     // panel driver's interrupts are there and must not queue behind ours. The
     // render task runs on this core and installs the engine inline
@@ -1668,7 +1720,27 @@ class SleepAnimation {
     // Animation selection; id and params may tear against each other for one
     // frame, which is harmless. Packed params: p[i] = (word >> 8*i) & 0xFF.
     std::atomic<uint8_t> animId{0};
-    std::atomic<uint32_t> animParams{0};
+    // Eight bytes in two words (the S3 has no 64-bit atomic store, and a
+    // libatomic lock has no place in the IRAM render loop); the two may tear
+    // against each other for one frame like id against params, harmless.
+    std::atomic<uint32_t> animParamsLo{0};
+    std::atomic<uint32_t> animParamsHi{0};
+    void storeParams(const uint8_t p[BG_ANIM_PARAMS]) {
+        uint32_t lo = 0, hi = 0;
+        for (int i = 0; i < 4; i++) {
+            lo |= static_cast<uint32_t>(p[i]) << (8 * i);
+            hi |= static_cast<uint32_t>(p[4 + i]) << (8 * i);
+        }
+        animParamsLo.store(lo);
+        animParamsHi.store(hi);
+    }
+    void loadParams(uint8_t p[BG_ANIM_PARAMS]) const {
+        const uint32_t lo = animParamsLo.load(), hi = animParamsHi.load();
+        for (int i = 0; i < 4; i++) {
+            p[i] = static_cast<uint8_t>((lo >> (8 * i)) & 0xFF);
+            p[4 + i] = static_cast<uint8_t>((hi >> (8 * i)) & 0xFF);
+        }
+    }
 #ifdef GM_ANIM_BENCH
     // The bench measures what the pipeline can do, so it must not sit against
     // the shipping frame cap -- a throttled frame reports the cap, not the cost.
@@ -1682,6 +1754,25 @@ class SleepAnimation {
     std::atomic<uint8_t> fpsOverride{0};
 #endif
     std::atomic<bool> testPattern{false};
+#ifdef GM_TOUCH_PROBE
+    // Gradient fixture state. The three atomics are written by the HTTP task
+    // and read by the render task; the LUT and its cache keys are touched only
+    // by the render task, which is the only writer of the band buffers.
+    std::atomic<int> rampFixMode{0};
+    std::atomic<int> rampFixY0{200};
+    std::atomic<int> rampFixY1{240};
+    std::atomic<uint32_t> rampFixFrames{0};
+    std::atomic<int> rampFixXoff{0};
+    uint16_t rampFixLut[256] = {0};
+    // Which published palette the LUT was built from, and whole frames drawn
+    // with it. Written by the render task, read over HTTP, hence atomic.
+    std::atomic<uint32_t> rampFixLutApplied{0};
+    std::atomic<uint32_t> rampFixTonedFrames{0};
+    int rampFixLutMode = 0;
+    // Set when the LUT was rebuilt part way through the frame being rendered,
+    // cleared when that frame ends. Render task only.
+    bool rampFixLutTorn = false;
+#endif
     int initializedAnimId = -1; // last id whose init() ran on the render task
     // Which animation currently holds allocated tables, or -1 for none. Kept
     // apart from initializedAnimId because start() clears that one to force an

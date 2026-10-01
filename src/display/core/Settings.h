@@ -190,12 +190,14 @@ class Settings {
     bool isSmartGrindActive() const { return smartGrindActive.get(); }
     bool isScaleMenuButton() const { return scaleMenuButton.get(); }
     int getBgAnimId() const { return bgAnimId.get(); }
+    int getBgAnimStandbyId() const { return bgAnimStandbyId.get(); }
     String getBgAnimParams() const { return copyOf(bgAnimParams); }
     bool isBgAnimAllScreens() const { return bgAnimAllScreens.get(); }
     int getBgAnimTheme() const { return bgAnimTheme.get(); }
     String getBgAnimCustomTheme() const { return copyOf(bgAnimCustomTheme); }
     // By reference: the UI task compares these (up to a few KB) every pass.
     String getBgAnimGradients() const { return copyOf(bgAnimGradients); }
+    String getBgAnimGradientRef() const { return copyOf(bgAnimGradientRef); }
     String getBgAnimThemeMap() const { return copyOf(bgAnimThemeMap); }
     int getBgAnimFps() const { return bgAnimFps.get(); }
     int getBgAnimHalfRes() const { return bgAnimHalfRes.get(); }
@@ -296,11 +298,13 @@ class Settings {
     void setSmartGrindActive(bool smart_grind_active);
     void setScaleMenuButton(bool scale_menu_button);
     void setBgAnimId(int bg_anim_id);
+    void setBgAnimStandbyId(int bg_anim_standby_id);
     void setBgAnimParams(const String &bg_anim_params);
     void setBgAnimAllScreens(bool bg_anim_all_screens);
     void setBgAnimTheme(int bg_anim_theme);
     void setBgAnimCustomTheme(const String &bg_anim_custom_theme);
     void setBgAnimGradients(const String &bg_anim_gradients);
+    void setBgAnimGradientRef(const String &bg_anim_gradient_ref);
     void setBgAnimThemeMap(const String &bg_anim_theme_map);
     void setBgAnimFps(int bg_anim_fps);
     void setBgAnimHalfRes(int bg_anim_half_res);
@@ -409,6 +413,13 @@ class Settings {
     // (index into BG_ANIMATIONS), its per-animation parameters, and whether it
     // runs behind every screen or only during standby sleep.
     Property<int> bgAnimId{registry, "bg_an", 0};
+    // The standby screen can play a different animation from the rest of
+    // the UI. -1 means "the same one as everywhere else", which is the
+    // default and what every device that has never set this stores.
+    // An id past the end of the registry reads as -1 too, so a build
+    // rolled back to a shorter roster falls back instead of indexing off
+    // the end (DefaultUI::updateState, CatAnimation.cpp).
+    Property<int> bgAnimStandbyId{registry, "bg_ans", -1};
     // Per-animation params, "p0,p1,p2,p3;p0,p1,p2,p3;..." indexed by anim id,
     // each 0-100; missing/short entries fall back to the animation's defaults.
     Property<String> bgAnimParams{registry, "bg_anp", ""};
@@ -419,6 +430,24 @@ class Settings {
     // the theme section of display/ui/default/bganim/BgAnim.h.
     Property<String> bgAnimGradients{registry, "bg_gl", ""};
     Property<String> bgAnimThemeMap{registry, "bg_thm", ""};
+    // The gradient every animation draws with unless its own map slot says
+    // otherwise, in the same grammar one map slot uses: a decimal built-in
+    // theme index, "c<id>" for a library entry, or "" for neither.
+    //
+    // "" is what every device that has never set this stores, and it means
+    // fall back to bgAnimTheme with bgAnimCustomTheme, which is exactly what
+    // the setting did before this field existed. So nothing migrates and no
+    // stored value changes meaning. It exists because bgAnimTheme is an int
+    // index into the built-in table and cannot name a library gradient: the
+    // only way to make one of the user's own gradients the default used to be
+    // writing it into every slot of bgAnimThemeMap, after which every
+    // animation carried an override and the global had no effect at all.
+    //
+    // Whoever writes a built-in here writes bgAnimTheme with it as well, so
+    // the legacy field stays in step for the on-display "Default (<name>)"
+    // label. A library gradient leaves bgAnimTheme where it was, which is then
+    // the fallback if that library entry is deleted.
+    Property<String> bgAnimGradientRef{registry, "bg_gref", ""};
     // Animation task frame-rate cap. Lower values cut the animation's PSRAM
     // write bandwidth (~460 KB/frame), which is the lever against RGB scan-out
     // underruns at high panel refresh rates.
@@ -426,19 +455,20 @@ class Settings {
     // 1 = render at half resolution and double on the way out. Defaults on:
     // it is the only way every animation clears 40 fps on this panel.
     Property<int> bgAnimHalfRes{registry, "bg_half", 1};
-    // 1 = push every other row pair, alternating each frame. Defaults on
-    // (gm-2cl.9, 2026-09-08): the interlaced loop is what the whole
-    // smooth-motion work was measured on. At cap 60 nine animations reach
-    // 41 to 52 fps interlaced with zero scan-out slips, and the whole-frame
-    // path cannot exceed 25.3 fps because a frame over one panel period
-    // takes two (CLAUDE.md, "Three refresh rates"). The earlier caution
-    // about the direct-DMA path's beam-racing writes is answered by those
-    // runs. NOTE: this is only the fallback for a key that has never been
-    // written to NVS. A device with bg_ilace persisted (the bench board
-    // stores 0) keeps reading its stored value back until it is set again
-    // or the NVS partition is erased; changing this line does not reach
-    // into storage that already exists.
-    Property<int> bgAnimInterlace{registry, "bg_ilace", 1};
+    // 1 = push every other row pair, alternating each frame. Defaults off
+    // (owner's decision, 2026-09-11; it was on from gm-2cl.9 on 2026-09-08
+    // to then). The trade is known and measured: interlaced, nine
+    // animations reach 41 to 52 fps at cap 60 with zero scan-out slips, and
+    // every animation runs about twice its whole-frame rate, because a
+    // whole frame over one panel period takes two (CLAUDE.md, "Three
+    // refresh rates" and the whole-frame sweep of 2026-09-11). Whole-frame
+    // refreshes every row every frame, which is the look the owner prefers
+    // at the cost of that rate. NOTE: this is only the fallback for a key
+    // that has never been written to NVS. A device with bg_ilace persisted
+    // keeps reading its stored value back until it is set again or the NVS
+    // partition is erased; changing this line does not reach into storage
+    // that already exists.
+    Property<int> bgAnimInterlace{registry, "bg_ilace", 0};
     // What to do with the opaque background plates on the screens that carry
     // one (brew, status, profile, info, and the pill holding the scale weight)
     // while the animation is running: 0 = leave them as the theme drew them,

@@ -51,7 +51,7 @@ const uint32_t TIMES[] = {0u, 33u, 100000u, 5000000u, 1000000000u, 4294900000u};
 
 struct ParamSet {
     const char *why;
-    uint8_t p[4];
+    uint8_t p[BG_ANIM_PARAMS];
 };
 
 // Builds the parameter sets probed for one animation: the defaults, the two
@@ -60,24 +60,27 @@ struct ParamSet {
 // interactions those miss.
 std::vector<ParamSet> paramSets(const BgAnimation &anim, int nRandom) {
     std::vector<ParamSet> out;
-    uint8_t def[4] = {anim.params[0].def, anim.params[1].def, anim.params[2].def, anim.params[3].def};
-    for (int i = 0; i < 4; i++) {
-        if (anim.params[i].key == nullptr) {
-            def[i] = 0; // bg_parse_params zeroes unused slots
-        }
+    ParamSet defs{"defaults", {}};
+    for (int i = 0; i < BG_ANIM_PARAMS; i++) {
+        defs.p[i] = anim.params[i].key != nullptr ? anim.params[i].def : 0; // bg_parse_params zeroes unused slots
     }
-    out.push_back({"defaults", {def[0], def[1], def[2], def[3]}});
-    out.push_back({"all-min", {0, 0, 0, 0}});
-    out.push_back({"all-max", {100, 100, 100, 100}});
+    out.push_back(defs);
+    ParamSet lo{"all-min", {}};
+    ParamSet hi{"all-max", {}};
+    for (int i = 0; i < BG_ANIM_PARAMS; i++) {
+        hi.p[i] = 100;
+    }
+    out.push_back(lo);
+    out.push_back(hi);
 
-    static char labels[8][32];
+    static char labels[2 * BG_ANIM_PARAMS][32];
     int nLabel = 0;
-    for (int i = 0; i < 4; i++) {
+    for (int i = 0; i < BG_ANIM_PARAMS; i++) {
         if (anim.params[i].key == nullptr) {
             continue;
         }
         for (uint8_t v : {static_cast<uint8_t>(0), static_cast<uint8_t>(100)}) {
-            ParamSet s{nullptr, {def[0], def[1], def[2], def[3]}};
+            ParamSet s = defs;
             s.p[i] = v;
             snprintf(labels[nLabel], sizeof(labels[0]), "%s=%u", anim.params[i].key, v);
             s.why = labels[nLabel++];
@@ -85,14 +88,15 @@ std::vector<ParamSet> paramSets(const BgAnimation &anim, int nRandom) {
         }
     }
 
-    static char rlabels[256][32];
+    static char rlabels[256][48];
     uint32_t seed = 0x1234567u;
     for (int r = 0; r < nRandom && r < 256; r++) {
-        ParamSet s{nullptr, {0, 0, 0, 0}};
-        for (int i = 0; i < 4; i++) {
+        ParamSet s{nullptr, {}};
+        for (int i = 0; i < BG_ANIM_PARAMS; i++) {
             s.p[i] = anim.params[i].key ? static_cast<uint8_t>(bganim::nextRand(seed) % 101) : 0;
         }
-        snprintf(rlabels[r], sizeof(rlabels[0]), "rand(%u,%u,%u,%u)", s.p[0], s.p[1], s.p[2], s.p[3]);
+        snprintf(rlabels[r], sizeof(rlabels[0]), "rand(%u,%u,%u,%u,%u,%u,%u,%u)", s.p[0], s.p[1], s.p[2], s.p[3], s.p[4], s.p[5],
+                 s.p[6], s.p[7]);
         s.why = rlabels[r];
         out.push_back(s);
     }
@@ -127,7 +131,7 @@ const int ALIGN_OFFSETS[] = {0, 4, 8, 12}; // bytes past a 16-byte boundary
 // Renders every band of one frame at width w through band() at each dst
 // offset and compares with bandRef(). Returns the number of failures, and
 // prints the first few.
-int alignCheck(const BgAnimation &anim, int w, const uint8_t p[4], uint32_t t, const char *why) {
+int alignCheck(const BgAnimation &anim, int w, const uint8_t p[BG_ANIM_PARAMS], uint32_t t, const char *why) {
     const int h = w;
     anim.frame(t, w, h, p);
     int failures = 0;

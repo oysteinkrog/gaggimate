@@ -1,0 +1,746 @@
+{
+  "_comment": [
+    "The built-in animation gradients. This file is the only place they",
+    "are written; scripts/gen_gradients.py turns it into the firmware",
+    "table, the simulator name table and the web mirror.",
+    "APPEND ONLY. A gradient's position in this list is its stored id:",
+    "bgAnimGradientRef and every slot of bgAnimThemeMap hold that index as",
+    "a decimal string, so reordering or removing an entry changes what a",
+    "device already set. Add new gradients at the end.",
+    "Six stops each, dark to bright. The animations index the palette by",
+    "intensity, so the ramp has to rise; tools/gradient_check.py enforces",
+    "that and the rest of the set rules."
+  ],
+  "categories": [
+    "Coffee",
+    "Fire and Heat",
+    "Water and Ice",
+    "Nature",
+    "Night Sky",
+    "Neon",
+    "Pastel",
+    "Metal and Stone"
+  ],
+  "gradients": [
+    {
+      "name": "Espresso",
+      "category": "Coffee",
+      "stops": [
+        "#080402",
+        "#2a1206",
+        "#6b3413",
+        "#b8703a",
+        "#e8b268",
+        "#f8e6c8"
+      ]
+    },
+    {
+      "name": "Ocean",
+      "category": "Water and Ice",
+      "stops": [
+        "#02060c",
+        "#06284a",
+        "#0a5276",
+        "#2596be",
+        "#66d3e8",
+        "#d8f6ff"
+      ]
+    },
+    {
+      "name": "Violet Dusk",
+      "category": "Night Sky",
+      "stops": [
+        "#0a0512",
+        "#2a1050",
+        "#5c2a94",
+        "#9a5ad4",
+        "#d09af0",
+        "#f4e2ff"
+      ]
+    },
+    {
+      "name": "Forest",
+      "category": "Nature",
+      "stops": [
+        "#020803",
+        "#0c2c12",
+        "#1e5c28",
+        "#46963c",
+        "#8cd464",
+        "#e6ffc8"
+      ]
+    },
+    {
+      "name": "Sunset",
+      "category": "Fire and Heat",
+      "stops": [
+        "#0c0410",
+        "#4a1030",
+        "#952038",
+        "#d4542c",
+        "#f89c3c",
+        "#ffe8a0"
+      ]
+    },
+    {
+      "name": "Fire",
+      "category": "Fire and Heat",
+      "stops": [
+        "#0a0200",
+        "#401004",
+        "#8c2808",
+        "#d85c10",
+        "#f8a428",
+        "#ffe8b0"
+      ]
+    },
+    {
+      "name": "Ice",
+      "category": "Water and Ice",
+      "stops": [
+        "#020408",
+        "#10203c",
+        "#2c4a74",
+        "#5486b4",
+        "#9cc8e4",
+        "#eafaff"
+      ]
+    },
+    {
+      "name": "Mono",
+      "category": "Metal and Stone",
+      "stops": [
+        "#000000",
+        "#202020",
+        "#484848",
+        "#808080",
+        "#c0c0c0",
+        "#ffffff"
+      ]
+    },
+    {
+      "name": "Rose",
+      "category": "Pastel",
+      "stops": [
+        "#0e0407",
+        "#3c1020",
+        "#7a2440",
+        "#c04868",
+        "#ee8ca4",
+        "#ffdce6"
+      ]
+    },
+    {
+      "name": "Gold",
+      "category": "Metal and Stone",
+      "stops": [
+        "#060402",
+        "#2e2008",
+        "#6e5014",
+        "#b48c24",
+        "#e8c453",
+        "#fff0b8"
+      ]
+    },
+    {
+      "name": "Aurora",
+      "category": "Night Sky",
+      "stops": [
+        "#010806",
+        "#063020",
+        "#0c6444",
+        "#14a878",
+        "#48e0b0",
+        "#c8ffec"
+      ]
+    },
+    {
+      "name": "Cyber",
+      "category": "Neon",
+      "stops": [
+        "#050008",
+        "#240448",
+        "#501090",
+        "#9018d8",
+        "#e030f8",
+        "#ff9cf0"
+      ]
+    },
+    {
+      "name": "Ember Coal",
+      "category": "Fire and Heat",
+      "stops": [
+        "#0a0604",
+        "#2b0a06",
+        "#6b1a08",
+        "#b8420f",
+        "#e2751f",
+        "#f4a94a"
+      ]
+    },
+    {
+      "name": "Deep Space",
+      "category": "Night Sky",
+      "stops": [
+        "#05050f",
+        "#150a28",
+        "#341840",
+        "#6b2f5e",
+        "#b3477d",
+        "#e6b3d6"
+      ]
+    },
+    {
+      "name": "Teal Reef",
+      "category": "Water and Ice",
+      "stops": [
+        "#050a0f",
+        "#0a1c28",
+        "#123a44",
+        "#1f6b6e",
+        "#3fb3a8",
+        "#bdeee0"
+      ]
+    },
+    {
+      "name": "Sakura",
+      "category": "Pastel",
+      "stops": [
+        "#0c060a",
+        "#341828",
+        "#6e3050",
+        "#b45c80",
+        "#e896b0",
+        "#ffe0ec"
+      ]
+    },
+    {
+      "name": "Lime",
+      "category": "Nature",
+      "stops": [
+        "#040802",
+        "#16300a",
+        "#326016",
+        "#5ea024",
+        "#9ee44c",
+        "#eaffc0"
+      ]
+    },
+    {
+      "name": "Arctic Night",
+      "category": "Water and Ice",
+      "stops": [
+        "#020206",
+        "#0a1424",
+        "#1a3048",
+        "#34587c",
+        "#6c94bc",
+        "#c4e4f8"
+      ]
+    },
+    {
+      "name": "Cappuccino",
+      "category": "Coffee",
+      "stops": [
+        "#100703",
+        "#3c2d27",
+        "#6f5347",
+        "#a27e6f",
+        "#d0afa1",
+        "#f5e5de"
+      ]
+    },
+    {
+      "name": "Cold Brew",
+      "category": "Coffee",
+      "stops": [
+        "#0d0400",
+        "#1f0f06",
+        "#382017",
+        "#5f3f33",
+        "#9c7d72",
+        "#e5d4ce"
+      ]
+    },
+    {
+      "name": "Crema",
+      "category": "Coffee",
+      "stops": [
+        "#0f0800",
+        "#48361f",
+        "#8a663d",
+        "#c99765",
+        "#f7c59c",
+        "#fff1e8"
+      ]
+    },
+    {
+      "name": "Dark Roast",
+      "category": "Coffee",
+      "stops": [
+        "#0d0600",
+        "#2c1f12",
+        "#543e25",
+        "#856847",
+        "#b09477",
+        "#d7c7b8"
+      ]
+    },
+    {
+      "name": "Flat White",
+      "category": "Coffee",
+      "stops": [
+        "#080601",
+        "#141106",
+        "#252115",
+        "#4a4433",
+        "#9b9686",
+        "#f6f3ec"
+      ]
+    },
+    {
+      "name": "Mocha",
+      "category": "Coffee",
+      "stops": [
+        "#110500",
+        "#381c12",
+        "#6c3926",
+        "#9e5b43",
+        "#b47862",
+        "#ebcbbf"
+      ]
+    },
+    {
+      "name": "Blowtorch",
+      "category": "Fire and Heat",
+      "stops": [
+        "#110801",
+        "#553100",
+        "#9a6001",
+        "#db9100",
+        "#ffc56b",
+        "#fff2e1"
+      ]
+    },
+    {
+      "name": "Brimstone",
+      "category": "Fire and Heat",
+      "stops": [
+        "#0b0700",
+        "#2e2200",
+        "#594401",
+        "#876902",
+        "#a48220",
+        "#e6cfa5"
+      ]
+    },
+    {
+      "name": "Forge",
+      "category": "Fire and Heat",
+      "stops": [
+        "#190300",
+        "#581c1a",
+        "#a2322a",
+        "#e15b46",
+        "#ff9c83",
+        "#ffe2d9"
+      ]
+    },
+    {
+      "name": "Magma",
+      "category": "Fire and Heat",
+      "stops": [
+        "#150001",
+        "#310002",
+        "#530013",
+        "#920123",
+        "#d65d5b",
+        "#ffcbc4"
+      ]
+    },
+    {
+      "name": "Solar Flare",
+      "category": "Fire and Heat",
+      "stops": [
+        "#0f0400",
+        "#200b00",
+        "#401300",
+        "#851d00",
+        "#f56b41",
+        "#fff1ec"
+      ]
+    },
+    {
+      "name": "Abyss",
+      "category": "Water and Ice",
+      "stops": [
+        "#070615",
+        "#13204e",
+        "#1d4197",
+        "#4765d1",
+        "#717fde",
+        "#cecefb"
+      ]
+    },
+    {
+      "name": "Glacier",
+      "category": "Water and Ice",
+      "stops": [
+        "#000c0e",
+        "#013f4c",
+        "#077792",
+        "#33add6",
+        "#8fd8ff",
+        "#e9f5ff"
+      ]
+    },
+    {
+      "name": "Lagoon",
+      "category": "Water and Ice",
+      "stops": [
+        "#010b0a",
+        "#012e2a",
+        "#015852",
+        "#008b83",
+        "#63c0b7",
+        "#c8f0eb"
+      ]
+    },
+    {
+      "name": "Fern",
+      "category": "Nature",
+      "stops": [
+        "#030c00",
+        "#164219",
+        "#197e33",
+        "#37b75f",
+        "#7ae49a",
+        "#cfffde"
+      ]
+    },
+    {
+      "name": "Jungle",
+      "category": "Nature",
+      "stops": [
+        "#000b04",
+        "#002515",
+        "#00472c",
+        "#02754a",
+        "#379d6d",
+        "#93bda5"
+      ]
+    },
+    {
+      "name": "Moss",
+      "category": "Nature",
+      "stops": [
+        "#060800",
+        "#1b2801",
+        "#314f01",
+        "#54781a",
+        "#739043",
+        "#cad6b1"
+      ]
+    },
+    {
+      "name": "Olive Grove",
+      "category": "Nature",
+      "stops": [
+        "#070701",
+        "#1c1a00",
+        "#343500",
+        "#625e1f",
+        "#a49963",
+        "#e8dfc5"
+      ]
+    },
+    {
+      "name": "Wheat",
+      "category": "Nature",
+      "stops": [
+        "#0b0a00",
+        "#3a3b11",
+        "#6e7120",
+        "#a3a642",
+        "#d4d37e",
+        "#f8f5ce"
+      ]
+    },
+    {
+      "name": "Eclipse",
+      "category": "Night Sky",
+      "stops": [
+        "#10040f",
+        "#341333",
+        "#632462",
+        "#964794",
+        "#b874b5",
+        "#caa9c7"
+      ]
+    },
+    {
+      "name": "Midnight",
+      "category": "Night Sky",
+      "stops": [
+        "#0a0310",
+        "#190c2f",
+        "#2d1857",
+        "#533687",
+        "#9476c0",
+        "#e1d1f5"
+      ]
+    },
+    {
+      "name": "Moonrise",
+      "category": "Night Sky",
+      "stops": [
+        "#080710",
+        "#1a1c2f",
+        "#35385d",
+        "#5f6290",
+        "#9fa0c9",
+        "#eae9fd"
+      ]
+    },
+    {
+      "name": "Nebula Drift",
+      "category": "Night Sky",
+      "stops": [
+        "#10060f",
+        "#3f2940",
+        "#714c78",
+        "#a277b0",
+        "#ccaadc",
+        "#f2e3fc"
+      ]
+    },
+    {
+      "name": "Starlight",
+      "category": "Night Sky",
+      "stops": [
+        "#09040a",
+        "#1a101b",
+        "#2f2033",
+        "#544059",
+        "#907e94",
+        "#ded4e0"
+      ]
+    },
+    {
+      "name": "Cyan Pulse",
+      "category": "Neon",
+      "stops": [
+        "#010c0c",
+        "#004041",
+        "#057a7b",
+        "#02b2b4",
+        "#11e5e8",
+        "#c0ffff"
+      ]
+    },
+    {
+      "name": "Electric Blue",
+      "category": "Neon",
+      "stops": [
+        "#0c0618",
+        "#36316e",
+        "#645dd4",
+        "#a192ff",
+        "#d3c8ff",
+        "#f5f2fe"
+      ]
+    },
+    {
+      "name": "Hot Magenta",
+      "category": "Neon",
+      "stops": [
+        "#170211",
+        "#571449",
+        "#a31489",
+        "#e739c4",
+        "#ff90e2",
+        "#ffdff5"
+      ]
+    },
+    {
+      "name": "Laser Pink",
+      "category": "Neon",
+      "stops": [
+        "#15000a",
+        "#2a0019",
+        "#48002d",
+        "#870058",
+        "#f859b1",
+        "#fff0f6"
+      ]
+    },
+    {
+      "name": "Neon Amber",
+      "category": "Neon",
+      "stops": [
+        "#0b0500",
+        "#190f01",
+        "#311e01",
+        "#623c01",
+        "#d18508",
+        "#fff1e5"
+      ]
+    },
+    {
+      "name": "Neon Lime",
+      "category": "Neon",
+      "stops": [
+        "#030700",
+        "#0a1401",
+        "#122701",
+        "#184f01",
+        "#55a92f",
+        "#dcfec8"
+      ]
+    },
+    {
+      "name": "Lavender",
+      "category": "Pastel",
+      "stops": [
+        "#0a0811",
+        "#393749",
+        "#6c698b",
+        "#a09cc7",
+        "#cfcbf0",
+        "#f4f2ff"
+      ]
+    },
+    {
+      "name": "Lilac Haze",
+      "category": "Pastel",
+      "stops": [
+        "#13060c",
+        "#502f3f",
+        "#975a78",
+        "#d789af",
+        "#ffbcdb",
+        "#fff0f6"
+      ]
+    },
+    {
+      "name": "Mint Cream",
+      "category": "Pastel",
+      "stops": [
+        "#040b02",
+        "#263422",
+        "#46603e",
+        "#6e8f64",
+        "#a2be98",
+        "#dfecdb"
+      ]
+    },
+    {
+      "name": "Peach",
+      "category": "Pastel",
+      "stops": [
+        "#140604",
+        "#532f2e",
+        "#9d5a58",
+        "#df8986",
+        "#febfbc",
+        "#fef0ef"
+      ]
+    },
+    {
+      "name": "Powder Blue",
+      "category": "Pastel",
+      "stops": [
+        "#050a0e",
+        "#323a40",
+        "#5e6f7a",
+        "#8ea4b2",
+        "#bfd1de",
+        "#edf5fa"
+      ]
+    },
+    {
+      "name": "Seafoam",
+      "category": "Pastel",
+      "stops": [
+        "#030c08",
+        "#2b3d36",
+        "#537467",
+        "#7fa999",
+        "#b3d7c8",
+        "#e6f7f0"
+      ]
+    },
+    {
+      "name": "Basalt",
+      "category": "Metal and Stone",
+      "stops": [
+        "#030802",
+        "#131c11",
+        "#263724",
+        "#4b6249",
+        "#8a9e87",
+        "#d9e2d7"
+      ]
+    },
+    {
+      "name": "Copper",
+      "category": "Metal and Stone",
+      "stops": [
+        "#140700",
+        "#5c2b15",
+        "#af5226",
+        "#f68049",
+        "#ffc1a6",
+        "#fff1eb"
+      ]
+    },
+    {
+      "name": "Graphite",
+      "category": "Metal and Stone",
+      "stops": [
+        "#0b080c",
+        "#342f35",
+        "#615662",
+        "#908292",
+        "#bfb2c0",
+        "#ece6ed"
+      ]
+    },
+    {
+      "name": "Sandstone",
+      "category": "Metal and Stone",
+      "stops": [
+        "#0c0900",
+        "#36301f",
+        "#645939",
+        "#94855d",
+        "#c3b591",
+        "#f0e8d5"
+      ]
+    },
+    {
+      "name": "Slate",
+      "category": "Metal and Stone",
+      "stops": [
+        "#000706",
+        "#081615",
+        "#142929",
+        "#2f4b4c",
+        "#70888a",
+        "#ced9da"
+      ]
+    },
+    {
+      "name": "Steel",
+      "category": "Metal and Stone",
+      "stops": [
+        "#07070c",
+        "#22232a",
+        "#444654",
+        "#6a6c7e",
+        "#848595",
+        "#d0d1d9"
+      ]
+    }
+  ]
+}

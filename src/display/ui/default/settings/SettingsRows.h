@@ -144,4 +144,56 @@ lv_obj_t *settingsRowConfirmCreate(SettingsUI &ui, lv_obj_t *parent, const char 
 // Label and value only; not clickable, no controls.
 lv_obj_t *settingsRowInfoCreate(SettingsUI &ui, lv_obj_t *parent, const char *rowName, const char *label);
 
+// ---- swatch ------------------------------------------------------------------
+
+// The colour ramp a swatch row draws is handed to it as samples, left to
+// right, so this file knows nothing about gradients: what a sample means is
+// the caller's business (settingsui::swatchBuildRamp565, GradientSwatch.h,
+// builds the ones the gradient picker uses). One sample per pixel column of
+// the swatch.
+constexpr int kSettingsRowSwatchSamples = 96;
+
+// An action row (a framed row, the whole row is the target, same onActivate
+// protocol) with a colour ramp at its right and a marker dot that says this is the entry
+// currently in force. Built for the gradient picker (gm-nov3.3): a list of
+// sixty gradient names carries no meaning without the colours next to it.
+//
+// The swatch is an lv_canvas over a row-owned RGB565 buffer from LVGL's heap
+// (PSRAM on the device), released with the row. Until
+// settingsRowSetSwatch() is called the swatch is hidden, which is also what a
+// disabled row wants: applyEnabledRecurse dims labels and images by exact
+// class and a canvas is neither, so a row that has no gradient to show hides
+// the swatch rather than dimming it.
+lv_obj_t *settingsRowSwatchCreate(SettingsUI &ui, lv_obj_t *parent, const char *rowName, const char *label,
+                                   SettingsRowActivateFn onActivate, void *user);
+
+// A swatch row that also steps (gm-nov3.32): three targets in one slot, the
+// centre band and a prev and a next arrow. Tapping the band calls onActivate,
+// same as the plain swatch row above; the arrows call onCycle(user, dir) with
+// the choice row's press-and-repeat protocol (once on PRESSED, once per
+// LV_EVENT_LONG_PRESSED_REPEAT, and no fast tier, because ten gradients a
+// second is already fast and a fast tier would skip the one being looked for).
+//
+// The row is laid out like a choice row (gm-3vj.50): prev and next are the
+// choice row's framed 56x56 buttons at x 204 and 264, and the band is a
+// framed target over the hit box left of them, x 0 to 200, so the geometry
+// audit sees the rectangles it already passes there. That leaves the band
+// 120 px narrower than a whole-row target, so its ramp is a 4 px bar under
+// the two text lines rather than a block at its right: the name needs the
+// width more than the ramp does. The marker dot the picker uses has no place
+// here (nothing marks a category row as "in force"), so this kind has none
+// and settingsRowSetSelected is a no-op on it.
+lv_obj_t *settingsRowSwatchStepCreate(SettingsUI &ui, lv_obj_t *parent, const char *rowName, const char *label,
+                                       SettingsRowActivateFn onActivate, SettingsRowCycleFn onCycle, void *user);
+
+// Paints the row's swatch from kSettingsRowSwatchSamples RGB565 samples, or
+// hides it when `ramp` is null. No-op on a row that is not a swatch row.
+// Both swatch kinds take it; a ramp wider or narrower than the row's own
+// canvas is sampled across it.
+void settingsRowSetSwatch(lv_obj_t *row, const uint16_t *ramp);
+
+// Shows or hides the row's marker dot (tagged role "selected", so a test can
+// read which entry a picker page says is in force).
+void settingsRowSetSelected(lv_obj_t *row, bool selected);
+
 #endif // GM_SETTINGS_ROWS_H

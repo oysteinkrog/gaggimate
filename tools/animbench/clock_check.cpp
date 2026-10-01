@@ -40,7 +40,7 @@ constexpr int FRAMES = 40;
 constexpr uint32_t FRAME_MS = 33;
 constexpr int BAND_H = 2; // production band height (BgAnim.h)
 
-const char *const kOnClock[] = {"fireflies", "aurora", "starfield", "ember", "orbits", "steam", "mandala"};
+const char *const kOnClock[] = {"fireflies", "aurora", "starfield", "ember", "orbits", "steam", "mandala", "lava", "silk", "silk2"};
 
 struct Start {
     const char *name;
@@ -78,7 +78,7 @@ std::vector<uint64_t> runFrom(int id, int size, uint32_t t0) {
     if (pid == 0) {
         close(fd[0]);
         const BgAnimation &a = bg_animation(id);
-        uint8_t p[4];
+        uint8_t p[BG_ANIM_PARAMS];
         bg_parse_params(nullptr, id, p);
         if (!a.init(size, size)) {
             _exit(3);

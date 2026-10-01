@@ -28,9 +28,16 @@
 // before indexing with it.
 
 #include <cstddef>
+#include <cstdint>
 #include <functional>
 #include <string>
 #include <vector>
+
+// For BG_ANIM_PARAMS alone, so the parameter-slot count below cannot drift
+// from the one the renderer uses. BgAnim.h is a declarations-only header
+// over <stdint.h>: including it pulls in no animation code and adds nothing
+// for the host test to link.
+#include <display/ui/default/bganim/BgAnim.h>
 
 namespace settingsui {
 
@@ -107,21 +114,70 @@ const char *animationLabel(const AnimationNameProvider &provider, int index);
 
 // ---- gradients --------------------------------------------------------------
 
+// Six RGB stops, dark to bright: the shape bg_theme_stops returns, named so
+// the provider can carry it without spelling the array-pointer type out.
+using ThemeStops = const uint8_t (*)[3];
+
+// Everything a picker needs about the built-in gradients, so that neither the
+// model nor a picker has to link BgAnimThemes.cpp. Both builds wire these to
+// bg_theme_*: that file has no device dependency, so the simulator compiles
+// it too (gm-nov3.3), and the host test wires the same six functions and
+// swaps a fixture table under them (bg_test_set_theme_table).
+//
+// Every accessor but count and name is optional: unset category reads empty,
+// unset categoryCount reads zero, unset stops reads null. That is what an
+// ungrouped, swatchless picker wants, and it is what the older two-field
+// callers get without changing.
 struct ThemeNameProvider {
     std::function<int()> count;
     std::function<const char *(int)> name;
+    // The category one built-in belongs to, indexed the same way as name.
+    std::function<const char *(int)> category;
+    // The declared category list, which is the order a picker groups by. It
+    // is the order of data/gradients.json's categories array, not the order
+    // the gradients happen to first mention a category in, and a category
+    // with no gradients in it is still declared.
+    std::function<int()> categoryCount;
+    std::function<const char *(int)> categoryName;
+    // One built-in's six stops, for a swatch row.
+    std::function<ThemeStops(int)> stops;
 };
 
-// One entry a gradient row can land on: a label to show and the
-// bgAnimThemeMap ref that entry writes ("" for Default/global theme, a
-// decimal built-in theme index, or "c<id>" for a library entry). Built in
-// this fixed order: Default, every built-in theme, every library entry.
+// One entry a gradient row can land on: a label to show, the bgAnimThemeMap
+// ref that entry writes ("" for Default/global theme, a decimal built-in
+// theme index, or "c<id>" for a library entry), and the category the picker
+// groups it under. Built in this fixed order: Default, every built-in theme,
+// every library entry.
+//
+// The category is empty for Default and for a library entry, because neither
+// belongs to one: Default is not a gradient, and a saved gradient is the
+// user's own. A picker puts those two in groups of their own.
 struct GradientChoice {
     std::string label;
     std::string ref;
+    std::string category;
 };
 
 std::vector<GradientChoice> gradientChoices(const ThemeNameProvider &themes, const std::string &library);
+
+// One group of a gradient picker's first page: a name to show and the
+// entries it opens, as indices into the gradientChoices() list above.
+struct GradientGroup {
+    std::string name;
+    std::vector<int> choices;
+};
+
+// The built-in groups a picker lists, in the provider's declared category
+// order. A declared category with no built-ins in it is dropped, because an
+// empty group is a row that opens onto nothing; a built-in whose category is
+// not declared (or is empty) lands in a trailing "Other" group, so every
+// built-in is reachable whatever the table says.
+std::vector<GradientGroup> gradientBuiltinGroups(const ThemeNameProvider &themes,
+                                                 const std::vector<GradientChoice> &choices);
+
+// The saved gradients in the same list, in stored order. Empty when the
+// library is, which is what hides a picker's "My gradients" row.
+std::vector<int> gradientLibraryChoices(const ThemeNameProvider &themes, const std::vector<GradientChoice> &choices);
 // The index in `choices` whose ref matches; 0 (Default) when nothing does,
 // e.g. a map ref naming a library entry that was since deleted.
 int gradientChoiceIndexForRef(const std::vector<GradientChoice> &choices, const std::string &ref);
@@ -130,6 +186,52 @@ int gradientChoiceIndexForRef(const std::vector<GradientChoice> &choices, const 
 // every other slot's text untouched; a map shorter than animId reads as "".
 std::string gradientMapReadRef(const std::string &map, int animId);
 std::string gradientMapWriteRef(const std::string &map, int animId, const std::string &newRef);
+
+// ---- background animation parameters ---------------------------------------
+//
+// bgAnimParams is one string for the whole roster: "p0,p1,...;p0,p1,...;...",
+// one ';'-separated group per animation id, up to kBgAnimParamSlots values of
+// 0 to 100 in each. A missing or short group means "the rest keep the
+// animation's own defaults", so a device that never edited a parameter stores
+// "". The defaults themselves live in the animation registry, which carries
+// the render kernels and so is out of this file's reach; every function below
+// therefore takes them from the caller (BgAnimation::params[i].def on the
+// device, the generated mirror on the simulator).
+//
+// Both the display's Parameters page and the web UI's sliders write this
+// string. They differ on purpose in what they leave behind: the web form
+// repacks every group of every animation (web/src/config/bgAnimations.js,
+// setBgAnimParam), while the writers here touch one group and leave every
+// other group's text exactly as it was, so an edit on the display cannot
+// bake one build's defaults into another animation's slot.
+
+constexpr int kBgAnimParamSlots = BG_ANIM_PARAMS;
+
+// 0 to 100, step 5, fast step 10 after a 2 s hold, no wrap and no unit. A
+// stored value off the step grid (the web UI's slider writes any integer) is
+// what stepValue's grid-snap rule exists for.
+extern const NumericSpec kBgAnimParamSpec;
+
+// Reads animId's group into out[kBgAnimParamSlots], starting from
+// defaults[kBgAnimParamSlots] and overriding from the string, by exactly the
+// rules bg_parse_params() applies on the device. A null `defaults` reads as
+// all zeroes.
+void bgParamsRead(const std::string &packed, int animId, const uint8_t *defaults, uint8_t *out);
+
+// The string with animId's whole group replaced by all kBgAnimParamSlots of
+// `values` (each clamped to 0..100). Groups between the stored end and animId
+// are appended empty; every other group keeps its own text.
+std::string bgParamsWriteGroup(const std::string &packed, int animId, const uint8_t *values);
+
+// The string with one slot of animId's group set to `value`. The group is
+// read through bgParamsRead first, so slots the string did not carry are
+// written at their defaults rather than at zero.
+std::string bgParamsWriteSlot(const std::string &packed, int animId, const uint8_t *defaults, int slot, long value);
+
+// The string with animId's group emptied, which reads back as the defaults.
+// Trailing empty groups are trimmed, so clearing the last group that carried
+// anything returns the whole string to "".
+std::string bgParamsClearGroup(const std::string &packed, int animId);
 
 // ---- palette ----------------------------------------------------------------
 

@@ -19,16 +19,16 @@
 namespace {
 
 // Category registry, in the epic's order. The tile page and openCategory()
-// index into this; production builds carry five tiles, GM_TOUCH_PROBE and
-// GAGGIMATE_SIM builds carry the bench-only Fixture tile (SettingsFixture.cpp)
-// as a sixth.
+// index into this; every firmware build carries five tiles, and only the
+// simulator carries the Fixture tile (SettingsFixture.cpp) as a sixth.
 const SettingsCategoryDef *const kCategories[] = {
     &kCatTemps, &kCatDisplay, &kCatAnimation, &kCatMachine, &kCatStatus,
-#if defined(GM_TOUCH_PROBE) || defined(GAGGIMATE_SIM)
+#if defined(GAGGIMATE_SIM)
     &kCatFixture,
 #endif
 };
 constexpr int kCategoryCount = sizeof(kCategories) / sizeof(kCategories[0]);
+static_assert(kCategoryCount == kSettingsCategoryCount, "kSettingsCategoryCount is out of step with kCategories");
 
 // Keeps a press with the page it started on. Deleting the object under a
 // finger that is still down makes lv_obj_del reset the indev (act_obj goes
@@ -283,29 +283,31 @@ void SettingsUI::pushPage(const SettingsCategoryDef *def, void *ctx) {
     rebuildPage();
 }
 
-void SettingsUI::popPage() {
-    if (pageStack.empty()) {
+void SettingsUI::popPages(int count) {
+    if (pageStack.empty() || count <= 0) {
         return;
     }
     ui_.beginOverlayTransition("settings_pop");
     dropHeldPress();
-    const SettingsCategoryDef *def = pageStack.back().def;
-    void *ctx = pageStack.back().ctx;
-    lv_obj_t *root = pageStack.back().root;
-    pageStack.pop_back();
-    {
-        Settings::Guard guard(controller_.getSettings());
-        if (def->commit) {
-            def->commit(ctx);
+    for (int i = 0; i < count && !pageStack.empty(); i++) {
+        const SettingsCategoryDef *def = pageStack.back().def;
+        void *ctx = pageStack.back().ctx;
+        lv_obj_t *root = pageStack.back().root;
+        pageStack.pop_back();
+        {
+            Settings::Guard guard(controller_.getSettings());
+            if (def->commit) {
+                def->commit(ctx);
+            }
         }
-    }
-    // The page's objects go before the ctx: row DELETE callbacks a category
-    // registered with its ctx as user data run during lv_obj_del.
-    if (root) {
-        lv_obj_del(root);
-    }
-    if (def->destroyCtx && ctx) {
-        def->destroyCtx(ctx);
+        // The page's objects go before the ctx: row DELETE callbacks a
+        // category registered with its ctx as user data run during lv_obj_del.
+        if (root) {
+            lv_obj_del(root);
+        }
+        if (def->destroyCtx && ctx) {
+            def->destroyCtx(ctx);
+        }
     }
     if (pageStack.empty()) {
         buildTilePage();
@@ -367,38 +369,85 @@ void SettingsUI::buildTilePage() {
 }
 
 void SettingsUI::buildTile(lv_obj_t *parent, int index, const SettingsCategoryDef *def, lv_color_t fg) {
-    // Six slots around the panel, avoiding the status icons at the top and
-    // the exit button at the bottom: hand-verified against
-    // the 96x96/12px-edge/56x56-arrow rules in the epic's shared contract
-    // (kTileRadius=145, kSize=96 keeps every corner inside radius 228 with
-    // 15-30 px to spare, and every pair of adjacent tiles at least a few px
-    // apart). Production uses the first five; Fixture (bench/sim only) takes
-    // the sixth.
-    static constexpr int16_t kAngles[6] = {45, 90, 135, 225, 270, 315};
-    static constexpr int kRadius = 145;
+    // One ring, evenly spaced, symmetric about the vertical axis, with the
+    // outermost pair at 135 degrees so the bottom keeps a 90 degree gap for
+    // the exit chevron's clipped hit box. The step is 270/(N-1) degrees and
+    // the index order runs clockwise from the top, so five tiles step 67.5
+    // and put one at the top, six step 54 and leave the top clear. There is
+    // no arrangement of five that is both even and clear of the top, because
+    // an odd count symmetric about the axis must put one tile on it and the
+    // bottom is taken; the owner chose the top on 2026-09-13.
+    //
+    // Measured on the simulator against the 96x96/12px-edge rules in the
+    // epic's shared contract, with the tiles temporarily forced to five: the
+    // top tile's icon clears the status icons (y 20 to 39) by 10 px, the two
+    // lower tiles' captions clear the chevron's 34 px click pad by 15 px, the
+    // nearest pair of tiles is 30 px apart, the nearest pair of caption boxes
+    // 57 px, and the furthest tile corner is 208.8 px from the centre against
+    // the 228 px edge rule. Six tiles pack the same ring tighter, and their
+    // nearest caption boxes are 15 px apart.
+    // The ring is a little tighter when a tile sits on the vertical axis,
+    // because that tile is the one that has to clear the status icons at the
+    // top: pulling it in is what pays for the bigger icons. The even count
+    // leaves the top clear and spends the radius on keeping its tiles apart.
+    static constexpr int kRadius = (kSettingsCategoryCount % 2 == 1) ? 135 : 145;
     static constexpr int kSize = 96;
+    // The 40x40 source icons drawn at 76x76 (256 is 1:1). LV_IMG_SIZE_MODE_REAL
+    // is what makes the flex layout see the drawn size rather than the source
+    // size, so the caption still sits under the icon. The icon is taller than
+    // the room the 96 px tile has under a two-line caption, so it overflows
+    // the tile at both ends, and what limits it is the tile on the axis: at
+    // 76 px its icon clears the status icons by 10 px and the lower tiles'
+    // captions clear the exit chevron's click pad by 15.
+    static constexpr uint16_t kIconZoom = 454;
 
     lv_obj_t *tileObj = lv_obj_create(parent);
     lv_obj_remove_style_all(tileObj);
     lv_obj_set_size(tileObj, kSize, kSize);
-    const double angleRad = kAngles[index % 6] * M_PI / 180.0;
+    // (N+1)/2 positions run clockwise from the top and the rest run back up
+    // the other side; the half step for an even count is what keeps the top
+    // clear when there is no tile to put on the axis.
+    constexpr int kN = kSettingsCategoryCount;
+    constexpr double kStep = 270.0 / (kN - 1);
+    constexpr double kHalfStep = (kN % 2 == 1) ? 0.0 : 0.5;
+    const double slot = (index < (kN + 1) / 2) ? index + kHalfStep : index + kHalfStep - kN;
+    const double angleRad = slot * kStep * M_PI / 180.0;
     const int x = static_cast<int>(lround(sin(angleRad) * kRadius));
     const int y = static_cast<int>(lround(-cos(angleRad) * kRadius));
     lv_obj_align(tileObj, LV_ALIGN_CENTER, x, y);
     lv_obj_clear_flag(tileObj, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(tileObj, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_EVENT_BUBBLE);
+    // The caption is wider than the tile (see below) and LVGL clips children
+    // to the parent's box unless told otherwise, which took the first letter
+    // off "Temperatures". The hit box stays 96x96, which is what the geometry
+    // audit measures; only the drawn caption reaches past it.
+    lv_obj_add_flag(tileObj, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_EVENT_BUBBLE | LV_OBJ_FLAG_OVERFLOW_VISIBLE);
     lv_obj_set_style_bg_opa(tileObj, LV_OPA_TRANSP, LV_PART_MAIN);
     lv_obj_set_flex_flow(tileObj, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_flex_align(tileObj, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
 
     lv_obj_t *icon = lv_img_create(tileObj);
     lv_img_set_src(icon, def->icon);
+    lv_img_set_size_mode(icon, LV_IMG_SIZE_MODE_REAL);
+    lv_img_set_zoom(icon, kIconZoom);
+    // Neither setter refreshes the object's own size, and the icon is sized by
+    // its content, so without this the flex layout goes on reserving 40x40 and
+    // the drawn image spills over the caption.
+    lv_obj_refresh_self_size(icon);
     lv_obj_set_style_img_recolor(icon, fg, LV_PART_MAIN);
     lv_obj_set_style_img_recolor_opa(icon, LV_OPA_COVER, LV_PART_MAIN);
 
     lv_obj_t *caption = lv_label_create(tileObj);
     lv_label_set_text(caption, def->title);
-    lv_obj_set_width(caption, kSize - 4);
+    // Wider than the tile on purpose. At 92 px "Temperatures" does not fit on
+    // a line of its own, and LVGL breaks a word that cannot fit rather than
+    // moving it to the next line, so the top caption read "Temperatur / es &
+    // timing". The caption box reaches 11 px past the tile on each side; the
+    // text is centred, so a short caption draws nowhere near those edges.
+    // Measured on the five-tile ring: no two caption boxes touch and the
+    // closest pair is 64 px apart, which is Temperatures against Display.
+    // Two lines at 16 px is also what fits inside the 96 px tile under the
+    // 55x55 icon, which is why the font went back up from 14 px.
+    lv_obj_set_width(caption, kSize + 22);
     lv_label_set_long_mode(caption, LV_LABEL_LONG_DOT);
     lv_obj_set_style_text_align(caption, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
     lv_obj_set_style_text_font(caption, &lv_font_montserrat_16, LV_PART_MAIN);
@@ -732,7 +781,7 @@ SettingsUI::State SettingsUI::state() const {
 }
 
 SettingsUI::FixtureCounters SettingsUI::fixtureCounters() const {
-#if defined(GM_TOUCH_PROBE) || defined(GAGGIMATE_SIM)
+#if defined(GAGGIMATE_SIM)
     void *liveCtx = (!pageStack.empty() && pageStack.back().def == &kCatFixture) ? pageStack.back().ctx : nullptr;
     return fixtureCountersFor(liveCtx);
 #else

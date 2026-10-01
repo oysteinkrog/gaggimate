@@ -329,6 +329,30 @@
 // its own comment by the #define) on exactly that evidence: correctness is
 // covered on both bodies, speed is not measured on either.
 
+// Parameter pass (gm-3vj.4, 2026-09-10): three params became eight. The five
+// new ones all act in frame() or on the palette, so bandRef(), renderRow(),
+// finalizeSpan() and both hand-written Xtensa kernels are byte for byte what
+// round 7 left; the only edits below band() are the two blob loops reading
+// activeBlobs instead of the constant NUM_BLOBS.
+//
+//   count    (p[3], def 67) how many blobs are live, 2 to 8, 6 at the
+//            default. NUM_BLOBS went 6 -> 8 and the blob loops now run to
+//            activeBlobs, which frame() sets.
+//   core     (p[4], def 50) weight of the t^6 hot-core term, 0 to 1.2, and
+//            exactly the old hard-coded 0.6f at 50. Acts in the LUT build.
+//   falloff  (p[5], def 40) exponent of the radial profile, 1 to 6 in six
+//            steps, 3 at the default. Acts in the LUT build.
+//   contrast (p[6], def 50) palette remap gain, 0.5 to 1.5, identity at 50.
+//            Acts on paletteLUT once per slider move, never per pixel.
+//   wander   (p[7], def 50) scale on the orbit amplitudes, 0 to 2, identity
+//            at 50. Acts on the per-frame blob positions.
+//
+// Every default is bit-exact against the pre-parameter output, checked
+// against this file's three goldens (mean 0.000, max 0). The exactness is not
+// an accident of rounding: each mapping either multiplies by exactly 1.0f,
+// halves 1.2f, or associates its multiplies the way the replaced expression
+// did.
+
 #include "BgAnim.h"
 #include "BgAnimClock.h"
 #include "BgAnimCommon.h"
@@ -359,7 +383,14 @@
 namespace {
 using namespace bganim;
 
-constexpr int NUM_BLOBS = 6;
+// Upper bound on the blob count. The "count" param (p[3]) picks how many of
+// these are live this frame (activeBlobs below, 2 to 8, 6 at the default), so
+// the table has to hold the largest choice. It was a flat 6 before the
+// parameter pass (gm-3vj.4, 2026-09-10); the two extra slots cost 200 B of
+// BSS (BlobDef 72 B + BlobState 28 B each) and nothing per pixel, since the
+// blob loops run to activeBlobs, not to this.
+constexpr int NUM_BLOBS = 8;
+constexpr int DEFAULT_BLOBS = 6; // what every frame rendered before p[3] existed
 // 1/1.6 exactly (1.6 = 8/5, so 1/1.6 = 0.625 = 5/8, exact in binary), folded
 // with the *255 index scale. Used only once per frame now (building
 // lavaLUT in frame()). band() never multiplies by it per pixel.
@@ -418,16 +449,16 @@ constexpr int LUT_SHIFT = FRAC_BITS - LUT_BITS; // 11
 // applied post-scale as an integer min() so overlapping hot blob cores
 // still saturate at the same brightness the original design intended:
 // dither can then still jitter the result below the cap, avoiding a
-// flat/banded look at blob overlaps. Its swing is now one palette step
-// wide rather than +-1 index unit, so a saturated core still dithers.
+// flat/banded look at blob overlaps. Its swing is +-1 index unit, the
+// design's own (see buildDitherLUT), so a saturated core still dithers.
 constexpr int32_t kIndexCap = 255;
 
 struct BlobDef {
     float ax1, ax2, ay1, ay2, px1, px2, py1, py2, cx, cy, R0, Rpulse, phR;
     // Oscillator rates as Q48 turns per millisecond (BgAnimClock.h), so each
     // one keeps its own exact phase however long the device has been up
-    // (gm-yr21). rx1..ry2 run on the speed-scaled clock, rR (the radius
-    // pulse) on wall time, as before.
+    // (gm-yr21). All five run on the one speed-scaled clock, rR (the radius
+    // pulse) included (gm-kh2s).
     uint64_t rx1, rx2, ry1, ry2, rR;
 };
 struct BlobState {
@@ -447,13 +478,23 @@ uint32_t lastThemeGen = 0xFFFFFFFF;
 bool inited = false;
 int allocW = 0; // width fieldRow was sized for
 // Animation time (BgAnimClock.h, gm-yr21). g_clock runs at the speed
-// setting and drives the blob paths; g_wall runs at speed 1 and drives the
-// radius pulse, which never followed the speed setting. Neither is reset by
-// release(), so the full/half switch keeps the motion where it was.
+// setting times the RATE_CAL calibration (frame()) and drives both the blob
+// paths and the radius pulse: one clock for the whole animation (gm-kh2s).
+// It is not reset by release(), so the full/half switch keeps the motion
+// where it was.
 AnimClock g_clock;
-AnimClock g_wall;
 // Blob path rate unit: one 45 s base cycle per animation millisecond.
 constexpr double LAVA_BASE = 6.283185307179586 / 45000.0;
+// How many blobs this frame renders (p[3], 2 to 8). frame() writes it and
+// every blob loop reads it, so a blob past this count is never touched: its
+// blob[] entry keeps whatever the last frame that did use it left there, and
+// no reader looks. Starts at the pre-parameter count so a band() that somehow
+// runs before the first frame() sees the shipped picture rather than zero
+// blobs.
+int activeBlobs = DEFAULT_BLOBS;
+// Last contrast param the palette was built for, so the ramp is remapped only
+// when the user moves the slider. -1 forces the first frame() to rebuild.
+int lastContrastP = -1;
 
 // Precomputed "no blob touched this pixel" row, one per Bayer row phase
 // 0..3, rebuilt only when paletteLUT changes (theme change). A pixel no
@@ -472,20 +513,54 @@ int bgRowAllW = 0;            // width bgRowAll was sized for (mirrors allocW's 
 
 // Rebuilds the four background rows from the current paletteLUT/ditherLUT.
 // Must run after both are populated, and again any time paletteLUT changes
-// (theme change), which now also means rebuilding ditherLUT first, since
-// its amplitude is derived from the palette's step spacing. w is always bgRowAllW: bgRowAll is sized once like fieldRow/allocW,
-// so this never risks writing past the allocation even if a caller's w
-// argument were to differ from the size decided at first init().
-// Amplitude is half the spacing between the palette's RGB565 steps, so the
-// dither cell spans exactly one step. The old fixed 255/128 was +-1 index unit,
-// enough to break lava's own fixed-point index quantization but not the panel's:
-// 9.9% of disc pixels sat on a monotone <=1 LSB staircase at brightness 100,
-// 13.5% at 55. Deriving it gives 2.3% and 2.9%.
+// (theme change). w is always bgRowAllW: bgRowAll is sized once like
+// fieldRow/allocW, so this never risks writing past the allocation even if
+// a caller's w argument were to differ from the size decided at first init().
+//
+// Dither amplitude: one palette index unit, the design's own (the page adds
+// 1/128 of the index range, which is +-1 index, before it rounds). From
+// 2026-08-18 to 2026-09-12 the amplitude was derived from the palette's
+// RGB565 step spacing instead (ditherAmp(), up to 16 index units), on the
+// measurement that a +-1 dither leaves 9.9% of disc pixels on a monotone
+// <=1 LSB staircase at brightness 100 and 13.5% at 55, against 2.3% and
+// 2.9% with the derived amplitude. That grain was visible against the page
+// render the owner approved (gm-pciz: 42k to 70k pixels differed per frame,
+// nearly all of them dither grain), so the device is back on the design's
+// amplitude and the page mirrors this table entry for entry. To trade the
+// staircase for grain again, put ditherAmp(paletteLUT, 256) back here, and
+// mirror it in anim_bench.html's Lava entry (ditherAmpJS exists there).
 void buildDitherLUT() {
-    const float amp = ditherAmp(paletteLUT, 256);
+    const float amp = 1.0f;
     for (int k = 0; k < 16; k++) {
         const float d = (static_cast<float>(BAYER4[k]) - 7.5f) * (amp / 7.5f);
         ditherLUT[k] = static_cast<int32_t>(d >= 0.0f ? d + 0.5f : d - 0.5f);
+    }
+}
+
+// Contrast (p[6]): rewrites the 256-entry palette in place so index i reads
+// the colour that used to sit at 128 + (i - 128) * gain, clamped to the ends.
+// gain > 1 pushes the ramp's dark end darker and its bright end brighter
+// sooner, gain < 1 pulls both toward the middle tone, which lifts the
+// background off the darkest stop. This is the whole of the parameter: the
+// field arithmetic, the LUT, the dither and both band() paths are untouched,
+// and the cost is one 256-entry pass when the slider moves, never per pixel.
+// gain == 1 is a bit-exact no-op and returns without touching anything, so
+// the default palette is the bytes buildThemeRamp() wrote.
+void applyPaletteContrast(float gain) {
+    if (gain == 1.0f) {
+        return;
+    }
+    uint16_t src[256];
+    memcpy(src, paletteLUT, sizeof(src));
+    for (int i = 0; i < 256; i++) {
+        const float f = 128.0f + (static_cast<float>(i) - 128.0f) * gain;
+        int j = static_cast<int>(f + 0.5f);
+        if (j < 0) {
+            j = 0;
+        } else if (j > 255) {
+            j = 255;
+        }
+        paletteLUT[i] = src[j];
     }
 }
 
@@ -503,6 +578,18 @@ void buildBgRows(int w) {
             row[x] = paletteLUT[idx];
         }
     }
+}
+
+// The whole palette chain, in the one order that is valid: the theme ramp
+// first, then the contrast remap on top of it, then the dither amplitude
+// (derived from the remapped ramp's step spacing) and the four background
+// rows (built from both). Called from frame() when the theme generation moves
+// or the contrast slider does.
+void rebuildPalette(float gain) {
+    buildThemeRamp(paletteLUT, 256);
+    applyPaletteContrast(gain);
+    buildDitherLUT();
+    buildBgRows(bgRowAllW);
 }
 
 bool init(int w, int h) {
@@ -579,31 +666,69 @@ bool init(int w, int h) {
             const float m = (w < h ? w : h);
             d.R0 = m * 0.19f;
             d.Rpulse = m * 0.05f;
-            d.rR = oscRateQ48(0.00011 + 0.00003 * i); // rad per wall millisecond
+            d.rR = oscRateQ48(0.00011 + 0.00003 * i); // rad per animation millisecond
             d.phR = ga * 2.7f;
         }
         buildThemeRamp(paletteLUT, 256);
         lastThemeGen = themeGen();
+        // init() takes no params, so the contrast is not knowable here: the
+        // ramp is built unmapped and lastContrastP stays -1, which makes the
+        // first frame() rebuild it through rebuildPalette(). At the default
+        // contrast that rebuild writes exactly these bytes again.
+        lastContrastP = -1;
         buildDitherLUT();       // amplitude follows the ramp just built
         buildBgRows(bgRowAllW); // needs both of the above
     }
     return true;
 }
 
-void frame(uint32_t tMs, int w, int, const uint8_t p[4]) {
+void frame(uint32_t tMs, int w, int, const uint8_t p[BG_ANIM_PARAMS]) {
     // Animation time from the wrapped millis() delta (BgAnimClock.h,
     // gm-yr21). The old t = tMs * omega0 was a float product: it stepped in
     // 32 ms jumps after 3.1 days of uptime, jumped on every speed change and
-    // at the 49.7-day wrap. Speed 50 still gives the 45 s base cycle.
-    g_clock.advance(tMs, speedMul(p[0]));
-    g_wall.advance(tMs, 1.0f);
+    // at the 49.7-day wrap.
+    //
+    // Speed calibration (gm-33fm). The whole clock is multiplied, both the
+    // orbit rate and the radius pulse further down, so the picture sequence
+    // is the one this file always drew and only the pace changes. 4.0 is an
+    // exact binary fraction, so the page's double clock and this float clock
+    // scale by the same amount.
+    //
+    // Speed rides on the whole clock rather than on the orbit rate (gm-kh2s,
+    // 2026-09-12). With the multiplier on the orbit rate alone the blobs
+    // travelled faster while each one still breathed at the rate it has at
+    // Speed 50: the matched-window sweep read 1148 ms of half change time at
+    // Speed 0 against 1417 at Speed 100, where one clock for the whole
+    // animation reads the same number at every setting. speedMul(50) is
+    // exactly 1, so at the default the clock runs at RATE_CAL alone.
+    constexpr float RATE_CAL = 4.0f;
+    g_clock.advance(tMs, RATE_CAL * speedMul(p[0]));
     const float sizeMul = 0.6f + (p[1] / 100.0f);
     const float intensity = 0.5f + (p[2] / 100.0f) * 1.3f;
-    if (themeGen() != lastThemeGen) {
-        buildThemeRamp(paletteLUT, 256);
+    // Blob count (p[3]): 2 at 0, 8 at 100, 6 (the shipped picture) at the
+    // default 67. Only the loop bound changes; blobs 6 and 7 continue the
+    // same golden-angle pattern init() lays down for 0 to 5.
+    activeBlobs = 2 + (static_cast<int>(p[3]) * 6 + 50) / 100;
+    // Hot core (p[4]): weight of the t^6 term that brightens a blob's middle.
+    // 0 at 0, 1.2 at 100, and exactly 0.6f at the default 50 (50/100 is 0.5
+    // exactly and halving 1.2f is exact), which is the constant this file
+    // hard-coded before.
+    const float coreW = p[4] / 100.0f * 1.2f;
+    // Falloff (p[5]): the exponent of the blob's radial profile, 1 at 0 up to
+    // 6 at 100, in six steps, and 3 at the default 40. A low exponent is a
+    // wide soft glow that fills the panel, a high one a tight bright core.
+    const int falloffExp = 1 + (static_cast<int>(p[5]) * 5) / 100;
+    // Contrast (p[6]): palette remap gain, 0.5 at 0 through 1.5 at 100, and
+    // exactly 1.0f at the default 50, where applyPaletteContrast() is a no-op.
+    const float contrastGain = 0.5f + (p[6] / 100.0f);
+    // Wander (p[7]): scale on the orbit amplitudes, 0 at 0 (blobs hold their
+    // centres and only pulse) through 2 at 100, exactly 1.0f at the default
+    // 50, where every multiply below is the identity.
+    const float wander = p[7] / 50.0f;
+    if (themeGen() != lastThemeGen || static_cast<int>(p[6]) != lastContrastP) {
         lastThemeGen = themeGen();
-        buildDitherLUT();
-        buildBgRows(bgRowAllW);
+        lastContrastP = p[6];
+        rebuildPalette(contrastGain);
     }
 
     // Rebuild the tt -> field-contribution LUT for this frame's intensity.
@@ -625,21 +750,37 @@ void frame(uint32_t tMs, int w, int, const uint8_t p[4]) {
         if (tt > 1.0f) {
             tt = 1.0f; // padding entries clamp to the tt=1 (blob-center) value
         }
-        const float t3 = tt * tt * tt;
-        const float contribution = (t3 * intensity + (tt > 0.7f ? t3 * t3 * intensity * 0.6f : 0.0f)) * kFieldScale;
-        // contribution is always >= 0 and its max (tt=1, intensity=1.8,
-        // hot core included) is 459.0: well inside int16_t's range, so
-        // the round-5 narrowing (see file-top comment) loses no precision
-        // versus the old int32_t storage, only bucket resolution (LUT_BITS).
+        // Repeated multiplication, not powf: falloffExp is small, this runs
+        // once per bucket per frame, and at falloffExp == 3 the product
+        // associates exactly as the tt*tt*tt this replaces, so the default
+        // stays bit-exact.
+        float t3 = tt;
+        for (int k = 1; k < falloffExp; k++) {
+            t3 *= tt;
+        }
+        const float contribution = (t3 * intensity + (tt > 0.7f ? t3 * t3 * intensity * coreW : 0.0f)) * kFieldScale;
+        // contribution is always >= 0. Its max is at tt=1 with intensity 1.8
+        // and coreW 1.2: (1.8 + 1.8*1.2) * 159.375 = 631.1, well inside
+        // int16_t's range, so the round-5 narrowing (see file-top comment)
+        // loses no precision versus the old int32_t storage, only bucket
+        // resolution (LUT_BITS). It was 459.0 before the hot-core weight
+        // became a parameter (gm-3vj.4).
         lavaLUT[p2] = static_cast<int16_t>(contribution + 0.5f);
     }
 
-    for (int i = 0; i < NUM_BLOBS; i++) {
+    for (int i = 0; i < activeBlobs; i++) {
         const BlobDef &d = blobDef[i];
         BlobState &b = blob[i];
-        b.bx = d.cx + d.ax1 * fastSinRad(oscRad(g_clock, d.rx1) + d.px1) + d.ax2 * fastSinRad(oscRad(g_clock, d.rx2) + d.px2);
-        b.by = d.cy + d.ay1 * fastCosRad(oscRad(g_clock, d.ry1) + d.py1) + d.ay2 * fastSinRad(oscRad(g_clock, d.ry2) + d.py2);
-        const float R = (d.R0 + d.Rpulse * fastSinRad(oscRad(g_wall, d.rR) + d.phR)) * sizeMul;
+        // The four orbit amplitudes carry the wander scale. At wander == 1
+        // each product is the identity on the value init() stored, so the
+        // default path is bit-exact.
+        const float ax1 = d.ax1 * wander;
+        const float ax2 = d.ax2 * wander;
+        const float ay1 = d.ay1 * wander;
+        const float ay2 = d.ay2 * wander;
+        b.bx = d.cx + ax1 * fastSinRad(oscRad(g_clock, d.rx1) + d.px1) + ax2 * fastSinRad(oscRad(g_clock, d.rx2) + d.px2);
+        b.by = d.cy + ay1 * fastCosRad(oscRad(g_clock, d.ry1) + d.py1) + ay2 * fastSinRad(oscRad(g_clock, d.ry2) + d.py2);
+        const float R = (d.R0 + d.Rpulse * fastSinRad(oscRad(g_clock, d.rR) + d.phR)) * sizeMul;
         b.R2 = R * R;
         b.invR2 = 1.0f / b.R2;
         // Constant curvature of tt(x) = 1 - invR2*((x-bx)^2 + dy^2): the x^2
@@ -755,6 +896,11 @@ void finalizeSpan(uint16_t *out, int lo, int hi, int yPhase) {
 // comment for why.
 void renderRow(uint16_t *out, int y, int w, int yPhase) {
     memset(fieldRow, 0, static_cast<size_t>(w) * sizeof(int32_t));
+    // The loop below runs to activeBlobs, the count p[3] chose this frame,
+    // not to NUM_BLOBS: an unused slot is not visited at all, so the count
+    // costs nothing when it is low and the pixel work is the only thing that
+    // grows when it is high.
+    //
     // Spans of blobs that actually reach this row (dy2 < R2), collected
     // in the same pass that accumulates the field: no extra iteration
     // over blobs. Everywhere outside their union, fieldRow is provably
@@ -764,7 +910,7 @@ void renderRow(uint16_t *out, int y, int w, int yPhase) {
     int spanLo[NUM_BLOBS];
     int spanHi[NUM_BLOBS];
     int nSpans = 0;
-    for (int i = 0; i < NUM_BLOBS; i++) {
+    for (int i = 0; i < activeBlobs; i++) {
         const BlobState &b = blob[i];
         const float dy = y - b.by;
         const float dy2 = dy * dy;
@@ -1153,7 +1299,7 @@ void renderRowAsm(uint16_t *out, int y, int w, int yPhase) {
     int spanLo[NUM_BLOBS];
     int spanHi[NUM_BLOBS];
     int nSpans = 0;
-    for (int i = 0; i < NUM_BLOBS; i++) {
+    for (int i = 0; i < activeBlobs; i++) {
         const BlobState &b = blob[i];
         const float dy = y - b.by;
         const float dy2 = dy * dy;
@@ -1262,6 +1408,10 @@ void release() {
     allocW = 0;
     bgRowAllW = 0;
     lastThemeGen = 0xFFFFFFFF;
+    // Back to the shipped count and to "palette not built for any contrast",
+    // so a re-init starts from the same state a cold boot does.
+    activeBlobs = DEFAULT_BLOBS;
+    lastContrastP = -1;
     inited = false;
 }
 
@@ -1271,7 +1421,14 @@ extern const BgAnimation bg_anim_lava;
 const BgAnimation bg_anim_lava = {
     "lava",
     "Lava",
-    {{"speed", "Speed", 50}, {"scale", "Blob size", 50}, {"glow", "Glow", 60}, {nullptr, nullptr, 0}},
+    {{"speed", "Speed", 50},
+     {"scale", "Blob size", 50},
+     {"glow", "Glow", 60},
+     {"count", "Blob count", 67},
+     {"core", "Hot core", 50},
+     {"falloff", "Falloff", 40},
+     {"contrast", "Contrast", 50},
+     {"wander", "Wander", 50}},
     init,
     frame,
     band,

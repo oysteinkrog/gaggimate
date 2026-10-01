@@ -22,6 +22,10 @@ class GitHubOTA {
     bool isUpdateAvailable(bool = false) const { return false; }
     String getCurrentVersion() const { return _version; }
     void update(bool = true, bool = true) {}
+    // The dev-deploy entry (gm-thg). The simulator has no flash to write, so
+    // it reports the failure the real one reports when there is nowhere to
+    // write: 0 is HTTP_UPDATE_FAILED in HTTPUpdateResult.
+    int updateFromUrl(const String &) { return 0; }
     void setReleaseUrl(const String &) {}
     void setControllerVersion(const String &) {}
 

@@ -138,11 +138,12 @@ struct TextCol {
     lv_obj_t *value;
 };
 
-TextCol buildTextCol(lv_obj_t *parent, const char *labelText, lv_coord_t x, lv_coord_t width, lv_coord_t height) {
+// Shared body for the two buildTextCol overloads below: builds the label
+// and value column without positioning it.
+TextCol buildTextColUnpositioned(lv_obj_t *parent, const char *labelText, lv_coord_t width, lv_coord_t height) {
     lv_obj_t *col = lv_obj_create(parent);
     lv_obj_remove_style_all(col);
     lv_obj_set_size(col, width, height);
-    lv_obj_align(col, LV_ALIGN_LEFT_MID, x, 0);
     lv_obj_clear_flag(col, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_clear_flag(col, LV_OBJ_FLAG_CLICKABLE); // see createRowContainer: lv_obj_create defaults this on
     lv_obj_add_flag(col, LV_OBJ_FLAG_EVENT_BUBBLE);
@@ -175,6 +176,26 @@ TextCol buildTextCol(lv_obj_t *parent, const char *labelText, lv_coord_t x, lv_c
     lv_obj_set_style_text_color(value, fg, LV_PART_MAIN);
 
     return {label, value};
+}
+
+// The height the two lines need with nothing around them, for a caller that
+// puts something else in the same column (the stepping swatch row's ramp bar).
+lv_coord_t textColContentH() {
+    return lv_font_get_line_height(&lv_font_montserrat_18) + lv_font_get_line_height(&lv_font_montserrat_20);
+}
+
+// Left-aligned at x inside a plain (non-flex) row: every stepper, choice,
+// framed and info row.
+TextCol buildTextCol(lv_obj_t *parent, const char *labelText, lv_coord_t x, lv_coord_t width, lv_coord_t height) {
+    TextCol col = buildTextColUnpositioned(parent, labelText, width, height);
+    lv_obj_align(lv_obj_get_parent(col.label), LV_ALIGN_LEFT_MID, x, 0);
+    return col;
+}
+
+// Positioned by the caller's own flex layout instead (the swatch and
+// step-band rows place the column themselves).
+TextCol buildTextCol(lv_obj_t *parent, const char *labelText, lv_coord_t width, lv_coord_t height = SettingsUI::kRowH) {
+    return buildTextColUnpositioned(parent, labelText, width, height);
 }
 
 // Recolours a target and everything drawn inside it: text, icons and
@@ -921,4 +942,310 @@ lv_obj_t *settingsRowInfoCreate(SettingsUI &ui, lv_obj_t *parent, const char *ro
     lv_obj_add_event_cb(
         row, [](lv_event_t *e) { delete[] static_cast<char *>(lv_event_get_user_data(e)); }, LV_EVENT_DELETE, buf);
     return row;
+}
+
+// ---- swatch ------------------------------------------------------------------
+
+namespace {
+
+// The picker row's geometry (gm-nov3.3, framed in gm-3vj.50). The row is a
+// framed row: a 316x52 object in its 320x56 slot whose 312x48 content holds,
+// left to right, the text column, a marker dot that is hidden unless the row
+// is the entry currently in force, and the ramp, one pixel column per sample.
+// The text starts kFramedTextX in, where every framed row's text starts, and
+// the ramp stops kSwatchPadRight short of the frame's inside edge.
+constexpr lv_coord_t kSwatchW = kSettingsRowSwatchSamples;
+constexpr lv_coord_t kSwatchH = 30;
+constexpr lv_coord_t kMarkerSize = 14;
+constexpr lv_coord_t kSwatchGap = 6;
+constexpr lv_coord_t kSwatchPadRight = 6;
+constexpr lv_coord_t kSwatchTextColW =
+    kFramedContentW - kFramedTextX - kSwatchGap - kMarkerSize - kSwatchGap - kSwatchW - kSwatchPadRight; // 176
+
+// The stepping row's geometry (gm-nov3.32, framed in gm-3vj.50). It is a plain
+// row laid out like a choice row: prev and next are the choice row's two
+// framed 56x56 buttons at x 204 and 264, and the band that opens the picker
+// takes the hit box left of them, x 0 to 200 of the slot, 4 px short of prev
+// like every other pair of neighbouring targets. So the audit sees the three
+// rectangles a choice row already passes, plus a band whose left edge is the
+// slot's own (the bottom row's far corner is 222.8 px from the panel centre).
+//
+// The band is a framed target, 196x52 with 192x48 inside its border, and the
+// two text lines need 43 of the 48 (Montserrat 18 and 20, line heights 21 and
+// 22). The ramp bar under them therefore gets 4 px, not the 10 it had before
+// the frame. The bar keeps the picker row's kSettingsRowSwatchSamples columns,
+// so the same ramp drawn on a category row and on a picker row is the same
+// pixels in a row and a check can compare the two widgets directly
+// (test_animation.py's high_id_row_draws_the_chosen_ramp does).
+constexpr lv_coord_t kStepBandHitW = kMinusHitX - kBtnGap;                   // 200
+constexpr lv_coord_t kStepBandW = kStepBandHitW - 2 * kFrameInset;           // 196
+constexpr lv_coord_t kStepBandContentW = kStepBandW - 2 * kFrameBorder;      // 192
+constexpr lv_coord_t kStepBandPadRight = 4;
+constexpr lv_coord_t kStepBandTextW = kStepBandContentW - kFramedTextX - kStepBandPadRight; // 180
+constexpr lv_coord_t kStepBarW = kSwatchW;
+constexpr lv_coord_t kStepBarH = 4;
+
+struct SwatchCtx {
+    char value[kSettingsRowValueCap] = {0};
+    SettingsRowActivateFn onActivate = nullptr;
+    void *user = nullptr;
+    lv_obj_t *canvas = nullptr;
+    lv_obj_t *marker = nullptr;
+    lv_color_t *buf = nullptr;
+    // The canvas this row owns. Both kinds are kSettingsRowSwatchSamples
+    // columns wide; only the height differs, 30 for the picker row's block
+    // and 4 for the stepping row's bar.
+    lv_coord_t canvasW = kSwatchW;
+    lv_coord_t canvasH = kSwatchH;
+    // Only the stepping variant fills these in.
+    SettingsRowCycleFn onCycle = nullptr;
+    RepeatBtn prev;
+    RepeatBtn next;
+};
+
+// Adapts a RepeatBtn onto onCycle, dropping fast, the way choiceStepAdapter
+// does for the choice row: a gradient arrow repeats while held and has no
+// fast tier.
+void swatchStepAdapter(void *userCtx, int dir, bool /*fast*/) {
+    auto *sc = static_cast<SwatchCtx *>(userCtx);
+    if (sc->onCycle != nullptr) {
+        sc->onCycle(sc->user, dir);
+    }
+}
+
+// The tap. Press feedback is the frame's own (makeFramedTarget's
+// framePressEvent recolours the border and the text; a canvas is neither a
+// label nor an image, so the ramp keeps its colours while pressed).
+void swatchEvent(lv_event_t *e) {
+    auto *ctx = static_cast<SwatchCtx *>(lv_event_get_user_data(e));
+    switch (lv_event_get_code(e)) {
+    case LV_EVENT_CLICKED:
+        if (ctx->onActivate != nullptr) {
+            ctx->onActivate(ctx->user);
+        }
+        break;
+    default:
+        break;
+    }
+}
+
+// The event codes the two setters below travel on, allocated once. Same
+// mechanism settingsRowSetLocked uses: a setter that reaches a row through
+// its own event queue needs no pointer into this file's per-kind context.
+lv_event_code_t swatchSetEventCode() {
+    static const lv_event_code_t code = static_cast<lv_event_code_t>(lv_event_register_id());
+    return code;
+}
+
+lv_event_code_t swatchSelectEventCode() {
+    static const lv_event_code_t code = static_cast<lv_event_code_t>(lv_event_register_id());
+    return code;
+}
+
+void swatchApply(SwatchCtx *ctx, const uint16_t *ramp) {
+    if (ctx->canvas == nullptr || ctx->buf == nullptr) {
+        return;
+    }
+    if (ramp == nullptr) {
+        lv_obj_add_flag(ctx->canvas, LV_OBJ_FLAG_HIDDEN);
+        return;
+    }
+    // One sample per column, copied down the rows. lv_color_t is a union over
+    // a 16-bit `full` at LV_COLOR_DEPTH 16, which is the format the samples
+    // already are, so nothing is converted here. Both kinds are as wide as
+    // the ramp today; a canvas of some other width samples across it rather
+    // than indexing it, so a width change cannot read past the ramp's end.
+    for (int x = 0; x < ctx->canvasW; x++) {
+        const int s = ctx->canvasW == kSettingsRowSwatchSamples
+                          ? x
+                          : x * kSettingsRowSwatchSamples / ctx->canvasW;
+        lv_color_t c;
+        c.full = ramp[s];
+        ctx->buf[x] = c;
+    }
+    for (int y = 1; y < ctx->canvasH; y++) {
+        memcpy(&ctx->buf[y * ctx->canvasW], ctx->buf, ctx->canvasW * sizeof(lv_color_t));
+    }
+    lv_obj_clear_flag(ctx->canvas, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_invalidate(ctx->canvas);
+}
+
+// The canvas both swatch kinds draw into, from LVGL's heap (PSRAM on the
+// device): 5.6 kB for a picker row's 96x30 block, 0.8 kB for a stepping
+// row's 96x4 bar, and at most five rows are built at a time. A failed
+// allocation leaves the row without a swatch rather than without a row.
+void swatchBuildCanvas(SettingsUI &ui, lv_obj_t *parent, SwatchCtx *ctx, const char *rowName, lv_color_t fg) {
+    ctx->buf = static_cast<lv_color_t *>(lv_mem_alloc(ctx->canvasW * ctx->canvasH * sizeof(lv_color_t)));
+    if (ctx->buf == nullptr) {
+        return;
+    }
+    ctx->canvas = lv_canvas_create(parent);
+    lv_canvas_set_buffer(ctx->canvas, ctx->buf, ctx->canvasW, ctx->canvasH, LV_IMG_CF_TRUE_COLOR);
+    lv_obj_clear_flag(ctx->canvas, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_flag(ctx->canvas, LV_OBJ_FLAG_EVENT_BUBBLE);
+    lv_obj_add_flag(ctx->canvas, LV_OBJ_FLAG_HIDDEN);
+    lv_canvas_fill_bg(ctx->canvas, fg, LV_OPA_COVER);
+    ui.tag(ctx->canvas, rowName, "swatch");
+}
+
+// settingsRowSetSwatch, settingsRowSetSelected and the row's own teardown,
+// all three addressed to the row container so both kinds answer the same
+// two setters whatever their internal shape is.
+void swatchWireSetters(lv_obj_t *row, SwatchCtx *ctx) {
+    lv_obj_add_event_cb(
+        row,
+        [](lv_event_t *e) {
+            auto *c = static_cast<SwatchCtx *>(lv_event_get_user_data(e));
+            swatchApply(c, static_cast<const uint16_t *>(lv_event_get_param(e)));
+        },
+        swatchSetEventCode(), ctx);
+    lv_obj_add_event_cb(
+        row,
+        [](lv_event_t *e) {
+            auto *c = static_cast<SwatchCtx *>(lv_event_get_user_data(e));
+            if (c->marker == nullptr) {
+                return;
+            }
+            if (*static_cast<const bool *>(lv_event_get_param(e))) {
+                lv_obj_clear_flag(c->marker, LV_OBJ_FLAG_HIDDEN);
+            } else {
+                lv_obj_add_flag(c->marker, LV_OBJ_FLAG_HIDDEN);
+            }
+        },
+        swatchSelectEventCode(), ctx);
+    lv_obj_add_event_cb(
+        row,
+        [](lv_event_t *e) {
+            auto *c = static_cast<SwatchCtx *>(lv_event_get_user_data(e));
+            // obj_del_core sends this before it deletes the row's children
+            // (lv_obj_tree.c), so the canvas still points at this buffer for
+            // the rest of the deletion. Nothing draws in between: the whole
+            // deletion runs inside one lv_obj_del call on the UI task.
+            c->canvas = nullptr;
+            c->marker = nullptr;
+            lv_mem_free(c->buf);
+            delete c;
+        },
+        LV_EVENT_DELETE, ctx);
+}
+
+} // namespace
+
+lv_obj_t *settingsRowSwatchCreate(SettingsUI &ui, lv_obj_t *parent, const char *rowName, const char *label,
+                                   SettingsRowActivateFn onActivate, void *user) {
+    const lv_color_t fg = themeFg();
+
+    // A framed row, like the action row it stands in for: the row object is
+    // the target and the frame. Its children are laid out by flex inside the
+    // frame's content area.
+    lv_obj_t *row = createFramedRow(ui, parent);
+    lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_left(row, kFramedTextX, LV_PART_MAIN);
+    lv_obj_set_style_pad_right(row, kSwatchPadRight, LV_PART_MAIN);
+    lv_obj_set_style_pad_column(row, kSwatchGap, LV_PART_MAIN);
+
+    auto *ctx = new SwatchCtx();
+    ctx->onActivate = onActivate;
+    ctx->user = user;
+
+    TextCol col = buildTextCol(row, label, kSwatchTextColW, kFramedContentH);
+    ui.tag(col.value, rowName, "value", ctx->value);
+
+    // An indicator, not a target, so it is filled rather than outlined. It
+    // has no border and is not a label or an image, so neither the press
+    // recolour nor a disabled row's dimming touches it.
+    ctx->marker = lv_obj_create(row);
+    lv_obj_remove_style_all(ctx->marker);
+    lv_obj_set_size(ctx->marker, kMarkerSize, kMarkerSize);
+    lv_obj_clear_flag(ctx->marker, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_clear_flag(ctx->marker, LV_OBJ_FLAG_CLICKABLE); // see createRowContainer
+    lv_obj_add_flag(ctx->marker, LV_OBJ_FLAG_EVENT_BUBBLE);
+    lv_obj_add_flag(ctx->marker, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_set_style_radius(ctx->marker, LV_RADIUS_CIRCLE, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(ctx->marker, fg, LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(ctx->marker, LV_OPA_COVER, LV_PART_MAIN);
+    ui.tag(ctx->marker, rowName, "selected");
+
+    swatchBuildCanvas(ui, row, ctx, rowName, fg);
+
+    lv_obj_add_event_cb(row, swatchEvent, LV_EVENT_ALL, ctx);
+    swatchWireSetters(row, ctx);
+    // Role "action", like every other whole-row target, so rows_on_page() and
+    // the geometry audit see one framed row here and not a second kind.
+    ui.tag(row, rowName, "action");
+    return row;
+}
+
+lv_obj_t *settingsRowSwatchStepCreate(SettingsUI &ui, lv_obj_t *parent, const char *rowName, const char *label,
+                                       SettingsRowActivateFn onActivate, SettingsRowCycleFn onCycle, void *user) {
+    const lv_color_t fg = themeFg();
+
+    // A plain row, like the choice row: the container is no target, and its
+    // three targets are each framed on their own.
+    lv_obj_t *row = createRowContainer(parent);
+
+    auto *ctx = new SwatchCtx();
+    ctx->onActivate = onActivate;
+    ctx->onCycle = onCycle;
+    ctx->user = user;
+    ctx->canvasW = kStepBarW;
+    ctx->canvasH = kStepBarH;
+
+    // The band opens the picker. A row-wide target laid over the arrows would
+    // be two targets in one place, which Rig.audit() rejects (gm-nov3.3's
+    // reason for taking the arrows off, which this shape answers rather than
+    // reverses).
+    lv_obj_t *band = lv_obj_create(row);
+    lv_obj_remove_style_all(band);
+    lv_obj_set_size(band, kStepBandW, kFramedRowH);
+    lv_obj_set_pos(band, kFrameInset, kFrameInset);
+    lv_obj_clear_flag(band, LV_OBJ_FLAG_SCROLLABLE);
+    makeFramedTarget(ui, band);
+    lv_obj_set_flex_flow(band, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(band, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+    lv_obj_set_style_pad_left(band, kFramedTextX, LV_PART_MAIN);
+    lv_obj_set_style_pad_right(band, kStepBandPadRight, LV_PART_MAIN);
+
+    TextCol col = buildTextCol(band, label, kStepBandTextW, textColContentH());
+    ui.tag(col.value, rowName, "value", ctx->value);
+
+    swatchBuildCanvas(ui, band, ctx, rowName, fg);
+
+    lv_obj_t *prevBtn = buildRowButton(ui, row, kMinusHitX, &img_angle_left_40x40);
+    ctx->prev = {swatchStepAdapter, ctx, -1, 0};
+    wireRepeatBtn(prevBtn, &ctx->prev);
+    ui.tag(prevBtn, rowName, "prev");
+
+    lv_obj_t *nextBtn = buildRowButton(ui, row, kPlusHitX, &img_angle_right_40x40);
+    ctx->next = {swatchStepAdapter, ctx, +1, 0};
+    wireRepeatBtn(nextBtn, &ctx->next);
+    ui.tag(nextBtn, rowName, "next");
+
+    lv_obj_add_event_cb(band, swatchEvent, LV_EVENT_ALL, ctx);
+    // The setters and the teardown stay on the row container: a caller holds
+    // the row, and settingsRowSetSwatch/settingsRowSetValue address it.
+    swatchWireSetters(row, ctx);
+    // Role "action" on the row container, as on the plain swatch row, so
+    // rows_on_page() counts one row here and a caller that taps the row's
+    // centre still lands on the band (the band's hit box is x 0 to 200 of the
+    // slot, and the centre is x 160). The container is not clickable, so the
+    // audit sees three targets on this row: the band and the two arrows.
+    ui.tag(row, rowName, "action");
+    ui.tag(band, rowName, "open");
+    return row;
+}
+
+void settingsRowSetSwatch(lv_obj_t *row, const uint16_t *ramp) {
+    if (row == nullptr) {
+        return;
+    }
+    lv_event_send(row, swatchSetEventCode(), const_cast<uint16_t *>(ramp));
+}
+
+void settingsRowSetSelected(lv_obj_t *row, bool selected) {
+    if (row == nullptr) {
+        return;
+    }
+    lv_event_send(row, swatchSelectEventCode(), &selected);
 }

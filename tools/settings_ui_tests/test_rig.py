@@ -28,7 +28,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 REPO_ROOT = os.path.abspath(os.path.join(HERE, "..", ".."))
 sys.path.insert(0, REPO_ROOT)
 
-from tools.settings_ui_tests import Rig, RigHTTPError, Sim, color_hex, num, schedules, seconds  # noqa: E402
+from tools.settings_ui_tests import Rig, Sim, color_hex, num, schedules, seconds  # noqa: E402
 from tools.settings_ui_tests.fixtures import Venue  # noqa: E402
 from tools.settings_ui_tests.rig import object_name  # noqa: E402
 
@@ -158,21 +158,23 @@ def check_tap_opens_menu(rig):
 
 def check_device_only_routes_unavailable(rig):
     """/api/debug/anim and /api/debug/synth are compiled only for the real
-    LilyGo panel (WebUIPlugin.cpp guards the whole block with
-    !GAGGIMATE_HEADLESS && !GAGGIMATE_SIM). Both fall through to the sim's
-    static/SPA handler on this build (200, the web UI bundle, not JSON),
-    which get_json() turns into a clean RigHTTPError instead of a raw decode
-    exception; this confirms that path, not the routes themselves (those
-    are the leader's device runs)."""
-    for name, call in (
-        ("anim", rig.anim),
-        ("synth", lambda: rig.synth(0)),
+    LilyGo panel (the real-panel block of WebUIPluginDebug.cpp, which
+    GAGGIMATE_SIM and GAGGIMATE_HEADLESS exclude). On this build both fall
+    through to WebUIPlugin.cpp's onNotFound, which rewrites any URL outside
+    /assets/ to index.html, so each answers exactly what GET / answers.
+    That match is what rig.route_absent() establishes, and it is what is
+    checked here: the routes themselves are the leader's device runs.
+
+    It used to be enough for the call to raise RigHTTPError. That exception
+    covers every HTTP status and every socket error, so a route that was
+    registered and answered 500, or answered 200 with a body that is not
+    JSON, passed as absent (gm-nov3.29)."""
+    for name, path in (
+        ("anim", "/api/debug/anim"),
+        ("synth", "/api/debug/synth?brew=0"),
     ):
-        try:
-            call()
-            check(rig, "%s_unavailable_on_sim" % name, False, "unexpectedly returned JSON")
-        except RigHTTPError as e:
-            check(rig, "%s_unavailable_on_sim" % name, True, str(e))
+        absent, detail = rig.route_absent(path)
+        check(rig, "%s_unavailable_on_sim" % name, absent, detail)
 
 
 def check_settingsui_state(rig):

@@ -246,6 +246,7 @@ void Settings::setSteamFillTime(int steam_fill_time) { steamFillTime.set(steam_f
 void Settings::setSmartGrindActive(bool smart_grind_active) { smartGrindActive.set(smart_grind_active); }
 void Settings::setScaleMenuButton(bool scale_menu_button) { scaleMenuButton.set(scale_menu_button); }
 void Settings::setBgAnimId(int bg_anim_id) { bgAnimId.set(bg_anim_id); }
+void Settings::setBgAnimStandbyId(int bg_anim_standby_id) { bgAnimStandbyId.set(bg_anim_standby_id); }
 void Settings::setBgAnimParams(const String &bg_anim_params) { assign(this->bgAnimParams, bg_anim_params); }
 void Settings::setBgAnimAllScreens(bool bg_anim_all_screens) { bgAnimAllScreens.set(bg_anim_all_screens); }
 void Settings::setBgAnimTheme(int bg_anim_theme) { bgAnimTheme.set(bg_anim_theme); }
@@ -289,6 +290,7 @@ void Settings::setPanelClockDiv(int panel_clock_div) { panelClockDiv.set(panel_c
 void Settings::setPanelVcom(int panel_vcom) { panelVcom.set(panel_vcom < 0 ? 0 : (panel_vcom > 127 ? 127 : panel_vcom)); }
 void Settings::setBgAnimCustomTheme(const String &bg_anim_custom_theme) { assign(this->bgAnimCustomTheme, bg_anim_custom_theme); }
 void Settings::setBgAnimGradients(const String &bg_anim_gradients) { assign(this->bgAnimGradients, bg_anim_gradients); }
+void Settings::setBgAnimGradientRef(const String &bg_anim_gradient_ref) { assign(this->bgAnimGradientRef, bg_anim_gradient_ref); }
 void Settings::setBgAnimThemeMap(const String &bg_anim_theme_map) { assign(this->bgAnimThemeMap, bg_anim_theme_map); }
 
 void Settings::setSmartGrindIp(String smart_grind_ip) { assign(this->smartGrindIp, smart_grind_ip); }

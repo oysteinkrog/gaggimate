@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
-"""Scenario for the Animation settings category (gm-flw.9): animation, frame
-rate, all-screens, theme, gradient, plates, plate colour/opacity, element
-tint/colour and text scrim, all eleven rows live. Built on
+"""Scenario for the Animation settings category (gm-flw.9): animation, the
+standby screen's own animation (gm-3vj.49), frame rate, all-screens, theme,
+gradient, plates, plate colour/opacity, element tint/colour and text scrim,
+every value row live, plus the Parameters child page the Parameters row
+pushes (gm-3vj.2) and the gradient picker the three gradient rows push
+(gm-nov3.3). Built on
 tools/settings_ui_tests/rig.py (gm-flw.16); runs against the desktop
 simulator by default (pio run -e display-sim) and against a loadtest device
 with --host.
@@ -30,24 +33,54 @@ REPO_ROOT = os.path.abspath(os.path.join(HERE, "..", ".."))
 sys.path.insert(0, REPO_ROOT)
 
 from tools.settings_ui_tests import Rig, Sim  # noqa: E402
+from tools.settings_ui_tests.gradients_gen import (  # noqa: E402
+    GRADIENT_CATEGORIES,
+    GRADIENT_CATEGORY_OF,
+    GRADIENT_NAMES as THEME_NAMES,
+)
+# The gradient-swatch oracle (gm-nov3.33, gm-nov3.38) lives in its own module
+# so tools/picker_device_checks.py, a standalone device script, can read it
+# without depending on this scenario file. Reused here rather than redefined.
+from tools.settings_ui_tests.swatch import (  # noqa: E402
+    BG_THEME_LEGACY_CUSTOM,
+    builtin_stops,
+    custom_theme_valid,
+    global_stops,
+    hex_rgb,
+    legacy_builtin,
+    library_entries,
+    stops_for_ref,
+    swatch_matches_stops,
+    toned_stops,
+)
 
 DEFAULT_PROGRAM = os.path.join(REPO_ROOT, ".pio", "build", "display-sim", "program")
 
-# Mirrors of the two firmware tables CatAnimation.cpp itself keeps a mirror
-# of (see that file's comment): BgAnimRegistry.cpp's REGISTRY order
-# (animation display names) and BgAnimThemes.cpp's THEMES order (built-in
-# gradient names). Both compile only outside GAGGIMATE_SIM, so there is no
-# device route this script could read them from instead; verified against
-# the same source at HEAD 2b87cb88. A change to either real table needs the
-# same edit made in three places now (BgAnimRegistry.cpp/BgAnimThemes.cpp,
-# CatAnimation.cpp's sim mirror, and this list) -- flagged to the epic lead.
+# THEME_NAMES above is BgAnimThemes.cpp's THEMES order (the built-in gradient
+# names), generated from data/gradients.json by scripts/gen_gradients.py along
+# with the firmware and web tables, so the runner cannot drift from what the
+# display shows. tools/animbench make check fails on a stale copy.
+#
+# ANIM_NAMES below is still hand written: it mirrors BgAnimRegistry.cpp's
+# REGISTRY order (animation display names), which CatAnimation.cpp also keeps
+# a mirror of (see that file's comment). REGISTRY compiles only outside
+# GAGGIMATE_SIM, so there is no device route this script could read it from
+# instead.
+#
+# ANIM_NAMES was regenerated from the real structs at HEAD 096292af
+# (gm-3vj.2), along with CatAnimation.cpp's own mirror. It had drifted twice
+# over: 14 names against a roster of 44, and eight of the names it did carry
+# were the pre-rename ones ("Brushed Metal" for "Brushed", and so on). A
+# change to the real roster still needs the same edit made in three places
+# (the Anim*.cpp structs, CatAnimation.cpp's mirror and this list) --
+# flagged to the epic lead, with the note that generating the last two from
+# the first is a few lines of Python.
 ANIM_NAMES = [
-    "Plasma", "Lava", "Silk", "Starfield", "Aurora", "Ripples", "Caustics", "Mandala",
-    "Orbits", "Fireflies", "Steam", "Ember", "Nebula", "Silk 2",
-]
-THEME_NAMES = [
-    "Espresso", "Ocean", "Violet Dusk", "Forest", "Sunset", "Fire", "Ice", "Mono", "Rose", "Gold", "Aurora", "Cyber",
-    "Ember Coal", "Deep Space", "Teal Reef", "Sakura", "Lime", "Arctic Night",
+    "Plasma", "Lava", "Silk", "Starfield", "Aurora", "Ripples", "Caustics", "Mandala", "Orbits",
+    "Fireflies", "Steam", "Ember", "Nebula", "Silk 2", "Brushed", "Horizon", "Oculus", "Chevrons",
+    "Mosaic", "Saddle", "Refraction", "Sundial", "Crescent", "Glint", "Tunnel", "Kaleido", "Shafts",
+    "Weave", "Lens", "Tide", "Truchet", "Quilt", "Rain", "Stripes", "Ribbon", "Harmonograph",
+    "Floor", "Hills", "Gyroid", "Barrel", "Grid", "Cells", "Dimples", "Cube",
 ]
 THEME_MODE_LABELS = ["Dark", "Light"]
 PLATES_LABELS = ["Keep", "Hide", "Custom"]
@@ -58,11 +91,12 @@ PALETTE = [
     ("Cyan", 0x00FFFF), ("Teal", 0x008080), ("Green", 0x00FF00), ("Black", 0x000000),
 ]
 
-# The fifteen fields CatAnimation.cpp writes; the "visit changes nothing
+# The sixteen fields CatAnimation.cpp writes; the "visit changes nothing
 # writes nothing" check compares these, byte for byte, before and after a
 # no-op visit.
 ANIMATION_FIELDS = [
-    "bgAnimId", "bgAnimFps", "bgAnimAllScreens", "themeMode", "bgAnimThemeMap", "bgAnimClearPlates",
+    "bgAnimId", "bgAnimStandbyId", "bgAnimFps", "bgAnimAllScreens", "themeMode", "bgAnimThemeMap",
+    "bgAnimClearPlates",
     "bgAnimPlateColor", "bgAnimPlateOpacity", "elementTintEnabled", "elementTintColor", "bgAnimScrim",
     "bgFadeOutMs", "bgFadeInMs", "bgFadeCurve", "bgAnimInterlace",
 ]
@@ -79,6 +113,7 @@ CHECKBOX_KEYS = {
 }
 
 FAILURES = []
+SKIPPED = []
 TOTAL = 0
 
 
@@ -89,6 +124,14 @@ def check(rig, name, cond, detail=""):
     if not cond:
         FAILURES.append((name, detail))
     return cond
+
+
+def skip(rig, name, reason):
+    """Records a check that refused to run, by name and reason. Same shape
+    as test_temps.py's. A check that quietly does nothing reads as a pass
+    in the counts, so every refusal here is counted and printed."""
+    rig.log("skip", name=name, reason=reason)
+    SKIPPED.append((name, reason))
 
 
 def run_check(rig, name, fn):
@@ -119,30 +162,70 @@ def map_write_ref(theme_map, anim_id, ref):
     return ";".join(parts)
 
 
+def gradient_name_for_ref(settings, ref):
+    """The name the display shows for one ref: a decimal index names a
+    built-in, "cN" names a saved gradient, and anything that resolves to
+    neither returns None. Library refs really do resolve on the simulator
+    since gm-nov3.3: BgAnimThemes.cpp compiles on the host now, so the sim
+    runs the same gradient rules the device does."""
+    ref = str(ref or "")
+    if ref == "":
+        return None
+    if ref.startswith("c"):
+        if not ref[1:].isdigit():
+            return None
+        wanted = int(ref[1:])
+        for entry_id, name, _gradient in library_entries(settings.get("bgAnimGradients", "")):
+            if entry_id == wanted:
+                return name
+        return None
+    if not ref.isdigit():
+        return None
+    idx = int(ref)
+    return THEME_NAMES[idx] if 0 <= idx < len(THEME_NAMES) else None
+
+
+def expected_global_gradient_text(settings):
+    """The Gradient all row's value: bgAnimGradientRef when it names something
+    that exists, else what the legacy pair resolves to. The legacy integer goes
+    through the frozen namespace rather than indexing THEME_NAMES directly, so
+    a stored 18 reads as the retained custom gradient the way the display reads
+    it (CatAnimation.cpp, globalGradientLabel) instead of naming the built-in
+    that lands at index 18."""
+    name = gradient_name_for_ref(settings, settings.get("bgAnimGradientRef", ""))
+    if name is not None:
+        return name
+    builtin = legacy_builtin(int(settings["bgAnimTheme"]),
+                             custom_theme_valid(settings.get("bgAnimCustomTheme", "")))
+    if builtin < 0:
+        return "Custom (legacy)"
+    return THEME_NAMES[builtin] if 0 <= builtin < len(THEME_NAMES) else THEME_NAMES[0]
+
+
 def expected_gradient_text(settings, anim_id=None):
     """Python mirror of gradientChoices()/gradientChoiceIndexForRef() plus
-    CatAnimation.cpp's "Default (<name>)" formatting, for the built-in-theme
-    and Default cases only. Returns None for a library ref ("cN"): this
-    script never creates a library entry, so it never needs to resolve
-    one."""
+    CatAnimation.cpp's "Global (<name>)" formatting. Returns None for a
+    library ref ("cN"): this script never creates a library entry, so it
+    never needs to resolve one."""
     if anim_id is None:
         anim_id = int(settings["bgAnimId"])
-    ref = map_ref(settings["bgAnimThemeMap"], anim_id)
-    if ref == "":
-        theme_idx = int(settings["bgAnimTheme"])
-        name = THEME_NAMES[theme_idx] if 0 <= theme_idx < len(THEME_NAMES) else THEME_NAMES[0]
-        return "Default (%s)" % name
-    if ref.startswith("c"):
-        return None
-    try:
-        idx = int(ref)
-    except ValueError:
-        idx = -1
-    if 0 <= idx < len(THEME_NAMES):
-        return THEME_NAMES[idx]
-    theme_idx = int(settings["bgAnimTheme"])
-    name = THEME_NAMES[theme_idx] if 0 <= theme_idx < len(THEME_NAMES) else THEME_NAMES[0]
-    return "Default (%s)" % name
+    name = gradient_name_for_ref(settings, map_ref(settings["bgAnimThemeMap"], anim_id))
+    if name is not None:
+        return name
+    # No override, or one naming something this build cannot resolve: the row
+    # names the global rather than saying "Default" and leaving the reader to
+    # find out where the default lives.
+    return "Global (%s)" % expected_global_gradient_text(settings)
+
+
+def expected_standby_text(settings):
+    """Python mirror of CatAnimation.cpp's clampStandbyAnimId plus
+    standbyChoiceLabel: the Standby anim row shows "Same" for -1 and for any
+    id outside the roster, and the animation's name otherwise."""
+    stored = int(settings["bgAnimStandbyId"])
+    if stored < 0 or stored >= len(ANIM_NAMES):
+        return "Same"
+    return ANIM_NAMES[stored]
 
 
 def expected_palette_text(color_int):
@@ -154,6 +237,16 @@ def expected_palette_text(color_int):
 
 def hex_to_int(hex_str):
     return int(hex_str.lstrip("#"), 16)
+
+
+def web_save_available(rig):
+    """Whether web_save() can run against this venue: it POSTs
+    /api/settings, and that is the simulator's stand-in for a browser and
+    is never done by hand against the bench board (CLAUDE.md: the response
+    carries the WiFi password in clear text and the web UI is its only
+    safe writer)."""
+    host = rig.host
+    return host == "127.0.0.1" or host.startswith("127.0.0.1:")
 
 
 def web_save(rig, overrides):
@@ -169,10 +262,13 @@ def web_save(rig, overrides):
     that /api/settings is never POSTed by hand against the real device, and
     this is the one place in this package that does POST it, on the
     simulator only, standing in for the browser that does not exist here.
+
+    A check that needs this asks web_save_available() before it changes
+    anything, so the refusal cannot arrive half way through a fixture that
+    the check then has no way to put back.
     """
-    host = rig.host
-    if not (host == "127.0.0.1" or host.startswith("127.0.0.1:")):
-        raise RuntimeError("web_save needs the web UI on this host (%r is not the simulator's loopback)" % host)
+    if not web_save_available(rig):
+        raise RuntimeError("web_save needs the web UI on this host (%r is not the simulator's loopback)" % rig.host)
     current = rig.settings()
     current.update(overrides)
     form = {}
@@ -222,61 +318,435 @@ def goto_page(rig, page):
     return rig.touchmap(screen=0)
 
 
+class AmbiguousRowName(AssertionError):
+    """A visible row name that more than one row of the open list carries.
+
+    Raised rather than resolved (gm-nov3.34). Every tag on a page is built
+    from the row's name, so a helper handed a repeated name has no way to
+    tell which row the caller meant, and the first row is not a safer guess
+    than any other: with two saved gradients both called "Custom", taking
+    the first made a check about the second read, tap and mark the first and
+    pass. A caller that means one of them addresses it by its position in
+    the list, which is unique where the name is not."""
+
+    def __init__(self, name, places):
+        self.name = name
+        self.places = list(places)
+        super().__init__(
+            "row name %r is carried by %d rows of this list (%s); address one by index instead"
+            % (name, len(self.places),
+               ", ".join("index %d on page %d" % (index, page) for page, index in self.places)))
+
+
+def raises_ambiguity(call):
+    """Whether `call` refused a repeated row name, as (raised, detail). Any
+    other exception is a failure with its type and message as the detail,
+    so a helper that breaks for an unrelated reason does not read as a
+    refusal."""
+    try:
+        call()
+    except AmbiguousRowName as e:
+        return True, str(e)
+    except Exception as e:  # noqa: BLE001 -- reported as the check's detail
+        return False, "raised %s: %s" % (type(e).__name__, e)
+    return False, "returned without raising"
+
+
+def list_rows(rig):
+    """Every row of the list on top, across all its pages, as
+    (page, index, slot_index, name) tuples in page order, with the dumps
+    they were read from.
+
+    `index` counts from the first row of the first page, so it is the row's
+    position in the list the user sees, and that position is what addresses
+    one of two rows sharing a name. `slot_index` is its position within its
+    own page, which is what Rig.row_slots indexes.
+
+    Every page is turned to, because a duplicate can sit on any of them: a
+    sweep that stopped at the first match is how the second "Custom" of the
+    repeated-name fixture became unreachable (gm-nov3.34). The shell is left
+    on the last page; row_place() and row_at() turn back."""
+    pages = int(rig.settingsui_state().get("pages", 1))
+    rows, dumps = [], {}
+    index = 0
+    for page in range(pages):
+        dump = goto_page(rig, page)
+        dumps[page] = dump
+        for slot_index, name in enumerate(rig.rows_on_page(dump)):
+            rows.append((page, index, slot_index, name))
+            index += 1
+    return rows, dumps
+
+
+def _turn_to_row(rig, page, slot_index, dumps, what):
+    """The (dump, slot) of one row from a list_rows() sweep, with the shell
+    turned back to its page. The sweep's own dump is reused when the shell
+    is still on that page (it is, for the last page of every sweep)."""
+    dump = dumps.get(page) if int(rig.settingsui_state().get("page", -1)) == page else None
+    if dump is None:
+        dump = goto_page(rig, page)
+    slots = rig.row_slots(dump)
+    if slot_index >= len(slots):
+        raise AssertionError("%s was slot %d of page %d during the sweep and that page now holds %d rows"
+                             % (what, slot_index, page, len(slots)))
+    return dump, slots[slot_index]
+
+
+def row_place(rig, name):
+    """The one row called `name` as (dump, slot, index), with the shell left
+    on its page. Raises AmbiguousRowName when the list holds more than one
+    row of that name, and AssertionError when it holds none."""
+    rows, dumps = list_rows(rig)
+    hits = [r for r in rows if r[3] == name]
+    if not hits:
+        raise AssertionError("no row %r on any of the %d pages; the list holds %r"
+                             % (name, len({p for p, _i, _s, _n in rows}), [n for _p, _i, _s, n in rows]))
+    if len(hits) > 1:
+        raise AmbiguousRowName(name, [(p, i) for p, i, _s, _n in hits])
+    page, index, slot_index, _n = hits[0]
+    dump, slot = _turn_to_row(rig, page, slot_index, dumps, "row %r" % name)
+    return dump, slot, index
+
+
+def row_at(rig, index):
+    """The row at list position `index` as (dump, slot), with the shell left
+    on its page. The address a repeated name cannot give."""
+    rows, dumps = list_rows(rig)
+    for page, i, slot_index, _name in rows:
+        if i == index:
+            return _turn_to_row(rig, page, slot_index, dumps, "row index %d" % index)
+    raise AssertionError("no row at index %d; the list holds %d rows" % (index, len(rows)))
+
+
+def page_with_row(rig, name):
+    """Turns to the page carrying the row called `name` and returns its dump.
+    Addressed by name rather than by page number because this category's rows
+    move across page boundaries whenever one is added: gm-3vj.2's Parameters
+    row pushed five of them onto the next page and made a fourth page. The
+    audit table (audit_pages.py) still pins the exact per-page row lists, so
+    nothing here has to.
+
+    Every page is searched, not just pages up to the first hit, and a name
+    two rows carry raises AmbiguousRowName (gm-nov3.34). It used to return
+    the first page holding the name, so with the two "Custom" entries of the
+    repeated-name fixture on different pages the second one could not be
+    reached at all: every helper that goes through here landed on the first
+    one's page and then read, tapped or marked that row instead."""
+    return row_place(rig, name)[0]
+
+
+def tap_row(rig, name, role):
+    """Turns to the page carrying the row called `name` and taps its `role`
+    control ("next", "prev", "plus", "minus", "toggle", "action"). Two rows
+    this scenario alternates between, Animation and Gradient, are on
+    different pages since gm-3vj.2."""
+    dump = page_with_row(rig, name)
+    target = rig.find_tag(dump, name, role)
+    if target is None:
+        raise AssertionError("row %r has no %r control on its page" % (name, role))
+    rig.tap_target(target)
+
+
 def close_animation(rig):
     rig.settingsui(close=1)
     rig.wait_until(lambda: rig.settingsui_state().get("open") is False, timeout=5)
 
 
 # ---------------------------------------------------------------------------
+# The gradient picker (gm-nov3.3)
+#
+# The three gradient rows are whole-row targets that push a two-level picker:
+# a page of groups (Global, My gradients, the built-in categories) and, under
+# each, the gradients in it. Choosing one applies it and stays on the page
+# with the marker moved (gm-nov3.31), so browsing is one tap per gradient;
+# the exit chevron pops one level and chooses nothing. picker_choose below
+# wraps the pair, because every check here wants one choice and then the page
+# underneath.
+
+
+def depth(rig):
+    return int(rig.settingsui_state().get("depth", 0))
+
+
+def rows_across_pages(rig):
+    """Every row on the page currently on top, across all its pages, in page
+    order. The picker's group and gradient lists run past five rows.
+
+    Repeated names are kept, one entry per row, the way Rig.rows_on_page
+    reports them. This used to drop a name it had already seen, which on
+    the library list meant two saved gradients called "Custom" read as one
+    row and the list read one entry short."""
+    rows, _dumps = list_rows(rig)
+    return [name for _page, _index, _slot, name in rows]
+
+
+def open_picker(rig, row):
+    """Taps one of the three gradient rows and waits for the picker's first
+    page. Returns its dump."""
+    dump = page_with_row(rig, row)
+    # The band gm-nov3.32 left as the picker's own target, or the whole-row
+    # target for a row that is still plain. Not the row container: its centre
+    # is x 239, which is inside the band only while the band spans x 80 to
+    # 279 (SettingsRows.cpp says so in as many words). Narrow the band and the
+    # tap lands in the gap or on an arrow, and the failure would be a timeout
+    # waiting for a page that never opened, saying nothing about why.
+    target = rig.find_tag(dump, row, "open") or rig.find_tag(dump, row, "action")
+    if target is None:
+        raise AssertionError("row %r offers neither an open band nor a whole-row target" % row)
+    before = depth(rig)
+    rig.tap_target(target)
+    rig.wait_until(lambda: depth(rig) == before + 1, timeout=5)
+    return rig.touchmap(screen=0)
+
+
+def picker_tap_slot(rig, dump, slot, what):
+    """Taps the whole-row target of one picker row, addressed by its slot.
+    `what` names the row in the failure message."""
+    target = rig.find_in_row(dump, slot, "action")
+    if target is None:
+        raise AssertionError("picker row %s offers no whole-row target" % what)
+    rig.tap_target(target)
+    return rig.touchmap(screen=0)
+
+
+def picker_tap(rig, name):
+    """Turns to the picker page carrying `name` and taps it. Returns the dump
+    of whatever is on screen afterwards.
+
+    The row is taken from its slot rather than from find_tag, and a name two
+    rows carry raises AmbiguousRowName (gm-nov3.34): both rows carry the tag
+    "<name>/action", so tapping the second of them by name was impossible and
+    asking for it tapped the first without saying so. picker_tap_at() is the
+    address that works on a repeated name."""
+    dump, slot, _index = row_place(rig, name)
+    return picker_tap_slot(rig, dump, slot, repr(name))
+
+
+def picker_tap_at(rig, index):
+    """The same tap, by the row's position in the list across its pages."""
+    dump, slot = row_at(rig, index)
+    return picker_tap_slot(rig, dump, slot, "at index %d" % index)
+
+
+def picker_choose(rig, group, name, index=None):
+    """Opens a group, chooses one gradient in it, and leaves the picker, so
+    the caller is back on the page that opened it.
+
+    Choosing no longer pops by itself (gm-nov3.31): a pick applies and stays
+    on the page so that trying the next gradient is one tap. The chevron is
+    what leaves, so this helper taps it on the way out, once per level. Every
+    caller here wants one choice and then the page underneath, which is what
+    it did before; a check that wants to see the picker still open after a
+    pick drives the taps itself.
+
+    `index` chooses the row at that position in the list instead of the one
+    called `name`, which is the only way to reach one of two rows sharing a
+    name; `name` is then only what the failure messages say.
+
+    The marker is checked by position (gm-nov3.34). This used to wait on
+    `name in picker_selected_rows(rig)`, and with two library rows called
+    "Custom" a marker landing on the wrong one satisfied that membership: the
+    helper returned having confirmed the row it had not chosen, and ten
+    checks reach here. The wait now asks for the marker on the row that was
+    tapped and on no other row."""
+    before = depth(rig)
+    picker_tap(rig, group)
+    rig.wait_until(lambda: depth(rig) == before + 1, timeout=5)
+    if index is None:
+        dump, slot, index = row_place(rig, name)
+        picker_tap_slot(rig, dump, slot, repr(name))
+    else:
+        picker_tap_at(rig, index)
+    # The marker lands on the tapped row in the same UI pass that applies the
+    # pick, so waiting for it is waiting for the write as well.
+    rig.wait_until(lambda: picker_selected_slots(rig) == [index], timeout=5)
+    picker_cancel(rig)
+    picker_cancel(rig)
+    rig.wait_until(lambda: depth(rig) == before - 1, timeout=5)
+
+
+def picker_cancel(rig):
+    """The exit chevron: pops one level without choosing."""
+    dump = rig.touchmap(screen=0)
+    target = rig.find_tag(dump, "exit", "exit")
+    if target is None:
+        raise AssertionError("no exit chevron on the picker page")
+    before = depth(rig)
+    rig.tap_target(target)
+    rig.wait_until(lambda: depth(rig) == before - 1, timeout=5)
+
+
+def picker_selected(rig):
+    """The picker rows whose marker dot is showing, across all pages of the
+    page on top, as (index, name) pairs in page order. `index` is the row's
+    position in the list, the way list_rows() counts.
+
+    Walked by position rather than looked up by name (gm-nov3.33). Every tag
+    on a page is built from the row's name, so find_tag handed back the first
+    row of a repeated name whichever row was asked for: with two entries both
+    called "Custom" and the second one selected, this reported no marked row
+    at all, and reported the first one as marked when the second was. Rig
+    keeps rows_on_page and row_slots in the same order, so zipping them names
+    the row a slot belongs to."""
+    pages = int(rig.settingsui_state().get("pages", 1))
+    marked = []
+    index = 0
+    for page in range(pages):
+        dump = goto_page(rig, page)
+        for name, slot in zip(rig.rows_on_page(dump), rig.row_slots(dump)):
+            if slot_marked(rig, dump, slot):
+                marked.append((index, name))
+            index += 1
+    return marked
+
+
+def picker_selected_rows(rig):
+    """The marked picker rows by name, in page order.
+
+    Names, so on a repeated name this says one row of that name is marked and
+    not which one: the 19 checks that read it compare against a name they
+    expect. A check about which of two rows sharing a name is marked reads
+    picker_selected_slots() instead, and so does picker_choose."""
+    return [name for _index, name in picker_selected(rig)]
+
+
+def picker_selected_slots(rig):
+    """The marked picker rows by list position, in page order. The address
+    that stays true on a repeated name (gm-nov3.34)."""
+    return [index for index, _name in picker_selected(rig)]
+
+
+def swatch_strip(rig, dump, row=None, data=None, slot=None):
+    """The row's swatch as a list of RGB triples, read straight out of the
+    full-resolution framebuffer along the middle of the canvas. None when
+    the row has no visible swatch. `data` reuses a framebuffer already read.
+
+    The row is found among the dumped page's own row containers, so `row` has
+    to name exactly one of them: a name two rows carry raises
+    AmbiguousRowName (gm-nov3.34). It used to go through find_tag, which
+    reads the first row of a repeated name whichever one was asked for, so
+    both "Custom" rows of the repeated-name fixture reported the first one's
+    swatch and a check that a row draws its own gradient could not fail.
+    `slot` reads the swatch of one row of the dump by position, from
+    Rig.row_slots, which is how a repeated name is addressed.
+
+    Rig.fb() is what reads it, so a body shorter than the X-FB-Size header
+    promised raises with both byte counts instead of being sampled. That
+    used to matter on a device: /api/debug/fb returned 4,800 of 460,800
+    bytes at step 1 (gm-6ivh, fixed in 28cec8ec), and reading a swatch out
+    of the five rows that arrived would have been a narrower sample with
+    nothing to say so."""
+    if slot is None:
+        if row is None:
+            raise AssertionError("swatch_strip needs a row name or a slot")
+        slots = rig.row_slots(dump)
+        hits = [s for s in slots if rig.tag_row(s) == row]
+        if len(hits) > 1:
+            # Slot numbers within the dumped page, which is the only address
+            # this signature has: the caller brought the dump, not the list.
+            page = int(rig.settingsui_state().get("page", -1))
+            raise AmbiguousRowName(row, [(page, i) for i, s in enumerate(slots) if rig.tag_row(s) == row])
+        if not hits:
+            return None
+        slot = hits[0]
+    obj = rig.find_in_row(dump, slot, "swatch")
+    if obj is None or obj.get("h"):
+        return None
+    if data is None:
+        _w, _h, data = rig.fb(step=1)
+    y = (obj["y1"] + obj["y2"]) // 2
+    return [rgb565_pixel(data, x, y) for x in range(obj["x1"], obj["x2"] + 1)]
+
+
+def check_swatch(rig, name, strip, stops):
+    """One swatch identity check: the strip is there and it is the ramp
+    `stops` describes. A missing swatch fails with that as the detail rather
+    than raising, because a ref the resolver refuses is drawn as no canvas at
+    all (gm-nov3.15) and that is a result worth reporting, not a crash."""
+    if strip is None:
+        check(rig, name, False, "no swatch on the row")
+        return False
+    ok, detail = swatch_matches_stops(strip, stops)
+    check(rig, name, ok, detail)
+    return ok
+
+
+# ---------------------------------------------------------------------------
 # Checks
 
 
+def all_row_values(rig):
+    """Every row value on every page of the open category, keyed by row name,
+    plus the per-page dumps. One sweep, so no check has to know which page a
+    row landed on (they move whenever a row is added)."""
+    pages = int(rig.settingsui_state().get("pages", 1))
+    values, dumps = {}, []
+    for page in range(pages):
+        dump = goto_page(rig, page)
+        dumps.append((page, dump))
+        for o in dump["objects"]:
+            tag = o.get("tag") or ""
+            if tag.endswith("/value"):
+                val = o.get("val")
+                values[tag[: -len("/value")]] = val if val is not None else o.get("t")
+    return values, dumps
+
+
 def check_rows_match_settings(rig):
-    """Acceptance: the eleven rows show the stored values as GET
-    /api/settings reports them, across all three pages, without a
-    renderer (the model's animation/gradient/palette logic is host code)."""
+    """Acceptance: every row shows the stored value as GET /api/settings
+    reports it, across all four pages, without a renderer (the model's
+    animation/gradient/palette logic is host code)."""
     s = rig.settings()
-    d0 = open_animation(rig)
-    check(rig, "row_animation", rig.row_value(d0, "Animation") == ANIM_NAMES[int(s["bgAnimId"])],
-          "%r vs bgAnimId=%s" % (rig.row_value(d0, "Animation"), s["bgAnimId"]))
-    check(rig, "row_frame_rate", rig.row_value(d0, "Frame rate") == "%d fps" % int(s["bgAnimFps"]),
-          rig.row_value(d0, "Frame rate"))
-    check(rig, "row_all_screens", rig.row_value(d0, "All screens") == ("On" if s["bgAnimAllScreens"] else "Off"),
-          rig.row_value(d0, "All screens"))
-    check(rig, "row_theme", rig.row_value(d0, "Theme") == THEME_MODE_LABELS[int(s["themeMode"])],
-          rig.row_value(d0, "Theme"))
+    open_animation(rig)
+    v, dumps = all_row_values(rig)
+    check(rig, "row_animation", v["Animation"] == ANIM_NAMES[int(s["bgAnimId"])],
+          "%r vs bgAnimId=%s" % (v["Animation"], s["bgAnimId"]))
+    # The Parameters row names the animation whose parameters it opens, so it
+    # tracks the row above it (CatAnimation.cpp).
+    check(rig, "row_parameters", v["Parameters"] == ANIM_NAMES[int(s["bgAnimId"])],
+          "%r vs bgAnimId=%s" % (v["Parameters"], s["bgAnimId"]))
+    # "Same" for -1 or for an id past the end of this build's roster, the
+    # animation's name otherwise (CatAnimation.cpp, clampStandbyAnimId).
+    check(rig, "row_standby_anim", v["Standby anim"] == expected_standby_text(s),
+          "%r vs bgAnimStandbyId=%s" % (v["Standby anim"], s["bgAnimStandbyId"]))
+    check(rig, "row_frame_rate", v["Frame rate"] == "%d fps" % int(s["bgAnimFps"]), v["Frame rate"])
+    check(rig, "row_all_screens", v["All screens"] == ("On" if s["bgAnimAllScreens"] else "Off"), v["All screens"])
+    check(rig, "row_theme", v["Theme"] == THEME_MODE_LABELS[int(s["themeMode"])], v["Theme"])
     exp_grad = expected_gradient_text(s)
-    if exp_grad is not None:
-        check(rig, "row_gradient", rig.row_value(d0, "Gradient") == exp_grad,
-              "%r vs %r" % (rig.row_value(d0, "Gradient"), exp_grad))
+    check(rig, "row_gradient", v["Gradient"] == exp_grad, "%r vs %r" % (v["Gradient"], exp_grad))
+    exp_all = expected_global_gradient_text(s)
+    check(rig, "row_gradient_all", v["Gradient all"] == exp_all, "%r vs %r" % (v["Gradient all"], exp_all))
+    # The standby rows are live only while the standby animation is a
+    # different one; the same id on both means one animation with one set of
+    # parameters, and both rows say so (CatAnimation.cpp, refreshStandbyRows).
+    standby = int(s["bgAnimStandbyId"])
+    separate = 0 <= standby < len(ANIM_NAMES) and standby != int(s["bgAnimId"])
+    if separate:
+        check(rig, "row_standby_params", v["Standby params"] == ANIM_NAMES[standby],
+              "%r vs bgAnimStandbyId=%s" % (v["Standby params"], s["bgAnimStandbyId"]))
+        exp_sgrad = expected_gradient_text(s, standby)
+        check(rig, "row_standby_gradient", v["Standby grad"] == exp_sgrad,
+              "%r vs %r" % (v["Standby grad"], exp_sgrad))
     else:
-        rig.log("row_gradient_skipped", reason="library ref not reachable on the simulator")
+        check(rig, "row_standby_params", v["Standby params"] == "Same as main", v["Standby params"])
+        check(rig, "row_standby_gradient", v["Standby grad"] == "Same as main", v["Standby grad"])
 
-    d1 = goto_page(rig, 1)
-    check(rig, "row_plates", rig.row_value(d1, "Plates") == PLATES_LABELS[int(s["bgAnimClearPlates"])],
-          rig.row_value(d1, "Plates"))
-    check(rig, "row_plate_colour", rig.row_value(d1, "Plate colour") == expected_palette_text(hex_to_int(s["bgAnimPlateColor"])),
-          rig.row_value(d1, "Plate colour"))
-    check(rig, "row_plate_opacity", rig.row_value(d1, "Plate opacity") == "%d %%" % int(s["bgAnimPlateOpacity"]),
-          rig.row_value(d1, "Plate opacity"))
-    check(rig, "row_element_tint", rig.row_value(d1, "Element tint") == ("On" if s["elementTintEnabled"] else "Off"),
-          rig.row_value(d1, "Element tint"))
-    check(rig, "row_tint_colour", rig.row_value(d1, "Tint colour") == expected_palette_text(hex_to_int(s["elementTintColor"])),
-          rig.row_value(d1, "Tint colour"))
+    check(rig, "row_plates", v["Plates"] == PLATES_LABELS[int(s["bgAnimClearPlates"])], v["Plates"])
+    check(rig, "row_plate_colour", v["Plate colour"] == expected_palette_text(hex_to_int(s["bgAnimPlateColor"])),
+          v["Plate colour"])
+    check(rig, "row_plate_opacity", v["Plate opacity"] == "%d %%" % int(s["bgAnimPlateOpacity"]), v["Plate opacity"])
+    check(rig, "row_element_tint", v["Element tint"] == ("On" if s["elementTintEnabled"] else "Off"),
+          v["Element tint"])
+    check(rig, "row_tint_colour", v["Tint colour"] == expected_palette_text(hex_to_int(s["elementTintColor"])),
+          v["Tint colour"])
 
-    d2 = goto_page(rig, 2)
-    check(rig, "row_text_scrim", rig.row_value(d2, "Text scrim") == "%d %%" % int(s["bgAnimScrim"]),
-          rig.row_value(d2, "Text scrim"))
-    check(rig, "row_fade_out", rig.row_value(d2, "Fade out") == "%d ms" % int(s["bgFadeOutMs"]),
-          rig.row_value(d2, "Fade out"))
-    check(rig, "row_fade_in", rig.row_value(d2, "Fade in") == "%d ms" % int(s["bgFadeInMs"]),
-          rig.row_value(d2, "Fade in"))
-    check(rig, "row_fade_curve", rig.row_value(d2, "Fade curve") == FADE_CURVE_LABELS[int(s["bgFadeCurve"])],
-          rig.row_value(d2, "Fade curve"))
-    check(rig, "row_interlace", rig.row_value(d2, "Interlace") == ("On" if int(s["bgAnimInterlace"]) else "Off"),
-          rig.row_value(d2, "Interlace"))
+    check(rig, "row_text_scrim", v["Text scrim"] == "%d %%" % int(s["bgAnimScrim"]), v["Text scrim"])
+    check(rig, "row_fade_out", v["Fade out"] == "%d ms" % int(s["bgFadeOutMs"]), v["Fade out"])
+    check(rig, "row_fade_in", v["Fade in"] == "%d ms" % int(s["bgFadeInMs"]), v["Fade in"])
+    check(rig, "row_fade_curve", v["Fade curve"] == FADE_CURVE_LABELS[int(s["bgFadeCurve"])], v["Fade curve"])
+    check(rig, "row_interlace", v["Interlace"] == ("On" if int(s["bgAnimInterlace"]) else "Off"), v["Interlace"])
 
-    for page, dump in ((0, d0), (1, d1), (2, d2)):
+    for page, dump in dumps:
         a = rig.audit(dump)
         check(rig, "audit_page_%d_clean" % page, len(a["violations"]) == 0, repr(a["violations"]))
 
@@ -287,11 +757,97 @@ def check_no_op_visit(rig):
     """Acceptance: a visit that changes nothing writes nothing."""
     before = {k: rig.settings()[k] for k in ANIMATION_FIELDS}
     open_animation(rig)
-    goto_page(rig, 1)
-    goto_page(rig, 2)
+    for page in range(1, int(rig.settingsui_state().get("pages", 1))):
+        goto_page(rig, page)
     close_animation(rig)
     after = {k: rig.settings()[k] for k in ANIMATION_FIELDS}
     check(rig, "no_op_visit_writes_nothing", before == after, "before=%r after=%r" % (before, after))
+
+
+def standby_choice(anim_id):
+    """The row's cycle position for a stored id: 0 is "Same", n is animation
+    n - 1 (CatAnimation.cpp, standbyChoiceIndex)."""
+    return 0 if anim_id < 0 else anim_id + 1
+
+
+def standby_id_for_choice(choice):
+    return -1 if choice <= 0 else choice - 1
+
+
+def standby_step(anim_id, direction):
+    """One tap of the row's next/prev arrow, over "Same" plus the roster."""
+    count = len(ANIM_NAMES) + 1
+    return standby_id_for_choice((standby_choice(anim_id) + direction) % count)
+
+
+def standby_label(anim_id):
+    return "Same" if anim_id < 0 else ANIM_NAMES[anim_id]
+
+
+def check_standby_anim(rig):
+    """Acceptance (gm-3vj.49): the Standby anim row cycles through "Same" and
+    then every animation, writes bgAnimStandbyId live, leaves bgAnimId alone,
+    and its value survives closing and reopening the category. The rule the
+    value drives (the standby screen playing that animation instead of the
+    main one) is a render-path effect and is not observable here: the
+    simulator has no renderer and no /api/debug/anim route (see "Not
+    verified" at the bottom of this file)."""
+    s0 = rig.settings()
+    stored0 = int(s0["bgAnimStandbyId"])
+    anim_id0 = int(s0["bgAnimId"])
+    # The row shows "Same" for a stored id outside the roster, so the value
+    # the arrows step from is the clamped one, not the raw stored one.
+    start = stored0 if 0 <= stored0 < len(ANIM_NAMES) else -1
+
+    open_animation(rig)
+    d = page_with_row(rig, "Standby anim")
+    check(rig, "standby_row_initial_text", rig.row_value(d, "Standby anim") == standby_label(start),
+          "%r vs stored %d" % (rig.row_value(d, "Standby anim"), stored0))
+
+    # Two taps forward: one crosses the "Same"/first-animation boundary from
+    # wherever the fixture starts, the second lands on a name either way.
+    expect = start
+    for step in (1, 2):
+        expect = standby_step(expect, +1)
+        btn = rig.find_tag(page_with_row(rig, "Standby anim"), "Standby anim", "next")
+        if btn is None:
+            check(rig, "standby_next_found", False, "no next arrow on the Standby anim row")
+            close_animation(rig)
+            return
+        rig.tap_target(btn)
+        got = int(rig.settings()["bgAnimStandbyId"])
+        check(rig, "standby_live_write_%d" % step, got == expect, "got %d want %d" % (got, expect))
+        d = page_with_row(rig, "Standby anim")
+        check(rig, "standby_row_value_%d" % step, rig.row_value(d, "Standby anim") == standby_label(expect),
+              "%r want %r" % (rig.row_value(d, "Standby anim"), standby_label(expect)))
+
+    check(rig, "standby_leaves_main_anim_alone", int(rig.settings()["bgAnimId"]) == anim_id0,
+          "bgAnimId %r want %d" % (rig.settings()["bgAnimId"], anim_id0))
+
+    for page, dump in all_row_values(rig)[1]:
+        a = rig.audit(dump)
+        check(rig, "standby_audit_page_%d_clean" % page, len(a["violations"]) == 0, repr(a["violations"]))
+
+    # Persistence: close the category, reopen it, and the row reads back the
+    # value the taps wrote rather than the one the visit opened on.
+    close_animation(rig)
+    persisted = int(rig.settings()["bgAnimStandbyId"])
+    check(rig, "standby_persists_after_close", persisted == expect, "got %d want %d" % (persisted, expect))
+    open_animation(rig)
+    d = page_with_row(rig, "Standby anim")
+    check(rig, "standby_row_after_reopen", rig.row_value(d, "Standby anim") == standby_label(expect),
+          "%r want %r" % (rig.row_value(d, "Standby anim"), standby_label(expect)))
+
+    # Restore, through the UI: two taps back the way they came. A stored id
+    # outside the roster cannot be put back this way (the row cannot show
+    # it), so that case is reported rather than forced.
+    for _ in range(2):
+        tap_row(rig, "Standby anim", "prev")
+    close_animation(rig)
+    final = int(rig.settings()["bgAnimStandbyId"])
+    check(rig, "standby_restored", final == start, "got %d want %d" % (final, start))
+    if final != stored0:
+        rig.log("could_not_restore", bgAnimStandbyId=final, was=stored0)
 
 
 def check_frame_rate_live_and_precedence(rig):
@@ -305,7 +861,10 @@ def check_frame_rate_live_and_precedence(rig):
     delta = -5 if direction == "minus" else 5
     fps1_expected = max(5, min(60, fps0 + delta))
 
-    d0 = open_animation(rig)
+    open_animation(rig)
+    # Frame rate moved off page 0 when the gradient and standby rows landed;
+    # find it by name, the way every other row in this file is found.
+    d0 = page_with_row(rig, "Frame rate")
     btn = rig.find_tag(d0, "Frame rate", direction)
     if btn is None:
         check(rig, "frame_rate_button_found", False, "no %r button tagged Frame rate" % direction)
@@ -317,21 +876,42 @@ def check_frame_rate_live_and_precedence(rig):
     d0b = rig.touchmap(screen=0)
     check(rig, "frame_rate_row_value", rig.row_value(d0b, "Frame rate") == "%d fps" % fps1, rig.row_value(d0b, "Frame rate"))
 
-    try:
+    if web_save_available(rig):
         fps_web = next(c for c in (40, 45, 50, 55, 20, 25, 15, 10) if c not in (fps0, fps1))
-        web_save(rig, {"bgAnimFps": fps_web})
-        check(rig, "web_save_landed", int(rig.settings()["bgAnimFps"]) == fps_web,
-              "got %r want %d" % (rig.settings()["bgAnimFps"], fps_web))
+        # bgAnimFps is a live field the open category restores within a UI
+        # pass (gm-nov3.39), so it cannot confirm its own POST. A field of the
+        # same form that no row of this category writes does: the document
+        # goes in one batchUpdate, so the witness arriving proves the request
+        # was accepted and applied (settings_ui_tests/README.md, "Confirming
+        # a web save landed").
+        bright0 = int(rig.settings()["bgAnimBrightness"])
+        bright_web = next(c for c in (95, 90, 85, 80) if c != bright0)
+        web_save(rig, {"bgAnimFps": fps_web, "bgAnimBrightness": bright_web})
+        landed = rig.wait_until(lambda: int(rig.settings()["bgAnimBrightness"]) == bright_web, timeout=6)
+        check(rig, "web_save_landed", bool(landed),
+              "witness bgAnimBrightness got %r want %d" % (rig.settings()["bgAnimBrightness"], bright_web))
+
+        # Before the pop: reconciliation has to put this visit's value back
+        # into the field the panel reads. After the pop commit has written it,
+        # so a version that reconciled nothing would pass either way.
+        live = rig.wait_until(lambda: int(rig.settings()["bgAnimFps"]) == fps1, timeout=6)
+        check(rig, "touched_field_live_before_pop", bool(live),
+              "expected %d before the pop, got %r (web posted %d)"
+              % (fps1, rig.settings()["bgAnimFps"], fps_web))
 
         rig.settingsui(pop=1)
         ok = rig.wait_until(lambda: int(rig.settings()["bgAnimFps"]) == fps1, timeout=6)
         check(rig, "touched_field_precedence", bool(ok), "expected %d after pop, got %r" % (fps1, rig.settings()["bgAnimFps"]))
-    except RuntimeError as e:
-        rig.log("touched_field_precedence_skipped", reason=str(e))
+        web_save(rig, {"bgAnimBrightness": bright0})
+        rig.wait_until(lambda: int(rig.settings()["bgAnimBrightness"]) == bright0, timeout=6)
+    else:
+        skip(rig, "touched_field_precedence",
+             "the interfering save is a web save, and web_save runs on the simulator only")
         rig.settingsui(pop=1)
 
     # Restore fps0 through the UI, never by POST.
-    d = open_animation(rig)
+    open_animation(rig)
+    d = page_with_row(rig, "Frame rate")
     current = int(rig.settings()["bgAnimFps"])
     if current != fps0:
         restore_dir = "minus" if current > fps0 else "plus"
@@ -355,7 +935,10 @@ def check_theme_recolor(rig):
     proves."""
     s0 = rig.settings()
     mode0 = int(s0["themeMode"])
-    d = open_animation(rig)
+    open_animation(rig)
+    # Theme moved off page 0 when the Standby anim row was added (gm-3vj.49),
+    # so the row is reached by name, like every other row this file touches.
+    d = page_with_row(rig, "Theme")
     row = rig.find_tag(d, "Theme", "row")
     if row is None:
         check(rig, "theme_row_found", False)
@@ -364,15 +947,18 @@ def check_theme_recolor(rig):
     x1, y1, x2, y2 = row["hit"]
     points = [(x1 + int((x2 - x1) * f), (y1 + y2) // 2) for f in (0.3, 0.5, 0.7)]
 
-    fb_before = rig.get_bytes("/api/debug/fb?step=1")
-    colors_before = [rgb565_pixel(fb_before, x, y) for x, y in points]
+    # step=2 (240x240) by choice, not by necessity: three pixels are read
+    # out of it, and every step is whole since gm-6ivh. A quarter of the
+    # bytes for the same three samples, with the coordinates halved.
+    _w, _h, fb_before = rig.fb(step=2)
+    colors_before = [rgb565_pixel(fb_before, x // 2, y // 2, w=240) for x, y in points]
 
     next_btn = rig.find_tag(d, "Theme", "next")
     rig.tap_target(next_btn)
     rig.wait_until(lambda: int(rig.settings()["themeMode"]) != mode0, timeout=2)
     time.sleep(0.5)  # one more rerender pass for applyTheme()'s change_color_theme + the page's own rebuildPage
-    fb_after = rig.get_bytes("/api/debug/fb?step=1")
-    colors_after = [rgb565_pixel(fb_after, x, y) for x, y in points]
+    _w, _h, fb_after = rig.fb(step=2)
+    colors_after = [rgb565_pixel(fb_after, x // 2, y // 2, w=240) for x, y in points]
 
     check(rig, "theme_mode_flipped", int(rig.settings()["themeMode"]) == (1 - mode0))
     check(rig, "theme_recolor_pixels_changed", any(a != b for a, b in zip(colors_before, colors_after)),
@@ -385,127 +971,1208 @@ def check_theme_recolor(rig):
     close_animation(rig)
 
 
-def check_gradient_default_and_builtin(rig):
-    """Acceptance: choosing a gradient writes bgAnimThemeMap's entry for the
-    current animation only; Default clears it. The library half of this
-    criterion (a real library entry, created through the web UI first) is
-    not run here: this scenario never POSTs a library by hand, only
-    through web_save's documented, narrow use above. The built-in-theme
-    half exercises the same map-write code path."""
+def library_row_index(settings, ref):
+    """The position of a "cN" ref in the My gradients list, or None when the
+    library holds no such entry. The picker lists the library in stored
+    order, so an entry's place in library_entries() is its row's place in
+    the list, and that is the address a repeated name cannot give
+    (gm-nov3.34)."""
+    if not str(ref).startswith("c") or not str(ref)[1:].isdigit():
+        return None
+    wanted = int(str(ref)[1:])
+    for index, (entry_id, _name, _gradient) in enumerate(library_entries(settings.get("bgAnimGradients", ""))):
+        if entry_id == wanted:
+            return index
+    return None
+
+
+def pick_ref(rig, row, settings, ref):
+    """Chooses `ref` through the picker opened from `row`: "" taps Global on
+    the first page, a decimal index opens its category, "cN" opens My
+    gradients. Used both to make a choice and to put one back.
+
+    A "cN" ref is chosen by its position in the library, not by the name it
+    resolves to (gm-nov3.34). Saved gradient names are whatever the user
+    typed, so two entries can carry one name, and restoring the second of
+    them by name silently selected the first. Built-in names are unique (60
+    of 60, generated from data/gradients.json), so a built-in is still
+    chosen by name."""
+    open_picker(rig, row)
+    if ref == "":
+        dump, slot, index = row_place(rig, "Global")
+        picker_tap_slot(rig, dump, slot, "'Global'")
+        # Assigning Global keeps the picker open too (gm-nov3.31), so the
+        # marker is what says the tap landed and the chevron is what leaves.
+        # Membership of the Global row's own index, because this page can
+        # also mark the group the global gradient itself belongs to.
+        rig.wait_until(lambda: index in picker_selected_slots(rig), timeout=5)
+        picker_cancel(rig)
+        return
+    name = gradient_name_for_ref(settings, ref)
+    if name is None:
+        raise AssertionError("ref %r names nothing the picker can choose" % ref)
+    if str(ref).startswith("c"):
+        index = library_row_index(settings, ref)
+        if index is None:
+            raise AssertionError("ref %r is not in the library the picker lists" % ref)
+        picker_choose(rig, "My gradients", name, index=index)
+        return
+    picker_choose(rig, GRADIENT_CATEGORY_OF[int(ref)], name)
+
+
+def picker_choose_from_row(rig, row, group, name):
+    """Opens the picker from one of the three entry rows and chooses one
+    gradient out of one group, in one call."""
+    open_picker(rig, row)
+    picker_choose(rig, group, name)
+
+
+def restore_fields_exactly(rig, name, fields):
+    """Puts stored strings back byte for byte with one web save, for the
+    restorations the picker has no route for: Gradient all cannot be set
+    back to "no ref at all" because the picker only ever offers a concrete
+    gradient, and clearing map slots through it leaves the separators
+    behind (";;" and "" resolve the same but are not the same string).
+    Checks the write landed, so a silent failure here is a failed run and
+    not a venue the next scenario inherits in a different state."""
+    if all(str(rig.settings().get(k, "")) == str(v) for k, v in fields.items()):
+        return
+    try:
+        web_save(rig, fields)
+        rig.wait_until(lambda: all(str(rig.settings().get(k, "")) == str(v) for k, v in fields.items()), timeout=5)
+    except Exception as e:  # noqa: BLE001 -- reported by the check below
+        rig.log("restore_web_save_failed", fields=fields, reason=str(e))
+    now = rig.settings()
+    check(rig, name, all(str(now.get(k, "")) == str(v) for k, v in fields.items()),
+          "want %r got %r" % (fields, {k: now.get(k) for k in fields}))
+
+
+def category_for_ref(ref, preferred):
+    """A gradient category that holds a built-in other than `ref`: the
+    preferred one when it does, else the first in table order that does.
+
+    Every check that picks "another built-in, from this category" needs the
+    category to hold two entries in the worst case, the case where `ref` is
+    one of its own. Naming a category and assuming is a flake waiting on
+    the table: Coffee held one entry on the 18 entry table, so
+    check_gradient_precedence_across_animations failed on a board whose
+    stored ref was in Coffee. The table is 60 entries now and Coffee holds
+    seven, which hid the assumption rather than removing it, so the
+    category is chosen from what the table actually contains and the
+    preferred name is a preference."""
+    order = [preferred] + [c for c in GRADIENT_CATEGORIES if c != preferred]
+    for cat in order:
+        if any(str(idx) != str(ref) and GRADIENT_CATEGORY_OF[idx] == cat for idx in range(len(THEME_NAMES))):
+            return cat
+    raise AssertionError("no gradient category holds a built-in other than %r" % (ref,))
+
+
+def builtin_ref_other_than(ref, category=None):
+    """A built-in ref that is not `ref`, from `category` when one is named."""
+    for idx, _name in enumerate(THEME_NAMES):
+        if str(idx) == str(ref):
+            continue
+        if category is not None and GRADIENT_CATEGORY_OF[idx] != category:
+            continue
+        return str(idx)
+    raise AssertionError("no built-in other than %r in %r" % (ref, category))
+
+
+def check_gradient_picker_navigation(rig):
+    """Acceptance: the three gradient rows are whole-row targets that push
+    the picker; Global comes first on a per-animation picker and names the
+    current global; choosing a built-in or a saved gradient writes that
+    exact ref into the current animation's map slot and nothing else;
+    choosing Global clears that slot. Replaces the prev/next arrow walk
+    this check used to do (gm-nov3.3): the arrows are gone, and the map
+    isolation and live-write assertions they carried are kept here."""
     s0 = rig.settings()
     anim0 = int(s0["bgAnimId"])
     map0 = s0["bgAnimThemeMap"]
+    ref0 = map_ref(map0, anim0)
+    lib = library_entries(s0["bgAnimGradients"])
+    check(rig, "picker_fixture_has_library", len(lib) >= 1, "bgAnimGradients has %d entries" % len(lib))
 
-    d = open_animation(rig)
-    grad0_text = rig.row_value(d, "Gradient")
-    next_btn = rig.find_tag(d, "Gradient", "next")
-    if next_btn is None:
-        check(rig, "gradient_next_found", False)
+    open_animation(rig)
+    d = page_with_row(rig, "Gradient")
+    # gm-nov3.3 removed the arrows and this asserted their absence. gm-nov3.32
+    # put them back beside the whole-row target, so the row now carries three
+    # targets. What the arrows do with them is checked in test_gradientdraft.py
+    # (the picker's order, the wrap at both ends, the marker after a step, the
+    # hold repeat and the registry clamp); this only says they are on the row.
+    check(rig, "gradient_row_has_both_arrows",
+          rig.find_tag(d, "Gradient", "next") is not None and rig.find_tag(d, "Gradient", "prev") is not None,
+          "the row carries a prev and a next arrow beside the whole-row target")
+
+    open_picker(rig, "Gradient")
+    st = rig.settingsui_state()
+    check(rig, "picker_pushed_one_level", st.get("depth") == 2, st.get("depth"))
+    check(rig, "picker_title_is_the_row", st.get("title") == "Gradient", st.get("title"))
+
+    groups = rows_across_pages(rig)
+    check(rig, "picker_global_first", groups[:1] == ["Global"], groups[:3])
+    d0 = goto_page(rig, 0)
+    check(rig, "picker_global_names_the_global",
+          rig.row_value(d0, "Global") == expected_global_gradient_text(s0),
+          "got %r want %r" % (rig.row_value(d0, "Global"), expected_global_gradient_text(s0)))
+    check(rig, "picker_library_group_present", "My gradients" in groups, groups)
+    wanted_cats = [c for c in GRADIENT_CATEGORIES if c in GRADIENT_CATEGORY_OF]
+    check(rig, "picker_lists_every_category", [g for g in groups if g in GRADIENT_CATEGORIES] == wanted_cats,
+          "got %r want %r" % ([g for g in groups if g in GRADIENT_CATEGORIES], wanted_cats))
+    counts_ok = True
+    for cat in wanted_cats:
+        dump = page_with_row(rig, cat)
+        n = sum(1 for c in GRADIENT_CATEGORY_OF if c == cat)
+        want = "%d gradient%s" % (n, "" if n == 1 else "s")
+        if rig.row_value(dump, cat) != want:
+            counts_ok = False
+            rig.log("picker_group_count_mismatch", group=cat, got=rig.row_value(dump, cat), want=want)
+    check(rig, "picker_group_counts", counts_ok)
+
+    # The Global row draws the global gradient, so its swatch is read against
+    # the stops that gradient carries. Counting distinct colours here said
+    # only that some ramp was drawn (gm-nov3.33).
+    strip = swatch_strip(rig, goto_page(rig, 0), "Global")
+    check_swatch(rig, "picker_global_row_draws_the_global_ramp", strip, toned_stops(s0, global_stops(s0)))
+
+    # A built-in, from a category that is not the first row on the page.
+    cat = category_for_ref(ref0, "Fire and Heat")
+    want_ref = builtin_ref_other_than(ref0, category=cat)
+    want_name = THEME_NAMES[int(want_ref)]
+    picker_choose(rig, cat, want_name)
+    check(rig, "picker_returns_to_animation", depth(rig) == 1, depth(rig))
+    d = page_with_row(rig, "Gradient")
+    check(rig, "picker_builtin_row_text", rig.row_value(d, "Gradient") == want_name, rig.row_value(d, "Gradient"))
+    map1 = rig.settings()["bgAnimThemeMap"]
+    check(rig, "picker_builtin_writes_exact_ref", map_ref(map1, anim0) == want_ref,
+          "got %r want %r" % (map_ref(map1, anim0), want_ref))
+    others = all(map_ref(map1, i) == map_ref(map0, i) for i in range(len(ANIM_NAMES)) if i != anim0)
+    check(rig, "picker_writes_only_current_anim", others)
+
+    # Reopening marks what is in force, in its own group and nowhere else.
+    open_picker(rig, "Gradient")
+    picker_tap(rig, "Fire and Heat")
+    rig.wait_until(lambda: depth(rig) == 3, timeout=5)
+    marked = picker_selected_rows(rig)
+    check(rig, "picker_marks_current", marked == [want_name], marked)
+    d = page_with_row(rig, want_name)
+    check(rig, "picker_marks_current_value_text", rig.row_value(d, want_name) == "Selected",
+          rig.row_value(d, want_name))
+    picker_cancel(rig)
+    check(rig, "picker_chevron_pops_one_level", depth(rig) == 2, depth(rig))
+    picker_cancel(rig)
+    check(rig, "picker_chevron_leaves_picker", depth(rig) == 1, depth(rig))
+    check(rig, "picker_cancel_changes_nothing", rig.settings()["bgAnimThemeMap"] == map1,
+          rig.settings()["bgAnimThemeMap"])
+
+    # A saved gradient: the same picker, a "cN" ref, and no legacy mirror.
+    lib_id, lib_name, _g = lib[0]
+    theme_before = rig.settings()["bgAnimTheme"]
+    picker_choose_from_row(rig, "Gradient", "My gradients", lib_name)
+    d = page_with_row(rig, "Gradient")
+    check(rig, "picker_library_row_text", rig.row_value(d, "Gradient") == lib_name, rig.row_value(d, "Gradient"))
+    s2 = rig.settings()
+    check(rig, "picker_library_writes_cref", map_ref(s2["bgAnimThemeMap"], anim0) == "c%d" % lib_id,
+          map_ref(s2["bgAnimThemeMap"], anim0))
+    check(rig, "picker_library_does_not_mirror_legacy", s2["bgAnimTheme"] == theme_before,
+          "bgAnimTheme %r -> %r" % (theme_before, s2["bgAnimTheme"]))
+
+    # Global clears the slot from the first page, with no second tap. It also
+    # stays open on it (gm-nov3.31), so the marker says it landed and the
+    # chevron is what leaves.
+    open_picker(rig, "Gradient")
+    picker_tap(rig, "Global")
+    rig.wait_until(lambda: "Global" in picker_selected_rows(rig), timeout=5)
+    picker_cancel(rig)
+    rig.wait_until(lambda: depth(rig) == 1, timeout=5)
+    s3 = rig.settings()
+    check(rig, "picker_global_clears_slot", map_ref(s3["bgAnimThemeMap"], anim0) == "",
+          map_ref(s3["bgAnimThemeMap"], anim0))
+    d = page_with_row(rig, "Gradient")
+    check(rig, "picker_global_row_text", rig.row_value(d, "Gradient") == expected_gradient_text(s3),
+          "got %r want %r" % (rig.row_value(d, "Gradient"), expected_gradient_text(s3)))
+    check(rig, "picker_global_clears_only_this_slot",
+          all(map_ref(s3["bgAnimThemeMap"], i) == map_ref(map0, i) for i in range(len(ANIM_NAMES)) if i != anim0))
+
+    if ref0 != "":
+        pick_ref(rig, "Gradient", s0, ref0)
+    close_animation(rig)
+    final_ref = map_ref(rig.settings()["bgAnimThemeMap"], anim0)
+    check(rig, "picker_navigation_restored", final_ref == ref0, "got %r want %r" % (final_ref, ref0))
+
+
+def check_gradient_all_and_standby_pickers(rig):
+    """Acceptance: Gradient all uses the same picker but offers no Global
+    and writes bgAnimGradientRef (mirroring bgAnimTheme for a built-in and
+    leaving it alone for a saved gradient, gm-nov3.7); Standby grad is
+    disabled while the standby screen follows the main animation, shows
+    "Same as main", and changes nothing when tapped; with a separate
+    standby animation it edits that animation's slot, not the main one."""
+    s0 = rig.settings()
+    anim0 = int(s0["bgAnimId"])
+    ref0 = s0["bgAnimGradientRef"]
+    theme0 = s0["bgAnimTheme"]
+    standby0 = int(s0["bgAnimStandbyId"])
+    map0 = s0["bgAnimThemeMap"]
+    lib = library_entries(s0["bgAnimGradients"])
+
+    open_animation(rig)
+    open_picker(rig, "Gradient all")
+    st = rig.settingsui_state()
+    check(rig, "all_picker_title", st.get("title") == "Gradient all", st.get("title"))
+    groups = rows_across_pages(rig)
+    check(rig, "all_picker_has_no_global", "Global" not in groups, groups)
+
+    cat = category_for_ref(ref0, "Water and Ice")
+    want_ref = builtin_ref_other_than(ref0, category=cat)
+    want_name = THEME_NAMES[int(want_ref)]
+    picker_choose(rig, cat, want_name)
+    s1 = rig.settings()
+    check(rig, "all_picker_writes_global_ref", s1["bgAnimGradientRef"] == want_ref, s1["bgAnimGradientRef"])
+    check(rig, "all_picker_mirrors_builtin", str(s1["bgAnimTheme"]) == want_ref,
+          "bgAnimTheme %r want %r" % (s1["bgAnimTheme"], want_ref))
+    d = page_with_row(rig, "Gradient all")
+    check(rig, "all_picker_row_text", rig.row_value(d, "Gradient all") == want_name,
+          rig.row_value(d, "Gradient all"))
+
+    if lib:
+        lib_id, lib_name, _g = lib[0]
+        mirror_before = rig.settings()["bgAnimTheme"]
+        picker_choose_from_row(rig, "Gradient all", "My gradients", lib_name)
+        s2 = rig.settings()
+        check(rig, "all_picker_library_ref", s2["bgAnimGradientRef"] == "c%d" % lib_id, s2["bgAnimGradientRef"])
+        check(rig, "all_picker_library_no_mirror", s2["bgAnimTheme"] == mirror_before,
+              "bgAnimTheme %r -> %r" % (mirror_before, s2["bgAnimTheme"]))
+
+    # Standby grad while the standby animation is the main one. Set from
+    # outside the visit, because the row reads the draft and the point here
+    # is the stored state, not a value this visit stepped.
+    close_animation(rig)
+    restore_fields_exactly(rig, "standby_same_as_main_setup", {"bgAnimStandbyId": anim0})
+    open_animation(rig)
+    d = page_with_row(rig, "Standby grad")
+    check(rig, "standby_grad_same_id_text", rig.row_value(d, "Standby grad") == "Same as main",
+          rig.row_value(d, "Standby grad"))
+    before_same = rig.settings()["bgAnimThemeMap"]
+    same_target = rig.find_tag(d, "Standby grad", "action")
+    if same_target is not None:
+        rig.tap_target(same_target)
+    check(rig, "standby_grad_same_id_no_push", depth(rig) == 1, depth(rig))
+    check(rig, "standby_grad_same_id_no_write", rig.settings()["bgAnimThemeMap"] == before_same)
+    close_animation(rig)
+    restore_fields_exactly(rig, "standby_same_as_main_cleared", {"bgAnimStandbyId": standby0})
+    open_animation(rig)
+
+    # Standby grad while the standby screen follows the main animation.
+    if standby0 < 0:
+        d = page_with_row(rig, "Standby grad")
+        check(rig, "standby_grad_same_as_main_text", rig.row_value(d, "Standby grad") == "Same as main",
+              rig.row_value(d, "Standby grad"))
+        before = rig.settings()["bgAnimThemeMap"]
+        target = rig.find_tag(d, "Standby grad", "action")
+        if target is not None:
+            rig.tap_target(target)
+        check(rig, "standby_grad_disabled_no_push", depth(rig) == 1, depth(rig))
+        check(rig, "standby_grad_disabled_no_write", rig.settings()["bgAnimThemeMap"] == before)
+
+    # A separate standby animation: the row edits that animation's slot.
+    standby_target = (anim0 + 1) % len(ANIM_NAMES)
+    steps = 0
+    while int(rig.settings()["bgAnimStandbyId"]) != standby_target and steps < len(ANIM_NAMES) + 2:
+        tap_row(rig, "Standby anim", "next")
+        steps += 1
+    separate = int(rig.settings()["bgAnimStandbyId"]) == standby_target
+    check(rig, "standby_anim_set_for_picker", separate, rig.settings()["bgAnimStandbyId"])
+    if separate:
+        standby_ref0 = map_ref(rig.settings()["bgAnimThemeMap"], standby_target)
+        cat2 = category_for_ref(standby_ref0, "Nature")
+        want2 = builtin_ref_other_than(standby_ref0, category=cat2)
+        picker_choose_from_row(rig, "Standby grad", cat2, THEME_NAMES[int(want2)])
+        s3 = rig.settings()
+        check(rig, "standby_grad_writes_standby_slot", map_ref(s3["bgAnimThemeMap"], standby_target) == want2,
+              map_ref(s3["bgAnimThemeMap"], standby_target))
+        check(rig, "standby_grad_leaves_main_slot", map_ref(s3["bgAnimThemeMap"], anim0) == map_ref(map0, anim0),
+              map_ref(s3["bgAnimThemeMap"], anim0))
+        d = page_with_row(rig, "Standby grad")
+        check(rig, "standby_grad_row_text", rig.row_value(d, "Standby grad") == THEME_NAMES[int(want2)],
+              rig.row_value(d, "Standby grad"))
+        # Put the standby slot and the standby animation back.
+        pick_ref(rig, "Standby grad", s3, map_ref(map0, standby_target))
+        steps = 0
+        while int(rig.settings()["bgAnimStandbyId"]) != standby0 and steps < len(ANIM_NAMES) + 2:
+            tap_row(rig, "Standby anim", "prev")
+            steps += 1
+
+    pick_ref(rig, "Gradient all", s0, ref0 if ref0 != "" else str(theme0))
+    close_animation(rig)
+    s9 = rig.settings()
+    check(rig, "all_and_standby_restored",
+          map_ref(s9["bgAnimThemeMap"], anim0) == map_ref(map0, anim0) and int(s9["bgAnimStandbyId"]) == standby0,
+          "map=%r standby=%r" % (s9["bgAnimThemeMap"], s9["bgAnimStandbyId"]))
+    restore_fields_exactly(rig, "all_picker_global_ref_restored",
+                           {"bgAnimGradientRef": ref0, "bgAnimTheme": theme0, "bgAnimThemeMap": map0})
+
+
+def library_renumbered(lib, new_ids):
+    """The stored library with its last entries renumbered to `new_ids`, in
+    order, plus the (id, name, gradient) triples that came out.
+
+    How many entries a library may hold (twelve) is not what bounds the ids
+    they carry. The web allocator hands out the lowest id nothing reserves,
+    and a ref that still names a deleted entry keeps that id reserved, so a
+    few rounds of copying and deleting leave a small library whose ids are
+    larger than its entry count. Larger still are legacy: the allocator this
+    replaced returned the largest id plus one with no ceiling (gm-nov3.21),
+    and the entries it wrote are still on devices. That is the state this
+    builds, without adding an entry."""
+    entries = library_entries(lib)
+    if len(entries) < len(new_ids):
+        raise AssertionError("the stored library has %d entries, %d are needed" % (len(entries), len(new_ids)))
+    head = entries[:len(entries) - len(new_ids)]
+    kept = [e[0] for e in head]
+    clash = [i for i in new_ids if i in kept]
+    if clash:
+        raise AssertionError("ids %r are already in the library" % clash)
+    tail = [(new_id, name, gradient) for new_id, (_old, name, gradient) in zip(new_ids, entries[len(head):])]
+    return ";".join("%d|%s|%s" % e for e in head + tail), tail
+
+
+def check_gradient_picker_high_library_ids(rig):
+    """Regression for gm-nov3.15: a saved gradient whose id is above 13 can
+    be chosen through all three gradient rows, and the choice lands as the
+    exact ref.
+
+    The picker validates a tap by re-resolving the ref (CatGradientPicker.cpp,
+    applyPick), and the resolver behind it refused every library id above
+    BG_GRADIENT_LIB_MAX + 1, which confused the library's capacity with the
+    range of the ids in it. Such an entry was listed in My gradients with no
+    swatch, and tapping it closed the picker without writing anything.
+
+    The library is set up through the web save the simulator provides, so
+    this refuses to run on a device and says why, before it changes
+    anything."""
+    if not web_save_available(rig):
+        skip(rig, "gradient_picker_high_library_ids",
+             "the high-id library is a web save fixture, and web_save runs on the simulator only")
+        return
+    s0 = rig.settings()
+    lib0 = s0["bgAnimGradients"]
+    map0 = s0["bgAnimThemeMap"]
+    ref0 = s0["bgAnimGradientRef"]
+    theme0 = s0["bgAnimTheme"]
+    standby0 = int(s0["bgAnimStandbyId"])
+    anim0 = int(s0["bgAnimId"])
+
+    # 14 is the first id the old resolver refused, and the current allocator
+    # still reaches it once 1 to 13 are held by entries or by refs that name
+    # a deleted one. 99999 is the largest the ref grammar accepts, and a
+    # legacy id: the allocator this replaced could climb to it, and the UI
+    # cannot normally reach it now under the library and map caps.
+    high_lib, high = library_renumbered(lib0, [14, 99999])
+    web_save(rig, {"bgAnimGradients": high_lib})
+    landed = rig.wait_until(lambda: rig.settings()["bgAnimGradients"] == high_lib, timeout=5)
+    check(rig, "high_id_library_write_landed", bool(landed), rig.settings()["bgAnimGradients"])
+    if not landed:
+        restore_fields_exactly(rig, "high_id_library_restored", {"bgAnimGradients": lib0})
+        return
+    high_id, high_name, high_stops = high[0]
+    top_id, top_name, top_stops = high[1]
+
+    # 1. The per-animation row. The swatch is read inside the picker as well
+    #    as on the row, because a refused ref showed there first: the entry
+    #    was listed with the canvas still hidden.
+    open_animation(rig)
+    theme_before = rig.settings()["bgAnimTheme"]
+    open_picker(rig, "Gradient")
+    picker_tap(rig, "My gradients")
+    rig.wait_until(lambda: depth(rig) == 3, timeout=5)
+    d = page_with_row(rig, high_name)
+    picker_strip = swatch_strip(rig, d, high_name)
+    check_swatch(rig, "high_id_picker_row_draws_its_own_ramp", picker_strip,
+                 toned_stops(s0, high_stops))
+    picker_tap(rig, high_name)
+    # The pick stays on the page (gm-nov3.31), so the marker is what says it
+    # landed; the two chevrons are what return to the Animation page.
+    rig.wait_until(lambda: high_name in picker_selected_rows(rig), timeout=5)
+    picker_cancel(rig)
+    picker_cancel(rig)
+    check(rig, "high_id_pick_returns_to_animation", depth(rig) == 1, depth(rig))
+    s1 = rig.settings()
+    check(rig, "high_id_writes_exact_ref", map_ref(s1["bgAnimThemeMap"], anim0) == "c%d" % high_id,
+          "got %r want %r" % (map_ref(s1["bgAnimThemeMap"], anim0), "c%d" % high_id))
+    check(rig, "high_id_writes_only_current_anim",
+          all(map_ref(s1["bgAnimThemeMap"], i) == map_ref(map0, i) for i in range(len(ANIM_NAMES)) if i != anim0))
+    check(rig, "high_id_no_legacy_mirror", s1["bgAnimTheme"] == theme_before,
+          "bgAnimTheme %r -> %r" % (theme_before, s1["bgAnimTheme"]))
+    d = page_with_row(rig, "Gradient")
+    check(rig, "high_id_row_text", rig.row_value(d, "Gradient") == high_name, rig.row_value(d, "Gradient"))
+    row_strip = swatch_strip(rig, d, "Gradient")
+    check(rig, "high_id_row_draws_the_chosen_ramp", row_strip is not None and row_strip == picker_strip,
+          "row %r picker %r" % (None if row_strip is None else row_strip[:4],
+                                None if picker_strip is None else picker_strip[:4]))
+
+    # 2. Gradient all, at the top of the id range. A saved gradient is not
+    #    mirrored into bgAnimTheme, which is the rollback policy for a ref
+    #    no older build could read (gm-nov3.7).
+    theme_before = rig.settings()["bgAnimTheme"]
+    picker_choose_from_row(rig, "Gradient all", "My gradients", top_name)
+    s2 = rig.settings()
+    check(rig, "high_id_all_writes_exact_ref", s2["bgAnimGradientRef"] == "c%d" % top_id, s2["bgAnimGradientRef"])
+    check(rig, "high_id_all_no_legacy_mirror", s2["bgAnimTheme"] == theme_before,
+          "bgAnimTheme %r -> %r" % (theme_before, s2["bgAnimTheme"]))
+    d = page_with_row(rig, "Gradient all")
+    check(rig, "high_id_all_row_text", rig.row_value(d, "Gradient all") == top_name,
+          rig.row_value(d, "Gradient all"))
+    all_strip = swatch_strip(rig, d, "Gradient all")
+    check_swatch(rig, "high_id_all_row_draws_the_chosen_ramp", all_strip, toned_stops(s0, top_stops))
+
+    # 3. Standby grad, which edits the standby animation's own slot. The
+    #    standby animation is set from outside the visit for the reason the
+    #    web-interference check gives: a field this visit stepped keeps its
+    #    draft against a web save.
+    close_animation(rig)
+    standby_target = (anim0 + 1) % len(ANIM_NAMES)
+    web_save(rig, {"bgAnimStandbyId": standby_target})
+    ready = rig.wait_until(lambda: int(rig.settings()["bgAnimStandbyId"]) == standby_target, timeout=5)
+    check(rig, "high_id_standby_setup_landed", bool(ready), rig.settings()["bgAnimStandbyId"])
+    if ready:
+        open_animation(rig)
+        picker_choose_from_row(rig, "Standby grad", "My gradients", top_name)
+        s3 = rig.settings()
+        check(rig, "high_id_standby_writes_standby_slot",
+              map_ref(s3["bgAnimThemeMap"], standby_target) == "c%d" % top_id,
+              map_ref(s3["bgAnimThemeMap"], standby_target))
+        check(rig, "high_id_standby_leaves_main_slot",
+              map_ref(s3["bgAnimThemeMap"], anim0) == "c%d" % high_id, map_ref(s3["bgAnimThemeMap"], anim0))
+        d = page_with_row(rig, "Standby grad")
+        check(rig, "high_id_standby_row_text", rig.row_value(d, "Standby grad") == top_name,
+              rig.row_value(d, "Standby grad"))
+        standby_strip = swatch_strip(rig, d, "Standby grad")
+        check_swatch(rig, "high_id_standby_row_draws_the_chosen_ramp", standby_strip,
+                     toned_stops(s0, top_stops))
+        close_animation(rig)
+
+    restore_fields_exactly(rig, "high_id_restored", {
+        "bgAnimGradients": lib0,
+        "bgAnimThemeMap": map0,
+        "bgAnimGradientRef": ref0,
+        "bgAnimTheme": theme0,
+        "bgAnimStandbyId": standby0,
+    })
+
+
+def check_gradient_picker_reachability(rig):
+    """Acceptance: every built-in is reachable through its category,
+    including the last partial page; every library entry is reachable; an
+    empty library hides My gradients. The empty-library half goes through a
+    real web save and asserts the write landed first, so it cannot pass by
+    the POST being rejected."""
+    s0 = rig.settings()
+    lib0 = s0["bgAnimGradients"]
+    lib = library_entries(lib0)
+
+    open_animation(rig)
+    open_picker(rig, "Gradient all")
+    seen = []
+    for group in rows_across_pages(rig):
+        picker_tap(rig, group)
+        rig.wait_until(lambda: depth(rig) == 3, timeout=5)
+        names = rows_across_pages(rig)
+        if group == "My gradients":
+            want = [name for _id, name, _g in lib]
+            check(rig, "picker_library_all_reachable", names == want, "got %r want %r" % (names, want))
+        else:
+            seen.extend(names)
+            want = [n for i, n in enumerate(THEME_NAMES) if GRADIENT_CATEGORY_OF[i] == group]
+            check(rig, "picker_group_%s_complete" % group.replace(" ", "_"), names == want,
+                  "got %r want %r" % (names, want))
+        picker_cancel(rig)
+    check(rig, "picker_every_builtin_reachable", sorted(seen) == sorted(THEME_NAMES),
+          "missing %r extra %r" % (sorted(set(THEME_NAMES) - set(seen)), sorted(set(seen) - set(THEME_NAMES))))
+    picker_cancel(rig)
+
+    # An empty library hides the group. The POST has to land for this to
+    # mean anything, so read it back before believing the UI. Only this half
+    # needs the web save: everything above is navigation, so a device runs
+    # that and refuses here, with the library it arrived with untouched.
+    if not web_save_available(rig):
+        skip(rig, "picker_empty_library_hides_group",
+             "emptying the library is a web save, and web_save runs on the simulator only")
         close_animation(rig)
         return
-    rig.tap_target(next_btn)
-    d2 = rig.touchmap(screen=0)
-    check(rig, "gradient_cycles_from_default", rig.row_value(d2, "Gradient") == THEME_NAMES[0], rig.row_value(d2, "Gradient"))
+    web_save(rig, {"bgAnimGradients": ""})
+    landed = rig.wait_until(lambda: rig.settings()["bgAnimGradients"] == "", timeout=5)
+    check(rig, "picker_empty_library_write_landed", bool(landed), rig.settings()["bgAnimGradients"])
+    open_picker(rig, "Gradient all")
+    groups = rows_across_pages(rig)
+    check(rig, "picker_empty_library_hides_group", "My gradients" not in groups, groups)
+    picker_cancel(rig)
 
-    map1 = rig.settings()["bgAnimThemeMap"]
-    check(rig, "gradient_writes_current_anim_slot", map_ref(map1, anim0) == "0", map_ref(map1, anim0))
-    others_untouched = all(map_ref(map1, i) == map_ref(map0, i) for i in range(len(ANIM_NAMES)) if i != anim0)
-    check(rig, "gradient_writes_only_current_anim", others_untouched)
+    web_save(rig, {"bgAnimGradients": lib0})
+    back = rig.wait_until(lambda: rig.settings()["bgAnimGradients"] == lib0, timeout=5)
+    check(rig, "picker_library_restored", bool(back))
+    close_animation(rig)
 
-    rig.tap_target(rig.find_tag(rig.touchmap(screen=0), "Gradient", "prev"))
-    d3 = rig.touchmap(screen=0)
-    check(rig, "gradient_restores_default_text", rig.row_value(d3, "Gradient") == grad0_text, rig.row_value(d3, "Gradient"))
-    map2 = rig.settings()["bgAnimThemeMap"]
-    check(rig, "gradient_default_clears_entry", map_ref(map2, anim0) == "", map_ref(map2, anim0))
+
+# The repeated-name fixture (gm-xiu6, gm-nov3.28, gm-nov3.34). Twelve
+# entries, five to a page, so three pages with the last one partial: the
+# same shape the bench board's library had. Two names repeat, and each pair
+# reaches a different fault:
+#
+#   "Custom" at list positions 0 and 5, which is page 0 and page 1. A helper
+#   that turned to the first page holding the name never reached the second
+#   row at all, so page_with_row's fault is only visible across a page
+#   boundary (gm-nov3.34). Both duplicates were on page 0 until then, which
+#   hid it completely.
+#
+#   "Sunrise" at positions 1 and 3, both on page 0. That is what keeps
+#   gm-xiu6's own fault reachable: a page reading that collects rows into a
+#   dict keyed by the name loses one of two rows on the same page, and no
+#   cross-page pair can show that.
+#
+# The four duplicated entries carry different stops on purpose. With the
+# same stops in both halves of a pair, nothing downstream of the name could
+# tell the two rows apart: both rows drawing the first one's swatch, a tap
+# on the second row writing the first one's ref, the two entries' callbacks
+# swapped and the selection marker on the wrong duplicate all looked
+# identical to a check that read names and counts. Each is a flat run toward
+# one primary, so the difference survives whatever the tone setting does to
+# a swatch, and none can be confused with the grey ramp the other eight
+# carry.
+REPEATED_NAMES = ["Custom", "Sunrise", "Saved 3", "Sunrise", "Saved 5", "Custom"] \
+    + ["Saved %d" % n for n in range(7, 13)]
+REPEATED_PLAIN_STOPS = "202020,f0f0f0"
+# List position -> (library id, stops). The id is the position plus one, the
+# way the web form numbers a saved gradient.
+REPEATED_DUPS = {
+    0: (1, "ff0000,ff2000"),   # "Custom", page 0
+    5: (6, "0000ff,0020ff"),   # "Custom", page 1
+    1: (2, "00ff00,20ff00"),   # "Sunrise", page 0
+    3: (4, "ff00ff,ff20ff"),   # "Sunrise", page 0
+}
+# The two pairs, as (list position, library id) each, in list order.
+REPEATED_CROSS_PAGE = ((0, 1), (5, 6))
+REPEATED_SAME_PAGE = ((1, 2), (3, 4))
+
+
+def repeated_names_library():
+    """The fixture library string, and the stop string of every entry by id."""
+    stops = [REPEATED_PLAIN_STOPS] * len(REPEATED_NAMES)
+    for index, (_entry_id, entry_stops) in REPEATED_DUPS.items():
+        stops[index] = entry_stops
+    packed = ";".join("%d|%s|%s" % (i + 1, name, s)
+                      for i, (name, s) in enumerate(zip(REPEATED_NAMES, stops)))
+    return packed, {i + 1: s for i, s in enumerate(stops)}
+
+
+def slot_marked(rig, dump, slot):
+    """Whether the selection dot inside `slot` is showing. The dump's "h" is
+    the hidden flag as an integer, so this is a truth test, not an identity
+    one against False."""
+    obj = rig.find_in_row(dump, slot, "selected")
+    return obj is not None and not obj.get("h", 1)
+
+
+def picker_leave(rig):
+    """Back to the category page underneath the picker, however many levels
+    are still open. A pick used to pop both levels by itself and now stays
+    on the page (gm-nov3.31), so a check that taps a row itself cannot
+    assume either depth."""
+    guard = 0
+    while depth(rig) > 1 and guard < 4:
+        picker_cancel(rig)
+        guard += 1
+
+
+def open_my_gradients(rig, row="Gradient"):
+    """Opens the picker from `row` and descends into My gradients, leaving
+    the library list on top."""
+    open_picker(rig, row)
+    picker_tap(rig, "My gradients")
+    rig.wait_until(lambda: depth(rig) == 3, timeout=5)
+
+
+def check_gradient_picker_repeated_names(rig):
+    """Regression for gm-xiu6: two saved gradients with the same name are
+    two rows on the list, not one.
+
+    Rig.rows_on_page collected a page's rows into a dict keyed by the row's
+    visible name, and rows_across_pages dropped a name it had already seen,
+    so a library of twelve entries with two called "Custom" listed as
+    eleven rows. Saved gradient names are whatever the user typed and
+    repeat easily; the bench board's own library held that pair, and the
+    reachability check above failed on it for that reason alone
+    (gm-nov3.11). A count is the thing to assert, because the names on
+    their own cannot tell the two readings apart.
+
+    Counting rows was as far as it went, though, and everything the picker
+    does after listing them was still addressed by name: find_tag returns
+    the first object with a matching tag, and both Custom rows carry the
+    same tags. This now walks the rows by position (Rig.row_slots and
+    Rig.find_in_row) and checks the three things a name cannot reach: each
+    row draws its own entry's stops, a tap on each row writes that row's
+    own ref, and a preselected ref marks that row and not its twin
+    (gm-nov3.28).
+
+    The fixture repeats two names now, one pair inside page 0 and one pair
+    across the page 0/page 1 boundary, and the cross-page pair is what
+    reaches the last of the four helpers (gm-nov3.34): a helper that turned
+    to the first page holding the name read, tapped and marked the page 0
+    row whichever row it was asked for, and the page 1 row could not be
+    addressed at all. The same-page pair keeps gm-xiu6's own fault
+    reachable, which no cross-page pair can show. What a name cannot say,
+    the helpers now refuse to guess: page_with_row, picker_tap and
+    swatch_strip raise AmbiguousRowName on a repeated name, and the checks
+    below say so.
+
+    Simulator only: the twelve-entry library is written through a web
+    save."""
+    if not web_save_available(rig):
+        skip(rig, "gradient_picker_repeated_names",
+             "the twelve entry library is a web save fixture, and web_save runs on the simulator only")
+        return
+    s0 = rig.settings()
+    lib0 = s0["bgAnimGradients"]
+    map0 = s0["bgAnimThemeMap"]
+    ref0 = s0["bgAnimGradientRef"]
+    anim0 = int(s0["bgAnimId"])
+
+    names = REPEATED_NAMES
+    packed, stops_by_id = repeated_names_library()
+    web_save(rig, {"bgAnimGradients": packed})
+    landed = rig.wait_until(lambda: rig.settings()["bgAnimGradients"] == packed, timeout=5)
+    check(rig, "repeated_names_library_landed", bool(landed), rig.settings()["bgAnimGradients"])
+    if not landed:
+        restore_fields_exactly(rig, "repeated_names_restored",
+                               {"bgAnimGradients": lib0, "bgAnimThemeMap": map0, "bgAnimGradientRef": ref0})
+        return
+
+    open_animation(rig)
+    open_my_gradients(rig)
+    listed = rows_across_pages(rig)
+    check(rig, "repeated_names_row_count", len(listed) == len(names),
+          "%d rows listed for %d library entries: %r" % (len(listed), len(names), listed))
+    check(rig, "repeated_names_rows_in_stored_order", listed == names,
+          "got %r want %r" % (listed, names))
+    for label, pair in (("customs", REPEATED_CROSS_PAGE), ("sunrises", REPEATED_SAME_PAGE)):
+        dup_name = names[pair[0][0]]
+        check(rig, "repeated_names_both_%s_listed" % label, listed.count(dup_name) == 2,
+              "%d rows named %r in %r" % (listed.count(dup_name), dup_name, listed))
+
+    # The same count, read one page at a time, so the fix is in
+    # Rig.rows_on_page and not only in this file's walk over the pages. The
+    # repeat this reaches is the same-page pair: a page reading keyed by the
+    # name loses one of two rows on one page, and the cross-page pair cannot
+    # show that however the pages are walked.
+    dump0 = goto_page(rig, 0)
+    first_page = rig.rows_on_page(dump0)
+    check(rig, "repeated_names_first_page_full", len(first_page) == 5,
+          "%d rows on page 0: %r" % (len(first_page), first_page))
+    check(rig, "repeated_names_first_page_keeps_repeat", first_page == names[:5],
+          "got %r want %r" % (first_page, names[:5]))
+
+    # Each duplicate draws its own entry. Slots, not names: find_tag would
+    # hand back the first row of the name for both halves of a pair, and for
+    # the cross-page pair it would not reach page 1 at all.
+    slots = rig.row_slots(dump0)
+    slot_names = [rig.tag_row(o) for o in slots]
+    check(rig, "repeated_names_slots_match_names", slot_names == names[:5], "%r" % (slot_names,))
+    strips = {}
+    for index, lib_id in REPEATED_CROSS_PAGE + REPEATED_SAME_PAGE:
+        # One framebuffer read per row, taken after the turn to its page:
+        # the pair straddles a page boundary, so one read cannot carry both
+        # halves of it.
+        dump, slot = row_at(rig, index)
+        strip = swatch_strip(rig, dump, slot=slot)
+        strips[index] = strip
+        name = "repeated_names_index%d_swatch_is_c%d" % (index, lib_id)
+        if strip is None:
+            check(rig, name, False, "no visible swatch at list index %d" % index)
+            continue
+        ok, detail = swatch_matches_stops(strip, stops_by_id[lib_id])
+        check(rig, name, ok, detail)
+    for label, pair in (("customs", REPEATED_CROSS_PAGE), ("sunrises", REPEATED_SAME_PAGE)):
+        a, b = strips.get(pair[0][0]), strips.get(pair[1][0])
+        check(rig, "repeated_names_%s_swatches_differ" % label,
+              a is not None and b is not None and a != b,
+              "first %r second %r" % (None if a is None else a[0], None if b is None else b[0]))
+
+    # A repeated name is refused, not resolved. Every helper that used to
+    # take the first row of the name now says which rows carry it, and a
+    # name only one row carries still resolves.
+    dup = names[REPEATED_CROSS_PAGE[0][0]]
+    same_page_dup = names[REPEATED_SAME_PAGE[0][0]]
+    unique = names[2]
+    for helper, call in (
+            ("page_with_row", lambda: page_with_row(rig, dup)),
+            ("picker_tap", lambda: picker_tap(rig, dup)),
+            ("swatch_strip", lambda: swatch_strip(rig, goto_page(rig, 0), same_page_dup)),
+    ):
+        raised, detail = raises_ambiguity(call)
+        check(rig, "repeated_names_%s_refuses_a_repeated_name" % helper, raised, detail)
+    raised, detail = raises_ambiguity(lambda: page_with_row(rig, unique))
+    check(rig, "repeated_names_page_with_row_takes_a_unique_name", not raised, detail)
+
+    picker_leave(rig)
+
+    # A tap addressed by list position writes that row's own ref, for both
+    # halves of both pairs. Waiting on the stored ref rather than on the
+    # depth, because a pick leaves the picker open (gm-nov3.31) and this
+    # check is about the write either way.
+    for index, lib_id in (REPEATED_CROSS_PAGE[1], REPEATED_CROSS_PAGE[0], REPEATED_SAME_PAGE[1]):
+        open_my_gradients(rig)
+        picker_tap_at(rig, index)
+        want = "c%d" % lib_id
+        got = rig.wait_until(lambda: map_ref(rig.settings()["bgAnimThemeMap"], anim0) or None, timeout=5)
+        check(rig, "repeated_names_index%d_tap_writes_c%d" % (index, lib_id), got == want,
+              "index %d wrote %r, want %r" % (index, got, want))
+        picker_leave(rig)
+
+    # A preselected ref marks its own row and not its twin. Written through
+    # the web save so the marker is read on a picker the check did not tap
+    # its way into. Positions across the whole list, so a marker on the
+    # page 1 duplicate is told apart from one on the page 0 duplicate.
+    close_animation(rig)
+    for index, lib_id in (REPEATED_CROSS_PAGE[0], REPEATED_CROSS_PAGE[1], REPEATED_SAME_PAGE[1]):
+        web_save(rig, {"bgAnimThemeMap": map_write_ref(map0, anim0, "c%d" % lib_id)})
+        rig.wait_until(lambda: map_ref(rig.settings()["bgAnimThemeMap"], anim0) == "c%d" % lib_id, timeout=5)
+        open_animation(rig)
+        open_my_gradients(rig)
+        marked = picker_selected_slots(rig)
+        check(rig, "repeated_names_c%d_marks_index%d" % (lib_id, index), marked == [index],
+              "marked %r, want [%d]" % (marked, index))
+        picker_leave(rig)
+        close_animation(rig)
+
+    # pick_ref puts a saved gradient back by its place in the library, which
+    # is the restore every other check in this file leans on. Both halves of
+    # the cross-page pair, each starting from the other one being in force,
+    # so choosing the first row would leave the setting where it already was
+    # and prove nothing.
+    fixture_settings = rig.settings()
+    for index, lib_id in (REPEATED_CROSS_PAGE[1], REPEATED_CROSS_PAGE[0]):
+        other = REPEATED_CROSS_PAGE[0][1] if lib_id == REPEATED_CROSS_PAGE[1][1] else REPEATED_CROSS_PAGE[1][1]
+        web_save(rig, {"bgAnimThemeMap": map_write_ref(map0, anim0, "c%d" % other)})
+        rig.wait_until(lambda: map_ref(rig.settings()["bgAnimThemeMap"], anim0) == "c%d" % other, timeout=5)
+        open_animation(rig)
+        pick_ref(rig, "Gradient", fixture_settings, "c%d" % lib_id)
+        got = map_ref(rig.settings()["bgAnimThemeMap"], anim0)
+        check(rig, "repeated_names_pick_ref_restores_c%d" % lib_id, got == "c%d" % lib_id,
+              "pick_ref(c%d) left %r (index %d of the library)" % (lib_id, got, index))
+        close_animation(rig)
+
+    restore_fields_exactly(rig, "repeated_names_restored", {
+        "bgAnimGradients": lib0,
+        "bgAnimThemeMap": map0,
+        "bgAnimGradientRef": ref0,
+    })
+
+
+def check_gradient_picker_pagination_and_cancel(rig):
+    """Acceptance: header arrows and horizontal swipes paginate inside a
+    picker page, they neither select nor leave; the chevron cancels one
+    level; and a visit that chooses nothing leaves every gradient setting
+    byte for byte as it was."""
+    s0 = rig.settings()
+    watched = ANIMATION_FIELDS + ["bgAnimGradientRef", "bgAnimTheme", "bgAnimCustomTheme"]
+    before = {k: s0[k] for k in watched if k in s0}
+
+    open_animation(rig)
+    open_picker(rig, "Gradient")
+    st = rig.settingsui_state()
+    check(rig, "picker_paginates_at_all", int(st.get("pages", 1)) > 1, st.get("pages"))
+    d = goto_page(rig, 0)
+    arrow = rig.find_tag(d, "page_next", "page_next")
+    check(rig, "picker_has_page_arrows", arrow is not None)
+    if arrow is not None:
+        rig.tap_target(arrow)
+        ok = rig.wait_until(lambda: rig.settingsui_state().get("page") == 1, timeout=5)
+        check(rig, "picker_arrow_turns_page", bool(ok), rig.settingsui_state().get("page"))
+        check(rig, "picker_arrow_stays_in_picker", depth(rig) == 2, depth(rig))
+
+    # A swipe across a row paginates and must not select the row it began on.
+    d = goto_page(rig, 1)
+    rows = rig.rows_on_page(d)
+    hit = rig.find_tag(d, rows[0], "action")["hit"]
+    y = (hit[1] + hit[3]) // 2
+    rig.swipe(hit[0] + 40, y, hit[0] + 40 + 160, y)
+    ok = rig.wait_until(lambda: rig.settingsui_state().get("page") == 0, timeout=5)
+    check(rig, "picker_swipe_turns_page", bool(ok), rig.settingsui_state().get("page"))
+    check(rig, "picker_swipe_does_not_select", depth(rig) == 2, depth(rig))
+
+    # Into a group, then back out one level at a time, choosing nothing.
+    picker_tap(rig, "My gradients")
+    rig.wait_until(lambda: depth(rig) == 3, timeout=5)
+    check(rig, "picker_group_paginates", int(rig.settingsui_state().get("pages", 1)) > 1,
+          rig.settingsui_state().get("pages"))
+    d = goto_page(rig, 1)
+    rows = rig.rows_on_page(d)
+    hit = rig.find_tag(d, rows[0], "action")["hit"]
+    y = (hit[1] + hit[3]) // 2
+    rig.swipe(hit[0] + 40, y, hit[0] + 40 + 160, y)
+    rig.wait_until(lambda: rig.settingsui_state().get("page") != 1, timeout=5)
+    check(rig, "picker_group_swipe_does_not_select", depth(rig) == 3, depth(rig))
+    picker_cancel(rig)
+    check(rig, "picker_group_chevron_pops_one", depth(rig) == 2, depth(rig))
+    picker_cancel(rig)
+    check(rig, "picker_first_chevron_pops_one", depth(rig) == 1, depth(rig))
+    close_animation(rig)
+
+    after = rig.settings()
+    changed = {k: (before[k], after[k]) for k in before if str(before[k]) != str(after[k])}
+    check(rig, "picker_no_choice_changes_nothing", not changed, changed)
+
+
+def check_gradient_picker_web_interference(rig):
+    """Acceptance: a web save while each picker level is open reaches the
+    parent's draft, the picker rebuilds on what is stored now, a deleted
+    library entry cannot be selected, and a web change of the edited
+    animation does not retarget an open picker. Every step reads the POST
+    back before judging the UI, so nothing here can pass by the write
+    being rejected.
+
+    Every step is a web save, so this refuses to run on a device up front
+    rather than setting up half a fixture it cannot put back."""
+    if not web_save_available(rig):
+        skip(rig, "gradient_picker_web_interference",
+             "every step here is a web save, and web_save runs on the simulator only")
+        return
+    s0 = rig.settings()
+    anim_a = int(s0["bgAnimId"])
+    anim_b = (anim_a + 1) % len(ANIM_NAMES)
+    map0 = s0["bgAnimThemeMap"]
+    lib0 = s0["bgAnimGradients"]
+    fps0 = int(s0["bgAnimFps"])
+    standby0 = int(s0["bgAnimStandbyId"])
+    lib = library_entries(lib0)
+
+    open_animation(rig)
+    open_picker(rig, "Gradient")
+
+    # 1. An untouched parent field changes under an open picker.
+    new_fps = 45 if fps0 != 45 else 50
+    web_save(rig, {"bgAnimFps": new_fps})
+    landed = rig.wait_until(lambda: int(rig.settings()["bgAnimFps"]) == new_fps, timeout=5)
+    check(rig, "picker_web_fps_landed", bool(landed), rig.settings()["bgAnimFps"])
+    picker_cancel(rig)
+    d = page_with_row(rig, "Frame rate")
+    check(rig, "picker_parent_draft_reconciled", rig.row_value(d, "Frame rate") == "%d fps" % new_fps,
+          "got %r want %r" % (rig.row_value(d, "Frame rate"), "%d fps" % new_fps))
+
+    # 2. The displayed library entry is deleted while its page is open.
+    if len(lib) >= 2:
+        lib_id, lib_name, _g = lib[0]
+        open_picker(rig, "Gradient")
+        picker_tap(rig, "My gradients")
+        rig.wait_until(lambda: depth(rig) == 3, timeout=5)
+        check(rig, "picker_deleted_entry_listed_first", lib_name in rows_across_pages(rig))
+        remaining = ";".join("%d|%s|%s" % e for e in lib[1:])
+        # The same save also moves an untouched parent field, so the second
+        # child level's reconcile is checked as well as the first one's.
+        deeper_fps = 35 if new_fps != 35 else 40
+        web_save(rig, {"bgAnimGradients": remaining, "bgAnimFps": deeper_fps})
+        landed = rig.wait_until(
+            lambda: rig.settings()["bgAnimGradients"] == remaining and int(rig.settings()["bgAnimFps"]) == deeper_fps,
+            timeout=5)
+        check(rig, "picker_delete_write_landed", bool(landed))
+        gone = rig.wait_until(lambda: lib_name not in rows_across_pages(rig), timeout=6)
+        check(rig, "picker_drops_deleted_entry", bool(gone), rows_across_pages(rig))
+        # Choosing whatever took its place must write that entry's ref, not
+        # the deleted one's.
+        names = rows_across_pages(rig)
+        picker_tap(rig, names[0])
+        # The pick stays on the page (gm-nov3.31); the chevrons are what take
+        # the run back to the Animation page for the checks below.
+        rig.wait_until(lambda: names[0] in picker_selected_rows(rig), timeout=5)
+        picker_cancel(rig)
+        picker_cancel(rig)
+        rig.wait_until(lambda: depth(rig) == 1, timeout=5)
+        chosen = map_ref(rig.settings()["bgAnimThemeMap"], anim_a)
+        check(rig, "picker_never_writes_deleted_ref", chosen != "c%d" % lib_id, chosen)
+        wanted = next("c%d" % e[0] for e in lib[1:] if e[1] == names[0])
+        check(rig, "picker_writes_surviving_ref", chosen == wanted, "got %r want %r" % (chosen, wanted))
+        d = page_with_row(rig, "Frame rate")
+        check(rig, "picker_second_level_reconciles_parent",
+              rig.row_value(d, "Frame rate") == "%d fps" % deeper_fps,
+              "got %r want %r" % (rig.row_value(d, "Frame rate"), "%d fps" % deeper_fps))
+        web_save(rig, {"bgAnimGradients": lib0})
+        check(rig, "picker_library_restored_after_delete",
+              bool(rig.wait_until(lambda: rig.settings()["bgAnimGradients"] == lib0, timeout=5)))
+
+    # 3. The edited animation changes under an open picker: the picker keeps
+    #    the slot it captured.
+    open_picker(rig, "Gradient")
+    web_save(rig, {"bgAnimId": anim_b})
+    landed = rig.wait_until(lambda: int(rig.settings()["bgAnimId"]) == anim_b, timeout=5)
+    check(rig, "picker_web_anim_change_landed", bool(landed), rig.settings()["bgAnimId"])
+    ref_a_now = map_ref(rig.settings()["bgAnimThemeMap"], anim_a)
+    cat = category_for_ref(ref_a_now, "Night Sky")
+    want_ref = builtin_ref_other_than(ref_a_now, category=cat)
+    picker_choose(rig, cat, THEME_NAMES[int(want_ref)])
+    s1 = rig.settings()
+    check(rig, "picker_writes_captured_slot", map_ref(s1["bgAnimThemeMap"], anim_a) == want_ref,
+          "anim %d got %r want %r" % (anim_a, map_ref(s1["bgAnimThemeMap"], anim_a), want_ref))
+    check(rig, "picker_leaves_other_slot", map_ref(s1["bgAnimThemeMap"], anim_b) == map_ref(map0, anim_b),
+          "anim %d got %r" % (anim_b, map_ref(s1["bgAnimThemeMap"], anim_b)))
+
+    # 4. The standby animation is turned off while its own picker is open:
+    #    the picker closes rather than editing a slot nothing reads. The
+    #    standby animation is set before the visit, not stepped inside it:
+    #    a field this visit touched keeps its draft against a web save, by
+    #    the same rule the precedence check covers, so a stepped Standby
+    #    anim row would (correctly) keep the picker open.
+    close_animation(rig)
+    standby_target = (anim_b + 1) % len(ANIM_NAMES)
+    web_save(rig, {"bgAnimStandbyId": standby_target})
+    ready = rig.wait_until(lambda: int(rig.settings()["bgAnimStandbyId"]) == standby_target, timeout=5)
+    check(rig, "picker_standby_setup_landed", bool(ready), rig.settings()["bgAnimStandbyId"])
+    open_animation(rig)
+    open_picker(rig, "Standby grad")
+    web_save(rig, {"bgAnimStandbyId": -1})
+    landed = rig.wait_until(lambda: int(rig.settings()["bgAnimStandbyId"]) == -1, timeout=5)
+    check(rig, "picker_standby_off_landed", bool(landed), rig.settings()["bgAnimStandbyId"])
+    closed = rig.wait_until(lambda: depth(rig) == 1, timeout=8)
+    check(rig, "picker_closes_when_slot_invalid", bool(closed), depth(rig))
+    check(rig, "picker_invalid_slot_wrote_nothing",
+          map_ref(rig.settings()["bgAnimThemeMap"], standby_target) == map_ref(map0, standby_target),
+          map_ref(rig.settings()["bgAnimThemeMap"], standby_target))
+
+    close_animation(rig)
+    web_save(rig, {"bgAnimThemeMap": map0, "bgAnimId": anim_a, "bgAnimFps": fps0, "bgAnimStandbyId": standby0})
+    restored = rig.wait_until(
+        lambda: rig.settings()["bgAnimThemeMap"] == map0 and int(rig.settings()["bgAnimId"]) == anim_a and
+        int(rig.settings()["bgAnimFps"]) == fps0 and int(rig.settings()["bgAnimStandbyId"]) == standby0,
+        timeout=5)
+    s9 = rig.settings()
+    check(rig, "picker_web_interference_restored", bool(restored),
+          "map=%r anim=%r fps=%r standby=%r" %
+          (s9["bgAnimThemeMap"], s9["bgAnimId"], s9["bgAnimFps"], s9["bgAnimStandbyId"]))
+
+
+def check_gradient_picker_teardown(rig):
+    """Acceptance: a route out of the category that is not the chevron tears
+    the whole cover down from under an open picker, commits what the visit
+    touched, and leaves nothing stale behind.
+
+    The real triggers named in the bead, a brew start and a standby timeout,
+    are not reachable from this simulator (test_temps.py's
+    check_forced_external_leave has the reasons). close=1 is the same code:
+    SettingsUI::close() and SettingsUI::onExternalLeave() both just call
+    teardownAll(). So this covers the teardown and leaves the triggers
+    themselves to the device."""
+    s0 = rig.settings()
+    anim0 = int(s0["bgAnimId"])
+    map0 = s0["bgAnimThemeMap"]
+    ref0 = map_ref(map0, anim0)
+    cat = category_for_ref(ref0, "Coffee")
+    want_ref = builtin_ref_other_than(ref0, category=cat)
+
+    open_animation(rig)
+    picker_choose_from_row(rig, "Gradient", cat, THEME_NAMES[int(want_ref)])
+    open_picker(rig, "Gradient")
+    picker_tap(rig, "Water and Ice")
+    rig.wait_until(lambda: depth(rig) == 3, timeout=5)
+
+    rig.settingsui(close=1)
+    closed = rig.wait_until(lambda: rig.settingsui_state().get("open") is False, timeout=5)
+    check(rig, "picker_teardown_closes_shell", bool(closed), rig.settingsui_state())
+    check(rig, "picker_teardown_commits_touched_slot",
+          map_ref(rig.settings()["bgAnimThemeMap"], anim0) == want_ref,
+          map_ref(rig.settings()["bgAnimThemeMap"], anim0))
+
+    # Nothing stale: the shell opens again on the tile page and the category
+    # rebuilds with the value the teardown committed.
+    open_animation(rig)
+    st = rig.settingsui_state()
+    check(rig, "picker_teardown_reopens_clean", st.get("depth") == 1 and st.get("category") == 2, st)
+    d = page_with_row(rig, "Gradient")
+    check(rig, "picker_teardown_row_shows_committed", rig.row_value(d, "Gradient") == THEME_NAMES[int(want_ref)],
+          rig.row_value(d, "Gradient"))
+    if ref0 != "":
+        pick_ref(rig, "Gradient", s0, ref0)
+    close_animation(rig)
+    restore_fields_exactly(rig, "picker_teardown_restored", {"bgAnimThemeMap": map0})
+
+
+def check_gradient_picker_audit(rig):
+    """Acceptance: Rig.audit passes on every picker page shape, with the
+    full library loaded, and no exemption is added beyond the exit
+    chevron's existing size and edge one."""
+    open_animation(rig)
+    for row in ("Gradient all", "Gradient"):
+        tag = "all" if "all" in row else "anim"
+        open_picker(rig, row)
+        for page in range(int(rig.settingsui_state().get("pages", 1))):
+            dump = goto_page(rig, page)
+            violations = rig.audit(dump)["violations"]
+            check(rig, "picker_audit_%s_page%d" % (tag, page), not violations, violations)
+        # The library and the longest category: the longest labels there are.
+        for group in ("My gradients", "Water and Ice"):
+            picker_tap(rig, group)
+            rig.wait_until(lambda: depth(rig) == 3, timeout=5)
+            for page in range(int(rig.settingsui_state().get("pages", 1))):
+                dump = goto_page(rig, page)
+                violations = rig.audit(dump)["violations"]
+                check(rig, "picker_audit_%s_%s_page%d" % (tag, group.split()[0].lower(), page),
+                      not violations, violations)
+            picker_cancel(rig)
+        picker_cancel(rig)
     close_animation(rig)
 
 
 def check_gradient_precedence_across_animations(rig):
     """Regression for the gm-flw.9 review on eed10a33: CatAnimation.cpp
     originally tracked only the most recently touched animation's gradient
-    edit (a single gradientTouchedAnimId/gradientLastRef pair). Touch
-    Gradient for animation A, switch to B, touch Gradient for B too: both
-    are now touched this visit, not just B, and commit() must write both
-    slots (one setBgAnimThemeMap call covering every touched entry whose
-    stored ref no longer matches this visit's last write), not just the
-    last one touched.
+    edit (a single gradientTouchedAnimId/gradientLastRef pair). Choose a
+    gradient for animation A, switch to B, choose one for B too: both are
+    touched this visit, not just B, and commit() must write both slots.
 
-    The review's own scenario adds a web save that replaces the whole map
-    with a different value for A's slot while both are touched, then
-    checks the display's value for A wins at pop. That step runs here
-    since gm-nov3.26 gave the simulator the real bg_map_valid() (the stub
-    in sim/platform/bganim_stub.cpp refused every map, so no POST could
-    change the field). The check below asserts the web write landed, and
-    the pop checks after it assert that A's touched draft and B's both
-    win over it."""
+    The review's own interference step runs here now (gm-nov3.3): the
+    simulator links the real BgAnimThemes.cpp, so bg_map_valid accepts a
+    well-formed map and a web save really does replace the whole string
+    while both slots are touched. What this check used to assert was the
+    opposite, that the POST bounced off the host stub, which meant the
+    step could not fail. The rule under test is the per-field one: a slot
+    this visit touched keeps the display's value at commit, and a slot it
+    did not touch keeps the web's.
+
+    The rows are the gm-nov3.3 picker rather than the old prev/next
+    arrows, so each touch here is a walk into the picker and a choice.
+
+    The four categories it walks are preferences, not assumptions: each one
+    has to offer a built-in other than the ref it replaces, so
+    category_for_ref picks another when the preferred one cannot."""
     s0 = rig.settings()
     anim_a = int(s0["bgAnimId"])
     anim_b = (anim_a + 1) % len(ANIM_NAMES)
+    anim_c = (anim_a + 2) % len(ANIM_NAMES)
+    map0 = s0["bgAnimThemeMap"]
+    ref0_a = map_ref(map0, anim_a)
+    ref0_b = map_ref(map0, anim_b)
+    ref0_c = map_ref(map0, anim_c)
 
-    d = open_animation(rig)
-    grad_a_btn = rig.find_tag(d, "Gradient", "next")
-    if grad_a_btn is None:
-        check(rig, "precedence_gradient_next_found", False)
-        close_animation(rig)
-        return
-    rig.tap_target(grad_a_btn)
-    ref_a = map_ref(rig.settings()["bgAnimThemeMap"], anim_a)
-    check(rig, "precedence_setup_touch_a", ref_a != "", "anim %d ref=%r" % (anim_a, ref_a))
+    open_animation(rig)
+    cat_a = category_for_ref(ref0_a, "Coffee")
+    ref_a = builtin_ref_other_than(ref0_a, category=cat_a)
+    picker_choose_from_row(rig, "Gradient", cat_a, THEME_NAMES[int(ref_a)])
+    check(rig, "precedence_setup_touch_a", map_ref(rig.settings()["bgAnimThemeMap"], anim_a) == ref_a,
+          map_ref(rig.settings()["bgAnimThemeMap"], anim_a))
 
-    rig.tap_target(rig.find_tag(rig.touchmap(screen=0), "Animation", "next"))
+    tap_row(rig, "Animation", "next")
     check(rig, "precedence_moved_to_b", int(rig.settings()["bgAnimId"]) == anim_b, rig.settings()["bgAnimId"])
 
-    rig.tap_target(rig.find_tag(rig.touchmap(screen=0), "Gradient", "next"))
+    cat_b = category_for_ref(ref0_b, "Neon")
+    ref_b = builtin_ref_other_than(ref0_b, category=cat_b)
+    picker_choose_from_row(rig, "Gradient", cat_b, THEME_NAMES[int(ref_b)])
     map_after_b = rig.settings()["bgAnimThemeMap"]
-    ref_b = map_ref(map_after_b, anim_b)
-    check(rig, "precedence_setup_touch_b", ref_b != "", "anim %d ref=%r" % (anim_b, ref_b))
+    check(rig, "precedence_setup_touch_b", map_ref(map_after_b, anim_b) == ref_b, map_ref(map_after_b, anim_b))
 
-    # The review's own interference step: a web save replacing the whole
-    # map with a different value for A's slot. It must land (a refusal
-    # would mean the precedence below is never tested), and the pop that
-    # follows must put the display's touched draft back over it.
-    web_ref_a = "1" if ref_a != "1" else "2"
-    web_map = map_write_ref(map_after_b, anim_a, web_ref_a)
-    try:
-        web_save(rig, {"bgAnimThemeMap": web_map})
-        after_post = map_ref(rig.settings()["bgAnimThemeMap"], anim_a)
-        check(rig, "webpost_bgAnimThemeMap_lands", after_post == web_ref_a,
-              "anim %d ref after the POST: got %r, want the posted %r" % (anim_a, after_post, web_ref_a))
-    except RuntimeError as e:
-        rig.log("gradient_precedence_web_save_unavailable", reason=str(e))
+    # The review's interference step: one web save replacing the whole map,
+    # with a different value in A's touched slot and in C's untouched one.
+    web_ref_a = builtin_ref_other_than(ref_a, category=category_for_ref(ref_a, "Pastel"))
+    web_ref_b = builtin_ref_other_than(ref_b, category=category_for_ref(ref_b, "Water and Ice"))
+    web_ref_c = builtin_ref_other_than(ref0_c, category=category_for_ref(ref0_c, "Metal and Stone"))
+    web_map = map_write_ref(map_write_ref(map_write_ref(map_after_b, anim_a, web_ref_a),
+                                          anim_b, web_ref_b), anim_c, web_ref_c)
+    interference = web_save_available(rig)
+    if not interference:
+        skip(rig, "precedence_web_interference",
+             "replacing the whole map is a web save, and web_save runs on the simulator only")
+    if interference:
+        # The map cannot be its own evidence that the POST landed. Since
+        # gm-nov3.36 the open category merges every touched slot back into the
+        # stored map within a UI pass, by design, so bgAnimThemeMap never
+        # equals web_map: the wait raised, the scenario aborted and the
+        # restore below never ran. A witness field the visit has not touched
+        # rides in the same request instead, and WebUIPlugin::handleSettings
+        # applies the whole document in one batchUpdate, so the witness
+        # arriving is the map arriving. Same shape as store_over_draft in
+        # test_gradientdraft.py, whose other_fps cannot be imported here
+        # because that module imports this one.
+        #
+        # A witness cannot say whether the map in the same document was stored
+        # or dropped by bg_map_valid, and the README says such a check needs
+        # its own preflight for that. This one does not: it asserts the
+        # untouched slot holds the ref the web wrote, and no page writes that
+        # slot, so a dropped map fails precedence_live_untouched_keeps_web.
+        fps_witness = 35 if int(s0["bgAnimFps"]) != 35 else 40
+        web_save(rig, {"bgAnimThemeMap": web_map, "bgAnimFps": fps_witness})
+        try:
+            landed = bool(rig.wait_until(lambda: int(rig.settings()["bgAnimFps"]) == fps_witness, timeout=5))
+        except TimeoutError:
+            landed = False
+        check(rig, "precedence_web_map_landed", landed,
+              "witness bgAnimFps %d, got %r" % (fps_witness, rig.settings()["bgAnimFps"]))
+
+        # What the old reading could not see at all, because it judged only
+        # after the pop: both touched slots go back to the display's values
+        # while the category is still open, and the untouched one keeps the
+        # web's. The web writes a different ref into all three slots, so each
+        # of these can fail on its own.
+        def live_settled():
+            m = rig.settings()["bgAnimThemeMap"]
+            return map_ref(m, anim_a) == ref_a and map_ref(m, anim_b) == ref_b
+
+        try:
+            live_ok = bool(rig.wait_until(live_settled, timeout=5))
+        except TimeoutError:
+            live_ok = False
+        live_map = rig.settings()["bgAnimThemeMap"]
+        check(rig, "precedence_live_a_reasserted", map_ref(live_map, anim_a) == ref_a,
+              "anim %d got %r want %r, the web wrote %r" %
+              (anim_a, map_ref(live_map, anim_a), ref_a, web_ref_a))
+        check(rig, "precedence_live_b_reasserted", map_ref(live_map, anim_b) == ref_b,
+              "anim %d got %r want %r, the web wrote %r" %
+              (anim_b, map_ref(live_map, anim_b), ref_b, web_ref_b))
+        check(rig, "precedence_live_both_reasserted", live_ok, live_map)
+        check(rig, "precedence_live_untouched_keeps_web", map_ref(live_map, anim_c) == web_ref_c,
+              "anim %d got %r want the web's %r" % (anim_c, map_ref(live_map, anim_c), web_ref_c))
 
     rig.settingsui(pop=1)
 
-    def restored():
+    def committed():
         m = rig.settings()["bgAnimThemeMap"]
         return map_ref(m, anim_a) == ref_a and map_ref(m, anim_b) == ref_b
 
-    ok = rig.wait_until(restored, timeout=6)
+    ok = rig.wait_until(committed, timeout=6)
     final_map = rig.settings()["bgAnimThemeMap"]
     check(rig, "gradient_precedence_a_survives", map_ref(final_map, anim_a) == ref_a,
           "anim %d got %r want %r" % (anim_a, map_ref(final_map, anim_a), ref_a))
     check(rig, "gradient_precedence_b_survives", map_ref(final_map, anim_b) == ref_b,
           "anim %d got %r want %r" % (anim_b, map_ref(final_map, anim_b), ref_b))
     check(rig, "gradient_precedence_both_survive", bool(ok))
+    if interference:
+        check(rig, "gradient_precedence_untouched_slot_keeps_web", map_ref(final_map, anim_c) == web_ref_c,
+              "anim %d got %r want the web's %r" % (anim_c, map_ref(final_map, anim_c), web_ref_c))
 
-    # Restore both to Default through the UI, never by a second POST. This
-    # visit opens on animId==anim_b (bgAnimId was written live by the
-    # "Animation next" tap above), Gradient showing ref_b one step from
-    # Default; undo it, step Animation back to A, undo A's edit the same
-    # way.
-    d = open_animation(rig)
-    rig.tap_target(rig.find_tag(d, "Gradient", "prev"))
-    rig.tap_target(rig.find_tag(rig.touchmap(screen=0), "Animation", "prev"))
-    rig.tap_target(rig.find_tag(rig.touchmap(screen=0), "Gradient", "prev"))
+    # Restore through the UI. This visit opens on animId==anim_b.
+    open_animation(rig)
+    pick_ref(rig, "Gradient", s0, ref0_b)
+    tap_row(rig, "Animation", "prev")
+    pick_ref(rig, "Gradient", s0, ref0_a)
     close_animation(rig)
 
     restored_map = rig.settings()["bgAnimThemeMap"]
-    a_default = map_ref(restored_map, anim_a) == ""
-    b_default = map_ref(restored_map, anim_b) == ""
-    check(rig, "gradient_precedence_restored", a_default and b_default,
-          "anim_a=%r anim_b=%r" % (map_ref(restored_map, anim_a), map_ref(restored_map, anim_b)))
-    if not (a_default and b_default):
+    if interference and map_ref(restored_map, anim_c) != ref0_c:
+        try:
+            web_save(rig, {"bgAnimThemeMap": map_write_ref(restored_map, anim_c, ref0_c)})
+            rig.wait_until(lambda: map_ref(rig.settings()["bgAnimThemeMap"], anim_c) == ref0_c, timeout=5)
+        except Exception as e:  # noqa: BLE001 -- best effort; the check below reports what is left
+            rig.log("could_not_restore_untouched_slot", reason=str(e))
+        restored_map = rig.settings()["bgAnimThemeMap"]
+    a_back = map_ref(restored_map, anim_a) == ref0_a
+    b_back = map_ref(restored_map, anim_b) == ref0_b
+    c_back = map_ref(restored_map, anim_c) == ref0_c
+    check(rig, "gradient_precedence_restored", a_back and b_back and c_back,
+          "anim_a=%r want %r, anim_b=%r want %r, anim_c=%r want %r" %
+          (map_ref(restored_map, anim_a), ref0_a, map_ref(restored_map, anim_b), ref0_b,
+           map_ref(restored_map, anim_c), ref0_c))
+    if not (a_back and b_back and c_back):
         rig.log("could_not_restore", bgAnimThemeMap=restored_map)
+    # The slots resolve back to what they were, but clearing one through the
+    # picker leaves the separators in the string; put the stored bytes back.
+    restore_fields_exactly(rig, "gradient_precedence_map_string_restored",
+                           {"bgAnimThemeMap": map0, "bgAnimFps": int(s0["bgAnimFps"])})
 
 
 def check_plates_and_tint_coupling(rig):
@@ -519,7 +2186,7 @@ def check_plates_and_tint_coupling(rig):
     tint0 = bool(s0["elementTintEnabled"])
 
     open_animation(rig)
-    d1 = goto_page(rig, 1)
+    d1 = page_with_row(rig, "Plates")
 
     steps_to_keep = (0 - plates0) % 3
     for _ in range(steps_to_keep):
@@ -553,37 +2220,38 @@ def check_plates_and_tint_coupling(rig):
     after_opacity = int(rig.settings()["bgAnimPlateOpacity"])
     check(rig, "plate_opacity_enabled_changes", after_opacity != before_opacity, "%r -> %r" % (before_opacity, after_opacity))
 
-    d1 = rig.touchmap(screen=0)
-    if rig.row_value(d1, "Element tint") == "On":
-        rig.tap_target(rig.find_tag(d1, "Element tint", "toggle"))
-    d1 = rig.touchmap(screen=0)
-    check(rig, "tint_off_for_test", rig.row_value(d1, "Element tint") == "Off", rig.row_value(d1, "Element tint"))
+    # Element tint and Tint colour are on different pages since gm-3vj.2, so
+    # the two rows are reached by name from here on.
+    dt = page_with_row(rig, "Element tint")
+    if rig.row_value(dt, "Element tint") == "On":
+        rig.tap_target(rig.find_tag(dt, "Element tint", "toggle"))
+    dt = rig.touchmap(screen=0)
+    check(rig, "tint_off_for_test", rig.row_value(dt, "Element tint") == "Off", rig.row_value(dt, "Element tint"))
     before_tc = rig.settings()["elementTintColor"]
-    rig.tap_target(rig.find_tag(d1, "Tint colour", "next"))
+    tap_row(rig, "Tint colour", "next")
     check(rig, "tint_color_disabled_ignored", rig.settings()["elementTintColor"] == before_tc)
 
-    rig.tap_target(rig.find_tag(rig.touchmap(screen=0), "Element tint", "toggle"))
-    d1 = rig.touchmap(screen=0)
-    check(rig, "tint_on_for_test", rig.row_value(d1, "Element tint") == "On", rig.row_value(d1, "Element tint"))
+    tap_row(rig, "Element tint", "toggle")
+    dt = page_with_row(rig, "Element tint")
+    check(rig, "tint_on_for_test", rig.row_value(dt, "Element tint") == "On", rig.row_value(dt, "Element tint"))
     before_tc = rig.settings()["elementTintColor"]
-    rig.tap_target(rig.find_tag(d1, "Tint colour", "next"))
+    tap_row(rig, "Tint colour", "next")
     after_tc = rig.settings()["elementTintColor"]
     check(rig, "tint_color_enabled_changes", after_tc != before_tc, "%r -> %r" % (before_tc, after_tc))
 
     # Restore, through the UI, in reverse.
-    rig.tap_target(rig.find_tag(rig.touchmap(screen=0), "Tint colour", "prev"))  # undo the one "next" above
+    tap_row(rig, "Tint colour", "prev")  # undo the one "next" above
     if not tint0:
-        rig.tap_target(rig.find_tag(rig.touchmap(screen=0), "Element tint", "toggle"))
-    d1 = rig.touchmap(screen=0)
-    check(rig, "tint_enabled_restored", bool(rig.row_value(d1, "Element tint") == "On") == tint0)
+        tap_row(rig, "Element tint", "toggle")
+    dt = page_with_row(rig, "Element tint")
+    check(rig, "tint_enabled_restored", bool(rig.row_value(dt, "Element tint") == "On") == tint0)
 
-    rig.tap_target(rig.find_tag(d1, "Plate colour", "prev"))  # undo the one "next" above
+    tap_row(rig, "Plate colour", "prev")  # undo the one "next" above
     restore_opacity_dir = "plus" if opacity_dir == "minus" else "minus"
-    rig.tap_target(rig.find_tag(rig.touchmap(screen=0), "Plate opacity", restore_opacity_dir))
+    tap_row(rig, "Plate opacity", restore_opacity_dir)
     steps_from_custom = (plates0 - 2) % 3
     for _ in range(steps_from_custom):
-        d1 = rig.touchmap(screen=0)
-        rig.tap_target(rig.find_tag(d1, "Plates", "next"))
+        tap_row(rig, "Plates", "next")
 
     final = rig.settings()
     check(rig, "plates_restored", int(final["bgAnimClearPlates"]) == plates0,
@@ -595,16 +2263,293 @@ def check_plates_and_tint_coupling(rig):
     close_animation(rig)
 
 
+def params_group(packed, anim_id):
+    """One animation's ';'-separated group of the bgAnimParams string, "" when
+    the string does not reach that far (which reads as "every parameter at its
+    default"; SettingsModel.h)."""
+    parts = str(packed or "").split(";")
+    return parts[anim_id] if 0 <= anim_id < len(parts) else ""
+
+
+def other_groups(packed, skip_id, count):
+    """Every group but `skip_id`, as text, for a "nothing else moved" check."""
+    return {i: params_group(packed, i) for i in range(count) if i != skip_id}
+
+
+def params_set_group(packed, anim_id, group):
+    """`packed` with one animation's group replaced, for the web-save half of
+    the Parameters check. The display's own writer does the same thing in C++
+    (SettingsModel.cpp, bgParamsWriteGroup)."""
+    parts = str(packed or "").split(";")
+    while len(parts) <= anim_id:
+        parts.append("")
+    parts[anim_id] = group
+    return ";".join(parts)
+
+
+def wait_depth(rig, depth, timeout=5):
+    def at():
+        state = rig.settingsui_state()
+        return state if int(state.get("depth", -1)) == depth else None
+
+    return rig.wait_until(at, timeout)
+
+
+def check_parameters_page(rig):
+    """Acceptance (gm-3vj.2): the Parameters row opens a page of one stepper
+    per parameter the current animation defines plus a Reset row; a step
+    writes that animation's group of bgAnimParams and no other group; Reset
+    puts the group back to the defaults; the chevron returns to the Animation
+    page.
+
+    The step and Reset halves are only exercised when the animation's group
+    is unset to begin with, which is what a fresh device and the simulator
+    fixture both store: Reset empties the group, so a run that started from
+    stored parameter values could not put them back through the UI
+    afterwards. The device runner hits that case if the bench board has
+    edited parameters, and logs it rather than moving a stored value it
+    cannot restore."""
+    s0 = rig.settings()
+    anim0 = int(s0["bgAnimId"])
+    packed0 = s0.get("bgAnimParams", "")
+    group0 = params_group(packed0, anim0)
+    others0 = other_groups(packed0, anim0, len(ANIM_NAMES))
+
+    d0 = open_animation(rig)
+    row = rig.find_tag(d0, "Parameters", "action")
+    if row is None:
+        check(rig, "params_row_found", False, "no Parameters action row on the Animation page")
+        close_animation(rig)
+        return
+    rig.tap_target(row)
+    state = wait_depth(rig, 2)
+    if state is None:
+        check(rig, "params_page_pushed", False, repr(rig.settingsui_state()))
+        close_animation(rig)
+        return
+    check(rig, "params_page_pushed", True)
+
+    # The title is the animation's name, with " params" behind it when the
+    # shell's 144 px title box can hold both (CatAnimParams.cpp).
+    name = ANIM_NAMES[anim0]
+    check(rig, "params_title", state.get("title") in (name, name + " params"),
+          "%r for animation %r" % (state.get("title"), name))
+
+    # Every page of the pushed page: audited, and its row list read.
+    pages = int(state.get("pages", 1))
+    names, dumps = [], []
+    for page in range(pages):
+        dump = goto_page(rig, page)
+        dumps.append((page, dump))
+        names += rig.rows_on_page(dump)
+    for page, dump in dumps:
+        a = rig.audit(dump)
+        check(rig, "params_audit_page_%d_clean" % page, len(a["violations"]) == 0, repr(a["violations"]))
+    check(rig, "params_has_reset_row", names and names[-1] == "Reset to defaults", repr(names))
+    param_names = names[:-1]
+    check(rig, "params_row_count", 1 <= len(param_names) <= 8, repr(names))
+    if not param_names:
+        rig.settingsui(pop=1)
+        close_animation(rig)
+        return
+
+    # Step the first parameter twice. Its row is the animation's slot 0: the
+    # page lists the slots the animation defines in slot order, and no
+    # animation in the roster leaves an undefined slot before a defined one.
+    first = param_names[0]
+    d = page_with_row(rig, first)
+    at_open = int(rig.row_value(d, first))
+    direction, delta = ("plus", 5) if at_open <= 90 else ("minus", -5)
+    expected = max(0, min(100, at_open + 2 * delta))
+    for _ in range(2):
+        tap_row(rig, first, direction)
+    d = page_with_row(rig, first)
+    shown = int(rig.row_value(d, first))
+    check(rig, "params_row_stepped", shown == expected, "got %d want %d (from %d)" % (shown, expected, at_open))
+
+    packed1 = rig.settings().get("bgAnimParams", "")
+    group1 = params_group(packed1, anim0)
+    slots1 = group1.split(",")
+    check(rig, "params_group_written", len(slots1) == 8, "%r" % group1)
+    check(rig, "params_group_first_slot", slots1 and slots1[0] == str(expected), "%r" % group1)
+    others1 = other_groups(packed1, anim0, len(ANIM_NAMES))
+    check(rig, "params_other_groups_untouched", others1 == others0,
+          "changed: %r" % {k: (others0[k], others1[k]) for k in others0 if others0[k] != others1[k]})
+
+    if group0 == "":
+        # Reset: the group goes back to being unset, and every row shows the
+        # animation's own default again.
+        d = page_with_row(rig, "Reset to defaults")
+        target = rig.find_tag(d, "Reset to defaults", "confirm")
+        if target is None:
+            check(rig, "params_reset_target_found", False, repr(rig.rows_on_page(d)))
+        else:
+            rig.tap_target(target, ms=2500)
+            packed2 = rig.settings().get("bgAnimParams", "")
+            check(rig, "params_reset_clears_group", params_group(packed2, anim0) == "",
+                  "%r" % params_group(packed2, anim0))
+            d = page_with_row(rig, first)
+            back = int(rig.row_value(d, first))
+            check(rig, "params_reset_restores_row", back == at_open, "got %d want %d" % (back, at_open))
+            others2 = other_groups(packed2, anim0, len(ANIM_NAMES))
+            check(rig, "params_reset_leaves_others", others2 == others0)
+    else:
+        # Started from stored values: undo the two steps instead of resetting.
+        undo = "minus" if direction == "plus" else "plus"
+        for _ in range(2):
+            tap_row(rig, first, undo)
+        rig.log("params_reset_skipped", reason="animation %d has stored parameters (%r)" % (anim0, group0))
+
+    # Out through the chevron: back on the Animation page, not closed.
+    d = page_with_row(rig, "Reset to defaults") if "Reset to defaults" in names else rig.touchmap(screen=0)
+    chevron = rig.find_tag(d, "exit", "exit")
+    if chevron is None:
+        check(rig, "params_chevron_found", False)
+    else:
+        rig.tap_target(chevron)
+        back = wait_depth(rig, 1)
+        check(rig, "params_chevron_returns_to_parent", back is not None, repr(rig.settingsui_state()))
+        if back is not None:
+            check(rig, "params_parent_page_rebuilt",
+                  rig.find_tag(rig.touchmap(screen=0), "Animation", "value") is not None,
+                  repr(rig.rows_on_page(rig.touchmap(screen=0))))
+    close_animation(rig)
+
+    final = rig.settings().get("bgAnimParams", "")
+    check(rig, "params_visit_restored", params_group(final, anim0) == group0,
+          "got %r want %r" % (params_group(final, anim0), group0))
+    if params_group(final, anim0) != group0:
+        rig.log("could_not_restore", bgAnimParams=final)
+
+
+def check_parameters_web_precedence(rig):
+    """Acceptance: a web save while the Parameters page is open is per-field
+    last writer wins, per parameter. A slot this visit stepped keeps the
+    visit's value and is re-asserted at pop; a slot it did not touch takes
+    the web value on the next pass.
+
+    Unlike bgAnimThemeMap, bgAnimParams is not gated behind a validity check
+    in WebUIPlugin.cpp, so the simulator can run this whole criterion: the
+    POST lands. Simulator only all the same, because web_save refuses any
+    host but loopback, and that refusal is taken here rather than after the
+    parameter row has been stepped: the step is the fixture, and the reset
+    that puts it back sits below the web save."""
+    if not web_save_available(rig):
+        skip(rig, "parameters_web_precedence",
+             "the interfering save is a web save, and web_save runs on the simulator only")
+        return
+    s0 = rig.settings()
+    anim0 = int(s0["bgAnimId"])
+    packed0 = s0.get("bgAnimParams", "")
+    if params_group(packed0, anim0) != "":
+        skip(rig, "parameters_web_precedence", "animation %d has stored parameters" % anim0)
+        return
+
+    d0 = open_animation(rig)
+    row = rig.find_tag(d0, "Parameters", "action")
+    if row is None:
+        check(rig, "params_web_row_found", False)
+        close_animation(rig)
+        return
+    rig.tap_target(row)
+    if wait_depth(rig, 2) is None:
+        check(rig, "params_web_page_pushed", False, repr(rig.settingsui_state()))
+        close_animation(rig)
+        return
+
+    names = rig.rows_on_page(rig.touchmap(screen=0))
+    param_names = [n for n in names if n != "Reset to defaults"]
+    if len(param_names) < 2:
+        skip(rig, "parameters_web_precedence", "animation %d defines fewer than two parameters" % anim0)
+        rig.settingsui(pop=1)
+        close_animation(rig)
+        return
+    touched_row, untouched_row = param_names[0], param_names[1]
+
+    d = page_with_row(rig, touched_row)
+    at_open = int(rig.row_value(d, touched_row))
+    direction, delta = ("plus", 5) if at_open <= 95 else ("minus", -5)
+    expected = max(0, min(100, at_open + delta))
+    tap_row(rig, touched_row, direction)
+
+    # A web save that moves both slots: the touched one to a third value,
+    # the untouched one to something the page has never shown.
+    packed1 = rig.settings().get("bgAnimParams", "")
+    slots = params_group(packed1, anim0).split(",")
+    web_touched = "5" if expected != 5 else "10"
+    web_untouched = "15" if slots[1] != "15" else "20"
+    slots[0], slots[1] = web_touched, web_untouched
+    web_save(rig, {"bgAnimParams": params_set_group(packed1, anim0, ",".join(slots))})
+
+    def untouched_shows_web():
+        dump = page_with_row(rig, untouched_row)
+        return dump if rig.row_value(dump, untouched_row) == web_untouched else None
+
+    ok = rig.wait_until(untouched_shows_web, timeout=6)
+    check(rig, "params_untouched_slot_takes_web_value", ok is not None,
+          "row %r shows %r, want %r" % (untouched_row, rig.row_value(page_with_row(rig, untouched_row), untouched_row),
+                                        web_untouched))
+    d = page_with_row(rig, touched_row)
+    check(rig, "params_touched_slot_keeps_draft", int(rig.row_value(d, touched_row)) == expected,
+          "row %r shows %r, want %d" % (touched_row, rig.row_value(d, touched_row), expected))
+
+    # Before the pop, because the slots are live fields: reconciliation has to
+    # put the touched slot back into the string the panel re-parses every
+    # pass, while the untouched slot keeps the web's value (gm-nov3.39).
+    stored = params_group(rig.settings().get("bgAnimParams", ""), anim0).split(",")
+    check(rig, "params_touched_slot_stored_before_pop", stored and stored[0] == str(expected),
+          "slot 0 is %r, want %r (web posted %r)"
+          % (stored[0] if stored else None, str(expected), web_touched))
+    check(rig, "params_untouched_slot_stored_before_pop", len(stored) > 1 and stored[1] == web_untouched,
+          "slot 1 is %r, want %r" % (stored[1] if len(stored) > 1 else None, web_untouched))
+
+    rig.settingsui(pop=1)
+    wait_depth(rig, 1)
+    final = params_group(rig.settings().get("bgAnimParams", ""), anim0).split(",")
+    check(rig, "params_commit_reasserts_touched_slot", final and final[0] == str(expected),
+          "slot 0 is %r, want %r" % (final[0] if final else None, str(expected)))
+    check(rig, "params_commit_keeps_web_slot", len(final) > 1 and final[1] == web_untouched,
+          "slot 1 is %r, want %r" % (final[1] if len(final) > 1 else None, web_untouched))
+
+    # Put the animation's group back to unset, through the UI.
+    rig.tap_target(rig.find_tag(rig.touchmap(screen=0), "Parameters", "action"))
+    if wait_depth(rig, 2) is not None:
+        d = page_with_row(rig, "Reset to defaults")
+        target = rig.find_tag(d, "Reset to defaults", "confirm")
+        if target is not None:
+            rig.tap_target(target, ms=2500)
+        rig.settingsui(pop=1)
+        wait_depth(rig, 1)
+    close_animation(rig)
+
+    restored = rig.settings().get("bgAnimParams", "")
+    check(rig, "params_web_precedence_restored", params_group(restored, anim0) == "",
+          "%r" % params_group(restored, anim0))
+    if params_group(restored, anim0) != "":
+        rig.log("could_not_restore", bgAnimParams=restored)
+
+
 # Every check, in order. One list, read by main() and by run() below, so a
 # standalone invocation and the end-to-end runner cannot drift apart.
 CHECKS = [
     ("rows_match_settings", check_rows_match_settings),
     ("no_op_visit", check_no_op_visit),
+    ("standby_anim", check_standby_anim),
     ("frame_rate_live_and_precedence", check_frame_rate_live_and_precedence),
     ("theme_recolor", check_theme_recolor),
-    ("gradient_default_and_builtin", check_gradient_default_and_builtin),
+    ("gradient_picker_navigation", check_gradient_picker_navigation),
+    ("gradient_all_and_standby_pickers", check_gradient_all_and_standby_pickers),
+    ("gradient_picker_high_library_ids", check_gradient_picker_high_library_ids),
+    ("gradient_picker_reachability", check_gradient_picker_reachability),
+    ("gradient_picker_repeated_names", check_gradient_picker_repeated_names),
+    ("gradient_picker_pagination_and_cancel", check_gradient_picker_pagination_and_cancel),
+    ("gradient_picker_web_interference", check_gradient_picker_web_interference),
+    ("gradient_picker_teardown", check_gradient_picker_teardown),
+    ("gradient_picker_audit", check_gradient_picker_audit),
     ("gradient_precedence_across_animations", check_gradient_precedence_across_animations),
     ("plates_and_tint_coupling", check_plates_and_tint_coupling),
+    ("parameters_page", check_parameters_page),
+    ("parameters_web_precedence", check_parameters_web_precedence),
 ]
 
 
@@ -615,11 +2560,13 @@ def run(rig, report, venue):
     simulator cannot reach (a library gradient, an external write to the
     theme map) already assert the simulator's own refusal internally."""
     del venue  # nothing here restarts the process or reads the log file
-    first_fail, first_total = len(FAILURES), TOTAL
+    first_fail, first_total, first_skip = len(FAILURES), TOTAL, len(SKIPPED)
     for name, fn in CHECKS:
         run_check(rig, name, fn)
     report.step("scenario_checks", scenario="animation", checks=TOTAL - first_total,
-                failed=len(FAILURES) - first_fail)
+                failed=len(FAILURES) - first_fail, skipped=len(SKIPPED) - first_skip)
+    for name, reason in SKIPPED[first_skip:]:
+        report.step("scenario_skip", scenario="animation", name=name, reason=reason)
     new_failures = FAILURES[first_fail:]
     if new_failures:
         raise AssertionError("; ".join("%s: %s" % (n, d) for n, d in new_failures))
@@ -653,6 +2600,10 @@ def main():
                 run_check(rig, name, fn)
 
     print()
+    if SKIPPED:
+        print("SKIPPED (%d):" % len(SKIPPED))
+        for name, reason in SKIPPED:
+            print("  %s: %s" % (name, reason))
     if FAILURES:
         print("FAIL (%d/%d checks failed):" % (len(FAILURES), TOTAL))
         for name, detail in FAILURES:
@@ -675,6 +2626,16 @@ if __name__ == "__main__":
 #   loop `rig.tap_target(find_tag(dump, "Animation", "next"))` once a
 #   second across all 14 animations against Rig("192.168.1.121"), reading
 #   rig.anim() and rig.heap() between taps.
+# - The Standby anim row's own effect (gm-3vj.49): the standby screen
+#   playing the chosen animation and the other screens keeping the main one,
+#   and the switch on a standby entry or exit costing no more than a live
+#   change of the main id does. Neither is observable here (no renderer, no
+#   /api/debug/anim route on the simulator). Command for the leader against
+#   the device: set Standby anim to an animation that differs from
+#   Animation, read rig.anim()["anim_id"] on an active screen, let the
+#   standby timeout land or force the standby screen, and read anim_id
+#   again; then walk in and out of standby a few times watching
+#   /api/debug/anim frames and /api/debug/heap int_free and hot_fail.
 # - Frame rate's device assertion: /api/debug/anim cap reaching 60 within
 #   500 ms, and the passive frame-counter rate check (orbits, all-screens
 #   on, interlace confirmed active). Command: rig.anim() before/after the
@@ -689,8 +2650,31 @@ if __name__ == "__main__":
 #   inferred from the write path (CatAnimation.cpp calls
 #   plugins().trigger("bganim:preview-end") in both onCycle handlers) but
 #   not independently confirmed by a device test here.
-# - The gradient library half of the Gradient acceptance criterion (a real
-#   library entry created through the web UI, then chosen): this scenario
-#   does not create one; needs a browser and the loadtest device.
+# - The gradient library and the map interference used to be listed here as
+#   unreachable, because sim/platform/bganim_stub.cpp made bg_library_valid
+#   and bg_map_valid always return false and WebUIPlugin.cpp gates every
+#   POST to those fields behind them. gm-nov3.3 deleted those stubs: the
+#   simulator links the real BgAnimThemes.cpp, so a well-formed library
+#   string and a well-formed map both land, and the checks above exercise
+#   them for real. Each such step reads the field back before judging the
+#   UI, so a future change that starts rejecting these POSTs fails the run
+#   instead of quietly passing it.
+# - How a swatch looks next to the panel. The picker checks read the
+#   framebuffer far enough to prove which gradient a row drew: the strip's
+#   two ends against that row's own stops (swatch_matches_stops, gm-nov3.28,
+#   pointed at the four remaining count-only checks by gm-nov3.33). What
+#   they do not establish is that the interior between those ends is the
+#   ramp the animation would paint. That is proved on the host instead, by
+#   tools/animbench/swatch_parity.cpp, which compares all 256 entries
+#   against the production palette code for every built-in and for library
+#   strings with 2 to 16 stops, repeated positions and flat endpoint runs,
+#   at seven tone settings.
+# - Picker frame rates. Whether a picker page costs the animation more than
+#   an ordinary settings page is a device question (the simulator has no
+#   renderer and no /api/debug/anim). Command for the leader: the runner's
+#   own page-rate phase against the loadtest board, with the animation,
+#   parameters, tone, frame cap, interlace and panel divider held, a
+#   repeated menu-screen baseline for the run-to-run spread, and the picker
+#   pages read the same way.
 # - "the web UI still loads the Display tab" after a gradient change: needs
 #   a real browser.

@@ -29,6 +29,11 @@ const int16_t *sinLut() {
 
 size_t g_allocSram = 0;
 size_t g_allocPsram = 0;
+#if defined(GM_TOUCH_PROBE) && defined(ESP_PLATFORM)
+std::atomic<int> g_harmoStampMode{1};
+std::atomic<uint32_t> g_harmoStampChecked{0};
+std::atomic<uint32_t> g_harmoStampMismatch{0};
+#endif
 
 namespace {
 // esp_ptr_external_ram() tests against the running target's real PSRAM window
@@ -162,11 +167,23 @@ void *allocHotShared(size_t size) {
 }
 
 void *alloc(size_t size) {
+    // 16-byte aligned, the same guarantee allocHot() gives, because a table
+    // from here can be a PIE kernel's source or destination and ee.vld/vst.128
+    // zero the low four address bits of their own access. ps_malloc promises
+    // four. On 2026-09-12 Truchet's blendLast came back 4-byte aligned on the
+    // bench board, every vector store landed up to twelve bytes before the
+    // block, the heap's head canary went with it, and the next free took the
+    // board down inside /api/debug/animtest. The host never showed it: glibc
+    // malloc is 16-byte aligned, so the goldens, the fuzzer and QEMU all agreed
+    // with a device that was writing outside its allocation. Aligning here
+    // rather than per table closes the whole class: an animation cannot get an
+    // unaligned table from bganim at all.
+    //
     // PSRAM by policy (see the header). The internal fall-back is for a build
     // without PSRAM or one that has exhausted it; on this board it never runs.
-    void *p = ps_malloc(size);
+    void *p = heap_caps_aligned_alloc(GM_BGANIM_ALLOC_ALIGN, size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (p == nullptr) {
-        p = heap_caps_malloc(size, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+        p = heap_caps_aligned_alloc(GM_BGANIM_ALLOC_ALIGN, size, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
         if (p != nullptr) {
             log_w("bganim: %u B in internal SRAM (PSRAM exhausted)", static_cast<unsigned>(size));
         }
@@ -436,6 +453,33 @@ int g_rawCount = 6;
 int g_brightness256 = 256; // Q8, 256 = unchanged
 int g_knee = 255;          // 255 = shoulder off
 
+// The tone the published palette was built with, packed together with the
+// generation that published it (gm-nov3.27).
+//
+// Bits 0..8 hold brightness256 (0..256), bits 9..16 the knee (0..255), and
+// bits 17..31 the low 15 bits of the generation. One load answers both halves
+// of "which palette is live and what tone went into it", which a reader cannot
+// get by reading two plain variables: it would see whichever pairing the two
+// separate loads happened to land on.
+//
+// The store is the LAST thing publishStops() does, with release ordering, so a
+// reader that acquire-loads this word and sees a tone has, by that fact, the
+// palette that tone was applied to. That direction is the whole point.
+// setThemeTone() assigns g_brightness256 and g_knee and only then rebuilds the
+// palette, so a reader of those two integers could see the new pair while the
+// render task was still drawing the old palette, and report a tone the panel
+// had not applied. Those two stay as the writer's own state and are now read
+// only on the task that writes them.
+//
+// The generation is truncated to 15 bits. It is only ever compared for
+// equality against another copy of this same word, and any publish makes the
+// render task rebuild within one frame, so nothing can be 32,768 generations
+// behind and match by accident.
+constexpr uint32_t packApplied(uint32_t gen, int bright, int knee) {
+    return (static_cast<uint32_t>(bright) & 0x1ffu) | ((static_cast<uint32_t>(knee) & 0xffu) << 9) | (gen << 17);
+}
+std::atomic<uint32_t> g_themeApplied{packApplied(0, 256, 255)};
+
 // Applies the tone to g_rawStops and publishes the result. Integer throughout:
 // this runs on a settings write, but the same arithmetic has to be describable
 // to the preview UI, and exact integer steps make the two agree.
@@ -476,6 +520,9 @@ void publishStops() {
     const uint32_t prev =
         g_themeMid.exchange(static_cast<uint32_t>(g_themeBack) | kThemeFresh, std::memory_order_acq_rel);
     g_themeBack = static_cast<int>(prev & 3);
+    // Last, and with release ordering, so that seeing this tone means seeing
+    // the palette above and the generation that carries it.
+    g_themeApplied.store(packApplied(b.gen, bright, knee), std::memory_order_release);
 }
 
 // Positions as a positional theme would carry them: p_i = i * 255 / (n - 1).
@@ -622,6 +669,38 @@ int themeStopCount() { return themeRead().count; }
 const uint8_t (*themeStops())[3] { return themeRead().stops; }
 const uint8_t *themeStopPositions() { return themeRead().pos; }
 bool themeUniform() { return themeRead().uniform; }
+
+int themeRawStops(uint8_t (*outStops)[3], uint8_t *outPos, int cap, bool *outUniform) {
+    int n = g_rawCount < cap ? g_rawCount : cap;
+    if (n < 0) {
+        n = 0;
+    }
+    for (int i = 0; i < n; i++) {
+        for (int c = 0; c < 3; c++) {
+            outStops[i][c] = g_rawStops[i][c];
+        }
+        if (outPos != nullptr) {
+            outPos[i] = g_rawPos[i];
+        }
+    }
+    if (outUniform != nullptr) {
+        *outUniform = g_rawUniform;
+    }
+    return n;
+}
+
+uint32_t themeApplied() { return g_themeApplied.load(std::memory_order_acquire); }
+
+void themeAppliedUnpack(uint32_t applied, int *brightness256, int *knee) {
+    if (brightness256 != nullptr) {
+        *brightness256 = static_cast<int>(applied & 0x1ffu);
+    }
+    if (knee != nullptr) {
+        *knee = static_cast<int>((applied >> 9) & 0xffu);
+    }
+}
+
+void themeToneState(int *brightness256, int *knee) { themeAppliedUnpack(themeApplied(), brightness256, knee); }
 
 void themeRGB(int pos, uint8_t out[3]) { themeRGBFrom(themeRead(), pos, out); }
 

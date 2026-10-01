@@ -2,22 +2,62 @@ import { useRef, useState } from 'preact/hooks';
 import { FontAwesomeIcon } from '@fortawesome/react-fontawesome';
 import { faChevronDown } from '@fortawesome/free-solid-svg-icons/faChevronDown';
 import { faChevronUp } from '@fortawesome/free-solid-svg-icons/faChevronUp';
+import { faCircleQuestion } from '@fortawesome/free-solid-svg-icons/faCircleQuestion';
 import { faLock } from '@fortawesome/free-solid-svg-icons/faLock';
 import { faXmark } from '@fortawesome/free-solid-svg-icons/faXmark';
+import { Tooltip } from './Tooltip.jsx';
+
+function labelToText(label, fallback) {
+  return typeof label === 'string' ? label : fallback;
+}
+
+export function SettingsHelpButton({ content, label, placement = 'top' }) {
+  if (!content) return null;
+
+  return (
+    <Tooltip
+      content={<span className='block max-w-xs text-left whitespace-normal'>{content}</span>}
+      placement={placement}
+    >
+      <button
+        type='button'
+        className='btn btn-ghost btn-circle btn-xs text-base-content/60 hover:text-base-content focus-visible:ring-primary h-5 min-h-0 w-5 shrink-0 p-0 focus-visible:ring-2 focus-visible:ring-offset-2 focus-visible:outline-none'
+        aria-label={`Help for ${label}`}
+        onClick={event => {
+          event.preventDefault();
+          event.currentTarget.focus();
+        }}
+      >
+        <FontAwesomeIcon icon={faCircleQuestion} className='h-3 w-3' aria-hidden='true' />
+      </button>
+    </Tooltip>
+  );
+}
+
+function FieldLabel({ label, htmlFor, tooltip, tooltipLabel }) {
+  return (
+    <div className='mb-1 flex items-start gap-1'>
+      <label htmlFor={htmlFor} className='block min-w-0 text-sm font-medium'>
+        {label}
+      </label>
+      <SettingsHelpButton content={tooltip} label={tooltipLabel || labelToText(label, htmlFor)} />
+    </div>
+  );
+}
 
 export function SettingsFormField({
   label,
   htmlFor,
   helpText,
+  tooltip,
+  tooltipLabel,
   children,
   className = '',
   noMargin = false,
 }) {
   return (
     <div className={`form-control ${noMargin ? '' : 'mb-3'} ${className}`}>
-      <label htmlFor={htmlFor} className='mb-1 block text-sm font-medium'>
-        {label}
-      </label>
+      <FieldLabel label={label} htmlFor={htmlFor} tooltip={tooltip} tooltipLabel={tooltipLabel} />
       {children}
       {helpText && <div className='mt-1 text-xs opacity-70'>{helpText}</div>}
     </div>
@@ -30,14 +70,14 @@ export function InputGroupField({
   unit,
   unitAriaLabel,
   helpText,
+  tooltip,
+  tooltipLabel,
   children,
   noMargin = false,
 }) {
   return (
     <div className={`form-control ${noMargin ? '' : 'mb-3'}`}>
-      <label htmlFor={htmlFor} className='mb-1 block text-sm font-medium'>
-        {label}
-      </label>
+      <FieldLabel label={label} htmlFor={htmlFor} tooltip={tooltip} tooltipLabel={tooltipLabel} />
       <div className='input-group'>
         <label htmlFor={htmlFor} className='input w-full'>
           {children}
@@ -49,11 +89,27 @@ export function InputGroupField({
   );
 }
 
-export function ToggleField({ label, htmlFor, checked, onChange, helpText }) {
+export function ToggleField({
+  label,
+  htmlFor,
+  checked,
+  onChange,
+  helpText,
+  tooltip,
+  tooltipLabel,
+}) {
   return (
     <div className='form-control'>
-      <label htmlFor={htmlFor} className='label cursor-pointer'>
-        <span className='label-text text-sm font-medium'>{label}</span>
+      <div className='label gap-3'>
+        <span className='flex min-w-0 items-center gap-1'>
+          <label htmlFor={htmlFor} className='label-text cursor-pointer text-sm font-medium'>
+            {label}
+          </label>
+          <SettingsHelpButton
+            content={tooltip}
+            label={tooltipLabel || labelToText(label, htmlFor)}
+          />
+        </span>
         <input
           id={htmlFor}
           name={htmlFor}
@@ -62,7 +118,7 @@ export function ToggleField({ label, htmlFor, checked, onChange, helpText }) {
           checked={checked}
           onChange={onChange}
         />
-      </label>
+      </div>
       {helpText && <div className='mt-1 text-xs opacity-70'>{helpText}</div>}
     </div>
   );

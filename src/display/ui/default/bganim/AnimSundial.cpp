@@ -1,0 +1,649 @@
+#ifndef GAGGIMATE_SIM
+
+// "Sundial": a breathing matte disc with a broad, softly edged beam turning
+// over it. This is entry 21 of tools/animbench/web/anim_bench.html, including
+// its radial face, left-to-right light gradient, drifting two-sine surface,
+// distance-based ray softness and radial beam falloff.
+//
+// The host PPM writer expands RGB565 with channel*255/max; the page uses
+// bit replication. Their low RGB888 bits can differ by one with identical
+// RGB565 pixels. The device gathers the original theme words directly.
+//
+// Brightness is Q4 (sixteenths of a theme-ramp index). Ray distances use the
+// shared sine table's scale of 512; smoothstep inputs and outputs are Q8,
+// including the endpoint 256. Every truncation below follows the page:
+// signed shifts round downward, integer divisions round toward zero, and
+// time products wrap as uint32_t before their unsigned shifts.
+//
+// The page materializes eight copies of colFace + surface + Bayer dither.
+// Here colSurface[x] + dith[(y & 7)*8 + (x & 7)] represents exactly the same
+// colPh entry without eight copies. colQ4 is folded into colFace when built,
+// since the page never reads the unshaded column radius again. In particular,
+// the radial beam uses that same dithered, shaded cp, not the bare radius.
+
+#include "BgAnim.h"
+#include "BgAnimCommon.h"
+#include <math.h>
+#include <string.h>
+
+#ifndef GM_BGANIM_SUNDIAL_ASM
+#define GM_BGANIM_SUNDIAL_ASM 1
+#endif
+
+namespace {
+using namespace bganim;
+
+constexpr int FACE_K = 92, FLOOR = 4;
+constexpr int RAD_RIM = (4080 * FACE_K) >> 8; // 1466 Q4 at the inscribed radius
+constexpr int RAD_LO = RAD_RIM * 6 / 10;      // 879; the code uses 60%, not the header's 55%
+constexpr int RAD_SPAN = RAD_RIM - RAD_LO;    // 587, the radial smoothstep's width
+// The beam's edge softness is the Edge softness slider (p[6], gm-3vj.24):
+// 24 + p * 140 / 100 pixels, so 94 px at 50, the old constant, and 24 to
+// 164 px over the range. softHalf and invSoft are set in frame() for that
+// width; at 94 px invSoft is 348, exactly the page's truncated reciprocal.
+// The kernel takes both only through its cursor seeds and steps. At 24 px
+// invSoft is 1365, so |q| stays under 400 million and q >> 16 under 6,000,
+// still inside the 32-bit accumulators and the 16-bit lane after the shift.
+int softHalf = 94 * 512 / 2, invSoft = 65536 * 256 / (94 * 512);
+// The shared Bayer matrix balances its columns (every column sums to 252) but
+// not its rows (168 to 336), and on a face this flat every eighth row came out
+// a third of a dither swing brighter than its neighbour: row to row steps in
+// mean brightness were 1.09 against 0.25 for columns on the goldens. The page
+// rotates each Bayer column by DITHER_ROT[x] (an xor on the row index), which
+// keeps the column sums and makes every row sum 252 too; of the 5,832
+// rotations that balance both it has the least low frequency power, 2% above
+// plain Bayer, with no row or column stripe component. The table is still
+// indexed dith[(y & 7) * 8 + (x & 7)] everywhere, so the kernels are untouched.
+constexpr uint8_t DITHER_ROT[8] = {0, 6, 2, 4, 5, 3, 7, 1};
+
+int32_t *colFace = nullptr;    // static radius and light gradient, frame() only
+int16_t *colSurface = nullptr; // colFace plus this frame's two surface sines
+int16_t *rowQ4 = nullptr;
+int16_t *surfRow = nullptr;
+int16_t *halfPx = nullptr;
+int16_t *dith = nullptr;
+uint16_t *palette = nullptr;
+uint32_t *palette32 = nullptr;  // same entries, 32-bit, for EE.LDXQ.32
+uint32_t *smooth32 = nullptr;
+uint32_t *radialAmp32 = nullptr;
+int16_t *field = nullptr;
+uint16_t *work = nullptr;      // 64 aligned bytes, beam terms then palette constants
+const int16_t *sine = nullptr; // borrowed shared table, never released here
+
+int allocW = 0, allocH = 0;
+uint32_t lastThemeGen = 0xFFFFFFFF;
+int lastShade = -1, lastContrast = -1;
+bool geometryValid = false;
+int faceBase = 0, beamQ4 = 0;
+int d0x = 0, d0y = 0, d1x = 0, d1y = 0;
+
+// At 480x480 the per-pixel tables fit the resident 9,216 B slab, 8,128 B of it:
+// colSurface, rowQ4, field: 960 B each; dith 128 B; palette 512 B;
+// palette32 1,024 B; smooth32 1,028 B (1,040 aligned); radialAmp32 2,352 B;
+// work 192 B.
+// The three 32-bit tables exist for EE.LDXQ.32, which scales its index by four
+// and so can only gather from a 32-bit table. They cost 2,832 B more than the
+// 16-bit versions, and surfRow and halfPx (960 B each) moved to PSRAM to pay
+// for it: both are read once per row rather than per pixel, which is the rule
+// for what may leave the slab.
+// colFace: 1,920 B in PSRAM, read only in the sequential frame() column pass.
+// smooth32/radialAmp32 are exact tabulations of bandRef's integer polynomials.
+// field is one reusable row, overwritten from the absolute y on every call.
+void release();
+
+BGANIM_INLINE int clampInt(int v, int lo, int hi) { return v < lo ? lo : (v > hi ? hi : v); }
+BGANIM_INLINE int smoothQ8(int u) { return (u * u * (768 - 2 * u)) >> 16; }
+
+bool init(int w, int h) {
+    if (allocW != 0 && (allocW != w || allocH != h)) {
+        release();
+    }
+    sine = sinLut();
+    if (sine == nullptr) {
+        release();
+        return false;
+    }
+    allocW = w;
+    allocH = h;
+    if (colFace == nullptr)
+        colFace = static_cast<int32_t *>(alloc(w * sizeof(int32_t)));
+    if (colSurface == nullptr)
+        colSurface = static_cast<int16_t *>(allocHot(w * sizeof(int16_t)));
+    if (rowQ4 == nullptr)
+        rowQ4 = static_cast<int16_t *>(allocHot(h * sizeof(int16_t)));
+    if (surfRow == nullptr)
+        surfRow = static_cast<int16_t *>(alloc(h * sizeof(int16_t)));
+    if (halfPx == nullptr)
+        halfPx = static_cast<int16_t *>(alloc(h * sizeof(int16_t)));
+    if (dith == nullptr)
+        dith = static_cast<int16_t *>(allocHot(64 * sizeof(int16_t)));
+    if (palette == nullptr)
+        palette = static_cast<uint16_t *>(allocHot(256 * sizeof(uint16_t)));
+    if (palette32 == nullptr)
+        palette32 = static_cast<uint32_t *>(allocHot(256 * sizeof(uint32_t)));
+    if (smooth32 == nullptr)
+        smooth32 = static_cast<uint32_t *>(allocHot(257 * sizeof(uint32_t)));
+    if (radialAmp32 == nullptr)
+        radialAmp32 = static_cast<uint32_t *>(allocHot((RAD_SPAN + 1) * sizeof(uint32_t)));
+    if (field == nullptr)
+        field = static_cast<int16_t *>(allocHot(w * sizeof(int16_t)));
+    if (work == nullptr)
+        work = static_cast<uint16_t *>(allocHot(192));
+    if (!work || !colFace || !colSurface || !rowQ4 || !surfRow || !halfPx || !dith || !palette || !palette32 ||
+        !smooth32 || !radialAmp32 || !field) {
+        release();
+        return false;
+    }
+    for (int u = 0; u <= 256; u++)
+        smooth32[u] = static_cast<uint32_t>(smoothQ8(u));
+    return true;
+}
+
+void frame(uint32_t tMs, int w, int h, const uint8_t p[BG_ANIM_PARAMS]) {
+    const uint32_t gen = themeGen();
+    if (!geometryValid || gen != lastThemeGen) {
+        buildThemeRamp(palette, 256);
+        for (int i = 0; i < 256; i++) palette32[i] = palette[i];
+        const float amp = ditherAmp(palette, 256) * 0.6f;
+        for (int y = 0; y < 8; y++) {
+            for (int x = 0; x < 8; x++) {
+                const int src = ((y ^ DITHER_ROT[x]) & 7) * 8 + x;
+                dith[y * 8 + x] = static_cast<int16_t>(lroundf((BAYER8[src] - 31.5f) * (amp * 16.0f / 31.5f)));
+            }
+        }
+        lastThemeGen = gen;
+    }
+    const int cx = w / 2, cy = h / 2;
+    if (!geometryValid || lastShade != p[3]) {
+        const int R = (cx < cy ? cx : cy) - 1;
+        const int R2 = R * R > 0 ? R * R : 1;
+        const int shade = p[3] * 24 / 100;
+        const int denomW = w > 1 ? w - 1 : 1;
+        for (int x = 0; x < w; x++) {
+            const int dx = x - cx;
+            // Negate BEFORE the arithmetic shift. Moving the minus past it
+            // changes nearly every column by one Q4 unit.
+            const int cq = (-static_cast<int>(static_cast<int64_t>(dx) * dx * 4080 / R2) * FACE_K) >> 8;
+            colFace[x] = cq - x * shade * 16 / denomW;
+        }
+        for (int y = 0; y < h; y++) {
+            const int dy = y - cy;
+            rowQ4[y] = static_cast<int16_t>((-static_cast<int>(static_cast<int64_t>(dy) * dy * 4080 / R2) * FACE_K) >> 8);
+            const int inside = R2 - dy * dy;
+            halfPx[y] = static_cast<int16_t>(inside > 0 ? static_cast<int>(sqrtf(static_cast<float>(inside))) : -1);
+        }
+        lastShade = p[3];
+    }
+    beamQ4 = (60 + p[2] * 88 / 100) * 16; // 960..2368 Q4, unchanged by theme tone
+    // Edge softness (p[6]): the soft band either side of each ray, 94 px at 50.
+    const int softPx = 24 + p[6] * 140 / 100;
+    softHalf = softPx * 512 / 2;
+    invSoft = 65536 * 256 / (softPx * 512);
+    if (!geometryValid || lastContrast != p[2]) {
+        for (int r = 0; r <= RAD_SPAN; r++) {
+            const int ur = r * 256 / RAD_SPAN;
+            radialAmp32[r] = static_cast<uint32_t>((beamQ4 * smoothQ8(ur)) >> 8);
+        }
+        lastContrast = p[2];
+    }
+    geometryValid = true;
+
+    // Speed follows the fleet's curve, speedMul(): 0.15x at 0, 1x at 50 and
+    // 6.7x at 100 of the rate Speed 50 has since gm-33fm (bead gm-kh2s).
+    // The multiplier is Q6 and 1664 at 50, the old rate of 26 with six
+    // fraction bits, and the five shifts below take those bits back, so
+    // Speed 50 is the same picture: the angle period is 1024*512/26 =
+    // 20.1649 seconds and the breath periods 5.0412 and 8.0660 seconds.
+    // The old affine law read 4 + p[0] * 44 / 100 and covered 0.15x to
+    // 1.85x. Every phase below reads at most bit 20 of its product, and Q6
+    // keeps bits 0..25, so the uint32 wrap never shows and the Speed 50
+    // output is bit identical to the old law's. Rounded, not truncated: the
+    // nearest .5 boundary over Speed 0..100 is 19 float ulps away, so the
+    // host, the device and the page agree.
+    const uint32_t speedQ6 = static_cast<uint32_t>(lroundf(1664.0f * speedMul(p[0])));
+    const uint32_t base = tMs * speedQ6;
+    const uint32_t angIdx = (base >> 15) & 1023;
+    const uint32_t phBr = base >> 13, phBr2 = (base * 5u) >> 16;
+    // Breath (p[4]) scales the two breath sines, 210 and 120 at 50: 0 holds
+    // the face's brightness still, 100 doubles the swing.
+    const int br1 = 210 * p[4] / 50, br2 = 120 * p[4] / 50;
+    const int breathQ4 = ((sine[phBr & 1023] * br1) >> 9) + ((sine[phBr2 & 1023] * br2) >> 9);
+    // Spatial steps 55/16 and 126/16 give wavelengths 297.891 and 130.032
+    // pixels. At Speed 50, the column waves drift -7.386 and +4.836 px/s;
+    // the row waves drift +11.079 and -3.224 px/s. Do not scale with w/h:
+    // the page holds these wavelengths and the 94-pixel softness fixed.
+    // Surface (p[5]) scales the four surface sines, 70 and 40 at 50: 0 is a
+    // smooth face, 100 doubles the ripple (column plus row at most 440 Q4, so
+    // cp stays well inside the kernel's 16-bit lanes).
+    const int s1 = 70 * p[5] / 50, s2 = 40 * p[5] / 50;
+    const uint32_t phS1 = base >> 16, phS2 = (base * 3u) >> 17;
+    for (int x = 0; x < w; x++) {
+        const int sc = ((sine[(((x * 55) >> 4) + phS1) & 1023] * s1) >> 9) + ((sine[(((x * 126) >> 4) - phS2) & 1023] * s2) >> 9);
+        colSurface[x] = static_cast<int16_t>(colFace[x] + sc);
+    }
+    for (int y = 0; y < h; y++) {
+        surfRow[y] = static_cast<int16_t>(((sine[(((y * 55) >> 4) - phS2) & 1023] * s1) >> 9) +
+                                          ((sine[(((y * 126) >> 4) + phS1) & 1023] * s2) >> 9));
+    }
+    const int wIdx = 96 + p[1] * 220 / 100; // 33.75..111.09375 degrees, always convex
+    const int a1 = (angIdx + wIdx) & 1023;
+    d0x = sine[(angIdx + 256) & 1023];
+    d0y = sine[angIdx];
+    d1x = sine[(a1 + 256) & 1023];
+    d1y = sine[a1];
+    // Face tone (p[7]) is the face's centre brightness, ramp index 104 at 50:
+    // 64 (a dark dial) at 0, 144 (a pale one) at 100.
+    const int faceHi = 64 + p[7] * 80 / 100;
+    faceBase = faceHi * 16 + breathQ4;
+}
+
+// floor/ceil rather than C's truncating division, for the page's signed
+// half-line intersections. These divisions happen once per ray per row.
+int floorDiv(int n, int d) {
+    const int q = n / d, r = n % d;
+    return q - (r != 0 && ((r < 0) != (d < 0)));
+}
+int ceilDiv(int n, int d) {
+    const int q = n / d, r = n % d;
+    return q + (r != 0 && ((r < 0) == (d < 0)));
+}
+
+void beamSpan(int y, int w, int &a, int &b) {
+    const int half = halfPx[y], cx = w / 2, dy = y - allocH / 2;
+    a = b = 0;
+    if (half < 0)
+        return;
+    a = clampInt(cx - half, 0, w);
+    b = clampInt(cx + half + 1, 0, w);
+    if (d0y > 0) {
+        const int xb = cx + floorDiv(d0x * dy + softHalf, d0y);
+        if (xb + 1 < b)
+            b = xb + 1;
+    } else if (d0y < 0) {
+        const int xb = cx + ceilDiv(d0x * dy + softHalf, d0y);
+        if (xb > a)
+            a = xb;
+    } else if (d0x * dy <= -softHalf)
+        b = a;
+    if (d1y > 0) {
+        const int xb = cx + ceilDiv(d1x * dy - softHalf, d1y);
+        if (xb > a)
+            a = xb;
+    } else if (d1y < 0) {
+        const int xb = cx + floorDiv(d1x * dy - softHalf, d1y);
+        if (xb + 1 < b)
+            b = xb + 1;
+    } else if (d1x * dy >= softHalf)
+        b = a;
+    // A ray nearly parallel to a row can intersect beyond the panel. Empty
+    // intersections render only the face, with no out-of-buffer prefix.
+    if (b <= a || a >= w || b <= 0) {
+        a = b = 0;
+    }
+}
+
+BGANIM_INLINE int beamValue(int cp, int rowBase, int rowRad, int g0, int g1) {
+    int v = rowBase + cp;
+    const int u0 = clampInt(((g0 + softHalf) * invSoft) >> 16, 0, 256);
+    const int u1 = clampInt(((g1 + softHalf) * invSoft) >> 16, 0, 256);
+    if (u0 > 0 && u1 > 0) {
+        int ur = (RAD_RIM - (rowRad - cp)) * 256 / RAD_SPAN;
+        if (ur > 256)
+            ur = 256;
+        if (ur > 0) {
+            const int amp = (beamQ4 * smoothQ8(ur)) >> 8;
+            v += (amp * ((smoothQ8(u0) * smoothQ8(u1)) >> 8)) >> 8;
+        }
+    }
+    return v;
+}
+
+GM_ANIM_IRAM void bandRef(uint16_t *__restrict dst, int y0, int rows, int w, uint32_t, const uint8_t *) {
+    for (int r = 0; r < rows; r++) {
+        const int y = y0 + r, dy = y - allocH / 2;
+        const int rowBase = faceBase + rowQ4[y] + surfRow[y], rowRad = -rowQ4[y];
+        const int16_t *off = dith + (y & 7) * 8;
+        uint16_t *out = dst + static_cast<size_t>(r) * w;
+        int a, b;
+        beamSpan(y, w, a, b);
+        int x = 0;
+        for (; x < a; x++)
+            out[x] = palette[clampInt((rowBase + colSurface[x] + off[x & 7]) >> 4, FLOOR, 255)];
+        int g0 = d0x * dy - d0y * (a - w / 2), g1 = (a - w / 2) * d1y - dy * d1x;
+        for (; x < b; x++) {
+            const int cp = colSurface[x] + off[x & 7];
+            const int v = beamValue(cp, rowBase, rowRad, g0, g1);
+            out[x] = palette[clampInt(v >> 4, FLOOR, 255)];
+            g0 -= d0y;
+            g1 += d1y;
+        }
+        for (; x < w; x++)
+            out[x] = palette[clampInt((rowBase + colSurface[x] + off[x & 7]) >> 4, FLOOR, 255)];
+    }
+}
+
+#if GM_BGANIM_SUNDIAL_ASM && defined(__XTENSA__) && !defined(GM_BGANIM_NO_ASM)
+// GCC 14 baseline, saved before writing these kernels with xtensa-asm14.sh:
+// bandRef is 431 instructions, no hardware loop. Its .L34 beam loop already
+// strength-reduces the two ray products to Q16 accumulators. The full radial
+// path still has three cubics, reciprocal division, spills and a bnez back
+// edge. Retain its srai/min/max and walking-phase shape, replacing the exact
+// integer curves by hot gathers and closing the gather with LOOP.
+//
+// PIE handles column+dither, eight beam-weight products, and the final
+// row add/clamp/shift. The unavoidable curve and palette gathers stay scalar.
+// There is no CPENABLE write: FreeRTOS owns lazy CP3 context. GCC never
+// allocates q0..q7 and has no q clobber syntax; each block defines every q
+// register it reads, and memory is clobbered. SAR is written inside each
+// block using it. The 64-byte work area and field/column bases are allocHot
+// aligned. The beam consumes a scalar prefix before any vector field access.
+// All three functions are copied verbatim into tests/anim_sundial/main.c.
+
+GM_ANIM_IRAM __attribute__((noinline)) void sundialColumnsAsm(int16_t *out, const int16_t *col, const int16_t *off, int n) {
+    int blocks = n >> 4;
+    int16_t *dst = out;
+    const int16_t *src = col;
+    // Six instructions per 16 pixels, 0.375/pixel. Two independent loads
+    // precede the adds, hiding their load-use gaps. Bayer repeats every eight.
+    asm volatile("ee.vld.128.ip q4, %[off], 0\n"
+                 "loopnez %[n], 1f\n"
+                 "ee.vld.128.ip q0, %[src], 16\n"
+                 "ee.vld.128.ip q1, %[src], 16\n"
+                 "ee.vadds.s16 q0, q0, q4\n"
+                 "ee.vadds.s16 q1, q1, q4\n"
+                 "ee.vst.128.ip q0, %[dst], 16\n"
+                 "ee.vst.128.ip q1, %[dst], 16\n"
+                 "1:\n"
+                 : [src] "+&r"(src), [dst] "+&r"(dst)
+                 : [off] "r"(off), [n] "r"(blocks)
+                 : "memory");
+    for (int x = blocks * 16; x < n; x++)
+        out[x] = col[x] + off[x & 7];
+}
+
+GM_ANIM_IRAM __attribute__((noinline)) void sundialBeamAsm(int16_t *pixels, uint16_t *work, const uint32_t *sm,
+                                                           const uint32_t *rad, int g0q, int g1q, int step0, int step1,
+                                                           int radialBias, int n) {
+    // q = (g + softHalf)*invSoft, (g + 24064)*348 at the default softness,
+    // exactly the reference before >>16. No reduced
+    // precision in the cursor. radialBias = 1466-rowRad; rad[r] includes the
+    // contrast-scaled radial cubic for r clamped to 0..587. Production cp
+    // stays within [-2254,264], steps within +/-178176, and |q| stays below
+    // 100 million at 480 pixels, so the signed accumulators cannot overflow,
+    // and q >> 16 stays within +/-1433, which is why the cursor can be
+    // narrowed to a 16-bit lane after the shift.
+    //
+    // Eight pixels an iteration. The three table reads the reference makes per
+    // pixel are the reason this used to be a scalar loop: PIE has no gather.
+    // EE.LDXQ.32 is the exception, a one-lane indexed 32-bit load, so eight of
+    // them plus one unzip fetch eight entries, and smooth and radialAmp are
+    // held as 32-bit tables for it. That is nine instructions for what cost
+    // about eight per pixel before. 62 instructions per eight pixels, 7.75 a
+    // pixel, against 25 for the scalar loop this replaces, and the arithmetic
+    // that follows is the same two multiplies and the same add as before.
+    //
+    // Register budget is the whole file: q0..q3 carry the two cursors as four
+    // 32-bit lane pairs and q4..q7 are scratch, so the five loop constants are
+    // read from the work area with a walking pointer that resets at the end.
+    while (n > 0) {
+        if (((uintptr_t)pixels & 15u) != 0 || n < 8) {
+            int u0 = g0q >> 16, u1 = g1q >> 16;
+            u0 = u0 < 0 ? 0 : (u0 > 256 ? 256 : u0);
+            u1 = u1 < 0 ? 0 : (u1 > 256 ? 256 : u1);
+            int r = radialBias + *pixels;
+            r = r < 0 ? 0 : (r > 587 ? 587 : r);
+            *pixels += (int16_t)((rad[r] * ((sm[u0] * sm[u1]) >> 8)) >> 8);
+            pixels++;
+            n--;
+            g0q += step0;
+            g1q += step1;
+            continue;
+        }
+        int16_t *c16 = (int16_t *)work;
+        int32_t *c32 = (int32_t *)work;
+        for (int k = 0; k < 8; k++) c16[k] = 256;          // +0   u clamp ceiling
+        for (int k = 0; k < 4; k++) c32[4 + k] = step0 * 8; // +16  cursor stride
+        for (int k = 0; k < 4; k++) c32[8 + k] = step1 * 8; // +32
+        for (int k = 0; k < 8; k++) c16[24 + k] = (int16_t)radialBias; // +48
+        for (int k = 0; k < 8; k++) c16[32 + k] = 587;     // +64  radial ceiling
+        for (int k = 0; k < 8; k++) {                      // +80  cursor seeds
+            c32[20 + k] = g0q + step0 * k;
+            c32[28 + k] = g1q + step1 * k;
+        }
+        const int blocks = n >> 3;
+        const int32_t *seed = c32 + 20;
+        const int16_t *cp = c16;
+        int16_t *px = pixels;
+        asm volatile("ee.vld.128.ip q0, %[seed], 16\n"
+                     "ee.vld.128.ip q1, %[seed], 16\n"
+                     "ee.vld.128.ip q2, %[seed], 16\n"
+                     "ee.vld.128.ip q3, %[seed], 0\n"
+                     "loopnez %[n], 1f\n"
+                     "ssai 16\n"
+                     "ee.vsr.32 q4, q0\n"
+                     "ee.vsr.32 q5, q1\n"
+                     "ee.vunzip.16 q4, q5\n"
+                     "ee.vsr.32 q5, q2\n"
+                     "ee.vsr.32 q6, q3\n"
+                     "ee.vunzip.16 q5, q6\n"
+                     "ee.zero.q q6\n"
+                     "ee.vmax.s16 q4, q4, q6\n"
+                     "ee.vmax.s16 q5, q5, q6\n"
+                     "ee.vld.128.ip q6, %[cp], 16\n"
+                     "ee.vmin.s16 q4, q4, q6\n"
+                     "ee.vmin.s16 q5, q5, q6\n"
+                     "ee.vld.128.ip q6, %[cp], 16\n"
+                     "ee.vadds.s32 q0, q0, q6\n"
+                     "ee.vadds.s32 q1, q1, q6\n"
+                     "ee.vld.128.ip q6, %[cp], 16\n"
+                     "ee.vadds.s32 q2, q2, q6\n"
+                     "ee.vadds.s32 q3, q3, q6\n"
+                     "ee.ldxq.32 q6, q4, %[sm], 0, 0\n"
+                     "ee.ldxq.32 q6, q4, %[sm], 1, 1\n"
+                     "ee.ldxq.32 q6, q4, %[sm], 2, 2\n"
+                     "ee.ldxq.32 q6, q4, %[sm], 3, 3\n"
+                     "ee.ldxq.32 q7, q4, %[sm], 0, 4\n"
+                     "ee.ldxq.32 q7, q4, %[sm], 1, 5\n"
+                     "ee.ldxq.32 q7, q4, %[sm], 2, 6\n"
+                     "ee.ldxq.32 q7, q4, %[sm], 3, 7\n"
+                     "ee.vunzip.16 q6, q7\n"
+                     "ee.ldxq.32 q4, q5, %[sm], 0, 0\n"
+                     "ee.ldxq.32 q4, q5, %[sm], 1, 1\n"
+                     "ee.ldxq.32 q4, q5, %[sm], 2, 2\n"
+                     "ee.ldxq.32 q4, q5, %[sm], 3, 3\n"
+                     "ee.ldxq.32 q7, q5, %[sm], 0, 4\n"
+                     "ee.ldxq.32 q7, q5, %[sm], 1, 5\n"
+                     "ee.ldxq.32 q7, q5, %[sm], 2, 6\n"
+                     "ee.ldxq.32 q7, q5, %[sm], 3, 7\n"
+                     "ee.vunzip.16 q4, q7\n"
+                     "ssai 8\n"
+                     "ee.vmul.u16 q6, q6, q4\n"
+                     "ee.vld.128.ip q4, %[px], 0\n"
+                     "ee.vld.128.ip q5, %[cp], 16\n"
+                     "ee.vadds.s16 q4, q4, q5\n"
+                     "ee.zero.q q5\n"
+                     "ee.vmax.s16 q4, q4, q5\n"
+                     "ee.vld.128.ip q5, %[cp], 16\n"
+                     "ee.vmin.s16 q4, q4, q5\n"
+                     "ee.ldxq.32 q5, q4, %[rad], 0, 0\n"
+                     "ee.ldxq.32 q5, q4, %[rad], 1, 1\n"
+                     "ee.ldxq.32 q5, q4, %[rad], 2, 2\n"
+                     "ee.ldxq.32 q5, q4, %[rad], 3, 3\n"
+                     "ee.ldxq.32 q7, q4, %[rad], 0, 4\n"
+                     "ee.ldxq.32 q7, q4, %[rad], 1, 5\n"
+                     "ee.ldxq.32 q7, q4, %[rad], 2, 6\n"
+                     "ee.ldxq.32 q7, q4, %[rad], 3, 7\n"
+                     "ee.vunzip.16 q5, q7\n"
+                     "ee.vmul.u16 q5, q5, q6\n"
+                     "ee.vld.128.ip q7, %[px], 0\n"
+                     "ee.vadds.s16 q7, q7, q5\n"
+                     "ee.vst.128.ip q7, %[px], 16\n"
+                     "addi %[cp], %[cp], -80\n"
+                     "1:\n"
+                     : [px] "+&r"(px), [cp] "+&r"(cp), [seed] "+&r"(seed)
+                     : [sm] "r"(sm), [rad] "r"(rad), [n] "r"(blocks)
+                     : "memory");
+        const int done = blocks * 8;
+        pixels += done;
+        n -= done;
+        g0q += step0 * done;
+        g1q += step1 * done;
+    }
+}
+
+GM_ANIM_IRAM __attribute__((noinline)) void sundialPaletteAsm(uint16_t *out, int16_t *pixels, const uint16_t *pal,
+                                                              const uint32_t *pal32, uint16_t *work, int rowBase, int n) {
+    // Four aligned vectors. Clamping in Q4 to [64,4080] before >>4 gives
+    // exactly the page's palette clamp to [4,255]. Multiplication by one
+    // with SAR=4 is the PIE arithmetic right shift for 16-bit lanes.
+    for (int k = 0; k < 8; k++) {
+        work[k] = rowBase;
+        work[8 + k] = 64;
+        work[16 + k] = 4080;
+        work[24 + k] = 1;
+    }
+    int16_t *src = pixels, *dst = pixels;
+    const uint16_t *constants = work;
+    const int blocks = n >> 4;
+    // Twelve instructions per 16 pixels, 0.75/pixel, with loads interleaved.
+    asm volatile("ee.vld.128.ip q4, %[c], 16\n"
+                 "ee.vld.128.ip q5, %[c], 16\n"
+                 "ee.vld.128.ip q6, %[c], 16\n"
+                 "ee.vld.128.ip q7, %[c], 0\n"
+                 "ssai 4\n"
+                 "loopnez %[n], 1f\n"
+                 "ee.vld.128.ip q0, %[src], 16\n"
+                 "ee.vld.128.ip q1, %[src], 16\n"
+                 "ee.vadds.s16 q0, q0, q4\n"
+                 "ee.vadds.s16 q1, q1, q4\n"
+                 "ee.vmax.s16 q0, q0, q5\n"
+                 "ee.vmax.s16 q1, q1, q5\n"
+                 "ee.vmin.s16 q0, q0, q6\n"
+                 "ee.vmin.s16 q1, q1, q6\n"
+                 "ee.vmul.s16 q0, q0, q7\n"
+                 "ee.vmul.s16 q1, q1, q7\n"
+                 "ee.vst.128.ip q0, %[dst], 16\n"
+                 "ee.vst.128.ip q1, %[dst], 16\n"
+                 "1:\n"
+                 : [src] "+&r"(src), [dst] "+&r"(dst), [c] "+&r"(constants)
+                 : [n] "r"(blocks)
+                 : "memory");
+    for (int x = blocks * 16; x < n; x++) {
+        int v = (pixels[x] + rowBase) >> 4;
+        pixels[x] = v < 4 ? 4 : (v > 255 ? 255 : v);
+    }
+    if ((((uintptr_t)out | (uintptr_t)pixels) & 15u) == 0 && n >= 8) {
+        // EE.LDXQ.32 reads eight palette entries with eight indexed loads and
+        // one unzip, where the scalar pair loop below needs eleven instructions
+        // for two pixels. palette32 holds the same entries, 32-bit, because the
+        // instruction's index is scaled by four. Both pointers are 16-byte
+        // aligned here, which EE.VLD.128.IP and EE.VST.128.IP require: they
+        // clear the low four address bits without complaint.
+        const int16_t *ip = pixels;
+        uint16_t *vop = out;
+        asm volatile("loopnez %[n], 1f\n"
+                     "ee.vld.128.ip q0, %[idx], 16\n"
+                     "ee.ldxq.32 q1, q0, %[pal32], 0, 0\n"
+                     "ee.ldxq.32 q1, q0, %[pal32], 1, 1\n"
+                     "ee.ldxq.32 q1, q0, %[pal32], 2, 2\n"
+                     "ee.ldxq.32 q1, q0, %[pal32], 3, 3\n"
+                     "ee.ldxq.32 q2, q0, %[pal32], 0, 4\n"
+                     "ee.ldxq.32 q2, q0, %[pal32], 1, 5\n"
+                     "ee.ldxq.32 q2, q0, %[pal32], 2, 6\n"
+                     "ee.ldxq.32 q2, q0, %[pal32], 3, 7\n"
+                     "ee.vunzip.16 q1, q2\n"
+                     "ee.vst.128.ip q1, %[out], 16\n"
+                     "1:\n"
+                     : [idx] "+&r"(ip), [out] "+&r"(vop)
+                     : [pal32] "r"(pal32), [n] "r"(n >> 3)
+                     : "memory");
+        const int done = (n >> 3) * 8;
+        for (int x = done; x < n; x++) out[x] = pal[pixels[x]];
+        return;
+    }
+    const int16_t *idx = pixels;
+    uint16_t *op = out;
+    int t0, t1;
+    // Eleven instructions per pair, 5.5/pixel. Two independently addressed
+    // loads separate every load from its consumer; the output needs only the
+    // contract's four-byte alignment, since no vector store touches out.
+    asm volatile("loopnez %[n], 1f\n"
+                 "l16ui %[t0], %[idx], 0\n"
+                 "l16ui %[t1], %[idx], 2\n"
+                 "addx2 %[t0], %[t0], %[pal]\n"
+                 "addx2 %[t1], %[t1], %[pal]\n"
+                 "l16ui %[t0], %[t0], 0\n"
+                 "l16ui %[t1], %[t1], 0\n"
+                 "addi %[idx], %[idx], 4\n"
+                 "slli %[t1], %[t1], 16\n"
+                 "or %[t0], %[t0], %[t1]\n"
+                 "s32i %[t0], %[out], 0\n"
+                 "addi %[out], %[out], 4\n"
+                 "1:\n"
+                 : [idx] "+&r"(idx), [out] "+&r"(op), [t0] "=&r"(t0), [t1] "=&r"(t1)
+                 : [pal] "r"(pal), [n] "r"(n >> 1)
+                 : "memory");
+    if (n & 1)
+        out[n - 1] = pal[pixels[n - 1]];
+}
+#endif
+
+GM_ANIM_IRAM void band(uint16_t *dst, int y0, int rows, int w, uint32_t tMs, const uint8_t *p) {
+#if GM_BGANIM_SUNDIAL_ASM && defined(__XTENSA__) && !defined(GM_BGANIM_NO_ASM)
+    for (int r = 0; r < rows; r++) {
+        const int y = y0 + r, dy = y - allocH / 2;
+        sundialColumnsAsm(field, colSurface, dith + (y & 7) * 8, w);
+        int a, b;
+        beamSpan(y, w, a, b);
+        if (b > a) {
+            const int g0 = d0x * dy - d0y * (a - w / 2), g1 = (a - w / 2) * d1y - dy * d1x;
+            sundialBeamAsm(field + a, work, smooth32, radialAmp32, (g0 + softHalf) * invSoft,
+                           (g1 + softHalf) * invSoft, -d0y * invSoft, d1y * invSoft, RAD_RIM + rowQ4[y], b - a);
+        }
+        sundialPaletteAsm(dst + static_cast<size_t>(r) * w, field, palette, palette32, work,
+                          faceBase + rowQ4[y] + surfRow[y], w);
+    }
+#else
+    bandRef(dst, y0, rows, w, tMs, p);
+#endif
+}
+
+void release() {
+    releaseTable(colFace, static_cast<size_t>(allocW) * sizeof(int32_t));
+    releaseTable(colSurface, static_cast<size_t>(allocW) * sizeof(int16_t));
+    releaseTable(rowQ4, static_cast<size_t>(allocH) * sizeof(int16_t));
+    releaseTable(surfRow, static_cast<size_t>(allocH) * sizeof(int16_t));
+    releaseTable(halfPx, static_cast<size_t>(allocH) * sizeof(int16_t));
+    releaseTable(dith, 64 * sizeof(int16_t));
+    releaseTable(palette, 256 * sizeof(uint16_t));
+    releaseTable(palette32, 256 * sizeof(uint32_t));
+    releaseTable(smooth32, 257 * sizeof(uint32_t));
+    releaseTable(radialAmp32, (RAD_SPAN + 1) * sizeof(uint32_t));
+    releaseTable(field, static_cast<size_t>(allocW) * sizeof(int16_t));
+    releaseTable(work, 192);
+    sine = nullptr;
+    allocW = allocH = 0;
+    lastThemeGen = 0xFFFFFFFF;
+    lastShade = lastContrast = -1;
+    geometryValid = false;
+    faceBase = beamQ4 = d0x = d0y = d1x = d1y = 0;
+    softHalf = 94 * 512 / 2;
+    invSoft = 65536 * 256 / (94 * 512);
+}
+
+} // namespace
+
+extern const BgAnimation bg_anim_sundial;
+const BgAnimation bg_anim_sundial = {
+    "sundial",
+    "Sundial",
+    {{"speed", "Speed", 50}, {"width", "Wedge width", 40}, {"contrast", "Contrast", 25}, {"shading", "Surface shading", 30},
+     {"breath", "Breath", 50}, {"surface", "Surface", 50}, {"softness", "Edge softness", 50}, {"tone", "Face tone", 50}},
+    init,
+    frame,
+    band,
+    release,
+    bandRef,
+};
+
+#endif // GAGGIMATE_SIM

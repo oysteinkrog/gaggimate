@@ -99,6 +99,7 @@ extern int64_t gm_ws_arc_us;
 #include <display/ui/default/eez/actions.h>
 #include <display/ui/default/eez/images.h>
 #include <display/ui/default/eez/ui.h>
+#include <display/ui/default/images/UiImages.h>
 
 // Kitchen-scale glyph for the menu's Scale button (img_scale_80x80.c).
 extern const lv_img_dsc_t img_scale_80x80;
@@ -205,39 +206,83 @@ void DefaultUI::openSettings() { settingsUI.open(); }
 void DefaultUI::closeSettings() { settingsUI.close(); }
 
 #ifndef GAGGIMATE_SIM
-// One-time carry-over from the single custom gradient (bgAnimCustomTheme,
-// selected by bgAnimTheme == bg_theme_count()) to the library: the string
-// becomes library entry 1 "Custom", and if it was the active theme every
-// animation is pointed at it so nothing changes on screen. Runs only while
-// the library is empty, so a user who has since built their own is left
-// alone.
+// One-time carry-over of the pre-library custom gradient (bgAnimCustomTheme,
+// selected by bgAnimTheme == BG_THEME_LEGACY_CUSTOM) into the library. The
+// decisions are all in bg_plan_gradient_migration and the ordering in
+// bg_run_gradient_migration (BgAnimThemes.cpp, which documents both at
+// length); this is only the Settings store they run against.
+//
+// Each step is its own flushNow(). Settings::doSave writes properties in
+// registration order, bg_th and bg_ct before bg_gl and bg_gref, and carries
+// on past a failed key, so one combined save could durably clear the custom
+// string before the library entry that replaces it exists.
+namespace {
+
+struct MigrateStore {
+    ::Settings *settings;
+    String library;
+};
+
+const char *migrateLibrary(void *user) {
+    auto *s = static_cast<MigrateStore *>(user);
+    s->library = s->settings->getBgAnimGradients();
+    return s->library.c_str();
+}
+
+void migrateSetLibrary(void *user, const char *library) {
+    auto *s = static_cast<MigrateStore *>(user);
+    ::Settings::Guard guard(*s->settings);
+    s->settings->setBgAnimGradients(String(library));
+}
+
+void migrateSetGlobalRef(void *user, const char *ref) {
+    auto *s = static_cast<MigrateStore *>(user);
+    ::Settings::Guard guard(*s->settings);
+    s->settings->setBgAnimGradientRef(String(ref));
+}
+
+void migrateSetLegacy(void *user, int themeId, const char *custom) {
+    auto *s = static_cast<MigrateStore *>(user);
+    ::Settings::Guard guard(*s->settings);
+    s->settings->setBgAnimTheme(themeId);
+    s->settings->setBgAnimCustomTheme(String(custom));
+}
+
+bool migrateFlush(void *user) { return static_cast<MigrateStore *>(user)->settings->flushNow(); }
+
+} // namespace
+
 void DefaultUI::migrateBgAnimGradients() {
     ::Settings &settings = controller->getSettings();
-    if (!settings.getBgAnimGradients().isEmpty()) {
-        return;
+    BgGradientMigration plan;
+    {
+        ::Settings::Guard guard(settings);
+        plan = bg_plan_gradient_migration(settings.getBgAnimGradients().c_str(),
+                                          settings.getBgAnimCustomTheme().c_str(), settings.getBgAnimTheme(),
+                                          settings.getBgAnimGradientRef().c_str(), settings.getBgAnimThemeMap().c_str());
     }
-    uint8_t stops[BG_THEME_MAX_STOPS][3];
-    uint8_t pos[BG_THEME_MAX_STOPS];
-    bool uniform = true;
-    const int n = bg_parse_gradient(settings.getBgAnimCustomTheme().c_str(), stops, pos, uniform);
-    if (n == 0) {
-        return;
+    MigrateStore store{&settings, String()};
+    BgGradientStore api;
+    api.user = &store;
+    api.library = migrateLibrary;
+    api.setLibrary = migrateSetLibrary;
+    api.setGlobalRef = migrateSetGlobalRef;
+    api.setLegacy = migrateSetLegacy;
+    api.flush = migrateFlush;
+    switch (bg_run_gradient_migration(api, plan)) {
+    case BgMigrateResult::NothingToDo:
+        break;
+    case BgMigrateResult::Deferred:
+        ESP_LOGW("DefaultUI", "custom gradient left where it is: %s", plan.reason);
+        break;
+    case BgMigrateResult::Incomplete:
+        ESP_LOGE("DefaultUI", "custom gradient migration did not persist; retrying on the next boot");
+        break;
+    case BgMigrateResult::Done:
+        ESP_LOGI("DefaultUI", "custom gradient carried over to library entry %d (%s)", plan.entryId,
+                 plan.reason[0] != '\0' ? plan.reason : "complete");
+        break;
     }
-    char gradient[BG_GRADIENT_STR_MAX];
-    bg_format_gradient(stops, pos, n, uniform, gradient, sizeof(gradient));
-    settings.setBgAnimGradients(String("1|Custom|") + gradient);
-    if (settings.getBgAnimTheme() == bg_theme_count() && settings.getBgAnimThemeMap().isEmpty()) {
-        String map;
-        for (int i = 0; i < bg_animation_count(); i++) {
-            if (i > 0) {
-                map += ';';
-            }
-            map += "c1";
-        }
-        settings.setBgAnimThemeMap(map);
-        settings.setBgAnimTheme(0);
-    }
-    ESP_LOGI("DefaultUI", "custom gradient moved to the library (%d stops)", n);
 }
 #endif
 
@@ -1318,6 +1363,19 @@ void DefaultUI::iconDeleted(lv_event_t *e) {
 
 void DefaultUI::scanIcons(lv_obj_t *obj) {
     if (lv_obj_check_type(obj, &lv_img_class)) {
+        // A clickable image is a button, and its PRESSED state changes are
+        // the user's taps, not a blink. The settings rows' arrows (clickable
+        // lv_img, SettingsRows.cpp) were taken over after their first tap
+        // and then sometimes vanished until the next redraw (owner's report,
+        // 2026-09-10); the likely reason is that the sprite waits for the
+        // publish after the handover invalidation and a settings page at
+        // rest has none, but the fix is the same either way. The blinking
+        // dial icons are not clickable, so nothing this path exists for is
+        // lost. A candidate that has become clickable falls out through the
+        // unseen sweep in serviceIconLayers, releasing its layer.
+        if (lv_obj_has_flag(obj, LV_OBJ_FLAG_CLICKABLE)) {
+            return;
+        }
         const bool hidden = lv_obj_has_flag(obj, LV_OBJ_FLAG_HIDDEN);
         // Press and focus are touch feedback, not a blink: counting them
         // made one press and release two toggles, enough to take a static
@@ -1331,7 +1389,14 @@ void DefaultUI::scanIcons(lv_obj_t *obj) {
             }
         }
         if (c == nullptr) {
-            if (iconCandN < kIconCandCap && lv_obj_get_width(obj) * lv_obj_get_height(obj) <= kIconMaxPx) {
+            // An image with no area cannot blink where anyone can see it, and
+            // a sprite of it would be empty. serviceSteamStartButton leaves
+            // one on the steam screen (objects.obj14, sized away because the
+            // button it stood in for now shows the state), and the generated
+            // tick still toggles its hidden flag, so without this it would
+            // qualify on the second toggle and take a layer slot.
+            const int px = lv_obj_get_width(obj) * lv_obj_get_height(obj);
+            if (iconCandN < kIconCandCap && px > 0 && px <= kIconMaxPx) {
                 c = &iconCands[iconCandN++];
                 c->obj = obj;
                 c->hidden = hidden;
@@ -1867,6 +1932,7 @@ void DefaultUI::init() {
     g_touchHitHook = &DefaultUI::touchHitHook;
     profileManager = controller->getProfileManager();
     g_overlayMinRefreshUs = OVERLAY_MIN_REFRESH_US;
+    g_uiMinRenderMs = RERENDER_MIN_INTERVAL;
     auto triggerRender = [this](Event const &) { rerender = true; };
     pluginManager->on("boiler:currentTemperature:change", [this](Event const &event) {
         int newTemp = static_cast<int>(event.getFloat("value"));
@@ -2076,6 +2142,15 @@ void DefaultUI::loop() {
     // too, and the settings shell needs its web-save reconciliation, refresh
     // tick and theme restyle checks there regardless of venue.
     serviceTouchMap();
+    if (g_scaleScreenReq >= 0) {
+        const int req = g_scaleScreenReq;
+        g_scaleScreenReq = -1;
+        if (req != 0) {
+            openScaleScreen();
+        } else {
+            scaleScreenRequested = false;
+        }
+    }
     settingsUI.service();
 #if defined(GM_TOUCH_PROBE) || defined(GAGGIMATE_SIM)
     serviceSettingsUi();
@@ -2100,7 +2175,8 @@ void DefaultUI::loop() {
     // only get applied on the pass AFTER the edge — run immediately.
     // ui_tick() and the maintain calls below still run on a held pass.
     const bool spacerHold =
-        rerender && diff < RERENDER_MIN_INTERVAL && esp_timer_get_time() - g_touchEdgeAtUs >= GM_TOUCH_GRACE_US;
+        rerender && diff < static_cast<unsigned long>(g_uiMinRenderMs < 0 ? 0 : g_uiMinRenderMs) &&
+        esp_timer_get_time() - g_touchEdgeAtUs >= GM_TOUCH_GRACE_US;
 
     if (rerender && !spacerHold) {
         rerender = false;
@@ -3129,6 +3205,28 @@ bool DefaultUI::layerMoveInFlight(const lv_obj_t *obj) const {
     return false;
 }
 
+namespace {
+// LVGL's lv_obj_add_flag and lv_obj_clear_flag invalidate the whole object for
+// LV_OBJ_FLAG_HIDDEN whether or not the flag actually changed (lv_obj.c, the
+// two LV_OBJ_FLAG_HIDDEN branches), and a whole-object invalidation of a
+// full-screen cover is a whole-page snapshot: on the bench board a median of
+// 147 ms of the UI task, during which the render task gets a fraction of the
+// PSRAM bus and the compositor-owned readouts stop easing. maintainScaleScreen
+// re-asserted the scale cover's visible state every pass, so the scale screen
+// invalidated all 480x480 about fourteen times a second and the weight readout
+// advanced in visible steps. Write the flag only when it moves.
+void setHiddenIfChanged(lv_obj_t *obj, bool hidden) {
+    if (obj == nullptr || lv_obj_has_flag(obj, LV_OBJ_FLAG_HIDDEN) == hidden) {
+        return;
+    }
+    if (hidden) {
+        lv_obj_add_flag(obj, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        lv_obj_clear_flag(obj, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+} // namespace
+
 void DefaultUI::serviceLayerMoves() {
 #ifndef GAGGIMATE_SIM
     for (LayerMove &m : layerMoves) {
@@ -3629,7 +3727,188 @@ static void tuneGeneratedRecurse(lv_obj_t *obj, int zoomFix, int clipMode) {
     }
 }
 
+// The start control is the one action its screen offers, and the studio left it
+// at 40x40 sitting low: measured on the simulator, the band between the last
+// control above it and the bottom icon row (which starts at y420) runs y264 to
+// 419 on brew, y260 to 419 on water and y273 to 419 on grind, so their centres
+// are 341, 340 and 346, and the button's centre sat at 369, 369 and 377. It is
+// also the smallest target on the page at 40 px, against the 56 px floor the
+// settings pages are held to.
+//
+// lv_imgbtn cannot scale its source: lv_obj_init_draw_img_dsc pins zoom to
+// LV_IMG_ZOOM_NONE for every widget that draws through it, so style alone
+// cannot make the button bigger. The 60x60 play and pause beside UiImages.h
+// come from the same icons/*.svg as the 40x40 pair, through
+// tools/icon_to_lvgl.py.
+//
+// The status screen's pause has its own offset, because its band is only y335
+// to 419: the shot readout ends at y334 and kActionButtonY would put the
+// button under it. kPauseButtonY is what keeps the chevron reachable. Every
+// one of these buttons carries a 25 px click pad, so a 60x60 one at
+// kActionButtonY has a hit rect of 110x110, and the dials' menu chevron has a
+// 130x95 one starting at y385; the two overlap and the later sibling wins, so
+// the chevron loses part of its pad. At y+130 the pause's hit rect would have
+// reached y424, 6 px from the chevron's own 40x40 body, where the 40x40 button
+// left 16. At y+118 it reaches y412 and leaves 18.
+//
+// The steam screen is the fifth one of these and has no generated button at
+// all; serviceSteamStartButton below builds it.
+//
+// Written on every UI pass rather than once per screen root, because the flow
+// engine deletes and recreates a screen (delete_screen_brew_screen) and a new
+// root can land on the old address. Nothing here invalidates when it changes
+// nothing: lv_obj_set_x, _y, _width and _height each read the local style
+// property first and return when it already holds the value, and the source
+// swap only matches the 40x40 descriptors.
+namespace {
+constexpr int kActionButtonSize = 60;
+constexpr int kActionButtonY = 103;
+constexpr int kPauseButtonY = 118;
+
+void growActionButton(lv_obj_t *btn, int y) {
+    if (btn == nullptr || !lv_obj_check_type(btn, &lv_imgbtn_class)) {
+        return;
+    }
+    for (int i = 0; i < _LV_IMGBTN_STATE_NUM; i++) {
+        const auto state = static_cast<lv_imgbtn_state_t>(i);
+        const void *mid = lv_imgbtn_get_src_middle(btn, state);
+        if (mid == &img_play_40x40) {
+            lv_imgbtn_set_src(btn, state, nullptr, &img_play_60x60, nullptr);
+        } else if (mid == &img_pause_40x40) {
+            lv_imgbtn_set_src(btn, state, nullptr, &img_pause_60x60, nullptr);
+        }
+    }
+    lv_obj_set_size(btn, kActionButtonSize, kActionButtonSize);
+    lv_obj_set_pos(btn, 0, y);
+}
+} // namespace
+
+void DefaultUI::growActionButtons() {
+    growActionButton(objects.start_button, kActionButtonY);
+    growActionButton(objects.water_start_button, kActionButtonY);
+    growActionButton(objects.grind_start_button, kActionButtonY);
+    growActionButton(objects.pause_button, kPauseButtonY);
+    serviceSteamStartButton();
+}
+
+// The steam screen's start control (gm-51t), built here because the generated
+// screen has none.
+//
+// It had one until b8e7831d ("Steam Rework and temperature indicator", June
+// 2025): an lv_imgbtn in the same slot the other screens put their start
+// button in. That commit added the auto-start in Controller::loopLogic, which
+// calls activate() once the boiler is within 5 C of the steam target, and
+// guarded action_on_simple_process_toggle with MODE_STEAM, which left the
+// button inert. The EEZ rework (2d10acb7, June 2026) then replaced it with a
+// plain lv_img of a wind icon, screens.c objects.obj14, whose hidden flag the
+// generated tick drives from "!ui_flags.active". So the screen has shown
+// whether it is steaming and offered no way to stop it, and the owner asked
+// for the button back with the auto-start kept.
+//
+// One imgbtn does both jobs: play when idle, pause while a SteamProcess runs,
+// the same pair of sources and the same LV_STATE_CHECKED the generated water
+// button uses. It is visible in both states on purpose, so the screen says
+// what is happening rather than only offering an action. The wind image is
+// redundant once it is there and would draw on top of it, so it is sized away
+// below.
+//
+// Runtime rather than generated because the studio rewrites eez/ on every
+// export. Parented to obj14's own parent so it lands in the same coordinate
+// space as the slot it replaces, and rebuilt whenever a screen delete takes
+// it: delete_screen_steam_screen frees the subtree and the DELETE callback
+// nulls the pointer.
+void DefaultUI::serviceSteamStartButton() {
+    // The identity is checked rather than assumed: obj14 is a studio-assigned
+    // name, and an export that gave it to something else would otherwise get a
+    // start button placed next to it and its own size taken away.
+    lv_obj_t *const slot = objects.obj14;
+    if (slot == nullptr || !lv_obj_check_type(slot, &lv_img_class) || lv_img_get_src(slot) != &img_wind_40x40) {
+        return;
+    }
+    if (steamStartBtn == nullptr) {
+        lv_obj_t *const btn = lv_imgbtn_create(lv_obj_get_parent(slot));
+        steamStartBtn = btn;
+        lv_imgbtn_set_src(btn, LV_IMGBTN_STATE_RELEASED, nullptr, &img_play_60x60, nullptr);
+        lv_imgbtn_set_src(btn, LV_IMGBTN_STATE_CHECKED_RELEASED, nullptr, &img_pause_60x60, nullptr);
+        lv_obj_set_size(btn, kActionButtonSize, kActionButtonSize);
+        lv_obj_set_style_align(btn, LV_ALIGN_CENTER, LV_PART_MAIN | LV_STATE_DEFAULT);
+        lv_obj_set_pos(btn, 0, kActionButtonY);
+        lv_obj_clear_flag(btn, LV_OBJ_FLAG_SCROLL_WITH_ARROW);
+        lv_obj_set_style_img_recolor_opa(btn, 255, LV_PART_MAIN | LV_STATE_DEFAULT);
+        // The 25 px pad every other start button on these screens carries.
+        // Open-coded rather than calling actions.cpp's applyClickArea, which
+        // the generated actions.h does not declare and which must not be
+        // hand-added to it: LVGL only looks inside an ancestor's own coords
+        // for a hit unless the ancestor has LV_OBJ_FLAG_OVERFLOW_VISIBLE, so
+        // the pad needs the flag all the way up to the screen.
+        lv_obj_set_ext_click_area(btn, 25);
+        for (lv_obj_t *a = lv_obj_get_parent(btn); a != nullptr && lv_obj_get_parent(a) != nullptr; a = lv_obj_get_parent(a)) {
+            lv_obj_add_flag(a, LV_OBJ_FLAG_OVERFLOW_VISIBLE);
+        }
+        lv_obj_add_event_cb(
+            btn,
+            [](lv_event_t *e) {
+                switch (lv_event_get_code(e)) {
+                case LV_EVENT_CLICKED:
+                    action_on_simple_process_toggle(e);
+                    break;
+                case LV_EVENT_DELETE: {
+                    auto *ui = static_cast<DefaultUI *>(lv_event_get_user_data(e));
+                    ui->steamStartBtn = nullptr;
+                    ui->steamStartAccent = -1;
+                    break;
+                }
+                default:
+                    break;
+                }
+            },
+            LV_EVENT_ALL, this);
+    }
+    // change_color_theme() is generated and knows nothing about this object, so
+    // the accent is re-asserted here, and only when it moves, because
+    // lv_obj_set_local_style_prop has no no-op guard and invalidates twice.
+    // What is remembered is the value last written, not the value read back:
+    // applyPressedRecurse gives the button a LV_STATE_PRESSED recolour, and a
+    // style read resolves against the state the object is in, so reading back
+    // while a finger is down would report the dim colour and rewrite the
+    // default one on every pass for as long as the press lasted.
+    const int64_t accent = static_cast<int64_t>(theme_colors[eez_flow_get_selected_theme_index()][0]);
+    if (accent != steamStartAccent) {
+        lv_obj_set_style_img_recolor(steamStartBtn, lv_color_hex(static_cast<uint32_t>(accent)),
+                                     LV_PART_MAIN | LV_STATE_DEFAULT);
+        steamStartAccent = accent;
+        // applyPressedFeedback() walks a screen once per root, and it runs
+        // earlier in the pass than this, so the button is created after the
+        // walk that would have styled it and a theme change reaches its rest
+        // colour only after the walk has derived a pressed colour from the old
+        // one. Styling the one object here covers both. A later dim-colour
+        // change or a plate-mode flip re-walks the whole screen and reaches it
+        // like any other child.
+        applyPressedFeedbackTo(steamStartBtn);
+    }
+    // Same source of truth the wind image had, read directly rather than
+    // through the flow. Not LV_OBJ_FLAG_CHECKABLE: the state follows the
+    // controller, and a click asks the controller to change rather than
+    // flipping the button and hoping.
+    const bool active = controller != nullptr && controller->isActive();
+    if (lv_obj_has_state(steamStartBtn, LV_STATE_CHECKED) != active) {
+        if (active) {
+            lv_obj_add_state(steamStartBtn, LV_STATE_CHECKED);
+        } else {
+            lv_obj_clear_state(steamStartBtn, LV_STATE_CHECKED);
+        }
+    }
+    // The wind image is left in place and given no area. lv_img's draw walks
+    // an empty rectangle and emits nothing, lv_obj_set_width and _height read
+    // the local style property first so this costs nothing per pass, and the
+    // generated tick goes on writing its hidden flag against a zero-area
+    // object, which lv_obj_invalidate_area drops. Deleting it instead would
+    // leave that tick dereferencing freed memory.
+    lv_obj_set_size(slot, 0, 0);
+}
+
 void DefaultUI::tuneGeneratedScreen() {
+    growActionButtons();
     lv_obj_t *scr = lv_scr_act();
     const int knobs = (g_zoomFixReq ? 1 : 0) | (g_clipCornerReq << 1);
     if (scr == nullptr || (scr == tunedRoot && knobs == tunedKnobs)) {
@@ -3782,13 +4061,11 @@ void DefaultUI::applyAnimPlates(int mode, uint32_t color, int opaPct) {
                 }
                 lv_obj_set_style_bg_color(disc, lv_color_hex(color), LV_PART_MAIN);
                 lv_obj_set_style_bg_opa(disc, static_cast<lv_opa_t>((opaPct * 255 + 50) / 100), LV_PART_MAIN);
-                lv_obj_clear_flag(disc, LV_OBJ_FLAG_HIDDEN);
+                setHiddenIfChanged(disc, false);
                 lv_obj_set_style_bg_opa(plates[i], LV_OPA_TRANSP, LV_PART_MAIN);
                 continue;
             }
-            if (disc != nullptr) {
-                lv_obj_add_flag(disc, LV_OBJ_FLAG_HIDDEN);
-            }
+            setHiddenIfChanged(disc, true);
         }
         switch (mode) {
         case 0:
@@ -4479,6 +4756,11 @@ void DefaultUI::refreshSleepOverlay() {
     g_overlayStats.lastAreaPx = static_cast<uint32_t>(probeArea);
     g_overlayStats.lastClips = static_cast<uint32_t>(clipN + copyN);
     g_overlayStats.refreshes = g_overlayStats.refreshes + 1;
+    // Stamped after the publish, which is when the panel can first show it.
+#ifdef GM_TOUCH_PROBE
+    g_pubLog[g_pubLogCount % PUBLOG_N] = static_cast<uint32_t>(esp_timer_get_time() / 1000);
+    g_pubLogCount = g_pubLogCount + 1;
+#endif
 #ifdef GM_TOUCH_PROBE
     {
         const int64_t snapUs = probeSnap1 - probeSnap0;
@@ -4538,7 +4820,7 @@ void DefaultUI::maintainScaleScreen() {
             // Re-asserted every pass: the EEZ tick fights HIDDEN flags on these
             // widgets, but never touches translate, so displacement sticks.
             displaceGrindWidgets(true);
-            lv_obj_clear_flag(scaleScreen, LV_OBJ_FLAG_HIDDEN);
+            setHiddenIfChanged(scaleScreen, false);
             lv_obj_move_foreground(scaleScreen);
             const float w = static_cast<float>(scaleHardwareWeight);
             if (scaleWeightLabel != nullptr && fabsf(w - lastShownScaleWeight) >= 0.05f) {
@@ -4549,7 +4831,7 @@ void DefaultUI::maintainScaleScreen() {
     } else if (scaleScreen != nullptr && !lv_obj_has_flag(scaleScreen, LV_OBJ_FLAG_HIDDEN) &&
                (!scaleScreenRequested || currentScreen != SCREEN_ID_GRIND_SCREEN)) {
         displaceGrindWidgets(false);
-        lv_obj_add_flag(scaleScreen, LV_OBJ_FLAG_HIDDEN);
+        setHiddenIfChanged(scaleScreen, true);
         if (currentScreen != SCREEN_ID_GRIND_SCREEN) {
             scaleScreenRequested = false;
         }
@@ -4622,6 +4904,16 @@ void DefaultUI::displaceGrindWidgets(bool displaced) {
     }
 }
 
+// The scale cover's layout. The number box is wide enough for "-999.9" in the
+// 48 pt face; the tare pill sits low enough to leave the readout room and still
+// clear the exit chevron's 45 px click pad, whose box starts at y385.
+namespace {
+constexpr lv_coord_t kScaleNumberW = 170;
+constexpr lv_coord_t kScaleReadoutGap = 8;
+constexpr lv_coord_t kScaleReadoutY = -15;
+constexpr lv_coord_t kScaleTareY = 100;
+} // namespace
+
 void DefaultUI::buildScaleScreen() {
     lv_obj_t *scr = objects.grind_screen;
     if (scr == nullptr) {
@@ -4666,12 +4958,12 @@ void DefaultUI::buildScaleScreen() {
     lv_obj_set_style_text_color(title, fg, LV_PART_MAIN);
     lv_obj_align(title, LV_ALIGN_CENTER, 0, -140);
 
-    // Readout as a flex row (number, unit) sized to its content and centred as
-    // a group. A one-shot lv_obj_align_to() of the unit against the number only
-    // holds for the width the number had at build time: "302.2" in a 48 pt face
-    // is ~60 px wider than "0.0", and a centre-aligned number grows both ways,
-    // so its last digits landed on top of the "g". Flex re-lays the pair on
-    // every width change, so the unit follows the number.
+    // Readout as a flex row (number, unit) sized to its content. A one-shot
+    // lv_obj_align_to() of the unit against the number only holds for the width
+    // the number had at build time: "302.2" in a 48 pt face is ~60 px wider
+    // than "0.0", and a centre-aligned number grows both ways, so its last
+    // digits landed on top of the "g". Flex re-lays the pair on every width
+    // change, so the unit follows the number.
     lv_obj_t *readout = lv_obj_create(cover);
     lv_obj_remove_style_all(readout);
     lv_obj_set_size(readout, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
@@ -4679,9 +4971,8 @@ void DefaultUI::buildScaleScreen() {
     // Cross axis END puts both baselines on the row's bottom edge; the unit's
     // bottom padding then lifts its glyph the 6 px the old alignment offset did.
     lv_obj_set_flex_align(readout, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_END, LV_FLEX_ALIGN_CENTER);
-    lv_obj_set_style_pad_column(readout, 8, LV_PART_MAIN);
+    lv_obj_set_style_pad_column(readout, kScaleReadoutGap, LV_PART_MAIN);
     lv_obj_clear_flag(readout, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_align(readout, LV_ALIGN_CENTER, 0, -15);
 
     scaleWeightLabel = lv_label_create(readout);
     lv_label_set_text(scaleWeightLabel, "0.0");
@@ -4692,8 +4983,10 @@ void DefaultUI::buildScaleScreen() {
     // animation's rate, while the flex row above is laid out only when LVGL
     // refreshes. A content-sized number would move the unit only on those
     // refreshes, so the "g" trailed the digits (2026-09-08). "-999.9" in the
-    // 48 pt face is under 170 px.
-    lv_obj_set_width(scaleWeightLabel, 170);
+    // 48 pt face is under 170 px. Right-aligned, so the last digit stays put
+    // and the number grows leftwards as the weight climbs, and so the "g" sits
+    // against the digits instead of drifting away from a short reading.
+    lv_obj_set_width(scaleWeightLabel, kScaleNumberW);
     lv_obj_set_style_text_align(scaleWeightLabel, LV_TEXT_ALIGN_RIGHT, LV_PART_MAIN);
     lastShownScaleWeight = -1000.0f;
 
@@ -4703,13 +4996,32 @@ void DefaultUI::buildScaleScreen() {
     lv_obj_set_style_text_color(unit, fg, LV_PART_MAIN);
     lv_obj_set_style_pad_bottom(unit, 6, LV_PART_MAIN);
 
+    // Centre what is on screen, not the boxes that hold it. Centring the row
+    // put "0.0 g" visibly right of the middle, because the row is as wide as
+    // the widest reading the number box must hold and a right-aligned short
+    // reading sits against that box's right edge, leaving the slack on the
+    // left. Shifting the row left by half the slack a representative reading
+    // leaves centres the ink; the unit drops out of the arithmetic, since it
+    // rides on the box's right edge in both the row's width and the ink's.
+    // A reading wider than the representative one therefore reads a little
+    // left of centre and a shorter one a little right, by half the difference.
+    // Re-aligning per reading is not an option: the number is painted by a
+    // compositor Text element between LVGL refreshes, and moving its container
+    // on every value is the flex re-flow churn of gm-nly by another route. Two
+    // digits and a decimal is the representative shape, since that is a dose
+    // and a shot yield; "0.0" at rest then reads 15 px right of centre, measured
+    // off a simulator framebuffer.
+    lv_point_t typical;
+    lv_txt_get_size(&typical, "88.8", &lv_font_montserrat_48, 0, 0, LV_COORD_MAX, LV_TEXT_FLAG_NONE);
+    lv_obj_align(readout, LV_ALIGN_CENTER, -(kScaleNumberW - typical.x) / 2, kScaleReadoutY);
+
     // Tare as a standard pill (mode_switch1 geometry: 160x50, r10, 2px border).
     // Opaque, and on screen over the animation, so applyAnimPlates drives its
     // background like the generated plates. It is registered below, after its
     // styles are set, so the first capture sees the designed values.
     lv_obj_t *tareBtn = lv_btn_create(cover);
     lv_obj_set_size(tareBtn, 160, 50);
-    lv_obj_align(tareBtn, LV_ALIGN_CENTER, 0, 70);
+    lv_obj_align(tareBtn, LV_ALIGN_CENTER, 0, kScaleTareY);
     lv_obj_set_style_radius(tareBtn, 10, LV_PART_MAIN);
     lv_obj_set_style_bg_color(tareBtn, fill, LV_PART_MAIN);
     lv_obj_set_style_bg_opa(tareBtn, LV_OPA_COVER, LV_PART_MAIN);
@@ -4844,9 +5156,29 @@ void DefaultUI::updateState() {
 #else
     bgAnimAllScreens = settings.isBgAnimAllScreens();
 #endif
+    // The standby screen can carry its own animation. bgAnimStandbyId is -1
+    // when it should play the same one as everywhere else, and an id past the
+    // end of the registry reads the same way, so a build rolled back to a
+    // shorter roster falls back instead of indexing off the end (nothing
+    // range-checks the value on its way in from the web form; CLAUDE.md,
+    // "Nothing range-checks a stored value on the web path"). Read every pass
+    // like the main id, so a change from either editor lands on the next
+    // frame, and so a standby entry or exit switches the animation over the
+    // same path a live edit of the main id already takes: renderFrame sees a
+    // new id, releases the outgoing animation's tables and inits the incoming
+    // one on that frame. The params are parsed for whichever id wins, and
+    // bgAnimParams is indexed per animation, so the standby animation brings
+    // its own parameters and its own gradient with it (the theme key below
+    // takes animId too).
+    int animId = settings.getBgAnimId();
+    if (currentScreen == SCREEN_ID_STANDBY_SCREEN) {
+        const int standbyId = settings.getBgAnimStandbyId();
+        if (standbyId >= 0 && standbyId < bg_animation_count()) {
+            animId = standbyId;
+        }
+    }
     // A live gradient preview overrides both the animation shown and its
     // gradient until it lapses; the saved selection is re-resolved after.
-    int animId = settings.getBgAnimId();
     bool previewActive = false;
     bool previewApply = false;
     String previewGradient;
@@ -4863,15 +5195,17 @@ void DefaultUI::updateState() {
         }
     }
     // The String settings this pass reads (params, custom theme, theme map,
-    // gradient library) are copies taken under the settings value lock, so
-    // they are re-read only when the container generation moved: an integer
-    // compare on an ordinary pass instead of four copies.
+    // gradient library, global gradient ref) are copies taken under the
+    // settings value lock, so they are re-read only when the container
+    // generation moved: an integer compare on an ordinary pass instead of
+    // five copies.
     static bool containerCacheValid = false;
     static uint32_t lastContainerGen = 0;
     static String cachedParams;
     static String lastCustom;
     static String lastMap;
     static String lastLibrary;
+    static String lastGlobalRef;
     bool themeStringsChanged = false;
     const uint32_t containerGen = settings.getContainerGeneration();
     if (!containerCacheValid || containerGen != lastContainerGen) {
@@ -4881,14 +5215,16 @@ void DefaultUI::updateState() {
         String custom = settings.getBgAnimCustomTheme();
         String map = settings.getBgAnimThemeMap();
         String library = settings.getBgAnimGradients();
-        if (custom != lastCustom || map != lastMap || library != lastLibrary) {
+        String globalRef = settings.getBgAnimGradientRef();
+        if (custom != lastCustom || map != lastMap || library != lastLibrary || globalRef != lastGlobalRef) {
             themeStringsChanged = true;
             lastCustom = std::move(custom);
             lastMap = std::move(map);
             lastLibrary = std::move(library);
+            lastGlobalRef = std::move(globalRef);
         }
     }
-    uint8_t animP[4];
+    uint8_t animP[BG_ANIM_PARAMS];
     bg_parse_params(cachedParams.c_str(), animId, animP);
     sleepAnimation.configure(static_cast<uint8_t>(animId), animP);
     // fps= on /api/debug/anim overrides the stored cap for a measurement
@@ -4921,7 +5257,7 @@ void DefaultUI::updateState() {
     // Publish the color theme only on change — setThemeStops bumps a
     // generation counter that makes every animation rebuild its palettes.
     // The key covers everything the resolution depends on: the animation,
-    // the theme id and the three strings cached above.
+    // the theme id and the four strings cached above.
     static int lastThemeAnim = -1;
     static int lastThemeId = -1;
     if (previewActive) {
@@ -4948,8 +5284,8 @@ void DefaultUI::updateState() {
             uint8_t pos[BG_THEME_MAX_STOPS];
             int nStops = 0;
             bool uniform = true;
-            bg_resolve_anim_theme(animId, lastMap.c_str(), lastLibrary.c_str(), themeId, lastCustom.c_str(), stops, pos,
-                                  nStops, uniform);
+            bg_resolve_anim_theme(animId, lastMap.c_str(), lastLibrary.c_str(), lastGlobalRef.c_str(), themeId,
+                                  lastCustom.c_str(), stops, pos, nStops, uniform);
             if (uniform) {
                 bganim::setThemeStops(stops, nStops);
             } else {
@@ -4962,7 +5298,15 @@ void DefaultUI::updateState() {
     // has dimmed the animation does not get full brightness back the moment
     // they try a different theme. setThemeTone is a no-op when neither value
     // moved, which keeps this off the generation counter on ordinary ticks.
-    bganim::setThemeTone(settings.getBgAnimBrightness() * 256 / 100, settings.getBgAnimHighlightKnee() * 255 / 100);
+    // Both overrides are -1 in every build that has not been told otherwise
+    // over /api/debug/gradfix, so this is the stored setting. They are read in
+    // one atomic load (gm-nov3.22) because the HTTP task publishes the pair in
+    // one store: two loads could pair a new brightness with an old rolloff.
+    int overrideB = -1, overrideK = -1;
+    gm_tone_unpack(g_animToneOverride.load(std::memory_order_acquire), overrideB, overrideK);
+    const int tonePctB = overrideB >= 0 ? overrideB : settings.getBgAnimBrightness();
+    const int tonePctK = overrideK >= 0 ? overrideK : settings.getBgAnimHighlightKnee();
+    bganim::setThemeTone(tonePctB * 256 / 100, tonePctK * 255 / 100);
     sleepAnimation.setScrim(settings.getBgAnimScrim());
 #endif
 

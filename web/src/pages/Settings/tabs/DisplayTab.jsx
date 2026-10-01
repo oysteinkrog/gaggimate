@@ -1,3 +1,4 @@
+import { useState } from 'preact/hooks';
 import { BG_ANIMATIONS, parseBgAnimParams, setBgAnimParam } from '../../../config/bgAnimations.js';
 import Card from '../../../components/Card.jsx';
 import { GradientEditor } from '../../../components/GradientEditor.jsx';
@@ -12,6 +13,16 @@ import { HelpTip } from '../../../components/HelpTip.jsx';
 // The stored value, or the firmware default when the device sent none.
 function intOr(value, def) {
   return value === undefined ? def : parseInt(value, 10);
+}
+
+// The standby animation selector's value. -1 is "same as main", which is
+// also what an id past the end of this build's roster means: the firmware
+// falls back to the main animation for one of those rather than indexing off
+// the end of the registry, so the form shows the same thing it does.
+function standbyAnimValue(stored) {
+  const id = parseInt(stored, 10);
+  if (!Number.isFinite(id) || id < 0 || id >= BG_ANIMATIONS.length) return -1;
+  return id;
 }
 
 // A labelled card. Card's own title is hidden below the lg breakpoint, so the
@@ -224,18 +235,32 @@ function ScreenSection({ formData, onChange, setField }) {
   );
 }
 
-// Animation picker plus the parameters of the selected animation only.
+// Animation picker, placement, and per-animation tuning.
+//
 // Params live in formData.bgAnimParams as the same packed string the firmware
 // stores ("p0,p1,p2,p3;..." indexed by animation id), edited via setField.
-function AnimationSection({ formData, onChange, setField }) {
-  const animIdx = Math.min(
-    BG_ANIMATIONS.length - 1,
-    Math.max(0, parseInt(formData.bgAnimId, 10) || 0),
-  );
+//
+// The standby screen can run its own animation. When it does, the switch
+// below picks which one this section (and the per-animation gradient in
+// Colours) is tuning; otherwise there is only one animation to tune and the
+// switch does not show. The tuning choice is kept in the parent so Colours
+// can show the matching gradient editor alongside it.
+function AnimationSection({
+  formData,
+  onChange,
+  setField,
+  animIdx,
+  standbyIdx,
+  standbySeparate,
+  tuning,
+  tuningIdx,
+  setTuningPick,
+}) {
   const anim = BG_ANIMATIONS[animIdx];
-  const values = parseBgAnimParams(formData.bgAnimParams)[animIdx];
+  const tuningAnim = BG_ANIMATIONS[tuningIdx];
+  const values = parseBgAnimParams(formData.bgAnimParams)[tuningIdx];
   const setParam = (j, v) =>
-    setField('bgAnimParams', setBgAnimParam(formData.bgAnimParams, animIdx, j, v));
+    setField('bgAnimParams', setBgAnimParam(formData.bgAnimParams, tuningIdx, j, v));
   return (
     <DisplaySection title='Animation'>
       <Toggle
@@ -264,7 +289,53 @@ function AnimationSection({ formData, onChange, setField }) {
           <p className='text-base-content/60 mt-1 text-sm'>{anim.description}</p>
         )}
       </Field>
-      {anim.params.map((param, j) => {
+      <Field
+        wide
+        label='Standby screen animation'
+        htmlFor='bgAnimStandbyId'
+        help='Standby can use the main animation or its own selection. It keeps its own parameters and its own gradient, both editable below. With show animation behind every screen turned off, only the standby animation is ever seen.'
+      >
+        <select
+          id='bgAnimStandbyId'
+          name='bgAnimStandbyId'
+          className='select select-bordered w-full'
+          value={standbyIdx}
+          onChange={onChange('bgAnimStandbyId')}
+        >
+          <option value={-1}>Same as main</option>
+          {BG_ANIMATIONS.map((a, i) => (
+            <option key={`standby-${a.id}`} value={i}>
+              {a.name}
+            </option>
+          ))}
+        </select>
+      </Field>
+      {standbySeparate && (
+        <div className='md:col-span-2' role='group' aria-label='Which animation to tune below'>
+          <div className='join'>
+            <button
+              type='button'
+              className={`btn join-item btn-sm ${tuning === 'main' ? 'btn-primary' : ''}`}
+              aria-pressed={tuning === 'main'}
+              onClick={() => setTuningPick('main')}
+            >
+              Main: {anim.name}
+            </button>
+            <button
+              type='button'
+              className={`btn join-item btn-sm ${tuning === 'standby' ? 'btn-primary' : ''}`}
+              aria-pressed={tuning === 'standby'}
+              onClick={() => setTuningPick('standby')}
+            >
+              Standby: {BG_ANIMATIONS[standbyIdx].name}
+            </button>
+          </div>
+          <p className='text-base-content/60 mt-2 text-sm'>
+            The two animations keep separate parameters and separate gradients.
+          </p>
+        </div>
+      )}
+      {tuningAnim.params.map((param, j) => {
         const def = param.def ?? 0;
         if (param.options) {
           const optionIdx = Math.min(
@@ -273,7 +344,7 @@ function AnimationSection({ formData, onChange, setField }) {
           );
           return (
             <Field
-              key={`${anim.id}-${param.key}`}
+              key={`${tuningAnim.id}-${param.key}`}
               label={param.label}
               htmlFor={`bgAnim-${param.key}`}
             >
@@ -302,7 +373,7 @@ function AnimationSection({ formData, onChange, setField }) {
         }
         return (
           <Field
-            key={`${anim.id}-${param.key}`}
+            key={`${tuningAnim.id}-${param.key}`}
             label={param.label}
             htmlFor={`bgAnim-${param.key}`}
             value={values[j]}
@@ -530,16 +601,32 @@ function LegibilitySection({ formData, onChange, setField }) {
 const TASTE_HELP =
   'Not needed for legibility while the text backdrop is on; it is there for taste. It is separate from screen brightness, which dims the text along with the animation and so does not make anything easier to read.';
 
-function ColoursSection({ formData, onChange, setField }) {
-  const animIdx = Math.min(
-    BG_ANIMATIONS.length - 1,
-    Math.max(0, parseInt(formData.bgAnimId, 10) || 0),
-  );
+function ColoursSection({ formData, onChange, setField, animIdx, tuningIdx }) {
   const range = { formData, onChange, setField };
+  const tuningAnim = BG_ANIMATIONS[tuningIdx];
   return (
     <DisplaySection title='Colours'>
       <div className='min-w-0 md:col-span-2'>
-        <GradientEditor animIdx={animIdx} formData={formData} setField={setField} />
+        <p className='text-base-content/60 mb-2 text-sm'>
+          Every animation draws with this gradient unless it has been given one of its own below.
+        </p>
+        <GradientEditor
+          scope={{ kind: 'global' }}
+          previewAnimIdx={animIdx}
+          formData={formData}
+          setField={setField}
+        />
+      </div>
+      <div className='min-w-0 md:col-span-2'>
+        <p className='text-base-content/60 mb-2 text-sm'>
+          {tuningAnim.name}'s own gradient. Pick which animation this edits, main or standby, in
+          the Animation section above.
+        </p>
+        <GradientEditor
+          scope={{ kind: 'anim', animIdx: tuningIdx }}
+          formData={formData}
+          setField={setField}
+        />
       </div>
       <RangeField
         {...range}
@@ -601,13 +688,33 @@ function ColoursSection({ formData, onChange, setField }) {
 
 export function DisplayTab({ formData, onChange, setField }) {
   const props = { formData, onChange, setField };
+  const animIdx = Math.min(
+    BG_ANIMATIONS.length - 1,
+    Math.max(0, parseInt(formData.bgAnimId, 10) || 0),
+  );
+  const standbyIdx = standbyAnimValue(formData.bgAnimStandbyId);
+  // "Same as main" and "the same animation as main" both mean one set of
+  // parameters, so there is nothing to switch between.
+  const standbySeparate = standbyIdx >= 0 && standbyIdx !== animIdx;
+  const [tuningPick, setTuningPick] = useState('main');
+  const tuning = standbySeparate ? tuningPick : 'main';
+  const tuningIdx = tuning === 'standby' ? standbyIdx : animIdx;
+
   return (
     <div className='space-y-4 sm:space-y-6'>
       <ScreenSection {...props} />
-      <AnimationSection {...props} />
+      <AnimationSection
+        {...props}
+        animIdx={animIdx}
+        standbyIdx={standbyIdx}
+        standbySeparate={standbySeparate}
+        tuning={tuning}
+        tuningIdx={tuningIdx}
+        setTuningPick={setTuningPick}
+      />
       <MotionSection {...props} />
       <LegibilitySection {...props} />
-      <ColoursSection {...props} />
+      <ColoursSection {...props} animIdx={animIdx} tuningIdx={tuningIdx} />
     </div>
   );
 }

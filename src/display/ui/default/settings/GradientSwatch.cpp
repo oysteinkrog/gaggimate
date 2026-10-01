@@ -1,0 +1,251 @@
+#include "GradientSwatch.h"
+
+#include <cstring>
+
+namespace settingsui {
+
+namespace {
+
+// The uniform positions a gradient with no explicit ones carries, which is
+// what both bg_parse_gradient and BgAnimCommon's fillUniformPositions fill in:
+// p_i = i * 255 / (n - 1), truncating, so six stops sit at 0, 51, 102, 153,
+// 204, 255.
+void fillUniformPositions(uint8_t *pos, int n) {
+    for (int i = 0; i < n; i++) {
+        pos[i] = static_cast<uint8_t>((i * 255) / (n - 1));
+    }
+}
+
+// bg_theme_stops returns six, and the resolver's fillBuiltin copies exactly
+// six: a built-in is not a variable-length gradient.
+constexpr int kBuiltinStops = 6;
+
+uint16_t rgb565(uint8_t r, uint8_t g, uint8_t b) {
+    return static_cast<uint16_t>(((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3));
+}
+
+// ---- the ref grammar ---------------------------------------------------------
+//
+// Transcribed from BgAnimThemes.cpp's parseId() and parseRef(), for the reason
+// the palette arithmetic above is transcribed: that file's parser is in an
+// anonymous namespace and the file itself does not compile into the simulator.
+// The rules, in full:
+//
+//   * a ref is "" (no gradient), a decimal built-in index, or 'c' then a
+//     decimal library id,
+//   * a decimal is one to five digits, so the widest id is 99999, and a sixth
+//     digit is trailing junk rather than part of the number, which is also
+//     what keeps the accumulator inside an int whatever a stored string holds,
+//   * a ref ends at the terminator or at the ';' that separates one slot of
+//     bgAnimThemeMap from the next; production parses refs both standalone and
+//     inside a map, so a swatch that refused the second reading would show no
+//     swatch for a ref the panel draws from.
+//
+// The library's id range is not its capacity. The first version of this
+// resolver rejected any id above BG_GRADIENT_LIB_MAX + 1 (gm-nov3.15), which
+// confused the twelve entries a library may hold at one time with the ids
+// those entries carry. Both ways of reaching a high id are live. The web
+// allocator hands out the lowest id nothing reserves
+// (web/src/config/bgAnimations.js), and a ref that still names a deleted
+// entry keeps its id reserved, so a user who copies and deletes a few
+// gradients reaches c14 with three entries saved. Larger ids than that are
+// legacy: the allocator this replaced returned the largest id plus one and
+// had no ceiling (gm-nov3.21), and the entries it wrote are still on devices
+// and still valid. Since the picker gates a selection on this resolver
+// (CatGradientPicker.cpp, applyPick), every saved gradient above c13 was
+// listed in My gradients, drawn by the panel, and silently unselectable.
+constexpr int kRefMaxDigits = 5;
+
+// Reads the decimal at s, advancing it past the digits. False when there is
+// no digit, or when one more follows the fifth.
+bool parseRefDigits(const char *&s, int &value) {
+    int v = 0;
+    int digits = 0;
+    while (*s >= '0' && *s <= '9') {
+        if (digits == kRefMaxDigits) {
+            return false; // production's parseId stops counting here and its
+                          // parseRef then rejects the leftover digit
+        }
+        v = v * 10 + (*s - '0');
+        s++;
+        digits++;
+    }
+    if (digits == 0) {
+        return false;
+    }
+    value = v;
+    return true;
+}
+
+bool refEnd(const char *s) { return *s == '\0' || *s == ';'; }
+
+} // namespace
+
+bool swatchFromThemeStops(const uint8_t (*stops)[3], SwatchGradient &out) {
+    if (stops == nullptr) {
+        return false;
+    }
+    std::memcpy(out.stops, stops, kBuiltinStops * 3);
+    out.count = kBuiltinStops;
+    out.uniform = true;
+    fillUniformPositions(out.pos, kBuiltinStops);
+    return true;
+}
+
+bool swatchFromWire(const char *wire, SwatchGradient &out) {
+    SwatchGradient parsed;
+    const int n = bg_parse_gradient(wire, parsed.stops, parsed.pos, parsed.uniform);
+    if (n < 2) {
+        return false;
+    }
+    parsed.count = n;
+    out = parsed;
+    return true;
+}
+
+bool swatchFromLegacyCustom(const char *custom, SwatchGradient &out) {
+    SwatchGradient parsed;
+    if (!swatchFromWire(custom, parsed)) {
+        return false;
+    }
+    parsed.uniform = true;
+    fillUniformPositions(parsed.pos, parsed.count);
+    out = parsed;
+    return true;
+}
+
+bool swatchResolveRef(const char *ref, const char *library, SwatchGradient &out) {
+    if (ref == nullptr || *ref == '\0') {
+        return false; // "" is "no gradient of its own", not a gradient
+    }
+    const char *s = ref;
+    const bool libraryRef = *s == 'c';
+    if (libraryRef) {
+        s++;
+    }
+    int id = 0;
+    if (!parseRefDigits(s, id) || !refEnd(s)) {
+        return false;
+    }
+    if (libraryRef) {
+        if (id <= 0) {
+            return false; // "c0" names no entry: library ids start at 1
+        }
+        SwatchGradient found;
+        int n = 0;
+        if (!bg_library_lookup(library, id, found.stops, found.pos, n, found.uniform) || n < 2) {
+            return false; // a deleted entry, which the caller shows as no swatch
+        }
+        found.count = n;
+        out = found;
+        return true;
+    }
+    if (id >= bg_theme_count()) {
+        return false; // an index from a longer table: no swatch rather than
+                      // the wrong one, since bg_theme_stops would clamp to 0
+    }
+    return swatchFromThemeStops(bg_theme_stops(id), out);
+}
+
+void swatchApplyTone(SwatchGradient &gradient, int brightnessPct, int kneePct) {
+    // The conversion DefaultUI::updateState does on every pass, including its
+    // integer division, then setThemeTone's own clamps.
+    int bright256 = brightnessPct * 256 / 100;
+    int knee = kneePct * 255 / 100;
+    if (bright256 < 0) {
+        bright256 = 0;
+    } else if (bright256 > 256) {
+        bright256 = 256;
+    }
+    if (knee < 0) {
+        knee = 0;
+    } else if (knee > 255) {
+        knee = 255;
+    }
+    for (int i = 0; i < gradient.count; i++) {
+        for (int c = 0; c < 3; c++) {
+            int v = gradient.stops[i][c];
+            // Shoulder first, then brightness: the knee is specified against
+            // full scale and has to act on the gradient's own values, or it
+            // would move wherever brightness happened to be set.
+            if (v > knee) {
+                v = knee + ((v - knee) >> 2);
+            }
+            v = (v * bright256) >> 8;
+            if (v < 0) {
+                v = 0;
+            } else if (v > 255) {
+                v = 255;
+            }
+            gradient.stops[i][c] = static_cast<uint8_t>(v);
+        }
+    }
+}
+
+void swatchSampleRgb(const SwatchGradient &gradient, int position, uint8_t out[3]) {
+    if (!gradient.valid()) {
+        out[0] = out[1] = out[2] = 0;
+        return;
+    }
+    const uint8_t(*st)[3] = gradient.stops;
+    const int n = gradient.count;
+    int pos = position;
+    if (pos < 0) {
+        pos = 0;
+    } else if (pos > 255) {
+        pos = 255;
+    }
+    if (gradient.uniform) {
+        const int scaled = pos * (n - 1);
+        const int seg = scaled >> 8;
+        const int f = scaled & 255;
+        for (int c = 0; c < 3; c++) {
+            out[c] = static_cast<uint8_t>(st[seg][c] + (((st[seg + 1][c] - st[seg][c]) * f) >> 8));
+        }
+        return;
+    }
+    // Positional: flat before the first stop and after the last, as in CSS.
+    const uint8_t *p = gradient.pos;
+    if (pos <= p[0]) {
+        for (int c = 0; c < 3; c++) {
+            out[c] = st[0][c];
+        }
+        return;
+    }
+    if (pos >= p[n - 1]) {
+        for (int c = 0; c < 3; c++) {
+            out[c] = st[n - 1][c];
+        }
+        return;
+    }
+    int seg = 0;
+    while (seg < n - 2 && pos >= p[seg + 1]) {
+        seg++;
+    }
+    const int width = p[seg + 1] - p[seg];
+    const int f = width > 0 ? ((pos - p[seg]) * 256) / width : 0;
+    for (int c = 0; c < 3; c++) {
+        out[c] = static_cast<uint8_t>(st[seg][c] + (((st[seg + 1][c] - st[seg][c]) * f) >> 8));
+    }
+}
+
+uint16_t swatchSample565(const SwatchGradient &gradient, int position) {
+    uint8_t c[3];
+    swatchSampleRgb(gradient, position, c);
+    return rgb565(c[0], c[1], c[2]);
+}
+
+void swatchBuildRamp565(const SwatchGradient &gradient, uint16_t *out, int count) {
+    if (out == nullptr || count <= 0) {
+        return;
+    }
+    if (count == 1) {
+        out[0] = swatchSample565(gradient, 0);
+        return;
+    }
+    for (int i = 0; i < count; i++) {
+        out[i] = swatchSample565(gradient, (i * 255) / (count - 1));
+    }
+}
+
+} // namespace settingsui

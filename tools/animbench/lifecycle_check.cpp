@@ -92,7 +92,7 @@ int rowStride(int w) { return (w + 1) & ~1; }
 // bands where the alignment contract allows them, one-row calls at an odd
 // width, and always one one-row call for the last row so the tail shape is
 // exercised at every size. Never calls frame().
-void renderAll(const BgAnimation &a, int w, int h, uint32_t t, const uint8_t p[4], std::vector<uint16_t> &fb) {
+void renderAll(const BgAnimation &a, int w, int h, uint32_t t, const uint8_t p[BG_ANIM_PARAMS], std::vector<uint16_t> &fb) {
     const int stride = rowStride(w);
     fb.assign(static_cast<size_t>(stride) * h, 0);
     const int bandRows = (w & 1) ? 1 : 2;
@@ -166,7 +166,7 @@ unsigned faultPhase(int size, bool slabFull, std::vector<uint16_t> &fb) {
     unsigned faultCases = 0;
     for (int id = 0; id < bg_animation_count(); id++) {
         const BgAnimation &a = bg_animation(id);
-        uint8_t p[4];
+        uint8_t p[BG_ANIM_PARAMS];
         bg_parse_params(nullptr, id, p);
         releaseAnim(a);
 
@@ -291,7 +291,7 @@ int main(int argc, char **argv) {
             const int size = sizes[si];
             for (int id = 0; id < n; id++) {
                 const BgAnimation &a = bg_animation(id);
-                uint8_t p[4];
+                uint8_t p[BG_ANIM_PARAMS];
                 bg_parse_params(nullptr, id, p);
                 const uint32_t failBefore = hotFailCount();
                 const size_t slabBefore = hotUsed();

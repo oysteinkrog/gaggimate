@@ -70,12 +70,26 @@ extern const SettingsCategoryDef kCatAnimation;
 extern const SettingsCategoryDef kCatMachine;
 extern const SettingsCategoryDef kCatStatus;
 
-// The sixth, bench/sim-only tile (SettingsFixture.cpp): one of each row
+// The sixth, simulator-only tile (SettingsFixture.cpp): one of each row
 // widget, so the shell's lifecycle and the widgets themselves stay
 // exercisable on their own, whatever the five real categories do. It never
 // had a stand-in and never needed one.
-#if defined(GM_TOUCH_PROBE) || defined(GAGGIMATE_SIM)
+//
+// It used to be compiled for GM_TOUCH_PROBE as well, which put it on the
+// bench board, where it is a menu tile the owner never wants to see. Only
+// the simulator carries it now, and the simulator is where every check that
+// reads the fixture counters runs.
+#if defined(GAGGIMATE_SIM)
 extern const SettingsCategoryDef kCatFixture;
+#endif
+
+// How many tiles the menu carries, which is what a category index is
+// range-checked against. SettingsUI.cpp static_asserts this against
+// kCategories itself, so the two cannot drift.
+#if defined(GAGGIMATE_SIM)
+constexpr int kSettingsCategoryCount = 6;
+#else
+constexpr int kSettingsCategoryCount = 5;
 #endif
 
 class SettingsUI {
@@ -116,7 +130,16 @@ class SettingsUI {
     // and reveals whatever is now on top (the tile page, or the parent page,
     // rebuilt so it reflects any edit the child made to a shared draft,
     // without re-entering it).
-    void popPage();
+    void popPage() { popPages(1); }
+    // The same, `count` pages deep and with one rebuild at the end rather
+    // than one per level. The gradient picker (CatGradientPicker.cpp) is two
+    // pages deep and closes both at once when the slot it was opened for
+    // stops being writable; popping level by level would build the
+    // intermediate page, allocate its swatch buffers and throw it away again
+    // before anyone saw it. Each level still commits, in top-down order.
+    // `count` past the bottom of the stack empties it, which is what a
+    // caller that has lost count wants.
+    void popPages(int count);
     // Clamps `page` to the top category's current page count and rebuilds
     // its five row slots from buildRow. Never calls enter or commit.
     void gotoPage(int page);
@@ -222,7 +245,7 @@ class SettingsUI {
     TileClickCtx tileClickCtx[8]{};
 };
 
-#if defined(GM_TOUCH_PROBE) || defined(GAGGIMATE_SIM)
+#if defined(GAGGIMATE_SIM)
 // Defined in SettingsFixture.cpp. liveCtx is the Fixture category's ctx
 // (a FixtureCtx*, opaque here) when it is the currently open page, else
 // nullptr. enter/commit/draft come from SettingsFixture.cpp's own

@@ -23,8 +23,13 @@ extern uint32_t nebula_lerp_self_test(uint32_t *firstBad);
 #include <display/models/profile.h>
 #include <display/plugins/BLEScalePlugin.h>
 #include <display/plugins/ShotHistoryPlugin.h>
+#include <cstring>
 #include <esp_memory_utils.h> // esp_ptr_external_ram, for the band-buffer placement report
 #include <esp_timer.h>        // esp_timer_dump, for /api/debug/timers
+#ifndef GAGGIMATE_SIM
+#include <esp_app_desc.h> // esp_app_get_description / _elf_sha256, for /api/ota/info
+#include <esp_ota_ops.h>  // the running and next app slots, same
+#endif
 #include <sys/stat.h>
 #ifdef GM_ANIM_BENCH
 #include <display/ui/default/SleepAnimation.h>
@@ -237,6 +242,20 @@ void WebUIPlugin::loop() {
         ota->update(updateComponent != "display", updateComponent != "controller");
         pluginManager->trigger("ota:update:end");
         updating = false;
+    }
+    if (devOtaPending.load()) {
+        // Copied out before the flag is cleared, so the producer cannot
+        // overwrite the buffer under the download.
+        String url(devOtaUrl);
+        devOtaPending.store(false);
+        // The same event the release path fires, and "display" is what makes
+        // DefaultUI stop the panel: the RGB peripheral streaming a framebuffer
+        // out of PSRAM and a 6 MB download into flash contend on the same bus,
+        // and the download is the one that aborts.
+        pluginManager->trigger("ota:update:start", "component", String("display"));
+        ota->updateFromUrl(url);
+        // Only reached when it failed; a good image restarts inside the call.
+        pluginManager->trigger("ota:update:end");
     }
     if (!serverRunning) {
         return;
@@ -1157,6 +1176,8 @@ void WebUIPlugin::setupServer() {
     server.on("/success.txt", [](AsyncWebServerRequest *request) { request->send(200); }); // firefox captive portal call home
     server.on("/ncsi.txt", [](AsyncWebServerRequest *request) { request->redirect(LOCAL_URL); }); // windows call home
     server.on("/api/settings", [this](AsyncWebServerRequest *request) { handleSettings(request); });
+    server.on("/api/ota/info", HTTP_GET, [this](AsyncWebServerRequest *request) { handleOtaInfo(request); });
+    server.on("/api/ota/dev", HTTP_POST, [this](AsyncWebServerRequest *request) { handleDevOta(request); });
     setupDebugEndpoints();
 
     server.on("/api/status", [this](AsyncWebServerRequest *request) {
@@ -1412,6 +1433,108 @@ void WebUIPlugin::handleOTAStart(uint32_t clientId, JsonDocument &request) {
     }
 }
 
+// GET /api/ota/info: what is running, and whether this build can be updated
+// over the air at all. Two fields carry the work (gm-thg). "sha" is
+// esp_app_get_elf_sha256, which changes on every link even when nothing in the
+// source did, so it is the only field that can tell a dev deploy apart from
+// the image it replaced; BUILD_GIT_VERSION does not move between two builds of
+// the same dirty tree. "slot" names the partition being executed, which is how
+// you see the image land in the other slot. tools/ota_dev.py reads both.
+void WebUIPlugin::handleOtaInfo(AsyncWebServerRequest *request) const {
+    AsyncResponseStream *response = request->beginResponseStream("application/json");
+    JsonDocument doc(&psramAllocator);
+    doc["version"] = BUILD_GIT_VERSION;
+    doc["dev_ota"] = GM_DEV_OTA != 0;
+#ifndef GAGGIMATE_SIM
+    char sha[17] = {};
+    esp_app_get_elf_sha256(sha, sizeof(sha));
+    doc["sha"] = sha;
+    const esp_app_desc_t *desc = esp_app_get_description();
+    if (desc != nullptr) {
+        doc["built"] = String(desc->date) + " " + desc->time;
+        doc["idf"] = desc->idf_ver;
+    }
+    const esp_partition_t *running = esp_ota_get_running_partition();
+    const esp_partition_t *next = esp_ota_get_next_update_partition(nullptr);
+    doc["slot"] = running != nullptr ? running->label : "?";
+    doc["next"] = next != nullptr ? next->label : "?";
+    doc["ota"] = next != nullptr && next != running;
+#else
+    doc["sha"] = "";
+    doc["slot"] = "sim";
+    doc["ota"] = false;
+#endif
+    doc["uptime_ms"] = millis();
+    doc["busy"] = controller->isActive() || updating || devOtaPending.load();
+    serializeJson(doc, *response);
+    request->send(response);
+}
+
+// POST /api/ota/dev?url=<http url>: flash the display from an image the
+// developer is serving, with no GitHub release and no version check (gm-thg).
+// It is the only way to change the firmware on a machine that is plumbed in,
+// where the USB port is not reachable.
+//
+// It only records the URL. The download runs on the display task in loop(),
+// where every other OTA already runs, because the flash writes block for tens
+// of seconds and this handler is on async_tcp: writing from here would stall
+// the web server it is answering on, and an erase every few kilobytes would
+// sit under the task watchdog.
+//
+// Pull, not push. A POST carrying the 6 MB image would have to write flash
+// from the async_tcp callback for that same reason, and the pull path is the
+// one the release update already uses, down to the event that stops the panel.
+// The cost is that the board has to reach the developer's host, which
+// tools/ota_dev.py checks before it asks for anything.
+//
+// Not authenticated, and present on the production build. That is deliberate,
+// and it is the trust boundary the rest of this server already assumes:
+// /api/settings returns the WiFi password in cleartext over plain http to
+// anyone on the LAN. Build with -DGM_DEV_OTA=0 to compile it out.
+void WebUIPlugin::handleDevOta(AsyncWebServerRequest *request) {
+#if GM_DEV_OTA
+    if (!request->hasArg("url")) {
+        request->send(400, "application/json", "{\"error\":\"url required\"}");
+        return;
+    }
+    const String url = request->arg("url");
+    // http:// or https:// only. Anything else reaches HTTPUpdate as a host it
+    // cannot parse, and the failure comes back as a generic update error
+    // seconds later with the panel already stopped.
+    if (!url.startsWith("http://") && !url.startsWith("https://")) {
+        request->send(400, "application/json", "{\"error\":\"url must be http:// or https://\"}");
+        return;
+    }
+    if (url.length() >= kDevOtaUrlCap) {
+        request->send(400, "application/json", "{\"error\":\"url too long\"}");
+        return;
+    }
+    // A shot, a steam or a grind is running. The panel stops for the whole
+    // download and the display task does nothing else while it runs, so this
+    // would take the UI away mid-brew.
+    if (controller->isActive()) {
+        request->send(409, "application/json", "{\"error\":\"a process is running\"}");
+        return;
+    }
+    // Test then set, with no atomic claim between them, because there is only
+    // one producer: every request handler runs on the async_tcp task, so two
+    // POSTs cannot be inside this function at once. The consumer is loop() on
+    // the display task, and it reads the buffer only after seeing the flag,
+    // which is why the flag is stored last.
+    if (updating || devOtaPending.load()) {
+        request->send(409, "application/json", "{\"error\":\"an update is already pending\"}");
+        return;
+    }
+    std::strncpy(devOtaUrl, url.c_str(), kDevOtaUrlCap - 1);
+    devOtaUrl[kDevOtaUrlCap - 1] = '\0';
+    devOtaPending.store(true);
+    ESP_LOGW("WebUIPlugin", "dev OTA queued: %s", devOtaUrl);
+    request->send(200, "application/json", "{\"ok\":true}");
+#else
+    request->send(404, "application/json", "{\"error\":\"dev OTA not built in\"}");
+#endif
+}
+
 void WebUIPlugin::handleAutotuneStart(uint32_t clientId, JsonDocument &request) {
     int testTime = request["time"].as<int>();
     int samples = request["samples"].as<int>();
@@ -1588,10 +1711,23 @@ void WebUIPlugin::handleSettings(AsyncWebServerRequest *request) const {
             flagArg("scaleMenuButton", [settings](bool v) { settings->setScaleMenuButton(v); });
             if (request->hasArg("bgAnimId"))
                 settings->setBgAnimId(request->arg("bgAnimId").toInt());
+            // -1 means "the standby screen plays the main animation". The
+            // form sends that value like any other, so nothing here has to
+            // special-case it; DefaultUI reads a negative or out of range id
+            // as "same as the main one".
+            if (request->hasArg("bgAnimStandbyId"))
+                settings->setBgAnimStandbyId(request->arg("bgAnimStandbyId").toInt());
             if (request->hasArg("bgAnimParams"))
                 settings->setBgAnimParams(request->arg("bgAnimParams"));
-            if (request->hasArg("bgAnimTheme"))
-                settings->setBgAnimTheme(request->arg("bgAnimTheme").toInt());
+            if (request->hasArg("bgAnimTheme")) {
+                // The legacy integer's namespace is frozen (BgAnim.h): 0 to
+                // 17 are the original built-ins and 18 is the pre-library
+                // custom gradient. Anything outside it is a stale form or a
+                // hand-made request, and is stored as 0 rather than kept to
+                // start meaning an appended built-in later.
+                const int theme = request->arg("bgAnimTheme").toInt();
+                settings->setBgAnimTheme(theme >= 0 && theme <= BG_THEME_LEGACY_CUSTOM ? theme : 0);
+            }
             if (request->hasArg("bgAnimFps"))
                 settings->setBgAnimFps(request->arg("bgAnimFps").toInt());
             // Guarded on hasArg like the flags above: a partial submit that
@@ -1687,6 +1823,23 @@ void WebUIPlugin::handleSettings(AsyncWebServerRequest *request) const {
                     settings->setBgAnimThemeMap(request->arg("bgAnimThemeMap"));
                 else
                     rejected.push_back("bgAnimThemeMap");
+            }
+            // The global gradient, in the same grammar as one map slot. A
+            // built-in written here is mirrored into bgAnimTheme so the two
+            // agree: bgAnimTheme is the last fallback and the on-display
+            // "Global (<name>)" label reads it. bg_legacy_mirror_for_ref
+            // (BgAnim.h) is the one mirror policy, shared with the display's
+            // two writers and mirrored by the web form.
+            if (request->hasArg("bgAnimGradientRef")) {
+                const String ref = request->arg("bgAnimGradientRef");
+                if (bg_ref_valid(ref.c_str())) {
+                    settings->setBgAnimGradientRef(ref);
+                    const int mirror = bg_legacy_mirror_for_ref(ref.c_str(), bg_theme_count());
+                    if (mirror >= 0)
+                        settings->setBgAnimTheme(mirror);
+                } else {
+                    rejected.push_back("bgAnimGradientRef");
+                }
             }
             flagArg("bgAnimAllScreens", [settings](bool v) { settings->setBgAnimAllScreens(v); });
             if (request->hasArg("smartGrindIp"))
@@ -1824,7 +1977,7 @@ void WebUIPlugin::handleSettings(AsyncWebServerRequest *request) const {
         // its state every 5 s while it is open, so an unsaved edit still being
         // previewed comes back on its own.
         if (request->hasArg("bgAnimThemeMap") || request->hasArg("bgAnimGradients") || request->hasArg("bgAnimTheme") ||
-            request->hasArg("bgAnimId")) {
+            request->hasArg("bgAnimGradientRef") || request->hasArg("bgAnimId")) {
             pluginManager->trigger("bganim:preview-end");
         }
         controller->setTargetTemp(controller->getTargetTemp());
@@ -1909,6 +2062,7 @@ void WebUIPlugin::handleSettings(AsyncWebServerRequest *request) const {
     doc["smartGrindActive"] = settings.isSmartGrindActive();
     doc["scaleMenuButton"] = settings.isScaleMenuButton();
     doc["bgAnimId"] = settings.getBgAnimId();
+    doc["bgAnimStandbyId"] = settings.getBgAnimStandbyId();
     doc["bgAnimParams"] = settings.getBgAnimParams();
     doc["bgAnimAllScreens"] = settings.isBgAnimAllScreens();
     doc["bgAnimTheme"] = settings.getBgAnimTheme();
@@ -1947,6 +2101,7 @@ void WebUIPlugin::handleSettings(AsyncWebServerRequest *request) const {
     doc["bgAnimCustomTheme"] = settings.getBgAnimCustomTheme();
     doc["bgAnimGradients"] = settings.getBgAnimGradients();
     doc["bgAnimThemeMap"] = settings.getBgAnimThemeMap();
+    doc["bgAnimGradientRef"] = settings.getBgAnimGradientRef();
     doc["smartGrindIp"] = settings.getSmartGrindIp();
     doc["smartGrindMode"] = settings.getSmartGrindMode();
     doc["momentaryButtons"] = settings.isMomentaryButtons();

@@ -37,6 +37,14 @@ volatile bool g_touchMapLoad = false;
 volatile bool g_touchMapPending = false;
 char *g_touchMapBuf = nullptr;
 volatile uint32_t g_touchMapLen = 0;
+volatile int32_t g_uiMinRenderMs = 250;
+volatile int g_scaleScreenReq = -1;
+// The inval-src recorder is a GM_TOUCH_PROBE instrument and /api/debug/anim,
+// its only reader, is device-only, so the simulator carries no ring. The patch
+// that calls it is applied to every env's LVGL copy, so the entry point still
+// has to exist here.
+extern "C" const void *gm_inval_caller = nullptr;
+extern "C" void gm_record_inval_src(const void *, const void *, int, int, int, int, int, int, int, int) {}
 
 extern "C" {
 uint8_t gm_snap_row_x0[GM_SNAP_ROWS];

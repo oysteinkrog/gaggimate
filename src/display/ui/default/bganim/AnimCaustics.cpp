@@ -146,6 +146,23 @@
 // 9.01/9.01/9.01 after the GRID change), so min_ms is what this pass
 // tracked and first_ms is reported for completeness only.
 
+// Parameter pass (2026-09-10, gm-3vj.9): five more sliders, taking this
+// animation from 3 to 8. Every one of them acts in frame(), either on the
+// three waves' angles or on the shaping table frame() rebuilds, so the
+// portable pixel loop and the hand-written Xtensa kernel below are byte for
+// byte what they were. Each new slider defaults to 50, and paramSpan()
+// returns its middle argument as a literal at 50, so the default arithmetic
+// collapses to the constant this file hard-coded before: the angle terms
+// add a literal 0.0f, the turn rate multiplies by a literal 1.0f, and the
+// shaping loop takes the branch that writes the original expression. The
+// default output is therefore the old output bit for bit, which is what the
+// golden frames check.
+//
+// shapeLUT is no longer rebuilt on every frame. It used to be 1,552 cheap
+// iterations; the edge softness slider makes it 1,552 powf calls away from
+// the default, so the rebuild is now gated on the three values that shape
+// it moving (see g_lastThresh below).
+
 #include "BgAnim.h"
 #include "BgAnimClock.h"
 #include "BgAnimCommon.h"
@@ -161,6 +178,27 @@ constexpr float PHASE0[K] = {0.0f, 2.1f, 4.6f};
 constexpr float FREQ_BASE[K] = {0.046f, 0.061f, 0.037f};
 constexpr float SPEED_MUL[K] = {1.0f, 0.82f, 1.28f};
 
+// The mean of BASE_ANGLE, the pivot the wave spread slider scales the three
+// angles about. Written out rather than computed so the constant folding is
+// visible: (0.35 + 2.55 + 4.55) / 3.
+constexpr float ANG_MEAN = 2.4833333f;
+
+// A 0-100 slider as a piecewise linear value with an exact midpoint: lo at
+// 0, mid at 50, hi at 100, and at 50 it returns the mid literal itself
+// rather than an expression that happens to round to it. Every slider this
+// file gained on 2026-09-10 defaults to 50 and either scales or offsets a
+// constant that was hard-coded before, so the `d == 0` branch is what makes
+// the unchanged default a guarantee instead of a hope about float rounding.
+// Called five times per frame, never per row and never per pixel.
+inline float paramSpan(uint8_t v, float lo, float mid, float hi) {
+    const int d = static_cast<int>(v) - 50;
+    if (d == 0) {
+        return mid;
+    }
+    const float f = d / 50.0f;
+    return d < 0 ? mid + (mid - lo) * f : mid + (hi - mid) * f;
+}
+
 // DDS phase scale: a uint32_t phase accumulator's full range (2^32) maps to
 // one full circle (2*pi radians), same convention as AnimEmber's STEP1/2/3.
 // idx = phaseQ >> 22 lands in [0,1023], directly indexing sin1024's LUT
@@ -168,24 +206,46 @@ constexpr float SPEED_MUL[K] = {1.0f, 0.82f, 1.28f};
 constexpr double PHASE_SCALE = 4294967296.0 / 6.283185307179586;
 constexpr int PHASE_SHIFT = 22; // 32 - log2(SIN_N)
 
-// Animation time (BgAnimClock.h, gm-4q9y). g_clock runs at the speed
-// setting and drives each wave's travel phase; g_wall runs at speed 1 and
-// drives the slow angle drift, which never followed the speed setting.
+// Animation time (BgAnimClock.h, gm-4q9y). g_clock runs at the calibrated
+// speed setting and drives each wave's travel phase; g_turn runs at that
+// same rate times the turn slider (p[7]) and drives the slow angle drift.
 // Neither is reset by release(), so the full/half switch keeps the motion.
 AnimClock g_clock;
-AnimClock g_wall;
+AnimClock g_turn;
 // The same rates frame() used to apply to t in seconds, per millisecond:
 // the angle drift in rad/s, and the travel phase at 0.8 * SPEED_MUL * 2
 // rad/s per unit of speed.
-constexpr uint64_t ANG_RATE[K] = {oscRateQ48(ANG_DRIFT[0] / 1000.0), oscRateQ48(ANG_DRIFT[1] / 1000.0),
-                                  oscRateQ48(ANG_DRIFT[2] / 1000.0)};
-constexpr uint64_t PHASE_RATE[K] = {oscRateQ48(0.8 * SPEED_MUL[0] * 2.0 / 1000.0),
-                                    oscRateQ48(0.8 * SPEED_MUL[1] * 2.0 / 1000.0),
-                                    oscRateQ48(0.8 * SPEED_MUL[2] * 2.0 / 1000.0)};
+// Seconds per millisecond and the 0.8 are the page's floats (0.001f, 0.8f),
+// so these are the page chain's own rates and the handover at
+// PAGE_EXACT_Q16 does not jump.
+constexpr double S_PER_MS = static_cast<double>(0.001f);
+constexpr uint64_t ANG_RATE[K] = {oscRateQ48(ANG_DRIFT[0] * S_PER_MS), oscRateQ48(ANG_DRIFT[1] * S_PER_MS),
+                                  oscRateQ48(ANG_DRIFT[2] * S_PER_MS)};
+constexpr uint64_t PHASE_RATE[K] = {oscRateQ48(S_PER_MS * static_cast<double>(0.8f) * SPEED_MUL[0] * 2.0),
+                                    oscRateQ48(S_PER_MS * static_cast<double>(0.8f) * SPEED_MUL[1] * 2.0),
+                                    oscRateQ48(S_PER_MS * static_cast<double>(0.8f) * SPEED_MUL[2] * 2.0)};
 // PHASE0 in DDS units. All three are under 2*pi, so each fits a uint32.
 constexpr uint32_t PHASE0_Q[K] = {static_cast<uint32_t>(PHASE0[0] * PHASE_SCALE + 0.5),
                                   static_cast<uint32_t>(PHASE0[1] * PHASE_SCALE + 0.5),
                                   static_cast<uint32_t>(PHASE0[2] * PHASE_SCALE + 0.5)};
+
+// How long frame() follows the page's own float arithmetic (gm-pciz). The
+// page builds t in float seconds and chains float products from it, so the
+// only way to draw its frames bit for bit is to run the same chain on the
+// clock's time. That chain loses resolution as t grows (a float phase near
+// 4096 rad steps by 0.5 mrad), so past 2048 s of calibrated clock time (8192 s
+// of wall time at Speed 50, where the travel phase is near 4200 rad) frame()
+// takes the Q48 oscillators above instead. The handover moves a phase by
+// about a milliradian, once; the oscillators then never lose precision and
+// never jump at a wrap.
+constexpr uint64_t PAGE_EXACT_Q16 = 2048000ull << 16;
+
+// A clock's time in float seconds, as the page forms t: the clock's
+// milliseconds rounded to float, times 0.001f. Exact milliseconds at Speed 50
+// (0.25 x whole milliseconds is exact in Q16).
+inline float clockSecondsF(const AnimClock &c) {
+    return static_cast<float>(static_cast<double>(c.simQ16) * (1.0 / 65536.0)) * 0.001f;
+}
 
 // Coarse-grid stride in x: the wave-sum field is evaluated exactly every
 // GRID columns and linearly interpolated in between (see file header). Must
@@ -256,6 +316,14 @@ uint32_t g_stepQ[K];    // per-pixel (x) phase step, DDS units
 int8_t ditherI[DITHER_N]; // (BAYER4[i]-7.5)*0.5, precomputed once at init
 uint8_t *shapeLUT = nullptr;
 
+// What shapeLUT was last built for. The initial triple is unreachable
+// (thresh is 0.14..0.69, the exponent 0.6..6.0, the gain 0.25..3.0), so the
+// first frame after every init() rebuilds; release() puts it back.
+constexpr float SHAPE_NEVER_BUILT = -1.0f;
+float g_lastThresh = SHAPE_NEVER_BUILT;
+float g_lastShapeExp = SHAPE_NEVER_BUILT;
+float g_lastGlow = SHAPE_NEVER_BUILT;
+
 void buildThemePalette() {
     // Sampled at SHADE_LEVELS positions spread across the full 0..255 theme
     // gradient (li*255/(SHADE_LEVELS-1), integer division -- this runs once
@@ -318,6 +386,9 @@ bool init(int, int) {
     }
     buildThemePalette();
     lastThemeGen = themeGen();
+    g_lastThresh = SHAPE_NEVER_BUILT;
+    g_lastShapeExp = SHAPE_NEVER_BUILT;
+    g_lastGlow = SHAPE_NEVER_BUILT;
     return true;
 }
 
@@ -336,7 +407,7 @@ bool init(int, int) {
 // integer-to-unsigned conversion perform the modular wrap the design wants.
 inline uint32_t ddsQ(double v) { return static_cast<uint32_t>(static_cast<int64_t>(fmod(v, 4294967296.0))); }
 
-void frame(uint32_t tMs, int, int, const uint8_t p[4]) {
+void frame(uint32_t tMs, int, int, const uint8_t p[BG_ANIM_PARAMS]) {
     if (themeGen() != lastThemeGen) {
         buildThemePalette();
         lastThemeGen = themeGen();
@@ -345,20 +416,79 @@ void frame(uint32_t tMs, int, int, const uint8_t p[4]) {
     // t = tMs * 0.001f was a float: it stepped in 32 ms jumps after 3.1 days
     // of uptime, the phase jumped on every speed change, and every wave
     // jumped at the 49.7-day wrap.
-    g_clock.advance(tMs, speedMul(p[0]));
-    g_wall.advance(tMs, 1.0f);
+    // Speed calibration (gm-33fm): the clock runs at 0.25x of the original
+    // rate, so Speed 50 gives about the same visible movement here as on
+    // every other animation. 0.25 is exact in float, so the clock's Q16
+    // speed holds it exactly. The Speed parameter, its label and its
+    // default of 50 are unchanged.
+    // Speed also drives the heading drift (gm-kh2s). It used to scale the
+    // wave phases alone and left the drift on the unscaled clock. The drift
+    // is small next to the phases at Speed 50, but it did not slow down, so
+    // at Speed 0 it was most of what still moved: the measured half change
+    // there was 4648 ms against a fleet target of 8050, and the drift is
+    // why. The drift clock below therefore runs at the same rate, times the
+    // turn slider, so Speed and turn bend the drift instead of jumping it.
+    constexpr float RATE_CAL = 0.25f;
+    const float rate = RATE_CAL * speedMul(p[0]);
+    g_clock.advance(tMs, rate);
     const float freqScale = lerpf(0.55f, 1.9f, p[1] / 100.0f);
     const float thresh = 0.14f + 0.55f * (p[2] / 100.0f); // p[2] = "contrast" param
     const float invSpan = 1.0f / fmaxf(1e-3f, 1.0f - thresh);
+    // p[3] "glow": gain on the shaped brightness, clamped at full. Dim, thin
+    // filaments at 0, wide saturated webs at 100.
+    const float glow = paramSpan(p[3], 0.25f, 1.0f, 3.0f);
+    // p[4] "spot": the shaping exponent, which sets how fast a lit spot
+    // falls off from its centre and so how large it reads. 6.0 at 0 is a
+    // hard bright point, the hard-coded 2.0 at 50, 0.6 at 100 a wide soft
+    // blob. Cell scale (p[1]) sets how far apart the spots sit; this sets
+    // how much of each cell one fills.
+    const float shapeExp = paramSpan(p[4], 6.0f, 2.0f, 0.6f);
+    // p[5] "spread": scales the three wave angles about their mean. At 0 all
+    // three collapse onto one heading and the picture is banded stripes; at
+    // 100 they are twice as far apart and the web is wider meshed.
+    const float spread = paramSpan(p[5], -1.0f, 0.0f, 1.0f);
+    // p[6] "tilt": one rotation added to every wave, a quarter turn each way.
+    const float tilt = paramSpan(p[6], -1.5707963f, 0.0f, 1.5707963f);
+    // p[7] "turn": how fast the headings drift, 0 for a fixed orientation and
+    // 4x the hard-coded rate at 100.
+    const float turn = paramSpan(p[7], 0.0f, 1.0f, 4.0f);
+    g_turn.advance(tMs, rate * turn);
+    const bool pageClock = g_clock.simQ16 < PAGE_EXACT_Q16;
+    const bool pageTurn = g_turn.simQ16 < PAGE_EXACT_Q16;
+    const float tClock = clockSecondsF(g_clock);
+    const float tTurn = clockSecondsF(g_turn);
+    const float speedScale = 0.8f;
 
     for (int k = 0; k < K; k++) {
-        const float ang = BASE_ANGLE[k] + oscRad(g_wall, ANG_RATE[k]);
-        const float cosA = fastCosRad(ang);
-        const float sinA = fastSinRad(ang);
+        // At the defaults spread and tilt are literal zeros, so this is
+        // BASE_ANGLE[k] plus the drift, which g_turn accumulates at the
+        // speed and turn in force for each frame.
+        // The drift is the page's ANG_DRIFT[k] * t on the turn clock while
+        // that is exact, then the oscillator (PAGE_EXACT_Q16).
+        const float drift = pageTurn ? ANG_DRIFT[k] * tTurn : oscRad(g_turn, ANG_RATE[k]);
+        const float ang = BASE_ANGLE[k] + (BASE_ANGLE[k] - ANG_MEAN) * spread + tilt + drift;
+        // The real heading, not the 256-entry cosTableF() lookup (gm-pciz).
+        // The table truncates the heading to 1/256 of a turn, so every wave
+        // ran up to 1.4 degrees off the page's heading and the pattern sat
+        // several pixels away from the design at the rim: a mean deviation of
+        // 5.5 per channel against the page, 1.0 with the exact heading.
+        // Evaluated in double and rounded once, like ddsQ() below: the
+        // single-precision libm routines are not correctly rounded, so cosf()
+        // on the host and Math.cos() on the page disagreed by one float ulp
+        // on a few calls in two hundred frames, and one ulp in the heading
+        // moves a phase step by one unit. Six calls a frame, none per pixel.
+        const float cosA = static_cast<float>(cos(static_cast<double>(ang)));
+        const float sinA = static_cast<float>(sin(static_cast<double>(ang)));
         const float freq = FREQ_BASE[k] * freqScale; // rad/pixel
         g_rowFreqQ[k] = ddsQ(static_cast<double>(sinA * freq) * PHASE_SCALE);
-        // The clock's Q32 turn is already a DDS phase word (2^32 = one turn).
-        g_phaseQ[k] = oscTurnQ32(g_clock, PHASE_RATE[k]) + PHASE0_Q[k];
+        // The page's float chain while it is exact, then the clock's Q32
+        // turn, which is already a DDS phase word (2^32 = one turn).
+        if (pageClock) {
+            const float phaseRad = PHASE0[k] + tClock * speedScale * SPEED_MUL[k] * 2.0f;
+            g_phaseQ[k] = ddsQ(static_cast<double>(phaseRad) * PHASE_SCALE);
+        } else {
+            g_phaseQ[k] = oscTurnQ32(g_clock, PHASE_RATE[k]) + PHASE0_Q[k];
+        }
         g_stepQ[k] = ddsQ(static_cast<double>(cosA * freq) * PHASE_SCALE);
     }
 
@@ -370,11 +500,23 @@ void frame(uint32_t tMs, int, int, const uint8_t p[4]) {
     // value shapeLUT[SHAPE_MAX] would hold, so band() never needs to clamp
     // mag.
     constexpr float NORM = 1.0f / static_cast<float>(SHAPE_MAX);
-    for (int i = 0; i < SHAPE_N; i++) {
-        float bright = (i * NORM - thresh) * invSpan;
-        bright = bright < 0 ? 0 : (bright > 1 ? 1 : bright);
-        bright *= bright;
-        shapeLUT[i] = static_cast<uint8_t>(bright * static_cast<float>(SHADE_LEVELS - 1) + 0.5f);
+    if (thresh != g_lastThresh || shapeExp != g_lastShapeExp || glow != g_lastGlow) {
+        for (int i = 0; i < SHAPE_N; i++) {
+            float bright = (i * NORM - thresh) * invSpan;
+            bright = bright < 0 ? 0 : (bright > 1 ? 1 : bright);
+            // The default exponent takes the multiply, not powf: powf(x, 2.0f)
+            // is not required to return x * x to the last bit, and the golden
+            // frames are checked against the bits this file wrote before.
+            bright = shapeExp == 2.0f ? bright * bright : powf(bright, shapeExp);
+            if (glow != 1.0f) {
+                bright *= glow;
+                bright = bright > 1 ? 1 : bright;
+            }
+            shapeLUT[i] = static_cast<uint8_t>(bright * static_cast<float>(SHADE_LEVELS - 1) + 0.5f);
+        }
+        g_lastThresh = thresh;
+        g_lastShapeExp = shapeExp;
+        g_lastGlow = glow;
     }
 }
 
@@ -717,6 +859,9 @@ void release() {
     releaseTable(rgbLUT, static_cast<size_t>(DITHER_N) * SHADE_LEVELS * sizeof(uint16_t));
     releaseTable(shapeLUT, static_cast<size_t>(SHAPE_N));
     lastThemeGen = 0xFFFFFFFF;
+    g_lastThresh = SHAPE_NEVER_BUILT;
+    g_lastShapeExp = SHAPE_NEVER_BUILT;
+    g_lastGlow = SHAPE_NEVER_BUILT;
 }
 
 } // namespace
@@ -725,7 +870,14 @@ extern const BgAnimation bg_anim_caustics;
 const BgAnimation bg_anim_caustics = {
     "caustics",
     "Caustics",
-    {{"speed", "Drift speed", 50}, {"scale", "Cell scale", 45}, {"contrast", "Contrast", 55}, {nullptr, nullptr, 0}},
+    {{"speed", "Drift speed", 50},
+     {"scale", "Cell scale", 45},
+     {"contrast", "Contrast", 55},
+     {"glow", "Glow", 50},
+     {"spot", "Spot size", 50},
+     {"spread", "Wave spread", 50},
+     {"tilt", "Pattern tilt", 50},
+     {"turn", "Turn rate", 50}},
     init,
     frame,
     band,

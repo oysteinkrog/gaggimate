@@ -18,6 +18,72 @@
 // error against a 27px wavelength (~13 degrees) — invisible under the
 // existing dither.
 //
+// That integer distance is why this animation does not draw its page design
+// pixel for pixel, and it is recorded debt against gm-pciz rather than a bug
+// to fix. Measured 2026-09-13 by building a variant that takes the page's
+// arithmetic per pixel and nothing else: the exact float centre instead of
+// the floored g_icx/g_icy, sqrt of the exact distance instead of the
+// tracker's floor(r), the page's envelope 1 - n*n instead of envLUT, the
+// page's cos(delta * 2*PI/27) instead of the 256-entry truncated cosine
+// table, and the page's own double row expression for the swell instead of
+// the same table. That variant is exact: 0 differing pixels at all three
+// golden frames, against 17,441, 18,369 and 15,358 here. Taken apart, the
+// distance and the two per-pixel tables are 97% of it and the row swell the
+// other 3% (593, 649 and 311 pixels left when only the distance and the
+// tables were fixed, and the largest deviation anywhere fell from 46 to 8,
+// one palette step).
+//
+// That partial variant is not a cheaper option, which is the number that
+// decides this. Three binaries built from the same tree and timed
+// interleaved, seven runs each, minimum of 240-frame host bench band times:
+// this file 0.263 ms a frame, the distance and tables fixed with the row
+// swell left on its table 0.562, everything exact 0.546. So the middle
+// option buys 97% of the gap for 100% of the cost, and the row swell is
+// free: it is one sine per row against about 100,000 ring pixels a frame.
+// The two alternatives are exactness at about 2.1x, or this file.
+//
+// The third variant, the row swell alone on libm and the distance left on
+// its tracker, was measured first and reported as 2.3x for 543 pixels,
+// which read as a bad trade. That multiple was against the same stale
+// baseline and should be disregarded: 2.3 times 0.118 is 0.271, which is
+// the shipped path's own time today, and the interleaved run says the same
+// thing directly, since the exact variant that carries the double swell
+// (0.546) is no slower than the partial one that keeps the table (0.562).
+// The row swell is free. It is only worth 3% of the gap, so it is not a fix
+// on its own, but nothing here is being declined on its account.
+//
+// So the swell takes the page's precision since 2026-10-01 (gm-pciz), and
+// without a sine per row, which the device would pay for in software double:
+// sin(a + b*y) is split as sin(a)cos(b*y) + cos(a)sin(b*y), with a from the
+// swell clock in double once a frame and the two per-row factors a table
+// built once in init() (g_swellRow). Its error is a few 1e-7 of a palette
+// position, so a row lands on the page's position except within that
+// distance of a boundary. The 256-entry table it replaces put whole rows of
+// background one palette step off: golden frames 30, 120 and 210 went from
+// 17,720, 18,688 and 15,709 differing pixels to 16,898, 17,750 and 15,168
+// (the gm-404a balanced dither had moved them up from the counts above).
+//
+// (An earlier note here said 0.118 to 0.541, about 4.6x. The 0.118 was a
+// stale baseline read off a fleet run from 2026-09-10, before something
+// outside this file changed what ripples does per frame; the same binary
+// measures 0.263 today, and the mathcount column reads 5 libm calls a frame
+// where the old runs read 1. Time a baseline in the same session as the
+// variant it is being compared with.)
+//
+// It is not shipped because the page's model is per-pixel libm, and the
+// device pays worse than the host does: band_us is already 14,004 for a
+// full frame, this is about 100,000 ring pixels a frame, and every one of
+// them would need a square root, a cosine and a divide where it now does
+// integer adds and two table reads. A float
+// version with a double fallback near the rounding boundaries, the scheme
+// AnimFireflies.cpp uses, would cut that but not to nothing, and it would
+// have to be transcribed bit for bit into the two hand-written Xtensa
+// kernels below, which have no build flag to fall back to the portable path.
+// Anyone taking that on should measure the device band first: the wave is
+// 27 px long, so what the error buys the panel is a ring up to 2 px off its
+// design radius, which is a fine-detail difference and not a defect of the
+// kind Mandala's wrong shape or Ember's darkness were.
+//
 // Row-window fix (this pass): a ring is a thin annulus (radial thickness
 // 2*HALFW), not a filled disk. The previous version bounded a ring-row's
 // x-range using only the OUTER edge (r+HALFW), which for a mature ring
@@ -148,6 +214,17 @@
 // (a per-pixel branch-and-load memset-alike, and a per-pixel-per-band range
 // check); left as a candidate for a future pass, not attempted here.
 
+// Parameter pass (2026-09-10, gm-3vj.8): four more sliders, taking this
+// animation from 4 to 8. Every one of them acts in frame() or in a table
+// frame() rebuilds -- drop spread moves the landing point, ring width
+// rewrites envLUT, water tone scales two per-row constants, trough dip
+// scales a colour factor blendPackSpan reads -- so neither pixel loop
+// changed and the two hand-written Xtensa kernels below are untouched.
+// Each new slider defaults to 50, and at 50 the arithmetic collapses to the
+// constant this file hard-coded before: paramScale returns a literal 1.0f,
+// the spread term is 1.0f + 0.0f, and rebuildEnvLUT takes a branch that
+// writes the original expression. So the default output is the old output
+// bit for bit, which is what the golden frames check.
 #include "BgAnim.h"
 #include "BgAnimClock.h"
 #include "BgAnimCommon.h"
@@ -166,26 +243,76 @@ constexpr float INV_ROWMAX = 1.0f / 479.0f;  // replaces a per-row divide by 479
 constexpr float RAD_TO_TABLE = 256.0f / 6.2831853f;
 constexpr float WIN_MARGIN = 2.0f; // px slack on every crossing window (see file header)
 
+// Speed law (2026-09-12, gm-kh2s). Before this pass the Speed slider set
+// the ring travel speed linearly, 25 px/s at 0 to 220 px/s at 100, a ring
+// lived a fixed 7 s at the default Fade, and its amplitude decayed with
+// age. The fleet's movement metric (half change time, target 1200 ms at
+// Speed 50) read 118 ms at 50, and slower again above 50, because a fast
+// ring outran the panel and left it empty. The target needs a ring to move
+// about 6 px in 1.2 s, so the travel speed at 50 is now RING_SPEED_50 and
+// follows the universal curve, and the other quantities are defined so the
+// pond keeps rings on it at every speed:
+//   speed  = RING_SPEED_50 * speedMul(p[0])          px/s
+//   travel = FADE_REF_SPEED * lifeS(p[2])            px, amplitude decay length
+//   life   = LIFE_MUL * lifeS(p[2]) / speedMul(p[0]) s
+//   drops  = interval(p[1]) / speedMul(p[0])         ms between deadlines
+//   amp    = rise * exp(-radius / travel) * tail(age / life)
+// where lifeS is the old 7 s to 2.2 s Fade span and FADE_REF_SPEED is the
+// old speed at slider 50, so the brightness a ring has at a given radius is
+// the one this file shipped with. The life is a time, so at a slow speed a
+// ring fades out while still on the panel, which the old hard cut at
+// amp 0.37 could not do without a visible pop: tail() takes the amplitude
+// to zero over the last TAIL_FRAC of the life. With four slots and a drop
+// every 9 s at the default Drop rate, a 37 s life keeps three to four rings
+// on the pond; a life tied to the travel distance instead was tried first
+// and at slow speeds it held every slot for minutes, so the pond emptied
+// for a quarter of the time and then took four drops in a burst. The
+// swell of the water surface follows the same speed multiplier so the
+// whole picture obeys the slider.
+constexpr float RING_SPEED_50 = 4.0f;
+constexpr float FADE_REF_SPEED = 122.5f;
+constexpr float LIFE_MUL = 8.0f;
+constexpr float TAIL_FRAC = 0.4f;
+
 // Padded clamp-to-uint8 LUT sizing. Worst case for cr/cg/cb (see clamp8f
-// call sites below): baseR/baseG/baseB in [0,255] (themeRGB output); ring
+// call sites below): baseR/baseG/baseB in [0,255] (themeRGB output, whatever
+// the water tone parameter does to the position it asks for); ring
 // term g*crestF/troughF where |g| = |hAcc * g_glow| and hAcc sums up to
 // MAX_RIPPLES per-ring contributions, each bounded by amp*cos*env <=
-// amp_max ~= 0.975 (rise in [0,1], expf(-ageS/life) < 1 with its peak at
-// ageS=0.18s -> ~0.975 for the largest tunable life of 7s), so
-// |hAcc| <= 4*0.975 = 3.9; g_glow in [0.35, 1.5] (p[3] 0..100) so
-// |g| <= 5.85. crestF[ch] <= 255*0.65 = 165.75 (crest branch, g>0):
-// cr_max ~= 255 + 5.85*165.75 + dith(4.125) ~= 1228.7. troughF[ch] <=
-// crestF*0.12 <= 19.89 (trough branch, g<0): cr_min ~= 0 - 5.85*19.89 -
-// 4.125 ~= -120.5. So the true range is about [-121, 1229]; CLAMP_PAD/SIZE
-// below add a comfortable margin on both ends.
-constexpr int CLAMP_PAD = 200;
-constexpr int CLAMP_SIZE = 1600; // covers b = (int)v in [-200, 1399]
+// amp_max * env_max ~= 0.98 * 1.6 = 1.57 (rise in [0,1], the tail in [0,1],
+// expf(-radius/travel) < 1 with its peak at ageS=0.18s, a radius under 6 px
+// at Speed 100 against a travel of at least 270 px -> ~0.98; envLUT holds
+// a*(1-n*n)^e with the base in [0,1] and a <= 1.6 at the
+// fattest ring width, p[5]=0), so |hAcc| <= 4*1.56 = 6.24; g_glow in
+// [0.35, 1.5] (p[3] 0..100) so |g| <= 9.36. crestF[ch] <= 255*0.65 = 165.75
+// (crest branch, g>0): cr_max ~= 255 + 9.36*165.75 + dith(4.125) ~= 1810.8.
+// troughF[ch] <= crestF*0.72 <= 119.34 (trough branch, g<0, at the deepest
+// trough dip p[7]=100): cr_min ~= 0 - 9.36*119.34 - 4.125 ~= -1121.2. So the
+// true range is about [-1122, 1811]; CLAMP_PAD/SIZE below add a comfortable
+// margin on both ends. Both grew for the two new parameters that widen this
+// bound (p[5] lifts env above 1, p[7] takes the trough factor to 6x its old
+// fixed 0.12), which costs 1,600 B more of the hot slab: 4,544 B of 9,216
+// before, 6,144 after, so nothing here had to be shrunk to fit either.
+constexpr int CLAMP_PAD = 1200;
+constexpr int CLAMP_SIZE = 3200; // covers b = (int)v in [-1200, 1999]
 
 // Local equivalents of bganim::fastCosRad/fastSinRad that take an already-
 // fetched table pointer, so callers don't pay a cosTableF() call8 per use
 // (see file header). Same indexing formula as BgAnimCommon.h.
 inline float cosRadLocal(const float *ct, float rad) { return ct[static_cast<int>(rad * RAD_TO_TABLE) & 255]; }
 inline float sinRadLocal(const float *ct, float rad) { return cosRadLocal(ct, rad - 1.5707963f); }
+
+// A 0-100 parameter as a multiplier on a tuned constant: exactly 1.0 at 50,
+// 1/base at 0, base at 100, geometric in between. Every parameter this file
+// gained on 2026-09-10 defaults to 50 and scales a constant that was
+// hard-coded before, so the default multiplies by a literal 1.0f and
+// reproduces the old constant bit for bit -- the `d == 0` branch is what
+// makes that a guarantee rather than a hope about powf's rounding. Called
+// from frame() and the table rebuilds, never per row and never per pixel.
+inline float paramScale(uint8_t v, float base) {
+    const int d = static_cast<int>(v) - 50;
+    return d == 0 ? 1.0f : powf(base, d / 50.0f);
+}
 
 // Quake-style fast approximate sqrt: rsqrt via the bit-hack magic constant,
 // refined by two Newton iterations, then sqrt(x) = x * rsqrt(x). Device has
@@ -242,40 +369,118 @@ struct RowState {
 
 struct Ripple {
     float cx, cy;
-    uint32_t birthMs;
+    int32_t birthMs; // signed so ages and deadlines survive the millis wrap
     bool active;
 };
 Ripple ripples[MAX_RIPPLES];
-// Animation time (BgAnimClock.h, gm-4q9y), at speed 1: the speed parameter
-// here is the rings' spread in px/s, not a time scale. Drop times and ring
+// Animation time (BgAnimClock.h, gm-4q9y), at speed 1: frame() applies the
+// Speed multiplier to the drop interval, the ring life and the travel speed
+// itself (gm-kh2s), not to this clock. Drop times and ring
 // births are on g_clock.ms(), and the schedule compares by signed difference
 // so it survives the clock's 32-bit wrap. Not reset by release(), so the
 // simulation keeps going across the full/half switch.
 AnimClock g_clock;
-uint32_t nextDropMs = 0;
+// The swell's own clock, advanced at the Speed multiplier so the water
+// surface follows the slider (gm-kh2s) without jumping when the slider moves
+// or when millis() wraps (gm-4q9y). The drop schedule stays on g_clock at
+// speed 1: frame() divides the interval and the life by the multiplier.
+AnimClock g_swellClock;
+int32_t nextDropMs = 0;
+bool primed = false; // the first frame after init warms the pond, see frame()
 uint32_t rng = 0xC0FFEE;
 float *envLUT = nullptr;     // 256: 1-(i/255)^2
 uint8_t *clampU8 = nullptr;  // CLAMP_SIZE: clamp(idx-CLAMP_PAD, 0, 255) — see derivation above
 float *g_hAccBuf = nullptr;  // 480 floats: one row's pre-summed ring height, see full comment at its use site below
+// 480 pairs: cos(0.014 y) and sin(0.014 y), each formed in double and
+// rounded once, for the swell's angle split (file header). Read once per
+// row, so PSRAM.
+float *g_swellRow = nullptr;
 const float *g_cosTable = nullptr; // cached once so band()/frame() never call cosTableF()
 bool inited = false;
 uint32_t lastThemeGen = 0xFFFFFFFF;
 float crestF[3] = {62, 98, 127}, troughF[3] = {7, 12, 15};
+// Parameter values the two rebuilt tables were last built for, so frame()
+// rebuilds only when the user moves that slider (envLUT is 256 powf calls,
+// the crest/trough colours three multiplies).
+uint8_t lastWidthP = 50;
+uint8_t lastTroughP = 50;
+// Water tone (p[6]): the vertical span and the offset of the background's
+// gradient position. 20.0f/3.0f are the values every build before
+// 2026-09-10 hard-coded, and paramScale(50, ...) puts them back exactly.
+float g_toneSpan = 20.0f;
+float g_toneOff = 3.0f;
 
 int g_n = 0;
 float g_cx[MAX_RIPPLES], g_cy[MAX_RIPPLES], g_r[MAX_RIPPLES], g_amp[MAX_RIPPLES];
 int g_icx[MAX_RIPPLES], g_icy[MAX_RIPPLES]; // centers rounded to nearest pixel, for the integer tracker
 float g_glow = 1.0f;
-float g_swellRad = 0.0f; // the swell's time phase, from g_clock in frame()
-// The swell's rate: the 0.00014 rad/ms frame() used to apply to tMs.
-constexpr uint64_t SWELL_RATE = oscRateQ48(0.00014);
+// sin and cos of the swell's time phase, 0.00014 rad per animation
+// millisecond of g_swellClock, set by frame() (file header).
+float g_swellSin = 0.0f, g_swellCos = 1.0f;
+
+// Ring width (p[5]): the radial envelope is a gather table, so the whole
+// parameter lives in this rebuild and neither pixel loop -- the portable one
+// or the hand-written Xtensa kernel, which reads envLUT by index and knows
+// nothing about its contents -- changes at all. n = ad/HALFW, and the
+// envelope is 1 - n*n at the default, written as the original expression on
+// purpose (powf(x, 1.0f) is very probably x, but "very probably" is not the
+// golden-frame contract).
+//
+// The two directions are shaped differently, and the reason is the fixed
+// cosine the envelope multiplies. cos(ad*WAVEFREQ) crosses zero at
+// ad = 6.75 px, so the annulus is a lit crest inside that radius and a
+// shadow outside it, and the envelope is already near 1 across the crest.
+// Bending the curve alone therefore moves only the shadow, which is a few
+// levels on near-black water: the first version of this parameter measured
+// 11 of 255 at one end and 5 at the other, which is not a parameter a
+// person would notice. So:
+//   thinner (above 50): squeeze the envelope's support, n' = min(1, n*c)
+//     with c up to 4, which takes it to zero at ad = 3.25 px instead of 13
+//     and narrows the lit band itself.
+//   fatter (below 50): flatten the curve AND lift it, a * (1 - n*n)^e with
+//     a up to 1.6 and e down to 0.2, so the crest reaches further out
+//     before it falls away and the shadow behind it deepens.
+// Both meet the default at 1 - n*n exactly (a and e are 1.0f there, and
+// multiplying by 1.0f is exact). The base stays in [0, 1] so there is no
+// negative base and no NaN, but the lift means the table now reaches 1.6
+// rather than 1, which the clamp table above is sized for.
+void rebuildEnvLUT(uint8_t widthP) {
+    if (envLUT == nullptr) {
+        return;
+    }
+    const int d = static_cast<int>(widthP) - 50;
+    if (d == 0) {
+        for (int i = 0; i < 256; i++) {
+            const float n = i / 255.0f;
+            envLUT[i] = 1.0f - n * n;
+        }
+        return;
+    }
+    if (d > 0) {
+        const float c = 1.0f + (d / 50.0f) * 3.0f; // 1 .. 4
+        for (int i = 0; i < 256; i++) {
+            float n = (i / 255.0f) * c;
+            if (n > 1.0f) {
+                n = 1.0f;
+            }
+            envLUT[i] = 1.0f - n * n;
+        }
+        return;
+    }
+    const float e = 1.0f + (d / 50.0f) * 0.8f;  // 1 .. 0.2
+    const float a = 1.0f - (d / 50.0f) * 0.6f;  // 1 .. 1.6
+    for (int i = 0; i < 256; i++) {
+        const float n = i / 255.0f;
+        envLUT[i] = a * powf(1.0f - n * n, e);
+    }
+}
 
 bool init(int, int) {
     // envLUT, clampU8 and g_hAccBuf are all read (and, for g_hAccBuf,
     // written) once or more per pixel -- allocHot() puts them in the fixed
     // internal-SRAM slab instead of PSRAM (BgAnimCommon.h's GM_BGANIM_HOT_SLAB
     // comment: placement decides more of band() time than the kernel does).
-    // Total ask is 1,024 + 1,600 + 1,920 = 4,544 B, comfortably inside the
+    // Total ask is 1,024 + 3,200 + 1,920 = 6,144 B, comfortably inside the
     // 9,216 B this animation gets after the shared sinLut/cosTableF term, so
     // nothing here was shrunk to fit. allocHot() falls back to alloc()
     // (PSRAM) on its own if the slab is ever full when this runs -- same
@@ -285,10 +490,13 @@ bool init(int, int) {
         if (envLUT == nullptr) {
             return false;
         }
-        for (int i = 0; i < 256; i++) {
-            const float n = i / 255.0f;
-            envLUT[i] = 1.0f - n * n;
-        }
+        // init() gets no parameters, so the table starts at the default
+        // width and frame() rebuilds it on the first pass that sees a
+        // different p[5]. lastWidthP is set here, next to the build it
+        // describes, so a release()/init() cycle can never leave the
+        // sentinel claiming a width the fresh table does not have.
+        lastWidthP = 50;
+        rebuildEnvLUT(lastWidthP);
     }
     if (clampU8 == nullptr) {
         clampU8 = static_cast<uint8_t *>(allocHot(CLAMP_SIZE));
@@ -310,6 +518,16 @@ bool init(int, int) {
         // left behind by a previous animation's use of this slab memory is
         // always overwritten before it is read.
     }
+    if (g_swellRow == nullptr) {
+        g_swellRow = static_cast<float *>(alloc(2 * 480 * sizeof(float)));
+        if (g_swellRow == nullptr) {
+            return false;
+        }
+        for (int y = 0; y < 480; y++) {
+            g_swellRow[2 * y] = static_cast<float>(cos(y * 0.014));
+            g_swellRow[2 * y + 1] = static_cast<float>(sin(y * 0.014));
+        }
+    }
     if (g_cosTable == nullptr) {
         // Fetched once here (same lazy-build semantics as fastCosRad's own
         // first call) so band()/frame() can index it directly with zero
@@ -321,27 +539,37 @@ bool init(int, int) {
         for (auto &r : ripples) {
             r.active = false;
         }
-        // On g_clock.ms(), which starts at 0 on the first frame, so the first
-        // drop lands 0.6 to 2.6 s after the animation first shows. (On raw
-        // millis() it fired at once whenever the animation was first
-        // selected more than 2.6 s after boot.)
-        nextDropMs = 600 + static_cast<uint32_t>(nextRandf(rng) * 2000);
+        // frame()'s first pass primes the schedule from g_clock.ms(), which
+        // starts at 0 on the first frame, so the pond does not depend on how
+        // long after boot the animation was first selected. (Seeding
+        // nextDropMs from raw millis() fired a drop at once whenever the
+        // animation was first selected more than 2.6 s after boot.)
+        primed = false;
     }
     return true;
 }
 
 // Water surface sits in the theme's darkest ~10%; ring crests borrow the
-// brightest stop, troughs a dimmed version of it.
-void rebuildThemeAssets() {
+// brightest stop, troughs a dimmed version of it. The trough dip (p[7])
+// scales that dimming: 0.12 of the crest colour at the default, a sixth of
+// that at 0 (a bright arc on flat water, no dark ring beside it at all) and
+// six times it at 100 (a dark ring that reaches black where the wave is
+// strongest). The water itself is only 10 to 25 levels above black, so this
+// is a small number of levels either way; it is what makes the shadow
+// beside a crest read as a trough rather than as nothing. Both factors are
+// read only by blendPackSpan, which is portable C++ shared by band() and
+// bandRef(), so this parameter does not reach the Xtensa kernel either.
+void rebuildThemeAssets(uint8_t troughP) {
     uint8_t c[3];
     themeRGB(255, c);
+    const float troughMul = 0.12f * paramScale(troughP, 6.0f);
     for (int ch = 0; ch < 3; ch++) {
         crestF[ch] = c[ch] * 0.65f;
-        troughF[ch] = crestF[ch] * 0.12f;
+        troughF[ch] = crestF[ch] * troughMul;
     }
 }
 
-void frame(uint32_t tMs, int w, int h, const uint8_t p[4]) {
+void frame(uint32_t tMs, int w, int h, const uint8_t p[BG_ANIM_PARAMS]) {
     // Time from the wrapped millis() delta (gm-4q9y). The old code used
     // tMs directly: the swell's float tMs * 0.00014f stepped in 32 ms jumps
     // after 3.1 days of uptime, and `tMs >= nextDropMs` stopped dropping
@@ -349,47 +577,151 @@ void frame(uint32_t tMs, int w, int h, const uint8_t p[4]) {
     // had.
     g_clock.advance(tMs, 1.0f);
     const uint32_t nowMs = g_clock.ms();
-    g_swellRad = oscRad(g_clock, SWELL_RATE);
-    if (themeGen() != lastThemeGen) {
-        rebuildThemeAssets();
+    if (themeGen() != lastThemeGen || p[7] != lastTroughP) {
+        lastTroughP = p[7];
+        rebuildThemeAssets(lastTroughP);
         lastThemeGen = themeGen();
     }
-    const float interval = lerpf(14000.0f, 1500.0f, p[1] / 100.0f);
-    if (static_cast<int32_t>(nowMs - nextDropMs) >= 0) {
+    if (p[5] != lastWidthP) {
+        lastWidthP = p[5];
+        rebuildEnvLUT(lastWidthP);
+    }
+    // Water tone (p[6]): scales both terms of the background gradient
+    // position, so the water goes from near-flat black at 0 to a clearly
+    // graded, lighter surface at 100.
+    {
+        const float toneMul = paramScale(p[6], 3.0f);
+        g_toneSpan = 20.0f * toneMul;
+        g_toneOff = 3.0f * toneMul;
+    }
+    // Drop spread (p[4]): the random landing point pulled toward the centre
+    // (0.30 at slider 0, so every drop lands inside the middle 30 percent of
+    // the panel) or pushed out past the rim (1.70 at slider 100, so some
+    // drops land off-panel and their rings sweep in as arcs). Written as rand*s + centre*(1-s)
+    // because at s == 1.0f exactly that is rand + 0.0f, the old expression
+    // bit for bit, and the random stream is untouched at every setting: the
+    // same drops at the same times, moved.
+    const float spread = 1.0f + static_cast<float>(static_cast<int>(p[4]) - 50) * 0.014f;
+    const float spd = speedMul(p[0]);
+    // Speed divides every time constant and multiplies the travel speed, so
+    // the fast end is the Speed 50 pond played faster rather than a different
+    // pond (gm-kh2s). Until 2026-09-12 only the travel speed scaled: a ring
+    // then reached the rim in a fraction of the time while drops still landed
+    // every nine seconds and a ring still took 37 s to fade, so the top of the
+    // slider showed less movement than three quarters of it. The fleet sweep
+    // caught it as a dip in the one-step change fraction, 6.04 percent at
+    // Speed 75 against 3.93 at Speed 100, which is the slider running
+    // backwards as far as the eye is concerned.
+    //
+    // travel is a distance, not a time, and stays where it is: a ring's
+    // brightness at a given radius is the one this file shipped with, at every
+    // speed. The catch-up bound below is unchanged, because life and interval
+    // are divided by the same number and only their ratio enters it.
+    const float interval = lerpf(14000.0f, 1500.0f, p[1] / 100.0f) / spd;
+    const float speed = RING_SPEED_50 * spd;
+    const float lifeS = lerpf(7.0f, 2.2f, p[2] / 100.0f);
+    const float travel = FADE_REF_SPEED * lifeS;
+    const float life = LIFE_MUL * lifeS / spd;
+    // The swell follows the speed multiplier on its own clock (see
+    // g_swellClock), so a slider move bends its phase instead of moving it.
+    // The phase is formed in double from the 64-bit clock, which is exact
+    // for years, so it never steps and never jumps at a wrap.
+    g_swellClock.advance(tMs, spd);
+    {
+        const double ph = static_cast<double>(g_swellClock.simQ16) * (1.0 / 65536.0) * 0.00014;
+        g_swellSin = static_cast<float>(sin(ph));
+        g_swellCos = static_cast<float>(cos(ph));
+    }
+    g_glow = 0.35f + 1.15f * (p[3] / 100.0f);
+
+    // Drops land on their deadlines, not on the frame that first passes one,
+    // and every deadline up to now is played out in turn. So the first frame
+    // after init, and the first frame after a gap longer than a ring's life,
+    // start from a pond that has been raining for one lifetime rather than
+    // from flat water: at the default Fade a ring takes 37 s to fade, and without
+    // this the panel would show empty water and then one small ring for the
+    // first half minute. The catch-up starts on the life boundary before
+    // the one that precedes now (between one and two lives back, so it is
+    // bounded at 2 * life / (0.55 * interval) deadlines, under a hundred at
+    // the fastest drop rate), and it starts there rather than at now minus
+    // one life so that the host bench, whose first frame is at 0, and the
+    // web page, whose first render is at 1990 ms, play the same deadlines
+    // from the same seed and draw the same rings. A deadline further back
+    // than one life restarts the same way. A ring that would have died
+    // before a deadline frees its slot before that deadline's drop, the
+    // same as it would have frame by frame.
+    // On g_clock's milliseconds, read as signed so the floor division and
+    // the deadline comparisons below survive the clock's 32-bit wrap.
+    const int32_t now = static_cast<int32_t>(nowMs);
+    const int32_t lifeMs = static_cast<int32_t>(life * 1000.0f);
+    // Signed differences of two wrapped counters go through unsigned
+    // arithmetic: a plain int32 subtraction is undefined when the two sit
+    // on opposite sides of the wrap (UBSan, merge fuzz 2026-10-01).
+    const auto since = [](int32_t a, int32_t b) {
+        return static_cast<int32_t>(static_cast<uint32_t>(a) - static_cast<uint32_t>(b));
+    };
+    if (!primed || since(now, nextDropMs) > lifeMs) {
+        primed = true;
+        int32_t q = now / lifeMs; // floor division for a negative now (after a wrap)
+        if (now % lifeMs < 0) {
+            q--;
+        }
+        nextDropMs = q * lifeMs - lifeMs;
+    }
+    while (since(now, nextDropMs) >= 0) {
+        const int32_t at = nextDropMs;
+        for (auto &r : ripples) {
+            if (r.active && since(at, r.birthMs) * 0.001f >= life) {
+                r.active = false;
+            }
+        }
         for (auto &r : ripples) {
             if (!r.active) {
-                r = {nextRandf(rng) * w, nextRandf(rng) * h, nowMs, true};
+                const float rx = nextRandf(rng) * w;
+                const float ry = nextRandf(rng) * h;
+                const float invS = 1.0f - spread;
+                r = {rx * spread + (w * 0.5f) * invS, ry * spread + (h * 0.5f) * invS, at, true};
                 break;
             }
         }
-        nextDropMs = nowMs + static_cast<uint32_t>(interval * (0.55f + 0.9f * nextRandf(rng)));
+        nextDropMs = at + static_cast<int32_t>(interval * (0.55f + 0.9f * nextRandf(rng)));
     }
-    const float speed = lerpf(25.0f, 220.0f, p[0] / 100.0f);
-    const float life = lerpf(7.0f, 2.2f, p[2] / 100.0f);
-    g_glow = 0.35f + 1.15f * (p[3] / 100.0f);
 
     g_n = 0;
     for (auto &r : ripples) {
         if (!r.active) {
             continue;
         }
-        const float ageS = (nowMs - r.birthMs) * 0.001f;
+        const float ageS = (now - r.birthMs) * 0.001f;
         if (ageS >= life) {
             r.active = false;
             continue;
         }
         const float radius = speed * ageS;
         const float rise = ageS < 0.18f ? ageS / 0.18f : 1.0f;
-        const float amp = rise * expf(-ageS / life);
+        // Smoothstep from 1 at (1 - TAIL_FRAC) of the life to 0 at its end.
+        float tail = (1.0f - ageS / life) * (1.0f / TAIL_FRAC);
+        if (tail > 1.0f) {
+            tail = 1.0f;
+        }
+        tail = tail * tail * (3.0f - 2.0f * tail);
+        const float amp = rise * expf(-radius / travel) * tail;
         if (radius <= 0 || amp < 0.008f) {
             continue;
         }
         g_cx[g_n] = r.cx;
         g_cy[g_n] = r.cy;
-        // Round once per frame (not per row/pixel) for the integer tracker;
-        // cx/cy are always >= 0 so truncation-after-offset is a valid round.
-        g_icx[g_n] = static_cast<int>(r.cx + 0.5f);
-        g_icy[g_n] = static_cast<int>(r.cy + 0.5f);
+        // Round once per frame (not per row/pixel) for the integer tracker.
+        // Truncation-after-offset is a valid round for cx/cy >= 0, which is
+        // every drop the spread parameter has not pushed off the panel; for
+        // a negative centre the extra decrement makes it a floor instead of
+        // a round toward zero. It lands one pixel low at an exact negative
+        // integer, which is the same ~1 px of phase error the rounding
+        // itself already costs and which WIN_MARGIN already budgets.
+        const float rcx = r.cx + 0.5f;
+        const float rcy = r.cy + 0.5f;
+        g_icx[g_n] = static_cast<int>(rcx) - (rcx < 0.0f ? 1 : 0);
+        g_icy[g_n] = static_cast<int>(rcy) - (rcy < 0.0f ? 1 : 0);
         g_r[g_n] = radius;
         g_amp[g_n] = amp;
         g_n++;
@@ -405,12 +737,18 @@ void buildRowState(int y, int w, RowState &rs) {
     const float wMinus1 = static_cast<float>(w - 1);
     {
         const float vt = y * INV_ROWMAX;
-        const float swell = sinRadLocal(g_cosTable, g_swellRad + y * 0.014f) * 2.5f;
-        int basePos = static_cast<int>(vt * 20.0f + swell + 3.0f);
+        const float swell = (g_swellSin * g_swellRow[2 * y] + g_swellCos * g_swellRow[2 * y + 1]) * 2.5f;
+        // g_toneSpan/g_toneOff are 20.0f/3.0f at the default water tone, so
+        // this is the original expression there. The upper clamp is 127
+        // rather than 31 because the highest tone (span 60, offset 9) asks
+        // for positions up to about 72; the old 31 was never reached at the
+        // default (max 25.5), so raising it changes nothing there, and
+        // themeRGB clamps to 255 on its own anyway.
+        int basePos = static_cast<int>(vt * g_toneSpan + swell + g_toneOff);
         if (basePos < 0) {
             basePos = 0;
-        } else if (basePos > 31) {
-            basePos = 31;
+        } else if (basePos > 127) {
+            basePos = 127;
         }
         uint8_t baseC[3];
         themeRGB(basePos, baseC);
@@ -921,6 +1259,7 @@ void release() {
     releaseTable(envLUT, 256 * sizeof(float));
     releaseTable(clampU8, CLAMP_SIZE);
     releaseTable(g_hAccBuf, 480 * sizeof(float));
+    releaseTable(g_swellRow, 2 * 480 * sizeof(float));
     // Borrowed: cosTableF() is owned and shared by BgAnimCommon.
     g_cosTable = nullptr;
     // Forces frame() to rebuild the crest/trough colors on the next init.
@@ -929,13 +1268,13 @@ void release() {
     // a freed table set is the bug class this entry point exists to prevent.
     lastThemeGen = 0xFFFFFFFF;
     // `inited` is deliberately NOT reset. It gates the ripple SIMULATION
-    // state (active flags and nextDropMs), not any table's content: envLUT and
-    // clampU8 are pure functions of compile-time constants, so init() refills
-    // them identically whatever `inited` says. Resetting it would re-seed
-    // nextDropMs to 600-2600 ms while g_clock.ms() (also kept) is already far
-    // past that, firing a drop the instant the animation is selected. Leaving the
-    // simulation intact across a release/init cycle is both correct and the
-    // behaviour that existed before this entry point.
+    // state (active flags, nextDropMs and primed), not any table's content:
+    // envLUT and clampU8 are pure functions of compile-time constants, so
+    // init() refills them identically whatever `inited` says. g_clock and
+    // g_swellClock are kept too, so the schedule and the swell carry on. Leaving the
+    // simulation intact across a release/init cycle means a short absence
+    // resumes the same pond, and a long one is caught up by frame() the
+    // same way the first frame is.
 }
 
 } // namespace
@@ -944,7 +1283,14 @@ extern const BgAnimation bg_anim_ripples;
 const BgAnimation bg_anim_ripples = {
     "ripples",
     "Ripples",
-    {{"speed", "Ring speed", 50}, {"rate", "Drop rate", 40}, {"decay", "Fade", 50}, {"glow", "Glow", 50}},
+    {{"speed", "Ring speed", 50},
+     {"rate", "Drop rate", 40},
+     {"decay", "Fade", 50},
+     {"glow", "Glow", 50},
+     {"spread", "Drop spread", 50},
+     {"width", "Ring width", 50},
+     {"tone", "Water tone", 50},
+     {"trough", "Trough dip", 50}},
     init,
     frame,
     band,

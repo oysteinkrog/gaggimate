@@ -95,7 +95,6 @@ MAPPING = {
     ],
     "anim_fireflies": [
         ("src/display/ui/default/bganim/AnimFireflies.cpp", "fillRowPie", "fillRowPieAsm"),
-        ("src/display/ui/default/bganim/AnimFireflies.cpp", "drawGlowSpanAsm", None),
     ],
     "anim_lava": [
         ("src/display/ui/default/bganim/AnimLava.cpp", "lavaFinalizeQuadAsm", None),

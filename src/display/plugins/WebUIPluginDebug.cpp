@@ -62,9 +62,11 @@ extern uint32_t nebula_lerp_self_test(uint32_t *firstBad);
 #include <display/plugins/ShotHistoryPlugin.h>
 #include <esp_memory_utils.h> // esp_ptr_external_ram, for the band-buffer placement report
 #include <esp_timer.h>        // esp_timer_dump, for /api/debug/timers
+#if !defined(GAGGIMATE_HEADLESS) && !defined(GAGGIMATE_SIM) // the radio exists on the device only
 #include <esp_wifi.h>         // esp_wifi_get_ps / sta_get_ap_info, for /api/debug/wifi
 #include <NimBLEDevice.h>     // the scanner state on /api/debug/wifi
 #include <ble/BleScanOwner.h> // the bench scan hold on /api/debug/wifi
+#endif
 #ifdef GM_ANIM_BENCH
 #include <display/ui/default/SleepAnimation.h>
 #include <display/ui/default/bganim/BgAnim.h>
@@ -1003,6 +1005,23 @@ void WebUIPlugin::setupDebugEndpoints() {
                 g_overlayMinRefreshUs = v;
             }
         }
+        // uimin=N: the telemetry pass spacing in milliseconds (see
+        // g_uiMinRenderMs). This is the gate upstream of ovmin: it decides how
+        // often the widgets are given new values, so it is what caps a
+        // readout's step rate. Not persisted; the boot value is
+        // RERENDER_MIN_INTERVAL.
+#ifdef GM_TOUCH_PROBE
+        if (request->hasArg("invmin")) {
+            const int v = request->arg("invmin").toInt();
+            g_invalSrcMinPx = v < 1 ? 1 : (v > 480 ? 480 : v);
+        }
+#endif
+        if (request->hasArg("uimin")) {
+            const long v = request->arg("uimin").toInt();
+            if (v >= 0 && v <= 5000) {
+                g_uiMinRenderMs = static_cast<int32_t>(v);
+            }
+        }
         // ovg=N: overlay gain, Q8, 0..256, applied from the next frame; the
         // measurement knob for the composite's fade cost (blend_us at 128
         // against 256). ovramp=ms starts a test ramp to the far end from the
@@ -1273,6 +1292,16 @@ void WebUIPlugin::setupDebugEndpoints() {
         doc["dma_install_fails"] = a->dmaInstallFails();
         doc["rprio"] = a->renderPrioValue();
         doc["useref"] = a->useBandRefOn();
+#ifdef GM_TOUCH_PROBE
+        // harmostamp=0|1|2: Harmonograph's stamp pass, portable, PIE, or
+        // both with a compare (see BgAnimCommon.h).
+        if (request->hasArg("harmostamp")) {
+            bganim::g_harmoStampMode.store(request->arg("harmostamp").toInt());
+        }
+        doc["harmostamp"] = bganim::g_harmoStampMode.load();
+        doc["harmostamp_checked"] = bganim::g_harmoStampChecked.load();
+        doc["harmostamp_mismatch"] = bganim::g_harmoStampMismatch.load();
+#endif
 #ifdef GM_KBLOB
         doc["useblob"] = a->useBlobOn();
         doc["blob_resident"] = a->kblobResident();
@@ -1364,6 +1393,7 @@ void WebUIPlugin::setupDebugEndpoints() {
         doc["ov_px_rows"] = a->overlayPixelRows();
         doc["ov_clips"] = g_overlayStats.lastClips;
         doc["ov_min_us"] = static_cast<int64_t>(g_overlayMinRefreshUs);
+        doc["ui_min_ms"] = static_cast<int32_t>(g_uiMinRenderMs);
         doc["fps_override"] = g_animFpsOverride;
         doc["ov_gain"] = a->overlayGain();
         doc["elem_us"] = a->lastElementUsValue();
@@ -1411,6 +1441,68 @@ void WebUIPlugin::setupDebugEndpoints() {
                 r.add(nowMs - e.tMs);
             }
             doc["dirty_total"] = n;
+
+#ifdef GM_TOUCH_PROBE
+            // ov_recent: the same "ms ago" encoding for the last publishes.
+            JsonArray pr = doc["ov_recent"].to<JsonArray>();
+            const uint32_t pn = g_pubLogCount;
+            const uint32_t pfrom = pn > static_cast<uint32_t>(PUBLOG_N) ? pn - PUBLOG_N : 0;
+            for (uint32_t i = pfrom; i < pn; i++) {
+                pr.add(nowMs - g_pubLog[i % PUBLOG_N]);
+            }
+            doc["ov_total"] = pn;
+
+            // inval_src: who asked for each near-whole-screen invalidation.
+            // cls is resolved by pointer against the classes these screens
+            // actually use; anything else reports as "?" rather than a
+            // fabricated name.
+            JsonArray isrc = doc["inval_src"].to<JsonArray>();
+            const uint32_t in = g_invalSrcCount;
+            const uint32_t ifrom = in > static_cast<uint32_t>(INVSRC_N) ? in - INVSRC_N : 0;
+            for (uint32_t i = ifrom; i < in; i++) {
+                const InvalSrcEntry &e = g_invalSrc[i % INVSRC_N];
+                JsonObject o = isrc.add<JsonObject>();
+                const char *cls = "?";
+                if (e.cls == &lv_obj_class)
+                    cls = "obj";
+                else if (e.cls == &lv_label_class)
+                    cls = "label";
+                else if (e.cls == &lv_img_class)
+                    cls = "img";
+                else if (e.cls == &lv_btn_class)
+                    cls = "btn";
+                else if (e.cls == &lv_arc_class)
+                    cls = "arc";
+                else if (e.cls == &lv_bar_class)
+                    cls = "bar";
+                else if (e.cls == &lv_meter_class)
+                    cls = "meter";
+                else if (e.cls == &lv_slider_class)
+                    cls = "slider";
+                else if (e.cls == &lv_switch_class)
+                    cls = "switch";
+                o["cls"] = cls;
+                o["obj"] = reinterpret_cast<uint32_t>(e.obj);
+                JsonArray ob = o["box"].to<JsonArray>();
+                ob.add(e.ox1);
+                ob.add(e.oy1);
+                ob.add(e.ox2);
+                ob.add(e.oy2);
+                JsonArray ar = o["area"].to<JsonArray>();
+                ar.add(e.ax1);
+                ar.add(e.ay1);
+                ar.add(e.ax2);
+                ar.add(e.ay2);
+                // Raw as the Xtensa windowed ABI leaves it; the reader strips
+                // the call-size bits and resolves it against the ELF. Absent
+                // for an invalidation of an explicit area, which names its own
+                // caller by the rectangle it asked for.
+                o["caller"] = reinterpret_cast<uint32_t>(e.caller);
+                o["age_ms"] = nowMs - e.tMs;
+            }
+            doc["inval_src_total"] = in;
+            doc["inval_min_px"] = g_invalSrcMinPx;
+#endif
         }
         {
             JsonArray te = doc["text_elems"].to<JsonArray>();
@@ -1502,6 +1594,7 @@ void WebUIPlugin::setupDebugEndpoints() {
         doc["anim_internal"] = a->objectInternal();
         doc["msync_us"] = a->lastMsyncUsValue();
         doc["push_us"] = a->lastPushUsValue();
+        doc["framefn_us"] = a->lastFrameFnUsValue();
         for (int i = 0; i < 2; i++) {
             const void *bp = a->bandBufAddr(i);
             doc["band_psram"][i] = bp != nullptr && esp_ptr_external_ram(bp);
@@ -1685,6 +1778,7 @@ void WebUIPlugin::setupDebugEndpoints() {
     // The counters are cumulative and there is no reset: a sweep takes the
     // difference between two reads of this endpoint, which keeps the reset
     // logic out of the ISR-side counters entirely.
+#if !defined(GAGGIMATE_HEADLESS) && !defined(GAGGIMATE_SIM) // device only: the simulator has no radio
     // /api/debug/wifi: the radio's state for the bench (gm-bzu.26). Reports
     // the power-save mode, the association's rssi, channel and PHY flags, and
     // whether the controller scan is running or held. On bench builds,
@@ -1723,6 +1817,7 @@ void WebUIPlugin::setupDebugEndpoints() {
                  bleScanHeld() ? "true" : "false", g_bleClientConnected ? "true" : "false");
         request->send(200, "application/json", buf);
     });
+#endif // device only
     server.on("/api/debug/pclk", [](AsyncWebServerRequest *request) {
 #if GM_DEBUG_WRITE_ROUTES
         if (request->hasArg("div")) {
@@ -1784,6 +1879,210 @@ void WebUIPlugin::setupDebugEndpoints() {
         heap_caps_free(buf);
     });
 
+#ifdef GM_TOUCH_PROBE
+    // /api/debug/gradfix[?on=0|1|2|3][&y0=&y1=][&xoff=0|1][&btone=&ktone=]
+    // [&stops=<wire>[&anim=N]]: the gradient framebuffer fixture (gm-nov3.10).
+    //
+    // The question it answers is whether the framebuffer really holds the
+    // colours web/src/config/gradientRamp.js says it will. tools/animbench's
+    // ramp_parity.js already proves that module equal to the firmware's C++,
+    // entry by entry, but a host-to-host proof cannot see the device: a
+    // stored brightness, a stored rolloff, a gradient reference that resolves
+    // to something else, or a compositor that drops bits would all pass it.
+    //
+    // What it cannot answer (gm-nov3.22). The reads go to framebuffer memory
+    // in PSRAM, which is where the render task leaves its pixels, so the
+    // result is evidence about the compositor and about nothing downstream of
+    // it. It says nothing about RGB scan-out, the bounce buffers, the DMA or
+    // the LCD_CAM peripheral, nothing about panel timing (the pixel-clock
+    // divider is not in this path and does not qualify the result either
+    // way), nothing about the ribbon or the wiring, nothing about the
+    // controller board, and nothing about what the glass shows. A panel could
+    // be dark, torn or miswired with every sample here still matching.
+    //
+    // Comparing an arbitrary animated frame is not an option. An animation
+    // maps the palette through its own pattern and its own gain, so a moving
+    // frame has no known relation to a ramp. So this paints a known one: rows
+    // [y0, y1) of the framebuffer carry the active theme's 256-entry ramp,
+    // column x holding index ((x + xoff) * 255) / (w - 1), written after every
+    // compositing stage so no overlay, layer, element or scrim can reach it.
+    // xoff is there because /api/debug/fb only delivers the framebuffer
+    // subsampled, so a host reads even columns and would never see the index
+    // on column 479; at xoff 1 that index lands on column 478 instead.
+    //
+    // The JSON is what makes the comparison possible rather than merely
+    // repeatable: it reports the stops BEFORE tone, the interpolation mode,
+    // both tone percentages with the integer values they converted to, the
+    // palette gain and the exact sampled region. A host feeds those back into
+    // the sampler and compares. Reading them here rather than from
+    // /api/settings is deliberate: that endpoint returns the WiFi password in
+    // clear text, and it would report what is stored rather than what the
+    // render task actually used.
+    //
+    // Bench builds only, never persisted, cleared by a reboot.
+    // tools/gradient_fb_check.py drives it.
+    server.on("/api/debug/gradfix", [this](AsyncWebServerRequest *request) {
+        SleepAnimation *a = sleep_animation_bench_instance();
+        if (a == nullptr) {
+            request->send(409, "application/json", "{\"error\":\"animation not running\"}");
+            return;
+        }
+        LilyGoDriver *drv = LilyGoDriver::peekInstance();
+        Display *disp = drv != nullptr ? drv->getDisplay() : nullptr;
+        if (disp == nullptr) {
+            request->send(404, "application/json", "{\"error\":\"not a LilyGo panel\"}");
+            return;
+        }
+        if (request->hasArg("on")) {
+            const int mode = request->arg("on").toInt();
+            const int h = disp->height();
+            int y0 = request->hasArg("y0") ? request->arg("y0").toInt() : a->rampFixtureY0();
+            int y1 = request->hasArg("y1") ? request->arg("y1").toInt() : a->rampFixtureY1();
+            y0 = y0 < 0 ? 0 : (y0 > h ? h : y0);
+            y1 = y1 < 0 ? 0 : (y1 > h ? h : y1);
+            const int xoff = request->hasArg("xoff") ? request->arg("xoff").toInt() : 0;
+            a->setRampFixture(mode, y0, y1, xoff);
+        }
+        // stops=<wire>[&anim=N]: hold an arbitrary gradient on the panel through
+        // the gradient editor's own live-preview path, which is what makes this
+        // usable for a whole batch: every entry in data/gradients.json can be
+        // put on the panel in turn without writing one stored setting. An empty
+        // value ends the preview and the stored theme comes back on the next UI
+        // pass. The preview lapses on its own after BGANIM_PREVIEW_HOLD_MS, so a
+        // caller re-sends it per pass; the report below says which stops the
+        // render task actually resolved, so a lapsed preview reads as the wrong
+        // gradient rather than as a silent pass.
+        if (request->hasArg("stops")) {
+            const String wire = request->arg("stops");
+            if (wire.length() == 0) {
+                pluginManager->trigger("bganim:preview-end");
+            } else {
+                Event ev;
+                ev.id = "bganim:preview";
+                ev.setInt("anim", request->hasArg("anim") ? request->arg("anim").toInt() : a->currentAnimId());
+                ev.setString("stops", wire);
+                pluginManager->trigger(ev);
+            }
+        }
+        // btone=/ktone=: the animation brightness and highlight rolloff in
+        // percent, held against DefaultUI's per-pass re-apply of the stored
+        // values until -1 releases them. This is how the fixture is run at a
+        // tone other than the device's own without writing NVS, and without
+        // POSTing /api/settings, which would need the WiFi password echoed
+        // back at it. The tone the render task ended up with is in the report
+        // below, so a caller checks the override took rather than assuming it.
+        //
+        // Both percentages go out in one atomic store (gm-nov3.22), so a
+        // request that carries both can never be seen half applied by the UI
+        // task. An argument that is absent keeps whatever is held now, which
+        // is why the current pair is read back first. Every request runs on
+        // the async_tcp task, so this is the only writer and the
+        // read-modify-write needs no compare-exchange.
+        if (request->hasArg("btone") || request->hasArg("ktone")) {
+            int btone = -1, ktone = -1;
+            gm_tone_unpack(g_animToneOverride.load(std::memory_order_relaxed), btone, ktone);
+            if (request->hasArg("btone")) {
+                btone = request->arg("btone").toInt();
+            }
+            if (request->hasArg("ktone")) {
+                ktone = request->arg("ktone").toInt();
+            }
+            g_animToneOverride.store(gm_tone_pack(btone, ktone), std::memory_order_release);
+        }
+        AsyncResponseStream *response = request->beginResponseStream("application/json");
+        JsonDocument doc(&psramAllocator);
+        doc["fw"] = BUILD_GIT_VERSION;
+        doc["built"] = BUILD_TIMESTAMP;
+        const int mode = a->rampFixtureMode();
+        doc["armed"] = mode != 0;
+        doc["mode"] = mode == 3 ? "wheel" : (mode == 2 ? "reversed" : (mode == 1 ? "ramp" : "off"));
+        doc["frames"] = a->rampFixtureFrames();
+        doc["y0"] = a->rampFixtureY0();
+        doc["y1"] = a->rampFixtureY1();
+        doc["x0"] = 0;
+        doc["x1"] = disp->width();
+        doc["w"] = disp->width();
+        doc["h"] = disp->height();
+        doc["xoff"] = a->rampFixtureXoff();
+        // Spelled out so a reader of the report never has to find this file.
+        doc["map"] = "index = ((x + xoff) * 255) / (w - 1), clamped to 255, every row of [y0,y1) alike";
+        // The gain buildThemeRamp is called with. Fixed at 256 (none): an
+        // animation's extra gain is a property of that animation, and the
+        // fixture represents the theme.
+        doc["gain256"] = 256;
+        // The percentages the render task's tone should come from, read in one
+        // atomic load, and read BEFORE the integers below. A UI pass applies
+        // the pair a moment after the store lands, so integers read first
+        // could be older than the percentages beside them and the host would
+        // see a conversion that never happened. This way the integers are
+        // never staler than the percentages, and a host that waits for the two
+        // to agree is waiting for the render task to pick the tone up.
+        int overrideB = -1, overrideK = -1;
+        gm_tone_unpack(g_animToneOverride.load(std::memory_order_acquire), overrideB, overrideK);
+        const int brightnessPct = overrideB >= 0 ? overrideB : controller->getSettings().getBgAnimBrightness();
+        const int kneePct = overrideK >= 0 ? overrideK : controller->getSettings().getBgAnimHighlightKnee();
+        // The tone that went into the palette that is published right now, in
+        // one acquire load (gm-nov3.27). Reading bganim's two plain integers
+        // here used to report the tone setThemeTone() had just assigned while
+        // the render task was still drawing the palette from before it, so a
+        // host could be told a tone the panel had not applied. Reported as one
+        // word as well, because the fixture below names the palette it drew
+        // with in the same currency and the host compares them.
+        const uint32_t applied = bganim::themeApplied();
+        int bright256 = 256, knee = 255;
+        bganim::themeAppliedUnpack(applied, &bright256, &knee);
+        doc["applied"] = applied;
+        doc["brightness256"] = bright256;
+        doc["knee"] = knee;
+        // Which palette the strip in the framebuffer actually came from, and
+        // how many whole frames have carried it. Equal to "applied" and at
+        // least one frame is the condition a host samples on: "frames" counts
+        // from the arm and says nothing about which tone painted them.
+        doc["fixApplied"] = a->rampFixtureApplied();
+        doc["tonedFrames"] = a->rampFixtureTonedFrames();
+        // The two settings the render task's tone came from, so the host can
+        // run the same percent-to-integer conversion and check it landed on
+        // the values above.
+        doc["brightnessPct"] = brightnessPct;
+        doc["kneePct"] = kneePct;
+        doc["toneOverride"] = overrideB >= 0 || overrideK >= 0;
+        uint8_t stops[BG_THEME_MAX_STOPS][3];
+        uint8_t pos[BG_THEME_MAX_STOPS];
+        bool uniform = true;
+        const int n = bganim::themeRawStops(stops, pos, BG_THEME_MAX_STOPS, &uniform);
+        doc["stopCount"] = n;
+        doc["uniform"] = uniform;
+        doc["themeGen"] = bganim::themeGen();
+        // The wire format the firmware's own parser reads, so the host can
+        // hand it straight to parseGradientWire without reassembling it: bare
+        // hex for a uniform theme, hex@pos for a positional one.
+        String wire;
+        for (int i = 0; i < n; i++) {
+            char part[16];
+            if (uniform) {
+                snprintf(part, sizeof(part), "%s%02x%02x%02x", i == 0 ? "" : ",", stops[i][0], stops[i][1], stops[i][2]);
+            } else {
+                snprintf(part, sizeof(part), "%s%02x%02x%02x@%u", i == 0 ? "" : ",", stops[i][0], stops[i][1], stops[i][2],
+                         static_cast<unsigned>(pos[i]));
+            }
+            wire += part;
+        }
+        doc["stops"] = wire;
+        // Whether the palette stood still for the whole of this report. The
+        // raw stops above are written before the palette that carries them is
+        // published, so a report taken across a publish can pair one with the
+        // other. A host waits for a report that was not, rather than sampling
+        // one that was. It does not close the last microseconds of
+        // setThemeStops itself (new raw stops, previous palette, no publish
+        // inside the read), and nothing here can: the next poll does not land
+        // there, and the fixture comparison catches it if one does.
+        doc["consistent"] = bganim::themeApplied() == applied;
+        serializeJson(doc, *response);
+        request->send(response);
+    });
+
+#endif // GM_TOUCH_PROBE
+
     // /api/debug/fb?n=0|1[&step=2] streams one panel framebuffer as raw
     // RGB565, little-endian, row-major, step**2 decimated.
     //
@@ -1842,26 +2141,58 @@ void WebUIPlugin::setupDebugEndpoints() {
         const int ow = w / step;
         const int oh = h / step;
         // Chunked, because a full 480x480 buffer is 460,800 bytes and this
-        // board has no business allocating that to answer a debug request. The
-        // callback is handed a row budget and fills whole output rows only, so
-        // it never has to carry a partial pixel across chunks.
-        // The row counter is owned by the filler: it goes when the response
-        // does, which the library deletes with the request on every path,
-        // a completed dump or a client that hung up halfway. It used to be
-        // freed on the final empty chunk, which an aborted dump never reaches.
-        auto state = std::make_shared<int>(0);
+        // board has no business allocating that to answer a debug request.
+        //
+        // Two rules this callback has to obey, both learned the hard way
+        // (gm-6ivh). Returning 0 while rows remain ends the response: the
+        // library reads 0 as "no more data", writes the terminating chunk and
+        // closes, so the client gets a well formed but short dump rather than
+        // an error. A row-at-a-time filler returns 0 exactly when the budget
+        // is smaller than one row, and at step 1 a row is 960 bytes, which is
+        // what the remaining TCP window always falls below on the first send
+        // round: 2 rows, 2 rows, 1 row and then a 928 byte budget, so every
+        // step=1 request delivered 4,800 of 460,800 bytes and said it was
+        // complete. So fill whole pixels rather than whole rows, and say
+        // RESPONSE_TRY_AGAIN when even two bytes do not fit, which parks the
+        // response until the next ack instead of ending it.
+        //
+        // The position comes from index (the bytes already filled) rather than
+        // from a heap cell the callback owns. The old cell was deleted only on
+        // the final call, so a client that disconnected part way through never
+        // freed it: 300 aborted requests cost 6,420 bytes of internal heap on
+        // the bench board and none of it came back. Deriving the position
+        // costs two divisions per call and cannot leak. The simulator branch
+        // below already did it this way.
         AsyncWebServerResponse *response = request->beginChunkedResponse(
-            "application/octet-stream", [fb, w, step, ow, oh, state](uint8_t *out, size_t maxLen, size_t) -> size_t {
+            "application/octet-stream", [fb, w, step, ow, oh](uint8_t *out, size_t maxLen, size_t index) -> size_t {
                 const size_t rowBytes = static_cast<size_t>(ow) * 2;
+                int oy = static_cast<int>(index / rowBytes);
+                int ox = static_cast<int>((index % rowBytes) / 2);
                 size_t written = 0;
-                while (*state < oh && written + rowBytes <= maxLen) {
-                    const uint16_t *src = fb + static_cast<size_t>(*state) * step * w;
-                    uint16_t *dst = reinterpret_cast<uint16_t *>(out + written);
-                    for (int x = 0; x < ow; x++)
-                        dst[x] = src[x * step];
-                    written += rowBytes;
-                    (*state)++;
+                while (oy < oh && written + 2 <= maxLen) {
+                    const uint16_t *src = fb + static_cast<size_t>(oy) * step * w;
+                    int run = static_cast<int>((maxLen - written) / 2);
+                    if (run > ow - ox)
+                        run = ow - ox;
+                    for (int i = 0; i < run; i++) {
+                        // Byte stores, because where a chunk starts inside
+                        // the library's send buffer is the library's business
+                        // (six bytes in, to leave room for the chunk header,
+                        // today) and a pixel no longer lands on a row
+                        // boundary.
+                        const uint16_t c = src[static_cast<size_t>(ox + i) * step];
+                        out[written + static_cast<size_t>(i) * 2] = static_cast<uint8_t>(c);
+                        out[written + static_cast<size_t>(i) * 2 + 1] = static_cast<uint8_t>(c >> 8);
+                    }
+                    written += static_cast<size_t>(run) * 2;
+                    ox += run;
+                    if (ox >= ow) {
+                        ox = 0;
+                        oy++;
+                    }
                 }
+                if (written == 0 && oy < oh)
+                    return RESPONSE_TRY_AGAIN;
                 return written;
             });
         char disposition[64];
@@ -1893,16 +2224,19 @@ void WebUIPlugin::setupDebugEndpoints() {
         // Pixel granular, not row granular like the framebuffer dump: a
         // 3-byte row of 480 pixels is 1440 bytes, and a later chunk's budget
         // can be just under that, which would end the response after the
-        // first chunk. state counts output pixels.
-        // Owned by the filler, like the framebuffer dump's row counter.
-        auto state = std::make_shared<int>(0);
+        // first chunk. The position comes from index (the bytes already
+        // filled), so nothing is allocated for it and a client that
+        // disconnects part way through leaves nothing behind, which is the
+        // leak the framebuffer dump above had (gm-6ivh). Three bytes a pixel
+        // and only whole pixels written, so index is always a multiple of 3.
         AsyncWebServerResponse *response = request->beginChunkedResponse(
-            "application/octet-stream", [buf, planePx, w, step, ow, oh, state](uint8_t *out, size_t maxLen, size_t) -> size_t {
+            "application/octet-stream", [buf, planePx, w, step, ow, oh](uint8_t *out, size_t maxLen, size_t index) -> size_t {
                 const int total = ow * oh;
+                int pix = static_cast<int>(index / 3);
                 size_t written = 0;
-                while (*state < total && written + 3 <= maxLen) {
-                    const int oy = *state / ow;
-                    const int ox = *state - oy * ow;
+                while (pix < total && written + 3 <= maxLen) {
+                    const int oy = pix / ow;
+                    const int ox = pix - oy * ow;
                     const size_t at = static_cast<size_t>(oy) * step * w + static_cast<size_t>(ox) * step;
                     const uint16_t c = buf[at];
                     const uint16_t a16 = buf[planePx + at];
@@ -1910,8 +2244,10 @@ void WebUIPlugin::setupDebugEndpoints() {
                     out[written + 1] = static_cast<uint8_t>(c >> 8);
                     out[written + 2] = a16 > 255 ? 255 : static_cast<uint8_t>(a16);
                     written += 3;
-                    (*state)++;
+                    pix++;
                 }
+                if (written == 0 && pix < total)
+                    return RESPONSE_TRY_AGAIN;
                 return written;
             });
         char disposition[64];
@@ -2099,6 +2435,38 @@ void WebUIPlugin::setupDebugEndpoints() {
                  controller->synthBrewingNow ? "true" : "false");
         request->send(200, "application/json", buf);
     });
+
+    // /api/debug/scale?ramp=<grams per second>[&tare=1]: a synthetic scale, so
+    // a steadily rising weight can be reproduced with no scale on the bench.
+    // The overlay cadence work needed it: the churn only appears while a
+    // weight is actually moving, and the bench has no scale. ramp=0 stops it.
+    // Queued here and applied by Controller::loop on its own thread, like the
+    // brew handshake above. screen=1 still opens the scale screen and screen=0
+    // leaves it, for the scripts written against this route, but that knob is
+    // /api/debug/scalescreen below now, where a build without a synthetic scale
+    // can reach it too.
+    server.on("/api/debug/scale", [this](AsyncWebServerRequest *request) {
+        if (request->hasArg("tare")) {
+            controller->synthScaleTareRequest = true;
+        }
+        if (request->hasArg("screen")) {
+            g_scaleScreenReq = request->arg("screen").toInt() != 0 ? 1 : 0;
+        }
+        if (request->hasArg("ramp")) {
+            const float gps = request->arg("ramp").toFloat();
+            long mg = lroundf(gps * 1000.0f);
+            if (mg < -100000) {
+                mg = -100000;
+            }
+            if (mg > 100000) {
+                mg = 100000;
+            }
+            controller->synthScaleRateMgPerS = static_cast<int>(mg);
+        }
+        char buf[64];
+        snprintf(buf, sizeof(buf), "{\"ramp_mg_per_s\":%d}", (int)controller->synthScaleRateMgPerS);
+        request->send(200, "application/json", buf);
+    });
 #endif
 
 #ifndef GAGGIMATE_SIM
@@ -2153,6 +2521,22 @@ void WebUIPlugin::setupDebugEndpoints() {
         request->send(response);
     });
 #endif
+#if defined(GM_TOUCH_PROBE) || defined(GAGGIMATE_SIM)
+    // /api/debug/scalescreen?on=0|1: opens or leaves the runtime-built scale
+    // cover on the UI task. It is reachable only from the menu, so a script
+    // that wants to look at it needs a stand-in for the finger, the same
+    // reason /api/debug/tap exists. Separate from /api/debug/scale because
+    // that route drives the synthetic scale and so only exists on the bench
+    // builds, while the cover is a layout the simulator draws as well as the
+    // board does.
+    server.on("/api/debug/scalescreen", [](AsyncWebServerRequest *request) {
+        if (request->hasArg("on")) {
+            g_scaleScreenReq = request->arg("on").toInt() != 0 ? 1 : 0;
+        }
+        request->send(200, "application/json", "{\"ok\":true}");
+    });
+#endif
+
 #if defined(GM_TOUCH_PROBE) || defined(GAGGIMATE_SIM)
     // /api/debug/settingsui[?open=1|close=1|cat=N|page=N|pop=1]: opens,
     // closes and navigates the on-display settings shell from a script and

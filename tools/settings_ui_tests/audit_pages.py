@@ -67,20 +67,33 @@ class PageSpec:
 
 
 # The five real categories plus the Fixture tile, in kCategories order. Row
-# counts: Temps 5 (1 page), Display 6 (2), Animation 15 (3), Machine 3 + the
-# Schedules row gm-flw.11 adds (1 page), Status 8 (2), Fixture 11 (3).
+# counts: Temps 5 (1 page), Display 6 (2), Animation 17 (4, the Parameters
+# row gm-3vj.2 adds and the Standby anim row gm-3vj.49 adds included),
+# Machine 3 + the Schedules row gm-flw.11 adds
+# (1 page), Status 8 (2), Fixture 11 (3).
+#
+# The Parameters page itself is not in this table. Its row list is one
+# stepper per parameter the current animation defines plus a Reset row, so
+# both the count and the names change with the stored bgAnimId; the animation
+# scenario audits it at visit time instead (test_animation.py,
+# check_parameters_page).
 CATEGORY_PAGES = [
     PageSpec("temps-p0", CAT_TEMPS, 0,
              ["Temperature offset", "Pressure sensor", "Brew delay", "Grind delay", "Delay auto-adjust"], "temps"),
     PageSpec("display-p0", CAT_DISPLAY, 0,
              ["Main brightness", "Standby brightness", "Dim after", "24-hour clock", "Time zone region"], "display"),
     PageSpec("display-p1", CAT_DISPLAY, 1, ["City"], "display"),
+    # Global before per-animation: which animations play, the gradient they all
+    # draw with, then the parameters and gradient of one animation at a time
+    # (CatAnimation.cpp's header comment carries the reasoning).
     PageSpec("animation-p0", CAT_ANIMATION, 0,
-             ["Animation", "Frame rate", "All screens", "Theme", "Gradient"], "animation"),
+             ["Animation", "Standby anim", "Gradient all", "Parameters", "Gradient"], "animation"),
     PageSpec("animation-p1", CAT_ANIMATION, 1,
+             ["Standby params", "Standby grad", "All screens", "Theme", "Frame rate"], "animation"),
+    PageSpec("animation-p2", CAT_ANIMATION, 2,
              ["Plates", "Plate colour", "Plate opacity", "Element tint", "Tint colour"], "animation"),
-    PageSpec("animation-p2", CAT_ANIMATION, 2, ["Text scrim", "Fade out", "Fade in", "Fade curve", "Interlace"],
-             "animation"),
+    PageSpec("animation-p3", CAT_ANIMATION, 3,
+             ["Text scrim", "Fade out", "Fade in", "Fade curve", "Interlace"], "animation"),
     PageSpec("machine-p0", CAT_MACHINE, 0,
              ["Startup mode", "Standby timeout", "Auto wake-up", "Schedules"], "machine"),
     PageSpec("status-p0", CAT_STATUS, 0,
@@ -345,8 +358,9 @@ def open_schedule_editor(rig, n=1):
 
 
 def category_pages(include_fixture=True):
-    """The category pages to visit. A production build has no Fixture tile;
-    the runner passes include_fixture from the tile count it saw."""
+    """The category pages to visit. Only the simulator has a Fixture tile, so
+    no device build has one; the runner passes include_fixture from the tile
+    count it saw rather than from which build it is talking to."""
     if include_fixture:
         return list(CATEGORY_PAGES)
     return [p for p in CATEGORY_PAGES if p.cat != CAT_FIXTURE]

@@ -147,7 +147,7 @@ void SleepAnimation::runKBench() {
         publish();
         return;
     }
-    uint8_t pFw[4];
+    uint8_t pFw[BG_ANIM_PARAMS];
     bg_parse_params(nullptr, id, pFw);
     releaseResident();
     initializedAnimId = -1;
@@ -174,8 +174,8 @@ void SleepAnimation::runKBench() {
         // Each descriptor's own parameter defaults: for a blob that is a
         // variant of animation `id` they are the same values, and for a blob
         // that is a new animation they are the only ones that make sense.
-        uint8_t p[4];
-        for (int i = 0; i < 4; i++) {
+        uint8_t p[BG_ANIM_PARAMS];
+        for (int i = 0; i < BG_ANIM_PARAMS; i++) {
             p[i] = obj == 0 ? pFw[i] : (a->params[i].key != nullptr ? a->params[i].def : 0);
         }
         if (a->release != nullptr) {

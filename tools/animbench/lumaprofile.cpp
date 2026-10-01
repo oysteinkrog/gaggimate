@@ -170,7 +170,7 @@ int main(int argc, char **argv) {
 
     for (int id = 0; id < bg_animation_count(); id++) {
         const BgAnimation &anim = bg_animation(id);
-        uint8_t p[4];
+        uint8_t p[BG_ANIM_PARAMS];
         bg_parse_params(nullptr, id, p);
         if (!anim.init(W, H)) { printf("%-10s INIT FAILED\n", anim.id); continue; }
 

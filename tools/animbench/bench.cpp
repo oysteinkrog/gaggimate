@@ -165,7 +165,8 @@ int main(int argc, char **argv) {
             continue;
         }
         const BgAnimation &anim = bg_animation(id);
-        uint8_t p[4] = {anim.params[0].def, anim.params[1].def, anim.params[2].def, anim.params[3].def};
+        uint8_t p[BG_ANIM_PARAMS];
+        bg_parse_params(nullptr, id, p);
         if (!anim.init(W, H)) {
             printf("%-11s INIT FAILED\n", anim.id);
             continue;

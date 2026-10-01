@@ -18,6 +18,7 @@ import json
 import math
 import os
 import re
+import signal
 import socket
 import struct
 import subprocess
@@ -139,7 +140,13 @@ def require_tag(dump, row, role):
 
 def find_tag(dump, row, role):
     """The object tagged "row/role" in dump, or None. Used directly for a
-    one-off lookup, and by row_value()/rows_on_page() below."""
+    one-off lookup, and by row_value()/rows_on_page() below.
+
+    This returns the FIRST match, so it cannot address the second of two
+    rows with the same name. Row names are user supplied on the gradient
+    picker, where a library may hold two entries both called "Custom", and
+    every one of those rows carries the same tag. Use row_slots() and
+    find_in_row() when the page can hold a repeated name (gm-nov3.28)."""
     target = "%s/%s" % (row, role)
     for o in dump["objects"]:
         if o.get("tag") == target:
@@ -176,15 +183,63 @@ def rows_on_page(dump):
     "action", "confirm"); the shell's five slot containers are role "slot"
     and never listed. Row widgets are 320x56, five to a page, so this is at
     most 5 entries for a settings category page; for a generated screen (no
-    rows tagged) it is empty."""
-    by_y = {}
+    rows tagged) it is empty.
+
+    Repeated names are kept, one entry per row. This used to collect the
+    rows into a dict keyed by name, which silently dropped every row after
+    the first of a name: row names are user supplied on the gradient picker
+    (a saved gradient is listed under whatever the user called it) and a
+    library holding two entries both called "Custom" read as one. Anything
+    that counts rows, or that zips this against what it expected the page
+    to hold, was wrong on exactly the page the gradient work cares about.
+
+    A caller that wants the distinct names asks for them: the name of a row
+    is not a key here."""
+    return [tag_row(o) for o in row_slots(dump)]
+
+
+def row_slots(dump):
+    """The row containers on the dumped page as objects, top to bottom: the
+    same rows rows_on_page() names, in the same order, so index i in one is
+    index i in the other.
+
+    This is how a check addresses one of two rows that share a name. A row's
+    position on the page is stable and unique where its name is neither, and
+    every tag on the page is built from the name, so find_tag() cannot tell
+    the two apart. Pass a slot from here to find_in_row() for its controls,
+    or to Rig.tap_target() when the slot is itself the whole-row target
+    (gm-nov3.28)."""
+    rows = []
     for o in dump["objects"]:
         if tag_role(o) not in ROW_CONTAINER_ROLES:
             continue
-        row = tag_row(o)
         y = o["hit"][1] if "hit" in o else o["y1"]
-        by_y.setdefault(row, y)
-    return [row for row, _ in sorted(by_y.items(), key=lambda kv: kv[1])]
+        rows.append((y, o))
+    rows.sort(key=lambda ro: ro[0])
+    return [o for _y, o in rows]
+
+
+def find_in_row(dump, slot, role):
+    """The object tagged "<slot's row name>/role" inside slot's own subtree,
+    or None. slot is an object from row_slots(); slot itself matches when it
+    carries the role (a whole-row target's container is tagged with the
+    role it doubles as).
+
+    Same lookup find_tag() does, narrowed to one row, which is what makes it
+    right on a page holding two rows of the same name (gm-nov3.28)."""
+    target = "%s/%s" % (tag_row(slot), role)
+    if slot.get("tag") == target:
+        return slot
+    objs = {o["i"]: o for o in dump["objects"]}
+    for o in dump["objects"]:
+        if o.get("tag") != target:
+            continue
+        p = objs.get(o["p"])
+        while p is not None:
+            if p["i"] == slot["i"]:
+                return o
+            p = objs.get(p["p"])
+    return None
 
 
 def targets(dump, include_hidden=False):
@@ -373,6 +428,60 @@ class Rig:
         except OSError as e:
             raise RigHTTPError("%s -> %s" % (url, e)) from e
 
+    def fetch(self, path, timeout=None):
+        """GET path and return (status, headers, body) instead of raising
+        on an HTTP status error, so a caller can assert on the status and
+        the body itself. A socket-level failure still raises RigHTTPError:
+        there is no response to describe.
+
+        _open() exists for the callers that only want the body and treat
+        every failure alike. It folds an HTTP status error and a socket
+        error into one RigHTTPError, so a check written on top of it can
+        only ever ask "did something go wrong", never "did this specific
+        thing go wrong". Use fetch() for a check that has to tell a 500
+        from a 404 from a fallback (gm-nov3.29).
+        """
+        url = self._url(path)
+        try:
+            resp = urllib.request.urlopen(url, timeout=timeout or self.timeout)
+        except urllib.error.HTTPError as e:
+            with e:
+                return e.code, dict(e.headers), e.read()
+        except OSError as e:
+            raise RigHTTPError("%s -> %s" % (url, e)) from e
+        with resp:
+            return resp.getcode(), dict(resp.headers), resp.read()
+
+    def route_absent(self, path, timeout=None):
+        """Whether this build compiles no route for path, established
+        positively: the reply must be the same SPA fallback GET / gets.
+        Returns (absent, detail), detail naming both replies either way.
+
+        WebUIPlugin.cpp's onNotFound sends every unrouted request through
+        serveWebAsset(), and resolveWebAsset() rewrites any URL outside
+        /assets/ to index.html. So an absent route answers 200, text/html,
+        gzip, with the index bundle byte for byte, exactly as GET / does.
+        Anything else means the route exists and answered for itself: a
+        registered route returning 500, or returning 200 with a body of
+        its own, is present however broken its reply is.
+
+        The reference reply is fetched from the same venue on every call
+        rather than hard-coded, because the embedded bundle changes with
+        every web build and its length is not a constant this package can
+        know."""
+        ref_status, ref_headers, ref_body = self.fetch("/", timeout)
+        ref_ctype = ref_headers.get("Content-Type", "")
+        status, headers, body = self.fetch(path, timeout)
+        ctype = headers.get("Content-Type", "")
+        detail = "%s -> HTTP %d %s %d bytes; GET / -> HTTP %d %s %d bytes" % (
+            path, status, ctype or "(none)", len(body),
+            ref_status, ref_ctype or "(none)", len(ref_body),
+        )
+        if ref_status != 200:
+            return False, "no SPA fallback to compare against: " + detail
+        absent = status == ref_status and ctype == ref_ctype and body == ref_body
+        return absent, detail
+
     def get_json(self, path, timeout=None):
         """GET path and parse the body as JSON. Raises RigHTTPError (with
         the URL, status and Content-Type) rather than a bare json/unicode
@@ -478,8 +587,12 @@ class Rig:
 
     find_tag = staticmethod(find_tag)
     require_tag = staticmethod(require_tag)
+    find_in_row = staticmethod(find_in_row)
+    tag_row = staticmethod(tag_row)
+    tag_role = staticmethod(tag_role)
     row_value = staticmethod(row_value)
     rows_on_page = staticmethod(rows_on_page)
+    row_slots = staticmethod(row_slots)
     targets = staticmethod(targets)
     audit = staticmethod(audit)
 
@@ -545,6 +658,31 @@ class Rig:
         if brew is not None:
             path += "?brew=%d" % (1 if brew else 0)
         return self.get_json(path)
+
+    def fb(self, step=1, timeout=60):
+        """/api/debug/fb as (width, height, raw RGB565 bytes), at 1/step
+        resolution. Raises when the body is not exactly the dump the
+        X-FB-Size header promised, so a short read is a failure with both
+        byte counts in it and never a narrower sample read on quietly.
+
+        Step 1 is the whole panel and is the default. It used to be
+        unusable on a device: the response filler wrote whole output rows
+        and returned 0 when the send budget could not hold one more, which
+        the web server reads as the end of the body, so a step 1 request
+        returned 4,800 of 460,800 bytes with a 200 and no error. That is
+        gm-6ivh, fixed in 28cec8ec on 2026-09-13, and every step is whole
+        now.
+        """
+        with self._open("/api/debug/fb?step=%d" % step, timeout) as resp:
+            size = resp.headers.get("X-FB-Size", "")
+            data = resp.read()
+        if "x" not in size:
+            raise RigHTTPError("/api/debug/fb: missing X-FB-Size header")
+        w, h = (int(v) for v in size.split("x"))
+        if len(data) != w * h * 2:
+            raise RigHTTPError("/api/debug/fb?step=%d: %d of %d bytes for %s"
+                               % (step, len(data), w * h * 2, size))
+        return w, h, data
 
     def fb_png(self, path, step=2, hit_rects=None):
         """Writes /api/debug/fb (RGB565) to path as a PNG, at 1/step
@@ -624,6 +762,12 @@ class Sim:
     # outside this bead's file list; flagged to the leader rather than fixed
     # here.
     BOOT_SETTLE_S = 1.5
+
+    # The exit status a clean ESP.restart() leaves: sim/platform/Esp.h maps
+    # EspClass::restart() (and esp_system.h maps esp_restart()) to exit(0).
+    # A restart check compares against this rather than accepting any exit;
+    # see wait_exited().
+    CLEAN_RESTART_STATUS = 0
 
     def __init__(self, program_path, data_dir, port=8080, log_path=None):
         if os.path.basename(os.path.normpath(data_dir)) != "sim_data":
@@ -714,6 +858,57 @@ class Sim:
             return True
         except RigHTTPError:
             return False
+
+    def exit_code(self):
+        """The simulator's exit status, or None while it is still
+        running (or was never launched)."""
+        return None if self.proc is None else self.proc.poll()
+
+    @staticmethod
+    def describe_exit(code):
+        """A readable form of a Popen exit status, for a check's detail
+        line. Popen reports a signal death as the negated signal number,
+        which reads as an arbitrary integer otherwise."""
+        if code is None:
+            return "still running"
+        if code < 0:
+            try:
+                name = signal.Signals(-code).name
+            except ValueError:
+                name = "unknown signal"
+            return "killed by signal %d (%s)" % (-code, name)
+        return "exited with status %d" % code
+
+    def wait_exited(self, timeout=10):
+        """Waits up to timeout for the simulator process to exit and
+        returns its exit status, or None if it is still running.
+
+        This is the only evidence a check has that ESP.restart() ran. A
+        failed request is not evidence: Rig folds every HTTP status error
+        and every socket error into one RigHTTPError, and an HTTP 500, a
+        malformed reply and a dropped connection all leave the process
+        running (gm-nov3.29).
+
+        The status matters as well as the exit. A clean restart on the
+        simulator is `Sim.CLEAN_RESTART_STATUS`, which is 0, because the
+        sim's Esp.h maps ESP.restart() to exit(0); that is the only status
+        a restart check should accept. Every other status is the
+        simulator dying some other way, which is a firmware fault, not the
+        restart the check is testing for: a crash on the way to the
+        restart, an abort inside a settings commit, or a signal death
+        (Popen reports that as minus the signal number, so -6 is SIGABRT).
+        Testing `is not None` accepts all of those and so cannot fail on
+        them (gm-nov3.37). Compare against CLEAN_RESTART_STATUS, and use
+        describe_exit() for the detail line."""
+        if self.proc is None:
+            return None
+        t0 = time.time()
+        while time.time() - t0 < timeout:
+            code = self.proc.poll()
+            if code is not None:
+                return code
+            time.sleep(0.05)
+        return self.proc.poll()
 
     def stop(self):
         if self.proc is not None and self.proc.poll() is None:

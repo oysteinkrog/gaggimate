@@ -1,4 +1,4 @@
-// The Fixture category (GM_TOUCH_PROBE and GAGGIMATE_SIM builds only): one
+// The Fixture category (GAGGIMATE_SIM builds only): one
 // of each row widget (SettingsRows.h) over 11 rows / 3 pages, so the
 // widgets and the shell's lifecycle (push/page/pop, commit-once, web-save
 // reconcile) are exercisable on the bench and the simulator before any real
@@ -11,7 +11,7 @@
 // (action, confirm, repeats, fastRepeats) are the opposite: they live in
 // FixtureCtx and reset every time the category is freshly entered, because
 // nothing in the epic needs them to survive a close.
-#if defined(GM_TOUCH_PROBE) || defined(GAGGIMATE_SIM)
+#if defined(GAGGIMATE_SIM)
 
 #include "SettingsRows.h"
 #include "SettingsUI.h"
@@ -277,4 +277,4 @@ SettingsUI::FixtureCounters fixtureCountersFor(void *liveCtx) {
     return c;
 }
 
-#endif // GM_TOUCH_PROBE || GAGGIMATE_SIM
+#endif // GAGGIMATE_SIM

@@ -37,7 +37,10 @@ uint16_t *palette = nullptr;    // base palette (theme-cycled build)
 uint16_t *rotPalette = nullptr; // palette pre-rotated by `cycle` each frame,
                                 // so band() can index with a plain & 255
                                 // instead of an extra per-pixel "+ cycle".
-uint8_t lastP[4] = {255, 255, 255, 255}; // force first palette build
+// Every slot, not just the first four: the palette follows p[2] and the
+// dither follows p[6], and comparing the whole array costs one 8-byte memcmp
+// per frame.
+uint8_t lastP[BG_ANIM_PARAMS] = {255, 255, 255, 255, 255, 255, 255, 255}; // force first palette build
 uint32_t lastThemeGen = 0xFFFFFFFF;
 // Dimensions colTerm/rowTerm were sized for. release() runs after a
 // resolution change too, when w/h no longer describe the allocation.
@@ -49,6 +52,9 @@ uint32_t cycle = 0;
 // Animation time (BgAnimClock.h, gm-4q9y), at the speed setting. Not reset
 // by release(), so the full/half switch keeps the drift where it was.
 AnimClock g_clock;
+// The colour cycle's clock: the speed setting times the colour cycle
+// slider (p[4]). Not reset by release() either.
+AnimClock g_cycleClock;
 
 // Table placement (round 2, see bganim::allocHot's comment in
 // BgAnimCommon.h): the hot slab is 9,216 B once the shared sinLut/cosTableF
@@ -72,6 +78,16 @@ AnimClock g_clock;
 // correctness, since this kernel is pure scalar and needs no particular
 // alignment (see plasmaRowAsm below) -- unlike round 1, nothing here
 // depends on allocHot()'s 16-byte-aligned return.
+// Sine-term frequency from a Q8 spatial scale, floored at 1. Scale and
+// Stretch multiply, so the lowest pair (scale 0 with stretch at either end)
+// would otherwise take a term to 0, and a zero-frequency sine is a constant:
+// the pattern would lose one of its two terms on that axis. At the defaults
+// the four frequencies are 5, 2, 4 and 3, so the floor never applies there.
+inline uint32_t freqOf(uint32_t scaled) {
+    const uint32_t f = scaled >> 8;
+    return f < 1 ? 1u : f;
+}
+
 bool init(int w, int h) {
     if (sinLut() == nullptr) {
         return false;
@@ -100,9 +116,9 @@ bool init(int w, int h) {
            rotPalette != nullptr;
 }
 
-void frame(uint32_t tMs, int w, int h, const uint8_t p[4]) {
-    if (memcmp(p, lastP, 4) != 0 || themeGen() != lastThemeGen) {
-        memcpy(lastP, p, 4);
+void frame(uint32_t tMs, int w, int h, const uint8_t p[BG_ANIM_PARAMS]) {
+    if (memcmp(p, lastP, BG_ANIM_PARAMS) != 0 || themeGen() != lastThemeGen) {
+        memcpy(lastP, p, BG_ANIM_PARAMS);
         lastThemeGen = themeGen();
         const uint16_t bright = 64 + static_cast<uint16_t>(p[2]) * 192 / 100; // 25%..100%
         buildThemeWheel(palette, bright);
@@ -112,49 +128,91 @@ void frame(uint32_t tMs, int w, int h, const uint8_t p[4]) {
         // step spacing, and a wheel's gradient is not uniform -- the steep arcs
         // would get over-dithered into visible texture at full amplitude. At
         // 0.75 the contour share is 12.6%/9.4% with the pattern still hidden.
-        const float amp = ditherAmp(palette, 256) * 0.75f;
+        // Grain scales that 0.75: none at 0, which is the bare staircase the
+        // animation had before the dither, the tuned 0.75 at 50, and four
+        // times that at 100, which reads as film grain over the ramp. The two
+        // segments meet at exactly 0.75f, so the default output is unchanged.
+        const float grain = p[6] <= 50 ? static_cast<float>(p[6]) * 0.75f / 50.0f
+                                       : 0.75f + static_cast<float>(p[6] - 50) * 2.25f / 50.0f;
+        const float amp = ditherAmp(palette, 256) * grain;
         for (int k = 0; k < 64; k++) {
             const float d = (static_cast<float>(BAYER8[k]) - 31.5f) * (amp * 16.0f / 31.5f);
             dithOff[k] = static_cast<int16_t>(lroundf(d));
         }
     }
-    // Speed 0-100 -> 0.25x..3x of the original drift (which advanced ~60
-    // sine-index units per second on the fastest term).
-    // The old `base = tMs * speedMul >> 4` was a uint32 product: it wrapped
-    // after about a day of uptime at full speed (2^32 / 48 ms), and every
-    // phase jumped there, on each speed change and at the millis() wrap.
-    // base now comes from the wrapped-delta clock (gm-4q9y). speedMul / 16
-    // is exact in the clock's Q16 speed, so with a constant speed base is
-    // the same integer as before, counted from the clock's first frame.
-    // The phases are taken from the 64-bit base, so they never overflow;
-    // band() only reads their low bits (& (SIN_N - 1), & 255).
-    const uint32_t speedMul = 4 + static_cast<uint32_t>(p[0]) * 44 / 100; // 4..48, /16 = 0.25..3
-    g_clock.advance(tMs, static_cast<float>(speedMul) * (1.0f / 16.0f));
-    const uint64_t base = g_clock.simQ16 >> 16; // ~= original frame*2 at 50
+    // Speed follows the fleet's curve, speedMul(): 0.15x at 0, 1x at 50 and
+    // 6.7x at 100 of the drift Speed 50 has always had (bead gm-kh2s). The
+    // old private law, 4 + p[0] * 44 / 100 over 16, covered 0.25x to 3x.
+    // The multiplier is Q9 and 832 at 50, the old 26 over 16 with five more
+    // fraction bits. Rounded, not truncated: the nearest .5 boundary over
+    // Speed 0..100 is 63 float ulps away, so exp2f on the host, exp2f on the
+    // device and Math.pow on the page land on the same integer.
+    // The old `base = tMs * speed >> k` was a uint32 product: it wrapped
+    // after about a day of uptime at full speed, and every phase jumped
+    // there, on each speed change and at the millis() wrap. base now comes
+    // from the wrapped-delta clock (gm-4q9y). speedQ9 / 512 is exact in the
+    // clock's Q16 speed, so with a constant speed base is the same integer
+    // the product gave, counted from the clock's first frame. The phases
+    // are taken from the 64-bit base, so they never overflow; band() only
+    // reads their low bits (& (SIN_N - 1), & 255).
+    const uint32_t speedQ9 = static_cast<uint32_t>(lroundf(832.0f * speedMul(p[0])));
+    const float speed = static_cast<float>(speedQ9) * (1.0f / 512.0f);
+    g_clock.advance(tMs, speed);
+    const uint64_t base = g_clock.simQ16 >> 16;
     phase1 = static_cast<uint32_t>(base * 30 >> 9); // ratios preserved from the frame-based original
     phase2 = static_cast<uint32_t>(base * 23 >> 9);
     phase3 = static_cast<uint32_t>(base * 26 >> 9);
-    cycle = static_cast<uint32_t>(base * 11 >> 9);
+    // Colour cycle: how fast the palette rotates under the pattern, apart from
+    // how fast the pattern itself drifts. 0 freezes the colours in place and
+    // only the shapes move; 50 is the original 11/512 of the drift; 100 is four
+    // times that. The two segments meet at exactly 11.
+    // The cycle has its own clock, advanced at the drift speed times
+    // cycNum / 11, so moving the slider bends the rotation instead of
+    // jumping the palette. At the default cycNum / 11 is exactly 1 and
+    // g_cycleClock counts the same as g_clock.
+    const uint32_t cycNum =
+        p[4] <= 50 ? static_cast<uint32_t>(p[4]) * 11 / 50 : 11 + static_cast<uint32_t>(p[4] - 50) * 33 / 50;
+    g_cycleClock.advance(tMs, speed * (static_cast<float>(cycNum) / 11.0f));
+    cycle = static_cast<uint32_t>((g_cycleClock.simQ16 >> 16) * 11 >> 9);
 
     // Scale 0-100 -> 0.5x..2x spatial frequency.
     const uint32_t sx = 128 + static_cast<uint32_t>(p[1]) * 384 / 100; // 128..512, /256
-    const uint32_t f5 = (5 * sx) >> 8;
-    const uint32_t f2 = (2 * sx) >> 8; // sx >= 128 keeps every frequency >= 1
-    const uint32_t f4 = (4 * sx) >> 8;
-    const uint32_t f3 = (3 * sx) >> 8;
+    // Stretch tips that scale between the two axes: at 50 both gains are 256
+    // and the frequencies are the original 5, 2, 4, 3; at 0 the horizontal
+    // terms halve and the vertical ones grow, so the blobs pull out sideways;
+    // at 100 it is the other way and they stand up tall.
+    const int32_t tilt = (static_cast<int32_t>(p[5]) - 50) * 256 / 100; // -128..+128
+    const uint32_t sxx = (sx * static_cast<uint32_t>(256 + tilt)) >> 8;
+    const uint32_t sxy = (sx * static_cast<uint32_t>(256 - tilt)) >> 8;
+    const uint32_t f5 = freqOf(5 * sxx);
+    const uint32_t f2 = freqOf(2 * sxx);
+    const uint32_t f4 = freqOf(4 * sxy);
+    const uint32_t f3 = freqOf(3 * sxy);
+    // Contrast scales both sine sums, so a pixel's index sweeps a narrower or
+    // wider arc of the 256-entry wheel: half at 0, where the frame settles into
+    // a few broad tones, and one and a half times at 100, where more of the
+    // palette shows and the colour edges tighten. The 256 at 50 shifts a value
+    // already multiplied by 256 back down by 8, which is the identity, so the
+    // default column and row terms are the bytes the animation had before.
+    const int32_t cgain = 128 + static_cast<int32_t>(p[3]) * 256 / 100; // 128..384, /256
     // Hoist the LUT pointer: sin1024() re-calls sinLut() (a real call8 on
     // Xtensa — the lazy-init check inside it defeats cross-TU inlining) on
     // every use, which otherwise costs 4 calls x (w+h) per frame here.
     const int16_t *sl = sinLut();
     for (int x = 0; x < w; x++) {
-        colTerm[x] = sl[(x * f5 + phase1) & (SIN_N - 1)] + sl[(x * f2 + SIN_N - (phase2 & (SIN_N - 1))) & (SIN_N - 1)];
+        const int32_t s =
+            sl[(x * f5 + phase1) & (SIN_N - 1)] + sl[(x * f2 + SIN_N - (phase2 & (SIN_N - 1))) & (SIN_N - 1)];
+        colTerm[x] = static_cast<int16_t>((s * cgain) >> 8);
     }
     for (int y = 0; y < h; y++) {
-        rowTerm[y] = sl[(y * f4 + phase2) & (SIN_N - 1)] + sl[(y * f3 + phase3) & (SIN_N - 1)];
+        const int32_t s = sl[(y * f4 + phase2) & (SIN_N - 1)] + sl[(y * f3 + phase3) & (SIN_N - 1)];
+        rowTerm[y] = static_cast<int16_t>((s * cgain) >> 8);
     }
     // Expand into the eight y-phase copies. colTerm's own range is +-1024 (two
-    // sine terms of amplitude 512) and the dither adds at most +-256, so int16
-    // still has headroom.
+    // sine terms of amplitude 512) times contrast's 1.5 at most, so +-1536, and
+    // the dither adds at most +-768 at grain 100 (ditherAmp() clamps itself to
+    // 16, times grain's 3, times 16/31.5 of the Bayer swing), so +-2304 all
+    // told and int16 still has ample headroom.
     for (int ph = 0; ph < 8; ph++) {
         int16_t *dstPh = colTermPh + static_cast<size_t>(ph) * w;
         const int16_t *off = &dithOff[ph * 8];
@@ -168,7 +226,15 @@ void frame(uint32_t tMs, int w, int h, const uint8_t p[4]) {
     // rotPalette[i] == palette[(i + cycle) & 255] for all i in 0..255, which
     // is algebraically identical to the old per-pixel ((v>>4) + cycle) & 255
     // since (v>>4) & 255 already reduces v>>4 mod 256 before the rotation.
-    const uint32_t rot = cycle & 255;
+    // Palette shift slides the whole wheel under the pattern without rotating
+    // it over time: nothing at 50, about 40 percent of the wheel back at 0 and
+    // forward at 100, which lands the theme's bright accent on a different part
+    // of the plasma. Not a hue control, whatever a rotation of a colour wheel
+    // suggests: a theme is one ramp from its darkest stop to its brightest, so
+    // what moves is which tone sits where, not which colours exist. A negative
+    // sum wraps through the mask the way the rotation itself does.
+    const int32_t shift = (static_cast<int32_t>(p[7]) - 50) * 2; // -100..+100 of 256
+    const uint32_t rot = static_cast<uint32_t>(static_cast<int32_t>(cycle & 255) + shift) & 255;
     for (int i = 0; i < 256; i++) {
         rotPalette[i] = palette[(i + rot) & 255];
     }
@@ -250,10 +316,17 @@ void bandRef(uint16_t *dst, int y0, int rows, int w, uint32_t, const uint8_t *) 
 // folded into colTermPh is capped at ditherAmp()*0.75*16/31.5*31.5 --
 // ditherAmp() itself clamps to 16.0f, so |dithOff| <= 192 pre-round. So
 // ct[i] is in [-1216, 1216] and ct[i]+rt is in [-2240, 2240], nowhere near
-// any width this arithmetic uses. Checked at both param extremes: p[0]
-// (speed) and p[1] (scale) only change phase/frequency, not amplitude;
-// p[2] (brightness) feeds buildThemeWheel and ditherAmp, and ditherAmp's
-// own 16.0f clamp already bounds the dither term regardless of brightness.
+// any width this arithmetic uses. Checked at every param extreme: p[0]
+// (speed), p[1] (scale) and p[5] (stretch) only change phase and frequency,
+// not amplitude; p[4] (colour cycle) and p[7] (palette shift) only move the
+// palette rotation; p[2] (brightness) feeds buildThemeWheel and ditherAmp,
+// and ditherAmp's own 16.0f clamp already bounds the dither term regardless
+// of brightness. Two params do widen the sum and frame() bounds both: p[3]
+// (contrast) scales each sine sum by at most 1.5, so |ct| <= 1536 plus 768
+// of dither and |rt| <= 1536, and p[6] (grain) is that 768, capped by the
+// same ditherAmp clamp times grain's own ceiling of 3.0. So ct[i] is in
+// [-2304, 2304] and ct[i]+rt in [-3840, 3840], still nowhere near any width
+// this arithmetic uses, and EXTUI's bits [4,12) are reached the same way.
 //
 // dst and ct need only their natural 4-byte/2-byte alignment (S32I/L16SI
 // have no wider requirement) -- unlike round 1's PIE kernel, nothing here
@@ -354,7 +427,14 @@ extern const BgAnimation bg_anim_plasma;
 const BgAnimation bg_anim_plasma = {
     "plasma",
     "Plasma",
-    {{"speed", "Speed", 50}, {"scale", "Scale", 50}, {"brightness", "Brightness", 70}, {nullptr, nullptr, 0}},
+    {{"speed", "Speed", 50},
+     {"scale", "Scale", 50},
+     {"brightness", "Brightness", 70},
+     {"contrast", "Contrast", 50},
+     {"cycle", "Colour cycle", 50},
+     {"stretch", "Stretch", 50},
+     {"grain", "Grain", 50},
+     {"shift", "Palette shift", 50}},
     init,
     frame,
     band,

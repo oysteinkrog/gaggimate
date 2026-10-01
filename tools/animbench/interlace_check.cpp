@@ -67,7 +67,7 @@ int rowStride(int w) { return (w + 1) & ~1; }
 
 // tMs is the time the frame was advanced to, as production passes it: a
 // row cache keyed on tMs would look pure if every call got the same constant.
-void renderShape(const BgAnimation &anim, const Shape &s, int W, int H, uint32_t tMs, const uint8_t p[4], uint16_t *fb) {
+void renderShape(const BgAnimation &anim, const Shape &s, int W, int H, uint32_t tMs, const uint8_t p[BG_ANIM_PARAMS], uint16_t *fb) {
     if (s.parity < 0) {
         const int bandH = (s.bandH > H) ? H : s.bandH;
         for (int y = 0; y < H; y += bandH) {
@@ -137,7 +137,7 @@ int main(int argc, char **argv) {
     int failures = 0;
     for (int id = 0; id < bg_animation_count(); id++) {
         const BgAnimation &anim = bg_animation(id);
-        uint8_t p[4];
+        uint8_t p[BG_ANIM_PARAMS];
         bg_parse_params(nullptr, id, p);
         if (anim.release != nullptr) {
             anim.release();

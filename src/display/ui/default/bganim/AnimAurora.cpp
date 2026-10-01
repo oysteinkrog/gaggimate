@@ -153,6 +153,15 @@
 // descriptor, added for the aurora2/lava2 redesign passes) before this
 // touched src/, and again here with tools/animbench/interlace_check.cpp
 // across the whole fleet.
+//
+// Parameters, 2026-09-10 (gm-3vj.7): three sliders became seven. Height,
+// Spread, Glow and Drift were fixed constants in frame(), computeRowState and
+// buildGlowLUT; they are now sliders that reach exactly those constants at
+// the default 50, so the goldens are unchanged (mean 0.000, max 0 on all
+// three frames). None of them touches the pixel loop or auroraPixelsAsm: two
+// feed the row envelope, one feeds the phase bases, one feeds the glow
+// colours. See the g_envCenter block below for why each maps as an offset
+// from the midpoint rather than as a span from a low end.
 #include "BgAnim.h"
 #include "BgAnimClock.h"
 #include "BgAnimCommon.h"
@@ -243,15 +252,51 @@ int32_t g_inten14 = 0; // intensity * 1.4 in Q8
 // Animation time (BgAnimClock.h, gm-bzu.50). Not reset by release(), so the
 // full/half switch keeps the curtains where they were. Each of the four
 // motions below keeps its own phase. The coefficients are the old ones, in
-// radians per second of t, where t was tMs * 0.001 * 0.45 * speed:
-// 0.45e-3 converts them to radians per animation millisecond.
+// radians per second of t, where t was tMs * 0.001 * 1.05 * speed:
+// 1.05e-3 converts them to radians per animation millisecond. The base rate
+// was 0.45 before the speed calibration (gm-33fm, 2026-09-12); 1.05 is that
+// rate times 2.33, so that Speed 50 moves this animation about as much per
+// second as every other animation at Speed 50.
 AnimClock g_clock;
-constexpr double T_PER_MS = 0.45e-3;
-constexpr uint64_t RATE_WARP1 = oscRateQ48(0.5 * T_PER_MS);
-constexpr uint64_t RATE_WARP2 = oscRateQ48(-0.44 * T_PER_MS);
-constexpr uint64_t RATE_BASE1 = oscRateQ48(0.12 * T_PER_MS);
-constexpr uint64_t RATE_BASE2 = oscRateQ48(0.07 * T_PER_MS);
-float g_warpPh1 = 0, g_warpPh2 = 0; // this frame's warp phases, radians in [0, 2*pi]
+// T_PER_MS is formed from the page's float constants, 0.001f * 1.05f, and
+// each coefficient below is the page's float too, so these are the page
+// chain's own rates and the handover at PAGE_EXACT_Q16 does not jump.
+constexpr double T_PER_MS = static_cast<double>(0.001f) * static_cast<double>(1.05f);
+constexpr uint64_t RATE_WARP1 = oscRateQ48(static_cast<double>(0.5f) * T_PER_MS);
+constexpr uint64_t RATE_WARP2 = oscRateQ48(static_cast<double>(0.44f) * T_PER_MS); // subtracted, as the page writes it
+// The bases are t * coeff * TICKS ticks on the page, with TICKS the float
+// 2^18 / 2pi, and 2^18 ticks are a turn here; this is that rate in radians.
+constexpr double BASE_RAD_PER_TICK = 6.283185307179586 / 262144.0;
+constexpr uint64_t RATE_BASE1 =
+    oscRateQ48(static_cast<double>(0.12f) * T_PER_MS * static_cast<double>(TICKS) * BASE_RAD_PER_TICK);
+constexpr uint64_t RATE_BASE2 =
+    oscRateQ48(static_cast<double>(0.07f) * T_PER_MS * static_cast<double>(TICKS) * BASE_RAD_PER_TICK);
+// This frame's warp phases in radians. The second is subtracted in
+// computeRowState, because the page writes y * 0.013 - t * 0.44 and adding a
+// negative-rate phase rounds differently.
+float g_warpPh1 = 0, g_warpPh2 = 0;
+// How long frame() follows the page's own float arithmetic (gm-pciz). The
+// page forms t in float seconds and chains float products from it, so the
+// only way to draw its frames bit for bit is to run the same chain on the
+// clock's time. That chain loses resolution as t grows, so past 2048 s of
+// animation time (34 minutes at Speed 50, where the fastest warp phase is near
+// 1100 rad and the bases near 1.1e7 ticks) frame() takes the Q48 rates
+// instead. The handover moves a warp phase by about 0.1 mrad and a base by
+// about one tick of the 256 per table entry, once; the rates then never lose
+// precision and never jump at a wrap.
+constexpr int64_t PAGE_EXACT_Q16 = 2048000ll << 16;
+// Q16 milliseconds as the page's float seconds: milliseconds rounded to
+// float, times 0.001f. Exact whole milliseconds at Speed 50.
+inline float pageSecondsF(int64_t q16) {
+    return static_cast<float>(static_cast<double>(q16) * (1.0 / 65536.0)) * 0.001f;
+}
+// The sideways travel's own time, Q16 animation milliseconds, scaled by the
+// Drift param (p6) as well as by Speed. It is a separate accumulator because
+// drift can be negative and AnimClock only runs forward: frame() adds
+// wall step x speed x drift in two's complement, and the product with a Q48
+// rate wraps modulo 2^64, a whole number of turns, the same as
+// oscTurnQ32's. A drift change bends the travel instead of moving it.
+uint64_t g_driftQ16 = 0;
 
 // Size. The curtains are drawn in render pixels: STEP1/STEP2 per column and
 // 0.021/0.013 rad per row. On the half-resolution path (240 or 233 px,
@@ -265,6 +310,24 @@ float g_warpPh1 = 0, g_warpPh2 = 0; // this frame's warp phases, radians in [0, 
 // at twice the rate (see computeRowState).
 int g_zoom = 1;
 float g_invH = 1.0f / 480.0f;
+
+// Params 3 to 6, added 2026-09-10 (gm-3vj.7). Every one of them acts on a
+// frame-constant or a row-constant term: three feed computeRowState and the
+// phase bases, one feeds the glow table. Nothing here reaches the pixel loop,
+// so auroraPixelsAsm below is untouched and bandRef stays its exact spec.
+//
+// Each slider maps to the constant it replaced as an OFFSET from the
+// midpoint, so at the default 50 the added term is exactly 0.0f in float and
+// the picture is bit for bit what it was before the params existed. Writing
+// them as "lo + (p/100)*span" instead would land a rounding error on the
+// default and move every golden frame by a least significant bit.
+float g_envCenter = 0.32f;     // p3 Height: where down the panel the band sits
+float g_envInv = 1.0f / 0.85f; // p4 Spread: reciprocal of the band's height
+float g_glowGain = 2.2f;       // p5 Glow: how fast the ramp reaches full colour
+float g_drift = 1.0f;          // p6 Drift: rate and direction of sideways travel
+// The p5 value glowLUT currently holds. 0xFF is not a reachable parameter
+// value (0 to 100), so it forces the first frame after init() to rebuild.
+uint8_t g_glowP = 0xFF;
 
 // Per-row phase = TICKS*(warp(y) + t*coeff). t*coeff is frame-constant (same
 // for all 480 rows), but t itself is proportional to uptime and unbounded, so
@@ -281,17 +344,21 @@ float g_invH = 1.0f / 480.0f;
 // is unchanged.
 uint32_t g_phBase1 = 0, g_phBase2 = 0;
 // The paragraph above predates the clock: t no longer grows with uptime, and
-// the bases now come from oscTurnQ32 (a full turn is 2^18 Q8 ticks, the top
-// 18 bits of the Q32 turn). The split between a per-frame base and a bounded
-// per-row warp term still holds.
+// the bases now come from g_driftQ16 times a Q48 rate (a full turn is 2^18
+// Q8 ticks, the top 18 bits of the Q32 turn). The split between a per-frame
+// base and a bounded per-row warp term still holds.
 
 // Curtain color rides the theme's mid-to-bright range; the fade ramp keeps
-// low intensities near-black so the additive blend stays subtle.
+// low intensities near-black so the additive blend stays subtle. g_glowGain
+// (p5) is how steep that ramp is: below the default the brightest curtain
+// never reaches the full theme colour and the whole curtain reads soft and
+// dim, above it the ramp saturates part way up and the curtain reads as a
+// hard bright sheet with a thin fade at its edge.
 void buildGlowLUT() {
     for (int i = 0; i < 256; i++) {
         uint8_t c[3];
         themeRGB(40 + ((i * 215) >> 8), c);
-        const float scale = fminf(1.0f, (i / 255.0f) * 2.2f);
+        const float scale = fminf(1.0f, (i / 255.0f) * g_glowGain);
         glowLUT[i] = rgb565(clamp8f(c[0] * scale), clamp8f(c[1] * scale), clamp8f(c[2] * scale));
     }
 }
@@ -342,31 +409,84 @@ bool init(int w, int h) {
     return true;
 }
 
-void frame(uint32_t tMs, int, int, const uint8_t p[4]) {
-    if (themeGen() != lastThemeGen) {
+void frame(uint32_t tMs, int, int, const uint8_t p[BG_ANIM_PARAMS]) {
+    // p5 changes the colours in glowLUT, so the table is rebuilt on the same
+    // terms a theme change rebuilds it: only when the value it was built for
+    // has moved. 256 entries with a themeRGB() sample each is too much to
+    // spend on every frame, and it buys nothing while the slider sits still.
+    g_glowGain = 2.2f + (static_cast<int>(p[5]) - 50) * 0.032f; // 0.6 .. 3.8
+    if (themeGen() != lastThemeGen || p[5] != g_glowP) {
         buildGlowLUT();
         lastThemeGen = themeGen();
+        g_glowP = p[5];
     }
     // One real rebuild per frame at most per background segment: see g_rowLUT.
+    // This also republishes the new glow colours through every row table.
     g_lastBgIdx = -1;
-    g_clock.advance(tMs, speedMul(p[0]));
-    g_warpPh1 = oscRad(g_clock, RATE_WARP1);
-    g_warpPh2 = oscRad(g_clock, RATE_WARP2);
+    // Speed calibration, gm-33fm 2026-09-12: the base rate carries a
+    // deliberate factor so that Speed 50 moves this animation about as
+    // much per second as every other animation at Speed 50 (T_PER_MS).
+    const float spd = speedMul(p[0]);
+    const uint32_t wallStep = g_clock.advance(tMs, spd);
+    if (g_clock.simQ16 < static_cast<uint64_t>(PAGE_EXACT_Q16)) {
+        const float t = pageSecondsF(static_cast<int64_t>(g_clock.simQ16)) * 1.05f;
+        g_warpPh1 = t * 0.5f;
+        g_warpPh2 = t * 0.44f;
+    } else {
+        g_warpPh1 = oscRad(g_clock, RATE_WARP1);
+        // Plus two turns, so y * 0.013 - ph2 + 1.7 stays negative on every
+        // row, as it is on the page once t * 0.44 has grown past 8: rowCos
+        // truncates toward zero, so a sign change would move part of the
+        // rows by one table entry at the handover.
+        g_warpPh2 = oscRad(g_clock, RATE_WARP2) + 2.0f * 6.2831853f;
+    }
     g_A1 = 0.6f + (p[2] / 100.0f) * 2.4f;
     g_A2 = 0.4f + (p[2] / 100.0f) * 1.6f;
     g_inten14 = static_cast<int32_t>((p[1] / 100.0f) * 1.4f * 256.0f);
+    // p3 moves the band up and down the panel, p4 makes it shorter or taller.
+    // Both are read once per row by computeRowState. The spread never reaches
+    // zero, so the reciprocal is always finite; env is clamped at 0 below it,
+    // and it still peaks at exactly 1, so rowScale keeps the bound ROWLUT_SIZE
+    // was derived from.
+    g_envCenter = 0.32f + (static_cast<int>(p[3]) - 50) * 0.006f;         // 0.02 .. 0.62
+    g_envInv = 1.0f / (0.85f + (static_cast<int>(p[4]) - 50) * 0.011f);   // band 0.30 .. 1.40 tall
+    // p6 scales how far the curtains travel sideways per second. Below about
+    // 38 it goes negative and they drift the other way; the warp terms in
+    // computeRowState keep waving either way, so nothing freezes at 0. The
+    // range is wide because the travel it scales is slow: the default is
+    // about 2 px a second, so a 2x end is a difference nobody notices in a
+    // glance. At 5x it is 10 px a second, and Speed multiplies on top.
+    g_drift = 1.0f + (static_cast<int>(p[6]) - 50) * 0.08f; // -3.0 .. 5.0
+    // speed x drift in Q16 is at most 6.7 x 5 x 65536, about 2.2e6, so it
+    // fits int32 and the product with a wall step fits int64 for any step.
+    const int32_t driftQ16 = static_cast<int32_t>(lroundf(spd * g_drift * 65536.0f));
+    g_driftQ16 += static_cast<uint64_t>(static_cast<int64_t>(wallStep) * driftQ16);
     // Q8 ticks of the 1024-entry LUT: a full turn is 2^18, the top 18 bits of
     // the Q32 turn. uint32 wraps whole turns, so the bases stay exact.
-    g_phBase1 = oscTurnQ32(g_clock, RATE_BASE1) >> 14;
-    g_phBase2 = oscTurnQ32(g_clock, RATE_BASE2) >> 14;
+    // While the travel is short the bases are the page's float chain on the
+    // travel's own time, which is the page's t * drift at the default drift.
+    const int64_t driftSigned = static_cast<int64_t>(g_driftQ16);
+    if (driftSigned < PAGE_EXACT_Q16 && driftSigned > -PAGE_EXACT_Q16) {
+        const float tD = pageSecondsF(driftSigned) * 1.05f;
+        g_phBase1 = static_cast<uint32_t>(static_cast<int64_t>(tD * 0.12f * TICKS));
+        g_phBase2 = static_cast<uint32_t>(static_cast<int64_t>(tD * 0.07f * TICKS));
+    } else {
+        g_phBase1 = static_cast<uint32_t>((g_driftQ16 * RATE_BASE1) >> 32) >> 14;
+        g_phBase2 = static_cast<uint32_t>((g_driftQ16 * RATE_BASE2) >> 32) >> 14;
+    }
 }
 
 // Pure helpers shared by both bandRef and the asm dispatch path below (both
 // need identical row-constant tables; these are the only piece it is safe
 // to share, since they take no hidden state beyond their arguments).
+// The page adds (BAYER8 - 31.5) / 63 * 0.03 to an intensity of 0..1, which is
+// a swing of 3.8 levels of 255 either way. The fold used to shift by 2, a
+// swing of -8..+7, twice the design's (gm-pciz); shifting by 3 gives -4..+3,
+// the design's amplitude within the integer rounding. ROWLUT_PAD still
+// covers the low end.
 void buildDitherFold(int32_t out[64]) {
     for (int i = 0; i < 64; i++) {
-        out[i] = ROWLUT_PAD + ((static_cast<int32_t>(BAYER8[i]) - 32) >> 2);
+        out[i] = ROWLUT_PAD + ((static_cast<int32_t>(BAYER8[i]) - 32) >> 3);
     }
 }
 
@@ -430,9 +550,11 @@ RowState computeRowState(int y, const float *ct, uint16_t rowLUT[ROWLUT_SIZE], i
 
     const float yz = static_cast<float>(y * g_zoom);
     const float warp1 = rowSin(yz * 0.021f + g_warpPh1) * g_A1;
-    const float warp2 = rowSin(yz * 0.013f + g_warpPh2 + 1.7f) * g_A2;
+    const float warp2 = rowSin(yz * 0.013f - g_warpPh2 + 1.7f) * g_A2;
     const float yn = y * g_invH; // was a divide (__divsf3 libcall on device)
-    float env = 1.0f - fabsf(yn - 0.32f) * (1.0f / 0.85f);
+    // Height (p3) and Spread (p4). At their defaults these two are exactly
+    // 0.32f and 1.0f/0.85f, the constants that used to be written here.
+    float env = 1.0f - fabsf(yn - g_envCenter) * g_envInv;
     env = env < 0 ? 0 : env * env;
     const int32_t envQ12 = static_cast<int32_t>(env * 4096.0f);
     RowState st;
@@ -790,6 +912,11 @@ void release() {
     releaseTable(g_rowLUT, static_cast<size_t>(ROWLUT_SIZE) * sizeof(uint16_t));
     g_lastBgIdx = -1;
     lastThemeGen = 0xFFFFFFFF;
+    // Same reason as lastThemeGen: the next init() builds glowLUT with
+    // whatever gain the last run left behind, so the first frame after it
+    // has to see a value it cannot match and rebuild.
+    g_glowGain = 2.2f;
+    g_glowP = 0xFF;
 }
 
 } // namespace
@@ -798,7 +925,14 @@ extern const BgAnimation bg_anim_aurora;
 const BgAnimation bg_anim_aurora = {
     "aurora",
     "Aurora",
-    {{"speed", "Speed", 50}, {"intensity", "Intensity", 55}, {"waviness", "Waviness", 50}, {nullptr, nullptr, 0}},
+    {{"speed", "Speed", 50},
+     {"intensity", "Intensity", 55},
+     {"waviness", "Waviness", 50},
+     {"height", "Height", 50},
+     {"spread", "Spread", 50},
+     {"glow", "Glow", 50},
+     {"drift", "Drift", 50},
+     {nullptr, nullptr, 0}},
     init,
     frame,
     band,

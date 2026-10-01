@@ -956,16 +956,17 @@ void *allocPreferInternal(size_t size) {
 
 SleepAnimation::~SleepAnimation() { stop(); }
 
-void SleepAnimation::configure(uint8_t id, const uint8_t p[4]) {
+void SleepAnimation::configure(uint8_t id, const uint8_t p[BG_ANIM_PARAMS]) {
     if constexpr (kAnimBench) {
         // The bench owns the selection: DefaultUI re-applies the stored
         // animation on every UI pass, which would otherwise yank the sweep
         // back to whatever is saved in settings after each frame.
+        (void)id;
+        (void)p;
         return;
     }
     animId.store(id);
-    animParams.store(static_cast<uint32_t>(p[0]) | (static_cast<uint32_t>(p[1]) << 8) | (static_cast<uint32_t>(p[2]) << 16) |
-                     (static_cast<uint32_t>(p[3]) << 24));
+    storeParams(p);
 }
 
 // Not bench-gated. The two framebuffer-ownership settings this exposes each
@@ -1450,6 +1451,37 @@ int SleepAnimation::renderPrioValue() const {
     TaskHandle_t h = static_cast<TaskHandle_t>(taskHandle);
     return h != nullptr ? static_cast<int>(uxTaskPriorityGet(h)) : -1;
 }
+
+#ifdef GM_TOUCH_PROBE
+void SleepAnimation::setRampFixture(int mode, int y0, int y1, int xoff) {
+    if (mode < 0 || mode > 3) {
+        mode = 0;
+    }
+    if (y0 < 0) {
+        y0 = 0;
+    }
+    // A safety cap only; the endpoint clamps to the live panel height, which
+    // this cannot read because it may be called while nothing is running.
+    if (y1 > MAX_BANDS * BAND_H) {
+        y1 = MAX_BANDS * BAND_H;
+    }
+    if (y1 <= y0) {
+        // An empty strip would arm the fixture, veto interlacing and paint
+        // nothing, which reads on the host as "the panel drew the animation".
+        // Refusing the range and staying off is the honest answer.
+        mode = 0;
+    }
+    rampFixXoff.store(xoff != 0 ? 1 : 0);
+    rampFixY0.store(y0);
+    rampFixY1.store(y1);
+    rampFixFrames.store(0);
+    // The region and the column offset move with the arm, so frames counted
+    // before it say nothing about the strip a host is about to read, whatever
+    // palette they were drawn with.
+    rampFixTonedFrames.store(0);
+    rampFixMode.store(mode);
+}
+#endif
 
 bool SleepAnimation::stop() {
     const bool selfStop = s_selfStop.exchange(false);
@@ -3997,6 +4029,19 @@ void IRAM_ATTR SleepAnimation::renderLoop() {
         fpsFrames++;
         animFrames.fetch_add(1);
         benchFrameDone(frameStart);
+#ifdef GM_TOUCH_PROBE
+        if (rampFixMode.load() != 0) {
+            rampFixFrames.fetch_add(1);
+            // Whole frames drawn with one palette, which is what a host may
+            // gate a sample on. A frame whose LUT changed mid way is not one.
+            if (rampFixLutTorn) {
+                rampFixLutTorn = false;
+                rampFixTonedFrames.store(0);
+            } else {
+                rampFixTonedFrames.fetch_add(1);
+            }
+        }
+#endif
 
         const unsigned long now = millis();
         if (now - fpsWindowStart >= 10000) {
@@ -4132,9 +4177,8 @@ bool IRAM_ATTR SleepAnimation::renderFrame() {
     // The slot, not the stored id: with GM_KBLOB and useBlob set this is the
     // hot-loaded blob, which renders with the stored animation's parameters.
     const int id = activeSlot();
-    const uint32_t packed = animParams.load();
-    const uint8_t p[4] = {static_cast<uint8_t>(packed & 0xFF), static_cast<uint8_t>((packed >> 8) & 0xFF),
-                          static_cast<uint8_t>((packed >> 16) & 0xFF), static_cast<uint8_t>((packed >> 24) & 0xFF)};
+    uint8_t p[BG_ANIM_PARAMS];
+    loadParams(p);
     // Half-resolution mode: the animation renders a 240x240 image and each
     // pixel is doubled on the way into the band buffer. Every animation here
     // is a smooth procedural field -- gradients, glows, warped curtains -- with
@@ -4215,7 +4259,16 @@ bool IRAM_ATTR SleepAnimation::renderFrame() {
         initializedHalf = half;
     }
     BENCH_T0(tSetup);
+    // The animation's once-per-frame work, timed on its own. band_us only
+    // covers the band kernel, and an animation that rasterises a whole
+    // picture here (Harmonograph clears and stamps a 230 KB coverage buffer
+    // in PSRAM every frame) pays it before the first band, at every row
+    // count, and neither band_us nor the kblob bench can see it: on the
+    // bench board that was 27 ms of a 41 ms interlaced frame with nothing
+    // in the stage counters to account for it (2026-09-11).
+    const int64_t tFrameFn = esp_timer_get_time();
     anim.frame(tMs, rw, rh, p);
+    lastFrameFnUs.store(static_cast<uint32_t>(esp_timer_get_time() - tFrameFn));
     BENCH_ACC(accBandUs, tSetup);
 
     // One overlay for the whole frame; a publish mid-frame lands next frame.
@@ -4393,7 +4446,14 @@ bool IRAM_ATTR SleepAnimation::renderFrame() {
         // outcome" instead of just "is bandWarm nonzero", since a nonzero
         // countdown on a band that would never have interlaced anyway (half
         // res, or the global warmup already covering it) forces nothing.
-        const bool wouldInterlace = frameMayInterlace && !half;
+#ifdef GM_TOUCH_PROBE
+        // The gradient fixture's strip has to land in both framebuffers (see
+        // setRampFixture), and an interlaced frame writes only one of them.
+        const int rampFix = rampFixMode.load();
+#else
+        constexpr int rampFix = 0;
+#endif
+        const bool wouldInterlace = frameMayInterlace && !half && rampFix == 0;
         const bool bandInterlaced = wouldInterlace && bandWarm == 0;
         if (half && interlace.load() && !frameWarm) {
             halfInterlaceVeto++;
@@ -4700,6 +4760,57 @@ bool IRAM_ATTR SleepAnimation::renderFrame() {
         BENCH_ADD(accSpanPx, spanPxLocal);
         BENCH_ADD(accScrimPx, scrimPxLocal);
         PROBE_SINK(probeAcc);
+#ifdef GM_TOUCH_PROBE
+        // The gradient framebuffer fixture, painted last on purpose: every
+        // compositing stage has already run, so the rows below carry the ramp
+        // and nothing else. The LUT is rebuilt when the published palette moves
+        // or the mode changes, which is once per settings write, not per band.
+        if (rampFix != 0) {
+            // Keyed on the published word rather than on the generation alone
+            // (gm-nov3.27), because the host's question is not "has the
+            // palette changed" but "was this strip drawn with the tone the
+            // endpoint is reporting", and that word answers both at once.
+            const uint32_t applied = bganim::themeApplied();
+            if (applied != rampFixLutApplied.load() || rampFix != rampFixLutMode) {
+                if (rampFix == 3) {
+                    bganim::buildThemeWheel(rampFixLut, 256);
+                } else {
+                    bganim::buildThemeRamp(rampFixLut, 256, rampFix == 2);
+                }
+                rampFixLutApplied.store(applied);
+                rampFixLutMode = rampFix;
+                // The bands before this one in this frame carried the old LUT,
+                // so the strip this frame leaves behind is part one palette and
+                // part the other. renderLoop() restarts the whole-frame count.
+                //
+                // A publish that lands between the load above and the build
+                // leaves the LUT a frame ahead of the word recorded for it.
+                // That is self correcting: the next band reads the newer word,
+                // sees it differ, and rebuilds, and the frame it happens in is
+                // torn and does not count either way.
+                rampFixLutTorn = true;
+            }
+            const int fy0 = rampFixY0.load();
+            const int fy1 = rampFixY1.load();
+            const int r0 = fy0 > y0 ? fy0 : y0;
+            const int r1 = fy1 < y0 + rows ? fy1 : y0 + rows;
+            // Every row of the band inside the strip, whatever any row-skipping
+            // above decided: a row the frame does not push keeps what it held,
+            // and while armed that is the same ramp, but a row this frame DOES
+            // push has to carry it.
+            const int xoff = rampFixXoff.load();
+            for (int y = r0; y < r1; y++) {
+                uint16_t *const prow = band + static_cast<size_t>(y - y0) * w;
+                for (int x = 0; x < w; x++) {
+                    int idx = ((x + xoff) * 255) / (w - 1);
+                    if (idx > 255) {
+                        idx = 255;
+                    }
+                    prow[x] = rampFixLut[idx];
+                }
+            }
+        }
+#endif
 
         // Compact the band to just the columns the round panel actually shows.
         // Rows are written full-width by the animations; here each row's
@@ -5200,9 +5311,9 @@ void SleepAnimation::runAnimTest() {
         publish();
         return;
     }
-    uint8_t psets[3][4];
+    uint8_t psets[3][BG_ANIM_PARAMS];
     bg_parse_params(nullptr, id, psets[0]);
-    for (int i = 0; i < 4; i++) {
+    for (int i = 0; i < BG_ANIM_PARAMS; i++) {
         psets[1][i] = 0;
         psets[2][i] = 100;
     }

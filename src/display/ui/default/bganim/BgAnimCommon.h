@@ -1,9 +1,27 @@
 #ifndef BGANIM_COMMON_H
 #define BGANIM_COMMON_H
 
+#include <atomic>
 #include <math.h>
 #include <stdint.h>
 #include <stdlib.h>
+
+// Where a kernel's code lives. The animations mark their band() and row
+// kernels GM_ANIM_IRAM, and by default that is nothing: the kernels run from
+// flash. Only the render loop itself is pinned in IRAM (SleepAnimation.cpp),
+// because IRAM text past the first 16 KB is taken from internal DRAM byte
+// for byte, and internal DRAM is what the web UI dies of (CLAUDE.md,
+// "Internal DRAM budget"). The 21 ported animations each pinned their own
+// kernels in 2026-09 and together took 21.5 KB: the loadtest build idled at
+// 9 KB internal instead of 30 and WiFi lost every outgoing frame. Build with
+// -DGM_BGANIM_IRAM_KERNELS=1 to pin them again for a bench A/B; never ship
+// that.
+#if defined(ESP_PLATFORM) && defined(GM_BGANIM_IRAM_KERNELS) && GM_BGANIM_IRAM_KERNELS
+#include <esp_attr.h>
+#define GM_ANIM_IRAM IRAM_ATTR
+#else
+#define GM_ANIM_IRAM
+#endif
 
 // Shared helpers for background animations. Everything here is safe to call
 // from the render task (core 1); allocations prefer internal SRAM and fall
@@ -164,7 +182,24 @@ bool internalHasRoomFor(size_t size);
 extern size_t g_allocSram;
 extern size_t g_allocPsram;
 
-void *alloc(size_t size); // PSRAM; see the hot slab above for the placement policy
+#if defined(GM_TOUCH_PROBE) && defined(ESP_PLATFORM)
+// Harmonograph's stamp pass, loadtest builds: 0 portable, 1 PIE (the
+// default), 2 both with a byte compare of the coverage buffer (checked and
+// mismatch counters below; `harmostamp=` on /api/debug/anim).
+extern std::atomic<int> g_harmoStampMode;
+extern std::atomic<uint32_t> g_harmoStampChecked;
+extern std::atomic<uint32_t> g_harmoStampMismatch;
+#endif
+
+// Both allocators return memory aligned to this, so any table from bganim can
+// be a PIE kernel's source or destination: ee.vld/vst.128 zero the low four
+// address bits of their own access, and an unaligned table means reading the
+// wrong bytes or writing outside the block (see alloc() in the .cpp for the
+// crash that set this).
+constexpr size_t GM_BGANIM_ALLOC_ALIGN = 16;
+
+// PSRAM, 16-byte aligned; see the hot slab above for the placement policy.
+void *alloc(size_t size);
 
 // Give back one table from alloc() or allocHot(). Takes the size because the
 // counters have to be decremented by the same amount they were charged.
@@ -316,6 +351,40 @@ int themeStopCount();
 const uint8_t (*themeStops())[3];
 const uint8_t *themeStopPositions();
 bool themeUniform(); // equal spacing: the original arithmetic is in use
+
+// The stops as the theme defines them, BEFORE tone, plus the tone in force.
+// themeStops() reports the toned result, which is what the animations draw
+// with but not what a host can rebuild the same ramp from: a host that is
+// handed toned stops has to be told the tone was already applied, and then it
+// is no longer checking the tone arithmetic at all. These two report the
+// inputs instead, so the gradient framebuffer fixture (gm-nov3.10) can say
+// "these stops at this brightness and this knee" and the host can run the
+// whole transform itself.
+//
+// themeRawStops() copies at most `cap` stops into outStops (and their
+// positions into outPos when it is not null), sets *outUniform, and returns
+// the number copied. Reporting only; not on any render path.
+int themeRawStops(uint8_t (*outStops)[3], uint8_t *outPos, int cap, bool *outUniform);
+
+// The tone that went into the palette that is published right now, and the
+// generation that published it, in one word (gm-nov3.27).
+//
+// Reading the brightness and the knee as two plain variables is not safe from
+// another task, and not because of tearing: they are aligned 32 bit integers
+// and a torn read is not the failure. The ordering is. setThemeTone() assigns
+// both integers and only then rebuilds and publishes the palette, so a reader
+// of the integers alone can see the new tone while the render task is still
+// drawing the old palette, and report a tone the panel has not applied. This
+// word is stored last, with release ordering, so seeing a tone here means the
+// palette it was applied to is the published one.
+//
+// Compare whole words for equality rather than picking the generation apart:
+// it is truncated (see the definition) and carries no meaning beyond "the
+// same published state or a different one".
+uint32_t themeApplied();
+void themeAppliedUnpack(uint32_t applied, int *brightness256, int *knee);
+// Shorthand for unpacking themeApplied(). Reporting only, like themeRawStops.
+void themeToneState(int *brightness256, int *knee);
 
 // Tone controls, applied to the stops before any animation sees them.
 //

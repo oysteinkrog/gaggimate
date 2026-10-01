@@ -334,11 +334,27 @@ def check_restart_persistence_and_relaunch(rig, sim):
     d_status = rig.touchmap(screen=0)
     target = rig.require_tag(d_status, "Restart", "confirm")
 
+    # The evidence that the hold restarted the device is the simulator
+    # process exiting cleanly, not the tap request failing and not the
+    # process dying somehow. A failed request is RigHTTPError either way:
+    # Rig folds every HTTP status error and every socket error into that
+    # one exception, so an HTTP 500, a malformed reply or a dropped
+    # connection with the process still running used to pass this check
+    # (gm-nov3.29). Then "a status, any status" passed on a crash or a
+    # signal death on the way to the restart (gm-nov3.37), so the status
+    # a clean ESP.restart() leaves is what is compared against.
+    tap_error = None
     try:
         rig.tap_target(target, ms=2500)
-        check(rig, "long_hold_restarts_process", False, "tap completed normally; process should have exited")
-    except RigHTTPError:
-        check(rig, "long_hold_restarts_process", True, "connection refused, as expected after ESP.restart()")
+    except RigHTTPError as e:
+        tap_error = e
+    code = sim.wait_exited(timeout=10)
+    check(
+        rig,
+        "long_hold_restarts_process",
+        code == Sim.CLEAN_RESTART_STATUS,
+        "%s, want status %d; tap_error=%s" % (Sim.describe_exit(code), Sim.CLEAN_RESTART_STATUS, tap_error),
+    )
 
     sim.restart()
     after = int(sim.rig.settings_value("standbyBrightness"))
@@ -404,12 +420,25 @@ def check_fail_flush_scenario(program, workdir, port):
             )
             check_still_up(rig, "forced_flush_failure_does_not_restart", up_before)
 
-            target2 = rig.require_tag(d2, "Restart", "confirm")
+            # Same rule as the restart check above: a clean exit is the
+            # evidence. A failed request is not (gm-nov3.29), and neither
+            # is an unclean exit (gm-nov3.37), which matters most here:
+            # this hold runs right after a settings save was forced to
+            # fail, so a crash on that path is exactly the fault the check
+            # would otherwise report as a successful restart.
+            target2 = rig.find_tag(d2, "Restart", "confirm")
+            tap_error = None
             try:
                 rig.tap_target(target2, ms=2500)
-                check(rig, "second_hold_restarts_after_forced_failure", False, "tap completed normally; process should have exited")
-            except RigHTTPError:
-                check(rig, "second_hold_restarts_after_forced_failure", True, "connection refused, as expected")
+            except RigHTTPError as e:
+                tap_error = e
+            code = sim.wait_exited(timeout=10)
+            check(
+                rig,
+                "second_hold_restarts_after_forced_failure",
+                code == Sim.CLEAN_RESTART_STATUS,
+                "%s, want status %d; tap_error=%s" % (Sim.describe_exit(code), Sim.CLEAN_RESTART_STATUS, tap_error),
+            )
     finally:
         if prior is None:
             os.environ.pop("GM_SIM_FAIL_FLUSH", None)

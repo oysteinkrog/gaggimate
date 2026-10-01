@@ -67,7 +67,30 @@ uint8_t shootCol[3] = {220, 225, 255};
 uint32_t lastThemeGen = 0xFFFFFFFF;
 int g_nStars = 0;
 
+// ---- state the four later parameters derive (gm-3vj.6) ------------------
+// p4 glow, p5 sky glow, p6 sky falloff and p7 star tint all act through the
+// tables below or through a per-star constant in frame(), never inside the
+// vignette pixel loop, so starfieldVigRowAsm and vigRowScalar are untouched
+// by this pass and stay bit-for-bit equal to each other.
+//
+// Every default reproduces the constant it replaced exactly: the spill
+// numerators are over 40, so 16/40 is 2/5 and 12/40 is 3/10 with the same
+// integer truncation; skySpan 36, tintBase 180 with tintSpanF 75 and gamma
+// exactly 1 are the old literals.
+int haloNum0 = 0;          // spill given to a single-pixel star, over 40
+int haloNum1 = 16;         // sizeClass >= 1 spill brightness, over 40
+int haloNum2 = 12;         // sizeClass >= 2 spill brightness, over 40
+int skySpan = 36;          // theme positions the vignette climbs through
+int tintBase = 180;        // lowest theme position a star colour comes from
+float tintSpanF = 75.0f;   // width of that window, in theme positions
+float falloffGamma = 1.0f; // shape of the radial fade; 1 is the linear fade
+float maxR2f = 0.0f;       // set in init(); buildVigLUT keeps init()'s own
+                           // float expression, which reads maxR2 twice and so
+                           // is not simply sqrtf(i / 127.0f) in float
+uint8_t lastSkyP = 50, lastFallP = 50, lastTintP = 50;
+
 void rebuildThemeAssets();
+void buildVigLUT();
 
 struct Shoot {
     bool active = false;
@@ -76,21 +99,45 @@ struct Shoot {
                       // per-band progress calc is a multiply, not a divide.
 };
 Shoot shoot;
-// Animation time (BgAnimClock.h, gm-bzu.50), run at speed 1: the speed
-// setting scales the drift only, as before. Twinkle phases and the shooting
-// star schedule read it, and the drift and the shooting star step by its
-// wrapped delta. Not reset by release(), so a full/half switch carries on.
+// Animation time (BgAnimClock.h, gm-bzu.50), run at the speed setting:
+// speed scales the twinkle and the shooting stars as well as the drift
+// (gm-kh2s). Twinkle phases and the shooting star schedule read it, and the
+// drift and the shooting star step by its wrapped delta. Its first call
+// takes a zero step, so the field starts at its init()-seeded positions,
+// which is where the page starts too when its first frame is at t = 0 (the
+// host bench's warm-up frame). Not reset by release(), so a full/half
+// switch carries on.
 AnimClock g_clock;
-uint32_t nextShootMs = 6000; // on g_clock.ms(), compared by signed difference
+// The first shooting star comes 2 to 6 s in, drawn from the same random
+// stream as the stars, and every later one is scheduled the same way the
+// page schedules it. A whole animation millisecond on g_clock.ms(), compared
+// by signed difference so the schedule survives the millis() wrap (the old
+// `tMs > nextShootMs` fired every frame once nextShootMs had wrapped past
+// zero). The page keeps a fractional deadline and fires when t is past it;
+// truncating that deadline keeps the same first millisecond, because
+// t > 3456.7 and t - 3456 > 0 hold for the same whole t.
+uint32_t nextShootMs = 6000;
 constexpr uint32_t RNG_SEED = 0xC0FFEE;
-// release() puts the seed back, so init() at the other resolution spawns the
-// same field rather than a new one, and a full/half switch does not swap
-// every star on screen (gm-bzu.50).
+// init() reseeds and release() puts the seed back: the page draws the same
+// field every time it starts, and init() at the other resolution then
+// spawns the same field rather than a new one, so a full/half switch does
+// not swap every star on screen (gm-bzu.50).
 uint32_t rng = RNG_SEED;
 int allocW = 0, allocH = 0; // dimensions dx2/dy2 were sized for
 // Render size over the 480 px design size, for the motions measured in
 // pixels per second (drift and the shooting star). Exactly 1 at 480.
 float g_scale = 1.0f;
+
+// The page uses mulberry32, not bganim's xorshift32 (gm-pciz). Unsigned
+// arithmetic reproduces Math.imul's low 32 bits; the float is the page's
+// u / 2^32 rounded to single, which is what its arithmetic then sees.
+uint32_t mulberry32(uint32_t &s) {
+    s += 0x6D2B79F5u;
+    uint32_t t = (s ^ (s >> 15)) * (1u | s);
+    t ^= t + (t ^ (t >> 7)) * (61u | t);
+    return t ^ (t >> 14);
+}
+float randf() { return static_cast<float>(mulberry32(rng)) * (1.0f / 4294967296.0f); }
 
 // Hot-slab placement (BgAnimCommon.h's GM_BGANIM_HOT_SLAB): 9,216 B budget.
 // Round 2 ranked by reads/frame and left dx2 in PSRAM on the theory that its
@@ -179,32 +226,36 @@ bool init(int w, int h) {
             const float d = y - cy;
             dy2[y] = static_cast<int32_t>(d * d * r2Scale);
         }
-        const float maxR2 = cx * cx + cy * cy;
-        for (int i = 0; i < 128; i++) {
-            // index maps r2 linearly; shade = 1 - r/maxR
-            const float rn = sqrtf(i / 127.0f * maxR2) / sqrtf(maxR2);
-            vigLUT[i] = static_cast<uint8_t>(fmaxf(0.0f, 1.0f - rn) * 255.0f);
-        }
+        maxR2f = cx * cx + cy * cy;
+        buildVigLUT();
+        // Reseed every init(): the page draws the same field every time it
+        // starts, and a release() and init() pair must give it back.
+        rng = RNG_SEED;
         for (int i = 0; i < MAX_STARS; i++) {
-            const float roll = nextRandf(rng);
+            const float roll = randf();
             const uint8_t layer = roll < 0.7f ? 0 : (roll < 0.92f ? 1 : 2);
-            stars[i].x = nextRandf(rng) * w;
-            stars[i].y = nextRandf(rng) * h;
-            stars[i].phase = nextRandf(rng) * 6.2831853f;
-            // 0.3 to 1.4 rad/s, as before, now a Q32 turn per millisecond.
-            const float rate = 0.3f + nextRandf(rng) * 1.1f;
+            stars[i].x = randf() * w;
+            stars[i].y = randf() * h;
+            stars[i].phase = randf() * 6.2831853f;
+            // 0.3 to 1.4 rad/s, as before, now a Q32 turn per animation
+            // millisecond (gm-bzu.50).
+            const float rate = 0.3f + randf() * 1.1f;
             stars[i].twinkleQ32 = static_cast<uint32_t>(rate * (4294967296.0f / 6283.1853f) + 0.5f);
-            stars[i].baseBrightness = layer == 0   ? (0.25f + nextRandf(rng) * 0.25f)
-                                      : layer == 1 ? (0.45f + nextRandf(rng) * 0.25f)
-                                                   : (0.7f + nextRandf(rng) * 0.3f);
+            stars[i].baseBrightness = layer == 0   ? (0.25f + randf() * 0.25f)
+                                      : layer == 1 ? (0.45f + randf() * 0.25f)
+                                                   : (0.7f + randf() * 0.3f);
             stars[i].sizeClass = layer;
-            stars[i].hue = nextRandf(rng);
-            stars[i].driftSpeed = 0.5f + nextRandf(rng);
-            starY[i] = static_cast<int16_t>(stars[i].y);
+            stars[i].hue = randf();
+            stars[i].driftSpeed = 0.5f + randf();
+            // Nearest row, as the page rounds it. y can round up to h, which
+            // no band ever reaches; the bucket index is clamped for it in frame().
+            starY[i] = static_cast<int16_t>(stars[i].y + 0.5f);
             // Q16.16 fixed-point drift phase, seeded from the initial float position
             // so frame 0 (dt=0 below) reproduces the old closed-form x exactly.
             driftQ[i] = static_cast<int32_t>(stars[i].x * 65536.0f);
         }
+        nextShootMs = g_clock.ms() + static_cast<uint32_t>(2000.0f + randf() * 4000.0f);
+        shoot.active = false;
         rebuildThemeAssets();
         lastThemeGen = themeGen();
     }
@@ -212,11 +263,31 @@ bool init(int w, int h) {
     return true;
 }
 
+// The radial fade the vignette reads, 128 steps of squared distance. At
+// falloffGamma 1 this is the linear fade init() built before this pass, down
+// to the two sqrtf calls; p6 away from 50 bends it with one powf per step,
+// which is a theme-rebuild cost and never a per-pixel one.
+void buildVigLUT() {
+    const float maxR2 = maxR2f;
+    if (maxR2 <= 0.0f) {
+        return; // no geometry yet; init() sets maxR2f before the first call
+    }
+    for (int i = 0; i < 128; i++) {
+        // index maps r2 linearly; shade = 1 - r/maxR
+        const float rn = sqrtf(i / 127.0f * maxR2) / sqrtf(maxR2);
+        float shade = fmaxf(0.0f, 1.0f - rn);
+        if (falloffGamma != 1.0f) {
+            shade = powf(shade, falloffGamma);
+        }
+        vigLUT[i] = static_cast<uint8_t>(shade * 255.0f);
+    }
+}
+
 // Stars sample the theme's bright end (per-star hue picks the exact spot);
 // the vignette background sits in the theme's darkest ~14%.
 void rebuildThemeAssets() {
     for (int i = 0; i < MAX_STARS; i++) {
-        themeRGB(180 + static_cast<int>(stars[i].hue * 75.0f), &starCol[i * 3]);
+        themeRGB(tintBase + static_cast<int>(stars[i].hue * tintSpanF), &starCol[i * 3]);
     }
     // One RGB565 step is 8.226 of 0..255 in red and blue, 4.048 in green. A
     // 0.75-step peak swing clears the contours (44.0% -> 0.0%) while moving
@@ -224,7 +295,7 @@ void rebuildThemeAssets() {
     // stays below the noise floor of a 0.13 mm pixel pitch.
     for (int idx = 0; idx < 128; idx++) {
         uint8_t c[3];
-        themeRGB((vigLUT[idx] * 36) >> 8, c);
+        themeRGB((vigLUT[idx] * skySpan) >> 8, c);
         for (int ph = 0; ph < VIG_PHASES; ph++) {
             const float d = (static_cast<float>(BAYER4[ph]) - 7.5f) * (0.75f / 7.5f);
             vigColor[ph * 128 + idx] = rgb565(clamp8f(c[0] + d * 8.226f), clamp8f(c[1] + d * 4.048f), clamp8f(c[2] + d * 8.226f));
@@ -233,14 +304,60 @@ void rebuildThemeAssets() {
     themeRGB(255, shootCol);
 }
 
-void frame(uint32_t tMs, int w, int h, const uint8_t p[4]) {
+void frame(uint32_t tMs, int w, int h, const uint8_t p[BG_ANIM_PARAMS]) {
     (void)h;
-    if (themeGen() != lastThemeGen) {
+    // p4 glow: how far a star spreads past its own pixel. Integer numerators
+    // over 40, so 50 gives back 2/5 and 3/10 with the same truncation the
+    // fixed fractions had. At 0 every star is a bare pixel. Above 50 the
+    // single-pixel stars start to spill as well, which is what makes the top
+    // of the range reach most of the field: seven stars in ten are that
+    // smallest class. haloNum0 grows from 0 at 50, so the default plots
+    // nothing extra and the branch below is not taken.
+    haloNum1 = (p[4] * 32) / 100;
+    haloNum2 = (p[4] * 24) / 100;
+    haloNum0 = p[4] > 50 ? ((p[4] - 50) * 32) / 50 : 0;
+
+    bool rebuild = themeGen() != lastThemeGen;
+    // p6 sky falloff: how quickly the sky glow fades toward the rim. Low
+    // spreads it out to a wide wash, high pulls it into the middle.
+    if (p[6] != lastFallP) {
+        lastFallP = p[6];
+        falloffGamma = p[6] == 50 ? 1.0f : (0.25f + p[6] * (1.5f / 100.0f));
+        buildVigLUT();
+        rebuild = true;
+    }
+    // p5 sky glow: how far up the theme the vignette climbs. 0 is a flat sky
+    // in the theme's darkest tone, 100 doubles the old reach.
+    if (p[5] != lastSkyP) {
+        lastSkyP = p[5];
+        skySpan = (p[5] * 36) / 50;
+        rebuild = true;
+    }
+    // p7 star tint: the window of theme positions star colours come from,
+    // anchored at the bright end. 0 gives every star the theme's accent, 100
+    // spreads them over the top 150 positions, so colour varies star to star.
+    if (p[7] != lastTintP) {
+        lastTintP = p[7];
+        const int span = (p[7] * 150) / 100;
+        tintSpanF = static_cast<float>(span);
+        tintBase = 255 - span;
+        rebuild = true;
+    }
+    if (rebuild) {
         rebuildThemeAssets();
         lastThemeGen = themeGen();
     }
     g_nStars = 40 + (p[1] * (MAX_STARS - 40)) / 100;
-    const uint32_t stepMs = g_clock.advance(tMs, 1.0f);
+    // Speed scales the twinkle and the shooting stars as well as the drift
+    // (gm-kh2s, 2026-09-12). Only driftPxPerSec carried the multiplier, so
+    // raising the slider blew the stars across faster while each one still
+    // twinkled at its Speed 50 rate and the shooting stars still arrived on
+    // the same wall clock: the matched-window sweep read 1130 ms of half
+    // change time at Speed 0 against 1391 at Speed 100, where one clock for
+    // the whole animation reads the same number at every setting.
+    // speedMul(50) is exactly 1, so nothing moves at the default.
+    const float spd = speedMul(p[0]);
+    const uint32_t stepMs = g_clock.advance(tMs, spd);
     const uint32_t nowMs = g_clock.ms();
     const float twinkleAmt = p[2] * (1.0f / 100.0f); // reciprocal multiply: dividend isn't a compile-time
                                                      // constant, so the compiler can't fold /100.0f itself
@@ -253,14 +370,15 @@ void frame(uint32_t tMs, int w, int h, const uint8_t p[4]) {
     // extinguish) at p[2]=100: 1 - (5/3)*(1-0.4) = 0. Expands only the top of
     // the range; p[2]<=50 is unchanged from before.
     const float twinkleDepth = twinkleAmt * (twinkleAmt * (4.0f / 3.0f) + (1.0f / 3.0f));
-    const float driftPxPerSec = 3.0f * speedMul(p[0]) * g_scale;
+    const float driftPxPerSec = 3.0f * spd * g_scale;
 
     // Integer phase-wrap drift: replaces the old fmodf(absolute_position, w) with
     // a per-star Q16.16 accumulator stepped by real elapsed time (dt) and wrapped
     // with a single compare+subtract (no libm, no divide). dt is clamped so a long
-    // pause between frame() calls can't overflow the Q16.16 delta; the clock's
-    // first call takes a zero step so star positions start exactly at their
-    // init()-seeded x, matching the old t=0 closed form exactly.
+    // pause between frame() calls can't overflow the Q16.16 delta. The step is
+    // the clock's wall-clock step, and the clock's first call takes a zero
+    // step, so star positions start exactly at their init()-seeded x: the
+    // page's t = 0 origin when its first frame is at t = 0.
     const float rawDt = static_cast<float>(stepMs) * 0.001f;
     const float driftDt = rawDt < 2.0f ? rawDt : 2.0f;
     const int32_t wQ = w << 16;
@@ -298,39 +416,50 @@ void frame(uint32_t tMs, int w, int h, const uint8_t p[4]) {
         const float twinkle = 0.7f + 0.3f * cosTab[static_cast<int>(twinkleRad * RAD_TO_TAB) & 255];
         float bF = s.baseBrightness * (1.0f - twinkleDepth * (1.0f - twinkle)) * edgeFade;
         bF = bF < 0.0f ? 0.0f : (bF > 1.0f ? 1.0f : bF);
-        draws[i].x = static_cast<int16_t>(x);
+        draws[i].x = static_cast<int16_t>(x + 0.5f); // nearest column, as the page rounds it
         draws[i].r = clamp8f(starCol[i * 3 + 0] * bF);
         draws[i].g = clamp8f(starCol[i * 3 + 1] * bF);
         draws[i].b = clamp8f(starCol[i * 3 + 2] * bF);
         draws[i].sizeClass = s.sizeClass;
-        const int bandIdx = starY[i] >> 4;
+        // A star rounded to row h lands in the bucket past the last one; it is
+        // never drawn (no band reaches row h), so it just joins the last bucket.
+        int bandIdx = starY[i] >> 4;
+        if (bandIdx > NUM_BANDS - 1) {
+            bandIdx = NUM_BANDS - 1;
+        }
         bandNext[i] = bandHead[bandIdx];
         bandHead[bandIdx] = static_cast<int16_t>(i);
     }
 
     // Shooting star lifecycle, on the clock's step (clamped like the drift's)
     // and its wrapping millisecond count, so the schedule survives the
-    // millis() wrap: the old `tMs > nextShootMs` fired every frame once
-    // nextShootMs had wrapped past zero.
-    const float dt = driftDt;
+    // millis() wrap. The shooting-star clock is the virtual one: dt is a
+    // virtual second and nextShootMs a virtual millisecond, so a star's
+    // flight and the wait for the next both scale with the speed (gm-kh2s).
+    // The page takes 1/30 s on its first frame where the clock takes 0; no
+    // star is ever active on a first frame (init() and release() clear it and
+    // the first is at least 2 s out), so the picture is the same.
+    const float dt = driftDt * spd;
     const uint8_t shootFreq = p[3];
     if (!shoot.active && shootFreq > 0 && static_cast<int32_t>(nowMs - nextShootMs) > 0) {
-        const float angle = 3.14159265f * 0.15f + nextRandf(rng) * 3.14159265f * 0.2f;
-        const float speed = (260.0f + nextRandf(rng) * 140.0f) * g_scale;
+        const float angle = 3.14159265f * 0.15f + randf() * 3.14159265f * 0.2f;
+        const float speed = (260.0f + randf() * 140.0f) * g_scale;
         shoot.active = true;
-        shoot.x = nextRandf(rng) * w * 0.6f;
-        shoot.y = nextRandf(rng) * w * 0.3f;
+        shoot.x = randf() * w * 0.6f;
+        shoot.y = randf() * h * 0.3f;
         shoot.vx = cosf(angle) * speed;
         shoot.vy = sinf(angle) * speed;
         shoot.life = 0;
-        shoot.maxLife = 0.5f + nextRandf(rng) * 0.3f;
+        shoot.maxLife = 0.5f + randf() * 0.3f;
         shoot.invMaxLife = 1.0f / shoot.maxLife; // one divide per shoot trigger (rare), not per band()
         const uint32_t interval = 1500 > 30000 - shootFreq * 280 ? 1500 : 30000 - shootFreq * 280;
-        nextShootMs = nowMs + interval + static_cast<uint32_t>(nextRandf(rng) * interval * 0.5f);
+        nextShootMs = nowMs + interval + static_cast<uint32_t>(randf() * interval * 0.5f);
     }
     if (shoot.active) {
         shoot.life += dt;
-        if (shoot.life >= shoot.maxLife) {
+        // The same product band() uses for progress, so the two never disagree
+        // about the last frame of a star.
+        if (shoot.life * shoot.invMaxLife >= 1.0f) {
             shoot.active = false;
         }
     }
@@ -340,12 +469,14 @@ inline void plotMax(uint16_t *dst, int rows, int w, int x, int y, uint8_t r, uin
     if (x < 0 || x >= w || y < 0 || y >= rows) {
         return;
     }
-    // Stars replace (max) rather than blend — background is near-black.
+    // Stars replace (max) rather than blend: the background is near-black.
+    // The max is per channel, as the page takes it, not on the packed word.
     uint16_t &px = dst[static_cast<size_t>(y) * w + x];
     const uint16_t c = rgb565(r, g, b);
-    if (c > px) {
-        px = c;
-    }
+    const uint16_t rm = (c & 0xF800) > (px & 0xF800) ? (c & 0xF800) : (px & 0xF800);
+    const uint16_t gm = (c & 0x07E0) > (px & 0x07E0) ? (c & 0x07E0) : (px & 0x07E0);
+    const uint16_t bm = (c & 0x001F) > (px & 0x001F) ? (c & 0x001F) : (px & 0x001F);
+    px = static_cast<uint16_t>(rm | gm | bm);
 }
 
 // ---------------------------------------------------------------------
@@ -400,12 +531,15 @@ void plotStarsAndShoot(uint16_t *dst, int y0, int rows, int w) {
             const StarDraw &d = draws[i];
             const int x = d.x;
             plotMax(dst, rows, w, x, y, d.r, d.g, d.b);
+            if (d.sizeClass == 0 && haloNum0 > 0) {
+                plotMax(dst, rows, w, x + 1, y, d.r * haloNum0 / 40, d.g * haloNum0 / 40, d.b * haloNum0 / 40);
+            }
             if (d.sizeClass >= 1) {
-                plotMax(dst, rows, w, x + 1, y, d.r * 2 / 5, d.g * 2 / 5, d.b * 2 / 5);
+                plotMax(dst, rows, w, x + 1, y, d.r * haloNum1 / 40, d.g * haloNum1 / 40, d.b * haloNum1 / 40);
             }
             if (d.sizeClass >= 2) {
-                plotMax(dst, rows, w, x, y + 1, d.r * 2 / 5, d.g * 2 / 5, d.b * 2 / 5);
-                plotMax(dst, rows, w, x - 1, y, d.r * 3 / 10, d.g * 3 / 10, d.b * 3 / 10);
+                plotMax(dst, rows, w, x, y + 1, d.r * haloNum1 / 40, d.g * haloNum1 / 40, d.b * haloNum1 / 40);
+                plotMax(dst, rows, w, x - 1, y, d.r * haloNum2 / 40, d.g * haloNum2 / 40, d.b * haloNum2 / 40);
             }
         }
     }
@@ -424,8 +558,10 @@ void plotStarsAndShoot(uint16_t *dst, int y0, int rows, int w) {
             const float px = hx - shoot.vx * 0.02f * k;
             const float py = hy - shoot.vy * 0.02f * k;
             const float fade = (1.0f - f) * (1.0f - progress * 0.3f);
-            plotMax(dst, rows, w, static_cast<int>(px), static_cast<int>(py) - y0, clamp8f(shootCol[0] * fade),
-                    clamp8f(shootCol[1] * fade), clamp8f(shootCol[2] * fade));
+            // Nearest pixel, as the page rounds it: floor(v + 0.5), which also
+            // sends a segment just left of the edge off screen instead of to column 0.
+            plotMax(dst, rows, w, static_cast<int>(floorf(px + 0.5f)), static_cast<int>(floorf(py + 0.5f)) - y0,
+                    clamp8f(shootCol[0] * fade), clamp8f(shootCol[1] * fade), clamp8f(shootCol[2] * fade));
         }
     }
 }
@@ -611,6 +747,19 @@ void release() {
     allocW = allocH = 0;
     lastThemeGen = 0xFFFFFFFF;
     rng = RNG_SEED;
+    shoot.active = false;
+    // Back to the defaults, so the next init() builds the tables the default
+    // parameters describe and frame()'s first pass rebuilds only what the
+    // stored parameters actually move.
+    haloNum0 = 0;
+    haloNum1 = 16;
+    haloNum2 = 12;
+    skySpan = 36;
+    tintBase = 180;
+    tintSpanF = 75.0f;
+    falloffGamma = 1.0f;
+    maxR2f = 0.0f;
+    lastSkyP = lastFallP = lastTintP = 50;
 }
 
 } // namespace
@@ -619,7 +768,14 @@ extern const BgAnimation bg_anim_starfield;
 const BgAnimation bg_anim_starfield = {
     "starfield",
     "Starfield",
-    {{"speed", "Drift speed", 50}, {"density", "Stars", 45}, {"twinkle", "Twinkle", 50}, {"shooting", "Shooting stars", 30}},
+    {{"speed", "Drift speed", 50},
+     {"density", "Stars", 45},
+     {"twinkle", "Twinkle", 50},
+     {"shooting", "Shooting stars", 30},
+     {"glow", "Star glow", 50},
+     {"skyglow", "Sky glow", 50},
+     {"falloff", "Sky falloff", 50},
+     {"tint", "Star tint", 50}},
     init,
     frame,
     band,

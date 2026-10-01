@@ -10,7 +10,7 @@ timestamped pass/fail report.
     python3 tools/settings_ui_test.py
         [--host 192.168.1.121]
         [--sim-program .pio/build/display-sim/program] [--sim-port 8080]
-        [--only rig,temps,display,animation,machine,schedules,status]
+        [--only rig,temps,display,animation,gradientdraft,machine,schedules,press,reject,status]
         [--skip-restart] [--report-dir DIR]
 
 Without --host it launches the desktop simulator itself, in a fresh
@@ -60,7 +60,12 @@ DEFAULT_PROGRAM = os.path.join(REPO_ROOT, ".pio", "build", "display-sim", "progr
 # at a deliberately odd 555 s, which is not on the Machine page's one
 # minute grid; running it earlier would leave the Machine and Schedules
 # scenarios starting from a value their own steppers cannot return to.
-SCENARIO_ORDER = ("temps", "display", "animation", "machine", "schedules", "press", "reject", "status", "rig")
+#
+# gradientdraft follows animation because it drives the same category and
+# uses that scenario's navigation helpers; it is simulator only (every check
+# in it needs the web save route that stands in for the browser there).
+SCENARIO_ORDER = ("temps", "display", "animation", "gradientdraft", "machine", "schedules", "press", "reject",
+                   "status", "rig")
 
 WARMUP_UPTIME_MS = 90_000
 BASELINE_WINDOW_S = 10.0
@@ -703,7 +708,11 @@ def run(args):
     sim = None
     try:
         if args.host:
-            rig = Rig(args.host)
+            # GM_RIG_TIMEOUT: per-request HTTP timeout in seconds (default 15).
+            # The bench board's link is round trip bound under BLE coex and on a
+            # bad radio evening a touchmap dump takes 20 to 30 s (2026-09-11,
+            # 37 percent ping loss, 200 ms average round trip).
+            rig = Rig(args.host, timeout=float(os.environ.get("GM_RIG_TIMEOUT", "15")))
             venue = Venue(sim=None, program=None, workdir=report_dir, port=None, host=args.host,
                           log_path=None, is_device=True, skip_restart=args.skip_restart)
             report.step("venue", kind="device", host=args.host)

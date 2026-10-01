@@ -21,10 +21,19 @@ restores the schedule list to what it found before exiting (including two
 fixtures it builds and tears down through the simulator-only web-save
 emulation, the same mechanism the bead text sanctions for the acceptance
 criteria's 9-entry import), and prints a PASS/FAIL summary at the end.
+
+One check restarts the simulator. check_malformed_time_editor needs a
+stored schedule with a malformed time, which no live route can write any
+more, so it writes the simulator's own preferences file and relaunches the
+process (plant_stored_schedules). Settings are flushed first, so the
+restart loses nothing; the runner tolerates a scenario rebooting its venue
+(close_shell in tools/settings_ui_test.py says so), and against a device
+host the whole block is skipped.
 """
 import argparse
 import json
 import os
+import shutil
 import sys
 import tempfile
 import time
@@ -123,6 +132,53 @@ def web_save_change(rig, key, value):
     req = urllib.request.Request(rig.base + "/api/settings", data=data, method="POST")
     with urllib.request.urlopen(req, timeout=rig.timeout) as resp:
         return resp.status
+
+
+def plant_stored_schedules(rig, sim, packed):
+    """Writes `packed` into the simulator's stored settings and restarts it,
+    returning the schedules string the restarted venue reports.
+
+    For a fixture no live route can build any more. The web POST drops an
+    entry whose time is not HH:MM in range (isScheduleTime, WebUIPlugin.cpp,
+    2026-09-09) and the display's own commit always formats HH:MM, so
+    settings stored before that change are the only way a malformed time
+    still reaches the editor. The NVS codec keeps any entry that has a "|"
+    in it (Settings.cpp), which is why such an entry survives the load.
+
+    The simulator keeps its preferences as one JSON file per namespace
+    (sim/platform/preferences_shim.cpp), so that file is this venue's NVS.
+    Settings writes a key only when its value changes, so the marker save is
+    what puts ab_schedules in the file at all; waiting for the file to carry
+    the marker also proves the save task has flushed everything else this
+    run has changed, which the terminate below would otherwise drop. The
+    relaunch truncates the simulator's log, so the log so far is copied
+    aside first."""
+    nvs = os.path.join(sim.data_dir, "nvs", "controller.json")
+    current = rig.settings_value("autowakeupSchedules")
+    marker = "08:15|1010101" if current != "08:15|1010101" else "09:20|0101010"
+    web_save_change(rig, "autowakeupSchedules", marker)
+
+    def flushed():
+        if not os.path.isfile(nvs):
+            return False
+        with open(nvs, "r", encoding="utf-8") as fp:
+            return json.load(fp).get("ab_schedules") == marker
+
+    rig.wait_until(flushed, timeout=15)
+    with open(nvs, "r", encoding="utf-8") as fp:
+        stored = json.load(fp)
+    stored["ab_schedules"] = packed
+
+    rig.log("plant_stored_schedules", packed=packed, nvs=nvs)
+    sim.stop()
+    try:
+        shutil.copyfile(sim.log_path, sim.log_path + ".before_schedules_restart")
+    except OSError:
+        pass
+    with open(nvs, "w", encoding="utf-8") as fp:
+        json.dump(stored, fp)
+    sim.restart()
+    return rig.settings_value("autowakeupSchedules")
 
 
 def py_days_summary(days):
@@ -669,6 +725,61 @@ def check_malformed_time_dropped(rig, s0):
     got = rig.settings_value("autowakeupSchedules")
     check(rig, "malformed_time_keeps_stored_list", got == orig_packed, repr(got))
 
+
+def check_malformed_time_editor(rig, s0, sim):
+    """Regression for the substr crash, now that the web save can no longer
+    reach it.
+
+    "|1111111" is a stored entry with an empty time. The editor's Hour and
+    Minute rows used to slice that string, and substr(3, 2) on an empty one
+    throws out_of_range, which aborts a firmware built without exceptions.
+    Both rows read it through the model's scheduleTimeParts now, which
+    treats anything malformed as midnight, so the editor must open on 00 and
+    00 and the venue must still be answering afterwards. Leaving the entry
+    untouched must write nothing.
+
+    The web path can no longer store such an entry at all: isScheduleTime
+    refuses the whole field under a 422 (gm-nov3.26, asserted above by
+    check_malformed_time_dropped), so there is no POST left that can plant
+    this fixture. It is planted directly through the simulator's own
+    preferences file instead (plant_stored_schedules), the way a value
+    written before that change, or by hand, still reaches the editor on a
+    real device."""
+    orig_packed = s0["autowakeupSchedules"]
+    broken_packed = "07:00|1111111;|1111111"
+
+    if sim is None:
+        rig.log("skip", reason="planting a malformed stored time needs the simulator process",
+                checks="malformed_fixture_planted,malformed_editor_opens,malformed_hour_is_00,"
+                       "malformed_minute_is_00,malformed_editor_still_open,malformed_left_byte_identical")
+        web_save_change(rig, "autowakeupSchedules", orig_packed)
+        return
+
+    got_fixture = plant_stored_schedules(rig, sim, broken_packed)
+    if not check(rig, "malformed_fixture_planted", got_fixture == broken_packed, repr(got_fixture)):
+        web_save_change(rig, "autowakeupSchedules", orig_packed)
+        return
+
+    dump = open_schedule_editor(rig, 2)
+    if not check(rig, "malformed_editor_opens", dump is not None, ""):
+        web_save_change(rig, "autowakeupSchedules", orig_packed)
+        return
+    a0 = rig.audit(dump)
+    check(rig, "malformed_editor_page0_audit_clean", not a0["violations"], repr(a0["violations"]))
+    check(rig, "malformed_hour_is_00", row_value(dump, "Hour") == "00", repr(row_value(dump, "Hour")))
+    check(rig, "malformed_minute_is_00", row_value(dump, "Minute") == "00", repr(row_value(dump, "Minute")))
+
+    # A crash would show up as a refused connection here, not as a wrong
+    # value: the state read is what proves the venue is still running.
+    st = rig.settingsui_state()
+    check(rig, "malformed_editor_still_open", st.get("depth") == 3, repr(st))
+
+    do(rig, pop=1)  # editor -> list
+    do(rig, pop=1)  # list -> Machine
+    do(rig, close=1)  # nothing touched, so commit writes no schedules
+    after = rig.settings_value("autowakeupSchedules")
+    check(rig, "malformed_left_byte_identical", after == broken_packed, repr(after))
+
     web_save_change(rig, "autowakeupSchedules", orig_packed)
     check(rig, "malformed_fixture_restored", rig.settings_value("autowakeupSchedules") == orig_packed, "")
 
@@ -849,11 +960,15 @@ def check_external_leave_persists(rig, s0):
     check(rig, "leave_check_restores_list", ok, repr(schedules(rig.settings_value("autowakeupSchedules"))))
 
 
-def _sequence(rig, venue=None):
+def _sequence(rig, venue=None, sim=None):
     """Every check, in order. Shared by main() and by run() below so the
-    runner and a standalone invocation cannot drift apart; nothing here
-    restarts the process, so the venue is only along for the signature."""
-    del venue
+    runner and a standalone invocation cannot drift apart. `sim` is the
+    simulator process this is driving, where there is one: the malformed
+    time check restarts it to plant a fixture no live route can write any
+    more, so that check is skipped without it (a device host, which
+    is_web_save_host skips anyway)."""
+    if sim is None:
+        sim = getattr(venue, "sim", None)
     s0 = rig.settings()
     rig.log("initial_settings", autowakeupSchedules=s0["autowakeupSchedules"])
 
@@ -867,12 +982,13 @@ def _sequence(rig, venue=None):
         run_check(rig, "eight_and_nine_and_audit", check_eight_and_nine_and_audit, s0)
         run_check(rig, "web_save_reconcile_editor", check_web_save_reconcile_editor, s0)
         run_check(rig, "malformed_time_dropped", check_malformed_time_dropped, s0)
+        run_check(rig, "malformed_time_editor", check_malformed_time_editor, s0, sim)
         run_check(rig, "web_save_reconciles_machine_row", check_web_save_reconciles_machine_row, s0)
     else:
         rig.log(
             "skip", reason="web-save emulation is simulator-only",
             checks="remove_disabled_at_one,eight_and_nine_and_audit,web_save_reconcile_editor,"
-                   "malformed_time_dropped,web_save_reconciles_machine_row",
+                   "malformed_time_dropped,malformed_time_editor,web_save_reconciles_machine_row",
         )
     run_check(rig, "external_leave_persists", check_external_leave_persists, s0)
 
@@ -935,7 +1051,7 @@ def main():
         with Sim(args.program, data_dir, port=args.port) as sim:
             rig = sim.rig
             rig.log("boot", program=args.program, port=args.port, workdir=args.workdir)
-            _sequence(rig)
+            _sequence(rig, sim=sim)
 
     print()
     if FAILURES:
@@ -958,7 +1074,9 @@ if __name__ == "__main__":
 #   and flashed only by the swarm leader. Running this script with --host
 #   192.168.1.121 covers everything except the web-save-emulation checks
 #   (remove_disabled_at_one, eight_and_nine_and_audit,
-#   web_save_reconcile_editor), which are simulator-only by design
+#   web_save_reconcile_editor, malformed_time_editor, which also needs to
+#   restart the process to plant its fixture, and
+#   web_save_reconciles_machine_row), which are simulator-only by design
 #   (is_web_save_host) and are skipped, logged, against a device host.
 # - /api/debug/heap (int_free/dma_free) before and after this script's
 #   heaviest state (the 9-entry list open, both list pages built): not

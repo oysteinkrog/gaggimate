@@ -2,6 +2,8 @@
 
 #include <cctype>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 
 #include <display/core/constants.h>
 
@@ -201,18 +203,97 @@ std::vector<std::string> splitEntries(const std::string &packed) {
     return parts;
 }
 
+// The inverse of splitEntries: ";"-joined, no trailing separator. An empty
+// vector joins to "", which is what a fully-default map or param string is.
+std::string joinEntries(const std::vector<std::string> &parts) {
+    std::string out;
+    for (size_t i = 0; i < parts.size(); i++) {
+        if (i != 0) {
+            out += ';';
+        }
+        out += parts[i];
+    }
+    return out;
+}
+
+uint8_t clampParam(long value) { return static_cast<uint8_t>(value < 0 ? 0 : (value > 100 ? 100 : value)); }
+
 } // namespace
 
 std::vector<GradientChoice> gradientChoices(const ThemeNameProvider &themes, const std::string &library) {
     std::vector<GradientChoice> out;
-    out.push_back({"Default", ""});
+    out.push_back({"Default", "", ""});
     const int themeCount = themes.count ? themes.count() : 0;
     for (int t = 0; t < themeCount; t++) {
         const char *name = themes.name ? themes.name(t) : nullptr;
-        out.push_back({name ? name : "", std::to_string(t)});
+        const char *cat = themes.category ? themes.category(t) : nullptr;
+        out.push_back({name ? name : "", std::to_string(t), cat ? cat : ""});
     }
     for (const LibraryEntry &entry : parseGradientLibrary(library)) {
-        out.push_back({entry.name, "c" + std::to_string(entry.id)});
+        out.push_back({entry.name, "c" + std::to_string(entry.id), ""});
+    }
+    return out;
+}
+
+std::vector<GradientGroup> gradientBuiltinGroups(const ThemeNameProvider &themes,
+                                                 const std::vector<GradientChoice> &choices) {
+    std::vector<GradientGroup> out;
+    const int themeCount = themes.count ? themes.count() : 0;
+    const int categoryCount = themes.categoryCount ? themes.categoryCount() : 0;
+    // gradientChoices' layout: [0] is Default, [1 .. themeCount] the
+    // built-ins in table order, the rest the library. Only the middle band is
+    // grouped here.
+    const int last = themeCount < static_cast<int>(choices.size()) - 1 ? themeCount
+                                                                       : static_cast<int>(choices.size()) - 1;
+    for (int c = 0; c < categoryCount; c++) {
+        const char *name = themes.categoryName ? themes.categoryName(c) : nullptr;
+        if (name == nullptr || *name == '\0') {
+            continue;
+        }
+        GradientGroup group;
+        group.name = name;
+        for (int i = 1; i <= last; i++) {
+            if (choices[static_cast<size_t>(i)].category == group.name) {
+                group.choices.push_back(i);
+            }
+        }
+        if (!group.choices.empty()) {
+            out.push_back(std::move(group));
+        }
+    }
+    // Anything the declared list did not claim. Nothing in the shipped table
+    // lands here; a built-in added with a category nobody declared would, and
+    // a picker that dropped it would make it unreachable.
+    GradientGroup other;
+    other.name = "Other";
+    for (int i = 1; i <= last; i++) {
+        bool claimed = false;
+        for (const GradientGroup &group : out) {
+            for (int idx : group.choices) {
+                if (idx == i) {
+                    claimed = true;
+                    break;
+                }
+            }
+            if (claimed) {
+                break;
+            }
+        }
+        if (!claimed) {
+            other.choices.push_back(i);
+        }
+    }
+    if (!other.choices.empty()) {
+        out.push_back(std::move(other));
+    }
+    return out;
+}
+
+std::vector<int> gradientLibraryChoices(const ThemeNameProvider &themes, const std::vector<GradientChoice> &choices) {
+    std::vector<int> out;
+    const int themeCount = themes.count ? themes.count() : 0;
+    for (int i = themeCount + 1; i < static_cast<int>(choices.size()); i++) {
+        out.push_back(i);
     }
     return out;
 }
@@ -252,14 +333,101 @@ std::string gradientMapWriteRef(const std::string &map, int animId, const std::s
     while (!parts.empty() && parts.back().empty()) {
         parts.pop_back();
     }
-    std::string out;
-    for (size_t i = 0; i < parts.size(); i++) {
-        if (i != 0) {
-            out += ';';
-        }
-        out += parts[i];
+    return joinEntries(parts);
+}
+
+// ---- background animation parameters ------------------------------------------
+
+const NumericSpec kBgAnimParamSpec{0, 100, 5, 10, ClampMode::Clamp, NumericFormat::Integer, ""};
+
+// Byte for byte the rules bg_parse_params() applies (BgAnimRegistry.cpp),
+// re-implemented here because that function lives in the animation registry,
+// which carries every render kernel and so compiles neither into the
+// simulator nor into the host test. The two must not drift: what the display
+// shows on a row is this parse, what the render task draws with is that one.
+void bgParamsRead(const std::string &packed, int animId, const uint8_t *defaults, uint8_t *out) {
+    for (int i = 0; i < kBgAnimParamSlots; i++) {
+        out[i] = defaults != nullptr ? defaults[i] : 0;
     }
-    return out;
+    if (animId < 0) {
+        return;
+    }
+    // Seek to the animId-th ';'-separated group.
+    const char *s = packed.c_str();
+    for (int skip = 0; skip < animId && s != nullptr; skip++) {
+        s = std::strchr(s, ';');
+        if (s != nullptr) {
+            s++;
+        }
+    }
+    if (s == nullptr || *s == '\0' || *s == ';') {
+        return;
+    }
+    for (int i = 0; i < kBgAnimParamSlots && *s != '\0' && *s != ';'; i++) {
+        char *end = nullptr;
+        const long v = std::strtol(s, &end, 10);
+        if (end == s) {
+            break; // not a number: the rest of the group keeps its defaults
+        }
+        out[i] = clampParam(v);
+        s = end;
+        if (*s == ',') {
+            s++;
+        }
+    }
+}
+
+std::string bgParamsWriteGroup(const std::string &packed, int animId, const uint8_t *values) {
+    if (animId < 0 || values == nullptr) {
+        return packed;
+    }
+    std::vector<std::string> parts = splitEntries(packed);
+    while (static_cast<int>(parts.size()) <= animId) {
+        parts.push_back(""); // animations between the stored end and animId
+    }
+    // Always all eight slots, even for an animation that defines fewer: the
+    // parser reads a short group as "the rest keep their defaults", so a
+    // group written short would silently follow a later build that gives
+    // that animation more parameters, rather than keeping what was stored.
+    std::string group;
+    for (int i = 0; i < kBgAnimParamSlots; i++) {
+        if (i != 0) {
+            group += ',';
+        }
+        group += std::to_string(static_cast<int>(clampParam(values[i])));
+    }
+    parts[static_cast<size_t>(animId)] = group;
+    // No trailing trim here, unlike gradientMapWriteRef: the group just
+    // written is never empty, so the last entry always carries information.
+    return joinEntries(parts);
+}
+
+std::string bgParamsWriteSlot(const std::string &packed, int animId, const uint8_t *defaults, int slot, long value) {
+    if (animId < 0 || slot < 0 || slot >= kBgAnimParamSlots) {
+        return packed;
+    }
+    uint8_t values[kBgAnimParamSlots];
+    bgParamsRead(packed, animId, defaults, values);
+    values[slot] = clampParam(value);
+    return bgParamsWriteGroup(packed, animId, values);
+}
+
+std::string bgParamsClearGroup(const std::string &packed, int animId) {
+    if (animId < 0) {
+        return packed;
+    }
+    std::vector<std::string> parts = splitEntries(packed);
+    if (static_cast<size_t>(animId) >= parts.size()) {
+        return packed; // nothing stored there: already the defaults
+    }
+    parts[static_cast<size_t>(animId)].clear();
+    // An emptied group reads back as the defaults, so trailing empty groups
+    // carry nothing; trimming them takes an all-default string back to "",
+    // the same state a device that never edited a parameter stores.
+    while (!parts.empty() && parts.back().empty()) {
+        parts.pop_back();
+    }
+    return joinEntries(parts);
 }
 
 // ---- palette ------------------------------------------------------------------
