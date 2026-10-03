@@ -187,6 +187,10 @@ void ShotHistoryPlugin::setup(Controller *c, PluginManager *pm) {
 #ifdef GAGGIMATE_SIM
     holdHandles = true;
 #endif
+    // The first shot's log and the index are opened on the history task's
+    // first idle pass (record()). Armed here rather than in loopTask because
+    // the simulator never runs that task; its main loop calls record().
+    armPrepare(0);
     pm->on("controller:brew:start", [this](Event const &) { startRecording(); });
     pm->on("controller:brew:end", [this](Event const &) { endRecording(); });
     pm->on("controller:brew:clear", [this](Event const &) { endExtendedRecording(); });
@@ -222,7 +226,12 @@ void ShotHistoryPlugin::record() {
                 currentFile = preparedLog;
                 preparedLog = File();
                 preparedId = "";
+                ESP_LOGI("ShotHistoryPlugin", "Shot %s uses the pre-opened log", currentId.c_str());
             } else {
+                if (holdHandles) {
+                    ESP_LOGW("ShotHistoryPlugin", "Shot %s opens its log during the shot (prepared: %s)", currentId.c_str(),
+                             preparedId.length() > 0 ? preparedId.c_str() : "none");
+                }
                 // No prepared file, or one for another id (a rebuild moved the
                 // counter): the old path, with its walks.
                 dropPreparedLog(true);
@@ -475,6 +484,8 @@ void ShotHistoryPlugin::preparePending() {
 }
 
 void ShotHistoryPlugin::prepareNextShot() {
+    // A no-op once done; the simulator reaches this before any other caller.
+    syncNextIdWithIndex();
     const String nextId = padId(String(controller->getSettings().getHistoryIndex()));
     if (!(preparedLog && preparedId == nextId)) {
         dropPreparedLog(true);
@@ -493,6 +504,7 @@ void ShotHistoryPlugin::prepareNextShot() {
             preparedLog = fs->open("/h/" + nextId + ".slog", FILE_WRITE);
             if (preparedLog) {
                 preparedId = nextId;
+                ESP_LOGI("ShotHistoryPlugin", "Pre-opened shot log %s for the next shot", nextId.c_str());
             } else {
                 ESP_LOGW("ShotHistoryPlugin", "Could not pre-open shot log %s; the shot will open it", nextId.c_str());
             }
@@ -957,9 +969,6 @@ void ShotHistoryPlugin::loopTask(void *arg) {
     // Before any shot is recorded, and off the setup task: opening index.bin
     // on the SD card walks /h, which takes seconds on a large history.
     plugin->syncNextIdWithIndex();
-    // Pre-open the first shot's log and the index now, at boot, while the
-    // task is already paying for the index walk above.
-    plugin->armPrepare(0);
     while (true) {
         plugin->record();
         // Use canonical interval from shot log format to avoid divergence.

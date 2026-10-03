@@ -152,7 +152,23 @@ summary; the KB carries the sources and the measurements behind it.
   at a time, a queue of eight, 503 past that; `hist_served`,
   `hist_dropped`, `hist_queue_max` and `hist_open_us_max` on
   `/api/debug/heap`. The walk itself is a layout cost (one flat FAT
-  directory with long-name entries) and is gm-bzu.23.
+  directory with long-name entries) and is gm-bzu.23. What a walk costs is
+  FatFs and VFS code fetched from flash plus one 512 B sector read per
+  SDMMC command, on core 0.
+- **No `/h` lookup runs during a shot** (gm-0api, 2026-10-03).
+  `ShotHistoryPlugin` runs on core 0 at priority 1, the render task's core
+  and priority, and a shot used to open its log on the first sample and
+  index.bin at 7.5 s and at the end: about 2 s of walks each. The owner saw
+  the animation fall from 21 to 4.7 fps for the first 4 s of a shot. The
+  history task now pre-opens the next shot's log and holds index.bin open
+  at idle (at boot, and 20 s after a shot ends), the first sample adopts
+  the held log, and every index read and write goes through
+  `IndexAccess`, which uses the held handle and flushes it so the web
+  worker's `fopen` sees the new size. SD card and simulator only;
+  LittleFS keeps the open-per-use path. A new index reader or writer goes
+  through `IndexAccess`, and anything that removes index.bin closes the
+  held handle first. The serial log says which path a shot took: `uses the
+  pre-opened log` or `opens its log during the shot`.
 
 ## UI-pipeline invariants (violate these and touch latency regresses)
 
@@ -1391,7 +1407,8 @@ DMA-capable, largest block 7.7 kB) and two browser tabs killed it. After the
   cache disabled** (`xTaskCreatePinnedToCoreWithCaps` with
   `MALLOC_CAP_SPIRAM`): SleepAnim, SleepPush, Controller::loopLogic,
   ESPMemoryMonitor, mdns, and the SD-backed history worker (reads go through
-  FatFs over SPI, which never disables the flash cache). Anything that
+  FatFs on the SDMMC host, 1-bit at 40 MHz on GPIO 38/39/40, which never
+  disables the flash cache). Anything that
   touches NVS, LittleFS or `esp_flash` stays internal (Settings::loop, the
   LittleFS-backed history worker, DefaultUI::loop, async_tcp). A WithCaps
   task must never delete itself: that spawns a helper task that needs
