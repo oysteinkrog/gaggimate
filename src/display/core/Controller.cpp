@@ -442,6 +442,8 @@ void Controller::setupBluetooth() {
             // Re-assert the connection interval for the fresh link (e.g. tight
             // again if we reconnected mid-shot).
             applyConnectionPriority(true);
+            // A reflashed controller may answer tares now; let the next start ask.
+            hardwareTareSilent.store(false);
         } else if (initialized) {
             pluginManager->trigger("controller:bluetooth:disconnect");
             waitingForController = true;
@@ -595,6 +597,7 @@ void Controller::setupBluetooth() {
     });
     comms.onTareResult([this](bool success) {
         hardwareTareOk.store(success);
+        hardwareTareSilent.store(false);
         hardwareTareResults.fetch_add(1);
         if (!success) {
             ESP_LOGW(LOG_TAG, "Controller reports the hardware scale tare failed");
@@ -1590,18 +1593,25 @@ void Controller::activate() {
             pluginManager->trigger("controller:brew:prestart");
         }
     }
-    if (hardwareTare) {
+    if (hardwareTare && !hardwareTareSilent.load()) {
         // The controller tares on its scale task and answers with a TareResult
         // (0.5 to about 1.2 s at 10 SPS), so the pump starts on a zeroed scale
         // and a failed tare stops the brew instead of running it untared. No
         // answer within the bound (a controller build without TareResult, or a
-        // lost link) keeps the old behaviour and starts anyway.
+        // lost link) keeps the old behaviour and starts anyway. This runs on
+        // the UI task, so the panel does not answer touch while it waits: a
+        // controller that stayed silent once is not asked again until it
+        // answers a tare or reconnects (gm-wc5u; the 2 s wait on every start
+        // was the freeze the owner saw at the start of each shot on a
+        // controller build without TareResult).
         const unsigned long started = millis();
         while (hardwareTareResults.load() == tareResultsBefore && millis() - started < HARDWARE_TARE_WAIT_MS) {
             delay(10);
         }
         if (hardwareTareResults.load() == tareResultsBefore) {
-            ESP_LOGW(LOG_TAG, "No tare result from the controller after %lu ms; starting the brew anyway",
+            hardwareTareSilent.store(true);
+            ESP_LOGW(LOG_TAG,
+                     "No tare result from the controller after %lu ms; starting the brew anyway and not waiting on later starts",
                      HARDWARE_TARE_WAIT_MS);
         } else if (!hardwareTareOk.load() && profileManager->getSelectedProfile().isVolumetric()) {
             ESP_LOGE(LOG_TAG, "Hardware scale tare failed; not starting a weight-targeted brew");

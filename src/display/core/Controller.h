@@ -323,6 +323,10 @@ class Controller {
     // TareResult and hardwareTareOk holds the latest outcome (set first).
     std::atomic<uint32_t> hardwareTareResults{0};
     std::atomic<bool> hardwareTareOk{false};
+    // Set when a start waited the full bound and no TareResult came: the
+    // controller build has no TareResult, so later starts do not wait on the
+    // UI task for it (gm-wc5u). Cleared by any TareResult and by a reconnect.
+    std::atomic<bool> hardwareTareSilent{false};
     static constexpr unsigned long HARDWARE_TARE_WAIT_MS = 2000;
 #ifdef NIGHTLY_BUILD
     // The virtual scale runs in parallel with a physical scale. If the selected
