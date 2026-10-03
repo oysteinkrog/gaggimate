@@ -62,6 +62,40 @@ class ShotHistoryPlugin : public Plugin {
     bool writeEntryAtPosition(File &indexFile, size_t position, const ShotIndexEntry &entry);
     bool createEarlyIndexEntry();
 
+    // index.bin through the held handle when there is one, else opened and
+    // closed as before. Every function that reads or writes index.bin goes
+    // through this, under indexLock (gm-0api). A held handle is seeked to 0
+    // on the way in and flushed on the way out, so an fopen reader on another
+    // task (the web history worker) sees the size and the bytes written; it
+    // is never closed here.
+    class IndexAccess {
+      public:
+        IndexAccess(ShotHistoryPlugin &plugin, const char *mode);
+        ~IndexAccess();
+        IndexAccess(const IndexAccess &) = delete;
+        IndexAccess &operator=(const IndexAccess &) = delete;
+        File &file() { return f; }
+        explicit operator bool() { return static_cast<bool>(f); }
+        bool isHeld() const { return held; }
+
+      private:
+        ShotHistoryPlugin &p;
+        File f;
+        bool held = false;
+    };
+
+    // The next shot's log and index.bin are opened at idle and held, so the
+    // first sample and the index writes during a shot cost no FAT directory
+    // walk (gm-0api). Only on the SD card, where a lookup walks the flat /h
+    // directory, and on the simulator, which runs the same path on host files.
+    void preparePending();
+    void prepareNextShot();
+    void armPrepare(unsigned long delayMs);
+    void dropPreparedLog(bool removeFile);
+    // Under indexLock.
+    void holdIndex();
+    void releaseHeldIndex();
+
     // False when the notes did not reach flash; the previous notes are left intact.
     bool saveNotes(const String &id, const JsonDocument &notes);
     void loadNotes(const String &id, JsonDocument &notes);
@@ -139,6 +173,17 @@ class ShotHistoryPlugin : public Plugin {
     // so a miss falls back to a linear scan. Cleared by a rebuild, which
     // writes the entries in id order. Under indexLock.
     bool indexOrderBroken = false;
+
+    // Held-handle state (gm-0api). preparedLog and preparedId belong to the
+    // history task (record() and loopTask). heldIndex and wantIndexHeld are
+    // under indexLock, because the rebuild task closes and reopens them.
+    bool holdHandles = false;
+    File preparedLog;
+    String preparedId;
+    bool prepareArmed = false;
+    unsigned long prepareDueAt = 0;
+    File heldIndex;
+    bool wantIndexHeld = false;
 
     TaskHandle_t taskHandle;
     void flushBuffer();

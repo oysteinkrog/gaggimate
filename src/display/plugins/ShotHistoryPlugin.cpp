@@ -42,6 +42,11 @@ constexpr int16_t FLOW_MAX_VALUE = 2000;  //  20.00 ml/s
 // the ±20 floor for seconds while the EMA bleeds off. See GM-110.
 constexpr float MAX_PLAUSIBLE_WEIGHT_DELTA = 5.0f; // grams per sample
 
+// How long after a shot's finalisation the next shot's log is pre-opened
+// (gm-0api). The walks the prepare costs land on core 0 at the render task's
+// priority, so they wait until the finished screen has had its time.
+constexpr unsigned long PREPARE_DELAY_AFTER_SHOT_MS = 20000;
+
 uint16_t encodeUnsigned(float value, float scale, uint16_t maxValue) {
     if (!std::isfinite(value)) {
         return 0;
@@ -173,6 +178,15 @@ void ShotHistoryPlugin::setup(Controller *c, PluginManager *pm) {
         fs = &SD_MMC;
         ESP_LOGI("ShotHistoryPlugin", "Logging shot history to SD card");
     }
+    // A FAT lookup in /h walks the whole directory (about 2 s a walk on a card
+    // with 3,000 shots), so on the SD card the next shot's log and index.bin
+    // are opened at idle and held through the shot (gm-0api). LittleFS keeps
+    // the open-per-use path. The simulator holds them too, so the host build
+    // runs the same code the board does.
+    holdHandles = controller->isSDCard();
+#ifdef GAGGIMATE_SIM
+    holdHandles = true;
+#endif
     pm->on("controller:brew:start", [this](Event const &) { startRecording(); });
     pm->on("controller:brew:end", [this](Event const &) { endRecording(); });
     pm->on("controller:brew:clear", [this](Event const &) { endExtendedRecording(); });
@@ -203,10 +217,20 @@ void ShotHistoryPlugin::record() {
 
     if (shouldRecord && (controller->getMode() == MODE_BREW || extendedRecording)) {
         if (!isFileOpen) {
-            if (!fs->exists("/h")) {
-                fs->mkdir("/h");
+            if (preparedLog && preparedId == currentId) {
+                // Pre-opened at idle (prepareNextShot): no directory walk here.
+                currentFile = preparedLog;
+                preparedLog = File();
+                preparedId = "";
+            } else {
+                // No prepared file, or one for another id (a rebuild moved the
+                // counter): the old path, with its walks.
+                dropPreparedLog(true);
+                if (!fs->exists("/h")) {
+                    fs->mkdir("/h");
+                }
+                currentFile = fs->open("/h/" + currentId + ".slog", FILE_WRITE);
             }
-            currentFile = fs->open("/h/" + currentId + ".slog", FILE_WRITE);
             if (currentFile) {
                 isFileOpen = true;
                 // Prepare header
@@ -420,6 +444,117 @@ void ShotHistoryPlugin::record() {
                 pluginManager->trigger(savedEvent);
             }
         }
+        // The shot's last index write is done. The index goes back to
+        // open-per-use until the next prepare, which waits so the walks it
+        // costs do not land on the finished screen.
+        {
+            std::lock_guard<std::recursive_mutex> guard(indexLock);
+            releaseHeldIndex();
+        }
+        armPrepare(PREPARE_DELAY_AFTER_SHOT_MS);
+    }
+    if (!recording && !extendedRecording && !isFileOpen) {
+        preparePending();
+    }
+}
+
+void ShotHistoryPlugin::armPrepare(unsigned long delayMs) {
+    if (!holdHandles) {
+        return;
+    }
+    prepareDueAt = millis() + delayMs;
+    prepareArmed = true;
+}
+
+void ShotHistoryPlugin::preparePending() {
+    if (!prepareArmed || static_cast<long>(millis() - prepareDueAt) < 0) {
+        return;
+    }
+    prepareArmed = false;
+    prepareNextShot();
+}
+
+void ShotHistoryPlugin::prepareNextShot() {
+    const String nextId = padId(String(controller->getSettings().getHistoryIndex()));
+    if (!(preparedLog && preparedId == nextId)) {
+        dropPreparedLog(true);
+        if (!fs->exists("/h")) {
+            fs->mkdir("/h");
+        }
+        // FILE_WRITE truncates. A file under the next id that already holds
+        // data is not ours to empty at idle (the counter can trail the card
+        // after an NVS reset with no index); the shot's own open still takes
+        // it, as it always has.
+        const long existing = historyFileSize(*fs, nextId + ".slog");
+        if (existing > 0) {
+            ESP_LOGW("ShotHistoryPlugin", "Not pre-opening shot log %s: a %ld byte file is already there", nextId.c_str(),
+                     existing);
+        } else {
+            preparedLog = fs->open("/h/" + nextId + ".slog", FILE_WRITE);
+            if (preparedLog) {
+                preparedId = nextId;
+            } else {
+                ESP_LOGW("ShotHistoryPlugin", "Could not pre-open shot log %s; the shot will open it", nextId.c_str());
+            }
+        }
+    }
+    std::lock_guard<std::recursive_mutex> guard(indexLock);
+    if (ensureIndexExists()) {
+        holdIndex();
+    }
+}
+
+void ShotHistoryPlugin::dropPreparedLog(bool removeFile) {
+    if (preparedLog) {
+        preparedLog.close();
+        preparedLog = File();
+        // It was created empty by prepareNextShot and nothing wrote to it.
+        if (removeFile && preparedId.length() > 0) {
+            fs->remove("/h/" + preparedId + ".slog");
+        }
+    }
+    preparedId = "";
+}
+
+void ShotHistoryPlugin::holdIndex() {
+    std::lock_guard<std::recursive_mutex> guard(indexLock);
+    wantIndexHeld = true;
+    if (heldIndex) {
+        return;
+    }
+    heldIndex = fs->open("/h/index.bin", "r+");
+    if (!heldIndex) {
+        ESP_LOGW("ShotHistoryPlugin", "Could not hold index.bin open; index writes open it per use");
+    }
+}
+
+void ShotHistoryPlugin::releaseHeldIndex() {
+    std::lock_guard<std::recursive_mutex> guard(indexLock);
+    wantIndexHeld = false;
+    if (heldIndex) {
+        heldIndex.close();
+        heldIndex = File();
+    }
+}
+
+ShotHistoryPlugin::IndexAccess::IndexAccess(ShotHistoryPlugin &plugin, const char *mode) : p(plugin) {
+    if (p.heldIndex) {
+        f = p.heldIndex;
+        held = true;
+        f.seek(0, SeekSet);
+    } else {
+        f = p.fs->open("/h/index.bin", mode);
+    }
+}
+
+ShotHistoryPlugin::IndexAccess::~IndexAccess() {
+    if (held) {
+        // fflush plus fsync: the directory entry's size is written, so an
+        // fopen on another task sees what was appended. Nothing to do and no
+        // I/O when the access only read.
+        f.flush();
+    } else if (f) {
+        f.close();
     }
 }
 
@@ -822,6 +957,9 @@ void ShotHistoryPlugin::loopTask(void *arg) {
     // Before any shot is recorded, and off the setup task: opening index.bin
     // on the SD card walks /h, which takes seconds on a large history.
     plugin->syncNextIdWithIndex();
+    // Pre-open the first shot's log and the index now, at boot, while the
+    // task is already paying for the index walk above.
+    plugin->armPrepare(0);
     while (true) {
         plugin->record();
         // Use canonical interval from shot log format to avoid divergence.
@@ -857,7 +995,18 @@ void ShotHistoryPlugin::flushBuffer() {
 // Index management methods
 bool ShotHistoryPlugin::ensureIndexExists() {
     std::lock_guard<std::recursive_mutex> guard(indexLock);
-    if (fs->exists("/h/index.bin")) {
+    if (heldIndex) {
+        // Held open: validate through the handle, no exists() walk.
+        heldIndex.seek(0, SeekSet);
+        ShotIndexHeader hdr{};
+        if (heldIndex.read(reinterpret_cast<uint8_t *>(&hdr), sizeof(hdr)) == sizeof(hdr) && hdr.magic == SHOT_INDEX_MAGIC) {
+            return true;
+        }
+        ESP_LOGW("ShotHistoryPlugin", "Corrupt index file detected (bad magic), recreating");
+        heldIndex.close();
+        heldIndex = File();
+        fs->remove("/h/index.bin");
+    } else if (fs->exists("/h/index.bin")) {
         // Validate existing index header
         File indexFile = fs->open("/h/index.bin", "r");
         if (indexFile) {
@@ -899,6 +1048,10 @@ bool ShotHistoryPlugin::ensureIndexExists() {
     }
 
     ESP_LOGI("ShotHistoryPlugin", "Created new index file");
+    // A held handle closed above for a corrupt file is reopened on the new one.
+    if (wantIndexHeld) {
+        holdIndex();
+    }
     return true;
 }
 
@@ -908,7 +1061,8 @@ bool ShotHistoryPlugin::appendToIndex(const ShotIndexEntry &entry) {
         return false;
     }
 
-    File indexFile = fs->open("/h/index.bin", "r+");
+    IndexAccess access(*this, "r+");
+    File &indexFile = access.file();
     if (!indexFile) {
         ESP_LOGE("ShotHistoryPlugin", "Failed to open index file for append");
         return false;
@@ -916,7 +1070,6 @@ bool ShotHistoryPlugin::appendToIndex(const ShotIndexEntry &entry) {
 
     ShotIndexHeader header{};
     if (!readIndexHeader(indexFile, header)) {
-        indexFile.close();
         return false;
     }
 
@@ -925,11 +1078,9 @@ bool ShotHistoryPlugin::appendToIndex(const ShotIndexEntry &entry) {
     if (existingPos >= 0) {
         if (writeEntryAtPosition(indexFile, existingPos, entry)) {
             ESP_LOGD("ShotHistoryPlugin", "Updated existing index entry for shot %u", entry.id);
-            indexFile.close();
             return true;
         }
         ESP_LOGE("ShotHistoryPlugin", "Failed to update existing index entry for shot %u", entry.id);
-        indexFile.close();
         return false;
     }
 
@@ -951,7 +1102,6 @@ bool ShotHistoryPlugin::appendToIndex(const ShotIndexEntry &entry) {
     size_t written = indexFile.write(reinterpret_cast<const uint8_t *>(&entry), sizeof(entry));
     if (written != sizeof(entry)) {
         ESP_LOGE("ShotHistoryPlugin", "Failed to write index entry for shot %u", entry.id);
-        indexFile.close();
         return false;
     }
 
@@ -968,18 +1118,17 @@ bool ShotHistoryPlugin::appendToIndex(const ShotIndexEntry &entry) {
     }
     if (!writeIndexHeader(indexFile, header)) {
         ESP_LOGE("ShotHistoryPlugin", "Wrote index entry for shot %u but could not update the header", entry.id);
-        indexFile.close();
         return false;
     }
 
-    indexFile.close();
     ESP_LOGD("ShotHistoryPlugin", "Appended shot %u to index", entry.id);
     return true;
 }
 
 void ShotHistoryPlugin::updateIndexMetadata(uint32_t shotId, uint8_t rating, uint16_t volume) {
     std::lock_guard<std::recursive_mutex> guard(indexLock);
-    File indexFile = fs->open("/h/index.bin", "r+");
+    IndexAccess access(*this, "r+");
+    File &indexFile = access.file();
     if (!indexFile) {
         ESP_LOGE("ShotHistoryPlugin", "Failed to open index file for metadata update");
         return;
@@ -987,7 +1136,6 @@ void ShotHistoryPlugin::updateIndexMetadata(uint32_t shotId, uint8_t rating, uin
 
     ShotIndexHeader header{};
     if (!readIndexHeader(indexFile, header)) {
-        indexFile.close();
         return;
     }
 
@@ -1010,13 +1158,12 @@ void ShotHistoryPlugin::updateIndexMetadata(uint32_t shotId, uint8_t rating, uin
     } else {
         ESP_LOGW("ShotHistoryPlugin", "Shot %u not found in index for metadata update", shotId);
     }
-
-    indexFile.close();
 }
 
 void ShotHistoryPlugin::markIndexDeleted(uint32_t shotId) {
     std::lock_guard<std::recursive_mutex> guard(indexLock);
-    File indexFile = fs->open("/h/index.bin", "r+");
+    IndexAccess access(*this, "r+");
+    File &indexFile = access.file();
     if (!indexFile) {
         ESP_LOGE("ShotHistoryPlugin", "Failed to open index file for deletion marking");
         return;
@@ -1024,7 +1171,6 @@ void ShotHistoryPlugin::markIndexDeleted(uint32_t shotId) {
 
     ShotIndexHeader header{};
     if (!readIndexHeader(indexFile, header)) {
-        indexFile.close();
         return;
     }
 
@@ -1053,20 +1199,18 @@ void ShotHistoryPlugin::markIndexDeleted(uint32_t shotId) {
     } else if (duplicatesFound > 1) {
         ESP_LOGW("ShotHistoryPlugin", "Found and marked %u duplicate entries for shot %u as deleted", duplicatesFound, shotId);
     }
-
-    indexFile.close();
 }
 
 size_t ShotHistoryPlugin::readRecentEntries(ShotIndexEntry *outEntries, size_t maxCount) {
     std::lock_guard<std::recursive_mutex> guard(indexLock);
-    File indexFile = fs->open("/h/index.bin", "r");
+    IndexAccess access(*this, "r");
+    File &indexFile = access.file();
     if (!indexFile) {
         return 0;
     }
 
     ShotIndexHeader header{};
     if (!readIndexHeader(indexFile, header)) {
-        indexFile.close();
         return 0;
     }
 
@@ -1084,7 +1228,6 @@ size_t ShotHistoryPlugin::readRecentEntries(ShotIndexEntry *outEntries, size_t m
         outEntries[found++] = entry;
     }
 
-    indexFile.close();
     return found;
 }
 
@@ -1092,24 +1235,22 @@ bool ShotHistoryPlugin::snapshotIndex(uint8_t **outBuf, size_t *outLen) {
     *outBuf = nullptr;
     *outLen = 0;
     std::lock_guard<std::recursive_mutex> guard(indexLock);
-    File indexFile = fs->open("/h/index.bin", "r");
+    IndexAccess access(*this, "r");
+    File &indexFile = access.file();
     if (!indexFile) {
         return false;
     }
     ShotIndexHeader header{};
     if (!readIndexHeader(indexFile, header)) {
-        indexFile.close();
         return false;
     }
     const size_t wanted = sizeof(ShotIndexHeader) + static_cast<size_t>(header.entryCount) * sizeof(ShotIndexEntry);
     auto *buf = static_cast<uint8_t *>(ps_malloc(wanted));
     if (buf == nullptr) {
         ESP_LOGE("ShotHistoryPlugin", "No memory for a %u byte index snapshot", static_cast<unsigned>(wanted));
-        indexFile.close();
         return false;
     }
     const size_t got = indexFile.read(buf + sizeof(ShotIndexHeader), wanted - sizeof(ShotIndexHeader));
-    indexFile.close();
     // A file shorter than its header claims (an append whose header write
     // landed but whose entry did not) is served as the entries it holds.
     const uint32_t entries = static_cast<uint32_t>(got / sizeof(ShotIndexEntry));
@@ -1129,13 +1270,13 @@ void ShotHistoryPlugin::syncNextIdWithIndex() {
         return;
     }
     nextIdSynced = true;
-    File indexFile = fs->open("/h/index.bin", "r");
+    IndexAccess access(*this, "r");
+    File &indexFile = access.file();
     if (!indexFile) {
         return;
     }
     ShotIndexHeader header{};
     if (!readIndexHeader(indexFile, header)) {
-        indexFile.close();
         return;
     }
     // One sequential read of the whole index, eight entries at a time (1 KB
@@ -1166,7 +1307,6 @@ void ShotHistoryPlugin::syncNextIdWithIndex() {
             break;
         }
     }
-    indexFile.close();
 
     if (!sorted) {
         ESP_LOGW("ShotHistoryPlugin", "index.bin is not in id order; lookups fall back to a linear scan until a rebuild");
@@ -1226,6 +1366,12 @@ void ShotHistoryPlugin::rebuildIndex() {
     bool created;
     {
         std::lock_guard<std::recursive_mutex> guard(indexLock);
+        // A handle held across a shot must not outlive the file it points at.
+        // ensureIndexExists reopens it on the new file if a prepare wants it.
+        if (heldIndex) {
+            heldIndex.close();
+            heldIndex = File();
+        }
         fs->remove("/h/index.bin");
         created = ensureIndexExists();
         indexOrderBroken = false;
