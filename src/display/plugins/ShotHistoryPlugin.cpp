@@ -453,13 +453,15 @@ void ShotHistoryPlugin::record() {
                 pluginManager->trigger(savedEvent);
             }
         }
-        // The shot's last index write is done. The index goes back to
-        // open-per-use until the next prepare, which waits so the walks it
-        // costs do not land on the finished screen.
-        {
-            std::lock_guard<std::recursive_mutex> guard(indexLock);
-            releaseHeldIndex();
-        }
+        // The shot's last index write is done. The index stays held: the
+        // first version released it here and reopened it at the next
+        // prepare, and that reopen is three directory walks of /h (the
+        // Arduino File's two stats and FatFs's own lookup, about 2 s each on
+        // a 3,000 shot card) that landed on the finished screen 20 s after
+        // every shot, next to the five the log pre-open costs (gm-5x0v,
+        // measured 2026-10-04: the animation at 0.6 to 1.6 fps for two
+        // windows of about 2 s). rebuildIndex and ensureIndexExists close
+        // the handle before they remove the file.
         armPrepare(PREPARE_DELAY_AFTER_SHOT_MS);
     }
     if (!recording && !extendedRecording && !isFileOpen) {

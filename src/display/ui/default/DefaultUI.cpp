@@ -776,6 +776,17 @@ void DefaultUI::serviceBarElement(bool canOwn) {
         barElem.lastX2 = -1;
         barElem.opa = lv_obj_get_style_bg_opa(bar, LV_PART_INDICATOR);
         lv_obj_set_style_bg_opa(bar, LV_OPA_TRANSP, LV_PART_INDICATOR);
+        // The style change above invalidates the bar once, so the overlay
+        // loses LVGL's fill. From here on the bar owes LVGL nothing: the
+        // generated tick's lv_bar_set_value invalidates the bar's box plus
+        // its 5 px indicator margin on every value (330x20 on the status
+        // screen), and each one was a snapshot and a publish, 2 to 5 a
+        // second for the whole shot, while the element already carried the
+        // fill (gm-5x0v, the owner's "freezes periodically" during a brew).
+        // USER_3 is the layer-owner flag the patched lv_obj_invalidate_area
+        // drops invalidations for (patch_lvgl_label_elem.py); the track is
+        // static and stays in the overlay from this pass.
+        lv_obj_add_flag(bar, LV_OBJ_FLAG_USER_3);
         overlayUrgentUntilUs = now + GM_TOUCH_GRACE_US;
     } else {
         int64_t dt = now - barElem.lastUs;
@@ -833,7 +844,11 @@ void DefaultUI::releaseBarElement() {
     }
     sleepAnimation.clearElement(BAR_ELEMENT);
     if (barElem.bar != nullptr) {
+        // Flag off first, so the style restore's invalidation reaches the
+        // display and LVGL draws its own fill again.
+        lv_obj_clear_flag(barElem.bar, LV_OBJ_FLAG_USER_3);
         lv_obj_remove_local_style_prop(barElem.bar, LV_STYLE_BG_OPA, LV_PART_INDICATOR);
+        lv_obj_invalidate(barElem.bar);
         overlayUrgentUntilUs = esp_timer_get_time() + GM_TOUCH_GRACE_US;
     }
     barElem.owned = false;
