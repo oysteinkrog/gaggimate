@@ -40,12 +40,13 @@ struct BlobDraw {
 };
 
 Wisp wisps[WISPS_MAX];
-Blob blobs[BLOBS_MAX];
-BlobDraw draws[BLOBS_MAX];
+Blob *blobs = nullptr;
+BlobDraw *draws = nullptr;
 uint8_t *alphaLUT = nullptr; // (1-sqrt(i/63))^1.6
 uint16_t *bgLUT = nullptr;
 int wispCount = 0;
 int builtCount = -1;
+int allocH = 0; // height bgLUT was sized for
 uint32_t rng = 0x1234abcd;
 int g_active = 0;
 uint32_t lastThemeGen = 0xFFFFFFFF;
@@ -86,8 +87,21 @@ void buildWisps(int count, int w, int h, uint32_t tMs) {
 }
 
 bool init(int, int h) {
+    if (blobs == nullptr) {
+        blobs = static_cast<Blob *>(alloc(BLOBS_MAX * sizeof(Blob)));
+        draws = static_cast<BlobDraw *>(alloc(BLOBS_MAX * sizeof(BlobDraw)));
+        // A fresh allocation holds garbage, not zeros, so no previous build
+        // survives in it. builtCount is a file-scope static that would survive,
+        // and if it happened to match the requested count buildWisps() would be
+        // skipped and frame() would read uninitialised blobs.
+        builtCount = -1;
+    }
+    if (blobs == nullptr || draws == nullptr) {
+        return false;
+    }
     if (alphaLUT == nullptr) {
         alphaLUT = static_cast<uint8_t *>(alloc(64));
+        allocH = h;
         bgLUT = static_cast<uint16_t *>(alloc(h * sizeof(uint16_t)));
         if (alphaLUT == nullptr || bgLUT == nullptr) {
             return false;
@@ -118,6 +132,14 @@ void frame(uint32_t tMs, int w, int h, const uint8_t p[4]) {
     const float swirl = 0.5f + (p[2] / 100.0f) * 1.7f;
     const float density = 0.5f + (p[3] / 100.0f) * 0.8f;
     const float maxHeight = h * 0.62f;
+    // Blob radii and sway amplitudes below were written as absolute pixel
+    // counts, which silently assumed the render target is always 480 wide.
+    // It is not: the renderer can compute the animation at half resolution and
+    // double it on the way out, and an absolute radius makes the blobs cover
+    // four times the relative area there -- so the stamping cost stays flat
+    // while everything else quarters. Scaling them to the render width keeps
+    // the picture identical at any resolution and makes the cost scale with it.
+    const float rscale = w * (1.0f / 480.0f);
 
     g_active = wispCount * BLOBS_PER_WISP;
     for (int i = 0; i < g_active; i++) {
@@ -133,8 +155,8 @@ void frame(uint32_t tMs, int w, int h, const uint8_t p[4]) {
         const float rise = riseSpeed * age;
         const float heightFrac = fminf(1.0f, rise / maxHeight);
         const float y = wp.y0 - rise;
-        const float R = (10.0f + 26.0f * heightFrac) * (0.85f + 0.3f * fastSinRad(b.seed));
-        const float swayAmp = (5.0f + 22.0f * heightFrac) * swirl;
+        const float R = (10.0f + 26.0f * heightFrac) * (0.85f + 0.3f * fastSinRad(b.seed)) * rscale;
+        const float swayAmp = (5.0f + 22.0f * heightFrac) * swirl * rscale;
         const float x = wp.x0 + swayAmp * fastSinRad(wp.swayFreq1 * tMs + wp.swayPhase1 + b.seed) +
                         swayAmp * 0.35f * fastSinRad(wp.swayFreq2 * tMs + wp.swayPhase2 + b.seed * 1.7f);
         float alpha = density * 0.44f * 4.0f * L * (1.0f - L) * (1.0f - heightFrac * 0.3f);
@@ -208,6 +230,16 @@ void band(uint16_t *dst, int y0, int rows, int w, uint32_t, const uint8_t *) {
     }
 }
 
+void release() {
+    releaseTable(blobs, static_cast<size_t>(BLOBS_MAX) * sizeof(Blob));
+    releaseTable(draws, static_cast<size_t>(BLOBS_MAX) * sizeof(BlobDraw));
+    releaseTable(alphaLUT, 64);
+    releaseTable(bgLUT, static_cast<size_t>(allocH) * sizeof(uint16_t));
+    allocH = 0;
+    builtCount = -1;
+    lastThemeGen = 0xFFFFFFFF;
+}
+
 } // namespace
 
 extern const BgAnimation bg_anim_steam;
@@ -218,6 +250,7 @@ const BgAnimation bg_anim_steam = {
     init,
     frame,
     band,
+    release,
 };
 
 #endif // GAGGIMATE_SIM

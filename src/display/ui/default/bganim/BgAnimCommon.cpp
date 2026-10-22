@@ -20,6 +20,17 @@ const int16_t *sinLut() {
     return lut;
 }
 
+size_t g_allocSram = 0;
+size_t g_allocPsram = 0;
+
+namespace {
+// Internal SRAM on the S3 is the 0x3FC.. data range; PSRAM maps at 0x3C...
+bool isPsram(const void *p) {
+    const uintptr_t a = reinterpret_cast<uintptr_t>(p);
+    return a >= 0x3C000000u && a < 0x3E000000u;
+}
+} // namespace
+
 void *alloc(size_t size) {
     // Animations allocate their LUTs lazily on first use and never free them,
     // so switching through the whole fleet in one power cycle accumulates every
@@ -31,9 +42,43 @@ void *alloc(size_t size) {
     // Small tables stay in SRAM, where their random-access latency actually
     // matters. Anything large is a bulk table read in sequential sweeps, which
     // PSRAM (8 MB, cache-line prefetched) serves fine.
-    if (size > SRAM_ALLOC_LIMIT) {
+    //
+    // CAVEAT for future tables: this size test is a proxy for access pattern,
+    // and the proxy fails for a large table indexed by a value computed per
+    // pixel. Aurora used to keep (v*v)>>12 in a 16 KB table for exactly that
+    // kind of index; being over the threshold put it in PSRAM and every pixel
+    // paid a bus round trip to avoid one multiply. Deleting the table was
+    // worth -21% on that animation. If a new table is over the limit AND its
+    // index is not monotonic across a row, either shrink it under the limit or
+    // compute the value instead -- do not assume PSRAM will serve it.
+    //
+    // The per-allocation size test above is necessary but NOT sufficient, and
+    // that gap was a real bug: it bounds one table but says nothing about the
+    // sum. Measured on device, walking the bench sweep through the fleet took
+    // the internal-SRAM total to 4,992 -> 8,448 -> 30,984 -> 42,068 -> 50,772
+    // -> 53,396 bytes, monotonically, none of it ever freed. The web UI went
+    // unreachable the moment it crossed 53 KB, and stayed unreachable.
+    //
+    // The failure is silent and does not look like memory pressure. lwIP's
+    // tcp_listen_input() drops an incoming SYN with no RST when tcp_alloc()
+    // returns null, so the symptom is a TCP connect TIMEOUT, while ICMP -- which
+    // allocates nothing -- keeps answering normally and uptime keeps climbing.
+    // For most of a session that reads as "the board hung", which is what it
+    // was misdiagnosed as, repeatedly.
+    //
+    // So the budget is cumulative, checked before the request rather than after.
+    // The first tables to ask still land in SRAM where the latency matters; once
+    // the fleet has taken its share, later tables go to PSRAM instead of eating
+    // the pool the network stack lives in. This is only a ceiling: it does not
+    // reclaim anything, because animations hold their tables in static pointers
+    // and re-initialise only when those are null. Freeing on switch would cap
+    // the peak at max-over-animations instead of sum-over-animations, and is the
+    // right eventual fix; it needs a release entry point on every animation.
+    const bool overBudget = g_allocSram + size > SRAM_TOTAL_BUDGET;
+    if (size > SRAM_ALLOC_LIMIT || overBudget) {
         void *big = ps_malloc(size);
         if (big != nullptr) {
+            g_allocPsram += size;
             return big;
         }
         // No PSRAM (or it is exhausted): fall through and try SRAM anyway
@@ -46,7 +91,24 @@ void *alloc(size_t size) {
             log_w("bganim: %u B in PSRAM (internal SRAM full)", static_cast<unsigned>(size));
         }
     }
+    if (p != nullptr) {
+        (isPsram(p) ? g_allocPsram : g_allocSram) += size;
+    }
     return p;
+}
+
+void release(void *&p, size_t size) {
+    if (p == nullptr) {
+        return;
+    }
+    // Decrement the pool the pointer actually came from, not the one the
+    // placement policy would have picked: a request over the per-allocation
+    // limit, or one made after the budget was spent, went to PSRAM, and an
+    // internal request can also have fallen back to PSRAM when SRAM was full.
+    size_t &counter = isPsram(p) ? g_allocPsram : g_allocSram;
+    counter = (counter > size) ? counter - size : 0;
+    heap_caps_free(p);
+    p = nullptr;
 }
 
 const float *cosTableF() {

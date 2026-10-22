@@ -44,8 +44,6 @@ int32_t *wLut2 = nullptr; // [1024] sin1024(i) * W2
 // full signed range so the per-pixel "clip negative to 0, then square>>12"
 // collapses to one branchless offset array read (negative entries are 0).
 constexpr int32_t V_MAX = (512 * (W1 + W2)) >> 7;
-uint16_t *sqLUTStorage = nullptr; // [2*V_MAX+1], indexed via sqLUT = storage + V_MAX
-uint16_t *sqLUT = nullptr;        // sqLUT[v] valid for v in [-V_MAX, V_MAX]
 
 float g_t = 0, g_A1 = 0, g_A2 = 0;
 int32_t g_inten14 = 0; // intensity * 1.4 in Q8
@@ -90,19 +88,12 @@ bool init(int, int) {
     if (wLut2 == nullptr) {
         wLut2 = static_cast<int32_t *>(alloc(SIN_N * sizeof(int32_t)));
     }
-    if (sqLUTStorage == nullptr) {
-        sqLUTStorage = static_cast<uint16_t *>(alloc((2 * V_MAX + 1) * sizeof(uint16_t)));
-        sqLUT = sqLUTStorage + V_MAX;
-    }
-    if (glowLUT == nullptr || wLut1 == nullptr || wLut2 == nullptr || sqLUTStorage == nullptr) {
+    if (glowLUT == nullptr || wLut1 == nullptr || wLut2 == nullptr) {
         return false;
     }
     for (int i = 0; i < SIN_N; i++) {
         wLut1[i] = static_cast<int32_t>(lut[i]) * W1;
         wLut2[i] = static_cast<int32_t>(lut[i]) * W2;
-    }
-    for (int32_t v = -V_MAX; v <= V_MAX; v++) {
-        sqLUT[v] = v < 0 ? 0 : static_cast<uint16_t>((v * v) >> 12);
     }
     buildGlowLUT();
     lastThemeGen = themeGen();
@@ -132,7 +123,6 @@ void band(uint16_t *dst, int y0, int rows, int w, uint32_t, const uint8_t *) {
     // twice per pixel, plus two multiplies) down to two plain array loads.
     const int32_t *__restrict w1 = wLut1;
     const int32_t *__restrict w2 = wLut2;
-    const uint16_t *__restrict sq = sqLUT; // sq[v] valid for v in [-V_MAX, V_MAX], 0 for v<0
 
     // Cache cosTableF() once too: fastSinRad()/fastCosRad() each call it
     // internally (another non-inlinable external call), and row-setup below
@@ -248,17 +238,34 @@ void band(uint16_t *dst, int y0, int rows, int w, uint32_t, const uint8_t *) {
         // compare + branch) across 8 pixels instead of paying it every pixel.
         // No clip left at all: rowLUT is padded to cover the analytically
         // bounded pre-clip range, so the index is always valid.
-        auto pixel = [&](int bit) -> uint16_t {
+        // always_inline is load-bearing, not a hint. At -O2 GCC declined to
+        // inline these two and emitted them as real functions, so the
+        // "unrolled, branch-free" loop below actually compiled to four
+        // indirect callx8 per 8 pixels -- a windowed-ABI register rotation
+        // plus caller-saved spills to stack plus a recomputed frame address
+        // to pass the by-reference captures, on every second pixel. That is
+        // where aurora's ~82 cycles/pixel went. Verified by disassembly, not
+        // assumed: before this attribute, band() contained 8 callx8 and the
+        // object exported two lambda operator() symbols.
+        auto pixel = [&](int bit) __attribute__((always_inline)) -> uint16_t {
             const int32_t v = (w1[(ph1 >> 8) & 1023] + w2[(ph2 >> 8) & 1023]) >> 7; // ~±4112
             ph1 += STEP1;
             ph2 += STEP2;
-            const int32_t scaledSq = (sq[v] * rowScale) >> 12;
+            // Was a table read: sqLUT[v] for v in [-V_MAX, V_MAX], which at
+            // V_MAX=4112 is 16,450 bytes -- over alloc()'s 8 KB threshold, so
+            // it lived in PSRAM, and v is computed per pixel, so the access
+            // was random rather than the sequential sweep that threshold
+            // assumes. Every pixel paid a PSRAM round trip to look up one
+            // multiply and one shift. Values are identical, so the rowLUT
+            // padding bounds derived from SQ_MAX still hold exactly.
+            const int32_t vc = v > 0 ? v : 0;
+            const int32_t scaledSq = (((vc * vc) >> 12) * rowScale) >> 12;
             return rowLUTAtBit[bit][scaledSq];
         };
         // Two pixels' worth of work packed into one 32-bit store (dst is
         // 4-byte aligned and w is even -- see xtensa-asm addendum). Halves
         // the store traffic vs. one s16i per pixel.
-        auto emitPair = [&](int xi, int bit0) {
+        auto emitPair = [&](int xi, int bit0) __attribute__((always_inline)) {
             const uint16_t p0 = pixel(bit0);
             const uint16_t p1 = pixel(bit0 + 1);
             *reinterpret_cast<uint32_t *>(row + xi) = static_cast<uint32_t>(p0) | (static_cast<uint32_t>(p1) << 16);
@@ -280,6 +287,13 @@ void band(uint16_t *dst, int y0, int rows, int w, uint32_t, const uint8_t *) {
     }
 }
 
+void release() {
+    releaseTable(glowLUT, 256 * sizeof(uint16_t));
+    releaseTable(wLut1, static_cast<size_t>(SIN_N) * sizeof(int32_t));
+    releaseTable(wLut2, static_cast<size_t>(SIN_N) * sizeof(int32_t));
+    lastThemeGen = 0xFFFFFFFF;
+}
+
 } // namespace
 
 extern const BgAnimation bg_anim_aurora;
@@ -290,6 +304,7 @@ const BgAnimation bg_anim_aurora = {
     init,
     frame,
     band,
+    release,
 };
 
 #endif // GAGGIMATE_SIM

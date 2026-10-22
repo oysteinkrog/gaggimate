@@ -11,9 +11,18 @@
 #include <display/plugins/BLEScalePlugin.h>
 #include <display/plugins/ShotHistoryPlugin.h>
 #ifdef GM_ANIM_BENCH
+#include <display/drivers/common/PanelClock.h>
 #include <display/ui/default/SleepAnimation.h>
 #include <display/ui/default/bganim/BgAnim.h>
+#include <display/ui/default/bganim/BgAnimCommon.h>
+#include <esp32s3/rom/cache.h> // Cache_WriteBack_Addr / Cache_Invalidate_Addr for /api/dmatest
+#include <esp_async_memcpy.h>
+#include <soc/gdma_channel.h> // SOC_GDMA_TRIG_PERIPH_LCD0 for /api/gdma
+#include <soc/gdma_struct.h>  // direct GDMA register access for /api/gdma
+#include <esp_heap_caps.h>
 #endif
+// Not bench-only: /api/debug/heap reports the animation SRAM budget.
+#include <display/ui/default/bganim/BgAnimCommon.h>
 #include <display/util/PsramStlAllocator.h>
 #include <display/util/PsramWsBuffer.h>
 #include <display/webassets/web_ui_manifest.h>
@@ -365,6 +374,38 @@ void WebUIPlugin::setupServer() {
     server.on("/success.txt", [](AsyncWebServerRequest *request) { request->send(200); }); // firefox captive portal call home
     server.on("/ncsi.txt", [](AsyncWebServerRequest *request) { request->redirect(LOCAL_URL); }); // windows call home
     server.on("/api/settings", [this](AsyncWebServerRequest *request) { handleSettings(request); });
+    // Headroom in the pool that actually runs out. Internal DRAM is the
+    // scarce one: ESPAsyncWebServer stages every response through a
+    // 2,872-byte buffer (ASYNC_RESPONCE_BUFF_SIZE, CONFIG_LWIP_TCP_MSS * 2)
+    // that it allocates and frees per send round, and with
+    // CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL at 4096 that allocation can never
+    // spill to PSRAM. When it fails, write_send_buffs() just breaks: no error,
+    // no RST, the response simply stalls forever.
+    //
+    // int_min is the one to watch -- the low-water mark since boot, which is
+    // what says how close the pool actually came to empty, rather than where it
+    // happens to sit when polled. Built with a fixed stack buffer so the
+    // endpoint still answers when the heap is too tight for a response stream.
+    // Exposes no configuration and no secrets.
+    server.on("/api/debug/heap", [](AsyncWebServerRequest *request) {
+        // anim_sram is the committed part of the animation budget and
+        // anim_budget its ceiling. The gap between them is the important
+        // figure: alloc() never frees, so every animation the user visits
+        // converts more of that gap into permanently resident internal DRAM.
+        // A comfortable int_min means nothing if the gap is larger than it.
+        char buf[320];
+        snprintf(buf, sizeof(buf),
+                 "{\"int_free\":%u,\"int_largest\":%u,\"int_min\":%u,\"psram_free\":%u,\"psram_largest\":%u,"
+                 "\"anim_sram\":%u,\"anim_psram\":%u,\"anim_budget\":%u}",
+                 static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL)),
+                 static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL)),
+                 static_cast<unsigned>(heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL)),
+                 static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_SPIRAM)),
+                 static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM)),
+                 static_cast<unsigned>(bganim::g_allocSram), static_cast<unsigned>(bganim::g_allocPsram),
+                 static_cast<unsigned>(bganim::SRAM_TOTAL_BUDGET));
+        request->send(200, "application/json", buf);
+    });
     server.on("/api/status", [this](AsyncWebServerRequest *request) {
         AsyncResponseStream *response = request->beginResponseStream("application/json");
         JsonDocument doc(&psramAllocator);
@@ -375,12 +416,416 @@ void WebUIPlugin::setupServer() {
         request->send(response);
     });
 #ifdef GM_ANIM_BENCH
+    // Bench build only: raw memory-path throughput, to attribute the flat ~19 ms
+    // push cost. esp_lcd_panel_draw_bitmap on an fb_in_psram panel is a CPU
+    // memcpy into the PSRAM framebuffer plus a cache writeback, so push should
+    // be bounded by whatever "memcpy SRAM -> PSRAM" measures here. The
+    // interesting comparison is against the read direction: a write that costs
+    // about twice a read is the signature of read-for-ownership, since the
+    // 32-byte write-allocate cache line gets fetched from PSRAM before it is
+    // overwritten. If that holds, a GDMA transfer -- which never passes through
+    // the CPU cache -- moves the same bytes for half the traffic, which is why
+    // esp_async_memcpy is measured alongside. Everything runs with the panel
+    // scanning out, so the numbers include the contention push really sees.
+    // Does GDMA actually deliver what it was handed? The animation's direct
+    // framebuffer push renders a sheared image while a byte-identical CPU copy
+    // to the same address renders correctly, which leaves two possibilities:
+    // the transfer is unfaithful, or it is faithful and the artefact is the
+    // panel scanning the region while it is written. Asking the panel cannot
+    // separate those. This can: same source alignment, same size, same engine
+    // config as the animation uses, but into scratch PSRAM nobody is scanning,
+    // then read back and compared.
+    // What is actually programmed into the GDMA channels, read back from the
+    // hardware rather than assumed. Two things worth knowing: which channel the
+    // RGB panel driver took (it never exposes its handle, so the only way to
+    // find it from outside is to scan the peripheral-select registers for
+    // LCD_CAM's trigger ID), and what external-memory block size each channel
+    // is running.
+    //
+    // That second one matters because the esp32s3 register field documents only
+    // 16 and 32 bytes as valid -- gdma_struct.h:212, "0: 16 bytes 1: 32 bytes
+    // 2/3:reserved" -- while the shared LL header still offers a 64B constant
+    // that is legal only on other targets. Both the panel init and the async
+    // memcpy config in this tree ask for 64.
+    //
+    // The poke arguments write the same fields at runtime so their effect can be
+    // measured without a reflash: ?ch=N with bkin/bkout (0=16B, 1=32B, 2=64B)
+    // and priin/priout (0-15).
+    server.on("/api/gdma", [this](AsyncWebServerRequest *request) {
+        AsyncResponseStream *response = request->beginResponseStream("application/json");
+        JsonDocument doc;
+        if (request->hasArg("ch")) {
+            const int ch = request->arg("ch").toInt();
+            if (ch >= 0 && ch < 5) {
+                if (request->hasArg("bkin")) {
+                    GDMA.channel[ch].in.conf1.in_ext_mem_bk_size = request->arg("bkin").toInt() & 0x3;
+                }
+                if (request->hasArg("bkout")) {
+                    GDMA.channel[ch].out.conf1.out_ext_mem_bk_size = request->arg("bkout").toInt() & 0x3;
+                }
+                if (request->hasArg("priin")) {
+                    GDMA.channel[ch].in.pri.rx_pri = request->arg("priin").toInt() & 0xF;
+                }
+                if (request->hasArg("priout")) {
+                    GDMA.channel[ch].out.pri.tx_pri = request->arg("priout").toInt() & 0xF;
+                }
+                doc["poked"] = ch;
+            }
+        }
+        JsonArray chans = doc["channels"].to<JsonArray>();
+        for (int ch = 0; ch < 5; ch++) {
+            JsonObject o = chans.add<JsonObject>();
+            o["ch"] = ch;
+            o["in_sel"] = static_cast<uint32_t>(GDMA.channel[ch].in.peri_sel.sel);
+            o["out_sel"] = static_cast<uint32_t>(GDMA.channel[ch].out.peri_sel.sel);
+            o["mem_trans"] = static_cast<uint32_t>(GDMA.channel[ch].in.conf0.mem_trans_en);
+            o["in_bk"] = static_cast<uint32_t>(GDMA.channel[ch].in.conf1.in_ext_mem_bk_size);
+            o["out_bk"] = static_cast<uint32_t>(GDMA.channel[ch].out.conf1.out_ext_mem_bk_size);
+            o["in_pri"] = static_cast<uint32_t>(GDMA.channel[ch].in.pri.rx_pri);
+            o["out_pri"] = static_cast<uint32_t>(GDMA.channel[ch].out.pri.tx_pri);
+            // The whole "M2M starves the LCD" theory predicts exactly one thing:
+            // the LCD channel's transmit FIFO runs dry. These are the raw
+            // interrupt status bits for that, sticky until cleared, so the
+            // hypothesis stops being an inference. l1 is the per-channel FIFO,
+            // l3 the shared one.
+            o["outfifo_udf"] = static_cast<uint32_t>(GDMA.channel[ch].out.int_raw.outfifo_udf_l1) |
+                               (static_cast<uint32_t>(GDMA.channel[ch].out.int_raw.outfifo_udf_l3) << 1);
+            o["outfifo_ovf"] = static_cast<uint32_t>(GDMA.channel[ch].out.int_raw.outfifo_ovf_l1) |
+                               (static_cast<uint32_t>(GDMA.channel[ch].out.int_raw.outfifo_ovf_l3) << 1);
+            o["infifo_udf"] = static_cast<uint32_t>(GDMA.channel[ch].in.int_raw.infifo_udf_l1) |
+                              (static_cast<uint32_t>(GDMA.channel[ch].in.int_raw.infifo_udf_l3) << 1);
+            o["infifo_ovf"] = static_cast<uint32_t>(GDMA.channel[ch].in.int_raw.infifo_ovf_l1) |
+                              (static_cast<uint32_t>(GDMA.channel[ch].in.int_raw.infifo_ovf_l3) << 1);
+            if (request->hasArg("clr")) {
+                GDMA.channel[ch].out.int_clr.val = 0xFFFFFFFF;
+                GDMA.channel[ch].in.int_clr.val = 0xFFFFFFFF;
+            }
+        }
+        doc["lcd_cam_trig_id"] = static_cast<uint32_t>(SOC_GDMA_TRIG_PERIPH_LCD0);
+        doc["arb_pri_dis"] = static_cast<uint32_t>(GDMA.misc_conf.arb_pri_dis);
+        serializeJson(doc, *response);
+        request->send(response);
+    });
+
+    server.on("/api/dmatest", [this](AsyncWebServerRequest *request) {
+        AsyncResponseStream *response = request->beginResponseStream("application/json");
+        JsonDocument doc;
+        const size_t rows = request->hasArg("rows") ? request->arg("rows").toInt() : 12;
+        const size_t w = 480;
+        const size_t bytes = rows * w * 2;
+        uint16_t *src = static_cast<uint16_t *>(heap_caps_aligned_alloc(64, bytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA));
+        uint16_t *dst = static_cast<uint16_t *>(heap_caps_aligned_alloc(64, bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+        async_memcpy_t h = nullptr;
+        async_memcpy_config_t cfg = ASYNC_MEMCPY_DEFAULT_CONFIG();
+        cfg.backlog = 64;
+        cfg.sram_trans_align = 4;
+        cfg.psram_trans_align = 64;
+        esp_err_t installErr = ESP_OK;
+        if (src != nullptr && dst != nullptr) {
+            installErr = esp_async_memcpy_install(&cfg, &h);
+        }
+        doc["src"] = reinterpret_cast<uint32_t>(src);
+        doc["dst"] = reinterpret_cast<uint32_t>(dst);
+        doc["bytes"] = static_cast<uint32_t>(bytes);
+        doc["install_err"] = static_cast<int>(installErr);
+        if (src == nullptr || dst == nullptr || h == nullptr) {
+            doc["ok"] = false;
+            doc["why"] = "alloc/install failed";
+        } else {
+            // A pattern where every 16-bit word encodes its own index, so a
+            // mismatch reports not just THAT it moved but WHERE it came from --
+            // a constant delta means a displaced transfer, noise means garbage.
+            const size_t words = bytes / 2;
+            for (size_t i = 0; i < words; i++) {
+                src[i] = static_cast<uint16_t>(i * 7 + 1);
+            }
+            memset(dst, 0xA5, bytes);
+            Cache_WriteBack_Addr(reinterpret_cast<uint32_t>(dst), static_cast<uint32_t>(bytes));
+            SemaphoreHandle_t done = xSemaphoreCreateBinary();
+            const int64_t t0 = esp_timer_get_time();
+            const esp_err_t err = esp_async_memcpy(
+                h, dst, src, bytes,
+                [](async_memcpy_t, async_memcpy_event_t *, void *arg) -> bool {
+                    BaseType_t woken = pdFALSE;
+                    xSemaphoreGiveFromISR(static_cast<SemaphoreHandle_t>(arg), &woken);
+                    return woken == pdTRUE;
+                },
+                done);
+            const bool completed = err == ESP_OK && xSemaphoreTake(done, pdMS_TO_TICKS(500)) == pdTRUE;
+            const uint32_t elapsedUs = static_cast<uint32_t>(esp_timer_get_time() - t0);
+            // The CPU's cached view of dst predates the transfer, so it must be
+            // dropped before the comparison or this would verify the cache.
+            Cache_Invalidate_Addr(reinterpret_cast<uint32_t>(dst), static_cast<uint32_t>(bytes));
+            uint32_t mismatches = 0;
+            int32_t firstIdx = -1;
+            uint32_t firstExp = 0, firstGot = 0;
+            int32_t deltaWords = 0;
+            for (size_t i = 0; i < words; i++) {
+                const uint16_t exp = static_cast<uint16_t>(i * 7 + 1);
+                if (dst[i] != exp) {
+                    if (firstIdx < 0) {
+                        firstIdx = static_cast<int32_t>(i);
+                        firstExp = exp;
+                        firstGot = dst[i];
+                        // If the value present is itself a valid pattern word,
+                        // report which index it belongs to: that difference is
+                        // the displacement, in words.
+                        if (firstGot >= 1 && ((firstGot - 1) % 7) == 0) {
+                            deltaWords = static_cast<int32_t>((firstGot - 1) / 7) - firstIdx;
+                        }
+                    }
+                    mismatches++;
+                }
+            }
+            doc["submit_err"] = static_cast<int>(err);
+            doc["completed"] = completed;
+            doc["elapsed_us"] = elapsedUs;
+            doc["mismatches"] = mismatches;
+            doc["words"] = static_cast<uint32_t>(words);
+            doc["first_bad_idx"] = firstIdx;
+            doc["first_expected"] = firstExp;
+            doc["first_got"] = firstGot;
+            doc["displacement_words"] = deltaWords;
+            doc["ok"] = completed && mismatches == 0;
+            vSemaphoreDelete(done);
+        }
+        if (h != nullptr) {
+            esp_async_memcpy_uninstall(h);
+        }
+        heap_caps_free(src);
+        heap_caps_free(dst);
+        serializeJson(doc, *response);
+        request->send(response);
+    });
+
+    server.on("/api/membench", [this](AsyncWebServerRequest *request) {
+        AsyncResponseStream *response = request->beginResponseStream("application/json");
+        JsonDocument doc;
+        // The PSRAM side must be much larger than the 32 KB data cache or the
+        // benchmark measures the cache instead of the bus: a first version used
+        // a 32 KB PSRAM buffer and reported 366 MB/s reads and 517 MB/s memsets,
+        // which is cache bandwidth -- the working set never left L1. PSRAM
+        // buffers are 512 KB and walked linearly so every access misses. The
+        // SRAM side stays small (a real band buffer is 15 KB) and is reused.
+        constexpr size_t SN = 16 * 1024;   // SRAM block, ~= one band buffer
+        constexpr size_t PN = 512 * 1024;  // PSRAM span, 16x the data cache
+        constexpr int REPS = 8;            // full sweeps of PN
+        constexpr int CHUNKS = PN / SN;
+        // 64-byte aligned on both sides: esp_async_memcpy validates the pointers
+        // against the configured trans_align and rejects the submit outright
+        // otherwise (a plain heap_caps_malloc returned a pointer that failed
+        // this and produced ESP_ERR_INVALID_ARG with no other diagnostic).
+        uint8_t *sram = static_cast<uint8_t *>(heap_caps_aligned_alloc(64, SN, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+        uint8_t *psram = static_cast<uint8_t *>(heap_caps_aligned_alloc(64, PN, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+        uint8_t *psram2 = static_cast<uint8_t *>(heap_caps_aligned_alloc(64, PN, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+        if (sram == nullptr || psram == nullptr || psram2 == nullptr) {
+            doc["error"] = "alloc failed";
+            doc["got_sram"] = sram != nullptr;
+            doc["got_psram"] = psram != nullptr && psram2 != nullptr;
+            doc["sram_free"] = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+            doc["sram_largest"] = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
+        } else {
+            memset(sram, 0x5A, SN);
+            memset(psram, 0x5A, PN);
+            memset(psram2, 0x5A, PN);
+            auto mbps = [](uint32_t us) {
+                return us ? static_cast<uint32_t>(static_cast<uint64_t>(PN) * REPS / us) : 0u;
+            };
+
+            // This is the push path: SRAM band buffer -> PSRAM framebuffer.
+            uint32_t t0 = micros();
+            for (int i = 0; i < REPS; i++) {
+                for (int c = 0; c < CHUNKS; c++) {
+                    memcpy(psram + c * SN, sram, SN);
+                }
+            }
+            doc["w_sram_to_psram_mbps"] = mbps(micros() - t0);
+
+            t0 = micros();
+            for (int i = 0; i < REPS; i++) {
+                for (int c = 0; c < CHUNKS; c++) {
+                    memcpy(sram, psram + c * SN, SN);
+                }
+            }
+            doc["r_psram_to_sram_mbps"] = mbps(micros() - t0);
+
+            t0 = micros();
+            for (int i = 0; i < REPS; i++) {
+                memcpy(psram2, psram, PN);
+            }
+            doc["psram_to_psram_mbps"] = mbps(micros() - t0);
+
+            // memset never reads the source, so if the write path really pays a
+            // read-for-ownership on every 32-byte line this lands close to the
+            // SRAM->PSRAM copy rather than well above it.
+            t0 = micros();
+            for (int i = 0; i < REPS; i++) {
+                memset(psram, static_cast<uint8_t>(i), PN);
+            }
+            doc["memset_psram_mbps"] = mbps(micros() - t0);
+
+            // GDMA path. If this clears the CPU memcpy by a wide margin, the
+            // push task should hand its band to the DMA engine rather than copy
+            // it, which also gives the byte movement back to hardware and frees
+            // the core entirely.
+            async_memcpy_config_t cfg = ASYNC_MEMCPY_DEFAULT_CONFIG();
+            cfg.backlog = 8;
+            cfg.psram_trans_align = 64;
+            cfg.sram_trans_align = 4;
+            async_memcpy_t asmcp = nullptr;
+            const esp_err_t inst = esp_async_memcpy_install(&cfg, &asmcp);
+            doc["dma_install_err"] = esp_err_to_name(inst);
+            if (inst == ESP_OK) {
+                static volatile int s_done = 0;
+                esp_err_t sub = ESP_OK;
+                bool ok = true;
+                // Serialised: every transfer is awaited, so this measures the
+                // engine's throughput rather than queue depth.
+                t0 = micros();
+                for (int i = 0; i < REPS && ok; i++) {
+                    for (int c = 0; c < CHUNKS && ok; c++) {
+                        s_done = 0;
+                        sub = esp_async_memcpy(
+                            asmcp, psram + c * SN, sram, SN,
+                            [](async_memcpy_t, async_memcpy_event_t *, void *) -> bool {
+                                s_done = 1;
+                                return false;
+                            },
+                            nullptr);
+                        if (sub != ESP_OK) {
+                            ok = false;
+                            break;
+                        }
+                        uint32_t spin = 0;
+                        while (s_done == 0 && spin < 4000000u) {
+                            spin++;
+                        }
+                        if (s_done == 0) {
+                            ok = false;
+                        }
+                    }
+                }
+                doc["dma_sram_to_psram_mbps"] = ok ? mbps(micros() - t0) : 0;
+                doc["dma_ok"] = ok;
+                doc["dma_submit_err"] = esp_err_to_name(sub);
+                // Reverse direction too. If GDMA declines a PSRAM destination
+                // but accepts a PSRAM source, the push cannot be handed to it
+                // and the write-allocate cost has to be attacked another way.
+                s_done = 0;
+                const esp_err_t rev = esp_async_memcpy(
+                    asmcp, sram, psram, SN,
+                    [](async_memcpy_t, async_memcpy_event_t *, void *) -> bool {
+                        s_done = 1;
+                        return false;
+                    },
+                    nullptr);
+                doc["dma_psram_src_err"] = esp_err_to_name(rev);
+                if (rev == ESP_OK) {
+                    uint32_t spin = 0;
+                    while (s_done == 0 && spin < 4000000u) {
+                        spin++;
+                    }
+                }
+                esp_async_memcpy_uninstall(asmcp);
+            } else {
+                doc["dma_ok"] = false;
+            }
+        }
+        heap_caps_free(sram);
+        heap_caps_free(psram);
+        heap_caps_free(psram2);
+        doc["psram_span"] = PN;
+        doc["reps"] = REPS;
+        doc["sram_block"] = SN;
+        serializeJson(doc, *response);
+        request->send(response);
+    });
+
     // Bench build only: the render task's own per-stage frame timings. Serial
     // is not a usable channel on this board (the IDF console goes to UART0,
     // not the USB CDC), so results come out over HTTP.
     server.on("/api/animbench", [this](AsyncWebServerRequest *request) {
         AsyncResponseStream *response = request->beginResponseStream("application/json");
         JsonDocument doc;
+        // ?div=n reprograms the RGB pixel clock (pclk = 80 MHz / n) and
+        // restarts the sweep. Scan-out reads the PSRAM framebuffer
+        // continuously, so the divider sets how much of the octal-PSRAM budget
+        // is left for the render task's writes -- this is the knob that tests
+        // whether the flat push cost is a bandwidth floor. Not persisted: it
+        // reverts to the stored setting on the next boot.
+        if (request->hasArg("fps")) {
+            SleepAnimation *a = sleep_animation_bench_instance();
+            const int f = request->arg("fps").toInt();
+            if (a != nullptr && f >= 5 && f <= 60) {
+                a->benchSetMaxFps(static_cast<uint8_t>(f));
+                a->benchRequestReset();
+            }
+        }
+        // ?dma=0/1 switches the framebuffer push between the CPU copy through
+        // the push task and GDMA straight into the panel's buffer. Takes effect
+        // at the next start(), because the engine is installed on the render
+        // task; benchRequestReset restarts the sweep so the two are not
+        // averaged together.
+        if (request->hasArg("dma")) {
+            SleepAnimation *a = sleep_animation_bench_instance();
+            if (a != nullptr) {
+                a->benchSetDma(request->arg("dma").toInt() != 0);
+                a->benchRequestReset();
+            }
+        }
+        // ?dmamode=0|1|2|3|4 -- see benchSetDmaMode. Bisect control, takes effect
+        // on the next band, no restart needed.
+        if (request->hasArg("dmamode")) {
+            SleepAnimation *a = sleep_animation_bench_instance();
+            if (a != nullptr) {
+                a->benchSetDmaMode(request->arg("dmamode").toInt());
+                a->benchRequestReset();
+            }
+        }
+        // ?ilace=0|1 -- push every other row, alternating each frame. Halves the
+        // push, which is the pipeline's ceiling; costs each row half the refresh
+        // rate. Takes effect on the next band.
+        if (request->hasArg("ilace")) {
+            SleepAnimation *a = sleep_animation_bench_instance();
+            if (a != nullptr) {
+                a->benchSetInterlace(request->arg("ilace").toInt() != 0);
+                a->benchRequestReset();
+            }
+        }
+        // ?rhalf=0|1 -- with interlacing on at half resolution, render only the
+        // source rows this frame will push, halving the animation's own cost.
+        if (request->hasArg("rhalf")) {
+            SleepAnimation *a = sleep_animation_bench_instance();
+            if (a != nullptr) {
+                a->benchSetRenderHalf(request->arg("rhalf").toInt() != 0);
+                a->benchRequestReset();
+            }
+        }
+        if (request->hasArg("only")) {
+            SleepAnimation *a = sleep_animation_bench_instance();
+            if (a != nullptr) {
+                a->benchSetOnly(request->arg("only").toInt());
+                a->benchRequestReset();
+            }
+        }
+        if (request->hasArg("half")) {
+            SleepAnimation *a = sleep_animation_bench_instance();
+            if (a != nullptr) {
+                a->benchSetHalfRes(request->arg("half").toInt() != 0);
+                a->benchRequestReset();
+            }
+        }
+        if (request->hasArg("div")) {
+            const int div = request->arg("div").toInt();
+            if (div >= 2 && div <= 16) {
+                panelclock::setDiv(div);
+                SleepAnimation *a = sleep_animation_bench_instance();
+                if (a != nullptr) {
+                    a->benchRequestReset();
+                }
+            }
+        }
+        SleepAnimation *anim0 = sleep_animation_bench_instance();
         const BenchGateState &g = bench_gate_state();
         JsonObject gate = doc["gate"].to<JsonObject>();
         gate["ui_initialized"] = g.uiInitialized;
@@ -398,6 +843,55 @@ void WebUIPlugin::setupServer() {
         gate["ctrl_initialized"] = controller->benchInitialized();
         gate["ctrl_screen_ready"] = controller->benchScreenReady();
         gate["uptime_ms"] = millis();
+        // The pixel prescale only, NOT the whole clock path: pclk is the LCD
+        // group clock (PLL160M divided by lcd_clkm_div_*) divided again by
+        // this. Reporting a derived Hz here would be wrong, so report the
+        // divider and let a caller compare relative values across settings.
+        gate["pclk_div"] = panelclock::currentDiv();
+        gate["half_res"] = anim0 != nullptr && anim0->benchHalfRes();
+        gate["only"] = anim0 != nullptr ? anim0->benchGetOnly() : -1;
+        gate["max_fps"] = anim0 != nullptr ? anim0->benchMaxFps() : 0;
+        // Where the animations' lookup tables actually landed. alloc() sends
+        // anything over SRAM_ALLOC_LIMIT to PSRAM on the assumption that big
+        // tables are swept sequentially; a table indexed by a computed value
+        // once per pixel is not, and pays a PSRAM round trip per miss.
+        gate["lut_sram_b"] = static_cast<uint32_t>(bganim::g_allocSram);
+        gate["lut_psram_b"] = static_cast<uint32_t>(bganim::g_allocPsram);
+        // Direct-to-framebuffer push. wanted vs active is the difference
+        // between asking and getting: the panel must hand over its framebuffer
+        // and the engine must install. issued minus done is the liveness
+        // check -- the render task cannot outrun the engine by more than
+        // NUM_SLOTS, so a gap parked above that means transfers stopped
+        // completing.
+        gate["dma_wanted"] = anim0 != nullptr && anim0->benchDmaWanted();
+        gate["dma_active"] = anim0 != nullptr && anim0->benchDmaActive();
+        gate["dma_mode"] = anim0 != nullptr ? anim0->benchDmaMode() : 0;
+        gate["interlace"] = anim0 != nullptr ? anim0->benchInterlace() : false;
+        gate["render_half"] = anim0 != nullptr ? anim0->benchRenderHalf() : false;
+        gate["bands_internal"] = anim0 != nullptr && anim0->benchBandsInternal();
+        if (anim0 != nullptr) {
+            JsonArray ba = gate["band_addr"].to<JsonArray>();
+            for (int i = 0; i < 3; i++) {
+                ba.add(anim0->benchBandAddr(i));
+            }
+        }
+        gate["dma_issued"] = anim0 != nullptr ? anim0->benchDmaIssued() : 0;
+        gate["dma_done"] = anim0 != nullptr ? anim0->benchDmaCompleted() : 0;
+        gate["dma_err"] = anim0 != nullptr ? anim0->benchDmaErrors() : 0;
+        gate["sram_limit"] = static_cast<uint32_t>(bganim::SRAM_ALLOC_LIMIT);
+        gate["sram_budget"] = static_cast<uint32_t>(bganim::SRAM_TOTAL_BUDGET);
+        gate["free_internal_b"] = static_cast<uint32_t>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+        // Largest contiguous block, not just the total. These diverge under
+        // fragmentation, and the network stack needs whole blocks: lwIP drops
+        // an incoming SYN silently when tcp_alloc() fails, so a fragmented pool
+        // shows up as HTTP connect timeouts with ICMP still answering, which
+        // reads as a wedged board rather than as memory pressure. Watching the
+        // two figures together is what distinguishes exhaustion from
+        // fragmentation.
+        gate["largest_internal_b"] =
+            static_cast<uint32_t>(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+        gate["min_free_internal_b"] =
+            static_cast<uint32_t>(heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL));
         SleepAnimation *anim = sleep_animation_bench_instance();
         if (anim == nullptr) {
             doc["running"] = false;
@@ -421,7 +915,16 @@ void WebUIPlugin::setupServer() {
                 o["push_us"] = res[i].pushUs;
                 o["total_us"] = res[i].totalUs;
                 o["max_us"] = res[i].maxTotalUs;
+                o["wait_us"] = res[i].waitUs;
+                o["pack_us"] = res[i].packUs;
+                o["span_px"] = res[i].spanPx;
+                o["blend_px"] = res[i].blendPx;
                 o["fps"] = res[i].achievedFps / 100.0;
+                // Per-row band cost with and without the scheduler suspended.
+                // A gap between them is preemption being charged to the band
+                // timer; parity means the band really is that expensive.
+                o["band_ns_row"] = res[i].bandNsPerRow;
+                o["band_locked_ns_row"] = res[i].bandLockedNsPerRow;
             }
         }
         serializeJson(doc, *response);
@@ -807,6 +1310,15 @@ void WebUIPlugin::handleSettings(AsyncWebServerRequest *request) const {
                 settings->setBgAnimTheme(request->arg("bgAnimTheme").toInt());
             if (request->hasArg("bgAnimFps"))
                 settings->setBgAnimFps(request->arg("bgAnimFps").toInt());
+            // Guarded on hasArg rather than read as a checkbox: a checkbox that
+            // is off is simply not posted, so a partial submit would read as
+            // "full resolution, no interlacing" and drop the panel to ~15 fps.
+            if (request->hasArg("bgAnimHalfRes"))
+                settings->setBgAnimHalfRes(request->arg("bgAnimHalfRes").toInt() != 0 ? 1 : 0);
+            if (request->hasArg("bgAnimInterlace"))
+                settings->setBgAnimInterlace(request->arg("bgAnimInterlace").toInt() != 0 ? 1 : 0);
+            if (request->hasArg("bgAnimClearPlates"))
+                settings->setBgAnimClearPlates(request->arg("bgAnimClearPlates").toInt() != 0 ? 1 : 0);
             if (request->hasArg("panelClockDiv")) {
                 // 0 = firmware default; explicit dividers outside the sane
                 // 4-12 window (6.7-20 MHz pclk) could leave the panel
@@ -973,6 +1485,9 @@ void WebUIPlugin::handleSettings(AsyncWebServerRequest *request) const {
     doc["bgAnimAllScreens"] = settings.isBgAnimAllScreens();
     doc["bgAnimTheme"] = settings.getBgAnimTheme();
     doc["bgAnimFps"] = settings.getBgAnimFps();
+    doc["bgAnimHalfRes"] = settings.getBgAnimHalfRes();
+    doc["bgAnimInterlace"] = settings.getBgAnimInterlace();
+    doc["bgAnimClearPlates"] = settings.getBgAnimClearPlates();
     doc["panelClockDiv"] = settings.getPanelClockDiv();
     doc["bgAnimCustomTheme"] = settings.getBgAnimCustomTheme();
     doc["smartGrindIp"] = settings.getSmartGrindIp();

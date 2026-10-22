@@ -157,10 +157,22 @@ void band(uint16_t *dst, int y0, int rows, int w, uint32_t, const uint8_t *) {
         for (int k = 0; k < 8; k++) {
             dith[k] = (static_cast<int>(bayerRow[k]) - 31) / 4;
         }
+#ifdef GM_NEBULA_CACHED_NOISE_PROBE
+        // Diagnostic only, visually wrong: pin all four samplers to one noise
+        // row so the working set is 256 bytes and always cache-resident. If
+        // band time collapses, the cost is PSRAM misses on the 64 KB texture
+        // (alloc() puts it there, being far over the 8 KB threshold) and not
+        // the per-row table math. Never build this into anything shipping.
+        const uint8_t *rowA0 = noise;
+        const uint8_t *rowA1 = noise;
+        const uint8_t *rowB = noise;
+        const uint8_t *rowC = noise;
+#else
         const uint8_t *rowA0 = noise + ((y + g_ayI) & 255) * 256;
         const uint8_t *rowA1 = noise + ((y + g_ayI + 1) & 255) * 256;
         const uint8_t *rowB = noise + ((y * 2 + g_by) & 255) * 256;
         const uint8_t *rowC = noise + ((y * 4 + g_cy) & 255) * 256;
+#endif
 
         // Build the bilinear-blended dominant octave once per row — reused
         // for the whole row via the x0 wraparound below. i=255's neighbor
@@ -215,19 +227,37 @@ void band(uint16_t *dst, int y0, int rows, int w, uint32_t, const uint8_t *) {
         // per-real-pixel cost (up to w=480/row) into a fixed 256/row cost,
         // with the real w-wide loop below reduced to a cache-resident
         // table copy.
+        // When the row is no wider than the memo period, the copy loop below
+        // reads fullColor[m] for m in [0, w) and never wraps -- so the memo is
+        // pure overhead and the combine loop can write the row itself. This is
+        // bit-identical, not an approximation: the copy loop's index starts at
+        // 0 and increments, so for w <= 256 it visits exactly the entries this
+        // loop just wrote, in order.
+        //
+        // It matters most where nebula is worst. The per-row table work is a
+        // fixed ~647 iterations regardless of w, so at half resolution (w=240)
+        // the tables cost five times the pixel loop they feed. Going direct
+        // drops the 16 entries the row never reads and the whole w/2-iteration
+        // copy loop.
+        const bool direct = w <= 256;
+        uint16_t *const combineOut = direct ? row : fullColor;
+        const int combineN = direct ? w : 256;
         {
             int x0 = g_axI & 255;
             int step = 0;
-            for (int m = 0; m < 256; m++) {
+            for (int m = 0; m < combineN; m++) {
                 const int a = blendedA[x0];
                 const uint16_t bc = bcTable[step];
                 const int b = bc & 0xFF;
                 const int c = bc >> 8;
                 const int v = c + ((((a - c) * wA) + ((b - c) * wB)) >> 6) + densOff + dith[m & 7];
-                fullColor[m] = paletteExt[PAD + v];
+                combineOut[m] = paletteExt[PAD + v];
                 x0 = (x0 + 1) & 255;
                 step = (step + 1) & 127;
             }
+        }
+        if (direct) {
+            continue;
         }
 
         // Real per-pixel loop: sequential read from a 256-entry (512B)

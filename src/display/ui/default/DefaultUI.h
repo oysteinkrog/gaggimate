@@ -74,6 +74,14 @@ class DefaultUI {
     void stopSleepAnimation();
     void maintainSleepAnimation();
     void refreshSleepOverlay();
+    // Hide or restore the opaque background plates the generated screens put
+    // behind their content. See the definition for which objects and why.
+    void applyAnimPlates(bool clear);
+    // lv_snapshot_take_to_buf with a clip area. Renders only `clip` into `buf`,
+    // leaving the rest of the buffer alone, so an overlay refresh costs what
+    // actually changed rather than a whole screen.
+    bool snapshotAreaToOverlay(lv_obj_t *obj, uint8_t *buf, uint32_t bufSize, const lv_area_t &clip, int *outW,
+                               int *outH);
     void maintainScaleScreen();
     void buildScaleScreen();
     void displaceGrindWidgets(bool displaced);
@@ -85,8 +93,22 @@ class DefaultUI {
     SleepAnimation sleepAnimation;
     unsigned long lastSleepAnimAttempt = 0;
     unsigned long lastSleepOverlayRefresh = 0;
+    // Dirty region still owed to each of the two overlay buffers, in screen
+    // coordinates, and whether that buffer has ever held a full render. They
+    // are written alternately, so each carries its own debt: a partial update
+    // is only valid against what that specific buffer already holds.
+    lv_area_t overlayDirty[2] = {{1, 1, 0, 0}, {1, 1, 0, 0}};
+    bool overlayValid[2] = {false, false};
     bool bgAnimAllScreens = false;         // settings.isBgAnimAllScreens(), cached per render
+    // millis() when setupPanel() finished building the UI, or 0 before that.
+    // The animation needs a live screen to host its overlay snapshot, so it
+    // cannot start earlier. `initialized` cannot serve this purpose: it is set
+    // only when a controller connects, which is a different thing entirely.
+    unsigned long uiBuiltAt = 0;
     lv_obj_t *animHostScreen = nullptr;    // screen whose bg was made transparent for the animation
+    bool animPlatesCleared = false;
+    lv_opa_t animPlateOpa[6] = {LV_OPA_COVER, LV_OPA_COVER, LV_OPA_COVER,
+                                LV_OPA_COVER, LV_OPA_COVER, LV_OPA_COVER};
     std::atomic<bool> panelStopRequested{false};
     std::atomic<bool> panelStopped{false};
     std::atomic<bool> otaEnded{false};

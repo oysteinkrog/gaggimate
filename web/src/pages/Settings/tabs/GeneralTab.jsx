@@ -254,10 +254,64 @@ function BackgroundAnimationSettings({ formData, onChange, setField }) {
             <option value={8}>38 Hz — most conservative</option>
           </select>
         </SettingsFormField>
+        <SettingsFormField label='Animation resolution' htmlFor='bgAnimHalfRes' noMargin>
+          <select
+            id='bgAnimHalfRes'
+            name='bgAnimHalfRes'
+            className='select select-bordered w-full'
+            value={formData.bgAnimHalfRes === undefined ? 1 : parseInt(formData.bgAnimHalfRes, 10)}
+            onChange={onChange('bgAnimHalfRes')}
+          >
+            <option value={1}>Half (240x240, doubled), every animation at 40+ fps</option>
+            <option value={0}>Full (480x480), sharper, 15 to 25 fps on the heavy ones</option>
+          </select>
+        </SettingsFormField>
+        <SettingsFormField label='Interlace animation' htmlFor='bgAnimInterlace' noMargin>
+          <select
+            id='bgAnimInterlace'
+            name='bgAnimInterlace'
+            className='select select-bordered w-full'
+            value={
+              formData.bgAnimInterlace === undefined ? 1 : parseInt(formData.bgAnimInterlace, 10)
+            }
+            onChange={onChange('bgAnimInterlace')}
+          >
+            <option value={1}>On, refreshes half the rows each frame (roughly doubles the rate)</option>
+            <option value={0}>Off, every row every frame</option>
+          </select>
+        </SettingsFormField>
+        <SettingsFormField label='Screen background panels' htmlFor='bgAnimClearPlates' noMargin>
+          <select
+            id='bgAnimClearPlates'
+            name='bgAnimClearPlates'
+            className='select select-bordered w-full'
+            value={
+              formData.bgAnimClearPlates === undefined
+                ? 1
+                : parseInt(formData.bgAnimClearPlates, 10)
+            }
+            onChange={onChange('bgAnimClearPlates')}
+          >
+            <option value={1}>Hide, animation fills every screen the same way</option>
+            <option value={0}>Keep, solid panel behind the dials on some screens</option>
+          </select>
+        </SettingsFormField>
       </div>
       <p className='text-base-content/60 mt-2 text-sm'>
         If the animation flickers or the image jumps, lower the frame rate or the refresh rate:
         both compete for the same memory bandwidth. Changes apply live after saving.
+      </p>
+      <p className='text-base-content/60 mt-2 text-sm'>
+        Resolution and interlacing trade sharpness for smoothness. Half resolution plus
+        interlacing is what lets every animation run above 40 fps; full resolution is visibly
+        sharper but the heaviest animations drop to around 15 fps. Interlacing refreshes half
+        the rows on each frame, which is not usually noticeable while something is moving.
+      </p>
+      <p className='text-base-content/60 mt-2 text-sm'>
+        The brew, status and profile screens carry a solid circle behind their dials, and the
+        info screen a solid panel, while the other screens carry none. With the animation
+        running behind every screen that shows up as a black disc on some screens and not
+        others, so by default those panels are hidden while the animation plays.
       </p>
       <div className='mt-4'>
         <ToggleField

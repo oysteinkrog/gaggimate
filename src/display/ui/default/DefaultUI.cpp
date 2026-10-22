@@ -40,6 +40,31 @@ static EffectManager effect_mgr;
 
 static constexpr uint32_t STARTUP_FADE_MS = 1000; // standby fade-in duration on power-up
 
+namespace {
+inline bool areaEmpty(const lv_area_t &a) { return a.x1 > a.x2 || a.y1 > a.y2; }
+inline void areaClear(lv_area_t &a) {
+    a.x1 = 1;
+    a.y1 = 1;
+    a.x2 = 0;
+    a.y2 = 0;
+}
+inline void areaMerge(lv_area_t &dst, const lv_area_t &src) {
+    if (areaEmpty(dst)) {
+        dst = src;
+        return;
+    }
+    if (src.x1 < dst.x1)
+        dst.x1 = src.x1;
+    if (src.y1 < dst.y1)
+        dst.y1 = src.y1;
+    if (src.x2 > dst.x2)
+        dst.x2 = src.x2;
+    if (src.y2 > dst.y2)
+        dst.y2 = src.y2;
+}
+} // namespace
+
+
 static constexpr int32_t GAUGE_TICK_LONG = 25;      // meter tick length on most screens
 static constexpr int32_t GAUGE_TICK_SHORT = 10;     // shortened tick length on profile / new-menu screens
 static constexpr uint32_t GAUGE_TICK_ANIM_MS = 300; // tick length transition duration
@@ -326,10 +351,17 @@ void DefaultUI::loop() {
         }
     }
 
+    // ui_tick() first: it runs the generated tick_screen_*, which is what derives
+    // widget visibility from flow state. Running it after the maintain calls
+    // meant that on the pass where a screen had just been created, the overlay
+    // snapshot captured HIDDEN flags still at their creation defaults, and the
+    // real values only reached the panel on the following refresh — a widget
+    // visibly settling a frame late, but only the first time a screen was
+    // entered, since after that the flags were already correct.
+    ui_tick();
     maintainSleepAnimation();
     maintainScaleScreen();
 
-    ui_tick();
     lv_task_handler();
 }
 
@@ -345,18 +377,20 @@ void DefaultUI::maintainSleepAnimation() {
 #ifndef GAGGIMATE_SIM
     const bool blocked = controller->isUpdating() || controller->isErrorState() || controller->isAutotuning() ||
                          controller->getSystemInfo().protocolMismatch;
-#ifdef GM_FAKE_CONTROLLER
-    // Bench build: no controller board is attached and BLE is never started, so
-    // the real link is permanently down. Only this gate is faked -- the client
-    // still reports honestly everywhere else, so nothing tries to transmit on
-    // an uninitialized BLE stack.
-    const bool connected = true;
-#else
-    const bool connected = controller->getClientController() != nullptr && controller->getClientController()->isConnected();
-#endif
-    const bool sleepWant =
-        currentScreen == SCREEN_ID_STANDBY_SCREEN && controller->getMode() == MODE_STANDBY && connected && !blocked;
-    const bool wantAnimation = bgAnimAllScreens ? (initialized && !blocked) : sleepWant;
+    const bool connected = controller->isLinkUp();
+    // getMode() is controller-sourced, so while the link is down its value
+    // carries no information -- only consult it once there is a link that could
+    // have supplied it. Requiring MODE_STANDBY unconditionally is what left the
+    // standby screen blank behind "Waiting for controller...".
+    const bool standbyMode = !connected || controller->getMode() == MODE_STANDBY;
+    // Not `initialized`, which despite the name only becomes true once a
+    // controller has connected -- testing it here is what kept the standby
+    // screen blank behind "Waiting for controller...". What the animation
+    // actually needs is a built UI and a finished power-up fade, since it
+    // suppresses the LVGL flushes the fade is made of.
+    const bool uiReady = uiBuiltAt != 0 && ::millis() - uiBuiltAt >= STARTUP_FADE_MS;
+    const bool sleepWant = uiReady && currentScreen == SCREEN_ID_STANDBY_SCREEN && standbyMode && !blocked;
+    const bool wantAnimation = bgAnimAllScreens ? (uiReady && !blocked) : sleepWant;
 
 #ifdef GM_ANIM_BENCH
     {
@@ -390,7 +424,8 @@ void DefaultUI::maintainSleepAnimation() {
             // Standby content changes once a minute (clock); active screens
             // update continuously — refresh the snapshot faster there so
             // gauges and numbers stay reasonably live behind the animation.
-            const unsigned long interval = currentScreen == SCREEN_ID_STANDBY_SCREEN ? 1000 : 250;
+            applyAnimPlates(controller->getSettings().getBgAnimClearPlates() != 0);
+            const unsigned long interval = currentScreen == SCREEN_ID_STANDBY_SCREEN ? 1000 : 33;
             if (::millis() - lastSleepOverlayRefresh > interval) {
                 refreshSleepOverlay();
             }
@@ -501,6 +536,7 @@ void DefaultUI::setupPanel() {
     // Set initial brightness based on settings
     const ::Settings &settings = controller->getSettings();
     setBrightness(settings.getMainBrightness());
+    uiBuiltAt = ::millis();
 }
 
 void DefaultUI::setupState() {
@@ -617,10 +653,51 @@ void DefaultUI::startSleepAnimation() {
             lv_obj_set_style_border_opa(icon, LV_OPA_TRANSP, LV_PART_MAIN);
         }
     }
+    applyAnimPlates(controller->getSettings().getBgAnimClearPlates() != 0);
     // Widget updates must not race the plasma on the panel: LVGL keeps
     // rendering to its draw buffer, but flushes are dropped until stop.
     lvgl_helper_suppress_flush(true);
+    overlayValid[0] = overlayValid[1] = false;
+    areaClear(overlayDirty[0]);
+    areaClear(overlayDirty[1]);
     refreshSleepOverlay();
+#endif
+}
+
+// The generated screens put a full-bleed opaque object behind their content:
+// brew, status and profile each a 360x360 circle (radius 180), info a 400x400
+// rounded square. Menu, steam, water and grind have none. startSleepAnimation
+// makes the SCREEN transparent, but not these children, so the animation shows
+// whole on the screens without a plate and with a black disc punched through it
+// on the ones with. Hiding them is what makes every screen look alike.
+//
+// The original opacity is saved and put back rather than dropping the local
+// style property, because the generated code sets that property explicitly and
+// removing it would fall through to the theme default instead of the value the
+// screen was designed with.
+void DefaultUI::applyAnimPlates(bool clear) {
+#ifndef GAGGIMATE_SIM
+    if (clear == animPlatesCleared) {
+        return;
+    }
+    // The last two are the profile-name labels on the brew and profile screens.
+    // They are not full-bleed panels but they are opaque, and because the text
+    // scrolls (LONG_SCROLL_CIRCULAR) the black bar behind it is in constant
+    // motion against the animation, which makes it the most obvious of the lot.
+    lv_obj_t *const plates[6] = {objects.obj2,   objects.obj9,        objects.obj15,
+                                 objects.obj26,  objects.profile_name, objects.profile_name_1};
+    for (int i = 0; i < 6; i++) {
+        if (plates[i] == nullptr) {
+            continue;
+        }
+        if (clear) {
+            animPlateOpa[i] = lv_obj_get_style_bg_opa(plates[i], LV_PART_MAIN);
+            lv_obj_set_style_bg_opa(plates[i], LV_OPA_TRANSP, LV_PART_MAIN);
+        } else {
+            lv_obj_set_style_bg_opa(plates[i], animPlateOpa[i], LV_PART_MAIN);
+        }
+    }
+    animPlatesCleared = clear;
 #endif
 }
 
@@ -628,6 +705,7 @@ void DefaultUI::stopSleepAnimation() {
 #ifndef GAGGIMATE_SIM
     sleepAnimation.stop();
     lvgl_helper_suppress_flush(false);
+    applyAnimPlates(false);
     for (lv_obj_t *icon : {objects.wifi_icon, objects.bluetooth_icon, objects.update_icon}) {
         if (icon != nullptr) {
             lv_obj_remove_local_style_prop(icon, LV_STYLE_BORDER_OPA, LV_PART_MAIN);
@@ -646,28 +724,155 @@ void DefaultUI::stopSleepAnimation() {
 // Renders the host screen's widgets into the animation's back overlay buffer
 // via an offscreen LVGL snapshot (RGB565+A8), then publishes it for the
 // render task to alpha-blend into every animation frame.
+// Modelled on lv_snapshot_take_to_buf (lvgl/src/extra/others/snapshot), with
+// one difference that is the entire point: buf_area stays the full snapshot
+// rectangle, so the buffer keeps its geometry and stride, while clip_area is
+// narrowed to the region that changed. LVGL then draws only that region, into
+// its correct place in the existing buffer.
+//
+// The upstream function also memsets the whole buffer first. Here only the clip
+// rectangle is cleared, because everything outside it is still valid from an
+// earlier pass. Clearing it at all matters: alpha has to go back to zero where
+// a widget shrank or moved away, or it would leave a trail.
+bool DefaultUI::snapshotAreaToOverlay(lv_obj_t *obj, uint8_t *buf, uint32_t bufSize, const lv_area_t &clip, int *outW,
+                                      int *outH) {
+#ifndef GAGGIMATE_SIM
+    const uint32_t needed = lv_snapshot_buf_size_needed(obj, LV_IMG_CF_TRUE_COLOR_ALPHA);
+    if (needed == 0 || needed > bufSize) {
+        return false;
+    }
+    const lv_coord_t ext = _lv_obj_get_ext_draw_size(obj);
+    lv_area_t snapshotArea;
+    lv_obj_get_coords(obj, &snapshotArea);
+    lv_area_increase(&snapshotArea, ext, ext);
+
+    const int w = lv_obj_get_width(obj) + ext * 2;
+    const int h = lv_obj_get_height(obj) + ext * 2;
+
+    lv_area_t clipped = clip;
+    if (clipped.x1 < snapshotArea.x1)
+        clipped.x1 = snapshotArea.x1;
+    if (clipped.y1 < snapshotArea.y1)
+        clipped.y1 = snapshotArea.y1;
+    if (clipped.x2 > snapshotArea.x2)
+        clipped.x2 = snapshotArea.x2;
+    if (clipped.y2 > snapshotArea.y2)
+        clipped.y2 = snapshotArea.y2;
+    if (areaEmpty(clipped)) {
+        return false;
+    }
+
+    // Reset alpha (and colour) across the region about to be redrawn.
+    const int rowBytes = (clipped.x2 - clipped.x1 + 1) * 3;
+    for (int y = clipped.y1; y <= clipped.y2; y++) {
+        uint8_t *row = buf + (static_cast<size_t>(y - snapshotArea.y1) * w + (clipped.x1 - snapshotArea.x1)) * 3;
+        memset(row, 0, rowBytes);
+    }
+
+    lv_disp_t *objDisp = lv_obj_get_disp(obj);
+    lv_disp_drv_t driver;
+    lv_disp_drv_init(&driver);
+    driver.hor_res = lv_disp_get_hor_res(objDisp);
+    driver.ver_res = lv_disp_get_hor_res(objDisp);
+    lv_disp_drv_use_generic_set_px_cb(&driver, LV_IMG_CF_TRUE_COLOR_ALPHA);
+
+    lv_disp_t fakeDisp;
+    lv_memset_00(&fakeDisp, sizeof(lv_disp_t));
+    fakeDisp.driver = &driver;
+
+    lv_draw_ctx_t *drawCtx = static_cast<lv_draw_ctx_t *>(lv_mem_alloc(objDisp->driver->draw_ctx_size));
+    if (drawCtx == nullptr) {
+        return false;
+    }
+    objDisp->driver->draw_ctx_init(fakeDisp.driver, drawCtx);
+    fakeDisp.driver->draw_ctx = drawCtx;
+    drawCtx->clip_area = &clipped;      // only this is redrawn
+    drawCtx->buf_area = &snapshotArea;  // buffer keeps full geometry and stride
+    drawCtx->buf = static_cast<void *>(buf);
+    driver.draw_ctx = drawCtx;
+
+    lv_disp_t *refrOri = _lv_refr_get_disp_refreshing();
+    _lv_refr_set_disp_refreshing(&fakeDisp);
+    lv_obj_redraw(drawCtx, obj);
+    _lv_refr_set_disp_refreshing(refrOri);
+
+    objDisp->driver->draw_ctx_deinit(fakeDisp.driver, drawCtx);
+    lv_mem_free(drawCtx);
+
+    if (outW != nullptr)
+        *outW = w;
+    if (outH != nullptr)
+        *outH = h;
+    return true;
+#else
+    return false;
+#endif
+}
+
 void DefaultUI::refreshSleepOverlay() {
 #ifndef GAGGIMATE_SIM
     lv_obj_t *scr = animHostScreen;
-    // nullptr also covers "render task is mid-frame in the back overlay" —
-    // don't stamp the refresh time, so the next UI pass retries immediately.
+    if (scr == nullptr) {
+        return;
+    }
+    // lv_obj_redraw() below draws objects where the layout says they are, and
+    // it does not run the layout itself — lv_task_handler() does, and that runs
+    // after this. On a freshly created screen the flex containers have not been
+    // laid out yet, so their children still sit at the container origin and the
+    // snapshot catches them stacked. This is a no-op once the layout is valid.
+    lv_obj_update_layout(scr);
+    // Collect what LVGL redrew since the last pass FIRST, and owe it to both
+    // buffers. Doing this before any early return is what makes the retry paths
+    // below safe: a refresh that cannot proceed loses nothing.
+    lv_area_t fresh;
+    if (lvgl_helper_take_dirty(&fresh)) {
+        areaMerge(overlayDirty[0], fresh);
+        areaMerge(overlayDirty[1], fresh);
+    }
+
+    // nullptr means the render task is still reading that buffer; retry next
+    // pass without stamping the refresh time.
     uint8_t *buf = sleepAnimation.overlayBackBuffer();
-    if (scr == nullptr || buf == nullptr) {
+    if (buf == nullptr) {
         return;
     }
+    const int back = sleepAnimation.overlayBackIndex();
+
+    // Nothing moved and this buffer is already complete: the whole refresh
+    // costs one comparison. This is the case that gives touch its time back on
+    // a screen that is merely sitting there.
+    if (overlayValid[back] && areaEmpty(overlayDirty[back])) {
+        return;
+    }
+
+    lv_area_t clip;
+    if (overlayValid[back]) {
+        clip = overlayDirty[back];
+    } else {
+        // First use of this buffer: it holds nothing, so a partial draw would
+        // composite against garbage. Take the whole screen once.
+        lv_obj_get_coords(scr, &clip);
+        const lv_coord_t ext = _lv_obj_get_ext_draw_size(scr);
+        lv_area_increase(&clip, ext, ext);
+    }
+
     lastSleepOverlayRefresh = ::millis();
-    const uint32_t needed = lv_snapshot_buf_size_needed(scr, LV_IMG_CF_TRUE_COLOR_ALPHA);
-    if (needed == 0 || needed > sleepAnimation.overlayCapacity()) {
-        log_w("Sleep overlay snapshot needs %u B, capacity %u B — skipping", static_cast<unsigned>(needed),
-              static_cast<unsigned>(sleepAnimation.overlayCapacity()));
-        return;
-    }
-    lv_img_dsc_t dsc;
-    if (lv_snapshot_take_to_buf(scr, LV_IMG_CF_TRUE_COLOR_ALPHA, &dsc, buf, needed) != LV_RES_OK) {
+    int w = 0, h = 0;
+    if (!snapshotAreaToOverlay(scr, buf, sleepAnimation.overlayCapacity(), clip, &w, &h)) {
         log_w("Sleep overlay snapshot failed");
         return;
     }
-    sleepAnimation.publishOverlay(dsc.header.w, dsc.header.h);
+
+    // Only the rows that changed need their alpha spans recomputed. The clip is
+    // in screen coordinates and the host object is the screen, so screen row
+    // and panel row are the same number.
+    sleepAnimation.publishOverlay(w, h, clip.y1, clip.y2 + 1);
+    overlayValid[back] = true;
+    areaClear(overlayDirty[back]);
+    // A widget just changed. Do not let interlacing split that change across
+    // two frames; on hard-edged UI content the half-updated frame is plainly
+    // visible, where on the animation it is not.
+    sleepAnimation.requestWholeFrames();
 #endif
 }
 
@@ -717,8 +922,11 @@ void DefaultUI::maintainScaleScreen() {
 // tick and would undo it. Translating them off-panel instead is tick-proof and
 // fully reversible (the local style prop is simply removed on exit).
 void DefaultUI::displaceGrindWidgets(bool displaced) {
-    lv_obj_t *const widgets[] = {objects.main_label4, objects.grind_start_button, objects.mode_switch1, objects.target_weight,
-                                 objects.target_time};
+    // grind_dials__menu_icon goes with them: the scale overlay draws its own exit
+    // arrow in that slot, and the dials' icon is flow-driven so it cannot simply
+    // be hidden.
+    lv_obj_t *const widgets[] = {objects.main_label4,  objects.grind_start_button, objects.mode_switch1,
+                                 objects.target_weight, objects.target_time,       objects.grind_dials__menu_icon};
     for (lv_obj_t *obj : widgets) {
         if (obj == nullptr) {
             continue;
@@ -806,11 +1014,16 @@ void DefaultUI::buildScaleScreen() {
     lv_obj_set_style_text_color(tareLabel, fg, LV_PART_MAIN);
     lv_obj_center(tareLabel);
 
-    // Exit to the menu: theme-recolored imgbtn in the grind start button's slot.
-    // Up-angle mirrors the swipe-up gesture, which also still works.
+    // Exit to the menu, in the dials widget's menu-icon slot (CENTER + 210) so
+    // it lands where it does on every other screen. The dials' own menu icon is
+    // translated off-panel by displaceGrindWidgets while this screen is up:
+    // both are img_angle_up_40x40 and both leave to the menu, so leaving both
+    // visible drew the arrow twice. This one is kept rather than the dials' one
+    // because it also clears scaleScreenRequested and deactivates the
+    // controller, which the generated handler does not.
     lv_obj_t *exitBtn = lv_imgbtn_create(cover);
     lv_obj_set_size(exitBtn, 40, 40);
-    lv_obj_align(exitBtn, LV_ALIGN_CENTER, 0, 130);
+    lv_obj_align(exitBtn, LV_ALIGN_CENTER, 0, 210);
     lv_imgbtn_set_src(exitBtn, LV_IMGBTN_STATE_RELEASED, nullptr, &img_angle_up_40x40, nullptr);
     lv_obj_set_style_img_recolor(exitBtn, fg, LV_PART_MAIN);
     lv_obj_set_style_img_recolor_opa(exitBtn, LV_OPA_COVER, LV_PART_MAIN);
@@ -906,6 +1119,8 @@ void DefaultUI::updateState() {
     bg_parse_params(settings.getBgAnimParams().c_str(), animId, animP);
     sleepAnimation.configure(static_cast<uint8_t>(animId), animP);
     sleepAnimation.setMaxFps(static_cast<uint8_t>(settings.getBgAnimFps()));
+    sleepAnimation.setHalfRes(settings.getBgAnimHalfRes() != 0);
+    sleepAnimation.setInterlace(settings.getBgAnimInterlace() != 0);
     // Panel refresh rate: live pclk divider (0 = build default). One register
     // poke, but only touch the peripheral on an actual change.
     static int lastPclkDiv = INT_MIN;

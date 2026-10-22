@@ -167,6 +167,9 @@ struct RowAux {
 RowAux *rowAux[4] = {nullptr, nullptr, nullptr, nullptr};
 uint32_t lastThemeGen = 0xFFFFFFFF;
 int lastGlow = -1;
+int rowAuxW[4] = {0, 0, 0, 0}; // width each rowAux phase was sized for,
+                               // per phase: they are retried independently
+                               // and can differ across init() calls
 float g_invR2 = 1.0f;
 float g_vignK = 0.32f; // 0.32f * g_invR2, folded so band() does one multiply instead of two
 int32_t g_step[3];    // per-pixel x-phase step, Q32 turns/px
@@ -257,6 +260,7 @@ bool init(int w, int h) {
                 continue;
             }
             rowAux[ph] = static_cast<RowAux *>(alloc(w * sizeof(RowAux)));
+            rowAuxW[ph] = w;
             if (rowAux[ph] == nullptr) {
                 continue; // retried on the next init()
             }
@@ -403,6 +407,22 @@ void band(uint16_t *dst, int y0, int rows, int w, uint32_t, const uint8_t *) {
     }
 }
 
+void release() {
+    releaseTable(g_lut, static_cast<size_t>(LUT_N) * sizeof(uint16_t));
+    // All three point into g_lut; freeing any of them would be a double free.
+    contrastLUT = nullptr;
+    paletteExt = nullptr;
+    palette = nullptr;
+    for (int ph = 0; ph < 4; ph++) {
+        releaseTable(rowAux[ph], static_cast<size_t>(rowAuxW[ph]) * sizeof(RowAux));
+        rowAuxW[ph] = 0;
+    }
+    // Borrowed from BgAnimCommon, which owns it and shares it fleet-wide.
+    g_sinLut = nullptr;
+    lastThemeGen = 0xFFFFFFFF;
+    lastGlow = -1;
+}
+
 } // namespace
 
 extern const BgAnimation bg_anim_silk;
@@ -413,6 +433,7 @@ const BgAnimation bg_anim_silk = {
     init,
     frame,
     band,
+    release,
 };
 
 #endif // GAGGIMATE_SIM

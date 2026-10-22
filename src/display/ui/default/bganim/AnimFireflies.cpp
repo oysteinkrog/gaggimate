@@ -64,6 +64,7 @@ uint8_t *ffCol = nullptr;    // FF_MAX * 3, per-particle base color from the the
 float *expLUT = nullptr;     // EXP_LUT_N entries, expf(-(dr*dr)*61.7f) over |dr| in [0, EXP_LUT_DR_MAX)
 int ffCount = 0;
 int builtCount = -1;
+int allocH = 0; // height bgLUT was sized for
 uint32_t rng = 0x9e3779b9;
 uint32_t lastThemeGen = 0xFFFFFFFF;
 int g_h = 480;
@@ -128,6 +129,7 @@ bool init(int w, int h) {
         ff = static_cast<Firefly *>(alloc(FF_MAX * sizeof(Firefly)));
         draws = static_cast<FfDraw *>(alloc(FF_MAX * sizeof(FfDraw)));
         alphaLUT = static_cast<uint8_t *>(alloc(64));
+        allocH = h;
         bgLUT = static_cast<uint16_t *>(alloc(h * sizeof(uint16_t)));
         ffCol = static_cast<uint8_t *>(alloc(FF_MAX * 3));
         expLUT = static_cast<float *>(alloc(EXP_LUT_N * sizeof(float)));
@@ -234,6 +236,18 @@ void band(uint16_t *dst, int y0, int rows, int w, uint32_t, const uint8_t *) {
     }
 }
 
+void release() {
+    releaseTable(ff, static_cast<size_t>(FF_MAX) * sizeof(Firefly));
+    releaseTable(draws, static_cast<size_t>(FF_MAX) * sizeof(FfDraw));
+    releaseTable(alphaLUT, 64);
+    releaseTable(bgLUT, static_cast<size_t>(allocH) * sizeof(uint16_t));
+    releaseTable(ffCol, static_cast<size_t>(FF_MAX) * 3);
+    releaseTable(expLUT, static_cast<size_t>(EXP_LUT_N) * sizeof(float));
+    allocH = 0;
+    builtCount = -1;
+    lastThemeGen = 0xFFFFFFFF;
+}
+
 } // namespace
 
 extern const BgAnimation bg_anim_fireflies;
@@ -244,6 +258,7 @@ const BgAnimation bg_anim_fireflies = {
     init,
     frame,
     band,
+    release,
 };
 
 #endif // GAGGIMATE_SIM

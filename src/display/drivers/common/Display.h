@@ -13,6 +13,23 @@ class Display {
     virtual uint8_t getPoint(int16_t *x, int16_t *y, uint8_t get_point) = 0;
     virtual bool supportsDirectMode() = 0;
 
+    // The panel's own framebuffer, when it has one the caller may write to
+    // directly, or nullptr when it does not. A CPU write to PSRAM costs twice a
+    // read on this part -- the 32-byte write-allocate line is fetched before it
+    // is overwritten -- so pushColors moves two frames of bus traffic to deliver
+    // one: 24 MB/s measured, against 48 for the same bytes over GDMA, which
+    // never passes through the cache. A caller that can drive its own DMA wants
+    // the destination address, not a copy routine.
+    virtual uint16_t *directFrameBuffer() { return nullptr; }
+    // Serialise a direct writer against this panel's own pushColors, which ends
+    // with a cache writeback over the region it touched.
+    virtual void lockFrameBuffer() {}
+    virtual void unlockFrameBuffer() {}
+    // Tell the panel that someone is writing its framebuffer behind the cache,
+    // so pushColors can stop trusting its own cached view of that memory. See
+    // the implementation for what goes wrong without it.
+    virtual void setDirectWriter(bool) {}
+
   protected:
     uint8_t _rotation;
 };

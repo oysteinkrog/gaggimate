@@ -44,7 +44,7 @@ struct Sample {
     uint8_t orbit;
 };
 constexpr int MAX_SAMPLES = MAX_ORBITS * 18;
-Sample samples[MAX_SAMPLES];
+Sample *samples = nullptr;
 int sampleCount = 0;
 
 void rebuildGeometry(int countP, int eccP, int w, int h) {
@@ -93,6 +93,12 @@ void rebuildGeometry(int countP, int eccP, int w, int h) {
 
 bool init(int w, int h) {
     g_w = w;
+    if (samples == nullptr) {
+        samples = static_cast<Sample *>(alloc(MAX_SAMPLES * sizeof(Sample)));
+        if (samples == nullptr) {
+            return false;
+        }
+    }
     if (pathBins == nullptr) {
         pathBins = static_cast<PathPt *>(alloc(MAX_ORBITS * NUM_BANDS * PTS_PER_BAND * sizeof(PathPt)));
         pathBinCount = static_cast<uint8_t *>(alloc(MAX_ORBITS * NUM_BANDS));
